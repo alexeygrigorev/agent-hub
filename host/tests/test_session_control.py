@@ -19,6 +19,12 @@ class TestSessionControlCli(unittest.TestCase):
     def parse(self, *args):
         return parser().parse_args(['sessions', *args])
 
+    def test_manual_intake_link_uses_canonical_route(self):
+        with patch.object(session_control, 'request', return_value={'intake_id': 'task-fixture'}) as transport:
+            result = session_control.execute(self.parse('link', 'owned-worker', '--intake-task-id', 'task-fixture', '--key', 'link-once'))
+        self.assertEqual(result['intake_id'], 'task-fixture')
+        transport.assert_called_once_with('POST', '/api/sessions/owned-worker/link', {'key': 'link-once', 'intake_task_id': 'task-fixture'})
+
     def test_wait_stops_at_failed_send_instead_of_waiting_until_timeout(self):
         failed = {'id': 'cmd', 'state': 'failed',
                   'ack': {'reason': 'send_unsupported_headless'}}

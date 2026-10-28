@@ -74,7 +74,7 @@ describe('CLI long-running warning projection and durable snooze', () => {
       expect((await s.handle(req('/warnings?threshold=no'), admin)).status).toBe(400);
       const foreign = { caller: { kind: 'agent', actor: 'other' }, scopes: ['fleet:launch'] };
       expect((await s.handle(req('/' + id + '/ack', {}), foreign)).status).toBe(404);
-      expect(await (await s.handle(req('/warnings'), foreign)).json()).toEqual({ warnings: [] });
+      expect(await (await s.handle(req('/warnings'), foreign)).json()).toEqual({ warnings: [], wake_alerts: [] });
       expect((await s.handle(req('/warnings'), {})).status).toBe(401);
     });
   });

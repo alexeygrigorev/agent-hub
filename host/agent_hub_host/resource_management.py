@@ -973,6 +973,8 @@ def classify_reason(entry: dict[str, Any], native_phase: Optional[str], native_d
         return "terminal"
     if native_dead is True:
         return "dead_pid"
+    if entry.get("idle_reap_allowed") is False or (entry.get("intake_id") and entry.get("idle_reap_allowed") is not True):
+        return None
     if idle_ms is not None and idle_ms >= 0:
         last_ms = _parse_iso_ms(entry.get("last_activity_at"))
         if last_ms is None:
@@ -1383,16 +1385,19 @@ def run_watchdog_cycle(
                         summary["skipped"] += 1
                         continue
                     dead = _native_dead(native)
+                    # Worktree-guard (AC2): never reap a session linked to an
+                    # open intake, and never reap out from under a Hub-locked
+                    # worktree. Both fail closed to skip (no stop, no error).
+                    # The open-intake check runs before classification so the
+                    # skip is counted even when the idle-permission gate in
+                    # classify_reason refuses first.
+                    if entry.get("linked_intake_open") is not False:
+                        summary["skipped"] += 1
+                        continue
                     reason = classify_reason(entry, phase, dead, idle_ms, now)
                     if reason is None:
                         continue
                     if reason not in REAP_REASONS:
-                        continue
-                    # Worktree-guard (AC2): never reap a session linked to an
-                    # open intake, and never reap out from under a Hub-locked
-                    # worktree. Both fail closed to skip (no stop, no error).
-                    if entry.get("linked_intake_open") is not False:
-                        summary["skipped"] += 1
                         continue
                     try:
                         from . import worktree_guard as _worktree_guard

@@ -4,11 +4,20 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { effectiveCheckin } from './registry';
 
-export function nativeObservationFresh(sql: SqlStorage, native: any, now: number): boolean {
+/** Host clocks may be reused only within one synchronous projection. Native
+ * fallback clocks remain per row when no host clock is available. */
+export type NativeObservationCache = Map<string, { at: string | null }>;
+
+export function nativeObservationFresh(sql: SqlStorage, native: any, now: number, cache?: NativeObservationCache): boolean {
   if (!native) return false;
-  const machine: any = sql.exec('SELECT last_checkin_at FROM machines WHERE id = ?', native.machine_id).toArray()[0];
-  const seen: any = sql.exec('SELECT observed_at FROM fleet_catalog_seen WHERE machine_id = ?', native.machine_id).toArray()[0];
-  const at = Date.parse(seen?.observed_at ?? effectiveCheckin(native.machine_id, machine?.last_checkin_at) ?? native.observed_at ?? '');
+  let host = cache?.get(native.machine_id);
+  if (!host) {
+    const machine: any = sql.exec('SELECT last_checkin_at FROM machines WHERE id = ?', native.machine_id).toArray()[0];
+    const seen: any = sql.exec('SELECT observed_at FROM fleet_catalog_seen WHERE machine_id = ?', native.machine_id).toArray()[0];
+    host = { at: seen?.observed_at ?? effectiveCheckin(native.machine_id, machine?.last_checkin_at) ?? null };
+    cache?.set(native.machine_id, host);
+  }
+  const at = Date.parse(host.at ?? native.observed_at ?? '');
   return Number.isFinite(at) && now - at <= 180000 && at <= now + 60000;
 }
 

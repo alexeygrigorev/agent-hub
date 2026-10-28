@@ -477,9 +477,42 @@ hub sessions capture <session-id|name> [--max-bytes 65536] [--screen] [--key k3]
 hub sessions stop <session-id|name> [--key k4] [--wait ...]
 hub sessions show <session-id|name>
 hub sessions commands <session-id|name>
+hub sessions wake <session-id|name> --at <ISO8601|now> (--prompt TEXT | --body-file F) [--key K]
 hub sessions host-receive --once --machine-id hetzner [--actor machine:hetzner]
     [--credential-family host:hetzner] [--journal-dir ABS] [--aplexer-bin aplexer] [--limit 20]
 ```
+
+### Scheduled wakes (waiting on an external event = register a Hub wake)
+
+Waiting on an external event means registering a Hub wake; a passive timer
+without a wake is not allowed for Hub sessions. There is no interim
+"aplexer wake not installed" path: use `hub sessions wake` instead of a
+transient `systemd-run`/sleep loop that nobody reads.
+
+```sh
+hub sessions wake my-session --at 2026-10-27T12:05:00+02:00 --prompt "Bank window opened, resume" --key wake-1
+hub sessions wake my-session --at now --body-file ./result-summary.md --key watcher-1
+```
+
+- Stored durably in DO SQLite (`session_control_wakes`), linked to the
+  session's intake task, surviving Worker/host restarts.
+- While pending, the session reports `state: waiting_until` with
+  `waiting_until` (ISO) in list/show/status/dashboard; it is not `stalled`
+  and idle/nudge logic does not fire before the wake time.
+- At due time the Hub delivers the prompt through the verified send path
+  (a durable `send` command) and requires an ack. If it is not acked within
+  10 minutes, or the session is gone, the Hub records a `missed_wake`
+  `session_control_wake_alerts` row (surfaced in `wakes` listing), appends an
+  intake note, and clears `waiting_until` so the idle-with-open-AC
+  replacement logic resumes. A terminal owner's wake also enters the existing
+  intake restart queue. Replacement still requires no live owner and fresh,
+  exact native exit evidence; a missing or unknown census stays attention-only.
+  A late verified acknowledgement or fresh output progress resolves the alert
+  without deleting its history.
+- Watchers wake their owner with `--at now --body-file <summary>` so
+  evidence capture always ends by waking the owning session.
+- REST: `POST /api/sessions/:id/wake {key, at, prompt|body}`,
+  `GET /api/sessions/:id/wakes`. MCP: `sessions_wake`.
 
 `--wait` polls boundedly to a terminal state (session: running/stopped/...;
 command: acked/refused/uncertain — `transported` alone never completes the
@@ -503,6 +536,11 @@ surfaces (no silent hint).
   UNIQUE(session_id, actor, request_key))`
 - `session_control_proofs(reply_envelope_id PRIMARY KEY, command_id,
   session_id, created_at)` — each native reply confirms at most one command.
+- `session_control_wakes(id, session_id, actor, request_key, wake_at_ms,
+  wake_at, prompt, state, command_id, intake_task_id, owner_token_id,
+  owner_family, created_at, updated_at, delivered_at, acked_at,
+  UNIQUE(session_id, actor, request_key))` + `session_control_wake_alerts`
+  (missed-wake needs_attention items + intake notes).
 
 Caps: 2000 pending commands globally, 200 per session, 20 offers per poll,
 100 rows per page with `next_cursor`; refusals are `429 queue_full` /

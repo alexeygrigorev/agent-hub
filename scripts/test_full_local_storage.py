@@ -17,12 +17,19 @@ import json, os, pathlib, socket, sys, time
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 record = pathlib.Path(os.environ["STORAGE_RECORD"])
+profile = pathlib.Path(os.environ.get("HUB_CONFIG_FILE") or
+                       pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "agent-hub/host.json")
 with record.open("a") as out:
     out.write(json.dumps({"tool": name, "args": args, "tmp": os.environ.get("TMPDIR"),
                           "home": os.environ.get("HOME"), "cache": os.environ.get("UV_CACHE_DIR"),
                           "pools": [os.environ.get(k) for k in ("UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS")],
                           "selectors": sorted(k for k in os.environ if k.startswith(("APLEXER_", "HUB_", "AGENT_HUB_"))
-                            or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR"))}) + "\n")
+                            or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR")),
+                          "profile": str(profile),
+                          "hub_env": sorted(k for k in os.environ if k.startswith(("HUB_", "AGENT_HUB_")))}) + "\n")
+if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_PROFILE_ISOLATION"):
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text("written by isolated Python fixture")
 if name == "python3" and args[:1] == ["-c"]:
     print("/fixture/user-base")
 if name == "npx" and os.environ.get("FAIL_VITEST"):
@@ -90,7 +97,7 @@ class FullLocalStorageTests(unittest.TestCase):
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
                    UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record))
         for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
-                    "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS"):
+                    "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS"):
             env.pop(key, None)
         env.update(overrides)
         child = subprocess.Popen(["bash", str(self.repo / "scripts" / RUNNER.name)],
@@ -117,6 +124,22 @@ class FullLocalStorageTests(unittest.TestCase):
 
     def assert_preserved(self):
         self.assertEqual(self.sentinel.read_text(), "preserve")
+
+    def test_python_discovery_does_not_touch_ambient_profiles(self):
+        profile = self.root / "ambient-profile.json"
+        profile.write_text("preserve ambient profile")
+        child, record = self.start("profile-isolation", CHECK_PROFILE_ISOLATION="1",
+                                  HUB_CONFIG_FILE=str(profile), HUB_URL="https://fixture.invalid",
+                                  HUB_TOKEN="fixture-only", AGENT_HUB_MANAGED_DIR=str(self.root / "managed"),
+                                  XDG_CONFIG_HOME=str(self.root / "ambient-config"))
+        code, output = self.finish(child)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(profile.read_text(), "preserve ambient profile")
+        python = next(row for row in self.records(record)
+                      if row["tool"] == "uv" and row["args"][0] == "run")
+        self.assertEqual(Path(python["profile"]), Path(python["home"]) / ".config/agent-hub/host.json")
+        self.assertEqual(python["hub_env"], [])
+        self.assert_preserved()
 
     def test_early_sync_failure_removes_only_new_run_directory(self):
         child, record = self.start("sync-fail", FAIL_SYNC="1")

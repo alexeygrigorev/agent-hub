@@ -122,7 +122,7 @@ export default {
       '/metrics', '/metrics.html', '/metrics.js', '/metrics-charts.js', '/metrics.css', '/host-health-charts.js', '/tbm.js', '/tbm.css', '/usage-history.js',
       '/usage', '/usage.html',
       '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
-      '/intake', '/intake.html', '/intake.js', '/intake.css', '/intake-overview.js', '/resource-management.js',
+      '/intake', '/intake.html', '/intake.js', '/intake.css', '/intake-overview.js', '/resource-management.js', '/idle-attention.js',
       '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',
       '/vendor/dakit/fonts/inter-var.woff2',
       '/vendor/dakit/fonts/ibm-plex-mono-400.woff2',

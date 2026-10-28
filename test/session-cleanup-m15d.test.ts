@@ -44,6 +44,8 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
     const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: reserve.hook });
     service.init();
     seedFixtureIntake(hub.sql);
+    hub.sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.history',json(?)) WHERE id='fixture-intake'",
+      JSON.stringify([{kind:'note',text:'DONE: synthetic completed cleanup fixture'}]));
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
     hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)

@@ -213,6 +213,9 @@ export class StatusService {
   /** Operator-only canonical check alerts; agent task grants do not grant
    * visibility into other actors' monitoring details. No second check loop.
    * Surfaced as needs_attention plus the stale history group (AC2). */
+  private sessionAttention: () => Obj[] = () => [];
+  setSessionAttention(provider: () => Obj[]) { this.sessionAttention = provider; }
+
   private attentionGroups(admin: boolean, measured: Obj[], intakeWarn: Obj | null = null): Obj {
     const { live, history } = this.needsAttentionSplit(admin, measured, intakeWarn);
     return { needs_attention: live, history_warnings: history };
@@ -250,8 +253,18 @@ export class StatusService {
         });
       }
     } catch { /* optional operator_notices table */ }
+    if (admin) {
+      try {
+        const wakes = this.sql.exec(`SELECT a.* FROM session_control_wake_alerts a
+          JOIN session_control_wakes w ON w.id=a.wake_id WHERE w.state='missed'
+          ORDER BY a.created_at DESC LIMIT 64`).toArray() as any[];
+        for (const w of wakes) noticeItems.push({ severity: 'error', subject: 'missed_wake:' + w.wake_id,
+          title: 'Scheduled session wake missed', detail: w.detail, session_id: w.session_id,
+          intake_task_id: w.intake_task_id, opened_at: w.created_at, source: 'session_control_wakes', scope: 'hub' });
+      } catch { /* wakes are additive */ }
+    }
     const storageWarning = admin ? this.intake.storageWarning() : null;
-    const base = [...intakeItems, ...(storageWarning ? [storageWarning] : []), ...noticeItems, ...measured];
+    const base = [...(admin ? this.sessionAttention() : []), ...intakeItems, ...(storageWarning ? [storageWarning] : []), ...noticeItems, ...measured];
     if (!admin) return { live: base, history: [] };
     let rows: any[];
     try {
@@ -477,11 +490,20 @@ export class StatusService {
     for (const task of tasks) for (const event of task.history ?? []) {
       if (event?.kind === 'link' && typeof event.hub_session_id === 'string' && SESSION_UUID.test(event.hub_session_id)) sessionIds.add(event.hub_session_id);
     }
+    // Read pending wakes once per projection rather than once per
+    // linked running session. Read wakes fresh: their writes do not advance
+    // the retained session-source cache revision.
+    const pendingWakes = new Map<string, number>();
+    try {
+      for (const wake of this.rows("SELECT session_id,wake_at_ms FROM session_control_wakes WHERE state='pending' ORDER BY wake_at_ms")) {
+        if (wake.wake_at_ms > now && !pendingWakes.has(wake.session_id)) pendingWakes.set(wake.session_id, wake.wake_at_ms);
+      }
+    } catch { /* wakes are additive */ }
     const sessionRows = new Map<string, Obj>();
     const ids = [...sessionIds];
     for (let i = 0; i < ids.length; i += 100) {
       const chunk = ids.slice(i, i + 100);
-      for (const row of this.cachedSourceRows(`SELECT id,actor,state,machine_id,engine,mode,fleet_launch_id,binding_json,updated_at FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk)) sessionRows.set(row.id, row);
+      for (const row of this.cachedSourceRows(`SELECT id,actor,state,machine_id,engine,mode,fleet_launch_id,binding_json,updated_at FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk)) sessionRows.set(row.id, { ...row, pending_wake_at_ms: pendingWakes.get(row.id) ?? null });
     }
     const lifecycleBySession = sessionIds.size ? this.lifecycleBySessionId(now, sessionIds) : new Map<string, Obj>();
     const items = tasks.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession, aliases, sessionRows));
@@ -1256,10 +1278,13 @@ export class StatusService {
       const hostStale = machineId ? (machine ? this.isStaleHost(machine, now) : true) : false;
       const live = lifecycleBySession.get(e.hub_session_id);
       const nativeId = binding && typeof (binding as any).native_id === 'string' ? (binding as any).native_id : null;
+      const waitingUntil = row.state === 'running' && typeof row.pending_wake_at_ms === 'number' && row.pending_wake_at_ms > now
+        ? new Date(row.pending_wake_at_ms).toISOString() : null;
       out.push({
         hub_session_id: e.hub_session_id,
         linkage: 'hub_session',
-        state: row.state ?? null,
+        state: waitingUntil ? 'waiting_until' : row.state ?? null,
+        ...(waitingUntil ? { waiting_until: waitingUntil } : {}),
         machine: machineId,
         engine: row.engine ?? null,
         mode: row.mode ?? null,

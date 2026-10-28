@@ -56,8 +56,10 @@ describe('Hub MCP protocol and parity', () => {
     expect(tools.map(tool => tool.name)).toEqual(MCP_ROUTES.map(route => route.name));
     // M5 messaging (intake 3bdf9715) added the six msg_* tools; the schema
     // per tool is ~0.55 KB of fixed skeleton, so the compact budget moves
-    // 45000 -> 48000 rather than shrinking the advertised contracts.
-    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(48000);
+    // 45000 -> 48000 rather than shrinking the advertised contracts. Scheduled
+    // wakes (intake 0405f52b) add sessions_link and sessions_wake, moving the
+    // budget 48000 -> 50000 on the same terms.
+    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(50000);
     for (const route of MCP_ROUTES) {
       const tool = tools.find(tool => tool.name === route.name)!;
       expect(tool.annotations.destructiveHint).toBe(route.method !== 'GET' && route.name !== 'sessions_capture');

@@ -18,19 +18,30 @@ export function workerAccessContext(sql: SqlStorage, tokenId: string | undefined
   if (!row || row.kind !== 'agent' || row.revoked_at || !Number.isSafeInteger(row.expires_at) || row.expires_at <= now || (!Number.isFinite(Date.parse(row.credential_expires_at)) || (!allowExpiredAccess && (!allowExpiredAccess && Date.parse(row.credential_expires_at) <= now)))) return null;
   let scopes: any; try { scopes = JSON.parse(row.scopes); } catch { return null; }
   if (!Array.isArray(scopes) || !scopes.includes(WORKER_SCOPE) || scopes.includes('admin')) return null;
-  const parent: any = sql.exec('SELECT fleet_launch_id,request_json,binding_json,state,engine FROM session_control_sessions WHERE id=?',row.session_id).toArray()[0];
+  const parent: any = sql.exec('SELECT fleet_launch_id,request_json,binding_json,state,engine,parent_id FROM session_control_sessions WHERE id=?',row.session_id).toArray()[0];
   if (!parent || parent.fleet_launch_id !== row.launch_id) return null;
   let binding: any; try { binding=JSON.parse(parent.binding_json); } catch {}
   let task: any; try { task=JSON.parse((sql.exec('SELECT data FROM intake_tasks WHERE id=?',row.task_id).toArray()[0] as any)?.data); } catch {}
   const native = binding && typeof binding === 'object' && !Array.isArray(binding) ? binding : null;
   return {...row, task_project: typeof task?.project === 'string' ? task.project : null,
-    native_binding: native, session_state: parent.state,
+    native_binding: native, session_state: parent.state, parent_id: parent.parent_id,
     native_workspace: typeof native?.workspace === 'string' ? native.workspace : null};
 }
 
 /** Refresh proves the opaque refresh token separately; job scope retains its hard deadline. */
 export function workerRefreshContext(sql: SqlStorage, tokenId: string, now = Date.now(), allowExpiredAccess = false): any | null {
   return workerAccessContext(sql, tokenId, now, true);
+}
+
+/** Narrow wake delegation: self, or the direct parent on the same intake.
+ * This never grants send/stop/cleanup authority over the parent. */
+export function workerWakeAllowed(sql: SqlStorage, tokenId: string | undefined, sessionId: string, now = Date.now()): boolean {
+  const worker = workerAccessContext(sql,tokenId,now);
+  if (!worker) return false;
+  if (worker.session_id === sessionId) return true;
+  if (worker.parent_id !== sessionId) return false;
+  const parent: any = sql.exec('SELECT request_json FROM session_control_sessions WHERE id=?',sessionId).toArray()[0];
+  try { return JSON.parse(parent?.request_json).intake_task_id === worker.task_id; } catch { return false; }
 }
 
 /** Route containment runs in addition to existing registry/family checks. */
@@ -51,9 +62,11 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
     return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] === '/events';
   }
   if (path === '/api/sessions') return ['GET', 'POST'].includes(request.method);
-  const session = /^\/api\/sessions\/([0-9a-f-]{36})(?:\/(commands|capture|send|stop))?$/.exec(path);
+  const session = /^\/api\/sessions\/([0-9a-f-]{36})(?:\/(commands|capture|send|stop|wake|wakes))?$/.exec(path);
   if (session) {
-    if (session[1] === worker.session_id) return request.method === 'GET' && !session[2];
+    if ([worker.session_id,worker.launch_id,worker.native_binding?.native_id].includes(session[1])) return (request.method === 'GET' && (!session[2] || ['commands','wakes'].includes(session[2]))) ||
+      (request.method === 'POST' && session[2] === 'wake');
+    if (session[2] === 'wake' && request.method === 'POST' && workerWakeAllowed(sql,tokenId,session[1])) return true;
     const child: any = sql.exec('SELECT actor,parent_id FROM session_control_sessions WHERE id=?',session[1]).toArray()[0];
     return !!child && child.actor === worker.actor && child.parent_id === worker.session_id;
   }

@@ -123,6 +123,36 @@ describe('scoped durable worker access',()=>{
   const res=await stub.fetch('https://hub.test/api/token/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grant_type:'refresh_token',refresh_token:worker.refresh_token})});
   expect(res.status).toBe(400);
  }));
+ it('registers and reads its own wake without gaining self-stop or foreign access',()=>setup(async({stub,id,session,other,worker,call}:any)=>{
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec("UPDATE session_control_sessions SET state='running' WHERE id=?",session));
+  const api=(path:string,body?:any)=>call(path,body,worker.access_token);
+  const at=new Date(Date.now()+3600000).toISOString();
+  const wake=await api('/api/sessions/'+session+'/wake',{key:'self-wait',at,prompt:'Resume own work'});
+  expect(wake.status,await wake.clone().text()).toBe(201);
+  expect(await (await api('/api/sessions/'+session)).json()).toMatchObject({state:'waiting_until',waiting_until:at});
+  expect((await (await api('/api/sessions/'+session+'/wakes')).json() as any).wakes).toHaveLength(1);
+  expect((await api('/api/sessions/'+session+'/commands')).status).toBe(200);
+  expect((await api('/api/sessions/'+id+'/wake',{key:'launch-ref',at,prompt:'Own launch wake'})).status).toBe(201);
+  expect((await api('/api/sessions/'+id)).status).toBe(200);
+  expect((await api('/api/sessions/'+session+'/stop',{key:'no-self-stop'})).status).toBe(403);
+  expect((await api('/api/sessions/'+other+'/wake',{key:'foreign',at,prompt:'no'})).status).toBe(403);
+ },'interactive'));
+ it('lets a watcher wake only its direct parent on the same intake',()=>setup(async({stub,session,task,other,worker,call}:any)=>{
+  const parent=uuid(), sibling=uuid();
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   for(const id of [parent,sibling]) h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at)
+    VALUES(?,'parent-creator',?,?,'interactive','running',?,?)`,id,id,JSON.stringify({intake_task_id:task,workspace:'/repo'}),new Date().toISOString(),new Date().toISOString());
+   h.sql.exec('UPDATE session_control_sessions SET parent_id=? WHERE id=?',parent,session);
+  });
+  const api=(path:string,body?:any)=>call(path,body,worker.access_token);
+  const at=new Date(Date.now()+3600000).toISOString();
+  expect((await api('/api/sessions/'+parent+'/wake',{key:'watcher-result',at,prompt:'Watcher result'})).status).toBe(201);
+  expect((await api('/api/sessions/'+sibling+'/wake',{key:'sibling',at,prompt:'no'})).status).toBe(403);
+  expect((await api('/api/sessions/'+parent+'/stop',{key:'parent-stop'})).status).toBe(403);
+  expect((await api('/api/sessions/'+parent)).status).toBe(403);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',JSON.stringify({intake_task_id:other}),parent));
+  expect((await api('/api/sessions/'+parent+'/wake',{key:'wrong-task',at,prompt:'no'})).status).toBe(403);
+ },'interactive'));
  it('restricts chained sessions to policy routed headless children on the same intake/workspace',()=>setup(async({stub,session,task,other,worker,call}:any)=>{
   const start=(body:any)=>call('/api/sessions',{key:uuid(),workspace:'/repo',intake_task_id:task,brief:'small real followup',...body},worker.access_token);
   for(const bad of [{workspace:'/else'},{intake_task_id:other},{mode:'interactive'},{parent_id:uuid()},{engine:'opencode',engine_override_reason:'no'},{machine:'worker-host'}]) expect([400,403]).toContain((await start(bad)).status);
