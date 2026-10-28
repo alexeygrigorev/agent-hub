@@ -55,7 +55,10 @@ describe('earned-reset genuine evidence correlation (offline fixtures)', () => {
     expect(rows.events).toHaveLength(1); // same physical credit cannot acquire a new key under another alias
   });
   it('prepares genuine EDF reset need at the reserve boundary without inventing a runnable factor', async () => {
-    await inDO(stub(), (h: any) => h.sql.exec('UPDATE tbm_quota_pools SET hard_floor_percent=15,remaining_percent=15,headroom_percentage=15'));
+    // rules.tbm_floor_percent overrides codex stored floors to 0 (intake 4f6cf562), so the
+    // policy halt boundary for codex pools is depletion; the attested native >=85% used
+    // threshold below is provider-side and unchanged.
+    await inDO(stub(), (h: any) => h.sql.exec('UPDATE tbm_quota_pools SET hard_floor_percent=0,remaining_percent=0,headroom_percentage=0'));
     const before = await inDO(stub(), (h: any) => loadProviderPacing(h.sql, now).get('codex:credit-test'));
     expect(before).toMatchObject({ halted: true });
     expect((await call({ ...input(), provider_used_percent: 84 })).status).toBe(400);
