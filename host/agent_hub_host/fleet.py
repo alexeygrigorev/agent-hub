@@ -373,6 +373,63 @@ def advertised_workspaces(settings) -> list[str]:
     # Keep the registration payload safely under the 4 KiB capabilities cap.
     return (roots + sorted(out - set(roots)))[:96]
 
+
+# registry.ts answers POST /api/machines/register with 400 payload_too_large
+# once JSON.stringify(capabilities).length passes the server budget (4096
+# before 0917add9, 16384 since). The advertisement sits near that budget on
+# catalog-heavy hosts (live RMTHZ sample after the raise: 4592 chars), so the
+# host mirrors the live limit and trims here instead of feeding the cycle's
+# first request a guaranteed 400 (intake 7db967f6).
+REGISTER_CAPABILITIES_BUDGET = 16384
+
+
+def _capabilities_json_size(caps) -> int:
+    """Size register capabilities the way the Hub rejects them.
+
+    registry.ts compares JSON.stringify(capabilities).length; compact JSON
+    matches that for ASCII payloads and the utf-8 length keeps multibyte
+    content on the safe side of the same budget.
+    """
+    compact = json.dumps(caps, separators=(',', ':'))
+    return max(len(compact), len(compact.encode('utf-8')))
+
+
+def register_capabilities_within_budget(caps, roots, budget=REGISTER_CAPABILITIES_BUDGET):
+    """Bound register capabilities JSON under the Hub limit (intake 7db967f6).
+
+    Trims in placement-priority order: the fleet_route_rejections diagnostic
+    list first, then tail workspaces -- advertised roots stay so Hub keeps
+    boundary-safe prefix matching (d1067890) -- then fleet_goal_routes and
+    jobs. Returns (caps, meta); meta is None when the payload already fits.
+    Whatever still exceeds the budget (pathological roots alone) is caught by
+    the register guard: the cycle continues and register retries next cycle.
+    """
+    before = _capabilities_json_size(caps)
+    if before <= budget:
+        return caps, None
+    bounded = dict(caps)
+    dropped = []
+    if bounded.pop('fleet_route_rejections', None) is not None:
+        dropped.append('fleet_route_rejections')
+    workspaces = bounded.get('workspaces')
+    if isinstance(workspaces, list):
+        root_set = set(roots)
+        trimmed = list(workspaces)
+        bounded['workspaces'] = trimmed
+        count = 0
+        while _capabilities_json_size(bounded) > budget and any(w not in root_set for w in trimmed):
+            trimmed.pop()
+            count += 1
+        if count:
+            dropped.append(f'workspaces:{count}')
+    if _capabilities_json_size(bounded) > budget and bounded.pop('fleet_goal_routes', None) is not None:
+        dropped.append('fleet_goal_routes')
+    if _capabilities_json_size(bounded) > budget and bounded.pop('jobs', None) is not None:
+        dropped.append('jobs')
+    return bounded, {'before': before, 'after': _capabilities_json_size(bounded),
+                     'dropped': dropped}
+
+
 def resolve_workspace_path(settings, name: str) -> Path:
     """Map an offer workspace id to a real local directory.
 
@@ -3748,7 +3805,23 @@ class Dispatcher:
         # Publish per-account gate truth, not just the OR of every account's
         # gate. Planning can then fail over before offering a refused route.
         _mark('admission')
-        self.request('POST', '/api/machines/register', info)
+        # 7db967f6: a rejected register (400 payload_too_large while the
+        # server cap was 4096, or any later refusal) must never kill the
+        # cycle ahead of the /api/host/poll heartbeat -- a missed check-in
+        # expires unclaimed stops as stop_host_unreachable. Capabilities are
+        # trimmed under the live server budget and register retries next
+        # cycle; genuinely broken credentials still surface at the
+        # heartbeat POST, which requires the same host authority.
+        bounded_caps, trim_meta = register_capabilities_within_budget(
+            caps, [root for root in _workspace_roots(self.settings) if absolute_workspace_ok(root)])
+        if trim_meta:
+            print(json.dumps({'event': 'register_capabilities_bounded', **trim_meta}), flush=True)
+            info = dict(info, capabilities=bounded_caps)
+        try:
+            self.request('POST', '/api/machines/register', info)
+        except Exception as exc:
+            print(json.dumps({'event': 'register_skipped',
+                              'error': _sanitized_transport_error(exc)}), flush=True)
         _mark('register')
         hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
         self.request('POST', '/api/host/poll', hb)
