@@ -1,6 +1,6 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { LivenessService } from './liveness';
-import { openWorktreeIntake } from './worktree-intakes';
+import { openWorktreeIntake, worktreeIntakeSnapshot } from './worktree-intakes';
 
 /** Operator custody is durable before any host filesystem effect. Census
  * labels never create these intents. An exact host receipt completes them. */
@@ -29,6 +29,9 @@ function observed(sql: SqlStorage, machine: string, input: any, now: number): an
 export function queueOperatorAdoptions(sql: SqlStorage, machine: string, inputs: any[], actor: string,
   token: string | null, now: number): { queued: number; existing: number; deferred: number } {
   let queued = 0, existing = 0, deferred = 0;
+  // One intake snapshot for the whole batch: per-row snapshots would rescan
+  // the projection ledger for every adoption request.
+  const worktreeLinks = worktreeIntakeSnapshot(sql);
   for (const input of inputs) {
     // Existing canonical sessions, including protected humans, never acquire
     // a new lock merely because an operator repeats an adoption request.
@@ -48,7 +51,7 @@ export function queueOperatorAdoptions(sql: SqlStorage, machine: string, inputs:
     const native = { native_id: row.native_id, tag: row.tag, workspace: row.workspace,
       cwd: row.cwd, engine: row.engine, created_at_ms: row.created_at_ms, phase: row.phase };
     const intake = openWorktreeIntake(sql, { id: row.native_id, machine_id: machine,
-      request_json: '{}', binding_json: JSON.stringify(native) });
+      request_json: '{}', binding_json: JSON.stringify(native) }, worktreeLinks);
     sql.exec("INSERT INTO session_adoption_intents VALUES (?,?,?,?,?,?,?,'pending',?)",
       crypto.randomUUID(), machine, row.native_id, JSON.stringify(native), actor, token, intake, new Date(now).toISOString());
     queued++;

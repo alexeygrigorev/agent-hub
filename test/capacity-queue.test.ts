@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService, isCapacityOnlyHold } from '../src/fleet';
 import { SessionControlService } from '../src/session_control';
-import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
+import { FIXTURE_INTAKE_ID, seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -367,7 +367,9 @@ describe('sessions_start capacity queue', () => {
     expect(stale.sessions).toHaveLength(0);
     expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', parked.id).one().state).toBe('queued');
     const pending: any = await (await s.handle(sessReq('/api/sessions/host-bindings', undefined, 'GET'), enrolled('hetzner'))).json();
-    expect(pending.sessions).toContainEqual({ id: parked.id, fleet_launch_id: parked.fleet_launch_id, engine: 'codex', native_id: state === 'running' ? nativeId : null });
+    // Worktree-guard AC1: binding offers carry the canonical intake id;
+    // combinedFixture starts carry the seeded open fixture intake.
+    expect(pending.sessions).toContainEqual({ id: parked.id, fleet_launch_id: parked.fleet_launch_id, intake_task_id: FIXTURE_INTAKE_ID, engine: 'codex', native_id: state === 'running' ? nativeId : null });
     const adopted: any = await (await s.handle(sessReq('/api/sessions/' + parked.id, undefined, 'GET'), admin)).json();
     expect(adopted.state).toBe('starting');
     expect(adopted.machine).toBe('hetzner');
