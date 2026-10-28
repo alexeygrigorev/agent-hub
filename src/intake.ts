@@ -503,7 +503,8 @@ export class IntakeService {
           seen.add(key);
           const n = externalSession(this.sql, e, Date.now());
           out.push({ hub_session_id: null, native_id: e.native_id, machine: e.host,
-            state: n?.liveness === 'unknown' || !n ? 'unknown' : n.liveness === 'terminal' ? 'failed' : n.phase,
+            state: n?.liveness === 'unknown' || !n ? 'unknown'
+              : n.liveness === 'terminal' && !['exited', 'stopped', 'failed'].includes(n.phase) ? 'failed' : n.phase,
             liveness: n?.liveness ?? 'unknown', engine: n?.engine ?? e.engine,
             observed_at: n?.observed_at ?? null, linkage: 'external_session',
             evidence: 'external_live_verified', launch_verified: false });

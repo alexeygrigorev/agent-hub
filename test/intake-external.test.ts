@@ -33,7 +33,12 @@ describe('verified external intake assignments', () => {
       expect((await append('bad-native',2,{...event,verify_live:'yes'})).status).toBe(400);
       h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('external-fixture',?)",new Date().toISOString());
       h.sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE native_id=?",native);
+      const exited = await (await call('/tasks/'+id)).json();
+      expect(exited.task.assigned_sessions[0]).toMatchObject({state:'exited',liveness:'terminal'});
       expect((await append('terminal-native',2,event)).status).toBe(409);
+      h.sql.exec("UPDATE fleet_sessions SET phase='stopped' WHERE native_id=?",native);
+      const stopped = await (await call('/tasks/'+id)).json();
+      expect(stopped.task.assigned_sessions[0]).toMatchObject({state:'stopped',liveness:'terminal'});
       h.sql.exec("UPDATE fleet_sessions SET phase='running' WHERE native_id=?",native);
       expect((await append('wrong-host',2,{...event,host:'different-host'})).status).toBe(409);
       expect((await append('short-id',2,{...event,native_id:'3261084c'})).status).toBe(409);
