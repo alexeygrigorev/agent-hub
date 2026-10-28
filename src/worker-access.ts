@@ -73,9 +73,20 @@ export class WorkerAccess {
       // and token freshness must be checked again inside the effect transaction.
       if (!this.hostAllowed(caller)) return reply({error:'host_credential_changed'},403);
       const launch: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id=? AND machine_id=?',id,caller.machineId!).toArray()[0];
-      if (!launch || !['headless','interactive'].includes(launch.mode) || launch.state !== 'starting') return reply({error:'worker_launch_not_starting'},409);
+      if (!launch || !['headless','interactive'].includes(launch.mode) || !['starting','running'].includes(launch.state)) return reply({error:'worker_launch_not_starting'},409);
       const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE fleet_launch_id=?',id).toArray()[0];
       if (!session) return reply({error:'worker_session_required'},409);
+      // The assigned host may restore a lost profile after launch. Keep the
+      // original intake binding; this does not restart or adopt a session.
+      // The host verifies native process liveness before requesting repair.
+      if (launch.state === 'running') {
+        let binding: any; try { binding = JSON.parse(session.binding_json); } catch {}
+        if (session.state !== 'running' || session.machine_id !== caller.machineId
+            || !launch.native_id || binding?.native_id !== launch.native_id
+            || binding?.tag !== (launch.mode === 'headless' ? 'task-hub-' : 'hub-') + id) {
+          return reply({error:'worker_launch_not_live'},409);
+        }
+      }
       let intakeId: any; try { intakeId=JSON.parse(session.request_json).intake_task_id; } catch { return reply({error:'worker_intake_required'},409); }
       if (typeof intakeId !== 'string' || !/^[a-zA-Z0-9-]{8,128}$/.test(intakeId)) return reply({error:'worker_intake_required'},409);
       const tasks: any[] = this.sql.exec("SELECT id,data FROM intake_tasks WHERE id=? OR substr(id,1,length(?))=? LIMIT 2",intakeId,intakeId,intakeId).toArray();
