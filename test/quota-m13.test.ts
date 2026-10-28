@@ -650,10 +650,11 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
       method: 'POST', headers: adminHeaders,
       body: JSON.stringify({ workspace: 'demo', prompt: 'm13 grok hold proof', idempotency_key: key, ...(engine ? { engine } : {}) }),
     }) as RequestInit;
-    // Direct reserve on the held engine is refused even with healthy quota.
+    // The Grok family deny takes precedence over the provider hold, even
+    // with healthy quota; neither reserve nor claim may authorize a start.
     const refused = await doFetch(new Request('http://example.com/api/fleet/launches', launchBody('m13-grok-1', 'grok')));
     expect(refused.status).toBe(409);
-    expect(((await refused.json()) as any).error).toBe('provider_disabled');
+    expect(((await refused.json()) as any).error).toBe('model_disabled_by_policy');
     // The allowed engine still reserves.
     const okRes = await doFetch(new Request('http://example.com/api/fleet/launches', launchBody('m13-codex-1', 'codex')));
     expect(okRes.status).toBe(201);
@@ -680,7 +681,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
       body: JSON.stringify({ gate_allowed: true, model: 'gpt-6.1-sol', observed_at: isoNow(), account: 'm13-grok-main', profile_supported: true }),
     }));
     expect(claimRes.status).toBe(409);
-    expect(((await claimRes.json()) as any).error).toBe('provider_disabled');
+    expect(((await claimRes.json()) as any).error).toBe('model_disabled_by_policy');
     const replayRes = await doFetch(new Request('http://example.com/api/fleet/launches', launchBody('m13-grok-pre')));
     const replayBody = (await replayRes.json()) as any;
     const diag: any = await runInDurableObject(stub, async (instance: Hub) =>
