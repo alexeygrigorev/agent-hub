@@ -19,6 +19,45 @@ def test_published_dependency_loads_native_client(tmp_path):
     assert Client(state_dir=tmp_path / 'state', runtime_dir=tmp_path / 'run').snapshot() == []
 
 
+def test_missing_aplexer_package_falls_back_to_cli_subprocess():
+    """Release venvs carry no third-party packages (bare venv + release .pth),
+    so `from aplexer import Client` fails there outside the bootstrap zipapp.
+    client_call must return None (CLI route, no effect attempted) instead of
+    raising, or every run_native caller on release deployments wedges — the
+    receiver crash-looped before claiming offers and stops expired as
+    stop_host_unreachable (intake 7db967f6 AC4 finding, 2026-10-28).
+    """
+    from agent_hub_host import native_sessions
+    argv = ['list', '--all', '--json']
+    with patch.dict(sys.modules, {'aplexer': None}):
+        assert client_call('aplexer', argv) is None
+        with patch.object(native_sessions.subprocess, 'run',
+                          return_value=subprocess.CompletedProcess(['aplexer'], 0, stdout='[]', stderr='')) as run:
+            proc = native_sessions.run_native('aplexer', argv)
+    assert proc.stdout == '[]'
+    assert run.call_args.args[0][:2] == ['aplexer', 'list']
+
+
+def test_missing_aplexer_submodule_still_raises():
+    """A half-installed client (package present, submodule missing) must not
+    silently degrade to the CLI: the effect contract requires the failure."""
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'aplexer' or name.startswith('aplexer.'):
+            raise ModuleNotFoundError('No module named aplexer.hooks', name='aplexer.hooks')
+        return real_import(name, *args, **kwargs)
+
+    with patch.object(builtins, '__import__', fake_import):
+        try:
+            client_call('aplexer', ['list', '--all', '--json'])
+        except ModuleNotFoundError as exc:
+            assert exc.name == 'aplexer.hooks'
+        else:
+            raise AssertionError('missing submodule must raise')
+
+
 def test_cpu_limited_start_uses_real_cli_not_client():
     """CPU-capped starts must reach the real CLI: the installed Client.start
     hardcodes cpu_quota_us=None, so client_call refuses the flags and run_json

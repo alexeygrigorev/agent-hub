@@ -54,10 +54,18 @@ def client_call(executable, args, *, env=None):
     try:
         from aplexer import Client, AplexerError
     except ModuleNotFoundError as exc:
-        import zipimport
-        if exc.name == 'aplexer' and isinstance(__loader__, zipimport.zipimporter):
-            # The self-contained HTTP/host bootstrap zipapp cannot carry a
-            # platform-specific extension. Preserve its supported CLI route.
+        if exc.name == 'aplexer':
+            # The native extension is genuinely absent, and no operation has
+            # been attempted yet, so the CLI subprocess route cannot duplicate
+            # an effect. This is not only the bootstrap zipapp: host release
+            # venvs carry no third-party packages (build-host-release creates
+            # a bare venv plus the release .pth), so raising here wedged every
+            # run_native caller on release deployments — the session receiver
+            # crash-looped in reconcile_pending_command/verify_ack_via_reply
+            # before ever claiming offers, expiring unclaimed stops as
+            # stop_host_unreachable (intake 7db967f6 AC4 finding, 2026-10-28).
+            # A missing SUBmodule (exc.name != 'aplexer') is a half-installed
+            # client and still raises.
             return None
         raise
     environment = os.environ if env is None else env
