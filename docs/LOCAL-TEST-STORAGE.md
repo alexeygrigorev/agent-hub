@@ -56,6 +56,14 @@ are no retries or discarded warm-up samples. Logs include p50, p95, maximum and
 the first 20 samples' p95 for comparison. The fixture retains 500 tasks, 2,000
 sessions and the blocked-work/claim cases.
 
+Vitest discovery defaults its libuv, Go/esbuild and V8 background pools to one
+thread (`UV_THREADPOOL_SIZE=1`, `GOMAXPROCS=1`, `--v8-pool-size=1`). Serial test
+files alone do not bound these pools: competing runtime threads can exhaust a
+small CPU quota and increase wall-clock tails. Explicit caller pool settings
+are preserved; other Node options are kept. These defaults apply only to the
+Vitest command. Console timing reports remain visible for passing tests too.
+No file is excluded, no sample is retried and the 100 ms threshold is unchanged.
+
 For bounded verification on a shared Linux host:
 
 ```sh

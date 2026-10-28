@@ -63,7 +63,16 @@ fi
 
 echo "=== 4/6: Vitest Discovery Suite (all test files, bounded concurrency) ==="
 VITEST_RC=0
-npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 || VITEST_RC=$?
+# Serial files still have Node/V8 and esbuild background pools. Bound those
+# pools inside the existing CPU cap rather than competing for its quota.
+VITEST_NODE_OPTIONS="${NODE_OPTIONS:-}"
+case "${VITEST_NODE_OPTIONS}" in
+  *--v8-pool-size*) ;;
+  *) VITEST_NODE_OPTIONS="${VITEST_NODE_OPTIONS:+${VITEST_NODE_OPTIONS} }--v8-pool-size=1" ;;
+esac
+UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-1}" GOMAXPROCS="${GOMAXPROCS:-1}" \
+NODE_OPTIONS="${VITEST_NODE_OPTIONS}" \
+npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept || VITEST_RC=$?
 if [ "${VITEST_RC}" -ne 0 ]; then
   echo "FAIL: Vitest discovery suite exited with code ${VITEST_RC}"
   FAILURES=$((FAILURES + 1))

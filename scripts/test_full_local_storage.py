@@ -20,6 +20,7 @@ record = pathlib.Path(os.environ["STORAGE_RECORD"])
 with record.open("a") as out:
     out.write(json.dumps({"tool": name, "args": args, "tmp": os.environ.get("TMPDIR"),
                           "home": os.environ.get("HOME"), "cache": os.environ.get("UV_CACHE_DIR"),
+                          "pools": [os.environ.get(k) for k in ("UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS")],
                           "selectors": sorted(k for k in os.environ if k.startswith(("APLEXER_", "HUB_", "AGENT_HUB_"))
                             or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR"))}) + "\n")
 if name == "python3" and args[:1] == ["-c"]:
@@ -88,7 +89,8 @@ class FullLocalStorageTests(unittest.TestCase):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
                    UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record))
-        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION"):
+        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
+                    "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS"):
             env.pop(key, None)
         env.update(overrides)
         child = subprocess.Popen(["bash", str(self.repo / "scripts" / RUNNER.name)],
@@ -126,6 +128,28 @@ class FullLocalStorageTests(unittest.TestCase):
         self.assertFalse(run.exists())
         self.assertFalse(any(row["tool"] == "uv" and row["args"][0] == "run" for row in rows))
         self.assert_preserved()
+
+    def test_vitest_bounds_background_pools_without_changing_discovery_or_other_steps(self):
+        for overrides, expected in (
+            ({}, ["1", "1", "--v8-pool-size=1"]),
+            ({"NODE_OPTIONS": "--trace-warnings"}, ["1", "1", "--trace-warnings --v8-pool-size=1"]),
+            ({"UV_THREADPOOL_SIZE": "2", "GOMAXPROCS": "3", "NODE_OPTIONS": "--v8-pool-size=2 --trace-warnings"},
+             ["2", "3", "--v8-pool-size=2 --trace-warnings"]),
+            ({"NODE_OPTIONS": "--v8-pool-size 2"}, ["1", "1", "--v8-pool-size 2"]),
+        ):
+            with self.subTest(overrides=overrides):
+                child, record = self.start(f"pools-{len(self.children)}", **overrides)
+                code, output = self.finish(child)
+                self.assertEqual(code, 0, output)
+                rows = self.records(record)
+                vitest = next(row for row in rows if row["tool"] == "npx")
+                self.assertEqual(vitest["pools"], expected)
+                self.assertEqual(vitest["args"], ["--no-install", "vitest", "run", "--configLoader", "runner",
+                    "--no-file-parallelism", "--maxWorkers", "1", "--disableConsoleIntercept"])
+                inherited = [overrides.get(k) for k in ("UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS")]
+                self.assertTrue(all(row["pools"] == inherited for row in rows if row["tool"] != "npx"))
+                self.assertFalse(Path(vitest["tmp"]).exists())
+                self.assert_preserved()
 
     def test_default_relative_tmpdir_preserves_existing_scratch(self):
         parent = self.repo / ".local/tmp"
