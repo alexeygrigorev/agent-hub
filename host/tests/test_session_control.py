@@ -517,15 +517,15 @@ class TestSessionControlCli(unittest.TestCase):
             import os
             os.unlink(tf_path)
 
-    def test_brief_prompt_alias_and_character_limit(self):
-        args = self.parse('start', '--workspace', 'demo', '--brief', 'do task', '--key', 'k')
+    def test_prompt_character_limit(self):
+        args = self.parse('start', '--workspace', 'demo', '--prompt', 'do task', '--key', 'k')
         with patch.object(session_control, 'request', return_value={}) as transport:
             session_control.execute(args)
         payload = transport.call_args.args[2]
         self.assertEqual(payload['brief'], 'do task')
 
         long_prompt = 'y' * (session_control.MAX_BRIEF_CHARS + 5)
-        bad_args = self.parse('start', '--workspace', 'demo', '--brief', long_prompt, '--key', 'k')
+        bad_args = self.parse('start', '--workspace', 'demo', '--prompt', long_prompt, '--key', 'k')
         with self.assertRaises(session_control.SessionInputError) as ctx:
             session_control.execute(bad_args)
         self.assertIn('character limit', str(ctx.exception))
