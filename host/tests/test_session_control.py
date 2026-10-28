@@ -121,13 +121,6 @@ class TestSessionControlCli(unittest.TestCase):
                     self.assertEqual(call.args[2]['intake_task_id'], 'task-fixture')
                     self.assertEqual(call.args[2].get('with_goal', False), bool(mode))
 
-    def test_start_accepts_deprecated_intake_task_alias(self):
-        with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
-                patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--brief-file', 'goal.txt',
-                                               '--key', 'k-alias', '--intake-task', 'task-alias'))
-        self.assertEqual(transport.call_args.args[2]['intake_task_id'], 'task-alias')
-
     def test_send_capture_stop_payloads(self):
         with patch.object(session_control, 'read_file', return_value='prompt'), \
                 patch.object(session_control, 'request', return_value={}) as transport:

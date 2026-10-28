@@ -468,7 +468,7 @@ class TestSessionRealWorker(unittest.TestCase):
                               "--engine", "codex", "--reason", "codex required for real loop test",
                               "--machine", "hetzner",
                               "--interactive",
-                              "--intake-task", "fixture-intake",
+                              "--intake-task-id", "fixture-intake",
                               "--key", "real-loop-1"], token="sess-agent-token")
         created = json.loads(start.stdout)
         self.assertEqual(created["state"], "offered")
