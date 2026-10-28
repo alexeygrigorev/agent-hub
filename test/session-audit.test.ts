@@ -14,7 +14,8 @@ function features(extra: Partial<AuditFeatures> = {}): AuditFeatures {
     intake: null, engine: 'codex', mode: 'headless', state: 'running', actor: 'agent:fixture-worker',
     bound: true, linked: true, census_stale: false, send_supported: true, nativePhase: 'running',
     protected_session: false, runtime_s: 10 * HOUR / 1000, idle_s: 2 * T, host_cpu: null, git: null,
-    intake_state: null, screen_tail: null, screen_age_s: null, nudges: 0, prior: null,
+    intake_state: null, screen_tail: null, screen_age_s: null, nudges: 0, escalations: 0,
+    send_broken: false, pending_stop: false, prior: null,
     ...extra,
   };
 }
@@ -39,8 +40,8 @@ describe('idle audit heuristic rules (AC2)', () => {
     expect(decide(features({ idle_s: null }))).toMatchObject({ rule: 'recent_progress', action: 'observe' });
   });
   it('escalates unbound running sessions once per idle episode, then stays quiet', () => {
-    expect(decide(features({ bound: false, linked: false, nudges: 0 }))).toMatchObject({ rule: 'unlinked_idle_native', action: 'escalate' });
-    expect(decide(features({ bound: false, linked: false, nudges: 1 }))).toMatchObject({ rule: 'unlinked_idle_known', action: 'observe' });
+    expect(decide(features({ bound: false, linked: false, escalations: 0 }))).toMatchObject({ rule: 'unlinked_idle_native', action: 'escalate' });
+    expect(decide(features({ bound: false, linked: false, escalations: 1 }))).toMatchObject({ rule: 'unlinked_idle_known', action: 'observe' });
   });
   it('observes non-running intents instead of auditing them for action', () => {
     expect(decide(features({ state: 'held', linked: false }))).toMatchObject({ rule: 'intent_not_running', action: 'observe' });
@@ -66,8 +67,12 @@ describe('idle audit heuristic rules (AC2)', () => {
     expect(decide(features({ idle_s: T, git: clean, screen_tail: 'working', screen_age_s: 60 })).action)
       .not.toBe('stop');
   });
-  it('waits for a pending stop instead of double-stopping', () => {
-    expect(decide(features({ prior: { action: 'stop', outcome: null } }))).toMatchObject({ rule: 'stop_pending', action: 'observe' });
+  it('waits for a pending stop ahead of every stop-producing branch (finding 4)', () => {
+    expect(decide(features({ pending_stop: true, prior: { action: 'stop', outcome: null } }))).toMatchObject({ rule: 'stop_pending', action: 'observe' });
+    // The guard now precedes stale_binding and both finished stops.
+    expect(decide(features({ pending_stop: true, linked: false, nativePhase: 'exited' }))).toMatchObject({ rule: 'stop_pending', action: 'observe' });
+    expect(decide(features({ pending_stop: true, intake: 't1', intake_state: 'done' }))).toMatchObject({ rule: 'stop_pending', action: 'observe' });
+    expect(decide(features({ pending_stop: true, git: { dirty: false, dirty_count: 0, unpushed: 0, checked_at: iso(NOW) }, idle_s: 2 * T }))).toMatchObject({ rule: 'stop_pending', action: 'observe' });
   });
   it('matches prompts only at the visible end of the screen, not in scrollback prose (finding 5)', () => {
     expect(matchInputPrompt('Proceed? [y/n]')).toMatchObject({ rule: 'yes_no_prompt', send: 'y' });
@@ -97,18 +102,33 @@ describe('idle audit heuristic rules (AC2)', () => {
     expect(decide(features({ ...cont }))).toMatchObject({ rule: 'waiting_for_input:continue_prompt', action: 'keystroke', send_text: 'continue' });
     expect(decide(features({ ...cont, send_supported: false })).action).toBe('observe');
   });
-  it('escalates after one unanswered nudge and stops after two (dead) — episode counts only dispatched steps', () => {
+  it('ladder: nudge once, escalate once, and stop only after BOTH landed (finding 1)', () => {
     const dirty = { dirty: true, dirty_count: 3, unpushed: 0, checked_at: iso(NOW) };
-    expect(decide(features({ git: dirty, nudges: 1 }))).toMatchObject({ rule: 'stuck_escalate', action: 'escalate' });
-    expect(decide(features({ git: dirty, nudges: 2 }))).toMatchObject({ rule: 'dead_after_nudge', action: 'stop' });
-    expect(decide(features({ git: dirty, nudges: 0 }))).toMatchObject({ rule: 'stuck_uncommitted', action: 'nudge', send_text: 'continue, commit, report' });
-    expect(decide(features({ git: dirty, nudges: 0, send_supported: false }))).toMatchObject({ rule: 'stuck_nudge_unsupported', action: 'escalate' });
+    expect(decide(features({ git: dirty, nudges: 0, escalations: 0 }))).toMatchObject({ rule: 'stuck_uncommitted', action: 'nudge', send_text: 'continue, commit, report' });
+    expect(decide(features({ git: dirty, nudges: 1, escalations: 0 }))).toMatchObject({ rule: 'stuck_escalate', action: 'escalate' });
+    expect(decide(features({ git: dirty, nudges: 1, escalations: 1 }))).toMatchObject({ rule: 'dead_after_nudge', action: 'stop' });
+    // Alerts alone never stop a session: no dispatched continuation, no stop.
+    expect(decide(features({ git: dirty, nudges: 0, escalations: 1 }))).toMatchObject({ rule: 'stuck_uncommitted', action: 'nudge' });
+    expect(decide(features({ git: dirty, nudges: 0, escalations: 5 }))).toMatchObject({ rule: 'stuck_uncommitted', action: 'nudge' });
+  });
+  it('unsupported headless targets escalate once per episode and are never stopped (finding 1)', () => {
+    const dirty = { dirty: true, dirty_count: 3, unpushed: 0, checked_at: iso(NOW) };
+    expect(decide(features({ git: dirty, send_supported: false, nudges: 0, escalations: 0 }))).toMatchObject({ rule: 'stuck_nudge_unsupported', action: 'escalate' });
+    expect(decide(features({ git: dirty, send_supported: false, nudges: 0, escalations: 1 }))).toMatchObject({ rule: 'unsupported_target', action: 'observe' });
+    expect(decide(features({ git: dirty, send_supported: false, nudges: 0, escalations: 9 }))).toMatchObject({ rule: 'unsupported_target', action: 'observe' });
+    expect(decide(features({ git: dirty, send_supported: false, nudges: 9, escalations: 9 })).action).toBe('observe');
+  });
+  it('a send endpoint that refuses continuations escalates once, then holds (finding 1)', () => {
+    const dirty = { dirty: true, dirty_count: 3, unpushed: 0, checked_at: iso(NOW) };
+    expect(decide(features({ git: dirty, send_broken: true, nudges: 0, escalations: 0 }))).toMatchObject({ rule: 'stuck_send_broken', action: 'escalate' });
+    expect(decide(features({ git: dirty, send_broken: true, nudges: 0, escalations: 1 }))).toMatchObject({ rule: 'send_broken_target', action: 'observe' });
   });
   it('never kills on idle alone while the host CPU says the native may be computing (AC1 CPU input)', () => {
     const busy = { busy_percent: 68, busy_cores: 5.4, cores: 8, observed_at: iso(NOW) };
-    expect(decide(features({ nudges: 2, host_cpu: busy }))).toMatchObject({ rule: 'cpu_active', action: 'observe' });
-    expect(decide(features({ nudges: 2, host_cpu: { ...busy, busy_percent: 12 } }))).toMatchObject({ rule: 'dead_after_nudge', action: 'stop' });
-    expect(decide(features({ nudges: 2, host_cpu: null }))).toMatchObject({ rule: 'dead_after_nudge', action: 'stop' });
+    const dirty = { dirty: true, dirty_count: 1, unpushed: 0, checked_at: iso(NOW) };
+    expect(decide(features({ git: dirty, nudges: 1, escalations: 1, host_cpu: busy }))).toMatchObject({ rule: 'cpu_active', action: 'observe' });
+    expect(decide(features({ git: dirty, nudges: 1, escalations: 1, host_cpu: { ...busy, busy_percent: 12 } }))).toMatchObject({ rule: 'dead_after_nudge', action: 'stop' });
+    expect(decide(features({ git: dirty, nudges: 1, escalations: 1, host_cpu: null }))).toMatchObject({ rule: 'dead_after_nudge', action: 'stop' });
   });
   it('captures when no fresh screen exists and waits while a capture resolves', () => {
     expect(decide(features({ screen_tail: null }))).toMatchObject({ rule: 'missing_screen', action: 'capture' });
@@ -218,6 +238,9 @@ describe('idle audit service (AC1/AC3/AC4)', () => {
     const run2 = await ctx.svc.tick('manual');
     expect(run2.counts).toMatchObject({ escalate: 1 });
     expect(ctx.alerts.some(a => a.kind === 'session_audit')).toBe(true);
+    // The alert actually landed: the escalation row records it as dispatched.
+    const escalateRow = decisions(ctx).filter((r: any) => r.action === 'escalate').at(-1);
+    expect(escalateRow).toMatchObject({ rule: 'stuck_escalate', dispatched: true, outcome: 'alerted' });
 
     ctx.advance(40 * 60 * 1000); ctx.refreshCatalog();
     const run3 = await ctx.svc.tick('manual');
@@ -332,7 +355,75 @@ describe('idle audit service (AC1/AC3/AC4)', () => {
     expect(row).toMatchObject({ action: 'nudge', dispatched: false, outcome: 'enqueue_failed' });
     ctx.advance(40 * 60 * 1000); ctx.refreshCatalog();
     const run2 = await ctx.svc.tick('manual');
+    // The refused continuation escalates as a broken send (never re-nudged, never counted as delivered).
     expect(run2.counts).toMatchObject({ escalate: 1, nudge: 0 });
+    expect(decisions(ctx).filter((r: any) => r.action === 'escalate').at(-1)).toMatchObject({ rule: 'stuck_send_broken' });
+  }));
+
+  it('records only alerts that actually landed; skipped and failed alerts retry, never advance the ladder', async () => fixture(async (h, ctx) => {
+    machine(h);
+    for (let i = 0; i < 15; i++) {
+      native(h, { native: `orphan-${i}`, tag: `goal-${i}`, progress: NOW - 3 * HOUR });
+    }
+    const run1 = await ctx.svc.tick('manual');
+    expect(run1.counts).toMatchObject({ escalate: 15, alert_skipped: 5, alert_failed: 0 });
+    const escalated = decisions(ctx).filter((r: any) => r.action === 'escalate');
+    expect(escalated.filter((r: any) => r.outcome === 'alerted' && r.dispatched)).toHaveLength(10);
+    expect(escalated.filter((r: any) => r.outcome === 'alert_skipped' && !r.dispatched)).toHaveLength(5);
+    // The 5 omitted from the notification are not "already escalated": they retry next run.
+    ctx.advance(40 * 60 * 1000); ctx.refreshCatalog();
+    const run2 = await ctx.svc.tick('manual');
+    expect(run2.counts).toMatchObject({ escalate: 5, alert_skipped: 0 });
+    expect(decisions(ctx).filter((r: any) => r.run_id === run2.run_id && r.action === 'observe' && r.rule === 'unlinked_idle_known')).toHaveLength(10);
+  }));
+
+  it('a failing notification sink is recorded as alert_failed and retried next run', async () => fixture(async (h, ctx) => {
+    machine(h);
+    native(h, { native: 'orphan-a', tag: 'goal-a', progress: NOW - 3 * HOUR });
+    let fail = true;
+    const flaky = new SessionAuditService(h.sql, {
+      notify: async () => { if (fail) throw new Error('sink down'); },
+    }, () => ctx.now, makeHeuristicDecider, undefined);
+    const run1 = await flaky.tick('manual');
+    expect(run1.counts).toMatchObject({ escalate: 1, alert_failed: 1 });
+    expect(decisions(ctx).filter((r: any) => r.action === 'escalate').at(-1)).toMatchObject({ dispatched: false, outcome: 'alert_failed' });
+    ctx.advance(40 * 60 * 1000); ctx.refreshCatalog();
+    fail = false;
+    const run2 = await ctx.svc.tick('manual');
+    // The failed alert never counted as an escalation: the retry escalates again and lands.
+    expect(run2.counts).toMatchObject({ escalate: 1, alert_failed: 0 });
+    expect(decisions(ctx).filter((r: any) => r.action === 'escalate').at(-1)).toMatchObject({ dispatched: true, outcome: 'alerted' });
+  }));
+
+  it('keeps verifying a timed-out stop until a census proves the exit (finding 3)', async () => fixture(async (h, ctx) => {
+    machine(h); worktree(h); intake(h, 't1', 'open');
+    const sid = session(h, { engine: 'claude' });
+    native(h, { progress: NOW - 5 * HOUR });
+    await ctx.svc.tick('manual'); // nudge
+    ctx.advance(40 * 60 * 1000); ctx.refreshCatalog();
+    await ctx.svc.tick('manual'); // escalate
+    ctx.advance(40 * 60 * 1000); ctx.refreshCatalog();
+    await ctx.svc.tick('manual'); // stop issued
+    // No acknowledgement ever arrives; past the timeout window the stop is
+    // marked stop_timeout but STAYS in the verification lifecycle.
+    ctx.advance(80 * 60 * 1000); ctx.refreshCatalog();
+    const run4 = await ctx.svc.tick('manual');
+    expect(run4.counts.stop ?? 0).toBe(0);
+    const stopRow = decisions(ctx).filter((r: any) => r.action === 'stop').at(-1);
+    expect(stopRow.outcome).toBe('stop_timeout');
+    expect(decisions(ctx).filter((r: any) => r.rule === 'stop_pending')).toHaveLength(1);
+    expect(ctx.alerts.filter(a => a.subject === 'stop-unverified').length).toBeGreaterThanOrEqual(1);
+    // Later audits keep tracking the timed-out stop (finding 3) ...
+    ctx.advance(40 * 60 * 1000); ctx.refreshCatalog();
+    await ctx.svc.tick('manual');
+    expect(ctx.alerts.filter(a => a.subject === 'stop-unverified').length).toBeGreaterThanOrEqual(2);
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM session_audit_decisions WHERE action='stop' AND outcome='stop_timeout'").one().n).toBe(1);
+    // ... until a fresh census proves the exit (AC2 verified gone).
+    h.sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE native_id='n1'");
+    h.sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", sid);
+    ctx.advance(40 * 60 * 1000); ctx.refreshCatalog();
+    await ctx.svc.tick('manual');
+    expect(decisions(ctx).filter((r: any) => r.action === 'stop').at(-1).outcome).toBe('stopped_verified');
   }));
 
   it('budget-skipped actions are recorded as skipped and never advance the ladder', async () => fixture(async (h, ctx) => {

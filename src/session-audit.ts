@@ -9,13 +9,17 @@
  * Safety (AC2): an intake blocked on a human is never acted against; the
  * audit only enqueues ordinary session-control commands and never passes a
  * cleanup flag, so it can never delete a worktree — uncommitted work survives
- * every action it takes.
+ * every action it takes. A session is stopped for idleness only after a
+ * continuation was actually dispatched to it and heeded by no one (episode
+ * nudge + escalation, both with delivered evidence).
  * Transport honesty: the hub's only send transport is the durable inbox
  * (raw PTY send is retired), so TUI gates that need a real keystroke
  * (y/n, approval, update, press-enter) are never "answered" by this audit —
  * they are observed and escalated to the operator. Only the continuation
  * nudge ("continue, commit, report") uses the inbox, and only for targets
- * whose engine/mode accepts inbox sends (headless codex/zcodex refuse them). */
+ * whose engine/mode accepts inbox sends (headless codex/zcodex refuse them):
+ * unsupported targets are escalated once per idle episode and then observed —
+ * they are never stopped on alerts alone. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { freshCatalogs } from './catalog-freshness';
 import { nativeProgress } from './session_stall';
@@ -31,7 +35,8 @@ const PROMPT_TAIL_CHARS = 300; // a live prompt sits at the visible end of the s
 const CPU_BUSY_PCT = 50; // host CPU above this means the native may be computing; idle alone never kills it
 const ACTION_BUDGET = 8; // sends + stops per run, bounded like the intake watchdog restart slice
 const CAPTURE_BUDGET = 12;
-const ESCALATE_BUDGET = 12;
+const ALERT_BUDGET = 12; // escalation/prompt entries considered per run
+const ALERT_SEND = 10; // entries actually carried by one notification
 const MAX_DETAIL = 512;
 const RETENTION_MS = 7 * 86400000;
 const RETENTION_DELETE = 400;
@@ -88,7 +93,10 @@ export type AuditFeatures = {
   intake_state: string | null;
   screen_tail: string | null;
   screen_age_s: number | null;
-  nudges: number; // dispatched nudge/escalate steps since the session last made progress (idle episode)
+  nudges: number; // continuation sends dispatched to this session since it last made progress
+  escalations: number; // operator alerts successfully sent about this session since it last made progress
+  send_broken: boolean; // the session's newest continuation dispatch was refused by the send endpoint
+  pending_stop: boolean; // a stop from an earlier run is still being verified
   prior: Obj | null; // newest unresolved prior decision for this session
 };
 
@@ -119,7 +127,7 @@ export function makeHeuristicDecider(idleThresholdS: number): SessionDecider {
       if (!f.bound) {
         // No control channel: alert once per idle episode, then stay quiet
         // until progress resets the episode (re-alerting on a new gap).
-        if (f.nudges >= 1)
+        if (f.escalations >= 1)
           return { rule: 'unlinked_idle_known', action: 'observe', detail: `already escalated this idle episode; operator informed (${detail(f)})` };
         return { rule: 'unlinked_idle_native', action: 'escalate', detail: `aplexer native without a Hub binding; no control channel (${detail(f)})` };
       }
@@ -127,6 +135,10 @@ export function makeHeuristicDecider(idleThresholdS: number): SessionDecider {
         return { rule: 'intent_not_running', action: 'observe', detail: `session state ${f.state}; only running sessions are audited for action` };
       if (f.census_stale)
         return { rule: 'evidence_stale', action: 'observe', detail: `host census for ${f.machine_id} is stale; never act on frozen evidence (${detail(f)})` };
+      // A stop from an earlier run is still being verified: never stack a
+      // second one, whatever the finished/stale evidence says (idempotent stop).
+      if (f.pending_stop)
+        return { rule: 'stop_pending', action: 'observe', detail: 'stop command still resolving; verified next audit' };
       if (!f.linked) {
         if (UNOBSERVED_PHASES.has(f.nativePhase ?? ''))
           return { rule: 'observation_unknown', action: 'observe', detail: `host census phase ${f.nativePhase}; never act on stale evidence` };
@@ -136,32 +148,41 @@ export function makeHeuristicDecider(idleThresholdS: number): SessionDecider {
         return { rule: 'finished_intake_closed', action: 'stop', detail: `intake ${f.intake} is ${f.intake_state}; ${detail(f)}; files stay on disk` };
       if (f.intake_state === null && f.git && f.git.dirty === false && (f.git.unpushed ?? 0) === 0 && f.idle_s! >= 2 * t)
         return { rule: 'finished_committed_idle', action: 'stop', detail: `no linked intake, clean pushed tree; ${detail(f)}` };
-      if (f.prior?.action === 'stop' && !f.prior.outcome)
-        return { rule: 'stop_pending', action: 'observe', detail: 'stop command still resolving; verified next audit' };
-      // A stuck gate keeps the screen unchanged, so the screen freshness window
-      // (not a tighter one) bounds prompt evidence; any new progress resets idle instead.
       const prompt = f.screen_age_s !== null && f.screen_age_s * 1000 <= SCREEN_FRESH_MS ? matchInputPrompt(f.screen_tail) : null;
       if (prompt) {
+        // A stuck gate keeps the screen unchanged, so the screen freshness window
+        // (not a tighter one) bounds prompt evidence; any new progress resets idle instead.
         if (prompt.keystroke_only)
           return { rule: 'waiting_for_input:' + prompt.rule, action: 'observe', detail: `screen matches ${prompt.rule} ("${prompt.matched}"); a real keystroke has no hub transport, so the operator is alerted (${detail(f)})` };
         if (!f.send_supported)
           return { rule: 'waiting_for_input:' + prompt.rule, action: 'observe', detail: `screen matches ${prompt.rule}; continuation send unsupported for headless ${f.engine} (${detail(f)})` };
         return { rule: 'waiting_for_input:' + prompt.rule, action: 'keystroke', send_text: prompt.send, detail: `screen matches ${prompt.rule} ("${prompt.matched}"); inbox continuation (${detail(f)})` };
       }
-      if (f.nudges >= 2) {
-        if (f.linked && f.host_cpu && Number(f.host_cpu.busy_percent) >= CPU_BUSY_PCT)
-          return { rule: 'cpu_active', action: 'observe', detail: `no progress through nudge and escalation but host CPU is busy (${f.host_cpu.busy_percent}%); possibly computing, not killed on idle alone (${detail(f)})` };
-        return { rule: 'dead_after_nudge', action: 'stop', detail: `no progress through nudge and escalation; ${detail(f)}; ordinary stop never deletes the worktree (AC2 uncommitted-work guard)` };
+      if (f.git && (f.git.dirty === true || (f.git.unpushed ?? 0) > 0)) {
+        if (!f.send_supported) {
+          // No supported continuation exists for this target: alert once per
+          // idle episode, then hold — it is never stopped on alerts alone.
+          if (f.escalations >= 1)
+            return { rule: 'unsupported_target', action: 'observe', detail: `uncommitted work but headless ${f.engine} refuses sends; operator alerted this episode, holding (${detail(f)})` };
+          return { rule: 'stuck_nudge_unsupported', action: 'escalate', detail: `uncommitted work but nudge transport refuses headless ${f.engine}; operator escalation (${detail(f)})` };
+        }
+        if (f.send_broken) {
+          if (f.escalations >= 1)
+            return { rule: 'send_broken_target', action: 'observe', detail: `send endpoint refused the continuation; operator alerted this episode, holding (${detail(f)})` };
+          return { rule: 'stuck_send_broken', action: 'escalate', detail: `send endpoint refused the continuation command; operator escalation (${detail(f)})` };
+        }
+        if (f.nudges >= 1) {
+          if (f.escalations >= 1) {
+            if (f.linked && f.host_cpu && Number(f.host_cpu.busy_percent) >= CPU_BUSY_PCT)
+              return { rule: 'cpu_active', action: 'observe', detail: `no progress through nudge and escalation but host CPU is busy (${f.host_cpu.busy_percent}%); possibly computing, not killed on idle alone (${detail(f)})` };
+            return { rule: 'dead_after_nudge', action: 'stop', detail: `continuation was dispatched and produced no progress through escalation; ${detail(f)}; ordinary stop never deletes the worktree (AC2 uncommitted-work guard)` };
+          }
+          return { rule: 'stuck_escalate', action: 'escalate', detail: `dispatched nudge produced no progress; ${detail(f)}` };
+        }
+        return { rule: 'stuck_uncommitted', action: 'nudge', send_text: 'continue, commit, report', detail: `uncommitted work (${f.git.dirty_count ?? '?'} dirty, ${f.git.unpushed ?? 0} unpushed); ${detail(f)}` };
       }
       if (f.prior?.action === 'capture' && !f.prior.outcome)
         return { rule: 'capture_pending', action: 'observe', detail: 'screen capture still resolving; classified next audit' };
-      if (f.nudges === 1)
-        return { rule: 'stuck_escalate', action: 'escalate', detail: `nudge produced no progress; ${detail(f)}` };
-      if (f.git && (f.git.dirty === true || (f.git.unpushed ?? 0) > 0)) {
-        if (!f.send_supported)
-          return { rule: 'stuck_nudge_unsupported', action: 'escalate', detail: `uncommitted work but nudge transport refuses headless ${f.engine}; operator escalation (${detail(f)})` };
-        return { rule: 'stuck_uncommitted', action: 'nudge', send_text: 'continue, commit, report', detail: `uncommitted work (${f.git.dirty_count ?? '?'} dirty, ${f.git.unpushed ?? 0} unpushed); ${detail(f)}` };
-      }
       if (!f.screen_tail || (f.screen_age_s !== null && f.screen_age_s * 1000 > SCREEN_FRESH_MS))
         return { rule: 'missing_screen', action: 'capture', detail: `no fresh screen evidence to classify; capturing (${detail(f)})` };
       return { rule: 'observe_idle', action: 'observe', detail: `idle past threshold with no matching rule; ${detail(f)}` };
@@ -177,7 +198,9 @@ export function idleThresholdFrom(env?: any): number {
 export type SessionAuditHooks = {
   /** Internal session-control call; returns parsed JSON and status. */
   request?: (path: string, init: { method: string; body?: string }) => Promise<{ status: number; body: Obj }>;
-  /** Liveness alert sink (same shape as the intake watchdog). */
+  /** Liveness alert sink (same shape as the intake watchdog). Returning
+   * false or throwing means the alert did not land and rows must not be
+   * recorded as successfully escalated. */
   notify?: (kind: string, subject: string, detail: string | null) => Promise<boolean | void>;
 };
 
@@ -269,40 +292,86 @@ export class SessionAuditService {
     return { tail: typeof capture === 'string' && capture ? capture.slice(-SCREEN_TAIL_CHARS) : null, ageS: age };
   }
 
-  /** Newest unresolved actionable decision per session (drives sequencing). */
-  private pendingPrior(): Map<string, Obj> {
-    const out = new Map<string, Obj>();
+  /** Every unresolved actionable decision per session, newest last (drives
+   * sequencing and verification). */
+  private pendingRows(): Map<string, Obj[]> {
+    const out = new Map<string, Obj[]>();
     for (const d of this.rows(`SELECT * FROM session_audit_decisions
         WHERE outcome IS NULL AND action IN ('keystroke','nudge','stop','capture') ORDER BY id`)) {
-      out.set(sessionKey(d.machine_id, d.native_id, d.session_id), d);
+      const key = sessionKey(d.machine_id, d.native_id, d.session_id);
+      if (!out.has(key)) out.set(key, []);
+      out.get(key)!.push(d);
     }
     return out;
   }
 
-  /** Dispatched remediation steps of the CURRENT idle episode per session:
-   * only rows actually dispatched (or deterministically refused, which can
-   * never reach the session) count, and progress after a step resets the
-   * episode — a session that recovered and went idle again starts over. */
-  private priorSteps(natives: Map<string, Obj>): Map<string, number> {
-    const out = new Map<string, number>();
-    for (const d of this.rows(`SELECT machine_id, native_id, session_id, at FROM session_audit_decisions
-        WHERE action IN ('nudge','escalate') AND (dispatched = 1 OR outcome = 'enqueue_failed') ORDER BY id`)) {
-      const native = d.machine_id && d.native_id ? natives.get(d.machine_id + '/' + d.native_id) : null;
-      const boundary = native ? nativeProgress(native) : null;
-      if (boundary !== null && Date.parse(d.at) <= boundary) continue;
+  /** Timed-out stops keep being verified on later evidence until a census
+   * proves the exit; they are reselected explicitly every run. */
+  private trackingStops(): Map<string, Obj[]> {
+    const out = new Map<string, Obj[]>();
+    for (const d of this.rows(`SELECT * FROM session_audit_decisions
+        WHERE action = 'stop' AND outcome = 'stop_timeout' ORDER BY id`)) {
       const key = sessionKey(d.machine_id, d.native_id, d.session_id);
-      out.set(key, (out.get(key) ?? 0) + 1);
+      if (!out.has(key)) out.set(key, []);
+      out.get(key)!.push(d);
     }
     return out;
+  }
+
+  /** Sessions whose newest continuation dispatch was refused by the send
+   * endpoint (episode-scoped: progress after the failure clears it). */
+  private brokenSends(natives: Map<string, Obj>): Map<string, boolean> {
+    const out = new Map<string, boolean>();
+    for (const d of this.rows(`SELECT machine_id, native_id, session_id, at, outcome FROM session_audit_decisions
+        WHERE action = 'nudge' AND dispatched = 0 AND outcome = 'enqueue_failed' ORDER BY id DESC LIMIT 400`)) {
+      const key = sessionKey(d.machine_id, d.native_id, d.session_id);
+      if (out.has(key)) continue; // newest nudge row per session wins
+      const native = d.machine_id && d.native_id ? natives.get(d.machine_id + '/' + d.native_id) : null;
+      const boundary = native ? nativeProgress(native) : null;
+      out.set(key, boundary === null || Date.parse(d.at) > boundary);
+    }
+    return out;
+  }
+
+  /** Dispatched remediation steps of the CURRENT idle episode: only rows that
+   * actually landed (a sent continuation, an alert the sink accepted) count,
+   * and progress after a step resets the episode — a session that recovered
+   * and went idle again starts over. */
+  private episodeSteps(natives: Map<string, Obj>): { nudges: Map<string, number>; escalations: Map<string, number> } {
+    const nudges = new Map<string, number>(), escalations = new Map<string, number>();
+    const inEpisode = (d: Obj): boolean => {
+      const native = d.machine_id && d.native_id ? natives.get(d.machine_id + '/' + d.native_id) : null;
+      const boundary = native ? nativeProgress(native) : null;
+      return boundary === null || Date.parse(d.at) > boundary;
+    };
+    for (const d of this.rows(`SELECT machine_id, native_id, session_id, at FROM session_audit_decisions
+        WHERE action = 'nudge' AND dispatched = 1 ORDER BY id`)) {
+      if (!inEpisode(d)) continue;
+      const key = sessionKey(d.machine_id, d.native_id, d.session_id);
+      nudges.set(key, (nudges.get(key) ?? 0) + 1);
+    }
+    for (const d of this.rows(`SELECT machine_id, native_id, session_id, at FROM session_audit_decisions
+        WHERE action = 'escalate' AND dispatched = 1 ORDER BY id`)) {
+      if (!inEpisode(d)) continue;
+      const key = sessionKey(d.machine_id, d.native_id, d.session_id);
+      escalations.set(key, (escalations.get(key) ?? 0) + 1);
+    }
+    return { nudges, escalations };
   }
 
   /** Outcome of the previous run's actions, evaluated on current evidence (AC2
-   * "verified gone, not just rc 0"; AC3 outcome after next audit). Stops whose
-   * census still shows the native alive stay unresolved so later runs keep
-   * verifying them; those (and timeouts) are returned for operator alerting. */
-  private resolveOutcomes(pending: Map<string, Obj>, natives: Map<string, Obj>, catalogs: Map<string, number>, now: number): Obj[] {
+   * "verified gone, not just rc 0"; AC3 outcome after next audit). Stops stay
+   * in the verification lifecycle until a fresh census proves the exit: an
+   * acknowledged-but-alive or timed-out stop alerts every run it remains
+   * unproven; those rows are returned for operator alerting. */
+  private resolveOutcomes(pending: Map<string, Obj[]>, tracking: Map<string, Obj[]>, natives: Map<string, Obj>, catalogs: Map<string, number>, now: number): Obj[] {
     const unverifiedStops: Obj[] = [];
-    for (const [, d] of pending) {
+    const seen = new Set<number>();
+    const rows: Obj[] = [];
+    for (const list of pending.values()) rows.push(...list);
+    for (const list of tracking.values()) for (const d of list) if (!seen.has(d.id)) rows.push(d);
+    for (const d of rows) {
+      seen.add(d.id);
       const native = d.machine_id && d.native_id ? natives.get(d.machine_id + '/' + d.native_id) : null;
       const fresh = !!d.machine_id && catalogs.has(d.machine_id);
       const terminal = !!native && TERMINAL_PHASES.has(native.phase);
@@ -311,10 +380,12 @@ export class SessionAuditService {
       const age = now - Date.parse(d.at);
       let outcome: string | null = null;
       if (d.action === 'stop') {
-        if (acked || (terminal && fresh)) {
-          if (native && fresh && !terminal) unverifiedStops.push(d); // acked but census says alive: keep verifying next run
-          else outcome = 'stopped_verified';
-        } else if (age > 2 * this.interval) { outcome = 'stop_timeout'; unverifiedStops.push(d); }
+        if (native && fresh && terminal) {
+          outcome = 'stopped_verified';
+        } else {
+          unverifiedStops.push(d); // acked-but-alive, stale, or still awaiting the census
+          if (!acked && age > 2 * this.interval && d.outcome !== 'stop_timeout') outcome = 'stop_timeout';
+        }
       } else if (d.action === 'capture') {
         const screen = d.session_id ? this.screenFor(d.session_id) : { tail: null, ageS: null };
         const screenAt = screen.ageS !== null ? now - screen.ageS * 1000 : null;
@@ -327,8 +398,8 @@ export class SessionAuditService {
         else if (acked) outcome = 'delivered';
         else if (age > 2 * this.interval) outcome = 'send_timeout';
       }
-      if (outcome) {
-        this.sql.exec('UPDATE session_audit_decisions SET outcome = ?, outcome_at = ? WHERE id = ? AND outcome IS NULL',
+      if (outcome && outcome !== d.outcome) {
+        this.sql.exec('UPDATE session_audit_decisions SET outcome = ?, outcome_at = ? WHERE id = ?',
           outcome, new Date(now).toISOString(), d.id);
         d.outcome = outcome;
       }
@@ -355,8 +426,10 @@ export class SessionAuditService {
     const boundNatives = new Set(sessions
       .filter((s: Obj) => s.machine_id && parse(s.binding_json)?.native_id)
       .map((s: Obj) => s.machine_id + '/' + parse(s.binding_json).native_id));
-    const pending = this.pendingPrior();
-    const steps = this.priorSteps(natives);
+    const pending = this.pendingRows();
+    const tracking = this.trackingStops();
+    const { nudges: nudgeSteps, escalations: escalationSteps } = this.episodeSteps(natives);
+    const sendBroken = this.brokenSends(natives);
     const audits: AuditFeatures[] = [];
     for (const s of sessions) {
       const request = parse(s.request_json);
@@ -371,6 +444,8 @@ export class SessionAuditService {
       const intake = request.intake_task_id ?? this.linkedIntakeId(s) ?? null;
       const screen = s.state === 'running' && bound ? this.screenFor(s.id) : { tail: null, ageS: null };
       const key = sessionKey(s.machine_id, binding?.native_id, s.id);
+      const pendingList = pending.get(key) ?? [];
+      const stopUnresolved = pendingList.some(d => d.action === 'stop') || (tracking.get(key) ?? []).length > 0;
       audits.push({
         session_id: s.id, machine_id: s.machine_id ?? null, native_id: binding?.native_id ?? null,
         intake, engine: s.engine ?? null, mode: s.mode ?? null, state: s.state,
@@ -384,8 +459,11 @@ export class SessionAuditService {
         git: wt ? { dirty: wt.dirty ?? null, dirty_count: wt.dirty_count ?? null, unpushed: wt.unpushed ?? null, checked_at: wt.checked_at ?? null } : null,
         intake_state: intake ? this.intakeStatus(intake) : null,
         screen_tail: screen.tail, screen_age_s: screen.ageS,
-        nudges: steps.get(key) ?? 0,
-        prior: pending.get(key) ?? null,
+        nudges: nudgeSteps.get(key) ?? 0,
+        escalations: escalationSteps.get(key) ?? 0,
+        send_broken: sendBroken.get(key) ?? false,
+        pending_stop: stopUnresolved,
+        prior: pendingList.at(-1) ?? null,
         nativePhase: native?.phase ?? null,
       });
     }
@@ -395,6 +473,7 @@ export class SessionAuditService {
       if (!catalogs.has(n.machine_id) || !['running', 'starting'].includes(n.phase) || boundNatives.has(key)) continue;
       const last = nativeProgress(n);
       const wt = n.workspace ? worktrees.get(n.machine_id + '|' + n.workspace) ?? null : null;
+      const pendingList = pending.get(key) ?? [];
       audits.push({
         session_id: null, machine_id: n.machine_id, native_id: n.native_id, intake: null,
         engine: n.engine ?? null, mode: null, state: 'observed', bound: false, linked: false,
@@ -405,7 +484,9 @@ export class SessionAuditService {
         host_cpu: cpuByMachine.get(n.machine_id) ?? null,
         git: wt ? { dirty: wt.dirty ?? null, dirty_count: wt.dirty_count ?? null, unpushed: wt.unpushed ?? null, checked_at: wt.checked_at ?? null } : null,
         intake_state: null, screen_tail: null, screen_age_s: null,
-        nudges: steps.get(key) ?? 0, prior: pending.get(key) ?? null, nativePhase: n.phase,
+        nudges: nudgeSteps.get(key) ?? 0, escalations: escalationSteps.get(key) ?? 0,
+        send_broken: false,
+        pending_stop: false, prior: pendingList.at(-1) ?? null, nativePhase: n.phase,
       });
     }
     return { audits };
@@ -439,16 +520,20 @@ export class SessionAuditService {
     const decider = this.decider(thresholdS);
     const natives = new Map(this.rows('SELECT * FROM fleet_sessions').map(n => [n.machine_id + '/' + n.native_id, n]));
     const catalogs = freshCatalogs(this.sql, now);
-    const unverifiedStops = this.resolveOutcomes(this.pendingPrior(), natives, catalogs, now);
+    const unverifiedStops = this.resolveOutcomes(this.pendingRows(), this.trackingStops(), natives, catalogs, now);
 
     const { audits } = this.collect(now);
     const runAt = new Date(now).toISOString();
     this.sql.exec('INSERT INTO session_audit_runs(at,source,scanned,counts_json) VALUES (?,?,?,?)', runAt, source, audits.length, '{}');
     const runId = Number(this.rows('SELECT id FROM session_audit_runs ORDER BY id DESC LIMIT 1')[0].id);
-    const counts: Obj = { observed: 0, capture: 0, keystroke: 0, nudge: 0, stop: 0, escalate: 0, prompt_alert: 0, enqueue_failed: 0, skipped: 0 };
+    const counts: Obj = { observed: 0, capture: 0, keystroke: 0, nudge: 0, stop: 0, escalate: 0, prompt_alert: 0, enqueue_failed: 0, skipped: 0, alert_skipped: 0, alert_failed: 0 };
     let actionBudget = ACTION_BUDGET, captureBudget = CAPTURE_BUDGET;
-    const escalated: string[] = [];
     let seq = 0;
+    // Alert pipeline: choices are recorded first, notification outcomes are
+    // reconciled afterwards so a row never claims an alert that did not land.
+    type AlertWant = { decisionIndex: number; text: string };
+    const alertWants: AlertWant[] = [];
+    let decisionIndex = 0;
 
     for (const f of audits) {
       const d = decider.decide(f);
@@ -458,14 +543,8 @@ export class SessionAuditService {
       let outcome: string | null = null;
       if (d.action === 'observe') {
         counts.observed++;
-        if (d.rule.startsWith('waiting_for_input:')) {
-          // Keystroke-only prompts have no transport: make them visible to the operator.
-          counts.prompt_alert++;
-          if (escalated.length < ESCALATE_BUDGET) escalated.push(`${f.session_id ?? f.native_id} ${f.machine_id ?? ''} ${d.rule}: ${d.detail}`.slice(0, 200));
-        }
+        if (d.rule.startsWith('waiting_for_input:')) counts.prompt_alert++;
       } else if (d.action === 'escalate') {
-        dispatched = 1; outcome = 'alerted';
-        if (escalated.length < ESCALATE_BUDGET) escalated.push(`${f.session_id ?? f.native_id} ${f.machine_id ?? ''} ${d.rule}: ${d.detail}`.slice(0, 200));
         counts.escalate++;
       } else if (d.action === 'capture') {
         if (captureBudget <= 0) { outcome = 'skipped'; counts.skipped++; }
@@ -486,16 +565,38 @@ export class SessionAuditService {
         f.idle_s === null ? null : Math.round(f.idle_s), d.rule, d.action, String(d.detail).slice(0, MAX_DETAIL), actionKey,
         outcome, outcome ? new Date(now).toISOString() : null, dispatched,
         JSON.stringify({ ...f, screen_tail: undefined }), f.screen_tail);
+      if (d.action === 'escalate' || (d.action === 'observe' && d.rule.startsWith('waiting_for_input:')))
+        alertWants.push({ decisionIndex, text: `${f.session_id ?? f.native_id} ${f.machine_id ?? ''} ${d.rule}: ${d.detail}`.slice(0, 200) });
+      decisionIndex++;
     }
+    // Decision rows are inserted in audits order; map each alert choice to its row id.
+    const runIds = this.rows('SELECT id FROM session_audit_decisions WHERE run_id = ? ORDER BY id', runId);
+    const sendList: Array<{ rowId: number; text: string }> = [];
+    for (let i = 0; i < alertWants.length && i < ALERT_SEND; i++)
+      sendList.push({ rowId: Number(runIds[alertWants[i].decisionIndex]?.id ?? 0), text: alertWants[i].text });
+    const skippedAlerts = alertWants.slice(ALERT_SEND);
 
     let alert: string | null = null;
-    if (escalated.length && this.hooks.notify) {
-      alert = escalated.slice(0, 10).join('; ');
-      try { await this.hooks.notify('session_audit', 'idle-actions', alert); } catch { /* alert retry elsewhere */ }
+    if (sendList.length && this.hooks.notify) {
+      const detail = sendList.map(a => a.text).join('; ');
+      let ok = false;
+      try { ok = await this.hooks.notify('session_audit', 'idle-actions', detail) !== false; } catch { ok = false; }
+      for (const a of sendList) {
+        this.sql.exec('UPDATE session_audit_decisions SET dispatched = ?, outcome = ?, outcome_at = ? WHERE id = ?',
+          ok ? 1 : 0, ok ? 'alerted' : 'alert_failed', new Date(now).toISOString(), a.rowId);
+        if (!ok) counts.alert_failed++;
+      }
+      if (ok) alert = detail;
+    }
+    for (const a of skippedAlerts) {
+      const rowId = Number(runIds[a.decisionIndex]?.id ?? 0);
+      this.sql.exec('UPDATE session_audit_decisions SET dispatched = 0, outcome = ?, outcome_at = ? WHERE id = ?',
+        'alert_skipped', new Date(now).toISOString(), rowId);
+      counts.alert_skipped++;
     }
     if (unverifiedStops.length && this.hooks.notify) {
       const detail = 'stop not verified by host census: ' + unverifiedStops.slice(0, 10).map(u => `${u.session_id ?? u.native_id} on ${u.machine_id}`).join('; ');
-      try { await this.hooks.notify('session_audit', 'stop-unverified', detail); } catch { /* alert retry elsewhere */ }
+      try { await this.hooks.notify('session_audit', 'stop-unverified', detail); } catch { /* stop rows stay in the tracking lifecycle */ }
       alert = alert ? alert + ' | ' + detail : detail;
     }
     const result = { state: 'audited', run_id: runId, at: runAt, scanned: audits.length, counts, threshold_s: thresholdS };
