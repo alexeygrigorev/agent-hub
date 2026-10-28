@@ -34,6 +34,12 @@ class TestMachineBinding(unittest.TestCase):
         self.path = Path(self.tmp.name) / "config" / "host.json"
         self.addCleanup(patch.stopall)
         patch.object(config, "get_config_path", return_value=self.path).start()
+        # save_config/load_config prefer the worker profile path, which they
+        # resolve from APLEXER_TAG/APLEXER_WORKSPACE and which bypasses the
+        # patched get_config_path: without this pin, a suite run from an
+        # aplexer session shell writes fixtures into that session's real
+        # hub-worker-auth file (and destroys its credential).
+        patch("agent_hub_host.worker_auth.config_path", return_value=None).start()
         # Reuse the real device polling loop without sleeping or printing codes.
         flow = auth._device_flow()
         real_login = flow.device_login

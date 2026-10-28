@@ -80,6 +80,9 @@ PYTHONUSERBASE="${ORIGINAL_USER_BASE}" \
 DTC_AUTH_HOME="${DTC_AUTH_PATH}" \
 PYTHONPATH="host:host/tests" \
 CODEX_LAUNCH_WRAPPER="" \
+APLEXER_TAG="" \
+APLEXER_WORKSPACE="" \
+APLEXER_SESSION_ID="" \
 "${UV_BIN}" run --frozen --with pytest python -m pytest -q \
   --basetemp "${RUN_TMP}/pytest" \
   -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none || PYTEST_RC=$?
