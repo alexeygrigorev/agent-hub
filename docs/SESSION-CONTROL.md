@@ -343,7 +343,7 @@ See [NATIVE-SESSIONS.md](NATIVE-SESSIONS.md) for adoption and lifecycle details.
   reported only with a non-empty `agent_state` AND a fresh `observed_at`
   (within 5 minutes, not in the future). Otherwise the send is queued with
   warning `target_no_reported_state`; with `require_ready: true`
-  (`--require-ready` / `--refuse-if-unready`) it is refused with HTTP 409
+  (`--require-ready`) it is refused with HTTP 409
   `target_not_ready`. Stale state never silently passes as ready.
 - Inbox waiting (AC5): a send whose recipient reply has not arrived is
   journaled as pending with NO terminal ack. Under the live claim fence the

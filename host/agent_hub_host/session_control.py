@@ -488,7 +488,7 @@ def add_commands(sub):
     body_src.add_argument('--body-file', help='UTF-8 prompt file, or - for stdin (max 16 KiB)')
     body_src.add_argument('--prompt', default=None,
                           help='Inline UTF-8 prompt text (max 16 KiB; same boundaries as --body-file)')
-    send.add_argument('--require-ready', '--refuse-if-unready', dest='require_ready', action='store_true',
+    send.add_argument('--require-ready', dest='require_ready', action='store_true',
                       help='Refuse send immediately if target session has no recent reported state')
     send.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(send)
