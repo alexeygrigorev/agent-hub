@@ -15,6 +15,7 @@
  * for `delivery=tui`, the native deliver guard (at most once into the TUI).
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import { generateUlid } from './bus';
 
 export const SESSION_PROJECT = 'session';
 export const NAMED_AGENT_PROJECT = 'agent';
@@ -24,38 +25,45 @@ export const DELIVERIES = new Set(['tui', 'inbox']);
 export const DEFAULT_DELIVER_BY_MS = 24 * 3600 * 1000;
 export const NOT_READY_BACKOFF_MS = [5000, 15000, 30000, 60000];
 const TUI_RENDER_BYTES = 2048;
-const REF_JSON_BYTES = 2048;
-
-/** Large payloads travel by reference, never in Hub storage (§10): bounded
- * `{kind, value, sha256?, bytes?, machine?}` JSON, ≤ 2 KiB. `path` refs only
- * point at a named machine and are shown, never fetched. Returns the
- * normalized JSON string, or null when no ref was given. */
-export function validateRef(ref: unknown): string | null {
-  if (ref === undefined || ref === null) return null;
-  if (typeof ref !== 'object' || Array.isArray(ref)) throw new Error('invalid_ref');
-  const r = ref as Record<string, unknown>;
-  const keys = Object.keys(r);
-  if (keys.some(k => !['kind', 'value', 'sha256', 'bytes', 'machine'].includes(k))) throw new Error('invalid_ref');
-  if (typeof r.kind !== 'string' || !['git', 'intake_artifact', 'url', 'path'].includes(r.kind)) throw new Error('invalid_ref');
-  if (typeof r.value !== 'string' || !r.value || r.value.length > 512) throw new Error('invalid_ref');
-  if (r.sha256 !== undefined && (typeof r.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(r.sha256))) throw new Error('invalid_ref');
-  if (r.bytes !== undefined && (typeof r.bytes !== 'number' || !Number.isInteger(r.bytes) || r.bytes < 0)) throw new Error('invalid_ref');
-  if (r.machine !== undefined && (typeof r.machine !== 'string' || !r.machine || r.machine.length > 128)) throw new Error('invalid_ref');
-  if (r.kind === 'path' && typeof r.machine !== 'string') throw new Error('invalid_ref');
-  const json = JSON.stringify(r);
-  if (new TextEncoder().encode(json).length > REF_JSON_BYTES) throw new Error('invalid_ref');
+/** References are displayed as data; Hub never fetches their contents. */
+export function validateRef(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_ref');
+  const ref = value as Record<string, unknown>;
+  if (Object.keys(ref).some(k => !['kind', 'value', 'sha256', 'bytes', 'machine'].includes(k)) ||
+      !['git', 'intake_artifact', 'url', 'path'].includes(String(ref.kind)) || typeof ref.value !== 'string' || !ref.value ||
+      (ref.sha256 !== undefined && (typeof ref.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(ref.sha256))) ||
+      (ref.bytes !== undefined && (!Number.isSafeInteger(ref.bytes) || Number(ref.bytes) < 0)) ||
+      (ref.machine !== undefined && (typeof ref.machine !== 'string' || !ref.machine)) ||
+      (ref.kind === 'path' && typeof ref.machine !== 'string')) throw new Error('invalid_ref');
+  const json = JSON.stringify({ kind: ref.kind, value: ref.value, ...(ref.sha256 !== undefined ? { sha256: ref.sha256 } : {}),
+    ...(ref.bytes !== undefined ? { bytes: ref.bytes } : {}), ...(ref.machine !== undefined ? { machine: ref.machine } : {}) });
+  if (new TextEncoder().encode(json).length > 2048) throw new Error('invalid_ref');
   return json;
 }
 
 export function initSessionMessaging(sql: SqlStorage): void {
   const cols = new Set(sql.exec('PRAGMA table_info(messages)').toArray().map((c: any) => String(c.name)));
-  for (const [col, type] of [['delivery', 'TEXT'], ['state', 'TEXT'], ['state_reason', 'TEXT'], ['deliver_by', 'INTEGER'], ['to_session_id', 'TEXT'], ['recipient_seq', 'INTEGER'], ['ref_json', 'TEXT']] as const) {
+  for (const [col, type] of [['delivery', 'TEXT'], ['state', 'TEXT'], ['state_reason', 'TEXT'], ['deliver_by', 'INTEGER'], ['to_session_id', 'TEXT'], ['from_session_id', 'TEXT'], ['recipient_seq', 'INTEGER'], ['ref_json', 'TEXT']] as const) {
     if (!cols.has(col)) sql.exec(`ALTER TABLE messages ADD COLUMN ${col} ${type}`);
   }
   // Delegated named-agent access for MCP callers (§9): the hub-mcp connector
   // keeps its human login; one row per (named agent, MCP client) grant.
   sql.exec('CREATE TABLE IF NOT EXISTS named_agent_delegates (agent TEXT NOT NULL, client TEXT NOT NULL, created_by TEXT, created_at TEXT, PRIMARY KEY(agent, client))');
   sql.exec('CREATE TABLE IF NOT EXISTS recipient_cursors (actor TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)');
+  // `agent` is a reserved registry project: its recipients are stable named
+  // identities. Preserve identities issued before the dedicated table existed.
+  sql.exec(`CREATE TABLE IF NOT EXISTS named_agents (name TEXT PRIMARY KEY, project TEXT, display TEXT NOT NULL,
+    credential_family TEXT, delegates_json TEXT NOT NULL DEFAULT '[]', forward_session_id TEXT,
+    created_by TEXT NOT NULL, created_at TEXT NOT NULL, disabled_at TEXT)`);
+  sql.exec(`INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at)
+    SELECT tag, tag, 'hub:migration', COALESCE(registered_at, '') FROM agents WHERE project = 'agent'`);
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS named_agent_registry_insert AFTER INSERT ON agents WHEN NEW.project = 'agent' BEGIN
+    INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at) VALUES (NEW.tag, NEW.tag, 'hub:registry', COALESCE(NEW.registered_at, ''));
+    END`);
+  sql.exec('CREATE INDEX IF NOT EXISTS messages_recipient_seq ON messages(to_actor, recipient_seq)');
+  sql.exec('CREATE INDEX IF NOT EXISTS messages_delivery_deadline ON messages(state, deliver_by)');
+  sql.exec('CREATE TABLE IF NOT EXISTS message_thread_status (thread_id TEXT NOT NULL, reason TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(thread_id, reason))');
   // Metadata only, never bodies; retained longer than bodies (180 days).
   sql.exec(`CREATE TABLE IF NOT EXISTS message_events (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL,
     event TEXT NOT NULL, actor TEXT, machine_id TEXT, at INTEGER NOT NULL, detail_json TEXT)`);
@@ -66,6 +74,11 @@ export function initSessionMessaging(sql: SqlStorage): void {
   const commandCols = new Set(sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_commands'").toArray().length
     ? sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)) : []);
   if (commandCols.size && !commandCols.has('not_before')) sql.exec('ALTER TABLE session_control_commands ADD COLUMN not_before TEXT');
+  if (commandCols.size && !commandCols.has('recipient_seq')) {
+    sql.exec('ALTER TABLE session_control_commands ADD COLUMN recipient_seq INTEGER');
+    sql.exec(`UPDATE session_control_commands SET recipient_seq = (SELECT recipient_seq FROM messages WHERE id = json_extract(payload_json, '$.message_id')) WHERE kind = 'message' AND json_valid(payload_json)`);
+  }
+  if (commandCols.size) sql.exec('CREATE INDEX IF NOT EXISTS session_message_order ON session_control_commands(session_id, kind, recipient_seq)');
   // Operator messaging configuration (docs/SESSION-MESSAGING.md §8): today only
   // cross_project_allow, the per-recipient-project grant for session senders.
   sql.exec('CREATE TABLE IF NOT EXISTS messaging_settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)');
@@ -92,15 +105,29 @@ export function crossProjectAllowed(sql: SqlStorage, project: string | null): bo
 
 const EVENT_RETENTION_MS = 180 * 24 * 3600 * 1000;
 
+export function expireMessageEvents(sql: SqlStorage, now: number): void {
+  sql.exec('DELETE FROM message_events WHERE id IN (SELECT id FROM message_events WHERE at < ? ORDER BY at LIMIT 100)', now - EVENT_RETENTION_MS);
+}
+
 export function messageEvent(sql: SqlStorage, messageId: string, event: string, actor: string | null, machineId: string | null, now: number, detail?: Record<string, unknown>): void {
   // Bounded retention (180 days, metadata only): trim a small slice per write.
   sql.exec('DELETE FROM message_events WHERE id IN (SELECT id FROM message_events WHERE at < ? ORDER BY at LIMIT 20)', now - EVENT_RETENTION_MS);
+  const json = detail ? JSON.stringify(detail) : null;
+  // Bound metadata by UTF-8 bytes while retaining valid JSON. Slicing JSON
+  // can cut an escape/string and make the entire status endpoint unreadable.
+  const bounded = json && new TextEncoder().encode(json).length > 2048 ? JSON.stringify({ truncated: true }) : json;
   sql.exec('INSERT INTO message_events (message_id, event, actor, machine_id, at, detail_json) VALUES (?, ?, ?, ?, ?, ?)',
-    messageId, event, actor, machineId, now, detail ? JSON.stringify(detail).slice(0, 2048) : null);
+    messageId, event, actor, machineId, now, bounded);
 }
 
 /** Forward-only message state with its audit event. */
 export function setMessageState(sql: SqlStorage, messageId: string, state: string, reason: string | null, actor: string | null, machineId: string | null, now: number, detail?: Record<string, unknown>): void {
+  const row: any = sql.exec('SELECT state, state_reason FROM messages WHERE id = ?', messageId).toArray()[0];
+  if (!row || ['expired', 'undeliverable', 'completed'].includes(row.state)) return;
+  const stages = ['accepted', 'dispatched', 'delivered', 'read', 'acked', 'accepted_work', 'completed'];
+  if (stages.indexOf(row.state) >= 2 && stages.indexOf(state) < stages.indexOf(row.state)) return;
+  if (row.state === 'uncertain' && !['delivered', 'expired', 'undeliverable'].includes(state)) return;
+  if (row.state === state && row.state_reason === reason) return;
   sql.exec('UPDATE messages SET state = ?, state_reason = ? WHERE id = ?', state, reason, messageId);
   if (state === 'delivered') sql.exec('UPDATE messages SET delivered_at = COALESCE(delivered_at, ?) WHERE id = ?', now, messageId);
   messageEvent(sql, messageId, state, actor, machineId, now, { ...(reason ? { reason } : {}), ...(detail || {}) });
@@ -252,22 +279,26 @@ export function renderTui(msg: { id: string; from_actor: string; thread_id: stri
 
 /** Assign the per-recipient sequence, the initial state, and for session
  * recipients the delivery command. Runs inside the bus send transaction. */
-export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?: string; deliverByMs?: number; refJson?: string | null; now: number }): void {
+export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?: string; deliverByMs?: number; ref?: unknown; now: number }): void {
   const prior: any = sql.exec('SELECT last_seq FROM recipient_cursors WHERE actor = ?', msg.to_actor).toArray()[0];
   const seq = (prior ? Number(prior.last_seq) : 0) + 1;
   sql.exec('INSERT INTO recipient_cursors (actor, last_seq) VALUES (?, ?) ON CONFLICT(actor) DO UPDATE SET last_seq = excluded.last_seq', msg.to_actor, seq);
   const sessionId = sessionIdOf(msg.to_actor);
   const named = msg.from_actor.startsWith(NAMED_AGENT_PROJECT + ':') || msg.from_actor.startsWith('human:') || msg.from_actor === 'admin';
-  const delivery = sessionId ? (opts.delivery ?? (named ? 'tui' : 'inbox')) : null;
-  const deliverBy = sessionId ? opts.now + Math.min(opts.deliverByMs ?? DEFAULT_DELIVER_BY_MS, 7 * 24 * 3600 * 1000) : null;
-  sql.exec('UPDATE messages SET recipient_seq = ?, state = ?, delivery = ?, deliver_by = ?, to_session_id = ?, ref_json = COALESCE(?, ref_json) WHERE id = ?',
-    seq, 'accepted', delivery, deliverBy, sessionId, opts.refJson ?? null, msg.id);
+  const delivery = opts.delivery ?? (sessionId && named ? 'tui' : 'inbox');
+  const deliverBy = opts.now + Math.min(opts.deliverByMs ?? DEFAULT_DELIVER_BY_MS, 7 * 24 * 3600 * 1000);
+  sql.exec('UPDATE messages SET recipient_seq = ?, state = ?, delivery = ?, deliver_by = ?, to_session_id = ?, from_session_id = ? WHERE id = ?',
+    seq, 'accepted', delivery, deliverBy, sessionId, sessionIdOf(msg.from_actor), msg.id);
+  sql.exec('UPDATE messages SET ref_json = ? WHERE id = ?', validateRef(opts.ref), msg.id);
   messageEvent(sql, msg.id, 'accepted', msg.from_actor, null, opts.now, { to: msg.to_actor, seq, ...(delivery ? { delivery } : {}) });
   if (msg.reply_to) {
     const parent: any = sql.exec('SELECT id, to_actor, read_at FROM messages WHERE id = ?', msg.reply_to).toArray()[0];
     if (parent && parent.to_actor === msg.from_actor) {
       // A reply implies the recipient read the original.
-      if (!parent.read_at) sql.exec('UPDATE messages SET delivered_at = COALESCE(delivered_at, ?), read_at = ? WHERE id = ?', opts.now, opts.now, parent.id);
+      if (!parent.read_at) {
+        sql.exec('UPDATE messages SET delivered_at = COALESCE(delivered_at, ?), read_at = ? WHERE id = ?', opts.now, opts.now, parent.id);
+        setMessageState(sql, parent.id, 'read', null, msg.from_actor, null, opts.now);
+      }
       messageEvent(sql, parent.id, 'replied', msg.from_actor, null, opts.now, { reply_id: msg.id });
     }
   }
@@ -277,18 +308,19 @@ export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?:
 /** Enqueue the session-control command of kind `message` that carries a
  * message to its session's host (§5); one live command per message. */
 export function queueSessionDelivery(sql: SqlStorage, messageId: string, fromActor: string, sessionId: string, delivery: string, now: number): void {
-  const msg: any = sql.exec('SELECT id, from_actor, thread_id, body, ref_json FROM messages WHERE id = ?', messageId).toArray()[0];
+  const msg: any = sql.exec('SELECT id, from_actor, thread_id, body, ref_json, recipient_seq FROM messages WHERE id = ?', messageId).toArray()[0];
   if (!msg) return;
   const session: any = sql.exec('SELECT id, binding_json FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
   const binding = (() => { try { return JSON.parse(session?.binding_json || 'null'); } catch { return null; } })();
   const generation = binding?.generation ?? 0;
   const id = crypto.randomUUID();
   const at = new Date(now).toISOString();
+  const seq = msg.recipient_seq;
   sql.exec(
-    'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    id, sessionId, 'message', fromActor, 'msg-' + messageId,
-    JSON.stringify({ message_id: messageId, delivery, from_actor: msg.from_actor, body: renderTui(msg) }), 'recorded', generation, `cmd:${id}:gen:${generation}`,
-    null, null, 0, at, at);
+    'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at, recipient_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    id, sessionId, 'message', fromActor, 'msg-' + msg.id,
+    JSON.stringify({ message_id: msg.id, recipient_seq: seq, delivery, from_actor: msg.from_actor, body: renderTui(msg) }), 'recorded', generation, `cmd:${id}:gen:${generation}`,
+    null, null, 0, at, at, seq);
 }
 
 /** Backoff for a not-ready TUI: 5 s, 15 s, 30 s, then every 60 s. */
@@ -298,23 +330,35 @@ export function notReadyDelay(count: number): number {
 
 /** Messages past deliver_by, or whose session ended, stop being offered:
  * the native inbox copy (if any) and the Hub inbox stay authoritative. */
-export function expireSessionMessages(sql: SqlStorage, now: number, machineId: string): void {
-  const rows = sql.exec(`SELECT c.id, c.payload_json, s.state AS session_state FROM session_control_commands c
-    JOIN session_control_sessions s ON s.id = c.session_id
-    WHERE s.machine_id = ? AND c.kind = 'message' AND c.state = 'recorded' LIMIT 100`, machineId).toArray() as any[];
+export function expireSessionMessages(sql: SqlStorage, now: number, machineId?: string, sessionId?: string): void {
+  const rows = sql.exec(`SELECT m.*, s.state AS session_state, s.machine_id FROM messages m
+    LEFT JOIN session_control_sessions s ON s.id = m.to_session_id
+    WHERE m.to_session_id IS NOT NULL AND m.state IN ('accepted','dispatched','uncertain')
+    AND (s.id IS NULL OR s.state NOT IN (${LIVE_SESSION_STATES.map(() => '?').join(',')}) OR m.deliver_by <= ?)
+    ${machineId ? 'AND s.machine_id = ?' : ''} ${sessionId ? 'AND m.to_session_id = ?' : ''}
+    ORDER BY m.deliver_by, m.id LIMIT 100`, ...LIVE_SESSION_STATES, now, ...(machineId ? [machineId] : []), ...(sessionId ? [sessionId] : [])).toArray() as any[];
   const at = new Date(now).toISOString();
   for (const row of rows) {
-    let messageId: string | null = null;
-    try { messageId = JSON.parse(row.payload_json)?.message_id ?? null; } catch {}
-    const msg: any = messageId ? sql.exec('SELECT deliver_by FROM messages WHERE id = ?', messageId).toArray()[0] : null;
     const ended = !LIVE_SESSION_STATES.includes(row.session_state);
-    const expired = !msg || (msg.deliver_by != null && Number(msg.deliver_by) <= now);
-    if (!ended && !expired) continue;
     const reason = ended ? 'session_ended' : 'deliver_by_passed';
-    sql.exec("UPDATE session_control_commands SET state = 'failed', ack_json = ?, updated_at = ? WHERE id = ? AND state = 'recorded'",
-      JSON.stringify({ outcome: 'failed', reason }), at, row.id);
-    if (messageId && msg) setMessageState(sql, messageId, ended ? 'undeliverable' : 'expired', reason, null, machineId, now);
+    sql.exec(`UPDATE session_control_commands SET state = 'failed', ack_json = ?, updated_at = ?
+      WHERE session_id = ? AND kind = 'message' AND json_extract(payload_json, '$.message_id') = ? AND state IN ('recorded','transported','claimed','uncertain')`,
+      JSON.stringify({ outcome: 'failed', reason }), at, row.to_session_id, row.id);
+    setMessageState(sql, row.id, ended ? 'undeliverable' : 'expired', reason, 'system:hub', row.machine_id ?? null, now);
+    if (ended) sessionEndedStatus(sql, row, now);
   }
+}
+
+/** One status per stopped thread, even when a large queue takes several sweeps. */
+export function sessionEndedStatus(sql: SqlStorage, message: any, now: number): void {
+  if (sql.exec("SELECT 1 FROM message_thread_status WHERE thread_id = ? AND reason = 'session_ended'", message.thread_id).toArray().length) return;
+  const id = generateUlid(now);
+  sql.exec("INSERT INTO message_thread_status (thread_id, reason, message_id) VALUES (?, 'session_ended', ?)", message.thread_id, id);
+  const status = { id, from_actor: 'system:hub', to_actor: message.from_actor, kind: 'status', thread_id: message.thread_id,
+    reply_to: message.id, body: 'Message undeliverable: session_ended' };
+  sql.exec(`INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, reply_to, body, idempotency_key, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, status.from_actor, status.to_actor, status.kind, status.thread_id, status.reply_to, status.body, 'session-ended:' + message.thread_id, now, now + 30 * 86400000);
+  afterMessageInsert(sql, status, { now });
 }
 
 const CREDENTIAL_TTL_MS = 3600 * 1000; // 1 h access token (docs/SESSION-MESSAGING.md §8)
@@ -366,6 +410,7 @@ export function mintSessionCredential(sql: SqlStorage, sessionId: string, machin
 export function revokeSessionCredentials(sql: SqlStorage, sessionId: string, now: number): void {
   sql.exec("UPDATE credentials SET revoked_at = ? WHERE kind = 'agent' AND registry_actor = ? AND revoked_at IS NULL",
     new Date(now).toISOString(), `${SESSION_PROJECT}:${sessionId}`);
+  expireSessionMessages(sql, now, undefined, sessionId);
 }
 
 /** Refresh-guard for session credentials (hub.ts refreshCredential): the
@@ -393,7 +438,7 @@ export function revokeEndedSessionCredentials(sql: SqlStorage, now: number): voi
  * replacement session and re-queue its delivery. Runs inside a storage
  * transaction; throws RecipientError for an unknown target and Error for
  * invalid input. */
-export function readdressMessage(sql: SqlStorage, messageId: string, toActor: string, now: number): { id: string; to_actor: string } {
+export function readdressMessage(sql: SqlStorage, messageId: string, toActor: string, now: number, operatorActor: string | null = null): { id: string; to_actor: string } {
   if (!toActor.startsWith(SESSION_PROJECT + ':')) throw new Error('invalid_readdress_target');
   const msg: any = sql.exec('SELECT id, from_actor, to_actor, to_session_id, delivery, state, read_at, deliver_by, expires_at FROM messages WHERE id = ?', messageId).toArray()[0];
   if (!msg || Number(msg.expires_at) <= now) throw new Error('not_found');
@@ -402,18 +447,20 @@ export function readdressMessage(sql: SqlStorage, messageId: string, toActor: st
   const target = resolveRecipient(sql, toActor, now);
   const targetSession = sessionIdOf(target);
   if (!targetSession) throw new Error('invalid_readdress_target');
-  // Any still-recorded delivery command for this message stops (old session,
-  // or a previous re-address target); the reason says why.
+  if (target === msg.to_actor) return { id: messageId, to_actor: target };
+  // Fence every old delivery command, including a claimed/uncertain one: a
+  // late receipt from that target must not advance the replacement's state.
   const at = new Date(now).toISOString();
-  sql.exec("UPDATE session_control_commands SET state = 'failed', ack_json = ?, updated_at = ? WHERE kind = 'message' AND state = 'recorded' AND request_key = ?",
-    JSON.stringify({ outcome: 'failed', reason: 'readdressed' }), at, 'msg-' + messageId);
+  sql.exec("UPDATE session_control_commands SET state = 'failed', ack_json = ?, updated_at = ? WHERE kind = 'message' AND state IN ('recorded','transported','claimed','uncertain') AND json_valid(payload_json) AND json_extract(payload_json, '$.message_id') = ?",
+    JSON.stringify({ outcome: 'failed', reason: 'readdressed' }), at, messageId);
   const prior: any = sql.exec('SELECT last_seq FROM recipient_cursors WHERE actor = ?', target).toArray()[0];
   const seq = (prior ? Number(prior.last_seq) : 0) + 1;
   sql.exec('INSERT INTO recipient_cursors (actor, last_seq) VALUES (?, ?) ON CONFLICT(actor) DO UPDATE SET last_seq = excluded.last_seq', target, seq);
   const deliverBy = Math.max(Number(msg.deliver_by) || 0, now + DEFAULT_DELIVER_BY_MS);
   sql.exec('UPDATE messages SET to_actor = ?, to_session_id = ?, recipient_seq = ?, state = ?, state_reason = NULL, deliver_by = ? WHERE id = ?',
     target, targetSession, seq, 'accepted', deliverBy, messageId);
-  messageEvent(sql, messageId, 'readdressed', null, null, now, { from: msg.to_actor, to: target, seq });
+  messageEvent(sql, messageId, 'readdressed', operatorActor, null, now, { from: msg.to_actor, to: target, seq });
+  messageEvent(sql, messageId, 'admin_override', operatorActor, null, now, { reason: 'readdressed', from: msg.to_actor, to: target });
   queueSessionDelivery(sql, messageId, msg.from_actor, targetSession, msg.delivery || 'inbox', now);
   return { id: messageId, to_actor: target };
 }

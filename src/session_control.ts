@@ -1,4 +1,4 @@
-import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials } from './session-messaging';
+import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
 import { IntakeWorktrees } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
 import { LivenessService } from './liveness';
@@ -83,7 +83,7 @@ const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const UUID_RE = /^[a-f0-9-]{36}$/;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COMMANDS = new Set(['send', 'capture', 'stop']);
-const ACK_OUTCOMES = new Set(['delivered', 'transported', 'refused', 'uncertain', 'failed']);
+const ACK_OUTCOMES = new Set(['delivered', 'transported', 'refused', 'uncertain', 'failed', 'not_ready']);
 // Pre-send readiness: a target counts as recently reported only when it has a
 // non-empty agent_state AND a fresh observed_at. fleet_sessions.observed_at is
 // the last report time; 5 minutes matches host heartbeat staleness (180s)
@@ -173,7 +173,7 @@ export function qualifiedNativeAlias(workspace: string, tag: string): string | n
   return `${base}:${tag}`;
 }
 
-async function body(request: Request): Promise<any> {
+async function body(request: Request, maxBytes = 32768): Promise<any> {
   if (!request.body) return null;
   const reader = request.body.getReader();
   let size = 0;
@@ -183,7 +183,7 @@ async function body(request: Request): Promise<any> {
       const part = await reader.read();
       if (part.done) break;
       size += part.value.byteLength;
-      if (size > 32768) { await reader.cancel(); return null; }
+      if (size > maxBytes) { await reader.cancel(); return null; }
       chunks.push(part.value);
     }
     const bytes = new Uint8Array(size);
@@ -1165,6 +1165,14 @@ export class SessionControlService {
    * journal. Missing journals on a different attester fail closed.
    */
   private expireClaim(row: any) {
+    if (row.kind === 'message') {
+      // A lost delivery claim may have typed already. Never re-type or apply
+      // the ordinary command retry limit; retain the fence for reconciliation.
+      this.markUncertain(row, 'claim_expired');
+      const id = parsed(row.payload_json, {})?.message_id;
+      if (typeof id === 'string') setMessageState(this.sql, id, 'uncertain', 'claim_expired', null, row.holder_machine ?? null, this.now());
+      return;
+    }
     const storedInInbox = row.host_status === 'waiting in inbox for recipient';
     if (storedInInbox) {
       this.sql.exec("UPDATE session_control_commands SET state = 'failed', ack_json = ?, poll_at = NULL, updated_at = ? WHERE id = ? AND state IN ('claimed','recorded','transported')",
@@ -1281,6 +1289,22 @@ export class SessionControlService {
   }
 
   async handle(request: Request, auth: Auth): Promise<Response> {
+    const result = await this.dispatch(request, auth);
+    const command = /^\/api\/session-commands\/([a-f0-9-]{36})\//.exec(new URL(request.url).pathname);
+    if (command && result.status >= 400 && auth.caller) {
+      const row: any = this.sql.exec("SELECT payload_json FROM session_control_commands WHERE id = ? AND kind = 'message'", command[1]).toArray()[0];
+      const messageId = parsed(row?.payload_json, {})?.message_id;
+      if (typeof messageId === 'string') {
+        const detail: any = await result.clone().json().catch(() => ({}));
+        const event = result.status === 401 || result.status === 403 ? 'auth_refused' : 'command_refused';
+        messageEvent(this.sql, messageId, event, auth.caller?.actor ?? null, auth.caller?.machineId ?? null, this.now(),
+          { code: String(detail.error ?? 'refused').slice(0, 128), command_id: command[1] });
+      }
+    }
+    return result;
+  }
+
+  private async dispatch(request: Request, auth: Auth): Promise<Response> {
     if (auth.error) return auth.error;
     const url = new URL(request.url);
     const path = url.pathname;
@@ -2522,7 +2546,7 @@ export class SessionControlService {
       if (sub && ['send', 'capture', 'stop'].includes(sub) && request.method === 'POST') {
         if (!writer || !this.ownerOk(session, caller)) return response({ error: 'forbidden' }, 403);
         const kind = sub;
-        const input = await body(request);
+        const input = await body(request, kind === 'send' ? 131072 : 32768);
         // Every mutation below runs inside one synchronous transaction that
         // re-reads the live session row AND the live caller authority after
         // the awaited body: revocation/expiry/rebound/reenroll — or a
@@ -2538,7 +2562,7 @@ export class SessionControlService {
         };
         if (kind === 'send') {
           if (!obj(input, ['key', 'body', 'require_ready']) || !label(input.key) ||
-              typeof input.body !== 'string' || !input.body.trim() || input.body.length > 16000) {
+              typeof input.body !== 'string' || !input.body.trim() || new TextEncoder().encode(input.body).length > 16384) {
             return response({ error: 'invalid_send' }, 400);
           }
           return this.transaction(() => {
@@ -2672,7 +2696,7 @@ export class SessionControlService {
            WHERE s.machine_id = ? AND c.state = 'recorded'
            AND (c.not_before IS NULL OR c.not_before <= ?)
            AND (c.kind <> 'message' OR NOT EXISTS (SELECT 1 FROM session_control_commands e WHERE e.session_id = c.session_id
-             AND e.kind = 'message' AND e.state IN ('recorded','transported','claimed') AND (e.created_at < c.created_at OR (e.created_at = c.created_at AND e.id < c.id))))
+             AND e.kind = 'message' AND e.state IN ('recorded','transported','claimed','uncertain') AND e.recipient_seq < c.recipient_seq))
            AND (? = 1 OR s.host_family IS NULL OR s.host_family = ?)
            ORDER BY CASE WHEN c.kind = 'stop' THEN 0 WHEN c.kind = 'message' THEN 1 ELSE 2 END, c.created_at, c.id LIMIT 20`,
           caller.machineId!, at, caller.isAdmin === true ? 1 : 0, this.presentingFamily(caller)).toArray() as any[];
@@ -2686,6 +2710,11 @@ export class SessionControlService {
           // nothing.
           if (!this.hostOk(session, caller).ok) continue;
           const binding = session?.binding_json ? parsed(session.binding_json, null) : null;
+          if (row.kind === 'message' && !row.claim_token && binding && row.generation !== binding.generation) {
+            row.generation = binding.generation;
+            row.correlation = `cmd:${row.id}:gen:${binding.generation}`;
+            this.sql.exec('UPDATE session_control_commands SET generation = ?, correlation = ?, updated_at = ? WHERE id = ?', row.generation, row.correlation, at, row.id);
+          }
           const requestJson = parsed(session.request_json, {});
           // Fetch receipt only: marking transported never authorizes an effect.
           if (row.state === 'recorded') {
@@ -2773,6 +2802,14 @@ export class SessionControlService {
         const gate = this.hostOk(session, caller);
         if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
         if (input.correlation !== row.correlation) return response({ error: 'correlation_mismatch' }, 409);
+        if (row.kind === 'message') {
+          expireSessionMessages(this.sql, this.now(), caller.machineId, session.id);
+          const fresh: any = this.sql.exec('SELECT state, not_before FROM session_control_commands WHERE id = ?', row.id).toArray()[0];
+          if (fresh.state === 'failed') return response({ error: 'invalid_transition' }, 409);
+          if (fresh.not_before && Date.parse(fresh.not_before) > this.now()) return response({ error: 'not_ready' }, 409);
+          const earlier = this.sql.exec("SELECT 1 FROM session_control_commands WHERE session_id = ? AND kind = 'message' AND state IN ('recorded','transported','claimed','uncertain') AND recipient_seq < ? LIMIT 1", session.id, row.recipient_seq).toArray();
+          if (earlier.length) return response({ error: 'earlier_message_pending' }, 409);
+        }
         if (row.kind === 'stop' && !row.claim_token) {
           const machineRow: any = session.machine_id ? this.sql.exec('SELECT drained, last_checkin_at FROM machines WHERE id = ?', session.machine_id).toArray()[0] : null;
           const checkinMs = typeof machineRow?.last_checkin_at === 'string' ? Date.parse(machineRow.last_checkin_at) : NaN;
@@ -2861,6 +2898,17 @@ export class SessionControlService {
         if (!session || session.machine_id !== caller.machineId) return response({ error: 'not_found' }, 404);
         const gate = this.hostOk(session, caller);
         if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
+        if (input.outcome === 'not_ready' && row.kind !== 'message') return response({ error: 'invalid_ack' }, 400);
+        if (row.kind === 'message') {
+          expireSessionMessages(this.sql, this.now(), caller.machineId, session.id);
+          const fresh: any = this.sql.exec('SELECT state FROM session_control_commands WHERE id = ?', row.id).toArray()[0];
+          if (fresh.state === 'failed' && row.state !== 'failed') return response({ error: 'delivery_ended' }, 409);
+          if (row.state === 'uncertain' && input.outcome === 'delivered' && row.claim_token === input.claim_token && row.correlation === input.correlation) {
+            const binding = parsed(session.binding_json, null);
+            if (!binding || input.native.native_id !== binding.native_id || input.native.tag !== binding.tag || input.native.workspace !== binding.workspace) return response({ error: 'binding_mismatch' }, 409);
+            return this.ackMessage(row, session, input, caller);
+          }
+        }
         // Each native reply envelope confirms at most one command, in every
         // state: a duplicate proof for the SAME command is idempotent success
         // (concurrent or lost-ack re-submit, no new effect), while reuse
@@ -3058,14 +3106,15 @@ export class SessionControlService {
     const messageId: string | null = typeof payload?.message_id === 'string' ? payload.message_id : null;
     const machine = caller.machineId ?? null;
     const reason = typeof input.reason === 'string' ? input.reason.slice(0, 512) : null;
-    if (input.outcome === 'refused' && reason && /^not_ready\b/.test(reason)) {
+    if (input.outcome === 'not_ready' || (input.outcome === 'refused' && reason !== 'session_ended')) {
       const count = Number(parsed(row.ack_json, {})?.not_ready_count ?? 0);
       this.sql.exec(`UPDATE session_control_commands SET state = 'recorded', holder_machine = NULL, claim_token = NULL, claim_expires_at = NULL,
         holder_attempt = NULL, attempts = 0, poll_at = NULL, not_before = ?, ack_json = ?, updated_at = ? WHERE id = ?`,
         new Date(now + notReadyDelay(count)).toISOString(), JSON.stringify({ not_ready_count: count + 1 }), at, row.id);
       if (messageId) {
-        this.sql.exec("UPDATE messages SET state = 'accepted', state_reason = 'not_ready' WHERE id = ?", messageId);
-        messageEvent(this.sql, messageId, 'not_ready', null, machine, now, { reason, count: count + 1 });
+        const retryReason = input.outcome === 'not_ready' || /^not_ready\b/.test(reason || '') ? 'not_ready' : 'delivery_refused';
+        setMessageState(this.sql, messageId, 'accepted', retryReason, null, machine, now);
+        messageEvent(this.sql, messageId, retryReason, null, machine, now, { reason, count: count + 1 });
       }
       return response({ command_id: row.id, state: 'recorded', not_before_ms: notReadyDelay(count) });
     }
@@ -3080,6 +3129,10 @@ export class SessionControlService {
       const messageState = state === 'acked' ? 'delivered' : state === 'uncertain' ? 'uncertain' : state === 'transported' ? 'dispatched' : 'undeliverable';
       setMessageState(this.sql, messageId, messageState, state === 'acked' ? null : reason, null, machine, now,
         { command_id: row.id, delivery: payload.delivery, ...(envelope ? { native_message_id: envelope } : {}) });
+      if (input.outcome === 'refused' && reason === 'session_ended') {
+        const msg: any = this.sql.exec('SELECT * FROM messages WHERE id = ?', messageId).toArray()[0];
+        if (msg) sessionEndedStatus(this.sql, msg, now);
+      }
     }
     return response({ command_id: row.id, state });
   }

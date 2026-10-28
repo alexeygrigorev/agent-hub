@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService } from '../src/session_control';
 import { BusService } from '../src/bus';
-import { resolveRecipient, afterMessageInsert, renderTui, checkSendScoping } from '../src/session-messaging';
+import { resolveRecipient, afterMessageInsert, renderTui, checkSendScoping, setMessageState } from '../src/session-messaging';
 import { sha256 } from '../src/auth/crypto';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
@@ -27,7 +27,8 @@ async function fixture(fn: (ctx: { bus: BusService; sc: SessionControlService; s
     const bus = new BusService(sql, tx, {
       resolveRecipient: (to, now) => resolveRecipient(sql, to, now),
       checkSendScope: (caller, from, to, now) => checkSendScoping(sql, caller, from, to, now),
-      afterInsert: (m, o, now) => afterMessageInsert(sql, m, { delivery: o.delivery, deliverByMs: o.deliverByMs, now }),
+      afterInsert: (m, o, now) => afterMessageInsert(sql, m, { delivery: o.delivery, deliverByMs: o.deliverByMs, ref: o.ref, now }),
+      onStage: (id, stage, actor, machine, now) => setMessageState(sql, id, stage, null, actor, machine, now),
     });
     const at = new Date().toISOString(); const far = new Date(Date.now() + 86400000).toISOString();
     sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
@@ -84,14 +85,14 @@ describe('cross-device session messaging', () => {
     expect(inbox.map((m: any) => m.body)).toEqual(['pong from Tabo']);
     expect(sql.exec("SELECT COUNT(*) AS n FROM session_control_commands WHERE kind = 'message'").one().n).toBe(1); // replies to a named agent stay in its inbox
     const status = bus.status(developer, sent.id);
-    expect(status.events.map((e: any) => e.event)).toEqual(['accepted', 'dispatched', 'not_ready', 'dispatched', 'delivered', 'replied']);
+    expect(status.events.map((e: any) => e.event)).toEqual(['accepted', 'dispatched', 'accepted', 'not_ready', 'dispatched', 'delivered', 'read', 'replied']);
     expect(status.read_at).toBeTruthy();
     expect(status.body).toBeUndefined();
   }));
 
   it('refuses spoofed senders, unknown sessions and foreign hosts', () => fixture(async ({ bus, sql }) => {
     expect(() => bus.send({ kind: 'host', machineId: 'other' } as any, { senderActor: 'session:' + SESSION, toActor: 'agent:developer', kind: 'note', body: 'x', idempotencyKey: 'k' })).toThrow('unauthorized');
-    expect(() => bus.send(developer, { senderActor: 'agent:oncall', toActor: 'session:' + SESSION, kind: 'note', body: 'x', idempotencyKey: 'k2' })).toThrow('unauthorized');
+    expect(() => bus.send(developer, { senderActor: 'agent:oncall', toActor: 'session:' + SESSION, kind: 'note', body: 'x', idempotencyKey: 'k2' })).toThrow('from_actor_mismatch');
     expect(() => bus.send(developer, { senderActor: 'agent:developer', toActor: 'session:44444444-4444-4444-8444-444444444444', kind: 'note', body: 'x', idempotencyKey: 'k3' })).toThrow('unknown_recipient');
     sql.exec("UPDATE session_control_sessions SET state = 'stopped'");
     expect(() => bus.send(developer, { senderActor: 'agent:developer', toActor: 'session:' + SESSION, kind: 'note', body: 'x', idempotencyKey: 'k4' })).toThrow('unknown_recipient');
@@ -210,8 +211,7 @@ describe('per-session messaging credential (M2, intake 008529b5)', () => {
     expect((await refusedSend.json() as any).error).toBe('cross_project_forbidden');
     await runInDurableObject(stub, async (hub: Hub) => {
       const refusals = hub.sql.exec("SELECT detail_json FROM message_events WHERE event = 'send_refused'").toArray() as any[];
-      expect(refusals.length).toBe(1); // survives the rolled-back send transaction
-      expect(JSON.parse(refusals[0].detail_json).code).toBe('cross_project_forbidden');
+      expect(refusals.map(r => JSON.parse(r.detail_json).code)).toEqual(['from_actor_mismatch', 'cross_project_forbidden']); // both refusals survive rollback
     });
     // AC2: stop revokes the family; the revoked token is refused.
     await runInDurableObject(stub, async (hub: Hub) => { hub.sql.exec("UPDATE session_control_sessions SET state = 'stopped'"); });
@@ -332,10 +332,10 @@ describe('M5 client surface (intake 3bdf9715)', () => {
       { kind: 'git', value: 'x', sha256: 'nope' }, { kind: 'git', value: 'x', extra: 1 }, 'string', ['array']]) {
       expect(() => validateRef(bad)).toThrow('invalid_ref');
     }
-    const sent = bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'with ref', idempotencyKey: 'ref-1', refJson: validateRef({ kind: 'url', value: 'https://example/blob' }) });
+    const sent = bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'with ref', idempotencyKey: 'ref-1', ref: { kind: 'url', value: 'https://example/blob' } });
     expect(JSON.parse(sql.exec('SELECT ref_json FROM messages WHERE id = ?', sent.id).one().ref_json)).toMatchObject({ kind: 'url' });
-    expect(() => bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'with ref', idempotencyKey: 'ref-1', refJson: validateRef({ kind: 'url', value: 'https://other' }) })).toThrow('conflict');
-    expect(bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'with ref', idempotencyKey: 'ref-1', refJson: validateRef({ kind: 'url', value: 'https://example/blob' }) }).id).toBe(sent.id);
+    expect(() => bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'with ref', idempotencyKey: 'ref-1', ref: { kind: 'url', value: 'https://other' } })).toThrow('conflict');
+    expect(bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'with ref', idempotencyKey: 'ref-1', ref: { kind: 'url', value: 'https://example/blob' } }).id).toBe(sent.id);
   }));
 
   it('delivers to human:<sub> recipients and keeps their inbox private', () => fixture(async ({ bus, sql }) => {
@@ -350,12 +350,17 @@ describe('M5 client surface (intake 3bdf9715)', () => {
     expect(() => bus.inbox({ kind: 'human', actor: 'human:zoe' } as any, 'human:alice')).toThrow('unauthorized');
   }));
 
-  it('filters the inbox by unread and thread, and batch-marks read', () => fixture(async ({ bus }) => {
+  it('filters the inbox by unread and thread, and batch-marks read', () => fixture(async ({ bus, sql }) => {
     const first = bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 't1 first', idempotencyKey: 'u-1', threadId: 'thread-a' });
     bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 't2', idempotencyKey: 'u-2', threadId: 'thread-b' });
     bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 't1 second', idempotencyKey: 'u-3', threadId: 'thread-a' });
     expect(bus.inbox(developer, 'agent:developer', 50, undefined, { thread: 'thread-a' }).map((m: any) => m.body)).toEqual(['t1 first', 't1 second']);
     expect(bus.markRead(developer, [first.id])).toEqual({ marked: 1 });
+    expect(sql.exec('SELECT state FROM messages WHERE id = ?', first.id).one().state).toBe('read');
+    expect(sql.exec("SELECT event FROM message_events WHERE message_id = ? AND event = 'read'", first.id).toArray()).toHaveLength(1);
+    const sessionMessage = bus.send(developer, { senderActor: 'agent:developer', toActor: 'session:' + SESSION, kind: 'note', body: 'host transport only', idempotencyKey: 'u-host' });
+    expect(bus.markRead(hostBus, [sessionMessage.id])).toEqual({ marked: 0 });
+    expect(sql.exec('SELECT read_at FROM messages WHERE id = ?', sessionMessage.id).one().read_at).toBeNull();
     // Same-millisecond ULIDs do not promise send order; compare as a set.
     expect(bus.inbox(developer, 'agent:developer', 50, undefined, { unread: true }).map((m: any) => m.body).sort()).toEqual(['t1 second', 't2'].sort());
     // Sender and admin views never mark read; unknown ids are skipped.
@@ -379,6 +384,10 @@ describe('M5 client surface (intake 3bdf9715)', () => {
     expect(row).toMatchObject({ to_actor: 'session:' + OTHER, to_session_id: OTHER, state: 'accepted' });
     const command: any = sql.exec("SELECT session_id, state FROM session_control_commands WHERE request_key = 'msg-" + sent.id + "'").toArray();
     expect(Object.fromEntries(command.map((c: any) => [c.session_id, c.state]))).toEqual({ [SESSION]: 'failed', [OTHER]: 'recorded' });
+    const queued = sql.exec("SELECT recipient_seq, payload_json FROM session_control_commands WHERE session_id = ? AND request_key = ?", OTHER, 'msg-' + sent.id).one();
+    const sequence = sql.exec('SELECT recipient_seq FROM messages WHERE id = ?', sent.id).one().recipient_seq;
+    expect(queued.recipient_seq).toBe(sequence);
+    expect(JSON.parse(queued.payload_json).recipient_seq).toBe(sequence);
     expect(sql.exec("SELECT detail_json FROM message_events WHERE message_id = ? AND event = 'readdressed'", sent.id).one().detail_json).toContain(OTHER);
     sql.exec("UPDATE messages SET read_at = strftime('%s','now') * 1000 WHERE id = ?", sent.id);
     expect(() => readdressMessage(sql, sent.id, 'session:' + OTHER, Date.now())).toThrow('already_read'); // after read, the inbox copy is authoritative
@@ -415,5 +424,29 @@ describe('M5 named-agent delegation (§9)', () => {
     // Revoking the grant stops future delegation.
     sql.exec("DELETE FROM named_agent_delegates WHERE agent = 'developer' AND client = 'test-client'");
     expect((hub as any).actingCallerFor(human, 'agent:developer').error?.status).toBe(403);
+  }));
+});
+
+describe('M1 and M5 delivery integration', () => {
+  it('fences a claimed old target and audits the operator when readdressing', () => fixture(async ({ bus, sc, sql }) => {
+    const { readdressMessage } = await import('../src/session-messaging');
+    const sent = bus.send(developer, { senderActor: 'agent:developer', toActor: 'session:' + SESSION, kind: 'note', body: 'replacement delivery', idempotencyKey: 'retarget-claimed' });
+    const [oldOffer] = await offers(sc);
+    const grant = await claim(sc, oldOffer);
+    const other = '44444444-4444-4444-8444-444444444444';
+    const at = new Date().toISOString();
+    sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+      VALUES (?, 'admin', 'replacement', '{}', 'tabo', 'codex', 'interactive', 'running', ?, ?, ?)`, other,
+      JSON.stringify({ native_id: NATIVE, tag: 'replacement', workspace: '/synthetic', generation: 0 }), at, at);
+    readdressMessage(sql, sent.id, 'session:' + other, Date.now(), 'human:operator');
+    expect((await ack(sc, oldOffer, grant.claim_token, 'delivered', { proof: { native_message_id: 'old-target' } })).status).toBe(409);
+    expect(sql.exec('SELECT state FROM messages WHERE id = ?', sent.id).one().state).toBe('accepted');
+    const [replacement] = await offers(sc);
+    expect(replacement.session_id).toBe(other);
+    expect(replacement.payload.recipient_seq).toBe(sql.exec('SELECT recipient_seq FROM messages WHERE id = ?', sent.id).one().recipient_seq);
+    expect(sql.exec("SELECT actor FROM message_events WHERE message_id = ? AND event = 'admin_override'", sent.id).one().actor).toBe('human:operator');
+    // A repeated request for the current target does not allocate another sequence or command.
+    readdressMessage(sql, sent.id, 'session:' + other, Date.now(), 'human:operator');
+    expect(sql.exec('SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ?', other).one().n).toBe(1);
   }));
 });

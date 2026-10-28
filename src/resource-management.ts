@@ -201,9 +201,12 @@ export class ResourceManagement {
     const m:any=this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine)[0];
     const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
     const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal');
+    // Expose the common state range to the machine/state index; the OR below
+    // still applies the exact running-ramp cutoff.
     const pending=this.readRows(`SELECT l.id,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,
       c.current_cpu_cores,c.observed_at AS cpu_observed_at FROM fleet_launches l
       LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_cpu_samples c ON c.launch_id=l.id WHERE machine_id=?
+      AND l.state IN ('offered','starting','running','uncertain')
       AND (state IN ('offered','starting','uncertain') OR (state='running' AND
       COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),created_at)>=?))`,machine,cutoff) as any[];
     const pendingKey=JSON.stringify([machine,cutoff,now]);
@@ -266,9 +269,11 @@ export class ResourceManagement {
     const hb = parse(machineRow?.last_heartbeat); const config = this.config();
     const cutoff = new Date(now - config.ramp_seconds * 1000).toISOString();
     // Only launch ramps are additional commitments. Resident usage is already in MemAvailable.
+    // The explicit state range lets SQLite skip retained terminal history.
     const pending = this.readRows(`SELECT l.id,l.engine,l.workspace,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb FROM fleet_launches l
       LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
-      WHERE l.machine_id=? AND (l.state IN ('offered','starting','uncertain') OR (l.state='running'
+      WHERE l.machine_id=? AND l.state IN ('offered','starting','running','uncertain')
+      AND (l.state IN ('offered','starting','uncertain') OR (l.state='running'
       AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),l.created_at)>=?))`, cutoff, machine, cutoff) as any[];
     let reserved = 0;
     for (const row of pending) {

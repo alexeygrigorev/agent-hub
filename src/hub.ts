@@ -1,4 +1,4 @@
-import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, validateRef, readdressMessage, setDelegate, listDelegates } from './session-messaging';
+import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
@@ -169,7 +169,15 @@ export class Hub extends DurableObject {
     this.busService = new BusService(this.sql, txSync, {
       resolveRecipient: (toActor, now) => resolveRecipient(this.sql, toActor, now),
       checkSendScope: (caller, senderActor, toActor, now) => checkSendScoping(this.sql, caller, senderActor, toActor, now),
-      afterInsert: (message, opts, now) => afterMessageInsert(this.sql, message, { delivery: opts.delivery, deliverByMs: opts.deliverByMs, now }),
+      afterInsert: (message, opts, now) => afterMessageInsert(this.sql, message, { delivery: opts.delivery, deliverByMs: opts.deliverByMs, ref: opts.ref, now }),
+      onStage: (id, state, actor, machine, now) => setMessageState(this.sql, id, state, null, actor, machine, now),
+      onRefusal: (caller, opts, error) => {
+        if (error instanceof ScopingRefusal || ['unauthorized', 'from_actor_mismatch'].includes(error?.message)) {
+          messageEvent(this.sql, 'refused-' + crypto.randomUUID(), 'send_refused', caller.actor ?? null, caller.machineId ?? null, Date.now(),
+            { code: error.message, to: opts.toActor, ...(error instanceof ScopingRefusal ? error.detail : {}) });
+        }
+      },
+      onOverride: (id, caller, sender, now) => messageEvent(this.sql, id, 'admin_override', caller.actor ?? null, caller.machineId ?? null, now, { from_actor: sender }),
     });
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
@@ -1487,6 +1495,7 @@ export class Hub extends DurableObject {
               if (address.project && rows.some(r => !r.project)) return Response.json({ error: 'agent_exists' }, { status: 409 });
               if (!address.project && rows.length > 1) return Response.json({ error: 'ambiguous_agent_tag' }, { status: 409 });
               const project = address.project ?? (rows.length === 1 ? rows[0].project : null);
+              if (project === NAMED_AGENT_PROJECT) return Response.json({ error: 'reserved_project' }, { status: 400 });
               const actor = project ? `${project}:${address.tag}` : address.tag;
               if (!registryAddress(actor)) return Response.json({ error: 'invalid_actor' }, { status: 400 });
               if (body.expected_actor !== undefined && body.expected_actor !== actor) return Response.json({ error: 'invalid_approval' }, { status: 400 });
@@ -1663,14 +1672,6 @@ export class Hub extends DurableObject {
     }
   }
 
-  /** Refusal audit (M2 AC4): written after the send transaction rolled back,
-   * so the event survives the refusal it records. */
-  private auditSendRefusal(e: ScopingRefusal, fromActor: string | null, machineId: string | null): void {
-    try {
-      messageEvent(this.sql, 'refused-' + crypto.randomUUID(), 'send_refused', fromActor, machineId, Date.now(), e.detail);
-    } catch { /* audit is best-effort; the refusal response stands */ }
-  }
-
   protected async refreshCredential(request: Request, binding?: { client: string; resource: string }): Promise<Response> {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const body = await safeJson(request);
@@ -1822,6 +1823,9 @@ export class Hub extends DurableObject {
     let diff = given.length === hash.length ? 0 : 1;
     for (let i = 0; i < hash.length; i++) diff |= (given.charCodeAt(i) || 0) ^ hash.charCodeAt(i);
     if (diff !== 0) { this.tokenFailures.push(now); return page('That token was not accepted.', 401); }
+    const sub = tokenAdminSubject(hash), at = new Date(now).toISOString();
+    this.sql.exec(`INSERT INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES (?, ?, 1, ?, ?)
+      ON CONFLICT(sub) DO UPDATE SET last_seen_at = excluded.last_seen_at`, sub, TOKEN_ADMIN_EMAIL, at, at);
     const cookie = await createSessionCookie(this.env, { sub: tokenAdminSubject(hash), email: TOKEN_ADMIN_EMAIL, isAdmin: true, csrfToken: randomString(32), exp: Math.floor(now / 1000) + 12 * 3600 });
     return new Response(null, { status: 303, headers: { ...headers, Location: next || '/', 'Set-Cookie': cookie } });
   }
@@ -1842,6 +1846,7 @@ export class Hub extends DurableObject {
       if (!b || Object.keys(b).some(k => !['tag', 'project', 'role', 'machine_id'].includes(k)) || typeof b.tag !== 'string' || !NAME.test(b.tag)) return json({ error: 'invalid_agent' }, 400);
       for (const k of ['project', 'role', 'machine_id']) if (b[k] !== undefined && b[k] !== null && !(k === 'project' && b[k] === '') && (typeof b[k] !== 'string' || !NAME.test(b[k]))) return json({ error: 'invalid_' + k }, 400);
       if (!registryAddress(b.project ? `${b.project}:${b.tag}` : b.tag)) return json({ error: 'invalid_project' }, 400);
+      if (b.project === NAMED_AGENT_PROJECT) return json({ error: 'reserved_project', reason: 'use_named_agent_api' }, 400);
       if (typeof b.role === 'string' && /^root/i.test(b.role)) return json({ error: 'root_role_reserved' }, 400);
       if (b.machine_id && !this.sql.exec('SELECT 1 FROM machines WHERE id = ?', b.machine_id).toArray().length) return json({ error: 'unknown_machine' }, 400);
       return this.ctx.storage.transactionSync(() => {
@@ -2134,6 +2139,10 @@ export class Hub extends DurableObject {
 
   async alarm() {
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
+    this.ctx.storage.transactionSync(() => {
+      expireSessionMessages(this.sql, now.getTime());
+      expireMessageEvents(this.sql, now.getTime());
+    });
     this.runTbmTick(now.getTime());
     try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
@@ -2257,7 +2266,7 @@ export class Hub extends DurableObject {
         }
       }
       return {
-        caller: { isAdmin: true, actor: 'admin', kind: 'human' },
+        caller: { isAdmin: true, actor: 'human:' + session.sub, kind: 'human' },
         scopes: ['admin', 'bus:send', 'bus:read', 'host', 'lease:root', 'jobs:create']
       };
     }
@@ -2442,6 +2451,25 @@ export class Hub extends DurableObject {
   }
 
   private async handleBusRoutes(request: Request, path: string): Promise<Response | null> {
+    const result = await this.dispatchBusRoutes(request, path);
+    if (result?.ok && request.method === 'POST' && ['/api/bus/send', '/api/bus/reply'].includes(path)) {
+      const alarm = await this.ctx.storage.getAlarm();
+      if (alarm === null || alarm > Date.now() + 60000) await this.ctx.storage.setAlarm(Date.now() + 60000);
+    }
+    if (result && result.status === 403) {
+      const auth = await this.authenticateBusRequest(request);
+      // Unknown/invalid credentials have no authenticated audit principal.
+      // Never let anonymous internet requests allocate retained event rows.
+      if (!auth.caller) return result;
+      const detail: any = await result.clone().json().catch(() => ({}));
+      const id = /^\/api\/bus\/messages\/([^/]+)/.exec(path)?.[1] ?? 'refused-' + crypto.randomUUID();
+      messageEvent(this.sql, id, 'auth_refused', auth.caller?.actor ?? null, auth.caller?.machineId ?? null, Date.now(),
+        { code: String(detail.reason ?? detail.error ?? 'forbidden').slice(0, 128), method: request.method });
+    }
+    return result;
+  }
+
+  private async dispatchBusRoutes(request: Request, path: string): Promise<Response | null> {
     if (!path.startsWith('/api/bus')) return null;
 
     const url = new URL(request.url);
@@ -2495,7 +2523,7 @@ export class Hub extends DurableObject {
       }
 
       const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch', 'delivery', 'deliver_by_s', 'ref', 'as']);
-      const parsed = await this.parseSafeBusBody(request, allowedKeys);
+      const parsed = await this.parseSafeBusBody(request, allowedKeys, false, 131072);
       if (parsed.error) return parsed.error;
       const body = parsed.data!;
 
@@ -2506,9 +2534,8 @@ export class Hub extends DurableObject {
         if (!sub || !String(sub).startsWith('human:')) return Response.json({ error: 'invalid_to_actor' }, { status: 400 });
         body.to_actor = String(sub);
       }
-      let refJson: string | null = null;
-      try { refJson = validateRef(body.ref); } catch { return Response.json({ error: 'invalid_ref' }, { status: 400 }); }
-
+      const newAddress = /^(session|human|agent):/.test(body.to_actor ?? '') || String(body.to_actor ?? '').includes('@') || /^(session|human|agent):/.test(acting.caller.actor ?? '');
+      if (newAddress && body.from_actor === undefined && acting.caller.actor) body.from_actor = acting.caller.actor;
       if (typeof body.from_actor !== 'string' || !body.from_actor || body.from_actor.length > 128) {
         return Response.json({ error: 'invalid_from_actor' }, { status: 400 });
       }
@@ -2542,7 +2569,7 @@ export class Hub extends DurableObject {
         const result = this.busService.send(acting.caller, {
           delivery: body.delivery,
           deliverByMs: body.deliver_by_s !== undefined ? body.deliver_by_s * 1000 : undefined,
-          refJson,
+          ref: body.ref,
           senderActor: body.from_actor,
           toActor: body.to_actor,
           kind: body.kind,
@@ -2556,8 +2583,9 @@ export class Hub extends DurableObject {
         this.auditDelegatedSend(auth.caller, acting, result.id);
         return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
       } catch (e: any) {
+        if (['invalid_ref', 'invalid_delivery', 'invalid_deliver_by'].includes(e.message)) return Response.json({ error: e.message }, { status: 400 });
         if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
-        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+        if (e.message === 'from_actor_mismatch' || e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
         if (e.message === 'conflict') return Response.json({ error: 'conflict' }, { status: 409 });
@@ -2565,7 +2593,6 @@ export class Hub extends DurableObject {
         if (e.message === 'unknown_recipient') return Response.json({ error: 'unknown_recipient' }, { status: 404 });
         if (e instanceof RecipientError && e.message === 'ambiguous_recipient') return Response.json({ error: 'ambiguous_recipient', candidates: e.candidates }, { status: 409 });
         if (e instanceof ScopingRefusal) {
-          this.auditSendRefusal(e, body.from_actor ?? null, auth.caller?.machineId ?? null);
           return Response.json({ error: 'cross_project_forbidden' }, { status: 403 });
         }
         if (e.message === 'invalid_reply_to') return Response.json({ error: 'invalid_reply_to' }, { status: 400 });
@@ -2583,7 +2610,7 @@ export class Hub extends DurableObject {
       }
 
       const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch', 'delivery', 'deliver_by_s', 'ref', 'as']);
-      const parsed = await this.parseSafeBusBody(request, allowedKeys);
+      const parsed = await this.parseSafeBusBody(request, allowedKeys, false, 131072);
       if (parsed.error) return parsed.error;
       const body = parsed.data!;
 
@@ -2594,8 +2621,6 @@ export class Hub extends DurableObject {
         if (!sub || !String(sub).startsWith('human:')) return Response.json({ error: 'invalid_to_actor' }, { status: 400 });
         body.to_actor = String(sub);
       }
-      let refJson: string | null = null;
-      try { refJson = validateRef(body.ref); } catch { return Response.json({ error: 'invalid_ref' }, { status: 400 }); }
       if (body.delivery !== undefined && !DELIVERIES.has(body.delivery)) return Response.json({ error: 'invalid_delivery' }, { status: 400 });
       if (body.deliver_by_s !== undefined && (!Number.isInteger(body.deliver_by_s) || body.deliver_by_s < 60 || body.deliver_by_s > 7 * 86400)) {
         return Response.json({ error: 'invalid_deliver_by' }, { status: 400 });
@@ -2604,6 +2629,8 @@ export class Hub extends DurableObject {
       if (!body.reply_to || typeof body.reply_to !== 'string' || body.reply_to.length > 128) {
         return Response.json({ error: 'missing_reply_to' }, { status: 400 });
       }
+      const newAddress = /^(session|human|agent):/.test(body.to_actor ?? '') || String(body.to_actor ?? '').includes('@') || /^(session|human|agent):/.test(acting.caller.actor ?? '');
+      if (newAddress && body.from_actor === undefined && acting.caller.actor) body.from_actor = acting.caller.actor;
       if (typeof body.from_actor !== 'string' || !body.from_actor || body.from_actor.length > 128) {
         return Response.json({ error: 'invalid_from_actor' }, { status: 400 });
       }
@@ -2624,7 +2651,7 @@ export class Hub extends DurableObject {
         const result = this.busService.send(acting.caller, {
           delivery: body.delivery,
           deliverByMs: body.deliver_by_s !== undefined ? body.deliver_by_s * 1000 : undefined,
-          refJson,
+          ref: body.ref,
           senderActor: body.from_actor,
           toActor: body.to_actor,
           kind: body.kind,
@@ -2638,8 +2665,9 @@ export class Hub extends DurableObject {
         this.auditDelegatedSend(auth.caller, acting, result.id);
         return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
       } catch (e: any) {
+        if (['invalid_ref', 'invalid_delivery', 'invalid_deliver_by'].includes(e.message)) return Response.json({ error: e.message }, { status: 400 });
         if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
-        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+        if (e.message === 'from_actor_mismatch' || e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
         if (e.message === 'conflict') return Response.json({ error: 'conflict' }, { status: 409 });
@@ -2647,7 +2675,6 @@ export class Hub extends DurableObject {
         if (e.message === 'invalid_reply_to') return Response.json({ error: 'invalid_reply_to' }, { status: 400 });
         if (e.message === 'unknown_recipient') return Response.json({ error: 'unknown_recipient' }, { status: 404 });
         if (e instanceof ScopingRefusal) {
-          this.auditSendRefusal(e, body.from_actor ?? null, auth.caller?.machineId ?? null);
           return Response.json({ error: 'cross_project_forbidden' }, { status: 403 });
         }
         if (e instanceof RecipientError && e.message === 'ambiguous_recipient') return Response.json({ error: 'ambiguous_recipient', candidates: e.candidates }, { status: 409 });
@@ -2675,6 +2702,7 @@ export class Hub extends DurableObject {
 
       let actor = url.searchParams.get('actor');
       if (!actor && acting.delegated) actor = acting.caller.actor;
+      if (actor === 'human:me' && auth.caller?.actor?.startsWith('human:')) actor = auth.caller.actor;
       if (!actor) return Response.json({ error: 'missing_actor' }, { status: 400 });
       if (acting.delegated && actor !== acting.caller.actor) return Response.json({ error: 'invalid_actor' }, { status: 400 });
 
@@ -2724,6 +2752,7 @@ export class Hub extends DurableObject {
           await new Promise(resolve => setTimeout(resolve, 1000));
         }
       } catch (e: any) {
+        if (e.message === 'invalid_cursor') return Response.json({ error: 'invalid_cursor' }, { status: 400 });
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
@@ -3228,7 +3257,7 @@ export class Hub extends DurableObject {
       const to = parsed.data?.to;
       if (typeof to !== 'string' || !to || to.length > 128) return Response.json({ error: 'invalid_readdress_target' }, { status: 400 });
       try {
-        const result = this.ctx.storage.transactionSync(() => readdressMessage(this.sql, decodeURIComponent(readdressMatch[1]), to, Date.now()));
+        const result = this.ctx.storage.transactionSync(() => readdressMessage(this.sql, decodeURIComponent(readdressMatch[1]), to, Date.now(), auth.caller!.actor ?? null));
         return Response.json({ status: 'readdressed', ...result });
       } catch (e: any) {
         if (e.message === 'not_found') return Response.json({ error: 'not_found' }, { status: 404 });
