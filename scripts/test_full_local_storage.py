@@ -20,9 +20,8 @@ record = pathlib.Path(os.environ["STORAGE_RECORD"])
 with record.open("a") as out:
     out.write(json.dumps({"tool": name, "args": args, "tmp": os.environ.get("TMPDIR"),
                           "home": os.environ.get("HOME"), "cache": os.environ.get("UV_CACHE_DIR"),
-                          "selectors": sorted(k for k in ("APLEXER_TAG", "APLEXER_WORKSPACE", "HUB_WORKER_CONFIG_FILE",
-                            "HUB_CONFIG_FILE", "HUB_URL", "HUB_BASE_URL", "HUB_TOKEN", "HUB_JOB_TOKEN",
-                            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME") if k in os.environ)}) + "\n")
+                          "selectors": sorted(k for k in os.environ if k.startswith(("APLEXER_", "HUB_", "AGENT_HUB_"))
+                            or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR"))}) + "\n")
 if name == "python3" and args[:1] == ["-c"]:
     print("/fixture/user-base")
 if name == "npx" and os.environ.get("FAIL_VITEST"):
@@ -183,12 +182,22 @@ class FullLocalStorageTests(unittest.TestCase):
                     STORAGE_HOST_SOURCE=str(RUNNER.parent.parent / "host"),
                     APLEXER_TAG="hub-11111111-1111-4111-8111-111111111111",
                     APLEXER_WORKSPACE=str(ambient),
+                    APLEXER_STATE_DIR=str(ambient / "state"),
+                    APLEXER_RUNTIME_DIR=str(ambient / "runtime"),
+                    APLEXER_CONFIG=str(ambient / "config.toml"),
+                    APLEXER_SESSION_ID="synthetic-session",
+                    HUB_WORKTREE_IDENTITY_DIR=str(ambient / "identity"),
+                    AGENT_HUB_MANAGED_DIR=str(ambient / "managed"),
+                    AGENT_HUB_OPENCODE_AUTH='{"synthetic":"only"}',
+                    APLEXER_FUTURE_SELECTOR="synthetic", HUB_FUTURE_SELECTOR="synthetic",
+                    AGENT_HUB_FUTURE_SELECTOR="synthetic", GH_CONFIG_DIR=str(ambient / "github"),
                     HUB_CONFIG_FILE=str(profile) if explicit else "",
                     HUB_WORKER_CONFIG_FILE=str(profile) if explicit else "",
                     HUB_URL="https://fixture.invalid", HUB_BASE_URL="https://fixture.invalid",
                     HUB_TOKEN="synthetic-token", HUB_JOB_TOKEN="synthetic-token",
                     XDG_CONFIG_HOME=str(ambient / "config"),
-                    XDG_DATA_HOME=str(ambient / "data"), XDG_STATE_HOME=str(ambient / "state"))
+                    XDG_DATA_HOME=str(ambient / "data"), XDG_STATE_HOME=str(ambient / "state"),
+                    XDG_RUNTIME_DIR=str(ambient / "runtime"))
                 code, output = self.finish(child)
                 self.assertEqual(code, 0, output)
                 python = next(row for row in self.records(record)

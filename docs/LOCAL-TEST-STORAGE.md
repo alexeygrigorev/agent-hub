@@ -40,8 +40,9 @@ build output, browser evidence,
 shared dependency installations, engine session history, and existing test
 scratch are outside this temporary-file retention policy.
 
-Python discovery clears inherited Hub credential selectors and aplexer identity
-in its child environment, along with XDG config/data/state overrides. A disposable
+Python discovery clears every inherited `APLEXER_*`, `HUB_*`, and `AGENT_HUB_*`
+variable in its child environment, along with XDG config/data/state/runtime and
+GitHub config overrides. A disposable
 HOME alone cannot isolate the per-launch worker profile selected by a native
 session tag. The parent session keeps its identity and credentials.
 
