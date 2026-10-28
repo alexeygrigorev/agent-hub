@@ -31,7 +31,10 @@ CI installs Playwright and Chromium before running the same dispatcher.
 The redundant F7 config/entrypoint are removed: they re-exported the same
 production Worker and `Hub` as the default config. The migration test checks
 preservation of every old message field while permitting columns added by
-later migrations.
+later migrations. Its credential/message-binding upgrade fixture retains the
+current project-scoped agents schema: the global-tag primary-key rebuild was
+retired by `b9d3b22c` / intake `19848714`. Binding-upgrade rollback still checks
+that the current agent keys and every old credential/message field survive.
 
 `conversation-bridge-gap.mjs` and its Worker/config are retired. They rebuilt
 the historical commit `d9b4cde` from Git rather than the current source, pinned
