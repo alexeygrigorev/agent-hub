@@ -34,7 +34,7 @@ END = '# END HUB MANAGED ENGINES\n'
 
 
 def root():
-    explicit = os.environ.get('AGENT_HUB_MANAGED_DIR') or os.environ.get('HUB_MANAGED_DIR')
+    explicit = os.environ.get('AGENT_HUB_MANAGED_DIR')
     if explicit:
         return Path(explicit).resolve()
     return config.get_host_config_path().parent / 'managed-engines'
@@ -1246,7 +1246,7 @@ def managed_subscriptions():
 
 def engine_environment(bundle, home, dest=None):
     dest = dest or Path(home).parent
-    env = {k: v for k, v in os.environ.items() if k not in ENV and k not in ('HUB_TOKEN', 'HUB_JOB_TOKEN', 'HUB_CONFIG_FILE', 'AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR')}
+    env = {k: v for k, v in os.environ.items() if k not in ENV and k not in ('HUB_TOKEN', 'HUB_JOB_TOKEN', 'HUB_CONFIG_FILE', 'AGENT_HUB_MANAGED_DIR')}
     env.update(
         HOME=str(home),
         GEMINI_CLI_HOME=str(home),
@@ -1573,7 +1573,7 @@ def execute():
             if not allowed:
                 print(json.dumps({'provider': 'codex', 'launch_allowed': False, 'reason': reason}), file=sys.stderr)
                 sys.exit(75)
-        for var in ('HUB_CONFIG_FILE', 'HUB_TOKEN', 'HUB_JOB_TOKEN', 'AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR'):
+        for var in ('HUB_CONFIG_FILE', 'HUB_TOKEN', 'HUB_JOB_TOKEN', 'AGENT_HUB_MANAGED_DIR'):
             env.pop(var, None)
     # Release the provisioning lock before any long-lived provider process.
     # Headless output must be retained before native automatic retirement;

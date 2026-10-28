@@ -17,7 +17,6 @@ from agent_hub_host import dispatch_diagnostics as dd
 
 def test_canonical_root_default(monkeypatch, tmp_path):
     monkeypatch.delenv('AGENT_HUB_MANAGED_DIR', raising=False)
-    monkeypatch.delenv('HUB_MANAGED_DIR', raising=False)
     # root() defaults to host config parent / managed-engines; just assert it
     # ends with managed-engines and is absolute.
     r = p.root()

@@ -132,7 +132,7 @@ def main():
         '--env', 'HUB_CONFIG_FILE=' + str(cred_path),
         '--env', 'PYTHONPATH=' + str(workspace / 'host'),
     ]
-    for var in ('AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR', 'CODEX_LAUNCH_WRAPPER'):
+    for var in ('AGENT_HUB_MANAGED_DIR', 'CODEX_LAUNCH_WRAPPER'):
         if var in os.environ:
             env_args.extend(['--env', f'{var}={os.environ[var]}'])
     receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
