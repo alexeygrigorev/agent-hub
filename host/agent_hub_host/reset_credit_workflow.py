@@ -1,7 +1,11 @@
-"""Operator workflow connecting actual Hub decisions to native reset receipts.
+"""Operator workflow connecting Hub decision receipts to reset evidence.
 
-No fallback fabricates Hub evidence. A failed prepare never reaches redemption.
-After a provider response, a failed Hub write is retried from the native journal.
+The Hub tracks expiring credits and asks Alexey for approval; it never
+redeems a reset (Alexey t1741u). Nothing here sends a provider redemption:
+prepare records the Hub decision receipt, record uploads an operator
+attestation of a reset Alexey performed, reconcile is read-only recovery,
+and link-work correlates the receipt with routed work. No fallback
+fabricates Hub evidence. A failed prepare never reaches any redemption.
 """
 import argparse
 import hashlib
@@ -44,20 +48,6 @@ def _get_event(hub, event_id):
     if len(events) != 1 or events[0].get('event_id') != event_id:
         raise native.CreditError('hub_decision_unavailable')
     return _event(events[0])
-
-
-def consume(rpc, hub, event_id, journal=None):
-    event = _get_event(hub, event_id)
-    d = event['decision']
-    if event.get('consumption_ready') is not True:
-        raise native.CreditError('hub_consumption_not_ready')
-    now_ms = int(time.time() * 1000)
-    if not isinstance(d.get('captured_at_ms'), int) or not 0 <= now_ms - d['captured_at_ms'] <= 300000:
-        raise native.CreditError('hub_decision_expired')
-    key = native._identifier(d.get('idempotency_key'))
-    receipt = native.redeem(rpc, native.journal_path() if journal is None else journal,
-                            d.get('provider_account_id'), d.get('credit_id'), idempotency_key=key)
-    return record(hub, event_id, receipt)
 
 
 def reconcile(rpc, hub, event_id, journal=None):
@@ -123,8 +113,6 @@ def main():
     p = commands.add_parser('prepare')
     p.add_argument('--account', required=True)
     p.add_argument('--credit-id', required=True)
-    p = commands.add_parser('consume')
-    p.add_argument('--event-id', required=True)
     p = commands.add_parser('reconcile')
     p.add_argument('--event-id', required=True)
     p = commands.add_parser('record')
@@ -136,12 +124,10 @@ def main():
     args = parser.parse_args()
     try:
         hub = session_control.request
-        if args.command in ('prepare', 'consume', 'reconcile'):
+        if args.command in ('prepare', 'reconcile'):
             with native.AppServer() as rpc:
                 if args.command == 'prepare':
                     result = prepare(rpc, hub, args.account, args.credit_id)
-                elif args.command == 'consume':
-                    result = consume(rpc, hub, args.event_id)
                 else:
                     result = reconcile(rpc, hub, args.event_id)
         elif args.command == 'record':
@@ -155,15 +141,10 @@ def main():
         print(json.dumps(result, sort_keys=True))
         if args.command == 'reconcile' and (result.get('reconciled') is False or result.get('requires_record')):
             return 2
-        if args.command == 'consume':
-            r = result.get('receipt') or {}
-            if (r.get('outcome') not in ('reset', 'alreadyRedeemed') or type(r.get('after_count')) is not int or
-                    r['after_count'] >= r.get('before_count', 0) or r.get('selected_credit_state') not in ('absent', 'redeemed')):
-                return 2
         return 0
     except Exception:
         # HTTP/provider exception bodies can contain private data. Never print them.
-        print(json.dumps({'error': 'reset_workflow_failed_closed', 'provider_outcome_may_require_journal_reconciliation': args.command == 'consume'}))
+        print(json.dumps({'error': 'reset_workflow_failed_closed'}))
         return 2
 
 

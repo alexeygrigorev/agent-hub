@@ -1,14 +1,10 @@
 """Offline safety tests; fixtures do not establish provider consumption."""
 import copy
-import fcntl
 import json
-import os
-from pathlib import Path
-import sqlite3
-import tempfile
 import unittest
 
-from agent_hub_host.codex_reset_credit import CONSUME, READ, CreditError, redeem, snapshot
+from agent_hub_host import codex_reset_credit as native
+from agent_hub_host.codex_reset_credit import READ, AppServer, CreditError, snapshot
 
 NOW = 1800000000
 
@@ -23,186 +19,26 @@ def view(count=2, used=90, credit=True):
 
 
 class Rpc:
-    def __init__(self, before=None, outcome='reset', after=None):
+    """Read-only provider stand-in; asserts no mutation call is ever made."""
+
+    def __init__(self, before=None):
         self.before = before or view()
-        self.after = after or view(count=1, used=0, credit=False)
-        self.outcome = outcome
         self.calls = []
-        self.reads = 0
-        self.on_consume = None
 
     def call(self, method, params=None):
         self.calls.append((method, params))
         if method == READ:
-            self.reads += 1
-            result = self.before if self.reads == 1 else self.after
-            if isinstance(result, Exception):
-                raise result
-            return copy.deepcopy(result)
-        if self.on_consume:
-            self.on_consume(params)
-        if isinstance(self.outcome, Exception):
-            raise self.outcome
-        return {'outcome': self.outcome}
+            return copy.deepcopy(self.before)
+        raise AssertionError('read-only adapter must never call ' + method)
 
 
 class ResetCreditTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.path = Path(self.temp.name) / 'attempts.sqlite3'
-
-    def run_attempt(self, rpc, credit='credit-a'):
-        return redeem(rpc, self.path, 'account-a', credit, now=NOW)
-
-    def receipt(self):
-        with sqlite3.connect(self.path) as db:
-            return json.loads(db.execute('SELECT receipt FROM attempts').fetchone()[0])
-
-    def test_success_requires_real_read_after_and_decrement(self):
-        rpc = Rpc()
-        result = self.run_attempt(rpc)
-        self.assertEqual([m for m, _ in rpc.calls], [READ, CONSUME, READ])
-        self.assertTrue(result['creditDecrementVerified'])
-        self.assertEqual(result['before']['availableCount'], 2)
-        self.assertEqual(result['after']['windows'][0]['usedPercent'], 0)
-        self.assertEqual(result, self.receipt())
-        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
-
-    def test_journal_is_committed_before_mutation(self):
-        rpc = Rpc()
-        def inspect(params):
-            saved = self.receipt()
-            self.assertEqual(saved['outcome'], 'pending')
-            self.assertEqual(saved['idempotencyKey'], params['idempotencyKey'])
-        rpc.on_consume = inspect
-        self.run_attempt(rpc)
-
-    def test_server_key_is_used_and_journal_rejects_key_changes(self):
-        rpc = Rpc()
-        redeem(rpc, self.path, 'account-a', 'credit-a', now=NOW, idempotency_key='server-key')
-        self.assertEqual(rpc.calls[1][1]['idempotencyKey'], 'server-key')
-        retry = Rpc()
-        with self.assertRaisesRegex(CreditError, 'key_conflict'):
-            redeem(retry, self.path, 'account-a', 'credit-a', now=NOW, idempotency_key='other-key')
-        self.assertFalse(any(m == CONSUME for m, _ in retry.calls))
-
-    def test_terminal_success_never_redeems_twice(self):
-        saved = self.run_attempt(Rpc())
-        retry = Rpc(before=view(count=1, credit=False))
-        self.assertEqual(self.run_attempt(retry), saved)
-        self.assertEqual([m for m, _ in retry.calls], [READ])
-
-    def test_uncertain_retry_uses_same_key_when_credit_has_disappeared(self):
-        rpc = Rpc(outcome=TimeoutError('private error'))
-        with self.assertRaisesRegex(CreditError, 'provider_outcome_unknown'):
-            self.run_attempt(rpc)
-        key = self.receipt()['idempotencyKey']
-        retry = Rpc(before=view(count=1, credit=False), outcome='alreadyRedeemed')
-        result = self.run_attempt(retry)
-        self.assertEqual(result['outcome'], 'alreadyRedeemed')
-        self.assertEqual(retry.calls[1][1]['idempotencyKey'], key)
-        self.assertTrue(result['creditDecrementVerified'])
-
-    def test_uncertain_attempt_blocks_other_credit_and_bounds_retries(self):
-        for _ in range(2):
-            with self.assertRaises(CreditError):
-                self.run_attempt(Rpc(outcome=TimeoutError()))
-        blocked = Rpc()
-        with self.assertRaisesRegex(CreditError, 'retry_limit'):
-            self.run_attempt(blocked)
-        self.assertFalse(any(m == CONSUME for m, _ in blocked.calls))
-        with self.assertRaisesRegex(CreditError, 'account_attempt_unresolved'):
-            self.run_attempt(Rpc(), credit='credit-b')
-
-    def test_success_with_failed_refresh_only_retries_read(self):
-        with self.assertRaisesRegex(CreditError, 'refresh_required'):
-            self.run_attempt(Rpc(after=TimeoutError()))
-        self.assertEqual(self.receipt()['outcome'], 'reset')
-        retry = Rpc(before=view(count=1, credit=False))
-        self.assertTrue(self.run_attempt(retry)['creditDecrementVerified'])
-        self.assertEqual([m for m, _ in retry.calls], [READ, READ])
-
-    def test_no_op_outcomes_preserved_without_repeat_mutation(self):
-        for outcome in ('nothingToReset', 'noCredit'):
-            with self.subTest(outcome=outcome):
-                path = Path(self.temp.name) / outcome
-                first = redeem(Rpc(outcome=outcome), path, 'account-a', 'credit-a', now=NOW)
-                retry = Rpc()
-                self.assertEqual(redeem(retry, path, 'account-a', 'credit-a', now=NOW), first)
-                self.assertEqual(first['outcome'], outcome)
-                self.assertEqual([m for m, _ in retry.calls], [READ])
-
-    def test_expired_unknown_and_nonexpiring_credits_refused(self):
-        for expiry in (NOW, NOW - 1, None, NOW + 86401):
-            with self.subTest(expiry=expiry):
-                raw = view()
-                raw['rateLimitResetCredits']['credits'][0]['expiresAt'] = expiry
-                rpc = Rpc(before=raw)
-                with self.assertRaises(CreditError):
-                    self.run_attempt(rpc)
-                self.assertFalse(any(m == CONSUME for m, _ in rpc.calls))
-
-    def test_healthy_quota_not_reset(self):
-        for used in (0, 1, 84):
-            with self.subTest(used=used):
-                rpc = Rpc(before=view(used=used))
-                with self.assertRaisesRegex(CreditError, 'unnecessary'):
-                    self.run_attempt(rpc)
-                self.assertFalse(any(m == CONSUME for m, _ in rpc.calls))
-
-    def test_account_mismatch_never_mutates(self):
-        rpc = Rpc()
-        with self.assertRaisesRegex(CreditError, 'account_mismatch'):
-            redeem(rpc, self.path, 'other-account', 'credit-a', now=NOW)
-        self.assertFalse(any(m == CONSUME for m, _ in rpc.calls))
-
-    def test_unknown_provider_outcome_remains_uncertain(self):
-        with self.assertRaisesRegex(CreditError, 'provider_outcome_unknown'):
-            self.run_attempt(Rpc(outcome='surprise'))
-        self.assertEqual(self.receipt()['outcome'], 'unknown')
-
-    def test_quota_drop_alone_does_not_verify_coupon_consumption(self):
-        result = self.run_attempt(Rpc(after=view(count=2, used=0)))
-        self.assertFalse(result['creditDecrementVerified'])
-
-    def test_count_drop_with_credit_still_available_does_not_verify(self):
-        result = self.run_attempt(Rpc(after=view(count=1, used=0)))
-        self.assertFalse(result['creditDecrementVerified'])
-
-    def test_inconclusive_success_blocks_other_credit_then_only_refreshes(self):
-        self.run_attempt(Rpc(after=view(count=2, used=0)))
-        with self.assertRaisesRegex(CreditError, 'account_attempt_unresolved'):
-            self.run_attempt(Rpc(), credit='credit-b')
-        retry = Rpc(before=view(count=1, credit=False))
-        self.assertTrue(self.run_attempt(retry)['creditDecrementVerified'])
-        self.assertEqual([m for m, _ in retry.calls], [READ, READ])
-
-    def test_unknown_permission_never_mutates(self):
-        raw = view()
-        del raw['ordinaryUsageAllowed']
-        rpc = Rpc(before=raw)
-        with self.assertRaisesRegex(CreditError, 'permission_unknown'):
-            self.run_attempt(rpc)
-        self.assertFalse(any(m == CONSUME for m, _ in rpc.calls))
-
-    def test_unknown_credit_type_or_redeeming_status_never_mutates(self):
-        for field, value in [('resetType', 'unknown'), ('status', 'redeeming'), ('status', 'redeemed')]:
-            with self.subTest(field=field, value=value):
-                raw = view()
-                raw['rateLimitResetCredits']['credits'][0][field] = value
-                rpc = Rpc(before=raw)
-                with self.assertRaises(CreditError):
-                    self.run_attempt(rpc)
-                self.assertFalse(any(m == CONSUME for m, _ in rpc.calls))
-
-    def test_concurrent_adapter_is_refused_before_provider_call(self):
-        with open(str(self.path) + '.lock', 'w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            rpc = Rpc()
-            with self.assertRaisesRegex(CreditError, 'busy'):
-                self.run_attempt(rpc)
-            self.assertEqual(rpc.calls, [])
+    def test_adapter_only_allows_initialize_and_read(self):
+        # The method allowlist refuses everything but initialize/READ, before
+        # any transport is touched (no provider process needed for the guard).
+        for method in ('account/rateLimitResetCredit/consume', 'redeem', 'other'):
+            with self.assertRaisesRegex(CreditError, 'unsupported_method'):
+                AppServer.call(object.__new__(AppServer), method, {})
 
     def test_missing_credit_details_fail_closed(self):
         for credits in (None, 'bad'):
@@ -218,6 +54,65 @@ class ResetCreditTests(unittest.TestCase):
         clean = json.dumps(snapshot(raw))
         self.assertNotIn('secret', clean)
         self.assertNotIn('remaining_tokens', clean)
+
+    def test_unknown_permission_refused(self):
+        raw = view()
+        del raw['ordinaryUsageAllowed']
+        with self.assertRaisesRegex(CreditError, 'permission_unknown'):
+            native._eligible(snapshot(raw), 'credit-a', NOW)
+
+    def test_expired_unknown_and_nonexpiring_credits_refused(self):
+        for expiry in (NOW, NOW - 1, None, NOW + 86401):
+            with self.subTest(expiry=expiry):
+                raw = view()
+                raw['rateLimitResetCredits']['credits'][0]['expiresAt'] = expiry
+                with self.assertRaises(CreditError):
+                    native._eligible(snapshot(raw), 'credit-a', NOW)
+
+    def test_healthy_quota_not_reset(self):
+        for used in (0, 1, 84):
+            with self.subTest(used=used):
+                raw = view(used=used)
+                with self.assertRaisesRegex(CreditError, 'unnecessary'):
+                    native._eligible(snapshot(raw), 'credit-a', NOW)
+
+    def test_missing_absent_or_wrong_type_credit_refused(self):
+        raw = view(credit=False)
+        with self.assertRaisesRegex(CreditError, 'not_available'):
+            native._eligible(snapshot(raw), 'credit-a', NOW)
+        for field, value in [('resetType', 'unknown'), ('status', 'redeeming'), ('status', 'redeemed')]:
+            with self.subTest(field=field, value=value):
+                raw = view()
+                raw['rateLimitResetCredits']['credits'][0][field] = value
+                with self.assertRaises(CreditError):
+                    native._eligible(snapshot(raw), 'credit-a', NOW)
+
+    def test_read_path_returns_clean_snapshot_and_only_reads(self):
+        rpc = Rpc()
+        snap = snapshot(rpc.call(READ))
+        self.assertEqual(snap['accountId'], 'account-a')
+        self.assertEqual(snap['availableCount'], 2)
+        self.assertEqual(snap['credits'][0]['id'], 'credit-a')
+        self.assertEqual(rpc.calls, [(READ, None)])
+
+
+class NoRedemptionGuardTests(unittest.TestCase):
+    """Alexey t1741u: track expiry and ask for approval, never redeem."""
+
+    FORBIDDEN = (
+        'rate-limit-reset-credits/consume', 'rate-limit-reset-credits/redeem',
+        'account/rateLimitResetCredit/consume', 'customer-package-reset/use')
+
+    def test_modules_carry_no_redemption_path(self):
+        import re
+        from pathlib import Path
+        root = Path(native.__file__).resolve().parent
+        for name in ('codex_reset_credit.py', 'reset_credit_workflow.py'):
+            source = (root / name).read_text()
+            for pattern in self.FORBIDDEN:
+                self.assertIsNone(re.search(pattern, source, re.I), (name, pattern))
+        self.assertFalse(hasattr(native, 'redeem'))
+        self.assertFalse(hasattr(native, 'CONSUME'))
 
 
 if __name__ == '__main__':
