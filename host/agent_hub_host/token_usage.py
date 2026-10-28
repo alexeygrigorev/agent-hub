@@ -8,15 +8,15 @@ session data (no quota percentages, no invented values):
   (account orin) and ``~/.zcodex`` (engine zcodex, account shared-zai);
 - Claude project JSONL ``message.usage`` entries under
   ``~/.claude/projects`` (engine claude, account shared-claude);
-- the OpenCode session table (engine opencode, account opencode-go).
+- completed OpenCode assistant messages (engine opencode, account shared-go).
 
 Engines without a native per-session token log on the host (gemini, grok,
 copilot) are NOT collected here; the server marks them explicitly
 unsupported per engine (see ``src/token-history.ts`` TOKEN_SOURCES).
 
-Projection: input = native input-side tokens (input + cache read/creation),
-output = native output-side tokens (output + reasoning where the engine
-reports it separately). Native detail stays in the session logs; only hourly
+Projection: Codex uses native input/output totals, whose cached/reasoning
+fields are subsets. Claude/OpenCode add their separately reported cache
+and reasoning categories. Native detail stays in the session logs; only hourly
 sums cross into the Hub. Project attribution maps a session cwd under
 ``/home/<user>/git/<repo>/...`` to the ``<repo>`` basename, else
 ``unattributed``. No prompts, transcripts, costs, emails or account
@@ -29,6 +29,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sqlite3
 import time
 import urllib.error
@@ -43,6 +44,7 @@ MAX_BODY_BYTES = 32 * 1024
 MAX_FILES_PER_SOURCE = 512
 MAX_BYTES_PER_FILE = 32 * 1024 * 1024
 MAX_LINES_PER_FILE = 100_000
+MAX_SCAN_BYTES = 128 * 1024 * 1024
 WINDOW_HOURS = 26
 POST_TIMEOUT_S = 10.0
 
@@ -65,6 +67,23 @@ def project_for_cwd(cwd: Any) -> str:
     """Map a session cwd to a bounded project label, else unattributed."""
     if not isinstance(cwd, str) or not cwd:
         return "unattributed"
+    # Git worktrees carry the canonical repository in their common-dir link.
+    # Read only Git path metadata, never a config or remote containing secrets.
+    path = Path(cwd)
+    for parent in (path, *list(path.parents)[:12]):
+        marker = parent / '.git'
+        try:
+            if marker.is_file():
+                pointer = marker.read_text()[:4096].strip()
+                if pointer.startswith('gitdir: '):
+                    gitdir = (parent / pointer[8:]).resolve()
+                    common = (gitdir / 'commondir').read_text()[:4096].strip()
+                    canonical = (gitdir / common).resolve()
+                    if canonical.name == '.git':
+                        cwd = str(canonical.parent)
+                        break
+        except OSError:
+            continue
     parts = cwd.strip("/").split("/")
     # /home/<user>/git/<repo>/... -> <repo>
     if len(parts) >= 4 and parts[0] == "home" and parts[2] == "git" and parts[3]:
@@ -118,6 +137,26 @@ def _iter_jsonl_files(root: Path, since_ms: int) -> List[Path]:
         return []
     found.sort(key=lambda item: item[0], reverse=True)
     return [path for _, path in found[:MAX_FILES_PER_SOURCE]]
+
+
+def _source_files(roots, since_ms):
+    """One bounded newest-first budget shared by classic and managed homes."""
+    candidates = {}
+    for root in roots:
+        for path in _iter_jsonl_files(Path(root), since_ms):
+            try:
+                stat = path.stat()
+                if stat.st_size <= MAX_BYTES_PER_FILE:
+                    candidates[str(path.resolve())] = (stat.st_mtime_ns, stat.st_size, path)
+            except OSError:
+                continue
+    total, files = 0, []
+    for _, size, path in sorted(candidates.values(), key=lambda row:row[0], reverse=True):
+        if len(files) >= MAX_FILES_PER_SOURCE or total + size > MAX_SCAN_BYTES:
+            break
+        files.append(path)
+        total += size
+    return files
 
 
 _SESSION_TOKEN_CACHE = {}
@@ -196,98 +235,104 @@ def native_session_tokens(row, locator=None):
 
 
 def collect_codex(home: str, since_ms: int, now_ms: int,
-                   engine: str, account: str) -> Dict[Tuple[int, str], List[int]]:
-    """Scan one codex-family sessions tree. Returns {(hour_ms, project): [in, out]}.
+                   engine: str, account: str, roots=None) -> Dict[Tuple[int, str], List[int]]:
+    """Read native cumulative totals, or per-response usage on older rollouts.
 
-    Rollout ``token_usage_record`` entries carry cumulative per-thread input
-    snapshots (monotonic within a thread) with per-turn outputs, so hourly
-    input is the sum of per-thread positive deltas (first record counts
-    fully) attributed to each record's own hour. This approximates billed
-    totals; compaction restarts are floored at zero, never negative.
+    Codex input/output totals already include cached/reasoning subsets. Both
+    native event formats can report the same cumulative total; positive deltas
+    against a thread high-water mark count that work only once. Records before
+    the requested window establish the baseline, never a new in-window charge.
     """
-    per_thread: Dict[str, Tuple[Optional[str], List[Tuple[int, Dict[str, Any]]]]] = {}
+    per_thread = {}
     try:
-        sessions = Path(home).expanduser() / "sessions"
-        files = _iter_jsonl_files(sessions, since_ms - 7 * 86400000)
+        files = _source_files([Path(root).expanduser() / "sessions" for root in (roots or [home])], since_ms - 7 * 86400000)
     except Exception:
         return {}
     for path in files:
         try:
             if path.stat().st_size > MAX_BYTES_PER_FILE:
                 continue
-        except OSError:
-            continue
-        project: Optional[str] = None
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            project, session_id = "unattributed", str(path)
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
                 for lineno, line in enumerate(handle):
                     if lineno >= MAX_LINES_PER_FILE:
                         break
                     try:
                         entry = json.loads(line)
-                    except Exception:
+                    except (ValueError, TypeError):
                         continue
                     if not isinstance(entry, dict):
-                        continue
-                    if project is None and entry.get("type") == "session_meta":
-                        payload = entry.get("payload")
-                        if isinstance(payload, dict):
-                            project = project_for_cwd(payload.get("cwd"))
-                    if entry.get("type") != "token_usage_record":
                         continue
                     payload = entry.get("payload")
                     if not isinstance(payload, dict):
                         continue
-                    usage = payload.get("usage")
+                    if entry.get("type") == "session_meta":
+                        project = project_for_cwd(payload.get("cwd"))
+                        if isinstance(payload.get("id"), str) and payload["id"]:
+                            session_id = payload["id"]
+                        continue
+                    cumulative, response_id = True, None
+                    if entry.get("type") == "token_usage_record":
+                        usage = payload.get("thread_token_usage")
+                        if not isinstance(usage, dict):
+                            usage, cumulative = payload.get("usage"), False
+                            response_id = payload.get("response_id")
+                    elif entry.get("type") == "event_msg" and payload.get("type") == "token_count":
+                        info = payload.get("info")
+                        usage = info.get("total_token_usage") if isinstance(info, dict) else None
+                    else:
+                        continue
                     if not isinstance(usage, dict):
                         continue
+                    inp, outp = _finite_int(usage.get("input_tokens")), _finite_int(usage.get("output_tokens"))
                     ts_ms = _parse_ts(entry.get("timestamp"))
-                    if ts_ms is None or ts_ms < since_ms or ts_ms > now_ms:
+                    if inp is None or outp is None or ts_ms is None or ts_ms > now_ms:
                         continue
-                    thread = payload.get("thread_id") or payload.get("session_id") or str(path)
+                    thread = payload.get("thread_id") or payload.get("session_id") or session_id
                     if not isinstance(thread, str):
-                        thread = str(path)
-                    slot = per_thread.get(thread)
-                    if slot is None:
-                        per_thread[thread] = (project or "unattributed", [(ts_ms, usage)])
-                    else:
-                        if project is not None and slot[0] == "unattributed":
-                            per_thread[thread] = (project, slot[1])
-                        slot[1].append((ts_ms, usage))
+                        thread = session_id
+                    per_thread.setdefault(thread, []).append((ts_ms, project, inp, outp, cumulative, response_id))
         except OSError:
             continue
     out: Dict[Tuple[int, str], List[int]] = {}
-    for proj, records in per_thread.values():
+    for records in per_thread.values():
         records.sort(key=lambda item: item[0])
-        prev_in: Optional[int] = None
-        for ts_ms, usage in records:
-            current_in = (_finite_int(usage.get("input_tokens")) or 0)
-            current_in += (_finite_int(usage.get("cached_input_tokens")) or 0)
-            current_in += (_finite_int(usage.get("cache_write_input_tokens")) or 0)
-            outp = _finite_int(usage.get("output_tokens")) or 0
-            if prev_in is None:
-                delta = current_in
+        previous = None
+        seen_responses = set()
+        # Prefer the native cumulative stream when present, so an older
+        # per-response duplicate cannot be added to the same thread totals.
+        has_totals = any(r[4] for r in records)
+        for ts_ms, project, inp, outp, cumulative, response_id in records:
+            if has_totals and not cumulative:
+                continue
+            if cumulative:
+                first = previous is None
+                delta_in, delta_out = (inp, outp) if first else (max(0, inp - previous[0]), max(0, outp - previous[1]))
+                previous = [inp, outp] if first else [max(previous[0], inp), max(previous[1], outp)]
+                if not first and delta_in == 0 and delta_out == 0:
+                    continue
             else:
-                delta = current_in - prev_in
-                if delta < 0:
-                    delta = 0
-            prev_in = current_in
-            key = (utc_hour_ms(ts_ms), proj or "unattributed")
-            have = out.get(key)
-            if have is None:
-                out[key] = [delta, outp]
-            else:
-                have[0] += delta
-                have[1] += outp
+                if isinstance(response_id, str) and response_id:
+                    if response_id in seen_responses:
+                        continue
+                    seen_responses.add(response_id)
+                delta_in, delta_out = inp, outp
+            if ts_ms < since_ms:
+                continue
+            key = (utc_hour_ms(ts_ms), project)
+            values = out.setdefault(key, [0, 0])
+            values[0] += delta_in
+            values[1] += delta_out
     return out
 
 
-def collect_claude(projects_dir: str, since_ms: int, now_ms: int) -> Dict[Tuple[int, str], List[int]]:
+def collect_claude(projects_dir: str, since_ms: int, now_ms: int, roots=None) -> Dict[Tuple[int, str], List[int]]:
     """Scan Claude project JSONL message usage. Same return shape."""
     out: Dict[Tuple[int, str], List[int]] = {}
+    messages = {}
     try:
         root = Path(projects_dir).expanduser()
-        files = _iter_jsonl_files(root, since_ms - 7 * 86400000)
+        files = _source_files(roots or [root], since_ms - 7 * 86400000)
     except Exception:
         return out
     for path in files:
@@ -314,70 +359,118 @@ def collect_claude(projects_dir: str, since_ms: int, now_ms: int) -> Dict[Tuple[
                     if not isinstance(usage, dict):
                         continue
                     ts_ms = _parse_ts(entry.get("timestamp"))
-                    if ts_ms is None or ts_ms < since_ms or ts_ms > now_ms:
+                    if ts_ms is None or ts_ms > now_ms:
                         continue
-                    inp = (_finite_int(usage.get("input_tokens")) or 0) + \
-                        (_finite_int(usage.get("cache_read_input_tokens")) or 0) + \
-                        (_finite_int(usage.get("cache_creation_input_tokens")) or 0)
-                    outp = (_finite_int(usage.get("output_tokens")) or 0)
+                    inp, outp = _finite_int(usage.get("input_tokens")), _finite_int(usage.get("output_tokens"))
+                    if inp is None or outp is None:
+                        continue
+                    cache = [_finite_int(usage.get(k, 0)) for k in
+                             ("cache_read_input_tokens", "cache_creation_input_tokens")]
+                    if any(v is None for v in cache):
+                        continue
+                    inp += sum(cache)
                     project = project_for_cwd(entry.get("cwd"))
-                    key = (utc_hour_ms(ts_ms), project)
-                    slot = out.get(key)
-                    if slot is None:
-                        out[key] = [inp, outp]
+                    # Streaming snapshots/content blocks reuse the native message
+                    # ID; retain its latest usage once across files/subagents.
+                    mid = message.get("id")
+                    identity = mid if isinstance(mid, str) and mid else (str(path), lineno)
+                    old = messages.get(identity)
+                    if old is None:
+                        messages[identity] = (ts_ms, ts_ms, project, inp, outp)
                     else:
-                        slot[0] += inp
-                        slot[1] += outp
+                        first = min(ts_ms, old[0])
+                        messages[identity] = ((first, ts_ms, project, inp, outp)
+                                              if ts_ms >= old[1] else (first, *old[1:]))
         except OSError:
             continue
+    for ts_ms, _, project, inp, outp in messages.values():
+        # A message's original native timestamp fixes its hour. Later stream
+        # snapshots correct that hour rather than charging the same request twice.
+        if ts_ms < since_ms:
+            continue
+        slot = out.setdefault((utc_hour_ms(ts_ms), project), [0, 0])
+        slot[0] += inp
+        slot[1] += outp
     return out
 
 
-def collect_opencode(db_path: str, since_ms: int, now_ms: int) -> Dict[Tuple[int, str], List[int]]:
-    """Read-only scan of the OpenCode session table. Same return shape."""
-    out: Dict[Tuple[int, str], List[int]] = {}
+def _opencode_messages(db_path, since_ms, now_ms, messages):
+    """Merge only valid completed usage; newest native update wins copies."""
     try:
         uri = "file:" + urllib.request.pathname2url(os.path.abspath(os.path.expanduser(db_path))) + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
     except Exception:
-        return out
+        return
     try:
-        try:
-            rows = conn.execute(
-                "SELECT time_created, directory, tokens_input, tokens_output,"
-                " tokens_reasoning, tokens_cache_read, tokens_cache_write"
-                " FROM session WHERE time_created >= ? AND time_created <= ? LIMIT 20000",
-                (since_ms, now_ms),
-            ).fetchall()
-        except Exception:
-            return out
-        for created, directory, ti, to, tr, tcr, tcw in rows:
-            if not isinstance(created, (int, float)):
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        message_tables = [t for t in ("message", "session_message") if t in tables]
+        if not message_tables:
+            return
+        session_tables = [t for t in ("session_v2", "session") if t in tables]
+        if not session_tables:
+            return
+        joins = " ".join(f"LEFT JOIN {table} s{i} ON s{i}.id=m.session_id" for i, table in enumerate(session_tables))
+        directories = [f"s{i}.directory" for i in range(len(session_tables))]
+        directory = directories[0] if len(directories) == 1 else "COALESCE(" + ",".join(directories) + ")"
+        queries = []
+        for table in message_tables:
+            columns = {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}
+            native_role = 'm.type' if 'type' in columns else 'NULL'
+            queries.append(conn.execute(f"SELECT m.id,m.data,{directory},{native_role},m.time_updated FROM {table} m {joins} "
+                                        "WHERE m.time_updated>=? AND m.time_created<=? LIMIT 20000", (since_ms, now_ms)))
+        for mid, raw, cwd, native_role, updated in (row for query in queries for row in query):
+            try:
+                data = json.loads(raw)
+            except (ValueError, TypeError):
                 continue
-            ts_ms = int(created)
-            if ts_ms < since_ms or ts_ms > now_ms:
+            if not isinstance(data, dict) or data.get("role", native_role) != "assistant":
                 continue
-            inp = (_finite_int(ti) or 0) + (_finite_int(tcr) or 0) + (_finite_int(tcw) or 0)
-            outp = (_finite_int(to) or 0) + (_finite_int(tr) or 0)
-            key = (utc_hour_ms(ts_ms), project_for_cwd(directory))
-            slot = out.get(key)
-            if slot is None:
-                out[key] = [inp, outp]
-            else:
-                slot[0] += inp
-                slot[1] += outp
+            times = data.get("time")
+            completed = times.get("completed") if isinstance(times, dict) else None
+            if type(completed) is not int or not 0 <= completed <= now_ms:
+                continue
+            tokens = data.get("tokens")
+            if not isinstance(tokens, dict):
+                continue
+            cache = tokens.get("cache")
+            if not isinstance(cache, dict):
+                continue
+            values = [_finite_int(tokens.get(k)) for k in ("input", "output", "reasoning")]
+            values.extend(_finite_int(cache.get(k)) for k in ("read", "write"))
+            if any(v is None for v in values):
+                continue
+            inp, outp, reasoning, read, write = values
+            # Charge the completed native response hour; unfinished usage can
+            # still change and must not be represented as a final measurement.
+            if completed < since_ms:
+                continue
+            observation = (updated, completed, project_for_cwd(cwd), inp + read + write, outp + reasoning)
+            previous = messages.get(mid)
+            if previous is None or observation[:2] > previous[:2]:
+                messages[mid] = observation
+    except (sqlite3.Error, OSError):
+        return
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        conn.close()
+
+
+def collect_opencode(db_path: str, since_ms: int, now_ms: int, roots=None) -> Dict[Tuple[int, str], List[int]]:
+    """Aggregate latest completed native messages across classic/managed DBs."""
+    messages = {}
+    for path in (roots or [db_path]):
+        _opencode_messages(path, since_ms, now_ms, messages)
+    out = {}
+    for _, completed, project, inp, outp in messages.values():
+        slot = out.setdefault((utc_hour_ms(completed), project), [0, 0])
+        slot[0] += inp
+        slot[1] += outp
     return out
 
 
 def build_hours(now_ms: int) -> List[Dict[str, Any]]:
     """Aggregate native tokens for complete hours in the trailing window."""
     current_hour = utc_hour_ms(now_ms)
-    since_ms = now_ms - WINDOW_HOURS * 3600000
+    since_ms = current_hour - WINDOW_HOURS * 3600000
     home = os.path.expanduser("~")
     per_key: Dict[Tuple[str, str, str, int], List[int]] = {}
 
@@ -393,20 +486,44 @@ def build_hours(now_ms: int) -> List[Dict[str, Any]]:
                 slot[0] += inp
                 slot[1] += outp
 
-    for engine, account, dirname in _CODEX_SOURCES:
+    sources = [(e, a, Path(home) / d) for e, a, d in _CODEX_SOURCES]
+    sources.extend([("claude", "shared-claude", Path(home) / '.claude' / 'projects'),
+                    ("opencode", "shared-go", Path(home) / '.local/share/opencode/opencode.db')])
+    # Retained revisions can contain unique sessions, so collect all installed
+    # homes, using only directory identity and the catalog's account aliases.
+    try:
+        from . import provisioning
+        from .model_contract import canonical_account_label
+        for dest in sorted(provisioning.root().iterdir())[:256]:
+            match = re.fullmatch(r'([a-z][a-z0-9_-]{0,47})-([a-f0-9-]{36})', dest.name)
+            if not match or not dest.is_dir():
+                continue
+            account = canonical_account_label(match[1])
+            managed = dest / 'home'
+            for engine, relative in [('codex', '.codex'), ('zcodex', '.zcodex'),
+                                     ('claude', '.claude/projects'),
+                                     ('opencode', '.local/share/opencode/opencode.db')]:
+                source = managed / relative
+                if source.exists():
+                    sources.append((engine, account, source))
+    except (OSError, ValueError, TypeError):
+        pass
+    grouped = {}
+    for engine, account, source in sources:
+        paths = grouped.setdefault((engine, account), set())
+        paths.add(str(source.resolve()))
+    for (engine, account), paths in grouped.items():
         try:
-            merge(engine, account, collect_codex(os.path.join(home, dirname), since_ms, now_ms, engine, account))
+            paths = sorted(paths)
+            if engine in ('codex', 'zcodex'):
+                buckets = collect_codex(paths[0], since_ms, now_ms, engine, account, roots=paths)
+                merge(engine, account, buckets)
+            elif engine == 'claude':
+                merge(engine, account, collect_claude(paths[0], since_ms, now_ms, roots=paths))
+            else:
+                merge(engine, account, collect_opencode(paths[0], since_ms, now_ms, roots=paths))
         except Exception:
             continue
-    try:
-        merge("claude", "shared-claude", collect_claude(os.path.join(home, ".claude", "projects"), since_ms, now_ms))
-    except Exception:
-        pass
-    try:
-        merge("opencode", "shared-go",
-              collect_opencode(os.path.join(home, ".local", "share", "opencode", "opencode.db"), since_ms, now_ms))
-    except Exception:
-        pass
     hours = [{
         "hour_start": hour_iso(hour_ms),
         "engine": engine,
@@ -571,10 +688,14 @@ class TokenCollector:
             if not hours:
                 self.last_snapshot = {"hours": 0}
                 return self.last_snapshot
-            if self.http_client:
-                result = self.http_client(target, hours, token=access_token)
-            else:
-                result = post_token_hours(target, hours, token=access_token)
+            # Respect the server bucket limit independently of body byte size.
+            result = None
+            for offset in range(0, len(hours), 48):
+                batch = hours[offset:offset + 48]
+                if self.http_client:
+                    result = self.http_client(target, batch, token=access_token)
+                else:
+                    result = post_token_hours(target, batch, token=access_token)
             self.last_snapshot = {"hours": len(hours)}
             self.last_error = None
             try:

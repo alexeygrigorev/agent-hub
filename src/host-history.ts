@@ -1,3 +1,4 @@
+import { initUsageStore } from './usage-store';
 /** Numeric, bounded operational history. Never stores prompts or raw heartbeat DTOs.
  * Source tables are read only. Compaction/expiry applies only to this derived cache.
  */
@@ -38,14 +39,14 @@ const numeric = (v: unknown): number | null => typeof v === 'number' && Number.i
 const json = (v: any) => { try { return JSON.parse(v || '{}'); } catch { return {}; } };
 
 type HistoryResponse = {series: any[];[key: string]: any};
-type Observation = {kind: string;entity: string;machine_id: string;at: number;values: Values;source: string};
+type Observation = {kind: string;entity: string;machine_id: string;at: number;values: Values;source: string;recorded_at?: number};
 export class HostHistoryService {
   private pending = new Map<number, Map<string, Observation>>();
   private cache = new Map<string, {at: number; data: HistoryResponse}>();
   private identity(o: {kind:string;entity:string;machine_id:string}) { return JSON.stringify([o.kind,o.entity,o.machine_id]); }
   private packet(raw: string): Observation[] { const p = json(raw); return Array.isArray(p) ? p : []; }
   constructor(private sql: SqlStorage, private fleet: FleetService, private now = Date.now) {}
-  init() { for (const s of HOST_HISTORY_SCHEMA.split(';')) if (s.trim()) this.sql.exec(s); }
+  init() { initUsageStore(this.sql); for (const s of HOST_HISTORY_SCHEMA.split(';')) if (s.trim()) this.sql.exec(s); }
   /** One real observation per minute; retries and backfill cannot overwrite newer evidence. */
   record(kind: string, entity: string, machine: string, at: number, values: Values, source: string) {
     if (!Number.isFinite(at) || at > this.now() + MINUTE || at < this.now() - HISTORY_RETENTION_MS) return;
@@ -64,7 +65,8 @@ export class HostHistoryService {
     const bucket = Math.floor(at / MINUTE) * MINUTE;
     let packet = this.pending.get(bucket);
     if (!packet) { packet = new Map(); this.pending.set(bucket, packet); }
-    const observation = {kind,entity,machine_id:machine,at,values:safe,source};
+    const observation = {kind,entity,machine_id:machine,at,values:safe,source,
+      ...(kind==='tokens' ? {recorded_at:this.now()} : {})};
     const key = this.identity(observation), existing = packet.get(key);
     if (!existing || at > existing.at) packet.set(key, observation);
   }
@@ -110,14 +112,15 @@ export class HostHistoryService {
    */
   private quotaWindowFromBlob(account: string, quotaJson: string, at: number, source: string) {
     const p = json(quotaJson);
+    if (p && typeof p === 'object' && ((Object.hasOwn(p,'status') && p.status !== 'ok') || p.details?.stale === true)) return;
     const windows = (p && typeof p === 'object' && (p as any).windows && typeof (p as any).windows === 'object') ? (p as any).windows : {};
     const names = Object.keys(windows).slice(0, 32);
     // No windows: record nothing. A gap is the absence of points, and an
     // explicit null marker would only consume the dimension registry.
     if (!names.length) return;
+    const values: Values = {};
     for (const name of names) {
       const w = windows[name] || {};
-      const values: Values = {};
       const remaining = w.present === true ? numeric(w.percent_remaining) : null;
       if (remaining !== null) values[name] = remaining;
       const resetMs = typeof w.reset_at === 'string' ? Date.parse(w.reset_at) : NaN;
@@ -125,13 +128,20 @@ export class HostHistoryService {
       if (reset !== null) values[name + '__reset_at'] = reset;
       // A fully unknown window (null percent, unknown reset) leaves no
       // trace; its gap after the last known point is the outage signal.
-      if (Object.keys(values).length) this.record('quota_window', account, '', at, values, source);
     }
+    // record() keeps one observation per account and timestamp. All windows
+    // must share that observation or later windows at the same instant vanish.
+    if (Object.keys(values).length) this.record('quota_window', account, '', at, values, source);
   }
   /** Fresh per-window observations from every quota source. Stale snapshots
    * (older than QUOTA_WINDOW_STALE_MS) are skipped: a stale hold-forward
    * would masquerade as a live measurement. Unknown windows stay gaps. */
   private quotaWindows(now: number) {
+    // The same persisted collection journal feeds TBM; minute packets below
+    // are only the bounded rendering/compaction projection of those samples.
+    for (const row of this.rows('SELECT account,observed_at_ms,quota_json FROM usage_quota_history WHERE observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms LIMIT 4096',now-QUOTA_WINDOW_STALE_MS,now)) {
+      this.quotaWindowFromBlob(row.account,row.quota_json,row.observed_at_ms,'usage_quota_history');
+    }
     for (const row of this.rows('SELECT account,captured_at,quota_json FROM server_quota_snapshots LIMIT 128')) {
       const at = Date.parse(row.captured_at);
       if (!Number.isFinite(at) || now - at > QUOTA_WINDOW_STALE_MS || at > now + MINUTE) continue;
@@ -279,18 +289,28 @@ export class HostHistoryService {
         for (const [metric,value] of Object.entries(o.values)) {
           const key=JSON.stringify([o.kind,entity,host,metric]);
           let series=groups.get(key);
+          // Native token observations are hourly totals, not minute gauges.
+          // Preserve every hour even on 30d, and fold revisions into that hour.
+          const seriesStep=o.kind==='tokens' ? 3600000 : o.kind==='quota_window' ? Math.max(step,15*MINUTE) : step;
+          const seriesFirst=Math.floor(start/seriesStep)*seriesStep;
+          const seriesCount=Math.floor((now-seriesFirst)/seriesStep)+1;
           if (!series) {
             if (groups.size>=256) {truncated=true;continue;}
-            series={kind:o.kind,entity,machine_id:host,metric,points:Array.from({length:count},(_,i)=>({at:first+i*step,value:null,observed_at:null})),source:o.source};
+            series={kind:o.kind,entity,machine_id:host,metric,step_ms:seriesStep,points:Array.from({length:seriesCount},(_,i)=>({at:seriesFirst+i*seriesStep,value:null,observed_at:null,...(o.kind==='quota_window' ? {bucket_at:seriesFirst+i*seriesStep} : {})})),source:o.source};
             groups.set(key,series);
           }
-          const index=Math.floor((o.at-first)/step), previous=series.points[index];
+          const index=Math.floor((o.at-seriesFirst)/seriesStep), previous=series.points[index];
           const legacyNative = o.kind==='account' && metric==='native_live' && o.source==='fleet_account_status';
           const legacyRunning = o.kind==='sessions' && metric==='running' && o.source==='fleet_catalog_and_launches';
           const proven = legacyNative || legacyRunning ? null : numeric(value);
           // Simultaneous alias gauges must not overwrite the canonical host's
           // real running count with the stale alias's unknown/zero projection.
-          if (!previous.observed_at || o.at>previous.at || (o.at===previous.at && o.machine_id===host)) series.points[index]={at:o.at,value:proven,observed_at:new Date(o.at).toISOString()};
+          const previousAt=previous.observed_at ? Date.parse(previous.recorded_at || previous.observed_at) : -Infinity;
+          const currentAt=o.kind==='tokens' ? (o.recorded_at ?? o.at) : o.at;
+          if (!previous.observed_at || currentAt>previousAt || (currentAt===previousAt && o.machine_id===host)) series.points[index]={at:o.kind==='tokens' ? seriesFirst+index*seriesStep : o.at,value:proven,observed_at:new Date(o.at).toISOString(),
+            // Quota aliases share a grid identity even when observations are off-grid.
+            ...(o.kind==='quota_window' ? {bucket_at:seriesFirst+index*seriesStep} : {}),
+            ...(o.kind==='tokens' && Number.isFinite(o.recorded_at) ? {recorded_at:new Date(o.recorded_at!).toISOString()} : {})};
         }
       }
     }
@@ -310,7 +330,13 @@ export class HostHistoryService {
     if (request.method !== 'GET') return Response.json({ error: 'method_not_allowed' }, { status: 405, headers });
     const url = new URL(request.url), range = url.searchParams.get('range') || '24h', machine = url.searchParams.get('machine') || undefined;
     if (!Object.hasOwn(HISTORY_RANGES, range) || (machine && !isValidMachineId(machine))) return Response.json({ error: 'invalid_range_or_machine' }, { status: 400, headers });
+    const kinds = url.searchParams.getAll('kind');
+    const usageOnly = url.pathname === '/api/usage/history' || auth.scopes?.includes('worker:own-intake');
+    const allowed = ['quota_window', 'quota', 'tokens'];
+    if (kinds.some(kind => !allowed.includes(kind))) return Response.json({error:'invalid_kind'}, {status:400, headers});
     this.sample();
-    return Response.json(this.query(range, machine), { headers });
+    const data = this.query(range, machine);
+    const selected = kinds.length ? kinds : usageOnly ? allowed : null;
+    return Response.json(selected ? {...data, series:data.series.filter(s => selected.includes(s.kind))} : data, { headers });
   }
 }

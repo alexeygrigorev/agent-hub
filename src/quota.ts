@@ -1636,6 +1636,11 @@ export class QuotaStore {
         state,
         source,
         windows: freshObs[0]?.quota.windows || {},
+        native_balance: freshObs[0]?.quota.status === 'ok' && freshObs[0]?.quota.details?.stale !== true && freshObs[0]?.quota.details &&
+          ['credits', 'usd_cents'].includes(freshObs[0].quota.details.unit) &&
+          typeof freshObs[0].quota.details.credits_remaining === 'number' &&
+          Number.isFinite(freshObs[0].quota.details.credits_remaining)
+          ? {remaining: freshObs[0].quota.details.credits_remaining, unit: freshObs[0].quota.details.unit} : null,
         remaining_percent: remaining,
         observed_at: observedAt,
         collector_version: collectorVersion,

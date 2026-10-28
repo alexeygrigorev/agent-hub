@@ -37,7 +37,13 @@ export function workerRefreshContext(sql: SqlStorage, tokenId: string, now = Dat
 export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId: string): boolean {
   const worker = workerAccessContext(sql, tokenId);
   if (!worker) return false;
-  const path = new URL(request.url).pathname;
+  const url = new URL(request.url), path = url.pathname;
+  // Usage evidence is shared with TBM. A worker may read only these three
+  // sanitized dimensions; this grants no monitoring writes or host telemetry.
+  if (path === '/api/monitoring/history' || path === '/api/usage/history') {
+    const kinds = url.searchParams.getAll('kind');
+    return request.method === 'GET' && kinds.every(kind => ['quota_window', 'quota', 'tokens'].includes(kind));
+  }
   const ownIntake = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events)?$/.exec(path);
   if (ownIntake) {
     const id = ownIntake[1];

@@ -64,3 +64,8 @@
   .metrics-section td::before { content: attr(data-label); display: block; font-family: var(--dk-font-sans); font-size: var(--dk-text-xs); color: var(--dk-text-muted); }
   .metrics-section td:empty { display: none; }
 }
+
+.usage-current-scroll { max-width: 100%; overflow-x: auto; }
+.usage-current-table { width: 100%; min-width: 640px; }
+.usage-current-table th, .usage-current-table td { vertical-align: top; white-space: normal; overflow-wrap: anywhere; }
+.usage-expiring-soon { border-inline-start: 3px solid #b45309; padding: 4px 8px; font-weight: 600; }

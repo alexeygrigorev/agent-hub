@@ -27,11 +27,13 @@ def add_commands(sub):
     parser.add_argument("--account", default=None, help="Limit to one account label")
     parser.add_argument("--admin-token-file", default=None, help="Use an existing private Hub operator token for this read")
     parser.add_argument("--json", action="store_true", help="Emit raw JSON instead of text")
-    parser.add_argument("tbm", nargs="?", default=None, choices=["pacing", "banked", "kill-switch"],
+    parser.add_argument("tbm", nargs="?", default=None, choices=["history", "pacing", "banked", "kill-switch"],
                         help="TBM view: pacing, banked, or kill-switch (fleet filters do not apply)")
     parser.add_argument("kill_action", nargs="?", default=None, choices=["on", "off"],
                         help="kill-switch write: on|off (read when omitted)")
     parser.add_argument("--reason", default=None, help="Reason for kill-switch on|off")
+    parser.add_argument("--range", default="24h", choices=["24h", "7d", "30d"], help="Usage history range")
+    parser.add_argument("--kind", default="quota_window", choices=["quota_window", "quota", "tokens"], help="Usage history dimension")
 
 
 def _label(value, what):
@@ -79,6 +81,14 @@ def execute(args):
         if getattr(args, "kill_action", None) is not None or getattr(args, "reason", None) is not None:
             raise ValueError("Invalid quota arguments")
         return fetch_quota(**kwargs)
+    if tbm_view == 'history':
+        if any(getattr(args, key, None) is not None for key in ('provider', 'engine', 'account', 'admin_token_file', 'kill_action', 'reason')):
+            raise ValueError('History accepts --range, --kind and --host only')
+        from . import bus
+        params = {'range': args.range, 'kind': args.kind}
+        if args.host is not None:
+            params['machine'] = _host_id(args.host)
+        return bus._do_request('GET', '/api/monitoring/history?' + urllib.parse.urlencode(params))
     # TBM views do not take fleet filters; fail loudly instead of silently ignoring them.
     for key in ("host", "provider", "engine", "account", "admin_token_file"):
         if getattr(args, key, None) is not None:
@@ -107,6 +117,8 @@ def render_text(data):
     """Human-readable usage table; unknown stays unknown, never zero."""
     if not isinstance(data, dict):
         raise ValueError("Invalid quota payload")
+    if isinstance(data.get('series'), list):
+        return '\n'.join('%s / %s / %s: %s known points' % (row.get('kind'), row.get('entity'), row.get('metric'), sum(isinstance(p.get('value'), (int, float)) for p in row.get('points', []))) for row in data['series']) or 'No usage history in this range.'
     lines = []
     pools = data.get("pools") if isinstance(data.get("pools"), list) else []
     for pool in pools:

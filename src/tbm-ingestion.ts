@@ -1,3 +1,4 @@
+import { initUsageStore, recordUsageQuota } from './usage-store';
 /** TBM projections of the existing account quota observations. Unknown tokens stay unknown. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { canonicalQuotaProvider, canonicalAccountLabel, snapshotRouteForAccount } from './quota';
@@ -114,7 +115,12 @@ function syncBanked(sql: SqlStorage, provider: string, account: string, quota: a
 export function syncTbmFromServerAccounts(sql: SqlStorage, accounts: {account: string; provider: string; quota: any}[], at: number): TbmSyncCounts {
   const result = { pools: 0, tranches: 0 };
   for (const row of accounts) {
-    const provider = canonicalQuotaProvider(row.provider), account = canonicalAccountLabel(row.account), quota = row.quota;
+    const provider = canonicalQuotaProvider(row.provider), account = canonicalAccountLabel(row.account);
+    recordUsageQuota(sql,account,provider,row.quota,at);
+    // Read back the shared persisted measurement. Never feed TBM a private
+    // latest-only copy that the dashboard cannot see.
+    const stored:any=sql.exec('SELECT quota_json FROM usage_quota_history WHERE account=? AND provider=? AND observed_at_ms=? LIMIT 1',account,provider,at).toArray()[0];
+    const quota=stored ? JSON.parse(stored.quota_json) : null;
     if (quota?.status !== 'ok') continue;
     const windows = Object.entries(quota.windows ?? {}).map(([windowName,window]) => ({provider,account,windowName,window}));
     const added = syncWindowsIntoTbm(sql,windows,at);
@@ -130,6 +136,7 @@ export function syncTbmFromHostSnapshot(sql: SqlStorage, host: string, routes: R
 
 /** Bootstrap and reconcile existing authoritative per-account observations; do not refresh their age. */
 export function syncStoredTbmSnapshots(sql: SqlStorage, now: number): void {
+  initUsageStore(sql);
   const rows: any[] = sql.exec(`SELECT account,provider,captured_at AS observed_at,quota_json FROM server_quota_snapshots
     UNION ALL SELECT account,service AS provider,observed_at,quota_json FROM fleet_subscriptions
     ORDER BY observed_at ASC`).toArray();
@@ -138,6 +145,8 @@ export function syncStoredTbmSnapshots(sql: SqlStorage, now: number): void {
     if (!Number.isFinite(at) || at > now || now-at >= 15*60000) continue;
     let quota: any;
     try { quota = JSON.parse(row.quota_json); } catch { continue; }
-    syncTbmFromServerAccounts(sql,[{account:row.account,provider:row.provider,quota}],at);
+    recordUsageQuota(sql,canonicalAccountLabel(row.account),canonicalQuotaProvider(row.provider),quota,at);
   }
+  const history:any[]=sql.exec('SELECT account,provider,observed_at_ms,quota_json FROM usage_quota_history WHERE observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms',now-15*60000,now).toArray();
+  for(const row of history) syncTbmFromServerAccounts(sql,[{account:row.account,provider:row.provider,quota:JSON.parse(row.quota_json)}],row.observed_at_ms);
 }

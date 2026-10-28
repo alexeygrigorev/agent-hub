@@ -23,6 +23,33 @@ async function setup(fn: (x:any)=>Promise<void>, mode = 'headless') {
  await fn({stub,id,task,session,other,worker,call});
 }
 describe('scoped durable worker access',()=>{
+ it('reads only shared usage dimensions without granting other monitoring or writes',()=>setup(async({stub,worker,call}:any)=>{
+  await runInDurableObject<Hub, any>(stub,(h:any)=>{
+   const now=Date.now();
+   h.hostHistoryService.record('quota_window','shared-codex','',now,{'5h':50,'7d':25},'fixture');
+   h.hostHistoryService.record('tokens','codex / shared-codex / agent-hub','worker-host',now,{input_tokens:100},'fixture');
+   h.hostHistoryService.record('host','private-host','private-host',now,{load1:5},'fixture');
+   h.hostHistoryService.flush();
+  });
+  for (const path of ['/api/monitoring/history','/api/usage/history']) {
+   const response=await call(path,undefined,worker.access_token);
+   expect(response.status).toBe(200);
+   const data:any=await response.json();
+   expect(data.series.some((s:any)=>s.kind==='quota_window' && s.entity==='shared-codex')).toBe(true);
+   expect(data.series.every((s:any)=>['quota_window','quota','tokens'].includes(s.kind))).toBe(true);
+   for(const kind of ['quota_window','quota','tokens']) {
+    const res=await call(path+'?kind='+kind,undefined,worker.access_token);
+    expect(res.status).toBe(200);
+    expect((await res.json() as any).series.every((s:any)=>s.kind===kind)).toBe(true);
+   }
+   expect((await call(path+'?kind=host',undefined,worker.access_token)).status).toBe(403);
+   expect((await call(path+'?kind=quota_window&kind=host',undefined,worker.access_token)).status).toBe(403);
+   expect((await call(path,{},worker.access_token)).status).toBe(403);
+  }
+  for(const path of ['/api/monitoring/tokens','/api/monitoring/health','/api/quota','/api/usage/history/other'])
+   expect([403,404]).toContain((await call(path,undefined,worker.access_token)).status);
+ }));
+
  it.each(['headless','interactive'])('%s reads only its intake and appends only notes/report/blocker, never decisions or close',(mode)=>setup(async({task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);

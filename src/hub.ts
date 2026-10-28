@@ -560,7 +560,7 @@ export class Hub extends DurableObject {
         if ((resolved as any).error) return (resolved as any).error;
         return this.statusService.handleObservation(request, (resolved as any).auth);
       }
-      if (path === '/api/monitoring/history') {
+      if (path === '/api/monitoring/history' || path === '/api/usage/history') {
         const auth = await this.authenticateBusRequest(request);
         const response = this.hostHistoryService.handle(request, auth);
         if (response.ok) {
@@ -597,7 +597,7 @@ export class Hub extends DurableObject {
         const nowMs = Date.now();
         for (const hour of validated.hours) {
           const entity = tokenEntity(hour);
-          const at = tokenPostAt(this.sql, entity, hour.hour_ms, hour.input_tokens, hour.output_tokens, nowMs, HISTORY_RETENTION_MS);
+          const at = tokenPostAt(this.sql, entity, hour.hour_ms, hour.input_tokens, hour.output_tokens, nowMs, HISTORY_RETENTION_MS, String(poster || ''));
           this.hostHistoryService.record('tokens', entity, String(poster || ''), at,
             { input_tokens: hour.input_tokens, output_tokens: hour.output_tokens }, 'native_token_usage');
         }

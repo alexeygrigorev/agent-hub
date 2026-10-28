@@ -1,3 +1,4 @@
+import { canonicalAccountLabel, canonicalHarness } from './quota';
 /** Native token usage history (usage-history intake, AC3).
  *
  * Engines that keep native per-session token logs (codex rollouts incl. the
@@ -32,7 +33,7 @@ export const TOKEN_SOURCES: TokenSourceStatus[] = [
   { engine: 'codex', supported: true, detail: 'codex rollout token_usage_record (shared-codex and orin homes)' },
   { engine: 'zcodex', supported: true, detail: 'zcodex rollout token_usage_record (shared-zai)' },
   { engine: 'claude', supported: true, detail: 'Claude project JSONL message usage (shared-claude)' },
-  { engine: 'opencode', supported: true, detail: 'OpenCode session table tokens (opencode-go)' },
+  { engine: 'opencode', supported: true, detail: 'OpenCode completed assistant-message tokens (shared-go)' },
   { engine: 'gemini', supported: false, detail: 'no native per-session token log on the host; quota percentages only' },
   { engine: 'grok', supported: false, detail: 'no native per-session token log on the host; quota percentages only' },
   { engine: 'copilot', supported: false, detail: 'no native per-session token log on the host; quota percentages only' },
@@ -109,7 +110,7 @@ export function validateTokenPayload(
 }
 
 export function tokenEntity(hour: Pick<TokenHour, 'engine' | 'account' | 'project'>): string {
-  return `${hour.engine} / ${hour.account} / ${hour.project}`.slice(0, 256);
+  return `${canonicalHarness(hour.engine)} / ${canonicalAccountLabel(hour.account)} / ${hour.project}`.slice(0, 256);
 }
 
 /** Posted-hour ledger (table token_hours_posted, created by
@@ -123,19 +124,33 @@ export function tokenPostAt(
   inputTokens: number,
   outputTokens: number,
   nowMs: number,
-  retentionMs: number
+  retentionMs: number,
+  machine = ''
 ): number {
-  const row = sql.exec('SELECT input_tokens, output_tokens, revision FROM token_hours_posted WHERE entity=? AND hour_ms=?', entity, hourMs).toArray()[0] as any;
+  const ledgerEntity = machine ? JSON.stringify([machine, entity]) : entity;
+  const row = sql.exec('SELECT input_tokens, output_tokens, revision FROM token_hours_posted WHERE entity=? AND hour_ms=?', ledgerEntity, hourMs).toArray()[0] as any;
   if (!row) {
-    sql.exec('INSERT INTO token_hours_posted VALUES(?,?,?,?,?)', entity, hourMs, inputTokens, outputTokens, 0);
+    // Existing deployments shared one ledger across machines. Seed the new
+    // machine ledger beyond that revision so its first correction wins over
+    // retained pre-upgrade history, without borrowing another host's totals.
+    const legacy = machine ? sql.exec('SELECT revision FROM token_hours_posted WHERE entity=? AND hour_ms=?', entity, hourMs).toArray()[0] : null;
+    const revision = legacy ? Number(legacy.revision || 0) + 1 : 0;
+    sql.exec('INSERT INTO token_hours_posted VALUES(?,?,?,?,?)', ledgerEntity, hourMs, inputTokens, outputTokens, revision);
     sql.exec('DELETE FROM token_hours_posted WHERE hour_ms < ?', nowMs - retentionMs);
-    return hourMs;
+    return hourMs + tokenRevisionOffset(revision);
   }
-  if (Number(row.input_tokens) === inputTokens && Number(row.output_tokens) === outputTokens) return hourMs;
-  const revision = Math.min(Number(row.revision || 0) + 1, 30);
+  if (Number(row.input_tokens) === inputTokens && Number(row.output_tokens) === outputTokens) return hourMs + tokenRevisionOffset(Number(row.revision || 0));
+  const revision = Number(row.revision || 0) + 1;
+  const offset = tokenRevisionOffset(revision);
   sql.exec('UPDATE token_hours_posted SET input_tokens=?, output_tokens=?, revision=? WHERE entity=? AND hour_ms=?',
-    inputTokens, outputTokens, revision, entity, hourMs);
-  // Newer observation instant wins in history merges; stays within the hour
-  // for the 24h/7d/30d step grids (worst case +30 minutes).
-  return hourMs + revision * 60000;
+    inputTokens, outputTokens, revision, ledgerEntity, hourMs);
+  // Preserve legacy minute revision instants, then advance by milliseconds.
+  // Every accepted correction must win while staying in its original hour.
+  return hourMs + offset;
+}
+
+function tokenRevisionOffset(revision: number): number {
+  const offset = revision <= 30 ? revision * 60000 : 1800000 + revision - 30;
+  if (offset >= 3600000) throw new Error('token_hour_revision_exhausted');
+  return offset;
 }
