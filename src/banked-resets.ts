@@ -50,7 +50,7 @@ export class BankedResets {
   }
 
   private accounts(): any[] {
-    return this.sql.exec("SELECT label,provider FROM fleet_accounts WHERE provider IN ('codex','zai') ORDER BY label").toArray();
+    return this.sql.exec("SELECT label,CASE WHEN provider='codex-orin' THEN 'codex' ELSE provider END AS provider FROM fleet_accounts WHERE provider IN ('codex','codex-orin','zai') ORDER BY label").toArray();
   }
 
   /** Use newest successful per-account evidence, across server and registered host producers. */

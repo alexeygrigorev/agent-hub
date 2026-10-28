@@ -13,7 +13,7 @@ const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('reset-' + c
 const setup = (h: any) => {
   h.sql.exec('DELETE FROM fleet_accounts');
   h.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-codex','codex',1,15,1)");
-  h.sql.exec("INSERT INTO fleet_accounts VALUES ('codex-orin','codex',1,15,1)");
+  h.sql.exec("INSERT INTO fleet_accounts VALUES ('codex-orin','codex-orin',1,15,1)");
   h.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-zai','zai',1,15,1)");
 };
 const quota = (grants: any[]) => ({ status: 'ok', details: { banked_resets: grants.map(g => ({ ...g, available: true })) } });
@@ -63,6 +63,9 @@ describe('scheduled reset alerts and operator fallback', () => {
       const first = service().run();
       expect(first).toHaveLength(3);
       expect(first.map(a => a.subject).sort()).toEqual(['codex-orin','shared-codex','shared-zai']);
+      expect(first.find(a => a.subject === 'codex-orin').detail).toContain('codex-orin (codex)');
+      const listing = await (await service().handle(new Request('https://hub/api/quota/resets'), operator)).json() as any;
+      expect(listing.accounts).toContainEqual({label:'codex-orin',provider:'codex'});
       expect(first.find(a => a.subject === 'shared-zai').detail).toContain('record');
       expect(service().run()).toHaveLength(0);
     });
