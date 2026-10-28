@@ -3316,7 +3316,7 @@ export class Hub extends DurableObject {
     }
 
     // Root actions (singular & plural)
-    if (path === '/api/root/action' || path === '/api/root/actions') {
+    if (path === '/api/root/actions') {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;

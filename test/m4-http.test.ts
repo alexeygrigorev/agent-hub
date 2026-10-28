@@ -602,7 +602,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     expect(betaData.offers.some((o: any) => o.id === 'job-poll-test')).toBe(false);
   });
 
-  it('POST /api/root/action (singular) and /actions (plural) bus_dispatch and job_transition', async () => {
+  it('POST /api/root/actions bus_dispatch and job_transition', async () => {
     const id = (env as any).HUB.idFromName("hub");
     const stub = (env as any).HUB.get(id);
 
@@ -626,8 +626,8 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
       );
     });
 
-    // 1. Singular POST /api/root/action with bus_dispatch
-    const resBusDispatch = await doFetch(new Request('http://example.com/api/root/action', {
+    // 1. POST /api/root/actions with bus_dispatch
+    const resBusDispatch = await doFetch(new Request('http://example.com/api/root/actions', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer token_host_alpha', 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -654,7 +654,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
       expect(msgs.length).toBeGreaterThan(0);
     });
 
-    // 2. Plural POST /api/root/actions with job_transition
+    // 2. POST /api/root/actions with job_transition
     const resTransition = await doFetch(new Request('http://example.com/api/root/actions', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer token_host_alpha', 'Content-Type': 'application/json' },
