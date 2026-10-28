@@ -1099,7 +1099,6 @@ describe('intake retention accounting', () => {
     expect(stats.bytes.events_within_tasks).toBe(expected.events);
     expect(stats.bytes.original_requests_within_events).toBeGreaterThan(0);
     expect(stats.hot_bytes).toBe(expected.open);
-    expect(stats.legacy_aggregate_bytes).toBe(stats.hot_bytes + stats.bytes.receipts);
     expect(stats.retained_bytes).toBe(expected.open + expected.archive + stats.bytes.receipts + stats.bytes.audit);
     expect(await state()).toEqual(before);
     const agent = await seedAgent(); await grant(agent);

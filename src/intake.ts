@@ -323,8 +323,7 @@ export class IntakeService {
       bytes: { open_tasks: open, archived_or_terminal_tasks: tasks - open, receipts, grants, rules, audit,
         events_within_tasks: Number(history.events), original_requests_within_events: Number(history.original_requests) },
       counts, hot_bytes: hot, hot_limit_bytes: INTAKE_LIMITS.totalBytes,
-      retained_bytes: retained, retained_planning_bytes: INTAKE_RETAINED_WARN_BYTES,
-      legacy_aggregate_bytes: hot + receipts, legacy_limit_bytes: 32 * 1024 * 1024 };
+      retained_bytes: retained, retained_planning_bytes: INTAKE_RETAINED_WARN_BYTES };
   }
   storageWarning(): Obj | null {
     const usage = this.storageUsage();
