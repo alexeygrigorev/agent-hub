@@ -58,12 +58,6 @@ class TestNoCasualEngine(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.parse('override', '--workspace', 'demo', '--reason', 'Missing engine')
 
-        # Alias engine-override works
-        alias_args = parser().parse_args(['sessions', 'engine-override', '--workspace', 'demo', '--engine', 'codex', '--reason', 'Deep refactor required'])
-        self.assertEqual(alias_args.workspace, 'demo')
-        self.assertEqual(alias_args.engine, 'codex')
-        self.assertEqual(alias_args.reason, 'Deep refactor required')
-
     def test_cli_sessions_start_requires_reason_if_engine_provided(self):
         # Default start without engine uses policy / tier and requires no reason
         with patch.object(session_control, 'request', return_value={}) as transport:

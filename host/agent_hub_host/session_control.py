@@ -462,7 +462,7 @@ def add_commands(sub):
     mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
     start.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(start)
-    override = commands.add_parser('override', aliases=['engine-override'], help='Dedicated command for engine override. REQUIRES --engine and --reason.')
+    override = commands.add_parser('override', help='Dedicated command for engine override. REQUIRES --engine and --reason.')
     override.add_argument('--engine', required=True, help='Specific model/engine to run')
     override.add_argument('--reason', required=True, help='Explanation why this specific model/engine must be chosen')
     override.add_argument('--machine')
@@ -743,10 +743,10 @@ def _execute(args):
         return result
     if cmd == 'commands':
         return request('GET', '/api/sessions/' + args.id + '/commands')
-    if cmd in ('start', 'override', 'engine-override'):
+    if cmd in ('start', 'override'):
         engine = getattr(args, 'engine', None)
         reason = getattr(args, 'reason', None)
-        if cmd in ('override', 'engine-override'):
+        if cmd == 'override':
             if not engine:
                 raise ValueError('--engine is required for dedicated engine override command')
             if not reason or not reason.strip():
