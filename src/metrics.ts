@@ -3,6 +3,7 @@ import { Env } from "./env";
 import { sha256 } from "./auth/crypto";
 import { getSession, verifyCsrf, allowedCallbackUrls, adminTokenHash, validSessionSecret } from "./auth/session";
 import { validateHumanCredentialRecord } from "./auth/human-credential";
+import { isPlainObject, parseUtcIso, readBoundedJsonBody } from "./strict-json";
 
 export const METRICS_SCHEMA_VERSION = "1.0";
 export const METRICS_MAX_BODY_BYTES = 32_768;
@@ -142,39 +143,6 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: PRIVATE_NO_STORE_HEADERS });
 }
 
-function isPlainObject(val: unknown): val is Record<string, unknown> {
-  if (typeof val !== "object" || val === null || Array.isArray(val)) return false;
-  const proto = Object.getPrototypeOf(val);
-  return proto === Object.prototype || proto === null;
-}
-
-export function parseUtcIso(raw: unknown): { iso: string; ms: number } | null {
-  if (typeof raw !== "string" || raw.length === 0 || raw.length > 64) return null;
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|\+00:00)$/.exec(raw);
-  if (!match) return null;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
-  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return null;
-  const ms = Date.parse(raw);
-  if (!Number.isFinite(ms)) return null;
-  const dt = new Date(ms);
-  if (
-    dt.getUTCFullYear() !== year ||
-    dt.getUTCMonth() + 1 !== month ||
-    dt.getUTCDate() !== day ||
-    dt.getUTCHours() !== hour ||
-    dt.getUTCMinutes() !== minute ||
-    dt.getUTCSeconds() !== second
-  ) {
-    return null;
-  }
-  return { iso: dt.toISOString(), ms };
-}
-
 function finiteNonNegative(val: unknown, integer: boolean): number | null | "bad" {
   if (val === null) return null;
   if (typeof val === "boolean") return "bad";
@@ -206,64 +174,6 @@ function scanPrivateKeys(val: unknown): boolean {
 
 function unknownKeys(obj: Record<string, unknown>, allowed: Set<string>): boolean {
   return Object.keys(obj).some((k) => !allowed.has(k));
-}
-
-async function readBoundedJsonBody(
-  request: Request,
-  maxBytes: number = METRICS_MAX_BODY_BYTES
-): Promise<{ data?: Record<string, unknown>; errorStatus?: number; errorCode?: string }> {
-  const contentLengthHeader = request.headers.get("content-length");
-  if (contentLengthHeader !== null && contentLengthHeader.trim() !== "") {
-    const declared = Number(contentLengthHeader);
-    if (!Number.isFinite(declared) || declared < 0) return { errorStatus: 400, errorCode: "invalid_content_length" };
-    if (declared > maxBytes) return { errorStatus: 413, errorCode: "body_too_large" };
-  }
-  if (!request.body) return { errorStatus: 400, errorCode: "missing_body" };
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-  try {
-    for (;;) {
-      const part = await reader.read();
-      if (part.done) break;
-      if (part.value) {
-        totalBytes += part.value.byteLength;
-        if (totalBytes > maxBytes) {
-          await reader.cancel();
-          return { errorStatus: 413, errorCode: "body_too_large" };
-        }
-        chunks.push(part.value);
-      }
-    }
-  } catch {
-    return { errorStatus: 400, errorCode: "stream_read_error" };
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {}
-  }
-  if (totalBytes === 0) return { errorStatus: 400, errorCode: "missing_body" };
-  const allBytes = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    allBytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  let text: string;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(allBytes);
-  } catch {
-    return { errorStatus: 400, errorCode: "invalid_utf8" };
-  }
-  if (/"__proto__"\s*:/.test(text)) return { errorStatus: 400, errorCode: "unknown_field" };
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return { errorStatus: 400, errorCode: "invalid_json" };
-  }
-  if (!isPlainObject(parsed)) return { errorStatus: 400, errorCode: "invalid_json_object" };
-  return { data: parsed };
 }
 
 export interface MetricsSnapshot {
@@ -1351,7 +1261,7 @@ export class MetricsStore {
       if (reqUrl.searchParams.has("host_id") && reqUrl.searchParams.get("host_id") !== hostId) {
         return jsonResponse({ error: "forbidden", reason: "query_host_id_mismatch" }, 403);
       }
-      const parsedBody = await readBoundedJsonBody(request);
+      const parsedBody = await readBoundedJsonBody(request, METRICS_MAX_BODY_BYTES);
       if (parsedBody.errorStatus || !parsedBody.data) {
         return jsonResponse({ error: parsedBody.errorCode || "invalid_body" }, parsedBody.errorStatus || 400);
       }
