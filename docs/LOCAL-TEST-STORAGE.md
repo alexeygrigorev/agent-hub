@@ -32,7 +32,21 @@ The uv cache uses the original HOME/XDG cache location, or explicit
 a new cache into each disposable home. Vitest uses `npx --no-install` so a
 missing binary cannot silently download another installation.
 
-The default TMPDIR remains relative to avoid long Unix socket paths in browser
-tests. Keep supplied paths short. Persistent build output, browser evidence,
+The default Python TMPDIR remains relative to avoid long Unix socket paths.
+The browser phase receives the absolute path to that same owned directory.
+Keep supplied Python paths short. Persistent build output, browser evidence,
 shared dependency installations, engine session history, and existing test
 scratch are outside this temporary-file retention policy.
+
+Python discovery clears every inherited `APLEXER_*`, `HUB_*`, and `AGENT_HUB_*`
+variable in its child environment, along with XDG config/data/state/runtime and
+GitHub config overrides. A disposable HOME alone cannot isolate the worker
+profile selected by a native session tag. The parent keeps its credentials.
+
+Vitest discovery defaults its libuv, Go/esbuild and V8 background pools to one
+thread (`UV_THREADPOOL_SIZE=1`, `GOMAXPROCS=1`, `--v8-pool-size=1`). Serial test
+files alone do not bound these pools: competing runtime threads can exhaust a
+small CPU quota and increase wall-clock tails. Explicit caller pool settings
+are preserved; other Node options are kept. These defaults apply only to the
+Vitest command. Console timing reports remain visible for passing tests too.
+No file is excluded, no sample is retried and the 100 ms threshold is unchanged.
