@@ -824,6 +824,44 @@ describe('generic accounts and launch placement', () => {
     expect(s.plan(intent()).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
     expect(s.plan(intent({ mode: 'interactive', prompt: '' })).selected?.machine).toBe('hetzner');
   }));
+  it('places a default daily start past claude-headless advertisement and antigravity tier gap (intake 4f6cf562)', async () => fixture(async (s, sql) => {
+    // RMTHZ 2026-10-28 shape: one machine advertises claude, antigravity and
+    // zcodex; the host refuses claude headless without a managed profile
+    // (advertised fleet_route_rejections) and argon, the only antigravity
+    // model, is deep/review-only. A default start (no engine, no tier) must
+    // still place on the remaining daily route instead of 409ing.
+    const entries = [['shared-claude', 'claude', 'claude', 90], ['shared-gemini', 'gemini', 'antigravity', 50], ['shared-zai', 'zai', 'zcodex', 20]];
+    const config = {
+      accounts: entries.map(([label, provider]) => ({ label, provider, max_concurrency: 8, reserve_percent: 0, enabled: true })),
+      routes: entries.map(([account, , engine]) => ({ machine_id: 'hetzner', engine, account, profile: null })),
+    };
+    expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(200);
+    const quota = (pct: number) => ({ status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: pct, reset_at: iso(86400000) } } });
+    await s.handle(request('/subscriptions', { subscriptions: entries.map(([account, service, , pct]) => ({ account, service, plan: 'pro', quota: quota(Number(pct)) })) }, 'PUT'), host('hetzner'));
+    const caps = { engines: ['claude', 'antigravity', 'zcodex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8,
+      fleet_route_rejections: [{ engine: 'claude', account: 'shared-claude', profile: null, mode: 'headless', reason: 'model_unsupported' }] };
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'hetzner');
+    const headless = s.plan(intent({ mode: 'headless' }));
+    expect(headless.selected?.engine, JSON.stringify(headless.rejected)).toBe('zcodex');
+    expect(headless.selected?.account).toBe('shared-zai');
+    // The native zai/zcodex route resolves through either daily alias; policy
+    // order picks glm-flash (same glm-5.3-flash native model, zcodex profile).
+    expect(headless.selected?.selection).toMatchObject({ id: 'glm-flash', model: 'glm-5.3-flash' });
+    expect(headless.rejected).toContainEqual({ machine: 'hetzner', engine: 'claude', reason: 'model_unsupported' });
+    expect(headless.rejected).toContainEqual({ machine: 'hetzner', engine: 'antigravity', reason: 'model_unsupported' });
+    // The headless refusal is mode-scoped: a default interactive start still
+    // lands on claude (its healthier quota wins here).
+    const interactive = s.plan(intent({ mode: 'interactive', prompt: '' }));
+    expect(interactive.selected?.engine, JSON.stringify(interactive.rejected)).toBe('claude');
+    expect(interactive.selected?.selection).toMatchObject({ id: 'sonnet' });
+    expect(interactive.rejected).toContainEqual({ machine: 'hetzner', engine: 'antigravity', reason: 'model_unsupported' });
+    expect(interactive.rejected).not.toContainEqual(expect.objectContaining({ engine: 'claude' }));
+    // The antigravity gap is daily-specific: a deep-tier default places there (argon).
+    const deep = s.plan(intent({ mode: 'headless', tier: 'deep' }));
+    expect(deep.selected?.engine, JSON.stringify(deep.rejected)).toBe('antigravity');
+    expect(deep.selected?.selection).toMatchObject({ id: 'argon' });
+    expect(deep.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
+  }));
   it('accepts complete native catalogs above 32 KiB while retaining catalog bounds', async () => fixture(async (s, sql) => {
     const sessions = Array.from({ length: 100 }, (_, i) => ({
       native_id: 'native-' + i, tag: 'native-' + i, engine: 'codex', phase: 'running',
