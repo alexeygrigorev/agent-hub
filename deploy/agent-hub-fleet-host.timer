@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Agent Hub host cycle every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=60s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
