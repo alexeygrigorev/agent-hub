@@ -646,12 +646,12 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
     });
   });
 
-  // Scenario 10: Non-destructive M3 -> M4 Schema Upgrade
-  it('Scenario 10 (non-destructive M3 to M4 schema upgrade): existing data preserved with new columns accessible', async () => {
+  // Scenario 10: Legacy M3 agents DDL through startup is preserved fail-closed
+  it('Scenario 10 (retired M3 rebuild): existing data preserved; legacy NOT NULL project fails closed', async () => {
     const id = (env as any).HUB.idFromName("hub");
     const stub = (env as any).HUB.get(id);
 
-    // Part A: Upgrade from real M3 BUS_SCHEMA_SQL (agents with project NOT NULL and no PK on tag)
+    // Part A: Startup over a real M3 BUS_SCHEMA_SQL agents table (project NOT NULL, no tag PK)
     await (runInDurableObject as any)(stub, async (instance: any) => {
       instance.ctx.storage.sql.exec('DROP TABLE IF EXISTS agents');
       for (const stmt of BUS_SCHEMA_SQL.split(';').map((s: string) => s.trim()).filter(Boolean)) {
@@ -672,19 +672,22 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       expect(oldAgent.tag).toBe('m3-old-agent');
       expect(oldAgent.project).toBe('m3-proj');
 
-      // Verify inserting an agent WITHOUT project succeeds (project is nullable in M4)
-      instance.ctx.storage.sql.exec(
-        `INSERT INTO agents (tag, role, machine_id, registered_at, state, updated_at) VALUES ('m3-agent-no-proj', 'worker', 'host-1', ?, 'idle', ?)`,
-        now, now
-      );
-      const newAgent = instance.ctx.storage.sql.exec("SELECT * FROM agents WHERE tag = 'm3-agent-no-proj'").toArray()[0] as any;
-      expect(newAgent.tag).toBe('m3-agent-no-proj');
+      // Intake 19848714: the M3->M4 copy-swap rebuild (which relaxed NOT NULL)
+      // was retired — the live DO schema is already nullable and no
+      // pre-migration rows remain. The legacy constraint is preserved and
+      // projectless inserts on such a database fail closed.
+      expect(() =>
+        instance.ctx.storage.sql.exec(
+          `INSERT INTO agents (tag, role, machine_id, registered_at, state, updated_at) VALUES ('m3-agent-no-proj', 'worker', 'host-1', ?, 'idle', ?)`,
+          now, now
+        )
+      ).toThrow();
 
-      // Verify project-qualified uniqueness replaces the global tag PRIMARY KEY
+      // Verify project-qualified uniqueness (no global tag PRIMARY KEY)
       const agentCols = instance.ctx.storage.sql.exec("PRAGMA table_info(agents)").toArray();
       const tagCol = agentCols.find((c: any) => c.name === 'tag');
       expect(tagCol.pk).toBe(0);
-      // The migrated contract permits same-tag peers, while preserving per-project uniqueness.
+      // The unique identity index keeps per-project uniqueness with same-tag peers.
       instance.ctx.storage.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')");
       instance.ctx.storage.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'second')");
       expect(() => instance.ctx.storage.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')")).toThrow();
