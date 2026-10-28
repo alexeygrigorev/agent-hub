@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
-from . import auth, config, fleet, self_update, session_control
+from . import auth, config, fleet, self_update, session_control, session_messages
 from .dispatch_diagnostics import MESSAGES as DISPATCH_MESSAGES
 from .disk_monitor import DiskMonitor
 from .host_health_monitor import HostHealthMonitor
@@ -828,7 +828,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             # (Windows hosts without ssh). An applied update sets ``stop``;
             # the supervisor restarts the controller on the new code.
             maybe_start_named_thread(
-                None, self_update.loop, (dispatcher.request, release_stop), 'host-release')
+                None, self_update.loop, (lambda *a: dispatcher.request(*a), release_stop), 'host-release')
             while not stop.is_set() and (cycles is None or count < cycles):
                 if release_stop.is_set():
                     (journal / RELEASE_RESTART_MARKER).write_text('restart\n', encoding='utf-8')
@@ -893,6 +893,12 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                         cleanup_roots=roots, settings=None))
                 except Exception as error:
                     print(json.dumps({'event': 'commands_error', 'type': type(error).__name__}), flush=True)
+                # Per-session messaging credentials (throttled to one pass a
+                # minute inside; docs/SESSION-MESSAGING.md §8).
+                try:
+                    session_messages.provision_credentials(dispatcher.request, cfg.get('base_url'))
+                except Exception as error:
+                    print(json.dumps({'event': 'session_credentials_error', 'type': type(error).__name__}), flush=True)
                 # Intake 4b161918: intake-worktree status/remove commands run in
                 # one single-inflight daemon thread (git fetch can take a minute),
                 # polled every WORKTREE_POLL_S to bound Hub requests.

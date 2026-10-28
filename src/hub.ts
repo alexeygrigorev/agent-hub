@@ -1,4 +1,4 @@
-import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, NAMED_AGENT_PROJECT } from './session-messaging';
+import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials } from './session-messaging';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
 import { RepoRegistry } from './repos';
@@ -775,6 +775,36 @@ export class Hub extends DurableObject {
       // Auth mirrors the intake mount exactly: bus credentials first, narrow
       // operator-token fallback for the public CLI, cookie sessions on the
       // existing session/CSRF path. No agent scope changes.
+      // Per-session messaging credentials (docs/SESSION-MESSAGING.md §8, M2):
+      // the bound host asks which of its running sessions need one and mints
+      // each; the token goes only to that host, which stores it privately.
+      if (path === '/api/session-messaging/credentials' || path.startsWith('/api/session-messaging/credentials/')) {
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        const caller: any = auth.caller;
+        if (caller?.kind !== 'host' || !caller.machineId || !auth.scopes?.includes('host') || !this.sessionControlService.hostObservationAllowed(caller.machineId, caller)) {
+          return Response.json({ error: 'forbidden' }, { status: 403 });
+        }
+        const now = Date.now();
+        if (path === '/api/session-messaging/credentials' && request.method === 'GET') {
+          return this.ctx.storage.transactionSync(() => {
+            revokeEndedSessionCredentials(this.sql, now);
+            return Response.json({ sessions: sessionsNeedingCredentials(this.sql, caller.machineId, now) });
+          });
+        }
+        const m = /^\/api\/session-messaging\/credentials\/([0-9a-f-]{36})$/.exec(path);
+        if (m && request.method === 'POST') {
+          await safeJson(request);
+          const tokens = await generateTokenPair();
+          return this.ctx.storage.transactionSync(() => {
+            const minted = mintSessionCredential(this.sql, m[1], caller.machineId, tokens, now);
+            if (!minted) return Response.json({ error: 'not_found' }, { status: 404 });
+            // The only response carrying this credential; never logged.
+            return Response.json({ ...minted, access_token: tokens.accessToken, refresh_token: tokens.refreshToken }, { status: 201, headers: { 'Cache-Control': 'private, no-store' } });
+          });
+        }
+        return Response.json({ error: 'not_found' }, { status: 404 });
+      }
       if (path === '/api/sessions' || path.startsWith('/api/sessions/') ||
           path === '/api/session-commands' || path.startsWith('/api/session-commands/')) {
         return this.sessionControlService.handle(request, await this.sessionControlAuth(request));

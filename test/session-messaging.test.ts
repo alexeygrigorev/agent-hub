@@ -21,7 +21,7 @@ async function fixture(fn: (ctx: { bus: BusService; sc: SessionControlService; s
   const stub = bindings.HUB.get(bindings.HUB.idFromName('session-messaging-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
     const sql = hub.sql;
-    const tx = (cb: any) => state.storage.transactionSync(cb);
+    const tx = <T,>(cb: () => T): T => state.storage.transactionSync(cb);
     const sc = new SessionControlService(sql, tx, Date.now, { reserve: () => ({ value: {}, status: 500 }) });
     sc.init();
     const bus = new BusService(sql, tx, {
@@ -149,5 +149,43 @@ describe('named agent credential', () => {
     const again: any = await (await call('/api/agents/named/developer/credential', human, {})).json();
     expect((await inbox(cred.access_token)).status).toBe(401);
     expect((await inbox(again.access_token)).status).toBe(200);
+  });
+});
+
+describe('per-session messaging credential (M2)', () => {
+  it('lets only the bound host mint a session credential that sends as the session, and revokes it when the session ends', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('session-cred-' + crypto.randomUUID()));
+    const hostToken = 'test-only-host-tabo'; const otherHost = 'test-only-host-other';
+    await runInDurableObject(stub, async (hub: Hub) => {
+      const at = new Date().toISOString(); const far = new Date(Date.now() + 86400000).toISOString();
+      for (const [id, machine, token] of [['cred-tabo', 'tabo', hostToken], ['cred-other', 'other', otherHost]]) {
+        hub.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
+          VALUES (?, 'host', ?, ?, ?, ?, ?, NULL, '["host"]', 't', ?, ?)`, id, await sha256(token), 'r-' + id, 'fam-' + id, machine, machine, at, far);
+        hub.sql.exec('INSERT INTO machines (id, name, hostname, credential_id, registered_at) VALUES (?, ?, ?, ?, ?)', machine, machine, machine, id, at);
+      }
+      hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES ('developer', 'agent', NULL, NULL, ?)", at);
+      hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+        VALUES (?, 'admin', 'k1', '{"workspace":"agent-hub"}', 'tabo', 'codex', 'interactive', 'running', ?, ?, ?)`, SESSION,
+        JSON.stringify({ native_id: NATIVE, tag: 'burn-tabo', workspace: 'C:\\repos\\agent-hub', generation: 1, native_created_at_ms: 1793180000000 }), at, at);
+    });
+    const call = (path: string, token: string, data?: any) => stub.fetch(new Request('https://hub.test' + path, {
+      method: data === undefined ? 'GET' : 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: data === undefined ? undefined : JSON.stringify(data) }));
+    const pending: any = await (await call('/api/session-messaging/credentials', hostToken)).json();
+    expect(pending.sessions).toEqual([{ session_id: SESSION, native_id: NATIVE, tag: 'burn-tabo', workspace: 'C:\\repos\\agent-hub' }]);
+    expect((await (await call('/api/session-messaging/credentials', otherHost)).json() as any).sessions).toEqual([]);
+    expect((await call('/api/session-messaging/credentials/' + SESSION, otherHost, {})).status).toBe(404);
+    const minted = await call('/api/session-messaging/credentials/' + SESSION, hostToken, {});
+    expect(minted.status).toBe(201);
+    const cred: any = await minted.json();
+    expect(cred.actor).toBe('session:' + SESSION);
+    expect((await (await call('/api/session-messaging/credentials', hostToken)).json() as any).sessions).toEqual([]);
+    const send = (from: string) => call('/api/bus/send', cred.access_token, { from_actor: from, to_actor: 'agent:developer', kind: 'note', body: 'hello from the Tabo session', idempotency_key: crypto.randomUUID() });
+    expect((await send('session:' + SESSION)).status).toBe(200);
+    expect((await send('agent:developer')).status).toBe(403); // never another identity
+    expect((await call('/api/session-messaging/credentials', cred.access_token)).status).toBe(403);
+    await runInDurableObject(stub, async (hub: Hub) => { hub.sql.exec("UPDATE session_control_sessions SET state = 'stopped'"); });
+    await call('/api/session-messaging/credentials', hostToken);
+    expect((await send('session:' + SESSION)).status).toBe(401);
   });
 });

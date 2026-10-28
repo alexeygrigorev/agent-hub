@@ -177,3 +177,46 @@ export function expireSessionMessages(sql: SqlStorage, now: number, machineId: s
     if (messageId && msg) setMessageState(sql, messageId, ended ? 'undeliverable' : 'expired', reason, null, machineId, now);
   }
 }
+
+const CREDENTIAL_TTL_MS = 24 * 3600 * 1000;
+const CREDENTIAL_RENEW_MS = 6 * 3600 * 1000;
+
+/** Bound, running sessions on this machine whose messaging credential is
+ * missing or due for renewal (docs/SESSION-MESSAGING.md §8, M2). */
+export function sessionsNeedingCredentials(sql: SqlStorage, machineId: string, now: number): { session_id: string; native_id: string; tag: string; workspace: string }[] {
+  const rows = sql.exec("SELECT id, binding_json FROM session_control_sessions WHERE machine_id = ? AND state = 'running' AND binding_json IS NOT NULL LIMIT 200", machineId).toArray() as any[];
+  const renewBy = new Date(now + CREDENTIAL_RENEW_MS).toISOString();
+  const out = [];
+  for (const row of rows) {
+    let binding: any = null;
+    try { binding = JSON.parse(row.binding_json); } catch {}
+    if (!binding?.native_id || !binding?.tag || !binding?.workspace) continue;
+    const live = sql.exec("SELECT 1 FROM credentials WHERE kind = 'agent' AND registry_actor = ? AND machine_id = ? AND revoked_at IS NULL AND expires_at > ? LIMIT 1",
+      `${SESSION_PROJECT}:${row.id}`, machineId, renewBy).toArray().length;
+    if (!live) out.push({ session_id: String(row.id), native_id: String(binding.native_id), tag: String(binding.tag), workspace: String(binding.workspace) });
+  }
+  return out.slice(0, 50);
+}
+
+/** Mint the session's own bus-only credential for its bound host; older
+ * families of the same session identity are revoked (one live identity). */
+export function mintSessionCredential(sql: SqlStorage, sessionId: string, machineId: string, tokens: { accessHash: string; refreshHash: string }, now: number): { actor: string; expires_at: string } | null {
+  const session: any = sql.exec("SELECT id, machine_id FROM session_control_sessions WHERE id = ? AND state = 'running' AND binding_json IS NOT NULL", sessionId).toArray()[0];
+  if (!session || session.machine_id !== machineId) return null;
+  const actor = ensureSessionIdentity(sql, sessionId, now);
+  const at = new Date(now).toISOString();
+  sql.exec("UPDATE credentials SET revoked_at = ? WHERE kind = 'agent' AND registry_actor = ? AND revoked_at IS NULL", at, actor);
+  const id = crypto.randomUUID();
+  const expires = new Date(now + CREDENTIAL_TTL_MS).toISOString();
+  sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
+    VALUES (?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, tokens.accessHash, tokens.refreshHash, id, actor, machineId, actor,
+    JSON.stringify(['bus:send', 'bus:read']), 'host:' + machineId, at, expires, actor);
+  return { actor, expires_at: expires };
+}
+
+/** A stopped or ended session's messaging identity stops working at once. */
+export function revokeEndedSessionCredentials(sql: SqlStorage, now: number): void {
+  const at = new Date(now).toISOString();
+  sql.exec(`UPDATE credentials SET revoked_at = ? WHERE kind = 'agent' AND revoked_at IS NULL AND registry_actor LIKE 'session:%'
+    AND NOT EXISTS (SELECT 1 FROM session_control_sessions s WHERE 'session:' || s.id = credentials.registry_actor AND s.state = 'running')`, at);
+}

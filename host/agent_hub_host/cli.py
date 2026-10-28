@@ -348,6 +348,8 @@ def main():
     p_update.add_argument("--install-dir", default=None, help="Directory to install the updated hub binary (default: current executable location or ~/.local/bin)")
     from . import routing
     routing.add_commands(sub)
+    from . import msg_cli
+    msg_cli.add_commands(sub)
     from . import conversations
     conversations.add_commands(sub)
     from . import intake
@@ -600,6 +602,15 @@ def main():
         except Exception as exc:
             print(webhooks_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
+        return
+    if args.cmd == 'msg':
+        from . import msg_cli
+        try:
+            print(json.dumps(msg_cli.execute(args), indent=2))
+        except Exception as exc:
+            # Bounded diagnostics only; never echo credentials.
+            print('hub msg failed: ' + str(exc)[:300], file=sys.stderr)
+            sys.exit(2 if 'status 4' in str(exc) or isinstance(exc, ValueError) else 4)
         return
     if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact', 'host-release'):
         try:

@@ -219,3 +219,40 @@ def relay_replies(*, journal_dir: str, executable: str, request: Callable,
                     record = fresh
                 relayed.append({"message_id": record["message_id"], "reply_id": (sent or {}).get("id")})
     return relayed
+
+
+_last_provision = [0.0]
+PROVISION_INTERVAL_S = 60.0
+
+
+def provision_credentials(request: Callable, base_url: Optional[str], *, auth_dir=None,
+                          clock: Callable[[], float] = time.monotonic, force: bool = False) -> list[str]:
+    """Mint and store each running session's own messaging credential
+    (docs/SESSION-MESSAGING.md §8). The file is owner-only, keyed by the
+    native session id the session sees as APLEXER_SESSION_ID, and never
+    enters the engine environment or a repository."""
+    if not force and clock() - _last_provision[0] < PROVISION_INTERVAL_S:
+        return []
+    _last_provision[0] = clock()
+    if not base_url:
+        return []
+    from .msg_cli import session_auth_dir
+    from . import private_fs
+    target_dir = auth_dir or session_auth_dir()
+    pending = (request("GET", "/api/session-messaging/credentials", None) or {}).get("sessions", [])
+    written = []
+    for row in pending[:50]:
+        sid, native = row.get("session_id"), str(row.get("native_id", "")).lower()
+        if not isinstance(sid, str) or len(native) != 36:
+            continue
+        minted = request("POST", "/api/session-messaging/credentials/" + sid, {})
+        if not isinstance(minted, dict) or not minted.get("access_token"):
+            continue
+        os.makedirs(target_dir, mode=0o700, exist_ok=True)
+        record = {"base_url": base_url, "client_kind": "agent", "actor": minted.get("actor"),
+                  "access_token": minted["access_token"], "refresh_token": minted.get("refresh_token"),
+                  "hub_session_id": sid}
+        private_fs.atomic_write(os.path.join(str(target_dir), native + ".json"),
+                                json.dumps(record).encode("utf-8"), 16384)
+        written.append(sid)
+    return written
