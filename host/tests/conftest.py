@@ -1,6 +1,5 @@
 import os
 import tempfile
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -82,18 +81,17 @@ def guard_worker_profile_writes(monkeypatch):
 
 @pytest.fixture(autouse=True, scope="session")
 def guard_real_worker_profiles():
-    """Detect writes in this checkout AND the canonical shared checkout."""
-    root = Path(__file__).resolve().parents[2]
-    common = subprocess.check_output(
-        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        cwd=root, text=True).strip()
-    directories = {root / ".local/hub-worker-auth",
-                   Path(common).parent / ".local/hub-worker-auth"}
-    before = {path: _snapshot_profile_dir(path) for path in directories}
+    """Watch this checkout; other live checkouts may legitimately refresh.
+
+    The pre-I/O guard above protects ALL non-temp profile paths, including
+    the canonical checkout. Watching its shared directory here would also
+    fail on unrelated real workers provisioning or refreshing credentials.
+    """
+    directory = Path(__file__).resolve().parents[2] / ".local/hub-worker-auth"
+    before = _snapshot_profile_dir(directory)
     yield
-    after = {path: _snapshot_profile_dir(path) for path in directories}
-    changed = [str(path / name) for path in directories
-               for name in set(before[path]) | set(after[path])
-               if before[path].get(name) != after[path].get(name)]
+    after = _snapshot_profile_dir(directory)
+    changed = sorted(name for name in set(before) | set(after)
+                     if before.get(name) != after.get(name))
     assert not changed, (
         "test session touched real hub-worker-auth profiles: " + ", ".join(changed))
