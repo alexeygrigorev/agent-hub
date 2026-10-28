@@ -454,7 +454,17 @@
       "go"
     ],
     "provider_preference": 1.3,
-    "reset_horizon_hours": 24,
+    "reset_horizon_hours": 168,
+    "burn_urgency_factor": 3,
+    "burn_min_cycle_hours": 24,
+    "burn_min_elapsed_hours": 12,
+    "burn_waste_alert_percent": 30,
+    "explicit_only_burn_release_percent": 30,
+    "explicit_only_burn_release_tiers": [
+      "daily",
+      "deep",
+      "review"
+    ],
     "reset_urgency_factor": 2.5,
     "headroom_floor": 0.05,
     "reserve_percent": {

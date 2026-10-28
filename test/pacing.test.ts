@@ -4,6 +4,7 @@ import { defaultEnv } from './m1-focus-setup';
 import type { Hub } from '../src/hub';
 import { ensureTbmQuotaSchema } from '../src/quota';
 import { modelCandidates, policy } from '../src/model-routing';
+import { burnForecast } from '../src/burn';
 import {
   bankedUrgencyMultiplier, baseTargetTpm, edfOrder, grokDemotion, hardFloorTokens, loadProviderPacing, netHeadroom,
   newPidState, pacingAlignment, pacingStep, providerPacing, providerPreference, refreshPacing, resetUrgency, routeScore,
@@ -289,8 +290,10 @@ describe('routing score factors', () => {
     const ads = [{ engine: 'opencode', profile: null, model: 'opencode-go/muse-spark-1.3-contributor', effort: null, account: 'g' }];
     const [neutral] = modelCandidates({ tier: 'daily' }, route, ads, quota, NOW) as any[];
     const urgency = resetUrgency(0.8, 2);
-    expect(neutral.factors).toEqual({ fit: 1, health: 1, preference: 1.3, headroom: 0.8, urgency, pacing: 1, grok: 1, banked: 1 });
-    expect(neutral.weight).toBeCloseTo(1.3 * 0.8 * urgency); expect(neutral.preempt).toBe(false);
+    const burn = burnForecast(quota, NOW)!.factor;
+    expect(burn).toBeGreaterThan(3);
+    expect(neutral.factors).toEqual({ fit: 1, health: 1, preference: 1.3, headroom: 0.8, urgency, pacing: 1, grok: 1, banked: 1, burn });
+    expect(neutral.weight).toBeCloseTo(1.3 * 0.8 * urgency * burn); expect(neutral.preempt).toBe(false);
     const lag = new Map([['go', { pacing: 2, banked: 3, preempt: true, halted: false }]]);
     const [boosted] = modelCandidates({ tier: 'daily' }, route, ads, quota, NOW, lag) as any[];
     expect(boosted.weight).toBeCloseTo(neutral.weight * 6); expect(boosted.preempt).toBe(true);
