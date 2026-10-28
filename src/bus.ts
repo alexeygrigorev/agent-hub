@@ -1,4 +1,12 @@
 import { registryAddress, registryRowSql } from './agent_registry';
+import { validateRef } from './session-messaging';
+/** Older writers could cut a metadata JSON string mid-escape. Keep the
+ * append-only row and expose an explicit unavailable-detail marker. */
+function messageEventDetail(value: string | null): any {
+  if (!value) return null;
+  try { return JSON.parse(value); } catch { return { invalid_json: true }; }
+}
+
 export interface SqlStorageCursor {
   toArray(): any[];
   [Symbol.iterator](): IterableIterator<any>;
@@ -34,8 +42,7 @@ export interface SendOpts {
   /** Session recipients only: 'tui' (inject into the terminal) or 'inbox'. */
   delivery?: string;
   deliverByMs?: number;
-  /** Validated `ref` JSON string (src/session-messaging validateRef). */
-  refJson?: string | null;
+  ref?: unknown;
 }
 
 /** Session-messaging seams (src/session-messaging.ts), run inside the send transaction. */
@@ -44,6 +51,9 @@ export interface BusSendHooks {
   /** Recipient scoping for session credentials (M2 AC4); throws RecipientError. */
   checkSendScope?(caller: CallerContext, senderActor: string, toActor: string, now: number): void;
   afterInsert(message: any, opts: SendOpts, now: number): void;
+  onStage?(messageId: string, state: string, actor: string | null, machineId: string | null, now: number): void;
+  onRefusal?(caller: CallerContext, opts: SendOpts, error: any): void;
+  onOverride?(messageId: string, caller: CallerContext, sender: string, now: number): void;
 }
 
 export const BUS_SCHEMA_SQL = `
@@ -101,7 +111,10 @@ export type BusAddress =
   | { kind: 'tag'; tag: string }
   | { kind: 'qualified'; project: string; tag: string }
   | { kind: 'role'; role: string }
-  | { kind: 'machine'; machineId: string };
+  | { kind: 'machine'; machineId: string }
+  | { kind: 'session'; sessionId: string }
+  | { kind: 'agent'; name: string }
+  | { kind: 'human'; sub: string };
 
 // One address segment: non-empty, no ':' separator, no whitespace or control characters.
 const ADDRESS_SEGMENT = /^[^\s:\x00-\x1f\x7f]+$/;
@@ -113,12 +126,20 @@ const ADDRESS_SEGMENT = /^[^\s:\x00-\x1f\x7f]+$/;
  */
 export function parseAddress(address: unknown): BusAddress | null {
   if (typeof address !== 'string' || address.length === 0 || address.length > 128) return null;
+  // Human subjects are opaque. Bootstrap subjects contain a ':' themselves;
+  // they still name one human and are never interpreted as registry projects.
+  if (address.startsWith('human:')) {
+    const sub = address.slice(6);
+    return sub && /^[^\s\x00-\x1f\x7f]+$/.test(sub) ? { kind: 'human', sub } : null;
+  }
   const parts = address.split(':');
   if (!parts.every(p => ADDRESS_SEGMENT.test(p))) return null;
   if (parts.length === 1) return { kind: 'tag', tag: parts[0] };
   if (parts.length !== 2) return null;
   if (parts[0] === 'role') return { kind: 'role', role: parts[1] };
   if (parts[0] === 'machine') return { kind: 'machine', machineId: parts[1] };
+  if (parts[0] === 'session') return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(parts[1]) ? { kind: 'session', sessionId: parts[1].toLowerCase() } : null;
+  if (parts[0] === 'agent') return registryAddress(address) ? { kind: 'agent', name: parts[1] } : null;
   return { kind: 'qualified', project: parts[0], tag: parts[1] };
 }
 
@@ -278,8 +299,10 @@ export class BusService {
     let rows: any[];
     if (addr.kind === 'tag') {
       rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE tag = ?', addr.tag).toArray();
-    } else if (addr.kind === 'qualified') {
-      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE project = ? AND tag = ?', addr.project, addr.tag).toArray();
+    } else if (addr.kind === 'qualified' || addr.kind === 'agent' || addr.kind === 'session') {
+      const project = addr.kind === 'qualified' ? addr.project : addr.kind;
+      const tag = addr.kind === 'qualified' ? addr.tag : addr.kind === 'agent' ? addr.name : addr.sessionId;
+      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE project = ? AND tag = ?', project, tag).toArray();
     } else if (addr.kind === 'role') {
       if (isRootRole(addr.role)) return null;
       rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE role = ?', addr.role).toArray();
@@ -295,7 +318,7 @@ export class BusService {
   private resolveAgentActor(actor: unknown): AgentIdentity | null {
     if (typeof actor !== 'string' || !registryAddress(actor)) return null;
     const addr = parseAddress(actor);
-    if (!addr || (addr.kind !== 'tag' && addr.kind !== 'qualified')) return null;
+    if (!addr || !['tag', 'qualified', 'session', 'agent'].includes(addr.kind)) return null;
     return this.resolveAgent(addr);
   }
 
@@ -371,8 +394,14 @@ export class BusService {
 
     // human:<sub> is a valid recipient when that human has a Hub login
     // (docs/SESSION-MESSAGING.md §3/§8); scoping decides which sessions may reach it.
-    if (addr.kind === 'qualified' && addr.project === 'human') {
-      try { return this.sql.exec('SELECT 1 FROM users WHERE sub = ?', addr.tag).toArray().length > 0; } catch { return false; }
+    if (addr.kind === 'human') {
+      try { return this.sql.exec('SELECT 1 FROM users WHERE sub = ?', addr.sub).toArray().length > 0; } catch { return false; }
+    }
+    if (this.hooks && addr.kind === 'session') {
+      return this.sql.exec("SELECT 1 FROM session_control_sessions WHERE id = ? AND state IN ('queued','held','offered','starting','running','uncertain')", addr.sessionId).toArray().length > 0;
+    }
+    if (this.hooks && addr.kind === 'agent') {
+      return this.sql.exec('SELECT 1 FROM named_agents WHERE name = ? AND disabled_at IS NULL', addr.name).toArray().length > 0;
     }
 
     return this.resolveAgent(addr) !== null;
@@ -453,8 +482,15 @@ export class BusService {
   }
 
   send(caller: CallerContext, opts: SendOpts): { id: string; threadId: string; thread_id: string } {
-    return this.runInTxn(() => {
+    try { return this.runInTxn(() => {
       const now = Date.now(); // internal server clock
+      const refJson = validateRef(opts.ref);
+      if (opts.delivery !== undefined && !['inbox', 'tui'].includes(opts.delivery)) throw new Error('invalid_delivery');
+      if (opts.deliverByMs !== undefined && (!Number.isSafeInteger(opts.deliverByMs) || opts.deliverByMs < 60000 || opts.deliverByMs > 7 * 86400000)) throw new Error('invalid_deliver_by');
+      const addressed = /^(session|human|agent):/.test(opts.toActor) || opts.toActor.includes('@') || /^(session|human|agent):/.test(opts.senderActor);
+      if (addressed && caller.kind !== 'host' && caller.actor && this.canonicalActor(opts.senderActor) !== this.canonicalActor(caller.actor)) {
+        throw new Error('from_actor_mismatch');
+      }
 
       if (new TextEncoder().encode(opts.body).length > 16384) {
         throw new Error("body_too_large");
@@ -478,7 +514,7 @@ export class BusService {
       }
       opts = { ...opts, senderActor: this.canonicalActor(opts.senderActor), toActor: this.canonicalActor(opts.toActor) };
       let existing = this.sql.exec(
-        'SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch, expires_at, ref_json FROM messages WHERE from_actor = ? AND idempotency_key = ?',
+        `SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch, expires_at${this.hooks ? ', ref_json, delivery, deliver_by, created_at' : ''} FROM messages WHERE from_actor = ? AND idempotency_key = ?`,
         opts.senderActor,
         opts.idempotencyKey
       ).toArray()[0] as any;
@@ -499,8 +535,9 @@ export class BusService {
           existing.kind !== opts.kind ||
           existing.reply_to !== expectedReplyTo ||
           existing.lease_epoch !== expectedLeaseEpoch ||
-          (opts.threadId !== undefined && existing.thread_id !== opts.threadId) ||
-          (existing.ref_json ?? null) !== (opts.refJson ?? null)
+          (this.hooks && ((existing.ref_json ?? null) !== refJson || (opts.delivery !== undefined && existing.delivery !== opts.delivery) ||
+            (opts.deliverByMs !== undefined && existing.deliver_by - existing.created_at !== opts.deliverByMs))) ||
+          (opts.threadId !== undefined && existing.thread_id !== opts.threadId)
         ) {
           throw new Error("conflict");
         }
@@ -533,13 +570,18 @@ export class BusService {
       const expiresAt = now + 30 * 24 * 3600 * 1000;
 
       this.sql.exec(`
-        INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, reply_to, body, idempotency_key, lease_epoch, created_at, expires_at, ref_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, id, opts.senderActor, opts.toActor, opts.kind, threadId, opts.replyTo || null, opts.body, opts.idempotencyKey, opts.leaseEpoch ?? null, now, expiresAt, opts.refJson ?? null);
+        INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, reply_to, body, idempotency_key, lease_epoch, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, id, opts.senderActor, opts.toActor, opts.kind, threadId, opts.replyTo || null, opts.body, opts.idempotencyKey, opts.leaseEpoch ?? null, now, expiresAt);
       if (this.hooks) this.hooks.afterInsert({ id, from_actor: opts.senderActor, to_actor: opts.toActor, kind: opts.kind, thread_id: threadId, reply_to: opts.replyTo || null, body: opts.body }, opts, now);
+      if (caller.isAdmin && opts.senderActor !== caller.actor) this.hooks?.onOverride?.(id, caller, opts.senderActor, now);
 
       return { id, threadId, thread_id: threadId };
-    });
+    }); } catch (error) {
+      // Refusal audit must survive the send transaction's rollback.
+      this.hooks?.onRefusal?.(caller, opts, error);
+      throw error;
+    }
   }
 
   /**
@@ -573,18 +615,32 @@ export class BusService {
         params.push(filters.thread);
       }
       if (cursor) {
-        query += ' AND id > ?';
-        params.push(cursor);
+        if (this.hooks) {
+          const legacy = /^\d+$/.test(cursor) ? null : this.sql.exec('SELECT recipient_seq FROM messages WHERE id = ? AND to_actor IN (' + aliases.map(() => '?').join(',') + ')', cursor, ...aliases).toArray()[0];
+          if (legacy && legacy.recipient_seq == null) {
+            query += ' AND ((recipient_seq IS NULL AND id > ?) OR recipient_seq IS NOT NULL)';
+            params.push(cursor);
+          } else {
+            const seq = /^\d+$/.test(cursor) ? Number(cursor) : Number(legacy?.recipient_seq);
+            if (!Number.isSafeInteger(seq) || seq < 0) throw new Error('invalid_cursor');
+            query += ' AND recipient_seq > ?';
+            params.push(seq);
+          }
+        } else {
+          query += ' AND id > ?';
+          params.push(cursor);
+        }
       }
-      query += ' ORDER BY id ASC LIMIT ?';
+      query += this.hooks ? ' ORDER BY recipient_seq ASC, id ASC LIMIT ?' : ' ORDER BY id ASC LIMIT ?';
       params.push(limit);
 
       const rows = this.sql.exec(query, ...params).toArray() as any[];
       if (this.isRecipientPrincipal(caller, actor, now)) {
         for (const row of rows) {
-          if (row.delivered_at) continue;
+          if (row.delivered_at || row.to_session_id) continue;
           this.sql.exec('UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL', now, row.id);
           row.delivered_at = now;
+          this.hooks?.onStage?.(row.id, 'delivered', caller.actor ?? null, caller.machineId ?? null, now);
         }
       }
       return rows;
@@ -599,11 +655,13 @@ export class BusService {
     return this.runInTxn(() => {
       let marked = 0;
       for (const id of ids.slice(0, 100)) {
-        const msg = this.sql.exec('SELECT to_actor, registry_unbound_to, expires_at, read_at FROM messages WHERE id = ?', id).toArray()[0] as any;
+        const msg = this.sql.exec('SELECT to_actor, registry_unbound_to, expires_at, read_at, to_session_id FROM messages WHERE id = ?', id).toArray()[0] as any;
         if (!msg || msg.expires_at <= now) continue;
+        if (msg.to_session_id && caller.kind === 'host') continue;
         if (!this.isAuthorizedForStoredActor({ ...caller, isAdmin: false }, msg.to_actor, now, !!msg.registry_unbound_to)) continue;
         if (msg.read_at) continue;
         this.sql.exec('UPDATE messages SET delivered_at = COALESCE(delivered_at, ?), read_at = ? WHERE id = ? AND read_at IS NULL', now, now, id);
+        this.hooks?.onStage?.(id, 'read', caller.actor ?? null, caller.machineId ?? null, now);
         marked++;
       }
       return { marked };
@@ -622,7 +680,7 @@ export class BusService {
       if (!caller.isAdmin && !this.isAuthorizedForStoredActor(caller, msg.to_actor, now, !!msg.registry_unbound_to) && !this.isAuthorizedForStoredActor(caller, msg.from_actor, now, !!msg.registry_unbound_from)) {
         throw new Error("unauthorized");
       }
-      if (this.isAuthorizedForStoredActor({ ...caller, isAdmin: false }, msg.to_actor, now, !!msg.registry_unbound_to)) {
+      if (!(msg.to_session_id && caller.kind === 'host') && this.isAuthorizedForStoredActor({ ...caller, isAdmin: false }, msg.to_actor, now, !!msg.registry_unbound_to)) {
         if (!msg.delivered_at) {
           this.sql.exec('UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL', now, messageId);
           msg.delivered_at = now;
@@ -630,6 +688,7 @@ export class BusService {
         if (!msg.read_at) {
           this.sql.exec('UPDATE messages SET read_at = ? WHERE id = ? AND read_at IS NULL', now, messageId);
           msg.read_at = now;
+          this.hooks?.onStage?.(msg.id, 'read', caller.actor ?? null, caller.machineId ?? null, now);
         }
       }
       return msg;
@@ -641,20 +700,28 @@ export class BusService {
   status(caller: CallerContext, messageId: string): any {
     const now = Date.now();
     const msg = this.sql.exec('SELECT * FROM messages WHERE id = ? AND expires_at > ?', messageId, now).toArray()[0] as any;
-    if (!msg) throw new Error("not_found");
+    if (!msg) {
+      if (!this.hooks) throw new Error('not_found');
+      const events = this.sql.exec('SELECT event, actor, machine_id, at, detail_json FROM message_events WHERE message_id = ? AND at >= ? ORDER BY id LIMIT 200', messageId, now - 180 * 86400000).toArray()
+        .map((e: any) => ({ event: e.event, actor: e.actor, machine_id: e.machine_id, at: e.at, detail: messageEventDetail(e.detail_json) }));
+      const first = events.find(e => e.event === 'accepted');
+      if (!first) throw new Error('not_found');
+      if (!caller.isAdmin && ![first.actor, first.detail?.to].some(a => typeof a === 'string' && this.isAuthorizedForActor(caller, a, now))) throw new Error('unauthorized');
+      return { id: messageId, from_actor: first.actor, to_actor: first.detail?.to, body_expired: true, events };
+    }
     if (!caller.isAdmin && !this.isAuthorizedForStoredActor(caller, msg.to_actor, now, !!msg.registry_unbound_to) && !this.isAuthorizedForStoredActor(caller, msg.from_actor, now, !!msg.registry_unbound_from)) {
       throw new Error("unauthorized");
     }
     const { body: _body, ...meta } = msg;
     const events = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='message_events'").toArray().length
       ? this.sql.exec('SELECT event, actor, machine_id, at, detail_json FROM message_events WHERE message_id = ? ORDER BY id LIMIT 200', messageId).toArray()
-        .map((e: any) => ({ event: e.event, actor: e.actor, machine_id: e.machine_id, at: e.at, detail: e.detail_json ? JSON.parse(e.detail_json) : null }))
+        .map((e: any) => ({ event: e.event, actor: e.actor, machine_id: e.machine_id, at: e.at, detail: messageEventDetail(e.detail_json) }))
       : [];
     return { ...meta, events };
   }
 
   private updateMessageStage(caller: CallerContext, messageId: string, stage: 'delivered_at' | 'read_at' | 'acked_at' | 'accepted_at' | 'completed_at', now: number = Date.now(), leaseEpoch?: number) {
-    const msg = this.sql.exec('SELECT to_actor, registry_unbound_to, delivered_at, read_at, acked_at, accepted_at, completed_at, expires_at FROM messages WHERE id = ?', messageId).toArray()[0] as any;
+    const msg = this.sql.exec('SELECT * FROM messages WHERE id = ?', messageId).toArray()[0] as any;
     if (!msg || msg.expires_at <= Date.now()) throw new Error("not_found");
 
     if (isRootRoleAddress(msg.to_actor) || isRootRoleAddress(caller.actor)) {
@@ -666,6 +733,8 @@ export class BusService {
     if (!this.isAuthorizedForStoredActor({ ...caller, isAdmin: false }, msg.to_actor, now, !!msg.registry_unbound_to)) {
       throw new Error("unauthorized");
     }
+    if (msg.to_session_id && caller.kind === 'host') throw new Error('unauthorized');
+    if (this.hooks && ['expired', 'undeliverable'].includes(msg.state)) throw new Error('invalid_stage');
 
     if (stage === 'read_at' && !msg.delivered_at) throw new Error("invalid_stage");
     if (stage === 'acked_at' && !msg.read_at && !msg.delivered_at) throw new Error("invalid_stage");
@@ -676,13 +745,15 @@ export class BusService {
     if (msg[stage]) return;
 
     this.sql.exec(`UPDATE messages SET ${stage} = ? WHERE id = ?`, now, messageId);
+    const state = { delivered_at: 'delivered', read_at: 'read', acked_at: 'acked', accepted_at: 'accepted_work', completed_at: 'completed' }[stage];
+    this.hooks?.onStage?.(messageId, state, caller.actor ?? null, caller.machineId ?? null, now);
   }
 
-  deliver(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.updateMessageStage(caller, messageId, 'delivered_at', now, leaseEpoch); }
-  read(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.updateMessageStage(caller, messageId, 'read_at', now, leaseEpoch); }
-  ack(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.updateMessageStage(caller, messageId, 'acked_at', now, leaseEpoch); }
-  accept(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.updateMessageStage(caller, messageId, 'accepted_at', now, leaseEpoch); }
-  complete(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.updateMessageStage(caller, messageId, 'completed_at', now, leaseEpoch); }
+  deliver(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.runInTxn(() => this.updateMessageStage(caller, messageId, 'delivered_at', now, leaseEpoch)); }
+  read(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.runInTxn(() => this.updateMessageStage(caller, messageId, 'read_at', now, leaseEpoch)); }
+  ack(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.runInTxn(() => this.updateMessageStage(caller, messageId, 'acked_at', now, leaseEpoch)); }
+  accept(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.runInTxn(() => this.updateMessageStage(caller, messageId, 'accepted_at', now, leaseEpoch)); }
+  complete(caller: CallerContext, messageId: string, now: number = Date.now(), leaseEpoch?: number) { this.runInTxn(() => this.updateMessageStage(caller, messageId, 'completed_at', now, leaseEpoch)); }
 
   claim(caller: CallerContext, project: string, scope: string, holder: string, ttlMs: number, now: number = Date.now(), leaseEpoch?: number): { id: string } {
     const effectiveNow = Date.now(); // internal server clock

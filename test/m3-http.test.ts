@@ -503,13 +503,13 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
   });
 
   it('6. Validation Boundaries: 16 KiB body limit, malformed pagination, unknown fields, address validation', async () => {
-    // A. 16 KiB limit: total JSON <= 16384 bytes accepted, > 16384 rejected with 413
+    // A. M1: decoded body is limited to 16384 UTF-8 bytes; JSON framing is extra.
     const prefix = '{"from_actor":"worker-1","to_actor":"worker-2","kind":"note","body":"';
     const suffix = '","idempotency_key":"size-16k-b"}';
     const overhead = prefix.length + suffix.length;
-    const okBody = 'x'.repeat(16384 - overhead);
+    const okBody = 'x'.repeat(16384);
     const okPayload = prefix + okBody + suffix;
-    expect(okPayload.length).toBe(16384);
+    expect(okPayload.length).toBe(16384 + overhead);
 
     const okRes = await doFetch(new Request('http://example.com/api/bus/send', {
       method: 'POST',
@@ -519,7 +519,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     expect(okRes.status).toBe(200);
 
     const overPayload = prefix + okBody + 'y' + suffix;
-    expect(overPayload.length).toBe(16385);
+    expect(overPayload.length).toBe(16385 + overhead);
     const overRes = await doFetch(new Request('http://example.com/api/bus/send', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer token_host_a', 'Content-Type': 'application/json' },
