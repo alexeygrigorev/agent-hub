@@ -347,7 +347,16 @@ M1–M3, M5 and M6 may be done by any implementer, in dependency order.
 - Storage: `<workspace>/.local/hub-session-auth/<native_id>.json`, written via
   `private_fs` (0600 on Linux, owner-only ACL on Windows). The CLI finds it
   through `APLEXER_SESSION_ID` + `APLEXER_WORKSPACE`, which aplexer already
-  sets; no token goes into the engine environment.
+  sets; no token goes into the engine environment. `.local` is gitignored, so
+  no repository sees the token.
+- Scopes are minted as `msg:send msg:read`; the bus messaging routes accept
+  the legacy `bus:*` vocabulary and `msg:*` alike (session credentials).
+- The refresh family is refreshable (`POST /api/token/refresh`) exactly while
+  the session is still running on the machine the credential was minted for;
+  a stop or rebind revokes every family of the session immediately (bind/stop
+  transitions) and the refresh guard enforces it again at use time.
+- Cross-project grants: `GET/POST /api/session-messaging/settings` (operator
+  only) reads/writes `{"cross_project_allow": {"<project>": true}}`.
 - **Project scoping.** A session credential may send to sessions of its own
   project, to named agents (§9), to `human:*` actors that are Hub operators,
   and to existing bus
@@ -472,11 +481,12 @@ How it maps onto the design:
 - Replies from a session: either `hub msg reply <id>` with the session's own
   credential, or the native `a message reply <envelope> "text"`, which the host
   relays as `session:<uuid>` (§6). The rendered TUI text names both.
-- Session credentials live in the user's state directory
-  (`~/.local/state/agent-hub/session-auth/<native-id>.json`,
-  `%LOCALAPPDATA%\agent-hub\session-auth\` on Windows), not in the workspace,
-  so no repository ever sees them. `hub msg` finds them via
-  `APLEXER_SESSION_ID`; an explicit `HUB_CONFIG_FILE` wins.
+- Session credentials live in the session's own workspace
+  (`<workspace>/.local/hub-session-auth/<native-id>.json`, owner-only via
+  `private_fs`; `.local` is gitignored), never in the engine environment or a
+  repository. `hub msg` finds them via `APLEXER_SESSION_ID` +
+  `APLEXER_WORKSPACE`; an explicit `HUB_CONFIG_FILE` wins. The bound host
+  mints through `POST /api/sessions/:id/messaging-credential` (host token).
 - Developer identity: `hub msg agent-credential developer --output
   ~/.config/agent-hub/developer.json` (operator), then `hub msg --profile
   developer inbox|send|reply`. Through hub-mcp, the human login sends with

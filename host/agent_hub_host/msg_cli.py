@@ -27,12 +27,11 @@ PROFILE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 CREDENTIAL_LIMIT = 16384
 
 
-def session_auth_dir() -> Path:
-    """Per-user directory the host writes session credentials into."""
-    if sys.platform == 'win32':
-        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~\\AppData\\Local')
-        return Path(base) / 'agent-hub' / 'session-auth'
-    return Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'agent-hub' / 'session-auth'
+def session_auth_dir(workspace: str) -> Path:
+    """The session's private credential directory inside its own workspace
+    (``<workspace>/.local/hub-session-auth``, docs/SESSION-MESSAGING.md §8);
+    ``.local`` is gitignored and private_fs writes owner-only files."""
+    return Path(workspace) / '.local' / 'hub-session-auth'
 
 
 def profile_path(name: str) -> Path:
@@ -55,10 +54,10 @@ def resolve_identity(profile: str | None) -> tuple[str | None, str]:
         path, source = profile_path(profile), 'profile:' + profile
         if not path.is_file():
             raise ValueError('No such profile; ask an operator for `hub msg agent-credential`')
-    elif os.environ.get('APLEXER_SESSION_ID') and not os.environ.get('HUB_CONFIG_FILE'):
+    elif os.environ.get('APLEXER_SESSION_ID') and os.environ.get('APLEXER_WORKSPACE') and not os.environ.get('HUB_CONFIG_FILE'):
         native = os.environ['APLEXER_SESSION_ID'].strip().lower()
         if re.fullmatch(r'[0-9a-f-]{36}', native):
-            candidate = session_auth_dir() / (native + '.json')
+            candidate = session_auth_dir(os.environ['APLEXER_WORKSPACE']) / (native + '.json')
             if candidate.is_file():
                 path, source = candidate, 'session'
     if path is None:

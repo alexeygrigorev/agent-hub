@@ -228,9 +228,11 @@ PROVISION_INTERVAL_S = 120.0
 def provision_credentials(request: Callable, base_url: Optional[str], *, auth_dir=None,
                           clock: Callable[[], float] = time.monotonic, force: bool = False) -> list[str]:
     """Mint and store each running session's own messaging credential
-    (docs/SESSION-MESSAGING.md §8). The file is owner-only, keyed by the
-    native session id the session sees as APLEXER_SESSION_ID, and never
-    enters the engine environment or a repository."""
+    (docs/SESSION-MESSAGING.md §8). The file lands owner-only in the session's
+    own workspace at ``<workspace>/.local/hub-session-auth/<native_id>.json``
+    — the location ``hub msg`` re-finds via APLEXER_SESSION_ID +
+    APLEXER_WORKSPACE — and never enters the engine environment or a
+    repository (``.local`` is gitignored)."""
     if not force and clock() - _last_provision[0] < PROVISION_INTERVAL_S:
         return []
     _last_provision[0] = clock()
@@ -238,16 +240,17 @@ def provision_credentials(request: Callable, base_url: Optional[str], *, auth_di
         return []
     from .msg_cli import session_auth_dir
     from . import private_fs
-    target_dir = auth_dir or session_auth_dir()
     pending = (request("GET", "/api/session-messaging/credentials", None) or {}).get("sessions", [])
     written = []
     for row in pending[:10]:
         sid, native = row.get("session_id"), str(row.get("native_id", "")).lower()
-        if not isinstance(sid, str) or len(native) != 36:
+        workspace = row.get("workspace")
+        if not isinstance(sid, str) or len(native) != 36 or not isinstance(workspace, str) or not workspace:
             continue
-        minted = request("POST", "/api/session-messaging/credentials/" + sid, {})
+        minted = request("POST", "/api/sessions/" + sid + "/messaging-credential", {})
         if not isinstance(minted, dict) or not minted.get("access_token"):
             continue
+        target_dir = auth_dir or session_auth_dir(workspace)
         os.makedirs(target_dir, mode=0o700, exist_ok=True)
         record = {"base_url": base_url, "client_kind": "agent", "actor": minted.get("actor"),
                   "access_token": minted["access_token"], "refresh_token": minted.get("refresh_token"),

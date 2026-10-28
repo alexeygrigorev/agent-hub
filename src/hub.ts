@@ -1,4 +1,4 @@
-import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials } from './session-messaging';
+import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent } from './session-messaging';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
 import { RepoRegistry } from './repos';
@@ -166,6 +166,7 @@ export class Hub extends DurableObject {
     initSessionMessaging(this.sql);
     this.busService = new BusService(this.sql, txSync, {
       resolveRecipient: (toActor, now) => resolveRecipient(this.sql, toActor, now),
+      checkSendScope: (caller, senderActor, toActor, now) => checkSendScoping(this.sql, caller, senderActor, toActor, now),
       afterInsert: (message, opts, now) => afterMessageInsert(this.sql, message, { delivery: opts.delivery, deliverByMs: opts.deliverByMs, now }),
     });
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
@@ -778,7 +779,27 @@ export class Hub extends DurableObject {
       // Per-session messaging credentials (docs/SESSION-MESSAGING.md §8, M2):
       // the bound host asks which of its running sessions need one and mints
       // each; the token goes only to that host, which stores it privately.
-      if (path === '/api/session-messaging/credentials' || path.startsWith('/api/session-messaging/credentials/')) {
+      if (path === '/api/session-messaging/settings') {
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        if (!auth.caller?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+        if (request.method === 'GET') return Response.json(messagingSettings(this.sql));
+        if (request.method === 'POST') {
+          const body = await safeJson(request);
+          if (!body || typeof body !== 'object' || Array.isArray(body)) return Response.json({ error: 'invalid_body' }, { status: 400 });
+          const patch: any = {};
+          if (body.cross_project_allow !== undefined) {
+            if (!body.cross_project_allow || typeof body.cross_project_allow !== 'object' || Array.isArray(body.cross_project_allow)) {
+              return Response.json({ error: 'invalid_cross_project_allow' }, { status: 400 });
+            }
+            patch.cross_project_allow = body.cross_project_allow;
+          }
+          return this.ctx.storage.transactionSync(() => Response.json(updateMessagingSettings(this.sql, patch)));
+        }
+        return Response.json({ error: 'not_found' }, { status: 404 });
+      }
+      if (path === '/api/session-messaging/credentials' || path.startsWith('/api/session-messaging/credentials/') ||
+          /^\/api\/sessions\/[0-9a-f-]{36}\/messaging-credential$/.test(path)) {
         const auth = await this.authenticateBusRequest(request);
         if (auth.error) return auth.error;
         const caller: any = auth.caller;
@@ -792,7 +813,11 @@ export class Hub extends DurableObject {
             return Response.json({ sessions: sessionsNeedingCredentials(this.sql, caller.machineId, now) });
           });
         }
-        const m = /^\/api\/session-messaging\/credentials\/([0-9a-f-]{36})$/.exec(path);
+        // Spec path (AC1): POST /api/sessions/:id/messaging-credential. The
+        // /api/session-messaging/credentials/:id spelling stays as an alias
+        // for hosts provisioned before the rename.
+        const m = /^\/api\/sessions\/([0-9a-f-]{36})\/messaging-credential$/.exec(path)
+          || /^\/api\/session-messaging\/credentials\/([0-9a-f-]{36})$/.exec(path);
         if (m && request.method === 'POST') {
           await safeJson(request);
           const tokens = await generateTokenPair();
@@ -1605,6 +1630,14 @@ export class Hub extends DurableObject {
     }
   }
 
+  /** Refusal audit (M2 AC4): written after the send transaction rolled back,
+   * so the event survives the refusal it records. */
+  private auditSendRefusal(e: ScopingRefusal, fromActor: string | null, machineId: string | null): void {
+    try {
+      messageEvent(this.sql, 'refused-' + crypto.randomUUID(), 'send_refused', fromActor, machineId, Date.now(), e.detail);
+    } catch { /* audit is best-effort; the refusal response stands */ }
+  }
+
   protected async refreshCredential(request: Request, binding?: { client: string; resource: string }): Promise<Response> {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const body = await safeJson(request);
@@ -1627,6 +1660,9 @@ export class Hub extends DurableObject {
       this.ctx.storage.transactionSync(() => {
       const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash = ?', refreshHash).toArray()[0] as any;
       const nowMs = Date.parse(now);
+      // Session messaging credentials (M2): the refresh family lives exactly
+      // as long as the session runs on its minted machine, never by the clock.
+      const sessionActor = Boolean(cred && sessionIdOf(cred.registry_actor || ''));
       const worker = cred ? workerRefreshContext(this.sql, cred.id, nowMs) : null;
       let workerScoped = false; try { workerScoped = JSON.parse(cred?.scopes || '[]').includes(WORKER_SCOPE); } catch {}
       const hasMcp = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_grants'").toArray().length > 0;
@@ -1645,7 +1681,11 @@ export class Hub extends DurableObject {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (workerScoped && !worker) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-      } else if (!worker && (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs)) {
+      } else if (sessionActor && !sessionRefreshAllowed(this.sql, cred.registry_actor, cred.machine_id)) {
+        // Stopped or rebound session: revoke the family so it cannot come back.
+        this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+      } else if (!worker && !sessionActor && (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs)) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (cred.kind === 'agent' && !credentialActor(this.sql, cred)) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
@@ -1655,7 +1695,8 @@ export class Hub extends DurableObject {
         this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else {
-        const accessExpiresAt = worker ? new Date(Math.min(nowMs + 3600000, worker.expires_at)).toISOString() : cred.expires_at;
+        const accessExpiresAt = worker ? new Date(Math.min(nowMs + 3600000, worker.expires_at)).toISOString()
+          : sessionActor ? new Date(nowMs + 3600000).toISOString() : cred.expires_at;
         const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
         if (res.rowsWritten !== 1) {
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
@@ -2350,7 +2391,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('msg:send') && !auth.scopes?.includes('admin')) { // msg:* = session messaging credentials (M2)
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
@@ -2412,6 +2453,10 @@ export class Hub extends DurableObject {
         if (e.message === 'invalid_lease_epoch') return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
         if (e.message === 'unknown_recipient') return Response.json({ error: 'unknown_recipient' }, { status: 404 });
         if (e instanceof RecipientError && e.message === 'ambiguous_recipient') return Response.json({ error: 'ambiguous_recipient', candidates: e.candidates }, { status: 409 });
+        if (e instanceof ScopingRefusal) {
+          this.auditSendRefusal(e, body.from_actor ?? null, auth.caller?.machineId ?? null);
+          return Response.json({ error: 'cross_project_forbidden' }, { status: 403 });
+        }
         if (e.message === 'invalid_reply_to') return Response.json({ error: 'invalid_reply_to' }, { status: 400 });
         return Response.json({ error: 'Internal Server Error' }, { status: 500 });
       }
@@ -2422,7 +2467,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('msg:send') && !auth.scopes?.includes('admin')) { // msg:* = session messaging credentials (M2)
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
@@ -2472,6 +2517,10 @@ export class Hub extends DurableObject {
         if (e.message === 'invalid_lease_epoch') return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
         if (e.message === 'invalid_reply_to') return Response.json({ error: 'invalid_reply_to' }, { status: 400 });
         if (e.message === 'unknown_recipient') return Response.json({ error: 'unknown_recipient' }, { status: 404 });
+        if (e instanceof ScopingRefusal) {
+          this.auditSendRefusal(e, body.from_actor ?? null, auth.caller?.machineId ?? null);
+          return Response.json({ error: 'cross_project_forbidden' }, { status: 403 });
+        }
         return Response.json({ error: 'Internal Server Error' }, { status: 500 });
       }
     }
@@ -2481,7 +2530,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('msg:read') && !auth.scopes?.includes('admin')) { // msg:* = session messaging credentials (M2)
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
@@ -2945,7 +2994,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('msg:send') && !auth.scopes?.includes('admin')) { // msg:* = session messaging credentials (M2)
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
@@ -2985,7 +3034,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('msg:read') && !auth.scopes?.includes('admin')) { // msg:* = session messaging credentials (M2)
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
       try {
@@ -3003,7 +3052,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('msg:read') && !auth.scopes?.includes('admin')) { // msg:* = session messaging credentials (M2)
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 

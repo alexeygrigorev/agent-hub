@@ -28,11 +28,12 @@ class MsgCliTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
+        self.workspace = self.home / "ws"  # the session's own (gitignored .local) workspace
         patcher = mock.patch.dict(os.environ, {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "cfg"),
                                                "XDG_STATE_HOME": str(self.home / "state"), "LOCALAPPDATA": str(self.home / "local")}, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in ("HUB_CONFIG_FILE", "APLEXER_SESSION_ID", "HUB_TOKEN", "HUB_JOB_TOKEN"):
+        for key in ("HUB_CONFIG_FILE", "APLEXER_SESSION_ID", "APLEXER_WORKSPACE", "HUB_TOKEN", "HUB_JOB_TOKEN"):
             os.environ.pop(key, None)
         self.calls = []
 
@@ -47,8 +48,8 @@ class MsgCliTest(unittest.TestCase):
     def fake_request(self, method, path, payload=None):
         self.calls.append((method, path, payload, os.environ.get("HUB_CONFIG_FILE")))
         if path == "/api/session-messaging/credentials":
-            return {"sessions": [{"session_id": HUB_SESSION, "native_id": NATIVE, "tag": "t", "workspace": "/w"}]}
-        if path.startswith("/api/session-messaging/credentials/"):
+            return {"sessions": [{"session_id": HUB_SESSION, "native_id": NATIVE, "tag": "t", "workspace": str(self.workspace)}]}
+        if path == "/api/sessions/" + HUB_SESSION + "/messaging-credential":
             return {"actor": "session:" + HUB_SESSION, "access_token": "hubt_secret", "refresh_token": "hubr_secret"}
         if path.startswith("/api/bus/messages/"):
             return {"id": "m1", "from_actor": "agent:developer", "to_actor": "session:" + HUB_SESSION}
@@ -57,12 +58,16 @@ class MsgCliTest(unittest.TestCase):
     def test_host_provisions_a_private_session_file_and_the_session_sends_as_itself(self):
         written = session_messages.provision_credentials(self.fake_request, "https://hub.example", force=True)
         self.assertEqual(written, [HUB_SESSION])
-        path = msg_cli.session_auth_dir() / (NATIVE + ".json")
+        # AC3: <workspace>/.local/hub-session-auth/<native_id>.json, owner-only.
+        path = msg_cli.session_auth_dir(str(self.workspace)) / (NATIVE + ".json")
+        self.assertEqual(path, self.workspace / ".local" / "hub-session-auth" / (NATIVE + ".json"))
         stored = json.loads(path.read_text())
         self.assertEqual(stored["actor"], "session:" + HUB_SESSION)
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        # The CLI finds it through APLEXER_SESSION_ID + APLEXER_WORKSPACE only.
         os.environ["APLEXER_SESSION_ID"] = NATIVE
+        os.environ["APLEXER_WORKSPACE"] = str(self.workspace)
         with mock.patch("agent_hub_host.bus._do_request", side_effect=self.fake_request):
             result = self.run_cli(["msg", "send", "--to", "agent:developer", "--body", "hi"])
             self.assertEqual(result["from"], "session:" + HUB_SESSION)
@@ -73,6 +78,11 @@ class MsgCliTest(unittest.TestCase):
             reply = self.run_cli(["msg", "reply", "m1", "--body", "pong"])
             self.assertEqual(self.calls[-1][2]["to_actor"], "agent:developer")
             self.assertEqual(reply["from"], "session:" + HUB_SESSION)
+        # Without APLEXER_WORKSPACE the session file is not discovered.
+        del os.environ["APLEXER_WORKSPACE"]
+        os.environ.pop("HUB_CONFIG_FILE", None)
+        with mock.patch("agent_hub_host.bus._do_request", side_effect=self.fake_request):
+            self.assertEqual(self.run_cli(["msg", "whoami"]), {"actor": None, "source": "default"})
 
     def test_named_profile_and_default_identity(self):
         profile = Path(os.environ["XDG_CONFIG_HOME"]) / "agent-hub" / "developer.json"

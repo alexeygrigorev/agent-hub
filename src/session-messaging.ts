@@ -41,6 +41,28 @@ export function initSessionMessaging(sql: SqlStorage): void {
   const commandCols = new Set(sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_commands'").toArray().length
     ? sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)) : []);
   if (commandCols.size && !commandCols.has('not_before')) sql.exec('ALTER TABLE session_control_commands ADD COLUMN not_before TEXT');
+  // Operator messaging configuration (docs/SESSION-MESSAGING.md §8): today only
+  // cross_project_allow, the per-recipient-project grant for session senders.
+  sql.exec('CREATE TABLE IF NOT EXISTS messaging_settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)');
+}
+
+export type MessagingSettings = { cross_project_allow?: Record<string, boolean> };
+
+export function messagingSettings(sql: SqlStorage): MessagingSettings {
+  const row: any = sql.exec('SELECT data FROM messaging_settings WHERE id = 1').toArray()[0];
+  try { const data = JSON.parse(row?.data || '{}'); return data && typeof data === 'object' ? data : {}; } catch { return {}; }
+}
+
+export function updateMessagingSettings(sql: SqlStorage, patch: MessagingSettings): MessagingSettings {
+  const merged = { ...messagingSettings(sql), ...patch };
+  sql.exec('INSERT INTO messaging_settings (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data', JSON.stringify(merged));
+  return merged;
+}
+
+/** The recipient project explicitly grants cross-project sends from sessions. */
+export function crossProjectAllowed(sql: SqlStorage, project: string | null): boolean {
+  if (!project) return false;
+  return messagingSettings(sql).cross_project_allow?.[project] === true;
 }
 
 const EVENT_RETENTION_MS = 180 * 24 * 3600 * 1000;
@@ -61,6 +83,13 @@ export function setMessageState(sql: SqlStorage, messageId: string, state: strin
 
 export class RecipientError extends Error {
   constructor(code: string, public candidates?: string[]) { super(code); }
+}
+
+/** A project-scoping refusal (M2 AC4). Auditing happens at the API boundary
+ * (hub.ts route catch), OUTSIDE the rolled-back send transaction — an audit
+ * row written inside the transaction would be rolled back with the refusal. */
+export class ScopingRefusal extends RecipientError {
+  constructor(public detail: Record<string, unknown>) { super('cross_project_forbidden'); }
 }
 
 function liveSession(sql: SqlStorage, id: string): any {
@@ -107,6 +136,77 @@ export function sessionIdOf(actor: string): string | null {
   if (!actor.startsWith(SESSION_PROJECT + ':')) return null;
   const id = actor.slice(SESSION_PROJECT.length + 1);
   return UUID.test(id) ? id : null;
+}
+
+/** A session's project comes from its linked intake task; null when unlinked
+ * or projectless (session_control derives it the same way). */
+export function sessionProject(sql: SqlStorage, sessionId: string): string | null {
+  const row: any = sql.exec('SELECT request_json FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
+  let req: any = null;
+  try { req = JSON.parse(row?.request_json || '{}'); } catch { return null; }
+  const taskId = typeof req?.intake_task_id === 'string' && req.intake_task_id ? req.intake_task_id : null;
+  if (!taskId) return null;
+  try {
+    const task: any = sql.exec('SELECT data FROM intake_tasks WHERE id = ?', taskId).toArray()[0];
+    const data = JSON.parse(task?.data || '{}');
+    return typeof data?.project === 'string' && data.project ? data.project : null;
+  } catch { return null; }
+}
+
+function isOperatorHuman(sql: SqlStorage, sub: string): boolean {
+  try { return sql.exec('SELECT 1 FROM users WHERE sub = ? AND is_admin = 1', sub).toArray().length > 0; } catch { return false; }
+}
+
+/** The projects a legacy address (tag, project:tag, role:<r>) can belong to;
+ * empty when it resolves to nothing (normal validation refuses it later). */
+function legacyAddressProjects(sql: SqlStorage, toActor: string): string[] {
+  const at = toActor.indexOf(':');
+  if (toActor.startsWith('role:')) {
+    return (sql.exec('SELECT DISTINCT project FROM agents WHERE role = ?', toActor.slice(5)).toArray() as any[]).map(r => r.project ?? null);
+  }
+  if (at < 0) {
+    return (sql.exec('SELECT DISTINCT project FROM agents WHERE tag = ?', toActor).toArray() as any[]).map(r => r.project ?? null);
+  }
+  const project = toActor.slice(0, at);
+  return sql.exec('SELECT 1 FROM agents WHERE project = ? AND tag = ?', project, toActor.slice(at + 1)).toArray().length ? [project] : [];
+}
+
+/** Project scoping for session credentials (docs/SESSION-MESSAGING.md §8,
+ * intake 008529b5 AC4). A session may send to sessions of its own project,
+ * named agents, operator humans, its own machine and legacy addresses of its
+ * project; everything else is refused as cross_project_forbidden unless the
+ * recipient project grants it in messaging settings. Admins and the bound
+ * host keep their existing authority. Refusals are audited. */
+export function checkSendScoping(sql: SqlStorage, caller: { kind?: string; isAdmin?: boolean; actor?: string }, senderActor: string, toActor: string, now: number): void {
+  const sessionId = sessionIdOf(senderActor);
+  if (!sessionId || caller.isAdmin || caller.kind === 'host') return;
+  const refuse = (detail: Record<string, unknown>) => {
+    throw new ScopingRefusal({ to: toActor, code: 'cross_project_forbidden', from_project: detail.from_project ?? null, ...detail });
+  };
+  const fromProject = sessionProject(sql, sessionId);
+  const ownMachine: string | null = (sql.exec('SELECT machine_id FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0] as any)?.machine_id ?? null;
+
+  const toSessionId = sessionIdOf(toActor);
+  if (toSessionId) {
+    const toProject = sessionProject(sql, toSessionId);
+    if (toProject !== null && toProject === fromProject) return;
+    if (crossProjectAllowed(sql, toProject)) return;
+    refuse({ recipient: 'session', from_project: fromProject, to_project: toProject });
+  }
+  if (toActor.startsWith(NAMED_AGENT_PROJECT + ':')) return;
+  if (toActor.startsWith('human:')) {
+    if (isOperatorHuman(sql, toActor.slice('human:'.length))) return;
+    refuse({ recipient: 'human', from_project: fromProject });
+  }
+  if (toActor.startsWith('machine:')) {
+    if (toActor.slice('machine:'.length) === ownMachine) return;
+    refuse({ recipient: 'machine', from_project: fromProject });
+  }
+  // Legacy bus addresses: same project only.
+  const projects = legacyAddressProjects(sql, toActor).filter((p): p is string => p !== null);
+  if (fromProject !== null && projects.includes(fromProject)) return;
+  if (projects.some(p => crossProjectAllowed(sql, p))) return;
+  refuse({ recipient: 'legacy', from_project: fromProject, to_project: projects.length === 1 ? projects[0] : projects });
 }
 
 /** Text typed into the TUI: bounded, control characters stripped, with the
@@ -185,16 +285,16 @@ export function expireSessionMessages(sql: SqlStorage, now: number, machineId: s
   }
 }
 
-const CREDENTIAL_TTL_MS = 24 * 3600 * 1000;
-const CREDENTIAL_RENEW_MS = 6 * 3600 * 1000;
+const CREDENTIAL_TTL_MS = 3600 * 1000; // 1 h access token (docs/SESSION-MESSAGING.md §8)
 
 /** Bound, running sessions on this machine that already have a messaging
  * identity (they were messaged, or an operator created it) and whose
- * credential is missing or due for renewal (docs/SESSION-MESSAGING.md §8, M2).
- * Bounded: driven by the small session-identity set, indexed lookups only. */
+ * credential family is gone (revoked with a stop or a rebind). The family is
+ * refresh-bound to the live session, so no time-based re-mint happens while
+ * it runs. Bounded: driven by the small session-identity set, indexed
+ * lookups only. */
 export function sessionsNeedingCredentials(sql: SqlStorage, machineId: string, now: number): { session_id: string; native_id: string; tag: string; workspace: string }[] {
   const identities = sql.exec('SELECT tag FROM agents WHERE project = ? AND machine_id = ? LIMIT 200', SESSION_PROJECT, machineId).toArray() as any[];
-  const renewBy = new Date(now + CREDENTIAL_RENEW_MS).toISOString();
   const out = [];
   for (const identity of identities) {
     const row: any = sql.exec("SELECT id, binding_json FROM session_control_sessions WHERE id = ? AND machine_id = ? AND state = 'running' AND binding_json IS NOT NULL", identity.tag, machineId).toArray()[0];
@@ -202,16 +302,18 @@ export function sessionsNeedingCredentials(sql: SqlStorage, machineId: string, n
     let binding: any = null;
     try { binding = JSON.parse(row.binding_json); } catch {}
     if (!binding?.native_id || !binding?.tag || !binding?.workspace) continue;
-    const live = sql.exec("SELECT 1 FROM credentials WHERE registry_actor = ? AND kind = 'agent' AND machine_id = ? AND revoked_at IS NULL AND expires_at > ? LIMIT 1",
-      `${SESSION_PROJECT}:${row.id}`, machineId, renewBy).toArray().length;
+    const live = sql.exec("SELECT 1 FROM credentials WHERE registry_actor = ? AND kind = 'agent' AND machine_id = ? AND revoked_at IS NULL LIMIT 1",
+      `${SESSION_PROJECT}:${row.id}`, machineId).toArray().length;
     if (!live) out.push({ session_id: String(row.id), native_id: String(binding.native_id), tag: String(binding.tag), workspace: String(binding.workspace) });
     if (out.length >= 10) break;
   }
   return out;
 }
 
-/** Mint the session's own bus-only credential for its bound host; older
- * families of the same session identity are revoked (one live identity). */
+/** Mint the session's own bus-only credential for its bound host: actor
+ * session:<uuid>, scopes msg:send msg:read, 1 h access with a refresh family
+ * that lives exactly as long as the session on this machine (hub.ts refresh
+ * guard). Older families of the same session identity are revoked. */
 export function mintSessionCredential(sql: SqlStorage, sessionId: string, machineId: string, tokens: { accessHash: string; refreshHash: string }, now: number): { actor: string; expires_at: string } | null {
   const session: any = sql.exec("SELECT id, machine_id FROM session_control_sessions WHERE id = ? AND state = 'running' AND binding_json IS NOT NULL", sessionId).toArray()[0];
   if (!session || session.machine_id !== machineId) return null;
@@ -222,8 +324,26 @@ export function mintSessionCredential(sql: SqlStorage, sessionId: string, machin
   const expires = new Date(now + CREDENTIAL_TTL_MS).toISOString();
   sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
     VALUES (?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, tokens.accessHash, tokens.refreshHash, id, actor, machineId, actor,
-    JSON.stringify(['bus:send', 'bus:read']), 'host:' + machineId, at, expires, actor);
+    JSON.stringify(['msg:send', 'msg:read']), 'host:' + machineId, at, expires, actor);
   return { actor, expires_at: expires };
+}
+
+/** AC2: a session's messaging credential stops working the moment the session
+ * stops or rebinds — called from the session-control stop/bind transitions
+ * (the host-poll sweep in revokeEndedSessionCredentials is the backstop). */
+export function revokeSessionCredentials(sql: SqlStorage, sessionId: string, now: number): void {
+  sql.exec("UPDATE credentials SET revoked_at = ? WHERE kind = 'agent' AND registry_actor = ? AND revoked_at IS NULL",
+    new Date(now).toISOString(), `${SESSION_PROJECT}:${sessionId}`);
+}
+
+/** Refresh-guard for session credentials (hub.ts refreshCredential): the
+ * family may rotate only while the session is still running on the machine
+ * the credential was minted for. */
+export function sessionRefreshAllowed(sql: SqlStorage, registryActor: string | null, machineId: string | null): boolean {
+  const sessionId = registryActor ? sessionIdOf(registryActor) : null;
+  if (!sessionId) return false;
+  const session: any = sql.exec("SELECT machine_id FROM session_control_sessions WHERE id = ? AND state = 'running'", sessionId).toArray()[0];
+  return Boolean(session) && String(session.machine_id ?? '') === String(machineId ?? '');
 }
 
 /** A stopped or ended session's messaging identity stops working: bounded

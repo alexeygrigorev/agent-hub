@@ -1,4 +1,4 @@
-import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages } from './session-messaging';
+import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials } from './session-messaging';
 import { IntakeWorktrees } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
 import { LivenessService } from './liveness';
@@ -1148,6 +1148,9 @@ export class SessionControlService {
       'running', JSON.stringify({ native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation,
         native_created_at_ms: binding.native_created_at_ms,
         ...(reporter ? { reported_by: reporter } : {}), reported_at: this.at() }), this.at(), sessionId);
+    // A (re)bind revokes the session's messaging credential; the freshly
+    // bound host re-mints within its provisioning cadence (M2 AC2).
+    revokeSessionCredentials(this.sql, sessionId, this.now());
     return { ok: true as const, generation };
   }
 
@@ -2366,6 +2369,7 @@ export class SessionControlService {
             "UPDATE session_control_sessions SET state = 'stopped', binding_json = ?, updated_at = ? WHERE id = ?",
             JSON.stringify(updatedBinding), at, live.id
           );
+          revokeSessionCredentials(this.sql, live.id, this.now());
           try {
             const reqObj = parsed(live.request_json, {});
             recordSessionOutcomeReward(this.sql, {
@@ -2629,6 +2633,7 @@ export class SessionControlService {
           };
           this.sql.exec("UPDATE session_control_commands SET state = 'acked', ack_json = ?, updated_at = ? WHERE id = ?", JSON.stringify(ack), at, cmd.id);
           this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, live.id);
+          revokeSessionCredentials(this.sql, live.id, this.now());
           if (live.fleet_launch_id) {
             try {
               this.sql.exec("UPDATE fleet_launches SET state = 'exited', finished_at = COALESCE(finished_at, ?), updated_at = ?, verification_status = 'verified' WHERE id = ? AND native_id IS NULL", at, at, live.fleet_launch_id);
@@ -3032,6 +3037,7 @@ export class SessionControlService {
         }
         if (state === 'acked' && row.kind === 'stop') {
           this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, session.id);
+          revokeSessionCredentials(this.sql, session.id, this.now());
           // The control binding can survive a lost launcher receipt while
           // Fleet.native_id remains unknown. The exact bound exit proof above
           // settles that linked reservation too; a conflicting native stays held.

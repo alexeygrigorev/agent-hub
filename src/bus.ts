@@ -39,6 +39,8 @@ export interface SendOpts {
 /** Session-messaging seams (src/session-messaging.ts), run inside the send transaction. */
 export interface BusSendHooks {
   resolveRecipient(toActor: string, now: number): string;
+  /** Recipient scoping for session credentials (M2 AC4); throws RecipientError. */
+  checkSendScope?(caller: CallerContext, senderActor: string, toActor: string, now: number): void;
   afterInsert(message: any, opts: SendOpts, now: number): void;
 }
 
@@ -365,6 +367,12 @@ export class BusService {
       return res.length > 0;
     }
 
+    // human:<sub> is a valid recipient when that human has a Hub login
+    // (docs/SESSION-MESSAGING.md §3/§8); scoping decides which sessions may reach it.
+    if (addr.kind === 'qualified' && addr.project === 'human') {
+      try { return this.sql.exec('SELECT 1 FROM users WHERE sub = ?', addr.tag).toArray().length > 0; } catch { return false; }
+    }
+
     return this.resolveAgent(addr) !== null;
   }
 
@@ -462,7 +470,10 @@ export class BusService {
         throw new Error("unauthorized");
       }
 
-      if (this.hooks) opts = { ...opts, toActor: this.hooks.resolveRecipient(opts.toActor, now) };
+      if (this.hooks) {
+        opts = { ...opts, toActor: this.hooks.resolveRecipient(opts.toActor, now) };
+        this.hooks.checkSendScope?.(caller, opts.senderActor, opts.toActor, now);
+      }
       opts = { ...opts, senderActor: this.canonicalActor(opts.senderActor), toActor: this.canonicalActor(opts.toActor) };
       let existing = this.sql.exec(
         'SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch, expires_at FROM messages WHERE from_actor = ? AND idempotency_key = ?',
