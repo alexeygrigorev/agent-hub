@@ -93,7 +93,6 @@
   "sessions send",
   "sessions show",
   "sessions start",
-  "sessions status",
   "sessions stop",
   "sessions tree",
   "sessions warnings",

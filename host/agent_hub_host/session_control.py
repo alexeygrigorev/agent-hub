@@ -513,7 +513,7 @@ def add_commands(sub):
     protect = commands.add_parser('protect', help='Permanently protect an owned session from automated cleanup; never stops it')
     protect.add_argument('id')
     protect.add_argument('--key', required=True, help='Stable protection key; this operation has no unprotect counterpart')
-    show = commands.add_parser('show', aliases=['status'], help='Show one session with its binding state')
+    show = commands.add_parser('show', help='Show one session with its binding state')
     show.add_argument('id')
     show.add_argument('--threshold')
     show.add_argument('--json', action='store_true')
@@ -719,7 +719,7 @@ def _execute(args):
             if not cursor:
                 break
         return {'sessions': seen[:limit], 'next_cursor': None}
-    if cmd in ('show', 'status'):
+    if cmd == 'show':
         return request('GET', threshold_path(args, '/api/sessions/' + args.id))
     if cmd == 'events':
         return request('GET', '/api/sessions/' + args.id + '/events')
