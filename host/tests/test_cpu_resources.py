@@ -18,6 +18,7 @@ class CpuResourcesTests(unittest.TestCase):
             (root / "pressure").mkdir()
             (root / "pressure/cpu").write_text("some avg10=12.34 avg60=10 total=100\nfull avg10=0.5 total=10\n")
             (root / "pressure/memory").write_text("full avg10=0.2 total=2\n")
+            (root / "pressure/io").write_text("full avg10=0.7 total=3\n")
             (root / "vmstat").write_text("oom_kill 10\n")
             (root / "stat").write_text("cpu 10 0 0 10 80 0 0 0 900 0\ncpu0 1\ncpu1 1\n")
             self.assertEqual(read_cpu_stat(directory)["ticks"], [10, 0, 0, 10, 80, 0, 0, 0])
@@ -30,10 +31,32 @@ class CpuResourcesTests(unittest.TestCase):
             self.assertEqual(result["psi_avg10"], 12.34)
             self.assertEqual(result["psi_full_avg10"], .5)
             self.assertEqual(result["memory_psi_full_avg10"], .2)
+            # io PSI full rides the same sample so rejections record it.
+            self.assertEqual(result["io_psi_full_avg10"], .7)
             self.assertEqual(result["observed_at"], "1970-01-01T00:16:40Z")
             unavailable = sample_cpu_usage(directory, sleep=lambda _: None)
             self.assertIsNone(unavailable["busy_cores"])
             self.assertEqual(unavailable["psi_full_avg10"], .5)
+
+    def test_missing_io_pressure_reads_as_null_not_failure(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pressure").mkdir()
+            (root / "pressure/cpu").write_text("full avg10=0.5 total=10\n")
+            (root / "pressure/memory").write_text("full avg10=0.2 total=2\n")
+            (root / "vmstat").write_text("oom_kill 10\n")
+            (root / "stat").write_text("cpu 10 0 0 10 80 0 0 0 900 0\ncpu0 1\n")
+            result = sample_cpu_usage(directory, sleep=lambda _: None)
+            self.assertIsNone(result["io_psi_full_avg10"])
+
+    def test_cpu_admission_sanitizer_accepts_io_psi(self):
+        from agent_hub_host.cpu_resources import sanitize_cpu_admission
+        valid = {"expected_cpu_cores": 2, "ramping_cpu_cores": 1, "limit_cpu_cores": 12,
+                 "target_utilization": 1, "psi_full_avg10": 6, "io_psi_full_avg10": 3.5}
+        self.assertEqual(sanitize_cpu_admission(valid), valid)
+        self.assertIsNone(sanitize_cpu_admission({**valid, "io_psi_full_avg10": 101}))
 
     def test_peak_journal_and_final_report_keep_lifetime_p95(self):
         from agent_hub_host.resource_management import update_peaks, _sample_row

@@ -204,9 +204,24 @@ function strictObservedAt(value: unknown, now: number): string {
 export class StatusService {
   constructor(private sql: SqlStorage, private tx: Tx, private intake: IntakeService, private now: () => number = Date.now) {}
 
+  /** Running build marker (deployed cli/manifest.json). Placement-reject
+   * warnings opened before this moment predate the deployed fix and read as
+   * history, not live problems (intake 1bc3add1 AC2). */
+  private deployMarker: { at_ms: number; sha: string | null } | null = null;
+  setDeployMarker(marker: { at_ms: number; sha: string | null } | null): void { this.deployMarker = marker; }
+
   /** Operator-only canonical check alerts; agent task grants do not grant
-   * visibility into other actors' monitoring details. No second check loop. */
-  private needsAttention(admin: boolean, measured: Obj[], intakeWarn: Obj | null = null): Obj[] {
+   * visibility into other actors' monitoring details. No second check loop.
+   * Surfaced as needs_attention plus the stale history group (AC2). */
+  private attentionGroups(admin: boolean, measured: Obj[], intakeWarn: Obj | null = null): Obj {
+    const { live, history } = this.needsAttentionSplit(admin, measured, intakeWarn);
+    return { needs_attention: live, history_warnings: history };
+  }
+
+  /** Live warnings plus the stale placement-reject history group. A
+   * placement-queue warning whose episode predates the running deploy, or is
+   * older than 1 h, is labelled stale and no longer counts as live (AC2). */
+  private needsAttentionSplit(admin: boolean, measured: Obj[], intakeWarn: Obj | null = null): { live: Obj[]; history: Obj[] } {
     const intakeItems: Obj[] = intakeWarn ? [{
       severity: 'warn',
       subject: 'intake:open_high',
@@ -237,7 +252,7 @@ export class StatusService {
     } catch { /* optional operator_notices table */ }
     const storageWarning = admin ? this.intake.storageWarning() : null;
     const base = [...intakeItems, ...(storageWarning ? [storageWarning] : []), ...noticeItems, ...measured];
-    if (!admin) return base;
+    if (!admin) return { live: base, history: [] };
     let rows: any[];
     try {
       rows = this.sql.exec(`SELECT a.id, a.subject_kind, a.subject, a.state, a.detail, a.opened_at
@@ -250,15 +265,35 @@ export class StatusService {
             (a.subject NOT LIKE 'placement-%' AND EXISTS
               (SELECT 1 FROM fleet_launches l WHERE l.id=a.subject AND l.state IN ('offered','starting')))
           ))) ORDER BY a.id DESC LIMIT 64`).toArray();
-    } catch { return base; }
-    return [...base, ...rows.map(row => ({
-      severity: 'warn', subject: row.subject_kind + ':' + row.subject,
-      title: (row.subject_kind === 'launch' ? 'Launch stuck: ' : 'Scheduled check: ') + row.subject, detail: snippet(row.detail),
-      state: row.state, alert_id: row.id, opened_at: row.opened_at,
-      source: 'liveness_alerts', scope: 'hub',
-    }))];
+    } catch { return { live: base, history: [] }; }
+    const marker = this.deployMarker;
+    const nowMs = this.now();
+    const staleReason = (openedAt: string): string | null => {
+      const opened = Date.parse(openedAt);
+      if (!Number.isFinite(opened)) return null;
+      if (marker && opened < marker.at_ms) return 'predates_deploy';
+      if (nowMs - opened > 3600000) return 'older_than_1h';
+      return null;
+    };
+    const live: Obj[] = [];
+    const history: Obj[] = [];
+    for (const row of rows) {
+      const entry: Obj = {
+        severity: 'warn', subject: row.subject_kind + ':' + row.subject,
+        title: (row.subject_kind === 'launch' ? 'Launch stuck: ' : 'Scheduled check: ') + row.subject, detail: snippet(row.detail),
+        state: row.state, alert_id: row.id, opened_at: row.opened_at,
+        source: 'liveness_alerts', scope: 'hub',
+      };
+      const stale = row.subject_kind === 'launch' && String(row.subject).startsWith('placement-queue:') ? staleReason(row.opened_at) : null;
+      if (stale) {
+        history.push({
+          ...entry, title: 'Launch stuck (stale): ' + row.subject, stale: true, stale_reason: stale,
+          ...(marker ? { deployed_build: { built_at: new Date(marker.at_ms).toISOString(), ...(marker.sha ? { sha: marker.sha } : {}) } } : {}),
+        });
+      } else live.push(entry);
+    }
+    return { live: [...base, ...live], history };
   }
-
   private agentCountsCache:{revision:string;value:{running:number;idle:number;waiting:number;waiting_confirmation:number}}|null=null;
   private statusSourceRows=new Map<string,Obj[]>();
   private statusSourceBytes=0;
@@ -631,7 +666,7 @@ export class StatusService {
           open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p, summaries),
           open_intake_warn_threshold: 100,
           ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
-          needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
+          ...this.attentionGroups(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next, total, limit },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,
@@ -740,7 +775,7 @@ export class StatusService {
           open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p, summaries),
           open_intake_warn_threshold: 100,
           ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
-          needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
+          ...this.attentionGroups(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next: null, total: tasks.length, limit: tasks.length },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,

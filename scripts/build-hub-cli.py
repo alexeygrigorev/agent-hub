@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,6 +80,11 @@ def build(out_dir: Path, version: str):
     out_dir.mkdir(parents=True, exist_ok=True)
     sha = git_sha()
     build_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Millisecond build time: the deployed Worker reads its own manifest via
+    # the ASSETS binding to know when the running build was produced, so
+    # status warnings opened before this moment can be labelled stale
+    # (intake 1bc3add1 AC2).
+    built_at_ms = int(time.time() * 1000)
     tmp_base = REPO / ".local" / "tmp"
     tmp_base.mkdir(parents=True, exist_ok=True)
     import tempfile
@@ -147,6 +153,7 @@ def build(out_dir: Path, version: str):
             },
             "built_from_commit": sha,
             "build_date": build_date,
+            "built_at_ms": built_at_ms,
             "files": ["install.sh", "install.ps1", "hub.pyz", "hub.pyz.sha256", "manifest.json"],
         }
         manifest_path = out_dir / "manifest.json"

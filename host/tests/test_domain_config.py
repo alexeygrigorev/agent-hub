@@ -42,11 +42,16 @@ class TestDomainConfig(unittest.TestCase):
         self.assertEqual(manifest.get("default_base_url"), "https://hub.dtcdev.click")
         self.assertIn("install.sh", manifest.get("files", []))
         self.assertIn("hub.pyz", manifest.get("files", []))
+        self.assertIsInstance(manifest.get("built_at_ms"), int)
+        self.assertGreater(manifest.get("built_at_ms"), 0)
 
     def test_build_hub_cli_default_base(self):
         build_script = REPO_ROOT / "scripts" / "build-hub-cli.py"
         content = build_script.read_text(encoding="utf-8")
         self.assertIn('"default_base_url": "https://hub.dtcdev.click"', content)
+        # The deployed Worker reads built_at_ms from its own manifest to
+        # label stale placement-reject warnings (intake 1bc3add1 AC2).
+        self.assertIn('"built_at_ms": built_at_ms', content)
 
 
 if __name__ == "__main__":

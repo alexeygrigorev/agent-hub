@@ -32,6 +32,14 @@ describe('heavy utilization without choking',()=>{
    expect(cpuVerdict(u,12,1,0,cfg,now)).toMatchObject({admitted:true,reason:null,telemetry_state:'unknown',current_cpu_cores:null});
   expect(sanitizeCpuUsage({...usage(),secret:'excluded'})).not.toHaveProperty('secret');
  });
+ it('carries io PSI full through the sanitized sample and verdict without gating admission',()=>{
+  expect(sanitizeCpuUsage(usage(1,{io_psi_full_avg10:3.5}))).toMatchObject({io_psi_full_avg10:3.5});
+  expect(sanitizeCpuUsage(usage(1,{io_psi_full_avg10:101}))?.io_psi_full_avg10).toBeNull();
+  expect(sanitizeCpuAdmission({...wireFixture.cpu,io_psi_full_avg10:0.9})).toMatchObject({io_psi_full_avg10:0.9});
+  expect(sanitizeCpuAdmission({...wireFixture.cpu,io_psi_full_avg10:100.1})).toBeNull();
+  // IO pressure is evidence only: it never refuses a route by itself.
+  expect(cpuVerdict(usage(1,{io_psi_full_avg10:99}),12,2,0,cfg,now)).toMatchObject({admitted:true,reason:null,io_psi_full_avg10:99});
+ });
  it('preserves each independent fresh choking signal when advisory CPU or another metric is unknown',()=>{
   expect(cpuVerdict(usage(2,{busy_cores:null,busy_percent:null,psi_full_avg10:6}),12,1,0,cfg,now)).toMatchObject({reason:'cpu_pressure',current_cpu_cores:null});
   expect(cpuVerdict(usage(2,{busy_cores:NaN,psi_full_avg10:NaN,memory_psi_full_avg10:2}),12,1,0,cfg,now).reason).toBe('memory_pressure');

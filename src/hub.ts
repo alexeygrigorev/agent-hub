@@ -160,6 +160,7 @@ export class Hub extends DurableObject {
     this.intakeService.init();
     this.statusService = new StatusService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.intakeService);
     this.statusService.init();
+    this.loadDeployMarker();
     this.busService = new BusService(this.sql, txSync);
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
@@ -236,7 +237,7 @@ export class Hub extends DurableObject {
       },
     });
     this.intakeWatchdog.init();
-    this.livenessService.setPressureProjection(() => placementPressureSubjects(this.sql, this.fleetService, Date.now()));
+    this.livenessService.setPressureProjection(() => placementPressureSubjects(this.sql, Date.now()));
     this.checksService = new ChecksService(this.sql);
     this.checksService.init();
     this.monitoringService = new MonitoringService(
@@ -361,6 +362,29 @@ export class Hub extends DurableObject {
         this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${colType}`);
       }
     }
+  }
+
+  /** Read the running build's cli/manifest.json through the ASSETS binding
+   * once per isolate and hand its build time to the status service, so
+   * placement-reject warnings opened before this build can be labelled
+   * stale (intake 1bc3add1 AC2). Missing or malformed manifests leave the
+   * marker unset and only the 1h staleness rule applies. */
+  private deployMarkerLoaded?: Promise<void>;
+  private loadDeployMarker(): Promise<void> {
+    this.deployMarkerLoaded ??= (async () => {
+      try {
+        const assets = (this.env as any).ASSETS;
+        if (!assets?.fetch) return;
+        const res = await assets.fetch(new Request('https://assets.internal/cli/manifest.json'));
+        if (!res.ok) return;
+        const manifest: any = await res.json();
+        const atMs = Number(manifest?.built_at_ms);
+        if (!Number.isSafeInteger(atMs) || atMs <= 0) return;
+        const shaRaw = typeof manifest?.built_from_commit === 'string' ? manifest.built_from_commit : '';
+        this.statusService.setDeployMarker({ at_ms: atMs, sha: /^[0-9a-f]{40}$/.test(shaRaw) ? shaRaw : null });
+      } catch { /* no deploy marker: only the 1h staleness rule applies */ }
+    })();
+    return this.deployMarkerLoaded;
   }
 
   public initDb() {
@@ -617,6 +641,7 @@ export class Hub extends DurableObject {
         return Response.json({ error: 'method_not_allowed' }, { status: 405 });
       }
       if (path === '/api/status') {
+        await this.loadDeployMarker();
         // M14d: GET stays the readonly paginated projection; POST projects
         // the COMPLETE bounded summary and advances the caller's own
         // baseline in the same transaction (one call total). Cookie POSTs

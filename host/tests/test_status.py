@@ -205,6 +205,33 @@ class TestStatusCli(unittest.TestCase):
         self.assertIn('host-hetzner: load=0.75, 1.10, 1.25', rendered)
         self.assertIn('mem=8.0GB/16.0GB (50.0%, 8.0GB avail) [fresh]', rendered)
 
+    def test_render_human_shows_stale_history_group_separate_from_live(self):
+        dto = dict(FIXTURE_DTO)
+        dto['needs_attention'] = [{
+            'severity': 'warn', 'subject': 'launch:placement-queue:fresh',
+            'title': 'Launch stuck: placement-queue:fresh', 'detail': 'held queued',
+        }]
+        dto['history_warnings'] = [{
+            'severity': 'warn', 'subject': 'launch:placement-queue:old',
+            'title': 'Launch stuck (stale): placement-queue:old',
+            'detail': 'mem_avail_mb=1234 psi_io_full=0.5%',
+            'stale': True, 'stale_reason': 'predates_deploy',
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('needs attention: 1', rendered)
+        self.assertIn('[warn] launch:placement-queue:fresh', rendered)
+        self.assertIn('history (not live): 1', rendered)
+        self.assertIn('[predates_deploy] launch:placement-queue:old', rendered)
+        # Stale rows never inflate the live warning count.
+        self.assertNotIn('needs attention: 2', rendered)
+
+    def test_render_human_omits_empty_history_group(self):
+        dto = dict(FIXTURE_DTO)
+        dto['needs_attention'] = []
+        dto['history_warnings'] = []
+        rendered = status.render_human(dto)
+        self.assertNotIn('history (not live)', rendered)
+
     def test_render_human_shows_canonical_reports_and_exact_probe_facts(self):
         dto = dict(FIXTURE_DTO)
         observed = '2026-10-19T01:38:08.858Z'

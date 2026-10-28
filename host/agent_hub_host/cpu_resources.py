@@ -36,7 +36,7 @@ def sanitize_resource_choking(value, cooldown_s=300, now=None):
 def sanitize_cpu_admission(value):
     """Fixed numeric refusal DTO. Arbitrary output never crosses this boundary."""
     required = {"expected_cpu_cores", "ramping_cpu_cores", "limit_cpu_cores", "target_utilization"}
-    optional = {"current_cpu_cores", "psi_avg10", "psi_full_avg10", "memory_psi_full_avg10", "oom_kills_delta", "host_oom_kills_delta", "observed_at"}
+    optional = {"current_cpu_cores", "psi_avg10", "psi_full_avg10", "memory_psi_full_avg10", "io_psi_full_avg10", "oom_kills_delta", "host_oom_kills_delta", "observed_at"}
     if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - optional:
         return None
     for key, number in value.items():
@@ -126,6 +126,7 @@ def sample_cpu_usage(proc_root="/proc", interval_s=0.2, sleep=time.sleep, monoto
     return {**result, "psi_avg10": read_cpu_psi(proc_root),
             "psi_full_avg10": read_cpu_psi(proc_root, category="full"),
             "memory_psi_full_avg10": read_cpu_psi(proc_root, resource="memory", category="full"),
+            "io_psi_full_avg10": read_cpu_psi(proc_root, resource="io", category="full"),
             "oom_kills_delta": read_oom_delta(proc_root),
             "host_oom_kills_delta": read_host_oom_delta() if proc_root == "/proc" else None, "interval_s": elapsed,
             "observed_at": datetime.fromtimestamp(clock(), timezone.utc).isoformat().replace("+00:00", "Z")}

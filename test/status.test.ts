@@ -165,6 +165,43 @@ describe('M14a authorized one-call status projection', () => {
       for (const subject of ['placement-reject:old', 'placement-failed:old', 'placement-queue:live']) h.livenessService.setAlert('launch', subject, null);
     });
   });
+  it('labels placement-queue warnings stale after the deploy marker or one hour, keeping them out of live warnings', async () => {
+    await seedCanonicalChain('stale-job-a', 'stale-old', 'host-a', 'stale-native-a', 'stale-tag-a');
+    await seedCanonicalChain('stale-job-b', 'stale-mid', 'host-a', 'stale-native-b', 'stale-tag-b');
+    await seedCanonicalChain('stale-job-c', 'stale-live', 'host-a', 'stale-native-c', 'stale-tag-c');
+    await inDO(stub(), (h: any) => {
+      for (const id of ['stale-old', 'stale-mid', 'stale-live']) h.sql.exec("UPDATE fleet_launches SET state='queued' WHERE id=?", id);
+      const nowMs = Date.now();
+      const insert = (subject: string, openedMs: number) => h.sql.exec(
+        "INSERT INTO liveness_alerts (subject_kind, subject, state, detail, opened_at) VALUES ('launch', ?, 'stuck', 'fixture hold', ?)",
+        subject, new Date(openedMs).toISOString());
+      insert('placement-queue:stale-old', nowMs - 2 * 3600000); // predates the build and is over 1h old
+      insert('placement-queue:stale-mid', nowMs - 45 * 60000); // under 1h, predates the build only
+      insert('placement-queue:stale-live', nowMs - 5 * 60000); // after the build, under 1h: live
+      h.statusService.setDeployMarker({ at_ms: nowMs - 30 * 60000, sha: 'a'.repeat(40) });
+    });
+    const status = await ok('');
+    const liveSubjects = status.needs_attention.map((a: any) => a.subject);
+    expect(liveSubjects).toContain('launch:placement-queue:stale-live');
+    expect(liveSubjects).not.toContain('launch:placement-queue:stale-old');
+    expect(liveSubjects).not.toContain('launch:placement-queue:stale-mid');
+    const bySubject = Object.fromEntries((status.history_warnings ?? []).map((w: any) => [w.subject, w]));
+    expect(bySubject['launch:placement-queue:stale-old']).toMatchObject({ stale: true, stale_reason: 'predates_deploy' });
+    expect(bySubject['launch:placement-queue:stale-mid']).toMatchObject({ stale: true, stale_reason: 'predates_deploy' });
+    expect(bySubject['launch:placement-queue:stale-old'].deployed_build).toMatchObject({ sha: 'a'.repeat(40) });
+    expect(bySubject['launch:placement-queue:stale-live']).toBeUndefined();
+    // Without a deploy marker only the 1h rule applies: the 45 min old
+    // warning returns to the live group, the 2h one stays stale.
+    await inDO(stub(), (h: any) => h.statusService.setDeployMarker(null));
+    const after = await ok('');
+    expect(after.needs_attention.map((a: any) => a.subject)).toContain('launch:placement-queue:stale-mid');
+    const staleAfter = Object.fromEntries((after.history_warnings ?? []).map((w: any) => [w.subject, w]));
+    expect(staleAfter['launch:placement-queue:stale-old']).toMatchObject({ stale: true, stale_reason: 'older_than_1h' });
+    expect(staleAfter['launch:placement-queue:stale-mid']).toBeUndefined();
+    await inDO(stub(), (h: any) => {
+      for (const subject of ['placement-queue:stale-old', 'placement-queue:stale-mid', 'placement-queue:stale-live']) h.livenessService.setAlert('launch', subject, null);
+    });
+  });
   it('keeps live account-capacity diagnostics beside memory holds and hides recovered queues immediately', async () => {
     await seedCanonicalHosts();
     await seedCanonicalChain('cap-holder-job', 'cap-holder', 'host-a', 'cap-holder-native', 'cap-holder-tag');

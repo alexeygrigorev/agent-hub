@@ -22,7 +22,7 @@ async function fixture(fn: (ctx: { fleet: FleetService; live: LivenessService; m
     fleet.init();
     const live = new LivenessService(hub.sql, DEFAULT_THRESHOLDS, clock);
     live.init();
-    live.setPressureProjection(() => placementPressureSubjects(hub.sql, fleet, now));
+    live.setPressureProjection(() => placementPressureSubjects(hub.sql, now));
     const monitoring = new MonitoringService(hub.sql, tx, live, undefined, undefined, clock);
     monitoring.init();
     monitoring.setResourceProjection(machine => fleet.hostResources(machine)[0]);
@@ -168,7 +168,7 @@ describe('fleet health visibility + machine aliasing', () => {
     expect(status.available_slots).toBe(6);
   }));
 
-  it('raises a stuck alert subject for launches held queued over 5 minutes, with numbers', () => fixture(async ({ live, sql }) => {
+  it('raises a stuck alert subject for launches held queued over 5 minutes without current numbers', () => fixture(async ({ live, sql }) => {
     sql.exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('b0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'held work', 'kq', '{}', '', '', '', NULL, 'headless', 'demo', 'goal', 'queued', NULL, ?, ?)",
       iso(-10 * 60000), iso(-10 * 60000),
@@ -177,6 +177,9 @@ describe('fleet health visibility + machine aliasing', () => {
     expect(subjects.length).toBe(1);
     expect(subjects[0].state).toBe('stuck');
     expect(subjects[0].detail).toContain('held queued');
+    // No recorded rejection yet: no current host numbers may be attached.
+    expect(subjects[0].detail).toContain('no recorded rejection evidence');
+    expect(subjects[0].detail).not.toContain('mem_avail_mb=');
     // A fresh queue (<5 min) stays silent.
     sql.exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('b0000000-0000-4000-8000-000000000002', 'admin', 'human', NULL, 'fresh wait', 'kq2', '{}', '', '', '', NULL, 'headless', 'demo', 'goal', 'queued', NULL, ?, ?)",
@@ -184,6 +187,58 @@ describe('fleet health visibility + machine aliasing', () => {
     );
     const fresh = live.evaluate().subjects.filter((s) => s.kind === 'launch' && s.id === 'b0000000-0000-4000-8000-000000000002');
     expect(fresh.length).toBe(0);
+  }));
+
+  it('shows rejection-time MemAvailable, PSI cpu/memory/io full and reason from the hold, never current numbers', () => fixture(async ({ live, sql }) => {
+    machine(sql, 'now-host', 'now-host', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 },
+      { mem_avail_mb: 36000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso(0)) });
+    sql.exec(
+      "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('f0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'held work', 'kq3', '{}', '', '', '', NULL, 'headless', 'demo', 'goal', 'queued', NULL, ?, ?)",
+      iso(-7 * 3600000), iso(-7 * 3600000),
+    );
+    sql.exec("INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused, evidence_json) VALUES ('f0000000-0000-4000-8000-000000000001', ?, ?, 1, ?)",
+      iso(-7 * 3600000), JSON.stringify([{ machine: 'now-host', engine: 'codex', reason: 'codex_quota_gate_codex_reserve_15_percent_required' }]),
+      JSON.stringify({ 'now-host': { mem_avail_mb: 1234, psi_cpu_full_avg10: 4.5, psi_memory_full_avg10: 2.5, psi_io_full_avg10: 0.5, observed_at: iso(-7 * 3600000) } }));
+    const subjects = live.evaluate().subjects.filter((s) => s.kind === 'launch' && s.id === 'placement-queue:f0000000-0000-4000-8000-000000000001');
+    expect(subjects.length).toBe(1);
+    const detail = subjects[0].detail;
+    expect(detail).toContain('codex_quota_gate_codex_reserve_15_percent_required');
+    expect(detail).toContain('mem_avail_mb=1234');
+    expect(detail).toContain('psi_cpu_full=4.5%');
+    expect(detail).toContain('psi_memory_full=2.5%');
+    expect(detail).toContain('psi_io_full=0.5%');
+    expect(detail).toContain(`observed_at=${iso(-7 * 3600000)}`);
+    // The host's CURRENT MemAvailable (36000) must not leak into the warning.
+    expect(detail).not.toContain('36000');
+  }));
+
+  it('persists rejection-time evidence on the launch hold when reserve parks for account capacity', () => fixture(async ({ fleet, live, sql }) => {
+    machine(sql, 'm1', 'm1', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 },
+      { mem_avail_mb: 32000, disk_free_gb: 100, load: [1], cpu_usage: freshCpu(iso(0), 8, 0, 1.5), gate: { launch_allowed: true, at: iso(0) } });
+    sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', 'm1', '1.0', iso(0), now, iso(0), now, 'ok', null,
+      JSON.stringify({ codex: { status: 'ok', observed_at: iso(0), details: { limit_reached: false }, windows: { '5h': { present: true, percent_remaining: 80, reset_at: iso(86400000) }, '7d': { present: true, percent_remaining: 80, reset_at: iso(86400000) } } } }));
+    sql.exec("INSERT INTO fleet_accounts VALUES ('a1', 'codex', 1, 15, 1)");
+    sql.exec("INSERT INTO fleet_routes VALUES ('m1', 'codex', 'a1', NULL)");
+    sql.exec(
+      "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('g0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'holder', 'kg', '{}', 'm1', 'codex', 'a1', NULL, 'headless', 'demo', 'goal', 'running', 'n-hold', ?, ?)",
+      iso(-60000), iso(-1000),
+    );
+    const res = fleet.reserve({ workspace: 'demo', prompt: 'queued behind capacity', idempotency_key: 'evidence-park-1' }, admin);
+    expect(res.status).toBe(202);
+    const value: any = res.value;
+    // Rejection-time evidence lands on the launch's hold record, captured
+    // from the heartbeat that drove the refusal.
+    const hold: any = sql.exec("SELECT rejected_json, evidence_json FROM fleet_memory_holds WHERE launch_id=?", value.id).one();
+    const persisted = JSON.parse(hold.evidence_json);
+    expect(persisted['m1']).toMatchObject({ mem_avail_mb: 32000, psi_cpu_full_avg10: 0, psi_memory_full_avg10: 0, psi_io_full_avg10: 1.5, observed_at: iso(0) });
+    expect(JSON.parse(hold.rejected_json)[0].reason).toBe('account_concurrency');
+    // The parked launch warns with the recorded evidence, not live numbers.
+    sql.exec("UPDATE fleet_launches SET created_at=? WHERE id=?", iso(-10 * 60000), value.id);
+    const subjects = live.evaluate().subjects.filter((s) => s.id === `placement-queue:${value.id}`);
+    expect(subjects.length).toBe(1);
+    expect(subjects[0].detail).toContain('account_concurrency');
+    expect(subjects[0].detail).toContain('mem_avail_mb=32000');
+    expect(subjects[0].detail).toContain('psi_io_full=1.5%');
   }));
 
   it('keeps terminal machine_capacity failures out of live stuck subjects', () => fixture(async ({ live, sql }) => {

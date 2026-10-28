@@ -1,7 +1,7 @@
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 import { sanitizeCommandFields } from './command-diagnostics';
-import {sanitizeCpuAdmission} from './cpu-headroom';
+import {sanitizeCpuAdmission,sanitizeCpuUsage} from './cpu-headroom';
 import { launcherDiskHeadroom } from './launcher-disk';
 /** Generic account registry and placement. Provider credentials never enter this service. */
 import type { SqlStorage } from '@cloudflare/workers-types';
@@ -32,7 +32,7 @@ export const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_to
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_queue_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), after_rowid INTEGER NOT NULL, high_water INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT);
+CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT, evidence_json TEXT);
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
 CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
@@ -401,6 +401,8 @@ export class FleetService {
     this.routing.init();
     this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
+    const holdColumns = this.sql.exec('PRAGMA table_info(fleet_memory_holds)').toArray().map((c: any) => c.name);
+    if (!holdColumns.includes('evidence_json')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN evidence_json TEXT');
     initResourceRequestProjection(this.sql, 'fleet_launches');
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
     for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key', 'runtime_json']) {
@@ -694,8 +696,20 @@ export class FleetService {
       const nowMs = this.now();
       const at = new Date(nowMs).toISOString();
       const machines = pressure.includes('launcher_memory_reserve') ? this.hostResources() : [];
+      let psiNote = '';
+      try {
+        const placeholders = machines.map(() => '?').join(',');
+        const heartbeats = machines.length
+          ? this.sql.exec(`SELECT id, last_heartbeat FROM machines WHERE id IN (${placeholders})`, ...machines.map((h) => h.machine_id)).toArray() as any[]
+          : [];
+        const parts = heartbeats.map((m) => {
+          const usage = sanitizeCpuUsage(parsed(m.last_heartbeat).cpu_usage);
+          return `${m.id}: psi_cpu_full=${usage?.psi_full_avg10 ?? 'unknown'}% psi_memory_full=${usage?.memory_psi_full_avg10 ?? 'unknown'}% psi_io_full=${usage?.io_psi_full_avg10 ?? 'unknown'}% observed_at=${usage?.observed_at ?? 'unknown'}`;
+        });
+        if (parts.length) psiNote = ' ' + parts.join('; ');
+      } catch { /* PSI evidence is best-effort */ }
       const memNote = machines.length
-        ? ' host ' + machines.map((h) => `${h.machine_id}: mem_avail_mb=${h.mem_avail_mb ?? 'unknown'} reserved_mb=${h.reserved_mb ?? 'unknown'} floor_mb=${MEMORY_FLOOR_MB} next_slot_mb=${NEXT_SLOT_MB} headroom_mb=${h.headroom_mb ?? 'unknown'}`).join('; ')
+        ? ' host ' + machines.map((h) => `${h.machine_id}: mem_avail_mb=${h.mem_avail_mb ?? 'unknown'} reserved_mb=${h.reserved_mb ?? 'unknown'} floor_mb=${MEMORY_FLOOR_MB} next_slot_mb=${NEXT_SLOT_MB} headroom_mb=${h.headroom_mb ?? 'unknown'}`).join('; ') + psiNote
         : '';
       const detail = `rejected [${pressure.join(', ')}] (all routes: ${reasons.join(', ')})${memNote}`;
       this.sql.exec('INSERT OR IGNORE INTO placement_rejections (id, created_at, created_at_ms, actor, reasons_json, detail) VALUES (?, ?, ?, ?, ?, ?)',
@@ -709,7 +723,7 @@ export class FleetService {
 
   private planWithinMaintenance(input: any):
     { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
-    { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[] } {
+    { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any> } {
     if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project', 'needs']) ||
       (input.project !== undefined && (typeof input.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.project))) ||
       (input.needs !== undefined && (!Array.isArray(input.needs) || input.needs.length > 64 || input.needs.some((n: any) => typeof n !== 'string' || !NEEDS_LABEL.test(n)) || new Set(input.needs).size !== input.needs.length)) ||
@@ -765,6 +779,11 @@ export class FleetService {
     const memoryByRoute=new Map<string,ReturnType<ResourceManagement['headroom']>>();
     const cpuByMachine=new Map<string,ReturnType<ResourceManagement['cpuHeadroom']>>();
     const diskByWorkspace=new Map<string,ReturnType<FleetService['diskHeadroom']>>();
+    // Rejection-time host telemetry (MemAvailable + PSI cpu/memory/io full),
+    // captured from the same heartbeat that drove the refusal and persisted
+    // with the rejected entry. Status warnings show these values, never a
+    // later observation (intake 1bc3add1 AC1).
+    const evidenceByMachine=new Map<string,any>();
     // Engines advertised by at least one live (non-drained, fresh-checkin)
     // host. A registry route for an engine no live host runs anymore is
     // stale registry debt, not a workspace/mode defect: it must not block
@@ -861,6 +880,19 @@ export class FleetService {
         if(!diskByWorkspace.has(key)) diskByWorkspace.set(key,this.diskHeadroom(route.machine_id,effectiveWorkspace,undefined,request.cwd));
         return diskByWorkspace.get(key);
       };
+      const evidence = () => {
+        if(!evidenceByMachine.has(route.machine_id)) {
+          const usage=sanitizeCpuUsage(hb.cpu_usage);
+          evidenceByMachine.set(route.machine_id,{
+            mem_avail_mb: Number.isFinite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
+            psi_cpu_full_avg10: usage?.psi_full_avg10 ?? null,
+            psi_memory_full_avg10: usage?.memory_psi_full_avg10 ?? null,
+            psi_io_full_avg10: usage?.io_psi_full_avg10 ?? null,
+            observed_at: usage?.observed_at ?? (typeof hb.at === 'string' ? hb.at : null),
+          });
+        }
+        return evidenceByMachine.get(route.machine_id);
+      };
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
       else if (gateRefusal) reason = gateRefusal.reason;
@@ -891,7 +923,7 @@ export class FleetService {
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_concurrency';
-      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
+      if (reason) { evidence(); rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
@@ -929,7 +961,7 @@ export class FleetService {
     if (candidates[0] && typeof candidates[0].workspace === 'string' && candidates[0].workspace !== request.workspace) {
       request.workspace = candidates[0].workspace;
     }
-    return { request, selected: candidates[0] || null, candidates, rejected };
+    return { request, selected: candidates[0] || null, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine) };
     });
   }
 
@@ -946,10 +978,14 @@ export class FleetService {
     return this.resources.headroom(machine);
   }
 
-  private memoryHold(id: string, rejected: any[], refused = false) {
+  /** Persist a placement hold with the rejection-time evidence map
+   * (MemAvailable + PSI cpu/memory/io full per machine, captured from the
+   * heartbeat that drove the refusal — intake 1bc3add1 AC1). Status
+   * warnings read these values, never a later observation. */
+  private memoryHold(id: string, rejected: any[], refused = false, evidence: Record<string, any> | null = null) {
     if (!rejected.some(r => CAPACITY_REASONS.has(r.reason))) return;
-    this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused) VALUES (?, ?, ?, ?) ON CONFLICT(launch_id) DO UPDATE SET rejected_json = excluded.rejected_json, refused = MAX(refused, excluded.refused)',
-      id, new Date(this.now()).toISOString(), JSON.stringify(rejected), refused ? 1 : 0);
+    this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused, evidence_json) VALUES (?, ?, ?, ?, ?) ON CONFLICT(launch_id) DO UPDATE SET rejected_json = excluded.rejected_json, refused = MAX(refused, excluded.refused), evidence_json = COALESCE(excluded.evidence_json, evidence_json)',
+      id, new Date(this.now()).toISOString(), JSON.stringify(rejected), refused ? 1 : 0, evidence ? JSON.stringify(evidence).slice(0, 8192) : null);
   }
 
   private memoryRejections(id: string): any[] {
@@ -1025,12 +1061,12 @@ export class FleetService {
         if (!plan || (plan as any).error) continue;
         if (!plan.selected) {
           const rejected = plan.rejected || [];
-          this.memoryHold(row.id, rejected);
+          this.memoryHold(row.id, rejected, false, plan.evidence);
           // Honest parked status: when a re-plan now fails for a non-capacity
           // reason (e.g. model_unsupported after memory cleared), record the
           // live reasons so status stops showing the last memory sample forever.
           if (!isCapacityOnlyHold(rejected) && rejected.length) {
-            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused) VALUES (?, ?, ?, 0) ON CONFLICT(launch_id) DO UPDATE SET rejected_json = excluded.rejected_json', row.id, nowIso, JSON.stringify(rejected));
+            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused, evidence_json) VALUES (?, ?, ?, 0, ?) ON CONFLICT(launch_id) DO UPDATE SET rejected_json = excluded.rejected_json, evidence_json = excluded.evidence_json', row.id, nowIso, JSON.stringify(rejected), plan.evidence && Object.keys(plan.evidence).length ? JSON.stringify(plan.evidence).slice(0, 8192) : null);
           }
           continue;
         }
@@ -1160,7 +1196,7 @@ export class FleetService {
         if (isCapacityOnlyHold(plan.rejected)) {
           const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString();
           this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), '', '', '', null, plan.request.mode, plan.request.workspace, plan.request.prompt, 'queued', at, at);
-          this.memoryHold(id, plan.rejected);
+          this.memoryHold(id, plan.rejected, false, plan.evidence);
           return result({ id, state: 'queued', queued: true, queue_position: this.queuePosition(id), rejected: plan.rejected, access: admitted.access.mode }, 202);
         }
         try { this.recordPlacementRejection(actor, plan.rejected); } catch { /* alerting never breaks placement */ }

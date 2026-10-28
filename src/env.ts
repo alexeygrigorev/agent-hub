@@ -3,7 +3,12 @@ import { Hub } from './hub';
 export interface Env {
   // Type-safe DurableObjectNamespace binding for Hub Durable Object
   HUB: DurableObjectNamespace<Hub>;
-  
+
+  // Static assets binding. The Worker reads its own deployed cli/manifest.json
+  // through it to learn when the running build was produced (status warning
+  // staleness, intake 1bc3add1 AC2). Optional: tests may omit it.
+  ASSETS?: Fetcher;
+
   // Auth Config
   AUTH_BASE_URL: string;
   AUTH_CLIENT_ID: string;

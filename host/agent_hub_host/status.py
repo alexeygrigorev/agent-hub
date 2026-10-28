@@ -170,6 +170,14 @@ def render_human(data):
                 escape_display(item.get('severity')),
                 escape_display(item.get('subject')),
                 escape_display(item.get('detail'))))
+    history_warnings = data.get('history_warnings') or []
+    if history_warnings:
+        lines.append('history (not live): %d' % len(history_warnings))
+        for item in history_warnings:
+            lines.append('  [%s] %s: %s' % (
+                escape_display(item.get('stale_reason') or 'stale'),
+                escape_display(item.get('subject')),
+                escape_display(item.get('detail'))))
     for task in data.get('tasks', []):
         lines.append('task %s [%s] %s updated=%s' % (
             escape_display(task.get('id')), escape_display(task.get('status')),
