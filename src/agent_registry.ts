@@ -1,6 +1,5 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 
-const quote = (name: string) => '"' + name.replaceAll('"', '""') + '"';
 export const AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const RESERVED_REGISTRY_NAME = /^(human|role|machine|routing|routing-client|job|schedule|admin|root|principal|system|hub)$/i;
 export function validRegistryName(value: unknown): value is string {
@@ -24,44 +23,22 @@ export function registryAddress(raw: string): { tag: string; project: string | n
   return { project: parts[0], tag: parts[1] };
 }
 
-/** Rebuild only the legacy constraint, preserving columns, rows, explicit indexes and triggers.
+/** Ensure the current agents layout: project-scoped identity indexes plus the
+ * projectless-collision guard. The M3/M4 global-tag-PK rebuild was retired
+ * (intake 19848714): the live DO schema is current and no pre-migration rows
+ * remain, so a legacy DDL here now fails closed at the index/check below
+ * instead of silently rebuilding.
  * The caller must supply the real storage transactionSync; any failure rolls back all DDL. */
-export function migrateAgentRegistry(sql: SqlStorage, transaction: <T>(fn: () => T) => T,
-  checkpoint?: (phase: string) => void): void {
+export function migrateAgentRegistry(sql: SqlStorage, transaction: <T>(fn: () => T) => T): void {
   transaction(() => {
-    if (!(sql.exec('PRAGMA table_info(agents)').toArray() as any[]).some(c => c.name === 'project')) sql.exec('ALTER TABLE agents ADD COLUMN project TEXT');
-    const columns = sql.exec('PRAGMA table_info(agents)').toArray() as any[];
-    const tag = columns.find(c => c.name === 'tag');
-    const project = columns.find(c => c.name === 'project');
-    if (tag?.pk || project?.notnull) {
-      const table = sql.exec("SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'").toArray()[0] as any;
-      let ddl: string = table.sql;
-      // Known M3/M4 schemas only: unknown constraints fail closed rather than discard data.
-      if (tag?.pk) {
-        const replaced = ddl.replace(/\btag\s+TEXT\s+PRIMARY\s+KEY/i, 'tag TEXT NOT NULL');
-        if (replaced === ddl || columns.some(c => c.name !== 'tag' && c.pk)) throw new Error('unsupported_agents_schema');
-        ddl = replaced;
-      }
-      if (project?.notnull) ddl = ddl.replace(/\bproject\s+TEXT\s+NOT\s+NULL/i, 'project TEXT');
-      ddl = ddl.replace(/CREATE TABLE(?: IF NOT EXISTS)?\s+["`[]?agents["`\]]?/i, 'CREATE TABLE agents_project_migration');
-      const dependent = sql.exec("SELECT name, type, sql FROM sqlite_master WHERE sql IS NOT NULL AND ((tbl_name='agents' AND type='index') OR (type='trigger' AND (tbl_name='agents' OR sql LIKE '%agents%')))").toArray() as any[];
-      // SQLite validates even triggers attached to other tables during RENAME.
-      for (const row of dependent) if (row.type === 'trigger') sql.exec(`DROP TRIGGER ${quote(row.name)}`);
-      sql.exec(ddl);
-      const names = columns.map(c => quote(c.name)).join(',');
-      sql.exec(`INSERT INTO agents_project_migration (${names}) SELECT ${names} FROM agents`);
-      checkpoint?.('copied');
-      sql.exec('DROP TABLE agents');
-      checkpoint?.('dropped');
-      sql.exec('ALTER TABLE agents_project_migration RENAME TO agents');
-      for (const row of dependent) sql.exec(row.sql);
+    if (!(sql.exec('PRAGMA table_info(agents)').toArray() as any[]).some(c => c.name === 'project')) {
+      throw new Error('unsupported_agents_schema');
     }
     if (sql.exec("SELECT 1 FROM agents a WHERE COALESCE(a.project,'') = '' AND (SELECT COUNT(*) FROM agents b WHERE b.tag = a.tag) > 1 LIMIT 1").toArray().length) {
       throw new Error('ambiguous_legacy_registry');
     }
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_project_tag_unique ON agents(COALESCE(project, ''), tag)");
     sql.exec('CREATE INDEX IF NOT EXISTS idx_agents_tag_lookup ON agents(tag)');
-    checkpoint?.('indexed');
   });
 }
 

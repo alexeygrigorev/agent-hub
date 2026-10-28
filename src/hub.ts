@@ -406,11 +406,6 @@ export class Hub extends DurableObject {
 
   public initDb() {
     this.ctx.storage.transactionSync(() => {
-    // Remove the global tag PK before creating/using the current schema.
-    if (this.sql.exec('PRAGMA table_info(agents)').toArray().length) {
-      migrateAgentRegistry(this.sql, fn => this.ctx.storage.transactionSync(fn));
-    }
-
     // 2. Execute SCHEMA_SQL
     for (const statement of SCHEMA_SQL.split(';')) {
       const trimmed = statement.trim();

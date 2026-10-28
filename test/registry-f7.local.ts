@@ -283,7 +283,7 @@ describe('F7 complete old-database startup through SELF', () => {
 });
 
 describe('F7 migration on actual Durable Object SQLite', () => {
-  it('preserves both same-tag M3 rows through full Hub startup without replacement inserts', async () => {
+  it('preserves both same-tag project rows through full Hub startup without replacement inserts', async () => {
     const isolated = bindings.HUB.get(bindings.HUB.idFromName('m3-f7-'+crypto.randomUUID()));
     await runInDurableObject(isolated as any, (hub: Hub,state) => {
       hub.sql.exec('DROP TABLE agents');
@@ -296,50 +296,6 @@ describe('F7 migration on actual Durable Object SQLite', () => {
       expect(()=>hub.sql.exec("INSERT INTO agents(tag,project) VALUES ('same-m3','m3B')")).toThrow();
       expect(hub.busService.validateRecipient('same-m3')).toBe(false);
       expect(hub.busService.validateRecipient('m3A:same-m3')).toBe(true);
-    });
-  });
-
-  for (const failAt of ['copied','dropped','indexed',null]) it('preserves old PK rows/index/credential references with checkpoint '+failAt, async () => {
-    const isolated = bindings.HUB.get(bindings.HUB.idFromName('old-f7-'+crypto.randomUUID()));
-    await runInDurableObject(isolated as any, async (hub: Hub,state) => {
-      // Genuine old global-PK DDL, never a constraintless acceptance fixture.
-      const table = SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS agents ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages'))
-        .replace('tag TEXT NOT NULL','tag TEXT PRIMARY KEY');
-      hub.sql.exec('DROP TABLE agents'); hub.sql.exec(table);
-      hub.sql.exec('ALTER TABLE agents ADD COLUMN credential_reference TEXT');
-      hub.sql.exec('CREATE INDEX old_agents_machine ON agents(machine_id, registered_at)');
-      hub.sql.exec('CREATE TABLE legacy_audit (id TEXT, n INTEGER)');
-      hub.sql.exec(`CREATE TRIGGER legacy_foreign_agents AFTER INSERT ON messages BEGIN
-        INSERT INTO legacy_audit(id,n) SELECT NEW.id,COUNT(*) FROM agents;
-      END`);
-      const foreignTrigger = hub.sql.exec("SELECT sql FROM sqlite_master WHERE name='legacy_foreign_agents'").toArray()[0];
-      hub.sql.exec('INSERT INTO agents(tag,project,role,machine_id,registered_at,state,health_at,credential_reference) VALUES (?,?,?,?,?,?,?,?)','old-worker','old','implementer','local-machine','2020-01-01','unknown','2020-01-02','local-reference');
-      hub.sql.exec("INSERT INTO agents(tag,project,role,machine_id,registered_at) VALUES ('win35-root','old','root','win35','2020-01-01')");
-      const before = hub.sql.exec('SELECT * FROM agents ORDER BY tag').toArray();
-      const indices = hub.sql.exec("SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name='agents' AND sql IS NOT NULL ORDER BY name").toArray();
-      const run = () => migrateAgentRegistry(hub.sql,fn=>state.storage.transactionSync(fn),phase=>{if(phase===failAt)throw new Error('local-injected');});
-      if (failAt) {
-        expect(run).toThrow('local-injected');
-        expect(hub.sql.exec('PRAGMA table_info(agents)').toArray().find((r:any)=>r.name==='tag')?.pk).toBe(1);
-        expect(hub.sql.exec('SELECT * FROM agents ORDER BY tag').toArray()).toEqual(before);
-        expect(()=>hub.sql.exec("INSERT INTO agents(tag,project) VALUES ('old-worker','other')")).toThrow();
-      } else run();
-      migrateAgentRegistry(hub.sql,fn=>state.storage.transactionSync(fn));
-      expect(hub.sql.exec('SELECT * FROM agents ORDER BY tag').toArray()).toEqual(before);
-      for (const index of indices) expect(hub.sql.exec('SELECT name,sql FROM sqlite_master WHERE name = ?',index.name).toArray()[0]).toEqual(index);
-      hub.sql.exec("INSERT INTO agents(tag,project) VALUES ('old-worker','other')");
-      expect(()=>hub.sql.exec("INSERT INTO agents(tag,project) VALUES ('old-worker','old')")).toThrow();
-      hub.sql.exec("INSERT INTO agents(tag,project) VALUES ('projectless',NULL)");
-      expect(()=>hub.sql.exec("INSERT INTO agents(tag,project) VALUES ('projectless','')")).toThrow();
-      const stable = hub.sql.exec('SELECT * FROM agents ORDER BY tag,project').toArray();
-      migrateAgentRegistry(hub.sql,fn=>state.storage.transactionSync(fn));
-      expect(hub.sql.exec('SELECT * FROM agents ORDER BY tag,project').toArray()).toEqual(stable);
-      expect(hub.sql.exec("SELECT sql FROM sqlite_master WHERE name='legacy_foreign_agents'").toArray()[0]).toEqual(foreignTrigger);
-      hub.sql.exec("INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at) VALUES ('audit-msg','admin','system','note','audit-msg','local','audit-key',0,1)");
-      expect(hub.sql.exec("SELECT n FROM legacy_audit WHERE id='audit-msg'").toArray()[0]).toEqual({n:stable.length});
-      // Full actual Hub startup must not put the global PK back.
-      new Hub(state,bindings);
-      expect(hub.sql.exec('SELECT * FROM agents ORDER BY tag,project').toArray()).toEqual(stable);
     });
   });
 });
