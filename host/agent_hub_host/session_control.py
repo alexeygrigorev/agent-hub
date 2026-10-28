@@ -37,6 +37,9 @@ TERMINAL_COMMAND = ('acked', 'refused', 'uncertain', 'failed')
 TERMINAL_SESSION = ('running', 'stopped', 'failed', 'refused', 'held', 'uncertain', 'cancelled')
 
 SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+# Match the normal JSON response bound in api.safe_http_json. A held-session
+# DTO can exceed 4 KiB when it includes per-route memory/admission evidence.
+MAX_ERROR_RESPONSE = 10 * 1024 * 1024
 
 
 class SessionHTTPError(ValueError):
@@ -94,8 +97,13 @@ def http_error(exc, key=None):
     provider_guidance = ''
     concurrency_guidance = ''
     try:
-        raw = exc.read(4096) if hasattr(exc, 'read') else b''
-        data = json.loads((raw or b'').decode('utf-8', 'replace'))
+        raw = exc.read(MAX_ERROR_RESPONSE + 1) if hasattr(exc, 'read') else b''
+        if len(raw) > MAX_ERROR_RESPONSE:
+            code = reason = 'response_too_large'
+            name = ' (response_too_large)'
+            data = {}
+        else:
+            data = json.loads((raw or b'').decode('utf-8', 'replace'))
         hold = data.get('hold') if isinstance(data, dict) else None
         err = data.get('error') if isinstance(data, dict) else None
         if (not isinstance(err, str) or not err) and isinstance(hold, dict):

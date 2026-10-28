@@ -754,10 +754,10 @@ export class SessionControlService {
         }
       } catch {} // Fleet is optional in isolated session-control installations.
     }
-    if ((row.state === 'held' || row.state === 'queued' || row.state === 'cancelled') && memoryRejected.length === 0) {
+    if ((row.state === 'refused' || row.state === 'held' || row.state === 'queued' || row.state === 'cancelled') && memoryRejected.length === 0) {
       const holdInfo = this.readHoldInfo(row, request);
       if (holdInfo.rejected.length > 0) memoryRejected = holdInfo.rejected;
-      if (holdInfo.reason && (row.state === 'held' || row.state === 'cancelled')) holdReason = holdInfo.reason;
+      if (holdInfo.reason && (row.state === 'refused' || row.state === 'held' || row.state === 'cancelled')) holdReason = holdInfo.reason;
     }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
@@ -784,6 +784,7 @@ export class SessionControlService {
       fleet_launch_id: row.fleet_launch_id ?? null,
       ...(modelReason ? { reason: modelReason } : {}),
       ...(memoryRejected.length ? { reason: holdReason ?? memoryRejected[0]?.reason ?? 'placement_unknown', rejected: memoryRejected } : holdReason ? { reason: holdReason } : {}),
+      ...(['refused', 'held'].includes(row.state) ? { reason: holdReason || memoryRejected[0]?.reason || 'placement_unknown', rejected: memoryRejected } : {}),
       ...(launchError ? { reason: launchError.reason, message: launchError.message, launch_error: launchError } : {}),
       ...(runtime ? { runtime } : {}),
       cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
@@ -1684,7 +1685,7 @@ export class SessionControlService {
           if (!prior) {
             const id = crypto.randomUUID();
             const at = this.at();
-            const noAuthHold = JSON.stringify({ error: 'no_placement_authority', reason: 'no_placement_authority' });
+            const noAuthHold = JSON.stringify({ error: 'no_placement_authority', reason: 'no_placement_authority', rejected: [] });
             this.sql.exec(
               'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, hold_json, owner_token_id, owner_family, parent_id, parent_source, session_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
               id, actor, input.key, canonical, mode, 'held', noAuthHold, caller.tokenId ?? null, creatorFamily, parentId, parentSource, sessionType, at, at);
@@ -1715,11 +1716,15 @@ export class SessionControlService {
         idempotency_key: 'session-control-' + id,
       }, auth);
         if (reserved.status === 400) {
-          this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'refused', at, id);
+          const rejected = Array.isArray(reserved.value?.rejected) ? reserved.value.rejected : [];
+          const reason = [reserved.value?.reason, rejected[0]?.reason, reserved.value?.error]
+            .find(value => typeof value === 'string' && value.trim()) || 'placement_refused';
+          const refusal = { ...reserved.value, reason, rejected };
+          this.sql.exec('UPDATE session_control_sessions SET state = ?, hold_json = ?, updated_at = ? WHERE id = ?', 'refused', JSON.stringify(refusal), at, id);
           const refused: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
           recordIntakeSessionLink(this.sql, refused, this.now());
           try { if (mode !== 'interactive') recordSessionOutcomeReward(this.sql, { session_id: id, intake_task_id: input.intake_task_id ?? null, engine: input.engine ?? null, outcome: 'refused' }, this.now()); } catch {}
-          return response(reserved.value, 400);
+          return response({ ...this.view(refused), ...refusal, requested: { engine: input.engine ?? null, machine: input.machine ?? null, needs: input.needs ?? null, workspace: input.workspace } }, 400);
         }
         // Capacity-only placement parks a waitable queued intent (202) linked
         // to the fleet waitlist row; the fleet drain auto-places it when a
@@ -1732,7 +1737,10 @@ export class SessionControlService {
           return finish(row, { queued: true, queue_position: reserved.value.queue_position ?? null, rejected: reserved.value.rejected ?? null, requested: { engine: input.engine ?? null, machine: input.machine ?? null, needs: input.needs ?? null, workspace: input.workspace } }, 202);
         }
         if (reserved.status >= 300) {
-          const holdPayload = reserved.value !== undefined ? JSON.stringify(reserved.value) : null;
+          const rejected = Array.isArray(reserved.value?.rejected) ? reserved.value.rejected : [];
+          const reason = [reserved.value?.reason, rejected[0]?.reason, reserved.value?.error]
+            .find(value => typeof value === 'string' && value.trim()) || 'placement_held';
+          const holdPayload = JSON.stringify({ ...reserved.value, reason, rejected });
           this.sql.exec('UPDATE session_control_sessions SET state = ?, hold_json = ?, updated_at = ? WHERE id = ?', 'held', holdPayload, at, id);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
           return finish(row, { hold: reserved.value, requested: { engine: input.engine ?? null, machine: input.machine ?? null, needs: input.needs ?? null, workspace: input.workspace } }, 409);

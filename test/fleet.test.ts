@@ -114,7 +114,7 @@ describe('generic accounts and launch placement', () => {
     // Prefix siblings must never gain access when a root is added.
     const outside = await (await s.handle(request('/plan', intent({ engine: 'glm-flash', tier: 'daily', workspace: '/data/agents/project/worktrees-other/recovery' })), admin)).json() as any;
     expect(outside.selected).toBeNull();
-    expect(outside.rejected).toContainEqual(expect.objectContaining({ reason: 'capability_unavailable' }));
+    expect(outside.rejected).toContainEqual(expect.objectContaining({ reason: 'workspace_unavailable' }));
   }));
 
   it('retires only a missing-adapter hold after fresh configuration admission', async () => fixture(async (s, sql) => {
@@ -1018,7 +1018,7 @@ describe('absolute workspace identifiers alongside labels', () => {
     advertise(sql, ['demo']);
     const plan: any = s.plan(intent({ workspace: ABS }));
     expect(plan.selected).toBeNull();
-    expect(plan.rejected[0].reason).toBe('capability_unavailable');
+    expect(plan.rejected[0].reason).toBe('workspace_unavailable');
     const res = await s.handle(request('/launches', intent({ workspace: ABS })), admin);
     expect(res.status).toBe(409);
     expect(sql.exec('SELECT COUNT(*) n FROM fleet_launches').one().n).toBe(0);
@@ -1071,11 +1071,11 @@ describe('bare workspace labels resolve under advertised absolute roots', () => 
     expect(plan.selected?.machine).toBe('hetzner');
     expect(plan.request.workspace).toBe(RESOLVED);
   }));
-  it('fails closed with capability_unavailable when no absolute root is advertised', async () => fixture(async (s, sql) => {
+  it('fails closed with workspace_unavailable when no absolute root is advertised', async () => fixture(async (s, sql) => {
     await configure(s);
     const plan: any = s.plan(intent({ workspace: 'unknown-label' }));
     expect(plan.selected).toBeNull();
-    expect(plan.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'capability_unavailable' });
+    expect(plan.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'workspace_unavailable' });
     const res = await s.handle(request('/launches', intent({ workspace: 'unknown-label' })), admin);
     expect(res.status).toBe(409);
     const body: any = await res.json();

@@ -898,11 +898,15 @@ export class FleetService {
       else if (gateRefusal) reason = gateRefusal.reason;
       else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, effectiveWorkspace) || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd))) {
         const engineMissing = !Array.isArray(caps.engines) || !caps.engines.includes(route.engine);
+        const modeMissing = !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode);
+        const workspaceMissing = !workspaceCapable(caps.workspaces, effectiveWorkspace)
+          || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd));
         // A route for an engine no live host advertises anymore is stale
         // registry debt, not a workspace/mode defect — but only when the live
         // fleet actually advertises engines. When nothing live advertises
         // anything (broken/empty registration), keep capability_unavailable.
-        reason = (engineMissing && liveEngines.size > 0 && !liveEngines.has(route.engine)) ? 'engine_unavailable' : 'capability_unavailable';
+        reason = (engineMissing && liveEngines.size > 0 && !liveEngines.has(route.engine)) ? 'engine_unavailable'
+          : !engineMissing && !modeMissing && workspaceMissing ? 'workspace_unavailable' : 'capability_unavailable';
       }
       // Intake 4398ce2a (Alexey t1523u): the aggregate host gate and launcher
       // telemetry are projections, not refusals. Missing, stale, failed or
