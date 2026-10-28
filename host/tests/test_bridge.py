@@ -736,16 +736,8 @@ sys.exit(0)
 
     def test_launcher_recovery_uses_shared_state_dir_helper(self):
         """F5: launcher_recovery resolves state via retired_native helper (XDG included)."""
-        from agent_hub_host import launcher_recovery
         from agent_hub_host.retired_native import resolve_aplexer_state_dir
-        import inspect
 
-        source = inspect.getsource(launcher_recovery.settle_retired_legacy)
-        self.assertIn(
-            "resolve_aplexer_state_dir",
-            source,
-            "settle_retired_legacy must use the shared helper, not a fourth copy",
-        )
         with patch.dict(
             os.environ, {"XDG_STATE_HOME": "/xdg/state"}, clear=True
         ):

@@ -22,7 +22,6 @@ def _silent_cycle(cfg, request, runner, journal=None):
         stack.enter_context(patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}}))
         stack.enter_context(patch('agent_hub_host.api.get_heartbeat_payload', return_value={}))
         stack.enter_context(patch('agent_hub_host.workclaim.sync_once', return_value={'ok': True}))
-        stack.enter_context(patch('agent_hub_host.launcher_recovery.settle_retired_legacy', return_value=[]))
         stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
         for method, value in [('report_catalog_bindings', []), ('reconcile_launches', []),
                               ('reconcile_imported_sessions', []), ('_derive_qualified_role_jobs', [])]:
@@ -63,7 +62,7 @@ def test_phases_published_with_expected_keys():
         phases = phase_events[0]['phases']
         for key in ('provisioning', 'system', 'register', 'admission', 'heartbeat',
                     'probes', 'subscriptions', 'catalog', 'workclaim', 'capabilities',
-                    'legacy', 'reconcile', 'watchdog', 'unconfigured_probes',
+                    'reconcile', 'watchdog', 'unconfigured_probes',
                     'offers', 'dispatch'):
             assert key in phases, (key, sorted(phases))
             assert isinstance(phases[key], (int, float)), (key, phases[key])
@@ -88,7 +87,6 @@ def test_subscriptions_400_is_nonfatal_and_offers_still_dispatched():
             stack.enter_context(patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}}))
             stack.enter_context(patch('agent_hub_host.api.get_heartbeat_payload', return_value={}))
             stack.enter_context(patch('agent_hub_host.workclaim.sync_once', return_value={'ok': True}))
-            stack.enter_context(patch('agent_hub_host.launcher_recovery.settle_retired_legacy', return_value=[]))
             stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
             for method, value in [('reconcile_launches', []), ('reconcile_imported_sessions', []),
                                   ('_derive_qualified_role_jobs', [])]:
@@ -120,7 +118,6 @@ def test_catalog_failure_is_nonfatal():
             stack.enter_context(patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}}))
             stack.enter_context(patch('agent_hub_host.api.get_heartbeat_payload', return_value={}))
             stack.enter_context(patch('agent_hub_host.workclaim.sync_once', return_value={'ok': True}))
-            stack.enter_context(patch('agent_hub_host.launcher_recovery.settle_retired_legacy', return_value=[]))
             stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
             for method, value in [('reconcile_launches', []), ('reconcile_imported_sessions', []),
                                   ('_derive_qualified_role_jobs', [])]:
@@ -160,7 +157,6 @@ def test_already_claimed_loser_holds_without_reject():
             stack.enter_context(patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}}))
             stack.enter_context(patch('agent_hub_host.api.get_heartbeat_payload', return_value={}))
             stack.enter_context(patch('agent_hub_host.workclaim.sync_once', return_value={'ok': True}))
-            stack.enter_context(patch('agent_hub_host.launcher_recovery.settle_retired_legacy', return_value=[]))
             stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
             for method, value in [('report_catalog_bindings', []), ('reconcile_launches', []),
                                   ('reconcile_imported_sessions', []), ('_derive_qualified_role_jobs', [])]:
@@ -205,7 +201,6 @@ def test_concurrent_cycle_skips_with_receipt_and_releases():
             stack.enter_context(patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}}))
             stack.enter_context(patch('agent_hub_host.api.get_heartbeat_payload', return_value={}))
             stack.enter_context(patch('agent_hub_host.workclaim.sync_once', return_value={'ok': True}))
-            stack.enter_context(patch('agent_hub_host.launcher_recovery.settle_retired_legacy', return_value=[]))
             stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
             for method, value in [('report_catalog_bindings', []), ('reconcile_launches', []),
                                   ('reconcile_imported_sessions', []), ('_derive_qualified_role_jobs', [])]:

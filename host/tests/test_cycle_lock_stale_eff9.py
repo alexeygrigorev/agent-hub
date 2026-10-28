@@ -43,7 +43,6 @@ def _stubbed_once(dispatcher):
         stack.enter_context(patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}}))
         stack.enter_context(patch('agent_hub_host.api.get_heartbeat_payload', return_value={}))
         stack.enter_context(patch('agent_hub_host.workclaim.sync_once', return_value={'ok': True}))
-        stack.enter_context(patch('agent_hub_host.launcher_recovery.settle_retired_legacy', return_value=[]))
         stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
         for method, value in [('report_catalog_bindings', []), ('reconcile_launches', []),
                               ('reconcile_imported_sessions', []), ('_derive_qualified_role_jobs', [])]:

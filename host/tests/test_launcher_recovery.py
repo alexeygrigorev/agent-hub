@@ -192,44 +192,6 @@ class LauncherRecoveryTests(unittest.TestCase):
         self.assertTrue(json.loads(entry.read_text())['settled'])
 
 
-@unittest.skipUnless(os.name == 'posix', 'POSIX launcher lock contract')
-class LegacyRetirementTests(unittest.TestCase):
-    def test_exact_retirement_releases_only_its_reservation_without_inventing_success(self):
-        from agent_hub_host.launcher_recovery import settle_retired_legacy
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); cfg = root / 'cfg'; cfg.mkdir(mode=0o700)
-            native = root / 'native'; (native / 'retired-sessions').mkdir(parents=True, mode=0o700)
-            (native / 'sessions').mkdir(mode=0o700)
-            task = 'hub-11111111-1111-4111-8111-111111111111'
-            sid = '22222222-2222-4222-8222-222222222222'
-            retired = native / 'retired-sessions' / sid; retired.mkdir(mode=0o700)
-            tomb = {'id': sid, 'tag': 'task-' + task, 'workspace': '/removed/workspace', 'cause': 'finished', 'finished_at_ms': 1790000000000}
-            leaf = retired / 'tombstone.json'
-            leaf.write_text(json.dumps(tomb)); leaf.chmod(0o600)
-            db = cfg / 'state.db'
-            with sqlite3.connect(db) as c:
-                c.executescript('CREATE TABLE tasks (id TEXT,state TEXT,payload TEXT,created_at TEXT,idempotency_key TEXT,reason TEXT,reviewer TEXT,updated_at TEXT); CREATE TABLE task_native_bindings (task_id TEXT);')
-                c.execute('INSERT INTO tasks VALUES (?,?,?,?,?,NULL,NULL,NULL)', (task, 'running', json.dumps({'owner': 'hub-fleet', 'cwd': '/removed/workspace'}), '2026-09-01 00:00:00', task))
-            def settle(): return settle_retired_legacy({'config_dir': str(cfg)}, state_dir=native)
-            for bad in ({'workspace': '/wrong'}, {'tag': 'task-other'}, {'cause': 'unknown'}, {'finished_at_ms': 1}, {'finished_at_ms': 9999999999999}, {'id': 'other'}):
-                leaf.write_text(json.dumps({**tomb, **bad})); self.assertEqual(settle(), [])
-            leaf.write_text(json.dumps(tomb))
-            live = native / 'sessions' / sid; live.mkdir(mode=0o700)
-            self.assertEqual(settle(), [])
-            live.rmdir()
-            reused = native / 'sessions' / '33333333-3333-4333-8333-333333333333'
-            reused.mkdir(mode=0o700)
-            record = reused / 'session.json'
-            record.write_text(json.dumps({'tag': tomb['tag']}))
-            self.assertEqual(settle(), [])
-            record.unlink(); reused.rmdir()
-            self.assertEqual(settle(), [{'task_id': task, 'native_id': sid, 'state': 'failed'}])
-            self.assertEqual(settle(), [])
-            with sqlite3.connect(db) as c:
-                self.assertEqual(c.execute('SELECT state FROM tasks').fetchone()[0], 'failed')
-                self.assertEqual(c.execute('SELECT count(*) FROM task_native_bindings').fetchone()[0], 0)
-
-
 class ResourceReconciliationTests(unittest.TestCase):
     def test_periodic_scan_uses_launcher_and_returns_only_accounting(self):
         from agent_hub_host.launcher_recovery import reconcile_resources

@@ -4000,9 +4000,6 @@ class Dispatcher:
             except Exception as exc:
                 _skip_telemetry('capabilities', exc)
         _mark('capabilities')
-        from .launcher_recovery import settle_retired_legacy
-        legacy_settled = settle_retired_legacy(self.settings.get('launcher', {}))
-        _mark('legacy')
         reconciled = self.reconcile_launches()
         self.reconcile_operator_adoptions()
         imported_reconciled = self.reconcile_imported_sessions()
@@ -4050,7 +4047,7 @@ class Dispatcher:
         from .account_capacity import reconcile_unstarted
         reconciled += [r for r in reconcile_unstarted(self, rows=offer_response.get('reconciliation', [])) if r['state'] in ('failed', 'exited')]
         _mark('offers')
-        results = [{'id': r['task_id'], 'state': 'failed', 'reason': 'legacy_native_finished'} for r in legacy_settled] + list(reconciled) + list(imported_reconciled)
+        results = list(reconciled) + list(imported_reconciled)
         results.append({"id": "workclaim-sync", **workclaim_summary})
         self._last_hb = hb
         _, dispatch_max_s = self.dispatch_offers(results, hb=hb, offers=offers,

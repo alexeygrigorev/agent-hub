@@ -31,8 +31,7 @@ class OfferedRefusals(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for name, value in [('provisioning.tick', None), ('provisioning.managed_subscriptions', []),
                                 ('system.get_system_info', {'capabilities': {}}),
-                                ('api.get_heartbeat_payload', {}), ('workclaim.sync_once', {'ok': True}),
-                                ('launcher_recovery.settle_retired_legacy', [])]:
+                                ('api.get_heartbeat_payload', {}), ('workclaim.sync_once', {'ok': True})]:
                 stack.enter_context(patch('agent_hub_host.' + name, return_value=value))
             stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
             for method, value in [('report_catalog_bindings', []), ('reconcile_launches', []),
