@@ -122,6 +122,7 @@ export default {
       '/metrics', '/metrics.html', '/metrics.js', '/metrics-charts.js', '/metrics.css', '/host-health-charts.js', '/tbm.js', '/tbm.css', '/usage-history.js',
       '/usage', '/usage.html',
       '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
+      '/webhooks', '/webhooks.html', '/webhooks.js', '/webhooks.css',
       '/intake', '/intake.html', '/intake.js', '/intake.css', '/intake-overview.js', '/resource-management.js',
       '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',
       '/vendor/dakit/fonts/inter-var.woff2',
@@ -146,6 +147,7 @@ export default {
     if (url.pathname === '/inbox') url.pathname = '/inbox.html';
     if (url.pathname === '/metrics' || url.pathname === '/usage' || url.pathname === '/usage.html') url.pathname = '/metrics.html';
     if (url.pathname === '/sessions') url.pathname = '/sessions.html';
+    if (url.pathname === '/webhooks') url.pathname = '/webhooks.html';
     if (url.pathname === '/fleet') url.pathname = '/fleet.html';
     if (url.pathname === '/conversations') url.pathname = '/conversations.html';
     if (url.pathname === '/engines') url.pathname = '/engines.html';

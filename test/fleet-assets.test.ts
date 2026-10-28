@@ -21,6 +21,34 @@ describe('private fleet assets', () => {
       expect(r.status).toBe(303); expect(r.headers.get('Location')).toBe('/auth/login');
     }
   });
+  it('protects and serves every webhooks asset through the private asset binding', async () => {
+    const cookie = await createSessionCookie(defaultEnv, { sub: 'human-test', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test', exp: Math.floor(Date.now() / 1000) + 60 });
+    for (const path of ['/webhooks', '/webhooks.html', '/webhooks.js', '/webhooks.css']) {
+      const requestedPaths: string[] = [];
+      const bindings = { ...defaultEnv, ASSETS: { fetch: async (req: Request) => {
+        requestedPaths.push(new URL(req.url).pathname);
+        return new Response('private webhooks asset');
+      } } };
+      for (const sessionCookie of ['', 'hub_session=fake', cookie]) {
+        const headers = new Headers();
+        if (sessionCookie) headers.set('Cookie', sessionCookie);
+        const ctx = createExecutionContext();
+        const response = await worker.fetch(new Request('https://hub.test' + path, { headers }), bindings as any, ctx);
+        await waitOnExecutionContext(ctx);
+        if (sessionCookie === cookie) {
+          expect(response.status).toBe(200);
+          expect(await response.text()).toBe('private webhooks asset');
+          expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+          expect(response.headers.get('Content-Security-Policy')).toContain("script-src 'self'");
+        } else {
+          expect(response.status).toBe(303);
+          expect(response.headers.get('Location')).toBe('/auth/login');
+          expect(requestedPaths).toEqual([]);
+        }
+      }
+      expect(requestedPaths).toEqual([path === '/webhooks' ? '/webhooks.html' : path]);
+    }
+  });
   it('serves only the exact auth resource list before sign-in, never fleet data or kit tools', async () => {
     for (const path of ['/auth.css','/auth.js','/vendor/dakit/device-code.js','/vendor/dakit/dakit.css','/vendor/dakit/shell.js','/vendor/dakit/fonts/inter-var.woff2','/vendor/dakit/fonts/ibm-plex-mono-400.woff2','/vendor/dakit/fonts/ibm-plex-mono-500.woff2']) {
       const bindings = {...defaultEnv, ASSETS:{fetch:async () => new Response('static public resource')}};

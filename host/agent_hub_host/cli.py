@@ -230,10 +230,13 @@ def cmd_machines_available(args):
         # {"reachable": [ {machine} ], "count": N}
         if isinstance(machines, list):
             output = {"reachable": machines, "count": len(machines)}
+        elif isinstance(machines, dict) and isinstance(machines.get("machines"), list):
+            reachable = machines["machines"]
+            output = {"reachable": reachable, "count": len(reachable)}
         elif isinstance(machines, dict) and "reachable" in machines:
             output = machines
         else:
-            output = {"reachable": machines, "count": len(machines)} if isinstance(machines, list) else machines
+            raise ValueError("Unexpected available machines response")
 
         if args.json:
             print(json.dumps(output, indent=2, sort_keys=True))
