@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { SessionAuditService, makeHeuristicDecider, matchInputPrompt, AUDIT_INTERVAL, type AuditFeatures } from '../src/session-audit';
+import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify, matchInputPrompt, AUDIT_INTERVAL, type AuditFeatures } from '../src/session-audit';
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
 const NOW = Date.parse('2026-10-28T12:00:00Z');
@@ -499,4 +499,108 @@ describe('idle audit service (AC1/AC3/AC4)', () => {
     expect(Number(h.sql.exec('SELECT COUNT(*) AS n FROM session_audit_runs WHERE at < ?', cutoff).one().n)).toBe(0);
     expect(Number(h.sql.exec('SELECT COUNT(*) AS n FROM session_audit_decisions WHERE at < ?', cutoff).one().n)).toBe(0);
   }));
+});
+
+// ---------------------------------------------------------------------------
+// Production notification adapter (review round 3): the real hub liveness +
+// delivery path must receipt each batch, never report failed delivery as
+// landed, and re-deliver every successive payload (new batch, new episode,
+// repeat stop warnings).
+// ---------------------------------------------------------------------------
+describe('production notification adapter (real hub liveness + delivery receipt)', () => {
+  function uniqueStub(name: string) {
+    const bindings = env as any;
+    return bindings.HUB.get(bindings.HUB.idFromName('audit-adapter-' + name + '-' + crypto.randomUUID()));
+  }
+  function seedNative(h: any, i: number) {
+    const nowMs = Date.now();
+    h.sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,progress_json)
+      VALUES (?,?,?,?,?,?,?,?)`, 'm1', 'n' + i, 'worker', 'codex', 'running', iso(nowMs),
+      '/home/alexey/git/demo-wt-' + i, JSON.stringify({ last_progress_at: iso(nowMs - 2 * HOUR) }));
+    h.sql.exec('INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES (?,?)', 'm1', iso(nowMs));
+  }
+  const outcomeCounts = (h: any) =>
+    Object.fromEntries(h.sql.exec('SELECT outcome, COUNT(*) AS n FROM session_audit_decisions GROUP BY outcome').toArray().map((r: any) => [r.outcome ?? 'pending', Number(r.n)]));
+  const auditAlerts = (h: any) =>
+    h.sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind='session_audit' ORDER BY id").toArray();
+
+  it('delivers each batch on its own alert: 10 alerted, 5 skipped, the 5 land next run', async () => {
+    await inDO(uniqueStub('fresh'), async (hub: any) => {
+      hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
+      for (let i = 0; i < 15; i++) seedNative(hub, i);
+      const r1 = await hub.sessionAudit.tick('manual');
+      expect(r1.counts).toMatchObject({ escalate: 15, alert_skipped: 5, alert_failed: 0 });
+      expect(outcomeCounts(hub)).toMatchObject({ alerted: 10, alert_skipped: 5 });
+      let alerts = auditAlerts(hub);
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0].subject).toBe('idle-actions');
+      expect(alerts[0].resolved_at).toBeNull();
+      expect(JSON.parse(alerts[0].delivered_to)).toContain('inbox:grok-bot');
+      expect(alerts[0].notify_error).toBeNull();
+
+      // Next run: only the 5 undispatched escalations retry; the payload is a
+      // NEW alert (old incident superseded) so it actually delivers.
+      const r2 = await hub.sessionAudit.tick('manual');
+      expect(r2.counts).toMatchObject({ escalate: 5, alert_skipped: 0, alert_failed: 0 });
+      expect(outcomeCounts(hub)).toMatchObject({ alerted: 15, alert_skipped: 5 });
+      alerts = auditAlerts(hub);
+      expect(alerts).toHaveLength(2);
+      expect(alerts[0].resolved_at).not.toBeNull();
+      expect(alerts[1].resolved_at).toBeNull();
+      expect(JSON.parse(alerts[1].delivered_to)).toContain('inbox:grok-bot');
+    });
+  });
+
+  it('failed delivery (no targets) records alert_failed; the batch lands once a target exists', async () => {
+    await inDO(uniqueStub('notargets'), async (hub: any) => {
+      hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
+      for (let i = 0; i < 10; i++) seedNative(hub, i);
+      const savedTo = hub.env.HUB_ALERT_TO, savedHook = hub.env.HUB_ALERT_WEBHOOK;
+      delete hub.env.HUB_ALERT_WEBHOOK;
+      hub.env.HUB_ALERT_TO = '';
+      try {
+        const r1 = await hub.sessionAudit.tick('manual');
+        expect(r1.counts).toMatchObject({ escalate: 10, alert_failed: 10, alert_skipped: 0 });
+        expect(outcomeCounts(hub)).toMatchObject({ alert_failed: 10 });
+        const alerts = auditAlerts(hub);
+        expect(alerts).toHaveLength(1);
+        expect(alerts[0].notify_error).toBe('no alert target configured');
+        expect(JSON.parse(alerts[0].delivered_to)).toEqual([]);
+      } finally {
+        hub.env.HUB_ALERT_TO = savedTo;
+        if (savedHook === undefined) delete hub.env.HUB_ALERT_WEBHOOK; else hub.env.HUB_ALERT_WEBHOOK = savedHook;
+      }
+
+      // Undispatched rows never advanced the ladder: they retry and land now.
+      const r2 = await hub.sessionAudit.tick('manual');
+      expect(r2.counts).toMatchObject({ escalate: 10, alert_failed: 0, alert_skipped: 0 });
+      expect(outcomeCounts(hub)).toMatchObject({ alert_failed: 10, alerted: 10 });
+      const alerts = auditAlerts(hub);
+      expect(alerts).toHaveLength(2);
+      expect(alerts[0].resolved_at).not.toBeNull();
+      expect(JSON.parse(alerts[1].delivered_to)).toContain('inbox:grok-bot');
+    });
+  });
+
+  it('successive payloads and repeat stop warnings each deliver fresh', async () => {
+    await inDO(uniqueStub('repeat'), async (hub: any) => {
+      hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
+      const notify = makeLivenessNotify({
+        setAlert: (kind: string, subject: string, problem: any) => hub.livenessService.setAlert(kind, subject, problem),
+        deliverAlert: (a: any) => (hub as any).notifyAlert(a),
+      });
+      expect(await notify('session_audit', 'stop-unverified', 'batch A: s1 on m1')).toBe(true);
+      expect(await notify('session_audit', 'stop-unverified', 'batch B: s1 on m1')).toBe(true);
+      expect(await notify('session_audit', 'idle-actions', 'escalations: n0 m1')).toBe(true);
+      const alerts = auditAlerts(hub);
+      expect(alerts).toHaveLength(3);
+      const [, stopB, idle] = alerts;
+      expect(stopB.subject).toBe('stop-unverified');
+      expect(stopB.detail).toContain('batch B');
+      expect(stopB.resolved_at).toBeNull();
+      expect(JSON.parse(stopB.delivered_to)).toContain('inbox:grok-bot');
+      expect(idle.subject).toBe('idle-actions');
+      expect(JSON.parse(idle.delivered_to)).toContain('inbox:grok-bot');
+    });
+  });
 });

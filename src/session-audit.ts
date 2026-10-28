@@ -204,6 +204,27 @@ export type SessionAuditHooks = {
   notify?: (kind: string, subject: string, detail: string | null) => Promise<boolean | void>;
 };
 
+/** Production notification adapter (wired in hub.ts). A liveness incident can
+ * only carry one payload: setAlert on an already-open incident updates the
+ * detail, returns null, and the ordinary retry path never re-sends changed
+ * details — so each audit payload must supersede the previous incident of the
+ * same subject (resolve old, open fresh) to be delivered at all. The return
+ * value is a receipt of THIS payload's actual deliveries, never incident
+ * bookkeeping: delivery failures leave the audit's rows undispatched so they
+ * retry next run and cannot advance the remediation ladder. */
+export function makeLivenessNotify(deps: {
+  setAlert: (kind: string, subject: string, problem: { state: string; detail: string } | null) => unknown;
+  deliverAlert: (alert: any) => Promise<{ delivered: string[]; errors: string[] }>;
+}): NonNullable<SessionAuditHooks['notify']> {
+  return async (kind, subject, detail) => {
+    deps.setAlert(kind, subject, null);
+    const alert = deps.setAlert(kind, subject, detail === null ? null : { state: 'attention', detail: String(detail) });
+    if (!alert) return false;
+    const receipt = await deps.deliverAlert(alert);
+    return receipt.delivered.length > 0;
+  };
+}
+
 /** Key a decision/prior is tracked by across runs. */
 const sessionKey = (machineId: any, nativeId: any, sessionId: any): string =>
   (machineId ?? '') + '/' + (nativeId ?? sessionId ?? '');
