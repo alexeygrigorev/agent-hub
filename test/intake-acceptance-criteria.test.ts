@@ -97,18 +97,11 @@ describe('intake acceptance-criteria start gate', () => {
     expect(unknown.data.error).toBe('unknown_intake_task');
   });
 
-  it('accepts CLI-shaped intake_task alias and rejects conflicting aliases', async () => {
+  it('rejects the removed intake_task body alias; intake_task_id is the only field', async () => {
     const full = (await create('', { acceptance_criteria: 'Alias parity verified.' })).task;
     const aliased = await sessionsCall({ key: 'ac-alias-' + ++seq, workspace: 'demo', brief: 'Synthetic alias goal', intake_task: full.id } as any);
-    expect([201, 409], JSON.stringify(aliased.data)).toContain(aliased.status);
-    expect(aliased.data.error ?? null).not.toBe('invalid_session_request');
-    const conflict = await sessionsCall({
-      key: 'ac-alias-conflict-' + ++seq, workspace: 'demo', brief: 'Synthetic conflict',
-      intake_task_id: full.id, intake_task: 'other-task',
-    } as any);
-    expect(conflict.status, JSON.stringify(conflict.data)).toBe(400);
-    expect(conflict.data.error).toBe('invalid_session_request');
-    expect(conflict.data.field).toBe('intake_task');
+    expect(aliased.status, JSON.stringify(aliased.data)).toBe(400);
+    expect(aliased.data.error).toBe('invalid_session_request');
   });
 
   it('accepts unambiguous prefix and URL-shaped intake_task_id, rejects ambiguous prefix', async () => {

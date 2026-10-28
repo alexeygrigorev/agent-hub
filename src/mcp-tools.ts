@@ -155,13 +155,6 @@ export function toolRequest(origin: string, name: string, args: unknown, authori
   }
   if (a.payload !== undefined && (!a.payload || typeof a.payload !== 'object' || Array.isArray(a.payload))) throw new Error('invalid_payload');
   let payload = a.payload || {};
-  // sessions_start: normalize CLI-shaped intake_task → API intake_task_id before the Hub gate.
-  if (route.name === 'sessions_start' && payload && typeof payload === 'object' && !Array.isArray(payload)
-      && Object.prototype.hasOwnProperty.call(payload, 'intake_task')) {
-    if (payload.intake_task_id !== undefined && payload.intake_task_id !== payload.intake_task) throw new Error('intake_task_conflicts');
-    payload = { ...payload, intake_task_id: payload.intake_task };
-    delete (payload as any).intake_task;
-  }
   const fixedMode = route.name === 'start_session' ? 'interactive' : ['start_agent', 'plan_agent'].includes(route.name) ? 'headless' : null;
   if (fixedMode) {
     if (payload.mode !== undefined && payload.mode !== fixedMode) throw new Error('invalid_launch_mode');

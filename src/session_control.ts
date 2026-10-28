@@ -1407,23 +1407,9 @@ export class SessionControlService {
     if (path === '/api/sessions' && request.method === 'POST') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      // CLI historically used --intake-task while the API field is intake_task_id.
-      // Accept the short alias when it does not conflict, so MCP/CLI parity does
-      // not surface as a spurious invalid_session_request for otherwise valid starts.
-      if (typeof input.intake_task === 'string') {
-        const m = /\/intake\/([A-Za-z0-9._:-]{6,128})/.exec(input.intake_task);
-        if (m) input.intake_task = m[1];
-      }
       if (typeof input.intake_task_id === 'string') {
         const m = /\/intake\/([A-Za-z0-9._:-]{6,128})/.exec(input.intake_task_id);
         if (m) input.intake_task_id = m[1];
-      }
-      if (Object.prototype.hasOwnProperty.call(input, 'intake_task')) {
-        if (input.intake_task_id !== undefined && input.intake_task_id !== input.intake_task) {
-          return response({ error: 'invalid_session_request', field: 'intake_task', detail: 'conflicts_with_intake_task_id' }, 400);
-        }
-        input.intake_task_id = input.intake_task;
-        delete input.intake_task;
       }
       // null / blank intake_task_id means "missing" so the TBM gate can return
       // intake_task_id_required instead of a generic invalid_session_request.
