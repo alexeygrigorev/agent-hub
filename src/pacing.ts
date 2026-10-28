@@ -375,10 +375,17 @@ export function providerPacing(
     let aggregateTranches = providerTranches;
     // A floor-blocked account must neither lend urgency to nor suppress critical
     // work on an eligible sibling account. Preserve global/provider kill gates.
-    if (opts.enforceFloors && accounts.size > 1 && eligibleAccounts.size > 0 && !globalHalted && !providerPools.some(p => p.kill_switch_active)) {
+    // Only filter when an account was actually excluded: with every account
+    // eligible the base aggregate must pass through unchanged, including
+    // pool-matched grants whose tranche row names an account outside the pool
+    // account set (accepted row shape, no cross-field constraint).
+    if (opts.enforceFloors && accounts.size > 1 && eligibleAccounts.size > 0 && eligibleAccounts.size < accounts.size && !globalHalted && !providerPools.some(p => p.kill_switch_active)) {
       aggregatePools = providerPools.filter(p => !p.account || p.account === '*' || eligibleAccounts.has(p.account));
       const poolIds = new Set(aggregatePools.map(p => p.pool_id));
-      aggregateTranches = providerTranches.filter(t => t.account && t.account !== '*'
+      // Ownership is consistent: an explicit account that maps to a known pool
+      // account decides; any other tranche follows its pool_id. Tranches owned
+      // by a halted account are excluded; foreign-account rows ride their pool.
+      aggregateTranches = providerTranches.filter(t => t.account && t.account !== '*' && accounts.has(t.account)
         ? eligibleAccounts.has(t.account)
         : poolIds.has(t.pool_id) || t.pool_id === '*' || t.pool_id === provider);
     }

@@ -182,6 +182,28 @@ describe('banked EDF arbiter', () => {
     const killed = providerPacing([pool({ ...longA, kill_switch_active: 1 }), healthy], [grantA, grantB], NOW, { enforceFloors: true });
     expect(killed.get('zai')).toMatchObject({ halted: true, banked: 1, preempt: false });
   });
+  it('keeps pool-matched grants with a foreign tranche account when every account is eligible', () => {
+    // Review finding (e083ff5d r2): with all accounts eligible the aggregate must
+    // pass through unchanged, even for the accepted row shape whose tranche names
+    // an explicit account absent from the pool account set.
+    const a = pool({ pool_id: 'zai:a:7d', account: 'a' });
+    const b = pool({ pool_id: 'zai:b:7d', account: 'b' });
+    const foreign = tranche('foreign-grant', 2, 1_000_000, { pool_id: a.pool_id, account: 'default' });
+    const allEligible = providerPacing([a, b], [foreign], NOW, { enforceFloors: true });
+    expect(allEligible.get('zai')).toMatchObject({ halted: false, banked: bankedUrgencyMultiplier(NOW + 2 * H, NOW), preempt: true });
+  });
+  it('attributes foreign-account tranches by pool when a sibling is halted', () => {
+    const a = pool({ pool_id: 'zai:a:7d', account: 'a' });
+    const b = pool({ pool_id: 'zai:b:7d', account: 'b', remaining_tokens: 0 });
+    const onEligiblePool = tranche('foreign-a', 2, 1_000_000, { pool_id: a.pool_id, account: 'default' });
+    const onHaltedPool = tranche('foreign-b', 2, 1_000_000, { pool_id: b.pool_id, account: 'default' });
+    const ownedByHalted = tranche('owned-b', 2, 1_000_000, { pool_id: b.pool_id, account: 'b' });
+    const mixed = providerPacing([a, b], [onEligiblePool, onHaltedPool, ownedByHalted], NOW, { enforceFloors: true });
+    expect(mixed.get('zai:b')).toMatchObject({ halted: true, banked: 1 });
+    // The eligible pool's grant keeps its urgency; halted-owned and halted-pool
+    // grants lend nothing to the provider aggregate.
+    expect(mixed.get('zai')).toMatchObject({ halted: false, banked: bankedUrgencyMultiplier(NOW + 2 * H, NOW), preempt: true });
+  });
 });
 
 describe('routing score factors', () => {
