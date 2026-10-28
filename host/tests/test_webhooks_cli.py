@@ -24,6 +24,7 @@ class WebhookCliSecretHygiene(unittest.TestCase):
         stderr = io.StringIO()
         with patch.object(sys, 'argv', ['hub'] + argv), \
                 patch.object(session_control, 'request', side_effect=request), \
+                patch('agent_hub_host.webhooks._base_url', return_value='https://hub.example'), \
                 redirect_stdout(stdout), redirect_stderr(stderr):
             try:
                 cli.main()

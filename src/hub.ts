@@ -29,6 +29,7 @@ import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { ProvisioningService } from './provisioning';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
+import { BankedResets } from './banked-resets';
 import { ChecksService, validateCheck, type ActionDeps } from './checks';
 import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
@@ -783,6 +784,11 @@ export class Hub extends DurableObject {
         if (auth.error) return auth.error;
         if (!auth.caller?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
         return handleTbmApi(request, this.sql);
+      }
+      if (path === '/api/quota/resets') {
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        return new BankedResets(this.sql, this.livenessService).handle(request, auth.caller || {});
       }
       const quotaResponse = await handleQuotaRoutes(request, path, this.quotaStore, url, (req) =>
         this.authenticateBusRequest(req)
@@ -1832,6 +1838,7 @@ export class Hub extends DurableObject {
   /** Cron and manual entry point for scheduled checks. */
   async runChecks(only?: string) {
     this.runTbmTick();
+    for (const alert of new BankedResets(this.sql, this.livenessService).run()) await this.notifyAlert(alert);
     this.livenessService.prune();
     const results = await this.checksService.runDue({
       liveness: this.livenessService,

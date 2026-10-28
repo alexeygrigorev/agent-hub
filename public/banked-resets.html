@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Banked resets · Agent Hub</title>
+  <link rel="stylesheet" href="/vendor/dakit/dakit.css">
+  <link rel="stylesheet" href="/auth.css">
+  <link rel="stylesheet" href="/engines.css">
+  <script src="/auth.js"></script>
+  <script src="/banked-resets.js" defer></script>
+</head>
+<body>
+<main class="dk-main" id="main-content">
+  <div class="dk-main__inner engine-page">
+    <nav aria-label="Navigation"><a href="/">Agent Hub</a> · <a href="/fleet.html#quota">Usage</a> · <a href="/engines.html">Accounts</a></nav>
+    <h1>Banked reset expiry</h1>
+    <p>Hub asks Alexey to approve a reset 48 hours before expiry, then again below 24 hours. Deadlines below use Europe/Berlin time. Only Alexey may approve and apply a reset manually.</p>
+    <p id="status" role="status">Loading…</p>
+    <div id="accounts"></div>
+    <h2>Record grants manually</h2>
+    <p>When automatic quota data is unavailable, read the provider's reset list and record every available grant here. For z.ai, sign in with email and password and complete any captcha yourself.</p>
+    <form id="record-form">
+      <p><label>Account <select id="account" class="dk-input" required></select></label></p>
+      <p>One grant per line: reset type | exact expiry with timezone, for example <code>Weekly reset | 2026-12-22T01:00:00+01:00</code>.</p>
+      <p><label>Available grants <textarea id="grants" class="dk-input" rows="5" maxlength="12000" aria-describedby="replace-note"></textarea></label></p>
+      <p id="replace-note">Saving replaces the complete recorded list for this account. Leave the list empty to confirm no available resets. After using a grant, remove it from the list and save.</p>
+      <button class="dk-button dk-button--primary" type="submit">Save complete list</button>
+    </form>
+  </div>
+</main>
+</body>
+</html>
