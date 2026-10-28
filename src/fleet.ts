@@ -78,10 +78,14 @@ const NATIVE_IN_FLIGHT = `(
    (l.mode = 'interactive' AND s.tag = 'hub-' || l.id)))`;
 // Separate exact native identity from the in-flight predicate so SQLite can
 // seek the native index instead of scanning every active reservation per row.
+// The managed tag narrows the second lookup to one primary key; the complete
+// incarnation predicate still proves the correlation (a tag alone cannot).
 const NATIVE_UNRESERVED = `NOT EXISTS (SELECT 1 FROM fleet_launches l
   WHERE l.machine_id=s.machine_id AND l.native_id=s.native_id AND l.state IN ${ACTIVE})
   AND NOT EXISTS (SELECT 1 FROM fleet_launches l
-  WHERE l.machine_id=s.machine_id AND ${NATIVE_IN_FLIGHT})`;
+  WHERE l.id = CASE WHEN substr(s.tag,1,9)='task-hub-' THEN substr(s.tag,10)
+    WHEN substr(s.tag,1,4)='hub-' THEN substr(s.tag,5) END
+  AND l.machine_id=s.machine_id AND ${NATIVE_IN_FLIGHT})`;
 
 /** Registry reserves cannot fall below the configured admission reserve. */
 const HEADROOM: Record<string, number> = { ...policy.rules.reserve_percent,

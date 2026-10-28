@@ -13,7 +13,7 @@ python3 scripts/local-dependencies.py || exit 1
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/uv}"
 TMP_PARENT="${TMPDIR:-.local/tmp}"
 mkdir -p "${TMP_PARENT}" || exit 1
-# Keep the default relative: long absolute paths can exceed Unix socket limits.
+# Python socket fixtures need short paths, even in a long checkout path.
 RUN_TMP="$(mktemp -d -p "${TMP_PARENT}" f-XXXXXX)" || exit 1
 cleanup() {
   # Retention applies only to this run's newly created temporary files.
@@ -23,7 +23,8 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 export TMPDIR="${RUN_TMP}"
-DISPOSABLE_HOME="$(cd "${RUN_TMP}" && pwd)/home"
+RUN_TMP_ABSOLUTE="$(cd "${RUN_TMP}" && pwd)" || exit 1
+DISPOSABLE_HOME="${RUN_TMP_ABSOLUTE}/home"
 mkdir "${DISPOSABLE_HOME}" || exit 1
 
 FAILURES=0
@@ -54,7 +55,16 @@ fi
 
 echo "=== 4/6: Vitest Discovery Suite (all test files, bounded concurrency) ==="
 VITEST_RC=0
-npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 || VITEST_RC=$?
+# Serial files still have Node/V8 and esbuild background pools. Bound those
+# pools inside the existing CPU cap rather than competing for its quota.
+VITEST_NODE_OPTIONS="${NODE_OPTIONS:-}"
+case "${VITEST_NODE_OPTIONS}" in
+  *--v8-pool-size*) ;;
+  *) VITEST_NODE_OPTIONS="${VITEST_NODE_OPTIONS:+${VITEST_NODE_OPTIONS} }--v8-pool-size=1" ;;
+esac
+UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-1}" GOMAXPROCS="${GOMAXPROCS:-1}" \
+NODE_OPTIONS="${VITEST_NODE_OPTIONS}" \
+npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept || VITEST_RC=$?
 if [ "${VITEST_RC}" -ne 0 ]; then
   echo "FAIL: Vitest discovery suite exited with code ${VITEST_RC}"
   FAILURES=$((FAILURES + 1))
@@ -75,12 +85,21 @@ if [ -z "${ORIGINAL_USER_BASE}" ]; then
 fi
 
 PYTEST_RC=0
+# Native worker-profile discovery bypasses HOME. Test children must not inherit
+# the real session identity, credential selectors, or managed XDG config roots.
+PYTHON_ENV=(env)
+while IFS= read -r name; do
+  case "$name" in
+    APLEXER_*|HUB_*|AGENT_HUB_*|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_RUNTIME_DIR|GH_CONFIG_DIR)
+      PYTHON_ENV+=(-u "$name") ;;
+  esac
+done < <(compgen -e)
 HOME="${DISPOSABLE_HOME}" \
 PYTHONUSERBASE="${ORIGINAL_USER_BASE}" \
 DTC_AUTH_HOME="${DTC_AUTH_PATH}" \
 PYTHONPATH="host:host/tests" \
 CODEX_LAUNCH_WRAPPER="" \
-"${UV_BIN}" run --frozen --with pytest python -m pytest -q \
+"${PYTHON_ENV[@]}" "${UV_BIN}" run --frozen --with pytest python -m pytest -q \
   --basetemp "${RUN_TMP}/pytest" \
   -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none || PYTEST_RC=$?
 
@@ -92,6 +111,9 @@ else
 fi
 
 echo "=== 6/7: Phone-width browser UI (390x844, light+dark) ==="
+# Chromium resolves shared-memory files from a different working directory.
+# Supply an absolute path only here; keep socket-sensitive Python paths short.
+export TMPDIR="${RUN_TMP_ABSOLUTE}"
 if [ -n "${SKIP_PHONE_UI:-}" ]; then
   echo "SKIP: SKIP_PHONE_UI is set; phone browser UI not executed."
 elif node test/phone-ui.browser.mjs --out .local/phone-ui && node test/host-health-charts.browser.mjs && node test/session-stall.browser.mjs && node test/usage-history.browser.mjs && node test/tbm-dashboard.browser.mjs; then

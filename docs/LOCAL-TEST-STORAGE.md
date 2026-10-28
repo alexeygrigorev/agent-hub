@@ -32,7 +32,46 @@ The uv cache uses the original HOME/XDG cache location, or explicit
 a new cache into each disposable home. Vitest uses `npx --no-install` so a
 missing binary cannot silently download another installation.
 
-The default TMPDIR remains relative to avoid long Unix socket paths in browser
-tests. Keep supplied paths short. Persistent build output, browser evidence,
+The default TMPDIR stays relative during Python tests to avoid long Unix socket
+paths. Browser subprocesses receive the absolute path to the same owned per-run
+directory: Chromium can open shared-memory files after changing its working
+directory. Keep supplied paths short for Python socket fixtures. Persistent
+build output, browser evidence,
 shared dependency installations, engine session history, and existing test
 scratch are outside this temporary-file retention policy.
+
+Python discovery clears every inherited `APLEXER_*`, `HUB_*`, and `AGENT_HUB_*`
+variable in its child environment, along with XDG config/data/state/runtime and
+GitHub config overrides. A disposable
+HOME alone cannot isolate the per-launch worker profile selected by a native
+session tag. The parent session keeps its identity and credentials.
+
+With a managed HOME, point `PLAYWRIGHT_BROWSERS_PATH` at an existing matching
+browser installation before running the suite. The runner does not download one.
+
+The retained-history performance test takes one fixed population of 100 samples
+per case, including every sample and keeping concurrent cohorts at four requests.
+Nearest-rank p95 must remain below 100 ms; six slow samples out of 100 fail. There
+are no retries or discarded warm-up samples. Logs include p50, p95, maximum and
+the first 20 samples' p95 for comparison. The fixture retains 500 tasks, 2,000
+sessions and the blocked-work/claim cases.
+
+Vitest discovery defaults its libuv, Go/esbuild and V8 background pools to one
+thread (`UV_THREADPOOL_SIZE=1`, `GOMAXPROCS=1`, `--v8-pool-size=1`). Serial test
+files alone do not bound these pools: competing runtime threads can exhaust a
+small CPU quota and increase wall-clock tails. Explicit caller pool settings
+are preserved; other Node options are kept. These defaults apply only to the
+Vitest command. Console timing reports remain visible for passing tests too.
+No file is excluded, no sample is retried and the 100 ms threshold is unchanged.
+
+For bounded verification on a shared Linux host:
+
+```sh
+systemd-run --user --scope -p CPUQuota=200% -p CPUQuotaPeriodSec=10ms \
+  -p MemoryMax=1500M bash scripts/test-full-local.sh
+```
+
+Wall-clock timing includes scheduling, authentication and Durable Object queueing.
+Retain failures alongside source SHA, cgroup `cpu.stat`/`cpu.pressure` and host
+CPU pressure when diagnosing contention. A passing repeat does not replace a
+failed full run; record the terminal result of every run without exclusions.

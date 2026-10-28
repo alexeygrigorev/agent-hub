@@ -8,6 +8,24 @@ import { freshCpu } from './cpu-fixture';
 const inDO: any = runInDurableObject;
 const sessionId = (i: number) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
 
+// One fixed population per case, including every sample, with no retries or
+// discarded warm-up. More samples reduce quantile variance; the 100ms budget
+// and the concurrent cohort width (four requests) are unchanged.
+const SAMPLES = 100;
+const quantile = (samples: number[], percent: number) => samples.slice().sort((a,b)=>a-b)[Math.ceil(samples.length*percent/100)-1];
+const p95 = (samples: number[]) => quantile(samples,95);
+const p50 = (samples: number[]) => quantile(samples,50);
+function report(name: string, samples: number[]) {
+  console.log(`${name} n=${samples.length} p50=${p50(samples)}ms p95=${p95(samples)}ms max=${Math.max(...samples)}ms first20_p95=${p95(samples.slice(0,20))}ms`);
+}
+it('keeps the same five-percent slow-sample allowance and rejects the 100ms boundary', () => {
+  expect(p95([...Array(19).fill(1),101])).toBe(1);
+  expect(p95([...Array(18).fill(1),101,101])).toBe(101);
+  expect(p95([...Array(95).fill(1),...Array(5).fill(101)])).toBe(1);
+  expect(p95([...Array(94).fill(1),...Array(6).fill(101)])).toBe(101);
+  expect(p95(Array(100).fill(100))).toBe(100);
+});
+
 it('keeps status and host handlers below 100ms p95 with retained production-scale history', async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('hub'));
   const cookie = (await createSessionCookie(env as any, { sub: 'perf-operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'perf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
@@ -86,7 +104,7 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
   for (const [method, path, host, payload, status] of cases) {
     const times: number[] = [];
     const clientTimes: number[] = [];
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < SAMPLES; i++) {
       const start = performance.now();
       const response = await stub.fetch('https://hub.test' + path, { method, headers: host ? {Authorization: 'Bearer ' + token} : {Cookie: cookie, 'x-csrf-token': 'perf'}, ...(payload ? {body: JSON.stringify(payload)} : {}) });
       times.push(performance.now() - start);
@@ -106,39 +124,36 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
         expect(body.tasks[0].hub_sessions[0].lifecycle.decision.kind).toBe('resume_on_reset');
       }
     }
-    times.sort((a, b) => a - b);
-    clientTimes.sort((a,b)=>a-b);
-    console.log(`DO fetch/headers ${method} ${path} p50=${times[9]}ms p95=${times[18]}ms; client body-inclusive p95=${clientTimes[18]}ms`);
+    report(`DO fetch/headers ${method} ${path}`, times);
+    report(`client body-inclusive ${method} ${path}`, clientTimes);
     // Clock must advance across real I/O; a frozen Worker clock cannot pass.
-    expect(times[18]).toBeGreaterThan(0);
-    expect.soft(times[18], `${method} ${path}`).toBeLessThan(100);
+    expect(p95(times)).toBeGreaterThan(0);
+    expect.soft(p95(times), `${method} ${path}`).toBeLessThan(100);
   }
   // Managed sessions share creator credentials. A census write invalidates
   // lifecycle facts; cold status must not re-query that creator per session.
   const coldPost:number[]=[];
-  for(let i=0;i<20;i++) {
+  for(let i=0;i<SAMPLES;i++) {
     await inDO(stub,(h:any)=>h.sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE machine_id='perf-host' AND native_id='native-0'",new Date(Date.now()+i).toISOString()).toArray());
     const start=performance.now();
     const response=await stub.fetch('https://hub.test/api/status',{method:'POST',headers:{Cookie:cookie,'x-csrf-token':'perf'},body:'{}'});
     coldPost.push(performance.now()-start);
     expect(response.status).toBe(200);await response.json();
   }
-  coldPost.sort((a,b)=>a-b);
-  console.log(`DO fetch/headers POST status after native write p50=${coldPost[9]}ms p95=${coldPost[18]}ms`);
-  expect.soft(coldPost[18],'POST status after native write').toBeLessThan(100);
+  report("DO fetch/headers POST status after native write", coldPost);
+  expect.soft(p95(coldPost),'POST status after native write').toBeLessThan(100);
   // A real host census changes activity before watchdog. Warm-only reads
   // would miss expensive canonical projection rebuilds after that write.
   const invalidatedWatchdog:number[]=[];
-  for(let i=0;i<20;i++) {
+  for(let i=0;i<SAMPLES;i++) {
     await inDO(stub,(h:any)=>h.sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE machine_id='perf-host' AND native_id='native-0'",new Date(Date.now()+i).toISOString()).toArray());
     const start=performance.now();
     const response=await stub.fetch('https://hub.test/api/fleet/resources/watchdog',{headers:{Authorization:'Bearer '+token}});
     invalidatedWatchdog.push(performance.now()-start);
     expect(response.status).toBe(200);await response.json();
   }
-  invalidatedWatchdog.sort((a,b)=>a-b);
-  console.log(`DO fetch/headers watchdog after native write p50=${invalidatedWatchdog[9]}ms p95=${invalidatedWatchdog[18]}ms`);
-  expect.soft(invalidatedWatchdog[18],'watchdog after native write').toBeLessThan(100);
+  report("DO fetch/headers watchdog after native write", invalidatedWatchdog);
+  expect.soft(p95(invalidatedWatchdog),'watchdog after native write').toBeLessThan(100);
   // Exercise actual admission/transition work as well as terminal replay.
   // An independent healthy host avoids altering the retained workload above.
   const claimToken = 'hubt_perf_synthetic_claim_host';
@@ -160,7 +175,7 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
   });
   const admittedTimes: number[] = [];
   const offeredTimes: number[] = [];
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < SAMPLES; i++) {
     const launch = await inDO(stub, (h: any) => {
       const service = new FleetService(h.sql, (cb) => h.ctx.storage.transactionSync(cb));
       const result = service.reserve({workspace: 'demo', prompt: 'Synthetic performance claim', machine: 'claim-host', idempotency_key: `perf-claim-${i}`},
@@ -186,10 +201,9 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
     await inDO(stub, (h: any) => { h.sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id=?", launch.id); });
   }
   for (const [name, times] of [['offers with live work', offeredTimes], ['successful claim', admittedTimes]] as const) {
-    times.sort((a, b) => a - b);
-    console.log(`DO fetch/headers ${name} p50=${times[9]}ms p95=${times[18]}ms`);
-    expect(times[18]).toBeGreaterThan(0);
-    expect.soft(times[18], name).toBeLessThan(100);
+    report(`DO fetch/headers ${name}`, times);
+    expect(p95(times)).toBeGreaterThan(0);
+    expect.soft(p95(times), name).toBeLessThan(100);
   }
   // A busy retained queue must not make every host poll re-plan its backlog.
   await inDO(stub, (h: any) => h.ctx.storage.transactionSync(() => {
@@ -242,7 +256,7 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
       sessionId(30000+i),'perf:owner',`routing-backlog-${i}`,JSON.stringify({workspace:'demo',needs:['unavailable'],tasks:[],access:{mode:'read'}}),new Date().toISOString(),new Date().toISOString());
   }));
   const backlogTimes: number[] = [];
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < SAMPLES; i++) {
     const start = performance.now();
     const response = await stub.fetch('https://hub.test/api/fleet/offers', {headers: {Authorization: 'Bearer ' + claimToken}});
     backlogTimes.push(performance.now() - start);
@@ -251,10 +265,9 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
     expect(body.offers).toHaveLength(20);
   }
   console.log('blocked offers ordered samples ms', JSON.stringify(backlogTimes));
-  backlogTimes.sort((a, b) => a - b);
-  console.log(`DO fetch/headers offers with blocked backlog p50=${backlogTimes[9]}ms p95=${backlogTimes[18]}ms`);
-  expect(backlogTimes[18]).toBeGreaterThan(0);
-  expect(backlogTimes[18]).toBeLessThan(100);
+  report("DO fetch/headers offers with blocked backlog", backlogTimes);
+  expect(p95(backlogTimes)).toBeGreaterThan(0);
+  expect(p95(backlogTimes)).toBeLessThan(100);
   // Competing requests exercise DO scheduling while both queues are retained.
   const mixed = [
     ['status','/api/status', {method:'POST',headers:{Cookie:cookie,'x-csrf-token':'perf'},body:'{}'}],
@@ -264,7 +277,7 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
   ] as const;
   const mixedTimes: number[][] = mixed.map(()=>[]);
   const cohortClientTimes: number[] = [];
-  for(let i=0;i<20;i++) {
+  for(let i=0;i<SAMPLES;i++) {
     const cohortStart=performance.now();
     const responses=await Promise.all(mixed.map(async ([,path,options],j)=>{
       const start=performance.now();
@@ -281,11 +294,10 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
     }));
     cohortClientTimes.push(performance.now()-cohortStart);
   }
-  cohortClientTimes.sort((a,b)=>a-b);
-  console.log(`concurrent full cohort including client bodies p95=${cohortClientTimes[18]}ms`);
+  report("concurrent full cohort including client bodies", cohortClientTimes);
   for(const [j,[name]] of mixed.entries()) {
-    const times=mixedTimes[j].sort((a,b)=>a-b);
-    console.log(`DO fetch/headers concurrent ${name} p50=${times[9]}ms p95=${times[18]}ms`);
-    expect.soft(times[18],`concurrent ${name}`).toBeLessThan(100);
+    const times=mixedTimes[j];
+    report(`DO fetch/headers concurrent ${name}`, times);
+    expect.soft(p95(times),`concurrent ${name}`).toBeLessThan(100);
   }
 }, 120000);
