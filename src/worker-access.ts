@@ -40,7 +40,7 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
   const url = new URL(request.url), path = url.pathname;
   // Usage evidence is shared with TBM. A worker may read only these three
   // sanitized dimensions; this grants no monitoring writes or host telemetry.
-  if (path === '/api/monitoring/history' || path === '/api/usage/history') {
+  if (path === '/api/monitoring/history') {
     const kinds = url.searchParams.getAll('kind');
     return request.method === 'GET' && kinds.every(kind => ['quota_window', 'quota', 'tokens'].includes(kind));
   }

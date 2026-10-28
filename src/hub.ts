@@ -571,7 +571,7 @@ export class Hub extends DurableObject {
         if ((resolved as any).error) return (resolved as any).error;
         return this.statusService.handleObservation(request, (resolved as any).auth);
       }
-      if (path === '/api/monitoring/history' || path === '/api/usage/history') {
+      if (path === '/api/monitoring/history') {
         const auth = await this.authenticateBusRequest(request);
         const response = this.hostHistoryService.handle(request, auth);
         if (response.ok) {

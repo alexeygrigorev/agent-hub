@@ -331,7 +331,7 @@ export class HostHistoryService {
     const url = new URL(request.url), range = url.searchParams.get('range') || '24h', machine = url.searchParams.get('machine') || undefined;
     if (!Object.hasOwn(HISTORY_RANGES, range) || (machine && !isValidMachineId(machine))) return Response.json({ error: 'invalid_range_or_machine' }, { status: 400, headers });
     const kinds = url.searchParams.getAll('kind');
-    const usageOnly = url.pathname === '/api/usage/history' || auth.scopes?.includes('worker:own-intake');
+    const usageOnly = Boolean(auth.scopes?.includes('worker:own-intake'));
     const allowed = ['quota_window', 'quota', 'tokens'];
     if (kinds.some(kind => !allowed.includes(kind))) return Response.json({error:'invalid_kind'}, {status:400, headers});
     this.sample();

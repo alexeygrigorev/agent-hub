@@ -31,7 +31,7 @@ describe('scoped durable worker access',()=>{
    h.hostHistoryService.record('host','private-host','private-host',now,{load1:5},'fixture');
    h.hostHistoryService.flush();
   });
-  for (const path of ['/api/monitoring/history','/api/usage/history']) {
+  for (const path of ['/api/monitoring/history']) {
    const response=await call(path,undefined,worker.access_token);
    expect(response.status).toBe(200);
    const data:any=await response.json();
@@ -46,7 +46,7 @@ describe('scoped durable worker access',()=>{
    expect((await call(path+'?kind=quota_window&kind=host',undefined,worker.access_token)).status).toBe(403);
    expect((await call(path,{},worker.access_token)).status).toBe(403);
   }
-  for(const path of ['/api/monitoring/tokens','/api/monitoring/health','/api/quota','/api/usage/history/other'])
+  for(const path of ['/api/monitoring/tokens','/api/monitoring/health','/api/quota','/api/monitoring/history/other'])
    expect([403,404]).toContain((await call(path,undefined,worker.access_token)).status);
  }));
 
