@@ -78,3 +78,32 @@ carry an explicit `max_agents`. A settings state without it (mid-relabel
 edit, generated file, degraded load) skips the PUT so the server keeps the
 last advertised value; it never advertises a defaulted `1`. A failed settings
 load never reaches the PUT at all (startup raises, reloads keep last good).
+
+## Checkout-installed hosts: Hub-pinned self-update
+
+Hosts that run the session host straight from a git checkout and have no
+inbound channel (Tabo: Windows, no ssh) take releases from the Hub instead
+of from an operator at the keyboard (intake a3227276):
+
+```sh
+hub host-release --machine cBynxGDoKVPoGpGWxvCTvg --sha <full main SHA>
+hub routing-machines   # host_release: desired_sha, current_sha, state, error
+hub host-release --machine cBynxGDoKVPoGpGWxvCTvg --clear   # stop pinning
+```
+
+The Hub stores only the target SHA. Every 120 s the session host
+(`host/agent_hub_host/self_update.py`) reads its own pin and, when it differs
+from `HEAD`, requires: the checkout's own `.git` (release trees report
+`unsupported`), branch `main`, no tracked changes (untracked files are kept),
+the SHA reachable from a fresh `origin/main`, and a fast-forward of `HEAD`.
+Anything else reports `refused` with the reason and changes nothing. It
+then fast-forwards, runs `python -m pip install -e .` in the service
+interpreter and an import smoke test; failure restores the previous commit
+(`git reset --keep`) and reports `failed`. Success reports `updated`,
+writes `host-release-restart` in the journal and exits the controller; the
+supervisor exits with 75 and the service (Scheduled Task wrapper or systemd)
+restarts everything on the new code without a crash alert.
+
+The first run of a host that predates this feature needs one manual
+bootstrap on the machine: `scripts/windows-host-update.ps1` (see
+[DEPLOY.md](DEPLOY.md#windows-tabo-session-host-arm64-under-x64-emulation)).

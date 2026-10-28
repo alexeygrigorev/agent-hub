@@ -239,5 +239,20 @@ needed. Logs: `%LOCALAPPDATA%\agent-hub\logs\`. Rollback:
 `Unregister-ScheduledTask AgentHubSessionHost` (revoke the machine in the Hub
 UI, then delete `%APPDATA%\agent-hub\host.json` only after the revoke).
 
+Updating a running Windows host: once, run the bootstrap on the machine
+(PowerShell, as the task's user; it never discards local work):
+
+```powershell
+git -C C:\repos\agent-hub pull --ff-only
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\repos\agent-hub\scripts\windows-host-update.ps1
+```
+
+It fast-forwards the clean `main` checkout, installs dependencies (including
+`quse`, without which every Codex route reports
+`codex_quota_gate_quota_check_failed`) into the service venv, smoke-tests,
+restarts the task and its own `hub-controller-*` sessions. After that,
+releases are remote: `hub host-release --machine <id> --sha <sha>`
+([HOST-RELEASE.md](HOST-RELEASE.md#checkout-installed-hosts-hub-pinned-self-update)).
+
 Legacy `hub run` (Basic Task, `hub.exe run`) is superseded for session hosts;
 keep it only for human CLI use.

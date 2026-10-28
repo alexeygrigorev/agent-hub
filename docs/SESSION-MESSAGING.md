@@ -10,8 +10,8 @@ others) message each other through Hub. A message to a headful (interactive)
 aplexer session lands in its TUI like `a send`, with receipts, and the session
 answers with `hub reply`.
 
-Status: design. Nothing in this document is implemented until a child intake
-records its commit.
+Status: implemented on main by tabo-hub-t1833 (intake a3227276) except where
+[§12](#12-implementation-notes) says otherwise.
 
 ## 1. What exists today (inventory)
 
@@ -452,3 +452,44 @@ hub --profile developer inbox                     # Developer identity
   The legacy `bus_*` tools stay for old addresses.
 - Exit codes: 0 accepted, 2 refused (auth/validation), 3 recipient unknown or
   ambiguous, 4 transport error after retries.
+
+## 12. Implementation notes
+
+Code: `src/session-messaging.ts` (addresses, states, audit, delivery commands,
+session credentials), `src/bus.ts` hooks, `src/session_control.ts`
+(`message` offers/claims/acks), `host/agent_hub_host/session_messages.py`
+(delivery, reply relay, credential provisioning), `host/agent_hub_host/msg_cli.py`
+(`hub msg`). Tests: `test/session-messaging.test.ts`,
+`host/tests/test_session_messages.py`, `host/tests/test_msg_cli.py`.
+
+How it maps onto the design:
+
+- Sessions and named agents are agent-registry identities (`session:<uuid>`,
+  `agent:<name>`), not a new table: the existing bus, its threads, idempotency,
+  recipient stages and host authority (agents bound to the host's machine)
+  apply unchanged. `named_agents` is therefore the `agents` rows with project
+  `agent`.
+- Replies from a session: either `hub msg reply <id>` with the session's own
+  credential, or the native `a message reply <envelope> "text"`, which the host
+  relays as `session:<uuid>` (§6). The rendered TUI text names both.
+- Session credentials live in the user's state directory
+  (`~/.local/state/agent-hub/session-auth/<native-id>.json`,
+  `%LOCALAPPDATA%\agent-hub\session-auth\` on Windows), not in the workspace,
+  so no repository ever sees them. `hub msg` finds them via
+  `APLEXER_SESSION_ID`; an explicit `HUB_CONFIG_FILE` wins.
+- Developer identity: `hub msg agent-credential developer --output
+  ~/.config/agent-hub/developer.json` (operator), then `hub msg --profile
+  developer inbox|send|reply`. Through hub-mcp, the human login sends with
+  `from_actor: agent:developer` and reads `bus_inbox actor=agent:developer`
+  (existing admin authority); the `as`/delegate check of §9 is not built.
+- CLI surface is `hub msg …` (new) instead of changing `hub send`, so existing
+  `hub send --from` users keep their behavior.
+
+Not built yet (follow-ups): MCP `as` delegation with `on_behalf_of` audit;
+`human:<sub>` recipients and the web Inbox page; `hub msg readdress`; named
+agent forwarding (`agent:orchestrator-main` → its current session) — today
+those coordinators are reachable once they are Hub sessions (operator
+adoption), as `<tag>@<machine>`; capture-marker resolution of `uncertain`
+deliveries (they stay `uncertain` with the inbox copy authoritative); the
+`tui_unverified_platform` fallback (Windows TUI delivery is proven on Tabo
+instead).
