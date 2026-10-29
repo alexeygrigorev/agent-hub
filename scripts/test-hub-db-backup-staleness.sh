@@ -197,6 +197,26 @@ else
   fail "S9 real stale after drill (rc=$rc9) -- $(head -5 "$mailbox" 2>/dev/null)"
 fi
 
+# ---- S9b: legacy state (no DRILL= line) must not kill the run with
+# pipefail — this is exactly the pre-9806fc14 prod state file shape; a hard
+# exit here would silently disable the staleness cron. ----
+new_tree fresh 3600; new_state s9b
+printf 'WAS_STALE=0\nLAST_ALERT=1793088901\n' > "$STATE_DIR/staleness.state"
+reset_mail
+if out="$(run_stale)"; then
+  pass "S9b legacy 2-line state file: fresh run exits 0"
+else
+  fail "S9b legacy state rc=$? -- $out"
+fi
+[[ "$(mail_count)" -eq 0 ]] && pass "S9b no mail on legacy state" || fail "S9b mailed"
+# Corrupt state values also degrade to defaults instead of exiting.
+printf 'WAS_STALE=banana\nLAST_ALERT=notanumber\nDRILL=maybe\n' > "$STATE_DIR/staleness.state"
+if out="$(run_stale)"; then
+  pass "S9c corrupt state values degrade to defaults (exit 0)"
+else
+  fail "S9c corrupt state rc=$? -- $out"
+fi
+
 # ---- S10: hygiene sweep — no real recipient in any captured mail ----
 if grep -q "datatalks\.club" "$mailbox" 2>/dev/null; then
   fail "S10 real datatalks.club recipient leaked into captured mail"

@@ -126,9 +126,13 @@ WAS_STALE=0
 WAS_DRILL=0
 if [[ -f "$STATE_FILE" ]]; then
   # Parse numeric/flag fields without sourcing (state dir must not be code).
-  LAST_ALERT="$(grep -E '^LAST_ALERT=[0-9]+$' "$STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2)"
-  WAS_STALE="$(grep -E '^WAS_STALE=[01]$' "$STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2)"
-  WAS_DRILL="$(grep -E '^DRILL=[01]$' "$STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2)"
+  # `|| true` keeps pipefail from killing the run when a field is absent:
+  # pre-9806fc14 state files have no DRILL= line, and a hard exit here would
+  # silently disable the staleness cron (exit 1, no mail). The normalization
+  # below defaults empty/garbage values.
+  LAST_ALERT="$(grep -E '^LAST_ALERT=[0-9]+$' "$STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
+  WAS_STALE="$(grep -E '^WAS_STALE=[01]$' "$STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
+  WAS_DRILL="$(grep -E '^DRILL=[01]$' "$STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
   [[ "$LAST_ALERT" =~ ^[0-9]+$ ]] || LAST_ALERT=0
   [[ "$WAS_STALE" =~ ^[01]$ ]] || WAS_STALE=0
   [[ "$WAS_DRILL" =~ ^[01]$ ]] || WAS_DRILL=0
