@@ -23,6 +23,7 @@ import { recordSessionTokens } from './tbm-controller';
 import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency } from './pacing';
 import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
 import { WORKER_SCOPE, workerAccessContext } from './worker-access';
+import { GOAL_STATUSES } from './intake-session';
 // Host telemetry freshness windows (intake 4398ce2a). The host posts a fast
 // heartbeat every TELEMETRY_REFRESH_S (host/agent_hub_host/fleet.py, 45 s);
 // keep LAUNCHER_TELEMETRY_STALE_MS >= 3x that (host regression test parses it).
@@ -1646,7 +1647,7 @@ export class FleetService {
               !['input_tokens', 'output_tokens'].every(k => Number.isInteger(s.tokens[k]) && s.tokens[k] >= 0 && s.tokens[k] <= 1e12))) ||
             (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup', 'terminal_error', 'goal_status', 'sampled_at']) ||
               (s.progress.sampled_at !== undefined && (typeof s.progress.sampled_at !== 'string' || !fresh(s.progress.sampled_at, this.now() + 60000, 366 * 86400000))) ||
-              (s.progress.goal_status !== undefined && !['blocked', 'paused', 'stalled', 'active', 'complete'].includes(s.progress.goal_status)) ||
+              (s.progress.goal_status !== undefined && !GOAL_STATUSES.includes(s.progress.goal_status)) ||
               (s.progress.terminal_error !== undefined && (s.progress.terminal_error !== 'codex_reconnect_failed' || s.engine !== 'codex' || s.progress.headless !== false)) ||
               typeof s.progress.last_progress_at !== 'string' || !fresh(s.progress.last_progress_at, this.now() + 60000, 366 * 86400000) ||
               typeof s.progress.headless !== 'boolean' || ![true, false, null].includes(s.progress.agent_alive) ||

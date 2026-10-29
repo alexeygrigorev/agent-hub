@@ -124,7 +124,7 @@ export class IdleWorkService {
           // Recover pre-upgrade attempts too: their command may be durable even
           // when the response was lost before command_id reached the episode.
           const prior: any = this.sql.exec("SELECT payload_json FROM session_control_commands WHERE session_id=? AND actor='hub:service:idle-work' AND request_key=?", row.id, n.key).toArray()[0];
-          n.body = parseObject(prior?.payload_json).body ?? `${request.with_goal || item.goal_status ? '/goal resume\n' : ''}Resume intake ${task.id}. Open acceptance criteria:\n${ac}\nLast intake note:\n${lastNote}\nRead current intake, acknowledge this message, then continue authorized work.`;
+          n.body = parseObject(prior?.payload_json).body ?? `${(request.with_goal || item.goal_status) && item.goal_status !== 'unregistered' ? '/goal resume\n' : ''}Resume intake ${task.id}. Open acceptance criteria:\n${ac}\nLast intake note:\n${lastNote}\nRead current intake, acknowledge this message, then continue authorized work.`;
         }
         this.sql.exec('UPDATE session_idle_episodes SET nudges_json=?,last_nudge_at=? WHERE session_id=?', JSON.stringify(nudges), n.at, row.id);
         const result = await this.command('/' + row.id + '/send', { key: n.key, body: n.body });

@@ -48,3 +48,70 @@ explicitly forbids full suites on the loaded host); exact integrated commit and 
 run; post-rollout command acknowledgements; and at least two hours of journal
 coverage with zero startup timeouts. A successful build or a longer timeout alone
 does not establish live acceptance.
+
+Heavy-test admission serializes registration and slot acquisition with
+`admission.lock`. `fifo-state.json` contains the monotonic sequence counter and
+only active waiters; a fixed `fifo-state.next` staging path is atomically renamed
+under that mutex, so crashes expose either the previous or next complete index.
+The counter and active set change together. Invalid state fails closed.
+
+Each waiter holds a `flock` on a lease in `leases/`. A recorded but unlocked
+lease belongs to a finished, timed-out or crashed waiter and is removed from the
+active index under the mutex. Its lock **file is reused, never unlinked**. Lease
+file count follows peak concurrent waiters rather than historical admissions.
+Registration checks active leases once; subsequent retries check only the head
+lease (discarding dead heads), and only the eligible head probes the slot files.
+Retries sleep 1–2 seconds with jitter, bounded by the remaining wait budget.
+There is no history-directory scan or per-retry subprocess. Existing slot and
+admission lock files are never removed or replaced. The active-index file is
+metadata, not a lock, and is replaced atomically.
+
+FIFO is defined by registration sequence within a priority class. For the final
+exact-source pre-push run use:
+
+```bash
+AGENT_HUB_HEAVY_TEST_PRIORITY=final scripts/test-full-local.sh
+# Or an individual command:
+scripts/capped-test-run.sh --priority final -- COMMAND
+```
+
+`normal` is the default. `final` precedes normal waiters; reserve it for the last
+exact-source pre-push verification, not routine development runs. The shared
+host user can set this environment variable: it is scheduling policy, not an
+authorization boundary. Admissions log the requested class and ticket number.
+After 300 seconds a normal waiter joins the final class with its original
+sequence, preventing later final arrivals from overtaking it indefinitely.
+Priority and aging never preempt a running suite or increase the slot cap.
+The existing wait budget still applies, including time before promotion.
+
+Existing slot filenames remain compatible with older wrappers, but FIFO and
+priority guarantees require all contenders to use the new wrapper. Old polling
+or blocking contenders bypass the index and can win a free slot during rollout.
+Update participating checkouts through their owners; do not stop or signal
+other sessions to migrate them. Prototype tickets left by an earlier local
+candidate are not read or deleted by the indexed scheduler.
+
+TERM/INT sent only to the wrapper retain the running command's slot until it
+exits. To stop an owned test run, signal its owning process group/session using
+its normal lifecycle controls. An uncatchable wrapper-only crash releases its
+descriptors, so commands that close inherited descriptors must also remain
+inside their owning session's lifecycle containment. Supported Vitest/pytest
+hooks use `AGENT_HUB_HEAVY_TEST_HELD=1` to avoid requesting a second slot.
+
+Malformed, unknown-version or inaccessible admission state returns **exit 3**
+with an `admission refused` diagnostic. Both supported direct-test hooks reject
+that code, so a damaged index cannot start an uncapped suite. CLI usage mistakes
+still return 2; command exit codes remain unchanged.
+
+For recovery, stop submitting new runs and notify the participating owners;
+let waiters receive their refusal without signalling other sessions. Running
+suites retain their slots. Under `admission.lock`, verify that every lease is
+unlocked before repairing the index; if any waiter still holds one, release the
+mutex and wait for its owner. Preserve the damaged metadata in the owner's
+private evidence directory. Restore a verified compatible index atomically with
+its monotonic `next` counter and no live waiter records; do not guess or reset
+the counter. If no verified counter/state can be recovered, keep admission
+refused until the queue owner supplies it. An unknown schema version requires
+compatible wrappers, not overwriting another version's state. Never remove or
+replace slot/admission/lease lock files, and never switch to a private lock root
+to work around refusal. No automatic reset or cleanup occurs on errors.

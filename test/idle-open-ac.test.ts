@@ -8,6 +8,7 @@ import { queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdopt
 import { IntakeWorktrees } from '../src/intake-worktrees';
 import { ResourceManagement } from '../src/resource-management';
 import { IdleWorkService } from '../src/idle-work';
+import { FleetService } from '../src/fleet';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -258,6 +259,32 @@ describe('idle with open acceptance criteria', () => {
     sql.exec("UPDATE fleet_sessions SET progress_json=json_set(progress_json,'$.sampled_at',?)",new Date(at).toISOString());
     await idle.tick();
     expect(sql.exec('SELECT * FROM session_control_commands').toArray()).toHaveLength(1);
+  }));
+  it('accepts and projects Codex goal store states, rejecting unknown values', async () => fixture(async ({sql,clock,view}: any) => {
+    const fleet = new FleetService(sql, (cb: any) => cb(), () => clock.now); fleet.init();
+    const progress = { last_progress_at: new Date(at).toISOString(), headless: false, agent_alive: null, orphaned: false, cleanup: 'none' };
+    const report = (goal_status: string) => fleet.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions: [
+      { native_id: id, tag: 'test-goal', workspace: '/test', engine: 'zcodex', phase: 'running', agent_state: 'idle', profile: null, account: null, created_at_ms: at - 3600000, progress: { ...progress, goal_status } }] }) }),
+      { caller: { machineId: 'idle-host', kind: 'host', actor: 'machine:idle-host' }, scopes: ['host'] });
+    for (const status of ['active', 'usage_limited', 'budget_limited', 'unregistered']) {
+      expect((await report(status)).status).toBe(200);
+      expect((await view()).goal_status).toBe(status);
+    }
+    expect((await report('pursuing')).status).toBe(400);
+    expect((await view()).goal_status).toBe('unregistered');
+  }));
+  it('does not prefix /goal resume when the launch goal was never registered', async () => fixture(async ({sql,clock,tx,sc}: any) => {
+    sql.exec("UPDATE fleet_sessions SET progress_json=?",JSON.stringify({last_progress_at:new Date(at).toISOString(),goal_status:'unregistered'}));
+    const idle = new IdleWorkService(sql,tx,sc,{},()=>clock.now); idle.init();
+    for (const minutes of [0, 30, 31]) {
+      clock.now=at+minutes*60000; sql.exec('UPDATE fleet_catalog_seen SET observed_at=?',new Date(clock.now).toISOString());
+      sql.exec("UPDATE fleet_sessions SET progress_json=json_set(progress_json,'$.sampled_at',?)",new Date(clock.now).toISOString());
+      await idle.tick();
+    }
+    const commands=sql.exec('SELECT * FROM session_control_commands').toArray();
+    expect(commands).toHaveLength(1);
+    expect(JSON.parse(commands[0].payload_json).body).not.toContain('/goal resume');
+    expect(JSON.parse(commands[0].payload_json).body).toContain('AC2 retain evidence');
   }));
   it('detects one episode note; sends durable nudge with full AC and resume; rate limits', async () => fixture(async ({sql,clock,tx,sc}: any) => {
     sql.exec("UPDATE fleet_sessions SET progress_json=json_set(progress_json,'$.last_progress_at',?)",new Date(at).toISOString());
