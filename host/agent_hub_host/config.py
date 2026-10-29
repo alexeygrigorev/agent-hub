@@ -153,7 +153,7 @@ class _TokenExchange:
         cfg["access_token"] = data["access_token"]
         # Requested scopes describe login intent, not the approver's consent.
         # The authenticated token response is also authoritative on refresh.
-        if "scope" in data:
+        if isinstance(data.get("scope"), str):
             cfg["granted_scopes"] = data["scope"].split()
         elif self.path == "/api/device/token":
             cfg.pop("granted_scopes", None)

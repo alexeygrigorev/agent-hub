@@ -1,4 +1,5 @@
 import datetime as dt
+import hashlib
 import io
 import json
 import os
@@ -40,7 +41,10 @@ class RepositoryEnrollmentTests(unittest.TestCase):
         self.assertEqual(env['GIT_CONFIG_KEY_3'], 'http.' + self.repo['origin'] + '.extraHeader')
         self.assertTrue(env['GIT_CONFIG_VALUE_3'].startswith('Authorization: Basic '))
         self.assertEqual(paths, {'demo': str(self.root / 'workspaces/demo')})
-        self.assertFalse(any(p.is_file() for p in self.root.rglob('*')))
+        for p in self.root.rglob('*'):
+            if p.is_file():
+                self.assertNotIn(b'Authorization', p.read_bytes())
+                self.assertNotIn(self.grant['token'].encode(), p.read_bytes())
 
     def test_existing_repository_is_verified_and_never_replaced(self):
         target = self.root / 'workspaces/demo'
@@ -92,6 +96,46 @@ class RepositoryEnrollmentTests(unittest.TestCase):
             (Path(argv[-1]) / '.git').mkdir(parents=True)
         r.sync(self.root, request=self.request, runner=succeed)
         self.assertTrue((self.root / 'workspaces/demo/.git').is_dir())
+
+    def stage_residue(self, *, owned):
+        digest = hashlib.sha256((self.repo['alias'] + '\0' + self.repo['origin']).encode()).hexdigest()
+        stage = self.root / 'workspaces' / ('.clone-owned-' + digest)
+        stage.mkdir(parents=True, mode=0o700)
+        stage.parent.chmod(0o700)
+        (stage / 'partial').write_text('interrupted clone')
+        if owned:
+            from agent_hub_host import private_fs
+            marker = stage.with_name(stage.name + '.json')
+            private_fs.atomic_write(marker, json.dumps(dict(self.repo, version=1)).encode(), 4096)
+        return stage
+
+    def test_sigkill_residue_is_recovered_only_with_matching_ownership(self):
+        stage = self.stage_residue(owned=True)
+        unknown = stage.parent / '.clone-other-session'
+        unknown.mkdir()
+        (unknown / 'keep').write_text('other owner')
+        def succeed(argv, **kwargs):
+            self.assertFalse((stage / 'partial').exists())
+            self.assertEqual(kwargs['timeout'], 1800)
+            (Path(argv[-1]) / '.git').mkdir(parents=True)
+        r.sync(self.root, request=self.request, runner=succeed)
+        self.assertFalse(stage.exists())
+        self.assertEqual((unknown / 'keep').read_text(), 'other owner')
+
+    def test_unmarked_stage_is_preserved(self):
+        stage = self.stage_residue(owned=False)
+        with self.assertRaisesRegex(ValueError, 'Unowned'):
+            r.sync(self.root, request=self.request, runner=lambda *a, **kw: self.fail('no clone'))
+        self.assertEqual((stage / 'partial').read_text(), 'interrupted clone')
+
+    def test_live_clone_lock_prevents_cleanup_or_duplicate_clone(self):
+        stage = self.stage_residue(owned=True)
+        digest = stage.name.removeprefix('.clone-owned-')
+        from agent_hub_host import private_fs
+        with private_fs.exclusive_lock(self.root / 'locks' / ('repository-' + digest + '.lock')):
+            with self.assertRaises(OSError):
+                r.sync(self.root, request=self.request, runner=lambda *a, **kw: self.fail('no clone'))
+        self.assertEqual((stage / 'partial').read_text(), 'interrupted clone')
 
 
 if __name__ == '__main__':

@@ -7,6 +7,16 @@ import urllib.error
 from agent_hub_host import auth, config
 
 class TestAuth(unittest.TestCase):
+    def test_non_string_token_scope_is_rejected_before_any_credentials_are_saved(self):
+        for scope in (None, [], {}, 42, True):
+            with self.subTest(scope=scope):
+                save = MagicMock()
+                exchange = config._TokenExchange('https://fake', '/api/device/token', {},
+                                                  _load_fn=lambda: {}, _save_fn=save)
+                with self.assertRaisesRegex(ValueError, 'metadata'):
+                    exchange.record({'access_token': 'synthetic', 'scope': scope})
+                save.assert_not_called()
+
     @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.save_config")
     @patch("agent_hub_host.config.load_config")

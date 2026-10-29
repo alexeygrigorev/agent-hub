@@ -30,6 +30,22 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 b.verify(asset, sums, 'runtime')
 
+    def test_mutated_runtime_is_rejected_against_the_source_pin(self):
+        (self.root / 'tmp').mkdir()
+        (self.root / 'bin').mkdir()
+        urls = []
+        def download(url, target):
+            urls.append(url)
+            Path(target).write_bytes(b'tampered runtime payload')
+        with patch.object(b.sys, 'platform', 'linux'), \
+             patch.object(b, 'architecture', return_value='x64'), \
+             patch.object(b, 'download', side_effect=download), patch.object(b, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+                b.ensure_aplexer(self.root)
+        self.assertEqual(len(urls), 1)
+        self.assertFalse((self.root / 'bin/aplexer').exists())
+        run.assert_not_called()
+
     def test_zip_rejects_traversal_windows_paths_and_links(self):
         for name in ('../escape', '/escape', 'C:/escape', 'dir\\escape', 'link'):
             archive = self.root / 'bad.zip'
@@ -70,6 +86,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn(str(self.root / 'engines'), [str(x) for x in argv])
         self.assertEqual(argv[-len(b.ENGINES):], list(b.ENGINES.values()))
         self.assertEqual(env['npm_config_prefix'], str(self.root / 'engines'))
+        for package in b.ENGINES.values():
+            self.assertRegex(package, r'@[0-9]+\.[0-9]+\.[0-9]+$')
 
     def prepare_aplexer_alias(self):
         binary_dir = self.root / 'bin'
@@ -195,14 +213,15 @@ class BootstrapTests(unittest.TestCase):
             self.assertTrue(launcher.stat().st_mode & 0o111)
 
     def test_user_service_preserves_paths_with_spaces(self):
-        unusual = self.root / 'a user % space'
+        unusual = self.root / 'a user % $ space'
         unusual.mkdir()
         with patch.object(b.sys, 'platform', 'linux'), patch.object(b.Path, 'home', return_value=self.root), \
-             patch.object(b, 'run') as run, patch.dict(os.environ, {'PYTHONPATH': str(unusual)}):
-            b.install_service(unusual, ['/a path/python', '-m', 'controller'])
+             patch.object(b, 'run') as run, patch.dict(os.environ, {'PATH': '/transient/install/bin', 'PYTHONPATH': '/transient/package'}):
+            b.install_service(unusual, ['/a $ path/python', '-m', 'controller'])
         unit = (self.root / '.config/systemd/user/agent-hub-controller.service').read_text()
-        self.assertIn('ExecStart="/a path/python" "-m" "controller"', unit)
-        self.assertIn('a user %% space', unit)
+        self.assertIn('ExecStart="/a $$ path/python" "-m" "controller"', unit)
+        self.assertIn('a user %% $ space', unit)
+        self.assertNotIn('/transient/', unit)
         self.assertEqual(run.call_args.args[0][:3], ['systemctl', '--user', 'restart'])
         self.assertNotIn('sudo', unit)
 
@@ -399,9 +418,25 @@ class BootstrapTests(unittest.TestCase):
             b.configure_default_engine()
             b.configure_default_engine()
         config = tomllib.loads(native.read_text())
-        self.assertEqual(config['default_engine'], 'claude')
+        self.assertEqual(config['default_engine'], 'codex')
         self.assertEqual(config['profiles']['personal']['engine'], 'codex')
-        self.assertEqual(json.loads(settings.read_text()), {'model': 'opus', 'hooks': {'Stop': []}})
+        self.assertEqual(json.loads(settings.read_text()), {'model': 'sonnet', 'hooks': {'Stop': []}})
+
+    def test_new_defaults_and_existing_shell_profile_modes_survive_rerun(self):
+        profile = self.root / '.profile'
+        profile.write_text('# existing profile\n')
+        profile.chmod(0o644)
+        with patch.object(b.sys, 'platform', 'linux'), \
+             patch.object(b.Path, 'home', return_value=self.root), \
+             patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.root / '.config')}):
+            b.configure_default_engine()
+            b.configure_default_engine()
+            b.publish_user_path(self.root / 'install')
+            b.publish_user_path(self.root / 'install')
+        self.assertEqual(profile.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(profile.read_text().count('# Agent Hub'), 1)
+        self.assertEqual(json.loads((self.root / '.claude/settings.json').read_text())['model'], 'opus')
+        self.assertIn('default_engine = "claude"', (self.root / '.config/aplexer/config.toml').read_text())
 
     def test_package_matches_supervisor_workspace_import_contract(self):
         install_root = self.root / 'install'
@@ -510,18 +545,63 @@ class BootstrapTests(unittest.TestCase):
         archive = self.root / 'hub.pyz'
         with zipfile.ZipFile(archive, 'w') as z:
             z.writestr('agent_hub_host/cli.py', '')
-        urls = []
-        def download(url, target):
-            urls.append(url)
-            Path(target).write_bytes(b'fixture')
+        requirements = []
+        def run(argv, **kwargs):
+            if '--require-hashes' in argv:
+                self.assertIn('--no-deps', argv)
+                requirements.extend(Path(argv[-1]).read_text().splitlines())
         with patch.object(b.sys, 'platform', 'darwin'), \
              patch.object(b, 'architecture', return_value='arm64'), \
-             patch.object(b, 'download', side_effect=download), patch.object(b, 'verify') as verify, \
-             patch.object(b, 'run') as run:
+             patch.object(b, 'run', side_effect=run):
             b.install_package(archive, self.root, self.root / 'uv')
-        self.assertIn('aplexer_client-0.1.22-cp311-abi3-macosx_11_0_arm64.whl', urls[0])
-        verify.assert_called_once()
-        self.assertTrue(str(run.call_args.args[0][-1]).endswith('.whl'))
+        self.assertEqual(len(requirements), 4)
+        self.assertIn('aplexer_client-0.1.22-cp311-abi3-macosx_11_0_arm64.whl', requirements[-1])
+        for line in requirements:
+            self.assertRegex(line, r'^https://.+\.whl --hash=sha256:[a-f0-9]{64}$')
+
+    def test_fresh_settings_advertise_routing_and_temporary_repo_outages_keep_service(self):
+        from agent_hub_host import api, auth, config, fleet, provisioning
+        errors = [urllib.error.HTTPError('https://hub.test', 503, 'Unavailable', {},
+                    io.BytesIO(b'{"error":"repository_access_unavailable"}')),
+                  urllib.error.URLError('offline'), TimeoutError()]
+        for i, error in enumerate(errors):
+            with self.subTest(error=type(error).__name__), contextlib.ExitStack() as stack:
+                install_root = self.root / str(i)
+                settings = install_root / 'subscriptions.json'
+                cfg = {'access_token': 'synthetic', 'base_url': 'https://hub.test',
+                       'machine_id': 'existing', 'granted_scopes': ['repositories:read']}
+                for obj, name, options in (
+                    (b, 'root', {'return_value': install_root}),
+                    (b.Path, 'home', {'return_value': install_root}),
+                    (b, 'validate_persistent_install', {}), (b, 'validate_side_effect_context', {}),
+                    (config, 'load_host_config', {'return_value': cfg}),
+                    (config, 'get_host_config_path', {'return_value': install_root / 'host.json'}),
+                    (api, 'register_machine', {}),
+                    (fleet, 'subscriptions_path', {'return_value': settings}),
+                    (b, 'publish_user_path', {}), (b, 'configure_default_engine', {}),
+                    (provisioning, 'host_request', {'side_effect': error}),
+                    (provisioning, 'sync', {}), (auth, 'device_login', {}),
+                ):
+                    stack.enter_context(patch.object(obj, name, **options))
+                stack.enter_context(patch.dict(os.environ))
+                service = stack.enter_context(patch.object(b, 'install_service', return_value='systemd_user'))
+                output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                b.configure('https://hub.test')
+                original = fleet.load_settings(settings)
+                posts = []
+                dispatcher = fleet.Dispatcher(original, request=lambda m,p,b: posts.append((m,p)))
+                with patch.object(api, 'get_heartbeat_payload', return_value={'type': 'heartbeat'}):
+                    dispatcher.checkin_tick()
+                self.assertIn(('PUT', '/api/fleet/routing/capabilities'), posts)
+                self.assertEqual(dispatcher.capabilities_put_payload(), {'needs': [], 'max_agents': 1, 'runners': []})
+                # Explicit operator settings must survive repair.
+                original['max_agents'] = 3
+                settings.write_text(json.dumps(original))
+                b.configure('https://hub.test')
+                self.assertEqual(fleet.load_settings(settings)['max_agents'], 3)
+                self.assertEqual(service.call_count, 2)
+                results = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith('{')]
+                self.assertEqual([r['repository_access'] for r in results], ['unavailable'] * 2)
 
 
 if __name__ == '__main__':

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+from contextlib import ExitStack
 import platform
 import re
 import shutil
@@ -22,6 +23,9 @@ import zipfile
 import shlex
 import plistlib
 import uuid
+import tomllib
+import stat
+from .bootstrap_pins import NODE_SHA256, APLEXER_SHA256, ANTIGRAVITY_RELEASES, ENGINE_PACKAGES, PYTHON_WHEELS
 
 
 NODE_VERSION = '22.23.4'
@@ -42,15 +46,93 @@ MICROMAMBA_SHA256 = {
     'osx-64': '17b20c4271d65c030a5c86788f5ca86eb575187209f626edabdb8c6a875c6838',
     'osx-arm64': 'acef4eaab19ec2174ad5a449e5aad981ca326270db819502ff096a92fc31caa6',
 }
-ENGINES = {'claude': '@anthropic-ai/claude-code', 'codex': '@openai/codex',
-           'opencode': 'opencode-ai', 'gemini': '@google/gemini-cli',
-           'grok': '@xai-official/grok'}
+ENGINES = ENGINE_PACKAGES
 
 
-def root():
+def user_install_root():
     if sys.platform == 'win32':
         return Path(os.environ['LOCALAPPDATA']) / 'Programs' / 'agent-hub'
     return Path.home() / '.local/share/agent-hub'
+
+
+def root():
+    return persistent_root()
+
+
+def persistent_root():
+    base = user_install_root()
+    selected = os.environ.get('HUB_INSTALL_RELEASE') if sys.platform == 'win32' else None
+    if selected:
+        selected = Path(selected).absolute()
+        if (selected.parent != (base / 'releases').absolute() or
+                not re.fullmatch(r'[a-f0-9]{16}-[a-f0-9]{12}', selected.name)):
+            raise ValueError('Invalid persistent Windows release path')
+        if any(p.is_symlink() for p in (base, base / 'releases', selected)):
+            raise ValueError('Linked Windows release refused')
+        return selected
+    return base
+
+
+def state_root(install_root):
+    # Repository work and journals survive an immutable Windows runtime upgrade.
+    if sys.platform == 'win32' and Path(install_root).parent == user_install_root() / 'releases':
+        return user_install_root()
+    return install_root
+
+
+def python_install_root(install_root):
+    return state_root(install_root) / 'python'
+
+
+def windows_release(archive, base):
+    """Reuse completed releases read-only; partial repairs always get a new tree.
+
+    Never truncate a live venv, native daemon binary, alias, or npm engine.
+    Previous and interrupted releases remain available for owner-led cleanup.
+    """
+    from . import private_fs
+    digest = hashlib.sha256(Path(archive).read_bytes()).hexdigest()
+    releases = base / 'releases'
+    if base.is_symlink() or releases.is_symlink():
+        raise ValueError('Linked Windows release root refused')
+    releases.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Keep Windows paths short; the completion marker carries the full hash.
+    for candidate in sorted(releases.glob(digest[:16] + '-*')):
+        if candidate.is_symlink() or not re.fullmatch(digest[:16] + '-[a-f0-9]{12}', candidate.name):
+            continue
+        try:
+            marker = json.loads(private_fs.read_bytes(candidate / 'runtime-ready.json', 256))
+            if marker != {'archive_sha256': digest}:
+                continue
+            python = candidate / 'venv/Scripts/python.exe'
+            required = [python, candidate / 'bin/aplexer.exe', candidate / 'bin/a.exe',
+                        candidate / 'bin/agy.exe', candidate / 'package/host/agent_hub_host/host_supervisor.py']
+            node = candidate / 'runtimes' / ('node-v' + NODE_VERSION + '-win-' + architecture())
+            git = candidate / 'runtimes' / ('git-' + GIT_VERSION + '-' + architecture())
+            required.extend([node / 'node.exe', node / 'node_modules/npm/bin/npm-cli.js',
+                             git / 'cmd/git.exe', git / 'usr/bin/bash.exe'])
+            if any(not p.is_file() or p.is_symlink() for p in required):
+                continue
+            packages_ok = True
+            for package in ENGINES.values():
+                name, version = package.rsplit('@', 1)
+                metadata = candidate / 'engines/node_modules' / name / 'package.json'
+                data = json.loads(metadata.read_text())
+                if not isinstance(data, dict) or data.get('version') != version:
+                    packages_ok = False
+                    break
+            if not packages_ok:
+                continue
+            env = dict(os.environ, PYTHONPATH=str(candidate / 'package/host'))
+            run([python, '-c', 'import aplexer, quse, agent_hub_host.bootstrap'], env=env, capture=True, timeout=30)
+            for binary in (node / 'node.exe', candidate / 'bin/aplexer.exe', candidate / 'bin/agy.exe'):
+                run([binary, '--version'], env=env, capture=True, timeout=30)
+        except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired):
+            continue
+        return candidate, True
+    candidate = releases / (digest[:16] + '-' + uuid.uuid4().hex[:12])
+    candidate.mkdir(mode=0o700)
+    return candidate, False
 
 
 def validate_persistent_install(install_root):
@@ -60,8 +142,7 @@ def validate_persistent_install(install_root):
     install root. This also catches incomplete test isolation before any
     credentials, executable wrappers or services can be changed.
     """
-    expected = (Path(os.environ['LOCALAPPDATA']) / 'Programs/agent-hub'
-                if sys.platform == 'win32' else Path.home() / '.local/share/agent-hub')
+    expected = persistent_root()
     install_root = Path(install_root).absolute()
     home = Path.home().absolute()
     if sys.platform == 'win32':
@@ -79,14 +160,14 @@ def validate_persistent_install(install_root):
         raise ValueError('Persistent Hub package is incomplete; launcher preserved')
     for path in (home / '.local', home / '.local/share', home / '.local/bin',
                  install_root, install_root / 'bin', install_root / 'venv', python.parent,
-                 install_root / 'python', install_root / 'package', package.parent, package):
+                 python_install_root(install_root), install_root / 'package', package.parent, package):
         if path.is_symlink():
             raise ValueError('Refusing a linked Hub installation')
     # A durable venv path can still redirect to a disposable base interpreter.
     # Check the running interpreter's base too (Windows venv launchers are
     # regular files, so checking only a POSIX symlink target is insufficient).
     base = Path(sys.base_prefix).resolve()
-    if not base.is_dir() or not base.is_relative_to((install_root / 'python').resolve()):
+    if not base.is_dir() or not base.is_relative_to(python_install_root(install_root).resolve()):
         raise ValueError('Refusing launcher using Python outside the persistent managed runtime')
 
 
@@ -198,10 +279,9 @@ def ensure_node(install_root):
         asset = name + extension
         base = 'https://nodejs.org/dist/v' + NODE_VERSION + '/'
         with tempfile.TemporaryDirectory(dir=install_root / 'tmp') as tmp:
-            archive, sums = Path(tmp) / asset, Path(tmp) / 'SHASUMS256.txt'
+            archive = Path(tmp) / asset
             download(base + asset, archive)
-            download(base + sums.name, sums)
-            verify(archive, sums.read_text(), asset)
+            verify(archive, NODE_SHA256[asset] + '  ' + asset, asset)
             unpack(archive, Path(tmp) / 'expanded')
             target.parent.mkdir(parents=True, exist_ok=True)
             # Repair a partially installed version in place. shutil.move
@@ -236,10 +316,9 @@ def ensure_aplexer(install_root):
     stamp = binary_dir / 'aplexer-version'
     if not binary.is_file() or not stamp.is_file() or stamp.read_text() != version:
         with tempfile.TemporaryDirectory(dir=install_root / 'tmp') as tmp:
-            staged, sums = Path(tmp) / asset, Path(tmp) / 'SHA256SUMS.txt'
+            staged = Path(tmp) / asset
             download(base + asset, staged)
-            download(base + sums.name, sums)
-            verify(staged, sums.read_text(), asset)
+            verify(staged, APLEXER_SHA256[version][asset] + '  ' + asset, asset)
             staged.chmod(0o755)
             run([staged, '--version'], capture=True)
             os.replace(staged, binary)
@@ -333,14 +412,10 @@ def ensure_antigravity(install_root):
     """Use Google's public updater manifest, the same source as its installer."""
     system = {'linux': 'linux', 'darwin': 'darwin', 'win32': 'windows'}[sys.platform]
     cpu = 'amd64' if architecture() == 'x64' else 'arm64'
-    manifest_url = ('https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/'
-                    'manifests/' + system + '_' + cpu + '.json')
+    data = ANTIGRAVITY_RELEASES[system + '_' + cpu]
     binary = install_root / 'bin' / ('agy.exe' if sys.platform == 'win32' else 'agy')
     stamp = install_root / 'bin/agy-version'
     with tempfile.TemporaryDirectory(dir=install_root / 'tmp') as tmp:
-        manifest = Path(tmp) / 'manifest.json'
-        download(manifest_url, manifest)
-        data = json.loads(manifest.read_text())
         if (not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', data.get('version', '')) or
                 not re.fullmatch('[a-fA-F0-9]{128}', data.get('sha512', '')) or
                 not data.get('url', '').startswith('https://storage.googleapis.com/antigravity-public/antigravity-cli/')):
@@ -367,27 +442,35 @@ def install_package(archive, install_root, uv):
     venv = install_root / 'venv'
     python = venv / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python')
     env = dict(os.environ)
-    env['UV_PYTHON_INSTALL_DIR'] = str(install_root / 'python')
+    env['UV_PYTHON_INSTALL_DIR'] = str(python_install_root(install_root))
     env['UV_PYTHON_DOWNLOADS'] = 'automatic'
     env.pop('UV_NO_MANAGED_PYTHON', None)
     # Never inherit the bootstrap interpreter: it may come from an activated
     # temporary venv. Reapplying also repairs an existing venv's stale base.
     requested = 'cpython-3.12-windows-x86_64' if sys.platform == 'win32' else '3.12'
     run([uv, 'venv', '--allow-existing', '--managed-python', '--python', requested, venv], env=env)
+    # Pin the complete runtime dependency set, including platform-specific
+    # native wheels. No live registry metadata determines installation content.
+    requirements = []
+    for name in ('quse', 'click', 'colorama'):
+        wheel = next(iter(PYTHON_WHEELS[name]['wheels'].values()))
+        requirements.append(wheel['url'] + ' --hash=sha256:' + wheel['sha256'])
     if sys.platform == 'darwin':
-        # The macOS wheels were published on GitHub but not on PyPI.
         cpu = 'x86_64' if architecture() == 'x64' else 'arm64'
         name = 'aplexer_client-' + aplexer_version() + '-cp311-abi3-macosx_11_0_' + cpu + '.whl'
-        base = 'https://github.com/PocketShell-io/aplexer/releases/download/v' + aplexer_version() + '/'
-        with tempfile.TemporaryDirectory(dir=install_root / 'tmp') as tmp:
-            wheel, sums = Path(tmp) / name, Path(tmp) / 'SHA256SUMS.txt'
-            download(base + name, wheel)
-            download(base + sums.name, sums)
-            verify(wheel, sums.read_text(), name)
-            run([uv, 'pip', 'install', '--python', python, 'quse>=0.0.17', wheel])
+        url = 'https://github.com/PocketShell-io/aplexer/releases/download/v' + aplexer_version() + '/' + name
+        checksum = APLEXER_SHA256[aplexer_version()][name]
     else:
-        run([uv, 'pip', 'install', '--python', python,
-             'quse>=0.0.17', 'aplexer-client==' + aplexer_version()])
+        suffix = ('win_amd64.whl' if sys.platform == 'win32' else
+                  'manylinux_2_28_' + ('x86_64' if architecture() == 'x64' else 'aarch64') + '.whl')
+        wheel = next(w for n, w in PYTHON_WHEELS['aplexer-client']['wheels'].items() if n.endswith(suffix))
+        url, checksum = wheel['url'], wheel['sha256']
+    requirements.append(url + ' --hash=sha256:' + checksum)
+    (install_root / 'tmp').mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=install_root / 'tmp') as tmp:
+        path = Path(tmp) / 'runtime-requirements.txt'
+        path.write_text('\n'.join(requirements) + '\n')
+        run([uv, 'pip', 'install', '--python', python, '--require-hashes', '--no-deps', '-r', path])
     # Keep the maintained supervisor's checkout contract: workspace/host is
     # the Python import root for its native controller and all descendants.
     package = install_root / 'package/host'
@@ -417,13 +500,15 @@ def install_package(archive, install_root, uv):
     return python, package
 
 
-def write_private(path, text):
+def write_private(path, text, *, mode=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Publish atomically and never follow an existing launcher symlink.
     fd, staging = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            if mode is not None:
+                os.fchmod(out.fileno(), mode)
             out.write(text)
         os.replace(staging, path)
     finally:
@@ -432,10 +517,13 @@ def write_private(path, text):
 
 
 def service_command(install_root, settings):
-    return [sys.executable, '-u', '-m', 'agent_hub_host.host_supervisor',
+    command = [sys.executable, '-u', '-m', 'agent_hub_host.host_supervisor',
             '--workspace', str(install_root / 'package'), '--config', str(settings),
             '--credential-config', str(__import__('agent_hub_host.config', fromlist=['']).get_host_config_path()),
-            '--journal-dir', str(install_root / 'journal')]
+            '--journal-dir', str(state_root(install_root) / 'journal')]
+    if sys.platform == 'win32':
+        command.extend(['--control-dir', str(state_root(install_root) / 'controller')])
+    return command
 
 
 def runtime_directories(install_root):
@@ -449,8 +537,8 @@ def runtime_directories(install_root):
         git_root = install_root / 'runtimes' / ('git-' + GIT_VERSION + '-' + architecture())
         directories.append(git_root / 'cmd')
     else:
-        directories.insert(0, Path.home() / '.local/bin')
         directories.append(install_root / 'runtimes/git/bin')
+        directories.append(Path.home() / '.local/bin')
     return directories
 
 
@@ -479,7 +567,8 @@ def publish_user_path(install_root):
                 continue
             old = profile.read_text() if profile.exists() else ''
             if include not in old:
-                write_private(profile, old + include)
+                mode = stat.S_IMODE(profile.stat().st_mode) if profile.exists() else None
+                write_private(profile, old + include, mode=mode)
     os.environ['PATH'] = os.pathsep.join([*(str(p) for p in directories), os.environ.get('PATH', '')])
 
 
@@ -493,21 +582,34 @@ def configure_default_engine():
     if any(p.is_symlink() for p in (native, native.parent, settings, settings.parent)):
         raise ValueError('Refusing linked engine configuration')
     content = native.read_text() if native.exists() else 'version = 1\n'
-    write_private(native, set_toml_top_level_keys(content, {'default_engine': 'claude'}))
+    if 'default_engine' not in tomllib.loads(content):
+        write_private(native, set_toml_top_level_keys(content, {'default_engine': 'claude'}))
     data = json.loads(settings.read_text()) if settings.exists() else {}
     if not isinstance(data, dict):
         raise ValueError('Invalid Claude settings; existing file preserved')
-    data['model'] = 'opus'
+    data.setdefault('model', 'opus')
     write_private(settings, json.dumps(data, indent=2) + '\n')
 
 
 def install_service(install_root, command):
     """Install only this user's named controller; never stop unrelated services."""
-    log = install_root / 'controller.log'
+    log = state_root(install_root) / 'controller.log'
     # Native controller sessions inherit only non-secret bootstrap paths.
-    env = {key: os.environ[key] for key in ('PATH', 'PYTHONPATH', 'UV_PYTHON_INSTALL_DIR', 'CLAUDE_CODE_GIT_BASH_PATH')
-           if key in os.environ}
     if sys.platform == 'win32':
+        system = Path(os.environ['SystemRoot'])
+        system_dirs = [system / 'System32', system, system / 'System32/Wbem',
+                       system / 'System32/WindowsPowerShell/v1.0']
+    else:
+        system_dirs = [Path('/usr/local/bin'), Path('/usr/bin'), Path('/bin')]
+    env = {'PATH': os.pathsep.join(map(str, [*runtime_directories(install_root), *system_dirs])),
+           'PYTHONPATH': str(install_root / 'package/host'),
+           'UV_PYTHON_INSTALL_DIR': str(python_install_root(install_root))}
+    if sys.platform == 'win32':
+        env['CLAUDE_CODE_GIT_BASH_PATH'] = str(install_root / 'runtimes' /
+            ('git-' + GIT_VERSION + '-' + architecture()) / 'usr/bin/bash.exe')
+    if sys.platform == 'win32':
+        from .bootstrap_control import handover
+        handover(state_root(install_root) / 'controller')
         runner = install_root / 'controller.ps1'
         quote = lambda s: "'" + str(s).replace("'", "''") + "'"
         lines = ['$ErrorActionPreference = \'Stop\'']
@@ -520,6 +622,11 @@ def install_service(install_root, command):
         # include the user SID so reruns reuse exactly one registration.
         ps = (' $id=[Security.Principal.WindowsIdentity]::GetCurrent();'
               ' $name="AgentHubController-"+$id.User.Value;'
+              ' $old=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue;'
+              ' $until=(Get-Date).AddSeconds(45);'
+              ' while($old -and $old.State -eq "Running" -and (Get-Date) -lt $until) {'
+              ' Start-Sleep -Milliseconds 500; $old=Get-ScheduledTask -TaskName $name; };'
+              ' if($old -and $old.State -eq "Running") { throw "Existing controller has not exited; preserved"; };'
               ' $a=New-ScheduledTaskAction -Execute "powershell.exe" -Argument '
               + quote('-NoProfile -ExecutionPolicy Bypass -File "' + str(runner) + '"') + ';'
               ' $t=New-ScheduledTaskTrigger -AtLogOn -User $id.Name;'
@@ -553,7 +660,7 @@ def install_service(install_root, command):
     unit = Path.home() / '.config/systemd/user/agent-hub-controller.service'
     lines = ['[Unit]', 'Description=Agent Hub user controller', 'After=network-online.target',
              '[Service]', 'Type=simple', 'WorkingDirectory=' + systemd_quote(str(install_root / 'package')),
-             'ExecStart=' + ' '.join(systemd_quote(str(x)) for x in command),
+             'ExecStart=' + ' '.join(systemd_quote(str(x).replace('$', '$$')) for x in command),
              'Restart=on-failure', 'RestartSec=10', 'TimeoutStopSec=45']
     lines.extend('Environment=' + systemd_quote(k + '=' + v) for k, v in env.items())
     lines.extend(['[Install]', 'WantedBy=default.target', ''])
@@ -586,6 +693,7 @@ def configure(base_url):
     settings = fleet.subscriptions_path()
     if not settings.exists():
         write_private(settings, json.dumps({'version': 1, 'subscriptions': [],
+                      'capabilities': [], 'max_agents': 1,
                       'workspaces': {'home': str(Path.home())}}))
     fleet.load_settings(settings)  # Validate, never overwrite local operator settings.
     publish_user_path(install_root)
@@ -605,13 +713,18 @@ def configure(base_url):
         repository_allowed = 'repositories:read' in requested
     if repository_allowed:
         try:
-            repositories = enrollment_repositories.sync(install_root)
+            repositories = enrollment_repositories.sync(state_root(install_root))
         except urllib.error.HTTPError as error:
-            if error.code != 403:
+            if error.code == 403:
+                repository_access = 'forbidden'
+            elif error.code in api.HUB_UNAVAILABLE_STATUS or error.code == 429:
+                repository_access = 'unavailable'
+            else:
                 raise
             # Optional repository consent must not strand an enrolled host
             # before its controller is installed, including on a repair run.
-            repository_access = 'forbidden'
+        except (urllib.error.URLError, TimeoutError):
+            repository_access = 'unavailable'
         else:
             repository_access = 'configured' if repositories is not None else 'not_configured'
         if repositories:
@@ -658,16 +771,40 @@ def main(argv=None):
     args = parser.parse_args(argv)
     from .api import check_url
     check_url(args.base_url)
-    install_root = root()
+    from . import private_fs
+    with ExitStack() as stack:
+        if sys.platform == 'win32':
+            stack.enter_context(private_fs.exclusive_lock(user_install_root() / 'locks/bootstrap.lock'))
+        _install(args)
+
+
+def _install(args):
+    # Ignore an ambient release selection; the verified archive chooses it.
+    os.environ.pop('HUB_INSTALL_RELEASE', None)
+    install_root = user_install_root()
+    ready = False
+    if sys.platform == 'win32':
+        install_root, ready = windows_release(args.archive, install_root)
+        os.environ['HUB_INSTALL_RELEASE'] = str(install_root)
     for name in ('bin', 'tmp', 'cache'):
         (install_root / name).mkdir(parents=True, exist_ok=True, mode=0o700)
     print('Installing runtimes in user scope (0 elevation prompts).', flush=True)
-    node, npm = ensure_node(install_root)
-    ensure_aplexer(install_root)
-    python, package = install_package(args.archive, install_root, args.uv)
-    ensure_git(install_root)
-    env = install_engines(install_root, node, npm)
-    ensure_antigravity(install_root)
+    if ready:
+        python = install_root / 'venv/Scripts/python.exe'
+        package = install_root / 'package/host'
+        env = dict(os.environ)
+    else:
+        node, npm = ensure_node(install_root)
+        ensure_aplexer(install_root)
+        python, package = install_package(args.archive, install_root, args.uv)
+        ensure_git(install_root)
+        env = install_engines(install_root, node, npm)
+        ensure_antigravity(install_root)
+        if sys.platform == 'win32':
+            from . import private_fs
+            digest = hashlib.sha256(args.archive.read_bytes()).hexdigest()
+            private_fs.atomic_write(install_root / 'runtime-ready.json',
+                                    json.dumps({'archive_sha256': digest}).encode(), 256)
     env['PYTHONPATH'] = str(package)
     env['PATH'] = os.pathsep.join([str(install_root / 'bin'), str(python.parent), env['PATH']])
     # Continue in the dedicated interpreter so installed native client/quota

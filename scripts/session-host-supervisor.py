@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from contextlib import ExitStack
 
 
 def native(*argv):
@@ -96,6 +97,7 @@ def main():
     parser.add_argument('--config', default=None, help='Subscription configuration (default: ~/.config/agent-hub/subscriptions.json)')
     parser.add_argument('--credential-config', default=None, help='Host credentials (default: ~/.config/agent-hub/host.json)')
     parser.add_argument('--journal-dir', default=None, help='Journal directory')
+    parser.add_argument('--control-dir', default=None, help='Private cooperative Windows installer handover')
     args = parser.parse_args()
     workspace = pathlib.Path(args.workspace).resolve(strict=True)
     if args.config:
@@ -136,48 +138,70 @@ def main():
                 'CLAUDE_CODE_GIT_BASH_PATH', 'UV_PYTHON_INSTALL_DIR'):
         if var in os.environ:
             env_args.extend(['--env', f'{var}={os.environ[var]}'])
-    receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
-                     '--tag', tag, '--engine', 'shell',
-                     *env_args,
-                     *controller_resource_argv(),
-                     '--history-bytes', '262144',
-                     '--', *command)
-    # Windows hosts contain the controller with a Job Object (containment_empty);
-    # Linux hosts use cgroup caps above. Exit proof never reads /sys/fs/cgroup on
-    # Windows: native_sessions._confirm_workload_exit accepts catalog
-    # containment_empty plus dead PIDs instead.
-    # Reuse the receipt only in this process; no user-provided ownership labels
-    # or persisted IDs can select another session for cleanup.
-    if (receipt.get('engine') != 'shell' or receipt.get('command') != command or receipt.get('workspace') != str(workspace)
-            or receipt.get('tag') != tag or not receipt.get('id') or type(receipt.get('created_at_ms')) is not int):
-        raise RuntimeError('Native controller receipt mismatch')
-    print(json.dumps({'event': 'controller_started', 'id': receipt['id']}), flush=True)
-    try:
-        while not stop.wait(5):
-            row = native('status', receipt['id'])
-            if not same_controller(row, receipt):
-                raise RuntimeError('Controller identity changed')
-            if row.get('phase') != 'running' or row.get('worker_alive') is False:
-                marker = journal / 'host-release-restart'
-                if marker.exists():
-                    # Planned exit to load a Hub-pinned host release (intake
-                    # a3227276): exit so the service restarts this supervisor
-                    # on the new code too; not a crash.
-                    marker.unlink()
-                    print(json.dumps({'event': 'controller_release_restart', 'id': receipt['id']}), flush=True)
-                    raise SystemExit(75)
-                if not stop.is_set():
-                    publish_controller_crash(row, receipt, journal / 'host-health.json')
-                raise RuntimeError('Controller exited; supervisor will restart')
-    finally:
-        # Only our exact receipt qualifies for stop. Missing records are not
-        # exit proof, and never cause another tag or PID to be selected.
+    with ExitStack() as stack:
+        lease = None
+        if args.control_dir:
+            if not is_windows():
+                raise ValueError('Installer handover is supported only for Windows Job Objects')
+            from agent_hub_host.bootstrap_control import ControllerLease
+            lease = stack.enter_context(ControllerLease(args.control_dir))
+        receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
+                         '--tag', tag, '--engine', 'shell',
+                         *env_args,
+                         *controller_resource_argv(),
+                         '--history-bytes', '262144',
+                         '--', *command)
+        # Windows hosts contain the controller with a Job Object (containment_empty);
+        # Linux hosts use cgroup caps above. Exit proof never reads /sys/fs/cgroup on
+        # Windows: native_sessions._confirm_workload_exit accepts catalog
+        # containment_empty plus dead PIDs instead.
+        # Reuse the receipt only in this process; no user-provided ownership labels
+        # or persisted IDs can select another session for cleanup.
+        if (receipt.get('engine') != 'shell' or receipt.get('command') != command or receipt.get('workspace') != str(workspace)
+                or receipt.get('tag') != tag or not receipt.get('id') or type(receipt.get('created_at_ms')) is not int):
+            raise RuntimeError('Native controller receipt mismatch')
         try:
-            row = native('status', receipt['id'])
-            if same_controller(row, receipt):
-                native('kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '30000')  # aplexer max 30000; > session_host DRAIN_TIMEOUT_S (4398ce2a)
-        except Exception:
-            print(json.dumps({'event': 'controller_cleanup_unconfirmed', 'id': receipt['id']}), flush=True)
+            if lease:
+                lease.publish(receipt)
+            print(json.dumps({'event': 'controller_started', 'id': receipt['id']}), flush=True)
+            while not stop.wait(5):
+                if lease and lease.stop_requested():
+                    break
+                row = native('status', receipt['id'])
+                if not same_controller(row, receipt):
+                    raise RuntimeError('Controller identity changed')
+                if row.get('phase') != 'running' or row.get('worker_alive') is False:
+                    marker = journal / 'host-release-restart'
+                    if marker.exists():
+                        # Planned exit to load a Hub-pinned host release (intake
+                        # a3227276): exit so the service restarts this supervisor
+                        # on the new code too; not a crash.
+                        marker.unlink()
+                        print(json.dumps({'event': 'controller_release_restart', 'id': receipt['id']}), flush=True)
+                        raise SystemExit(75)
+                    if not stop.is_set():
+                        publish_controller_crash(row, receipt, journal / 'host-health.json')
+                    raise RuntimeError('Controller exited; supervisor will restart')
+        finally:
+            # Only our exact receipt qualifies for stop. Missing records are not
+            # exit proof, and never cause another tag or PID to be selected.
+            try:
+                row = native('status', receipt['id'])
+                if same_controller(row, receipt):
+                    result = native('kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '30000')  # aplexer max 30000; > session_host DRAIN_TIMEOUT_S (4398ce2a)
+                    if lease:
+                        # Pinned aplexer 0.1.23 removes a finished record only
+                        # after containment cleanup. An affirmative kill reply
+                        # is proof; an independently missing record is not.
+                        proven = result.get('id') == receipt['id'] and result.get('record_removed') is True
+                        if not proven:
+                            row = native('status', receipt['id'])
+                            proven = same_controller(row, receipt) and row.get('containment_empty') is True
+                        if not proven:
+                            raise RuntimeError('Owned controller exit is unproven')
+                        lease.confirm_exit()
+            except Exception:
+                print(json.dumps({'event': 'controller_cleanup_unconfirmed', 'id': receipt['id']}), flush=True)
 
 if __name__ == '__main__':
     main()
