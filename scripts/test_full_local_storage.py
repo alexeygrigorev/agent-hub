@@ -17,6 +17,8 @@ STUB = r'''
 import json, os, pathlib, socket, sys, time
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
+if name == "python3" and args and pathlib.Path(args[0]).name == "heavy-test-admission.py":
+    os.execv(sys.executable, [sys.executable] + args)
 record = pathlib.Path(os.environ["STORAGE_RECORD"])
 profile = pathlib.Path(os.environ.get("HUB_CONFIG_FILE") or
                        pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "agent-hub/host.json")
@@ -82,6 +84,7 @@ class FullLocalStorageTests(unittest.TestCase):
         # host-wide cap wrapper; fixtures carry the real wrapper so the
         # shell under test resolves the same path it uses in production.
         shutil.copyfile(CAPPED_RUNNER, scripts / CAPPED_RUNNER.name)
+        shutil.copyfile(CAPPED_RUNNER.with_name("heavy-test-admission.py"), scripts / "heavy-test-admission.py")
         # copyfile drops modes; the runner execs the wrapper directly.
         (scripts / CAPPED_RUNNER.name).chmod(0o755)
         (scripts / "local-dependencies.py").write_text("# Command stub handles this fixture.\n")
@@ -116,6 +119,7 @@ class FullLocalStorageTests(unittest.TestCase):
         for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
                     "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS"):
             env.pop(key, None)
+        env.update(AGENT_HUB_HEAVY_TEST_PRIORITY="normal")
         env.update(overrides)
         child = subprocess.Popen(["bash", str(self.repo / "scripts" / RUNNER.name)],
                                  cwd=self.repo, env=env, stdout=subprocess.PIPE,
