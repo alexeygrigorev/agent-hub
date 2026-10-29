@@ -34,6 +34,9 @@ TRACKED_PATHS = [
     "scripts/session-host-supervisor.py",
     "scripts/metrics-dashboard-export.py",
     "scripts/host-release-manifest.json",
+    "scripts/build-host-release.py",
+    "scripts/verify-host-release.py",
+    "scripts/switch-host-release.py",
     "pyproject.toml",
     "uv.lock",
 ]
@@ -60,8 +63,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rev", required=True, help="git revision to build from")
     parser.add_argument("--releases-dir", default=str(DEFAULT_RELEASES))
+    parser.add_argument("--source-repo", default=str(REPO), help="Git object source; its checkout is never changed")
     args = parser.parse_args()
-    rev = run("git", "rev-parse", args.rev, cwd=str(REPO)).stdout.strip()
+    source_repo = Path(args.source_repo).resolve()
+    rev = run("git", "rev-parse", args.rev, cwd=str(source_repo)).stdout.strip()
     if len(rev) != 40 or any(c not in "0123456789abcdef" for c in rev):
         raise SystemExit("build-host-release: invalid revision")
     short = rev
@@ -76,11 +81,10 @@ def main():
         write_pth(target)
         print("build-host-release: OK: " + str(target))
         return 0
-    template = json.loads(MANIFEST_TEMPLATE.read_text(encoding="utf-8"))
     staging = Path(tempfile.mkdtemp(prefix="host-release-", dir=str(releases)))
     # git archive streams to stdout; extract explicitly so failures are loud.
     proc = subprocess.run(["git", "archive", rev, "--", *TRACKED_PATHS],
-                          capture_output=True, timeout=120, cwd=str(REPO))
+                          capture_output=True, timeout=120, cwd=str(source_repo))
     if proc.returncode != 0 or not proc.stdout:
         shutil.rmtree(staging, ignore_errors=True)
         raise SystemExit("build-host-release: git archive failed")
@@ -93,6 +97,7 @@ def main():
         if not (staging / name).exists():
             shutil.rmtree(staging, ignore_errors=True)
             raise SystemExit("build-host-release: archived rev is missing: " + name)
+    template = json.loads((staging / "scripts" / "host-release-manifest.json").read_text(encoding="utf-8"))
     hashes = {}
     for name in template["files"]:
         data = (staging / name).read_bytes()

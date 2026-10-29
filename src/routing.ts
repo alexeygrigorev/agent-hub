@@ -19,7 +19,7 @@ const label = (x: unknown): x is string => typeof x === 'string' && LABEL.test(x
 const CAP = /^[a-z0-9][a-z0-9:_-]{0,95}$/;
 const TERMINAL = ['done', 'failed'];
 const SHA = /^[0-9a-fA-F]{40}$/;
-const HOST_RELEASE_STATES = ['current', 'updated', 'refused', 'failed', 'unsupported'];
+const HOST_RELEASE_STATES = ['current', 'updating', 'updated', 'refused', 'failed', 'unsupported'];
 const reply = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store' } });
 const obj = (x: any, keys: string[]) => x && typeof x === 'object' && !Array.isArray(x) && Object.keys(x).every(k => keys.includes(k));
 export function redact(text: string): string {
@@ -239,6 +239,8 @@ export class RoutingService {
       if (!this.sql.exec('SELECT 1 FROM machines WHERE id = ?', releaseMatch[1]).toArray().length) return reply({ error: 'machine_not_found' }, 404);
       this.sql.exec('INSERT INTO host_release_targets (machine_id, sha, set_by, set_at) VALUES (?, ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET sha = excluded.sha, set_by = excluded.set_by, set_at = excluded.set_at',
         releaseMatch[1], data.sha === null ? null : data.sha.toLowerCase(), String(caller.actor || 'admin').slice(0, 128), this.at());
+      if (data.sha !== null) this.sql.exec('UPDATE host_goals SET sha=?,generation=?,set_at=? WHERE machine_id=? AND sha<>?',
+        data.sha.toLowerCase(), crypto.randomUUID(), this.at(), releaseMatch[1], data.sha.toLowerCase());
       return reply({ machine_id: releaseMatch[1], sha: data.sha === null ? null : data.sha.toLowerCase() });
     }
     if (path === '/api/routing/machines' && request.method === 'GET') {

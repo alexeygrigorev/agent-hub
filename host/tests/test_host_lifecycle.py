@@ -28,7 +28,7 @@ class HostLifecycleTest(unittest.TestCase):
             reports.append(body)
         with patch.object(self_update, 'repo_root', return_value=None), patch.object(self_update, 'release_sha', return_value='a' * 40):
             self.assertFalse(self_update.step_once(request, log=lambda *a, **k: None))
-        self.assertEqual(reports, [{'current_sha': 'a' * 40, 'state': 'unsupported', 'error': 'immutable_release'}])
+        self.assertEqual(reports[-1], {'current_sha': 'a' * 40, 'state': 'unsupported', 'error': 'immutable_layout_missing'})
 
     def test_capabilities_native_arch_replaces_stale_operator_label(self):
         dispatcher = object.__new__(fleet.Dispatcher)

@@ -1,12 +1,21 @@
 param(
   [Parameter(Mandatory=$true)][string]$Runner,
-  [string]$TaskName = 'AgentHubSessionHost'
+  [string]$TaskName
 )
 $ErrorActionPreference = 'Stop'
 $runnerPath = (Resolve-Path -LiteralPath $Runner).Path
-$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$user = $identity.Name
+if ([string]::IsNullOrWhiteSpace($TaskName)) {
+  # A legacy boot task may have an administrator-owned ACL. Create this
+  # user's task instead of modifying or stopping that existing task.
+  $TaskName = "AgentHubSessionHost-User-$($identity.User.Value)"
+}
+if ($TaskName.Length -gt 238 -or $TaskName -notmatch '^AgentHubSessionHost(?:-[A-Za-z0-9_-]+)?$') {
+  throw 'Invalid Hub task name'
+}
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existing -and $existing.Principal.UserId -ne $user -and $existing.Principal.UserId -ne [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
+if ($existing -and $existing.Principal.UserId -ne $user -and $existing.Principal.UserId -ne $identity.User.Value) {
   throw 'Existing task belongs to another user'
 }
 $psExe = (Get-Command powershell.exe).Source
@@ -23,4 +32,6 @@ $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel L
 # A policy denying S4U/batch logon is an explicit installation failure.
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
+$taskRecord = Join-Path (Split-Path -Parent $runnerPath) 'autostart-task-name.txt'
+Set-Content -LiteralPath $taskRecord -Value $TaskName -Encoding ASCII
 Write-Output 'Host autostart registered: per-user S4U, one-minute timer, no logon dependency. Reboot/wake verification still required.'

@@ -85,7 +85,18 @@ class ReleaseCompletenessTests(unittest.TestCase):
         # `root = ...parents[2]` variable may bypass the manifest.
         direct = sum(len(RELEASE_READ.findall((HOST_PKG / name).read_text(encoding="utf-8")))
                      for name in sorted(q.name for q in HOST_PKG.glob("*.py")))
-        self.assertEqual(anchor_uses, direct)
+        # The updater also passes its release root to the manifest verifier.
+        # Keep these two indirect anchors explicit so a new one still fails.
+        updater = (HOST_PKG / "self_update.py").read_text(encoding="utf-8")
+        approved = [
+            "Path(package or __file__).resolve().parent.parent.parent",
+            "root=Path(__file__).resolve().parent.parent.parent, run=run, python=python)",
+        ]
+        for expression in approved:
+            self.assertEqual(updater.count(expression), 1)
+        self.assertEqual(anchor_uses, direct + len(approved))
+        self.assertTrue({"scripts/build-host-release.py", "scripts/verify-host-release.py",
+                         "scripts/switch-host-release.py"}.issubset(manifest["files"]))
         for name in found:
             self.assertTrue(
                 name in manifest["files"] or any(
@@ -135,6 +146,9 @@ class ReleaseCompletenessTests(unittest.TestCase):
                 ("config/model-routing.json", "{}"),
                 ("scripts/session-host-supervisor.py", "#"),
                 ("scripts/metrics-dashboard-export.py", "#"),
+                ("scripts/build-host-release.py", "#"),
+                ("scripts/verify-host-release.py", "#"),
+                ("scripts/switch-host-release.py", "#"),
                 ("pyproject.toml", ""), ("uv.lock", ""),
             ]:
                 dest = target / name
@@ -276,7 +290,10 @@ class CrossAliasDispatchTests(unittest.TestCase):
             offer = {"id": offer_id, "engine": "opencode", "profile": None,
                      "account": offer_account, "mode": "interactive",
                      "workspace": "demo"}
-            result = fleet.Dispatcher(cfg, fake_request, fake_runner).dispatch(offer)
+            # Route identity tests must not depend on shared-host load.
+            with patch("agent_hub_host.host_load.check_live_load", return_value={}), \
+                 patch.object(fleet.Dispatcher, "_lock_session_worktree"):
+                result = fleet.Dispatcher(cfg, fake_request, fake_runner).dispatch(offer)
             self.assertEqual(result.get("state"), "running")
             self.assertEqual(result.get("native_id"), "native-1")
             # Gate sees the local subscription identity ...

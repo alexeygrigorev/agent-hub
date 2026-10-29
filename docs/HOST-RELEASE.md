@@ -81,6 +81,16 @@ load never reaches the PUT at all (startup raises, reloads keep last good).
 
 ## Checkout-installed hosts: Hub-pinned self-update
 
+Linux immutable releases built with the desired-state update kit also consume
+the Hub pin automatically. They build from Git objects in `AGENT_HUB_SOURCE_REPO`
+(default `~/git/agent-hub`) using `build-host-release.py --source-repo`, verify
+the new tree, and switch the user unit through the normal restart marker. The
+source checkout and its dependencies are left intact. The kit is bundled and
+hashed in the release manifest. The managed final drop-in is
+`zz~~hub-desired-release.conf`; later conflicting overrides are refused.
+Status retains the running SHA during `updating`/`updated` and changes to the
+new SHA only when the new release reports `current`.
+
 Hosts that run the session host straight from a git checkout and have no
 inbound channel (Tabo: Windows, no ssh) take releases from the Hub instead
 of from an operator at the keyboard (intake a3227276):
@@ -93,8 +103,8 @@ hub host-release --machine cBynxGDoKVPoGpGWxvCTvg --clear   # stop pinning
 
 The Hub stores only the target SHA. Every 120 s the session host
 (`host/agent_hub_host/self_update.py`) reads its own pin and, when it differs
-from `HEAD`, requires: the checkout's own `.git` (release trees report
-`unsupported`), branch `main`, no tracked changes (untracked files are kept),
+from `HEAD`, requires: the checkout's own `.git` (Linux release trees use the
+bundled update kit above), branch `main`, no tracked changes (untracked files are kept),
 the SHA reachable from a fresh `origin/main`, and a fast-forward of `HEAD`.
 Anything else reports `refused` with the reason and changes nothing. It
 then fast-forwards, runs `python -m pip install -e .` in the service

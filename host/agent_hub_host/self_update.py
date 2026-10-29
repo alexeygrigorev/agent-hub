@@ -56,10 +56,10 @@ class UpdateRefused(Exception):
         self.reason = reason
 
 
-def _run(run, argv, cwd, timeout, env=None):
+def _run(run, argv, cwd, timeout, env=None, umask=-1):
     result = run(argv, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                  stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace',
-                 timeout=timeout, env=env)
+                 timeout=timeout, env=env, umask=umask)
     return result.returncode, (result.stdout or '').strip()
 
 
@@ -108,7 +108,7 @@ def ensure_windows_autostart(root, run=subprocess.run):
     try:
         if marker.read_text(encoding='ascii').strip() == digest:
             return 'configured'
-    except OSError:
+    except (OSError, UnicodeError):
         pass
     try:
         code, _ = _run(run, ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script), '-Runner', str(runner)], root, 90)
@@ -174,7 +174,13 @@ def step_once(request, *, root=None, run=subprocess.run, python=None, log=print)
     target = target.lower() if isinstance(target, str) and SHA.match(target.lower()) else None
     if root is None:
         sha = release_sha()
-        state, error = ('current', None) if sha and (target is None or sha == target) else ('unsupported', 'immutable_release' if sha else 'release_provenance_missing')
+        if sha and target and sha != target:
+            request('POST', '/api/fleet/routing/host-release/report', {'current_sha': sha, 'state': 'updating', 'error': None})
+            from .immutable_release import apply as apply_immutable
+            state, error, sha = apply_immutable(target, sha, request,
+                root=Path(__file__).resolve().parent.parent.parent, run=run, python=python)
+        else:
+            state, error = ('current', None) if sha else ('unsupported', 'release_provenance_missing')
     elif target is None:
         sha = current_sha(root, run)
         state, error = ('current', None) if sha else ('unsupported', 'not_a_git_checkout')
