@@ -989,6 +989,7 @@ def bounded_catalog(raw, limit=CATALOG_LIMIT):
 def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
     from .account_capacity import confirmed_empty
     from .session_progress import event_ms
+    from .session_observation import native_session_model
     sessions = raw if isinstance(raw, list) else raw.get("sessions", [])
     clean = []
     for session in sessions:
@@ -1019,6 +1020,8 @@ def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
                       "cwd": cwd,
                       "last_activity_at": _ms_to_iso(event_ms(session)),
                       "created_at_ms": created_at_ms,
+                      "model": native_session_model(session),
+                      "parent_id": session.get("parent_session") if isinstance(session.get("parent_session"), str) else None,
                       **({'progress': progress[session['id']]} if progress and session['id'] in progress else {})})
         if collect_tokens and session.get('tag', '').startswith(('hub-', 'task-hub-')):
             from .token_usage import native_session_tokens
@@ -4167,6 +4170,15 @@ class Dispatcher:
         reconciled = self.reconcile_launches()
         self.reconcile_operator_adoptions()
         imported_reconciled = self.reconcile_imported_sessions()
+        # e37b0e83 AC1: stop native trees whose Hub session is terminal or
+        # missing. Bounded per cycle; the server authorizes each incarnation.
+        if self.journal_dir and raw is not None:
+            from .session_reaper import reconcile as reconcile_native_trees
+            native_rows = raw if isinstance(raw, list) else raw.get('sessions') if isinstance(raw, dict) else None
+            reap = reconcile_native_trees(self.request, native_rows, self.journal_dir,
+                                          executable=self.settings.get('aplexer_bin', 'aplexer'))
+            if any(reap.values()):
+                print(json.dumps({'event': 'fleet_native_reconcile', **reap}), flush=True)
         _mark('reconcile')
         # Resource management (intake 4fcd3139): per-session exact sampler +
         # safe watchdog. Best-effort only with durable local state in the

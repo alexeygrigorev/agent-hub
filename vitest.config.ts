@@ -19,5 +19,6 @@ export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
     fileParallelism: false,
+    globalSetup: ['./test/heavy-slot.global-setup.mjs'],
   },
 });

@@ -79,20 +79,28 @@ def read_bytes(path, limit, *, private=True):
             return data
 
 
-def _existing(anchor, path):
+def _existing(anchor, path, engine_owned=False):
+    # Engine CLIs rewrite their own files in a private directory: on Windows the
+    # replacement inherits the owner-only parent ACE instead of a protected
+    # DACL, on POSIX it gets the engine's umask. Both are still same-owner,
+    # regular, singly linked files that this write replaces with a private one.
     try:
-        fd = _open(anchor, path, os.O_RDONLY)
+        fd = _open(anchor, path, os.O_RDONLY, private=not engine_owned)
     except FileNotFoundError:
         return
-    os.close(fd)
+    try:
+        if engine_owned and not _windows() and os.fstat(fd).st_uid != os.getuid():
+            raise PermissionError('Unsafe managed file owner')
+    finally:
+        os.close(fd)
 
 
-def atomic_write(path, raw, limit):
+def atomic_write(path, raw, limit, *, engine_owned=False):
     if len(raw) > limit:
         raise ValueError('Private file exceeds byte bound')
     path = Path(path)
     with parent(path, create=True) as anchor:
-        _existing(anchor, path)
+        _existing(anchor, path, engine_owned)
         # Random, exclusive staging avoids clobbering crash residue or another writer.
         tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
         fd = _open(anchor, tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -101,7 +109,7 @@ def atomic_write(path, raw, limit):
                 stream.write(raw)
                 stream.flush()
                 os.fsync(stream.fileno())
-            _existing(anchor, path)
+            _existing(anchor, path, engine_owned)
             if _windows():
                 from . import win32_fs
                 win32_fs.replace(tmp, path)

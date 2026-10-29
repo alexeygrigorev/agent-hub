@@ -387,19 +387,18 @@ describe('worktree guard (intake a0f01448)', () => {
 
 
 describe('observed-native adoption requires verified custody and a host lock', () => {
-  it('defers unknown census identity despite spoofed ownership and lock labels, with one durable alert', async () => {
+  it('publishes unknown census identity without trusting ownership and lock labels', async () => {
     await fixture(async (_service, sql) => {
       const native = { native_id: NATIVE_ID, tag: 'hub-spoofed', workspace: NATIVE_WS,
         engine: 'codex', phase: 'running', created_at_ms: NATIVE_CREATED,
         owner: 'demo:assistant', protected: false, worktree_locked: true };
-      for (let i = 0; i < 2; i++) {
-        expect(adoptObservedNativeSessions(sql, 'hetzner', [native], Date.now()).adopted).toBe(0);
-      }
-      expect(sql.exec('SELECT id FROM session_control_sessions WHERE id=?', NATIVE_ID).toArray()).toHaveLength(0);
-      const alerts = sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind='session_adoption' AND subject=? AND resolved_at IS NULL", 'hetzner/' + NATIVE_ID).toArray();
-      expect(alerts).toHaveLength(1);
-      expect(alerts[0].state).toBe('needs_attention');
-      expect(JSON.parse(alerts[0].detail).reason).toBe('adoption_ownership_lock_unverified');
+      expect(adoptObservedNativeSessions(sql, 'hetzner', [native], Date.now()).adopted).toBe(1);
+      expect(adoptObservedNativeSessions(sql, 'hetzner', [native], Date.now()).adopted).toBe(0);
+      const observation: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', NATIVE_ID).toArray()[0];
+      expect(observation).toMatchObject({actor:'unknown',owner_token_id:null,owner_family:null});
+      expect(JSON.parse(observation.request_json).observation_only).toBe(true);
+      expect(JSON.parse(observation.binding_json).adoption_lock).toBeUndefined();
+
     });
   });
 

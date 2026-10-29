@@ -100,6 +100,7 @@ PYTEST_RC=0
 PYTHON_ENV=(env)
 while IFS= read -r name; do
   case "$name" in
+    AGENT_HUB_HEAVY_TEST_HELD) ;;  # keep: nested runners must not take a second slot
     APLEXER_*|HUB_*|AGENT_HUB_*|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_RUNTIME_DIR|GH_CONFIG_DIR)
       PYTHON_ENV+=(-u "$name") ;;
   esac

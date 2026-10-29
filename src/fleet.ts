@@ -1,3 +1,4 @@
+import { observationModel } from './session-observation';
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 import { sanitizeCommandFields } from './command-diagnostics';
@@ -1638,7 +1639,9 @@ export class FleetService {
       if (!object(data, ['sessions']) || !Array.isArray(data.sessions) || data.sessions.length > 500) return response({ error: 'invalid_sessions' }, 400);
       const ids = new Set();
       for (const s of data.sessions) {
-        if (!object(s, ['native_id', 'tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit', 'progress', 'tokens']) ||
+        if (!object(s, ['native_id', 'tag', 'engine', 'model', 'parent_id', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit', 'progress', 'tokens']) ||
+            (s.model !== undefined && s.model !== null && observationModel(s.model) === null) ||
+            (s.parent_id !== undefined && s.parent_id !== null && (typeof s.parent_id !== 'string' || !/^[a-zA-Z0-9-]{1,160}$/.test(s.parent_id))) ||
             (s.tokens !== undefined && (!object(s.tokens, ['input_tokens', 'output_tokens']) ||
               !['input_tokens', 'output_tokens'].every(k => Number.isInteger(s.tokens[k]) && s.tokens[k] >= 0 && s.tokens[k] <= 1e12))) ||
             (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup', 'terminal_error', 'goal_status', 'sampled_at']) ||

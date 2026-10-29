@@ -7,6 +7,7 @@ install -m755 "$here/lib/session-ctl.sh" "$here/lib/watchdog.sh" "$dest/"
 install -m755 "$here/lib/send.sh" "$HOME/bin/orch-send"
 install -m755 "$here/lib/send.sh" "$HOME/bin/oncall-send"
 install -m644 "$here"/systemd/ops-watchdog.service "$here"/systemd/ops-watchdog.timer "$HOME/.config/systemd/user/"
+mkdir -p "$HOME/tmp/briefs" && install -m644 "$here/orchestrator/brief.md" "$HOME/tmp/briefs/orchestrator-main.md"
 systemctl --user daemon-reload
 systemctl --user enable --now ops-watchdog.timer
 echo "installed: $dest, ~/bin/orch-send, ~/bin/oncall-send, ops-watchdog.timer"

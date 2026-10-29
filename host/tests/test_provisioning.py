@@ -1201,3 +1201,85 @@ def test_admission_self_heals_missing_aplexer_profile_from_installed_state(tmp_p
 
 
 
+
+
+def test_engine_rewritten_config_toml_is_accepted_and_preserved_6cbb862a(tmp_path):
+    """Regression 6cbb862a: codex rewrites config.toml with its own umask/ACL; install must not fail or drop it."""
+    home = tmp_path / 'home'
+    codex = home / '.codex'
+    codex.mkdir(parents=True, mode=0o700)
+    home.chmod(0o700)
+    cfg = codex / 'config.toml'
+    p.install_managed_engine_permissions({'provider': 'codex'}, home)
+    cfg.write_text(cfg.read_text() + '\n[notice]\nhide_rate_limit_model_nudge = true\n')
+    cfg.chmod(0o644)  # engine replaced the file with its default umask
+    p.install_managed_engine_permissions({'provider': 'codex'}, home)
+    assert 'hide_rate_limit_model_nudge = true' in cfg.read_text()
+    assert 'approval_policy = "never"' in cfg.read_text()
+    assert cfg.stat().st_mode & 0o777 == 0o600
+
+
+def test_unchanged_engine_configs_are_not_rewritten_6cbb862a(tmp_path):
+    home = tmp_path / 'home'
+    home.mkdir(mode=0o700)
+    p.install_managed_engine_permissions(None, home)
+    with patch.object(p.private_fs, 'atomic_write') as write:
+        p.install_managed_engine_permissions(None, home)
+    assert write.call_args_list == []
+
+
+def test_windows_inherited_owner_only_acl_falls_back_to_verified_read_6cbb862a(tmp_path):
+    target = tmp_path / 'config.toml'
+    calls = []
+    def read_bytes(path, limit, *, private=True):
+        calls.append(private)
+        if private:
+            raise PermissionError('Private owner/protected DACL required')
+        return b'model = "x"\n'
+    with patch.object(p.private_fs, 'read_bytes', side_effect=read_bytes), patch.object(p.os, 'name', 'nt'):
+        assert p.read_engine_file(target) == b'model = "x"\n'
+        assert p.preserve_managed_file(target) is True
+    assert calls == [True, False, True, False]
+    # A foreign owner or extra ACE still fails closed.
+    with patch.object(p.private_fs, 'read_bytes', side_effect=PermissionError('Unexpected or inherited private ACE')), \
+         patch.object(p.os, 'name', 'nt'):
+        with pytest.raises(PermissionError):
+            p.read_engine_file(target)
+
+
+def test_failed_reinstall_keeps_offered_bundle_dir_and_logs_type_only_6cbb862a(tmp_path, monkeypatch, capsys):
+    """Regression 6cbb862a: a failed install must not rmtree an offered bundle under a live engine."""
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    shared, orin = bundle('44444444-4444-4444-8444-444444444444'), bundle('55555555-5555-4555-8555-555555555555')
+    shared['label'], orin['label'] = 'shared-codex', 'codex-orin'
+    desired = [shared, orin]
+
+    def request(method, path, payload=None):
+        return {'engines': desired} if method == 'GET' else {'status': 'installed'}
+
+    with patch.object(p.subprocess, 'run', side_effect=installer):
+        assert sorted(p.sync(request)['profiles']) == ['hub-codex-orin', 'hub-shared-codex']
+    shared_dir = root_dir / f"shared-codex-{shared['revision']}"
+    engine_file = shared_dir / 'engine' / 'node_modules' / '.bin' / 'codex'
+    real_install = p.install
+
+    def flaky(b, request=None):
+        if b['label'] == 'shared-codex':
+            raise PermissionError('C:\\secret\\path Private owner/protected DACL required')
+        return real_install(b, request)
+
+    with patch.object(p, 'install', side_effect=flaky):
+        result = p.sync(request)
+        assert result['failed_labels'] == ['shared-codex']
+        p.sync(request)  # the next heartbeat must not delete the engine either
+    assert engine_file.is_file()
+    err = capsys.readouterr().err
+    assert '"managed_install_failed": "shared-codex"' in err and 'PermissionError' in err
+    assert 'secret' not in err
+    with patch.object(p.subprocess, 'run', side_effect=installer):
+        assert sorted(p.sync(request)['profiles']) == ['hub-codex-orin', 'hub-shared-codex']
+        desired[:] = [orin]  # Hub withdrew the account: only then is the dir removed
+        assert p.sync(request)['profiles'] == ['hub-codex-orin']
+    assert not shared_dir.exists()

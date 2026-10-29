@@ -77,12 +77,12 @@ def guard_worker_profile_writes(monkeypatch):
     original = private_fs.atomic_write
     temporary = Path(tempfile.gettempdir()).resolve()
 
-    def guarded(path, raw, limit):
+    def guarded(path, raw, limit, **kwargs):
         target = Path(path)
         if "hub-worker-auth" in target.parts:
             assert target.resolve().is_relative_to(temporary), (
                 "test attempted a real hub-worker-auth write: " + str(target))
-        return original(path, raw, limit)
+        return original(path, raw, limit, **kwargs)
 
     monkeypatch.setattr(private_fs, "atomic_write", guarded)
 
@@ -117,3 +117,41 @@ def isolated_host_load(monkeypatch):
     from agent_hub_host import host_load
     monkeypatch.setattr(host_load, "os", SimpleNamespace(
         getloadavg=lambda: (0.0, 0.0, 0.0), cpu_count=lambda: 12))
+
+
+# Host-wide heavy-test cap for direct pytest runs (736ba282 AC6h): hold one
+# scripts/capped-test-run.sh slot for the session unless already under the
+# wrapper (AGENT_HUB_HEAVY_TEST_HELD=1). The holder exits, releasing the
+# slot, when this process closes the pipe (also on crash). CI, Windows and
+# AGENT_HUB_HEAVY_TEST_AUTO=0 skip; wrapper/env problems fail open.
+def heavy_slot_wanted(env, platform):
+    return (env.get("AGENT_HUB_HEAVY_TEST_HELD") != "1" and not env.get("CI")
+            and env.get("AGENT_HUB_HEAVY_TEST_AUTO") != "0" and platform != "win32")
+
+
+def pytest_configure(config):
+    import subprocess
+    import sys
+    if not heavy_slot_wanted(os.environ, sys.platform) or hasattr(config, "workerinput"):
+        return  # xdist workers run under their controller's slot
+    wrapper = Path(__file__).resolve().parents[2] / "scripts" / "capped-test-run.sh"
+    try:
+        holder = subprocess.Popen(
+            ["bash", str(wrapper), "--", "bash", "-c", "echo heavy-slot-held; read -r _"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    except OSError:
+        return
+    line = holder.stdout.readline()
+    if "heavy-slot-held" not in line:
+        if holder.wait() == 3:
+            raise pytest.UsageError("heavy-test slot not acquired; host test cap is full")
+        return
+    config._agent_hub_heavy_slot = holder
+    os.environ["AGENT_HUB_HEAVY_TEST_HELD"] = "1"  # nested runners reuse this slot
+
+
+def pytest_unconfigure(config):
+    holder = getattr(config, "_agent_hub_heavy_slot", None)
+    if holder is not None:
+        holder.stdin.close()
+        holder.wait(timeout=30)

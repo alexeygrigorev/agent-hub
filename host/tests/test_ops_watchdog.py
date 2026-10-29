@@ -61,6 +61,9 @@ class OpsWatchdogTest(unittest.TestCase):
         (self.home / 'exclude').touch()
         self.runtime = self.home / 'runtime.json'
         self.state = self.home / 'tmp/agent-reports/orchestrator/state'
+        self.ticks = self.home / 'tmp/agent-reports/orchestrator-ticks.jsonl'
+        self.ticks.parent.mkdir(parents=True)
+        self.ticks.write_text('{}\n')  # fresh tick log: the orchestrator is progressing
         self.data = {'sessions': []}
         self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)+':'+os.environ['PATH'], 'LOOP_INTERVAL': 'off', 'MIN_RESTART_GAP': '0'}
 
@@ -139,6 +142,12 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn('OK session=live', result.stdout)
         self.assertNotIn('a kill', self.calls())
+
+    def test_stale_tick_log_is_stall(self):
+        self.data['sessions'] = [{**self.session(True), 'id': 'live'}]
+        os.utime(self.ticks, (0, 0))
+        result = self.run_ctl()
+        self.assertIn('STALLED session=live', result.stdout)
 
     def test_failed_loop_send_is_restart_failure(self):
         self.env['LOOP_INTERVAL'] = '1h'

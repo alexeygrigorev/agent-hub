@@ -278,6 +278,21 @@ One source of truth: `host/agent_hub_host/provisioning.py::root()`.
 - Same-revision reconcile and execution preserve nonempty runtime files after validating their private parent, owner, regular-file type and single-link confinement; POSIX file modes are tightened to 0600. Missing or truncated files are restored from the bundle. This preserves refresh-token rotation instead of resetting credentials from an older central snapshot.
 - To heal an invalid credential, re-import it (`hub engines add --provider codex --label <account> --auth-file <private-authorized-source>`) or, for Claude, `hub engines login`; Hub publishes a new generation and every host converges on its next sync or launch. Never hand-copy secrets or print tokens. Verify with `hub engines list` (credential `status: ok`) and `hub quota` (fresh `hub-direct` reading).
 
+## Account slot limit default (intake 40fa0d3e)
+
+A Hub-central account created by `PUT /api/engines/<label>` (import) or a
+central Claude login inherits the provider default `max_concurrency` of 8
+(t1248u; `PROVIDER_DEFAULT_MAX_CONCURRENCY` in `src/provisioning.ts`). Set it
+explicitly on create with `?max_concurrency=N` on the PUT or
+`"max_concurrency": N` in the credential-login start body (integer 1..100).
+Re-importing or adopting an existing account never changes its limits.
+
+Accounts created before this change sat at an implicit 1. A one-time migration
+(`managed_account_max_concurrency_default_v1`) raises managed accounts still at
+1 to the provider default and records each label in `GET /api/engines`
+`account_migrations`. Unmanaged registry rows and any later explicit 1 are left
+alone.
+
 ## Multiple profiles and the same launch everywhere
 
 Each managed label is an account, with its own HOME, credential files, aplexer

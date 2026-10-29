@@ -6,6 +6,7 @@ import { IntakeTriage } from './intake-triage';
 import { IntakeVerifier } from './intake-verifier';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
 import { RepoRegistry } from './repos';
+import { hostReconcileFact, validReconcileNative } from './host-reconcile';
 import { IntakeService } from './intake';
 import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceReviewHuman, deviceResult } from './ui-pages';
 import { DurableObject } from "cloudflare:workers";
@@ -846,6 +847,22 @@ export class Hub extends DurableObject {
       // refuses every non-admin caller and only serves GET.
       if (path === '/api/backup/export' || path === '/api/backup/status') {
         return this.backupService.handle(request, await this.sessionControlAuth(request));
+      }
+      // e37b0e83 AC1: read-only exact-incarnation authority for the host
+      // reaper. A native is reapable only when its Hub session is terminal
+      // or missing, headless, managed and unprotected.
+      if (path === '/api/sessions/host-reconcile') {
+        if (request.method !== 'POST') return Response.json({error:'method_not_allowed'},{status:405});
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        const caller = auth.caller;
+        const allowed = () => caller?.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host') &&
+          this.sessionControlService.hostObservationAllowed(caller.machineId, caller);
+        if (!allowed()) return Response.json({error:'forbidden'},{status:403});
+        const input = await safeJson(request);
+        if (!input || Object.keys(input).length !== 1 || !validReconcileNative(input.native)) return Response.json({error:'invalid_native'},{status:400});
+        if (!allowed()) return Response.json({error:'host_credential_changed'},{status:403});
+        return Response.json({session:hostReconcileFact(this.sql,caller!.machineId!,input.native)});
       }
       // M12e session control (narrow seam, owned by platform-session-api-r2).
       // Auth mirrors the intake mount exactly: bus credentials first, narrow

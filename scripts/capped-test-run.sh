@@ -4,6 +4,8 @@
 # The full local runner uses this automatically. All checkouts of the same user
 # share locks, including children using a disposable HOME. Linux flock releases
 # a slot on exit/crash; no PID files, stale-slot deletion, or signals to sessions.
+# Vitest and pytest acquire a slot on their own when not run under this wrapper
+# (test/heavy-slot.global-setup.mjs, host/tests/conftest.py).
 # Env defaults: AGENT_HUB_HEAVY_TEST_SLOTS=2,
 # AGENT_HUB_HEAVY_TEST_WAIT_S=1800, AGENT_HUB_HEAVY_TEST_DIR (shared lock root).
 set -uo pipefail
@@ -31,26 +33,34 @@ fi
 command -v flock >/dev/null || { echo 'capped-test-run: flock required' >&2; exit 2; }
 mkdir -p -- "${SEMAPHORE_ROOT}" || exit 2
 deadline=$((SECONDS + WAIT_S))
+run_holding_slot() {
+  interrupted=0
+  trap 'interrupted=130' INT
+  trap 'interrupted=143' TERM
+  # Runners that acquire a slot on their own (vitest globalSetup, pytest
+  # conftest) see this and never ask for a second one: a nested request
+  # could deadlock once every slot is held by an outer wrapper.
+  AGENT_HUB_HEAVY_TEST_HELD=1 "$@" <&0 &
+  command_pid=$!
+  # A signal interrupts bash wait. Retain the slot until our command
+  # finishes; releasing it early would admit another suite over the cap.
+  while true; do
+    wait "${command_pid}"
+    command_rc=$?
+    kill -0 "${command_pid}" 2>/dev/null || break
+  done
+  if [ "${interrupted}" -ne 0 ]; then exit "${interrupted}"; fi
+  exit "${command_rc}"
+}
+round=0
+announced=0
 while true; do
   for ((i=0; i<SLOTS; i++)); do
     # Keep the lock in this wrapper: Node and subprocess runners can close
     # inherited descriptors. Never unlink a lock file while users may hold it.
     exec 9>"${SEMAPHORE_ROOT}/slot-${i}.lock" || exit 2
     if flock -n 9; then
-      interrupted=0
-      trap 'interrupted=130' INT
-      trap 'interrupted=143' TERM
-      "$@" <&0 &
-      command_pid=$!
-      # A signal interrupts bash wait. Retain the slot until our command
-      # finishes; releasing it early would admit another suite over the cap.
-      while true; do
-        wait "${command_pid}"
-        command_rc=$?
-        kill -0 "${command_pid}" 2>/dev/null || break
-      done
-      if [ "${interrupted}" -ne 0 ]; then exit "${interrupted}"; fi
-      exit "${command_rc}"
+      run_holding_slot "$@"
     fi
     exec 9>&-
   done
@@ -58,5 +68,16 @@ while true; do
     echo "capped-test-run: no heavy-test slot free after ${WAIT_S}s (${SLOTS} slots)" >&2
     exit 3
   fi
-  sleep 0.2
+  if [ "${announced}" -eq 0 ]; then
+    echo "capped-test-run: all ${SLOTS} heavy-test slots busy; waiting up to ${WAIT_S}s" >&2
+    announced=1
+  fi
+  # Block on one slot (rotating) instead of polling: a busy host can have
+  # dozens of waiters, and a sleep+flock loop per waiter is a fork storm.
+  exec 9>"${SEMAPHORE_ROOT}/slot-$((round % SLOTS)).lock" || exit 2
+  round=$((round + 1))
+  if flock -w 2 9; then
+    run_holding_slot "$@"
+  fi
+  exec 9>&-
 done
