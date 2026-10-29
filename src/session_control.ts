@@ -1,4 +1,4 @@
-import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates } from './session-observation';
+import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
 import { IntakeWorktrees } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
@@ -3757,6 +3757,7 @@ export function adoptObservedNativeSessions(
 
   // Reconcile late START notes and exact registered-worktree evidence in
   // one bounded pass. Linkage never grants ownership or filesystem authority.
+  const linkageRevision = sessions.length ? observationIntakeRevision(sql, machineId) : '';
   const pending: any[] = [];
   for (const native of sessions) {
     if (!native || typeof native.native_id !== 'string') continue;
@@ -3767,7 +3768,7 @@ export function adoptObservedNativeSessions(
         binding.tag !== native.tag || binding.workspace !== native.workspace ||
         binding.native_created_at_ms !== (native.created_at_ms ?? null) || row.engine !== native.engine) continue;
     const request = parsed(row.request_json, {});
-    const revision = `${row.updated_at}/${request.observation_only === true}/${row.owner_family ?? ''}/${row.owner_token_id ?? ''}`;
+    const revision = `${linkageRevision}/${row.updated_at}/${request.observation_only === true}/${row.owner_family ?? ''}/${row.owner_token_id ?? ''}`;
     if (request.observation_link_revision === revision) continue;
     sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',
       JSON.stringify({...request, observation_link_revision: revision}), row.id);

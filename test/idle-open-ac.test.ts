@@ -98,9 +98,34 @@ describe('idle with open acceptance criteria', () => {
     expect(intake(natives[0])).toBe(taskId);
     expect(intake(natives[1])).toBe(taskId);
     expect(intake(natives[2])).toBeUndefined();
-    expect(reads.filter(q=>q==='SELECT id, data FROM intake_tasks LIMIT 101')).toHaveLength(1);
+    expect(reads.filter(q=>q.includes('AS events FROM intake_tasks WHERE id>'))).toHaveLength(1);
     reads.length = 0;
     adoptObservedNativeSessions(counted as any,'idle-host',natives,at+1000);
+    expect(reads.some(q=>q.includes('FROM intake_tasks'))).toBe(false);
+  }));
+  it('backfills large ledgers in bounded pages and observes late START notes without native changes', async () => fixture(async ({sql,task}: any) => {
+    const native={native_id:crypto.randomUUID(),tag:'late-manual',workspace:'/late-manual',engine:'codex',created_at_ms:at-1000,phase:'running'};
+    for (let n=0;n<120;n++) {
+      const otherId=`history-${String(n).padStart(3,'0')}`;
+      sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',otherId,JSON.stringify({...task,id:otherId,history:[]}));
+    }
+    const reads:string[]=[];
+    const counted={exec(query:string,...args:any[]){reads.push(query);return sql.exec(query,...args);}};
+    adoptObservedNativeSessions(counted as any,'idle-host',[native],at);
+    expect(sql.exec('SELECT count(*) AS n FROM session_observation_intakes').one().n).toBe(100);
+    expect(sql.exec('SELECT complete FROM session_observation_intake_meta').one().complete).toBe(0);
+    adoptObservedNativeSessions(counted as any,'idle-host',[native],at+1000);
+    expect(sql.exec('SELECT complete FROM session_observation_intake_meta').one().complete).toBe(1);
+    expect(reads.filter(q=>q.includes('AS events FROM intake_tasks WHERE id>'))).toHaveLength(2);
+    const revision=sql.exec('SELECT updated_at FROM session_control_sessions WHERE id=?',native.native_id).one().updated_at;
+    task.history.push({kind:'note',text:`START: native ${native.native_id}`});
+    sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(task),taskId);
+    adoptObservedNativeSessions(counted as any,'idle-host',[native],at+2000);
+    const row=sql.exec('SELECT request_json,updated_at FROM session_control_sessions WHERE id=?',native.native_id).one();
+    expect(JSON.parse(row.request_json).intake_task_id).toBe(taskId);
+    expect(row.updated_at).toBe(revision);
+    reads.length=0;
+    adoptObservedNativeSessions(counted as any,'idle-host',[native],at+3000);
     expect(reads.some(q=>q.includes('FROM intake_tasks'))).toBe(false);
   }));
   it('keeps ambiguous intake evidence and foreign-host native links unassigned', async () => fixture(async ({sql,task}: any) => {
