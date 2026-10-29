@@ -15,7 +15,7 @@
  * produce a working session.
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import { nativeObservationFresh } from './session_stall';
+import { nativeObservationFresh, nativeProgress } from './session_stall';
 
 export const OPS_ROLES = ['orchestrator', 'oncall'] as const;
 /** Roles that must report: silence counts from Hub's first evaluation even with no row. */
@@ -117,10 +117,13 @@ export class OpsLiveness {
       recovery_failures: r?.recovery_failures ?? 0, alert };
   }
 
-  /** Bounded backlog view: open intakes with AC, and intake sessions with fresh evidence of
-   * work: offered/starting rows updated within the window, running rows whose bound native
-   * session is observed live. A retained row alone, or one for a closed intake, is not work. */
-  backlog(now = this.now()): { open_with_ac: number; active_sessions: number } {
+  /** Bounded backlog view: open intakes with AC, and intake sessions actually working.
+   * Work needs fresh evidence on an open/in-progress intake: an offered/starting row updated
+   * within the window, or a running row whose bound native session is observed live on a
+   * fresh host AND made host-sampled progress within the window. A fresh observation of an
+   * idle process is not work. `last_work_at` is the newest such evidence (including recent
+   * session ends), so the idle clock starts at the last useful work, not at detection. */
+  backlog(now = this.now()): { open_with_ac: number; active_sessions: number; last_work_at: number | null } {
     const open = this.rows(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM intake_task_projection
       WHERE json_extract(data,'$.status') IN ('open','in_progress','blocked','pending_approval') AND json_extract(data,'$.archived_at') IS NULL
       AND json_extract(data,'$.status') IN ('open','in_progress')
@@ -130,15 +133,27 @@ export class OpsLiveness {
       FROM session_control_sessions s JOIN intake_task_projection p ON p.id=${requestIntake}
       WHERE s.state IN ${ACTIVE_STATES} AND json_extract(p.data,'$.status') IN ('open','in_progress') LIMIT 201`);
     const cache = new Map();
-    let active = 0;
+    let active = 0, lastWork: number | null = null;
+    const saw = (t: number | null) => { if (t !== null && Number.isFinite(t) && t <= now) lastWork = lastWork === null ? t : Math.max(lastWork, t); };
     for (const c of candidates) {
-      if (c.state !== 'running') { if (now - (Date.parse(c.updated_at) || 0) <= OPS_WINDOW_MS) active++; continue; }
+      if (c.state !== 'running') {
+        const at = Date.parse(c.updated_at) || 0;
+        saw(at);
+        if (now - at <= OPS_WINDOW_MS) active++;
+        continue;
+      }
       if (!c.native_id) continue;
-      const native = this.rows(`SELECT machine_id, native_id, observed_at FROM fleet_sessions WHERE machine_id=? AND native_id=?
-        AND phase NOT IN ('exited','stopped','failed') LIMIT 1`, c.machine_id, c.native_id)[0];
-      if (native && now - (Date.parse(native.observed_at) || 0) <= NATIVE_STALE_MS && nativeObservationFresh(this.sql, native, now, cache)) active++;
+      const native = this.rows(`SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?
+        AND phase NOT IN ('exited','stopped','failed','dead','pruned','forgotten') LIMIT 1`, c.machine_id, c.native_id)[0];
+      if (!native || now - (Date.parse(native.observed_at) || 0) > NATIVE_STALE_MS || !nativeObservationFresh(this.sql, native, now, cache)) continue;
+      const progress = nativeProgress(native);
+      saw(progress);
+      if (progress !== null && now - progress <= OPS_WINDOW_MS) active++;
     }
-    return { open_with_ac: open, active_sessions: active };
+    // A recent intake session end is useful work too (bounded: newest rows by creation).
+    for (const r of this.rows(`SELECT updated_at FROM session_control_sessions WHERE state NOT IN ${ACTIVE_STATES}
+      AND ${requestIntake} IS NOT NULL ORDER BY created_at DESC LIMIT 32`)) saw(Date.parse(r.updated_at) || null);
+    return { open_with_ac: open, active_sessions: active, last_work_at: lastWork };
   }
 
   status(now = this.now()): Obj {
@@ -188,19 +203,27 @@ export class OpsLiveness {
         this.sql.exec('UPDATE ops_backlog_idle SET resolved_at=? WHERE id=?', now, open.id);
         await this.hooks.alert?.('ops-backlog-idle', null);
       }
-      return { state: b.open_with_ac === 0 ? 'no_backlog' : 'working', ...b };
+      return { state: b.open_with_ac === 0 ? 'no_backlog' : 'working', open_with_ac: b.open_with_ac, active_sessions: b.active_sessions };
     }
     const orchestrator = this.roleStatus('orchestrator', byRole.get('orchestrator'), now);
-    const why = { open_with_ac: b.open_with_ac, active_sessions: 0, orchestrator: orchestrator.state,
+    const why = { open_with_ac: b.open_with_ac, active_sessions: 0, last_work_at: iso(b.last_work_at), orchestrator: orchestrator.state,
       orchestrator_tick_age_s: orchestrator.tick_age_s ?? null, watchdog_state: orchestrator.watchdog_state ?? null,
       watchdog_age_s: orchestrator.watchdog_age_s ?? null, queue_holds: this.safeHolds() };
     if (!open) {
-      this.sql.exec('INSERT INTO ops_backlog_idle(started_at,open_with_ac,reason_json) VALUES(?,?,?)', now, b.open_with_ac, JSON.stringify(why));
-      return { state: 'idle_started', ...b };
+      // Idle since the last useful work; fresh observations of idle processes never reset it.
+      // Work older than one window means it is already proven idle: kick on this tick.
+      const since = b.last_work_at ?? now;
+      const id = this.sql.exec('INSERT INTO ops_backlog_idle(started_at,open_with_ac,reason_json) VALUES(?,?,?) RETURNING id', since, b.open_with_ac, JSON.stringify(why)).one().id;
+      if (now - since < OPS_WINDOW_MS) return { state: 'idle_started', idle_for_s: age(now, since), open_with_ac: b.open_with_ac, active_sessions: 0 };
+      return this.kick(now, this.rows('SELECT * FROM ops_backlog_idle WHERE id=?', id)[0], b, why);
     }
     this.sql.exec('UPDATE ops_backlog_idle SET open_with_ac=?, reason_json=? WHERE id=?', b.open_with_ac, JSON.stringify(why), open.id);
     const since = open.last_kick_at ?? open.started_at;
-    if (now - since < OPS_WINDOW_MS) return { state: 'idle', idle_for_s: age(now, open.started_at), ...b };
+    if (now - since < OPS_WINDOW_MS) return { state: 'idle', idle_for_s: age(now, open.started_at), open_with_ac: b.open_with_ac, active_sessions: 0 };
+    return this.kick(now, open, b, why);
+  }
+
+  private async kick(now: number, open: Obj, b: { open_with_ac: number }, why: Obj): Promise<Obj> {
     // Still idle a full window after the previous kick: that kick did not produce work.
     const failed = open.last_kick_at ? open.failed_kicks + 1 : open.failed_kicks;
     let kick: KickResult = { task_id: null, reason: 'kick_unavailable' };
@@ -212,7 +235,7 @@ export class OpsLiveness {
       failed, now, JSON.stringify({ ...kick, at: iso(now) }), open.id);
     if (failed >= 2) await this.hooks.alert?.('ops-backlog-idle',
       `${b.open_with_ac} open intakes with AC and no intake session starting or running for ${age(now, open.started_at)}s; ${failed} automatic starts in a row did not produce a working session (last: ${kick.task_id ?? 'none'} ${kick.reason}). Why idle: orchestrator ${why.orchestrator}, tick age ${why.orchestrator_tick_age_s ?? 'unknown'}s.`);
-    return { state: 'kicked', kick, failed_kicks: failed, ...b };
+    return { state: 'kicked', kick, failed_kicks: failed, open_with_ac: b.open_with_ac, active_sessions: 0 };
   }
 
   private safeHolds(): Obj {

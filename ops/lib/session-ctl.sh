@@ -25,6 +25,22 @@ STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "
 log() { echo "[$(date -u +%FT%TZ)] $ROLE: $*"; }
 t() { timeout "${T:-60}" "$@"; }
 tick_mtime() { stat -c %Y "$TICKS" 2>/dev/null || echo 0; }
+# Proof needs the tick history, not the newest mtime: is any tick line's "ts" in (start, due]?
+tick_in_window() {  # $1 = start epoch, $2 = due epoch; prints the first in-window tick epoch
+  [ -r "$TICKS" ] || return 1
+  tail -n 2000 "$TICKS" | python3 -c '
+import json,sys,datetime
+lo,hi=int(sys.argv[1]),int(sys.argv[2])
+for line in sys.stdin:
+    try:
+        ts=json.loads(line)["ts"]
+        t=datetime.datetime.fromisoformat(ts.replace("Z","+00:00")).timestamp()
+    except Exception:
+        continue
+    if lo < t <= hi:
+        print(int(t)); sys.exit(0)
+sys.exit(1)' "$1" "$2"
+}
 failures() { local n=0; read -r n < "$STATE/restart_failures" 2>/dev/null || n=0; [[ "$n" =~ ^[0-9]+$ ]] || n=0; echo "$n"; }
 
 # Hub-side liveness (src/ops-liveness.ts) watches these reports independently of this
@@ -38,17 +54,24 @@ hub_report() {  # $1 = state
   T=30 t hub "${args[@]}" >/dev/null 2>&1 || log "hub ops report failed (state=$1)"
 }
 
-# Exact-time watchdog runs: the 10-min timer alone would bound detection at ~41 min.
-# Each transient timer re-runs watchdog.sh under the same lock (waiting, not skipping),
-# so a deadline that falls during another run is still checked right after it.
-SELF_DIR="$(dirname "$(readlink -f "$0")")"
+# Exact-time checks: the 10-min timer alone would bound detection at ~41 min. Each transient
+# timer runs this role's check directly, not watchdog.sh, so it never waits behind the other
+# role or the shared service lock. The per-role lock (role_lock) is held only by one
+# orchestrator check at a time, so a deadline waits at most for an in-flight check of the
+# same session (seconds; a minute or more only while a restart is already recovering it).
+SELF="$(readlink -f "$0")"
+LOCK_DIR="${OPS_LOCK_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"
+role_lock() {
+  exec 9>"$LOCK_DIR/ops-ctl-$ROLE.lock" || return 1
+  flock -w "${ROLE_LOCK_WAIT:-300}" 9 || { log "role lock busy for ${ROLE_LOCK_WAIT:-300}s; next timer retries"; return 1; }
+}
 arm_timer() {  # $1 = kind (deadline|proof), $2 = seconds from now
   [ "${OPS_TIMERS:-1}" = 1 ] || return 0
   local unit="ops-$1-$ROLE" delay="$2"; [ "$delay" -lt 1 ] && delay=1
   systemctl --user stop "$unit-*.timer" >/dev/null 2>&1 || true
   systemd-run --user --collect -q --on-active="$delay" --timer-property=AccuracySec=1s --unit "$unit-$(date +%s%N)" \
     --setenv=PATH="$PATH" --setenv=HUB_CONFIG_FILE="${HUB_CONFIG_FILE:-}" --setenv=APLEXER_LAUNCH_SYSTEM_SCOPE=system \
-    /usr/bin/flock -w 900 -o "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ops-watchdog-v2.lock" /usr/bin/timeout 900 "$SELF_DIR/watchdog.sh" \
+    /usr/bin/timeout 900 "$SELF" "$ROLE" check \
     >/dev/null 2>&1 || log "$1 timer not armed; the 10-min timer will check"
 }
 
@@ -220,28 +243,22 @@ recover() {  # $1 = path, $2 = reason
   [ "$rc" = 0 ] || restart_failed restart_failed
 }
 
-# Returns 0 when no proof is pending or it just passed; 2 while still inside the window or
-# after a late tick (counted, no restart);
+# Returns 0 when no proof is pending or it just passed; 2 while still inside the window;
 # 1 after handling a failed proof (next recovery path started).
 check_proof() {
   [ -f "$STATE/proof_due" ] || return 0
-  local due path now ls_ts tk; read -r due path < "$STATE/proof_due"; now=$(date +%s)
-  ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0); tk=$(tick_mtime)
-  if [ "$tk" -gt "$ls_ts" ] && [ "$tk" -le "${due:-0}" ]; then
+  local due path now ls_ts first; read -r due path < "$STATE/proof_due"; now=$(date +%s)
+  ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
+  if first=$(tick_in_window "$ls_ts" "${due:-0}"); then
     rm -f "$STATE/proof_due"; echo 0 > "$STATE/restart_failures"
-    log "recovery proven: fresh tick $((tk-ls_ts))s after start (path ${path:-1})"; return 0
+    log "recovery proven: fresh tick $((first-ls_ts))s after start (path ${path:-1})"; return 0
   fi
   local id; id=$(find_session) || id=""
-  if [ "$tk" -gt "${due:-0}" ]; then
-    # Ticking now, but not within the window: the recovery failed its proof. Count it;
-    # a session that is ticking is not restarted again.
-    rm -f "$STATE/proof_due"
-    log "recovery proof FAILED (path ${path:-1}): first tick $((tk-ls_ts))s after start, window ${PROOF_WINDOW}s; session is ticking now"
-    restart_failed proof_failed; return 2
-  fi
-  if [ "$now" -lt "${due:-0}" ] && [ -n "$id" ]; then log "recovery pending proof: session=$id, $((due-now))s left"; hub_report proof_pending; return 2; fi
+  if [ "$now" -le "${due:-0}" ] && [ -n "$id" ]; then log "recovery pending proof: session=$id, $((due-now))s left"; hub_report proof_pending; return 2; fi
+  # No tick inside the window (none, or only a late one): the recovery failed its proof
+  # and the next recovery path starts, as AC2 requires.
   rm -f "$STATE/proof_due"
-  log "recovery proof FAILED (path ${path:-1}): no tick ${PROOF_WINDOW}s after start${id:+ (session $id alive)}"
+  log "recovery proof FAILED (path ${path:-1}): no tick within ${PROOF_WINDOW}s after start${id:+ (session $id alive)}"
   restart_failed proof_failed
   local next=2; [ "${path:-1}" = 2 ] && next=1
   recover "$next" "no tick within ${PROOF_WINDOW}s after recovery path ${path:-1}" || true
@@ -284,10 +301,10 @@ check() {
 }
 
 case "$CMD" in
-  start) start ;;
-  ensure|check) check ;;
+  start) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; start ;;
+  ensure|check) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; check ;;
   status) id=$(find_session); [ -n "$id" ] && { log "running $id"; echo "attach: a attach $id   (or: a open $TAG --workspace $RUNDIR)"; } || { log "not running"; exit 1; } ;;
-  restart) FORCE=1 restart "manual" ;;
+  restart) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; FORCE=1 restart "manual" ;;
   handoff-restart)  # called BY the session itself after writing handoff.md; detaches so it survives the kill
     FORCE=1 setsid nohup bash -c "sleep 5; '$0' $ROLE restart" >>"$STATE/restart.log" 2>&1 < /dev/null & log "restart scheduled in 5s" ;;
   skills-sync) skills_sync ;;

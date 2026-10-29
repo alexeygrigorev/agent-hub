@@ -27,9 +27,10 @@ function session(h: Hub, id: string, taskId: string, state: string, at = NOW, na
     VALUES(?,'admin',?,?,'claude','interactive',?,?,?,'hetzner',?)`, id, id, JSON.stringify({ intake_task_id: taskId }), state, isoAt(at), isoAt(at),
     native ? JSON.stringify({ native_id: native }) : null);
 }
-/** Host census observing a live native session now. */
-function observe(h: Hub, native: string, at: number) {
-  h.sql.exec("INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('hetzner',?,?,'running',?,'demo')", native, native, isoAt(at));
+/** Host census observing a live native session at `at`, whose last sampled progress was `progress`. */
+function observe(h: Hub, native: string, at: number, progress: number | null = at) {
+  h.sql.exec("INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,progress_json) VALUES('hetzner',?,?,'running',?,'demo',?)",
+    native, native, isoAt(at), JSON.stringify(progress === null ? {} : { last_progress_at: isoAt(progress) }));
   h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('hetzner',?)", isoAt(at));
 }
 function service(h: Hub, clock: { t: number }, hooks: any = {}) {
@@ -154,11 +155,44 @@ describe('ops liveness (intake 500fd60b)', () => {
     session(h, 'ghost-running', 'waiting', 'running', NOW, 'ghost-native');
     observe(h, 'ghost-native', NOW - 11 * MIN);  // host census stopped seeing it
     session(h, 'closed-live', 'closed', 'running', NOW, 'closed-native'); observe(h, 'closed-native', NOW);
-    expect((await s.tick()).idle).toMatchObject({ state: 'idle_started', active_sessions: 0 });
-    await tick(s, clock, 30);
+    // The stale offer is the last evidence of work (31 min ago): already proven idle, kick now.
+    expect((await s.tick()).idle).toMatchObject({ state: 'kicked', active_sessions: 0 });
     expect(kicks).toHaveLength(1);
     session(h, 'fresh-offer', 'waiting', 'offered', clock.t);
     expect((await tick(s, clock, 1)).idle.state).toBe('working');
+  }));
+
+  it('a freshly observed but idle process is not work; the idle clock starts at its last progress', () => fixture(async (h, clock) => {
+    intake(h, 'stuck');
+    const kicks: number[] = [];
+    const { s } = service(h, clock, { kick: async () => { kicks.push(clock.t); return { task_id: 'stuck', reason: 'queued:held' }; } });
+    session(h, 'idle-run', 'stuck', 'running', NOW - 6 * 3600000, 'idle-native');
+    for (let m = 0; m <= 120; m++) {   // census every minute; progress stays 4-6 h old
+      observe(h, 'idle-native', clock.t, NOW - 4 * 3600000);
+      const r = await s.tick();
+      expect(r.idle.active_sessions).toBe(0);
+      clock.t += MIN;
+    }
+    // Last work 4 h ago: the first evaluation kicks, then one kick per 30 min, never 60 min late.
+    expect(kicks[0]).toBe(NOW);
+    expect(kicks.map(k => (k - NOW) / MIN)).toEqual([0, 30, 60, 90, 120]);
+    expect(s.status().idle.why_idle.last_work_at).toBe(isoAt(NOW - 4 * 3600000));
+  }));
+
+  it('pickup happens about 30 min after the last progress, not 60 (no second window)', () => fixture(async (h, clock) => {
+    intake(h, 'recent');
+    const kicks: number[] = [];
+    const { s } = service(h, clock, { kick: async () => { kicks.push(clock.t); return { task_id: 'recent', reason: 'submitted:canonical_queued' }; } });
+    const last = NOW - 10 * MIN;
+    session(h, 'recent-run', 'recent', 'running', NOW - 3600000, 'recent-native');
+    for (let m = 0; m <= 25; m++) {   // census every minute, progress frozen at `last`
+      observe(h, 'recent-native', clock.t, last);
+      const r = await s.tick();
+      if (clock.t - last <= 30 * MIN) expect(r.idle.state).toBe('working');
+      clock.t += MIN;
+    }
+    expect(kicks).toHaveLength(1);
+    expect((kicks[0] - last) / MIN).toBe(31);  // first minute tick after progress turned 30 min old
   }));
 
   it('a live working intake session or an empty backlog is never an idle episode', () => fixture(async (h, clock) => {
