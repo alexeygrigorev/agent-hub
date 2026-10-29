@@ -39,6 +39,48 @@ describe('safety floors', () => {
   });
 });
 
+describe('explicit zero floors (configured 0/0 policy, intake 95c1862c)', () => {
+  const pctPool = (o: Partial<TbmPoolRow> = {}): TbmPoolRow => pool({
+    total_capacity_tokens: 0, remaining_tokens: 0, remaining_percent: 1, headroom_percentage: 1,
+    capacity_known: 0, quota_unit: 'percent', cycle_ms: 7 * 24 * H, reset_at_ms: NOW + 6 * H, ...o,
+  });
+  it('honor an explicit stored 0 hard floor: no percentage floor and no absolute token minimum', () => {
+    expect(hardFloorTokens(pool({ hard_floor_percent: 0 }))).toBe(0);
+    expect(hardFloorTokens(pool({ total_capacity_tokens: 100_000, hard_floor_percent: 0 }))).toBe(0);
+    expect(hardFloorTokens(pctPool({ hard_floor_percent: 0 }))).toBe(0);
+    // Unset/stored defaults still apply.
+    expect(hardFloorTokens(pool())).toBe(500_000);
+    expect(hardFloorTokens(pctPool())).toBe(5);
+  });
+  it('honor an explicit stored 0 soft reserve: the initial reserve collapses to the hard floor', () => {
+    expect(softReserveTokens(pool({ hard_floor_percent: 0, soft_reserve_percent: 0 }), NOW)).toBe(0);
+    expect(softReserveTokens(pool({ soft_reserve_percent: 0 }), NOW)).toBe(500_000);
+    expect(softReserveTokens(pctPool({ hard_floor_percent: 0, soft_reserve_percent: 0 }), NOW)).toBe(0);
+    expect(softReserveTokens(pool(), NOW)).toBe(2_000_000);
+  });
+  it('a 1%-remaining zero-floor pool stays admissible with a selected burn source', () => {
+    const one = pool({ hard_floor_percent: 0, soft_reserve_percent: 0, remaining_tokens: 60_000, headroom_percentage: 1, reset_at_ms: NOW + H });
+    expect(selectBurnSource(one, [], NOW)).toMatchObject({ source: 'primary', tranche: null });
+    const grant = tranche('bank:g', 0.5, 0, { quantity_known: 0 });
+    expect(selectBurnSource(one, [grant], NOW)).toMatchObject({ source: 'banked', omega: 4, critical: true });
+    expect(baseTargetTpm(one, NOW)).toBeGreaterThan(0);
+  });
+  it('still block a truly depleted zero-floor pool and an active kill switch', () => {
+    expect(selectBurnSource(pool({ hard_floor_percent: 0, soft_reserve_percent: 0, remaining_tokens: 0, headroom_percentage: 0 }), [], NOW)).toBeNull();
+    expect(selectBurnSource(pctPool({ hard_floor_percent: 0, soft_reserve_percent: 0, remaining_percent: 0, headroom_percentage: 0 }), [], NOW)).toBeNull();
+    expect(selectBurnSource(pool({ hard_floor_percent: 0, soft_reserve_percent: 0, kill_switch_active: 1 }), [], NOW)).toBeNull();
+  });
+  it('switching a grant from deadline-only to known quantity trades the bounded maximum for the real rate comparison', () => {
+    const zero = pool({ hard_floor_percent: 0, soft_reserve_percent: 0, remaining_tokens: 60_000, headroom_percentage: 1 });
+    const grant = tranche('switching', 5, 0, { quantity_known: 0 });
+    expect(selectBurnSource(zero, [grant], NOW)).toMatchObject({ source: 'banked', omega: 4, critical: false });
+    const known = selectBurnSource(zero, [{ ...grant, quantity_known: 1, allocated_tokens: 1000, remaining_tokens: 1000 }], NOW)!;
+    expect(known.source).toBe('banked'); // still inside the 6h dispatch window
+    expect(known.omega).toBeCloseTo(bankedUrgencyMultiplier(grant.expires_at_ms, NOW));
+    expect(known.omega).toBeLessThan(4);
+  });
+});
+
 describe('continuous target burn', () => {
   it('base target is max(0, Q_rem - R_soft) / time_to_reset in tokens/minute', () => {
     const p = pool();
@@ -319,6 +361,26 @@ describe('Phase 1 schema integration', () => {
       expect(t.empty.status).toBe('exhausted');
       expect(t.live.target_banked_burn_rate_tpm).toBeCloseTo(1_800_000 / 180);
       expect(loadProviderPacing(sql, NOW).get('zai')).toMatchObject({ preempt: true });
+    });
+  });
+  it('loadProviderPacing applies rules.tbm_floor_percent overrides, so configured zero-floor providers are not halted at stored default floors', async () => {
+    const policyStub = defaultEnv.HUB.get(defaultEnv.HUB.idFromName('pacing-policy-floors'));
+    await runInDurableObject(policyStub, async (instance: Hub) => {
+      const sql = instance.sql; ensureTbmQuotaSchema(sql);
+      const ins = (poolId: string, provider: string) => sql.exec(
+        `INSERT INTO tbm_quota_pools (pool_id, provider, account, total_capacity_tokens, remaining_tokens, headroom_percentage, remaining_percent, capacity_known, quota_unit, reset_at_ms, cycle_ms, window_type, last_updated_ms)
+         VALUES (?, ?, 'shared', 0, 0, 1, 1, 0, 'percent', ?, ?, '7d', ?)`,
+        poolId, provider, NOW + 6 * H, 7 * 24 * H, NOW);
+      ins('codex:shared:7d', 'codex');
+      ins('claude:shared:7d', 'claude');
+      sql.exec(`INSERT INTO tbm_banked_tranches (tranche_id, pool_id, provider, account, allocated_tokens, remaining_tokens, granted_at_ms, expires_at_ms, status, quantity_known, updated_at_ms)
+        VALUES ('bank:codex:g1', 'codex:shared:7d', 'codex', 'shared', 0, 0, ?, ?, 'active', 0, ?)`, NOW - H, NOW + 12 * H, NOW);
+      const pacing = loadProviderPacing(sql, NOW);
+      // Codex is configured 0/0: 1% remaining is admissible and the deadline-only
+      // grant's banked urgency flows through instead of being silently lost.
+      expect(pacing.get('codex')).toMatchObject({ halted: false, banked: 4, preempt: false });
+      // Claude keeps its stored default floors: 1% remaining is below the 5% hard floor.
+      expect(pacing.get('claude')).toMatchObject({ halted: true });
     });
   });
 });

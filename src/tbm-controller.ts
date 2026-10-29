@@ -13,6 +13,7 @@ import {
   isPercentOnlyTbmPool,
   normalizeProviderFamily,
   resolveTbmPoolCycleMs,
+  withPolicyTbmFloors,
 } from './quota_admission';
 import {
   FREE_POOL_PROVIDERS,
@@ -362,7 +363,9 @@ function resolvePoolForOutcome(
   provider: string | null | undefined,
   account: string | null | undefined
 ): { poolId: string; pool: TbmPoolRow | null; provider: string } {
-  const pools = loadPools(sql, false);
+  // Floor-breach penalties must use the effective floors (operator overrides applied),
+  // not the stored defaults a configured zero floor replaces.
+  const pools = loadPools(sql, false).map(p => withPolicyTbmFloors(p));
   if (explicitPoolId && explicitPoolId !== '*') {
     const exact = pools.find(p => p.pool_id === explicitPoolId) ?? null;
     if (exact) return { poolId: exact.pool_id, pool: exact, provider: exact.provider };
@@ -661,7 +664,9 @@ function processResetPenalties(sql: SqlStorage, pools: TbmPoolRow[], nowMs: numb
       p.headroom_percentage,
       p.remaining_percent ?? p.headroom_percentage,
       isPercentOnlyTbmPool(p) ? 0 : 1,
-      p.hard_floor_percent || 5,
+      typeof p.hard_floor_percent === 'number' && Number.isFinite(p.hard_floor_percent) && p.hard_floor_percent >= 0 && p.hard_floor_percent <= 100
+        ? p.hard_floor_percent
+        : 5,
       nowMs
     );
   }
@@ -672,7 +677,11 @@ function processResetPenalties(sql: SqlStorage, pools: TbmPoolRow[], nowMs: numb
   for (const r of unrewarded) {
     const eventId = `reset:${r.pool_id}:${r.reset_at_ms}`;
     const pctOnly = Number(r.capacity_known) === 0 || Number(r.total_capacity_tokens) <= 0;
-    const hardPct = typeof r.hard_floor_percent === 'number' && r.hard_floor_percent > 0 ? r.hard_floor_percent : 5;
+    // Snapshot honors an explicit 0 floor: waste is everything left at the boundary,
+    // never a default 5% allowance the deployed policy replaced.
+    const hardPct = typeof r.hard_floor_percent === 'number' && Number.isFinite(r.hard_floor_percent) && r.hard_floor_percent >= 0 && r.hard_floor_percent <= 100
+      ? r.hard_floor_percent
+      : 5;
     let leftoverFraction = 0;
     let leftoverTokens: number | null = null;
     if (pctOnly) {
@@ -684,7 +693,7 @@ function processResetPenalties(sql: SqlStorage, pools: TbmPoolRow[], nowMs: numb
     } else {
       const total = Number(r.total_capacity_tokens);
       const rem = Number(r.remaining_tokens);
-      const hard = Math.min(total, Math.max(total * (hardPct / 100), 50_000));
+      const hard = hardPct === 0 ? 0 : Math.min(total, Math.max(total * (hardPct / 100), 50_000));
       const leftover = Math.max(0, rem - hard);
       leftoverFraction = total > 0 ? leftover / total : 0;
       leftoverTokens = Math.round(leftover);
@@ -948,7 +957,9 @@ export interface TbmTickSummary {
  */
 export function tickTbm(sql: SqlStorage, nowMs = Date.now()): TbmTickSummary {
   ensureTbmControllerSchema(sql);
-  const initialPools = loadPools(sql, false);
+  // Effective floors: the tick's targets, reset snapshots and waste penalties must
+  // match what admission and routing compute under rules.tbm_floor_percent overrides.
+  const initialPools = loadPools(sql, false).map(p => withPolicyTbmFloors(p));
   const resetsProcessed = processResetPenalties(sql, initialPools, nowMs);
   const tranchesUpdated = settleTranchesAndPenalties(sql, nowMs);
 
@@ -1018,7 +1029,7 @@ export function tickTbm(sql: SqlStorage, nowMs = Date.now()): TbmTickSummary {
   }
 
   const sessionRewards = sweepTerminalSessionRewards(sql, nowMs);
-  const updatedPools = loadPools(sql, false);
+  const updatedPools = loadPools(sql, false).map(p => withPolicyTbmFloors(p));
   const rollupsWritten = writePoolRollups(sql, updatedPools, nowMs);
   const routingFactors = Object.fromEntries(loadProviderPacing(sql, nowMs));
 

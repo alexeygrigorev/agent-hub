@@ -14,6 +14,7 @@ import {
   isPercentOnlyTbmPool,
   normalizeProviderFamily,
   resolveTbmPoolCycleMs,
+  withPolicyTbmFloors,
 } from './quota_admission';
 
 const MINUTE = 60000;
@@ -76,21 +77,28 @@ export const FLOOR_DEFAULTS = { hardAbsTokens: 50_000, softAbsTokens: 200_000, w
  * R_hard = max(total * hard%, R_hard_abs), never above the pool itself.
  * For percentage-only pools (capacity_known=0), returns hard_floor_percent (default 5%)
  * in percentage points without applying the 50k token floor.
+ * An explicit stored 0 (or any finite value in [0,100]) is honored — mirroring
+ * tbmHardFloor in quota_admission — so a configured zero floor disables the
+ * percentage floor AND the absolute token minimum, leaving only depletion.
  */
 export function hardFloorTokens(
   pool: Pick<TbmPoolRow, 'total_capacity_tokens' | 'hard_floor_percent'> & Partial<TbmPoolRow>,
   hardAbs = FLOOR_DEFAULTS.hardAbsTokens
 ): number {
-  const hardPct = typeof pool.hard_floor_percent === 'number' && Number.isFinite(pool.hard_floor_percent) && pool.hard_floor_percent > 0
-    ? pool.hard_floor_percent
+  const stored = pool.hard_floor_percent;
+  const hardPct = typeof stored === 'number' && Number.isFinite(stored) && stored >= 0 && stored <= 100
+    ? stored
     : 5;
   if (isPercentPool(pool)) {
     return Math.min(100, Math.max(0, hardPct));
   }
+  if (hardPct === 0) return 0;
   return Math.min(pool.total_capacity_tokens, Math.max(pool.total_capacity_tokens * hardPct / 100, hardAbs));
 }
 
-/** R_soft(t) = R_hard + (R_soft_init - R_hard) * ((T_reset - t) / T_window)^kappa, decaying to R_hard at reset. */
+/** R_soft(t) = R_hard + (R_soft_init - R_hard) * ((T_reset - t) / T_window)^kappa, decaying to R_hard at reset.
+ * An explicit stored 0 soft_reserve_percent is honored (mirroring tbmSoftReserve): the initial
+ * reserve collapses to R_hard instead of the 20% default / 200k token minimum. */
 export function softReserveTokens(
   pool: Pick<TbmPoolRow, 'total_capacity_tokens' | 'hard_floor_percent' | 'soft_reserve_percent' | 'convexity_exponent' | 'reset_at_ms'> & Partial<TbmPoolRow>,
   nowMs: number,
@@ -102,8 +110,9 @@ export function softReserveTokens(
     window_type: pool.window_type,
   });
   const windowMs = opts.windowMs ?? inferredWindowMs;
-  const softPct = typeof pool.soft_reserve_percent === 'number' && Number.isFinite(pool.soft_reserve_percent) && pool.soft_reserve_percent > 0
-    ? pool.soft_reserve_percent
+  const storedSoft = pool.soft_reserve_percent;
+  const softPct = typeof storedSoft === 'number' && Number.isFinite(storedSoft) && storedSoft >= 0 && storedSoft <= 100
+    ? storedSoft
     : 20;
   if (isPercentPool(pool)) {
     const hard = hardFloorTokens(pool, 0);
@@ -113,7 +122,9 @@ export function softReserveTokens(
   }
   const o = { ...FLOOR_DEFAULTS, ...opts, windowMs };
   const hard = hardFloorTokens(pool, o.hardAbsTokens);
-  const init = Math.min(pool.total_capacity_tokens, Math.max(pool.total_capacity_tokens * softPct / 100, o.softAbsTokens, hard));
+  const init = softPct === 0
+    ? hard
+    : Math.min(pool.total_capacity_tokens, Math.max(pool.total_capacity_tokens * softPct / 100, o.softAbsTokens, hard));
   const fraction = windowMs == null ? 1 : Math.max(0, Math.min(1, (pool.reset_at_ms - nowMs) / Math.max(1, windowMs)));
   return hard + (init - hard) * Math.pow(fraction, Math.max(1, pool.convexity_exponent || 1.5));
 }
@@ -488,9 +499,13 @@ export function loadProviderEfficiencies(sql: SqlStorage, nowMs: number): Map<st
   return out;
 }
 
-/** Routing context from stored rows; empty tables keep routing neutral. */
+/** Routing context from stored rows; empty tables keep routing neutral.
+ * Operator floor overrides (rules.tbm_floor_percent) are applied here — the same
+ * override evaluateTbmAdmission applies — so burn selection and pacing factors
+ * see the floors admission sees. Stored rows keep the pre-override defaults
+ * (5/20) for pools whose provider family has no override. */
 export const loadProviderPacing = (sql: SqlStorage, nowMs: number) =>
-  providerPacing(loadPools(sql, true), loadActiveTranches(sql, nowMs), nowMs, {
+  providerPacing(loadPools(sql, true).map(p => withPolicyTbmFloors(p)), loadActiveTranches(sql, nowMs), nowMs, {
     enforceFloors: true,
     efficiencies: loadProviderEfficiencies(sql, nowMs),
   });
@@ -510,7 +525,7 @@ export function refreshPacing(sql: SqlStorage, nowMs: number, states: Map<string
   for (const t of loadActiveTranches(sql, nowMs)) {
     sql.exec('UPDATE tbm_banked_tranches SET target_banked_burn_rate_tpm = ?, updated_at_ms = ? WHERE tranche_id = ?', trancheUrgencyTpm(t, nowMs), nowMs, t.tranche_id);
   }
-  return loadPools(sql, false).map(pool => {
+  return loadPools(sql, false).map(p => withPolicyTbmFloors(p)).map(pool => {
     const result = pacingStep(pool, states.get(pool.pool_id) ?? newPidState(), nowMs, opts);
     states.set(pool.pool_id, result.state);
     sql.exec('UPDATE tbm_quota_pools SET target_burn_rate_tpm = ?, pacing_ratio = ? WHERE pool_id = ?', result.targetTpm, result.pacingRatio, pool.pool_id);
