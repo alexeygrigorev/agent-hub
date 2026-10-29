@@ -3,6 +3,7 @@ import ast
 import errno
 import fcntl
 import importlib.util
+import io
 import json
 from unittest import mock
 import os
@@ -326,14 +327,19 @@ class QueueCostTests(unittest.TestCase):
                 def sleep(delay):
                     sleeps.append(delay)
                     now[0] += delay
-                with mock.patch.dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=temp), \
-                     mock.patch.object(sys, 'argv', ['wrapper', '--wait', '5', '--', 'true']), \
+                diagnostics = io.StringIO()
+                with mock.patch.dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=temp,
+                                     AGENT_HUB_HEAVY_TEST_PRIORITY='final'), \
+                     mock.patch.object(sys, 'argv', ['wrapper', '--priority', 'normal', '--slots', '1', '--wait', '5', '--', 'true']), \
+                     mock.patch.object(sys, 'stderr', diagnostics), \
                      mock.patch.object(Path, 'open', tracking_open), \
                      mock.patch.object(self.module.signal, 'signal'), \
                      mock.patch.object(self.module.time, 'monotonic', lambda: now[0]), \
                      mock.patch.object(self.module.time, 'sleep', sleep), \
                      mock.patch.object(self.module.random, 'uniform', return_value=1.5):
                     self.assertEqual(self.module.main(), 3)
+                self.assertIn('(normal ticket 1000001)', diagnostics.getvalue())
+                self.assertNotIn('admitted', diagnostics.getvalue())
                 # Registration probes 40 active leases once; four retries plus
                 # the deadline probe touch just the head, not all 40 tickets.
                 self.assertLessEqual(sum(p.parent == queue.leases for p in opened), 46)
