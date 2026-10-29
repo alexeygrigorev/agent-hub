@@ -2620,9 +2620,6 @@ class Dispatcher:
         # server placement (both deliberately choking-only), so the 1-minute
         # load average is checked here: above factor x cores the launch is
         # held (queued, retried next cycle). Nothing running is touched.
-        offer_id = offer.get("id")
-        if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
-            raise ValueError("Invalid offer id")
         from .host_load import check_live_load
         check_live_load(self.settings)
         sub = self._route(offer)
@@ -2635,6 +2632,9 @@ class Dispatcher:
                 raise ValueError('Required capabilities are no longer available locally')
             if not isinstance(selection, dict) or selection.get('model') != sub.get('launcher_model') or selection.get('effort') != sub.get('launcher_effort'):
                 raise ValueError('Selected model/effort is not configured locally')
+        offer_id = offer.get("id")
+        if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
+            raise ValueError("Invalid offer id")
         if offer.get("task_id") is not None:
             if not isinstance(offer["task_id"], str) or not LABEL.fullmatch(offer["task_id"]):
                 raise ValueError("Invalid task id")
