@@ -3,6 +3,8 @@ import contextlib
 import importlib.util
 import io
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -77,6 +79,32 @@ class CanaryHarnessTests(unittest.TestCase):
         for key in inherited.keys() - {'HOME'}:
             self.assertNotIn(key, env)
         self.assertIn(str(canary.REPO_ROOT), env['PYTHONPATH'].split(os.pathsep))
+
+    @unittest.skipUnless(shutil.which('git'), 'Git is required for discovery regression')
+    def test_git_discovery_stops_at_scratch_but_finds_synthetic_repositories(self):
+        parent = Path(self.tmp.name) / 'parent-repository'
+        scratch = parent / 'canary-run'
+        plain = scratch / 'tmp' / 'plain'
+        plain.mkdir(parents=True)
+        with patch.dict(os.environ):
+            os.environ.pop('GIT_CEILING_DIRECTORIES', None)
+            env = canary.suite_env(scratch)
+        init = subprocess.run(['git', 'init', '-q'], cwd=parent, env=env,
+                              capture_output=True, text=True)
+        self.assertEqual(init.returncode, 0, init.stderr)
+        probe = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                               cwd=plain, env=env, capture_output=True, text=True)
+        self.assertNotEqual(probe.returncode, 0,
+                            'synthetic directory discovered its parent checkout')
+        repo = scratch / 'tmp' / 'repo'
+        repo.mkdir()
+        init = subprocess.run(['git', 'init', '-q'], cwd=repo, env=env,
+                              capture_output=True, text=True)
+        self.assertEqual(init.returncode, 0, init.stderr)
+        probe = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                               cwd=repo, env=env, capture_output=True, text=True)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(Path(probe.stdout.strip()).resolve(), repo.resolve())
 
     def test_relative_run_paths_survive_the_unittest_working_directory(self):
         relative = Path(os.path.relpath(self.tmp.name, Path.cwd()))

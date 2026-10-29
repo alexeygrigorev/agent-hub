@@ -79,12 +79,15 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
              patch.object(se, "stop_controlled_session", side_effect=fake_stop), \
              patch.object(se, "_run_cleanup_tree_after_stop", side_effect=fake_tree), \
              patch("agent_hub_host.worktree_guard.release_session_lock",
-                   side_effect=lambda *args, **kwargs: events.append("unlock") or True):
+                   side_effect=lambda *args, **kwargs: events.append("unlock") or True) as unlock:
             out = se._run_claimed_effect(
                 "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
                 journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
                 cleanup_tree_authorized=True, linked_intake_open=False)
-        self.assertEqual(events, ["capture", "stop", "unlock", "tree"])
+        # Canonical lifecycle reconciliation owns unlocks; a stop command
+        # cannot release a retained lock before successor fencing is checked.
+        self.assertEqual(events, ["capture", "stop", "tree"])
+        unlock.assert_not_called()
         self.assertIn("tree", out)
         # Durable private evidence outside the cleanup roots (split raw+meta
         # so full 64KiB + JSON escaping never overflows the journal bound).

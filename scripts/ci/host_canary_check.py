@@ -81,6 +81,9 @@ def suite_env(run_tmp: Path) -> dict:
     env.pop("APPDATA", None)
     env["HOME"] = str(run_tmp / "canary-home")
     env["TMPDIR"] = str(run_tmp / "tmp")
+    # Bare unittest has no pytest fixture to bound Git discovery. Synthetic
+    # non-repositories below scratch must never discover this real checkout.
+    env["GIT_CEILING_DIRECTORIES"] = env["TMPDIR"]
     # Cross-test imports ("from test_fleet import ...") need the test dir on
     # the path for both runners, like scripts/test-full-local.sh; absolute so
     # the unittest leg can run from host/ with the same value.

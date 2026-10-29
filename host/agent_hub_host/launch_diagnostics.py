@@ -11,9 +11,10 @@ import json
 # Messages are constants: suffixes, payloads, paths and credentials never survive.
 REFUSALS = {
     'Launcher temporary directory unavailable': ('launcher_tmpdir_unavailable', 'The launcher temporary directory could not be safely prepared.'),
-    'worktree_lock_failed: checkout could not be protected': ('worktree_lock_failed', 'The checkout is locked to another session or could not be protected; same-intake reuse requires confirmed terminal ownership.'),
-    'worktree_lock_failed: missing canonical session identity': ('worktree_lock_failed', 'The launch is missing its canonical Hub session identity for worktree protection.'),
-    'worktree_identity_failed: original repository could not be recorded': ('worktree_identity_failed', 'The original worktree repository identity could not be recorded.'),
+    'worktree_lock_failed: missing offer identity': ('launcher_worktree_lock_failed', 'The launch has no worktree protection identity.'),
+    'worktree_lock_failed: missing canonical session identity': ('launcher_worktree_lock_failed', 'The launch has no canonical session identity for worktree protection.'),
+    'worktree_lock_failed: checkout could not be protected': ('launcher_worktree_lock_failed', 'The checkout could not be protected; an existing session or operator lock is preserved.'),
+    'worktree_identity_failed: original repository could not be recorded': ('launcher_worktree_identity_failed', 'The original worktree repository identity could not be recorded before native start.'),
     'launcher_disk_reserve': ('launcher_disk_reserve', 'Host disk headroom after launcher reservations is below the maintained disk floor.'),
     'Worker Hub credential could not be prepared': ('launcher_worker_auth_unavailable', 'Worker Hub credential could not be prepared.'),
     'memory_pressure': ('memory_pressure', 'Host memory full pressure exceeds the safety cap.'),
@@ -636,6 +637,14 @@ class LocalCommandError(RuntimeError):
         # Raw exceptions are classification input, not captured command output.
         self.command_diagnostic = command_details(command, stdout, stderr)
         self.diagnostic.update(self.command_diagnostic)
+        if (self.diagnostic.get('reason') == 'launcher_command_failed'
+                and isinstance(raw, (str, bytes)) and not raw.strip()
+                and stdout is not None and stderr is not None
+                and not self.command_diagnostic['stdout_tail']
+                and not self.command_diagnostic['stderr_tail']
+                and type(exit_code) is int):
+            self.diagnostic['message'] = ('The launcher returned exit code %d without stdout or stderr; '
+                                          'no native receipt was captured.' % exit_code)
         if reconcile_effects:
             self.diagnostic['message'] = 'Native client operation failed; reconcile effects'
         super().__init__(self.diagnostic['message'])
