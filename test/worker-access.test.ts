@@ -310,4 +310,39 @@ describe('scoped durable worker access',()=>{
   expect((await api('/api/intake/tasks/'+created.id)).status).toBe(403);
   expect((await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'late',text:'x',source:src})).status).toBe(403);
  }));
+ it('extends read and note scope to a continuation only through a server-verified session link (34d0271b note 083c1588)',()=>setup(async({stub,session,task,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const code=async(r:Response)=>((await r.json()) as any).error;
+  const src={type:'unknown',reference:'test'};
+  const native=uuid(), [cont,other2,launched]=[uuid(),uuid(),uuid()];
+  const link=(extra:any)=>({id:uuid(),kind:'link',engine:'codex',tier:null,host:null,hub:null,routing_job_id:null,provenance:src,actor:'tester',captured_at:Date.now(),...extra});
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify({native_id:native,tag:'hub-x',workspace:'/repo'}),session);
+   const put=(id:string,history:any[])=>h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',id,JSON.stringify({id,project:'agent-hub',status:'open',version:1,created_at:Date.now(),updated_at:Date.now(),title:'continuation',scope:null,acceptance_criteria:'ac',history:[{id:uuid(),kind:'intake',text:'x',authority:'untrusted_task_data',actor:'tester',captured_at:Date.now()},...history]}));
+   // Operator verify_live link to the native session; Hub launch link by session id; a client-supplied unverified link.
+   put(cont,[link({native_id:native,hub_session_id:null,evidence:'external_live_verified',authority:'host_census_verified'})]);
+   put(launched,[link({native_id:null,hub_session_id:session,evidence:'hub_launch_verified',authority:'hub_launch_verified'})]);
+   put(other2,[link({native_id:native,hub_session_id:session,evidence:'external_unverified_not_launch_proof',authority:'untrusted_task_data'})]);
+  });
+  for(const id of [cont,launched]) {
+   for(const sfx of ['','/history']) expect((await api('/api/intake/tasks/'+id+sfx)).status).toBe(200);
+   const note=await api('/api/intake/tasks/'+id+'/events',{key:uuid(),expected_version:1,event:{kind:'note',text:'owner note on continuation',source:src}});
+   expect(note.status,await note.clone().text()).toBe(200);
+   for(const body of [{status:'done'},{acceptance_criteria:'changed'}]) {
+    const res=await api('/api/intake/tasks/'+id,{key:uuid(),expected_version:2,...body});
+    expect(res.status).toBe(403);expect(await code(res)).toBe('cross_intake_forbidden');
+   }
+   expect((await api('/api/intake/tasks/'+id+'/events',{key:uuid(),expected_version:2,event:{kind:'decision',text:'no',source:src}})).status).toBe(403);
+  }
+  const untrusted=await api('/api/intake/tasks/'+other2);
+  expect(untrusted.status).toBe(403);expect(await code(untrusted)).toBe('cross_intake_forbidden');
+  // A one-time backfill rebuilds the index from existing open intakes.
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   h.sql.exec('DROP TABLE intake_session_links');h.intakeService.init();
+   const rows=h.sql.exec('SELECT task_id FROM intake_session_links WHERE session_key IN (?,?)',native,session).toArray().map((r:any)=>r.task_id);
+   expect(new Set(rows)).toEqual(new Set([cont,launched]));
+  });
+  expect((await api('/api/intake/tasks/'+cont)).status).toBe(200);
+  expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
+ }));
 });

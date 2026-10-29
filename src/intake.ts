@@ -8,7 +8,7 @@ import { SCOPE_POLICY_VERSION, SCOPE_VERDICTS, classifyScope, getScopeStatus, sc
 type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
-import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, triageTargets, workerAccessContext, workerCreatedTargets } from './worker-access';
+import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, initSessionLinks, triageTargets, workerAccessContext, workerCreatedTargets, workerLinkedTargets } from './worker-access';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
@@ -302,6 +302,7 @@ export class IntakeService {
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_note_archive(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,seq INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(task_id,seq))');
       for (const op of ['UPDATE', 'DELETE']) this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_note_archive_no_' + op.toLowerCase() +
         ' BEFORE ' + op + " ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
+      initSessionLinks(this.sql);
       // Independent, append-only lifecycle ledger. No FK: survives loss of a task row.
       this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, project TEXT NOT NULL,
@@ -517,10 +518,12 @@ export class IntakeService {
       const triage = triageTargets(this.sql, worker.session_id);
       // Follow-up intakes this session filed; worker writes stay limited to note/report/blocker events.
       const created = workerCreatedTargets(this.sql, worker.session_id);
+      // ...and intakes a server-verified link ties to this session (continuations).
+      const linked = workerLinkedTargets(this.sql, worker);
       return { admin: false, worker: true, actor: binding.actor, identity: 'family:' + binding.family_id, caller, triage,
         worker_session_id: worker.session_id, worker_launch_id: worker.launch_id, worker_task_id: worker.task_id,
         grants: [{ scope: 'task', target: worker.task_id, access: 'write', expires_at: worker.expires_at },
-          ...[...triage, ...created].map(target => ({ scope: 'task', target, access: 'write', expires_at: worker.expires_at }))],
+          ...[...triage, ...created, ...linked].map(target => ({ scope: 'task', target, access: 'write', expires_at: worker.expires_at }))],
         valid_until: Math.min(Date.parse(c.expires_at), worker.expires_at) };
     }
     const grants = this.rows('grants').filter(g => !g.revoked_at && g.expires_at > Date.now() && canonical(g.binding) === canonical(binding));
