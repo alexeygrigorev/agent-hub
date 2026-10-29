@@ -153,8 +153,7 @@ export class AskLedger {
     this.sql.exec('CREATE INDEX IF NOT EXISTS asks_state ON asks(state, created_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS asks_intake ON asks(intake_id)');
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_agents(agent_id TEXT PRIMARY KEY, agent_name TEXT, covered_through INTEGER,
-      window_last_seq INTEGER, window_changed_at INTEGER, last_message_at INTEGER, silent_alert_day TEXT)`);
-    if (!this.rows("SELECT 1 FROM pragma_table_info('ask_agents') WHERE name='window_diag'").length) this.sql.exec('ALTER TABLE ask_agents ADD COLUMN window_diag TEXT');
+      window_last_seq INTEGER, window_changed_at INTEGER, last_message_at INTEGER, silent_alert_day TEXT, window_diag TEXT)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_gaps(scope TEXT NOT NULL, from_seq INTEGER NOT NULL, to_seq INTEGER NOT NULL, kind TEXT NOT NULL,
       detected_at INTEGER NOT NULL, resolved_at INTEGER, alert_subject TEXT, PRIMARY KEY(scope, from_seq, to_seq))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_sources(machine_id TEXT NOT NULL, source TEXT NOT NULL, last_ingest_at INTEGER NOT NULL,
@@ -180,6 +179,7 @@ export class AskLedger {
     if (!body || typeof body !== 'object' || Array.isArray(body)) fail('invalid_body');
     const source = String(body.source ?? '');
     if (!SOURCES.has(source)) fail('invalid_source');
+    if (!caller.admin && source === 'backfill') fail('backfill_requires_operator', 403);
     let machine: string | null = body.machine_id == null ? null : String(body.machine_id).slice(0, 128);
     if (!caller.admin) {
       if (!caller.machineId) fail('forbidden', 403);
@@ -379,7 +379,8 @@ export class AskLedger {
       let task: Obj | null = null, match = 'ref';
       if (a.intake_hint) { try { task = this.task(a.intake_hint, tasks); match = 'explicit'; } catch { task = null; } }
       if (!task) {
-        const cands = byRef.get(a.t_id) ?? [];
+        // A ref merely mentioned in a closed intake is not coverage; closed ones need a matching AC line.
+        const cands = (byRef.get(a.t_id) ?? []).filter(t => OPEN.has(t.status) || matchAcLine(a.text, a.t_id, t.acceptance_criteria));
         // Prefer the candidate whose AC covers the ask, then open over closed, then oldest.
         task = [...cands].sort((x, y) => (matchAcLine(a.text, a.t_id, y.acceptance_criteria) ? 1 : 0) - (matchAcLine(a.text, a.t_id, x.acceptance_criteria) ? 1 : 0) ||
           (OPEN.has(y.status) ? 1 : 0) - (OPEN.has(x.status) ? 1 : 0) || (x.created_at ?? 0) - (y.created_at ?? 0))[0] ?? null;
@@ -408,11 +409,9 @@ export class AskLedger {
       const marks = noteMarks(n.text);
       const byRef = marks.refs.get(ask.t_id) ?? marks.refs.get('ask:' + ask.id.slice(0, 8));
       if (byRef !== undefined) { verdict = byRef; continue; }
-      if (ask.ac_line != null) {
-        const byAc = marks.ac.get(ask.ac_line);
-        if (byAc !== undefined) verdict = byAc;
-        else if (VERIFIED_NOTE.test(n.text) && verdict === null) verdict = true; // verifier checked every AC item
-      }
+      const byAc = ask.ac_line != null ? marks.ac.get(ask.ac_line) : undefined;
+      if (byAc !== undefined) verdict = byAc;
+      else if (VERIFIED_NOTE.test(n.text) && verdict === null) verdict = true; // the verifier checked the whole intake
     }
     return verdict === true;
   }
@@ -421,7 +420,7 @@ export class AskLedger {
    * closed_unverified closes stay possible; their asks are marked, not dropped. */
   closeGate(task: Obj, unverified: boolean): { code: string; detail: Obj } | null {
     if (unverified) return null;
-    const asks = this.rows(`SELECT a.*,m.t_id FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.intake_id=? AND a.state IN ('mapped','dropped_after_done')`, task.id);
+    const asks = this.rows(`SELECT a.*,m.t_id FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.intake_id=? AND a.state IN ('mapped','dropped_after_done','closed_unverified')`, task.id);
     const missing = asks.filter(a => !this.provenByNotes(a, task));
     if (!missing.length) return null;
     return { code: 'asks_unverified', detail: {
@@ -432,7 +431,7 @@ export class AskLedger {
   private reconcile(tasks: Obj[], now: number): Obj[] {
     const byId = new Map(tasks.map(t => [t.id, t]));
     const dropped: Obj[] = [];
-    for (const a of this.rows(`SELECT a.*,m.t_id,m.source FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.intake_id IS NOT NULL AND a.state IN ('mapped','verified','dropped_after_done')`)) {
+    for (const a of this.rows(`SELECT a.*,m.t_id,m.source,m.received_at FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.intake_id IS NOT NULL AND a.state IN ('mapped','verified','dropped_after_done','closed_unverified')`)) {
       const t = byId.get(a.intake_id);
       if (!t) continue;
       let next = a.state;
@@ -440,7 +439,9 @@ export class AskLedger {
       else if (t.status === 'done') next = t.outcome === 'closed_unverified' ? 'closed_unverified'
         : a.verified_by === 'manual' || this.provenByNotes(a, t) ? 'verified' : 'dropped_after_done';
       else if (a.state === 'verified' && a.verified_by !== 'manual') next = 'mapped';
-      else if (a.state === 'dropped_after_done') next = 'mapped';
+      else if (a.state === 'dropped_after_done' || a.state === 'closed_unverified') next = 'mapped';
+      // Back on an open intake: a later drop must alert again.
+      if (OPEN.has(t.status) && a.dropped_subject && a.dropped_subject !== 'backfill') { this.sql.exec('UPDATE asks SET dropped_subject=NULL WHERE id=?', a.id); a.dropped_subject = null; }
       if (next !== a.state) this.sql.exec(`UPDATE asks SET state=?,verified_by=CASE WHEN ?='verified' THEN COALESCE(verified_by,'note') ELSE verified_by END,updated_at=? WHERE id=?`, next, next, now, a.id);
       if (next === 'dropped_after_done' && !a.dropped_subject) dropped.push({ ...a, task: t });
     }
@@ -459,7 +460,7 @@ export class AskLedger {
   /** Resolve batch alerts whose members all left the alerting state. */
   private async clearBatches(kind: string, table: string, column: string, stillOpen: string) {
     if (!this.hooks.notify) return;
-    const subjects = this.rows(`SELECT DISTINCT ${column} AS s FROM ${table} WHERE ${column} LIKE ?`, kind + '-%').map(r => r.s);
+    const subjects = this.rows(`SELECT DISTINCT ${column} AS s FROM ${table} WHERE ${column} LIKE ? AND ${column} NOT LIKE '%:resolved'`, kind + '-%').map(r => r.s);
     for (const s of subjects) {
       if (this.rows(`SELECT 1 FROM ${table} WHERE ${column}=? AND ${stillOpen} LIMIT 1`, s).length) continue;
       await this.hooks.notify(kind, s, null);
@@ -477,6 +478,9 @@ export class AskLedger {
     let reopened = 0;
     for (const d of dropped) {
       if (d.source === 'backfill') continue;
+      // Never reopen work that closed before the ask existed unless a person mapped it there.
+      const closedAt = [...(d.task.history ?? [])].reverse().find((e: Obj) => e.kind === 'update' && e.changes?.status === 'done')?.captured_at ?? 0;
+      if (!['explicit', 'manual'].includes(d.match) && closedAt < d.received_at) continue;
       // Historical backfill only flags; live asks reopen the intake through the ordinary service path.
       const r = this.intake.serviceRecordEvent(d.task.id, { status: 'open', event: { kind: 'note', actor: 'hub:service:ask-ledger', authority: 'operator_record',
         text: `REOPENED by Hub ask ledger: intake closed done but mapped ask ${d.id.slice(0, 8)} (${d.t_id}${d.ac_line != null ? ', AC' + d.ac_line : ''}) is not marked met in the DONE note.\nAsk (verbatim): ${d.text.slice(0, 1500)}` } });
@@ -501,6 +505,8 @@ export class AskLedger {
       `unrecorded_messages: ${gaps.length} range(s) of Alexey message refs never reached the ask ledger.`,
       s => { for (const g of gaps) this.sql.exec('UPDATE ask_gaps SET alert_subject=? WHERE scope=? AND from_seq=? AND to_seq=?', s, g.scope, g.from_seq, g.to_seq); }, now);
     await this.clearBatches('asks_unmapped', 'asks', 'alert_subject', "state='unmapped'");
+    // A window overflow is a one-time loss: alerted once, then it ages out after a day.
+    this.sql.exec(`UPDATE ask_gaps SET resolved_at=? WHERE kind='window_overflow' AND resolved_at IS NULL AND alert_subject IS NOT NULL AND detected_at<=?`, now, now - DAY);
     await this.clearBatches('asks_unrecorded', 'ask_gaps', 'alert_subject', 'resolved_at IS NULL');
     const silent = await this.checkSources(now);
     const daily = await this.daily(now);
@@ -541,13 +547,14 @@ export class AskLedger {
     for (const r of this.rows('SELECT state,COUNT(*) AS n FROM asks GROUP BY state')) c[r.state] = r.n;
     const gaps = this.rows('SELECT COUNT(*) AS n FROM ask_gaps WHERE resolved_at IS NULL')[0].n;
     const messages = this.rows("SELECT COUNT(*) AS n FROM ask_messages WHERE role='user'")[0].n;
-    return { ...c, open_gaps: gaps, messages };
+    const conflicts = this.rows('SELECT COUNT(*) AS n FROM ask_messages WHERE conflict_count>0')[0].n;
+    return { ...c, open_gaps: gaps, messages, conflicts };
   }
   /** Status/digest line; null when the ledger is empty. */
   summaryLine(): string | null {
     const c = this.counts();
     if (!c.messages) return null;
-    return `Asks: ${c.unmapped} unmapped, ${c.dropped_after_done} dropped after done, ${c.pending} pending, ${c.mapped} mapped, ${c.verified} verified; ${c.open_gaps} unrecorded range(s); ${c.messages} message(s) recorded`;
+    return `Asks: ${c.unmapped} unmapped, ${c.dropped_after_done} dropped after done, ${c.pending} pending, ${c.mapped} mapped, ${c.verified} verified; ${c.open_gaps} unrecorded range(s); ${c.messages} message(s) recorded${c.conflicts ? `; ${c.conflicts} message(s) re-posted with different text` : ''}`;
   }
 
   /** A10: one reconciler session at a time, started 2 min after the last batch with

@@ -177,6 +177,8 @@ describe('mapping, unmapped alert and clearing (AC2, AC3, AC7)', () => {
     expect(asks(h)[0]).toMatchObject({ state: 'mapped', intake_id: t.id, ac_line: 1, match: 'manual' });
     await l.tick();
     expect(alerts.filter(a => a.subject === alert.subject).map(a => a.detail === null)).toEqual([false, true]);
+    await l.tick(); await l.tick(); // a resolved batch is never re-resolved (review finding 2)
+    expect(alerts.filter(a => a.kind === 'asks_unmapped')).toHaveLength(2);
   }));
   it('auto-maps an ask whose ref is cited in an intake history, to the matching AC line', () => fixture(async (h, l) => {
     const t = await intake(h, '1. Ledger table\n2. Usage over time dashboard with daily points', 'Alexey t300u: дашборд', 't300u');
@@ -260,6 +262,30 @@ describe('drop-after-done gate (AC5, beside done-gate f0b21a52)', () => {
     l.map(a.id, { intake_id: t.id }, 'op');
     expect(() => l.verify(a.id, {}, 'op')).toThrow('evidence_required');
     expect(l.verify(a.id, { evidence: 'live at /x' }, 'op').ask).toMatchObject({ state: 'verified', verified_by: 'manual' });
+  }));
+});
+
+describe('review regressions', () => {
+  it('a verifier PASS proves a ref-mapped ask without an AC line', () => fixture(async (h, l) => {
+    const t = await intake(h, '1. Something unrelated', 'Alexey t1100u', 't1100u');
+    ingest(l, 'dev', [msg('t1100u', 'совсем другое')]);
+    await l.tick();
+    expect(asks(h)[0]).toMatchObject({ state: 'mapped', ac_line: null });
+    await note(h, t.id, 'DONE — VERIFIED by Hub verifier\nevidence: agent-hub@0123456789abcdef x\nlive check: curl /x -> 200\nresult: AC1 proven');
+    expect((await close(h, t.id)).status).toBe(200);
+  }));
+  it('a ref merely mentioned in a closed intake neither maps nor reopens it', () => fixture(async (h, l) => {
+    const t = await intake(h, '1. Old unrelated work', 'see Alexey t1200u for context', 't1200u');
+    await note(h, t.id, DONE('AC1: met'));
+    expect((await close(h, t.id)).status).toBe(200);
+    ingest(l, 'dev', [msg('t1200u', 'Нужен новый экспорт отчётов')]);
+    const r = await l.tick();
+    expect(asks(h)[0].state).toBe('pending');
+    expect(r.reopened).toBe(0);
+    expect((await show(h, t.id)).status).toBe('done');
+  }));
+  it('hosts cannot post backfill', () => fixture(async (h, l) => {
+    expect(() => l.ingest({ source: 'backfill', machine_id: 'tabo', agents: [] }, { admin: false, actor: 'host:tabo', machineId: 'tabo' })).toThrow('backfill_requires_operator');
   }));
 });
 
