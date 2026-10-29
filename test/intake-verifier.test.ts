@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { IntakeVerifier, classifyVerification, latestDoneClaim } from '../src/intake-verifier';
-import { IntakeWatchdog } from '../src/intake-watchdog';
+import { IntakeWatchdog, queuePolicyFrom } from '../src/intake-watchdog';
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
 const admin = { caller: { isAdmin: true, actor: 'human:operator', kind: 'human' }, scopes: ['admin'] } as any;
@@ -282,7 +282,8 @@ describe('human-needed holds alert once (AC8)', () => {
     const notes: any[] = [];
     const clock = { now: NOW };
     const w = new IntakeWatchdog(h.sql, { statusAuthorizedTasks: () => tasks } as any, (f: any) => f(),
-      { start: async () => ({ status: 202, body: { id: 'x' } }), notify: async (kind: string, subject: string, detail: any) => { if (kind === 'intake_human_hold') notes.push(detail); return true; } }, () => clock.now);
+      { policy: () => queuePolicyFrom({ HUB_INTAKE_QUEUE_ENABLED: 'true', HUB_INTAKE_QUEUE_PROJECTS: 'nowhere-configured' }),
+        start: async () => ({ status: 202, body: { id: 'x' } }), notify: async (kind: string, subject: string, detail: any) => { if (kind === 'intake_human_hold') notes.push(detail); return true; } }, () => clock.now);
     w.init();
     expect(((await w.tick()) as any).human_hold_alerts).toBe(2);
     expect(notes).toHaveLength(1);
