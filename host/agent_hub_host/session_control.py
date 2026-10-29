@@ -21,6 +21,7 @@ from pathlib import Path
 from . import api, auth, config
 
 MAX_REQUEST = 32768
+MAX_ACK_REQUEST = 262144
 MAX_BRIEF = 8192
 MAX_BRIEF_CHARS = 8000
 MAX_BODY = 16384
@@ -199,7 +200,8 @@ def request(method, path, payload=None):
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
     api.check_url(base)
     data = json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None
-    if data is not None and len(data) > MAX_REQUEST:
+    max_req = MAX_ACK_REQUEST if (method == 'POST' and path.startswith('/api/session-commands/') and path.endswith('/ack')) else MAX_REQUEST
+    if data is not None and len(data) > max_req:
         raise SessionInputError('Session request exceeds capacity')
     env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
     token = env_token or auth.get_access_token()
@@ -936,6 +938,9 @@ def _execute(args):
         queued = dict(queued, client_key=key)
         if queued.get('warning') == 'target_no_reported_state':
             sys.stderr.write('Warning: target session has no recent reported state\n')
+        if queued.get('delivery') == 'next_turn':
+            sys.stderr.write('Note: headless session; message queued in its inbox for its next turn '
+                             '(acked when the recipient acknowledges it; add --wait to follow)\n')
         if timeout is not None:
             if cmd == 'stop' and queued.get('state') == 'cancelled' and (queued.get('cancellation') or {}).get('effect') == 'no_native_start':
                 queued['stop_wait'] = {'state': 'cancelled', 'effect': 'no_native_start'}

@@ -38,7 +38,7 @@ function fakeReserve(fail?: any) {
   return { calls, hook: (input: any) => {
     calls.push(input);
     if (fail) return { value: fail, status: fail.status || 409 };
-    return { value: { id: 'launch-' + calls.length, state: 'offered', machine: input.machine || 'hetzner', engine: input.engine || 'codex' }, status: 201 };
+    return { value: { id: 'launch-' + calls.length, state: 'offered', machine: input.machine || 'hetzner', engine: input.engine || 'claude' }, status: 201 };
   } };
 }
 
@@ -74,7 +74,7 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
 function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', nativeId: string | null = NATIVE_ID, launchState = 'running') {
   const at = new Date().toISOString();
   sql.exec(`INSERT OR REPLACE INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
-    VALUES (?, 'test-admin', 'human', NULL, 'fixture', ?, '{"workspace":"demo"}', ?, 'codex', 'fixture-acct', NULL, 'headless', 'demo', 'goal', ?, ?, NULL, ?, ?)`,
+    VALUES (?, 'test-admin', 'human', NULL, 'fixture', ?, '{"workspace":"demo"}', ?, 'claude', 'fixture-acct', NULL, 'headless', 'demo', 'goal', ?, ?, NULL, ?, ?)`,
     launchId, 'fleet-' + launchId, machine, launchState, nativeId, at, at);
 }
 
@@ -84,7 +84,7 @@ function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', nati
 function reportFleetSession(sql: any, machine: string, nativeId: string, tag: string, workspace: string, phase = 'running', cwd: string | null = null) {
   const at = new Date().toISOString();
   sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at)
-    VALUES (?, ?, ?, 'codex', ?, NULL, ?, ?, ?, NULL, 'fixture-acct', NULL)`,
+    VALUES (?, ?, ?, 'claude', ?, NULL, ?, ?, ?, NULL, 'fixture-acct', NULL)`,
     machine, nativeId, tag, phase, at, workspace, cwd);
 }
 
@@ -1981,5 +1981,95 @@ describe('bounded command custody recovery', () => {
       expect(shownSuperseded.state).toBe('cancelled');
       expect(shownSuperseded.reason).toBe('superseded_by_newer_session');
     }, input => available ? placed.hook(input) : { status: 409, value: { error: 'no_eligible_route', rejected: rejectedList } });
+  });
+
+  it('accepts a 64 KiB capture ack whose JSON body exceeds 32 KiB and promotes an expired inbox-waiting send on late delivery proof', async () => {
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, { machine: 'hetzner' });
+      await bindHttp(s, sql, session.id);
+      sql.exec("UPDATE fleet_sessions SET agent_state = 'idle' WHERE native_id = ?", NATIVE_ID);
+
+      // 1. 64 KiB capture ack with newlines/quotes so serialized JSON body exceeds 32 KiB (>70 KiB)
+      const capCmd: any = await (await s.handle(request(`/api/sessions/${session.id}/capture`, { key: 'cap-64k', max_bytes: 65536 }), admin)).json();
+      const capPoll: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      const capOffer = capPoll.offers.find((o: any) => o.command_id === capCmd.command_id);
+      const capClaim = await claimAs(s, capCmd.command_id, capOffer.correlation);
+      const bigCapture = ('line "quoted"\n').repeat(4681) + 'tail'; // 65,538 chars -> trim to 65,536
+      const exactCapture = bigCapture.slice(0, 65536);
+      const capAckRes = await s.handle(request(`/api/session-commands/${capCmd.command_id}/ack`, {
+        correlation: capOffer.correlation,
+        claim_token: capClaim.claim_token,
+        native: native(),
+        outcome: 'delivered',
+        capture: exactCapture,
+      }), host('hetzner'));
+      expect(capAckRes.status).toBe(200);
+      expect(((await capAckRes.json()) as any).state).toBe('acked');
+      const capListed: any = await (await s.handle(request(`/api/sessions/${session.id}/commands`, undefined, 'GET'), admin)).json();
+      const capRow = capListed.commands.find((c: any) => c.id === capCmd.command_id);
+      expect(capRow.state).toBe('acked');
+      expect(capRow.ack.capture.length).toBe(65536);
+
+      // 2. An inbox-waiting send expired by server-side expireClaim (no host claim_token in ack_json)
+      //    is promoted to acked when the host later submits a valid delivered proof on the same claim_token.
+      const sendCmd: any = await (await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'late-headless-send', body: 'hello headless' }), admin)).json();
+      const sendPoll: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      const sendOffer = sendPoll.offers.find((o: any) => o.command_id === sendCmd.command_id);
+      const sendClaim = await claimAs(s, sendCmd.command_id, sendOffer.correlation);
+      await s.handle(request(`/api/session-commands/${sendCmd.command_id}/status`, {
+        claim_token: sendClaim.claim_token,
+        status: 'waiting in inbox for recipient',
+        reason: 'aplexer inbox recorded; recipient has not acknowledged',
+      }), host('hetzner'));
+      sql.exec('UPDATE session_control_commands SET claim_expires_at = ? WHERE id = ?', new Date(Date.now() - 1000).toISOString(), sendCmd.command_id);
+      await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'));
+
+      const afterSweep: any = await (await s.handle(request(`/api/sessions/${session.id}/commands`, undefined, 'GET'), admin)).json();
+      expect(afterSweep.commands.find((c: any) => c.id === sendCmd.command_id).state).toBe('failed');
+
+      const lateAck = await s.handle(request(`/api/session-commands/${sendCmd.command_id}/ack`, {
+        correlation: sendOffer.correlation,
+        claim_token: sendClaim.claim_token,
+        native: native(),
+        outcome: 'delivered',
+        reason: 'recipient acknowledged native inbox message at turn',
+        proof: goodProof(),
+      }), host('hetzner'));
+      expect(lateAck.status).toBe(200);
+      expect(((await lateAck.json()) as any).state).toBe('acked');
+    }, fakeReserve().hook);
+  });
+
+  it('rejects send to a headless codex session at send time and hints next-turn delivery for other headless engines (repro db717cb7)', async () => {
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, { machine: 'hetzner' });
+      await bindHttp(s, sql, session.id);
+      sql.exec("UPDATE fleet_sessions SET agent_state = 'working' WHERE native_id = ?", NATIVE_ID);
+
+      // Hook-capable headless engine: queued for its next turn, with a hint.
+      const queued = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'next-turn', body: 'cancel the booking' }), admin);
+      expect(queued.status).toBe(201);
+      const queuedData: any = await queued.json();
+      expect(queuedData.state).toBe('recorded');
+      expect(queuedData.delivery).toBe('next_turn');
+
+      // Headless codex/zcodex (exec) never reads input: refused at send time, nothing recorded.
+      for (const engine of ['codex', 'zcodex']) {
+        sql.exec('UPDATE session_control_sessions SET engine = ? WHERE id = ?', engine, session.id);
+        const refused = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'exec-' + engine, body: 'cancel the booking' }), admin);
+        expect(refused.status).toBe(409);
+        const refusedData: any = await refused.json();
+        expect(refusedData.error).toBe('send_unsupported_headless');
+        expect(refusedData.message).toContain('accept no input');
+        const rows = sql.exec("SELECT id FROM session_control_commands WHERE session_id = ? AND request_key = ?", session.id, 'exec-' + engine).toArray();
+        expect(rows.length).toBe(0);
+      }
+
+      // Interactive sessions of any engine keep the normal path without the hint.
+      sql.exec("UPDATE session_control_sessions SET engine = 'codex', mode = 'interactive' WHERE id = ?", session.id);
+      const interactive = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'interactive', body: 'hello' }), admin);
+      expect(interactive.status).toBe(201);
+      expect(((await interactive.json()) as any).delivery).toBeUndefined();
+    }, fakeReserve().hook);
   });
 });

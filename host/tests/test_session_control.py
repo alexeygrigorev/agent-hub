@@ -639,6 +639,25 @@ class TestSessionControlCli(unittest.TestCase):
             session_control.execute(args)
             self.assertIn('Warning: target session has no recent reported state', fake_err.getvalue())
 
+    def test_send_notes_headless_next_turn_delivery(self):
+        import io
+        args = self.parse('send', 's1', '--prompt', 'cancel the booking', '--key', 'k-next')
+        with patch.object(session_control, 'request', return_value={'command_id': 'c1', 'state': 'recorded', 'delivery': 'next_turn'}), \
+                patch('sys.stderr', new_callable=io.StringIO) as fake_err:
+            session_control.execute(args)
+            self.assertIn('queued in its inbox for its next turn', fake_err.getvalue())
+
+    def test_send_rejected_at_send_time_for_headless_exec_fails_with_hint(self):
+        args = self.parse('send', 's1', '--prompt', 'cancel the booking', '--key', 'k-exec')
+        refused = session_control.SessionHTTPError(
+            409, code='send_unsupported_headless',
+            message='send_unsupported_headless: headless codex sessions accept no input')
+        with patch.object(session_control, 'request', side_effect=refused):
+            with self.assertRaises(ValueError) as caught:
+                session_control.execute(args)
+        self.assertIn('send_unsupported_headless', str(caught.exception))
+        self.assertIn('accept no input', session_control.diagnostic(caught.exception))
+
     def test_send_require_ready_passes_flag(self):
         args = self.parse('send', 's1', '--prompt', 'hello', '--require-ready', '--key', 'k-ready')
         with patch.object(session_control, 'request', return_value={'command_id': 'c1', 'state': 'recorded'}) as transport:

@@ -31,7 +31,7 @@ function hubRequest(path: string, data?: any, method = 'POST', headers?: Record<
 function fakeReserve() {
   let seq = 0;
   return (_input: any) => ({
-    value: { id: 'launch-' + ++seq, state: 'offered', machine: 'hetzner', engine: 'codex' },
+    value: { id: 'launch-' + ++seq, state: 'offered', machine: 'hetzner', engine: 'claude' },
     status: 201,
   });
 }
@@ -40,7 +40,7 @@ function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', stat
   const at = new Date().toISOString();
   sql.exec(
     `INSERT OR REPLACE INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
-     VALUES (?, 'test-admin', 'human', NULL, 'fixture', ?, '{"workspace":"demo"}', ?, 'codex', 'fixture-acct', NULL, 'headless', 'demo', 'goal', ?, ?, NULL, ?, ?)`,
+     VALUES (?, 'test-admin', 'human', NULL, 'fixture', ?, '{"workspace":"demo"}', ?, 'claude', 'fixture-acct', NULL, 'headless', 'demo', 'goal', ?, ?, NULL, ?, ?)`,
     launchId, 'fleet-' + launchId, machine, state, null, at, at,
   );
 }
@@ -49,7 +49,7 @@ function reportFleetSession(sql: any, machine: string, nativeId: string, tag: st
   const at = new Date().toISOString();
   sql.exec(
     `INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at)
-     VALUES (?, ?, ?, 'codex', 'running', NULL, ?, ?, NULL, 'fixture-acct', NULL)`,
+     VALUES (?, ?, ?, 'claude', 'running', NULL, ?, ?, NULL, 'fixture-acct', NULL)`,
     machine, nativeId, tag, at, workspace,
   );
 }

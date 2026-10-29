@@ -184,6 +184,10 @@ export function qualifiedNativeAlias(workspace: string, tag: string): string | n
   return `${base}:${tag}`;
 }
 
+// A 64 KiB capture JSON-escapes to well over the 32 KiB default body cap.
+const MAX_ACK_BODY_BYTES = 262144;
+const HEADLESS_NO_INPUT_ENGINES = new Set(['codex', 'zcodex']);
+
 async function body(request: Request, maxBytes = 32768): Promise<any> {
   if (!request.body) return null;
   const reader = request.body.getReader();
@@ -2940,11 +2944,22 @@ export class SessionControlService {
             const nowMs = this.now();
             const hasReported = Boolean(reported?.agent_state) && Number.isFinite(observedMs) &&
               observedMs <= nowMs + 60000 && nowMs - observedMs <= RECENT_STATE_MS;
+            // Headless codex/zcodex run `exec` and never read input or the
+            // inbox: refuse at send time (the host would only fail it later)
+            // instead of returning `recorded` for a message nobody reads.
+            if (live.mode === 'headless' && HEADLESS_NO_INPUT_ENGINES.has(String(live.engine ?? ''))) {
+              return response({ error: 'send_unsupported_headless',
+                message: `headless ${live.engine} sessions accept no input; stop and start a new session with the instruction in its brief` }, 409);
+            }
             if (!hasReported && input.require_ready === true) {
               return response({ error: 'target_not_ready', message: 'target has no recent reported state' }, 409);
             }
             const warning = !hasReported ? 'target_no_reported_state' : undefined;
-            return this.enqueue(live, kind, actorName(caller), caller, input.key, { body: input.body }, warning);
+            // Other headless engines get the message in their native inbox,
+            // surfaced by the awareness hook at their next turn; the command
+            // acks once the recipient acknowledges it.
+            const delivery = live.mode === 'headless' ? 'next_turn' : undefined;
+            return this.enqueue(live, kind, actorName(caller), caller, input.key, { body: input.body }, warning, delivery);
           });
         }
         if (kind === 'capture') {
@@ -3237,7 +3252,7 @@ export class SessionControlService {
     const ackMatch = /^\/api\/session-commands\/([a-f0-9-]{36})\/ack$/.exec(path);
     if (ackMatch && request.method === 'POST') {
       if (!host) return response({ error: 'forbidden' }, 403);
-      const input = await body(request);
+      const input = await body(request, MAX_ACK_BODY_BYTES);
       if (!obj(input, ['correlation', 'outcome', 'native', 'reason', 'capture', 'confirmed_exit', 'claim_token', 'proof', 'tree']) ||
           typeof input.correlation !== 'string' || !ACK_OUTCOMES.has(input.outcome) ||
           typeof input.claim_token !== 'string' || !input.claim_token ||
@@ -3299,9 +3314,11 @@ export class SessionControlService {
               return response({ command_id: row.id, state: row.state });
             }
           }
-          if (row.state === 'uncertain' || (CLAIMABLE.has(row.state) && row.claim_token)) {
+          if (row.state === 'uncertain' || (CLAIMABLE.has(row.state) && row.claim_token) ||
+              (row.state === 'failed' && input.outcome === 'delivered' && !parsed(row.ack_json, null)?.claim_token && parsed(row.ack_json, null)?.reason === 'recipient_not_ready')) {
             const late = this.lateReplyAck(row, input, caller);
             if (late) return late;
+            if (row.state === 'failed') return response({ error: 'claim_required' }, 409);
             return response({ error: 'command_uncertain' }, 409);
           }
           return response({ error: 'claim_required' }, 409);
@@ -3495,7 +3512,7 @@ export class SessionControlService {
     return response({ command_id: row.id, state });
   }
 
-  private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any, warning?: string) {
+  private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any, warning?: string, delivery?: string) {
     // Post-body ownership inside the mutation txn: a credential revoked,
     // expired, rebound, or re-enrolled while the body streamed must not
     // enqueue or stamp a NULL family. ownerOk re-verifies the live
@@ -3526,7 +3543,7 @@ export class SessionControlService {
       'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       id, session.id, kind, actor, key, JSON.stringify(payload), 'recorded', generation, correlation,
       caller.tokenId ?? null, this.presentingFamily(caller), 0, at, at);
-    return response({ command_id: id, state: 'recorded', ...(warning ? { warning } : {}) }, 201);
+    return response({ command_id: id, state: 'recorded', ...(warning ? { warning } : {}), ...(delivery ? { delivery } : {}) }, 201);
   }
 }
 
