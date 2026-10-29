@@ -948,6 +948,35 @@ def _ms_to_iso(value):
         return None
 
 
+CATALOG_LIMIT = 500  # Hub PUT /api/fleet/sessions refuses larger catalogs
+
+
+def bounded_catalog(raw, limit=CATALOG_LIMIT):
+    """Keep the native census within the Hub's row limit, live rows first.
+
+    Intake c206f556: aplexer retains every dead session record, so a busy host
+    passes 500 rows and Hub rejects the whole census (400 invalid_sessions).
+    Bindings, exits and progress then stop for every session on the host.
+    Running natives come first, then other non-terminal rows, then terminal
+    records; each tier newest first. Dropped rows are long-dead history Hub
+    already holds; a missing row is never exit proof on the Hub side.
+    """
+    rows = raw if isinstance(raw, list) else (raw or {}).get('sessions', [])
+    rows = [row for row in rows if isinstance(row, dict)]
+    if len(rows) <= limit:
+        return rows
+
+    def rank(row):
+        phase = row.get('state') or row.get('phase')
+        tier = (0 if phase in ('running', 'starting') and row.get('worker_alive') is not False
+                else 2 if phase in ('exited', 'dead', 'pruned', 'forgotten', 'failed', 'stopped') else 1)
+        recency = max((v for v in (row.get('last_activity_ms'), row.get('updated_at_ms'), row.get('created_at_ms'))
+                       if type(v) is int), default=0)
+        return tier, -recency
+
+    return sorted(rows, key=rank)[:limit]
+
+
 def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
     from .account_capacity import confirmed_empty
     from .session_progress import event_ms
@@ -3313,8 +3342,9 @@ class Dispatcher:
                         if record.get('containment_empty') is not row.get('containment_empty'):
                             record['containment_empty'] = row.get('containment_empty')
                             persist_observation(self, record)
-        progress = self._session_progress.sample(rows, active_launches)
-        enriched = session_metadata(raw, self.settings, progress)
+        catalog = bounded_catalog(rows)
+        progress = self._session_progress.sample(catalog, active_launches)
+        enriched = session_metadata(catalog, self.settings, progress)
         with self._catalog_report_lock:
             # Enrichment is never authoritative for identity or lifecycle.
             # Replace, rather than grow, the cache on every complete sample.
@@ -3346,7 +3376,7 @@ class Dispatcher:
         started = time.monotonic()
         raw = self.runner([self.settings.get('aplexer_bin', 'aplexer'), 'list', '--all', '--json'])
         census_done = time.monotonic()
-        metadata = session_metadata(raw, self.settings, collect_tokens=False)
+        metadata = session_metadata(bounded_catalog(raw), self.settings, collect_tokens=False)
         for row in metadata:
             row.update(self._catalog_enrichment.get(self._catalog_identity(row), {}))
         metadata_done = time.monotonic()

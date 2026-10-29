@@ -82,6 +82,31 @@ def diagnostic(exc):
     return 'Session operation failed; check authentication, grants, capacity and current versions.'
 
 
+def hub_unavailable(exc):
+    """Opaque Hub-side failure or lost response: a keyed replay is safe."""
+    return isinstance(exc, SessionTransportError) or (
+        isinstance(exc, SessionHTTPError) and exc.status in api.HUB_UNAVAILABLE_STATUS
+        and exc.code in ('request_failed', 'internal_error'))
+
+
+def replay_delays():
+    """Replay delays that fit inside an active request deadline, if any."""
+    deadline = _request_deadline.get()
+    if deadline is None:
+        return api.KEYED_REPLAY_DELAYS
+    delays, remaining = [], deadline - time.monotonic() - 1
+    for delay in api.KEYED_REPLAY_DELAYS:
+        if delay > remaining:
+            break
+        delays.append(delay)
+        remaining -= delay
+    return tuple(delays)
+
+
+def replay_notice(exc, delay):
+    sys.stderr.write(f'Hub unavailable ({diagnostic(exc).split(";")[0]}); replaying the same key in {delay}s\n')
+
+
 def http_error(exc, key=None):
     # Surface the server error code (top-level or inside a 409 hold
     # payload) plus the held session id, so the receiver can classify
@@ -896,7 +921,11 @@ def _execute(args):
         else:
             payload = {'key': key}
         try:
-            queued = request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
+            enqueue = lambda: request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
+            # Capture is diagnostic and stays single-shot; keyed mutations
+            # replay, never past the caller's wait budget.
+            queued = (api.replay_keyed(enqueue, hub_unavailable, delays=replay_delays(), notify=replay_notice)
+                      if cmd in ('send', 'stop') else enqueue())
         except ValueError as exc:
             msg = str(exc)
             if cmd == 'stop' and isinstance(exc, SessionTransportError):
