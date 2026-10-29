@@ -1881,7 +1881,7 @@ export class FleetService {
               ...(body.reason && CLAIM_HTTP_SLUGS.has(body.reason) ? { hub_reason: body.reason } : {}),
               retryable: row.state === 'offered' && !row.native_id && !row.launcher_task_id && status === 409 && RETRYABLE_CLAIM_ERRORS.has(body.error) };
             // A racing post-start attempt must not overwrite native failure proof.
-            if (!row.native_id && !row.launcher_task_id) {
+            if (row.state === 'offered' && !row.native_id && !row.launcher_task_id) {
               this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), row.id);
             }
             return response(body, status);

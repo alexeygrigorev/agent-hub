@@ -419,6 +419,41 @@ def protect_bound_worktree(git_bin: str, path: str, session_id: Any, intake_id: 
     return ensure_locked(git_bin, root, session_id, intake_id, runner)
 
 
+def reuse_stopped_intake_lock(git_bin: str, path: str, session_id: str,
+                             intake_id: Any, request: Callable) -> bool:
+    """Reuse protection without unlocking a stopped predecessor's same-intake tree.
+
+    The host-scoped ledger must prove both identities and predecessor exit.
+    The original lock stays in place; release is fenced by all live sessions
+    linked to the intake. Missing evidence or a foreign/manual lock refuses.
+    """
+    try:
+        lock_reason(session_id, intake_id)
+        if not intake_id or intake_id == "none":
+            return False
+        root = bound_worktree_root(path, git_bin)
+        entry = find_entry(list_entries(git_bin, root), root) if root else None
+        owner = parse_lock_reason(entry.get("reason")) if entry else None
+        if not entry or not entry.get("locked") or not owner or owner[1] != intake_id:
+            return False
+        facts = request("GET", "/api/sessions/worktree-guards")["sessions"]
+        successor = [f for f in facts if f.get("session_id") == session_id and f.get("intake_task_id") == intake_id]
+        previous = [f for f in facts if f.get("session_id") == owner[0] and f.get("intake_task_id") == intake_id]
+        if len(successor) != 1 or successor[0].get("terminal") is not False or len(previous) != 1:
+            return False
+        fact = previous[0]
+        expected = expected_repository(fact)
+        if (fact.get("terminal") is not True or fact.get("native_terminal") is not True
+                or not expected or expected.get("workspace") != root
+                or expected.get("repository") != repository_identity(root, git_bin)):
+            return False
+        # Re-read after remote I/O; never silently accept a replaced lock.
+        current = find_entry(list_entries(git_bin, root), root)
+        return bool(current and current.get("locked") and current.get("reason") == entry.get("reason"))
+    except Exception:
+        return False
+
+
 def release_session_lock(git_bin: str, path: str, session_id: Any,
                          *, terminal: bool, intake_state: str,
                          runner: Optional[Callable] = None) -> bool:
@@ -600,7 +635,7 @@ def reconcile_terminal_locks(request: Callable, git_bin: str = "git") -> int:
         position = (offset + index) % len(facts)
         _reconcile_offset = position + 1
         fact = facts[position]
-        if not isinstance(fact, dict) or fact.get("terminal") is not True or fact.get("native_terminal") is not True or fact.get("linked_intake_open") is not False or (fact.get("protected") is not False and fact.get("lock_release_permitted") is not True):
+        if not isinstance(fact, dict) or fact.get("terminal") is not True or fact.get("native_terminal") is not True or fact.get("linked_intake_open") is not False or fact.get("lock_release_permitted") is False or (fact.get("protected") is not False and fact.get("lock_release_permitted") is not True):
             continue
         expected = expected_repository(fact)
         path = expected.get("workspace") if expected else None

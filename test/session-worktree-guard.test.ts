@@ -283,8 +283,42 @@ describe('worktree guard (intake a0f01448)', () => {
     sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", created.id);
     sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
     closeFixtureIntake(sql);
-    expect((await facts())[0]).toMatchObject({ terminal: true, native_terminal: true, linked_intake_open: false });
+    const stopped = (await facts())[0];
+    expect(stopped).toMatchObject({ terminal: true, native_terminal: true, linked_intake_open: false, lock_release_permitted: true });
+    // Closing an intake cannot unlock the predecessor's retained lock while
+    // a successor still runs on that same intake (d31eba1f).
+    const successor = crypto.randomUUID();
+    sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,mode,state,created_at,updated_at)
+      VALUES(?,'demo:assistant',?,?,'hetzner','interactive','starting',?,?)`, successor,successor,
+      JSON.stringify({intake_task_id:stopped.intake_task_id}),new Date().toISOString(),new Date().toISOString());
+    expect((await facts()).find((f:any)=>f.session_id===created.id).lock_release_permitted).toBe(false);
+    sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?",successor);
+    expect((await facts()).find((f:any)=>f.session_id===created.id).lock_release_permitted).toBe(true);
     expect((await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), agent())).status).toBe(403);
+  }));
+
+  it('reuses a proven stopped unbound predecessor without releasing its lock for a live successor', async () => fixture(async (s,sql) => {
+    const previous = await startAgentSession(s,'guard-stopped-unbound');
+    ensureFleetLaunch(sql,'launch-1',null,'uncertain');
+    sql.exec("UPDATE session_control_sessions SET state='uncertain' WHERE id=?",previous.id);
+    const stop = await s.handle(request('/api/sessions/'+previous.id+'/stop',{key:'stop-unbound-proof'}),admin);
+    expect((await stop.json() as any).state).toBe('acked');
+    // Repeated idempotent stops must retain unbound exit proof even after
+    // the original receipt leaves the bounded twenty-receipt lookup.
+    sql.exec("UPDATE session_control_commands SET updated_at='2000-01-01T00:00:00.000Z' WHERE session_id=? AND kind='stop'", previous.id);
+    for (let i = 0; i < 25; i++) {
+      const replay = await s.handle(request('/api/sessions/'+previous.id+'/stop',{key:'stop-unbound-repeat-'+i}),admin);
+      expect((await replay.json() as any).state).toBe('acked');
+    }
+    closeFixtureIntake(sql);
+    const facts = async () => (await (await s.handle(request('/api/sessions/worktree-guards',undefined,'GET'),host('hetzner'))).json() as any).sessions;
+    const old = (await facts()).find((f:any)=>f.session_id===previous.id);
+    expect(old).toMatchObject({native_id:null,terminal:true,native_terminal:true,lock_release_permitted:true});
+    const successor = crypto.randomUUID(), at = new Date().toISOString();
+    sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,mode,state,created_at,updated_at)
+      VALUES(?,'demo:assistant',?,?,'hetzner','interactive','starting',?,?)`,successor,successor,
+      JSON.stringify({intake_task_id:old.intake_task_id}),at,at);
+    expect((await facts()).find((f:any)=>f.session_id===previous.id)).toMatchObject({native_terminal:true,lock_release_permitted:false});
   }));
 
   it('projects a recreated worktree path distinctly (AC5)', async () => fixture(async (s, sql) => {

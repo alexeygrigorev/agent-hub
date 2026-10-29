@@ -47,6 +47,7 @@ import { isValidMachineId } from './machine-id';
 import type { Env } from './env';
 import {
   buildLifecycleView,
+  buildSessionInputs,
   classifyKey,
   collectCleanupEligible,
   initLifecycleTables,
@@ -1584,11 +1585,16 @@ export class SessionControlService {
         LEFT JOIN credentials c ON c.id=s.owner_token_id LEFT JOIN session_control_protections p ON p.session_id=s.id
         WHERE s.machine_id = ?`, caller.machineId!).toArray();
       const worktreeLinks = worktreeIntakeSnapshot(this.sql);
+      // One immutable read snapshot for the whole response. classifyKey
+      // rebuilds every session's inputs; doing that per row made the host's
+      // stop/restart maintenance exceed its HTTP budget at fleet scale.
+      const guardRefs = buildSessionInputs(this.sql).refs;
       let sessions = rows.filter(row => this.hostOk(row, caller).ok).map(row => {
         const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
-        const unstarted = !binding && !row.guard_launch_native && ['failed', 'refused'].includes(row.guard_launch_state);
+        const unstarted = !binding && !row.guard_launch_native &&
+          (['failed', 'refused'].includes(row.guard_launch_state) || (row.state === 'stopped' && this.confirmedStopRecorded(row)));
         const protectedSession = binding
-          ? classifyKey(this.sql, `${row.machine_id}/${binding.native_id}`, this.now())?.refs?.protected_session !== false
+          ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.protected_session !== false
           : !(unstarted && row.guard_owner_kind === 'agent' && !row.guard_explicit_protection);
         const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
         const nativeTerminal = unstarted || !!(native &&
@@ -1597,7 +1603,7 @@ export class SessionControlService {
         const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
           this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
             binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
-        return { session_id: row.id, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+        return { session_id: row.id, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
           lock_release_permitted: !protectedSession || (adoptedLock && !row.guard_explicit_protection),
           engine: row.engine, adoption_intent_id: binding?.adoption_intent_id ?? null,
           tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),
@@ -1609,12 +1615,12 @@ export class SessionControlService {
       // exact native incarnation. Never unlock through a terminal alias
       // while another linked Hub session is live or human-protected.
       sessions = sessions.map(fact => {
-        if (!fact.native_id) return fact;
-        const aliases = sessions.filter(other => other.native_id === fact.native_id &&
-          other.native_created_at_ms === fact.native_created_at_ms);
+        const aliases = fact.native_id ? sessions.filter(other => other.native_id === fact.native_id &&
+          other.native_created_at_ms === fact.native_created_at_ms) : [fact];
         return { ...fact, terminal: aliases.every(other => other.terminal),
           protected: aliases.some(other => other.protected),
-          lock_release_permitted: aliases.every(other => other.lock_release_permitted),
+          lock_release_permitted: aliases.every(other => other.lock_release_permitted) &&
+            (!fact.intake_task_id || sessions.filter(other => other.intake_task_id === fact.intake_task_id).every(other => other.terminal)),
           linked_intake_open: aliases.some(other => other.linked_intake_open) };
       });
       return response({ sessions });
@@ -2988,7 +2994,24 @@ export class SessionControlService {
           if (!new Set([...STOPPABLE, 'stopped']).has(live.state)) return response({ error: 'session_not_stoppable' }, 409);
           const actor = actorName(caller);
           const resp = this.enqueue(live, kind, actor, caller, input.key, {});
-          if (resp.status >= 400 || live.state !== 'uncertain' || live.binding_json) return resp;
+          if (resp.status >= 400) return resp;
+          // A confirmed terminal session needs no second host delivery. The
+          // native runtime may already have retired its record, or the host
+          // may be offline; neither invalidates the recorded exit proof.
+          // The state label alone is insufficient: legacy stopped rows can
+          // still have a live workload, so require a matching exit receipt.
+          if (live.state === 'stopped' && this.confirmedStopRecorded(live)) {
+            const cmd: any = this.sql.exec('SELECT * FROM session_control_commands WHERE session_id = ? AND actor = ? AND request_key = ?', live.id, actor, input.key).toArray()[0];
+            if (!cmd || !['recorded', 'transported', 'failed'].includes(cmd.state) || cmd.claim_token) return resp;
+            const at = this.at();
+            const binding = parsed(live.binding_json, null);
+            const native = binding ? { native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace }
+              : { native_id: '00000000-0000-0000-0000-000000000000', tag: 'unbound', workspace: '/' };
+            this.sql.exec("UPDATE session_control_commands SET state = 'acked', ack_json = ?, updated_at = ? WHERE id = ?",
+              JSON.stringify({outcome: 'delivered', confirmed_exit: true, native, reason: 'session_already_stopped'}), at, cmd.id);
+            return response({command_id: cmd.id, session_id: live.id, kind, state: 'acked', generation: cmd.generation, correlation: cmd.correlation, replay: resp.status === 200}, resp.status);
+          }
+          if (live.state !== 'uncertain' || live.binding_json) return resp;
           // An unbound uncertain session whose fleet launch never recorded a
           // native start and has no correlated live native row settles to
           // stopped without stranding on stop_host_unreachable or stop_refused.
@@ -3510,6 +3533,24 @@ export class SessionControlService {
       }
     }
     return response({ command_id: row.id, state });
+  }
+
+  private confirmedStopRecorded(session: any): boolean {
+    const binding = parsed(session.binding_json, null);
+    const receipts = this.sql.exec(`SELECT ack_json FROM session_control_commands
+      WHERE session_id=? AND kind='stop' AND state='acked' AND generation=?
+      ORDER BY updated_at DESC LIMIT 20`, session.id, binding?.generation ?? 0).toArray() as any[];
+    if (receipts.some(row => {
+      const ack = parsed(row.ack_json, {});
+      return ack.outcome === 'delivered' && ack.confirmed_exit === true &&
+        (binding ? ack.native?.native_id === binding.native_id && ack.native?.tag === binding.tag && ack.native?.workspace === binding.workspace
+          : ['unbound_uncertain_no_native_process', 'session_already_stopped'].includes(ack.reason) &&
+            ack.native?.native_id === '00000000-0000-0000-0000-000000000000' &&
+            ack.native?.tag === 'unbound' && ack.native?.workspace === '/');
+    })) return true;
+    if (!binding || !session.fleet_launch_id) return false;
+    const launch: any = this.sql.exec('SELECT state, verification_status, native_id FROM fleet_launches WHERE id=? AND machine_id=?', session.fleet_launch_id, session.machine_id).toArray()[0];
+    return launch?.state === 'exited' && launch.verification_status === 'verified' && launch.native_id === binding.native_id;
   }
 
   private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any, warning?: string, delivery?: string) {

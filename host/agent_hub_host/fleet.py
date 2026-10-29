@@ -1962,7 +1962,9 @@ class Dispatcher:
         if not guard.protect_bound_worktree("git", str(target_path),
                                            offer.get("hub_session_id"),
                                            offer.get("intake_task_id")):
-            raise ValueError("worktree_lock_failed: checkout could not be protected")
+            if not guard.reuse_stopped_intake_lock("git", str(target_path), offer.get("hub_session_id"),
+                                                  offer.get("intake_task_id"), self.request):
+                raise ValueError("worktree_lock_failed: checkout could not be protected")
         return True
 
     def _maybe_cleanup_worktree(self, workspace: Path, native_id: Optional[str] = None):
@@ -2868,6 +2870,9 @@ class Dispatcher:
         # Intake 488b860e: the key spans this host attempt (reused across
         # cycles while the claim stays unconfirmed). A timeout retries with
         # the same key, so a late-landing claim replays instead of doubling.
+        # Protection failures are definitive pre-start refusals, not an
+        # uncertain native launch holding a dispatch reservation forever.
+        self._lock_session_worktree(offer, target_cwd)
         claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
         self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, offer_workspace)
         from .launch_diagnostics import capture_log_offsets
@@ -2912,7 +2917,6 @@ class Dispatcher:
                 if mode == 'headless':
                     fence['task_id'] = task_id
                 self._persist_launch_record(fence)
-            self._lock_session_worktree(offer, target_cwd)
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")
