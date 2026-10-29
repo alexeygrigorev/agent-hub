@@ -19,7 +19,7 @@ class ScopeCliTest(unittest.TestCase):
 
     def test_show_preserves_scope_flag_and_operator_decision(self):
         task = {'id': 'fixture', 'scope_flag': 'needs_decision', 'scope': {
-            'policy_version': 1, 'clear': False, 'block_code': 'scope_decision_required'}}
+            'policy_version': 1, 'clear': True}}
         with patch.object(intake, 'request', return_value={'task': task}):
             code, out, err = self.run_cli('intake', 'show', 'fixture')
         self.assertEqual(code, 0, err)

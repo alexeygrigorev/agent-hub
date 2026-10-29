@@ -2,6 +2,7 @@
 MESSAGES = {
     'dispatch_worktree_refused': 'The worktree could not be protected before native start.',
     'host_overload': 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
+    'dispatch_worktree_refused': 'The worktree could not be protected before native start.',
     'cpu_headroom': 'Host CPU usage plus expected session demand exceeds the CPU target.',
     'cpu_pressure': 'Host CPU pressure exceeds the safety cap.',
     'memory_pressure': 'Host memory full pressure exceeds the safety cap.',

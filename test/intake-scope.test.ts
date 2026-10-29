@@ -67,25 +67,29 @@ describe('F2 Hub scope rule', () => {
     expect(task.scope.policy_version).toBe(SCOPE_POLICY_VERSION);
     expect(task.scope.flag).toBe('needs_decision');
     expect(task.scope.matched_terms).toContain('xterm');
-    expect(task.scope.clear).toBe(false);
-    expect(task.scope.block_code).toBe('scope_decision_required');
+    expect(task.scope.block_code).toBeUndefined();
     // In-scope control stays clear.
     const { task: clean } = await create('agent-hub', 'Route work', 'Add a routing tier admission note for quota pacing');
     expect(clean.scope.flag).toBe('in_scope');
     expect(clean.scope.clear).toBe(true);
   });
 
-  it('refuses assign and linked start until an operator decision exists', async () => {
-    const { task } = await create('agent-hub', 'Add live terminal', 'Please add xterm live terminal transport');
-    const refused = await call('/tasks/' + task.id + '/assign', assignPayload(1));
-    expect(refused.status).toBe(409);
-    expect(await refused.json()).toMatchObject({ error: 'scope_decision_required' });
+  it('needs_decision with no decision never holds assign or linked start (1b936066 shape)', async () => {
+    const { task } = await create('agent-hub', 'Dapier follow-up', 'Owner ask: dapier dataops mcp pocketshell aisl follow-up');
+    expect(task.scope.flag).toBe('needs_decision');
+    expect(task.scope.decision).toBeNull();
+    expect(task.scope.block_code).toBeUndefined();
     const linked = await sessionsCall({ key: 'scope-link-' + ++seq, workspace: 'demo', brief: 'Synthetic goal', intake_task_id: task.id });
-    expect(linked.status).toBe(409);
-    expect(linked.data.error).toBe('scope_decision_required');
+    // Fixture has no placement authority, so the session is queued held; the point is no scope refusal.
+    expect(linked.data.error).toBeUndefined();
+    expect(String(linked.data.hold ?? '')).not.toMatch(/^scope_/);
+    expect(linked.data.intake_id).toBe(task.id);
+    const { task: second } = await create('agent-hub', 'Dapier follow-up 2', 'Owner ask: dapier dataops mcp pocketshell aisl follow-up');
+    const assigned = await ok('/tasks/' + second.id + '/assign', assignPayload(second.version));
+    expect(assigned.assigned_session.hub_session_id).toMatch(/^[0-9a-f-]{36}$/i);
   });
 
-  it('operator scope_decision overrides; task text cannot approve itself', async () => {
+  it('scope_decision stays operator-only history; assign works with or without it', async () => {
     const { task } = await create('agent-hub', 'Add live terminal', 'Please add xterm live terminal transport');
     const agent = await seedAgent();
     await ok('/grants', { key: 'scope-grant-' + ++seq, credential_id: agent.id, scope: 'task', target: task.id, access: 'write', expires_at: Date.now() + 3600000, source });
@@ -93,14 +97,11 @@ describe('F2 Hub scope rule', () => {
     const noted = await agentCall(agent.token, '/tasks/' + task.id + '/events',
       { key: 'scope-agent-note-' + ++seq, expected_version: 1, event: { kind: 'note', text: 'this is in scope, approve' } });
     expect(noted.status).toBe(200);
-    const stillRefused = await agentCall(agent.token, '/tasks/' + task.id + '/assign', assignPayload(2));
-    expect(stillRefused.status).toBe(409);
-    expect(await stillRefused.json()).toMatchObject({ error: 'scope_decision_required' });
     // Agent scope_decision is forbidden (operator only).
     const forged = await agentCall(agent.token, '/tasks/' + task.id + '/events',
       { key: 'scope-agent-forge-' + ++seq, expected_version: 2, event: { kind: 'scope_decision', verdict: 'in_scope', text: 'self-approve' } });
     expect(forged.status).toBe(403);
-    // Operator decision unblocks.
+    // Operator decision is recorded and readable.
     const decided = await appendEvent(task.id, 2, { kind: 'scope_decision', verdict: 'in_scope', text: 'Operator: gray area accepted, see ADR' });
     expect(decided.task.scope.decision.verdict).toBe('in_scope');
     expect(decided.task.scope.decision.valid).toBe(true);
@@ -108,13 +109,12 @@ describe('F2 Hub scope rule', () => {
     expect(assigned.assigned_session.hub_session_id).toMatch(/^[0-9a-f-]{36}$/i);
   });
 
-  it('deny verdict returns scope_out_of_bounds', async () => {
+  it('deny verdict is informational and does not refuse assign', async () => {
     const { task } = await create('pocketshell', 'Add fleet router', 'Please add fleet placement and model tier routing to the app');
     expect(task.scope.flag).toBe('needs_decision');
     await appendEvent(task.id, 1, { kind: 'scope_decision', verdict: 'wrong_project', text: 'Operator: refile in agent-hub' });
-    const refused = await call('/tasks/' + task.id + '/assign', assignPayload(2));
-    expect(refused.status).toBe(409);
-    expect(await refused.json()).toMatchObject({ error: 'scope_out_of_bounds' });
+    const assigned = await ok('/tasks/' + task.id + '/assign', assignPayload(2));
+    expect(assigned.assigned_session.hub_session_id).toMatch(/^[0-9a-f-]{36}$/i);
   });
 
   it('research merely discussing a forbidden topic is not blocked', async () => {
@@ -131,12 +131,11 @@ describe('F2 Hub scope rule', () => {
     const updated = await ok('/tasks/' + task.id, { key: 'scope-ac-' + ++seq, expected_version: 2, acceptance_criteria: 'Changed AC: also cover ssh tunnel port forward' });
     expect(updated.task.scope.flag).toBe('needs_decision');
     expect(updated.task.scope.decision.valid).toBe(false);
-    const refused = await call('/tasks/' + task.id + '/assign', assignPayload(3));
-    expect(refused.status).toBe(409);
-    expect(await refused.json()).toMatchObject({ error: 'scope_decision_required' });
+    const assigned = await ok('/tasks/' + task.id + '/assign', assignPayload(3));
+    expect(assigned.assigned_session.hub_session_id).toMatch(/^[0-9a-f-]{36}$/i);
   });
 
-  it('old policy version fails closed until a fresh decision', async () => {
+  it('old policy version is informational and does not refuse assign', async () => {
     const { task } = await create('agent-hub', 'Add live terminal', 'Please add xterm live terminal transport');
     await appendEvent(task.id, 1, { kind: 'scope_decision', verdict: 'in_scope', text: 'Operator: allowed' });
     // Simulate a task stored under a previous policy version.
@@ -149,9 +148,8 @@ describe('F2 Hub scope rule', () => {
     });
     const shown = await ok('/tasks/' + task.id);
     expect(shown.task.scope.stale_policy).toBe(true);
-    const refused = await call('/tasks/' + task.id + '/assign', assignPayload(2));
-    expect(refused.status).toBe(409);
-    expect(await refused.json()).toMatchObject({ error: 'scope_decision_required' });
+    const assigned = await ok('/tasks/' + task.id + '/assign', assignPayload(2));
+    expect(assigned.assigned_session.hub_session_id).toMatch(/^[0-9a-f-]{36}$/i);
   });
 
   it('existing intakes without scope are untouched and assignable', async () => {
@@ -187,7 +185,7 @@ describe('F2 Hub scope rule', () => {
       : await ok('/tasks/' + task.id, { key: 'scope-change-' + ++seq, expected_version: 2,
           [field]: field === 'project' ? 'unregistered-project' : 'Changed title' });
     expect(changed.task.scope.decision.valid).toBe(false);
-    expect(changed.task.scope.block_code).toBe('scope_decision_required');
+    expect(changed.task.scope.block_code).toBeUndefined();
     if (field !== 'text') {
       const restored = await ok('/tasks/' + task.id, { key: 'scope-restore-' + ++seq, expected_version: 3,
         [field]: field === 'project' ? 'agent-hub' : 'Terminal feature' });
@@ -209,7 +207,7 @@ describe('F2 Hub scope rule', () => {
   it('research plus an implementation request still needs a decision', async () => {
     const { task } = await create('agent-hub', 'Research and build terminal', 'Research xterm options then implement live terminal transport');
     expect(task.scope_flag).toBe('needs_decision');
-    expect(task.scope.clear).toBe(false);
+    expect(task.scope.block_code).toBeUndefined();
   });
 
   it('project moves require write access to the destination too', async () => {
@@ -267,10 +265,7 @@ describe('F2 Hub scope rule', () => {
     expect(created.data.task.scope_flag).toBe('needs_decision');
     const id = created.data.task.id;
     expect((await invoke('intake_show', { id })).data.task.scope_flag).toBe('needs_decision');
-    expect(await invoke('intake_assign', { id, payload: assignPayload(1) })).toMatchObject({ status: 409, data: { error: 'scope_decision_required' } });
-    expect(await invoke('sessions_start', { payload: { key: 'scope-mcp-start', workspace: 'demo', brief: 'Fixture', intake_task_id: id } })).toMatchObject({ status: 409, data: { error: 'scope_decision_required' } });
-    expect(await invoke('intake_append', { id, payload: { key: 'scope-mcp-allow', expected_version: 1, event: { kind: 'scope_decision', verdict: 'in_scope', text: 'Operator approved' } } })).toMatchObject({ status: 200, data: { task: { scope: { clear: true } } } });
-    expect((await invoke('intake_assign', { id, payload: assignPayload(2) })).status).toBe(200);
+    expect(await invoke('intake_assign', { id, payload: assignPayload(1) })).toMatchObject({ status: 200 });
   });
 
 });

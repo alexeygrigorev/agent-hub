@@ -15,8 +15,13 @@ merely discusses a term is allowed; a mixed research/implementation request is
 flagged. Unknown projects have no matching terms. Operators review ambiguous
 requests against the project charter.
 
-A flagged task refuses assignment and linked session starts with HTTP 409
-`scope_decision_required`. HTTP, CLI and MCP use the same server check.
+**Policy v2 (Alexey t1600u-t1602u, 2026-10-27): scope is informational only.** A
+flagged task is never held: assign, linked session starts, the watchdog restart
+and the verifier start proceed regardless of flag or decision, and the codes
+`scope_decision_required` / `scope_out_of_bounds` are no longer returned. Flag,
+matched terms and any recorded decision remain visible in show/list/handoff.
+The text below describes the historical decision event, which stays readable
+but is optional and never required to start work.
 Ordinary task text, `decision` notes and agent claims cannot approve work.
 An authenticated operator appends this event through the ordinary CAS endpoint:
 
@@ -37,7 +42,7 @@ Use `POST /api/intake/tasks/<id>/events`, `hub intake append <id> --version 1
 --key scope-decision-unique-key --event-file event.json` (event object only in
 the CLI file), or MCP `intake_append`. Verdicts `in_scope` and `gray_adr` allow
 work; `gray_adr` requires a source reference to the approved ADR. Verdicts
-`out_of_scope` and `wrong_project` refuse with `scope_out_of_bounds`; refile or
+`out_of_scope` and `wrong_project` are recorded as history only (no refusal); refile or
 move the project under an authorized CAS update before requesting a new decision.
 Changing project requires write access in both source and destination.
 

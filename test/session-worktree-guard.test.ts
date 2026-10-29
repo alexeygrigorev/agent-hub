@@ -311,6 +311,34 @@ describe('worktree guard (intake a0f01448)', () => {
     expect((await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), agent())).status).toBe(403);
   }));
 
+  it('releases a terminal session whose pruned native is only unobserved in the census', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'guard-unobserved-release');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    sql.exec("UPDATE session_control_sessions SET state='failed' WHERE id=?", created.id);
+    sql.exec("UPDATE fleet_sessions SET phase='unobserved' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
+    closeFixtureIntake(sql);
+    const facts = async () => {
+      const res = await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), host('hetzner'));
+      expect(res.status).toBe(200);
+      return (await res.json() as any).sessions.find((row: any) => row.session_id === created.id);
+    };
+    // Pruned after a dispatch-false-failure finish: census says not live.
+    expect(await facts()).toMatchObject({ terminal: true, native_terminal: true, linked_intake_open: false });
+    // 'uncertain' is an unconfirmed terminal label, not absence evidence.
+    sql.exec("UPDATE fleet_sessions SET phase='uncertain' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
+    expect(await facts()).toMatchObject({ terminal: true, native_terminal: false });
+  }));
+
+  it('keeps a non-terminal session held even when its census incarnation is unobserved', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'guard-unobserved-live-hold');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    sql.exec("UPDATE fleet_sessions SET phase='unobserved' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
+    closeFixtureIntake(sql);
+    const res = await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), host('hetzner'));
+    const fact = (await res.json() as any).sessions.find((row: any) => row.session_id === created.id);
+    expect(fact).toMatchObject({ terminal: false, native_terminal: true, linked_intake_open: false });
+  }));
+
   it('reuses a proven stopped unbound predecessor without releasing its lock for a live successor', async () => fixture(async (s,sql) => {
     const previous = await startAgentSession(s,'guard-stopped-unbound');
     ensureFleetLaunch(sql,'launch-1',null,'uncertain');

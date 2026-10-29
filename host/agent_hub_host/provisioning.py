@@ -15,7 +15,7 @@ import sys
 import tempfile
 import zipfile
 
-from . import bus, config, private_fs
+from . import bus, config, hook_command, private_fs
 
 LABEL = re.compile(r'[a-z][a-z0-9_-]{0,47}\Z')
 REV = re.compile(r'[a-f0-9-]{36}\Z')
@@ -163,8 +163,8 @@ def install_aplexer_state_hooks(bundle=None, home=None):
             template_hooks = None
 
     if not template_hooks or not isinstance(template_hooks, dict) or 'hooks' not in template_hooks:
-        a_cmd = shutil.which('a') or str(Path.home() / '.local/bin/a')
-        aplexer_cmd = shutil.which('aplexer') or str(Path.home() / '.local/bin/aplexer')
+        a_cmd = hook_command.tool_command('a')
+        aplexer_cmd = hook_command.tool_command('aplexer')
         template_hooks = {
             "hooks": {
                 "PostToolUse": [
@@ -448,16 +448,27 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         # notification fires while the session rests and its expiring
         # `waiting` push would clobber Stop's durable `idle` (REPORTED_STATE_
         # STALE_MS is 8s), re-creating the same deadlock.
-        a_cmd = shutil.which('a') or str(Path.home() / '.local/bin/a')
+        # Claude runs hook commands through bash (Git Bash on Windows), so the
+        # executable path must be bash-safe: forward slashes, quoted if needed.
+        a_cmd = hook_command.tool_command('a')
         hooks = settings.setdefault('hooks', {})
         if isinstance(hooks, dict):
-            working_hook = {"hooks": [{"command": f"{a_cmd} state-report working || true",
+            working_hook = {"hooks": [{"command": hook_command.state_report_command(a_cmd, 'working'),
                                        "type": "command"}]}
-            idle_hook = {"hooks": [{"command": f"{a_cmd} state-report idle || true",
+            idle_hook = {"hooks": [{"command": hook_command.state_report_command(a_cmd, 'idle'),
                                     "type": "command"}]}
             hooks.setdefault('SessionStart', [dict(working_hook)])
             hooks.setdefault('UserPromptSubmit', [dict(working_hook)])
             hooks.setdefault('Stop', [dict(idle_hook)])
+            # Re-bootstrap repairs state-report hooks we generated earlier with
+            # a raw native path (backslashes eaten by bash on Windows).
+            for groups in hooks.values():
+                for group in groups if isinstance(groups, list) else []:
+                    entries = group.get('hooks') if isinstance(group, dict) else None
+                    for entry in entries if isinstance(entries, list) else []:
+                        if isinstance(entry, dict) and 'command' in entry:
+                            entry['command'] = hook_command.repair_state_report_command(
+                                entry['command'], a_cmd)
         with private_fs.parent(settings_path, create=True):
             pass
         private_fs.atomic_write(settings_path, json.dumps(settings, indent=2).encode('utf-8'), 131072)

@@ -4,7 +4,6 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import { intakeCompletionHoldReason, type IntakeService } from './intake';
 import { freshCatalogs } from './catalog-freshness';
 import { parseNativeActor } from './work_claim';
-import { getScopeStatus } from './intake_scope';
 import { nativeTerminalError, sessionTerminalError } from './session_stall';
 import { externalSessionInCensus } from './intake-external';
 type Obj = Record<string, any>;
@@ -15,7 +14,7 @@ export const WATCHDOG_INTERVAL = 1800000;
 const DAY = 86400000;
 /** Hold reasons only a person can clear (AC8, intake d8d509d2): each (intake, reason)
  * pair is alerted exactly once instead of waiting silently on an operator. */
-export const HUMAN_HOLD_REASONS = new Set(['workspace_configuration_required', 'scope_decision_required', 'scope_out_of_bounds',
+export const HUMAN_HOLD_REASONS = new Set(['workspace_configuration_required',
   'reported_completion_requires_operator_review', 'done_evidence_requires_operator_review']);
 const HUMAN_ALERT_LIST = 30;
 const parse = (raw: any): Obj => { try { return JSON.parse(raw || '{}'); } catch { return {}; } };
@@ -166,8 +165,6 @@ export class IntakeWatchdog {
     const completionHold = intakeCompletionHoldReason(fresh);
     if (completionHold) return this.hold(fresh, completionHold, now);
     if (!fresh.acceptance_criteria?.trim()) return this.hold(fresh, 'acceptance_criteria_required', now);
-    const block = getScopeStatus(fresh).block_code;
-    if (block) return this.hold(fresh, block, now);
     const links = this.rows('SELECT * FROM session_control_sessions').filter(s => parse(s.request_json).intake_task_id === t.id)
       .sort((a, b) => ms(b.created_at) - ms(a.created_at));
     const prior = parse(links[0]?.request_json);

@@ -84,8 +84,9 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
                 "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
                 journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
                 cleanup_tree_authorized=True, linked_intake_open=False)
-        # Canonical lifecycle reconciliation owns unlocks; a stop command
-        # cannot release a retained lock before successor fencing is checked.
+        # c0e2a44f: a stopped predecessor cannot prove that a successor no
+        # longer needs its retained lock. Fresh worktree reconciliation owns
+        # unlocks; cleanup evidence must still precede stop and tree cleanup.
         self.assertEqual(events, ["capture", "stop", "tree"])
         unlock.assert_not_called()
         self.assertIn("tree", out)
