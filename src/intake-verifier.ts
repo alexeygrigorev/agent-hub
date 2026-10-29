@@ -97,15 +97,20 @@ export class IntakeVerifier {
     const counts = Object.fromEntries(this.rows('SELECT state, COUNT(*) AS n FROM intake_verifications GROUP BY state').map(r => [r.state, r.n]));
     return { enabled_at: m.enabled_at ?? null, last_checked_at: m.last_tick ?? null, last_result: parse(m.last_result), states: counts };
   }
-  /** Engines that implemented this intake, from its canonical sessions and links. */
-  private implementerEngines(task: Obj): Set<string> {
+  /** Engine of the implementation behind this DONE claim: the newest non-review
+   * session for the intake created before the claim. Review sessions (verifiers,
+   * triage) never count, so an old Claude review cannot force a Codex verifier.
+   * Without a canonical implementer, fall back to the newest non-review link engine. */
+  private implementerEngine(task: Obj, claim: Obj): string | null {
+    const at = claim.captured_at ?? Number.MAX_SAFE_INTEGER;
     const ids = new Set((task.history || []).map((e: Obj) => e.hub_session_id).filter(Boolean));
-    const engines = new Set<string>((task.history || []).map((e: Obj) => e.engine).filter((e: any) => typeof e === 'string'));
-    for (const s of this.rows('SELECT id,engine,request_json FROM session_control_sessions')) {
-      const req = parse(s.request_json);
-      if ((ids.has(s.id) || req.intake_task_id === task.id) && req.task_kind !== 'review' && typeof s.engine === 'string') engines.add(s.engine);
-    }
-    return engines;
+    const sessions = this.rows('SELECT id,engine,request_json,created_at FROM session_control_sessions').map((s): Obj => ({ ...s, req: parse(s.request_json) }))
+      .filter(s => (ids.has(s.id) || s.req.intake_task_id === task.id) && s.req.task_kind !== 'review' && typeof s.engine === 'string' && ms(s.created_at) <= at)
+      .sort((a, b) => ms(b.created_at) - ms(a.created_at));
+    if (sessions.length) return sessions[0].engine;
+    const review = new Set(this.rows('SELECT id,request_json FROM session_control_sessions').filter(s => parse(s.request_json).task_kind === 'review').map(s => s.id));
+    const links = (task.history || []).filter((e: Obj) => e.kind === 'link' && typeof e.engine === 'string' && !review.has(e.hub_session_id) && (e.captured_at ?? 0) <= at);
+    return links.length ? links[links.length - 1].engine : null;
   }
   private workspace(task: Obj): string {
     const prior = this.rows('SELECT request_json FROM session_control_sessions ORDER BY created_at DESC')
@@ -144,7 +149,7 @@ export class IntakeVerifier {
   }
   private async launch(task: Obj, claim: Obj, row: Obj): Promise<boolean> {
     if (!this.hooks.start) return false;
-    const claudeImplemented = this.implementerEngines(task).has('claude');
+    const claudeImplemented = this.implementerEngine(task, claim) === 'claude';
     const engine = claudeImplemented ? 'codex' : 'claude';
     const attempt = (row.attempts ?? 0) + 1;
     const input = { key: 'verify-' + crypto.randomUUID(), engine, tier: 'review', task_kind: 'review', mode: 'headless',

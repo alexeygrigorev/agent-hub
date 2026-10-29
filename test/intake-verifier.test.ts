@@ -140,6 +140,22 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await tick(v, clock);
     expect(starts[0]).toMatchObject({ engine: 'codex', workspace: 'demo' });
   }));
+  it('picks the newest non-review implementer before the claim: old Claude review + latest Codex work gets Claude', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
+    const v = verifier(h, starts, clock);
+    const t = await task(h, { title: 'Change session placement' });
+    const row = (id: string, engine: string, kind: string | null, ageMs: number) => h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      VALUES(?,'fixture',?,?,?,'headless','exited',?,?)`, id, id, JSON.stringify({ intake_task_id: t.id, workspace: 'demo', ...(kind ? { task_kind: kind } : {}) }),
+      engine, new Date(Date.now() - ageMs).toISOString(), new Date(Date.now() - ageMs).toISOString());
+    row('old-claude-impl', 'claude', null, 3 * 3600000);
+    row('claude-review', 'claude', 'review', 2 * 3600000);
+    row('latest-codex-impl', 'codex', null, 3600000);
+    await note(h, t.id, DONE_EVIDENCE);
+    row('later-claude-after-claim', 'claude', null, -60000); // after the claim: not the implementer of it
+    clock.now = Date.now();
+    await tick(v, clock);
+    expect(starts[0]).toMatchObject({ engine: 'claude' });
+  }));
   it('ignores another actor forging a PASS or FAIL and requires evidence in the verifier PASS itself', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
     const v = verifier(h, starts, clock);
