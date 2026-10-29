@@ -154,6 +154,7 @@ describe('contract v2: both sides, JSONL, reconciler (290b935a A10-A13)', () => 
     state = 'stopped';
     await rl.tick();
     expect((await rl.reconcileDue()).state).toBe('started');
+    state = 'running'; // the fake reports the new session rec-2 as live
     expect((await rl.reconcileDue()).state).toBe('running');
   }));
 });
@@ -232,7 +233,7 @@ describe('drop-after-done gate (AC5, beside done-gate f0b21a52)', () => {
     await note(h, old.id, DONE('AC1: met'));
     expect((await close(h, old.id)).status).toBe(200);
     ingest(l, 'dev', [msg('t500u', 'the jev decider must ship', { intake_id: live.id })]);
-    l.ingest({ source: 'backfill', agents: [{ agent_id: 'dev', messages: [msg('t420u', 'old dropped spec', { intake_id: old.id })] }] }, op);
+    l.ingest({ source: 'backfill', agents: [{ agent_id: 'dev', messages: [msg('t420u', 'jev спека осталась только в памяти', { intake_id: old.id })] }] }, op);
     const r = await l.tick();
     expect(r.reopened).toBe(1);
     expect((await show(h, live.id)).status).toBe('open');
@@ -361,7 +362,8 @@ describe('gap detector (AC4)', () => {
     expect(alerts.filter(a => a.kind === 'asks_unrecorded').at(-1).detail).toBeNull();
   }));
   it('defaults to window-only gaps (counter also numbers non-user entries)', () => fixture(async (h, l) => {
-    h.sql.exec("UPDATE ask_meta SET gap_scope=(SELECT dflt_value FROM pragma_table_info('ask_meta') WHERE name='gap_scope') WHERE id=1");
+    expect(h.sql.exec("SELECT dflt_value AS d FROM pragma_table_info('ask_meta') WHERE name='gap_scope'").toArray()[0].d).toBe("'window'");
+    h.sql.exec("UPDATE ask_meta SET gap_scope='window' WHERE id=1");
     expect(ingest(l, 'dev', [msg('t650u', 'a'), msg('t660u', 'b')]).gaps).toEqual([]);
     ingest(l, 'dev', [], { window: { first_t_id: 't640a', last_t_id: 't661a', diag: { user_entries: 2, kinds: { message: 2 } } } });
     expect(l.cursor('dev')).toMatchObject({ covered_through: 661, window_diag: { user_entries: 2 } });
