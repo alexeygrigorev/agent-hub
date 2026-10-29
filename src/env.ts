@@ -25,7 +25,8 @@ export interface Env {
   HOST_REPO_ACCESS_POLICY?: string;
 
   // Liveness and alerts (optional)
-  // Comma-separated inbox actors for alert delivery; defaults to ['grok-bot'] when unset.
+  // Comma-separated inbox actors with a fresh credential/read loop. No default.
+  // An unset destination opens an alert_routing failure; configure a receiver before rollout.
   HUB_ALERT_TO?: string;
   HUB_ALERT_WEBHOOK?: string;
   HUB_MACHINE_STALE_S?: string;
