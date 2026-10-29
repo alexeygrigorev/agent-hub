@@ -49,8 +49,8 @@ class FakeHub:
             self.add_table(name, 3)
         self.add_table("token_hours_posted", 4, without_rowid=True)
 
-    def add_table(self, name: str, n: int, without_rowid: bool = False) -> None:
-        self.tables[name] = {i + 1: {"id": f"{name}-{i}", "v": i} for i in range(n)}
+    def add_table(self, name: str, n: int, without_rowid: bool = False, start: int = 1) -> None:
+        self.tables[name] = {start + i: {"id": f"{name}-{i}", "v": i} for i in range(n)}
         if without_rowid:
             self.without_rowid.add(name)
 
@@ -98,9 +98,9 @@ class FakeHub:
         if "after" in q:
             if self.api_version < 5 or table in self.without_rowid:
                 return 400, {"error": "keyset_unsupported"}
-            after = int(q["after"][0])
-            page = [(k, r) for k, r in ordered if k > after][:limit]
-            body.update(cursor="rowid", after=after, next_after=page[-1][0] if page else None)
+            raw = q["after"][0]
+            page = [(k, r) for k, r in ordered if raw == "first" or k > int(raw)][:limit]
+            body.update(cursor="rowid", after=raw, next_after=str(page[-1][0]) if page else None)
         else:
             offset = int(q.get("offset", ["0"])[0])
             page = ordered[offset:offset + limit]
@@ -290,6 +290,20 @@ class HubDbBackupScriptTest(unittest.TestCase):
         self.assertIn("table ok session_control_commands rows=1000 cursor=rowid attempts=2", res.stdout)
         self.assertEqual(len(self.load_export()["tables"]["session_control_commands"]), 1000)
         self.assertEqual(self.alerts(), [])
+
+    def test_keyset_covers_extreme_rowids(self) -> None:
+        # Rows at the int64 floor and past 2^53 (review finding on 30fad3c5).
+        hub = FakeHub()
+        hub.add_table("session_control_commands", 1200, start=-(2 ** 63))
+        rows = hub.tables["session_control_commands"]
+        rows[2 ** 63 - 1] = {"id": "max", "v": 0}
+        rows[2 ** 53 + 1] = {"id": "big", "v": 0}
+        res = self.run_backup(hub)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        got = {r["id"] for r in self.load_export()["tables"]["session_control_commands"]}
+        self.assertEqual(len(got), 1202)
+        self.assertTrue({"session_control_commands-0", "max", "big"} <= got)
+        self.assertIn("after=first", " ".join(hub.requests))
 
     def test_api_v4_server_falls_back_to_offset_paging(self) -> None:
         hub = FakeHub(api_version=4)

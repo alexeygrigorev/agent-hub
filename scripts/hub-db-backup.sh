@@ -5,7 +5,7 @@
 # request, so giant tables/exports never exceed DO memory):
 #   GET /api/backup/status                 (table names + row counts)
 #   GET /api/backup/export?schema=1        (full DDL, no rows)
-#   GET /api/backup/export?table=X&after=R&limit=M   (keyset row slices, API v5+)
+#   GET /api/backup/export?table=X&after=first|R&limit=M  (keyset row slices, API v5+)
 #   GET /api/backup/export?table=X&offset=N&limit=M  (offset row slices)
 # (429/413/500 fail-closed) and writes it OFF Cloudflare (Hetzner local +
 # Storagebox mirror):
@@ -198,8 +198,9 @@ open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines) + "\n")
 PY
 [[ -s "$TABLES_LIST" ]] || fail "empty table list"
 
-# Lowest JS safe integer: below any rowid the Hub hands out.
-KEYSET_START="-9007199254740991"
+# Keyset cursors are exact signed 64-bit decimals from the server; the first
+# page uses "first" (no lower bound), so no sentinel can hide a row.
+KEYSET_START="first"
 CHUNKS_DIR="${TMP_PARTS}/chunks"
 mkdir -p "$CHUNKS_DIR"
 
@@ -221,7 +222,7 @@ fetch_table() {
 import json, sys
 b = json.load(open(sys.argv[1], encoding='utf-8'))
 n = b.get('next_after')
-print(len(b.get('rows', [])), '-' if n is None else int(n))" "$part" 2>/dev/null) || true
+print(len(b.get('rows', [])), '-' if n is None else int(str(n)))" "$part" 2>/dev/null) || true
     [[ "${got:-}" =~ ^[0-9]+$ ]] || fetch_fail "unparseable chunk table=${table} ${query}"
     # NOTE: plain assignments, not ((..)) arithmetic (which returns non-zero
     # for a zero result and would trip set -e on empty tables).
@@ -232,7 +233,9 @@ print(len(b.get('rows', [])), '-' if n is None else int(n))" "$part" 2>/dev/null
     if (( got < CHUNK_ROWS )); then break; fi
     if [[ "$mode" == "rowid" ]]; then
       [[ "$next" =~ ^-?[0-9]+$ ]] || fetch_fail "keyset chunk without next_after table=${table}"
-      (( next > pos )) || fetch_fail "keyset cursor did not advance table=${table} after=${pos} next=${next}"
+      if [[ "$pos" != "$KEYSET_START" ]] && ! (( next > pos )); then
+        fetch_fail "keyset cursor did not advance table=${table} after=${pos} next=${next}"
+      fi
       pos="$next"
     else
       pos=$((pos + got))
@@ -309,7 +312,7 @@ for label, body in (("pre", pre), ("post", post)):
 schema = schema_body.get("schema")
 assert isinstance(schema, dict) and schema, "schema missing/empty"
 
-KEYSET_START = -9007199254740991
+KEYSET_START = "first"
 assembled: dict = {}
 final_totals: dict = {}
 markers = {"bigint": 0, "blob": 0, "unreadable": 0}
@@ -351,7 +354,8 @@ for table in tables:
         offset += len(chunk_rows)
         if modes[table] == "rowid":
             nxt = body.get("next_after")
-            assert isinstance(nxt, int) and nxt > after, f"keyset cursor did not advance {part}"
+            assert isinstance(nxt, str) and nxt.lstrip("-").isdigit(), f"keyset next_after invalid {part}"
+            assert after == KEYSET_START or int(nxt) > int(after), f"keyset cursor did not advance {part}"
             after = nxt
         if offset > 1000000:
             raise AssertionError(f"assembly exceeded 1M rows table={table}")

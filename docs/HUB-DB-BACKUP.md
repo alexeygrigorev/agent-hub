@@ -69,8 +69,11 @@ giant JSON string cannot name the failing table), the script fetches
 3. Per table, until a short page (`CHUNK_ROWS`, default 500, endpoint caps
    at 5000):
    - rowid tables on API v5+: keyset
-     `GET /api/backup/export?table=X&after=<rowid>&limit=M` (rowid order;
-     the response carries `cursor:"rowid"`, `after`, `next_after`). Inserts
+     `GET /api/backup/export?table=X&after=first|<rowid>&limit=M` (rowid
+     order; the response carries `cursor:"rowid"`, `after`, `next_after`).
+     Cursors are exact signed 64-bit decimal strings (`CAST` in SQL, never
+     a JS number), and `after=first` has no lower bound, so no sentinel can
+     hide a row at the int64 floor. Inserts
      land after the cursor and deletes never shift unread rows, so a hot
      table can neither skip nor duplicate rows across chunks.
    - `WITHOUT ROWID` tables (listed in status `without_rowid`) and API v4

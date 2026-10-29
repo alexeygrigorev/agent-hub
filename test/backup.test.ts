@@ -266,7 +266,7 @@ describe('Hub DB backup export', () => {
 
     await seed('hot_keyset');
     const got: string[] = [];
-    let after = -9007199254740991;
+    let after = 'first';
     let pages = 0;
     for (;;) {
       const res = await call(s, `/api/backup/export?table=hot_keyset&after=${after}&limit=3`, headers);
@@ -280,7 +280,8 @@ describe('Hub DB backup export', () => {
       }
       if (pages++ === 0) await churn('hot_keyset');
       if (body.rows.length < 3) break;
-      expect(body.next_after).toBeGreaterThan(after);
+      expect(typeof body.next_after).toBe('string');
+      if (after !== 'first') expect(BigInt(body.next_after) > BigInt(after)).toBe(true);
       after = body.next_after;
     }
     // Every row that existed throughout plus every appended row, once each.
@@ -307,6 +308,40 @@ describe('Hub DB backup export', () => {
     expect(((await wr.json()) as any).error).toBe('keyset_unsupported');
     expect((await call(s, '/api/backup/export?table=hot_keyset&after=0&offset=0&limit=3', headers)).status).toBe(400);
     expect((await call(s, '/api/backup/export?table=hot_keyset&after=abc&limit=3', headers)).status).toBe(400);
+    expect((await call(s, '/api/backup/export?table=hot_keyset&after=9223372036854775808&limit=3', headers)).status).toBe(400);
+  });
+
+  // Review finding: a numeric start sentinel hid rows at or below it, and JS
+  // numbers lose precision past 2^53. Cursors are exact decimal strings and
+  // the first page has no lower bound.
+  it('keyset cursor is exact across the full signed 64-bit rowid range', async () => {
+    const name = 'backup-keyset-range-' + crypto.randomUUID();
+    const token = 'synthetic_operator_backup_keyset_range_0123456789';
+    await configureOperator(name, token);
+    const s = stub(name);
+    const headers = { Authorization: 'Bearer ' + token };
+    const ids = ['-9223372036854775808', '-9007199254740992', '-9007199254740991', '0',
+      '9007199254740992', '9007199254740993', '9223372036854775806', '9223372036854775807'];
+    await runInDurableObject(stub(name), async (hub: Hub) => {
+      hub.sql.exec('CREATE TABLE extreme_rowids (k TEXT NOT NULL)');
+      // rowid and k both from the same decimal text; CAST keeps it exact.
+      for (const id of ids) hub.sql.exec('INSERT INTO extreme_rowids(rowid, k) VALUES (CAST(? AS INTEGER), ?)', id, id);
+    });
+    const got: string[] = [];
+    const cursors: string[] = [];
+    let after = 'first';
+    for (;;) {
+      const res = await call(s, `/api/backup/export?table=extreme_rowids&after=${after}&limit=3`, headers);
+      expect(res.status).toBe(200);
+      const body = await res.json() as any;
+      expect(body.after).toBe(after);
+      got.push(...body.rows.map((r: any) => r.k));
+      if (body.rows.length < 3) break;
+      cursors.push(body.next_after);
+      after = body.next_after;
+    }
+    expect(got).toEqual(ids);
+    expect(cursors).toEqual(['-9007199254740991', '9007199254740993']);
   });
 
   it('keeps chunked reads on a separate generous budget', async () => {

@@ -48,7 +48,7 @@ const CHUNK_DEFAULT_ROWS = 500;
 // Backup export API version. Bump on any BackupService behavior change so
 // operators can tell which code a live (possibly long-lived) DO isolate is
 // actually executing: it is reported by /api/backup/status.
-// v5 (intake e27e0f9d): keyset chunk cursor (?after=<rowid>) ordered by
+// v5 (intake e27e0f9d): keyset chunk cursor (?after=first|<rowid>) ordered by
 // rowid, ORDER BY rowid on offset reads, and status lists WITHOUT ROWID
 // tables (those keep stable PK-ordered offset paging).
 const BACKUP_API_VERSION = 5;
@@ -75,6 +75,20 @@ export class ExportTooLarge extends Error {}
 
 // Synthetic cursor column for keyset chunk reads; stripped from every row.
 const ROWID_COL = '__hub_backup_rowid';
+// Keyset cursors are signed 64-bit rowids carried as decimal strings (JS
+// numbers lose precision past 2^53); 'first' starts without a lower bound,
+// so no sentinel value can hide a row.
+const KEYSET_FIRST = 'first';
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+
+/** Canonical decimal for a signed 64-bit cursor, or null when invalid. */
+function parseKeysetCursor(raw: string): string | null {
+  if (raw === KEYSET_FIRST) return raw;
+  if (!/^-?[0-9]{1,19}$/.test(raw)) return null;
+  const v = BigInt(raw);
+  return v >= INT64_MIN && v <= INT64_MAX ? v.toString() : null;
+}
 
 function isWithoutRowid(ddl: string): boolean {
   return /\bWITHOUT\s+ROWID\b/i.test(ddl);
@@ -195,20 +209,21 @@ export class BackupService {
    *
    * Cursor modes (intake e27e0f9d):
    * - keyset (`after` set, rowid tables only): rows with rowid > after in
-   *   rowid order; `next_after` is the last rowid served. Concurrent inserts
+   *   rowid order (`after=first`: from the lowest rowid); `next_after` is the
+   *   last rowid served, as a lossless decimal string. Concurrent inserts
    *   land after the cursor and deletes never shift unread rows, so a hot
    *   table can neither skip nor duplicate rows across chunks.
    * - offset (legacy): ORDER BY rowid for rowid tables (WITHOUT ROWID tables
    *   scan in primary-key order). A delete in an already-read range shifts
    *   later rows down and can skip one, which is why the backup script uses
    *   keyset whenever the table supports it and re-reads on drift. */
-  private tableChunk(table: string, cursor: { offset: number } | { after: number }, limit: number): {
+  private tableChunk(table: string, cursor: { offset: number } | { after: string }, limit: number): {
     exported_at: string;
     snapshot: string;
     table: string;
     offset?: number;
-    after?: number;
-    next_after?: number | null;
+    after?: string;
+    next_after?: string | null;
     cursor: 'offset' | 'rowid';
     limit: number;
     total: number;
@@ -228,7 +243,7 @@ export class BackupService {
       const withoutRowid = isWithoutRowid(ddl);
       const keyset = 'after' in cursor;
       if (keyset) {
-        if (!Number.isSafeInteger(cursor.after)) throw new ExportStageError('range', table);
+        if (parseKeysetCursor(cursor.after) !== cursor.after) throw new ExportStageError('range', table);
         if (withoutRowid) throw new ExportStageError('keyset', table);
       } else if (!Number.isInteger(cursor.offset) || cursor.offset < 0 || cursor.offset > total) {
         throw new ExportStageError('range', table);
@@ -237,9 +252,13 @@ export class BackupService {
       let rows: any[];
       try {
         if (keyset) {
-          rows = this.sql.exec(
-            `SELECT _rowid_ AS ${ROWID_COL}, * FROM ${q} WHERE _rowid_ > ? ORDER BY _rowid_ LIMIT ?`,
-            (cursor as { after: number }).after, limit).toArray() as any[];
+          // CAST both ways keeps the cursor exact across the full int64 range.
+          const after = (cursor as { after: string }).after;
+          const select = `SELECT CAST(_rowid_ AS TEXT) AS ${ROWID_COL}, * FROM ${q}`;
+          rows = (after === KEYSET_FIRST
+            ? this.sql.exec(`${select} ORDER BY _rowid_ LIMIT ?`, limit)
+            : this.sql.exec(`${select} WHERE _rowid_ > CAST(? AS INTEGER) ORDER BY _rowid_ LIMIT ?`, after, limit)
+          ).toArray() as any[];
         } else {
           const order = withoutRowid ? '' : ' ORDER BY _rowid_';
           rows = this.sql.exec(`SELECT * FROM ${q}${order} LIMIT ? OFFSET ?`,
@@ -248,17 +267,17 @@ export class BackupService {
       } catch (err) {
         throw new ExportStageError('export', table);
       }
-      let nextAfter: number | null = null;
+      let nextAfter: string | null = null;
       if (keyset) {
         for (const row of rows) {
-          nextAfter = Number(row[ROWID_COL]);
+          nextAfter = String(row[ROWID_COL]);
           delete row[ROWID_COL];
         }
       }
       const stats = { bigint: 0, blob: 0, unreadable: 0 };
       const clean = this.sanitizeRows(table, rows, stats);
       const position = keyset
-        ? { cursor: 'rowid' as const, after: (cursor as { after: number }).after, next_after: nextAfter }
+        ? { cursor: 'rowid' as const, after: (cursor as { after: string }).after, next_after: nextAfter }
         : { cursor: 'offset' as const, offset: (cursor as { offset: number }).offset };
       return {
         exported_at: new Date().toISOString(), snapshot: 'hub-do-sqlite',
@@ -474,11 +493,12 @@ export class BackupService {
           if (afterParam !== null && offsetParam !== null) {
             return Response.json({ error: 'invalid_combination' }, { status: 400 });
           }
-          if (afterParam !== null && !/^-?[0-9]{1,16}$/.test(afterParam)) {
+          const after = afterParam === null ? null : parseKeysetCursor(afterParam);
+          if (afterParam !== null && after === null) {
             return Response.json({ error: 'invalid_range' }, { status: 400 });
           }
-          const cursor = afterParam !== null
-            ? { after: Number(afterParam) }
+          const cursor = after !== null
+            ? { after }
             : { offset: Number(offsetParam ?? '0') };
           try {
             return Response.json(this.tableChunk(table, cursor, limit),
