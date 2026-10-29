@@ -10,6 +10,14 @@ export const WORKER_SCOPE = 'worker:own-intake';
 export const WORKER_ACCESS_SCHEMA = `CREATE TABLE IF NOT EXISTS worker_access (
   family_id TEXT PRIMARY KEY, launch_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL,
   task_id TEXT NOT NULL, workspace TEXT NOT NULL, expires_at INTEGER NOT NULL)`;
+/** Follow-up intakes a worker session filed (intake 34d0271b). The creating
+ * session may read them and append note/report/blocker; nothing else. */
+export const WORKER_CREATED_SCHEMA = `CREATE TABLE IF NOT EXISTS worker_created_intakes (
+  task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, launch_id TEXT NOT NULL,
+  parent_task_id TEXT NOT NULL, created_at INTEGER NOT NULL)`;
+export const WORKER_CREATED_INDEX = 'CREATE INDEX IF NOT EXISTS worker_created_intakes_session ON worker_created_intakes(session_id, task_id)';
+/** Per-session cap on follow-up intakes; also bounds the per-request lookup. */
+export const WORKER_CREATE_LIMIT = 25;
 
 export function workerAccessContext(sql: SqlStorage, tokenId: string | undefined, now = Date.now(), allowExpiredAccess = false): any | null {
   if (!tokenId || !sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_access'").toArray().length) return null;
@@ -79,6 +87,23 @@ export function triageTargets(sql: SqlStorage, sessionId: string | null | undefi
   } catch { /* ledger absent outside the Hub composition */ }
   return out;
 }
+/** Intakes this worker session created, exact ids only. */
+export function workerCreatedTargets(sql: SqlStorage, sessionId: string | null | undefined): Set<string> {
+  if (!sessionId || !sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_created_intakes'").toArray().length) return new Set();
+  return new Set(sql.exec('SELECT task_id FROM worker_created_intakes WHERE session_id=? ORDER BY task_id LIMIT ?', sessionId, WORKER_CREATE_LIMIT)
+    .toArray().map((r: any) => r.task_id as string));
+}
+const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context)?$/;
+/** Denial code for a worker request outside its capability. Intake reads or
+ * writes aimed at another intake say so explicitly instead of a generic 403. */
+export function workerDenialCode(sql: SqlStorage, request: Request, tokenId: string): string {
+  const path = new URL(request.url).pathname;
+  if (path !== '/api/intake/tasks' && !path.startsWith('/api/intake/tasks/')) return 'worker_scope_forbidden';
+  const worker = workerAccessContext(sql, tokenId);
+  const id = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)/.exec(path)?.[1];
+  if (worker && id && (id === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id)))) return 'worker_scope_forbidden';
+  return 'cross_intake_forbidden';
+}
 export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId: string): boolean {
   const worker = workerAccessContext(sql, tokenId);
   if (!worker) return false;
@@ -93,13 +118,16 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
     const kinds = url.searchParams.getAll('kind');
     return request.method === 'GET' && kinds.every(kind => ['quota_window', 'quota', 'tokens'].includes(kind));
   }
-  const ownIntake = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events)?$/.exec(path);
+  // Filing a follow-up intake; the intake service records provenance and caps volume.
+  if (path === '/api/intake/tasks') return request.method === 'POST';
+  const ownIntake = INTAKE_TASK_PATH.exec(path);
   if (ownIntake) {
     const id = ownIntake[1];
     // A triage reviewer may read, note and amend AC/project on its requested intakes.
     if (id !== worker.task_id && triageTargets(sql, worker.session_id).has(id))
-      return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] !== '/history';
-    if (id !== worker.task_id && !(id.length >= 8 && worker.task_id.startsWith(id))) return false;
+      return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && (!ownIntake[2] || ownIntake[2] === '/events');
+    const own = id === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id));
+    if (!own && !workerCreatedTargets(sql, worker.session_id).has(id)) return false;
     return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] === '/events';
   }
   if (path === '/api/sessions') return ['GET', 'POST'].includes(request.method);
@@ -116,7 +144,7 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
 
 export class WorkerAccess {
   constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private hostAllowed: (caller: CallerContext) => boolean) {}
-  init() { this.sql.exec(WORKER_ACCESS_SCHEMA); }
+  init() { this.sql.exec(WORKER_ACCESS_SCHEMA); this.sql.exec(WORKER_CREATED_SCHEMA); this.sql.exec(WORKER_CREATED_INDEX); }
   async issue(request: Request, caller: CallerContext | undefined, scopes: string[] | undefined): Promise<Response> {
     const id = /^\/api\/fleet\/launches\/([0-9a-f-]{36})\/worker-credential$/.exec(new URL(request.url).pathname)?.[1];
     const reply = (data: any, status=200) => Response.json(data,{status,headers:{'Cache-Control':'no-store'}});

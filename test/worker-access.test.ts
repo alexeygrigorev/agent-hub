@@ -232,4 +232,69 @@ describe('scoped durable worker access',()=>{
    expect(child.parent_id).toBe(session);expect(JSON.parse(child.request_json).intake_task_id).toBe(task);
   });
  }));
+ it('files follow-up intakes with provenance, reads/notes only its own creations, and names cross-intake denials (34d0271b)',()=>setup(async({stub,id,session,task,other,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const code=async(r:Response)=>((await r.json()) as any).error;
+  const src={type:'unknown',reference:'test'};
+  // Own intake: links/context are the same read view as show.
+  for(const sfx of ['','/history','/links','/context']) expect((await api('/api/intake/tasks/'+task+sfx)).status).toBe(200);
+  const made=await api('/api/intake/tasks',{key:uuid(),project:'dataops',title:'follow-up',text:'blocker found',source:src});
+  expect(made.status,await made.clone().text()).toBe(200);
+  const created:any=(await made.json() as any).task;
+  expect(created.project).toBe('dataops');
+  expect(created.created_by).toMatchObject({kind:'worker_session',hub_session_id:session,fleet_launch_id:id,parent_intake_id:task});
+  for(const sfx of ['','/history','/links','/context']) expect((await api('/api/intake/tasks/'+created.id+sfx)).status).toBe(200);
+  let version=1;
+  for(const kind of ['note','report','blocker']) {
+   const res=await api('/api/intake/tasks/'+created.id+'/events',{key:uuid(),expected_version:version,event:kind==='report'?{kind,reference:'r',source:src}:{kind,text:'worker '+kind,source:src}});
+   expect(res.status,await res.clone().text()).toBe(200);version++;
+  }
+  expect((await api('/api/intake/tasks/'+created.id+'/events',{key:uuid(),expected_version:version,event:{kind:'decision',text:'no',source:src}})).status).toBe(403);
+  // Status/AC updates and close stay denied on created and unrelated intakes, with a specific code.
+  for(const target of [created.id,other]) {
+   for(const body of [{status:'done'},{acceptance_criteria:'changed'},{title:'x'}]) {
+    const res=await api('/api/intake/tasks/'+target,{key:uuid(),expected_version:version,...body});
+    expect(res.status).toBe(403);expect(await code(res)).toBe('cross_intake_forbidden');
+   }
+   const close=await api('/api/intake/tasks/'+target+'/close',{key:uuid(),expected_version:version});
+   expect(close.status).toBe(403);expect(await code(close)).toBe('cross_intake_forbidden');
+   const del=await stub.fetch('https://hub.test/api/intake/tasks/'+target,{method:'DELETE',headers:{Authorization:'Bearer '+worker.access_token}});
+   expect(del.status).toBe(403);
+  }
+  for(const sfx of ['','/history','/links']) {
+   const res=await api('/api/intake/tasks/'+other+sfx);expect(res.status).toBe(403);expect(await code(res)).toBe('cross_intake_forbidden');
+  }
+  const noteOther=await api('/api/intake/tasks/'+other+'/events',{key:uuid(),expected_version:1,event:{kind:'note',text:'x',source:src}});
+  expect(noteOther.status).toBe(403);expect(await code(noteOther)).toBe('cross_intake_forbidden');
+  // Own intake status changes remain a scope denial, not a cross-intake one.
+  const ownClose=await api('/api/intake/tasks/'+task,{key:uuid(),expected_version:1,status:'done'});
+  expect(ownClose.status).toBe(403);expect(await code(ownClose)).toBe('worker_scope_forbidden');
+  // Rules and grants stay operator-only.
+  for(const [path,body] of [['/api/intake/rules',undefined],['/api/intake/grants',undefined],
+   ['/api/intake/rules',{key:uuid(),id:'r',expected_version:0,text:'x',source:src,decision:'x'}],
+   ['/api/intake/grants',{key:uuid(),credential_id:'c',scope:'all',access:'write',expires_at:Date.now()+1000,source:src}]] as any[]) {
+   const res=await api(path,body);expect(res.status).toBe(403);expect(await code(res)).toBe('worker_scope_forbidden');
+  }
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   const data=JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',created.id).toArray()[0].data);
+   expect(data.status).toBe('open');expect(data.acceptance_criteria??null).toBeNull();
+   expect(JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',other).toArray()[0].data).status).toBe('open');
+  });
+  // A different worker session never sees another session's creations.
+  const id2=uuid(), session2=uuid(), now=new Date().toISOString();
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at) VALUES(?,'tester','human','s',?,'{}','worker-host','opencode','shared-muse','headless','/repo','task','starting',?,?)`,id2,'key-'+id2,now,now);
+   h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,created_at,updated_at) VALUES(?,'tester',?,?,?,'worker-host','opencode','headless','starting',?,?)`,session2,'session-'+session2,JSON.stringify({intake_task_id:other,workspace:'/repo'}),id2,now,now);
+  });
+  const issued=await call('/api/fleet/launches/'+id2+'/worker-credential',{});expect(issued.status).toBe(200);
+  const worker2:any=await issued.json();
+  const peek=await call('/api/intake/tasks/'+created.id,undefined,worker2.access_token);
+  expect(peek.status).toBe(403);expect(await code(peek)).toBe('cross_intake_forbidden');
+  // Per-session creation cap.
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   for(let i=1;i<25;i++) h.sql.exec('INSERT INTO worker_created_intakes(task_id,session_id,launch_id,parent_task_id,created_at) VALUES(?,?,?,?,?)',uuid(),session,id,task,Date.now());
+  });
+  const capped=await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'one more',text:'x',source:src});
+  expect(capped.status).toBe(429);expect(await code(capped)).toBe('worker_create_limit');
+ }));
 });

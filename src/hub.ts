@@ -1,6 +1,6 @@
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { IdleWorkService } from './idle-work';
-import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
+import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog, queuePolicyFrom } from './intake-watchdog';
 import { OpsLiveness } from './ops-liveness';
 import { IntakeTriage } from './intake-triage';
@@ -2470,7 +2470,7 @@ export class Hub extends DurableObject {
     }
 
     if (scopes.includes(WORKER_SCOPE) && !workerRequestAllowed(this.sql, request, cred.id)) {
-      return { error: Response.json({ error: 'worker_scope_forbidden' }, { status: 403 }) };
+      return { error: Response.json({ error: workerDenialCode(this.sql, request, cred.id) }, { status: 403 }) };
     }
 
     const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
