@@ -1598,7 +1598,12 @@ export class SessionControlService {
         const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
         const nativeTerminal = unstarted || !!(native &&
           native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
-          ['exited', 'dead', 'pruned', 'forgotten'].includes(native.phase));
+          // 'unobserved' is the census writer's positive absence verdict ("an
+          // orphan no longer observed is not a live workload"): a native that
+          // finished and was pruned (the dispatch-false-failure path) never
+          // reports an explicit terminal phase, which would hold the AC1 lock
+          // forever. 'uncertain' stays held — an unconfirmed terminal label.
+          ['exited', 'dead', 'pruned', 'forgotten', 'unobserved'].includes(native.phase));
         const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
           this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
             binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
