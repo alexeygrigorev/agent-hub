@@ -206,7 +206,7 @@ def relay_replies(*, journal_dir: str, executable: str, request: Callable,
                     continue
                 try:
                     # The bus limits UTF-8 bytes; drop a partial trailing code point.
-                    body = env["body"].encode("utf-8")[:16384].decode("utf-8", "ignore")
+                    body = env["body"].encode("utf-8", "replace")[:16384].decode("utf-8", "ignore")
                     sent = request("POST", "/api/bus/send", {
                         "from_actor": "session:" + record["hub_session_id"], "to_actor": record["from_actor"],
                         "kind": "reply", "body": body, "reply_to": record["message_id"],

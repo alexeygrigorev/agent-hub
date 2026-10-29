@@ -39,6 +39,9 @@ class Utf8RelayTests(unittest.TestCase):
     def test_short_unicode_unchanged(self):
         self.relay_case('Tabo says Привет 😀', 'Tabo says Привет 😀')
 
+    def test_lone_surrogate_is_replaced_and_relayed_once(self):
+        self.relay_case('Tabo says \ud83d', 'Tabo says ?')
+
     def test_ascii_at_byte_limit_unchanged(self):
         self.relay_case('a' * 16384, 'a' * 16384)
 
