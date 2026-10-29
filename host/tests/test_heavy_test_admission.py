@@ -53,7 +53,19 @@ class AdmissionTests(unittest.TestCase):
     def start(self, name, priority='normal', code=None, wait='40'):
         count = self.state()['next']
         code = code or f"from pathlib import Path; p=Path({str(self.root / 'order')!r}); f=p.open('a'); f.write({name!r}+'\\n'); f.close()"
-        child = subprocess.Popen([str(WRAPPER), '--priority', priority, '--wait', wait,
+        command = [str(WRAPPER)]
+        if hasattr(self, 'scheduler_clock_origin'):
+            # Keep a shared positive clock epoch even on freshly booted CI VMs.
+            # Elapsed time and sleep remain real; only this fixture's epoch moves.
+            helper = WRAPPER.with_name('heavy-test-admission.py')
+            bootstrap = (
+                'import runpy,sys,time; real_monotonic=time.monotonic; '
+                f'time.monotonic=lambda:1000+real_monotonic()-{self.scheduler_clock_origin!r}; '
+                f'sys.argv=[{str(helper)!r}]+sys.argv[1:]; '
+                'runpy.run_path(sys.argv[0],run_name="__main__")'
+            )
+            command = [sys.executable, '-c', bootstrap]
+        child = subprocess.Popen(command + ['--priority', priority, '--wait', wait,
                                   '--', sys.executable, '-c', code], env=self.env,
                                  start_new_session=True)
         self.children.append(child)
@@ -84,6 +96,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.order(), ['final1', 'final2', 'normal1', 'normal2'])
 
     def test_aged_waiter_cannot_be_overtaken_by_new_finals(self):
+        self.scheduler_clock_origin = time.monotonic()
         normal = self.start('normal')
         first_final = self.start('final1', 'final')
         # Advance only this fixture's normal registration age, under the same
@@ -94,6 +107,7 @@ class AdmissionTests(unittest.TestCase):
             for row in state['active'].values():
                 if row['priority'] == 'normal':
                     row['created'] -= 301
+                    self.assertGreaterEqual(row['created'], 0)
             staging = self.root / 'fifo-state.next'
             staging.write_text(json.dumps(state))
             os.replace(staging, self.root / 'fifo-state.json')
