@@ -1,3 +1,4 @@
+import { insertSessionObservation, observedHubTagMatches, observationModel } from './session-observation';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
 import { IntakeWorktrees } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
@@ -1030,7 +1031,7 @@ export class SessionControlService {
       stall_threshold: stallThreshold(this.options.env), lifecycle_state: row.state,
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
-      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? null,
+      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? request.model ?? null,
       expected_cpu_cores:expectedCpu?.expected_cpu_cores ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_cores ?? null,
       expected_cpu_source:expectedCpu?.expected_cpu_source ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_source ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
@@ -2413,8 +2414,14 @@ export class SessionControlService {
             } catch {}
           }
         }
+        if (!session && sub !== 'binding' && sub !== 'retirement') {
+          const matches = observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller));
+          if (matches.length > 1) return response({error:'ambiguous_session_prefix'}, 409);
+          session = matches[0] ?? null;
+        }
       } else if (/^[a-f0-9][a-f0-9-]{7,34}$/i.test(rawRef) && sub !== 'binding' && sub !== 'retirement') {
-        const matches = visibleSessionPrefixMatches(this.sql, rawRef, row => this.ownerOk(row, caller));
+        const matches = [...new Map([...visibleSessionPrefixMatches(this.sql, rawRef, row => this.ownerOk(row, caller)),
+          ...observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller))].map(row => [row.id, row])).values()];
         if (matches.length > 1) return response({ error: 'ambiguous_session_prefix',
           matches: matches.map(row => ({ id: row.id, name: parsed(row.request_json, {}).name ?? null })) }, 409);
         session = matches[0] ?? null;
@@ -3701,29 +3708,28 @@ export function adoptObservedNativeSessions(
     const parentSource = parentId ? 'inferred' : 'unknown_external';
 
     if (!existing) {
-      // A census is observation, never authenticated ownership or authority
-      // to lock another user's checkout. Fleet-owned sessions reconcile via
-      // host-bindings, where the host verifies the exact native/repository
-      // tuple and locks before the canonical binding is accepted. There is
-      // currently no equivalent ownership witness for a new observed native.
-      // Keep it visible in fleet_sessions, but defer the ownership transition.
-      // Caller labels, tags and even an admin adoption request cannot bypass.
-      deferred++;
-      const alertTable = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='liveness_alerts'").toArray().length;
-      const alerts = new LivenessService(sql, undefined, () => nowMs);
-      if (!alertTable) alerts.init();
-      // An unchanged complete catalog must not rewrite every deferred native
-      // on every heartbeat. One unresolved durable alert is sufficient.
-      if (sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='session_adoption' AND subject=? AND resolved_at IS NULL", machineId + '/' + nativeId).toArray().length) continue;
-      alerts.setAlert('session_adoption', machineId + '/' + nativeId, {
-        state: 'needs_attention',
-        detail: JSON.stringify({ reason: 'adoption_ownership_lock_unverified',
-          native_id: nativeId, machine_id: machineId,
-          required: 'authenticated Hub ownership and exact host native/repository worktree lock receipt' }),
-      });
-      continue;
+      // Visibility is independent of operator custody and filesystem locks.
+      insertSessionObservation(sql, machineId, s, state, resolvedFamily, nowMs);
+      adopted++;
+      if (sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='liveness_alerts'").toArray().length) {
+        new LivenessService(sql, undefined, () => nowMs).setAlert('session_adoption', machineId + '/' + nativeId, null);
+      }
     } else {
+      // A census must not mutate another host, incarnation, or canonical intent.
+      const binding = parsed(existing.binding_json, {});
+      if (existing.machine_id !== machineId || binding.provenance !== 'observed_native' ||
+          binding.native_id !== nativeId || binding.tag !== tag || binding.workspace !== workspace ||
+          binding.native_created_at_ms !== createdAtMs || existing.engine !== s.engine) {
+        deferred++;
+        continue;
+      }
       refreshObservedHostFamily(sql, machineId, existing, s, resolvedFamily);
+      const request = parsed(existing.request_json, {});
+      const model = observationModel(s.model);
+      if (model && request.model !== model) {
+        sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', JSON.stringify({...request,model}),nativeId);
+      }
+
       // Update existing adopted session if state or phase changed
       let shouldUpdate = false;
       let nextState = existing.state;

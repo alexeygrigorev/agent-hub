@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { insertSessionObservation, observedHubTagMatches } from '../src/session-observation';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService, adoptObservedNativeSessions } from '../src/session_control';
 import { historyReferencesSession, linkedIntake, openWorkPreventsIdleReap } from '../src/intake-session';
@@ -46,12 +47,65 @@ describe('idle with open acceptance criteria', () => {
     expect(historyReferencesSession({history:[{kind:'note',text:'RCA: ' + id}]}, {id:'canonical'}, binding)).toBe(false);
     expect(historyReferencesSession({history:[{kind:'note',text:'START: test-goal-extra'}]}, {}, binding)).toBe(false);
   });
+  it('publishes a census identity with no owner or lock and resolves only visible unambiguous tag aliases', async () => fixture(async ({sql,sc}: any) => {
+    const native = {native_id:'55555555-5555-4555-8555-555555555555',
+      tag:'hub-988b8d49-cacf-4a5e-900c-a214a6402808',workspace:'/test-native',engine:'zcodex',
+      model:'glm-5.3-flash',created_at_ms:at-1000,owner:'operator',worktree_locked:true};
+    insertSessionObservation(sql,'idle-host',native,'running','host-family',at);
+    const observation = sql.exec('SELECT * FROM session_control_sessions WHERE id=?',native.native_id).toArray()[0];
+    expect(observation).toMatchObject({actor:'unknown',owner_token_id:null,owner_family:null,machine_id:'idle-host',state:'running'});
+    expect(JSON.parse(observation.request_json)).toMatchObject({observation_only:true,model:'glm-5.3-flash'});
+    expect(JSON.parse(observation.binding_json).adoption_lock).toBeUndefined();
+    expect(observedHubTagMatches(sql,'988b8d49',()=>true).map(r=>r.id)).toEqual([native.native_id]);
+    expect(observedHubTagMatches(sql,'988b8d49',()=>false)).toEqual([]);
+    for (const ref of ['988b8d49','988b8d49-cacf-4a5e-900c-a214a6402808']) {
+      const result = await sc.handle(new Request('https://hub/api/sessions/' + ref), auth);
+      expect(result.status).toBe(200);
+      expect(await result.json()).toMatchObject({id:native.native_id,model:'glm-5.3-flash'});
+    }
+    insertSessionObservation(sql,'idle-host',{...native,native_id:'66666666-6666-4666-8666-666666666666'},'running','host-family',at);
+    expect(observedHubTagMatches(sql,'988b8d49',()=>true)).toHaveLength(2);
+    expect((await sc.handle(new Request('https://hub/api/sessions/988b8d49'),auth)).status).toBe(409);
+  }));
+  it('reconciles exact census incarnations and ignores foreign or replaced identities', async () => fixture(async ({sql}: any) => {
+    const native = {native_id:'77777777-7777-4777-8777-777777777777',tag:'manual-worker',workspace:'/manual',engine:'zcodex',created_at_ms:at-1000,phase:'running'};
+    expect(adoptObservedNativeSessions(sql,'idle-host',[native],at).adopted).toBe(1);
+    const read=()=>sql.exec('SELECT state FROM session_control_sessions WHERE id=?',native.native_id).toArray()[0].state;
+    for (const [machine,change] of [['foreign-host',{}],['idle-host',{created_at_ms:at}],['idle-host',{workspace:'/elsewhere'}]] as const) {
+      adoptObservedNativeSessions(sql,machine,[{...native,...change,phase:'exited',confirmed_exit:true}],at+1000);
+      expect(read()).toBe('running');
+    }
+    adoptObservedNativeSessions(sql,'idle-host',[{...native,phase:'exited',confirmed_exit:false}],at+1000);
+    expect(read()).toBe('uncertain');
+    adoptObservedNativeSessions(sql,'idle-host',[{...native,phase:'exited',confirmed_exit:true}],at+2000);
+    expect(read()).toBe('stopped');
+    adoptObservedNativeSessions(sql,'idle-host',[native],at+3000);
+    expect(read()).toBe('stopped');
+  }));
+  it('upgrades a visibility-only census row only after an exact operator host receipt', async () => fixture(async ({sql,row}: any) => {
+    const current = row();
+    const binding = { ...JSON.parse(current.binding_json), provenance: 'observed_native' };
+    sql.exec("UPDATE session_control_sessions SET actor='unknown',request_json=?,binding_json=? WHERE id=?",
+      JSON.stringify({provenance:'observed_native',observation_only:true,workspace:'/test'}), JSON.stringify(binding), id);
+    const native = {native_id:id,tag:binding.tag,workspace:binding.workspace,engine:'codex',created_at_ms:binding.native_created_at_ms};
+    expect(queueOperatorAdoptions(sql,'idle-host',[native],'operator',null,at).queued).toBe(1);
+    expect(row().actor).toBe('unknown');
+    const adoption = pendingOperatorAdoptions(sql,'idle-host',at)[0];
+    const receipt = {id:adoption.id,native,lock_verified:true,worktree:false};
+    expect(completeOperatorAdoption(sql,'idle-host',{...receipt,lock_verified:false},at,'host-family').ok).toBe(false);
+    expect(completeOperatorAdoption(sql,'idle-host',{...receipt,native:{...native,created_at_ms:1}},at,'host-family').ok).toBe(false);
+    expect(row().actor).toBe('unknown');
+    expect(completeOperatorAdoption(sql,'idle-host',receipt,at,'host-family').ok).toBe(true);
+    expect(row().actor).toBe('operator');
+    expect(JSON.parse(row().request_json).observation_only).toBe(false);
+    expect(JSON.parse(row().binding_json).adoption_intent_id).toBe(adoption.id);
+    expect(completeOperatorAdoption(sql,'idle-host',receipt,at,'host-family')).toMatchObject({ok:true,replay:true});
+  }));
   it('persists late START-note linkage for an adopted native session', async () => fixture(async ({sql,task}: any) => {
     const nativeId='44444444-4444-4444-8444-444444444444';
     const native={native_id:nativeId,tag:'backup-goal',workspace:'/backup',engine:'codex',phase:'running',created_at_ms:at-10000};
-    // Census alone must defer new ownership; use main's explicit operator
-    // intent and exact host receipt before testing late-link reconciliation.
-    expect(adoptObservedNativeSessions(sql,'idle-host',[native],at,'host-family').deferred).toBe(1);
+    // Visibility comes first; explicit ownership still requires the host receipt.
+    expect(adoptObservedNativeSessions(sql,'idle-host',[native],at,'host-family').adopted).toBe(1);
     sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,workspace,engine,phase,observed_at,created_at_ms)
       VALUES('idle-host',?,'backup-goal','/backup','codex','running',?,?)`,nativeId,new Date(at).toISOString(),native.created_at_ms);
     expect(queueOperatorAdoptions(sql,'idle-host',[native],'operator',null,at).queued).toBe(1);

@@ -15,6 +15,19 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const tuple = (s: any) => [s?.native_id, s?.tag, s?.workspace, s?.engine, s?.created_at_ms];
 const same = (a: any, b: any) => JSON.stringify(tuple(a)) === JSON.stringify(tuple(b));
 
+/** A census row is visibility only. It has no authenticated owner or lock. */
+function observationOnly(row: any, machine: string, native: any): boolean {
+  if (!row || row.machine_id !== machine || row.actor !== 'unknown' || row.fleet_launch_id ||
+      row.owner_token_id || row.owner_family) return false;
+  try {
+    const request = JSON.parse(row.request_json);
+    const binding = JSON.parse(row.binding_json);
+    return request.observation_only === true && binding.provenance === 'observed_native' &&
+      !binding.adoption_intent_id && !binding.adoption_lock && same({ ...binding,
+        created_at_ms: binding.native_created_at_ms, engine: row.engine }, native);
+  } catch { return false; }
+}
+
 function observed(sql: SqlStorage, machine: string, input: any, now: number): any | null {
   if (!input || typeof input.native_id !== 'string' || !uuid.test(input.native_id)) return null;
   const row: any = sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', machine, input.native_id).toArray()[0];
@@ -35,7 +48,8 @@ export function queueOperatorAdoptions(sql: SqlStorage, machine: string, inputs:
   for (const input of inputs) {
     // Existing canonical sessions, including protected humans, never acquire
     // a new lock merely because an operator repeats an adoption request.
-    if (typeof input?.native_id === 'string' && sql.exec('SELECT id FROM session_control_sessions WHERE id=?', input.native_id).toArray().length) {
+    const canonical: any = typeof input?.native_id === 'string' && sql.exec('SELECT * FROM session_control_sessions WHERE id=?', input.native_id).toArray()[0];
+    if (canonical && !observationOnly(canonical, machine, input)) {
       existing++; continue;
     }
     const row = observed(sql, machine, input, now);
@@ -51,7 +65,7 @@ export function queueOperatorAdoptions(sql: SqlStorage, machine: string, inputs:
     const native = { native_id: row.native_id, tag: row.tag, workspace: row.workspace,
       cwd: row.cwd, engine: row.engine, created_at_ms: row.created_at_ms, phase: row.phase };
     const intake = openWorktreeIntake(sql, { id: row.native_id, machine_id: machine,
-      request_json: '{}', binding_json: JSON.stringify(native) }, worktreeLinks);
+      request_json: canonical?.request_json || '{}', binding_json: JSON.stringify(native) }, worktreeLinks);
     sql.exec("INSERT INTO session_adoption_intents VALUES (?,?,?,?,?,?,?,'pending',?)",
       crypto.randomUUID(), machine, row.native_id, JSON.stringify(native), actor, token, intake, new Date(now).toISOString());
     queued++;
@@ -88,7 +102,8 @@ export function completeOperatorAdoption(sql: SqlStorage, machine: string, input
     const owner: any = sql.exec('SELECT revoked_at,expires_at FROM credentials WHERE id=?', intent.owner_token_id).toArray()[0];
     if (!owner || owner.revoked_at || !(Date.parse(owner.expires_at) > now)) return { ok: false, error: 'adoption_owner_revoked' };
   }
-  if (sql.exec('SELECT id FROM session_control_sessions WHERE id=?', intent.native_id).toArray().length ||
+  const canonical: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', intent.native_id).toArray()[0];
+  if ((canonical && !observationOnly(canonical, machine, input.native)) ||
       sql.exec('SELECT id FROM fleet_launches WHERE machine_id=? AND native_id=?', machine, intent.native_id).toArray().length) return { ok: false, error: 'adoption_identity_conflict' };
   const native = JSON.parse(intent.native_json);
   const receipt = input.repository;
@@ -102,7 +117,11 @@ export function completeOperatorAdoption(sql: SqlStorage, machine: string, input
     native_created_at_ms: native.created_at_ms, generation: 1, provenance: 'observed_native',
     adopted_at: at, adoption_intent_id: intent.id, adoption_lock: input.worktree !== false,
     lock_path: input.lock_path, repository: receipt };
-  sql.exec(`INSERT INTO session_control_sessions
+  if (canonical) {
+    sql.exec(`UPDATE session_control_sessions SET actor=?,request_json=?,binding_json=?,owner_token_id=?,
+      host_family=?,updated_at=? WHERE id=?`, intent.actor, JSON.stringify({ ...JSON.parse(canonical.request_json),
+        ...request, observation_only: false }), JSON.stringify(binding), intent.owner_token_id, hostFamily, at, native.native_id);
+  } else sql.exec(`INSERT INTO session_control_sessions
     (id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,session_type,
      owner_token_id,host_family,created_at,updated_at)
     VALUES (?,?,?,?,?,?,'interactive','running',?,'aplexer',?,?,?,?)`,
