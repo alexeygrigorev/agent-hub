@@ -24,6 +24,15 @@
 #      ALERT_OPS_TO only. Re-run without the flag to clear.
 #   3. --dry-run / --no-mail / --check-only still send nothing.
 #
+# Same-run failure page (intake e27e0f9d): hub-db-backup.sh calls
+#   hub-db-backup-staleness.sh --backup-failed "<reason>" [--drill]
+# on any non-zero exit. It mails "[FAIL] Hub DB backup run failed" with the
+# reason and the newest surviving export to ALERT_TO immediately (no 26h/36h
+# wait, no dedupe: the job runs once a day), honoring the test-path guard;
+# --drill (HUB_DB_BACKUP_FAIL_DRILL=1 in the backup script) routes it to
+# ALERT_OPS_TO only. It never reads or writes the staleness state file.
+# Exit 0 after the attempt.
+#
 # Exit codes: 0 fresh, 2 stale (mail attempted unless --no-mail / DRY_RUN=1),
 # 1 on usage/config error. --dry-run prints what would happen without mailing.
 # State dir dedupes repeat pages: at most one mail per ALERT_REPEAT_HOURS
@@ -59,13 +68,20 @@ DRY_RUN="${DRY_RUN:-0}"
 HUB_DB_STALE_DRILL="${HUB_DB_STALE_DRILL:-0}"
 
 NO_MAIL=0
+BACKUP_FAILED=0
+BACKUP_FAILED_REASON=""
+FAIL_DRILL=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --backup-failed)
+      [[ $# -ge 2 ]] || { echo "--backup-failed needs a reason" >&2; exit 1; }
+      BACKUP_FAILED=1; BACKUP_FAILED_REASON="$2"; shift 2 ;;
+    --drill) FAIL_DRILL=1; shift ;;
     --no-mail) NO_MAIL=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --check-only) NO_MAIL=1; DRY_RUN=1; shift ;;
     -h|--help)
-      echo "Usage: hub-db-backup-staleness.sh [--no-mail] [--dry-run] [--check-only]"
+      echo "Usage: hub-db-backup-staleness.sh [--no-mail] [--dry-run] [--check-only] [--backup-failed REASON [--drill]]"
       exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -206,6 +222,35 @@ send_mail() {
 
 if [[ "$TEST_PATH_GUARD" -eq 1 ]]; then
   log "GUARD: test paths in BACKUP_DIR/STORAGEBOX_DIR/STATE_DIR — all mail routes to ${ALERT_OPS_TO} only (9806fc14)"
+fi
+
+if [[ "$BACKUP_FAILED" -eq 1 ]]; then
+  # Keep the reason to one bounded line (it reaches a mail subject/body).
+  BACKUP_FAILED_REASON="$(printf '%s' "$BACKUP_FAILED_REASON" | tr -d '\r' | tr '\n' ' ' | cut -c1-400)"
+  if [[ "$AGE_S" -lt 0 ]]; then
+    LAST_GOOD="none found"
+  else
+    LAST_GOOD="${NEWEST_PATH} (age ~$(( AGE_S / 3600 ))h)"
+  fi
+  FAIL_TO="$(effective_to)"
+  SUBJECT_PREFIX="[FAIL]"
+  if [[ "$FAIL_DRILL" -eq 1 ]]; then
+    FAIL_TO="$ALERT_OPS_TO"
+    SUBJECT_PREFIX="[FAIL][DRILL]"
+  fi
+  log "BACKUP_FAILED reason='${BACKUP_FAILED_REASON}' last_good=${LAST_GOOD} drill=${FAIL_DRILL}"
+  if [[ "$DRY_RUN" -eq 1 || "$NO_MAIL" -eq 1 ]]; then
+    log "would-alert backup-failed to=${FAIL_TO} (mail suppressed by flag)"
+    exit 0
+  fi
+  send_mail "${SUBJECT_PREFIX} Hub DB backup run failed on $(hostname)" \
+"Hub DB backup run FAILED $(date -u '+%Y-%m-%dT%H:%M:%SZ') on $(hostname).
+Reason: ${BACKUP_FAILED_REASON}
+Last good export: ${LAST_GOOD}
+Log: /var/log/hub-db-backup.log
+Rerun: /usr/local/sbin/hub-db-backup.sh (read-only on the Hub DB); see docs/HUB-DB-BACKUP.md." \
+  "$FAIL_TO"
+  exit 0
 fi
 
 if [[ "$HUB_DB_STALE_DRILL" == "1" ]]; then

@@ -66,17 +66,30 @@ giant JSON string cannot name the failing table), the script fetches
    or process argv (`ps aux`).
 2. `GET /api/backup/status` (table inventory + counts), then
    `GET /api/backup/export?schema=1` (full DDL, no rows).
-3. Per table: `GET /api/backup/export?table=X&offset=N&limit=M`
-   (`CHUNK_ROWS`, default 500, endpoint caps at 5000) until a short page.
-   Chunked reads share a generous per-caller budget (2000/hour); the
-   unbounded full dump keeps the tight 30/hour budget.
+3. Per table, until a short page (`CHUNK_ROWS`, default 500, endpoint caps
+   at 5000):
+   - rowid tables on API v5+: keyset
+     `GET /api/backup/export?table=X&after=<rowid>&limit=M` (rowid order;
+     the response carries `cursor:"rowid"`, `after`, `next_after`). Inserts
+     land after the cursor and deletes never shift unread rows, so a hot
+     table can neither skip nor duplicate rows across chunks.
+   - `WITHOUT ROWID` tables (listed in status `without_rowid`) and API v4
+     servers: `GET /api/backup/export?table=X&offset=N&limit=M` (ordered:
+     `ORDER BY rowid`, or primary-key order for WITHOUT ROWID).
+   Each table is then checked against **its own read**: assembled rows vs
+   the `total` (COUNT(*)) of its final chunk, within `max(10, 2%)`. A miss
+   re-reads that table, up to `TABLE_ATTEMPTS` (default 3); only persistent
+   drift fails the run. Chunked reads share a generous per-caller budget
+   (2000/hour); the unbounded full dump keeps the tight 30/hour budget.
 4. Assembles the canonical export document (same shape as the monolithic
    endpoint) and validates: `snapshot == hub-do-sqlite`, every table
    present exactly once, per-table DDL matches the schema dump, core tables
    (`intake_tasks`, `session_control_sessions`, `claims`, `audit`) exist,
-   `backup_rate`/`sqlite_%`/`_cf_%` absent, `value_markers` shape, and row
-   counts within `max(10 rows, 2%)` of a post-read status (hot-table drift
-   across chunks is expected; larger drift fails the run for cron to retry).
+   `backup_rate`/`sqlite_%`/`_cf_%` absent, `value_markers` shape, keyset
+   cursor continuity (`after` == previous `next_after`, strictly
+   increasing), and each table's count within `max(10, 2%)` of its own
+   final-chunk COUNT(*). The post-read status is a presence check only
+   (see the 2026-10-29 incident below).
 5. `gzip -c`, `chmod 600`, stores to both trees:
    - `BACKUP_DIR/YYYY/MM/DD/hub-do-<STAMP>.json.gz` (Hetzner local)
    - `STORAGEBOX_DIR/YYYY/MM/DD/hub-do-<STAMP>.json.gz` (Storagebox sshfs mirror)
@@ -85,6 +98,30 @@ giant JSON string cannot name the failing table), the script fetches
    `RETENTION_DAYS` default 30, enforced `>= 30` — the script fails closed
    otherwise. Temp files live under absolute `$TMPDIR` (default
    `/var/lib/hub-db-backup/tmp`, never `/tmp`), created 700.
+
+7. Any non-zero exit pages on the same run (section 3, "Same-run failure
+   alert").
+
+### 2026-10-29 incident (intake e27e0f9d)
+
+The 04:20 run failed with `row drift too large
+table=session_control_commands assembled=1710 post=1748 bound=34`. The
+table was read completely at 03:20:47 (1710 rows, matching its COUNT(*));
+at 03:20:57 a burst of `capture` session-control commands (~8/s) started,
+and the run-wide post status at ~03:21:02 counted 1748. The 38 rows were
+appended after the table had been read, so nothing was lost, but the old
+validation compared every table with that later post status, and 38 > the
+2% bound (34). Hot tables could fail any night a burst landed in the
+seconds between a table's read and the end of the run. Separately, the
+unordered `LIMIT/OFFSET` paging could silently skip a row whenever rows were
+deleted from an already-read range mid-table, and the drift bound would
+have hidden that. Fix: keyset paging, per-table validation against the
+table's own COUNT(*), bounded per-table retry, same-run failure alert.
+Regression tests: `test/backup.test.ts` (keyset vs offset under churn) and
+`host/tests/test_hub_db_backup_script.py` (replays the 10-29 pattern
+against the real script with a fake Hub; also row loss, retry, v4 fallback,
+alert and drill). The failed run's assembled count is reproduced exactly by
+the old script in that test.
 
 S3 (`dtc-coolify-backups` under a new prefix) is intentionally NOT used:
 the existing `coolify-s3-backup-writer` credential is scoped to `coolify/*`
@@ -118,6 +155,26 @@ both trees decides; missing dir or zero exports counts as stale.
   fallback): the default account's sandbox identity is SES-denied for
   `noreply@datatalks.club` (554), while `ses` delivers it (250 Ok in the
   msmtp log). Repeat pages deduped to one per 24h.
+
+### Same-run failure alert (intake e27e0f9d)
+
+`hub-db-backup.sh` traps EXIT: any non-zero exit (config, fetch, drift,
+validation, store) runs `ALERT_CMD` (default: the sibling
+`hub-db-backup-staleness.sh --backup-failed "<reason>"`), which mails
+`[FAIL] Hub DB backup run failed on <host>` to `ALERT_TO` right away, with
+the reason (table names and counts only) and the newest surviving export.
+No 36h wait and no dedupe (the job runs once a day); the test-path guard
+still applies, and it never touches the staleness state file. Disable only
+for local experiments with `ALERT_ON_FAIL=0`.
+
+Drill: `HUB_DB_BACKUP_FAIL_DRILL=1` makes the backup script fail at once
+(no Hub request) and passes `--drill`, so the mail
+(`[FAIL][DRILL] ...`) goes to `ALERT_OPS_TO` only:
+
+```bash
+sudo -u alexey HUB_DB_BACKUP_FAIL_DRILL=1 /usr/local/sbin/hub-db-backup.sh; echo $?   # expect 1
+tail -n 3 /var/log/hub-db-backup.log ~/.msmtp.log 2>/dev/null
+```
 
 ### Mail hygiene (intake 9806fc14)
 
@@ -161,6 +218,24 @@ real backup dirs outside `/tmp` and no `--dry-run`/`--no-mail` flag.
 
 Goal: prove the latest export loads locally and row counts match live
 within expected drift. Nothing is written back to prod.
+
+Scripted drill (intake e27e0f9d), throwaway SQLite under
+`~/.local/hub-db-restore-drill/drill-<stamp>/`: replays tables, loads every
+row (bigint/blob markers decoded), then indexes/triggers/views, runs
+`PRAGMA integrity_check`, and compares each table with the export
+(`row_counts`, must be equal) and live `/api/backup/status` (drift reported):
+
+```bash
+python3 scripts/hub-db-restore-drill.py            # newest export
+python3 scripts/hub-db-restore-drill.py FILE.json.gz --no-live
+# expect: integrity_check ok, ddl_errors=0, 145/145 equal, RESTORE_DRILL OK
+```
+
+2026-10-29 result (export `hub-do-20261029T0522+0100.json.gz`): 145/145
+tables equal, 82228 rows, integrity ok; `intake_tasks` 764 and
+`session_control_sessions` 4110 equal to live.
+
+Manual equivalent:
 
 ```bash
 LATEST=$(ls -t /var/backups/hub-do/*/*/*/hub-do-*.json.gz \

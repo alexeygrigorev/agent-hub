@@ -48,7 +48,10 @@ const CHUNK_DEFAULT_ROWS = 500;
 // Backup export API version. Bump on any BackupService behavior change so
 // operators can tell which code a live (possibly long-lived) DO isolate is
 // actually executing: it is reported by /api/backup/status.
-const BACKUP_API_VERSION = 4;
+// v5 (intake e27e0f9d): keyset chunk cursor (?after=<rowid>) ordered by
+// rowid, ORDER BY rowid on offset reads, and status lists WITHOUT ROWID
+// tables (those keep stable PK-ordered offset paging).
+const BACKUP_API_VERSION = 5;
 
 // DO memory is 128 MiB; materializing every table into JS objects peaks at
 // ~2-3x the JSON size. Fail closed well below that ceiling.
@@ -69,6 +72,13 @@ const SCHEMA_OBJECT_WHERE =
   " AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND sql IS NOT NULL";
 
 export class ExportTooLarge extends Error {}
+
+// Synthetic cursor column for keyset chunk reads; stripped from every row.
+const ROWID_COL = '__hub_backup_rowid';
+
+function isWithoutRowid(ddl: string): boolean {
+  return /\bWITHOUT\s+ROWID\b/i.test(ddl);
+}
 
 export class ExportStageError extends Error {
   constructor(readonly stage: string, readonly table?: string) {
@@ -181,13 +191,25 @@ export class BackupService {
 
   /** Chunked per-table read: bounded rows per request so giant tables (and
    * giant exports) never exceed DO memory. Each chunk is internally
-   * consistent (single transaction); cross-chunk drift is possible on hot
-   * tables and verified tolerant by the backup script. */
-  private tableChunk(table: string, offset: number, limit: number): {
+   * consistent (single transaction).
+   *
+   * Cursor modes (intake e27e0f9d):
+   * - keyset (`after` set, rowid tables only): rows with rowid > after in
+   *   rowid order; `next_after` is the last rowid served. Concurrent inserts
+   *   land after the cursor and deletes never shift unread rows, so a hot
+   *   table can neither skip nor duplicate rows across chunks.
+   * - offset (legacy): ORDER BY rowid for rowid tables (WITHOUT ROWID tables
+   *   scan in primary-key order). A delete in an already-read range shifts
+   *   later rows down and can skip one, which is why the backup script uses
+   *   keyset whenever the table supports it and re-reads on drift. */
+  private tableChunk(table: string, cursor: { offset: number } | { after: number }, limit: number): {
     exported_at: string;
     snapshot: string;
     table: string;
-    offset: number;
+    offset?: number;
+    after?: number;
+    next_after?: number | null;
+    cursor: 'offset' | 'rowid';
     limit: number;
     total: number;
     ddl: string;
@@ -198,22 +220,49 @@ export class BackupService {
       const names = new Set(this.userTables().map(t => String(t.name)));
       if (!names.has(table)) throw new ExportStageError('table', table);
       const total = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM ${quoteIdent(table)}`).one() as any).n);
-      if (!Number.isInteger(offset) || !Number.isInteger(limit) || offset < 0 || limit < 1 || limit > CHUNK_MAX_ROWS || offset > total) {
+      if (!Number.isInteger(limit) || limit < 1 || limit > CHUNK_MAX_ROWS) {
         throw new ExportStageError('range', table);
       }
       const ddlRow = (this.schemaObjects().filter(t => String(t.name) === table)[0] as any);
       const ddl = String(ddlRow?.sql || '');
+      const withoutRowid = isWithoutRowid(ddl);
+      const keyset = 'after' in cursor;
+      if (keyset) {
+        if (!Number.isSafeInteger(cursor.after)) throw new ExportStageError('range', table);
+        if (withoutRowid) throw new ExportStageError('keyset', table);
+      } else if (!Number.isInteger(cursor.offset) || cursor.offset < 0 || cursor.offset > total) {
+        throw new ExportStageError('range', table);
+      }
+      const q = quoteIdent(table);
       let rows: any[];
       try {
-        rows = this.sql.exec(`SELECT * FROM ${quoteIdent(table)} LIMIT ? OFFSET ?`, limit, offset).toArray() as any[];
+        if (keyset) {
+          rows = this.sql.exec(
+            `SELECT _rowid_ AS ${ROWID_COL}, * FROM ${q} WHERE _rowid_ > ? ORDER BY _rowid_ LIMIT ?`,
+            (cursor as { after: number }).after, limit).toArray() as any[];
+        } else {
+          const order = withoutRowid ? '' : ' ORDER BY _rowid_';
+          rows = this.sql.exec(`SELECT * FROM ${q}${order} LIMIT ? OFFSET ?`,
+            limit, (cursor as { offset: number }).offset).toArray() as any[];
+        }
       } catch (err) {
         throw new ExportStageError('export', table);
       }
+      let nextAfter: number | null = null;
+      if (keyset) {
+        for (const row of rows) {
+          nextAfter = Number(row[ROWID_COL]);
+          delete row[ROWID_COL];
+        }
+      }
       const stats = { bigint: 0, blob: 0, unreadable: 0 };
       const clean = this.sanitizeRows(table, rows, stats);
+      const position = keyset
+        ? { cursor: 'rowid' as const, after: (cursor as { after: number }).after, next_after: nextAfter }
+        : { cursor: 'offset' as const, offset: (cursor as { offset: number }).offset };
       return {
         exported_at: new Date().toISOString(), snapshot: 'hub-do-sqlite',
-        table, offset, limit, total, ddl, rows: clean, value_markers: stats,
+        table, ...position, limit, total, ddl, rows: clean, value_markers: stats,
       };
     });
   }
@@ -313,10 +362,11 @@ export class BackupService {
     }
   }
 
-  private snapshot(): { exported_at: string; tables: string[]; row_counts: Record<string, number>; api_version: number } {
+  private snapshot(): { exported_at: string; tables: string[]; row_counts: Record<string, number>; without_rowid: string[]; api_version: number } {
     return this.tx(() => {
       const names: string[] = [];
       const counts: Record<string, number> = {};
+      const withoutRowid: string[] = [];
       let tables: { name: string; sql: string }[];
       try {
         tables = this.userTables();
@@ -327,12 +377,13 @@ export class BackupService {
         const name = String(t.name);
         try {
           names.push(name);
+          if (isWithoutRowid(String(t.sql || ''))) withoutRowid.push(name);
           counts[name] = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`).one() as any).n);
         } catch (err) {
           throw new ExportStageError('snapshot', name);
         }
       }
-      return { exported_at: new Date().toISOString(), tables: names, row_counts: counts, api_version: BACKUP_API_VERSION };
+      return { exported_at: new Date().toISOString(), tables: names, row_counts: counts, without_rowid: withoutRowid, api_version: BACKUP_API_VERSION };
     });
   }
 
@@ -414,13 +465,23 @@ export class BackupService {
               { headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
           }
           const table = String(tableParam);
-          const offset = Number(url.searchParams.get('offset') ?? '0');
+          const afterParam = url.searchParams.get('after');
+          const offsetParam = url.searchParams.get('offset');
           const limit = Number(url.searchParams.get('limit') ?? String(CHUNK_DEFAULT_ROWS));
           if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
             return Response.json({ error: 'invalid_table' }, { status: 400 });
           }
+          if (afterParam !== null && offsetParam !== null) {
+            return Response.json({ error: 'invalid_combination' }, { status: 400 });
+          }
+          if (afterParam !== null && !/^-?[0-9]{1,16}$/.test(afterParam)) {
+            return Response.json({ error: 'invalid_range' }, { status: 400 });
+          }
+          const cursor = afterParam !== null
+            ? { after: Number(afterParam) }
+            : { offset: Number(offsetParam ?? '0') };
           try {
-            return Response.json(this.tableChunk(table, offset, limit),
+            return Response.json(this.tableChunk(table, cursor, limit),
               { headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
           } catch (err) {
             if (err instanceof ExportStageError && err.stage === 'table') {
@@ -428,6 +489,9 @@ export class BackupService {
             }
             if (err instanceof ExportStageError && err.stage === 'range') {
               return Response.json({ error: 'invalid_range' }, { status: 400 });
+            }
+            if (err instanceof ExportStageError && err.stage === 'keyset') {
+              return Response.json({ error: 'keyset_unsupported' }, { status: 400 });
             }
             throw err;
           }

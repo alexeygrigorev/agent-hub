@@ -120,8 +120,11 @@ describe('Hub DB backup export', () => {
     const body = await res.json() as any;
     const expected = await listTables(name);
     expect(body.tables).toEqual(expected);
-    expect(body.api_version).toBe(4);
+    expect(body.api_version).toBe(5);
     expect(Object.keys(body.row_counts).sort()).toEqual(expected);
+    // WITHOUT ROWID tables are listed so the script pages them by offset.
+    expect(body.without_rowid).toContain('token_hours_posted');
+    for (const t of body.without_rowid) expect(expected).toContain(t);
     expect(body).not.toHaveProperty('schema');
   });
 
@@ -239,6 +242,71 @@ describe('Hub DB backup export', () => {
     expect((await call(s, '/api/backup/export?schema=1&table=chunk_probe', headers)).status).toBe(400);
     expect((await call(s, '/api/backup/export?schema=yes', headers)).status).toBe(400);
     expect((await call(s, '/api/backup/export?table=chunk_probe&offset=0&limit=3', headers, 'POST')).status).toBe(405);
+  });
+
+  // Regression (intake e27e0f9d, 2026-10-29 nightly failure): a hot table
+  // mutating between chunk reads must neither skip nor duplicate rows.
+  // Offset paging shifts unread rows down when already-read rows are
+  // deleted (silent skip); the rowid keyset cursor does not.
+  it('keyset cursor never skips or duplicates rows on a hot table', async () => {
+    const name = 'backup-keyset-' + crypto.randomUUID();
+    const token = 'synthetic_operator_backup_keyset_0123456789';
+    await configureOperator(name, token);
+    const s = stub(name);
+    const headers = { Authorization: 'Bearer ' + token };
+    const seed = async (table: string) => runInDurableObject(stub(name), async (hub: Hub) => {
+      hub.sql.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT NOT NULL)`);
+      for (let i = 0; i < 7; i++) hub.sql.exec(`INSERT INTO ${table}(id, v) VALUES(?, ?)`, 'k' + i, 'row-' + i);
+    });
+    // Between page 1 and page 2: prune two already-read rows and append a burst.
+    const churn = async (table: string) => runInDurableObject(stub(name), async (hub: Hub) => {
+      hub.sql.exec(`DELETE FROM ${table} WHERE id IN ('k0', 'k1')`);
+      for (let i = 7; i < 10; i++) hub.sql.exec(`INSERT INTO ${table}(id, v) VALUES(?, ?)`, 'k' + i, 'row-' + i);
+    });
+
+    await seed('hot_keyset');
+    const got: string[] = [];
+    let after = -9007199254740991;
+    let pages = 0;
+    for (;;) {
+      const res = await call(s, `/api/backup/export?table=hot_keyset&after=${after}&limit=3`, headers);
+      expect(res.status).toBe(200);
+      const body = await res.json() as any;
+      expect(body.cursor).toBe('rowid');
+      expect(body.after).toBe(after);
+      for (const row of body.rows) {
+        expect(row).not.toHaveProperty('__hub_backup_rowid');
+        got.push(row.v);
+      }
+      if (pages++ === 0) await churn('hot_keyset');
+      if (body.rows.length < 3) break;
+      expect(body.next_after).toBeGreaterThan(after);
+      after = body.next_after;
+    }
+    // Every row that existed throughout plus every appended row, once each.
+    expect(got).toEqual(['row-0', 'row-1', 'row-2', 'row-3', 'row-4', 'row-5', 'row-6', 'row-7', 'row-8', 'row-9']);
+
+    // Same churn under legacy offset paging skips row-3 (the bug class the
+    // drift bound used to paper over).
+    await seed('hot_offset');
+    const legacy: string[] = [];
+    let offset = 0;
+    for (let page = 0; ; page++) {
+      const body = await (await call(s, `/api/backup/export?table=hot_offset&offset=${offset}&limit=3`, headers)).json() as any;
+      expect(body.cursor).toBe('offset');
+      legacy.push(...body.rows.map((r: any) => r.v));
+      if (page === 0) await churn('hot_offset');
+      if (body.rows.length < 3) break;
+      offset += body.rows.length;
+    }
+    expect(legacy).not.toContain('row-3');
+
+    // Keyset is refused (not silently mis-paged) on WITHOUT ROWID tables.
+    const wr = await call(s, '/api/backup/export?table=token_hours_posted&after=0&limit=3', headers);
+    expect(wr.status).toBe(400);
+    expect(((await wr.json()) as any).error).toBe('keyset_unsupported');
+    expect((await call(s, '/api/backup/export?table=hot_keyset&after=0&offset=0&limit=3', headers)).status).toBe(400);
+    expect((await call(s, '/api/backup/export?table=hot_keyset&after=abc&limit=3', headers)).status).toBe(400);
   });
 
   it('keeps chunked reads on a separate generous budget', async () => {
