@@ -240,6 +240,7 @@ export class Hub extends DurableObject {
     this.provisioningService = new ProvisioningService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env, this.fleetService,
       (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller));
     this.provisioningService.init();
+    new HostGoals(this.sql, this.fleetService).init();
     // Hub-owned credentials (intake 5814e109): a provider rejection opens one
     // alert per account; the next successful provider read resolves it.
     const pendingCredentialAlerts: any[] = [];

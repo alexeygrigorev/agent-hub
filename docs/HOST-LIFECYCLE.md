@@ -32,8 +32,9 @@ proves startup. The retained proof includes launch id, native id and verificatio
 time. A new bundle revision requires new proof. Failed starts remain visible and
 do not cause unbounded automatic retry sessions.
 
-Windows hosts with the existing `run-session-host.ps1` supervisor wrapper can
-register user-scoped autostart without requesting elevation:
+Windows self-update migrates the existing `run-session-host.ps1` supervisor task
+in user scope and reports `autostart_state` to Hub. The same idempotent task
+registration can be run explicitly without requesting elevation:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows-host-autostart.ps1 `

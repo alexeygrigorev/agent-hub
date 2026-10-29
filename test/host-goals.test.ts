@@ -26,7 +26,7 @@ it('requires release, installation and observed native running proof; does not t
     expect(goals.view('tabo').engines[0].state).toBe('verifying_native');
     sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,account) VALUES('tabo','native','proof','claude','running',?,'tasks','claude-test')", at);
     expect(goals.view('tabo').state).toBe('done');
-    goals.reconcile();
+    // No maintenance tick is needed to retain a short session's running proof.
     sql.exec("UPDATE fleet_sessions SET phase='exited'");
     sql.exec("UPDATE fleet_launches SET state='exited'");
     expect(goals.view('tabo').engines[0].verified_at).toBe(at);

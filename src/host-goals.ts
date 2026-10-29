@@ -10,6 +10,31 @@ export class HostGoals {
     this.sql.exec('CREATE TABLE IF NOT EXISTS host_goals(machine_id TEXT PRIMARY KEY, generation TEXT NOT NULL, engines_json TEXT NOT NULL, workspace TEXT NOT NULL, sha TEXT NOT NULL, set_at TEXT NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS host_goal_proofs(generation TEXT NOT NULL,label TEXT NOT NULL,revision TEXT NOT NULL,launch_id TEXT NOT NULL,verified_at TEXT,native_id TEXT,PRIMARY KEY(generation,label,revision))');
     this.sql.exec('CREATE TABLE IF NOT EXISTS host_goal_holds(generation TEXT NOT NULL,label TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(generation,label))');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS host_goal_proof_launch ON host_goal_proofs(launch_id)');
+    // Routing initializes before fleet/provisioning on a fresh database.
+    // Hub calls init again after both schemas exist.
+    if (this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('fleet_sessions','engine_installations')").toArray().length !== 2) return;
+    // Capture positive evidence as it arrives. A short real session may exit
+    // between maintenance ticks; its observed running state must not be lost.
+    for (const event of ['INSERT', 'UPDATE']) this.sql.exec(`
+      CREATE TRIGGER IF NOT EXISTS host_goal_running_${event.toLowerCase()}
+      AFTER ${event} ON fleet_sessions WHEN NEW.phase='running'
+      BEGIN
+        UPDATE host_goal_proofs SET verified_at=NEW.observed_at,native_id=NEW.native_id
+        WHERE verified_at IS NULL AND launch_id IN (
+          SELECT id FROM fleet_launches WHERE machine_id=NEW.machine_id AND native_id=NEW.native_id
+        ) AND EXISTS (
+          SELECT 1 FROM fleet_launches l
+          JOIN host_goals g ON g.generation=host_goal_proofs.generation AND g.machine_id=l.machine_id
+          JOIN host_release_targets r ON r.machine_id=g.machine_id
+          JOIN engine_installations i ON i.machine_id=g.machine_id AND i.label=host_goal_proofs.label AND i.revision=host_goal_proofs.revision
+          WHERE l.id=host_goal_proofs.launch_id AND l.state IN ('starting','running')
+            AND l.account=NEW.account AND l.engine=NEW.engine AND l.profile IS NEW.profile AND l.workspace=NEW.workspace
+            AND l.created_at>=g.set_at AND NEW.observed_at>=l.created_at
+            AND julianday(NEW.observed_at) BETWEEN julianday('now','-180 seconds') AND julianday('now','+30 seconds')
+            AND r.current_sha=g.sha AND r.state IN ('current','updated') AND r.reported_at>=g.set_at
+        );
+      END`);
   }
   set(machine: string, input: any): { error: string } | any {
     if (!input || Object.keys(input).some(k => !['engines', 'workspace', 'sha'].includes(k)) ||
@@ -47,7 +72,7 @@ export class HostGoals {
       return { label, revision: bundle?.revision ?? null, installed, placement_reason: hold?.reason ?? null, launch_id: proof?.launch_id ?? null, native_id: proof?.native_id ?? native?.native_id ?? null, verified_at: proof?.verified_at ?? null,
         running_now: !!running, state: installed && (proof?.verified_at || running) ? 'running_proven' : !installed ? 'installing' : !proof ? 'awaiting_placement' : launch?.state === 'running' ? 'verifying_native' : launch?.state ?? 'unknown' };
     });
-    return { machine_id: machine, generation: goal.generation, desired_sha: goal.sha, workspace: goal.workspace, online, release_ready: releaseReady, release_state: release?.state ?? 'report_missing', release_error: release?.error ?? null, engines, state: !online ? 'waiting_for_host' : !releaseReady ? 'updating_release' : engines.every((e: any) => e.state === 'running_proven') ? 'done' : 'bringing_up' };
+    return { machine_id: machine, generation: goal.generation, desired_sha: goal.sha, workspace: goal.workspace, online, release_ready: releaseReady, release_state: release?.state ?? 'report_missing', autostart_state: release?.autostart_state ?? null, release_error: release?.error ?? null, engines, state: !online ? 'waiting_for_host' : !releaseReady ? 'updating_release' : engines.every((e: any) => e.state === 'running_proven') ? 'done' : 'bringing_up' };
   }
   /** Called by Hub maintenance. Existing provisioning sync installs bundles in user scope.
    * The normal fleet admission path retains all quota/resource/claim checks. */
