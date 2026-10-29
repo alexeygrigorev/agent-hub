@@ -156,6 +156,36 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await tick(v, clock);
     expect(starts[0]).toMatchObject({ engine: 'claude' });
   }));
+  it('the DONE author (canonical launch worker) decides the implementer over a newer different-model session', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
+    const v = verifier(h, starts, clock);
+    const t = await task(h, { title: 'Change session placement' });
+    const row = (id: string, launch: string, engine: string, ageMs: number) => h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,engine,mode,state,created_at,updated_at)
+      VALUES(?,'fixture',?,?,?,?,'headless','running',?,?)`, id, id, JSON.stringify({ intake_task_id: t.id, workspace: 'demo' }), launch, engine,
+      new Date(Date.now() - ageMs).toISOString(), new Date(Date.now() - ageMs).toISOString());
+    row('claude-author', 'launch-claude', 'claude', 2 * 3600000);
+    row('newer-codex', 'launch-codex', 'codex', 3600000);
+    await note(h, t.id, DONE_EVIDENCE);
+    // Attribute the claim to the older Claude worker, as its worker credential would.
+    const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', t.id).one().data);
+    data.history[data.history.length - 1].actor = 'hub-workers:worker-launch-claude';
+    h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), t.id);
+    clock.now = Date.now();
+    await tick(v, clock);
+    expect(starts[0]).toMatchObject({ engine: 'codex' });
+  }));
+  it('never routes on unverified history link engines', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
+    const v = verifier(h, starts, clock);
+    const t = await task(h, { title: 'Change session placement' });
+    const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', t.id).one().data);
+    data.history.push({ id: 'l1', kind: 'link', native_id: 'n', engine: 'claude', authority: 'untrusted_task_data', captured_at: Date.now() - 1000 });
+    data.version++; h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), t.id);
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    expect(starts[0]).toMatchObject({ engine: 'claude' });
+  }));
   it('ignores another actor forging a PASS or FAIL and requires evidence in the verifier PASS itself', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
     const v = verifier(h, starts, clock);
