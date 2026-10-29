@@ -58,7 +58,7 @@ class CatalogTest(unittest.TestCase):
     def test_rejects_bad_catalog(self):
         for mutate in (lambda a: a.__setitem__("account", "codex-orin"),
                        lambda a: a["credential"].__setitem__("mode", "vault"),
-                       lambda a: a.__setitem__("quota_probe", ["quux", "--json"]),
+                       lambda a: a.__setitem__("quota_probe", "not-a-list"),
                        lambda a: a.__setitem__("aplexer_profile", "codex")):
             bad = sample_accounts()
             mutate(bad[0])
@@ -178,7 +178,8 @@ class AplexerTest(unittest.TestCase):
 
 
 class ManagedSubscriptionTest(unittest.TestCase):
-    def test_managed_entries_carry_catalog_probe(self):
+    def test_managed_entries_carry_no_host_quota_probe(self):
+        """Intake 5814e109 I4: Hub reads quota; managed subscriptions carry no quse argv."""
         import tempfile
         from agent_hub_host import provisioning
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,7 +191,7 @@ class ManagedSubscriptionTest(unittest.TestCase):
             with patch.dict(os.environ, {"AGENT_HUB_MANAGED_DIR": str(managed)}):
                 subs = provisioning.managed_subscriptions()
             orin = next(s for s in subs if s["account_label"] == "codex-orin")
-            self.assertEqual(["quse", "codex-orin", "--json"], orin["quota_argv"])
+            self.assertNotIn("quota_argv", orin)
             self.assertEqual("hub-codex-orin", orin["profile"])
 
 
@@ -242,7 +243,7 @@ class DriftTest(unittest.TestCase):
         for needle in ("subscriptions: account codex-orin has no host entry",
                        "routes: bogus/codex-orin",
                        "aplexer: managed profile [hub-codex-orin] is missing",
-                       "quse: shared-zai probe failed",
+                       "quota: shared-zai exit 2: No such option",
                        "credential: home path"):
             self.assertIn(needle, joined)
 

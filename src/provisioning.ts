@@ -3,9 +3,16 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import type { Env } from './env';
 import { validSessionSecret } from './auth/session';
 import type { FleetService } from './fleet';
-import { canonicalQuotaProvider } from './quota';
+import { canonicalQuotaProvider, canonicalAccountLabel, validateQuotaSnapshotPayload } from './quota';
+import { syncTbmFromServerAccounts } from './tbm-ingestion';
+import { CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claudeAuthorization, claudeExchange, credentialFreshness, credentialSubset,
+  fetchQuota, needsRefresh, refreshCredential, refreshable, structurallyValid, validCredentialFiles, type CredentialFiles, type FetchLike } from './credentials';
 
 const LABEL = /^[a-z][a-z0-9_-]{0,47}$/;
+const MIGRATION_GRACE_MS = 2 * 3600000;
+// One maintenance pass per isolate: overlapping cron/manual runs would refresh
+// the same single-use token twice and raise a false rejection.
+let maintaining = false;
 export const PACKAGES: Record<string, { pkg: string; bin: string; engine: string }> = {
   codex: { pkg: '@openai/codex', bin: 'codex', engine: 'codex' },
   claude: { pkg: '@anthropic-ai/claude-code', bin: 'claude', engine: 'claude' },
@@ -19,7 +26,9 @@ const reply = (data: unknown, status = 200) => Response.json(data, { status, hea
 const object = (v: any) => v && typeof v === 'object' && !Array.isArray(v);
 export function validBundle(v: any): boolean {
   if (!object(v) || Object.keys(v).some(k => !['label', 'provider', 'version', 'files', 'env', 'args', 'auth_method'].includes(k)) || !LABEL.test(v.label) || !Object.hasOwn(PACKAGES, v.provider) || typeof v.version !== 'string' || !/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(v.version)) return false;
-  if (v.provider === 'gemini' && (v.auth_method !== 'machine-login' || Object.keys(v.files || {}).some(k => /oauth|credential|token/i.test(k)) || Object.keys(v.env || {}).length)) return false;
+  if (v.provider === 'gemini' && (Object.keys(v.env || {}).length || (v.auth_method === 'machine-login'
+    ? Object.keys(v.files || {}).some(k => /oauth|credential|token/i.test(k))
+    : v.auth_method !== undefined || typeof v.files?.['.gemini/oauth_creds.json'] !== 'string'))) return false;
   if (!object(v.files) || Object.keys(v.files).length > 24 || !object(v.env) || Object.keys(v.env).length > 12) return false;
   if (v.provider === 'go' && (Object.keys(v.files).length || Object.keys(v.env).length)) return false;
   for (const [path, value] of Object.entries(v.files)) {
@@ -40,6 +49,26 @@ export class ProvisioningService {
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_bundles (label TEXT PRIMARY KEY, provider TEXT NOT NULL, version TEXT NOT NULL, revision TEXT NOT NULL, ciphertext TEXT NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_logins (id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL, url TEXT, code_ciphertext TEXT, expires_at INTEGER NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_installations (machine_id TEXT NOT NULL, label TEXT NOT NULL, revision TEXT NOT NULL, PRIMARY KEY(machine_id,label))');
+    for (const ddl of CREDENTIAL_SCHEMA) this.sql.exec(ddl);
+  }
+  private now() { return Date.now(); }
+  private credentialRow(label: string): any { return this.sql.exec('SELECT * FROM engine_credentials WHERE label=?', label).toArray()[0]; }
+  private async sealCredential(label: string, generation: number, files: CredentialFiles) {
+    return this.seal({ label, files }, 'credential:' + generation);
+  }
+  private async openCredential(row: any): Promise<CredentialFiles> {
+    return (await this.open({ label: row.label, revision: 'credential:' + row.generation, ciphertext: row.ciphertext })).files;
+  }
+  /** Publish a new credential generation (inside the caller's transaction). Clears host rejections of older generations. */
+  private writeCredential(label: string, provider: string, generation: number, ciphertext: string, files: CredentialFiles, by: string) {
+    this.sql.exec('INSERT OR REPLACE INTO engine_credentials VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', label, provider, generation, ciphertext,
+      credentialFreshness(provider, files), accessExpiry(provider, files), 'ok', null, by, this.now(), null,
+      this.credentialRow(label)?.quota_attempt_at ?? null);
+    this.sql.exec('DELETE FROM engine_credential_rejections WHERE label=? AND generation<?', label, generation);
+  }
+  /** Non-secret credential metadata for operators. */
+  credentialStatus() {
+    return this.sql.exec('SELECT label,provider,generation,freshness_ms,access_expires_ms,status,status_reason,updated_by,updated_at FROM engine_credentials ORDER BY label').toArray();
   }
   private async key() {
     if (!validSessionSecret(this.env)) throw new Error('provisioning_key_unavailable');
@@ -55,7 +84,11 @@ export class ProvisioningService {
     const c = JSON.parse(row.ciphertext);
     const data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(c.iv), additionalData: new TextEncoder().encode(row.label + ':' + row.revision) }, await this.key(), new Uint8Array(c.data));
     const account: any = this.sql.exec('SELECT provider FROM fleet_accounts WHERE label=?', row.label).toArray()[0];
-    return { ...JSON.parse(new TextDecoder().decode(data)), revision: row.revision, quota_provider: account?.provider ?? row.provider };
+    const bundle = JSON.parse(new TextDecoder().decode(data));
+    const cred: any = row.revision.startsWith('credential:') ? null : this.credentialRow(row.label);
+    if (cred && bundle.files) bundle.files = { ...bundle.files, ...await this.openCredential(cred) };
+    return { ...bundle, revision: row.revision, quota_provider: account?.provider ?? row.provider,
+      ...(cred ? { credential_generation: cred.generation, credential_paths: CREDENTIAL_PATHS[row.provider] ?? [], credential_status: cred.status } : {}) };
   }
   async handle(request: Request, auth: any): Promise<Response> {
     if (auth.error) return auth.error;
@@ -67,7 +100,8 @@ export class ProvisioningService {
     const rows = () => this.sql.exec('SELECT * FROM engine_bundles ORDER BY label').toArray() as any[];
     if (path === '/api/engines' && request.method === 'GET') {
       if (!admin) return reply({ error: 'forbidden' }, 403);
-      return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => ({ ...meta, supports_goal: ['codex', 'zai'].includes(meta.provider) })), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray() });
+      return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => ({ ...meta, supports_goal: ['codex', 'zai'].includes(meta.provider) })), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray(),
+        credentials: this.credentialStatus(), credential_rejections: this.sql.exec('SELECT machine_id,label,generation,reason,observed_at FROM engine_credential_rejections ORDER BY label,machine_id').toArray() });
     }
     if (path === '/api/engines/sync' && request.method === 'GET') {
       if (!host) return reply({ error: 'forbidden' }, 403);
@@ -83,8 +117,16 @@ export class ProvisioningService {
       const a = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', data.label).toArray()[0];
       const installed = this.sql.exec('SELECT 1 FROM engine_installations i JOIN engine_bundles b ON b.label=i.label AND b.revision=i.revision WHERE i.machine_id=? AND i.label=?', auth.caller.machineId, data.label).toArray().length;
       const quotaStatus = a ? this.fleet.accountStatus(a).status : 'unmapped';
-      return reply({ launch_allowed: !!installed && !!a && quotaStatus !== 'blocked', profile_supported: !!installed,
+      const cred = this.credentialRow(data.label);
+      const rejected = cred && this.sql.exec('SELECT 1 FROM engine_credential_rejections WHERE machine_id=? AND label=? AND generation=?', auth.caller.machineId, data.label, cred.generation).toArray().length;
+      // Hub-held quota and credential state decide admission; the host runs no quota probe.
+      // Native (host-home) accounts have no managed profile; Hub still owns their quota verdict.
+      const native = data.native === true;
+      const reason = !installed && !native ? 'profile_not_installed' : !a ? 'account_unmapped' : cred?.status === 'invalid' ? 'credential_invalid'
+        : rejected ? 'credential_rejected' : quotaStatus === 'blocked' ? 'quota_exhausted' : null;
+      return reply({ launch_allowed: !reason, profile_supported: !!installed || (native && !!a), ...(reason ? { reason } : {}),
         ...(quotaStatus === 'unknown' ? { quota_warning: 'quota_probe_unavailable' } : {}),
+        ...(cred ? { credential_generation: cred.generation } : {}),
         account_label: data.label, observed_at: new Date().toISOString() });
     }
     if (path === '/api/engines/logins' && request.method === 'POST') {
@@ -129,6 +171,18 @@ export class ProvisioningService {
       this.sql.exec('UPDATE engine_logins SET status=?,url=?,code_ciphertext=CASE WHEN ? THEN NULL ELSE code_ciphertext END WHERE id=?',data.status,url,Number(['authenticated','failed'].includes(data.status)),row.id);
       return reply({status:data.status});
     }
+    if (path === '/api/engines/maintain' && request.method === 'POST') {
+      if (!admin) return reply({ error: 'forbidden' }, 403);
+      return reply({ results: await this.maintainCredentials() });
+    }
+    const credentialLogin = await this.handleCredentialLogin(request, path, admin);
+    if (credentialLogin) return credentialLogin;
+    const credentialMatch = /^\/api\/engines\/([a-z][a-z0-9_-]{0,47})\/(credential|rejection)$/.exec(path);
+    if (credentialMatch) {
+      if (!host) return reply({ error: 'forbidden' }, 403);
+      return credentialMatch[2] === 'credential' ? this.handleCredential(request, credentialMatch[1], auth.caller)
+        : this.handleRejection(request, credentialMatch[1], auth.caller);
+    }
     const match = /^\/api\/engines\/([a-z][a-z0-9_-]{0,47})$/.exec(path);
     if (!match) return reply({ error: 'not_found' }, 404);
     const label = match[1];
@@ -154,6 +208,8 @@ export class ProvisioningService {
       this.sql.exec('DELETE FROM engine_logins WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_installations WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_bundles WHERE label=?', label);
+      this.sql.exec('DELETE FROM engine_credentials WHERE label=?', label);
+      this.sql.exec('DELETE FROM engine_credential_rejections WHERE label=?', label);
       this.sql.exec('DELETE FROM fleet_accounts WHERE label=?', label);
       return reply({ status: 'removed', label });
     });
@@ -166,7 +222,15 @@ export class ProvisioningService {
     try { const bytes = new Uint8Array(size); let offset = 0; for (const c of chunks) { bytes.set(c, offset); offset += c.length; } bundle = JSON.parse(new TextDecoder().decode(bytes)); } catch { return reply({ error: 'invalid_bundle' }, 400); }
     if (!validBundle(bundle) || bundle.label !== label) return reply({ error: 'invalid_bundle' }, 400);
     const revision = crypto.randomUUID(); let ciphertext: string;
-    try { ciphertext = await this.seal(bundle, revision); } catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
+    // The imported credential becomes the next Hub-owned generation; the
+    // bundle keeps the install snapshot only (intake 5814e109 I1).
+    const credential = credentialSubset(bundle.provider, bundle.files);
+    const generation = Number(this.credentialRow(label)?.generation ?? 0) + 1;
+    let credentialCipher: string | null = null;
+    try {
+      ciphertext = await this.seal(bundle, revision);
+      if (Object.keys(credential).length) credentialCipher = await this.sealCredential(label, generation, credential);
+    } catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
     return this.tx(() => {
       const managed = this.sql.exec('SELECT 1 FROM engine_bundles WHERE label=?', label).toArray().length;
       const existing: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label=?', label).toArray()[0];
@@ -187,7 +251,259 @@ export class ProvisioningService {
       this.sql.exec('DELETE FROM fleet_routes WHERE account=?', label);
       this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', label);
       if (!existing) this.sql.exec('INSERT INTO fleet_accounts VALUES (?,?,?,?,?)', label, bundle.provider, 1, bundle.provider === 'codex' ? 15 : 0, 1);
-      return reply({ status: 'configured', label, revision });
+      if (credentialCipher) {
+        if (Number(this.credentialRow(label)?.generation ?? 0) + 1 !== generation) return reply({ error: 'credential_changed' }, 409);
+        this.writeCredential(label, bundle.provider, generation, credentialCipher, credential, 'import');
+      } else {
+        this.sql.exec('DELETE FROM engine_credentials WHERE label=?', label);
+        this.sql.exec('DELETE FROM engine_credential_rejections WHERE label=?', label);
+      }
+      return reply({ status: 'configured', label, revision, ...(credentialCipher ? { credential_generation: generation } : {}) });
+    });
+  }
+
+  /** Current credential for launch-time materialization (GET) or a CAS write-back of a host-side rotation (POST). */
+  private async handleCredential(request: Request, label: string, caller: any): Promise<Response> {
+    const bundle: any = this.sql.exec('SELECT provider FROM engine_bundles WHERE label=?', label).toArray()[0];
+    const row = this.credentialRow(label);
+    if (!bundle || !row) return reply({ error: 'not_found' }, 404);
+    const current = async () => {
+      const latest = this.credentialRow(label);
+      const files = await this.openCredential(latest);
+      if (!this.hostAllowed(caller.machineId, caller)) return reply({ error: 'forbidden' }, 403);
+      return reply({ label, generation: latest.generation, status: latest.status, files });
+    };
+    if (request.method === 'GET') {
+      try { return await current(); } catch { return reply({ error: 'bundle_decryption_unavailable' }, 503); }
+    }
+    if (request.method !== 'POST') return reply({ error: 'method_not_allowed' }, 405);
+    const data = await request.json().catch(() => null) as any;
+    if (!data || !Number.isInteger(data.base_generation) || !validCredentialFiles(bundle.provider, data.files)) return reply({ error: 'invalid_credential' }, 400);
+    let stored: CredentialFiles;
+    try { stored = await this.openCredential(row); } catch { return reply({ error: 'bundle_decryption_unavailable' }, 503); }
+    const merged = { ...stored, ...data.files };
+    const unchanged = Object.keys(data.files).every(k => stored[k] === data.files[k]);
+    const incoming = credentialFreshness(bundle.provider, merged);
+    // CAS: a rotation based on the current generation wins; a divergent copy
+    // wins only when its tokens were provably issued later. Otherwise the
+    // host receives Hub's current copy and must adopt it.
+    // Never accept an unusable file or a copy provably older than Hub's.
+    const older = incoming !== null && row.freshness_ms !== null && incoming < row.freshness_ms;
+    const accept = !unchanged && structurallyValid(bundle.provider, merged) && !older && (data.base_generation === row.generation
+      || (incoming !== null && row.freshness_ms !== null && incoming > row.freshness_ms));
+    if (accept) {
+      const generation = row.generation + 1;
+      let cipher: string;
+      try { cipher = await this.sealCredential(label, generation, merged); } catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
+      const written = this.tx(() => {
+        if (this.credentialRow(label)?.generation !== row.generation) return false;
+        this.writeCredential(label, bundle.provider, generation, cipher, merged, 'host:' + caller.machineId);
+        return true;
+      });
+      if (!written) return reply({ error: 'credential_changed' }, 409);
+    }
+    try { const res = await current(); const body: any = await res.json(); return reply({ ...body, accepted: accept }, res.status); }
+    catch { return reply({ error: 'bundle_decryption_unavailable' }, 503); }
+  }
+
+  /** A host reports that a credential generation failed authentication on it (I5). */
+  private async handleRejection(request: Request, label: string, caller: any): Promise<Response> {
+    if (request.method !== 'POST') return reply({ error: 'method_not_allowed' }, 405);
+    const data = await request.json().catch(() => null) as any;
+    const row = this.credentialRow(label);
+    if (!row) return reply({ error: 'not_found' }, 404);
+    if (!data || !Number.isInteger(data.generation) || typeof data.reason !== 'string' || !/^[a-z0-9_]{1,64}$/.test(data.reason)) return reply({ error: 'invalid_rejection' }, 400);
+    if (data.generation !== row.generation) return reply({ status: 'superseded', generation: row.generation });
+    this.tx(() => {
+      this.sql.exec('INSERT OR REPLACE INTO engine_credential_rejections VALUES (?,?,?,?,?)', caller.machineId, label, row.generation, data.reason, this.now());
+      // Re-validate centrally on the next maintenance pass instead of waiting for the schedule.
+      this.sql.exec('UPDATE engine_credentials SET refresh_attempt_at=NULL, quota_attempt_at=NULL WHERE label=?', label);
+    });
+    return reply({ status: 'recorded', generation: row.generation });
+  }
+
+  /** Hub-central provider login: Hub owns the resulting token family; no host ever logs in. */
+  private async handleCredentialLogin(request: Request, path: string, admin: boolean): Promise<Response | null> {
+    const m = /^\/api\/engines\/credential-logins(?:\/([a-f0-9-]{36}))?$/.exec(path);
+    if (!m) return null;
+    if (!admin) return reply({ error: 'forbidden' }, 403);
+    if (request.method !== 'POST') return reply({ error: 'method_not_allowed' }, 405);
+    this.sql.exec('DELETE FROM engine_credential_logins WHERE expires_at <= ?', this.now());
+    const data = await request.json().catch(() => null) as any;
+    if (!m[1]) {
+      if (!data || data.provider !== 'claude' || !LABEL.test(data.label) || (data.version !== undefined && (typeof data.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(data.version)))) return reply({ error: 'invalid_login' }, 400);
+      const bundle: any = this.sql.exec('SELECT provider FROM engine_bundles WHERE label=?', data.label).toArray()[0];
+      if (bundle && bundle.provider !== 'claude') return reply({ error: 'account_provider_mismatch' }, 409);
+      const id = crypto.randomUUID();
+      const { url, verifier, state } = await claudeAuthorization();
+      let sealed: string;
+      try { sealed = await this.seal({ label: data.label, verifier, state, version: data.version ?? null, adopt: data.adopt === true }, 'login:' + id); }
+      catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
+      this.sql.exec('INSERT INTO engine_credential_logins VALUES (?,?,?,?,?)', id, data.label, 'claude', sealed, this.now() + 600000);
+      return reply({ id, url, expires_in: 600 });
+    }
+    const row: any = this.sql.exec('SELECT * FROM engine_credential_logins WHERE id=?', m[1]).toArray()[0];
+    if (!row) return reply({ error: 'not_found' }, 404);
+    if (!data || typeof data.code !== 'string' || data.code.length > 4096 || !/^[A-Za-z0-9_\-#.~]+$/.test(data.code.trim())) return reply({ error: 'invalid_code' }, 400);
+    let login: any;
+    try { login = await this.open({ label: row.label, revision: 'login:' + row.id, ciphertext: row.sealed }); } catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
+    this.sql.exec('DELETE FROM engine_credential_logins WHERE id=?', row.id);
+    const result = await claudeExchange(data.code, login.verifier, login.state, this.fetchFn, this.now());
+    if (!result.ok) return reply({ error: result.reason }, 400);
+    return this.installCentralCredential(row.label, 'claude', login.version, result.files, login.adopt === true);
+  }
+
+  /** Store a Hub-minted credential: create the account bundle on first login, else publish a new generation. */
+  private async installCentralCredential(label: string, provider: string, version: string | null, files: CredentialFiles, adopt: boolean): Promise<Response> {
+    const bundleRow: any = this.sql.exec('SELECT * FROM engine_bundles WHERE label=?', label).toArray()[0];
+    if (!bundleRow) {
+      const bundle = { label, provider, version: version || '2.1.304', files: { '.claude/settings.json': '{}' }, env: {}, args: [] };
+      const put = new Request('https://hub.internal/api/engines/' + label + (adopt ? '?adopt=true' : ''), { method: 'PUT', body: JSON.stringify(bundle) });
+      const res = await this.handle(put, { caller: { isAdmin: true } });
+      if (res.status !== 200) return res;
+    }
+    const row = this.credentialRow(label);
+    const generation = Number(row?.generation ?? 0) + 1;
+    let cipher: string;
+    try { cipher = await this.sealCredential(label, generation, files); } catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
+    this.tx(() => this.writeCredential(label, provider, generation, cipher, files, 'hub_login'));
+    return reply({ status: 'configured', label, credential_generation: generation });
+  }
+
+  fetchFn: FetchLike = (input, init) => fetch(input, init);
+  private alert: (label: string, problem: { state: string; detail: string } | null) => void = () => {};
+  setAlertSink(fn: (label: string, problem: { state: string; detail: string } | null) => void) { this.alert = fn; }
+
+  /**
+   * Central maintenance (cron): refresh each OAuth credential before any host
+   * engine would, read quota directly from the provider with the stored
+   * credential, and mark a credential invalid (alerting once) when the provider
+   * rejects it. Returns non-secret per-label outcomes.
+   */
+  async maintainCredentials(nowMs = this.now()) {
+    if (maintaining) return [{ status: 'already_running' }];
+    maintaining = true;
+    try { return await this.maintainOnce(nowMs); } finally { maintaining = false; }
+  }
+
+  private async maintainOnce(nowMs: number) {
+    const out: any[] = [];
+    await this.migrateCredentials(nowMs);
+    const rows = this.sql.exec("SELECT * FROM engine_credentials ORDER BY label").toArray() as any[];
+    for (const row of rows.slice(0, 32)) {
+      const result: any = { label: row.label, generation: row.generation };
+      try {
+        let files = await this.openCredential(row);
+        let generation = row.generation;
+        const publish = async (next: CredentialFiles, by: string) => {
+          const gen = generation + 1;
+          const cipher = await this.sealCredential(row.label, gen, next);
+          const ok = this.tx(() => {
+            if (this.credentialRow(row.label)?.generation !== generation) return false;
+            this.writeCredential(row.label, row.provider, gen, cipher, next, by);
+            return true;
+          });
+          if (ok) { files = next; generation = gen; return true; }
+          // A host wrote back meanwhile. Our refresh consumed the token family's
+          // previous refresh token, so our copy is the live one unless theirs is newer.
+          const latest = this.credentialRow(row.label);
+          const ours = credentialFreshness(row.provider, next);
+          if (!latest || ours === null || (latest.freshness_ms !== null && latest.freshness_ms >= ours)) return false;
+          generation = latest.generation;
+          return publish(next, by);
+        };
+        const markInvalid = (reason: string) => {
+          const latest = this.credentialRow(row.label);
+          // A newer generation landed (host write-back): judge that one next pass.
+          if (!latest || latest.generation !== generation) { result.status = 'raced'; return; }
+          // Two consecutive rejections of the same generation, at least one
+          // backoff apart, before the account is withdrawn fleet-wide.
+          const strike = typeof latest.status_reason === 'string' && latest.status_reason.startsWith('rejected_once:');
+          if (!strike) {
+            this.sql.exec('UPDATE engine_credentials SET status_reason=?, refresh_attempt_at=? WHERE label=? AND generation=?', 'rejected_once:' + reason, nowMs, row.label, generation);
+            result.status = 'suspect'; result.reason = reason; return;
+          }
+          this.sql.exec("UPDATE engine_credentials SET status='invalid', status_reason=?, refresh_attempt_at=? WHERE label=? AND generation=?", reason, nowMs, row.label, generation);
+          this.alert(row.label, { state: 'reauth_required', detail: `Engine account ${row.label} (${row.provider}) credential was rejected by the provider (${reason}). Hub will not offer it until it is re-authenticated: hub engines login/add --label ${row.label}.` });
+          result.status = 'invalid'; result.reason = reason;
+        };
+        const tryRefresh = async (force: boolean) => {
+          if (!refreshable(row.provider, files) || (!force && !needsRefresh(row.provider, files, nowMs))) return 'skipped';
+          // Back off transient provider failures for ten minutes.
+          if (!force && row.refresh_attempt_at && nowMs - row.refresh_attempt_at < 600000) return 'backoff';
+          this.sql.exec('UPDATE engine_credentials SET refresh_attempt_at=? WHERE label=?', nowMs, row.label);
+          const r = await refreshCredential(row.provider, files, this.fetchFn, nowMs);
+          if (r.ok) return (await publish(r.files, 'hub_refresh')) ? 'refreshed' : 'raced';
+          if (r.invalid) { markInvalid(r.reason); return result.status === 'invalid' ? 'invalid' : 'rejected'; }
+          this.sql.exec('UPDATE engine_credentials SET status_reason=? WHERE label=?', r.reason, row.label);
+          return r.reason;
+        };
+        if (row.status === 'invalid') { result.status = 'invalid'; out.push(result); continue; }
+        // A credential migrated from a pre-existing bundle may be an old
+        // snapshot whose live rotation sits on a host. Give hosts time to write
+        // it back before Hub refreshes or judges it.
+        const grace = row.updated_by === 'migration' && nowMs - row.updated_at < MIGRATION_GRACE_MS;
+        if (grace) result.refresh = 'migration_grace';
+        else result.refresh = await tryRefresh(false);
+        if (result.refresh !== 'invalid' && (!row.quota_attempt_at || nowMs - row.quota_attempt_at >= 240000)) {
+          this.sql.exec('UPDATE engine_credentials SET quota_attempt_at=? WHERE label=?', nowMs, row.label);
+          let q = await fetchQuota(row.provider, files, this.fetchFn, nowMs);
+          if (!q.ok && q.unauthorized && grace) { result.quota = 'migration_grace'; result.generation = generation; out.push(result); continue; }
+          if (!q.ok && q.unauthorized && refreshable(row.provider, files)) {
+            result.refresh = await tryRefresh(true);
+            if (result.refresh === 'refreshed') q = await fetchQuota(row.provider, files, this.fetchFn, nowMs);
+          }
+          if (q.ok) {
+            result.quota = this.storeQuota(row.label, row.provider, q.quota, nowMs) ? 'stored' : 'rejected';
+            this.sql.exec("UPDATE engine_credentials SET status_reason=NULL WHERE label=? AND generation=? AND status_reason LIKE 'rejected_once:%'", row.label, generation);
+            this.alert(row.label, null);
+          }
+          else if (q.unauthorized && !result.status) markInvalid(q.reason);
+          else result.quota = q.reason;
+        }
+        result.generation = generation;
+      } catch { result.error = 'maintenance_failed'; }
+      out.push(result);
+    }
+    return out;
+  }
+
+  /** Adopt credentials of bundles imported before Hub owned them (generation 1, 'migration'). */
+  private async migrateCredentials(nowMs: number) {
+    const missing = this.sql.exec('SELECT b.* FROM engine_bundles b LEFT JOIN engine_credentials c ON c.label=b.label WHERE c.label IS NULL').toArray() as any[];
+    for (const row of missing) {
+      if (!(CREDENTIAL_PATHS[row.provider] ?? []).length) continue;
+      try {
+        const bundle = await this.open(row);
+        const files = credentialSubset(row.provider, bundle.files);
+        if (!Object.keys(files).length) continue;
+        const cipher = await this.sealCredential(row.label, 1, files);
+        this.tx(() => {
+          if (this.credentialRow(row.label)) return;
+          this.writeCredential(row.label, row.provider, 1, cipher, files, 'migration');
+          this.sql.exec('UPDATE engine_credentials SET updated_at=? WHERE label=?', nowMs, row.label);
+        });
+      } catch { /* undecryptable legacy bundle: leave it to the existing path */ }
+    }
+  }
+
+  /** Persist a Hub-direct provider observation exactly like a server collector snapshot. */
+  private storeQuota(label: string, provider: string, quota: any, nowMs: number): boolean {
+    const account = canonicalAccountLabel(label);
+    const capturedAt = new Date(nowMs).toISOString();
+    const family = canonicalQuotaProvider(provider);
+    const valid = validateQuotaSnapshotPayload({ schema_version: '1.1', collector_version: 'hub-direct/1.0', captured_at: capturedAt, host_id: 'hub-server', status: 'ok', error: null,
+      routes: { [family]: quota } }, 'hub-server', nowMs);
+    if (!valid.ok) return false;
+    return this.tx(() => {
+      const old: any = this.sql.exec('SELECT captured_at, quota_json FROM server_quota_snapshots WHERE account = ?', account).toArray()[0];
+      if (old && Date.parse(old.captured_at) >= nowMs) return false;
+      const stored = valid.snapshot!.routes[family];
+      const deadline = old ? JSON.parse(old.quota_json)?.details?.cooldown_until : null;
+      if (stored.details.cooldown_until == null && typeof deadline === 'string' && Date.parse(deadline) > nowMs) stored.details.cooldown_until = deadline;
+      this.sql.exec('INSERT OR REPLACE INTO server_quota_snapshots VALUES (?, ?, ?, ?)', account, family, capturedAt, JSON.stringify(stored));
+      syncTbmFromServerAccounts(this.sql, [{ account, provider: family, quota: stored }], nowMs);
+      return true;
     });
   }
 }

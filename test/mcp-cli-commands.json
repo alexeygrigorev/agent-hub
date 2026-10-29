@@ -24,6 +24,8 @@
   "conversations send",
   "engines add",
   "engines list",
+  "engines login",
+  "engines maintain",
   "engines quota",
   "engines remove",
   "engines sync",

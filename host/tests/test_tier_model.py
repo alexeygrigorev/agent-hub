@@ -94,7 +94,7 @@ def test_managed_execute_replaces_bundle_model(tmp_path, monkeypatch):
     p.write_json(catalog / 'state.json', [dict(label=b['label'], revision=b['revision'], provider='codex')])
     calls = []
     monkeypatch.setattr(p.os, 'execve', lambda cmd, argv, env: calls.append(argv))
-    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda label, request=None: (True, 'ok'))
     monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', 'exec', '--model', 'gpt-6-astra', 'check'])
     p.execute()
     assert native_model(calls[0]) == 'gpt-6-astra'

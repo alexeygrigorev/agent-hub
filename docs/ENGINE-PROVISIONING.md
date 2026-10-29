@@ -214,11 +214,59 @@ code for only the target machine; the host's native CLI exchanges it. Provider
 tokens stay on that machine. The login PTY has no disk transcript and never receives
 a model prompt. Successful login enables its route on the next heartbeat.
 
+## Hub owns every login (intake 5814e109)
+
+Hub is the single source of truth for each managed account's credential. The
+imported bundle is only the install snapshot; the current credential lives in
+`engine_credentials` (AES-GCM, same key derivation) as a numbered **generation**.
+
+- **Central refresh.** The five-minute cron refreshes OAuth tokens in Hub before
+  any engine would: Codex when `last_refresh` is three days old or the access
+  token has under three days left (Codex itself waits eight days); Claude when
+  under three hours of validity remain. Each refresh publishes a new generation.
+  One owner per token family, so a refresh can never stale another host.
+- **Hosts materialize, never own.** `hub engines sync` (each heartbeat) and every
+  launch (`execute` fetches `GET /api/engines/<label>/credential`) write Hub's
+  current generation into the isolated HOME. Only digests are kept locally
+  (`credential-state.json`). A generation change never reinstalls the engine.
+- **Write-back with CAS.** If an engine still rotated a token locally, the host
+  posts it with `base_generation`; Hub accepts it when based on the current
+  generation or provably newer (Codex `last_refresh`, Claude `expiresAt`) and
+  every other host converges. A stale copy is refused and replaced.
+- **Quota without quse.** Hub reads quota directly from the provider with the
+  stored credential (ChatGPT `wham/usage`, Anthropic `oauth/usage`) into
+  `server_quota_snapshots`. Host admission and launch ask Hub
+  (`/api/engines/admission`); no host runs a quota CLI, and a host without
+  `quse` is never rejected. The server collector's managed path reads the
+  provider directly too (`credentials.probe_quota`).
+- **Rejections.** A provider-rejected credential is marked `invalid`, alerts once
+  (`engine_credential` alert) and is offered nowhere. A host that reports a
+  generation rejected (`POST /api/engines/<label>/rejection`, or a launch failing
+  `engine_auth_expired`) is not offered that account again until Hub publishes a
+  newer generation. A fresh host-advertised route rejection is always honoured.
+- **New hosts.** Enrolment plus one sync installs every account at its current
+  generation; there is no per-host provider login.
+
+Claude gets its own Hub-owned token family through a central login (never a copy
+of a machine's `~/.claude`, whose rotation would invalidate the other copy):
+
+```bash
+hub engines login --provider claude --label hub-claude   # open the URL, paste the code (not echoed)
+hub engines list        # credentials[]: generation, status, expiry - never secrets
+hub engines maintain    # operator: run central refresh + direct quota now
+```
+
+Gemini accounts may import their OAuth cache (`--provider gemini --auth-file
+~/.gemini/oauth_creds.json`); Google refresh tokens do not rotate. OpenCode Go
+keeps host-local device login (see OPENCODE-AUTH.md). Bundles imported before
+this change are adopted as generation 1 on the first cron pass, with a two-hour
+grace so a host holding the newer rotated copy writes it back before Hub
+refreshes or judges the old snapshot.
+
 The native-login relay is Linux-only and has bounded five-minute login processes.
 Its protocol and UI are tested with synthetic consent; no real Google consent is
 claimed. Existing per-provider credential expiry or provider revocation can require
-renewal. The current slice does not centralize Codex refresh-token rotations; if a
-copied cache stops refreshing, re-import its current cache once.
+renewal. Codex and Claude refresh-token rotation is centralized (see above).
 
 ## Canonical managed-engine root (intake 59a6f44a AC1)
 
@@ -228,7 +276,7 @@ One source of truth: `host/agent_hub_host/provisioning.py::root()`.
 - Override: `AGENT_HUB_MANAGED_DIR` when explicitly set.
 - Interactive dispatch (`host/agent_hub_host/fleet.py` `provisioning.module_command('execute', ...)` embeds `AGENT_HUB_MANAGED_DIR=<root>`) and launcher headless starts (`fleet.py` sends `payload["managed_dir"] = str(provisioning.root())`, launcher `fetch_managed_quse` falls back to `AGENT_HUB_MANAGED_DIR` then `~/.config/agent-hub/managed-engines`) use the same root per account. Refresh-token rotation in one copy must never break another because there is only one live copy per host; `~/git/agent-hub/.local/placement-recovery/managed-engines` is a legacy recovery snapshot and is not used by the active host (`agent-hub-session-host.service` sets `AGENT_HUB_MANAGED_DIR=/home/alexey/.config/agent-hub/managed-engines`).
 - Same-revision reconcile and execution preserve nonempty runtime files after validating their private parent, owner, regular-file type and single-link confinement; POSIX file modes are tightened to 0600. Missing or truncated files are restored from the bundle. This preserves refresh-token rotation instead of resetting credentials from an older central snapshot.
-- To heal an invalid credential, use the normal native import (`hub engines add --provider codex --label <account> --auth-file <private-authorized-source>`) to publish a new revision, then `hub engines sync` on the host. Same-revision sync preserves existing credentials and cannot heal a revoked token. Never hand-copy secrets or print tokens. Verify with `quse codex --json` status `ok` and `check_codex_quota_gate -> (True, 'ok')` in that home (HOME set to the bundle home, since `quse codex` reads `Path.home()/.codex/auth.json`).
+- To heal an invalid credential, re-import it (`hub engines add --provider codex --label <account> --auth-file <private-authorized-source>`) or, for Claude, `hub engines login`; Hub publishes a new generation and every host converges on its next sync or launch. Never hand-copy secrets or print tokens. Verify with `hub engines list` (credential `status: ok`) and `hub quota` (fresh `hub-direct` reading).
 
 ## Multiple profiles and the same launch everywhere
 

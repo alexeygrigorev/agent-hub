@@ -846,6 +846,14 @@ def codex_plan():
     return None
 
 
+def _is_quota_cli(argv):
+    """True for the retired host-side quota CLI (any path to quse / quse.exe / -m quse.cli)."""
+    if not isinstance(argv, list) or not argv:
+        return False
+    name = re.split(r"[\\/]", str(argv[0]))[-1].lower()
+    return name in ("quse", "quse.exe") or any(str(a) in ("quse", "quse.cli") for a in argv[1:3])
+
+
 def collect_subscriptions(settings, runner=run_json):
     """Probe default accounts once per service. Alternate accounts require explicit wrappers."""
     subscriptions = settings["subscriptions"]
@@ -855,9 +863,10 @@ def collect_subscriptions(settings, runner=run_json):
         service = sub["service"]
         raw = {}
         profile = sub.get("profile")
-        # quse itself uses existing native authentication. We never open credential files.
-        command = sub.get("quota_argv") or (["quse", service, "--json"] if counts[service] == 1 and sub.get("profile") is None else None)
-        if command:
+        # Quota is Hub's (intake 5814e109 I4): the host runs no quota CLI. An
+        # explicitly configured non-quse adapter argv is still honoured.
+        command = sub.get("quota_argv")
+        if command and not _is_quota_cli(command):
             try:
                 raw = runner(command)
             except Exception:
@@ -3706,10 +3715,20 @@ class Dispatcher:
                 allowed |= admitted
                 if admitted:
                     admitted_engines.add(sub.get('engine', sub['service']))
+                elif gate.get('reason') in ('credential_rejected', 'credential_invalid'):
+                    # Hub's own credential verdict for this account (any engine).
+                    for mode in caps['fleet_modes']:
+                        caps['fleet_route_rejections'].append({
+                            'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
+                            'profile': sub.get('profile'), 'mode': mode,
+                            'reason': 'credential_rejected', 'observed_at': utcnow()})
                 elif sub.get('service') == 'codex':
                     reason = gate.get('reason', '')
+                    # Only a Hub quota verdict is a refusal; anything else
+                    # (Hub unreachable, local profile repair) carries no
+                    # credential verdict and stays fail-open server-side.
                     if not re.fullmatch(r'codex_quota_gate_[a-z0-9_]{1,64}', reason):
-                        reason = 'codex_quota_gate_quota_unavailable'
+                        reason = 'codex_quota_gate_quota_check_failed'
                     for mode in caps['fleet_modes']:
                         caps['fleet_route_rejections'].append({
                             'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],

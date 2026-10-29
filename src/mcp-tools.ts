@@ -108,6 +108,8 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'sessions ack': 'Long-running warning snooze is CLI-only by product scope.',
   'sessions events': 'Warning acknowledgement history is CLI-only by product scope.',
   'engines add': 'Operator credential import reads private native files; never expose provider credentials through model tools.',
+  'engines login': 'Hub-central provider login needs a human browser consent and a pasted one-time code; never through model tools.',
+  'engines maintain': 'Operator trigger for Hub credential refresh and direct provider quota; the cron already runs it.',
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',
   'engines remove': 'Operator credential withdrawal stays in the explicit credential-management CLI/UI workflow.',
   'engines sync': 'Local enrolled-host engine installation; no second remote executor.',

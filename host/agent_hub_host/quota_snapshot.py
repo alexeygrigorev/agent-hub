@@ -16,6 +16,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import sys
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from . import api, auth, config
@@ -889,3 +891,25 @@ if __name__ == "__main__":
             collector.step()
             time.sleep(1.0)
 
+
+def quse_argv(env):
+    """Resolve the native quota CLI for this host's NATIVE-account collector.
+
+    Managed (Hub-held) accounts never use it: Hub reads their quota directly
+    (intake 5814e109). A Windows service runs the venv interpreter without an
+    activated venv, so prefer PATH, then the interpreter's Scripts directory,
+    then the module.
+    """
+    found = shutil.which('quse', path=env.get('PATH') if isinstance(env, dict) else None)
+    if found:
+        return [found]
+    found = shutil.which('quse', path=str(Path(sys.executable).parent))
+    if found:
+        return [found]
+    try:
+        import importlib.util
+        if importlib.util.find_spec('quse.cli') is not None:
+            return [sys.executable, '-m', 'quse.cli']
+    except (ImportError, ValueError):
+        pass
+    return ['quse']

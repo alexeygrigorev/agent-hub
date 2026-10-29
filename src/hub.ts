@@ -233,6 +233,14 @@ export class Hub extends DurableObject {
     this.provisioningService = new ProvisioningService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env, this.fleetService,
       (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller));
     this.provisioningService.init();
+    // Hub-owned credentials (intake 5814e109): a provider rejection opens one
+    // alert per account; the next successful provider read resolves it.
+    const pendingCredentialAlerts: any[] = [];
+    this.provisioningService.setAlertSink((label, problem) => {
+      const opened = this.livenessService.setAlert('engine_credential', label, problem);
+      if (opened) pendingCredentialAlerts.push(opened);
+    });
+    this.flushCredentialAlerts = async () => { for (const a of pendingCredentialAlerts.splice(0)) await this.notifyAlert(a); };
     // M14b slice2 (narrow STATUS composition): observation writes are gated
     // by the live SessionControlService.hostObservationAllowed (existing
     // fresh host family/approval authority, owned by the cleanup worker).
@@ -2023,8 +2031,18 @@ export class Hub extends DurableObject {
   protected extraCheckDeps(): Partial<ActionDeps> { return {}; }
 
   /** Cron and manual entry point for scheduled checks. */
+  private flushCredentialAlerts: () => Promise<void> = async () => {};
+
+  /** Central refresh + direct provider quota for Hub-held engine credentials. */
+  async maintainCredentials() {
+    try { return await this.provisioningService.maintainCredentials(); }
+    catch { console.warn('credential_maintenance_failed'); return []; }
+    finally { await this.flushCredentialAlerts().catch(() => console.warn('credential_alert_failed')); }
+  }
+
   async runChecks(only?: string) {
     this.runTbmTick();
+    if (!only) await this.maintainCredentials();
     for (const alert of new BankedResets(this.sql, this.livenessService).run()) await this.notifyAlert(alert);
     this.livenessService.prune();
     const results = await this.checksService.runDue({

@@ -20,6 +20,7 @@ import { freshCatalogs } from './catalog-freshness';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency } from './pacing';
+import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
 // Host telemetry freshness windows (intake 4398ce2a). The host posts a fast
 // heartbeat every TELEMETRY_REFRESH_S (host/agent_hub_host/fleet.py, 45 s);
 // keep LAUNCHER_TELEMETRY_STALE_MS >= 3x that (host regression test parses it).
@@ -143,6 +144,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "admission_unconfigured": "This local route has no maintained fresh admission adapter.",
   "admission_refused": "Fresh admission refused this account or could not verify its timestamp and model.",
   "engine_auth_expired": "The engine authentication is unavailable or expired.",
+  "credential_rejected": "The host's copy of the Hub-held engine credential was rejected.",
   "codex_quota_gate_quota_unavailable": "The managed Codex account quota gate refused launch before execution.",
   "codex_quota_gate_codex_reserve_required": "The managed Codex account is below the configured weekly reserve.",
   "codex_quota_gate_stale_window_evidence": "The managed Codex quota evidence is stale.",
@@ -787,6 +789,11 @@ export class FleetService {
     const needs: string[] = Array.isArray(input.needs) ? [...input.needs] : [];
     if (needs.length) request.needs = needs;
     const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = [];
+    // Hub-held credential state (intake 5814e109 I5): an account whose Hub
+    // credential the provider rejected is offered nowhere, and a host that
+    // reported a generation rejected is not offered that account again until
+    // Hub publishes a newer generation.
+    const credentialInvalid = invalidLabels(this.sql); const credentialRejected = rejectedPairs(this.sql);
     this.reconcileCapacity();
     // Planning below is read-only after reconciliation. Drop the snapshot
     // before reserve/promotion writes so the next plan sees every commitment.
@@ -885,7 +892,13 @@ export class FleetService {
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
         && r.mode === request.mode && /^codex_quota_gate_[a-z0-9_]{1,64}$/.test(r.reason)
         && fresh(r.observed_at, this.now(), 300000));
-      const gateRefusal = gateProjection && !['codex_quota_gate_quota_unavailable', 'codex_quota_gate_quota_check_failed', 'codex_quota_gate_stale_window_evidence'].includes(gateProjection.reason) ? gateProjection : null;
+      // A host-reported refusal of this exact route is honoured (I5: never
+      // offer an account the host rejected). Only a probe that itself crashed
+      // (no verdict about the credential) still fails open (intake 4398ce2a).
+      const gateRefusal = gateProjection && gateProjection.reason !== 'codex_quota_gate_quota_check_failed' ? gateProjection : null;
+      const hostCredentialRefusal = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.find((r: any) =>
+        r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
+        && r.reason === 'credential_rejected' && fresh(r.observed_at, this.now(), 300000));
       const routeProv = definition ? this.observationProvenance(definition, route) : null;
       const routeQuota = evaluateLaunchQuota({ provider: String(definition?.provider ?? ''), quota: routeProv?.quota ?? null,
         subscriptionObservedAt: routeProv?.subscriptionObservedAt ?? null, nowMs: this.now(),
@@ -919,6 +932,8 @@ export class FleetService {
       };
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
+      else if (credentialInvalid.has(route.account)) reason = 'credential_invalid';
+      else if (credentialRejected.has(route.machine_id + '\u0000' + route.account) || hostCredentialRefusal) reason = 'credential_rejected';
       else if (gateRefusal) reason = gateRefusal.reason;
       else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, effectiveWorkspace) || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd))) {
         const engineMissing = !Array.isArray(caps.engines) || !caps.engines.includes(route.engine);
@@ -996,7 +1011,7 @@ export class FleetService {
     }
     const codexSelector = input.engine === 'codex' || overrideModels.some(m => m.provider === 'codex');
     if (!candidates.length && codexSelector && !input.account && rejected.some(r =>
-      r.reason.startsWith('codex_quota_gate_') || ['account_blocked', 'account_unknown', 'engine_auth_expired'].includes(r.reason))) {
+      r.reason.startsWith('codex_quota_gate_') || ['account_blocked', 'account_unknown', 'engine_auth_expired', 'credential_invalid', 'credential_rejected'].includes(r.reason))) {
       const fallback: any = this.plan({ ...input, engine: undefined, tier: input.tier ?? taskTier({ model: overrideModels[0]?.id }) });
       if (!fallback.error) return { ...fallback, request: { ...fallback.request, engine: request.engine }, rejected: [...rejected, ...fallback.rejected], fallback_from: input.engine };
     }
@@ -1791,6 +1806,9 @@ export class FleetService {
       return this.transaction(() => {
         const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
+        // An authentication failure of a Hub-held credential on this host
+        // excludes this (machine, account) until a newer generation exists (I5).
+        if (row.account && (data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected')) recordCredentialRejection(this.sql, row.machine_id, row.account, data.reason, this.now());
         if (match[2] === 'reject') {
           if (!object(data, ['reason', 'diagnostic']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
@@ -1809,7 +1827,7 @@ export class FleetService {
             // Retain the same intent; next offer repeats every admission/authority gate.
             return response({ id: row.id, state: 'held', reason: data.reason, diagnostic, retryable: true });
           }
-          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
+          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
             if (data.reason === 'engine_auth_expired') {
               this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
             }

@@ -14,7 +14,7 @@ from collections import namedtuple
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host import disk_monitor, provisioning, session_host, system
+from agent_hub_host import disk_monitor, provisioning, quota_snapshot, session_host, system
 
 
 def fake_msvcrt(fail_times=0):
@@ -159,16 +159,11 @@ class ArchWindowsArm64Test(unittest.TestCase):
 
 
 class CodexQuotaGateWindowsTest(unittest.TestCase):
-    """AC4: quse is installed with the host package but not on the service PATH.
-
-    Root cause on Tabo: subprocess.run(['quse', ...]) raised FileNotFoundError
-    (the venv Scripts dir is not on the Scheduled Task PATH; quse was not
-    installed at all), which the gate mapped to quota_check_failed for every
-    Codex route.
+    """AC4 history: Tabo's service PATH lacked quse, so every Codex route was
+    refused as quota_check_failed. Since intake 5814e109 Hub owns the quota
+    verdict and managed launches never invoke quse; the resolver below only
+    serves the native-account collector.
     """
-
-    QUSE_OK = ('{"codex": {"status": "ok", "details": {"limit_reached": false}, '
-               '"windows": {"7d": {"percent_remaining": 80.0, "reset_at": "2999-01-01T00:00:00Z"}}}}')
 
     def test_resolves_quse_next_to_interpreter_when_not_on_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,46 +172,22 @@ class CodexQuotaGateWindowsTest(unittest.TestCase):
             quse = scripts / 'quse'
             quse.write_text('#!/bin/sh\n')
             quse.chmod(0o755)
-            with patch.object(provisioning.sys, 'executable', str(scripts / 'python')):
-                self.assertEqual(provisioning.quse_argv({'PATH': str(Path(tmp) / 'empty')}), [str(quse)])
+            with patch.object(quota_snapshot.sys, 'executable', str(scripts / 'python')):
+                self.assertEqual(quota_snapshot.quse_argv({'PATH': str(Path(tmp) / 'empty')}), [str(quse)])
 
     def test_falls_back_to_installed_module(self):
         with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(provisioning.sys, 'executable', str(Path(tmp) / 'python')), \
+                patch.object(quota_snapshot.sys, 'executable', str(Path(tmp) / 'python')), \
                 patch('importlib.util.find_spec', return_value=object()):
-            self.assertEqual(provisioning.quse_argv({'PATH': tmp}),
+            self.assertEqual(quota_snapshot.quse_argv({'PATH': tmp}),
                              [str(Path(tmp) / 'python'), '-m', 'quse.cli'])
 
-    def test_gate_admits_with_resolved_quse_and_utf8_env(self):
-        seen = {}
-
-        def run(argv, **kw):
-            seen.update(argv=argv, **kw)
-            return types.SimpleNamespace(returncode=0, stdout=self.QUSE_OK, stderr='')
-
-        with patch.object(provisioning, 'quse_argv', return_value=['C:\\venv\\Scripts\\quse.exe']), \
-                patch.object(provisioning.subprocess, 'run', side_effect=run):
-            self.assertEqual(provisioning.check_codex_quota_gate({'CODEX_HOME': 'x'}), (True, 'ok'))
-        self.assertEqual(seen['argv'], ['C:\\venv\\Scripts\\quse.exe', 'codex', '--json'])
-        self.assertEqual((seen['encoding'], seen['env']['PYTHONIOENCODING'], seen['env']['CODEX_HOME']),
-                         ('utf-8', 'utf-8', 'x'))
-
-    def test_missing_quse_is_unavailable_not_check_failed(self):
-        with patch.object(provisioning, 'quse_argv', return_value=['quse']), \
-                patch.object(provisioning.subprocess, 'run', side_effect=FileNotFoundError('quse')):
-            self.assertEqual(provisioning.check_codex_quota_gate({}), (True, 'quota_probe_warning:quota_unavailable'))
-
-    def test_probe_timeout_is_unavailable_not_check_failed(self):
-        """A probe that exceeds the 30s budget produced no evidence.
-
-        A slow Windows cold start (antivirus scanning the venv probe) must not
-        resurface quota_check_failed for every Codex route after the quse
-        rollout; an unfinished check is quota_unavailable, like a missing one.
-        """
-        with patch.object(provisioning, 'quse_argv', return_value=['quse']), \
-                patch.object(provisioning.subprocess, 'run',
-                             side_effect=subprocess.TimeoutExpired(cmd=['quse', 'codex'], timeout=30)):
-            self.assertEqual(provisioning.check_codex_quota_gate({}), (True, 'quota_probe_warning:quota_unavailable'))
+    def test_managed_launch_gate_ignores_missing_quse(self):
+        """A host without quse is never rejected: Hub decides (I4)."""
+        hub = lambda method, path, payload=None: {'launch_allowed': True, 'account_label': payload['label']}
+        with patch.object(provisioning.subprocess, 'run', side_effect=FileNotFoundError('quse')), \
+                patch('shutil.which', return_value=None):
+            self.assertEqual(provisioning.hub_launch_gate('codex-orin', hub), (True, 'ok'))
 
     def test_host_package_depends_on_quse(self):
         text = (Path(__file__).resolve().parents[2] / 'pyproject.toml').read_text()
@@ -378,9 +349,9 @@ class CycleReportsWindowsTest(unittest.TestCase):
         self.assertEqual((collector.last_hold, collector.last_error), ('quse_unavailable', None))
 
     def test_session_host_resolves_quse_for_quota_collector(self):
-        with patch('agent_hub_host.provisioning.quse_argv', return_value=['C:\\venv\\Scripts\\quse.exe']):
+        with patch('agent_hub_host.quota_snapshot.quse_argv', return_value=['C:\\venv\\Scripts\\quse.exe']):
             self.assertEqual(session_host.resolve_quse_cmd(), 'C:\\venv\\Scripts\\quse.exe')
-        with patch('agent_hub_host.provisioning.quse_argv', return_value=['py', '-m', 'quse.cli']):
+        with patch('agent_hub_host.quota_snapshot.quse_argv', return_value=['py', '-m', 'quse.cli']):
             self.assertEqual(session_host.resolve_quse_cmd(), ['py', '-m', 'quse.cli', '--json'])
 
     def test_native_cli_output_decodes_as_utf8(self):
