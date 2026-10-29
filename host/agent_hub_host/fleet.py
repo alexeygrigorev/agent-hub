@@ -45,6 +45,20 @@ def _terminal_fleet_state(reconciled_state, has_result, diagnostic_reason=None):
     return 'exited'
 
 
+def _clean_native_success(report, evidence):
+    """A receipt-less launcher failure is superseded only by clean completion.
+
+    Intake 17e774f8: the worker's done report plus a native exit code of
+    exactly 0 and no signal. Missing exit evidence, any nonzero code (137)
+    or signal (9) keeps the launch failed; the report is still forwarded.
+    """
+    return (isinstance(report, dict) and report.get('report_status') == 'done'
+            and isinstance(evidence, dict) and type(evidence.get('exit_code')) is int
+            and evidence['exit_code'] == 0
+            and (evidence.get('exit_signal') is None
+                 or (type(evidence.get('exit_signal')) is int and evidence['exit_signal'] == 0)))
+
+
 def _sanitize_launcher_slug(text, limit=64):
     """Keep a bounded launcher reason slug (alnum plus ._-); never fail."""
     try:
@@ -1659,6 +1673,60 @@ class Dispatcher:
         self.request('POST', '/api/fleet/launches/' + offer_id + '/result', payload)
         return {'id': offer_id, **payload, 'reason': diagnostic['reason']}
 
+    def _settle_retired_dispatch(self, *, offer_id, task_id, workspace, target_cwd, target,
+                                 offer, sub, launched_at_ts, log_offsets, record, failure):
+        """Intake 17e774f8: a retired native after a receipt-less launcher exit.
+
+        The maintained launcher can exit 1 with empty pipes when the engine
+        finishes before any first action validates (Windows headless Claude,
+        b99fab81) although the worker completed and wrote its result. Native
+        retirement alone neither proves success nor releases the launcher's
+        reservation, so bind the exact native in the ordinary headless shape
+        and let reconcile_launches settle it: launcher release confirmed,
+        exited only for a clean native exit with a done report, failed (with
+        any worker report forwarded) otherwise. Unconfirmed release keeps the
+        reservation and reports uncertain; reconciliation finishes it later.
+        """
+        # Only this launch's own native may settle it: a foreign or stale
+        # start file must never qualify an unrelated retirement.
+        try:
+            started_ms = int(launched_at_ts * 1000) if type(launched_at_ts) in (int, float) else None
+            same = (target.tag == 'task-' + task_id
+                    and target.workspace == str(Path(workspace).resolve(strict=True))
+                    and isinstance(offer.get('engine'), str) and target.engine == offer['engine']
+                    and type(target.created_at_ms) is int and started_ms is not None
+                    and started_ms - 60_000 <= target.created_at_ms <= int(time.time() * 1000) + 60_000)
+        except (OSError, ValueError, TypeError):
+            same = False
+        if not same:
+            return None
+        native_id = str(target.session_id)
+        record.update(state='running', settled=False, native_id=native_id, tag=target.tag,
+                      engine=target.engine, incarnation=target.created_at_ms,
+                      account=sub.get('account_label'), profile=offer.get('profile') or sub.get('profile'),
+                      launched_at_ts=launched_at_ts if type(launched_at_ts) in (int, float) else time.time(),
+                      log_offsets=log_offsets, retired_dispatch=True, dispatch_failure=failure,
+                      result_path=str(Path(workspace) / '.local' / 'hub-results' / (offer_id + '.json')))
+        record.pop('reason', None)
+        record.pop('diagnostic', None)
+        self._persist_launch_record(record)
+        self._active_launches[offer_id] = record
+        self.reconcile_launches([offer_id], terminal_only=True)
+        current = self._active_launches.get(offer_id) or record
+        if current.get('settled') is True and current.get('state') in ('exited', 'failed'):
+            return {'id': offer_id, 'state': current['state'], 'native_id': native_id,
+                    'launcher_task_id': task_id, 'recovered_receipt': True,
+                    **({'diagnostic': failure} if current['state'] == 'failed' else {})}
+        if not isinstance(current.get('terminal_payload'), dict):
+            # Nothing terminal was sent: expose the bound native as uncertain.
+            # A pending terminal payload is replayed by reconciliation instead.
+            self.request('POST', '/api/fleet/launches/' + offer_id + '/result',
+                         {'state': 'uncertain', 'native_id': native_id,
+                          'launcher_task_id': task_id, 'diagnostic': failure})
+        return {'id': offer_id, 'state': 'uncertain', 'native_id': native_id,
+                'launcher_task_id': task_id, 'reason': failure['reason'],
+                'diagnostic': failure, 'pending_release': True}
+
     def _recover_live_native_after_lost_receipt(self, *, offer_id, task_id, workspace, target,
                                                 start_engine, retire_detail, sub, offer,
                                                 launched_at_ts, log_offsets):
@@ -1812,8 +1880,14 @@ class Dispatcher:
             resources_reserved = reconcile_out.get("resources_reserved")
 
             # Require confirmed physical release of the same native execution.
+            # A retired dispatch (intake 17e774f8) may hold no launcher
+            # binding when no first action validated: a missing (never a
+            # different) launcher native_id is accepted for it only.
+            launcher_native = reconcile_out.get("native_id")
             if (resources_reserved is not False
-                    or reconcile_out.get("native_id") != record["native_id"]
+                    or (launcher_native != record["native_id"]
+                        and not (launcher_native is None and record.get("retired_dispatch") is True
+                                 and reconcile_out.get("task_id") == record["task_id"]))
                     or reconciled_state not in ("completed-awaiting-review", "accepted", "failed")):
                 continue
 
@@ -1842,12 +1916,19 @@ class Dispatcher:
                 if acknowledge(self, record, cached, cached.get('runtime', {}).get('outcome') == 'reported'):
                     reconciled.append({'id': offer_id, 'state': 'exited', 'reconciled': True})
                 continue
-            fleet_state = cached['state'] if cached else _terminal_fleet_state(
-                reconciled_state, bool(_peeked),
-                (record.get('diagnostic') or {}).get('reason')
-                if isinstance(record.get('diagnostic'), dict) else None)
             from .exit_evidence import terminal_evidence, bound_finish_fields
             evidence = dict(cached['runtime']) if cached and isinstance(cached.get('runtime'), dict) else terminal_evidence(record, tombstone or {}, state_dir=state_dir)
+            if cached:
+                fleet_state = cached['state']
+            elif record.get('retired_dispatch') is True:
+                # The launcher's own state is failed (no first action); only a
+                # clean native completion with a done report supersedes it.
+                fleet_state = 'exited' if _clean_native_success(_peeked, evidence) else 'failed'
+            else:
+                fleet_state = _terminal_fleet_state(
+                    reconciled_state, bool(_peeked),
+                    (record.get('diagnostic') or {}).get('reason')
+                    if isinstance(record.get('diagnostic'), dict) else None)
             evidence['outcome'] = ('reported' if _peeked else
                 'failed-with-partial-work' if evidence['observed_commits'] or evidence['dirty_paths'] or evidence['log_tail'] else
                 'failed-without-report')
@@ -1921,6 +2002,9 @@ class Dispatcher:
                 result_payload['diagnostic'] = record['dispatch_diagnostic']
             elif record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
                 result_payload['diagnostic'] = record['diagnostic']
+            elif (fleet_state == 'failed' and record.get('retired_dispatch') is True
+                    and isinstance(record.get('dispatch_failure'), dict)):
+                result_payload['diagnostic'] = record['dispatch_failure']
             # AC a19cac9e: missing result JSON now forces failed above, so
             # every exit-without-result carries exit code/signal/wall-time/
             # tail here. Exited-with-result receipts keep no failure
@@ -3158,6 +3242,14 @@ class Dispatcher:
             l_at = locals().get("launched_at_ts")
             failure = exception_diagnostic(exc, "dispatch_headless" if mode == "headless" else "dispatch_interactive",
                                            engine=engine_name, cwd=t_cwd, task_id=t_id, launched_at=l_at, start_offsets=l_offsets)
+            if mode == "headless" and t_id and failure.get("reason") == "launcher_command_failed":
+                # Intake 17e774f8: an empty-pipe launcher exit still saved its
+                # cause in this launch's own record; keep it, sanitized.
+                try:
+                    from .launch_diagnostics import launcher_record_cause
+                    failure = launcher_record_cause(failure, workspace, t_id, l_at)
+                except Exception:
+                    pass
             if mode == "headless" and not offer.get("task_id") and t_id:
                 try:
                     health = self._check_headless_health(offer_id, t_id, workspace, engine_name)
@@ -3202,9 +3294,20 @@ class Dispatcher:
                                         engine=cand_engine,
                                     ).validated()
                                     is_retired, tomb, retire_detail = verify_native_retirement(native, target, state_dir=self.settings.get("aplexer_state_dir"))
-                                    if is_retired:
+                                    if is_retired and failure.get("reason") != "launcher_command_failed":
+                                        # Diagnosed model/auth/permission failures keep their policy.
                                         proven_dead = True
                                         native_session_id = cand_id
+                                    elif is_retired:
+                                        settled = self._settle_retired_dispatch(
+                                            offer_id=offer_id, task_id=task_id, workspace=workspace,
+                                            target_cwd=target_cwd, target=target, offer=offer,
+                                            sub=sub if isinstance(locals().get("sub"), dict) else {},
+                                            launched_at_ts=l_at, log_offsets=l_offsets,
+                                            record=record, failure=failure)
+                                        if settled is not None:
+                                            return settled
+                                        # Foreign/stale start identity: keep uncertain.
                                     else:
                                         recovered = self._recover_live_native_after_lost_receipt(
                                             offer_id=offer_id, task_id=task_id, workspace=workspace,
