@@ -5,6 +5,7 @@ import { IntakeWatchdog, queuePolicyFrom } from './intake-watchdog';
 import { OpsLiveness } from './ops-liveness';
 import { IntakeTriage } from './intake-triage';
 import { IntakeVerifier } from './intake-verifier';
+import { AskLedger } from './asks';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
 import { RepoRegistry } from './repos';
 import { hostReconcileFact, validReconcileNative } from './host-reconcile';
@@ -134,6 +135,7 @@ export class Hub extends DurableObject {
   public opsLiveness: OpsLiveness;
   public intakeTriage: IntakeTriage;
   public intakeVerifier: IntakeVerifier;
+  public askLedger: AskLedger;
   public sessionAudit: SessionAuditService;
   public busService: BusService;
   public jobsService: JobsService;
@@ -310,8 +312,34 @@ export class Hub extends DurableObject {
     }
     this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
     this.livenessService.init();
+    // Ask ledger (intake 55c10deb): Alexey's verbatim messages -> asks -> intake AC
+    // lines. Its pass runs on the watchdog tick and its close gate sits beside
+    // DONE evidence and the worktree gate.
+    this.askLedger = new AskLedger(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
+      notify: async (kind, subject, detail) => {
+        const alert = this.livenessService.setAlert(kind, subject, detail === null ? null : { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
+        return !!alert;
+      },
+      start: async input => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
+          { method: 'POST', body: JSON.stringify(input) }),
+          { caller: { isAdmin: true, actor: 'hub:service:ask-reconciler', kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+      sessionState: id => (this.sql.exec('SELECT state FROM session_control_sessions WHERE id=?', id).toArray()[0] as any)?.state ?? null,
+      hostFresh: machineId => {
+        const m = this.sql.exec('SELECT last_checkin_at FROM machines WHERE id=?', machineId).toArray()[0] as any;
+        return !!m?.last_checkin_at && Date.now() - Date.parse(m.last_checkin_at) < 15 * 60000;
+      },
+    });
+    this.askLedger.init();
+    this.intakeService.addCloseGate((task, unverified) => this.askLedger.closeGate(task, unverified));
+    this.statusService.setAskSummary(() => this.askLedger.counts());
     this.intakeWatchdog = new IntakeWatchdog(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
       policy: () => queuePolicyFrom(env as unknown as Record<string, unknown>),
+      asks: now => this.askLedger.tick(now),
+      asksDigest: () => this.askLedger.summaryLine(),
       start: async input => {
         const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
           { method: 'POST', body: JSON.stringify(input) }),
@@ -732,6 +760,14 @@ export class Hub extends DurableObject {
     }
 
     try {
+      if (path === '/api/asks' || path.startsWith('/api/asks/')) {
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        const c: any = auth.caller;
+        const admin = !!c?.isAdmin && c.kind === 'human';
+        const host = !admin && c?.kind === 'host' && this.sessionControlService.hostObservationAllowed(c.machineId, c);
+        return this.askLedger.handle(request, admin || host ? { admin, actor: c.actor ?? (host ? 'host:' + c.machineId : 'admin'), machineId: host ? c.machineId : null } : null);
+      }
       if (path === '/api/intake' || path.startsWith('/api/intake/')) {
         return this.intakeService.handle(request, async () => {
           if (request.headers.has('Authorization') && request.headers.has('Cookie')) return { error: Response.json({ error: 'mixed_authority' }, { status: 403 }) };
@@ -2275,6 +2311,8 @@ export class Hub extends DurableObject {
     for (const alert of await m('watch_hosts', () => this.livenessService.watchHosts())) await this.notifyAlert(alert);
     await m('host_goals', () => new HostGoals(this.sql, this.fleetService).reconcile());
     await m('tbm', () => this.runTbmTick());
+    // A10 (290b935a/55c10deb): the 5-min slot starts the ask reconciler when new asks wait.
+    if (!only) { try { await m('ask_reconcile', () => this.askLedger.reconcileDue()); } catch (e) { console.error('ask reconcile', e); } }
     if (!only) await m('credentials', () => this.maintainCredentials());
     for (const alert of await m('banked_resets', () => new BankedResets(this.sql, this.livenessService).run())) await this.notifyAlert(alert);
     await m('liveness_prune', () => this.livenessService.prune());

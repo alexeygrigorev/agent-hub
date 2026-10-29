@@ -272,9 +272,14 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   return true;
 }
 
+/** Extra done-close gates beside DONE evidence and the worktree gate (e.g. the
+ * ask ledger, 55c10deb AC5). Synchronous: they run inside the close transaction. */
+export type IntakeCloseGate = (task: Obj, unverified: boolean) => { code: string; detail?: Obj } | null;
 export class IntakeService {
   public worktrees: IntakeWorktrees;
   public mergeGate: MergeGate;
+  private closeGates: IntakeCloseGate[] = [];
+  addCloseGate(gate: IntakeCloseGate) { this.closeGates.push(gate); }
   constructor(public sql: SqlStorage, private tx: Tx = <T>(fn: () => T) => fn(), private hooks: IntakeHooks = {}) {
     this.worktrees = new IntakeWorktrees(sql);
     this.mergeGate = new MergeGate(sql);
@@ -479,6 +484,10 @@ export class IntakeService {
       // outcome=closed_unverified and its reason; no DONE evidence is implied.
       const note = unverified ? { text: 'closed_unverified: ' + reason } : this.doneNote(task);
       if (!note) fail('done_evidence_required', 409);
+      for (const gate of this.closeGates) {
+        const refused = gate(task, unverified);
+        if (refused) throw new IntakeError(refused.code, 409, undefined, undefined, refused.detail);
+      }
       // Close gate (intake 4b161918): every linked worktree merged and removed.
       const gate = this.worktrees.gate(task.id);
       if (!gate.ok) {

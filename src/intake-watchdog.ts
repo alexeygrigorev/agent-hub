@@ -56,6 +56,9 @@ export type WatchdogHooks = {
   observe?: (sessionId: string) => Promise<{ status: number; body: Obj }>;
   note?: (task: Obj, text: string, key: string) => Promise<boolean>;
   notify?: (kind: string, subject: string, detail: string | null) => Promise<boolean | void>;
+  /** Ask ledger pass (intake 55c10deb) run on this tick, and its digest line. */
+  asks?: (now: number) => Promise<Obj>;
+  asksDigest?: () => string | null;
 };
 export class IntakeWatchdog {
   constructor(private sql: SqlStorage, private intake: IntakeService,
@@ -605,7 +608,9 @@ export class IntakeWatchdog {
       const due=items.filter(t=>!done.has(t.id));
       if(due.length) {
         const unmerged=this.intake.mergeGate?.unmerged(20)??[];
-        const text='Daily open intake digest '+day+' (bounded batch)\n'+this.digest(due)+(unmerged.length?'\n\nUNMERGED intakes ('+this.intake.mergeGate.counts().total_unmerged+'): work not in origin/main or not deployed\n'+unmerged.map(m=>`${m.task_id} ${m.state}; requeues ${m.requeues}; ${m.problems.join('; ')}`).join('\n'):'');
+        // The ask ledger line rides on the day's first digest batch only.
+        const asksLine=meta.digest_day!==day ? this.hooks.asksDigest?.() : null;
+        const text='Daily open intake digest '+day+' (bounded batch)\n'+(asksLine ? asksLine+'\n\n' : '')+this.digest(due)+(unmerged.length?'\n\nUNMERGED intakes ('+this.intake.mergeGate.counts().total_unmerged+'): work not in origin/main or not deployed\n'+unmerged.map(m=>`${m.task_id} ${m.state}; requeues ${m.requeues}; ${m.problems.join('; ')}`).join('\n'):'');
         const chunks:string[]=[];
         for(const line of text.split('\n')) {
           const tail=chunks.length-1;
@@ -638,7 +643,12 @@ export class IntakeWatchdog {
     }).sort((a,b)=>(context.queue.get(a.id)?.updated_at??0)-(context.queue.get(b.id)?.updated_at??0)||a.id.localeCompare(b.id));
     for(const item of ordered.slice(0,8))await this.restart(tasks.find(t=>t.id===item.id)!,now);
     const human_hold_alerts=await this.alertHumanHolds(tasks,now);
-    const result={state:'checked',checked_at:now,forgotten_count:forgotten.length,open_count:items.length,human_hold_alerts,
+    let asks:Obj|undefined;
+    if(this.hooks.asks) {
+      try { asks=await this.hooks.asks(now); }
+      catch(e:any) { asks={state:'error',error:String(e?.message||e).slice(0,200)}; }
+    }
+    const result={state:'checked',checked_at:now,forgotten_count:forgotten.length,open_count:items.length,human_hold_alerts,...(asks?{asks}:{}),
       observation_scope:'cursor_batch',batch_limit:QUEUE_BATCH_SIZE,observed_sessions:context.sessions.length,observed_native:context.native.length,observation_limited:context.overflow,elapsed_ms:performance.now()-began};
     this.sql.exec('UPDATE intake_watchdog_meta SET last_result=? WHERE id=1',JSON.stringify(result));return result;
   }

@@ -214,6 +214,13 @@ export class StatusService {
    * visibility into other actors' monitoring details. No second check loop.
    * Surfaced as needs_attention plus the stale history group (AC2). */
   private sessionAttention: () => Obj[] = () => [];
+  /** Ask ledger counts (intake 55c10deb); operator status only. */
+  private askSummary: (() => Obj) | null = null;
+  setAskSummary(fn: () => Obj): void { this.askSummary = fn; }
+  private asksDto(admin: boolean): Obj {
+    if (!admin || !this.askSummary) return {};
+    try { return { asks: this.askSummary() }; } catch { return {}; }
+  }
   setSessionAttention(provider: () => Obj[]) { this.sessionAttention = provider; }
 
   private attentionGroups(admin: boolean, measured: Obj[], intakeWarn: Obj | null = null): Obj {
@@ -710,6 +717,7 @@ export class StatusService {
           open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p, summaries),
           open_intake_warn_threshold: 100,
           ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
+          ...this.asksDto(!!(p as any).admin),
           ...this.attentionGroups(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next, total, limit },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
@@ -819,6 +827,7 @@ export class StatusService {
           open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p, summaries),
           open_intake_warn_threshold: 100,
           ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
+          ...this.asksDto(!!(p as any).admin),
           ...this.attentionGroups(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next: null, total: tasks.length, limit: tasks.length },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
