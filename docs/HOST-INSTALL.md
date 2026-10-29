@@ -1,6 +1,6 @@
 # Install a Hub session host
 
-This installer is under review. We still need to verify the published entrypoints and enrollment on a fresh Windows profile.
+We're still reviewing this installer: the commands aren't published yet, and fresh Windows enrollment remains unverified. The macOS runtime can't enforce Hub's required resource limits, so its controller won't start.
 
 Run one command in your ordinary user account. You don't need an administrator terminal.
 
@@ -28,7 +28,7 @@ Your engine commands include Claude Code, Codex and OpenCode. We also install Ge
 
 We select Claude with Opus as your default engine. Your host then receives the engine accounts configured centrally in Hub. Account delivery and a successful model session are separate from installing an executable.
 
-We support installation paths for Linux with glibc 2.28 or newer, macOS 11 or newer, and Windows 10/11 on x64 and ARM64. macOS uses the matching aplexer binary and client from release `0.1.22`. Linux and Windows use `0.1.23`. ZCode/ZAI installation across these platforms remains unfinished.
+The installer targets Linux with glibc 2.28 or newer, macOS 11 or newer, and Windows 10/11 on x64 and ARM64. macOS uses the matching aplexer binary and client from release `0.1.22`. Linux and Windows use `0.1.23`. ZCode/ZAI installation across these platforms remains unfinished.
 
 Keep your user session active so its controller can report availability. Open a new terminal to pick up the saved engine commands on PATH. Windows PowerShell also receives the updated PATH when installation finishes.
 
