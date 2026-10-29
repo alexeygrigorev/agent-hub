@@ -235,7 +235,7 @@ export interface ScopeStatus {
   stale_policy: boolean;
 }
 
-/** Informational scope projection (policy v2): never blocks assign, start or restart. */
+/** Informational scope projection (policy v2, intake 8afb6375): never blocks assign, start, restart or verifier start. */
 export function getScopeStatus(task: Obj): ScopeStatus {
   const scope = task.scope ?? null;
   if (!scope || typeof scope !== 'object') return { scope: null, decision: null, clear: true, stale_policy: false };
