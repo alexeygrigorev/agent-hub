@@ -47,9 +47,13 @@ export function linkedIntake(sql: SqlStorage, session: any, inferHistory = false
   return matches.length === 1 ? matches[0] : null;
 }
 
+/** Host-reported Codex goal states: the thread_goals store values, the screen's
+ * `stalled`, and `unregistered` (a `/goal` launch Codex never turned into a goal). */
+export const GOAL_STATUSES = ['blocked', 'paused', 'stalled', 'active', 'complete', 'usage_limited', 'budget_limited', 'unregistered'];
+
 export function nativeGoalStatus(native: any): string | null {
   const p = parseObject(native?.progress_json);
-  return ['blocked', 'paused', 'stalled', 'active', 'complete'].includes(p.goal_status) ? p.goal_status : null;
+  return GOAL_STATUSES.includes(p.goal_status) ? p.goal_status : null;
 }
 
 /** Optional scheduled-wake contract; no scheduler or second delivery path. */

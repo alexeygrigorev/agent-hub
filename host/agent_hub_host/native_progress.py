@@ -46,6 +46,72 @@ def matches_launch(path, row):
         return False
 
 
+# Codex thread_goals CHECK constraint plus the host's screen-derived `stalled`.
+GOAL_STATUSES = ('blocked', 'paused', 'stalled', 'active', 'complete', 'usage_limited', 'budget_limited')
+
+
+def rollout_thread(path):
+    """Thread id from the rollout's own session_meta line, else None."""
+    try:
+        with path.open('rb') as stream:
+            meta = json.loads(stream.readline(65537))
+        thread = meta.get('payload', {}).get('id') if meta.get('type') == 'session_meta' else None
+        return thread if isinstance(thread, str) and 0 < len(thread) <= 128 else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def stored_goal_status(path):
+    """(status, thread_id, read_ok) from <CODEX_HOME>/goals_<n>.sqlite for the
+    rollout's exact thread. Read-only, 50 ms budget. read_ok is True only after
+    a clean read, so only then does a missing row prove there is no goal."""
+    thread = rollout_thread(path)
+    # Rollouts live at <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl.
+    if thread is None or len(path.parents) < 5 or path.parents[3].name != 'sessions':
+        return None, thread, False
+    stores = []
+    for db in path.parents[4].glob('goals_*.sqlite'):
+        suffix = db.stem.removeprefix('goals_')
+        if suffix.isdigit():
+            stores.append((int(suffix), db))
+    if not stores:
+        return None, thread, False
+    db = max(stores)[1]
+    try:
+        with closing(sqlite3.connect(db.as_uri() + '?mode=ro', uri=True, timeout=.05)) as conn:
+            deadline = time.monotonic() + .05
+            conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+            found = conn.execute('SELECT status FROM thread_goals WHERE thread_id = ?', (thread,)).fetchone()
+    except sqlite3.Error:
+        return None, thread, False
+    if found:
+        return (found[0] if found[0] in GOAL_STATUSES else None), thread, False
+    return None, thread, True
+
+
+def goal_requested_as_text(path, lines=64):
+    """True when an early user message is literally `/goal <objective>`."""
+    try:
+        with path.open('rb') as stream:
+            for line in itertools.islice(stream, lines):
+                try:
+                    payload = json.loads(line).get('payload')
+                except (ValueError, UnicodeDecodeError, AttributeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get('type') == 'thread_goal_updated':
+                    return False
+                if payload.get('type') == 'message' and payload.get('role') == 'user':
+                    for item in payload.get('content') or []:
+                        text = item.get('text') if isinstance(item, dict) else None
+                        if isinstance(text, str) and text.startswith('/goal ') and text[6:].strip():
+                            return True
+    except OSError:
+        return False
+    return False
+
+
 class NativeTranscriptProgress:
     def __init__(self, roots=codex_roots, proc_root=Path('/proc'), opencode_data=None):
         self.roots, self.proc_root = roots, proc_root
@@ -73,12 +139,21 @@ class NativeTranscriptProgress:
         return None
 
     def goal_status(self, row):
-        """Read only the exact bound rollout, bounded tail, no transcript upload."""
+        """Exact bound thread only: Codex goal store first, then a bounded rollout tail.
+
+        No transcript upload. A launch whose rollout opens with a literal
+        `/goal ...` user message, and whose cleanly read store has no row for
+        the thread, reports `unregistered`:
+        Codex sent the text to the model instead of creating a goal.
+        """
         if row.get('engine') not in ('codex', 'zcodex'):
             return None
         path = self.paths.get((row['id'], row['created_at_ms'])) or self.locate(row)
         if path is None:
             return None
+        stored, _, no_stored_goal = stored_goal_status(path)
+        if stored:
+            return stored
         import re
         latest = None
         try:
@@ -108,13 +183,15 @@ class NativeTranscriptProgress:
                             except ValueError:
                                 pass
                         elif name.split('.')[-1] == 'exec' and isinstance(arguments, str):
-                            matches = re.findall(r'\btools\.update_goal\(\s*\{\s*status\s*:\s*[\"\'](blocked|paused|stalled|active|complete)[\"\']', arguments)
+                            matches = re.findall(r'\btools\.update_goal\(\s*\{\s*status\s*:\s*[\"\'](' + '|'.join(GOAL_STATUSES) + r')[\"\']', arguments)
                             if matches:
                                 status = matches[-1]
-                    if status in ('blocked', 'paused', 'stalled', 'active', 'complete'):
+                    if status in GOAL_STATUSES:
                         latest = status
         except (OSError, ValueError, TypeError):
             return None
+        if latest is None and no_stored_goal and goal_requested_as_text(path):
+            return 'unregistered'
         return latest
 
     def opencode_progress(self, row):
