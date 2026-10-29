@@ -1,8 +1,8 @@
 [Unit]
-Description=15-minute dead-session watchdog for ops Claude sessions
+Description=10-minute dead-session watchdog for ops Claude sessions
 
 [Timer]
-OnCalendar=*:0/15
+OnCalendar=*:0/10
 RandomizedDelaySec=60
 Persistent=false
 
