@@ -38,3 +38,53 @@ export function observedHubTagMatches(sql: SqlStorage, ref: string, owns: (row: 
       return /^hub-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(tag) && owns(row);
     });
 }
+
+/** Reconcile linkage as evidence only. Scan retained history once per census,
+ * releasing each parsed task before reading the next; never once per native. */
+export function observedIntakeCandidates(sql: SqlStorage, machine: string, rows: any[]): Map<string, string> {
+  const candidates = new Map<string, Set<string>>();
+  if (!rows.length) return new Map();
+  const ids = new Map<string, any[]>(), tags = new Map<string, any[]>(), paths = new Map<string, any[]>();
+  const add = (index: Map<string, any[]>, key: string, row: any) => {
+    if (key) index.set(key, [...(index.get(key) ?? []), row]);
+  };
+  const mark = (targets: any[] | undefined, task: string, host?: string) => {
+    for (const row of targets ?? []) {
+      if (host && host !== row.machine_id) continue;
+      const matches = candidates.get(row.id) ?? new Set<string>();
+      matches.add(task); candidates.set(row.id, matches);
+    }
+  };
+  for (const row of rows) {
+    const binding = JSON.parse(row.binding_json);
+    add(ids, row.id, row);
+    if (binding.native_id !== row.id) add(ids, binding.native_id, row);
+    add(tags, binding.tag, row); add(paths, binding.workspace, row);
+  }
+  const knownTasks = new Set<string>();
+  for (const stored of sql.exec('SELECT id, data FROM intake_tasks')) {
+    let task: any;
+    try { task = JSON.parse(String(stored.data)); } catch { continue; }
+    if (!task || typeof task !== 'object') continue;
+    knownTasks.add(String(stored.id));
+    if (!Array.isArray(task.history)) continue;
+    for (const event of task.history) {
+      if (!event || typeof event !== 'object') continue;
+      mark(ids.get(event.hub_session_id), String(stored.id));
+      mark(ids.get(event.native_id), String(stored.id), event.host);
+      if (event.kind !== 'note' || typeof event.text !== 'string' || !/^START(?:ED)?\b/i.test(event.text.trim())) continue;
+      for (const token of event.text.split(/[^A-Za-z0-9_.:/~-]+/)) {
+        mark(ids.get(token), String(stored.id));
+        mark(tags.get(token), String(stored.id));
+        if (token.includes(':')) mark(tags.get(token.slice(token.lastIndexOf(':') + 1)), String(stored.id));
+      }
+    }
+  }
+  const hasWorktrees = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_worktrees'").toArray().length;
+  if (hasWorktrees) {
+    for (const tree of sql.exec("SELECT path,task_id FROM intake_worktrees WHERE machine=? AND state='active'", machine)) {
+      if (knownTasks.has(String(tree.task_id))) mark(paths.get(String(tree.path)), String(tree.task_id));
+    }
+  }
+  return new Map([...candidates].filter(([, tasks]) => tasks.size === 1).map(([id, tasks]) => [id, [...tasks][0]]));
+}

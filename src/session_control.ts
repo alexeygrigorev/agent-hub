@@ -1,4 +1,4 @@
-import { insertSessionObservation, observedHubTagMatches, observationModel } from './session-observation';
+import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates } from './session-observation';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
 import { IntakeWorktrees } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
@@ -3755,18 +3755,27 @@ export function adoptObservedNativeSessions(
     }
   }
 
-  // Notes may be appended after initial adoption. Reconcile existing imports too.
-  for (const s of sessions) {
-    if (!s || typeof s.native_id !== 'string') continue;
-    const row: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', s.native_id).toArray()[0];
-    if (!row || row.fleet_launch_id || parsed(row.request_json, {}).intake_task_id) continue;
-    const task = linkedIntake(sql, row, true);
-    if (task) {
-      const intent = { ...parsed(row.request_json, {}), intake_task_id: task.id };
-      sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', JSON.stringify(intent), row.id);
-      row.request_json = JSON.stringify(intent);
-      recordIntakeSessionLink(sql, row, nowMs);
-    }
+  // Reconcile late START notes and exact registered-worktree evidence in
+  // one bounded pass. Linkage never grants ownership or filesystem authority.
+  const pending: any[] = [];
+  for (const native of sessions) {
+    if (!native || typeof native.native_id !== 'string') continue;
+    const row: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', native.native_id).toArray()[0];
+    if (!row || row.machine_id !== machineId || row.fleet_launch_id || parsed(row.request_json, {}).intake_task_id) continue;
+    const binding = parsed(row.binding_json, {});
+    if (binding.provenance !== 'observed_native' || binding.native_id !== native.native_id ||
+        binding.tag !== native.tag || binding.workspace !== native.workspace ||
+        binding.native_created_at_ms !== (native.created_at_ms ?? null) || row.engine !== native.engine) continue;
+    pending.push(row);
+  }
+  const links = observedIntakeCandidates(sql, machineId, pending);
+  for (const row of pending) {
+    const taskId = links.get(row.id);
+    if (!taskId) continue;
+    const intent = { ...parsed(row.request_json, {}), intake_task_id: taskId };
+    sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', JSON.stringify(intent), row.id);
+    row.request_json = JSON.stringify(intent);
+    recordIntakeSessionLink(sql, row, nowMs);
   }
   return { adopted, updated, deferred };
 }

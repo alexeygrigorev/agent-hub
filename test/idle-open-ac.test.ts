@@ -5,6 +5,7 @@ import { SessionControlService, adoptObservedNativeSessions } from '../src/sessi
 import { historyReferencesSession, linkedIntake, openWorkPreventsIdleReap } from '../src/intake-session';
 import { recordIntakeSessionLink } from '../src/intake';
 import { queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from '../src/session-adoption';
+import { IntakeWorktrees } from '../src/intake-worktrees';
 import { ResourceManagement } from '../src/resource-management';
 import { IdleWorkService } from '../src/idle-work';
 import type { Hub } from '../src/hub';
@@ -81,6 +82,38 @@ describe('idle with open acceptance criteria', () => {
     expect(read()).toBe('stopped');
     adoptObservedNativeSessions(sql,'idle-host',[native],at+3000);
     expect(read()).toBe('stopped');
+  }));
+  it('links late START notes and exact registered workspaces in one census history scan', async () => fixture(async ({sql,task}: any) => {
+    new IntakeWorktrees(sql,()=>at).init();
+    const natives = ['started','registered','unrelated'].map(tag=>({native_id:crypto.randomUUID(),tag,workspace:'/'+tag,engine:'codex',created_at_ms:at-1000,phase:'running'}));
+    task.history.push({kind:'note',text:`START: native ${natives[0].native_id}`},
+      {kind:'note',text:`RCA: reference ${natives[2].native_id}`});
+    sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(task),taskId);
+    sql.exec(`INSERT INTO intake_worktrees(id,task_id,machine,path,created_at,updated_at,origin,state)
+      VALUES(?,?,'idle-host','/registered',?,?,'operator','active')`,crypto.randomUUID(),taskId,at,at);
+    const reads: string[]=[];
+    const counted={exec(query:string,...args:any[]){reads.push(query);return sql.exec(query,...args);}};
+    expect(adoptObservedNativeSessions(counted as any,'idle-host',natives,at).adopted).toBe(3);
+    const intake=(native:any)=>JSON.parse(sql.exec('SELECT request_json FROM session_control_sessions WHERE id=?',native.native_id).one().request_json).intake_task_id;
+    expect(intake(natives[0])).toBe(taskId);
+    expect(intake(natives[1])).toBe(taskId);
+    expect(intake(natives[2])).toBeUndefined();
+    expect(reads.filter(q=>q==='SELECT id, data FROM intake_tasks')).toHaveLength(1);
+  }));
+  it('keeps ambiguous intake evidence and foreign-host native links unassigned', async () => fixture(async ({sql,task}: any) => {
+    const native={native_id:crypto.randomUUID(),tag:'ambiguous',workspace:'/ambiguous',engine:'codex',created_at_ms:at-1000,phase:'running'};
+    const otherId=crypto.randomUUID();
+    for (const target of [taskId,otherId]) {
+      const body={...task,id:target,history:[{kind:'note',text:`START: native ${native.native_id}`}]};
+      sql.exec('INSERT OR REPLACE INTO intake_tasks(id,data) VALUES(?,?)',target,JSON.stringify(body));
+    }
+    adoptObservedNativeSessions(sql,'idle-host',[native],at);
+    const row=()=>sql.exec('SELECT * FROM session_control_sessions WHERE id=?',native.native_id).one();
+    expect(JSON.parse(row().request_json).intake_task_id).toBeUndefined();
+    sql.exec('DELETE FROM intake_tasks WHERE id=?',otherId);
+    sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify({...task,history:[{kind:'link',native_id:native.native_id,host:'foreign-host'}]}),taskId);
+    adoptObservedNativeSessions(sql,'idle-host',[native],at+1000);
+    expect(JSON.parse(row().request_json).intake_task_id).toBeUndefined();
   }));
   it('upgrades a visibility-only census row only after an exact operator host receipt', async () => fixture(async ({sql,row}: any) => {
     const current = row();

@@ -1,4 +1,9 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from agent_hub_host.session_observation import native_session_model
 
 from agent_hub_host.fleet import session_metadata
 
@@ -23,6 +28,31 @@ class SessionObservationTests(unittest.TestCase):
                 result = session_metadata([{**row, "command": command}],
                                           {"subscriptions": []}, collect_tokens=False)[0]
                 self.assertIsNone(result["model"])
+
+    def test_bound_codex_and_claude_transcripts_resolve_default_models(self):
+        row = {'id': 'native', 'engine': 'codex', 'created_at_ms': 1700000000000}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'transcript.jsonl'
+            locate = SimpleNamespace(locate=lambda _: path)
+            path.write_text(json.dumps({'type':'turn_context','payload':{'model':'gpt-6.1-sol'}})+'\n')
+            self.assertEqual(native_session_model(row,locate),'gpt-6.1-sol')
+            path.write_text(json.dumps({'type':'assistant','message':{'model':'claude-opus-4-8','content':'private content'}})+'\n')
+            self.assertEqual(native_session_model({**row,'engine':'claude'},locate),'claude-opus-4-8')
+
+    def test_latest_bounded_context_wins_and_untyped_model_labels_are_ignored(self):
+        row = {'id': 'native-tail', 'engine': 'codex', 'created_at_ms': 1700000000000}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'transcript.jsonl'
+            path.write_bytes(json.dumps({'type':'turn_context','payload':{'model':'old-model'}}).encode()+b'\n'+b'\n'*(256*1024)+
+                             json.dumps({'type':'turn_context','payload':{'model':'new-model'}}).encode()+b'\n'+
+                             json.dumps({'type':'user','model':'spoofed-model'}).encode()+b'\n')
+            self.assertEqual(native_session_model(row,SimpleNamespace(locate=lambda _:path)),'new-model')
+
+    def test_absent_bound_metadata_is_unknown_and_shell_is_not_applicable(self):
+        locate = SimpleNamespace(locate=lambda _:None)
+        self.assertIsNone(native_session_model({'id':'native','engine':'codex','created_at_ms':1700000000000},locate))
+        self.assertEqual(native_session_model({'id':'shell','engine':'shell'}),'not_applicable')
+        self.assertEqual(native_session_model({'model':'runtime-model','command':['codex','--model','requested-model']}),'runtime-model')
 
 
 if __name__ == "__main__":

@@ -989,7 +989,7 @@ def bounded_catalog(raw, limit=CATALOG_LIMIT):
 def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
     from .account_capacity import confirmed_empty
     from .session_progress import event_ms
-    from .model_contract import native_model
+    from .session_observation import native_session_model
     sessions = raw if isinstance(raw, list) else raw.get("sessions", [])
     clean = []
     for session in sessions:
@@ -1020,7 +1020,7 @@ def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
                       "cwd": cwd,
                       "last_activity_at": _ms_to_iso(event_ms(session)),
                       "created_at_ms": created_at_ms,
-                      "model": native_model(session.get("command")),
+                      "model": native_session_model(session),
                       "parent_id": session.get("parent_session") if isinstance(session.get("parent_session"), str) else None,
                       **({'progress': progress[session['id']]} if progress and session['id'] in progress else {})})
         if collect_tokens and session.get('tag', '').startswith(('hub-', 'task-hub-')):

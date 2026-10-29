@@ -276,23 +276,23 @@ describe('generic accounts and launch placement', () => {
     const active = () => s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active;
     expect((await report(row)).status).toBe(200);
     expect(sql.exec('SELECT phase FROM fleet_sessions WHERE native_id=?',id).one().phase).toBe('running');
-    // Worktree-guard R2: a census observation alone never adopts an unknown
-    // native into session_control ownership; it defers with a durable
-    // needs_attention alert. Fleet catalog and account capacity stay held.
-    expect(sql.exec('SELECT id FROM session_control_sessions WHERE id=?',id).toArray().length).toBe(0);
-    expect(sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='session_adoption' AND subject=? AND resolved_at IS NULL",'hetzner/'+id).toArray().length).toBe(1);
+    // Census visibility creates no authenticated owner or worktree lock.
+    const control = () => sql.exec('SELECT * FROM session_control_sessions WHERE id=?',id).one();
+    expect(control()).toMatchObject({state:'running',actor:'unknown',owner_token_id:null,owner_family:null});
+    expect(JSON.parse(control().request_json).observation_only).toBe(true);
+    expect(JSON.parse(control().binding_json).adoption_lock).toBeUndefined();
     expect(active()).toBe(1);
     for (const proof of [undefined, false]) {
       expect((await report({...row,phase:'exited',confirmed_exit:proof})).status).toBe(200);
       expect(sql.exec('SELECT phase FROM fleet_sessions WHERE native_id=?',id).one().phase).toBe('uncertain');
-      expect(sql.exec('SELECT id FROM session_control_sessions WHERE id=?',id).toArray().length).toBe(0);
+      expect(control().state).toBe('uncertain');
       expect(active()).toBe(1);
     }
     expect((await report({...row,phase:'exited',confirmed_exit:'true'})).status).toBe(400);
     expect(active()).toBe(1);
     expect((await report({...row,cwd:'/gone',phase:'exited',confirmed_exit:true})).status).toBe(200);
     expect(sql.exec('SELECT phase FROM fleet_sessions WHERE native_id=?',id).one().phase).toBe('exited');
-    expect(sql.exec('SELECT id FROM session_control_sessions WHERE id=?',id).toArray().length).toBe(0);
+    expect(control().state).toBe('stopped');
     expect(active()).toBe(0);
   }));
   it('refuses Opus and Claude when no live route exists', async () => fixture(async (s, sql) => {
@@ -1233,21 +1233,19 @@ describe('imported session lifecycle and non-resurrection in fleet catalog', () 
     const rep1 = await s.handle(request('/sessions', { sessions: [live1] }, 'PUT'), host('hetzner'));
     expect(rep1.status).toBe(200);
 
-    // Verified present in fleet_sessions; census-only observation defers
-    // adoption (needs_attention alert) instead of minting ownership.
+    // Both catalogs expose the live native while custody stays unowned.
     const row1 = sql.exec('SELECT * FROM fleet_sessions WHERE native_id = ?', NATIVE_ID_1).toArray()[0];
     expect(row1).toBeDefined();
     expect(row1.phase).toBe('running');
 
     const sc1 = sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', NATIVE_ID_1).toArray()[0];
-    expect(sc1).toBeUndefined();
-    expect(sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='session_adoption' AND subject=? AND resolved_at IS NULL", 'hetzner/' + NATIVE_ID_1).toArray().length).toBe(1);
+    expect(sc1).toMatchObject({state:'running',actor:'unknown',owner_token_id:null,owner_family:null});
+    expect(JSON.parse(sc1.request_json).observation_only).toBe(true);
+    expect(JSON.parse(sc1.binding_json).adoption_lock).toBeUndefined();
 
-    // 2. Canonical positive retirement stops the session (a session row that
-    // genuinely exists — e.g. previously adopted — is stopped canonically).
-    sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, binding_json, parent_id, parent_source, session_type, owner_token_id, owner_family, host_family, created_at, updated_at)
-      VALUES (?, 'unknown', 'native-observed', '{}', NULL, 'hetzner', 'antigravity', 'interactive', 'stopped', ?, NULL, 'unknown_external', 'aplexer', NULL, NULL, NULL, ?, ?)`,
-      NATIVE_ID_1, JSON.stringify({ native_id: NATIVE_ID_1, native_created_at_ms: INCARNATION, provenance: 'observed_native' }), iso(), iso());
+    // 2. A positive terminal census stops that exact observed incarnation.
+    expect((await s.handle(request('/sessions', {sessions:[{...live1,phase:'exited',confirmed_exit:true}]}, 'PUT'), host('hetzner'))).status).toBe(200);
+    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',NATIVE_ID_1).one().state).toBe('stopped');
 
     // 3. Late live-catalog snapshot arrives reporting the SAME session/incarnation still running
     const lateRep = await s.handle(request('/sessions', { sessions: [live1] }, 'PUT'), host('hetzner'));
@@ -1257,7 +1255,7 @@ describe('imported session lifecycle and non-resurrection in fleet catalog', () 
     // History remains inactive and canonical control state remains stopped.
     const fleetCheck = sql.exec('SELECT * FROM fleet_sessions WHERE native_id = ?', NATIVE_ID_1).toArray();
     expect(fleetCheck.length).toBe(1);
-    expect(fleetCheck[0].phase).toBe('unobserved');
+    expect(fleetCheck[0].phase).toBe('exited');
 
     const scCheck = sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_ID_1).toArray()[0];
     expect(scCheck.state).toBe('stopped');
@@ -1283,9 +1281,8 @@ describe('imported session lifecycle and non-resurrection in fleet catalog', () 
     expect(row2).toBeDefined();
     expect(row2.phase).toBe('running');
 
-    // New UUID tag reuse is accepted at the fleet level; census-only
-    // observation still defers ownership instead of minting a session row.
-    expect(sql.exec('SELECT id FROM session_control_sessions WHERE id = ?', NATIVE_ID_2).toArray().length).toBe(0);
+    // New UUID tag reuse gets a distinct unowned observation row.
+    expect(sql.exec('SELECT state,actor,owner_token_id FROM session_control_sessions WHERE id = ?', NATIVE_ID_2).one()).toMatchObject({state:'running',actor:'unknown',owner_token_id:null});
     // And the canonically stopped same-incarnation row was not resurrected.
     expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_ID_1).toArray()[0].state).toBe('stopped');
   }));
