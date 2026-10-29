@@ -4,7 +4,6 @@ Never read profile credentials or infer a provider default. Only the model
 identifier leaves the host; transcript contents and paths stay local.
 """
 import json
-import os
 from pathlib import Path
 import re
 import time
@@ -39,11 +38,6 @@ def _claude_transcript(row):
         roots = {Path(home) / '.claude'}
     else:
         roots = {Path.home() / '.claude'}
-        try:
-            import pwd
-            roots.add(Path(pwd.getpwuid(os.getuid()).pw_dir) / '.claude')
-        except (ImportError, KeyError, OSError):
-            pass
     project = re.sub(r'[^A-Za-z0-9]', '-', cwd)
     matches = {root / 'projects' / project / (sid + '.jsonl') for root in roots
                if (root / 'projects' / project / (sid + '.jsonl')).is_file()}
