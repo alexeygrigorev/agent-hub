@@ -2,6 +2,7 @@
 """Tests for CI/CD workflow validator, rollback helper and wrangler deploy retry."""
 
 import importlib.util
+import re
 import subprocess
 import sys
 import unittest
@@ -26,11 +27,20 @@ RETRY = load_retry_module()
 
 class TestCICD(unittest.TestCase):
     def test_reset_credit_safety_suites_are_discovered(self):
-        """The deploy job uses explicit discovery: these money-adjacent guards must run."""
+        """Money-adjacent reset-credit guards must run in the deploy job."""
         workflow = (REPO_ROOT / '.github/workflows/deploy.yml').read_text()
-        for test in ('host/tests/test_codex_reset_credit.py', 'host/tests/test_reset_credit_workflow.py',
-                     'test/reset-credit-evidence.test.ts'):
+        # Python money-adjacent suites are listed explicitly in the deploy pytest step.
+        for test in ('test/test_no_reset_apply.py', 'host/tests/test_codex_reset_credit.py',
+                     'host/tests/test_reset_credit_workflow.py'):
             self.assertEqual(workflow.count(test), 1, test)
+        # Vitest discovery is unfiltered: the guard file must exist and no vitest
+        # invocation may narrow discovery with an explicit .test.ts file list.
+        self.assertTrue((REPO_ROOT / 'test/reset-credit-evidence.test.ts').is_file(),
+                        'test/reset-credit-evidence.test.ts')
+        vitest_lines = [ln for ln in workflow.splitlines() if 'vitest run' in ln]
+        self.assertTrue(vitest_lines, 'deploy.yml runs vitest discovery')
+        for ln in vitest_lines:
+            self.assertIsNone(re.search(r'\btest/[\w./-]+\.test\.ts', ln), ln)
 
     def test_validate_workflows_passes(self):
         """Verify current repository workflows pass static validation."""
