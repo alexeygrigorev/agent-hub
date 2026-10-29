@@ -182,11 +182,11 @@ describe('human-needed holds alert once (AC8)', () => {
     const w = new IntakeWatchdog(h.sql, { statusAuthorizedTasks: () => tasks } as any, (f: any) => f(),
       { start: async () => ({ status: 202, body: { id: 'x' } }), notify: async (kind: string, subject: string, detail: any) => { if (kind === 'intake_human_hold') notes.push(detail); return true; } }, () => clock.now);
     w.init();
-    expect((await w.tick()).human_hold_alerts).toBe(2);
+    expect(((await w.tick()) as any).human_hold_alerts).toBe(2);
     expect(notes).toHaveLength(1);
     expect(notes[0]).toMatch(/hh1 workspace_configuration_required/);
     clock.now += 3600000;
-    expect((await w.tick()).human_hold_alerts).toBe(0);
+    expect(((await w.tick()) as any).human_hold_alerts).toBe(0);
     expect(notes).toHaveLength(1);
   }));
 });
