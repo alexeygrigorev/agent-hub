@@ -92,6 +92,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Either drill selector makes a --backup-failed alert sink-only: no
+# combination of drill flags/env may reach send_mail.
+if [[ "$BACKUP_FAILED" -eq 1 && "$HUB_DB_STALE_DRILL" == "1" ]]; then
+  FAIL_DRILL=1
+fi
 if [[ "$FAIL_DRILL" -eq 1 && "$BACKUP_FAILED" -ne 1 ]]; then
   echo "--drill is only valid with --backup-failed (use HUB_DB_STALE_DRILL=1 for the staleness drill)" >&2
   exit 1

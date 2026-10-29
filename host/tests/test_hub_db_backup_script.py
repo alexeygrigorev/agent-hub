@@ -435,6 +435,17 @@ class StalenessBackupFailedModeTest(unittest.TestCase):
         self.assertEqual(target.read_text(), "keep")
         self.assertEqual(self.mails(), [])
 
+    def test_stale_drill_env_with_backup_failed_never_sends_mail(self) -> None:
+        # Review finding on 4934849d: HUB_DB_STALE_DRILL=1 + --backup-failed
+        # (no --drill) reached send_mail.
+        env = {**self.env, "HUB_DB_STALE_DRILL": "1"}
+        res = subprocess.run(["bash", str(STALENESS), "--backup-failed", "real-looking reason"],
+                             env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.mails(), [])
+        self.assertIn("Reason: real-looking reason",
+                      (self.work / "state" / "drill-mail.log").read_text())
+
     def test_drill_flag_alone_is_refused(self) -> None:
         res = self.run_stale("--drill")
         self.assertEqual(res.returncode, 1)
