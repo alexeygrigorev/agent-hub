@@ -22,6 +22,12 @@ def _runner(fleet):
     return runner
 
 
+def _routes(body):
+    """A /api/host/routes body without its fence number."""
+    assert isinstance(body.get('seq'), int) and body['seq'] > 0
+    return {k: v for k, v in body.items() if k != 'seq'}
+
+
 class _Host:
     """System, heartbeat telemetry and provisioning stubs for a Dispatcher under test."""
     def __init__(self, heartbeat=None):
@@ -56,7 +62,9 @@ def test_routes_are_posted_before_every_heartbeat_and_heartbeats_carry_none(tmp_
     polls = [i for i, p in enumerate(paths) if p == '/api/host/poll']
     routes = [i for i, p in enumerate(paths) if p == '/api/host/routes']
     assert len(polls) >= 2 and routes and routes[0] < polls[0]
-    assert all(calls[i][1] == {'fleet_routes': EXPECTED} for i in routes)
+    assert all(_routes(calls[i][1]) == {'fleet_routes': EXPECTED} for i in routes)
+    seqs = [calls[i][1]['seq'] for i in routes]
+    assert seqs == sorted(set(seqs))
     # Heartbeat bodies are exactly what they were without route advertisement.
     assert not any({'fleet_routes', 'fleet_routes_overflow', 'fleet_routes_at'} & set(calls[i][1]) for i in polls)
 
@@ -82,7 +90,7 @@ def test_a_changed_list_is_posted_before_the_next_heartbeat_and_an_unchanged_one
         d.settings['subscriptions'] = [s for s in d.settings['subscriptions'] if s['account_label'] != 'codex-orin']
         d.checkin_tick()
     assert [p for p, _ in calls][:2] == ['/api/host/routes', '/api/host/poll']
-    assert calls[0][1] == {'fleet_routes': EXPECTED[1:]}
+    assert _routes(calls[0][1]) == {'fleet_routes': EXPECTED[1:]}
 
 
 def test_a_failed_route_post_skips_the_heartbeat_and_its_offers(tmp_path):
@@ -116,7 +124,7 @@ def test_near_limit_telemetry_still_gets_explicit_route_state(tmp_path):
     with _Host(heartbeat=base):
         d = fleet.Dispatcher(_cfg(tmp_path), request, _runner(fleet))
         d.checkin_tick()
-    assert calls[0] == ('/api/host/routes', {'fleet_routes': EXPECTED})
+    assert calls[0][0] == '/api/host/routes' and _routes(calls[0][1]) == {'fleet_routes': EXPECTED}
     poll = next(b for p, b in calls if p == '/api/host/poll')
     assert not {'fleet_routes', 'fleet_routes_overflow'} & set(poll)
     assert poll['launcher_resources'] == base['launcher_resources']
@@ -144,7 +152,7 @@ def test_route_post_is_complete_at_64_65_128_routes(tmp_path):
         d = _dispatcher(fleet, tmp_path, calls)
         d.settings['subscriptions'] = _subs(n)
         d.post_route_advertisement()
-        assert calls[0][0] == '/api/host/routes' and len(calls[0][1]['fleet_routes']) == n
+        assert calls[0][0] == '/api/host/routes' and len(_routes(calls[0][1])['fleet_routes']) == n
         for i in (0, n - 1):
             assert {'engine': 'codex', 'account': f'acct-{i}', 'profile': f'hub-acct-{i}'} in calls[0][1]['fleet_routes']
             assert d._route({'account': f'acct-{i}', 'engine': 'codex', 'profile': f'hub-acct-{i}', 'workspace': 'demo'}) is not None
@@ -157,7 +165,7 @@ def test_route_post_past_the_count_cap_is_an_explicit_overflow(tmp_path):
     d = _dispatcher(fleet, tmp_path, calls)
     d.settings['subscriptions'] = _subs(129) + _subs(3)  # duplicates count once
     d.post_route_advertisement()
-    assert calls == [('/api/host/routes', {'fleet_routes_overflow': 129})]
+    assert [(p, _routes(b)) for p, b in calls] == [('/api/host/routes', {'fleet_routes_overflow': 129})]
 
 
 def test_largest_route_post_fits_the_hub_body_limit(tmp_path):
@@ -170,7 +178,7 @@ def test_largest_route_post_fits_the_hub_body_limit(tmp_path):
                                    for i in range(128)]
     d.post_route_advertisement()
     body = calls[0][1]
-    assert len(body['fleet_routes']) == 128
+    assert len(body['fleet_routes']) == 128 and body['seq'] > 0
     assert len(json.dumps(body).encode('utf-8')) < 32768
 
 
@@ -186,3 +194,95 @@ def _telemetry(path_len=476, aliases=64):
             'launcher_resources': {'active_mem_mb': 0, 'observed_at': at, 'active_disk_mb': 0, 'disk_floor_mb': 20480,
                                    'next_disk_mb': 512, 'disk_paths': [{'path': path, 'free_gb': 80}, {'path': path + '/.local/tmp', 'free_gb': 80}],
                                    'disk_aliases': {n: path for n in names}, 'disk_task_ids': []}}
+
+
+class _FencedHub:
+    """Hub's /api/host/routes rule: store only a seq above the stored one, else 409."""
+    def __init__(self):
+        self.stored, self.rejected = None, []
+
+    def deliver(self, body):
+        if self.stored is not None and body['seq'] <= self.stored['seq']:
+            self.rejected.append(body)
+            raise OSError('HTTP request failed with status 409')
+        self.stored = body
+
+
+def test_concurrent_posts_are_serialized_and_a_delayed_older_post_never_wins(tmp_path):
+    """Review cb384dbb: overlapping telemetry/check-in posts with reversed delivery and acknowledgements."""
+    import threading
+    from agent_hub_host import fleet
+    hub = _FencedHub()
+    inflight, release, sent = [], threading.Event(), []
+    shared = [{'service': 'codex', 'account_label': 'shared-codex', 'engine': 'codex', 'profile': 'hub-shared-codex', 'admission_argv': ['maintained-gate']}]
+
+    def request(method, path, body=None):
+        sent.append(body)
+        if len(sent) == 1:          # A's request: held in flight until released
+            inflight.append(body)
+            release.wait(5)
+        hub.deliver(body)
+        return {}
+    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
+        d = fleet.Dispatcher(_cfg(tmp_path, shared), request, lambda *a, **k: {})
+    a = threading.Thread(target=d.post_route_advertisement)
+    a.start()
+    while not inflight:
+        pass
+    # The managed sync replaces the routes with 129 others while A is in flight.
+    d.settings['subscriptions'] = _subs(129)
+    b_done = threading.Event()
+    b = threading.Thread(target=lambda: (d.post_route_advertisement(), b_done.set()))
+    b.start()
+    assert not b_done.wait(0.3)     # B waits for A: snapshot/send/ack are serialized
+    release.set()
+    a.join(5)
+    b.join(5)
+    assert b_done.is_set() and len(sent) == 2
+    assert _routes(sent[1]) == {'fleet_routes_overflow': 129} and sent[1]['seq'] > sent[0]['seq']
+    assert _routes(hub.stored) == {'fleet_routes_overflow': 129}
+    # A replayed / late-delivered copy of A's old request is fenced out.
+    import pytest
+    with pytest.raises(OSError):
+        hub.deliver(dict(inflight[0]))
+    assert _routes(hub.stored) == {'fleet_routes_overflow': 129}
+    # The cache reflects what Hub holds: an unchanged list sends nothing; a withdrawal is sent at once.
+    d.post_route_advertisement()
+    assert len(sent) == 2
+    d.settings['subscriptions'] = _subs(2)
+    d.post_route_advertisement()
+    assert _routes(hub.stored) == {'fleet_routes': [{'engine': 'codex', 'account': f'acct-{i}', 'profile': f'hub-acct-{i}'} for i in range(2)]}
+
+
+def test_an_unacknowledged_post_never_suppresses_the_next_one(tmp_path):
+    """A post whose response failed (e.g. timed out after Hub stored it) is re-sent, never cached as current."""
+    import pytest
+    from agent_hub_host import fleet
+    hub, sent = _FencedHub(), []
+
+    def request(method, path, body=None):
+        sent.append(body)
+        hub.deliver(body)
+        if len(sent) == 1:
+            raise OSError('response lost')
+        return {}
+    calls = []
+    d = _dispatcher(fleet, tmp_path, calls)
+    d.request = request
+    with pytest.raises(OSError):
+        d.post_route_advertisement()
+    d.post_route_advertisement()
+    assert len(sent) == 2 and sent[1]['seq'] > sent[0]['seq'] and hub.stored is sent[1]
+
+
+def test_seq_is_strictly_increasing_even_if_the_clock_does_not_move(tmp_path):
+    from agent_hub_host import fleet
+    calls = []
+    d = _dispatcher(fleet, tmp_path, calls)
+    with patch('agent_hub_host.fleet.time.time_ns', return_value=10**18):
+        for n in (1, 2, 3):
+            d.settings['subscriptions'] = _subs(n)
+            d.post_route_advertisement()
+    seqs = [b['seq'] for _, b in calls]
+    assert seqs == [10**15, 10**15 + 1, 10**15 + 2]
+    assert all(s < 2 ** 53 for s in seqs)  # exact in Hub's JavaScript

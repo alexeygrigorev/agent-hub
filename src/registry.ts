@@ -134,36 +134,43 @@ export function effectiveRoutesAt(machineId: string, persisted: unknown): string
  * complete bounded list of label tuples or an explicit overflow count (the
  * host's list exceeds MAX_ADVERTISED_ROUTES). Anything else is rejected whole,
  * never partially kept. */
-export function sanitizeRouteAdvertisement(body: any): { fleet_routes: any[] } | { fleet_routes_overflow: number } | null {
+export type RouteAdvertisement = ({ fleet_routes: any[] } | { fleet_routes_overflow: number }) & { seq: number };
+export function sanitizeRouteAdvertisement(body: any): RouteAdvertisement | null {
   if (!body || typeof body !== 'object') return null;
+  // seq: the host's strictly increasing post number (wall-clock microseconds).
+  const seq = body.seq;
+  if (!Number.isSafeInteger(seq) || seq <= 0) return null;
   const hasList = body.fleet_routes !== undefined, hasOverflow = body.fleet_routes_overflow !== undefined;
   if (hasList === hasOverflow) return null;
   if (hasOverflow) {
     const n = body.fleet_routes_overflow;
-    return Number.isInteger(n) && n > MAX_ADVERTISED_ROUTES && n <= 100000 ? { fleet_routes_overflow: n } : null;
+    return Number.isInteger(n) && n > MAX_ADVERTISED_ROUTES && n <= 100000 ? { fleet_routes_overflow: n, seq } : null;
   }
   const list = body.fleet_routes;
   if (!Array.isArray(list) || list.length > MAX_ADVERTISED_ROUTES || !list.every((r: any) =>
       r && typeof r === 'object' && typeof r.engine === 'string' && ROUTE_LABEL.test(r.engine)
       && typeof r.account === 'string' && ROUTE_LABEL.test(r.account)
       && (r.profile === null || r.profile === undefined || (typeof r.profile === 'string' && ROUTE_LABEL.test(r.profile))))) return null;
-  return { fleet_routes: list.map((r: any) => ({ engine: r.engine, account: r.account, profile: r.profile ?? null })) };
+  return { fleet_routes: list.map((r: any) => ({ engine: r.engine, account: r.account, profile: r.profile ?? null })), seq };
 }
 
 /** Store a host's route advertisement (POST /api/host/routes), separate from
  * the heartbeat so its size never competes with telemetry for the 32 KiB
  * body limit. It replaces any previous list or overflow, is stamped
  * fleet_routes_at, and is persisted at once; heartbeats only carry it
- * forward. */
-export function updateRouteAdvertisement(machineId: string, advert: { fleet_routes: any[] } | { fleet_routes_overflow: number }, sql: SqlStorage, now = Date.now()): string {
+ * forward. Returns null (stale) when seq does not exceed the stored one. */
+export function updateRouteAdvertisement(machineId: string, advert: RouteAdvertisement, sql: SqlStorage, now = Date.now()): string | null {
   let st = machineState.get(machineId);
   let previous: any = st?.hb;
   if (!previous) {
     try { previous = JSON.parse(String((sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machineId).toArray()[0] as any)?.last_heartbeat ?? 'null')); } catch { previous = null; }
   }
-  const { fleet_routes: _l, fleet_routes_overflow: _o, fleet_routes_at: _a, ...rest } = (previous && typeof previous === 'object') ? previous : {} as any;
+  const { fleet_routes: _l, fleet_routes_overflow: _o, fleet_routes_at: _a, fleet_routes_seq: storedSeq, ...rest } = (previous && typeof previous === 'object') ? previous : {} as any;
+  // Fence: a delayed older post (lower seq) never replaces newer route state.
+  if (Number.isSafeInteger(storedSeq) && advert.seq <= storedSeq) return null;
+  const { seq, ...routes } = advert;
   const at = new Date(now).toISOString();
-  const hb = { ...rest, ...advert, fleet_routes_at: at };
+  const hb = { ...rest, ...routes, fleet_routes_at: at, fleet_routes_seq: seq };
   if (!st) {
     st = { lastSeenAt: 0, lastPersistedAt: 0, fingerprint: '', hb: null };
     machineState.set(machineId, st);
@@ -210,6 +217,7 @@ export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStor
       if (Array.isArray(previous.fleet_routes)) { hb.fleet_routes = previous.fleet_routes; hb.fleet_routes_at = previous.fleet_routes_at; }
       else if (Number.isInteger(previous.fleet_routes_overflow)) { hb.fleet_routes_overflow = previous.fleet_routes_overflow; hb.fleet_routes_at = previous.fleet_routes_at; }
     }
+    if (Number.isSafeInteger(previous?.fleet_routes_seq)) hb.fleet_routes_seq = previous.fleet_routes_seq;
   }
   const fingerprint = getFingerprint(hb);
   
@@ -467,7 +475,9 @@ export async function handleRegistryRoutes(
     if (!cred || !cred.machine_id) return Response.json({ error: 'Unauthorized' }, { status: 401 });
     const advert = sanitizeRouteAdvertisement(await safeJson(request));
     if (!advert) return Response.json({ error: 'invalid_route_advertisement' }, { status: 400 });
-    return Response.json({ status: 'ok', fleet_routes_at: updateRouteAdvertisement(cred.machine_id, advert, sql) });
+    const at = updateRouteAdvertisement(cred.machine_id, advert, sql);
+    if (!at) return Response.json({ error: 'stale_route_advertisement' }, { status: 409 });
+    return Response.json({ status: 'ok', fleet_routes_at: at });
   }
 
   if (path === '/api/host/poll') {

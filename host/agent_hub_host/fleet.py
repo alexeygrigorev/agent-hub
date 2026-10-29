@@ -1152,6 +1152,11 @@ class Dispatcher:
         self._dispatching_guard = threading.Lock()
         self._bindings_lock = threading.Lock()
         self._catalog_report_lock = threading.Lock()
+        # Intake 6cbb862a: telemetry and check-in threads both post the route
+        # advertisement; snapshot, send and cache update are serialized.
+        self._route_advertisement_lock = threading.Lock()
+        self._route_advertisement_seq = 0
+        self._route_advertisement_posted = None
         self._catalog_enrichment = {}
         self._catalog_sampled_at = 0.0
         self._catalog_raw = None
@@ -2352,19 +2357,29 @@ class Dispatcher:
         older than 180 s as stale and holds every route). A failed post
         raises, so the caller skips that heartbeat (and its offers) exactly
         as if the heartbeat itself had failed.
+
+        Concurrent producers (telemetry and check-in threads) are fenced: the
+        lock serializes snapshot, send and cache update, and every post carries
+        a strictly increasing seq (wall-clock microseconds, so it also orders
+        posts across restarts) that Hub requires to exceed the stored one, so a
+        delayed older request can never replace newer route state.
         """
-        routes = self.route_advertisement()
-        body = {'fleet_routes': routes} if len(routes) <= MAX_ADVERTISED_ROUTES else {'fleet_routes_overflow': len(routes)}
-        key = json.dumps(body, sort_keys=True)
-        last = getattr(self, '_route_advertisement_posted', None)
-        now = time.monotonic()
-        if last and last[0] == key and now - last[1] < ROUTE_ADVERTISEMENT_REFRESH_S:
+        with self._route_advertisement_lock:
+            routes = self.route_advertisement()
+            body = {'fleet_routes': routes} if len(routes) <= MAX_ADVERTISED_ROUTES else {'fleet_routes_overflow': len(routes)}
+            key = json.dumps(body, sort_keys=True)
+            last = self._route_advertisement_posted
+            now = time.monotonic()
+            if last and last[0] == key and now - last[1] < ROUTE_ADVERTISEMENT_REFRESH_S:
+                return body
+            if 'fleet_routes_overflow' in body:
+                print(json.dumps({'event': 'fleet_routes_overflow', 'routes': len(routes)}), flush=True)
+            seq = max(time.time_ns() // 1000, self._route_advertisement_seq + 1)
+            self._route_advertisement_seq = seq
+            self._route_advertisement_posted = None  # an unacknowledged post never suppresses the next one
+            self.request('POST', '/api/host/routes', {**body, 'seq': seq})
+            self._route_advertisement_posted = (key, now)
             return body
-        if 'fleet_routes_overflow' in body:
-            print(json.dumps({'event': 'fleet_routes_overflow', 'routes': len(routes)}), flush=True)
-        self.request('POST', '/api/host/routes', body)
-        self._route_advertisement_posted = (key, now)
-        return body
 
     def goal_routes(self):
         """Advertise executable local routes, independent of quota admission."""

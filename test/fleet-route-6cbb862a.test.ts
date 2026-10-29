@@ -110,8 +110,10 @@ describe('placement offers only host-advertised routes (6cbb862a AC a)', () => {
 
 // The host posts its route advertisement separately (POST /api/host/routes),
 // so its size never competes with heartbeat telemetry (review d2b92d22).
+let postSeq = 1000;
+// The host's fence number is assigned in increasing order unless a test sets it.
 const postRoutes = (id: string, body: any, sql: any) => {
-  const advert = sanitizeRouteAdvertisement(body);
+  const advert = sanitizeRouteAdvertisement(body && body.seq === undefined ? { ...body, seq: ++postSeq } : body);
   return advert ? updateRouteAdvertisement(id, advert, sql, now) : null; // the fixture's pinned clock
 };
 async function machineRow(fn: (hub: Hub, id: string, stored: () => any) => void) {
@@ -184,6 +186,48 @@ describe('route advertisement storage (6cbb862a AC a)', () => {
     expect(stored().fleet_routes).toEqual([SHARED]);
     expect(stored().fleet_routes_overflow).toBeUndefined();
   }));
+});
+
+describe('route advertisement fencing (6cbb862a review cb384dbb)', () => {
+  it('requires a positive safe-integer seq', async () => machineRow((hub, id, stored) => {
+    for (const seq of [0, -1, 1.5, '7', 2 ** 53, null]) expect(postRoutes(id, { fleet_routes: [SHARED], seq }, hub.sql)).toBeNull();
+    expect(sanitizeRouteAdvertisement({ fleet_routes: [SHARED] })).toBeNull();
+    expect(postRoutes(id, { fleet_routes: [SHARED], seq: 2 ** 53 - 1 }, hub.sql)).toEqual(expect.any(String));
+    expect(stored().fleet_routes_seq).toBe(2 ** 53 - 1);
+  }));
+
+  it('never lets a delayed older post clear an overflow, also across heartbeats', async () => machineRow((hub, id, stored) => {
+    expect(postRoutes(id, { fleet_routes: [SHARED], seq: 10 }, hub.sql)).toEqual(expect.any(String));
+    expect(postRoutes(id, { fleet_routes_overflow: 129, seq: 11 }, hub.sql)).toEqual(expect.any(String));
+    // Thread A's older snapshot arrives late; equal seq is a replay.
+    expect(postRoutes(id, { fleet_routes: [SHARED], seq: 10 }, hub.sql)).toBeNull();
+    expect(postRoutes(id, { fleet_routes: [SHARED], seq: 11 }, hub.sql)).toBeNull();
+    updateHeartbeat(id, { type: 'heartbeat', mem_avail_mb: 1 }, hub.sql);
+    expect(stored().fleet_routes_overflow).toBe(129);
+    expect(stored().fleet_routes).toBeUndefined();
+    expect(stored().fleet_routes_seq).toBe(11);
+    expect(postRoutes(id, { fleet_routes: [SHARED], seq: 12 }, hub.sql)).toEqual(expect.any(String));
+    expect(stored().fleet_routes).toEqual([SHARED]);
+  }));
+
+  it('keeps a withdrawn route held when the older list arrives after the withdrawal', async () => {
+    const m = 'fence-' + crypto.randomUUID().slice(0, 8);
+    await fleet(async (s, sql) => {
+      const ORIN = { engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' };
+      postRoutes(m, { fleet_routes: [SHARED, ORIN], seq: 20 }, sql);
+      postRoutes(m, { fleet_routes: [ORIN], seq: 22 }, sql);
+      expect(postRoutes(m, { fleet_routes: [SHARED, ORIN], seq: 21 }, sql)).toBeNull();
+      updateHeartbeat(m, nearLimitHb(), sql, now);
+      const plan: any = s.plan(intent({ machine: m, account: 'shared-codex' }));
+      expect(plan.selected).toBeFalsy();
+      expect(plan.rejected).toEqual([{ machine: m, engine: 'codex', reason: 'route_not_advertised', account: 'shared-codex', profile: 'hub-shared-codex' }]);
+      // Overflow stays fail closed against a late older list too.
+      postRoutes(m, { fleet_routes_overflow: 129, seq: 30 }, sql);
+      expect(postRoutes(m, { fleet_routes: [SHARED, ORIN], seq: 29 }, sql)).toBeNull();
+      updateHeartbeat(m, nearLimitHb(), sql, now);
+      expect((s.plan(intent({ machine: m })) as any).rejected.map((r: any) => r.reason)).toEqual(['route_advertisement_overflow', 'route_advertisement_overflow']);
+    }, m);
+  });
 });
 
 describe('route advertisement placement (6cbb862a review)', () => {
@@ -277,11 +321,12 @@ describe('route advertisement over HTTP (6cbb862a review)', () => {
     const stored = async () => { let hb: any; await runInDurableObject(stub, async (hub: Hub) => {
       hb = JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', approved.machine_id).toArray()[0] as any).last_heartbeat ?? 'null')); }); return hb; };
 
-    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes: [SHARED] }))).status).toBe(401);
+    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes: [SHARED], seq: 1 }))).status).toBe(401);
+    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes: [SHARED] }), tokens.access_token)).status).toBe(400); // seq required
     // Largest valid post: 128 routes with 64-character engine, account and profile labels.
     const long = (p: string, i: number) => (p + i).padEnd(64, 'x');
     const routes = Array.from({ length: 128 }, (_, i) => ({ engine: long('e', i), account: long('a', i), profile: long('p', i) }));
-    const body = JSON.stringify({ fleet_routes: routes });
+    const body = JSON.stringify({ fleet_routes: routes, seq: Date.now() * 1000 });
     expect(body.length).toBeLessThan(32768);
     const res = await call('/api/host/routes', body, tokens.access_token);
     expect(res.status).toBe(200);
@@ -295,10 +340,15 @@ describe('route advertisement over HTTP (6cbb862a review)', () => {
     expect((await stored()).fleet_routes).toHaveLength(128);
     expect(Object.keys((await stored()).launcher_resources.disk_aliases)).toHaveLength(64);
     // Overflow and malformed posts.
-    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes_overflow: 300 }), tokens.access_token)).status).toBe(200);
+    const overflowSeq = Date.now() * 1000 + 5;
+    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes_overflow: 300, seq: overflowSeq }), tokens.access_token)).status).toBe(200);
+    // A delayed older post is refused with 409 and changes nothing.
+    const late = await call('/api/host/routes', JSON.stringify({ fleet_routes: [SHARED], seq: overflowSeq - 1 }), tokens.access_token);
+    expect(late.status).toBe(409);
+    expect(((await late.json()) as any).error).toBe('stale_route_advertisement');
     expect((await stored()).fleet_routes_overflow).toBe(300);
     expect((await stored()).fleet_routes).toBeUndefined();
-    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes: [{ engine: 'codex', account: 'bad account' }] }), tokens.access_token)).status).toBe(400);
+    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes: [{ engine: 'codex', account: 'bad account' }], seq: overflowSeq + 1 }), tokens.access_token)).status).toBe(400);
     expect((await stored()).fleet_routes_overflow).toBe(300);
   });
 });
