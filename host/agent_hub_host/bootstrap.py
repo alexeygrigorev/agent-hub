@@ -19,6 +19,7 @@ import urllib.request
 import zipfile
 import shlex
 import plistlib
+import uuid
 
 
 NODE_VERSION = '22.23.4'
@@ -366,8 +367,29 @@ def install_package(archive, install_root, uv):
     # Keep the maintained supervisor's checkout contract: workspace/host is
     # the Python import root for its native controller and all descendants.
     package = install_root / 'package/host'
-    package.mkdir(parents=True, exist_ok=True)
-    unpack(archive, package)
+    package.parent.mkdir(parents=True, exist_ok=True)
+    # Extraction must finish before replacing any installed source. Keep the
+    # old tree beside the staged tree until publication succeeds, so an I/O
+    # error can restore the complete previous package.
+    with tempfile.TemporaryDirectory(prefix='.package-', dir=package.parent) as tmp:
+        staged = Path(tmp) / 'host'
+        # Outside the staging cleanup: even a failed rollback must retain
+        # the previous source for recovery rather than deleting it on exit.
+        previous = package.parent / ('.host-previous-' + uuid.uuid4().hex)
+        staged.mkdir()
+        unpack(archive, staged)
+        moved_previous = False
+        if package.exists():
+            os.replace(package, previous)
+            moved_previous = True
+        try:
+            os.replace(staged, package)
+        except BaseException:
+            if moved_previous:
+                os.replace(previous, package)
+            raise
+        if moved_previous:
+            shutil.rmtree(previous)
     return python, package
 
 

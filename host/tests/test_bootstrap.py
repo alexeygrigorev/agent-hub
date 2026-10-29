@@ -271,6 +271,38 @@ class BootstrapTests(unittest.TestCase):
                 b.validate_side_effect_context(self.root / 'isolated-home/.local/share/agent-hub')
         run.assert_not_called()
 
+    def test_failed_package_extraction_preserves_installed_package(self):
+        package = self.root / 'package/host/agent_hub_host'
+        package.mkdir(parents=True)
+        (package / 'cli.py').write_text('previous complete package')
+        def fail(archive, destination):
+            target = destination / 'agent_hub_host'
+            target.mkdir()
+            (target / 'cli.py').write_text('incomplete replacement')
+            raise OSError('disk write failed')
+        with patch.object(b, 'run'), patch.object(b, 'unpack', side_effect=fail):
+            with self.assertRaisesRegex(OSError, 'disk write failed'):
+                b.install_package(self.root / 'archive', self.root, self.root / 'uv')
+        self.assertEqual((package / 'cli.py').read_text(), 'previous complete package')
+        self.assertEqual(list(package.parent.parent.glob('.package-*')), [])
+
+    def test_failed_package_publication_restores_previous_tree(self):
+        package = self.root / 'package/host/agent_hub_host'
+        package.mkdir(parents=True)
+        (package / 'cli.py').write_text('previous complete package')
+        archive = self.root / 'archive.zip'
+        with zipfile.ZipFile(archive, 'w') as z:
+            z.writestr('agent_hub_host/cli.py', 'replacement')
+        replace = os.replace
+        def publish(source, destination):
+            if Path(source).name == 'host' and Path(source).parent.name.startswith('.package-'):
+                raise OSError('publication failed')
+            return replace(source, destination)
+        with patch.object(b, 'run'), patch.object(b.os, 'replace', side_effect=publish):
+            with self.assertRaisesRegex(OSError, 'publication failed'):
+                b.install_package(archive, self.root, self.root / 'uv')
+        self.assertEqual((package / 'cli.py').read_text(), 'previous complete package')
+
     def test_windows_split_home_cannot_change_live_appdata_or_registry(self):
         from agent_hub_host import config
         home = self.root / 'home'
