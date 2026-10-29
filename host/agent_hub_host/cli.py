@@ -383,6 +383,10 @@ def main():
     resources_cmd.add_commands(sub)
     from . import provisioning
     provisioning.add_commands(sub)
+    from . import shared_config as shared_config_cmd
+    shared_config_cmd.add_commands(sub)
+    from . import aws_gate as aws_gate_cmd
+    aws_gate_cmd.add_commands(sub)
     add_bridge_resume_command(sub)
 
     for command in ('start-agent', 'start-session', 'plan-agent'):
@@ -561,6 +565,26 @@ def main():
             print(json.dumps(provisioning.command(args)))
         except Exception:
             print('Hub engine operation failed; check authentication, bundle permissions and host prerequisites.', file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'shared-config':
+        try:
+            from . import shared_config as shared_config_mod
+            print(json.dumps(shared_config_mod.command(args)))
+        except Exception:
+            print('Hub shared-config operation failed; check the versioned bundle and host paths.', file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'aws-gate':
+        try:
+            from . import aws_gate as aws_gate_mod
+            result = aws_gate_mod.command(args)
+            if result is not None:
+                print(json.dumps(result))
+        except SystemExit:
+            raise
+        except Exception:
+            print('AWS Gate credential request failed', file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'update':

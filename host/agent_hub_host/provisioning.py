@@ -1114,6 +1114,14 @@ def sync(request=None):
     if len({b['label'] for b in bundles}) != len(bundles):
         raise ValueError('Duplicate managed label')
     with lock():
+        # Hub-owned shared config (shared-config/ bundle) syncs on every
+        # engines tick so all hosts converge. Best-effort: never fail engine
+        # sync when the bundle is unavailable (e.g. minimal checkouts).
+        try:
+            from . import shared_config as _shared_sync
+            _shared_sync.sync_shared_config()
+        except Exception:
+            pass
         previous = read_json(root() / 'state.json', [])
         # Withdraw removed/changed profiles before touching credentials or installing updates.
         retained = [
@@ -1311,6 +1319,30 @@ def engine_environment(bundle, home, dest=None):
             'ANTHROPIC_CUSTOM_HEADERS',
         ):
             env.pop(k, None)
+    # Hub-managed AWS shared config (shared-config/aws/config): managed homes
+    # isolate HOME so ~/.aws/config is invisible. Point AWS at the Hub-owned
+    # shared copy and at a nonexistent credentials file inside the managed
+    # home so per-machine static keys (e.g. main-temp) stay unreachable.
+    # Set last so bundle env can never redirect workers at real host files.
+    for k in (
+        'AWS_ACCESS_KEY_ID',
+        'AWS_SECRET_ACCESS_KEY',
+        'AWS_SESSION_TOKEN',
+        'AWS_PROFILE',
+        'AWS_DEFAULT_PROFILE',
+    ):
+        env.pop(k, None)
+    try:
+        from . import shared_config as _shared_config
+        env['AWS_CONFIG_FILE'] = str(_shared_config.hub_aws_config_file())
+    except Exception:
+        pass
+    env.setdefault('AWS_CONFIG_FILE', str(Path(home) / '.config' / 'agent-hub' / 'shared' / 'aws' / 'config'))
+    try:
+        from . import shared_config as _shared_config2
+        env['AWS_SHARED_CREDENTIALS_FILE'] = str(_shared_config2.hub_aws_credentials_file(home))
+    except Exception:
+        env['AWS_SHARED_CREDENTIALS_FILE'] = str(Path(home) / '.aws' / 'credentials')
     return env
 
 

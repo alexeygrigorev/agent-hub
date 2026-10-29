@@ -30,6 +30,7 @@ DEFAULT_RELEASES = Path.home() / ".local" / "share" / "agent-hub" / "host-releas
 
 TRACKED_PATHS = [
     "host",
+    "shared-config",
     "config/model-routing.json",
     "scripts/session-host-supervisor.py",
     "scripts/metrics-dashboard-export.py",

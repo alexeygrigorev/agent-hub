@@ -93,6 +93,29 @@ def build(out_dir: Path, version: str):
         pkg_dst = staging / "agent_hub_host"
         shutil.copytree(HOST_PKG, pkg_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         shutil.copyfile(REPO / "config" / "model-routing.json", pkg_dst / "model-routing.json")
+        # Embed the versioned non-secret shared-config bundle so install-only
+        # machines (no repo checkout) can `hub shared-config sync`. Fail closed
+        # at build time if the bundle ever contains static keys.
+        bundle_src = REPO / "shared-config"
+        bundle_files: dict = {}
+        try:
+            bundle_manifest = json.loads((bundle_src / "manifest.json").read_text(encoding="utf-8"))
+            for rel in bundle_manifest.get("files", []):
+                if not isinstance(rel, str) or ".." in rel.split("/") or not rel or rel.startswith("/"):
+                    raise SystemExit("build-hub-cli: unsafe shared-config entry")
+                text = (bundle_src / rel).read_text(encoding="utf-8")
+                lowered = text.lower()
+                if "aws_access_key_id" in lowered or "aws_secret_access_key" in lowered or "akia" in lowered:
+                    raise SystemExit("build-hub-cli: shared-config bundle must not contain static keys")
+                bundle_files[rel] = text
+        except FileNotFoundError:
+            raise SystemExit("build-hub-cli: shared-config bundle missing")
+        (pkg_dst / "_shared_bundle.py").write_text(
+            '"""Embedded non-secret shared-config bundle (generated at build time)."""\nFILES = '
+            + json.dumps(bundle_files, indent=2, sort_keys=True)
+            + '\n',
+            encoding="utf-8",
+        )
         (pkg_dst / "_build_info.py").write_text(
             f'"""Build information stamped during zipapp creation."""\nBUILD_COMMIT = "{sha}"\nBUILD_DATE = "{build_date}"\n',
             encoding="utf-8",

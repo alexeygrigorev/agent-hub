@@ -101,6 +101,8 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'msg agent-delegate': 'Operator grant of named-agent delegation to an MCP client; deliberate CLI step.',
   'msg readdress': 'Operator re-address of an undelivered session message; deliberate CLI step.',
   'msg whoami': 'Reports the local CLI identity source; MCP callers are identified by their own login.',
+  'shared-config sync': 'Local host configuration sync writes host files; enrolled hosts own installation.',
+  'aws-gate credential-process': 'Local AWS credential provider emits temporary credentials; never expose credential output through MCP.',
   'repos seed': 'Local-only parser reads the private project map and submits bounded seed batches.',
   'repos refresh': 'Local-only scanner invokes git/gh on host directories; MCP cannot scan the host filesystem.',
   'sessions warnings': 'Long-running warning display is CLI-only by product scope.',

@@ -99,6 +99,7 @@ class ReleaseCompletenessTests(unittest.TestCase):
         self.assertEqual(found, {
             "config/model-routing.json",
             "scripts/metrics-dashboard-export.py",
+            "shared-config",
         })
 
     def test_verify_refuses_incomplete_release(self):
@@ -122,6 +123,41 @@ class ReleaseCompletenessTests(unittest.TestCase):
             proc = subprocess.run([sys.executable, str(VERIFY), str(target)],
                                   capture_output=True, text=True, timeout=60)
             self.assertNotEqual(proc.returncode, 0)
+
+    def test_verify_accepts_multi_tree_release_past_package_checks(self):
+        # Regression: with hashed_trees ["host", "shared-config"], the host
+        # entry check must apply to the host tree only. A complete tree set
+        # must pass package checks and fail later (missing interpreter),
+        # never with "host package entry is missing".
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "rel"
+            files = {
+                "config/model-routing.json": "{}",
+                "scripts/session-host-supervisor.py": "#",
+                "scripts/metrics-dashboard-export.py": "#",
+                "pyproject.toml": "",
+                "uv.lock": "",
+                "host/agent_hub_host/__init__.py": "# pkg",
+                "shared-config/aws/config": "[default]\n",
+                "shared-config/manifest.json": "{}",
+            }
+            hashes = {}
+            for name, body in files.items():
+                dest = target / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(body)
+                hashes[name] = hashlib.sha256(body.encode()).hexdigest()
+            (target / "release-manifest.json").write_text(json.dumps({
+                "manifest_version": json.loads(MANIFEST.read_text())["version"],
+                "release_rev": "0" * 40,
+                "files_sha256": hashes,
+            }))
+            proc = subprocess.run([sys.executable, str(VERIFY), str(target)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertNotIn("host package entry is missing", proc.stdout)
+            self.assertIn("release interpreter is missing", proc.stdout)
 
     def test_verify_refuses_tampered_package_tree(self):
         import hashlib

@@ -113,7 +113,7 @@ def main(argv):
         for name, digest in actual.items():
             if hashes.get(name) != digest:
                 return fail("package file changed after build: " + name)
-        if "host/agent_hub_host/__init__.py" not in actual:
+        if tree == "host" and "host/agent_hub_host/__init__.py" not in actual:
             return fail("host package entry is missing")
     venv_python = release / ".venv" / "bin" / "python"
     if not venv_python.is_file():

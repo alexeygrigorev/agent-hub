@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "files": [
     "config/model-routing.json",
     "scripts/session-host-supervisor.py",
@@ -8,6 +8,7 @@
     "uv.lock"
   ],
   "hashed_trees": [
-    "host"
+    "host",
+    "shared-config"
   ]
 }
