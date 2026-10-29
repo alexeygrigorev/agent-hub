@@ -967,6 +967,21 @@ describe('generic accounts and launch placement', () => {
     expect(deep.selected?.selection).toMatchObject({ id: 'argon' });
     expect(deep.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
   }));
+  it('accepts host model and parent metadata in census reports and rejects malformed values atomically', async () => fixture(async (s, sql) => {
+    const native={native_id:crypto.randomUUID(),tag:'native-observation',engine:'codex',model:'openai/gpt-6.1-sol',
+      parent_id:crypto.randomUUID(),phase:'running',agent_state:'idle',workspace:'/demo',cwd:'/demo',
+      profile:null,account:null,created_at_ms:now-1000};
+    const report=(row:any)=>s.handle(request('/sessions',{sessions:[row]},'PUT'),host('hetzner'));
+    expect((await report(native)).status).toBe(200);
+    const canonical=sql.exec('SELECT request_json,parent_id FROM session_control_sessions WHERE id=?',native.native_id).one();
+    expect(JSON.parse(canonical.request_json).model).toBe(native.model);
+    expect(canonical.parent_id).toBe(native.parent_id);
+    for(const patch of [{model:'private prompt with spaces'},{model:12},{parent_id:'bad\nparent'},{parent_id:12}]) {
+      expect((await report({...native,...patch})).status).toBe(400);
+    }
+    expect((await report({...native,model:null,parent_id:null})).status).toBe(200);
+    expect(JSON.parse(sql.exec('SELECT request_json FROM session_control_sessions WHERE id=?',native.native_id).one().request_json).model).toBe(native.model);
+  }));
   it('accepts complete native catalogs above 32 KiB while retaining catalog bounds', async () => fixture(async (s, sql) => {
     const sessions = Array.from({ length: 100 }, (_, i) => ({
       native_id: 'native-' + i, tag: 'native-' + i, engine: 'codex', phase: 'running',
