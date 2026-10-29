@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import unittest
 import subprocess
 import os
@@ -296,6 +297,58 @@ class TestCappedTestRun(unittest.TestCase):
                     holder.communicate("done\n", timeout=10)
             free = self.run_capped("--slots", "2", "--wait", "0", "--", "true", env_extra=env)
             self.assertEqual(free.returncode, 0)
+
+    def test_command_is_marked_as_holding_a_slot(self):
+        # 736ba282 AC6h: auto-acquiring runners nested under the wrapper must
+        # not request a second slot (deadlock once every slot is held).
+        with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
+            env = {"AGENT_HUB_HEAVY_TEST_DIR": os.path.join(tmpdir, "heavy")}
+            marked = self.run_capped("--", "bash", "-c", 'echo "held=$AGENT_HUB_HEAVY_TEST_HELD"',
+                                     env_extra=env)
+            self.assertEqual(marked.returncode, 0, marked.stderr)
+            self.assertIn("held=1", marked.stdout)
+
+    def test_waiter_blocks_without_polling_and_runs_when_slot_frees(self):
+        with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
+            env = {**os.environ, "AGENT_HUB_HEAVY_TEST_DIR": os.path.join(tmpdir, "heavy")}
+            holder = subprocess.Popen([self.capped, "--slots", "1", "--", "bash", "-c",
+                                       'echo ready; read -r line'], env=env, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            waiter = None
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "ready")
+                waiter = subprocess.Popen([self.capped, "--slots", "1", "--wait", "60", "--",
+                                           "bash", "-c", "echo WAITER-RAN"], env=env,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                notice = waiter.stderr.readline()
+                self.assertIn("heavy-test slots busy", notice)
+                # A blocked waiter sits in flock, not in a sleep loop.
+                import time
+                time.sleep(1.0)
+                children = subprocess.run(["pgrep", "-P", str(waiter.pid), "-x", "sleep"],
+                                          capture_output=True, text=True).stdout.split()
+                self.assertEqual(children, [])
+                holder.communicate("done\n", timeout=10)
+                out, _ = waiter.communicate(timeout=20)
+                self.assertEqual(waiter.returncode, 0)
+                self.assertIn("WAITER-RAN", out)
+            finally:
+                for proc in (holder, waiter):
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=10)
+
+    def test_vitest_global_setup_skips_held_ci_windows_and_opt_out(self):
+        script = ("import('./test/heavy-slot.global-setup.mjs').then(m => console.log(JSON.stringify(["
+                  "m.heavySlotWanted({}, 'linux'),"
+                  "m.heavySlotWanted({AGENT_HUB_HEAVY_TEST_HELD: '1'}, 'linux'),"
+                  "m.heavySlotWanted({CI: 'true'}, 'linux'),"
+                  "m.heavySlotWanted({AGENT_HUB_HEAVY_TEST_AUTO: '0'}, 'linux'),"
+                  "m.heavySlotWanted({}, 'win32')])))")
+        result = subprocess.run(["node", "--input-type=module", "-e", script],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [True, False, False, False, False])
 
     def test_crash_releases_slot_without_stale_files_or_deletion(self):
         with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
