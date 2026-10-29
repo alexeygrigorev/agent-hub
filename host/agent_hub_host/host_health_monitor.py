@@ -197,14 +197,24 @@ def collect_process_stats(
     }
 
 
+def _native_memory_reader() -> Optional[Dict[str, Any]]:
+    import platform
+    if platform.system() not in ("Windows", "Darwin"):
+        return None
+    from .host_memory import read_host_memory
+    return read_host_memory()
+
+
 def collect_memory_stats(
     meminfo_path: str = "/proc/meminfo",
     *,
     warn_percent: float = DEFAULT_WARN_PERCENT,
     critical_percent: float = DEFAULT_CRITICAL_PERCENT,
     open_fn: Callable[..., Any] = open,
+    platform_reader: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
-    """Collect memory statistics from Linux /proc/meminfo stdlib file."""
+    """Collect memory statistics from /proc/meminfo, or the native Windows/macOS
+    API when there is no /proc (intake 63a9ee3a). Unknown stays unknown."""
     total_kb: Optional[int] = None
     available_kb: Optional[int] = None
     free_kb: Optional[int] = None
@@ -238,6 +248,12 @@ def collect_memory_stats(
                     cached_kb = val_kb
     except Exception:
         pass
+
+    if (total_kb is None or total_kb <= 0) and meminfo_path == "/proc/meminfo":
+        reading = (platform_reader or _native_memory_reader)()
+        if reading:
+            total_kb = reading["total_bytes"] // 1024
+            available_kb = reading["available_bytes"] // 1024
 
     if total_kb is None or total_kb <= 0:
         return {

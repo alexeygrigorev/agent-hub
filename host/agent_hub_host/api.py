@@ -277,35 +277,12 @@ def get_heartbeat_payload(clock=None, running_jobs=None) -> dict:
     else:
         jobs_list = []
 
-    mem_avail_mb = 0
-    mem_total_mb = None
-    if platform.system() == "Windows":
-        import ctypes
-        class MEMORYSTATUSEX(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        stat = MEMORYSTATUSEX()
-        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-            mem_avail_mb = stat.ullAvailPhys // (1024 * 1024)
-            try:
-                mem_total_mb = stat.ullTotalPhys // (1024 * 1024)
-            except Exception:
-                mem_total_mb = None
-    else:
-        try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        mem_avail_mb = int(line.split()[1]) // 1024
-                    elif line.startswith("MemTotal:"):
-                        try:
-                            mem_total_mb = int(line.split()[1]) // 1024
-                        except (ValueError, IndexError):
-                            pass
-        except Exception:
-            pass
-        if not isinstance(mem_total_mb, int) or mem_total_mb <= 0:
-            mem_total_mb = None
+    # Intake 63a9ee3a: an unreadable host reports null, never 0 — Hub reads
+    # a finite 0 as a real empty host and refuses with launcher_memory_reserve.
+    from .host_memory import read_host_memory
+    reading = read_host_memory()
+    mem_avail_mb = reading["available_bytes"] // (1024 * 1024) if reading else None
+    mem_total_mb = reading["total_bytes"] // (1024 * 1024) if reading else None
     from .cpu_resources import sample_cpu_usage
     cpu_usage = sample_cpu_usage()
     payload: dict = {
