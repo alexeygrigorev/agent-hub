@@ -18,6 +18,7 @@ const AGENT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const MSG_ID = /^t(\d{1,9})([a-z]+)(\d*)$/;
 const ANY_ID = /^t(\d{1,9})[a-z]*$/;
 const SOURCES = new Set(['grok-bot-replica', 'tabo-replica', 'bot', 'cli', 'backfill']);
+const WATCHERS = new Set(['grok-bot-replica', 'tabo-replica']);
 /** Terminal ask states never alert again. */
 export const ASK_STATES = ['pending', 'unmapped', 'mapped', 'verified', 'dropped_after_done', 'closed_unverified', 'cancelled', 'not_an_ask'];
 const OPEN = new Set(['open', 'in_progress', 'blocked', 'pending_approval']);
@@ -107,7 +108,7 @@ export function matchAcLine(askText: string, ref: string, ac: string | null | un
 export function noteMarks(text: string): { ac: Map<number, boolean>; refs: Map<string, boolean> } {
   const ac = new Map<number, boolean>(), refs = new Map<string, boolean>();
   for (const line of String(text ?? '').split(/\r?\n/)) {
-    const neg = /\b(?:not[\s_-]?met|unmet|fail(?:ed)?|missing|not done|not verified)\b/i.test(line);
+    const neg = /\b(?:not[\s_-]?met|unmet|fail(?:ed)?|missing|not done|nothing done|not verified)\b/i.test(line);
     const pos = /\b(?:met|pass(?:ed)?|proven|verified|done)\b/i.test(line);
     if (!neg && !pos) continue;
     for (const m of line.matchAll(/\bAC\s*#?(\d{1,3})\b/gi)) {
@@ -147,13 +148,17 @@ export class AskLedger {
     this.sql.exec('CREATE INDEX IF NOT EXISTS ask_messages_split ON ask_messages(split_state, received_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS ask_messages_agent_seq ON ask_messages(agent_id, seq)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS ask_messages_received ON ask_messages(received_at)');
+    // Status counts stay index-only.
+    this.sql.exec('CREATE INDEX IF NOT EXISTS ask_messages_role ON ask_messages(role)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS ask_messages_conflicts ON ask_messages(conflict_count) WHERE conflict_count>0');
     this.sql.exec(`CREATE TABLE IF NOT EXISTS asks(id TEXT PRIMARY KEY, message_id TEXT NOT NULL, part INTEGER NOT NULL, text TEXT NOT NULL,
       state TEXT NOT NULL, intake_id TEXT, ac_line INTEGER, ac_text TEXT, match TEXT, verified_by TEXT, evidence TEXT, actor TEXT,
       created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, alert_subject TEXT, dropped_subject TEXT, UNIQUE(message_id, part))`);
     this.sql.exec('CREATE INDEX IF NOT EXISTS asks_state ON asks(state, created_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS asks_intake ON asks(intake_id)');
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_agents(agent_id TEXT PRIMARY KEY, agent_name TEXT, covered_through INTEGER,
-      window_last_seq INTEGER, window_changed_at INTEGER, last_message_at INTEGER, silent_alert_day TEXT, window_diag TEXT)`);
+      window_last_seq INTEGER, window_changed_at INTEGER, last_message_at INTEGER, silent_alert_day TEXT, window_diag TEXT,
+      msg_count INTEGER NOT NULL DEFAULT 0, last_any_at INTEGER)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_gaps(scope TEXT NOT NULL, from_seq INTEGER NOT NULL, to_seq INTEGER NOT NULL, kind TEXT NOT NULL,
       detected_at INTEGER NOT NULL, resolved_at INTEGER, alert_subject TEXT, PRIMARY KEY(scope, from_seq, to_seq))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_sources(machine_id TEXT NOT NULL, source TEXT NOT NULL, last_ingest_at INTEGER NOT NULL,
@@ -200,7 +205,15 @@ export class AskLedger {
         this.sql.exec(`INSERT INTO ask_agents(agent_id,agent_name) VALUES(?,?) ON CONFLICT(agent_id) DO UPDATE SET agent_name=COALESCE(excluded.agent_name,agent_name)`, agentId, name);
         for (const m of messages) {
           const v = this.message(m, source, caller, now);
-          if ('error' in v) { out.rejected.push({ agent_id: agentId, msg_id: String(m?.msg_id ?? m?.t_id ?? '').slice(0, 32), error: v.error }); continue; }
+          if ('error' in v) {
+            out.rejected.push({ agent_id: agentId, msg_id: String(m?.msg_id ?? m?.t_id ?? '').slice(0, 32), error: v.error });
+            // A rejected user message never reaches the ledger: surface it as an unrecorded range.
+            const id = MSG_ID.exec(String(m?.msg_id ?? m?.t_id ?? ''));
+            if (id && source !== 'backfill' && (m?.role === 'user' || (m?.role == null && id[2] === 'u')))
+              this.sql.exec(`INSERT OR IGNORE INTO ask_gaps(scope,from_seq,to_seq,kind,detected_at) VALUES(?,?,?,?,?)`,
+                this.scopeFor(agentId), Number(id[1]), Number(id[1]), 'rejected:' + v.error, now);
+            continue;
+          }
           const prior = this.rows('SELECT id,text_hash FROM ask_messages WHERE agent_id=? AND t_id=?', agentId, v.msgId)[0];
           if (prior) {
             if (prior.text_hash === v.hash) out.duplicates++;
@@ -216,6 +229,7 @@ export class AskLedger {
             crypto.randomUUID(), agentId, name, v.msgId, v.seq, v.ts, v.text, v.hash, source, machine, caller.actor, v.hint, now,
             isAsk ? 'pending' : 'record', v.role, v.kind, v.replyTo, v.attachments, batch);
           out.accepted++;
+          this.sql.exec('UPDATE ask_agents SET msg_count=msg_count+1,last_any_at=? WHERE agent_id=?', now, agentId);
           if (isAsk) {
             out.accepted_user++;
             this.sql.exec('UPDATE ask_agents SET last_message_at=MAX(COALESCE(last_message_at,0),?) WHERE agent_id=?', now, agentId);
@@ -245,7 +259,8 @@ export class AskLedger {
         }
       });
     }
-    if (machine) this.sql.exec(`INSERT INTO ask_sources(machine_id,source,last_ingest_at,last_reason) VALUES(?,?,?,?)
+    // Only the watcher posts continuously; fallback writers (bot/cli) are not liveness sources.
+    if (machine && WATCHERS.has(source)) this.sql.exec(`INSERT INTO ask_sources(machine_id,source,last_ingest_at,last_reason) VALUES(?,?,?,?)
       ON CONFLICT(machine_id,source) DO UPDATE SET last_ingest_at=excluded.last_ingest_at,last_reason=excluded.last_reason`,
       machine, source, now, body.reason == null ? null : oneLine(body.reason, 32));
     if (out.accepted_user) {
@@ -333,7 +348,7 @@ export class AskLedger {
       // A hole closes only when every number in it is recorded.
       const have = this.rows(`SELECT COUNT(DISTINCT seq) AS n FROM ask_messages WHERE role='user' AND seq BETWEEN ? AND ? ${g.scope === '*' ? '' : 'AND agent_id=?'}`,
         g.from_seq, g.to_seq, ...(g.scope === '*' ? [] : [g.scope]))[0].n;
-      if (g.kind === 'hole' && have >= g.to_seq - g.from_seq + 1)
+      if ((g.kind === 'hole' || g.kind.startsWith('rejected:')) && have >= g.to_seq - g.from_seq + 1)
         this.sql.exec('UPDATE ask_gaps SET resolved_at=? WHERE scope=? AND from_seq=? AND to_seq=?', now, g.scope, g.from_seq, g.to_seq);
     }
   }
@@ -440,10 +455,9 @@ export class AskLedger {
         : a.verified_by === 'manual' || this.provenByNotes(a, t) ? 'verified' : 'dropped_after_done';
       else if (a.state === 'verified' && a.verified_by !== 'manual') next = 'mapped';
       else if (a.state === 'dropped_after_done' || a.state === 'closed_unverified') next = 'mapped';
-      // Back on an open intake: a later drop must alert again.
-      if (OPEN.has(t.status) && a.dropped_subject && a.dropped_subject !== 'backfill') { this.sql.exec('UPDATE asks SET dropped_subject=NULL WHERE id=?', a.id); a.dropped_subject = null; }
       if (next !== a.state) this.sql.exec(`UPDATE asks SET state=?,verified_by=CASE WHEN ?='verified' THEN COALESCE(verified_by,'note') ELSE verified_by END,updated_at=? WHERE id=?`, next, next, now, a.id);
-      if (next === 'dropped_after_done' && !a.dropped_subject) dropped.push({ ...a, task: t });
+      // Each fresh drop alerts (and may reopen) once; a flagged backfill ask stays flagged.
+      if (next === 'dropped_after_done' && a.state !== 'dropped_after_done' && a.dropped_subject !== 'backfill') dropped.push({ ...a, task: t });
     }
     return dropped;
   }
@@ -480,11 +494,12 @@ export class AskLedger {
       if (d.source === 'backfill') continue;
       // Never reopen work that closed before the ask existed unless a person mapped it there.
       const closedAt = [...(d.task.history ?? [])].reverse().find((e: Obj) => e.kind === 'update' && e.changes?.status === 'done')?.captured_at ?? 0;
-      if (!['explicit', 'manual'].includes(d.match) && closedAt < d.received_at) continue;
+      if (!['explicit', 'manual'].includes(d.match) && closedAt < d.received_at) { d.outcome = 'not reopened: intake closed before the ask'; continue; }
       // Historical backfill only flags; live asks reopen the intake through the ordinary service path.
       const r = this.intake.serviceRecordEvent(d.task.id, { status: 'open', event: { kind: 'note', actor: 'hub:service:ask-ledger', authority: 'operator_record',
         text: `REOPENED by Hub ask ledger: intake closed done but mapped ask ${d.id.slice(0, 8)} (${d.t_id}${d.ac_line != null ? ', AC' + d.ac_line : ''}) is not marked met in the DONE note.\nAsk (verbatim): ${d.text.slice(0, 1500)}` } });
-      if (r.ok) { reopened++; this.sql.exec(`UPDATE asks SET state='mapped',updated_at=? WHERE id=?`, now, d.id); }
+      if (r.ok) { reopened++; d.outcome = 'reopened'; this.sql.exec(`UPDATE asks SET state='mapped',updated_at=? WHERE id=?`, now, d.id); }
+      else d.outcome = 'reopen failed: ' + String((r as Obj).error ?? 'unknown');
     }
     const unmapped = this.rows(`SELECT a.*,m.t_id,m.agent_id,m.agent_name FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.state='unmapped' AND a.alert_subject IS NULL AND m.source<>'backfill' ORDER BY a.created_at`);
     const unmappedAlerts = await this.alertBatch('asks_unmapped', unmapped,
@@ -496,19 +511,31 @@ export class AskLedger {
     for (const d of backfilled) this.sql.exec(`UPDATE asks SET dropped_subject='backfill' WHERE id=?`, d.id);
     const live = dropped.filter(d => d.source !== 'backfill');
     const droppedAlerts = await this.alertBatch('asks_dropped', live,
-      a => `${a.id.slice(0, 8)} ${a.t_id} → intake ${a.intake_id.slice(0, 8)}${a.ac_line != null ? ' AC' + a.ac_line : ''} (${a.task.status}, reopened): ${oneLine(a.text)}`,
+      a => `${a.id.slice(0, 8)} ${a.t_id} → intake ${a.intake_id.slice(0, 8)}${a.ac_line != null ? ' AC' + a.ac_line : ''} (${a.task.status}, ${a.outcome}): ${oneLine(a.text)}`,
       `${live.length} ask(s) were dropped after done: their intake closed without marking them met.`,
       s => { for (const a of live) this.sql.exec('UPDATE asks SET dropped_subject=? WHERE id=?', s, a.id); }, now);
+    // A re-drop moved its ask to the new batch; resolve batches left without members.
+    for (const a of live) {
+      const old = a.dropped_subject;
+      if (old && old !== 'backfill' && !old.endsWith(':resolved') && !this.rows('SELECT 1 FROM asks WHERE dropped_subject=? LIMIT 1', old).length) await this.hooks.notify?.('asks_dropped', old, null);
+    }
     const gaps = this.rows('SELECT * FROM ask_gaps WHERE resolved_at IS NULL AND alert_subject IS NULL ORDER BY detected_at');
     const gapAlerts = await this.alertBatch('asks_unrecorded', gaps,
-      g => `${g.scope === '*' ? 'all agents' : g.scope}: t${g.from_seq}u–t${g.to_seq}u (${g.to_seq - g.from_seq + 1} ref(s), ${g.kind})`,
+      g => `${g.scope === '*' ? 'all agents' : g.scope}: ${g.from_seq === g.to_seq ? `t${g.from_seq}u` : `t${g.from_seq}u–t${g.to_seq}u`} (${g.to_seq - g.from_seq + 1} ref(s), ${g.kind})`,
       `unrecorded_messages: ${gaps.length} range(s) of Alexey message refs never reached the ask ledger.`,
       s => { for (const g of gaps) this.sql.exec('UPDATE ask_gaps SET alert_subject=? WHERE scope=? AND from_seq=? AND to_seq=?', s, g.scope, g.from_seq, g.to_seq); }, now);
     await this.clearBatches('asks_unmapped', 'asks', 'alert_subject', "state='unmapped'");
-    // A window overflow is a one-time loss: alerted once, then it ages out after a day.
-    this.sql.exec(`UPDATE ask_gaps SET resolved_at=? WHERE kind='window_overflow' AND resolved_at IS NULL AND alert_subject IS NOT NULL AND detected_at<=?`, now, now - DAY);
+    // Resolved once every ask in the batch is proven, dismissed or otherwise off the open path.
+    await this.clearBatches('asks_dropped', 'asks', 'dropped_subject', "state IN ('dropped_after_done','mapped')");
+    // Window overflow and rejected messages are one-time losses: alerted once, then they age out after a day.
+    this.sql.exec(`UPDATE ask_gaps SET resolved_at=? WHERE kind<>'hole' AND resolved_at IS NULL AND alert_subject IS NOT NULL AND detected_at<=?`, now, now - DAY);
     await this.clearBatches('asks_unrecorded', 'ask_gaps', 'alert_subject', 'resolved_at IS NULL');
     const silent = await this.checkSources(now);
+    // An agent that was alerted silent and has since recorded messages is no longer silent.
+    for (const a of this.rows(`SELECT agent_id,silent_alert_day FROM ask_agents WHERE silent_alert_day IS NOT NULL AND last_any_at>=?`, now - DAY)) {
+      await this.hooks.notify?.('asks_agent_silent', a.agent_id + '-' + a.silent_alert_day, null);
+      this.sql.exec('UPDATE ask_agents SET silent_alert_day=NULL WHERE agent_id=?', a.agent_id);
+    }
     const daily = await this.daily(now);
     const result = { state: 'checked', checked_at: now, split, mapped, reopened, unmapped_alerts: unmappedAlerts, dropped_alerts: droppedAlerts,
       gap_alerts: gapAlerts, silent_sources: silent, ...daily, counts: this.counts() };
@@ -529,15 +556,15 @@ export class AskLedger {
     }
     return silent;
   }
-  /** Daily: an agent whose chat moved (window advanced) in 24h but recorded zero messages. */
+  /** Daily: an agent whose chat moved (window advanced) in 24h but had zero messages of either side recorded in that time. */
   private async daily(now: number): Promise<Obj> {
     const day = new Date(now).toISOString().slice(0, 10);
     if (this.meta().daily_day === day) return {};
     this.sql.exec('UPDATE ask_meta SET daily_day=? WHERE id=1', day);
-    const quiet = this.rows(`SELECT * FROM ask_agents WHERE window_changed_at>=? AND COALESCE(last_message_at,0)<? AND COALESCE(silent_alert_day,'')<>?`, now - DAY, now - DAY, day);
+    const quiet = this.rows(`SELECT * FROM ask_agents WHERE window_changed_at>=? AND COALESCE(last_any_at,0)<? AND silent_alert_day IS NULL`, now - DAY, now - DAY);
     for (const a of quiet) {
       await this.hooks.notify?.('asks_agent_silent', a.agent_id + '-' + day,
-        `Agent ${a.agent_name || a.agent_id} was active in the last 24h (chat window advanced) but zero of Alexey's messages were recorded for it.`);
+        `Agent ${a.agent_name || a.agent_id} was active in the last 24h (chat window advanced) but zero messages were recorded for it, so Alexey's asks to it are not reaching the ledger.`);
       this.sql.exec('UPDATE ask_agents SET silent_alert_day=? WHERE agent_id=?', day, a.agent_id);
     }
     return { silent_agents: quiet.length };
@@ -621,9 +648,8 @@ export class AskLedger {
   cursor(agentId: string | null): Obj {
     if (!agentId || !AGENT_ID.test(agentId)) fail('invalid_agent_id');
     const r = this.rows('SELECT t_id,seq,ts FROM ask_messages WHERE agent_id=? ORDER BY seq DESC LIMIT 1', agentId)[0];
-    const n = this.rows('SELECT COUNT(*) AS n FROM ask_messages WHERE agent_id=?', agentId)[0].n;
-    const a = this.rows('SELECT covered_through,window_diag FROM ask_agents WHERE agent_id=?', agentId)[0];
-    return { agent_id: agentId, last_t_id: r?.t_id ?? null, last_seq: r?.seq ?? null, last_ts: r?.ts ?? null, count: n,
+    const a = this.rows('SELECT covered_through,window_diag,msg_count FROM ask_agents WHERE agent_id=?', agentId)[0];
+    return { agent_id: agentId, last_t_id: r?.t_id ?? null, last_seq: r?.seq ?? null, last_ts: r?.ts ?? null, count: a?.msg_count ?? 0,
       covered_through: a?.covered_through ?? null, window_diag: a?.window_diag ? JSON.parse(a.window_diag) : null };
   }
   summary(): Obj {

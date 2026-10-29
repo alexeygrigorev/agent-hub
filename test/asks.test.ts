@@ -284,6 +284,57 @@ describe('review regressions', () => {
     expect(r.reopened).toBe(0);
     expect((await show(h, t.id)).status).toBe('done');
   }));
+  it('a dropped-ask alert says what happened and resolves once the ask is proven', () => fixture(async (h, l, alerts) => {
+    const t = await intake(h, '1. Something else');
+    await note(h, t.id, DONE('AC1: met'));
+    expect((await close(h, t.id)).status).toBe(200);
+    ingest(l, 'dev', [msg('t1300u', 'the decider must ship', { intake_id: t.id })]);
+    await l.tick();
+    const raised = alerts.filter(a => a.kind === 'asks_dropped');
+    expect(raised).toHaveLength(1);
+    expect(raised[0].detail).toContain('reopened');
+    await l.tick();
+    expect(alerts.filter(a => a.kind === 'asks_dropped')).toHaveLength(1); // still open: the ask is unproven
+    l.verify(asks(h)[0].id, { evidence: 'decider live at /jev' }, 'op');
+    await l.tick();
+    const last = alerts.filter(a => a.kind === 'asks_dropped');
+    expect(last).toHaveLength(2);
+    expect(last[1]).toMatchObject({ subject: raised[0].subject, detail: null });
+    await l.tick();
+    expect(alerts.filter(a => a.kind === 'asks_dropped')).toHaveLength(2);
+  }));
+  it('fallback writers are not liveness sources; the cursor count is a counter', () => fixture(async (h, l, alerts, clock) => {
+    l.ingest({ source: 'cli', agents: [{ agent_id: 'dev', messages: [msg('t1400u', 'one-off ask')] }] }, { admin: false, actor: 'host:tabo', machineId: 'tabo' });
+    expect(h.sql.exec('SELECT COUNT(*) AS n FROM ask_sources').toArray()[0].n).toBe(0);
+    clock.now += 3 * 3600000;
+    expect((await l.tick()).silent_sources).toBe(0);
+    ingest(l, 'dev', [msg('t1401a', 'reply', { role: 'assistant' }), msg('t1402u', 'next')]);
+    expect(l.cursor('dev')).toMatchObject({ count: 3, last_t_id: 't1402u' });
+  }));
+  it('a rejected user message becomes an unrecorded range and clears when it is re-sent valid', () => fixture(async (h, l, alerts) => {
+    const r = ingest(l, 'dev', [msg('t1500u', 'x'.repeat(131073)), msg('t1501a', 'y'.repeat(131073), { role: 'assistant' })]);
+    expect(r.rejected.map((x: any) => x.error)).toEqual(['text_too_long', 'text_too_long']);
+    await l.tick();
+    const gap = alerts.find(a => a.kind === 'asks_unrecorded');
+    expect(gap.detail).toContain('t1500u (1 ref(s), rejected:text_too_long)');
+    expect(gap.detail).not.toContain('t1501');
+    ingest(l, 'dev', [msg('t1500u', 'shorter, valid')]);
+    await l.tick();
+    expect(alerts.filter(a => a.kind === 'asks_unrecorded').at(-1)).toMatchObject({ subject: gap.subject, detail: null });
+  }));
+  it('daily silent-agent alert ignores agents with recorded traffic and resolves when messages arrive', () => fixture(async (h, l, alerts, clock) => {
+    ingest(l, 'busy', [msg('t1601a', 'bot talking', { role: 'assistant' })], { window: { first_t_id: 't1600a', last_t_id: 't1601a' } });
+    ingest(l, 'mute', [], { window: { first_t_id: 't1u', last_t_id: 't9a' } });
+    await l.tick();
+    const silent = alerts.filter(a => a.kind === 'asks_agent_silent');
+    expect(silent.map(a => a.subject.split('-')[0])).toEqual(['mute']);
+    ingest(l, 'mute', [msg('t10u', 'hello')]);
+    await l.tick();
+    expect(alerts.filter(a => a.kind === 'asks_agent_silent').at(-1)).toMatchObject({ subject: silent[0].subject, detail: null });
+  }));
+  it('"nothing done" is not met', () => {
+    expect(noteMarks('AC2: nothing done yet').ac.get(2)).toBe(false);
+  });
   it('hosts cannot post backfill', () => fixture(async (h, l) => {
     expect(() => l.ingest({ source: 'backfill', machine_id: 'tabo', agents: [] }, { admin: false, actor: 'host:tabo', machineId: 'tabo' })).toThrow('backfill_requires_operator');
   }));
