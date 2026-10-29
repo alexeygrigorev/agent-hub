@@ -103,3 +103,17 @@ def guard_real_worker_profiles():
                      if before.get(name) != after.get(name))
     assert not changed, (
         "test session touched real hub-worker-auth profiles: " + ", ".join(changed))
+
+
+@pytest.fixture(autouse=True)
+def isolated_host_load(monkeypatch):
+    """Unit dispatch uses a stable host; overload tests inject their own samples.
+
+    Other sessions' live load must not decide which mocked launch path runs.
+    Patch only this module's OS reader, preserving the real gate and every
+    explicit numeric/error sample in the dedicated load and dispatch tests.
+    """
+    from types import SimpleNamespace
+    from agent_hub_host import host_load
+    monkeypatch.setattr(host_load, "os", SimpleNamespace(
+        getloadavg=lambda: (0.0, 0.0, 0.0), cpu_count=lambda: 12))

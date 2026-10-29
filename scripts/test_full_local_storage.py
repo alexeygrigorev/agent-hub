@@ -12,6 +12,7 @@ import unittest
 
 
 RUNNER = Path(__file__).with_name("test-full-local.sh")
+CAPPED_RUNNER = Path(__file__).with_name("capped-test-run.sh")
 STUB = r'''
 import json, os, pathlib, socket, sys, time
 name = pathlib.Path(sys.argv[0]).name
@@ -71,6 +72,12 @@ class FullLocalStorageTests(unittest.TestCase):
         scripts = self.repo / "scripts"
         scripts.mkdir(parents=True)
         shutil.copyfile(RUNNER, scripts / RUNNER.name)
+        # Intake 0689ce9c: the runner gates heavy phases through the
+        # host-wide cap wrapper; fixtures carry the real wrapper so the
+        # shell under test resolves the same path it uses in production.
+        shutil.copyfile(CAPPED_RUNNER, scripts / CAPPED_RUNNER.name)
+        # copyfile drops modes; the runner execs the wrapper directly.
+        (scripts / CAPPED_RUNNER.name).chmod(0o755)
         (scripts / "local-dependencies.py").write_text("# Command stub handles this fixture.\n")
         self.bin = self.root / "bin"
         self.bin.mkdir()

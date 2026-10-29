@@ -1,0 +1,23 @@
+[Unit]
+Description=Agent Hub host: one bounded heartbeat, subscription and session report cycle
+After=network-online.target
+Wants=network-online.target
+
+# Sequential admission, catalog, reconciliation and dispatch can exceed 240s
+# under load. Give the bounded cycle 600s; retain the cycle lock and timer.
+# Preserve installed release/configuration drop-ins during rollout. Reload
+# systemd and let any active cycle finish; do not restart native work sessions.
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/git/agent-hub/host
+Environment=PATH=%h/.local/bin:%h/.nvm/versions/node/v24.13.1/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HUB_CONFIG_FILE=%h/git/agent-hub/.local/platform-runtime/host.json
+Environment=PYTHONPATH=%h/git/agent-hub/host
+ExecStart=/usr/bin/python3 -m agent_hub_host.cli fleet-host --cycles 1 --config %h/git/agent-hub/.local/platform-runtime/subscriptions.json
+TimeoutStartSec=600
+TimeoutStopSec=90
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

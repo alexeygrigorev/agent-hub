@@ -1,6 +1,7 @@
 """Fixed pre-start reasons plus bounded, redacted typed command evidence."""
 MESSAGES = {
     'dispatch_worktree_refused': 'The worktree could not be protected before native start.',
+    'host_overload': 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
     'cpu_headroom': 'Host CPU usage plus expected session demand exceeds the CPU target.',
     'cpu_pressure': 'Host CPU pressure exceeds the safety cap.',
     'memory_pressure': 'Host memory full pressure exceeds the safety cap.',
@@ -65,7 +66,7 @@ def classify(exc, *, workspace_available=True):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'engine_auth_expired', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'engine_auth_expired', 'host_overload', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
         if value.startswith('HTTP request failed with status '):
             reason = 'dispatch_claim_refused'
     elif isinstance(exc, (RuntimeError, OSError)):
