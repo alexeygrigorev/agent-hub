@@ -23,6 +23,7 @@ profile = pathlib.Path(os.environ.get("HUB_CONFIG_FILE") or
 with record.open("a") as out:
     out.write(json.dumps({"tool": name, "args": args, "tmp": os.environ.get("TMPDIR"),
                           "home": os.environ.get("HOME"), "cache": os.environ.get("UV_CACHE_DIR"),
+                          "cap_dir": os.environ.get("AGENT_HUB_HEAVY_TEST_DIR"),
                           "pools": [os.environ.get(k) for k in ("UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS")],
                           "selectors": sorted(k for k in os.environ if k.startswith(("APLEXER_", "HUB_", "AGENT_HUB_"))
                             or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR")),
@@ -102,7 +103,11 @@ class FullLocalStorageTests(unittest.TestCase):
         record = self.root / f"{name}.jsonl"
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
-                   UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record))
+                   UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record),
+                   # These commands are stubs, not real heavy suites. Keep
+                   # shell-storage fixtures out of the real host semaphore.
+                   AGENT_HUB_HEAVY_TEST_DIR=str(self.root / "fixture-heavy-slots"),
+                   AGENT_HUB_HEAVY_TEST_SLOTS="2")
         for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
                     "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS"):
             env.pop(key, None)
@@ -131,6 +136,26 @@ class FullLocalStorageTests(unittest.TestCase):
 
     def assert_preserved(self):
         self.assertEqual(self.sentinel.read_text(), "preserve")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX advisory locks required")
+    def test_stubbed_runner_is_isolated_from_occupied_ambient_heavy_slots(self):
+        import fcntl
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        ambient = self.root / "occupied-ambient-slots"
+        ambient.mkdir()
+        with ExitStack() as stack:
+            for number in range(2):
+                lock = stack.enter_context((ambient / f"slot-{number}.lock").open("w"))
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.dict(os.environ, {"AGENT_HUB_HEAVY_TEST_DIR": str(ambient),
+                                        "AGENT_HUB_HEAVY_TEST_WAIT_S": "1"}):
+                child, record = self.start("ambient-cap-isolation")
+                code, output = self.finish(child)
+            self.assertEqual(code, 0, output)
+            vitest = next(row for row in self.records(record) if row["tool"] == "npx")
+            self.assertEqual(vitest["cap_dir"], str(self.root / "fixture-heavy-slots"))
+            self.assert_preserved()
 
     def test_python_discovery_does_not_touch_ambient_profiles(self):
         profile = self.root / "ambient-profile.json"
