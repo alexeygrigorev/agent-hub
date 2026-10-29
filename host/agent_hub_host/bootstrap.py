@@ -4,6 +4,7 @@ The small shell/PowerShell entrypoints supply uv, Python and a checked zipapp.
 This module is also usable for repair on an already enrolled machine.
 """
 import argparse
+import filecmp
 import hashlib
 import json
 import os
@@ -241,11 +242,21 @@ def ensure_aplexer(install_root):
             staged.chmod(0o755)
             run([staged, '--version'], capture=True)
             os.replace(staged, binary)
-            shutil.copy2(binary, binary_dir / ('a' + suffix))
             stamp.write_text(version)
     alias = binary_dir / ('a' + suffix)
-    if not alias.is_file():
-        shutil.copy2(binary, alias)
+    # Keep the `a` used by hooks consistent after upgrades and repairs.
+    # Stage the alias too: an interrupted copy must not
+    # truncate the existing executable, and unchanged Windows binaries may
+    # still be in use and must not be replaced unnecessarily.
+    if alias.is_symlink() or not alias.is_file() or not filecmp.cmp(binary, alias, shallow=False):
+        fd, staging = tempfile.mkstemp(prefix='.a-', suffix=suffix, dir=binary_dir)
+        os.close(fd)
+        try:
+            shutil.copy2(binary, staging)
+            os.replace(staging, alias)
+        finally:
+            if os.path.exists(staging):
+                os.unlink(staging)
     return binary
 
 

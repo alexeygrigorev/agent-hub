@@ -68,6 +68,78 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(argv[-len(b.ENGINES):], list(b.ENGINES.values()))
         self.assertEqual(env['npm_config_prefix'], str(self.root / 'engines'))
 
+    def prepare_aplexer_alias(self):
+        binary_dir = self.root / 'bin'
+        binary_dir.mkdir()
+        binary = binary_dir / 'aplexer'
+        binary.write_bytes(b'current runtime')
+        binary.chmod(0o755)
+        (binary_dir / 'aplexer-version').write_text(b.APLEXER_VERSION)
+        alias = binary_dir / 'a'
+        alias.write_bytes(b'previous runtime')
+        return binary, alias
+
+    def test_aplexer_repair_updates_stale_alias_without_downloading(self):
+        binary, alias = self.prepare_aplexer_alias()
+        with patch.object(b.sys, 'platform', 'linux'), \
+             patch.object(b, 'architecture', return_value='x64'), \
+             patch.object(b, 'download') as download:
+            b.ensure_aplexer(self.root)
+        download.assert_not_called()
+        self.assertEqual(alias.read_bytes(), binary.read_bytes())
+        self.assertTrue(alias.stat().st_mode & 0o111)
+
+    def test_aplexer_repair_preserves_identical_alias(self):
+        binary, alias = self.prepare_aplexer_alias()
+        alias.write_bytes(binary.read_bytes())
+        with patch.object(b.sys, 'platform', 'linux'), \
+             patch.object(b, 'architecture', return_value='x64'), \
+             patch.object(b.shutil, 'copy2') as copy:
+            b.ensure_aplexer(self.root)
+        copy.assert_not_called()
+
+    def test_failed_aplexer_alias_copy_preserves_previous_executable(self):
+        _, alias = self.prepare_aplexer_alias()
+        previous = alias.read_bytes()
+        def interrupted(source, target):
+            Path(target).write_bytes(b'partial')
+            raise OSError('interrupted copy')
+        with patch.object(b.sys, 'platform', 'linux'), \
+             patch.object(b, 'architecture', return_value='x64'), \
+             patch.object(b.shutil, 'copy2', side_effect=interrupted):
+            with self.assertRaises(OSError):
+                b.ensure_aplexer(self.root)
+        self.assertEqual(alias.read_bytes(), previous)
+        self.assertEqual(sorted(p.name for p in alias.parent.iterdir()),
+                         ['a', 'aplexer', 'aplexer-version'])
+
+    def test_aplexer_upgrade_resumes_after_interrupted_alias_publication(self):
+        binary, alias = self.prepare_aplexer_alias()
+        binary.write_bytes(alias.read_bytes())
+        (alias.parent / 'aplexer-version').write_text('previous version')
+        (self.root / 'tmp').mkdir()
+        previous = alias.read_bytes()
+        def download(url, target):
+            Path(target).write_bytes(b'upgraded runtime')
+        def interrupted(source, target):
+            Path(target).write_bytes(b'partial')
+            raise OSError('interrupted copy')
+        with patch.object(b.sys, 'platform', 'linux'), \
+             patch.object(b, 'architecture', return_value='x64'), \
+             patch.object(b, 'download', side_effect=download), \
+             patch.object(b, 'verify'), patch.object(b, 'run'), \
+             patch.object(b.shutil, 'copy2', side_effect=interrupted):
+            with self.assertRaises(OSError):
+                b.ensure_aplexer(self.root)
+        self.assertEqual(alias.read_bytes(), previous)
+        self.assertEqual(binary.read_bytes(), b'upgraded runtime')
+        with patch.object(b.sys, 'platform', 'linux'), \
+             patch.object(b, 'architecture', return_value='x64'), \
+             patch.object(b, 'download') as fetch:
+            b.ensure_aplexer(self.root)
+        fetch.assert_not_called()
+        self.assertEqual(alias.read_bytes(), b'upgraded runtime')
+
     def test_windows_portable_git_is_extracted_without_executing_installer(self):
         (self.root / 'tmp').mkdir()
         commands = []
