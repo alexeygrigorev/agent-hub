@@ -97,6 +97,7 @@ tool('accounts_write', 'PUT', '/api/fleet/accounts', 'Operator-only account regi
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
   'host-release': 'Operator release pin for a checkout-installed host; deliberate CLI step, not an agent tool.',
+  'launcher-release': 'Operator release pin for a checkout-installed launcher; deliberate CLI step, not an agent tool.',
   'msg agent-credential': 'Writes a new private local credential file; MCP cannot write host files.',
   'msg agent-delegate': 'Operator grant of named-agent delegation to an MCP client; deliberate CLI step.',
   'msg readdress': 'Operator re-address of an undelivered session message; deliberate CLI step.',

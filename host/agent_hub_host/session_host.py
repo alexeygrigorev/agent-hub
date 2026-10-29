@@ -828,7 +828,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             # (Windows hosts without ssh). An applied update sets ``stop``;
             # the supervisor restarts the controller on the new code.
             maybe_start_named_thread(
-                None, self_update.loop, (lambda *a: dispatcher.request(*a), release_stop), 'host-release')
+                None, lambda *args: self_update.loop(*args, launcher_settings=lambda: dispatcher.settings),
+                (lambda *a: dispatcher.request(*a), release_stop), 'host-release')
             while not stop.is_set() and (cycles is None or count < cycles):
                 if release_stop.is_set():
                     (journal / RELEASE_RESTART_MARKER).write_text('restart\n', encoding='utf-8')

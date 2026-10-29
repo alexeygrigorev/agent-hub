@@ -643,7 +643,7 @@ def main():
             print('hub msg failed: ' + str(exc)[:300], file=sys.stderr)
             sys.exit(msg_cli.exit_code_for(exc))
         return
-    if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact', 'host-release'):
+    if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact', 'host-release', 'launcher-release'):
         try:
             print(json.dumps(routing.execute(args), indent=2))
         except Exception:

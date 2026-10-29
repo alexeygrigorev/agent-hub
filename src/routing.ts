@@ -54,6 +54,7 @@ export class RoutingService {
     // its own clean checkout to it and reports the outcome. The Hub never
     // ships code, only the target SHA, which the host verifies is on main.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS host_release_targets (machine_id TEXT PRIMARY KEY, sha TEXT, set_by TEXT, set_at TEXT, current_sha TEXT, state TEXT, error TEXT, reported_at TEXT)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS launcher_release_targets (machine_id TEXT PRIMARY KEY, sha TEXT, set_by TEXT, set_at TEXT, current_sha TEXT, state TEXT, error TEXT, reported_at TEXT, root TEXT)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_artifacts (job_id TEXT NOT NULL, name TEXT NOT NULL, media_type TEXT NOT NULL, data_base64 TEXT NOT NULL, PRIMARY KEY(job_id, name))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_jobs (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, launch_id TEXT, state TEXT NOT NULL, report TEXT NOT NULL DEFAULT '', artifacts_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, selection_json TEXT, UNIQUE(actor, request_key))`);
     this.sql.exec('CREATE INDEX IF NOT EXISTS routing_pending ON routing_jobs(state, launch_id)');
@@ -227,6 +228,30 @@ export class RoutingService {
         releaseMatch[1], data.sha === null ? null : data.sha.toLowerCase(), String(caller.actor || 'admin').slice(0, 128), this.at());
       return reply({ machine_id: releaseMatch[1], sha: data.sha === null ? null : data.sha.toLowerCase() });
     }
+    if (path === '/api/routing/launcher-release' && request.method === 'GET') {
+      if (!host) return reply({ error: 'forbidden' }, 403);
+      const row: any = this.sql.exec('SELECT sha FROM launcher_release_targets WHERE machine_id = ?', caller.machineId).toArray()[0];
+      return reply({ sha: row?.sha ?? null });
+    }
+    if (path === '/api/routing/launcher-release/report' && request.method === 'POST') {
+      if (!host) return reply({ error: 'forbidden' }, 403);
+      const data = await jsonBody(request, 4096);
+      if (!obj(data, ['current_sha', 'state', 'error', 'root']) || (data.current_sha !== null && !(typeof data.current_sha === 'string' && SHA.test(data.current_sha))) ||
+        !(data.root === null || (typeof data.root === 'string' && data.root.length <= 1024 && !/[\x00-\x1f]/.test(data.root))) || !HOST_RELEASE_STATES.includes(data.state) || (data.error !== undefined && data.error !== null && !(typeof data.error === 'string' && /^[a-z0-9_]{1,64}$/.test(data.error)))) return reply({ error: 'invalid_launcher_release_report' }, 400);
+      this.sql.exec('INSERT INTO launcher_release_targets (machine_id, current_sha, state, error, reported_at, root) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET current_sha = excluded.current_sha, state = excluded.state, error = excluded.error, reported_at = excluded.reported_at, root = excluded.root',
+        caller.machineId, data.current_sha, data.state, data.error ?? null, this.at(), data.root);
+      return reply({ status: 'recorded' });
+    }
+    const launcherMatch = /^\/api\/routing\/launcher-release\/([A-Za-z0-9_-]{1,64})$/.exec(path);
+    if (launcherMatch && request.method === 'PUT') {
+      if (!admin) return reply({ error: 'forbidden' }, 403);
+      const data = await jsonBody(request, 1024);
+      if (!obj(data, ['sha']) || (data.sha !== null && !(typeof data.sha === 'string' && SHA.test(data.sha)))) return reply({ error: 'invalid_launcher_release' }, 400);
+      if (!this.sql.exec('SELECT 1 FROM machines WHERE id = ?', launcherMatch[1]).toArray().length) return reply({ error: 'machine_not_found' }, 404);
+      this.sql.exec('INSERT INTO launcher_release_targets (machine_id, sha, set_by, set_at) VALUES (?, ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET sha = excluded.sha, set_by = excluded.set_by, set_at = excluded.set_at',
+        launcherMatch[1], data.sha === null ? null : data.sha.toLowerCase(), String(caller.actor || 'admin').slice(0, 128), this.at());
+      return reply({ machine_id: launcherMatch[1], sha: data.sha === null ? null : data.sha.toLowerCase() });
+    }
     if (path === '/api/routing/machines' && request.method === 'GET') {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);
       // Intake 056a4131 AC2: runner available/health answers with plan()'s
@@ -237,7 +262,8 @@ export class RoutingService {
         return this.sql.exec("SELECT engine, machine_id, reason, updated_at FROM fleet_engine_health WHERE status = 'unavailable'").toArray() as any[];
       } catch { return []; } })();
       const releases = new Map((this.sql.exec('SELECT * FROM host_release_targets').toArray() as any[]).map(r => [r.machine_id, { desired_sha: r.sha ?? null, current_sha: r.current_sha ?? null, state: r.state ?? null, error: r.error ?? null, reported_at: r.reported_at ?? null, set_at: r.set_at ?? null }]));
-      return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.os, m.arch, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id').toArray() as any[]).map(m => ({ id: m.machine_id, host_release: releases.get(m.machine_id) ?? null, hostname: m.hostname, os: m.os ?? '', arch: (m as any).arch ?? '', needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json).map((rn: any) => ({ ...rn, ...runnerHealth(healthRowsFor(unavailableRows, rn.engine, m.machine_id), this.now()) })), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
+      const launchers = new Map((this.sql.exec('SELECT * FROM launcher_release_targets').toArray() as any[]).map(r => [r.machine_id, { root: r.root ?? null, desired_sha: r.sha ?? null, current_sha: r.current_sha ?? null, state: r.state ?? null, error: r.error ?? null, reported_at: r.reported_at ?? null, set_at: r.set_at ?? null }]));
+      return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.os, m.arch, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id').toArray() as any[]).map(m => ({ id: m.machine_id, host_release: releases.get(m.machine_id) ?? null, launcher_release: launchers.get(m.machine_id) ?? null, hostname: m.hostname, os: m.os ?? '', arch: (m as any).arch ?? '', needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json).map((rn: any) => ({ ...rn, ...runnerHealth(healthRowsFor(unavailableRows, rn.engine, m.machine_id), this.now()) })), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
     }
     if (path === '/api/routing/policy/grok') {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);
