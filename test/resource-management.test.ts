@@ -48,6 +48,12 @@ describe('resource management',()=>{
   const observer=new ResourceManagement(boundedSql,()=>now);
   observer.finishObserved('host',[{native_id:'native',phase:'exited',confirmed_exit:true}]);
   expect(queries).toBe(1);expect(reads).toBe(1);
+  // A full host census must remain inside SQLite's bind limit, including
+  // the machine filter, and still inspect IDs in the final partial batch.
+  observer.finishObserved('host',Array.from({length:500},(_,i)=>({
+   native_id:i===499?'native':'retained-native-'+(i+1),phase:'exited',confirmed_exit:true,
+  })));
+  expect(queries).toBeGreaterThan(1);expect(reads).toBe(501);
  }));
  it('excludes negative, fractional and unsafe token counts consistently from period totals',async()=>fixture(async(r,sql)=>{
   r.report('host',{samples:[sample()],reaps:[]});
