@@ -28,7 +28,9 @@ def test_supervisor_propagates_venv_python_to_owned_native_child(tmp_path):
             '--credential-config', str(config), '--journal-dir', str(tmp_path / 'journal')]
     with patch.object(supervisor.sys, 'argv', argv), \
          patch.object(supervisor.sys, 'executable', '/release/.venv/bin/python'), \
-         patch.object(supervisor.os, 'environ', {'AGENT_HUB_MANAGED_DIR': '/custom/managed'}), \
+         patch.object(supervisor.os, 'environ', {'AGENT_HUB_MANAGED_DIR': '/custom/managed',
+             'PATH': '/user/runtimes/bin', 'CLAUDE_CODE_GIT_BASH_PATH': '/user/git/bash',
+             'UV_PYTHON_INSTALL_DIR': '/user/python'}), \
          patch.object(supervisor.threading, 'Event', return_value=stopped), \
          patch.object(supervisor.signal, 'signal'), \
          patch.object(supervisor, 'native', side_effect=native):
@@ -40,4 +42,7 @@ def test_supervisor_propagates_venv_python_to_owned_native_child(tmp_path):
     assert calls[0][calls[0].index('--cpu-period-us') + 1] == '100000'
     assert '--env' in calls[0]
     assert 'AGENT_HUB_MANAGED_DIR=/custom/managed' in calls[0]
+    assert 'PATH=/user/runtimes/bin' in calls[0]
+    assert 'CLAUDE_CODE_GIT_BASH_PATH=/user/git/bash' in calls[0]
+    assert 'UV_PYTHON_INSTALL_DIR=/user/python' in calls[0]
     assert calls[-1][:2] == ('kill', receipt['id'])

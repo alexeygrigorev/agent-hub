@@ -35,6 +35,8 @@ import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
 import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { ProvisioningService } from './provisioning';
+import { hostRepositoryAccess } from './host-repo-access';
+import { hostRepositoryAuthorizer } from './host-repo-authority';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
 import { BankedResets } from './banked-resets';
 import { ChecksService, validateCheck, type ActionDeps } from './checks';
@@ -860,6 +862,14 @@ export class Hub extends DurableObject {
       if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/') || path === '/api/ops/heartbeat' || path === '/api/ops/liveness') {
         return this.handleWatchRoutes(request, path);
       }
+      if (path === '/api/host/repositories' || path === '/api/host/repositories/token') {
+        if (request.headers.has('Cookie')) return Response.json({ error: 'mixed_authority' }, { status: 403 });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        return hostRepositoryAccess(() => this.env.HOST_REPO_ACCESS_POLICY,
+          hostRepositoryAuthorizer(this.sql, auth.caller,
+            (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller)))(request);
+      }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
         return this.provisioningService.handle(request, await this.authenticateBusRequest(request));
       }
@@ -1305,13 +1315,14 @@ export class Hub extends DurableObject {
           return Response.json({ error: 'Invalid payload' }, { status: 400 });
         }
         
-        const allowedScopes = ['host', 'bus:send', 'bus:read', 'health:report', 'jobs:create', 'lease:root', 'fleet:launch'];
+        const allowedScopes = ['host', 'bus:send', 'bus:read', 'health:report', 'jobs:create', 'lease:root', 'fleet:launch', 'repositories:read'];
         for (const scope of body.requested_scopes) {
           if (!allowedScopes.includes(scope)) {
             return Response.json({ error: 'invalid_scope' }, { status: 400 });
           }
         }
         if (body.client_kind === 'host' && body.requested_scopes.includes('fleet:launch')) return Response.json({ error: 'invalid_scope' }, { status: 400 });
+        if (body.client_kind !== 'host' && body.requested_scopes.includes('repositories:read')) return Response.json({ error: 'invalid_scope' }, { status: 400 });
         
         if (body.requested_scopes.includes('lease:root') || body.requested_scopes.includes('jobs:create') || (body.client_kind === 'agent' && body.requested_scopes.includes('host'))) return Response.json({ error: 'invalid_scope' }, { status: 400 });
         

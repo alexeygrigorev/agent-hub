@@ -157,7 +157,7 @@ def build(out_dir: Path, version: str):
             "built_from_commit": sha,
             "build_date": build_date,
             "built_at_ms": built_at_ms,
-            "files": ["install.sh", "install.ps1", "hub.pyz", "hub.pyz.sha256", "manifest.json"],
+            "files": ["install.sh", "install.ps1", "host-install.sh", "host-install.ps1", "hub.pyz", "hub.pyz.sha256", "manifest.json"],
         }
         manifest_path = out_dir / "manifest.json"
         manifest_tmp = out_dir / "manifest.json.tmp"

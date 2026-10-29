@@ -14,7 +14,12 @@ try {
         $OldUvInstall = $env:UV_UNMANAGED_INSTALL
         try {
             $env:UV_UNMANAGED_INSTALL = $Bin
-            Invoke-RestMethod 'https://astral.sh/uv/0.13.6/install.ps1' | Invoke-Expression
+            $UvInstaller = Join-Path $Work 'uv-install.ps1'
+            Invoke-WebRequest 'https://astral.sh/uv/0.13.6/install.ps1' -OutFile $UvInstaller -UseBasicParsing
+            if ((Get-FileHash $UvInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd00580051699bee58a2e2d9b925f45788b35f7e0fff7966fd5bedfc3c547dc7d') {
+                throw 'uv installer checksum mismatch'
+            }
+            Get-Content -LiteralPath $UvInstaller -Raw | Invoke-Expression
         } finally { $env:UV_UNMANAGED_INSTALL = $OldUvInstall }
     }
     $env:PATH = "$Bin;$env:PATH"
@@ -26,6 +31,7 @@ try {
     Invoke-WebRequest "$Base/cli/hub.pyz" -OutFile $Archive -UseBasicParsing
     Invoke-WebRequest "$Base/cli/hub.pyz.sha256" -OutFile "$Archive.sha256" -UseBasicParsing
     $Expected = ((Get-Content "$Archive.sha256" -Raw).Trim() -split '\s+')[0]
+    if ($Expected -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid Hub checksum file' }
     if ((Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Expected.ToLowerInvariant()) {
         throw 'Hub download checksum mismatch'
     }
@@ -43,6 +49,9 @@ main(['--archive', sys.argv[1], '--base-url', sys.argv[2], '--uv', sys.argv[3]])
 '@ | Set-Content -LiteralPath $Entry -Encoding UTF8
     & $Uv run --no-project --python $Python python $Entry $Archive $Base $Uv
     if ($LASTEXITCODE -ne 0) { throw 'Hub host setup did not complete; rerun the same command to resume.' }
+    $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:PATH = "$UserPath;$env:PATH"
+    $env:CLAUDE_CODE_GIT_BASH_PATH = [Environment]::GetEnvironmentVariable('CLAUDE_CODE_GIT_BASH_PATH', 'User')
 } finally {
     Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
 }

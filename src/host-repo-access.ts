@@ -1,7 +1,7 @@
 /**
- * Source preparation for host repository enrollment; not mounted by Hub yet.
- * No account/key creation or default grant. The eventual route must supply a
- * fresh host-family AND explicitly approved repo-read-scope predicate.
+ * Scoped repository enrollment, mounted on the authenticated host routes.
+ * No account/key creation or default grant. The route supplies a fresh
+ * host-family AND explicitly approved repository-read-scope predicate.
  *
  * Contract: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app
  */

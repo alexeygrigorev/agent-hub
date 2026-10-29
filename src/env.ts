@@ -21,6 +21,8 @@ export interface Env {
   SESSION_SECRET: string;
   // Optional: SHA-256 hex of a high-entropy admin sign-in token (POST /auth/token)
   HUB_ADMIN_TOKEN_SHA256?: string;
+  // Optional existing GitHub App key and explicit repository allowlist (secret).
+  HOST_REPO_ACCESS_POLICY?: string;
 
   // Liveness and alerts (optional)
   // Comma-separated inbox actors for alert delivery; defaults to ['grok-bot'] when unset.

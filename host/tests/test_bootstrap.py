@@ -65,7 +65,7 @@ class BootstrapTests(unittest.TestCase):
             env = b.install_engines(self.root, self.root / 'bin/node', self.root / 'npm-cli.js')
         argv = run.call_args.args[0]
         self.assertIn(str(self.root / 'engines'), [str(x) for x in argv])
-        self.assertEqual(argv[-4:], list(b.ENGINES.values()))
+        self.assertEqual(argv[-len(b.ENGINES):], list(b.ENGINES.values()))
         self.assertEqual(env['npm_config_prefix'], str(self.root / 'engines'))
 
     def test_windows_portable_git_is_extracted_without_executing_installer(self):
@@ -100,6 +100,25 @@ class BootstrapTests(unittest.TestCase):
         download.assert_not_called()
         self.assertEqual(run.call_args.args[0], [git, '--version'])
 
+    def test_node_recreates_npm_and_npx_launchers_after_skipping_archive_links(self):
+        node_root = self.root / 'runtimes' / ('node-v' + b.NODE_VERSION + '-linux-x64')
+        node = node_root / 'bin/node'
+        npm = node_root / 'lib/node_modules/npm/bin/npm-cli.js'
+        node.parent.mkdir(parents=True)
+        npm.parent.mkdir(parents=True)
+        node.touch()
+        npm.touch()
+        with patch.object(b.sys, 'platform', 'linux'), \
+             patch.object(b, 'architecture', return_value='x64'), \
+             patch.object(b, 'run'), patch.object(b, 'download') as download:
+            b.ensure_node(self.root)
+        download.assert_not_called()
+        for name in ('npm', 'npx'):
+            launcher = node.parent / name
+            self.assertIn(str(node), launcher.read_text())
+            self.assertIn(name + '-cli.js', launcher.read_text())
+            self.assertTrue(launcher.stat().st_mode & 0o111)
+
     def test_user_service_preserves_paths_with_spaces(self):
         unusual = self.root / 'a user % space'
         unusual.mkdir()
@@ -127,6 +146,7 @@ class BootstrapTests(unittest.TestCase):
         with patch.object(b, 'root', return_value=install_root), \
              patch.object(b.Path, 'home', return_value=self.root), \
              patch.object(b.sys, 'executable', str(python)), \
+             patch.object(b, 'validate_side_effect_context'), \
              patch.object(config, 'load_host_config', return_value={'access_token': 'synthetic', 'base_url': 'https://hub.test', 'machine_id': 'existing'}), \
              patch.object(config, 'get_host_config_path', return_value=self.root / 'host.json'), \
              patch.object(auth, 'device_login') as login, patch.object(api, 'register_machine') as register, \
@@ -142,6 +162,7 @@ class BootstrapTests(unittest.TestCase):
     def test_cross_hub_reuse_refused_before_effects(self):
         from agent_hub_host import config, auth
         with patch.object(b, 'root', return_value=self.root), patch.object(b, 'validate_persistent_install'), \
+             patch.object(b, 'validate_side_effect_context'), \
              patch.object(config, 'load_host_config', return_value={'base_url': 'https://other.test'}), \
              patch.object(auth, 'device_login') as login, patch.dict(os.environ):
             with self.assertRaises(ValueError):
@@ -155,6 +176,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(os.environ['HUB_CONFIG_FILE'], str(host))
             return {'base_url': 'https://another.test'}
         with patch.object(b, 'validate_persistent_install'), \
+             patch.object(b, 'validate_side_effect_context'), \
              patch.object(b.Path, 'home', return_value=self.root), \
              patch.object(config, 'load_host_config', side_effect=load), \
              patch.dict(os.environ, {'HUB_CONFIG_FILE': str(self.root / 'human.json'),
@@ -241,6 +263,81 @@ class BootstrapTests(unittest.TestCase):
         workspace = Path(command[command.index('--workspace') + 1])
         self.assertEqual(workspace / 'host', package)
         self.assertTrue((package / 'agent_hub_host/cli.py').is_file())
+
+    def test_service_context_refuses_overridden_home_before_os_effects(self):
+        with patch.object(b.Path, 'home', return_value=self.root / 'isolated-home'), \
+             patch.object(b.sys, 'platform', 'linux'), patch.object(b, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'overridden user profile'):
+                b.validate_side_effect_context(self.root / 'isolated-home/.local/share/agent-hub')
+        run.assert_not_called()
+
+    def test_windows_split_home_cannot_change_live_appdata_or_registry(self):
+        from agent_hub_host import config
+        home = self.root / 'home'
+        local = self.root / 'other-user/AppData/Local'
+        install_root = local / 'Programs/agent-hub'
+        with patch.object(b.sys, 'platform', 'win32'), \
+             patch.object(b.Path, 'home', return_value=home), \
+             patch.object(b, 'root', return_value=install_root), \
+             patch.dict(os.environ, {'LOCALAPPDATA': str(local), 'APPDATA': str(home / 'AppData/Roaming')}), \
+             patch.object(config, 'load_host_config') as load, patch.object(b, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'split Windows user profile'):
+                b.configure('https://hub.test')
+        load.assert_not_called()
+        run.assert_not_called()
+
+    def test_partial_venv_without_interpreter_is_repaired(self):
+        root = self.root / 'install'
+        (root / 'venv').mkdir(parents=True)
+        archive = self.root / 'archive.zip'
+        with zipfile.ZipFile(archive, 'w') as z:
+            z.writestr('agent_hub_host/cli.py', '')
+        with patch.object(b, 'run') as run:
+            b.install_package(archive, root, self.root / 'uv')
+        self.assertIn('--allow-existing', run.call_args_list[0].args[0])
+
+    def test_macos_repair_reloads_existing_launch_agent(self):
+        from types import SimpleNamespace
+        with patch.object(b.sys, 'platform', 'darwin'), \
+             patch.object(b.Path, 'home', return_value=self.root), \
+             patch.object(b.subprocess, 'run', return_value=SimpleNamespace(returncode=0)), \
+             patch.object(b, 'run') as run:
+            b.install_service(self.root / 'installation', ['/user/python', '-m', 'supervisor'])
+        self.assertEqual([c.args[0][1] for c in run.call_args_list], ['bootout', 'bootstrap', 'kickstart'])
+        self.assertIn('-k', run.call_args.args[0])
+
+    def test_macos_uses_published_native_release_instead_of_linux_assets(self):
+        (self.root / 'bin').mkdir()
+        (self.root / 'tmp').mkdir()
+        urls = []
+        def download(url, target):
+            urls.append(url)
+            Path(target).write_bytes(b'fixture')
+        with patch.object(b.sys, 'platform', 'darwin'), \
+             patch.object(b, 'architecture', return_value='arm64'), \
+             patch.object(b, 'download', side_effect=download), patch.object(b, 'verify'), \
+             patch.object(b, 'run'):
+            b.ensure_aplexer(self.root)
+        self.assertIn('/v0.1.22/aplexer-macos-arm64', urls[0])
+        self.assertEqual((self.root / 'bin/aplexer-version').read_text(), '0.1.22')
+
+    def test_macos_installs_matching_verified_github_wheel_not_missing_pypi_wheel(self):
+        (self.root / 'tmp').mkdir()
+        archive = self.root / 'hub.pyz'
+        with zipfile.ZipFile(archive, 'w') as z:
+            z.writestr('agent_hub_host/cli.py', '')
+        urls = []
+        def download(url, target):
+            urls.append(url)
+            Path(target).write_bytes(b'fixture')
+        with patch.object(b.sys, 'platform', 'darwin'), \
+             patch.object(b, 'architecture', return_value='arm64'), \
+             patch.object(b, 'download', side_effect=download), patch.object(b, 'verify') as verify, \
+             patch.object(b, 'run') as run:
+            b.install_package(archive, self.root, self.root / 'uv')
+        self.assertIn('aplexer_client-0.1.22-cp311-abi3-macosx_11_0_arm64.whl', urls[0])
+        verify.assert_called_once()
+        self.assertTrue(str(run.call_args.args[0][-1]).endswith('.whl'))
 
 
 if __name__ == '__main__':

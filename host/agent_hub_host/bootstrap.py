@@ -23,6 +23,9 @@ import plistlib
 
 NODE_VERSION = '22.23.4'
 APLEXER_VERSION = '0.1.23'
+# v0.1.23 omits the previously published macOS assets. Keep each native
+# binary and Python client on the same published release for that platform.
+APLEXER_MACOS_VERSION = '0.1.22'
 GIT_VERSION = '2.56.0.4'
 GIT_SHA256 = {
     'x64': 'b1f3e52216e2ed6882d1bebfd4d3fdf319bec40d2edbbf9fd26ec4fd3fce7ed1',
@@ -37,7 +40,8 @@ MICROMAMBA_SHA256 = {
     'osx-arm64': 'acef4eaab19ec2174ad5a449e5aad981ca326270db819502ff096a92fc31caa6',
 }
 ENGINES = {'claude': '@anthropic-ai/claude-code', 'codex': '@openai/codex',
-           'opencode': 'opencode-ai', 'gemini': '@google/gemini-cli'}
+           'opencode': 'opencode-ai', 'gemini': '@google/gemini-cli',
+           'grok': '@xai-official/grok'}
 
 
 def root():
@@ -56,6 +60,12 @@ def validate_persistent_install(install_root):
     expected = (Path(os.environ['LOCALAPPDATA']) / 'Programs/agent-hub'
                 if sys.platform == 'win32' else Path.home() / '.local/share/agent-hub')
     install_root = Path(install_root).absolute()
+    home = Path.home().absolute()
+    if sys.platform == 'win32':
+        for field in ('LOCALAPPDATA', 'APPDATA'):
+            value = Path(os.environ.get(field, '')).absolute()
+            if not value.is_relative_to(home):
+                raise ValueError('Refusing split Windows user profile paths')
     if install_root != expected.absolute():
         raise ValueError('Refusing launcher outside the persistent per-user Hub installation')
     python = install_root / ('venv/Scripts/python.exe' if sys.platform == 'win32' else 'venv/bin/python')
@@ -64,9 +74,32 @@ def validate_persistent_install(install_root):
     package = install_root / 'package/host/agent_hub_host'
     if any(not (package / name).is_file() for name in ('cli.py', 'host_supervisor.py')):
         raise ValueError('Persistent Hub package is incomplete; launcher preserved')
-    for path in (install_root, install_root / 'package', package.parent, package):
+    for path in (home / '.local', home / '.local/share', home / '.local/bin',
+                 install_root, install_root / 'bin', install_root / 'venv', python.parent,
+                 install_root / 'package', package.parent, package):
         if path.is_symlink():
             raise ValueError('Refusing a linked Hub installation')
+
+
+def validate_side_effect_context(install_root):
+    """An overridden HOME must never reconfigure the live user's OS services."""
+    if sys.platform == 'win32':
+        import winreg
+        from .win32_fs import api
+        key = r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' + '\\' + api().sid_text
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as profile:
+            native_home = Path(os.path.expandvars(winreg.QueryValueEx(profile, 'ProfileImagePath')[0]))
+    else:
+        import pwd
+        native_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    if Path.home().resolve() != native_home.resolve():
+        raise ValueError('Refusing service or registry changes for an overridden user profile')
+    temporary = [Path('/tmp'), Path('/var/tmp'), Path('/private/tmp'),
+                 Path(tempfile.gettempdir()), native_home / '.local/tmp']
+    if sys.platform == 'win32':
+        temporary.append(native_home / 'AppData/Local/Temp')
+    if any(Path(install_root).resolve().is_relative_to(p.resolve()) for p in temporary):
+        raise ValueError('Refusing service or registry launchers in temporary storage')
 
 
 def architecture():
@@ -166,23 +199,33 @@ def ensure_node(install_root):
             # into an existing directory would nest it and remain broken.
             shutil.copytree(Path(tmp) / 'expanded' / name, target, dirs_exist_ok=True)
     run([node, '--version'], capture=True)
+    if sys.platform != 'win32':
+        # Runtime extraction deliberately skips links. Replace Node's npm/npx
+        # symlinks with durable launchers needed by managed provisioning too.
+        for command in ('npm', 'npx'):
+            script = node.parent / command
+            cli = npm.with_name(command + '-cli.js')
+            write_private(script, '#!/bin/sh\nexec ' + shlex.quote(str(node)) + ' ' +
+                          shlex.quote(str(cli)) + ' "$@"\n')
+            script.chmod(0o755)
     return node, npm
+
+
+def aplexer_version():
+    return APLEXER_MACOS_VERSION if sys.platform == 'darwin' else APLEXER_VERSION
 
 
 def ensure_aplexer(install_root):
     binary_dir = install_root / 'bin'
     suffix = '.exe' if sys.platform == 'win32' else ''
     binary = binary_dir / ('aplexer' + suffix)
-    if sys.platform == 'darwin':
-        # The native runtime does not yet publish macOS binaries. Do not
-        # silently install a Linux binary or claim service readiness.
-        raise RuntimeError('macOS native session runtime release is pending')
-    system = 'windows' if sys.platform == 'win32' else 'linux'
+    system = {'win32': 'windows', 'darwin': 'macos', 'linux': 'linux'}[sys.platform]
     cpu = 'amd64' if architecture() == 'x64' else 'arm64'
     asset = 'aplexer-' + system + '-' + cpu + suffix
-    base = 'https://github.com/PocketShell-io/aplexer/releases/download/v' + APLEXER_VERSION + '/'
+    version = aplexer_version()
+    base = 'https://github.com/PocketShell-io/aplexer/releases/download/v' + version + '/'
     stamp = binary_dir / 'aplexer-version'
-    if not binary.is_file() or not stamp.is_file() or stamp.read_text() != APLEXER_VERSION:
+    if not binary.is_file() or not stamp.is_file() or stamp.read_text() != version:
         with tempfile.TemporaryDirectory(dir=install_root / 'tmp') as tmp:
             staged, sums = Path(tmp) / asset, Path(tmp) / 'SHA256SUMS.txt'
             download(base + asset, staged)
@@ -192,7 +235,10 @@ def ensure_aplexer(install_root):
             run([staged, '--version'], capture=True)
             os.replace(staged, binary)
             shutil.copy2(binary, binary_dir / ('a' + suffix))
-            stamp.write_text(APLEXER_VERSION)
+            stamp.write_text(version)
+    alias = binary_dir / ('a' + suffix)
+    if not alias.is_file():
+        shutil.copy2(binary, alias)
     return binary
 
 
@@ -300,11 +346,23 @@ def ensure_antigravity(install_root):
 
 def install_package(archive, install_root, uv):
     venv = install_root / 'venv'
-    if not venv.exists():
-        run([uv, 'venv', '--python', sys.executable, venv])
     python = venv / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python')
-    run([uv, 'pip', 'install', '--python', python,
-         'quse>=0.0.17', 'aplexer-client==' + APLEXER_VERSION])
+    if not python.is_file():
+        run([uv, 'venv', '--allow-existing', '--python', sys.executable, venv])
+    if sys.platform == 'darwin':
+        # The macOS wheels were published on GitHub but not on PyPI.
+        cpu = 'x86_64' if architecture() == 'x64' else 'arm64'
+        name = 'aplexer_client-' + aplexer_version() + '-cp311-abi3-macosx_11_0_' + cpu + '.whl'
+        base = 'https://github.com/PocketShell-io/aplexer/releases/download/v' + aplexer_version() + '/'
+        with tempfile.TemporaryDirectory(dir=install_root / 'tmp') as tmp:
+            wheel, sums = Path(tmp) / name, Path(tmp) / 'SHA256SUMS.txt'
+            download(base + name, wheel)
+            download(base + sums.name, sums)
+            verify(wheel, sums.read_text(), name)
+            run([uv, 'pip', 'install', '--python', python, 'quse>=0.0.17', wheel])
+    else:
+        run([uv, 'pip', 'install', '--python', python,
+             'quse>=0.0.17', 'aplexer-client==' + aplexer_version()])
     # Keep the maintained supervisor's checkout contract: workspace/host is
     # the Python import root for its native controller and all descendants.
     package = install_root / 'package/host'
@@ -334,8 +392,7 @@ def service_command(install_root, settings):
             '--journal-dir', str(install_root / 'journal')]
 
 
-def publish_user_path(install_root):
-    """Expose the same per-user engines and quota CLI to humans and services."""
+def runtime_directories(install_root):
     node_dir = install_root / 'runtimes' / ('node-v' + NODE_VERSION + '-' +
                 {'linux': 'linux', 'darwin': 'darwin', 'win32': 'win'}[sys.platform] + '-' + architecture())
     directories = [install_root / 'bin',
@@ -345,6 +402,18 @@ def publish_user_path(install_root):
     if sys.platform == 'win32':
         git_root = install_root / 'runtimes' / ('git-' + GIT_VERSION + '-' + architecture())
         directories.append(git_root / 'cmd')
+    else:
+        directories.insert(0, Path.home() / '.local/bin')
+        directories.append(install_root / 'runtimes/git/bin')
+    return directories
+
+
+def publish_user_path(install_root):
+    """Expose the same per-user engines and quota CLI to humans and services."""
+    directories = runtime_directories(install_root)
+    if sys.platform == 'win32':
+        git_root = install_root / 'runtimes' / ('git-' + GIT_VERSION + '-' + architecture())
+        os.environ['CLAUDE_CODE_GIT_BASH_PATH'] = str(git_root / 'usr/bin/bash.exe')
         quote = lambda s: "'" + str(s).replace("'", "''") + "'"
         ps = ('$old=[Environment]::GetEnvironmentVariable("Path","User");'
               '$add=@(' + ','.join(quote(p) for p in directories) + ');'
@@ -354,12 +423,10 @@ def publish_user_path(install_root):
               quote(git_root / 'usr/bin/bash.exe') + ',"User")')
         run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', ps])
     else:
-        directories.insert(0, Path.home() / '.local/bin')
-        directories.append(install_root / 'runtimes/git/bin')
         path_script = install_root / 'path.sh'
         write_private(path_script, 'export PATH=' + shlex.quote(':'.join(map(str, directories))) + ':"$PATH"\n')
         include = '\n# Agent Hub per-user runtimes\n. ' + shlex.quote(str(path_script)) + '\n'
-        for name in ('.profile', '.zprofile', '.bashrc'):
+        for name in ('.profile', '.zprofile', '.zshrc', '.bashrc'):
             profile = Path.home() / name
             # Preserve shell profiles and refuse linked files outside HOME.
             if profile.is_symlink():
@@ -428,9 +495,10 @@ def install_service(install_root, command):
         domain = 'gui/' + str(os.getuid())
         probe = subprocess.run(['launchctl', 'print', domain + '/click.dtcdev.agent-hub'],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if probe.returncode:
-            run(['launchctl', 'bootstrap', domain, path])
-        run(['launchctl', 'kickstart', domain + '/click.dtcdev.agent-hub'])
+        if not probe.returncode:
+            run(['launchctl', 'bootout', domain, path])
+        run(['launchctl', 'bootstrap', domain, path])
+        run(['launchctl', 'kickstart', '-k', domain + '/click.dtcdev.agent-hub'])
         return 'launch_agent'
     def systemd_quote(value):
         if any(c in value for c in ('\n', '\r', '\0')):
@@ -456,6 +524,7 @@ def configure(base_url):
     from . import api, auth, config, fleet, provisioning, system
     install_root = root()
     validate_persistent_install(install_root)
+    validate_side_effect_context(install_root)
     # An operator may have exported the human CLI profile. Host enrollment
     # must select its own durable file before reading or saving credentials.
     config_root = (Path(os.environ['APPDATA']) if sys.platform == 'win32' else
@@ -465,24 +534,40 @@ def configure(base_url):
     if cfg.get('base_url') and not config.same_origin(base_url, cfg['base_url']):
         raise ValueError('Existing host belongs to another Hub; no credentials changed')
     if not cfg.get('access_token'):
-        auth.device_login(base_url, 'host', 'agent-hub-host', system.get_hostname(), auth.HOST_SCOPES)
+        auth.device_login(base_url, 'host', 'agent-hub-host', system.get_hostname(),
+                          auth.HOST_SCOPES + ['repositories:read'])
     api.register_machine(base_url)
     settings = fleet.subscriptions_path()
     if not settings.exists():
         write_private(settings, json.dumps({'version': 1, 'subscriptions': [],
                       'workspaces': {'home': str(Path.home())}}))
     fleet.load_settings(settings)  # Validate, never overwrite local operator settings.
-    print('Host enrolled; reconciling centrally managed engine accounts.', flush=True)
-    provisioning.sync()
     publish_user_path(install_root)
     configure_default_engine()
+    from . import enrollment_repositories
+    paired = config.load_host_config()
+    repositories = None
+    if 'repositories:read' in paired.get('requested_scopes', []):
+        repositories = enrollment_repositories.sync(install_root)
+        if repositories:
+            data = json.loads(settings.read_text())
+            workspaces = data.setdefault('workspaces', {})
+            for alias, path in repositories.items():
+                if alias in workspaces and workspaces[alias] != path:
+                    raise ValueError('Existing repository workspace differs; settings preserved')
+                workspaces[alias] = path
+            write_private(settings, json.dumps(data, indent=2))
+            fleet.load_settings(settings)
     # Keep the runtime PATH usable for human commands and all service children.
     bin_dir = install_root / 'bin'
     if sys.platform == 'win32':
-        launcher = '@echo off\r\n"' + sys.executable + '" -m agent_hub_host.cli %*\r\n'
+        batch = lambda value: str(value).replace('%', '%%')
+        launcher = '@echo off\r\n"' + batch(sys.executable) + '" -m agent_hub_host.cli %*\r\n'
         # PYTHONPATH is inherited by service children; human launcher embeds
         # its own package path rather than depending on a shell profile.
-        launcher = launcher.replace('@echo off\r\n', '@echo off\r\nsetlocal\r\nset "PYTHONPATH=' + str(install_root / 'package/host') + '"\r\n')
+        launcher = launcher.replace('@echo off\r\n', '@echo off\r\nsetlocal\r\nset "PYTHONPATH=' + batch(install_root / 'package/host') + '"\r\n' +
+                   'set "PATH=' + ';'.join(batch(p) for p in runtime_directories(install_root)) + ';%PATH%"\r\n' +
+                   'set "CLAUDE_CODE_GIT_BASH_PATH=' + batch(os.environ['CLAUDE_CODE_GIT_BASH_PATH']) + '"\r\n')
         write_private(bin_dir / 'hub.cmd', launcher)
     else:
         human_bin = Path.home() / '.local/bin'
@@ -490,9 +575,12 @@ def configure(base_url):
         wrapper = '#!/bin/sh\n. ' + shlex.quote(str(install_root / 'path.sh')) + '\nexport PYTHONPATH=' + shlex.quote(str(install_root / 'package/host')) + '\nexec ' + shlex.quote(sys.executable) + ' -m agent_hub_host.cli "$@"\n'
         write_private(human_bin / 'hub', wrapper)
         (human_bin / 'hub').chmod(0o755)
+    print('Host enrolled; reconciling centrally managed engine accounts.', flush=True)
+    provisioning.sync()
     service = install_service(install_root, service_command(install_root, settings))
     print(json.dumps({'status': 'installed', 'machine_id': config.load_host_config().get('machine_id'),
-                      'service': service, 'elevation_prompts': 0}), flush=True)
+                      'service': service, 'elevation_prompts': 0,
+                      'repository_access': 'configured' if repositories is not None else 'not_configured'}), flush=True)
 
 
 def main(argv=None):
