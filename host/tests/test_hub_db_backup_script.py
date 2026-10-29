@@ -405,6 +405,8 @@ class StalenessBackupFailedModeTest(unittest.TestCase):
         return [l for l in out.splitlines() if "[DRILL]" in l]
 
     def assert_one_drill_line(self, out: str, *needles: str) -> str:
+        # One log line per drill: the drill's whole output is that one line.
+        self.assertEqual(len(out.strip().splitlines()), 1, out)
         lines = self.drill_lines(out)
         self.assertEqual(len(lines), 1, out)
         line = lines[0]
@@ -452,8 +454,17 @@ class StalenessBackupFailedModeTest(unittest.TestCase):
         res = subprocess.run(["bash", str(STALENESS)], env=env, capture_output=True,
                              text=True, timeout=60)
         self.assertEqual(self.mails(), [])
-        if self.drill_lines(res.stdout):
-            self.assert_one_drill_line(res.stdout, "drill cleared")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assert_one_drill_line(res.stdout, "drill cleared")
+
+    def test_drill_line_keeps_mail_none_with_long_reason_and_path(self) -> None:
+        deep = self.work / "local" / ("x" * 200) / "2026" / "10" / "28"
+        deep.mkdir(parents=True)
+        (deep / "hub-do-20261028T0420+0100.json.gz").write_bytes(b"x")
+        res = self.run_stale("--backup-failed", "r" * 1000, "--drill")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        line = self.assert_one_drill_line(res.stdout)
+        self.assertTrue(line.endswith(" mail=none"), line)
 
     def test_drill_flag_alone_is_refused(self) -> None:
         res = self.run_stale("--drill")

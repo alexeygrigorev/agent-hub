@@ -177,9 +177,12 @@ write_state() {
 # (stdout, appended to the cron log): "<UTC ts> [DRILL] <what> result=<...>
 # mail=none". No MTA is invoked and no other file is written.
 drill_log() {
-  # $1=what $2=result; newlines/CRs are flattened so it stays one line.
-  local line="[DRILL] $1 result=$2 mail=none"
-  log "$(printf '%s' "$line" | tr '\r\n' '  ' | cut -c1-600)"
+  # $1=what $2=result. Each part is flattened to one line and bounded on its
+  # own, so the mandatory "mail=none" suffix always survives.
+  local what result
+  what="$(printf '%s' "$1" | tr '\r\n' '  ' | cut -c1-120)"
+  result="$(printf '%s' "$2" | tr '\r\n' '  ' | cut -c1-900)"
+  log "[DRILL] ${what} result=${result} mail=none"
 }
 
 effective_to() {
@@ -284,17 +287,18 @@ if [[ "$HUB_DB_STALE_DRILL" == "1" ]]; then
 fi
 
 if [[ "$IS_STALE" -eq 0 ]]; then
+  if [[ "${WAS_STALE:-0}" -eq 1 && "${WAS_DRILL:-0}" -eq 1 && "$NO_MAIL" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+    # Close a drill: exactly one [DRILL] log line (no separate "fresh:" line)
+    # and no mail; the forced FAIL never pages anyone backward.
+    drill_log "staleness drill cleared, RECOVERED suppressed" "fresh age_s=${AGE_S} path=${NEWEST_PATH}"
+    write_state 0 "${LAST_ALERT:-0}" 0
+    exit 0
+  fi
   AGE_H="$(python3 -c "print(f'{$AGE_S/3600:.1f}')" 2>/dev/null || echo '?')"
   log "fresh: newest export age ${AGE_S}s (~${AGE_H}h) path=${NEWEST_PATH}"
   if [[ "${WAS_STALE:-0}" -eq 1 && "$NO_MAIL" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
-    if [[ "${WAS_DRILL:-0}" -eq 1 ]]; then
-      # Close a drill: the RECOVERED is one [DRILL] log line too (drills never send
-      # real mail); the forced FAIL never pages anyone backward.
-      drill_log "staleness drill cleared, RECOVERED suppressed" "fresh age_s=${AGE_S} path=${NEWEST_PATH}"
-    else
-      send_mail "RECOVERED: Hub DB backup fresh again" \
-        "Hub DB backup is fresh again. Newest export: ${NEWEST_PATH} (age ${AGE_S}s)."
-    fi
+    send_mail "RECOVERED: Hub DB backup fresh again" \
+      "Hub DB backup is fresh again. Newest export: ${NEWEST_PATH} (age ${AGE_S}s)."
   fi
   write_state 0 "${LAST_ALERT:-0}" 0
   exit 0
