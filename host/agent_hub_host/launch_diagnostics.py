@@ -538,7 +538,10 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         candidate = re.sub(r'^(?:ValueError|RuntimeError|PermissionError|OSError|FileNotFoundError|TimeoutError|JSONDecodeError): ', '', clean_line)
         # Current launcher resource policy uses a configurable MiB floor.
         # Accept only its complete numeric grammar, never arbitrary exception text.
-        if re.fullmatch(r'host MemAvailable below [0-9]{1,7}MiB floor after reservation \(launcher_memory_reserve\)', candidate):
+        # Intake 63a9ee3a: newer launchers append the numeric
+        # available/reserved/required/floor breakdown.
+        if re.fullmatch(r'host MemAvailable below [0-9]{1,7}MiB floor after reservation \(launcher_memory_reserve\)'
+                        r'(?:: available_mb=[0-9]{1,9} reserved_mb=[0-9]{1,9} required_mb=[0-9]{1,9} floor_mb=[0-9]{1,7})?', candidate):
             reason, message = REFUSALS['launcher_memory_reserve']
             surfaced_tail = error_type + ': ' + candidate
             refusal_found = True
