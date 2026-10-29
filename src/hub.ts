@@ -1,4 +1,4 @@
-import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS } from './alert-routing';
+import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting } from './alert-routing';
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
@@ -1211,10 +1211,11 @@ export class Hub extends DurableObject {
       if (registryResponse) return registryResponse;
       const busResponse = await this.handleBusRoutes(request, path);
       if (busResponse) {
-        if (request.method === 'GET' && busResponse.status === 401) {
+        if (request.method === 'GET' && (busResponse.status === 401 || busResponse.ok)) {
           const header = request.headers.get('Authorization') || '';
-          const cred = header.startsWith('Bearer ') ? this.sql.exec('SELECT actor, registry_actor, kind, subject FROM credentials WHERE token_hash=?', await sha256(header.slice(7).trim())).toArray()[0] as any : null;
-          this.recordBusAuthFailure(cred, 'bus read rejected HTTP 401');
+          const cred = header.startsWith('Bearer ') ? this.sql.exec('SELECT * FROM credentials WHERE token_hash=?', await sha256(header.slice(7).trim())).toArray()[0] as any : null;
+          if (busResponse.status === 401) this.recordBusReadFailure(cred);
+          else this.resolveBusAuthFailure(cred);
         }
         return busResponse;
       }
@@ -2135,11 +2136,12 @@ export class Hub extends DurableObject {
 
       });
       if (errorResponse) {
-        const cred = this.sql.exec('SELECT actor, registry_actor, kind, subject FROM credentials WHERE refresh_hash=?', refreshHash).toArray()[0] as any;
-        this.recordBusAuthFailure(cred, 'credential refresh rejected; bus reader cannot refresh');
+        const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash=?', refreshHash).toArray()[0] as any;
+        if (cred && !cred.revoked_at) this.recordBusAuthFailure(cred, 'credential refresh rejected; bus reader cannot refresh');
         return errorResponse;
       }
 
+      this.resolveBusAuthFailure(this.sql.exec('SELECT * FROM credentials WHERE id=?', newId).toArray()[0]);
       return Response.json({
         access_token: accessToken,
         refresh_token: refreshToken,
@@ -2329,13 +2331,51 @@ export class Hub extends DurableObject {
     return json({ error: 'not_found' }, 404);
   }
 
+  private busAuthSubject(cred: any): string | null {
+    if (!cred) return null;
+    const actor = cred.kind === 'agent' ? cred.registry_actor
+      : cred.actor || (cred.kind === 'host' && cred.machine_id ? 'machine:' + cred.machine_id : null);
+    return typeof actor === 'string' && actor ? actor : null;
+  }
+
+  private resolveBusAuthFailure(cred: any) {
+    const subject = this.busAuthSubject(cred);
+    if (!subject || cred.revoked_at) return;
+    this.sql.exec('DELETE FROM bus_auth_pending WHERE subject=?', subject);
+    this.livenessService.setAlert('bus_auth', subject, null);
+  }
+
+  private recordBusReadFailure(cred: any) {
+    const subject = this.busAuthSubject(cred);
+    // Anonymous scans and stopped/revoked readers cannot allocate incidents.
+    if (!subject || cred.revoked_at) return;
+    const expired = Date.parse(cred.expires_at) <= Date.now();
+    const refreshable = cred.refresh_hash && (workerRefreshContext(this.sql, cred.id) ||
+      (sessionIdOf(cred.registry_actor || '') && sessionRefreshAllowed(this.sql, cred.registry_actor, cred.machine_id)));
+    if (expired && refreshable) {
+      this.sql.exec(`INSERT INTO bus_auth_pending(subject,credential_id,first_failed_at) VALUES(?,?,?)
+        ON CONFLICT(subject) DO NOTHING`, subject, cred.id, Date.now());
+      return;
+    }
+    this.recordBusAuthFailure(cred, 'bus read rejected HTTP 401');
+  }
+
   private recordBusAuthFailure(cred: any, detail: string) {
-    // Identity comes only from a matching stored credential, never query params
-    // or an unverified token payload. Unknown requests share a bounded subject.
-    const actor = cred?.kind === 'agent' ? cred.registry_actor : cred?.actor;
-    const subject = typeof actor === 'string' && actor ? actor : 'unidentified-reader';
+    const subject = this.busAuthSubject(cred);
+    if (!subject) return;
+    this.sql.exec('DELETE FROM bus_auth_pending WHERE subject=?', subject);
     const alert = this.livenessService.setAlert('bus_auth', subject, { state: 'unauthorized', detail });
     if (alert) this.ctx.waitUntil(this.notifyAlert(alert));
+  }
+
+  private checkBusAuthFailures() {
+    const due = this.sql.exec(`SELECT c.*, p.subject AS pending_subject FROM bus_auth_pending p
+      LEFT JOIN credentials c ON c.id=p.credential_id WHERE p.first_failed_at<=?
+      ORDER BY p.first_failed_at LIMIT 20`, Date.now() - BUS_REFRESH_GRACE_MS).toArray() as any[];
+    for (const cred of due) {
+      this.sql.exec('DELETE FROM bus_auth_pending WHERE subject=?', cred.pending_subject);
+      if (cred.id && !cred.revoked_at) this.recordBusAuthFailure(cred, 'bus read HTTP 401; no successful refresh/read within 120s');
+    }
   }
 
   private notifyingAlerts = new Map<string, Promise<{ delivered: string[]; errors: string[] }>>();
@@ -2363,15 +2403,17 @@ export class Hub extends DurableObject {
       if (!actors.length && !webhook) errors.push('no alert target configured');
       // Audit summaries group distinct actionable batches under one display subject.
       // Keep their payloads independent while identical batches remain idempotent.
+      const stallCooldown = alert.subject_kind === 'session' && alert.state === 'stalled' && alert.detail.includes('no_native_progress');
       const receiptSubject = alert.subject_kind === 'session_audit'
-        ? alert.subject + ':' + await sha256(alert.detail) : alert.subject;
+        ? alert.subject + ':' + await sha256(alert.detail) : JSON.stringify([alert.subject, alert.state, stallCooldown ? 'no_native_progress' : null]);
       const receipt = (target: string) => this.sql.exec('SELECT * FROM alert_delivery_receipts WHERE subject_kind=? AND subject=? AND target=?', alert.subject_kind, receiptSubject, target).toArray()[0] as any;
       const allowed = (target: string) => {
         const last = receipt(target);
         if (last?.alert_id === alert.id) { delivered.add(target); return false; }
         if (last && Date.now() - last.sent_at < ALERT_SUBJECT_COOLDOWN_MS) {
           if (alert.subject_kind === 'session_audit') delivered.add(target);
-          else errors.push('subject rate limited for destination');
+          else if (stallCooldown) errors.push('subject rate limited for destination');
+          else return true;
           return false;
         }
         return true;
@@ -2449,6 +2491,7 @@ export class Hub extends DurableObject {
     }
     for (const alert of await m('banked_resets', () => new BankedResets(this.sql, this.livenessService).run())) await this.notifyAlert(alert);
     await m('liveness_prune', () => this.livenessService.prune());
+    pruneAlertRouting(this.sql);
     this.checkBusAuthFailures();
     const destinations = alertDestinations(this.env);
     const destinationHash = await sha256(JSON.stringify(destinations));
