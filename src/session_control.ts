@@ -3767,7 +3767,7 @@ export function adoptObservedNativeSessions(
         binding.tag !== native.tag || binding.workspace !== native.workspace ||
         binding.native_created_at_ms !== (native.created_at_ms ?? null) || row.engine !== native.engine) continue;
     const request = parsed(row.request_json, {});
-    const revision = `${row.updated_at}/${row.owner_family ?? ''}/${row.owner_token_id ?? ''}`;
+    const revision = `${row.updated_at}/${request.observation_only === true}/${row.owner_family ?? ''}/${row.owner_token_id ?? ''}`;
     if (request.observation_link_revision === revision) continue;
     sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',
       JSON.stringify({...request, observation_link_revision: revision}), row.id);
