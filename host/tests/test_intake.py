@@ -342,6 +342,24 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(code, 0, error)
         self.assertIsNone(transport.call_args.args[2]['acceptance_criteria'])
 
+    def test_create_and_update_carry_verification_policy(self):
+        with patch.object(intake, 'read_file', return_value='synthetic'), \
+                patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'create', '--project', 'demo', '--title', 'Synthetic',
+                                          '--text-file', '-', '--key', 'capture-verify', '--verification', 'skip')
+        self.assertEqual(code, 0, error)
+        self.assertEqual(transport.call_args.args[2]['verification'], 'skip')
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '2', '--key', 'update-verify',
+                                          '--verification', 'required')
+        self.assertEqual(code, 0, error)
+        self.assertEqual(transport.call_args.args[2]['verification'], 'required')
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, _ = self.run_cli('intake', 'update', 'task-1', '--version', '2', '--key', 'bad-verify',
+                                      '--verification', 'sometimes')
+        self.assertNotEqual(code, 0)
+        transport.assert_not_called()
+
     def test_acceptance_criteria_gate_error_code_survives_transport(self):
         raw = b'{"error":"acceptance_criteria_required"}'
         exc = urllib.error.HTTPError('https://fixture.test', 400, 'private', {}, io.BytesIO(raw))

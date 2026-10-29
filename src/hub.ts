@@ -2,6 +2,8 @@ import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES,
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
+import { IntakeTriage } from './intake-triage';
+import { IntakeVerifier } from './intake-verifier';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
 import { RepoRegistry } from './repos';
 import { IntakeService } from './intake';
@@ -119,6 +121,8 @@ export class Hub extends DurableObject {
   public intakeService: IntakeService;
   private workerAccess: WorkerAccess;
   public intakeWatchdog: IntakeWatchdog;
+  public intakeTriage: IntakeTriage;
+  public intakeVerifier: IntakeVerifier;
   public sessionAudit: SessionAuditService;
   public busService: BusService;
   public jobsService: JobsService;
@@ -154,7 +158,7 @@ export class Hub extends DurableObject {
     this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn), {
       forgotten: tasks => {
         const items = this.intakeWatchdog.project(tasks).filter(t => t.forgotten);
-        return { items, forgotten_count: items.length, observed_at: Date.now(), watchdog: this.intakeWatchdog.status() };
+        return { items, forgotten_count: items.length, observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };
       },
       startSession: async (input, auth) => {
         const res = await this.sessionControlService.handle(
@@ -279,6 +283,37 @@ export class Hub extends DurableObject {
       },
     });
     this.intakeWatchdog.init();
+    // Hourly backlog triage (intake d8d509d2 AC5): one Claude Opus reviewer
+    // session per slice of forgotten intakes, started through the canonical path.
+    this.intakeTriage = new IntakeTriage(this.sql, this.intakeService, this.intakeWatchdog, fn => this.ctx.storage.transactionSync(fn), {
+      start: async input => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
+          { method: 'POST', body: JSON.stringify(input) }),
+          { caller: { isAdmin: true, actor: 'hub:service:intake-triage', kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+    });
+    this.intakeTriage.init();
+    // Post-DONE verifier (intake d8d509d2, t1936u): a separate verification-only
+    // session per DONE claim; pass closes through the ordinary close rules.
+    const verifierAuth = { caller: { isAdmin: true, actor: 'hub:service:intake-verifier', kind: 'human' }, scopes: ['admin'] } as any;
+    this.intakeVerifier = new IntakeVerifier(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
+      start: async input => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
+          { method: 'POST', body: JSON.stringify(input) }), verifierAuth);
+        return { status: r.status, body: await r.json() as any };
+      },
+      write: async (path, payload) => {
+        const r = await this.intakeService.handle(new Request('https://hub.internal/api/intake' + path,
+          { method: 'POST', body: JSON.stringify(payload) }), async () => verifierAuth);
+        return { status: r.status, body: await r.json() as any };
+      },
+      alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('intake_verifier', subject, { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
+      },
+    });
+    this.intakeVerifier.init();
     // Idle-session audit (intake 27d1e27b): scheduled 30-min continue/kill pass
     // with a durable decision dataset. Actions go through the ordinary
     // session-control command path; never a cleanup flag, never a worktree.
@@ -2125,12 +2160,20 @@ export class Hub extends DurableObject {
     }
 
     await this.idleWork.tick();
+    // The verifier registers fresh DONE claims first, so the watchdog never alerts
+    // a person about a completion the verifier owns (AC8).
+    let intakeVerifier: any;
+    try { intakeVerifier = await this.intakeVerifier.tick(source); }
+    catch (e: any) { intakeVerifier = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     const intakeWatchdog = await this.intakeWatchdog.tick(source);
     // The audit must never break the scheduler slot for the jobs/watchdog;
     // failures surface in the tick result and the next run retries.
     let sessionAudit: any;
     try { sessionAudit = await this.sessionAudit.tick(source); }
     catch (e: any) { sessionAudit = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
+    let intakeTriage: any;
+    try { intakeTriage = await this.intakeTriage.tick(source); }
+    catch (e: any) { intakeTriage = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     const slotStartIso = slotDate.toISOString();
     const tickResult = this.jobsService.tickRootSlot(slotStartIso);
 
@@ -2154,7 +2197,7 @@ export class Hub extends DurableObject {
       }
     }
 
-    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit };
+    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit, intake_triage: intakeTriage, intake_verifier: intakeVerifier };
   }
 
   async sampleHostHistory() {

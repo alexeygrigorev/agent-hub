@@ -13,6 +13,11 @@ const FAILED = new Set(['failed', 'refused', 'cancelled', 'engine_failed', 'engi
 const OPEN = new Set(['open', 'in_progress', 'blocked', 'pending_approval']);
 export const WATCHDOG_INTERVAL = 1800000;
 const DAY = 86400000;
+/** Hold reasons only a person can clear (AC8, intake d8d509d2): each (intake, reason)
+ * pair is alerted exactly once instead of waiting silently on an operator. */
+export const HUMAN_HOLD_REASONS = new Set(['workspace_configuration_required', 'scope_decision_required', 'scope_out_of_bounds',
+  'reported_completion_requires_operator_review', 'done_evidence_requires_operator_review']);
+const HUMAN_ALERT_LIST = 30;
 const parse = (raw: any): Obj => { try { return JSON.parse(raw || '{}'); } catch { return {}; } };
 const ms = (v: any): number => typeof v === 'number' ? v : (Date.parse(v) || 0);
 export type WatchdogHooks = {
@@ -28,6 +33,32 @@ export class IntakeWatchdog {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_restart_queue(task_id TEXT PRIMARY KEY, state TEXT NOT NULL,
       reason TEXT NOT NULL, request_key TEXT, request_json TEXT, session_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
       next_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    this.sql.exec('CREATE TABLE IF NOT EXISTS intake_human_alerts(task_id TEXT NOT NULL, reason TEXT NOT NULL, alerted_at INTEGER NOT NULL, PRIMARY KEY(task_id, reason))');
+  }
+  /** One aggregated alert per tick for holds that newly need a person. Completion
+   * holds owned by the post-DONE verifier are excluded until it escalates them. */
+  private async alertHumanHolds(tasks: Obj[], now: number): Promise<number> {
+    if (!this.hooks.notify) return 0;
+    let verifierOwned = new Set<string>();
+    try {
+      verifierOwned = new Set(this.rows("SELECT task_id FROM intake_verifications WHERE state<>'needs_human'").map(r => r.task_id));
+    } catch { /* verifier table absent outside the Hub composition */ }
+    const alerted = new Set(this.rows('SELECT task_id,reason FROM intake_human_alerts').map(r => r.task_id + '\n' + r.reason));
+    const byId = new Map(tasks.map(t => [t.id, t]));
+    const fresh = this.rows("SELECT task_id,reason FROM intake_restart_queue WHERE state='queued'")
+      .filter(q => HUMAN_HOLD_REASONS.has(q.reason) && byId.has(q.task_id) && !alerted.has(q.task_id + '\n' + q.reason) &&
+        !(q.reason.includes('completion') || q.reason.includes('done_evidence') ? verifierOwned.has(q.task_id) : false));
+    if (!fresh.length) return 0;
+    const lines = fresh.slice(0, HUMAN_ALERT_LIST).map(q => `${q.task_id} ${q.reason} — ${String(byId.get(q.task_id)?.title ?? '').replace(/[\r\n]/g, ' ').slice(0, 100)}`);
+    const detail = `${fresh.length} intake(s) newly wait on a person (hold reasons that no agent can clear). Review hub intake forgotten.\n` + lines.join('\n') +
+      (fresh.length > HUMAN_ALERT_LIST ? `\n…and ${fresh.length - HUMAN_ALERT_LIST} more` : '');
+    const opened = await this.hooks.notify('intake_human_hold', 'human-hold-' + now, detail);
+    if (opened === false) return 0;
+    for (const q of fresh) {
+      this.sql.exec('INSERT OR IGNORE INTO intake_human_alerts(task_id,reason,alerted_at) VALUES(?,?,?)', q.task_id, q.reason, now);
+      this.audit(byId.get(q.task_id)!, 'human_hold_alert', q.reason + ' alerted once to existing alerts', now);
+    }
+    return fresh.length;
   }
   /** A missed wake enters the existing recovery queue. This is not proof of
    * death: project/restart still require canonical evidence and no live owner. */
@@ -228,7 +259,8 @@ export class IntakeWatchdog {
       return (qa?.updated_at ?? 0) - (qb?.updated_at ?? 0) || a.id.localeCompare(b.id);
     });
     for (const item of ordered.slice(0, 8)) await this.restart(tasks.find(t => t.id === item.id)!, now);
-    const result = { state: 'checked', checked_at: now, forgotten_count: forgotten.length, open_count: items.length };
+    const human_hold_alerts = await this.alertHumanHolds(tasks, now);
+    const result = { state: 'checked', checked_at: now, forgotten_count: forgotten.length, open_count: items.length, human_hold_alerts };
     this.sql.exec('UPDATE intake_watchdog_meta SET last_result=? WHERE id=1', JSON.stringify(result));
     return result;
   }

@@ -14,7 +14,7 @@ import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
 
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
-function currentHistory(task: Obj): Obj[] {
+export function currentHistory(task: Obj): Obj[] {
   const history: Obj[] = task.history ?? [];
   const boundary = history.reduce((n, e, i) =>
     e.kind === 'update' && ['status', 'title', 'project', 'acceptance_criteria'].some(k => k in (e.changes ?? {})) ? i : n, -1);
@@ -25,6 +25,11 @@ function currentDoneNote(task: Obj): Obj | undefined {
     /^DONE\b/m.test(e.text ?? '') &&
     (/\b[0-9a-f]{7,40}\b/i.test(e.text) || /https:\/\/[^\s]+\/(?:actions\/runs|deployments)\/[^\s]+/.test(e.text)) &&
     /live check:[ \t]*\S[^\n]*/i.test(e.text) && /result:[ \t]*\S[^\n]*/i.test(e.text));
+}
+export const VERIFICATION_MODES = ['required', 'skip', 'auto'];
+function verificationMode(v: any): string {
+  if (!VERIFICATION_MODES.includes(v)) throw new IntakeError('invalid_verification', 400, 'verification');
+  return v;
 }
 /** Worktree-guard (intake a0f01448): an intake counts as closed for cleanup
  * and reap gating when it carries a qualifying DONE note (live proof of
@@ -1089,11 +1094,12 @@ export class IntakeService {
   private write(path: string, b: Obj, p: Obj): Obj {
     const now = Date.now();
     if (path === '/tasks') {
-      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria']);
+      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria', 'verification']);
       const project = identifier(b.project);
       const task: Obj = { id: crypto.randomUUID(), project, title: str(b.title, 256, 'title'), status: 'open', version: 1,
         created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null,
-        acceptance_criteria: acNullable(b.acceptance_criteria), history: [] };
+        acceptance_criteria: acNullable(b.acceptance_criteria), history: [],
+        ...(b.verification !== undefined ? { verification: verificationMode(b.verification) } : {}) };
       if (!this.allowed(p, task, true)) fail('forbidden', 403);
       // t1038u: no hard task-row refuse on create; totalBytes/taskBytes/events still apply.
       // Soft warn when open count is high (surfaced on the response below).
@@ -1182,10 +1188,10 @@ export class IntakeService {
         task.scope = scopeHint(task, (task.scope.basis_version ?? 1) + 1);
       }
     } else {
-      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'reason', 'superseded_by', 'force']);
+      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by', 'force']);
       if ('force' in b && typeof b.force !== 'boolean') throw new IntakeError('invalid_field', 400, 'force');
       if (b.force === true && (b.status !== 'done' || typeof b.reason !== 'string' || !b.reason.trim())) fail('force_reason_required');
-      if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'].some(k => k in b)) fail('empty_update');
+      if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification'].some(k => k in b)) fail('empty_update');
       const changes: Obj = {};
       const previousStatus = task.status;
       if (b.status === 'done' && ['title', 'project', 'acceptance_criteria'].some(k => k in b && b[k] !== task[k])) fail('done_evidence_required', 409);
@@ -1197,6 +1203,12 @@ export class IntakeService {
           : field === 'acceptance_criteria' ? acNullable(b[field])
           : nullable(b[field], field === 'title' ? 256 : 8192);
         if (previous !== task[field]) changes[field] = task[field];
+      }
+      // Post-DONE verification policy (d8d509d2 t1936u): required|skip|auto, default auto.
+      if ('verification' in b) {
+        const mode = verificationMode(b.verification);
+        if ((task.verification ?? 'auto') !== mode) changes.verification = mode;
+        task.verification = mode;
       }
       if (!this.allowed(p, task, true)) fail('forbidden', 403);
       task.history.push({ id: crypto.randomUUID(), kind: 'update', changes, actor: p.actor, captured_at: now, authority: 'untrusted_task_data' });
