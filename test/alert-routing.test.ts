@@ -106,6 +106,19 @@ describe('alert routing acceptance', () => {
     expect(inboxReaderStatus(h.sql, 'watched').active_reader).toBe(false);
   }));
 
+  it('keeps distinct audit batches deliverable and reuses identical payload receipts', () => fixture(async h => {
+    const caller=await reader(h);h.busService.inbox(caller,'watched');
+    h.env={...h.env,HUB_ALERT_TO:'watched'};
+    const send=async (detail:string)=>{
+      h.livenessService.setAlert('session_audit','idle-actions',null);
+      return h.notifyAlert(h.livenessService.setAlert('session_audit','idle-actions',{state:'attention',detail}));
+    };
+    expect((await send('batch A: native1')).delivered).toContain('inbox:watched');
+    expect((await send('batch B: native2')).delivered).toContain('inbox:watched');
+    expect((await send('batch B: native2')).delivered).toContain('inbox:watched');
+    expect(h.sql.exec('SELECT COUNT(*) AS n FROM messages').one().n).toBe(2);
+  }));
+
   it('recognizes project and role aliases but rejects a reader after registry rebinding', () => fixture(async h => {
     h.sql.exec("INSERT INTO agents(tag,project,role,registered_at) VALUES ('alerts','team','alerts',?)", new Date().toISOString());
     h.sql.exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at)
