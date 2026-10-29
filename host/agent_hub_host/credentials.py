@@ -65,7 +65,7 @@ def _read_state(dest: Path):
 
 
 def _write_file(target: Path, data: bytes):
-    private_fs.atomic_write(target, data, MAX_FILE * 2)
+    private_fs.atomic_write(target, data, MAX_FILE * 2, engine_owned=True)
     if os.name != 'nt':
         try:
             os.chmod(target, 0o600)

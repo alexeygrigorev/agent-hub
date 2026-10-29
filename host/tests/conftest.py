@@ -77,12 +77,12 @@ def guard_worker_profile_writes(monkeypatch):
     original = private_fs.atomic_write
     temporary = Path(tempfile.gettempdir()).resolve()
 
-    def guarded(path, raw, limit):
+    def guarded(path, raw, limit, **kwargs):
         target = Path(path)
         if "hub-worker-auth" in target.parts:
             assert target.resolve().is_relative_to(temporary), (
                 "test attempted a real hub-worker-auth write: " + str(target))
-        return original(path, raw, limit)
+        return original(path, raw, limit, **kwargs)
 
     monkeypatch.setattr(private_fs, "atomic_write", guarded)
 
