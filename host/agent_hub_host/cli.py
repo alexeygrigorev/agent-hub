@@ -455,6 +455,8 @@ def main():
     ops_liveness.add_parser(sub)
     from . import limits_cli
     limits_cli.add_parser(sub)
+    from . import asks as asks_cli
+    asks_cli.add_parser(sub)
     
     p_login = sub.add_parser("login", help="Login to Agent Hub")
     p_login.add_argument("base_url", help="Base URL of the Agent Hub")
@@ -669,6 +671,19 @@ def main():
     if args.cmd == 'limits':
         from . import limits_cli
         limits_cli.run(args)
+        return
+    if args.cmd == 'asks':
+        from . import asks as asks_cli
+        try:
+            result = asks_cli.execute(args)
+            rendered = asks_cli.render_output(args, result)
+            if isinstance(rendered, str):
+                print(rendered)
+            else:
+                print(json.dumps(rendered, indent=2, ensure_ascii=False))
+        except Exception as exc:
+            print(asks_cli.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
         return
     if args.cmd == 'webhooks':
         from . import webhooks as webhooks_cli
