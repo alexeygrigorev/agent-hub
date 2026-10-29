@@ -290,11 +290,23 @@ describe('scoped durable worker access',()=>{
   const worker2:any=await issued.json();
   const peek=await call('/api/intake/tasks/'+created.id,undefined,worker2.access_token);
   expect(peek.status).toBe(403);expect(await code(peek)).toBe('cross_intake_forbidden');
+  // Workers cannot author AC/verification (auto-pickup would turn it into launch
+  // authority) or forge provenance; refused creates leave no ledger row.
+  for(const extra of [{acceptance_criteria:'do things'},{verification:'manual'},{created_by:{hub_session_id:session2}}]) {
+   const res=await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'x',text:'x',source:src,...extra});
+   expect([400,403]).toContain(res.status);
+  }
+  expect((await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'x',text:'x',source:src,acceptance_criteria:'a'}).then(code))).toBe('worker_ac_forbidden');
+  await runInDurableObject<Hub,any>(stub,(h:any)=>expect(h.sql.exec('SELECT COUNT(*) AS n FROM worker_created_intakes').toArray()[0].n).toBe(1));
   // Per-session creation cap.
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    for(let i=1;i<25;i++) h.sql.exec('INSERT INTO worker_created_intakes(task_id,session_id,launch_id,parent_task_id,created_at) VALUES(?,?,?,?,?)',uuid(),session,id,task,Date.now());
   });
   const capped=await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'one more',text:'x',source:src});
   expect(capped.status).toBe(429);expect(await code(capped)).toBe('worker_create_limit');
+  // Access to created intakes ends with the worker grant.
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE worker_access SET expires_at=? WHERE launch_id=?',Date.now()-1,id));
+  expect((await api('/api/intake/tasks/'+created.id)).status).toBe(403);
+  expect((await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'late',text:'x',source:src})).status).toBe(403);
  }));
 });

@@ -1235,7 +1235,10 @@ export class IntakeService {
         ...(b.verification !== undefined ? { verification: verificationMode(b.verification) } : {}) };
       if (p.worker) {
         // Intake 34d0271b: a worker may file follow-up intakes in any project.
-        // Provenance names the parent intake and the creating session.
+        // Provenance names the parent intake and the creating session. Open
+        // intakes with AC are auto-picked up (410caa75), so worker-authored AC
+        // would become launch authority: an operator adds AC/verification later.
+        if (b.acceptance_criteria != null || b.verification !== undefined) fail('worker_ac_forbidden', 403);
         this.sql.exec(WORKER_CREATED_SCHEMA);
         const count = (this.sql.exec('SELECT COUNT(*) AS n FROM worker_created_intakes WHERE session_id=?', p.worker_session_id).toArray()[0] as any).n;
         if (count >= WORKER_CREATE_LIMIT) fail('worker_create_limit', 429);
