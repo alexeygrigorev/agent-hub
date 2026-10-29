@@ -1,3 +1,4 @@
+import { inboxReaderStatus } from './alert-routing';
 /**
  * Scheduled checks: the generic form of the competition's routine agent. Each check runs on an
  * interval from the Worker cron, evaluates a condition and, when it fails (or always, for a
@@ -276,14 +277,17 @@ export class ChecksService {
       case 'delivery_slo': {
         const maxAgeS = p.max_age_s ?? 300;
         const cutoff = this.now() - maxAgeS * 1000;
-        let count = 0;
-        if (p.actor) {
-          count = Number(this.sql.exec('SELECT COUNT(*) AS n FROM messages WHERE to_actor = ? AND acked_at IS NULL AND created_at < ? AND expires_at > ?', p.actor, cutoff, this.now()).one().n);
-          return count ? { status: 'fail', detail: `${count} unacknowledged message(s) for ${p.actor} older than ${maxAgeS}s (delivery SLO violated)` } : { status: 'pass', detail: `delivery SLO met for ${p.actor} (${maxAgeS}s limit)` };
-        } else {
-          count = Number(this.sql.exec('SELECT COUNT(*) AS n FROM messages WHERE acked_at IS NULL AND created_at < ? AND expires_at > ?', cutoff, this.now()).one().n);
-          return count ? { status: 'fail', detail: `${count} unacknowledged message(s) older than ${maxAgeS}s (delivery SLO violated)` } : { status: 'pass', detail: `delivery SLO met across all inboxes (${maxAgeS}s limit)` };
-        }
+        const recipients = this.sql.exec(`SELECT to_actor AS actor, COUNT(*) AS n,
+          SUM(registry_unbound_to) AS unbound FROM messages WHERE acked_at IS NULL
+          AND created_at < ? AND expires_at > ? ${p.actor ? 'AND to_actor = ?' : ''}
+          GROUP BY to_actor ORDER BY to_actor`, cutoff, this.now(), ...(p.actor ? [p.actor] : [])).toArray() as any[];
+        if (!recipients.length) return { status: 'pass', detail: `delivery SLO met (${maxAgeS}s limit)` };
+        const count = recipients.reduce((n, r) => n + Number(r.n), 0);
+        const noReader = recipients.filter(r => Number(r.unbound) > 0 || !inboxReaderStatus(this.sql, r.actor, this.now()).active_reader);
+        const detail = `${count} unacknowledged message(s) older than ${maxAgeS}s (delivery SLO violated); ` +
+          recipients.map(r => `${r.actor}: ${r.n} overdue${Number(r.unbound) ? `, ${r.unbound} registry-unbound` : ''}`).join('; ');
+        return { status: 'fail', detail: (noReader.length ? 'NO_READER: ' + noReader.map(r => r.actor).join(', ') + '; ' : '') + detail };
+
       }
       case 'dispatch_route': {
         // Consecutive pre-start dispatch failures with the same reason inside

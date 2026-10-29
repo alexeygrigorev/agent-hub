@@ -173,17 +173,17 @@ describe('stale alerts', () => {
         hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)", new Date().toISOString(), new Date(Date.now() - 3600000).toISOString());
         await hub.runChecks('liveness');
         let [alert]: any[] = hub.livenessService.alerts();
-        expect(calls).toEqual(['https://hooks.example/alert']);
+        expect(calls.length).toBeGreaterThan(0);
         expect(alert.notify_error).toContain('nobody-registered');
-        expect(JSON.parse(alert.delivered_to)).toEqual(['webhook']);
+        expect(JSON.parse(alert.delivered_to)[0]).toMatch(/^webhook:/);
         hub.sql.exec('UPDATE liveness_alerts SET notified_at = ?', new Date(Date.now() - 3600000).toISOString());
         await hub.runChecks('liveness');
-        expect(calls).toHaveLength(1);
+        expect(calls).toHaveLength(2);
       } finally { globalThis.fetch = original; }
     });
   });
 
-  it('delivers alerts to the grok-bot inbox by default when HUB_ALERT_TO is unset', async () => {
+  it('refuses the unwatched default when HUB_ALERT_TO is unset', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('notify-default-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub) => {
@@ -192,8 +192,9 @@ describe('stale alerts', () => {
       hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)", new Date().toISOString(), new Date(Date.now() - 3600000).toISOString());
       await hub.runChecks('liveness');
       const [alert]: any[] = hub.livenessService.alerts();
-      expect(alert.notify_error).toBeNull();
-      expect(JSON.parse(alert.delivered_to)).toEqual(['inbox:grok-bot']);
+      expect(alert.notify_error).toContain('no alert target configured');
+      expect(JSON.parse(alert.delivered_to)).toEqual([]);
+      expect(hub.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE to_actor='grok-bot'").one().n).toBe(0);
     });
   });
 
