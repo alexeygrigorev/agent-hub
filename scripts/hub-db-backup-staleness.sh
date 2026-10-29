@@ -28,9 +28,12 @@
 #   hub-db-backup-staleness.sh --backup-failed "<reason>" [--drill]
 # on any non-zero exit. It mails "[FAIL] Hub DB backup run failed" with the
 # reason and the newest surviving export to ALERT_TO immediately (no 26h/36h
-# wait, no dedupe: the job runs once a day), honoring the test-path guard;
-# --drill (HUB_DB_BACKUP_FAIL_DRILL=1 in the backup script) routes it to
-# ALERT_OPS_TO only. It never reads or writes the staleness state file.
+# wait, no dedupe: the job runs once a day), honoring the test-path guard.
+# --drill (HUB_DB_BACKUP_FAIL_DRILL=1 in the backup script) NEVER sends mail
+# (standing rule: tests and drills never send real mail): the fully rendered
+# message is appended to a local mode-600 sink (HUB_DB_DRILL_SINK, default
+# STATE_DIR/drill-mail.log) and no MTA is invoked. It never reads or writes
+# the staleness state file.
 # Exit 0 after the attempt.
 #
 # Exit codes: 0 fresh, 2 stale (mail attempted unless --no-mail / DRY_RUN=1),
@@ -66,6 +69,7 @@ MSMTP_ACCOUNT="${MSMTP_ACCOUNT:-ses}"
 STATE_DIR="${STATE_DIR:-/var/lib/hub-db-backup}"
 DRY_RUN="${DRY_RUN:-0}"
 HUB_DB_STALE_DRILL="${HUB_DB_STALE_DRILL:-0}"
+HUB_DB_DRILL_SINK="${HUB_DB_DRILL_SINK:-${STATE_DIR%/}/drill-mail.log}"
 
 NO_MAIL=0
 BACKUP_FAILED=0
@@ -232,24 +236,31 @@ if [[ "$BACKUP_FAILED" -eq 1 ]]; then
   else
     LAST_GOOD="${NEWEST_PATH} (age ~$(( AGE_S / 3600 ))h)"
   fi
-  FAIL_TO="$(effective_to)"
-  SUBJECT_PREFIX="[FAIL]"
-  if [[ "$FAIL_DRILL" -eq 1 ]]; then
-    FAIL_TO="$ALERT_OPS_TO"
-    SUBJECT_PREFIX="[FAIL][DRILL]"
-  fi
-  log "BACKUP_FAILED reason='${BACKUP_FAILED_REASON}' last_good=${LAST_GOOD} drill=${FAIL_DRILL}"
-  if [[ "$DRY_RUN" -eq 1 || "$NO_MAIL" -eq 1 ]]; then
-    log "would-alert backup-failed to=${FAIL_TO} (mail suppressed by flag)"
-    exit 0
-  fi
-  send_mail "${SUBJECT_PREFIX} Hub DB backup run failed on $(hostname)" \
-"Hub DB backup run FAILED $(date -u '+%Y-%m-%dT%H:%M:%SZ') on $(hostname).
+  FAIL_SUBJECT="[FAIL] Hub DB backup run failed on $(hostname)"
+  FAIL_BODY="Hub DB backup run FAILED $(date -u '+%Y-%m-%dT%H:%M:%SZ') on $(hostname).
 Reason: ${BACKUP_FAILED_REASON}
 Last good export: ${LAST_GOOD}
 Log: /var/log/hub-db-backup.log
-Rerun: /usr/local/sbin/hub-db-backup.sh (read-only on the Hub DB); see docs/HUB-DB-BACKUP.md." \
-  "$FAIL_TO"
+Rerun: /usr/local/sbin/hub-db-backup.sh (read-only on the Hub DB); see docs/HUB-DB-BACKUP.md."
+  log "BACKUP_FAILED reason='${BACKUP_FAILED_REASON}' last_good=${LAST_GOOD} drill=${FAIL_DRILL}"
+  if [[ "$FAIL_DRILL" -eq 1 ]]; then
+    # Drill: render to the local sink only; never call send_mail or any MTA.
+    mkdir -p "$(dirname "$HUB_DB_DRILL_SINK")" 2>/dev/null || true
+    ( umask 077
+      { echo "=== DRILL $(date -u '+%Y-%m-%dT%H:%M:%SZ') (not sent; would go to: $(effective_to))"
+        echo "Subject: [DRILL] ${FAIL_SUBJECT}"
+        echo ""
+        printf '%s\n' "$FAIL_BODY"
+      } >> "$HUB_DB_DRILL_SINK" ) || { log "ERROR: drill sink not writable: ${HUB_DB_DRILL_SINK}"; exit 1; }
+    chmod 600 "$HUB_DB_DRILL_SINK" 2>/dev/null || true
+    log "DRILL backup-failed alert rendered to sink=${HUB_DB_DRILL_SINK}; no mail sent"
+    exit 0
+  fi
+  if [[ "$DRY_RUN" -eq 1 || "$NO_MAIL" -eq 1 ]]; then
+    log "would-alert backup-failed to=$(effective_to) (mail suppressed by flag)"
+    exit 0
+  fi
+  send_mail "$FAIL_SUBJECT" "$FAIL_BODY"
   exit 0
 fi
 

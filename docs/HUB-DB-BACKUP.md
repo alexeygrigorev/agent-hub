@@ -171,13 +171,23 @@ still applies, and it never touches the staleness state file. Disable only
 for local experiments with `ALERT_ON_FAIL=0`.
 
 Drill: `HUB_DB_BACKUP_FAIL_DRILL=1` makes the backup script fail at once
-(no Hub request) and passes `--drill`, so the mail
-(`[FAIL][DRILL] ...`) goes to `ALERT_OPS_TO` only:
+(no Hub request) and passes `--drill`. **Drills never send mail** (standing
+rule: tests and drills never send real mail; a 2026-10-29 05:25 Berlin drill
+of an earlier revision mailed dev@ and was corrected). The fully rendered
+alert is appended to a local mode-600 sink (`HUB_DB_DRILL_SINK`, default
+`/var/lib/hub-db-backup/drill-mail.log`) and no MTA is invoked. This proves
+trap -> alert command -> message rendering; the transport is the same
+`send_mail` used by the staleness alerts.
 
 ```bash
 sudo -u alexey HUB_DB_BACKUP_FAIL_DRILL=1 /usr/local/sbin/hub-db-backup.sh; echo $?   # expect 1
-tail -n 3 /var/log/hub-db-backup.log ~/.msmtp.log 2>/dev/null
+tail -n 8 /var/lib/hub-db-backup/drill-mail.log   # "[DRILL] [FAIL] ...", "not sent"
 ```
+
+Covered by `host/tests/test_hub_db_backup_script.py`
+(`test_backup_failed_drill_never_sends_mail`,
+`test_full_backup_drill_chain_never_sends_mail`: stub MTAs must capture
+nothing).
 
 ### Mail hygiene (intake 9806fc14)
 

@@ -44,8 +44,9 @@
 # Failure alerting: any non-zero exit (config, fetch, validation, store)
 # pages on the same run via ALERT_CMD (default: the sibling
 # hub-db-backup-staleness.sh --backup-failed: same mail path and test-path
-# guard). HUB_DB_BACKUP_FAIL_DRILL=1 forces an immediate failure whose alert
-# goes to ALERT_OPS_TO only; no Hub request is made.
+# guard). HUB_DB_BACKUP_FAIL_DRILL=1 forces an immediate failure; its alert
+# is rendered to a local drill sink and NEVER mailed (tests and drills never
+# send real mail); no Hub request is made.
 #
 # Exit code: 0 only if fetch+validate+store+mirror all succeeded.
 set -euo pipefail
