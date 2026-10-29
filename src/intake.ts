@@ -556,7 +556,7 @@ export class IntakeService {
     return task.status === 'open' ? 'ready' : 'closed_or_waiting';
   }
   /** F2 scope projection. Null scope = legacy pre-policy task (grandfathered).
-   * The classifier only hints; only an operator scope_decision unblocks. */
+   * The classifier is informational only (scope policy v2); it never blocks. */
   private scopeView(task: Obj): Obj | null {
     if (!task.scope || typeof task.scope !== 'object') return null;
     const status = getScopeStatus(task);
@@ -566,7 +566,6 @@ export class IntakeService {
       matched_terms: Array.isArray(task.scope.matched_terms) ? task.scope.matched_terms : [],
       decision: status.decision,
       clear: status.clear,
-      ...(status.block_code ? { block_code: status.block_code } : {}),
       ...(status.stale_policy ? { stale_policy: true } : {}),
     };
   }
@@ -1300,11 +1299,6 @@ export class IntakeService {
       this.expected(b, task.version - (ownAdvance ? 1 : 0));
       if (!ownLink && task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
       if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
-      // F2 scope gate (single check shared with linked session starts):
-      // the intake is always saved, but assign refuses until an operator
-      // scope decision exists. Research hints never block (classifier only).
-      const preScope = getScopeStatus(task).block_code;
-      if (preScope) fail(preScope, 409);
       const active = this.activeAssignment(task);
       if (active && active !== prior?.id) fail('active_assignment_exists', 409);
       // Persist the original assignment fingerprint before the async start.
@@ -1350,9 +1344,6 @@ export class IntakeService {
       if (task.history.length + extraEvents > INTAKE_LIMITS.events) fail('history_capacity', 507);
       // Re-check after the start round-trip: AC cleared mid-flight still fails closed.
       if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
-      // F2: scope decision revoked or basis changed mid-flight still fails closed.
-      const postScope = getScopeStatus(task).block_code;
-      if (postScope) fail(postScope, 409);
       const active = this.activeAssignment(task);
       if (active && active !== created.id) fail('active_assignment_exists', 409);
       // The created (or deterministically replayed) session must still be

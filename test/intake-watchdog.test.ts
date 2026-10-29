@@ -98,10 +98,10 @@ describe('forgotten intake watchdog', () => {
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:202,body:{id:'new',state:'queued'}}}},()=>NOW);w.init();await w.tick();
     expect(starts).toBe(1);expect(w.project([t])[0].restart.state).toBe('submitted');
   }));
-  it('keeps unresolved scope in the visible queue without inventing operator approval', async () => fixture(async h => {
-    const t={...task(),scope:{flag:'unknown',policy_version:1}};let starts=0;
-    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:200,body:{}}}},()=>NOW);w.init();await w.tick();
-    expect(starts).toBe(0);expect(w.project([t])[0].restart.reason).toBe('scope_decision_required');
+  it('unresolved scope flag never holds a watchdog restart', async () => fixture(async h => {
+    const t={...task(),scope:{flag:'needs_decision',policy_version:1,matched_terms:['dapier']}};session(h,'old-failure',t,'failed');let starts=0;
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:202,body:{id:'new',state:'queued'}}}},()=>NOW);w.init();await w.tick();
+    expect(starts).toBe(1);expect(JSON.stringify(w.project([t])[0])).not.toMatch(/scope_/);
   }));
   it('queues rather than duplicating an unlinked native worker when claim bridging is absent', async () => fixture(async h => {
     const t=task();session(h,'old-failure',t,'failed');let starts=0;

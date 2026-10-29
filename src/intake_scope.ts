@@ -232,42 +232,15 @@ export interface ScopeStatus {
   scope: { policy_version: number; flag: string; matched_terms: string[] } | null;
   decision: ScopeDecisionSummary | null;
   clear: boolean;
-  /** Present when blocked: which refusal the gates must return. */
-  block_code: 'scope_decision_required' | 'scope_out_of_bounds' | null;
   stale_policy: boolean;
 }
 
-/** The single check used by intake assign and linked session starts. */
+/** Informational scope projection (policy v2): never blocks assign, start or restart. */
 export function getScopeStatus(task: Obj): ScopeStatus {
   const scope = task.scope ?? null;
-  if (!scope || typeof scope !== 'object') {
-    return { scope: null, decision: null, clear: true, block_code: null, stale_policy: false };
-  }
+  if (!scope || typeof scope !== 'object') return { scope: null, decision: null, clear: true, stale_policy: false };
   const stale_policy = scope.policy_version !== SCOPE_POLICY_VERSION;
   const decision = describeScopeDecision(task);
-  const decisionClear = !!decision && decision.valid && (SCOPE_ALLOW_VERDICTS as string[]).includes(decision.verdict);
   const decisionDeny = !!decision && decision.valid && (SCOPE_DENY_VERDICTS as string[]).includes(decision.verdict);
-  // Live flag: stored flag, but a stale policy version re-hints from current text.
-  let flag = scope.flag;
-  if (stale_policy) {
-    const texts = Array.isArray(task.history)
-      ? task.history.filter((e: Obj) => e?.kind === 'intake').map((e: Obj) => (typeof e.text === 'string' ? e.text : '')).join('\n')
-      : '';
-    flag = classifyScope(task.project ?? '', task.title ?? '', texts, typeof task.acceptance_criteria === 'string' ? task.acceptance_criteria : null).flag;
-  }
-  if (decisionClear) {
-    return { scope, decision, clear: true, block_code: null, stale_policy };
-  }
-  if (decisionDeny) {
-    return { scope, decision, clear: false, block_code: 'scope_out_of_bounds', stale_policy };
-  }
-  if (flag === 'in_scope' && !stale_policy && !decision) {
-    return { scope, decision, clear: true, block_code: null, stale_policy };
-  }
-  return { scope, decision, clear: false, block_code: 'scope_decision_required', stale_policy };
-}
-
-/** Returns the refusal error code, or null when start/assign may proceed. */
-export function getScopeBlock(task: Obj): 'scope_decision_required' | 'scope_out_of_bounds' | null {
-  return getScopeStatus(task).block_code;
+  return { scope, decision, clear: !decisionDeny, stale_policy };
 }
