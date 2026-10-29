@@ -533,6 +533,9 @@ def normalize_git_identity(conf) -> dict[str, str]:
 # Routes one heartbeat may advertise; must equal MAX_ADVERTISED_ROUTES in
 # src/registry.ts. Matches Hub's per-machine subscription limit (128).
 MAX_ADVERTISED_ROUTES = 128
+# A heartbeat carrying fleet_routes stays below Hub's 32 KiB body limit
+# (src/hub.ts), with headroom for transport framing.
+HEARTBEAT_ROUTE_BODY_LIMIT = 30 * 1024
 
 
 def load_settings(path=None):
@@ -2323,15 +2326,12 @@ class Dispatcher:
         return sorted(qualified)
 
     def route_advertisement(self):
-        """Every (engine, account, profile) route _route() accepts, for each heartbeat.
+        """Every distinct (engine, account, profile) route _route() accepts.
 
         Hub offers only these while the advertisement is fresh, so a route the
         host dropped (e.g. a failed managed install) holds with
         route_not_advertised instead of failing dispatch_route_unconfigured on
-        the host (intake 6cbb862a). Never truncated: a list that would not fit
-        MAX_ADVERTISED_ROUTES is replaced by an explicit overflow count, and
-        Hub then treats the host as unadvertised rather than holding valid
-        routes.
+        the host (intake 6cbb862a). Never truncated.
         """
         routes, seen = [], set()
         for s in self.settings['subscriptions']:
@@ -2339,9 +2339,25 @@ class Dispatcher:
             if route not in seen:
                 seen.add(route)
                 routes.append({'engine': route[0], 'account': route[1], 'profile': route[2]})
-        if len(routes) > MAX_ADVERTISED_ROUTES:
-            return {'fleet_routes_overflow': len(routes)}
-        return {'fleet_routes': routes}
+        return routes
+
+    def attach_route_advertisement(self, hb):
+        """Add the complete route list to a finished heartbeat, or an explicit overflow.
+
+        A list over MAX_ADVERTISED_ROUTES, or one that would push the whole
+        heartbeat past HEARTBEAT_ROUTE_BODY_LIMIT (Hub rejects bodies over
+        32 KiB), is replaced by fleet_routes_overflow=<count>: Hub then holds
+        every route on this host as route_advertisement_overflow rather than
+        trusting a partial list or older evidence.
+        """
+        routes = self.route_advertisement()
+        hb.pop('fleet_routes_overflow', None)
+        hb['fleet_routes'] = routes
+        if len(routes) > MAX_ADVERTISED_ROUTES or len(json.dumps(hb, default=str).encode()) > HEARTBEAT_ROUTE_BODY_LIMIT:
+            del hb['fleet_routes']
+            hb['fleet_routes_overflow'] = len(routes)
+            print(json.dumps({'event': 'fleet_routes_overflow', 'routes': len(routes)}), flush=True)
+        return hb
 
     def goal_routes(self):
         """Advertise executable local routes, independent of quota admission."""
@@ -3612,7 +3628,7 @@ class Dispatcher:
         except Exception:
             fresh_hb = hb
         try:
-            fresh_hb.update(self.route_advertisement())
+            self.attach_route_advertisement(fresh_hb)
             self.request('POST', '/api/host/poll', fresh_hb)
         except Exception:
             pass
@@ -3901,7 +3917,7 @@ class Dispatcher:
             {'launch_allowed': allowed,
              'reason': 'fleet local admission' if allowed else 'fleet admission unavailable',
              'at': utcnow()}, self.settings)
-        hb.update(self.route_advertisement())
+        self.attach_route_advertisement(hb)
         self.request('POST', '/api/host/poll', hb)
         self._last_hb = hb
         return hb
@@ -3948,7 +3964,7 @@ class Dispatcher:
         for key in ('gate', 'launcher_resources'):
             if key in latest:
                 hb[key] = latest[key]
-        hb.update(self.route_advertisement())
+        self.attach_route_advertisement(hb)
         self.request('POST', '/api/host/poll', hb)
         caps = self.capabilities_put_payload()
         if caps is not None:
@@ -4133,7 +4149,7 @@ class Dispatcher:
                               'error': _sanitized_transport_error(exc)}), flush=True)
         _mark('register')
         hb['gate'] = allowed_gate
-        hb.update(self.route_advertisement())
+        self.attach_route_advertisement(hb)
         self.request('POST', '/api/host/poll', hb)
         _mark('heartbeat')
         for engine in sorted(admitted_engines):

@@ -87,9 +87,9 @@ function sanitizeHeartbeat(body: any) {
   }
   // Executable routes the host's dispatcher accepts (intake 6cbb862a). Bounded
   // label tuples only; a malformed list is dropped, never partially kept. A
-  // host with more routes sends fleet_routes_overflow instead of a truncated
-  // list, which clears the advertisement (no route evidence).
-  if (Number.isInteger(body.fleet_routes_overflow) && body.fleet_routes_overflow > MAX_ADVERTISED_ROUTES && body.fleet_routes_overflow <= 100000) {
+  // host whose complete list does not fit (count or heartbeat bytes) sends
+  // fleet_routes_overflow instead, and Hub holds all its routes.
+  if (Number.isInteger(body.fleet_routes_overflow) && body.fleet_routes_overflow >= 0 && body.fleet_routes_overflow <= 100000) {
     hb.fleet_routes_overflow = body.fleet_routes_overflow;
   } else if (Array.isArray(body.fleet_routes) && body.fleet_routes.length <= MAX_ADVERTISED_ROUTES && body.fleet_routes.every((r: any) =>
       r && typeof r === 'object' && typeof r.engine === 'string' && ROUTE_LABEL.test(r.engine)
@@ -166,19 +166,21 @@ export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStor
     sql.exec('INSERT INTO resource_choking_events VALUES(?,?,?) ON CONFLICT(machine_id,reason) DO UPDATE SET observed_at=excluded.observed_at WHERE excluded.observed_at>resource_choking_events.observed_at',machineId,'host_oom',cpu.observed_at);
   }
   let st = machineState.get(machineId);
-  // Route advertisement carries its own freshness (fleet_routes_at): a
-  // heartbeat without the field (e.g. the role-job poller) keeps the last
-  // advertisement and its original time, so it can age out but never looks
-  // newer than it is.
-  const advertisedNow = !!hb.fleet_routes;
+  // Route advertisement (a list or an explicit overflow) carries its own
+  // freshness (fleet_routes_at): a heartbeat without either field (e.g. the
+  // role-job poller) keeps the last advertisement and its original time, so
+  // it can age out but never looks newer than it is, and never erases an
+  // overflow.
+  const advertisedNow = !!hb.fleet_routes || hb.fleet_routes_overflow !== undefined;
   if (advertisedNow) hb.fleet_routes_at = new Date(now).toISOString();
-  else if (!hb.fleet_routes_overflow) {
+  else {
     let previous: any = st?.hb;
     if (!previous) {
       try { previous = JSON.parse(String((sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machineId).toArray()[0] as any)?.last_heartbeat ?? 'null')); } catch { previous = null; }
     }
-    if (Array.isArray(previous?.fleet_routes) && typeof previous.fleet_routes_at === 'string') {
-      hb.fleet_routes = previous.fleet_routes; hb.fleet_routes_at = previous.fleet_routes_at;
+    if (typeof previous?.fleet_routes_at === 'string') {
+      if (Array.isArray(previous.fleet_routes)) { hb.fleet_routes = previous.fleet_routes; hb.fleet_routes_at = previous.fleet_routes_at; }
+      else if (Number.isInteger(previous.fleet_routes_overflow)) { hb.fleet_routes_overflow = previous.fleet_routes_overflow; hb.fleet_routes_at = previous.fleet_routes_at; }
     }
   }
   const fingerprint = getFingerprint(hb);

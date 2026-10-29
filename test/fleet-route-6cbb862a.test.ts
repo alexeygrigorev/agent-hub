@@ -149,7 +149,7 @@ describe('route advertisement size bound (6cbb862a review)', () => {
     });
   });
 
-  it('clears the advertisement on an explicit overflow instead of holding valid routes', async () => {
+  it('keeps an explicit overflow across bare heartbeats until a complete list replaces it', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-overflow-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub) => {
@@ -161,8 +161,13 @@ describe('route advertisement size bound (6cbb862a review)', () => {
       const hb = stored();
       expect(hb.fleet_routes_overflow).toBe(129);
       expect(hb.fleet_routes).toBeUndefined();
-      expect(hb.fleet_routes_at).toBeUndefined();
-      expect(advertisedRoutes(hb, null, now)).toBeNull(); // no route evidence: registry placement
+      expect(typeof hb.fleet_routes_at).toBe('string');
+      updateHeartbeat(id, { type: 'heartbeat', mem_avail_mb: 1 }, hub.sql); // unrelated heartbeat never erases it
+      expect(stored().fleet_routes_overflow).toBe(129);
+      expect(stored().fleet_routes).toBeUndefined();
+      updateHeartbeat(id, { type: 'heartbeat', fleet_routes: [SHARED] }, hub.sql);
+      expect(stored().fleet_routes).toEqual([SHARED]);
+      expect(stored().fleet_routes_overflow).toBeUndefined();
     });
   });
 
@@ -173,12 +178,61 @@ describe('route advertisement size bound (6cbb862a review)', () => {
     }));
   }
 
-  it('places a host that reports overflow by registry routes, not route_not_advertised', async () => fleet(async (s, sql) => {
-    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'tabo'", JSON.stringify({ ...HB, cpu_usage: freshCpu(iso()), fleet_routes_overflow: 129 }));
-    const plan: any = s.plan(intent({ account: 'shared-codex' }));
-    expect(plan.selected?.account).toBe('shared-codex');
-    expect(plan.rejected.filter((r: any) => r.reason === 'route_not_advertised')).toEqual([]);
-  }));
+  // Review 91bf3c43: overflow must fail closed. The registry still lists
+  // shared-codex, the host's real routes omit it, and no other evidence
+  // (absent, empty or older runners) may reopen it.
+  const overflowHb = (sql: any) => sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'tabo'",
+    JSON.stringify({ ...HB, cpu_usage: freshCpu(iso()), fleet_routes_overflow: 129, fleet_routes_at: iso() }));
+  const runners = (sql: any, list: any[] | null) => {
+    if (list) sql.exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', 'tabo', '[]', 6, iso(),
+      JSON.stringify(list.map((r: any) => ({ ...r, model: 'm', effort: 'high' }))));
+  };
+  for (const [label, list] of [['absent', null], ['empty', []], ['older listing the route', [SHARED]]] as const) {
+    it(`holds every route on an overflowing host with ${label} runner evidence`, async () => fleet(async (s, sql) => {
+      overflowHb(sql);
+      runners(sql, list as any);
+      const plan: any = s.plan(intent({ account: 'shared-codex' }));
+      expect(plan.selected).toBeFalsy();
+      expect(plan.rejected).toEqual([{ machine: 'tabo', engine: 'codex', reason: 'route_advertisement_overflow', account: 'shared-codex', profile: 'hub-shared-codex', advertised_routes: 129 }]);
+      expect(isCapacityOnlyHold(plan.rejected)).toBe(true);
+      const open: any = s.plan(intent());
+      expect(open.selected).toBeFalsy();
+      expect(open.rejected.every((r: any) => r.reason === 'route_advertisement_overflow')).toBe(true);
+    }));
+  }
+});
+
+describe('route advertisement over HTTP (6cbb862a review)', () => {
+  it('accepts a complete 128-route heartbeat within the host byte budget and rejects bodies over 32 KiB', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-http-' + crypto.randomUUID()));
+    const adminSecret = 'local-test-only-admin-sign-in';
+    const machineRow = 'paired-' + crypto.randomUUID();
+    await runInDurableObject(stub, async (hub: Hub) => {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(adminSecret));
+      hub.env = { ...hub.env, HUB_ADMIN_TOKEN_SHA256: [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('') } as Env;
+      hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, 'route-host', 'route-host', ?)", machineRow, iso());
+    });
+    const login = await stub.fetch(new Request('https://hub.test/auth/token', { method: 'POST', redirect: 'manual', body: new URLSearchParams({ token: adminSecret }).toString() }));
+    const cookie = login.headers.get('Set-Cookie')!.split(';')[0];
+    const me: any = await (await stub.fetch(new Request('https://hub.test/auth/me', { headers: { Cookie: cookie } }))).json();
+    const call = (path: string, body: string, token?: string) => stub.fetch(new Request('https://hub.test' + path, { method: 'POST', headers: {
+      'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : { Cookie: cookie, 'X-CSRF-Token': me.csrf_token }) }, body }));
+    const challenge: any = await (await call('/api/device/code', JSON.stringify({ client_kind: 'host', name: 'route-host', requested_scopes: ['host'] }))).json();
+    const approved: any = await (await call('/api/device/approve/' + challenge.user_code, JSON.stringify({ granted_scopes: ['host'], machine_id: machineRow }))).json();
+    const tokens: any = await (await call('/api/device/token', JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: challenge.device_code }))).json();
+    const long = (p: string, i: number) => (p + i).padEnd(64, 'x');
+    const routes = Array.from({ length: 128 }, (_, i) => ({ engine: 'codex', account: long('a', i), profile: long('p', i) }));
+    const body = JSON.stringify({ type: 'heartbeat', at: iso(), mem_avail_mb: 32000, fleet_routes: routes });
+    expect(body.length).toBeLessThanOrEqual(30 * 1024); // the host's HEARTBEAT_ROUTE_BODY_LIMIT
+    expect((await call('/api/host/poll', body, tokens.access_token)).status).toBe(200);
+    await runInDurableObject(stub, async (hub: Hub) => {
+      const hb = JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', approved.machine_id).toArray()[0] as any).last_heartbeat));
+      expect(hb.fleet_routes).toHaveLength(128);
+    });
+    const oversize = JSON.stringify({ type: 'heartbeat', at: iso(), fleet_routes: routes, pad: 'x'.repeat(32768 - body.length + 64) });
+    expect((await call('/api/host/poll', oversize, tokens.access_token)).status).not.toBe(200);
+  });
 });
 
 describe('sessions show names the offered route on dispatch errors (6cbb862a AC c)', () => {
