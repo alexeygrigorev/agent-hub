@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Ask ledger · Agent Hub</title>
+  <link rel="stylesheet" href="/vendor/dakit/dakit.css">
+  <link rel="stylesheet" href="/auth.css">
+  <link rel="stylesheet" href="/engines.css">
+  <script src="/auth.js"></script>
+  <script src="/asks.js" defer></script>
+</head>
+<body>
+<main class="dk-main" id="main-content">
+  <div class="dk-main__inner engine-page">
+    <nav aria-label="Navigation"><a href="/">Agent Hub</a> · <a href="/intake">Intake</a></nav>
+    <h1>Ask ledger</h1>
+    <p>Every message Alexey sends an agent, split into asks. Each ask must map to an intake acceptance-criteria line within 30 minutes; an intake cannot close while a mapped ask is not marked met.</p>
+    <p id="status" role="status">Loading…</p>
+    <p><label>State <select id="state" class="dk-input">
+      <option value="">all</option><option>unmapped</option><option>pending</option><option>mapped</option><option>dropped_after_done</option>
+      <option>verified</option><option>not_an_ask</option><option>closed_unverified</option><option>cancelled</option>
+    </select></label></p>
+    <div class="dk-table-wrap"><table class="dk-table">
+      <thead><tr><th>State</th><th>Source ref</th><th>Ask (verbatim)</th><th>Intake · AC line</th><th>Received</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+    <h2>Sources and gaps</h2>
+    <div id="sources"></div>
+  </div>
+</main>
+</body>
+</html>
