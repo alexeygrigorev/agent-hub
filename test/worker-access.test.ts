@@ -39,6 +39,11 @@ describe('scoped durable worker access',()=>{
   const ac=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
   expect(ac.status,await ac.clone().text()).toBe(200);
   const v=(await ac.json() as any).task.version;
+  // A lost reply retried with the same key replays the saved receipt; a new key may not overwrite.
+  const replay=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
+  expect(replay.status,await replay.clone().text()).toBe(200);
+  expect((await replay.json() as any).task.version).toBe(v);
+  expect((await api('/api/intake/tasks/'+blank,{key:'t-ac2',expected_version:v,acceptance_criteria:'second fill'})).status).toBe(403);
   for (const bad of [{key:'t-st',expected_version:v,status:'done'},{key:'t-ti',expected_version:v,title:'renamed'},
     {key:'t-mix',expected_version:v,project:'aws-infra',status:'cancelled',reason:'x'}])
    expect((await api('/api/intake/tasks/'+blank,bad)).status).toBe(403);

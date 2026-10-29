@@ -1198,6 +1198,9 @@ export class IntakeService {
       }
     } else {
       keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by', 'force', 'outcome']);
+      // AC5 triage reviewers only fill missing AC; enforced at effect time so an
+      // exact retry of a successful fill replays its receipt instead.
+      if (p.worker && 'acceptance_criteria' in b && hasAcceptanceCriteria(task)) fail('forbidden', 403);
       const unverified = b.outcome === 'closed_unverified';
       if ('outcome' in b) {
         if (!unverified || b.status !== 'done') throw new IntakeError('invalid_outcome', 400, 'outcome');
@@ -1603,11 +1606,7 @@ export class IntakeService {
         // Do not replay a private response after the caller loses its task/operator grant.
         if (path.startsWith('/rules') || path.startsWith('/grants')) this.operator(p);
         const taskMatch = /^\/tasks\/([^/]+)/.exec(path);
-        if (taskMatch) {
-          const t = this.get('tasks', taskMatch[1]); if (!t || !this.allowed(p, t, true)) fail('not_found', 404);
-          // Triage reviewers only fill missing AC; existing criteria are never replaced.
-          if (triageUpdate && 'acceptance_criteria' in payload && hasAcceptanceCriteria(t)) fail('forbidden', 403);
-        }
+        if (taskMatch) { const t = this.get('tasks', taskMatch[1]); if (!t || !this.allowed(p, t, true)) fail('not_found', 404); }
         if (path === '/tasks' && !this.allowed(p, { project: payload.project, id: '' }, true)) fail('forbidden', 403);
         const id = p.identity + ':' + payload.key;
         const previous = this.get('receipts', id); const fingerprint = canonical({ path, payload });
