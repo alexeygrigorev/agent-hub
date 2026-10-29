@@ -35,6 +35,7 @@
     ]
   },
   "vars": {
+    "HUB_ALERT_TO": "",
     "HUB_ADDITIONAL_ADMINS": "alexey@datatalks.club,orin@datatalks.club",
     "AUTH_CLIENT_ID": "1tplqm9l6q6545mrk0gjv6eaeh",
     "AUTH_ISSUER": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs",

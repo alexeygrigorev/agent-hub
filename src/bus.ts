@@ -1,3 +1,4 @@
+import { initAlertRouting } from './alert-routing';
 import { registryAddress, registryRowSql } from './agent_registry';
 import { validateRef } from './session-messaging';
 /** Older writers could cut a metadata JSON string mid-escape. Keep the
@@ -285,6 +286,7 @@ export class BusService {
 
   constructor(sql: SqlStorage, txSync?: <T>(fn: () => T) => T, hooks?: BusSendHooks) {
     this.sql = sql;
+    initAlertRouting(sql);
     this.txSync = txSync;
     this.hooks = hooks;
   }
@@ -636,6 +638,11 @@ export class BusService {
 
       const rows = this.sql.exec(query, ...params).toArray() as any[];
       if (this.isRecipientPrincipal(caller, actor, now)) {
+        if (caller.tokenId) {
+          this.sql.exec(`INSERT INTO bus_reader_activity(recipient, credential_id, last_read_at) VALUES (?, ?, ?)
+            ON CONFLICT(recipient, credential_id) DO UPDATE SET last_read_at=excluded.last_read_at
+            WHERE last_read_at < excluded.last_read_at - 60000`, this.canonicalActor(actor), caller.tokenId, now);
+        }
         for (const row of rows) {
           if (row.delivered_at || row.to_session_id) continue;
           this.sql.exec('UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL', now, row.id);

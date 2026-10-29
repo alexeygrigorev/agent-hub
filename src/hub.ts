@@ -1,3 +1,4 @@
+import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS } from './alert-routing';
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
@@ -1209,7 +1210,14 @@ export class Hub extends DurableObject {
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
       const busResponse = await this.handleBusRoutes(request, path);
-      if (busResponse) return busResponse;
+      if (busResponse) {
+        if (request.method === 'GET' && busResponse.status === 401) {
+          const header = request.headers.get('Authorization') || '';
+          const cred = header.startsWith('Bearer ') ? this.sql.exec('SELECT actor, registry_actor, kind, subject FROM credentials WHERE token_hash=?', await sha256(header.slice(7).trim())).toArray()[0] as any : null;
+          this.recordBusAuthFailure(cred, 'bus read rejected HTTP 401');
+        }
+        return busResponse;
+      }
       const jobsResponse = await this.handleJobsRoutes(request, path, url);
       if (jobsResponse) return jobsResponse;
       if (['/api/quota/pacing', '/api/quota/banked', '/api/quota/kill-switch', '/api/quota/rewards', '/api/quota/reset-credits'].includes(path)) {
@@ -2126,7 +2134,11 @@ export class Hub extends DurableObject {
       }
 
       });
-      if (errorResponse) return errorResponse;
+      if (errorResponse) {
+        const cred = this.sql.exec('SELECT actor, registry_actor, kind, subject FROM credentials WHERE refresh_hash=?', refreshHash).toArray()[0] as any;
+        this.recordBusAuthFailure(cred, 'credential refresh rejected; bus reader cannot refresh');
+        return errorResponse;
+      }
 
       return Response.json({
         access_token: accessToken,
@@ -2317,37 +2329,74 @@ export class Hub extends DurableObject {
     return json({ error: 'not_found' }, 404);
   }
 
-  /** Deliver a newly opened alert to the configured inbox actors and optional webhook.
-   * Returns the per-call receipt so callers (session audit) can only count an
-   * escalation as dispatched when it actually reached at least one target. */
-  private async notifyAlert(alert: any): Promise<{ delivered: string[]; errors: string[] }> {
-    const text = alertText(alert); const errors: string[] = [];
-    // Each target is delivered once; a retry only covers targets that have not succeeded yet.
-    const delivered = new Set(this.livenessService.deliveredTo(alert));
-    const targets = typeof this.env.HUB_ALERT_TO === 'string' ? this.env.HUB_ALERT_TO.split(',').map(t => t.trim()).filter(Boolean) : ['grok-bot'];
-    for (const to of targets) {
-      if (delivered.has('inbox:' + to)) continue;
-      try {
-        this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: `alert-${alert.id}-${to}` });
-        delivered.add('inbox:' + to);
-      } catch (e: any) { errors.push(`${to}: ${String(e?.message || e).slice(0, 80)}`); }
+  private recordBusAuthFailure(cred: any, detail: string) {
+    // Identity comes only from a matching stored credential, never query params
+    // or an unverified token payload. Unknown requests share a bounded subject.
+    const actor = cred?.kind === 'agent' ? cred.registry_actor : cred?.actor;
+    const subject = typeof actor === 'string' && actor ? actor : 'unidentified-reader';
+    const alert = this.livenessService.setAlert('bus_auth', subject, { state: 'unauthorized', detail });
+    if (alert) this.ctx.waitUntil(this.notifyAlert(alert));
+  }
+
+  private notifyingAlerts = new Map<string, Promise<{ delivered: string[]; errors: string[] }>>();
+  private notifyAlert(input: any): Promise<{ delivered: string[]; errors: string[] }> {
+    if (!input) return Promise.resolve({ delivered: [], errors: [] });
+    const key = JSON.stringify([input.subject_kind, input.subject]);
+    const pending = this.notifyingAlerts.get(key);
+    if (pending) return pending.then(() => this.notifyAlert(input));
+    const delivery = this.deliverAlert(input).finally(() => this.notifyingAlerts.delete(key));
+    this.notifyingAlerts.set(key, delivery);
+    return delivery;
+  }
+
+  private async deliverAlert(input: any) {
+    // Callers can hold an old row across awaits. Receipts in storage win.
+    const alert = this.sql.exec('SELECT * FROM liveness_alerts WHERE id=? AND resolved_at IS NULL', input.id).toArray()[0] as any;
+    if (!alert) return { delivered: [], errors: [] };
+    {
+      const text = alertText(alert); const errors: string[] = [];
+      const delivered = new Set(this.livenessService.deliveredTo(alert));
+      const { actors: configuredActors, webhook, invalidWebhook, invalidActors } = alertDestinations(this.env);
+      const actors = [...new Set(configuredActors.map(to => this.busService.canonicalActor(to)))];
+      if (invalidActors) errors.push('invalid alert inbox configuration');
+      if (invalidWebhook) errors.push('invalid alert webhook configuration (HTTPS required)');
+      if (!actors.length && !webhook) errors.push('no alert target configured');
+      const receipt = (target: string) => this.sql.exec('SELECT * FROM alert_delivery_receipts WHERE subject_kind=? AND subject=? AND target=?', alert.subject_kind, alert.subject, target).toArray()[0] as any;
+      const allowed = (target: string) => {
+        const last = receipt(target);
+        if (last?.alert_id === alert.id) { delivered.add(target); return false; }
+        if (last && Date.now() - last.sent_at < ALERT_SUBJECT_COOLDOWN_MS) { errors.push('subject rate limited for destination'); return false; }
+        return true;
+      };
+      const success = (target: string) => {
+        delivered.add(target);
+        this.sql.exec(`INSERT INTO alert_delivery_receipts VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(subject_kind, subject, target) DO UPDATE SET alert_id=excluded.alert_id, sent_at=excluded.sent_at`, alert.subject_kind, alert.subject, target, alert.id, Date.now());
+      };
+      for (const to of actors) {
+        const target = 'inbox:' + to;
+        if (delivered.has(target)) continue;
+        const canonical = this.busService.canonicalActor(to);
+        if (!inboxReaderStatus(this.sql, canonical).active_reader) { errors.push(`${to}: no_active_credential_read_loop`); continue; }
+        if (!allowed(target)) continue;
+        try {
+          const key = 'alert-' + alert.id + '-' + (await sha256(target)).slice(0, 24);
+          this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: key });
+          success(target);
+        } catch { errors.push(`${to}: inbox delivery failed`); }
+      }
+      // Keep a destination fingerprint, never the webhook URL, in receipts.
+      const webhookTarget = webhook ? 'webhook:' + (await sha256(webhook)).slice(0, 24) : null;
+      if (webhook && webhookTarget && !delivered.has(webhookTarget) && allowed(webhookTarget)) {
+        try {
+          const r = await fetch(webhook, { method: 'POST', redirect: 'error', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `hub-alert-${alert.id}` }, body: JSON.stringify({ text, alert: { id: alert.id, subject_kind: alert.subject_kind, subject: alert.subject, state: alert.state, detail: alert.detail, opened_at: alert.opened_at } }), signal: AbortSignal.timeout(10000) });
+          if (r.ok) success(webhookTarget); else errors.push(`webhook: HTTP ${r.status}`);
+        } catch { errors.push('webhook: unreachable'); }
+      }
+      this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : null, [...delivered]);
+      if (alert.subject_kind === 'intake_digest' && !errors.length) this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
+      return { delivered: [...delivered], errors };
     }
-    const webhook = typeof this.env.HUB_ALERT_WEBHOOK === 'string' && this.env.HUB_ALERT_WEBHOOK.startsWith('https://') ? this.env.HUB_ALERT_WEBHOOK : null;
-    if (webhook && !delivered.has('webhook')) {
-      try {
-        const r = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, alert: { id: alert.id, subject_kind: alert.subject_kind, subject: alert.subject, state: alert.state, detail: alert.detail, opened_at: alert.opened_at } }), signal: AbortSignal.timeout(10000) });
-        if (r.ok) delivered.add('webhook'); else errors.push(`webhook: HTTP ${r.status}`);
-      } catch { errors.push('webhook: unreachable'); }
-    }
-    const anyTarget = targets.length > 0 || !!webhook;
-    this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : (anyTarget ? null : 'no alert target configured'), [...delivered]);
-    // A delivered informational digest is not an ongoing incident. Preserve its
-    // receipt/history, but keep it out of the unresolved incident queue. Failed
-    // targets stay open for the ordinary retry path.
-    if (['intake_digest', 'host_recovery'].includes(alert.subject_kind) && anyTarget && !errors.length) {
-      this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
-    }
-    return { delivered: [...delivered], errors };
   }
 
   protected extraCheckDeps(): Partial<ActionDeps> { return {}; }
@@ -2392,6 +2441,22 @@ export class Hub extends DurableObject {
     }
     for (const alert of await m('banked_resets', () => new BankedResets(this.sql, this.livenessService).run())) await this.notifyAlert(alert);
     await m('liveness_prune', () => this.livenessService.prune());
+    this.checkBusAuthFailures();
+    const destinations = alertDestinations(this.env);
+    const destinationHash = await sha256(JSON.stringify(destinations));
+    const previousDestinations = this.sql.exec("SELECT value FROM hub_meta WHERE key='alert_destination_hash'").toArray()[0]?.value;
+    if (previousDestinations !== destinationHash) {
+      // Previously delivered alerts may have gone to an unread destination.
+      // Retry only after the target changes; receipts prevent duplicate sends.
+      this.sql.exec("UPDATE liveness_alerts SET notify_error='alert destinations changed', notified_at=NULL WHERE resolved_at IS NULL");
+      this.sql.exec("INSERT INTO hub_meta(key,value) VALUES ('alert_destination_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", destinationHash);
+    }
+    const routingErrors = destinations.actors.filter(to => !inboxReaderStatus(this.sql, this.busService.canonicalActor(to)).active_reader).map(to => `${to}: no_active_credential_read_loop`);
+    if (destinations.invalidWebhook) routingErrors.push('invalid alert webhook configuration');
+    if (destinations.invalidActors) routingErrors.push('invalid alert inbox configuration');
+    if (!destinations.actors.length && !destinations.webhook) routingErrors.push('no alert target configured');
+    const routingAlert = this.livenessService.setAlert('alert_routing', 'destination', routingErrors.length ? { state: 'fail', detail: routingErrors.join('; ') } : null);
+    if (routingAlert) await m('alert_routing', () => this.notifyAlert(routingAlert));
     const results = await m('run_due', () => this.checksService.runDue({
       liveness: this.livenessService,
       notify: alert => this.notifyAlert(alert).then(() => undefined),

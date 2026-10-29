@@ -26,7 +26,7 @@ async function fixture(fn: (live: LivenessService, sql: any) => Promise<void> | 
 }
 
 describe('hub-ops liveness reproducer', () => {
-  it('hubops-default-inbox delivers alerts to the grok-bot inbox when HUB_ALERT_TO is unset', async () => {
+  it('hubops-default-inbox refuses an unset alert destination', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('hubops-default-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub) => {
@@ -39,8 +39,9 @@ describe('hub-ops liveness reproducer', () => {
       );
       await hub.runChecks('liveness');
       const [alert]: any[] = hub.livenessService.alerts();
-      expect(alert.notify_error).toBeNull();
-      expect(JSON.parse(alert.delivered_to)).toEqual(['inbox:grok-bot']);
+      expect(alert.notify_error).toContain('no alert target configured');
+      expect(JSON.parse(alert.delivered_to)).toEqual([]);
+      expect(hub.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE to_actor='grok-bot'").one().n).toBe(0);
     });
   });
 
