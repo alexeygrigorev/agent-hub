@@ -46,6 +46,22 @@ class SessionObservationTests(unittest.TestCase):
             path.write_text(json.dumps({'type':'assistant','message':{'model':'claude-opus-4-8','content':'private content'}})+'\n')
             self.assertEqual(native_session_model({**row,'engine':'claude'},locate),'claude-opus-4-8')
 
+    def test_claude_hook_binds_exact_conversation_and_current_incarnation(self):
+        sid='11111111-1111-4111-8111-111111111111'
+        row={'id':'native-hook','engine':'claude','created_at_ms':1700000000000,
+             'reported_state_at_ms':1700000001000,'reported_state_engine_session_id':sid,
+             'cwd':'/repo/project','state':'running'}
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'projects'/'-repo-project'/(sid+'.jsonl')
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({'type':'assistant','message':{'model':'claude-opus-4-8','content':'private'}})+'\n')
+            native={**row,'env':{'CLAUDE_CONFIG_DIR':folder}}
+            locator=SimpleNamespace(locate=lambda _:None)
+            self.assertEqual(native_session_model(native,locator),'claude-opus-4-8')
+            self.assertIsNone(native_session_model({**native,'reported_state_at_ms':1699999999999},locator))
+            self.assertIsNone(native_session_model({**native,'reported_state_engine_session_id':'../wrong'},locator))
+            self.assertIsNone(native_session_model({**native,'cwd':'/different/project'},locator))
+
     def test_latest_bounded_context_wins_and_untyped_model_labels_are_ignored(self):
         row = {'id': 'native-tail', 'engine': 'codex', 'created_at_ms': 1700000000000}
         with tempfile.TemporaryDirectory() as folder:

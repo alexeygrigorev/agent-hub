@@ -4,6 +4,8 @@ Never read profile credentials or infer a provider default. Only the model
 identifier leaves the host; transcript contents and paths stay local.
 """
 import json
+import os
+from pathlib import Path
 import re
 import time
 
@@ -16,6 +18,36 @@ _CACHE = {}
 
 def _model(value):
     return value if isinstance(value, str) and _MODEL.fullmatch(value) else None
+
+
+def _claude_transcript(row):
+    """Use the native hook's exact conversation id, never newest-by-workspace."""
+    sid = row.get('reported_state_engine_session_id')
+    if (row.get('engine') != 'claude' or not isinstance(sid, str)
+            or not re.fullmatch(r'[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}', sid)
+            or type(row.get('reported_state_at_ms')) is not int
+            or row['reported_state_at_ms'] < row['created_at_ms']):
+        return None
+    cwd = row.get('cwd') or row.get('workspace')
+    if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        return None
+    env = row.get('env') if isinstance(row.get('env'), dict) else {}
+    config, home = env.get('CLAUDE_CONFIG_DIR'), env.get('HOME')
+    if isinstance(config, str) and Path(config).is_absolute():
+        roots = {Path(config)}
+    elif isinstance(home, str) and Path(home).is_absolute():
+        roots = {Path(home) / '.claude'}
+    else:
+        roots = {Path.home() / '.claude'}
+        try:
+            import pwd
+            roots.add(Path(pwd.getpwuid(os.getuid()).pw_dir) / '.claude')
+        except (ImportError, KeyError, OSError):
+            pass
+    project = re.sub(r'[^A-Za-z0-9]', '-', cwd)
+    matches = {root / 'projects' / project / (sid + '.jsonl') for root in roots
+               if (root / 'projects' / project / (sid + '.jsonl')).is_file()}
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def native_session_model(row, locator=None):
@@ -32,7 +64,7 @@ def native_session_model(row, locator=None):
     from .native_progress import NativeTranscriptProgress
     locator = locator or NativeTranscriptProgress()
     try:
-        path = locator.locate(row)
+        path = locator.locate(row) or _claude_transcript(row)
         if path is None:
             return None
         stat = path.stat()
