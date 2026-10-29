@@ -231,6 +231,8 @@ export class Hub extends DurableObject {
     this.sql.exec('CREATE INDEX IF NOT EXISTS lifecycle_decision_latest ON session_lifecycle_decisions(session_key,created_at DESC,decision_id DESC)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS status_observation_latest ON status_observations(hub_session_id,kind,observed_at DESC,received_at DESC)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_fleet_lookup ON session_control_sessions(fleet_launch_id,machine_id)');
+    // Status attention reads only running sessions; avoid scanning retained prompts.
+    this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_state ON session_control_sessions(state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native ON fleet_launches(machine_id,native_id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_created ON session_control_sessions(created_at DESC,id DESC)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_actor_created ON session_control_sessions(actor,created_at DESC,id DESC)');

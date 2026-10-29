@@ -61,10 +61,39 @@ export function sessionWakeState(sql: SqlStorage, sessionId: string, now: number
   return { waiting_until: Number.isFinite(pending?.at) ? new Date(pending.at).toISOString() : null, missed };
 }
 
-export function openWorkPreventsIdleReap(sql: SqlStorage, session: any, now = Date.now()): boolean {
+/** Read-only memo for one synchronous idle-reap projection over many
+ * sessions: linked-intake facts by id and the idle-episode index. */
+export type IdleReapCache = { intakes: Map<string, { done: boolean } | null>; episodes?: Set<string> | null };
+
+// JSON letters decode only from literal characters or \u escapes, so data
+// without either cannot hold a DONE note; skip parsing retained history.
+const mayHoldDone = (raw: string) => /done|\\u/i.test(raw);
+
+function cachedIntakeFacts(sql: SqlStorage, session: any, request: any, cache: IdleReapCache): { done: boolean } | null {
+  let id: any = request.intake_task_id;
+  if (!id) {
+    const binding = parseObject(session.binding_json);
+    const ids: any[] = sql.exec(`SELECT DISTINCT i.id FROM intake_task_projection i, json_each(i.links) e
+      WHERE json_extract(e.value,'$.hub_session_id')=? OR
+      (json_extract(e.value,'$.native_id')=? AND (json_extract(e.value,'$.host') IS NULL OR json_extract(e.value,'$.host')=?)) LIMIT 2`,
+      session.id || '', binding.native_id || '', session.machine_id || '').toArray();
+    if (ids.length !== 1) return null;
+    id = ids[0].id;
+  }
+  const key = JSON.stringify([typeof id, String(id)]);
+  if (cache.intakes.has(key)) return cache.intakes.get(key)!;
+  // Only copy retained history into JS when it could hold a DONE note.
+  const row: any = sql.exec(`SELECT CASE WHEN typeof(data)<>'text' OR data LIKE '%done%' OR instr(data, '\\u')>0
+    THEN data END AS data FROM intake_tasks WHERE id=?`, id).toArray()[0];
+  const facts = row ? { done: typeof row.data === 'string' && mayHoldDone(row.data) ? intakeHasDone(parseObject(row.data)) : false } : null;
+  cache.intakes.set(key, facts);
+  return facts;
+}
+
+export function openWorkPreventsIdleReap(sql: SqlStorage, session: any, now = Date.now(), cache?: IdleReapCache): boolean {
   try {
     const request = parseObject(session.request_json);
-    const task = linkedIntake(sql, session);
+    const task = cache ? cachedIntakeFacts(sql, session, request, cache) : linkedIntake(sql, session);
     // A missing linked intake is unknown, never permission to destroy its executor.
     if (!task && !request.intake_task_id) {
       const binding = parseObject(session.binding_json);
@@ -75,9 +104,16 @@ export function openWorkPreventsIdleReap(sql: SqlStorage, session: any, now = Da
         (json_extract(e.value,'$.native_id')=? AND (json_extract(e.value,'$.host') IS NULL OR json_extract(e.value,'$.host')=?)) LIMIT 1`,
         session.id || '',binding.native_id || '',session.machine_id || '').toArray().length > 0;
     }
-    if (task && intakeHasDone(task)) return false;
-    const table = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray();
-    if (table.length) {
+    if (task && (cache ? (task as { done: boolean }).done : intakeHasDone(task))) return false;
+    if (cache && cache.episodes === undefined) {
+      const exists = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray().length > 0;
+      cache.episodes = exists ? new Set((sql.exec('SELECT session_id FROM session_idle_episodes WHERE replacement_id IS NOT NULL').toArray() as any[]).map(r => r.session_id)) : null;
+    }
+    // Without a replacement id the join below cannot match, so the cached
+    // index only skips queries that would return no row.
+    const episodes = cache ? cache.episodes !== null && cache.episodes!.has(session.id)
+      : sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray().length > 0;
+    if (episodes) {
       const replacement: any = sql.exec(`SELECT s.* FROM session_idle_episodes e JOIN session_control_sessions s
         ON s.id=e.replacement_id WHERE e.session_id=?`, session.id).toArray()[0];
       const binding = parseObject(replacement?.binding_json), old = parseObject(session.binding_json);
