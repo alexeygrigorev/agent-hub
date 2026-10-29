@@ -116,7 +116,9 @@ function disabledEngines(): Set<string> {
 // route_advertisement_overflow: the host's complete route list did not fit a
 // heartbeat, so no membership is known and every route on it holds (never a
 // fallback to older or registry-only evidence).
-const CAPACITY_REASONS = new Set(['route_not_advertised', 'route_advertisement_overflow', 'disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+// route_advertisement_stale: the host's last complete list aged out (e.g. its
+// telemetry left no room in the heartbeat body); every route holds.
+const CAPACITY_REASONS = new Set(['route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -1023,6 +1025,7 @@ export class FleetService {
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
       else if (hb.fleet_routes_overflow !== undefined) reason = 'route_advertisement_overflow';
+      else if (Array.isArray(hb.fleet_routes) && !fresh(effectiveRoutesAt(route.machine_id, hb.fleet_routes_at), this.now(), 180000)) reason = 'route_advertisement_stale';
       else if (!routeAdvertised(advertisedRoutes(Array.isArray(hb.fleet_routes) ? { ...hb, fleet_routes_at: effectiveRoutesAt(route.machine_id, hb.fleet_routes_at) } : hb,
         routingRunners(route.machine_id), this.now()), route)) reason = 'route_not_advertised';
       else if (credentialInvalid.has(route.account)) reason = 'credential_invalid';
@@ -1059,7 +1062,7 @@ export class FleetService {
       else if (!account || account.status === 'blocked') reason = 'account_' + (account?.status || 'unmapped');
       else if (!routeQuota.ok) reason = 'quota_' + routeQuota.reason;
       else if (account.available_slots < 1) reason = 'account_concurrency';
-      if (reason) { evidence(); rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'route_not_advertised' || reason === 'route_advertisement_overflow' ? { account: route.account, profile: route.profile ?? null } : {}), ...(reason === 'route_advertisement_overflow' ? { advertised_routes: hb.fleet_routes_overflow } : {}), ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
+      if (reason) { evidence(); rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason.startsWith('route_') ? { account: route.account, profile: route.profile ?? null } : {}), ...(reason === 'route_advertisement_overflow' ? { advertised_routes: hb.fleet_routes_overflow } : {}), ...(reason === 'route_advertisement_stale' ? { advertised_at: effectiveRoutesAt(route.machine_id, hb.fleet_routes_at) } : {}), ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];

@@ -1169,7 +1169,7 @@ export class SessionControlService {
     if (!this.hooks.reserve) return { promoted, cancelled };
     const transientReasons = new Set([
       'disk_floor', 'launcher_disk_reserve', 'resource_limit', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity',
-      'route_not_advertised', 'route_advertisement_overflow', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking',
+      'route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking',
     ]);
     try {
       const rows = this.sql.exec(

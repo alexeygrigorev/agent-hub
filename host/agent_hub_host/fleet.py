@@ -533,9 +533,14 @@ def normalize_git_identity(conf) -> dict[str, str]:
 # Routes one heartbeat may advertise; must equal MAX_ADVERTISED_ROUTES in
 # src/registry.ts. Matches Hub's per-machine subscription limit (128).
 MAX_ADVERTISED_ROUTES = 128
-# A heartbeat carrying fleet_routes stays below Hub's 32 KiB body limit
-# (src/hub.ts), with headroom for transport framing.
-HEARTBEAT_ROUTE_BODY_LIMIT = 30 * 1024
+# Hub rejects request bodies over this many bytes (src/hub.ts); a heartbeat
+# with route advertisement never exceeds it.
+HEARTBEAT_BODY_LIMIT = 32768
+
+
+def heartbeat_body_bytes(hb):
+    """Bytes of the POST body bus.request sends for hb."""
+    return len(json.dumps(hb, default=str).encode('utf-8'))
 
 
 def load_settings(path=None):
@@ -2342,21 +2347,30 @@ class Dispatcher:
         return routes
 
     def attach_route_advertisement(self, hb):
-        """Add the complete route list to a finished heartbeat, or an explicit overflow.
+        """Add the complete route list to a finished heartbeat, never exceeding Hub's body limit.
 
-        A list over MAX_ADVERTISED_ROUTES, or one that would push the whole
-        heartbeat past HEARTBEAT_ROUTE_BODY_LIMIT (Hub rejects bodies over
-        32 KiB), is replaced by fleet_routes_overflow=<count>: Hub then holds
-        every route on this host as route_advertisement_overflow rather than
-        trusting a partial list or older evidence.
+        In order: the complete list when the whole serialized heartbeat stays
+        within HEARTBEAT_BODY_LIMIT (Hub rejects bodies over 32 KiB); else an
+        explicit fleet_routes_overflow=<count>, which Hub holds as
+        route_advertisement_overflow; else (telemetry alone leaves no room)
+        no route field at all, so the heartbeat is byte-identical to one
+        without this advertisement and Hub holds the aged-out list as
+        route_advertisement_stale. Never a partial list.
         """
         routes = self.route_advertisement()
+        hb.pop('fleet_routes', None)
         hb.pop('fleet_routes_overflow', None)
-        hb['fleet_routes'] = routes
-        if len(routes) > MAX_ADVERTISED_ROUTES or len(json.dumps(hb, default=str).encode()) > HEARTBEAT_ROUTE_BODY_LIMIT:
+        if len(routes) <= MAX_ADVERTISED_ROUTES:
+            hb['fleet_routes'] = routes
+            if heartbeat_body_bytes(hb) <= HEARTBEAT_BODY_LIMIT:
+                return hb
             del hb['fleet_routes']
-            hb['fleet_routes_overflow'] = len(routes)
-            print(json.dumps({'event': 'fleet_routes_overflow', 'routes': len(routes)}), flush=True)
+        hb['fleet_routes_overflow'] = len(routes)
+        event = 'fleet_routes_overflow'
+        if heartbeat_body_bytes(hb) > HEARTBEAT_BODY_LIMIT:
+            del hb['fleet_routes_overflow']
+            event = 'fleet_routes_unsent'
+        print(json.dumps({'event': event, 'routes': len(routes)}), flush=True)
         return hb
 
     def goal_routes(self):

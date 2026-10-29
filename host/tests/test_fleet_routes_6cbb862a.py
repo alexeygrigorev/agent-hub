@@ -74,20 +74,62 @@ def test_advertisement_past_the_count_cap_is_an_explicit_overflow(tmp_path):
     assert d.attach_route_advertisement(hb) == {'type': 'heartbeat', 'fleet_routes': d.route_advertisement()}
 
 
-def test_heartbeat_with_routes_stays_under_the_hub_body_limit(tmp_path):
-    """Review 91bf3c43: 128 long-label routes plus large launcher telemetry exceeded Hub's 32 KiB body limit."""
+def _telemetry(path_len=476, aliases=64):
+    """Review 4224a469 fixture: supported launcher telemetry near Hub's 32 KiB body limit."""
+    parts = [159, 159, path_len - 3 - 318]
+    path = '/' + '/'.join(c * n for c, n in zip('def', parts))
+    names = ['ws-%02d' % i for i in range(aliases)]
+    names[0] += 'x' * 32
+    at = '2026-10-29T20:00:00Z'
+    return {'type': 'heartbeat', 'mem_avail_mb': 32000, 'disk_free_gb': 80, 'load': [1.0, 1.0, 1.0],
+            'gate': {'launch_allowed': True, 'at': at}, 'running_jobs': [], 'sessions_summary': {},
+            'launcher_resources': {'active_mem_mb': 0, 'observed_at': at, 'active_disk_mb': 0, 'disk_floor_mb': 20480,
+                                   'next_disk_mb': 512, 'disk_paths': [{'path': path, 'free_gb': 80}, {'path': path + '/.local/tmp', 'free_gb': 80}],
+                                   'disk_aliases': {n: path for n in names}, 'disk_task_ids': []}}
+
+
+def test_heartbeat_with_routes_never_exceeds_the_hub_body_limit(tmp_path):
+    """Review 91bf3c43 / 4224a469: neither the list nor the overflow fallback may push a heartbeat past 32 KiB."""
     import json
     from agent_hub_host import fleet
     d = _dispatcher(fleet, tmp_path)
+    size = lambda hb: len(json.dumps(hb).encode('utf-8'))
+    assert fleet.HEARTBEAT_BODY_LIMIT == 32768
     long = lambda p, i: (p + str(i)).ljust(64, 'x')
-    d.settings['subscriptions'] = [{'service': 'codex', 'account_label': long('a', i), 'engine': 'codex', 'profile': long('p', i)} for i in range(128)]
-    path = '/' + '/'.join(['d' * 199, 'e' * 199])
-    telemetry = {'type': 'heartbeat', 'launcher_resources': {'workspaces': {f'ws-{i}': path for i in range(24)},
-                                                             'disk_paths': [path, path]}}
-    without = len(json.dumps(telemetry).encode())
-    hb = d.attach_route_advertisement(dict(telemetry))
-    assert hb['fleet_routes_overflow'] == 128 and 'fleet_routes' not in hb
-    assert len(json.dumps(hb).encode()) < 32768 and len(json.dumps(hb).encode()) - without < 64
-    # The same 128 long routes with ordinary telemetry fit, complete.
+    long_routes = [{'service': 'codex', 'account_label': long('a', i), 'engine': 'codex', 'profile': long('p', i)} for i in range(128)]
+
+    # Reviewer's exact case: 32,750-byte telemetry, one short route. Neither the
+    # list nor the overflow marker fits, so the heartbeat is sent unchanged.
+    base = _telemetry()
+    assert size(base) == 32750
+    d.settings['subscriptions'] = [{'service': 'codex', 'account_label': 'a', 'engine': 'codex', 'profile': None}]
+    hb = d.attach_route_advertisement(json.loads(json.dumps(base)))
+    assert hb == base and size(hb) <= 32768
+
+    # Near-limit telemetry with 128 long routes: the list does not fit, the overflow marker does.
+    base = _telemetry(aliases=60)
+    assert 32768 - 64 > size(base) > 32768 - 29000
+    d.settings['subscriptions'] = long_routes
+    hb = d.attach_route_advertisement(json.loads(json.dumps(base)))
+    assert hb == {**base, 'fleet_routes_overflow': 128} and size(hb) <= 32768
+
+    # Already-oversized telemetry: never grows.
+    base = _telemetry(aliases=64, path_len=600)
+    assert size(base) > 32768
+    hb = d.attach_route_advertisement(json.loads(json.dumps(base)))
+    assert hb == base
+
+    # Ordinary telemetry: the complete 128-route list fits.
     small = d.attach_route_advertisement({'type': 'heartbeat'})
-    assert len(small['fleet_routes']) == 128 and len(json.dumps(small).encode()) <= fleet.HEARTBEAT_ROUTE_BODY_LIMIT < 32768
+    assert len(small['fleet_routes']) == 128 and size(small) <= 32768
+
+    # Every fallback step keeps the body bounded for any supported telemetry size that fit before.
+    for aliases in range(1, 65, 3):
+        base = _telemetry(aliases=aliases)
+        for subs in (long_routes, _subs(129), _subs(3)):
+            d.settings['subscriptions'] = subs
+            hb = d.attach_route_advertisement(json.loads(json.dumps(base)))
+            assert size(hb) <= max(32768, size(base))
+            assert ('fleet_routes' in hb) + ('fleet_routes_overflow' in hb) <= 1
+            if 'fleet_routes' in hb:
+                assert len(hb['fleet_routes']) == len({(x['engine'], x['account_label'], x['profile']) for x in subs})

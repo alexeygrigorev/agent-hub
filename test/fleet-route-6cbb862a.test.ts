@@ -38,6 +38,7 @@ async function fleet(fn: (service: FleetService, sql: any) => Promise<void>) {
     await fn(service, sql);
   });
 }
+const SHARED = { engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex' };
 const HB = { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } };
 // Latest heartbeat as the registry stores it: fleet_routes plus its own freshness.
 const advertise = (sql: any, routes: any[] | undefined, at = iso()) =>
@@ -71,7 +72,13 @@ describe('placement offers only host-advertised routes (6cbb862a AC a)', () => {
     advertise(sql, [{ engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex' }], iso(-181000));
     const plan: any = s.plan(intent({ account: 'shared-codex' }));
     expect(plan.selected).toBeFalsy();
-    expect(plan.rejected).toEqual([{ machine: 'tabo', engine: 'codex', reason: 'route_not_advertised', account: 'shared-codex', profile: 'hub-shared-codex' }]);
+    // Explicit fail-closed state, e.g. a host whose telemetry left no room for the list (review 4224a469).
+    expect(plan.rejected).toEqual([{ machine: 'tabo', engine: 'codex', reason: 'route_advertisement_stale', account: 'shared-codex', profile: 'hub-shared-codex', advertised_at: iso(-181000) }]);
+    expect(isCapacityOnlyHold(plan.rejected)).toBe(true);
+    // Stale evidence never falls back to fresh runners or the registry.
+    sql.exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', 'tabo', '[]', 6, iso(),
+      JSON.stringify([{ ...SHARED, model: 'm', effort: 'high' }]));
+    expect((s.plan(intent({ account: 'shared-codex' })) as any).rejected[0].reason).toBe('route_advertisement_stale');
   }));
 
   it('judges pre-release hosts only by fresh exact runner tuples, holding unknown routes', async () => fleet(async (s, sql) => {
@@ -127,7 +134,6 @@ describe('heartbeat route advertisement storage (6cbb862a AC a)', () => {
 // Review 89766b23: the host config supports 128 routes, so an advertisement is
 // never truncated; past the cap the host sends an explicit overflow count.
 const fillers = (n: number) => Array.from({ length: n }, (_, i) => ({ engine: 'codex', account: `filler-${i}`, profile: `hub-filler-${i}` }));
-const SHARED = { engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex' };
 
 describe('route advertisement size bound (6cbb862a review)', () => {
   it('stores 64, 65 and 128 advertised routes completely and drops an oversize list', async () => {
@@ -203,7 +209,7 @@ describe('route advertisement size bound (6cbb862a review)', () => {
 });
 
 describe('route advertisement over HTTP (6cbb862a review)', () => {
-  it('accepts a complete 128-route heartbeat within the host byte budget and rejects bodies over 32 KiB', async () => {
+  it('accepts a complete 128-route heartbeat and the near-limit overflow fallback, and rejects bodies over 32 KiB', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-http-' + crypto.randomUUID()));
     const adminSecret = 'local-test-only-admin-sign-in';
@@ -224,7 +230,7 @@ describe('route advertisement over HTTP (6cbb862a review)', () => {
     const long = (p: string, i: number) => (p + i).padEnd(64, 'x');
     const routes = Array.from({ length: 128 }, (_, i) => ({ engine: 'codex', account: long('a', i), profile: long('p', i) }));
     const body = JSON.stringify({ type: 'heartbeat', at: iso(), mem_avail_mb: 32000, fleet_routes: routes });
-    expect(body.length).toBeLessThanOrEqual(30 * 1024); // the host's HEARTBEAT_ROUTE_BODY_LIMIT
+    expect(body.length).toBeLessThanOrEqual(32768); // the host's HEARTBEAT_BODY_LIMIT
     expect((await call('/api/host/poll', body, tokens.access_token)).status).toBe(200);
     await runInDurableObject(stub, async (hub: Hub) => {
       const hb = JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', approved.machine_id).toArray()[0] as any).last_heartbeat));
@@ -232,6 +238,25 @@ describe('route advertisement over HTTP (6cbb862a review)', () => {
     });
     const oversize = JSON.stringify({ type: 'heartbeat', at: iso(), fleet_routes: routes, pad: 'x'.repeat(32768 - body.length + 64) });
     expect((await call('/api/host/poll', oversize, tokens.access_token)).status).not.toBe(200);
+    // Review 4224a469: the host's overflow fallback for near-limit launcher
+    // telemetry (64 disk aliases to a 476-character path) is delivered and
+    // stored with the telemetry intact.
+    const path = '/' + ['d'.repeat(159), 'e'.repeat(159), 'f'.repeat(155)].join('/');
+    const aliases: Record<string, string> = {};
+    for (let i = 0; i < 63; i++) aliases[(i ? 'ws-' + String(i).padStart(2, '0') : 'ws-00' + 'x'.repeat(32))] = path;
+    const telemetry = { type: 'heartbeat', mem_avail_mb: 32000, disk_free_gb: 80, load: [1, 1, 1], gate: { launch_allowed: true, at: iso() },
+      launcher_resources: { active_mem_mb: 0, observed_at: iso(), active_disk_mb: 0, disk_floor_mb: 20480, next_disk_mb: 512,
+        disk_paths: [{ path, free_gb: 80 }, { path: path + '/.local/tmp', free_gb: 80 }], disk_aliases: aliases, disk_task_ids: [] } };
+    const overflow = JSON.stringify({ ...telemetry, fleet_routes_overflow: 128 });
+    expect(overflow.length).toBeGreaterThan(32768 - 1024);
+    expect(overflow.length).toBeLessThanOrEqual(32768);
+    expect((await call('/api/host/poll', overflow, tokens.access_token)).status).toBe(200);
+    await runInDurableObject(stub, async (hub: Hub) => {
+      const hb = JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', approved.machine_id).toArray()[0] as any).last_heartbeat));
+      expect(hb.fleet_routes_overflow).toBe(128);
+      expect(hb.fleet_routes).toBeUndefined();
+      expect(Object.keys(hb.launcher_resources?.disk_aliases ?? {})).toHaveLength(63);
+    });
   });
 });
 
