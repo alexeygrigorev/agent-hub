@@ -37,6 +37,9 @@ async function safeJson(req: Request): Promise<any> {
 }
 
 const ROUTE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// Routes one heartbeat may advertise; equals MAX_ADVERTISED_ROUTES in
+// host/agent_hub_host/fleet.py and the per-machine subscription limit.
+export const MAX_ADVERTISED_ROUTES = 128;
 function sanitizeHeartbeat(body: any) {
   if (!body || body.type !== 'heartbeat') return null;
   const hb: any = { type: 'heartbeat' };
@@ -83,8 +86,12 @@ function sanitizeHeartbeat(body: any) {
     hb.running_jobs = body.running_jobs.filter((j: any) => typeof j === 'string' && j.length <= 128).slice(0, 50);
   }
   // Executable routes the host's dispatcher accepts (intake 6cbb862a). Bounded
-  // label tuples only; a malformed list is dropped, never partially kept.
-  if (Array.isArray(body.fleet_routes) && body.fleet_routes.length <= 64 && body.fleet_routes.every((r: any) =>
+  // label tuples only; a malformed list is dropped, never partially kept. A
+  // host with more routes sends fleet_routes_overflow instead of a truncated
+  // list, which clears the advertisement (no route evidence).
+  if (Number.isInteger(body.fleet_routes_overflow) && body.fleet_routes_overflow > MAX_ADVERTISED_ROUTES && body.fleet_routes_overflow <= 100000) {
+    hb.fleet_routes_overflow = body.fleet_routes_overflow;
+  } else if (Array.isArray(body.fleet_routes) && body.fleet_routes.length <= MAX_ADVERTISED_ROUTES && body.fleet_routes.every((r: any) =>
       r && typeof r === 'object' && typeof r.engine === 'string' && ROUTE_LABEL.test(r.engine)
       && typeof r.account === 'string' && ROUTE_LABEL.test(r.account)
       && (r.profile === null || r.profile === undefined || (typeof r.profile === 'string' && ROUTE_LABEL.test(r.profile))))) {
@@ -110,7 +117,8 @@ function getFingerprint(hb: any): string {
     launcher_resources: hb.launcher_resources,
     running_jobs: hb.running_jobs,
     sessions_summary: hb.sessions_summary,
-    fleet_routes: hb.fleet_routes
+    fleet_routes: hb.fleet_routes,
+    fleet_routes_overflow: hb.fleet_routes_overflow
   });
 }
 
@@ -164,7 +172,7 @@ export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStor
   // newer than it is.
   const advertisedNow = !!hb.fleet_routes;
   if (advertisedNow) hb.fleet_routes_at = new Date(now).toISOString();
-  else {
+  else if (!hb.fleet_routes_overflow) {
     let previous: any = st?.hb;
     if (!previous) {
       try { previous = JSON.parse(String((sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machineId).toArray()[0] as any)?.last_heartbeat ?? 'null')); } catch { previous = null; }

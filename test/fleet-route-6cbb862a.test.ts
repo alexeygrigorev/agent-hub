@@ -5,7 +5,7 @@ import { freshCpu } from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService, advertisedRoutes, hostAdvertisesRoute, isCapacityOnlyHold } from '../src/fleet';
-import { updateHeartbeat } from '../src/registry';
+import { MAX_ADVERTISED_ROUTES, updateHeartbeat } from '../src/registry';
 import { SessionControlService } from '../src/session_control';
 import { seedFixtureIntake } from './tbm-fixture';
 import type { Hub } from '../src/hub';
@@ -122,6 +122,63 @@ describe('heartbeat route advertisement storage (6cbb862a AC a)', () => {
       expect(stored().fleet_routes).toEqual([{ engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' }]);
     });
   });
+});
+
+// Review 89766b23: the host config supports 128 routes, so an advertisement is
+// never truncated; past the cap the host sends an explicit overflow count.
+const fillers = (n: number) => Array.from({ length: n }, (_, i) => ({ engine: 'codex', account: `filler-${i}`, profile: `hub-filler-${i}` }));
+const SHARED = { engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex' };
+
+describe('route advertisement size bound (6cbb862a review)', () => {
+  it('stores 64, 65 and 128 advertised routes completely and drops an oversize list', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-size-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (hub: Hub) => {
+      const id = 'm-' + crypto.randomUUID().slice(0, 8);
+      hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', id, id, id, iso());
+      const stored = () => JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', id).toArray()[0] as any).last_heartbeat));
+      expect(MAX_ADVERTISED_ROUTES).toBe(128);
+      for (const n of [64, 65, 128]) {
+        const routes = [...fillers(n - 1), SHARED];
+        updateHeartbeat(id, { type: 'heartbeat', fleet_routes: routes }, hub.sql);
+        expect(stored().fleet_routes).toEqual(routes);
+      }
+      updateHeartbeat(id, { type: 'heartbeat', fleet_routes: [...fillers(128), SHARED] }, hub.sql);
+      expect(stored().fleet_routes).toHaveLength(128); // oversize list dropped whole, never truncated
+      expect(stored().fleet_routes_overflow).toBeUndefined();
+    });
+  });
+
+  it('clears the advertisement on an explicit overflow instead of holding valid routes', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-overflow-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (hub: Hub) => {
+      const id = 'm-' + crypto.randomUUID().slice(0, 8);
+      hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', id, id, id, iso());
+      const stored = () => JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', id).toArray()[0] as any).last_heartbeat));
+      updateHeartbeat(id, { type: 'heartbeat', fleet_routes: [SHARED] }, hub.sql);
+      updateHeartbeat(id, { type: 'heartbeat', fleet_routes_overflow: 129 }, hub.sql);
+      const hb = stored();
+      expect(hb.fleet_routes_overflow).toBe(129);
+      expect(hb.fleet_routes).toBeUndefined();
+      expect(hb.fleet_routes_at).toBeUndefined();
+      expect(advertisedRoutes(hb, null, now)).toBeNull(); // no route evidence: registry placement
+    });
+  });
+
+  for (const n of [64, 65, 128]) {
+    it(`places the last of ${n} advertised routes`, async () => fleet(async (s, sql) => {
+      advertise(sql, [...fillers(n - 1), SHARED]);
+      expect((s.plan(intent({ account: 'shared-codex' })) as any).selected?.account).toBe('shared-codex');
+    }));
+  }
+
+  it('places a host that reports overflow by registry routes, not route_not_advertised', async () => fleet(async (s, sql) => {
+    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'tabo'", JSON.stringify({ ...HB, cpu_usage: freshCpu(iso()), fleet_routes_overflow: 129 }));
+    const plan: any = s.plan(intent({ account: 'shared-codex' }));
+    expect(plan.selected?.account).toBe('shared-codex');
+    expect(plan.rejected.filter((r: any) => r.reason === 'route_not_advertised')).toEqual([]);
+  }));
 });
 
 describe('sessions show names the offered route on dispatch errors (6cbb862a AC c)', () => {

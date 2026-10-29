@@ -530,6 +530,11 @@ def normalize_git_identity(conf) -> dict[str, str]:
     return res
 
 
+# Routes one heartbeat may advertise; must equal MAX_ADVERTISED_ROUTES in
+# src/registry.ts. Matches Hub's per-machine subscription limit (128).
+MAX_ADVERTISED_ROUTES = 128
+
+
 def load_settings(path=None):
     """Explicit non-secret machine configuration, including several accounts per service."""
     default_path = path is None
@@ -2323,10 +2328,20 @@ class Dispatcher:
         Hub offers only these while the advertisement is fresh, so a route the
         host dropped (e.g. a failed managed install) holds with
         route_not_advertised instead of failing dispatch_route_unconfigured on
-        the host (intake 6cbb862a).
+        the host (intake 6cbb862a). Never truncated: a list that would not fit
+        MAX_ADVERTISED_ROUTES is replaced by an explicit overflow count, and
+        Hub then treats the host as unadvertised rather than holding valid
+        routes.
         """
-        return [{'engine': s.get('engine', s['service']), 'account': s['account_label'], 'profile': s.get('profile')}
-                for s in self.settings['subscriptions']][:64]
+        routes, seen = [], set()
+        for s in self.settings['subscriptions']:
+            route = (s.get('engine', s['service']), s['account_label'], s.get('profile'))
+            if route not in seen:
+                seen.add(route)
+                routes.append({'engine': route[0], 'account': route[1], 'profile': route[2]})
+        if len(routes) > MAX_ADVERTISED_ROUTES:
+            return {'fleet_routes_overflow': len(routes)}
+        return {'fleet_routes': routes}
 
     def goal_routes(self):
         """Advertise executable local routes, independent of quota admission."""
@@ -3597,7 +3612,7 @@ class Dispatcher:
         except Exception:
             fresh_hb = hb
         try:
-            fresh_hb['fleet_routes'] = self.route_advertisement()
+            fresh_hb.update(self.route_advertisement())
             self.request('POST', '/api/host/poll', fresh_hb)
         except Exception:
             pass
@@ -3886,7 +3901,7 @@ class Dispatcher:
             {'launch_allowed': allowed,
              'reason': 'fleet local admission' if allowed else 'fleet admission unavailable',
              'at': utcnow()}, self.settings)
-        hb['fleet_routes'] = self.route_advertisement()
+        hb.update(self.route_advertisement())
         self.request('POST', '/api/host/poll', hb)
         self._last_hb = hb
         return hb
@@ -3933,7 +3948,7 @@ class Dispatcher:
         for key in ('gate', 'launcher_resources'):
             if key in latest:
                 hb[key] = latest[key]
-        hb['fleet_routes'] = self.route_advertisement()
+        hb.update(self.route_advertisement())
         self.request('POST', '/api/host/poll', hb)
         caps = self.capabilities_put_payload()
         if caps is not None:
@@ -4118,7 +4133,7 @@ class Dispatcher:
                               'error': _sanitized_transport_error(exc)}), flush=True)
         _mark('register')
         hb['gate'] = allowed_gate
-        hb['fleet_routes'] = self.route_advertisement()
+        hb.update(self.route_advertisement())
         self.request('POST', '/api/host/poll', hb)
         _mark('heartbeat')
         for engine in sorted(admitted_engines):
