@@ -1,0 +1,48 @@
+# irm https://hub.dtcdev.click/cli/host-install.ps1 | iex
+# Per-user only: no RunAs, machine PATH, MSI or elevated scheduled task.
+$ErrorActionPreference = 'Stop'
+$Base = if ($env:HUB_BASE_URL) { $env:HUB_BASE_URL.TrimEnd('/') } else { 'https://hub.dtcdev.click' }
+$Root = Join-Path $env:LOCALAPPDATA 'Programs\agent-hub'
+$Bin = Join-Path $Root 'bin'
+$TempRoot = Join-Path $Root 'tmp'
+New-Item -ItemType Directory -Force -Path $Bin,$TempRoot | Out-Null
+$Work = Join-Path $TempRoot ([guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $Work | Out-Null
+try {
+    $Uv = Join-Path $Bin 'uv.exe'
+    if (-not (Test-Path -LiteralPath $Uv)) {
+        $OldUvInstall = $env:UV_UNMANAGED_INSTALL
+        try {
+            $env:UV_UNMANAGED_INSTALL = $Bin
+            Invoke-RestMethod 'https://astral.sh/uv/0.13.6/install.ps1' | Invoke-Expression
+        } finally { $env:UV_UNMANAGED_INSTALL = $OldUvInstall }
+    }
+    $env:PATH = "$Bin;$env:PATH"
+    $env:UV_PYTHON_INSTALL_DIR = Join-Path $Root 'python'
+    $env:UV_CACHE_DIR = Join-Path $Root 'cache\uv'
+    $env:TMP = $TempRoot
+    $env:TEMP = $TempRoot
+    $Archive = Join-Path $Work 'hub.pyz'
+    Invoke-WebRequest "$Base/cli/hub.pyz" -OutFile $Archive -UseBasicParsing
+    Invoke-WebRequest "$Base/cli/hub.pyz.sha256" -OutFile "$Archive.sha256" -UseBasicParsing
+    $Expected = ((Get-Content "$Archive.sha256" -Raw).Trim() -split '\s+')[0]
+    if ((Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Expected.ToLowerInvariant()) {
+        throw 'Hub download checksum mismatch'
+    }
+    # x64 Python runs under WoA emulation when native client wheels are absent;
+    # native Node/agent binaries still use the actual ARM64 host architecture.
+    $Python = 'cpython-3.12-windows-x86_64'
+    # A file avoids Windows PowerShell 5.1 removing embedded quotes while
+    # passing a Python -c expression through its native argument marshaler.
+    $Entry = Join-Path $Work 'bootstrap.py'
+    @'
+import sys
+sys.path.insert(0, sys.argv[1])
+from agent_hub_host.bootstrap import main
+main(['--archive', sys.argv[1], '--base-url', sys.argv[2], '--uv', sys.argv[3]])
+'@ | Set-Content -LiteralPath $Entry -Encoding UTF8
+    & $Uv run --no-project --python $Python python $Entry $Archive $Base $Uv
+    if ($LASTEXITCODE -ne 0) { throw 'Hub host setup did not complete; rerun the same command to resume.' }
+} finally {
+    Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+}
