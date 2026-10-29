@@ -1,5 +1,6 @@
 """Exercise the real ops shell controller with isolated runtime/OS adapters."""
 import json
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -54,7 +55,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.bin = self.home / 'bin'
         self.bin.mkdir()
-        for cmd in ('a', 'git', 'gh', 'sleep', 'systemd-run', 'hub'):
+        for cmd in ('a', 'git', 'gh', 'sleep', 'systemd-run', 'systemctl', 'hub'):
             file = self.bin / cmd
             file.write_text(ADAPTER)
             file.chmod(0o755)
@@ -178,6 +179,38 @@ class OpsWatchdogTest(unittest.TestCase):
         _, path = due.read_text().split()
         due.write_text(f'{int(time.time()) - 1} {path}\n')
 
+    def timer_delays(self, kind):
+        out = []
+        for line in self.calls().splitlines():
+            if line.startswith('systemd-run') and f'--unit ops-{kind}-orchestrator-' in line:
+                self.assertIn('--timer-property=AccuracySec=1s', line)
+                self.assertIn('flock -w 900', line)  # waits for a running watchdog instead of skipping
+                out.append(int(re.search(r'--on-active=(\d+)', line).group(1)))
+        return out
+
+    def test_tick_after_proof_deadline_is_a_failed_recovery(self):
+        self.data['sessions'] = [self.session()]
+        self.run_ctl()
+        start = int((self.state / 'last_start').read_text())
+        self.tick(after_start=700)  # first tick 100s after the 600s window
+        result = self.run_ctl()
+        self.assertIn('recovery proof FAILED (path 1): first tick 700s after start', result.stdout)
+        self.assertNotIn('recovery proven', result.stdout)
+        self.assertEqual((self.state / 'restart_failures').read_text().strip(), '1')
+        self.assertEqual(len(self.starts()), 1)  # a ticking session is not restarted again
+        self.assertIn('--state proof_failed --recovery-failures 1', self.calls())
+
+    def test_deadline_timer_bounds_detection_to_thirty_minutes(self):
+        self.data['sessions'] = [{**self.session(True, os.getpid()), 'id': 'live'}]
+        self.data['kill_ok'] = True
+        self.tick(age=29 * 60)
+        self.assertIn('OK session=live', self.run_ctl().stdout)
+        delays = self.timer_delays('deadline')
+        self.assertTrue(55 <= delays[-1] <= 60, delays)  # re-check exactly when the tick turns 30 min old
+        self.assertIn("systemctl --user stop ops-deadline-orchestrator-*.timer", self.calls())  # one pending deadline
+        self.tick(age=30 * 60)  # exactly 1800s is a stall
+        self.assertIn('STALLED session=live: no tick for 1800s', self.run_ctl().stdout)
+
     def starts(self):
         return [line for line in self.calls().splitlines() if line.startswith('a start')]
 
@@ -205,7 +238,10 @@ class OpsWatchdogTest(unittest.TestCase):
     def test_restart_proven_by_fresh_tick_within_window(self):
         self.data['sessions'] = [self.session()]
         self.run_ctl()
-        self.assertIn('--on-active=630', self.calls())  # exact-time proof check is armed
+        # exact-time proof check: due = recorded start + 600s, 1s timer accuracy
+        delays = self.timer_delays('proof')
+        self.assertEqual(len(delays), 1)
+        self.assertTrue(590 <= delays[0] <= 601, delays)
         result = self.run_ctl()
         self.assertIn('recovery pending proof: session=new', result.stdout)
         self.assertEqual(len(self.starts()), 1)  # no second restart inside the window

@@ -38,8 +38,8 @@ Source: clone of `alexeygrigorev/bot-skills` at `~/git/bot-skills-ops` (note: `~
 **`/loop` inside the interactive session is the scheduler.** There is no external cron that re-prompts or does work. `ops-watchdog.timer` (user, every 10 min) -> `ops-watchdog.service` -> `flock -n` + `timeout 900` + `nice -n 10` + `ionice -c3` -> `watchdog.sh` -> `session-ctl.sh <role> check`.
 
 For the orchestrator a live process is not enough. `check`:
-- restarts when the session is dead, or when it is alive but `~/tmp/agent-reports/orchestrator-ticks.jsonl` has not changed for 30 min (`MAX_TICK_AGE`);
-- proves every restart: the new session must append a tick within 10 min (`PROOF_WINDOW`). A transient `systemd-run --on-active` timer re-runs the watchdog right after the window. Inside the window it neither restarts again nor reports OK;
+- restarts when the session is dead, or when it is alive but `~/tmp/agent-reports/orchestrator-ticks.jsonl` has not changed for 30 min (`MAX_TICK_AGE`). Every OK run arms a 1s-accurate transient deadline timer for the moment the newest tick turns 30 min old, so detection does not wait for the 10-min timer;
+- proves every restart: the new session must append a tick within 10 min of the recorded start (`PROOF_WINDOW`). A transient timer re-runs the watchdog right after the deadline. Inside the window it neither restarts again nor reports OK. A first tick after the deadline counts as a failed recovery, but a ticking session is not restarted;
 - if the proof fails, it starts recovery path 2: a new session on `ORCH_FALLBACK_ENGINE` (default `sonnet`) with a fresh handoff, again with a 10-min proof. Paths then alternate;
 - counts consecutive failed recoveries (failed restart or failed proof). Only at 2 does it alert: `NEEDS_ALEXEY.md`, the oncall inbox, and Hub (below). A proven recovery resets the count;
 - reports each run to Hub: `hub ops heartbeat --kind watchdog --state <ok|recovering|proof_pending|proof_failed|...> --recovery-failures N --tick-at <tick log time>`. A failed report never changes the local decision.

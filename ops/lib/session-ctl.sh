@@ -38,16 +38,27 @@ hub_report() {  # $1 = state
   T=30 t hub "${args[@]}" >/dev/null 2>&1 || log "hub ops report failed (state=$1)"
 }
 
-# After a restart the new session must append a tick within PROOF_WINDOW. A transient
-# timer re-runs the watchdog right after the window, so the proof does not wait for the
-# next 10-minute slot.
+# Exact-time watchdog runs: the 10-min timer alone would bound detection at ~41 min.
+# Each transient timer re-runs watchdog.sh under the same lock (waiting, not skipping),
+# so a deadline that falls during another run is still checked right after it.
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
+arm_timer() {  # $1 = kind (deadline|proof), $2 = seconds from now
+  [ "${OPS_TIMERS:-1}" = 1 ] || return 0
+  local unit="ops-$1-$ROLE" delay="$2"; [ "$delay" -lt 1 ] && delay=1
+  systemctl --user stop "$unit-*.timer" >/dev/null 2>&1 || true
+  systemd-run --user --collect -q --on-active="$delay" --timer-property=AccuracySec=1s --unit "$unit-$(date +%s%N)" \
+    --setenv=PATH="$PATH" --setenv=HUB_CONFIG_FILE="${HUB_CONFIG_FILE:-}" --setenv=APLEXER_LAUNCH_SYSTEM_SCOPE=system \
+    /usr/bin/flock -w 900 -o "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ops-watchdog-v2.lock" /usr/bin/timeout 900 "$SELF_DIR/watchdog.sh" \
+    >/dev/null 2>&1 || log "$1 timer not armed; the 10-min timer will check"
+}
+
+# After a restart the new session must append a tick within PROOF_WINDOW of the recorded
+# start (last_start is written before launch and prompt readiness, so the wait counts).
 arm_proof() {  # $1 = recovery path (1 = restart, 2 = new session on the fallback engine)
   [ "$ROLE" = orchestrator ] || return 0
-  echo "$(( $(date +%s) + PROOF_WINDOW )) $1" > "$STATE/proof_due"
-  if [ "${OPS_PROOF_TIMER:-1}" = 1 ]; then
-    systemd-run --user --collect -q --on-active="$((PROOF_WINDOW + 30))" --unit "ops-proof-$ROLE-$(date +%s)" \
-      /usr/bin/systemctl --user start ops-watchdog.service >/dev/null 2>&1 || log "proof timer not armed; the 10-min timer will check"
-  fi
+  local started due; started=$(cat "$STATE/last_start" 2>/dev/null || date +%s); due=$((started + PROOF_WINDOW))
+  echo "$due $1" > "$STATE/proof_due"
+  arm_timer proof "$((due - $(date +%s) + 1))"
   log "recovery path $1 started; proof due: fresh tick within ${PROOF_WINDOW}s"
 }
 
@@ -209,17 +220,25 @@ recover() {  # $1 = path, $2 = reason
   [ "$rc" = 0 ] || restart_failed restart_failed
 }
 
-# Returns 0 when no proof is pending or it just passed; 2 while still inside the window;
+# Returns 0 when no proof is pending or it just passed; 2 while still inside the window or
+# after a late tick (counted, no restart);
 # 1 after handling a failed proof (next recovery path started).
 check_proof() {
   [ -f "$STATE/proof_due" ] || return 0
   local due path now ls_ts tk; read -r due path < "$STATE/proof_due"; now=$(date +%s)
   ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0); tk=$(tick_mtime)
-  if [ "$tk" -gt "$ls_ts" ]; then
+  if [ "$tk" -gt "$ls_ts" ] && [ "$tk" -le "${due:-0}" ]; then
     rm -f "$STATE/proof_due"; echo 0 > "$STATE/restart_failures"
     log "recovery proven: fresh tick $((tk-ls_ts))s after start (path ${path:-1})"; return 0
   fi
   local id; id=$(find_session) || id=""
+  if [ "$tk" -gt "${due:-0}" ]; then
+    # Ticking now, but not within the window: the recovery failed its proof. Count it;
+    # a session that is ticking is not restarted again.
+    rm -f "$STATE/proof_due"
+    log "recovery proof FAILED (path ${path:-1}): first tick $((tk-ls_ts))s after start, window ${PROOF_WINDOW}s; session is ticking now"
+    restart_failed proof_failed; return 2
+  fi
   if [ "$now" -lt "${due:-0}" ] && [ -n "$id" ]; then log "recovery pending proof: session=$id, $((due-now))s left"; hub_report proof_pending; return 2; fi
   rm -f "$STATE/proof_due"
   log "recovery proof FAILED (path ${path:-1}): no tick ${PROOF_WINDOW}s after start${id:+ (session $id alive)}"
@@ -242,10 +261,11 @@ check() {
     # (grace = MAX_TICK_AGE after a start)
     local now ls_ts tk; now=$(date +%s); ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
     tk=$(tick_mtime); [ "$tk" -lt "$ls_ts" ] && tk=$ls_ts
-    if [ $((now-tk)) -gt "$MAX_TICK_AGE" ]; then
+    if [ $((now-tk)) -ge "$MAX_TICK_AGE" ]; then
       log "STALLED session=$id: no tick for $((now-tk))s"
       recover 1 "no tick for $((now-tk))s (stalled)"; return
     fi
+    arm_timer deadline "$((tk + MAX_TICK_AGE - now))"
   fi
   if [ -n "$id" ]; then
     echo 0 > "$STATE/restart_failures"

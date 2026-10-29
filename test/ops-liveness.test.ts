@@ -22,13 +22,25 @@ function intake(h: Hub, id: string, ac = 'Do the thing', status = 'open', projec
   h.sql.exec('INSERT OR REPLACE INTO intake_task_projection(id,data,links) VALUES(?,?,?)', id, JSON.stringify(data), '[]');
   return data;
 }
-function session(h: Hub, id: string, taskId: string, state: string) {
-  h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at,machine_id)
-    VALUES(?,'admin',?,?,'claude','interactive',?,?,?,'hetzner')`, id, id, JSON.stringify({ intake_task_id: taskId }), state, isoAt(NOW), isoAt(NOW));
+function session(h: Hub, id: string, taskId: string, state: string, at = NOW, native: string | null = null) {
+  h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at,machine_id,binding_json)
+    VALUES(?,'admin',?,?,'claude','interactive',?,?,?,'hetzner',?)`, id, id, JSON.stringify({ intake_task_id: taskId }), state, isoAt(at), isoAt(at),
+    native ? JSON.stringify({ native_id: native }) : null);
+}
+/** Host census observing a live native session now. */
+function observe(h: Hub, native: string, at: number) {
+  h.sql.exec("INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('hetzner',?,?,'running',?,'demo')", native, native, isoAt(at));
+  h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('hetzner',?)", isoAt(at));
 }
 function service(h: Hub, clock: { t: number }, hooks: any = {}) {
-  const alerts: [string, string | null][] = [];
-  const s = new OpsLiveness(h.sql, { alert: async (subject: string, detail: string | null) => { alerts.push([subject, detail]); return true; }, ...hooks }, () => clock.t);
+  // Mirrors LivenessService.setAlert: record only open/resolve transitions per subject.
+  const alerts: [string, string | null][] = [], current = new Map<string, boolean>();
+  h.sql.exec('DELETE FROM ops_liveness_meta');  // the Hub constructor seeded it with the real clock
+  const s = new OpsLiveness(h.sql, { alert: async (subject: string, detail: string | null) => {
+    const opened = detail !== null;
+    if ((current.get(subject) ?? false) === opened) return false;
+    current.set(subject, opened); alerts.push([subject, detail]); return opened;
+  }, ...hooks }, () => clock.t);
   s.init();
   return { s, alerts, open: () => alerts.filter(([, d]) => d !== null) };
 }
@@ -45,7 +57,7 @@ describe('ops liveness (intake 500fd60b)', () => {
     expect(s.record({ role: 'orchestrator', kind: 'watchdog', token: 'x' })).toEqual({ error: 'invalid_ops_heartbeat' });
     expect(s.record({ role: 'orchestrator', kind: 'watchdog', tick_at: isoAt(NOW + 3600000) })).toEqual({ error: 'invalid_tick_at' });
     expect(s.record({ role: 'orchestrator', kind: 'tick', summary: 'bad\nline' })).toEqual({ error: 'invalid_summary' });
-    expect(s.status().roles.orchestrator).toMatchObject({ state: 'watchdog_stale', tick_age_s: 0, tick_summary: 'tick 1' });
+    expect(s.status().roles.orchestrator).toMatchObject({ state: 'ok', tick_age_s: 0, tick_summary: 'tick 1', watchdog_at: null });
     expect(s.status().roles.oncall).toMatchObject({ state: 'never_reported' });
   }));
 
@@ -74,6 +86,26 @@ describe('ops liveness (intake 500fd60b)', () => {
     expect(alerts.at(-1)).toEqual(['ops-orchestrator', null]);
   }));
 
+  it('an expected orchestrator that never reports alerts after two windows', () => fixture(async (h, clock) => {
+    const { s, open } = service(h, clock);
+    await s.tick();
+    expect(s.status().roles.orchestrator.state).toBe('never_reported_ok');
+    await tick(s, clock, 31);
+    expect(s.status().roles.orchestrator.state).toBe('never_reported_tick_and_watchdog_stale');
+    expect(open()).toEqual([]);
+    await tick(s, clock, 30);
+    expect(open()).toHaveLength(1);
+    expect(open()[0][1]).toContain('ops-watchdog never reported for 3660s');
+  }));
+
+  it('tick-only reports (watchdog never installed) still alert after two windows', () => fixture(async (h, clock) => {
+    const { s, open } = service(h, clock);
+    for (let i = 0; i < 8; i++) { s.record({ role: 'orchestrator', kind: 'tick' }); await tick(s, clock, 10); }
+    expect(s.status().roles.orchestrator).toMatchObject({ state: 'watchdog_stale', watchdog_at: null });
+    expect(open()).toHaveLength(1);
+    expect(open()[0][1]).toContain('ops-watchdog never reported');
+  }));
+
   it('detects a dead watchdog independently and alerts after two missed windows', () => fixture(async (h, clock) => {
     const { s, open } = service(h, clock);
     s.record({ role: 'orchestrator', kind: 'watchdog', state: 'ok' });
@@ -97,26 +129,43 @@ describe('ops liveness (intake 500fd60b)', () => {
     expect((await tick(s, clock, 29)).idle.state).toBe('idle');
     expect(kicks).toHaveLength(0);
     expect((await tick(s, clock, 1)).idle).toMatchObject({ state: 'kicked', failed_kicks: 0 });
-    expect(kicks[0]).toMatchObject({ open_with_ac: 1, active_sessions: 0, orchestrator: 'tick_stale', queue_holds: { watchdog_project_not_enabled: 640 } });
+    expect(kicks[0]).toMatchObject({ open_with_ac: 1, active_sessions: 0, orchestrator: expect.any(String), orchestrator_tick_age_s: null, queue_holds: { watchdog_project_not_enabled: 640 } });
     const idle = s.status().idle;
-    expect(idle).toMatchObject({ kicks: 1, idle_for_s: 1800, why_idle: { orchestrator: 'tick_stale' }, last_kick: { task_id: 'with-ac' } });
+    expect(idle).toMatchObject({ kicks: 1, idle_for_s: 1800, why_idle: { orchestrator_tick_age_s: null }, last_kick: { task_id: 'with-ac' } });
     expect((await tick(s, clock, 30)).idle).toMatchObject({ state: 'kicked', failed_kicks: 1 });
     expect(open()).toEqual([]);
     expect((await tick(s, clock, 30)).idle).toMatchObject({ state: 'kicked', failed_kicks: 2 });
     expect(open().map(a => a[0])).toContain('ops-backlog-idle');
     expect(open().find(a => a[0] === 'ops-backlog-idle')![1]).toContain('2 automatic starts in a row');
-    session(h, 'kicked-session', 'with-ac', 'running');
+    session(h, 'kicked-session', 'with-ac', 'running', clock.t, 'native-kicked');
+    expect((await tick(s, clock, 1)).idle.state).toBe('idle');  // running row without live native evidence is not work
+    observe(h, 'native-kicked', clock.t);
     expect((await tick(s, clock, 1)).idle.state).toBe('working');
     expect(alerts.at(-1)).toEqual(['ops-backlog-idle', null]);
     expect(s.status().idle).toBeNull();
     expect(s.status().recent_idle[0]).toMatchObject({ kicks: 3, failed_kicks: 2, resolved_at: expect.any(String) });
   }));
 
-  it('a working intake session or an empty backlog is never an idle episode', () => fixture(async (h, clock) => {
+  it('retained rows are not work: stale offered, running without a live native, rows for closed intakes', () => fixture(async (h, clock) => {
+    intake(h, 'waiting'); intake(h, 'closed', 'AC', 'done');
+    const kicks: any[] = [];
+    const { s } = service(h, clock, { kick: async () => { kicks.push(1); return { task_id: null, reason: 'no_ready_intake' }; } });
+    session(h, 'old-offer', 'waiting', 'offered', NOW - 31 * MIN);
+    session(h, 'ghost-running', 'waiting', 'running', NOW, 'ghost-native');
+    observe(h, 'ghost-native', NOW - 11 * MIN);  // host census stopped seeing it
+    session(h, 'closed-live', 'closed', 'running', NOW, 'closed-native'); observe(h, 'closed-native', NOW);
+    expect((await s.tick()).idle).toMatchObject({ state: 'idle_started', active_sessions: 0 });
+    await tick(s, clock, 30);
+    expect(kicks).toHaveLength(1);
+    session(h, 'fresh-offer', 'waiting', 'offered', clock.t);
+    expect((await tick(s, clock, 1)).idle.state).toBe('working');
+  }));
+
+  it('a live working intake session or an empty backlog is never an idle episode', () => fixture(async (h, clock) => {
     const { s } = service(h, clock, { kick: async () => { throw new Error('must not kick'); } });
     expect((await s.tick()).idle.state).toBe('no_backlog');
-    intake(h, 'busy'); session(h, 'busy-session', 'busy', 'starting');
-    for (let i = 0; i < 4; i++) expect((await tick(s, clock, 30)).idle.state).toBe('working');
+    intake(h, 'busy'); session(h, 'busy-session', 'busy', 'running', NOW, 'busy-native');
+    for (let i = 0; i < 4; i++) { await tick(s, clock, 30); observe(h, 'busy-native', clock.t); clock.t += 1; expect((await tick(s, clock, 1)).idle.state).toBe('working'); }
   }));
 
   it('idle kick starts a real backlog intake through canonical admission when its project is not enabled', () => fixture(async (h, clock) => {
@@ -136,6 +185,17 @@ describe('ops liveness (intake 500fd60b)', () => {
     expect(inputs[0]).toMatchObject({ intake_task_id: 'z-older', workspace: 'demo', with_goal: true });
     expect(result).toEqual({ task_id: 'z-older', reason: 'submitted:canonical_queued' });
     expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_audit WHERE task_id='z-older' AND kind='idle_kick'").one().n).toBe(1);
+    // Unknown work (live-looking session, stale host observation) is never duplicated.
+    const unknownIntake = intake(h, 'b-unknown', 'AC', 'open', 'demo', NOW - 3 * 86400000);
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at,machine_id,binding_json)
+      VALUES('unknown-run','hub:service:intake-watchdog','unknown-run',?,'codex','interactive','running',?,?,'ops-host',?)`,
+      JSON.stringify({ intake_task_id: 'b-unknown', workspace: 'demo', with_goal: true }), isoAt(NOW), isoAt(NOW), JSON.stringify({ native_id: 'unknown-native', tag: 'native', workspace: 'demo', native_created_at_ms: NOW - 3600000 }));
+    const before = inputs.length;
+    const w2 = new IntakeWatchdog(h.sql, { statusAuthorizedTasks: () => [unknownIntake] } as any, (f: any) => f(), { policy: proofOnly,
+      start: async (input: any) => { inputs.push(input); return { status: 202, body: { id: 'dup', state: 'queued' } }; } }, () => clock.t);
+    w2.init();
+    expect(await w2.idleKick()).toEqual({ task_id: null, reason: 'no_ready_intake' });
+    expect(inputs.length).toBe(before);
     // An operator's explicit disable wins over the idle kick.
     expect(await make(() => queuePolicyFrom({ HUB_INTAKE_QUEUE_ENABLED: 'false' })).idleKick()).toEqual({ task_id: null, reason: 'watchdog_disabled' });
     expect(inputs).toHaveLength(1);

@@ -15,12 +15,16 @@
  * produce a working session.
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import { nativeObservationFresh } from './session_stall';
 
 export const OPS_ROLES = ['orchestrator', 'oncall'] as const;
+/** Roles that must report: silence counts from Hub's first evaluation even with no row. */
+export const EXPECTED_ROLES = new Set(['orchestrator']);
 export const OPS_WINDOW_MS = 30 * 60000;
 export const OPS_EVAL_INTERVAL_MS = 60000;
 const WATCHDOG_STATES = new Set(['ok', 'stalled', 'dead', 'recovering', 'proof_pending', 'proof_failed', 'census_failed', 'restart_failed']);
 const ACTIVE_STATES = "('starting','offered','running')";
+const NATIVE_STALE_MS = 10 * 60000;
 const requestIntake = "json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id')";
 
 type Obj = Record<string, any>;
@@ -48,8 +52,10 @@ export class OpsLiveness {
       resolved_at INTEGER, open_with_ac INTEGER NOT NULL, reason_json TEXT NOT NULL, kicks INTEGER NOT NULL DEFAULT 0,
       failed_kicks INTEGER NOT NULL DEFAULT 0, last_kick_at INTEGER, last_kick_json TEXT)`);
     this.sql.exec('CREATE INDEX IF NOT EXISTS ops_backlog_idle_open ON ops_backlog_idle(resolved_at, id)');
-    this.sql.exec('CREATE TABLE IF NOT EXISTS ops_liveness_meta(id INTEGER PRIMARY KEY CHECK(id=1), last_eval INTEGER)');
-    this.sql.exec('INSERT OR IGNORE INTO ops_liveness_meta(id,last_eval) VALUES(1,NULL)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS ops_liveness_meta(id INTEGER PRIMARY KEY CHECK(id=1), last_eval INTEGER, expected_since INTEGER)');
+    this.sql.exec('INSERT OR IGNORE INTO ops_liveness_meta(id,last_eval,expected_since) VALUES(1,NULL,?)', this.now());
+    const cols = (this.sql.exec('PRAGMA table_info(ops_liveness)').toArray() as any[]).map(c => c.name);
+    if (!cols.includes('first_seen_at')) this.sql.exec('ALTER TABLE ops_liveness ADD COLUMN first_seen_at INTEGER');
   }
 
   /** One report from the orchestrator tick (kind=tick) or the host watchdog (kind=watchdog). */
@@ -69,7 +75,7 @@ export class OpsLiveness {
       if (!Number.isFinite(t) || t > now + 120000) return { error: 'invalid_tick_at' };
       relayed = Math.min(t, now);
     }
-    this.sql.exec('INSERT OR IGNORE INTO ops_liveness(role,updated_at) VALUES(?,?)', role, now);
+    this.sql.exec('INSERT OR IGNORE INTO ops_liveness(role,updated_at,first_seen_at) VALUES(?,?,?)', role, now, now);
     if (kind === 'tick') {
       if (input.state !== undefined || input.recovery_failures !== undefined) return { error: 'invalid_ops_heartbeat' };
       this.sql.exec('UPDATE ops_liveness SET tick_at=?, tick_summary=?, updated_at=? WHERE role=?', relayed ?? now, input.summary ?? null, now, role);
@@ -87,43 +93,62 @@ export class OpsLiveness {
 
   private rows(q: string, ...a: any[]): Obj[] { return this.sql.exec(q, ...a).toArray() as Obj[]; }
 
-  /** Pure classification of one role; also used by the read endpoint. */
-  roleStatus(r: Obj | undefined, now = this.now()): Obj {
-    if (!r) return { state: 'never_reported', alert: null };
-    const tickAge = age(now, r.tick_at), watchdogAge = age(now, r.watchdog_at);
-    const tickStale = tickAge === null || tickAge * 1000 > OPS_WINDOW_MS;
-    const watchdogStale = watchdogAge === null || watchdogAge * 1000 > OPS_WINDOW_MS;
+  private expectedSince(): number | null {
+    return this.rows('SELECT expected_since FROM ops_liveness_meta WHERE id=1')[0]?.expected_since ?? null;
+  }
+
+  /** Classification of one role; also used by the read endpoint. A reporter that never
+   * reported is silent since the role was first seen, or since Hub started expecting it. */
+  roleStatus(role: string, r: Obj | undefined, now = this.now()): Obj {
+    const since = r?.first_seen_at ?? r?.updated_at ?? (EXPECTED_ROLES.has(role) ? this.expectedSince() : null);
+    if (!r && since === null) return { state: 'never_reported', alert: null };
+    const tickAge = age(now, r?.tick_at), watchdogAge = age(now, r?.watchdog_at);
+    const tickSilent = age(now, r?.tick_at ?? since) ?? 0, watchdogSilent = age(now, r?.watchdog_at ?? since) ?? 0;
+    const tickStale = tickSilent * 1000 > OPS_WINDOW_MS, watchdogStale = watchdogSilent * 1000 > OPS_WINDOW_MS;
     const state = tickStale && watchdogStale ? 'tick_and_watchdog_stale' : tickStale ? 'tick_stale' : watchdogStale ? 'watchdog_stale' : 'ok';
     const last = tickAge === null ? 'never' : tickAge + 's ago';
     let alert: string | null = null;
-    if (!watchdogStale && r.recovery_failures >= 2)
-      alert = `automatic recovery failed ${r.recovery_failures} times in a row (watchdog state ${r.watchdog_state}); last tick ${last}. Inspect journalctl --user -u ops-watchdog.service on the host.`;
-    else if (watchdogAge === null ? false : watchdogAge * 1000 > 2 * OPS_WINDOW_MS)
-      alert = `host ops-watchdog silent for ${watchdogAge}s (two 30-minute recovery windows missed); last tick ${last}. Check ops-watchdog.timer and the host.`;
-    return { state, tick_at: iso(r.tick_at), tick_age_s: tickAge, tick_summary: r.tick_summary ?? null,
-      watchdog_at: iso(r.watchdog_at), watchdog_age_s: watchdogAge, watchdog_state: r.watchdog_state ?? null,
-      recovery_failures: r.recovery_failures ?? 0, alert };
+    if (!watchdogStale && (r?.recovery_failures ?? 0) >= 2)
+      alert = `automatic recovery failed ${r!.recovery_failures} times in a row (watchdog state ${r!.watchdog_state}); last tick ${last}. Inspect journalctl --user -u ops-watchdog.service on the host.`;
+    else if (watchdogSilent * 1000 > 2 * OPS_WINDOW_MS)
+      alert = `host ops-watchdog ${watchdogAge === null ? 'never reported' : 'silent'} for ${watchdogSilent}s (two 30-minute recovery windows missed); last tick ${last}. Check ops-watchdog.timer and the host.`;
+    return { state: r ? state : 'never_reported_' + state, tick_at: iso(r?.tick_at), tick_age_s: tickAge, tick_summary: r?.tick_summary ?? null,
+      watchdog_at: iso(r?.watchdog_at), watchdog_age_s: watchdogAge, watchdog_state: r?.watchdog_state ?? null,
+      recovery_failures: r?.recovery_failures ?? 0, alert };
   }
 
-  /** Bounded backlog view: open intakes with AC and intake-linked sessions starting or running. */
-  backlog(): { open_with_ac: number; active_sessions: number } {
+  /** Bounded backlog view: open intakes with AC, and intake sessions with fresh evidence of
+   * work: offered/starting rows updated within the window, running rows whose bound native
+   * session is observed live. A retained row alone, or one for a closed intake, is not work. */
+  backlog(now = this.now()): { open_with_ac: number; active_sessions: number } {
     const open = this.rows(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM intake_task_projection
       WHERE json_extract(data,'$.status') IN ('open','in_progress','blocked','pending_approval') AND json_extract(data,'$.archived_at') IS NULL
       AND json_extract(data,'$.status') IN ('open','in_progress')
       AND length(trim(coalesce(json_extract(data,'$.acceptance_criteria'),'')))>0 LIMIT 1001)`)[0]?.n ?? 0;
-    const active = this.rows(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_sessions WHERE state IN ${ACTIVE_STATES}
-      AND ${requestIntake} IS NOT NULL LIMIT 1001)`)[0]?.n ?? 0;
+    const candidates = this.rows(`SELECT s.state, s.updated_at, s.machine_id,
+        CASE WHEN json_valid(s.binding_json) THEN json_extract(s.binding_json,'$.native_id') END AS native_id
+      FROM session_control_sessions s JOIN intake_task_projection p ON p.id=${requestIntake}
+      WHERE s.state IN ${ACTIVE_STATES} AND json_extract(p.data,'$.status') IN ('open','in_progress') LIMIT 201`);
+    const cache = new Map();
+    let active = 0;
+    for (const c of candidates) {
+      if (c.state !== 'running') { if (now - (Date.parse(c.updated_at) || 0) <= OPS_WINDOW_MS) active++; continue; }
+      if (!c.native_id) continue;
+      const native = this.rows(`SELECT machine_id, native_id, observed_at FROM fleet_sessions WHERE machine_id=? AND native_id=?
+        AND phase NOT IN ('exited','stopped','failed') LIMIT 1`, c.machine_id, c.native_id)[0];
+      if (native && now - (Date.parse(native.observed_at) || 0) <= NATIVE_STALE_MS && nativeObservationFresh(this.sql, native, now, cache)) active++;
+    }
     return { open_with_ac: open, active_sessions: active };
   }
 
   status(now = this.now()): Obj {
     const roles: Obj = {};
     const byRole = new Map(this.rows('SELECT * FROM ops_liveness').map(r => [r.role, r]));
-    for (const role of OPS_ROLES) roles[role] = this.roleStatus(byRole.get(role), now);
+    for (const role of OPS_ROLES) roles[role] = this.roleStatus(role, byRole.get(role), now);
     const open = this.rows('SELECT * FROM ops_backlog_idle WHERE resolved_at IS NULL ORDER BY id DESC LIMIT 1')[0];
     const recent = this.rows('SELECT * FROM ops_backlog_idle ORDER BY id DESC LIMIT 10').map(e => this.episode(e, now));
     let backlog: Obj = {};
-    try { backlog = this.backlog(); } catch { backlog = { error: 'backlog_unavailable' }; }
+    try { backlog = this.backlog(now); } catch { backlog = { error: 'backlog_unavailable' }; }
     const meta = this.rows('SELECT last_eval FROM ops_liveness_meta WHERE id=1')[0];
     return { evaluated_at: iso(meta?.last_eval), window_s: OPS_WINDOW_MS / 1000, roles, backlog,
       idle: open ? this.episode(open, now) : null, recent_idle: recent };
@@ -147,7 +172,7 @@ export class OpsLiveness {
     const out: Obj = { state: 'checked', roles: {} };
     const byRole = new Map(this.rows('SELECT * FROM ops_liveness').map(r => [r.role, r]));
     for (const role of OPS_ROLES) {
-      const s = this.roleStatus(byRole.get(role), now);
+      const s = this.roleStatus(role, byRole.get(role), now);
       out.roles[role] = s.state;
       if (s.state !== 'never_reported') await this.hooks.alert?.('ops-' + role, s.alert);
     }
@@ -156,7 +181,7 @@ export class OpsLiveness {
   }
 
   private async idleTick(now: number, byRole: Map<any, Obj>): Promise<Obj> {
-    const b = this.backlog();
+    const b = this.backlog(now);
     const open = this.rows('SELECT * FROM ops_backlog_idle WHERE resolved_at IS NULL ORDER BY id DESC LIMIT 1')[0];
     if (b.open_with_ac === 0 || b.active_sessions > 0) {
       if (open) {
@@ -165,7 +190,7 @@ export class OpsLiveness {
       }
       return { state: b.open_with_ac === 0 ? 'no_backlog' : 'working', ...b };
     }
-    const orchestrator = this.roleStatus(byRole.get('orchestrator'), now);
+    const orchestrator = this.roleStatus('orchestrator', byRole.get('orchestrator'), now);
     const why = { open_with_ac: b.open_with_ac, active_sessions: 0, orchestrator: orchestrator.state,
       orchestrator_tick_age_s: orchestrator.tick_age_s ?? null, watchdog_state: orchestrator.watchdog_state ?? null,
       watchdog_age_s: orchestrator.watchdog_age_s ?? null, queue_holds: this.safeHolds() };
