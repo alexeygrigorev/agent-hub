@@ -170,7 +170,7 @@ class FullLocalStorageTests(unittest.TestCase):
         python = next(row for row in self.records(record)
                       if row["tool"] == "uv" and row["args"][0] == "run")
         self.assertEqual(Path(python["profile"]), Path(python["home"]) / ".config/agent-hub/host.json")
-        self.assertEqual(python["hub_env"], [])
+        self.assertEqual(python["hub_env"], ["AGENT_HUB_HEAVY_TEST_HELD"])
         self.assert_preserved()
 
     def test_early_sync_failure_removes_only_new_run_directory(self):
@@ -283,7 +283,7 @@ class FullLocalStorageTests(unittest.TestCase):
                 self.assertEqual(code, 0, output)
                 python = next(row for row in self.records(record)
                               if row["tool"] == "uv" and row["args"][0] == "run")
-                self.assertEqual(python["selectors"], [])
+                self.assertEqual(python["selectors"], ["AGENT_HUB_HEAVY_TEST_HELD"])
                 self.assertEqual(profile.read_bytes(), original)
                 self.assertFalse(Path(python["home"]).exists())
 
