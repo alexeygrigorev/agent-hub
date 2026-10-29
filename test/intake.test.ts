@@ -916,6 +916,117 @@ describe('private durable intake HTTP/SQLite', () => {
     await inDO(stub(), (h: any) => h.sql.exec('DROP TRIGGER intake_fixture_fault'));
     expect((await ok('/tasks/' + task.id, payload)).task.version).toBe(2);
   });
+  it('accepts both session links and notes on an existing 173 KiB open ledger', async () => {
+    const { task } = await create();
+    const seeded = await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      for (let i = 0; i < 22; i++) data.history.push({ id: crypto.randomUUID(), kind: 'note',
+        text: 'legacy note ' + i + '界'.repeat(2650), source, actor: 'fixture', captured_at: Date.now(),
+        authority: 'untrusted_task_data' });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      let linkError: string | null = null;
+      try { h.ctx.storage.transactionSync(() => recordIntakeSessionLink(h.sql, { id: crypto.randomUUID(),
+        actor: 'fixture', request_json: JSON.stringify({ intake_task_id: task.id }) }, Date.now())); }
+      catch (e: any) { linkError = e.code; }
+      const after = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      return { linkError, version: after.version, bytes: new TextEncoder().encode(JSON.stringify(data)).length,
+        history: data.history };
+    });
+    expect(seeded.bytes).toBeGreaterThan(173000);
+    const response = await call('/tasks/' + task.id + '/events', { key: 'legacy-oversized', expected_version: seeded.version,
+      event: { kind: 'note', text: 'driver marker', source } });
+    const result: any = await response.json();
+    expect({ linkError: seeded.linkError, appendStatus: response.status, appendError: result.error ?? null })
+      .toEqual({ linkError: null, appendStatus: 200, appendError: null });
+    expect(result.task.payload_data.history.slice(0, seeded.history.length)).toEqual(seeded.history);
+    expect(result.task.status).toBe('open');
+  });
+
+  it('keeps a 95c1862c-shaped open intake writable beyond taskBytes and the old receipt cap', async () => {
+    let { task } = await create();
+    const originals: any[] = [...task.payload_data.history];
+    // Legitimate bounded notes grow the actual encoded ledger past 173 KiB,
+    // then 256 KiB. No SQL padding or deleted history manufactures the case.
+    for (let i = 0; i < 34; i++) {
+      const result = await append(task.id, task.version, { kind: 'note', text: String(i) + '界'.repeat(2700), source });
+      task = result.task;
+      originals.push(task.payload_data.history.at(-1));
+    }
+    const size = await inDO(stub(), (h: any) => {
+      const row = h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one();
+      return new TextEncoder().encode(row.data).length;
+    });
+    expect(size).toBeGreaterThan(262144);
+    expect(size).toBeGreaterThan(INTAKE_LIMITS.taskBytes);
+    expect(task.status).toBe('open');
+    const sessionId = crypto.randomUUID();
+    const linked = await inDO(stub(), (h: any) => h.ctx.storage.transactionSync(() =>
+      recordIntakeSessionLink(h.sql, { id: sessionId, actor: 'fixture', engine: 'codex',
+        request_json: JSON.stringify({ intake_task_id: task.id }), created_at: new Date().toISOString() }, Date.now())));
+    expect(linked).toBe(true);
+    task = (await ok('/tasks/' + task.id)).task;
+    expect(task.payload_data.history.slice(0, originals.length)).toEqual(originals);
+    expect(task.payload_data.history.at(-1)).toMatchObject({ kind: 'link', hub_session_id: sessionId });
+    const payload = { key: 'oversized-replay', expected_version: task.version,
+      event: { kind: 'note', text: 'driver-posted marker after link', source } };
+    const first = await ok('/tasks/' + task.id + '/events', payload);
+    expect(await ok('/tasks/' + task.id + '/events', payload)).toEqual(first);
+    expect(first.task.payload_data.history.slice(0, originals.length)).toEqual(originals);
+    expect(first.task.payload_data.history.at(-1).text).toBe(payload.event.text);
+    expect(first.task.status).toBe('open');
+  }, 30000);
+
+  it('keeps link-heavy task projections below the SQL row limit', async () => {
+    const { task } = await create();
+    const result = await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      // Every variable field respects link-event input limits. Escaped text
+      // exercises encoded-byte accounting and the projection's duplicate links.
+      while (data.history.length < INTAKE_LIMITS.events - 2) {
+        const link = { id: crypto.randomUUID(), kind: 'link', native_id: '\n'.repeat(512),
+          engine: '\n'.repeat(128), tier: '\n'.repeat(128), host: '\n'.repeat(512), hub: '\n'.repeat(2048),
+          provenance: { type: 'unknown', reference: '\n'.repeat(2048), timestamp: null },
+          routing_job_id: null, hub_session_id: null, actor: 'fixture', captured_at: Date.now(),
+          authority: 'untrusted_task_data', evidence: 'external_unverified_not_launch_proof' };
+        if (new TextEncoder().encode(JSON.stringify({ ...data, history: [...data.history, link] })).length >
+          INTAKE_LIMITS.taskRecordBytes - 4096) break;
+        data.history.push(link);
+      }
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      const projection = h.sql.exec('SELECT length(CAST(data AS BLOB))+length(CAST(links AS BLOB))+length(CAST(id AS BLOB)) AS bytes FROM intake_task_projection WHERE id=?', task.id).one();
+      return { bytes: projection.bytes, taskBytes: new TextEncoder().encode(JSON.stringify(data)).length };
+    });
+    expect(result.taskBytes).toBeGreaterThan(INTAKE_LIMITS.taskRecordBytes * 0.9);
+    expect(result.bytes).toBeLessThan(2000000);
+    const appended = await append(task.id, task.version, { kind: 'note', text: 'bounded marker', source });
+    expect(appended.task.status).toBe('open');
+  });
+
+  it('rolls back oversized-history writes at the separate record safety bound', async () => {
+    const { task } = await create();
+    const result = await inDO(stub(), (h: any) => {
+      const row = h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one();
+      const data = JSON.parse(row.data);
+      data.history.push({ kind: 'note', text: 'x'.repeat(INTAKE_LIMITS.taskRecordBytes) });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      const before = h.sql.exec('SELECT revision FROM intake_meta WHERE id=1').one().revision;
+      let error: string | undefined;
+      try { h.ctx.storage.transactionSync(() => recordIntakeSessionLink(h.sql, {
+        id: crypto.randomUUID(), actor: 'fixture', request_json: JSON.stringify({ intake_task_id: task.id }),
+      }, Date.now())); } catch (e: any) { error = e.code; }
+      return { error, same: h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data === JSON.stringify(data),
+        revisionUnchanged: before === h.sql.exec('SELECT revision FROM intake_meta WHERE id=1').one().revision };
+    });
+    expect(result).toEqual({ error: 'record_byte_capacity', same: true, revisionUnchanged: true });
+    const before = await state();
+    const response = await call('/tasks/' + task.id + '/events', {
+      key: 'record-capacity', expected_version: task.version, event: { kind: 'note', text: 'bounded note', source },
+    });
+    expect(response.status).toBe(507);
+    expect(await response.json()).toMatchObject({ error: 'record_byte_capacity' });
+    expect(await state()).toEqual(before);
+  });
+
   it('refuses global/task/count/history caps explicitly and preserves prior work', async () => {
     const { task } = await create();
     await inDO(stub(), (h: any) => {

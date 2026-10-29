@@ -54,9 +54,9 @@ export type IntakeHooks = { queue?: (tasks: Obj[]) => Obj; forgotten?: (tasks: O
 /** Soft intake capacity (t1038u): no hard 507 refuse on task row count for create.
  * `tasks` remains only as a schema safety-net ceiling (very high). Open (non-terminal)
  * count > OPEN_INTAKE_WARN_THRESHOLD emits a warning requiring DONE evidence before close. */
-export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, events: 128,
+export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, taskRecordBytes: 896 * 1024, receiptRecordBytes: 1920 * 1024, events: 128,
   // Hot admission budget excludes retained archives and exact replay receipts.
-  // 128 MiB accommodates 1,000 maximum-size task records; retained storage
+  // 128 MiB bounds all hot task records including retained history; storage
   // has a separate 256 MiB planning budget below the Free plan's 1 GB/DO.
   grants: 256, rules: 128, receipts: 8192, totalBytes: 128 * 1024 * 1024, page: 100 };
 export const INTAKE_RETAINED_WARN_BYTES = 256 * 1024 * 1024;
@@ -92,6 +92,15 @@ function worktreeFail(e: unknown): never {
 }
 function fail(code: string, status = 400): never { throw new IntakeError(code, status); }
 const encoded = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+/** History is a retained ledger, not mutable task metadata. Budget it through
+ * event count, bounded input, full-record and aggregate storage limits instead
+ * of making a legitimate old note consume the next session link's allowance. */
+function taskCapacityError(task: Obj): string | null {
+  const { history, ...metadata } = task;
+  if (encoded(metadata) > INTAKE_LIMITS.taskBytes) return 'task_capacity';
+  if (encoded(task) > INTAKE_LIMITS.taskRecordBytes) return 'record_byte_capacity';
+  return null;
+}
 function object(value: any): Obj {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('invalid_object');
   return value;
@@ -192,7 +201,8 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
     captured_at: now, intake_key: session.request_key,
     ...(session.state === 'held' && hold !== undefined ? { assignment_hold: hold } : {}) });
   task.version++; task.updated_at = now;
-  if (encoded(task) > INTAKE_LIMITS.taskBytes) throw new IntakeSessionLinkError('task_capacity');
+  const capacityError = taskCapacityError(task);
+  if (capacityError) throw new IntakeSessionLinkError(capacityError);
   sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(task), task.id);
   if (hotBytes(sql) > INTAKE_LIMITS.totalBytes) throw new IntakeSessionLinkError('storage_capacity');
   sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
@@ -309,7 +319,14 @@ export class IntakeService {
     return r ? JSON.parse(r.data) : undefined;
   }
   private put(table: string, data: Obj) {
-    if (encoded(data) > 262144) fail('record_byte_capacity', 507);
+    if (table === 'tasks') {
+      const capacityError = taskCapacityError(data);
+      if (capacityError) fail(capacityError, 507);
+    } else {
+      // Exact task response receipts retain the same history as the task.
+      const limit = table === 'receipts' ? INTAKE_LIMITS.receiptRecordBytes : 262144;
+      if (encoded(data) > limit) fail('record_byte_capacity', 507);
+    }
     this.sql.exec(`INSERT INTO intake_${table}(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`, data.id, JSON.stringify(data));
   }
   private revision(): number { return (this.sql.exec('SELECT revision FROM intake_meta WHERE id=1').toArray()[0] as any).revision; }
@@ -1100,7 +1117,8 @@ export class IntakeService {
     for (const e of events) task.history.push({ id: crypto.randomUUID(), ...e, actor, captured_at: now, authority: 'hub_worktree_registry',
       ...(key ? { intake_key: key } : {}) });
     task.version++; task.updated_at = now;
-    if (encoded(task) > INTAKE_LIMITS.taskBytes) fail('task_capacity', 507);
+    const capacityError = taskCapacityError(task);
+    if (capacityError) fail(capacityError, 507);
     this.put('tasks', task);
   }
   /** Host-agent path (plan/observe/results): append registry events to the
@@ -1257,7 +1275,8 @@ export class IntakeService {
     }
     task.history[task.history.length - 1].intake_key = b.key;
     task.version++; task.updated_at = now;
-    if (encoded(task) > INTAKE_LIMITS.taskBytes) fail('task_capacity', 507);
+    const capacityError = taskCapacityError(task);
+    if (capacityError) fail(capacityError, 507);
     this.put('tasks', task); return { task: this.view(task, p) };
   }
   /** M12b assignment: create the task's Hub session through the canonical
@@ -1384,7 +1403,8 @@ export class IntakeService {
           captured_at: now, authority: 'untrusted_task_data', intake_key: b.key });
       }
       if (!startLink || Object.keys(changes).length) { task.version++; task.updated_at = now; }
-      if (encoded(task) > INTAKE_LIMITS.taskBytes) fail('task_capacity', 507);
+      const capacityError = taskCapacityError(task);
+      if (capacityError) fail(capacityError, 507);
       this.put('tasks', task);
       const assigned = this.assignedSessions(task, fresh).find(s => s.hub_session_id === created.id) ??
         { hub_session_id: created.id, linkage: 'hub_session' };
@@ -1467,9 +1487,8 @@ export class IntakeService {
           },
         ],
       };
-      if (encoded(task) > INTAKE_LIMITS.taskBytes) {
-        return { ok: false, error: 'task_capacity' };
-      }
+      const capacityError = taskCapacityError(task);
+      if (capacityError) return { ok: false, error: capacityError };
       try { this.capacity(encoded(task) + new TextEncoder().encode(task.id).byteLength); }
       catch (e: any) { return { ok: false, error: e.code || 'storage_capacity' }; }
       this.put('tasks', task);
@@ -1542,9 +1561,8 @@ export class IntakeService {
       task.version++;
       task.updated_at = now;
 
-      if (encoded(task) > INTAKE_LIMITS.taskBytes) {
-        return { ok: false, error: 'task_capacity' };
-      }
+      const capacityError = taskCapacityError(task);
+      if (capacityError) return { ok: false, error: capacityError };
 
       try { this.capacity((!task.archived_at && OPEN.includes(task.status) ? encoded(task) : 0) - priorBytes); }
       catch (e: any) { return { ok: false, error: e.code || 'storage_capacity' }; }
