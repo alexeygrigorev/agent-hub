@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { IntakeWatchdog, WATCHDOG_INTERVAL, QUEUE_RETRY_BASE_MS } from '../src/intake-watchdog';
+import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom, WATCHDOG_INTERVAL, QUEUE_RETRY_BASE_MS } from '../src/intake-watchdog';
+// Forgotten-work dispatch cases opt in explicitly; the queue suite checks the disabled default.
+class IntakeWatchdog extends BaseIntakeWatchdog {
+  constructor(...args: ConstructorParameters<typeof BaseIntakeWatchdog>) {
+    args[3] = {policy:()=>queuePolicyFrom({HUB_INTAKE_QUEUE_ENABLED:'true',HUB_INTAKE_QUEUE_PROJECTS:'*'}),...args[3]};
+    super(...args);
+  }
+}
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
 const NOW = Date.parse('2026-10-26T12:00:00Z');

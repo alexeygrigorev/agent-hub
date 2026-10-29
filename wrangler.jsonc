@@ -41,7 +41,9 @@
     "AUTH_BASE_URL": "https://auth.dtcdev.click",
     "AUTH_CALLBACK_URL": "https://hub.dtcdev.click/auth/callback",
     "AUTH_CALLBACK_URLS": "https://hub.dtcdev.click/auth/callback,https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev/auth/callback,http://localhost:19130/auth/callback",
-    "AUTH_JWKS_URL": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs/.well-known/jwks.json"
+    "AUTH_JWKS_URL": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs/.well-known/jwks.json",
+    "HUB_INTAKE_QUEUE_ENABLED": "true",
+    "HUB_INTAKE_QUEUE_PROJECTS": "agent-hub-queue-proof"
   },
   "dev": {
     "port": 19130

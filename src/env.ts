@@ -32,9 +32,10 @@ export interface Env {
   HUB_IDLE_OPEN_AC_NUDGE_MINUTES?: string;
   HUB_HEARTBEAT_STALE_S?: string;
   HUB_LAUNCH_STUCK_S?: string;
-  // Autonomous queue rollout: defaults to two owned in-flight intents globally,
-  // one per project. Invalid settings disable automatic mutations.
+  // Autonomous queue rollout is off by default. Enabling also requires an
+  // explicit project list (or '*'). Invalid settings disable mutations.
   HUB_INTAKE_QUEUE_ENABLED?: string;
+  HUB_INTAKE_QUEUE_PROJECTS?: string;
   HUB_INTAKE_QUEUE_MAX_INFLIGHT?: string;
   HUB_INTAKE_QUEUE_MAX_PER_PROJECT?: string;
 }

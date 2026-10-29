@@ -1,6 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { IntakeWatchdog, queuePolicyFrom, WATCHDOG_INTERVAL, QUEUE_STALL_MS, QUEUE_RETRY_LIMIT, QUEUE_RETRY_MAX_MS } from '../src/intake-watchdog';
+import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom as parseQueuePolicy, WATCHDOG_INTERVAL, QUEUE_STALL_MS, QUEUE_RETRY_LIMIT, QUEUE_RETRY_MAX_MS } from '../src/intake-watchdog';
+// Existing dispatch/recovery cases explicitly opt in; production-default tests use the base class.
+const queuePolicyFrom = (settings: Record<string, unknown> = {}) => parseQueuePolicy({HUB_INTAKE_QUEUE_ENABLED:'true',HUB_INTAKE_QUEUE_PROJECTS:'*',...settings});
+class IntakeWatchdog extends BaseIntakeWatchdog {
+  constructor(...args: ConstructorParameters<typeof BaseIntakeWatchdog>) {
+    args[3] = {policy:()=>queuePolicyFrom(),...args[3]};
+    super(...args);
+  }
+}
 const NOW = Date.parse('2026-10-28T10:00:00Z');
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('queue-tests'));
 const task = (id = 'queue-task'): any => ({ id, project:'demo', title:'Queue task', status:'open', version:1,
@@ -18,6 +26,43 @@ function session(h:any, t:any, id:string, state:string, bound=false) {
     VALUES(?,'hub:service:intake-watchdog',?,?,'codex','interactive',?,?,?,'queue-host',?)`,id,id,JSON.stringify({intake_task_id:t.id,workspace:'demo',with_goal:true}),state,new Date(NOW).toISOString(),new Date(NOW).toISOString(),bound?JSON.stringify({native_id:'native',tag:'native',workspace:'demo',native_created_at_ms:NOW-3600000}):null);
 }
 describe('autonomous intake queue',()=>{
+  it('ships disabled and requires an explicit project scope even when enabled',()=>{
+    expect(parseQueuePolicy()).toMatchObject({valid:true,enabled:false,projects:[]});
+    expect(parseQueuePolicy({HUB_INTAKE_QUEUE_ENABLED:'true'})).toMatchObject({valid:false,enabled:false,projects:[]});
+    expect(queuePolicyFrom({HUB_INTAKE_QUEUE_PROJECTS:'proof'})).toMatchObject({valid:true,enabled:true,projects:['proof']});
+    expect(queuePolicyFrom()).toMatchObject({valid:true,enabled:true,projects:null});
+  });
+  it('does not launch or recover backlog work under the real production default',()=>fixture(async h=>{
+    const tasks=[task('default-new'),task('default-held')];session(h,tasks[1],'default-held-session','held');let starts=0,commands=0;
+    const w=new BaseIntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>tasks} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:202,body:{}}},command:async()=>{commands++;return {status:202,body:{}}}},()=>NOW);w.init();await w.tick();
+    expect(starts).toBe(0);expect(commands).toBe(0);
+    expect(w.queue(tasks).find(r=>r.id==='default-new')).toMatchObject({state:'queued',reason:'watchdog_disabled',attempts:0});
+  }));
+  it.each(['',',','proof,','proof,proof','*,proof','not/a/project',42,Array.from({length:65},(_,i)=>'p'+i).join(',')])('fails closed on malformed project scope %j',scope=>{
+    expect(queuePolicyFrom({HUB_INTAKE_QUEUE_PROJECTS:scope})).toMatchObject({valid:false,enabled:false,projects:[]});
+  });
+  it('picks up only the dedicated proof project and leaves the real backlog queued',()=>fixture(async h=>{
+    const backlog=task('a-backlog'),proof={...task('z-proof'),project:'proof'},tasks=[backlog,...Array.from({length:12},(_,i)=>task('b-backlog-'+i)),proof],inputs:any[]=[];
+    h.sql.exec('UPDATE machines SET capabilities=? WHERE id=?',JSON.stringify({workspaces:['demo','proof']}),'queue-host');
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>tasks} as any,(f:any)=>f(),{policy:()=>queuePolicyFrom({HUB_INTAKE_QUEUE_PROJECTS:'proof'}),start:async input=>{inputs.push(input);session(h,proof,'proof-start','queued');return {status:202,body:{id:'proof-start',state:'queued'}}}},()=>NOW);w.init();await w.tick();
+    expect(inputs).toHaveLength(1);expect(inputs[0]).toMatchObject({intake_task_id:proof.id,workspace:'proof'});expect(inputs[0]).not.toHaveProperty('engine');
+    expect(w.queue(tasks).find(r=>r.id===backlog.id)).toMatchObject({state:'queued',reason:'watchdog_project_not_enabled',attempts:0,queue_position:null});
+    expect(w.queue(tasks).find(r=>r.id===proof.id)?.queue_position).toBe(1);
+    expect(w.status().automation.projects).toEqual(['proof']);
+  }));
+  it('does not retry a held intent outside the explicitly enabled project',()=>fixture(async h=>{
+    const backlog=task('a-backlog'),proof={...task('z-proof'),project:'proof'},tasks=[backlog,proof],commands:string[]=[];
+    session(h,backlog,'backlog-held','held');session(h,proof,'proof-held','held');
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>tasks} as any,(f:any)=>f(),{policy:()=>queuePolicyFrom({HUB_INTAKE_QUEUE_PROJECTS:'proof'}),command:async id=>{commands.push(id);return {status:409,body:{state:'held'}}}},()=>NOW);w.init();await w.tick();
+    expect(commands).toEqual(['proof-held']);
+  }));
+  it('rechecks project scope after awaited stall observation before stopping a worker',()=>fixture(async h=>{
+    const t=task('changed-project');session(h,t,'project-worker','running',true);let commands=0;
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,agent_state,progress_json) VALUES('queue-host','native','native','running',?,'demo',?,'idle',?)",new Date(NOW).toISOString(),NOW-3600000,JSON.stringify({last_progress_at:new Date(NOW-QUEUE_STALL_MS-1).toISOString()}));
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{policy:()=>queuePolicyFrom({HUB_INTAKE_QUEUE_PROJECTS:'demo'}),observe:async()=>{t.project='backlog';return {status:200,body:{stalled:true,stall_reason:'no_native_progress'}}},command:async()=>{commands++;return {status:202,body:{}}}},()=>NOW);w.init();await w.tick();
+    expect(commands).toBe(0);
+  }));
   it('continues beyond three productive sessions by resetting the healthy episode',()=>fixture(async h=>{
     const t=task('healthy-episode');let now=NOW,starts=0,notes=0;
     const fresh=()=>h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(now).toISOString());

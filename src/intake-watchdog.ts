@@ -23,14 +23,21 @@ export const QUEUE_BATCH_SIZE = 64;
 const CONTEXT_LIMIT = 512;
 const requestIntake = "json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id')";
 const OWNED = "actor='hub:service:intake-watchdog' AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.with_goal')=1";
-export type QueuePolicy = { enabled: boolean; valid: boolean; max_inflight: number; max_per_project: number };
+export type QueuePolicy = { enabled: boolean; valid: boolean; max_inflight: number; max_per_project: number; projects: string[] | null };
 export function queuePolicyFrom(env: Record<string, unknown> = {}): QueuePolicy {
-  const enabled = env.HUB_INTAKE_QUEUE_ENABLED ?? 'true';
+  const enabled = env.HUB_INTAKE_QUEUE_ENABLED ?? 'false';
   const global = Number(env.HUB_INTAKE_QUEUE_MAX_INFLIGHT ?? 2);
   const project = Number(env.HUB_INTAKE_QUEUE_MAX_PER_PROJECT ?? 1);
+  const scope = env.HUB_INTAKE_QUEUE_PROJECTS;
+  const projects = typeof scope === 'string' && scope.length <= 64 * 129 ? scope.split(',').map(p => p.trim()) : [];
+  const all = projects.length === 1 && projects[0] === '*';
+  const scoped = projects.length > 0 && projects.length <= 64 && new Set(projects).size === projects.length &&
+    projects.every(p => /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(p));
   const valid = ['true', 'false'].includes(String(enabled)) && Number.isInteger(global) && global >= 1 && global <= 32 &&
-    Number.isInteger(project) && project >= 1 && project <= global;
-  return { enabled: valid && String(enabled) === 'true', valid, max_inflight: valid ? global : 2, max_per_project: valid ? project : 1 };
+    Number.isInteger(project) && project >= 1 && project <= global &&
+    (scope === undefined || all || scoped) && (String(enabled) !== 'true' || all || scoped);
+  return { enabled: valid && String(enabled) === 'true', valid, max_inflight: valid ? global : 2,
+    max_per_project: valid ? project : 1, projects: valid && all ? null : valid && scoped ? projects : [] };
 }
 const bindingNative = "json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id')";
 const DAY = 86400000;
@@ -128,12 +135,18 @@ export class IntakeWatchdog {
       automation: this.policy() };
   }
   private policy(): QueuePolicy { return this.hooks.policy?.() ?? queuePolicyFrom(); }
+  private automationHold(t: Obj): string | null {
+    const policy = this.policy();
+    if (!policy.valid) return 'watchdog_configuration_invalid';
+    if (!policy.enabled) return 'watchdog_disabled';
+    return policy.projects !== null && !policy.projects.includes(t.project) ? 'watchdog_project_not_enabled' : null;
+  }
   /** Canonical rows plus durable pre-admission reservations bound even awaited
    * or lost replies. Unknown reservations remain occupied until a receipt. */
   private admissionHold(t: Obj): string | null {
     const policy = this.policy();
-    if (!policy.valid) return 'watchdog_configuration_invalid';
-    if (!policy.enabled) return 'watchdog_disabled';
+    const rollout = this.automationHold(t);
+    if (rollout) return rollout;
     const active = this.rows(`SELECT id,${requestIntake} AS task_id,request_json FROM session_control_sessions
       WHERE ${OWNED} AND state IN ('queued','held','offered','starting','running','uncertain') LIMIT ?`, policy.max_inflight + 1);
     const reservations = this.rows('SELECT * FROM intake_queue_admissions LIMIT 33');
@@ -313,6 +326,8 @@ export class IntakeWatchdog {
     // Re-read after every awaited admission; canonical admission also rechecks AC.
     const fresh = this.task(t.id);
     if (!fresh || !DISPATCHABLE.has(fresh.status))return;
+    const rollout = this.automationHold(fresh);
+    if (rollout) return this.hold(fresh, rollout, now, WATCHDOG_INTERVAL);
     const context=this.snapshot([fresh],now);
     if(!this.project([fresh],now,context)[0]?.ready)return;
     const existing = this.rows('SELECT * FROM intake_restart_queue WHERE task_id=?', t.id)[0];
@@ -386,6 +401,7 @@ export class IntakeWatchdog {
       if (state === 'running') reason = s ? 'canonical_' + s.state : 'live_native_owner';
       if (state === 'queued' && s?.hold_reason) reason = s.hold_reason;
       else if (state === 'queued' && s && q?.state !== 'recovering') reason = 'canonical_' + s.state;
+      if (state === 'queued') reason = this.automationHold(t) ?? reason;
       const history = this.rows('SELECT state,reason,at FROM intake_queue_movement WHERE task_id=? ORDER BY seq DESC LIMIT ?', p.id, includeHistory ? 32 : 1).reverse();
       const last = history[history.length - 1];
       const at = last?.at ?? ms(t.created_at);
@@ -396,7 +412,7 @@ export class IntakeWatchdog {
     }).sort((a,b) => Number(a.next_at > now) - Number(b.next_at > now) ||
       (queueRows.get(a.id)?.updated_at ?? 0) - (queueRows.get(b.id)?.updated_at ?? 0) || a.id.localeCompare(b.id));
     let position = 0;
-    for (const item of items) if (item.state === 'queued') item.queue_position = ++position;
+    for (const item of items) if (item.state === 'queued' && !this.automationHold(byId.get(item.id)!)) item.queue_position = ++position;
     return items;
   }
   private async escalate(t: Obj, reason: string, now: number) {
@@ -420,7 +436,7 @@ export class IntakeWatchdog {
     if(context.overflow || !this.policy().enabled)return;
     const {catalogs,native,sessions}=context;
     const queueRows=context.queue;
-    const ordered = tasks.filter(t => DISPATCHABLE.has(t.status) && !t.archived_at).sort((a,b) =>
+    const ordered = tasks.filter(t => DISPATCHABLE.has(t.status) && !t.archived_at && !this.automationHold(t)).sort((a,b) =>
       (queueRows.get(a.id)?.updated_at ?? 0) - (queueRows.get(b.id)?.updated_at ?? 0) || a.id.localeCompare(b.id));
     let actions = 0, observations = 0;
     for (const t of ordered) {
@@ -484,7 +500,7 @@ export class IntakeWatchdog {
       const attempts = q?.attempts ?? 0;
       if (attempts >= QUEUE_RETRY_LIMIT) { await this.escalate(t, held ? 'held_retry_limit' : 'stall_retry_limit', now); continue; }
       const latestTask=this.task(t.id);
-      if(!latestTask || !DISPATCHABLE.has(latestTask.status) || this.waiting(s.id))continue;
+      if(!latestTask || !DISPATCHABLE.has(latestTask.status) || this.automationHold(latestTask) || this.waiting(s.id))continue;
       const action = held ? 'retry' : 'stop';
       const key = 'iw-' + action + '-' + s.id;
       this.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,session_id,attempts,next_at,updated_at)
@@ -557,7 +573,8 @@ export class IntakeWatchdog {
     await this.reconcile(tasks,now,context);
     const ordered=items.filter(i=>{
       const q=this.queueRow(i.id);
-      return i.ready && q?.state!=='escalated' && (!q || q.next_at<=now);
+      const task=tasks.find(t=>t.id===i.id);
+      return task && !this.automationHold(task) && i.ready && q?.state!=='escalated' && (!q || q.next_at<=now);
     }).sort((a,b)=>(context.queue.get(a.id)?.updated_at??0)-(context.queue.get(b.id)?.updated_at??0)||a.id.localeCompare(b.id));
     for(const item of ordered.slice(0,8))await this.restart(tasks.find(t=>t.id===item.id)!,now);
     const human_hold_alerts=await this.alertHumanHolds(tasks,now);
