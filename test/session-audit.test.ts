@@ -508,6 +508,15 @@ describe('idle audit service (AC1/AC3/AC4)', () => {
 // repeat stop warnings).
 // ---------------------------------------------------------------------------
 describe('production notification adapter (real hub liveness + delivery receipt)', () => {
+  function seedAlertReader(hub: any) {
+    hub.env = { ...hub.env, HUB_ALERT_TO: 'grok-bot' };
+    hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
+    hub.sql.exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at)
+      VALUES ('audit-reader','agent','audit-reader-hash','audit-reader','grok-bot','grok-bot','["bus:read"]','test',?,?)`,
+      new Date().toISOString(), new Date(Date.now()+3600000).toISOString());
+    hub.busService.inbox({kind:'agent',actor:'grok-bot',tokenId:'audit-reader'},'grok-bot');
+  }
+
   function uniqueStub(name: string) {
     const bindings = env as any;
     return bindings.HUB.get(bindings.HUB.idFromName('audit-adapter-' + name + '-' + crypto.randomUUID()));
@@ -526,7 +535,7 @@ describe('production notification adapter (real hub liveness + delivery receipt)
 
   it('delivers each batch on its own alert: 10 alerted, 5 skipped, the 5 land next run', async () => {
     await inDO(uniqueStub('fresh'), async (hub: any) => {
-      hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
+      seedAlertReader(hub);
       for (let i = 0; i < 15; i++) seedNative(hub, i);
       const r1 = await hub.sessionAudit.tick('manual');
       expect(r1.counts).toMatchObject({ escalate: 15, alert_skipped: 5, alert_failed: 0 });
@@ -553,7 +562,7 @@ describe('production notification adapter (real hub liveness + delivery receipt)
 
   it('failed delivery (no targets) records alert_failed; the batch lands once a target exists', async () => {
     await inDO(uniqueStub('notargets'), async (hub: any) => {
-      hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
+      seedAlertReader(hub);
       for (let i = 0; i < 10; i++) seedNative(hub, i);
       const savedTo = hub.env.HUB_ALERT_TO, savedHook = hub.env.HUB_ALERT_WEBHOOK;
       delete hub.env.HUB_ALERT_WEBHOOK;
@@ -584,7 +593,7 @@ describe('production notification adapter (real hub liveness + delivery receipt)
 
   it('successive payloads and repeat stop warnings each deliver fresh', async () => {
     await inDO(uniqueStub('repeat'), async (hub: any) => {
-      hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
+      seedAlertReader(hub);
       const notify = makeLivenessNotify({
         setAlert: (kind: string, subject: string, problem: any) => hub.livenessService.setAlert(kind, subject, problem),
         deliverAlert: (a: any) => (hub as any).notifyAlert(a),
