@@ -5,7 +5,7 @@ import { freshCpu } from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService, advertisedRoutes, hostAdvertisesRoute, isCapacityOnlyHold } from '../src/fleet';
-import { MAX_ADVERTISED_ROUTES, updateHeartbeat } from '../src/registry';
+import { MAX_ADVERTISED_ROUTES, sanitizeRouteAdvertisement, updateHeartbeat, updateRouteAdvertisement } from '../src/registry';
 import { SessionControlService } from '../src/session_control';
 import { seedFixtureIntake } from './tbm-fixture';
 import type { Hub } from '../src/hub';
@@ -16,22 +16,22 @@ const now = Date.now();
 const iso = (delta = 0) => new Date(now + delta).toISOString();
 const BASE_CAPS = { engines: ['codex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 };
 
-async function fleet(fn: (service: FleetService, sql: any) => Promise<void>) {
+async function fleet(fn: (service: FleetService, sql: any) => Promise<void>, machine = 'tabo') {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-route-6cbb862a-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
     const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now);
     service.init(); const sql = hub.sql;
     sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      'tabo', 'tabo', 'tabo', iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify(BASE_CAPS));
+      machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify(BASE_CAPS));
     sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      'tabo', '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify({ codex: { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } } }));
+      machine, '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify({ codex: { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } } }));
     const registry = { accounts: [
       { label: 'shared-codex', provider: 'codex', max_concurrency: 2, reserve_percent: 15, enabled: true },
       { label: 'codex-orin', provider: 'codex', max_concurrency: 2, reserve_percent: 15, enabled: true },
     ], routes: [
-      { machine_id: 'tabo', engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex' },
-      { machine_id: 'tabo', engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' },
+      { machine_id: machine, engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex' },
+      { machine_id: machine, engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' },
     ] };
     const put = await service.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify(registry) }), admin);
     expect(put.status).toBe(200);
@@ -108,75 +108,85 @@ describe('placement offers only host-advertised routes (6cbb862a AC a)', () => {
   });
 });
 
-describe('heartbeat route advertisement storage (6cbb862a AC a)', () => {
-  it('sanitizes fleet_routes, stamps freshness, and keeps the original time across heartbeats without it', async () => {
-    const bindings = env as unknown as Env;
-    const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-6cbb862a-' + crypto.randomUUID()));
-    await runInDurableObject(stub, async (hub: Hub) => {
-      const id = 'm-' + crypto.randomUUID().slice(0, 8);
-      hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', id, id, id, iso());
-      const stored = () => JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', id).toArray()[0] as any).last_heartbeat));
-      const route = { engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex' };
-      updateHeartbeat(id, { type: 'heartbeat', fleet_routes: [route, { engine: 'codex', account: 'codex-orin' }] }, hub.sql);
-      const first = stored();
-      expect(first.fleet_routes).toEqual([route, { engine: 'codex', account: 'codex-orin', profile: null }]);
-      expect(typeof first.fleet_routes_at).toBe('string');
-      updateHeartbeat(id, { type: 'heartbeat', mem_avail_mb: 1 }, hub.sql);
-      expect(stored().fleet_routes_at).toBe(first.fleet_routes_at);
-      updateHeartbeat(id, { type: 'heartbeat', fleet_routes: [{ engine: 'codex', account: 'bad account', profile: null }] }, hub.sql);
-      expect(stored().fleet_routes_at).toBe(first.fleet_routes_at); // malformed list dropped, never partially kept
-      updateHeartbeat(id, { type: 'heartbeat', fleet_routes: [{ engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' }] }, hub.sql);
-      expect(stored().fleet_routes).toEqual([{ engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' }]);
-    });
+// The host posts its route advertisement separately (POST /api/host/routes),
+// so its size never competes with heartbeat telemetry (review d2b92d22).
+const postRoutes = (id: string, body: any, sql: any) => {
+  const advert = sanitizeRouteAdvertisement(body);
+  return advert ? updateRouteAdvertisement(id, advert, sql, now) : null; // the fixture's pinned clock
+};
+async function machineRow(fn: (hub: Hub, id: string, stored: () => any) => void) {
+  const bindings = env as unknown as Env;
+  const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-6cbb862a-' + crypto.randomUUID()));
+  await runInDurableObject(stub, async (hub: Hub) => {
+    const id = 'm-' + crypto.randomUUID().slice(0, 8);
+    hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', id, id, id, iso());
+    fn(hub, id, () => JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', id).toArray()[0] as any).last_heartbeat)));
   });
-});
-
-// Review 89766b23: the host config supports 128 routes, so an advertisement is
-// never truncated; past the cap the host sends an explicit overflow count.
+}
+// Review 4224a469 fixture: supported launcher telemetry (64 disk aliases to a
+// 476-character path) that nearly fills Hub's 32 KiB heartbeat body.
+const nearLimitHb = () => {
+  const path = '/' + ['d'.repeat(159), 'e'.repeat(159), 'f'.repeat(155)].join('/');
+  const aliases: Record<string, string> = {};
+  for (let i = 0; i < 64; i++) aliases[(i ? 'ws-' + String(i).padStart(2, '0') : 'ws-00' + 'x'.repeat(32))] = path;
+  return { type: 'heartbeat', mem_avail_mb: 32000, disk_free_gb: 80, load: [1, 1, 1], gate: { launch_allowed: true, at: iso() }, cpu_usage: freshCpu(iso()),
+    launcher_resources: { active_mem_mb: 0, observed_at: iso(), active_disk_mb: 0, disk_floor_mb: 20480, next_disk_mb: 512,
+      disk_paths: [{ path, free_gb: 80 }, { path: path + '/.local/tmp', free_gb: 80 }], disk_aliases: aliases, disk_task_ids: [] } };
+};
 const fillers = (n: number) => Array.from({ length: n }, (_, i) => ({ engine: 'codex', account: `filler-${i}`, profile: `hub-filler-${i}` }));
 
-describe('route advertisement size bound (6cbb862a review)', () => {
-  it('stores 64, 65 and 128 advertised routes completely and drops an oversize list', async () => {
-    const bindings = env as unknown as Env;
-    const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-size-' + crypto.randomUUID()));
-    await runInDurableObject(stub, async (hub: Hub) => {
-      const id = 'm-' + crypto.randomUUID().slice(0, 8);
-      hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', id, id, id, iso());
-      const stored = () => JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', id).toArray()[0] as any).last_heartbeat));
-      expect(MAX_ADVERTISED_ROUTES).toBe(128);
-      for (const n of [64, 65, 128]) {
-        const routes = [...fillers(n - 1), SHARED];
-        updateHeartbeat(id, { type: 'heartbeat', fleet_routes: routes }, hub.sql);
-        expect(stored().fleet_routes).toEqual(routes);
-      }
-      updateHeartbeat(id, { type: 'heartbeat', fleet_routes: [...fillers(128), SHARED] }, hub.sql);
-      expect(stored().fleet_routes).toHaveLength(128); // oversize list dropped whole, never truncated
-      expect(stored().fleet_routes_overflow).toBeUndefined();
-    });
-  });
+describe('route advertisement storage (6cbb862a AC a)', () => {
+  it('stores a sanitized posted list with its own freshness; heartbeats carry it forward but never write it', async () => machineRow((hub, id, stored) => {
+    const route = { engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex' };
+    expect(postRoutes(id, { fleet_routes: [route, { engine: 'codex', account: 'codex-orin' }] }, hub.sql)).toEqual(expect.any(String));
+    const first = stored();
+    expect(first.fleet_routes).toEqual([route, { engine: 'codex', account: 'codex-orin', profile: null }]);
+    expect(typeof first.fleet_routes_at).toBe('string');
+    updateHeartbeat(id, { type: 'heartbeat', mem_avail_mb: 1 }, hub.sql);
+    expect(stored().fleet_routes).toEqual(first.fleet_routes);
+    expect(stored().fleet_routes_at).toBe(first.fleet_routes_at);
+    expect(stored().mem_avail_mb).toBe(1);
+    // A heartbeat body can no longer write routes.
+    updateHeartbeat(id, { type: 'heartbeat', mem_avail_mb: 2, fleet_routes: [], fleet_routes_overflow: 999 }, hub.sql);
+    expect(stored().fleet_routes).toEqual(first.fleet_routes);
+    expect(stored().fleet_routes_overflow).toBeUndefined();
+    // A malformed post is rejected whole and changes nothing.
+    expect(postRoutes(id, { fleet_routes: [{ engine: 'codex', account: 'bad account', profile: null }] }, hub.sql)).toBeNull();
+    expect(postRoutes(id, { fleet_routes: [], fleet_routes_overflow: 200 }, hub.sql)).toBeNull();
+    expect(stored().fleet_routes).toEqual(first.fleet_routes);
+    // A new post replaces the list and keeps the telemetry.
+    postRoutes(id, { fleet_routes: [{ engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' }] }, hub.sql);
+    expect(stored().fleet_routes).toEqual([{ engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' }]);
+    expect(stored().mem_avail_mb).toBe(2);
+  }));
 
-  it('keeps an explicit overflow across bare heartbeats until a complete list replaces it', async () => {
-    const bindings = env as unknown as Env;
-    const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-overflow-' + crypto.randomUUID()));
-    await runInDurableObject(stub, async (hub: Hub) => {
-      const id = 'm-' + crypto.randomUUID().slice(0, 8);
-      hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', id, id, id, iso());
-      const stored = () => JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', id).toArray()[0] as any).last_heartbeat));
-      updateHeartbeat(id, { type: 'heartbeat', fleet_routes: [SHARED] }, hub.sql);
-      updateHeartbeat(id, { type: 'heartbeat', fleet_routes_overflow: 129 }, hub.sql);
-      const hb = stored();
-      expect(hb.fleet_routes_overflow).toBe(129);
-      expect(hb.fleet_routes).toBeUndefined();
-      expect(typeof hb.fleet_routes_at).toBe('string');
-      updateHeartbeat(id, { type: 'heartbeat', mem_avail_mb: 1 }, hub.sql); // unrelated heartbeat never erases it
-      expect(stored().fleet_routes_overflow).toBe(129);
-      expect(stored().fleet_routes).toBeUndefined();
-      updateHeartbeat(id, { type: 'heartbeat', fleet_routes: [SHARED] }, hub.sql);
-      expect(stored().fleet_routes).toEqual([SHARED]);
-      expect(stored().fleet_routes_overflow).toBeUndefined();
-    });
-  });
+  it('stores 64, 65 and 128 routes completely and rejects an oversize list or a non-overflow count', async () => machineRow((hub, id, stored) => {
+    expect(MAX_ADVERTISED_ROUTES).toBe(128);
+    for (const n of [64, 65, 128]) {
+      const routes = [...fillers(n - 1), SHARED];
+      postRoutes(id, { fleet_routes: routes }, hub.sql);
+      expect(stored().fleet_routes).toEqual(routes);
+    }
+    expect(postRoutes(id, { fleet_routes: [...fillers(128), SHARED] }, hub.sql)).toBeNull();
+    expect(postRoutes(id, { fleet_routes_overflow: 128 }, hub.sql)).toBeNull();
+    expect(stored().fleet_routes).toHaveLength(128);
+  }));
 
+  it('keeps an explicit overflow across heartbeats until a complete list replaces it', async () => machineRow((hub, id, stored) => {
+    postRoutes(id, { fleet_routes: [SHARED] }, hub.sql);
+    postRoutes(id, { fleet_routes_overflow: 129 }, hub.sql);
+    expect(stored().fleet_routes_overflow).toBe(129);
+    expect(stored().fleet_routes).toBeUndefined();
+    updateHeartbeat(id, { type: 'heartbeat', mem_avail_mb: 1 }, hub.sql);
+    expect(stored().fleet_routes_overflow).toBe(129);
+    expect(stored().fleet_routes).toBeUndefined();
+    postRoutes(id, { fleet_routes: [SHARED] }, hub.sql);
+    expect(stored().fleet_routes).toEqual([SHARED]);
+    expect(stored().fleet_routes_overflow).toBeUndefined();
+  }));
+});
+
+describe('route advertisement placement (6cbb862a review)', () => {
   for (const n of [64, 65, 128]) {
     it(`places the last of ${n} advertised routes`, async () => fleet(async (s, sql) => {
       advertise(sql, [...fillers(n - 1), SHARED]);
@@ -189,14 +199,15 @@ describe('route advertisement size bound (6cbb862a review)', () => {
   // (absent, empty or older runners) may reopen it.
   const overflowHb = (sql: any) => sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'tabo'",
     JSON.stringify({ ...HB, cpu_usage: freshCpu(iso()), fleet_routes_overflow: 129, fleet_routes_at: iso() }));
-  const runners = (sql: any, list: any[] | null) => {
-    if (list) sql.exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', 'tabo', '[]', 6, iso(),
+  const runners = (sql: any, machine: string, list: any[] | null) => {
+    if (list) sql.exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', machine, '[]', 6, iso(),
       JSON.stringify(list.map((r: any) => ({ ...r, model: 'm', effort: 'high' }))));
   };
-  for (const [label, list] of [['absent', null], ['empty', []], ['older listing the route', [SHARED]]] as const) {
+  const RUNNERS = [['absent', null], ['empty', []], ['older listing the route', [SHARED]]] as const;
+  for (const [label, list] of RUNNERS) {
     it(`holds every route on an overflowing host with ${label} runner evidence`, async () => fleet(async (s, sql) => {
       overflowHb(sql);
-      runners(sql, list as any);
+      runners(sql, 'tabo', list as any);
       const plan: any = s.plan(intent({ account: 'shared-codex' }));
       expect(plan.selected).toBeFalsy();
       expect(plan.rejected).toEqual([{ machine: 'tabo', engine: 'codex', reason: 'route_advertisement_overflow', account: 'shared-codex', profile: 'hub-shared-codex', advertised_routes: 129 }]);
@@ -206,18 +217,54 @@ describe('route advertisement size bound (6cbb862a review)', () => {
       expect(open.rejected.every((r: any) => r.reason === 'route_advertisement_overflow')).toBe(true);
     }));
   }
+
+  // Review d2b92d22, end to end through storage and placement: a withdrawn
+  // route holds at once (no 180 s window), also when the host's telemetry
+  // fills its heartbeat, and a host's first advertisement blocks immediately
+  // even with absent/empty runners. Each case uses its own machine id because
+  // route freshness is also tracked in memory per machine.
+  const ORIN = { engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' };
+  it('holds a just-withdrawn route immediately, with near-limit telemetry still flowing', async () => {
+    const m = 'withdraw-' + crypto.randomUUID().slice(0, 8);
+    await fleet(async (s, sql) => {
+      postRoutes(m, { fleet_routes: [SHARED, ORIN] }, sql);
+      expect((s.plan(intent({ machine: m, account: 'shared-codex' })) as any).selected?.account).toBe('shared-codex');
+      postRoutes(m, { fleet_routes: [ORIN] }, sql);
+      updateHeartbeat(m, nearLimitHb(), sql, now);
+      const plan: any = s.plan(intent({ machine: m, account: 'shared-codex' }));
+      expect(plan.selected).toBeFalsy();
+      expect(plan.rejected).toEqual([{ machine: m, engine: 'codex', reason: 'route_not_advertised', account: 'shared-codex', profile: 'hub-shared-codex' }]);
+      expect((s.plan(intent({ machine: m })) as any).selected?.account).toBe('codex-orin');
+    }, m);
+  });
+  for (const [label, list] of RUNNERS.slice(0, 2)) {
+    it(`blocks on a host's first advertisement with ${label} runners`, async () => {
+      const m = 'first-' + crypto.randomUUID().slice(0, 8);
+      await fleet(async (s, sql) => {
+        runners(sql, m, list as any);
+        updateHeartbeat(m, nearLimitHb(), sql, now);
+        // Before any advertisement this is a pre-release host (registry placement).
+        expect((s.plan(intent({ machine: m, account: 'shared-codex' })) as any).selected?.account).toBe('shared-codex');
+        postRoutes(m, { fleet_routes: [ORIN] }, sql);
+        expect((s.plan(intent({ machine: m, account: 'shared-codex' })) as any).rejected).toEqual([{ machine: m, engine: 'codex', reason: 'route_not_advertised', account: 'shared-codex', profile: 'hub-shared-codex' }]);
+        postRoutes(m, { fleet_routes_overflow: 300 }, sql);
+        updateHeartbeat(m, nearLimitHb(), sql, now);
+        expect((s.plan(intent({ machine: m })) as any).rejected.map((r: any) => r.reason)).toEqual(['route_advertisement_overflow', 'route_advertisement_overflow']);
+      }, m);
+    });
+  }
 });
 
 describe('route advertisement over HTTP (6cbb862a review)', () => {
-  it('accepts a complete 128-route heartbeat and the near-limit overflow fallback, and rejects bodies over 32 KiB', async () => {
+  it('accepts the largest complete route post and an overflow at /api/host/routes, and keeps heartbeats unchanged', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-http-' + crypto.randomUUID()));
     const adminSecret = 'local-test-only-admin-sign-in';
-    const machineRow = 'paired-' + crypto.randomUUID();
+    const rowId = 'paired-' + crypto.randomUUID();
     await runInDurableObject(stub, async (hub: Hub) => {
       const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(adminSecret));
       hub.env = { ...hub.env, HUB_ADMIN_TOKEN_SHA256: [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('') } as Env;
-      hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, 'route-host', 'route-host', ?)", machineRow, iso());
+      hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, 'route-host', 'route-host', ?)", rowId, iso());
     });
     const login = await stub.fetch(new Request('https://hub.test/auth/token', { method: 'POST', redirect: 'manual', body: new URLSearchParams({ token: adminSecret }).toString() }));
     const cookie = login.headers.get('Set-Cookie')!.split(';')[0];
@@ -225,38 +272,34 @@ describe('route advertisement over HTTP (6cbb862a review)', () => {
     const call = (path: string, body: string, token?: string) => stub.fetch(new Request('https://hub.test' + path, { method: 'POST', headers: {
       'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : { Cookie: cookie, 'X-CSRF-Token': me.csrf_token }) }, body }));
     const challenge: any = await (await call('/api/device/code', JSON.stringify({ client_kind: 'host', name: 'route-host', requested_scopes: ['host'] }))).json();
-    const approved: any = await (await call('/api/device/approve/' + challenge.user_code, JSON.stringify({ granted_scopes: ['host'], machine_id: machineRow }))).json();
+    const approved: any = await (await call('/api/device/approve/' + challenge.user_code, JSON.stringify({ granted_scopes: ['host'], machine_id: rowId }))).json();
     const tokens: any = await (await call('/api/device/token', JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: challenge.device_code }))).json();
+    const stored = async () => { let hb: any; await runInDurableObject(stub, async (hub: Hub) => {
+      hb = JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', approved.machine_id).toArray()[0] as any).last_heartbeat ?? 'null')); }); return hb; };
+
+    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes: [SHARED] }))).status).toBe(401);
+    // Largest valid post: 128 routes with 64-character engine, account and profile labels.
     const long = (p: string, i: number) => (p + i).padEnd(64, 'x');
-    const routes = Array.from({ length: 128 }, (_, i) => ({ engine: 'codex', account: long('a', i), profile: long('p', i) }));
-    const body = JSON.stringify({ type: 'heartbeat', at: iso(), mem_avail_mb: 32000, fleet_routes: routes });
-    expect(body.length).toBeLessThanOrEqual(32768); // the host's HEARTBEAT_BODY_LIMIT
-    expect((await call('/api/host/poll', body, tokens.access_token)).status).toBe(200);
-    await runInDurableObject(stub, async (hub: Hub) => {
-      const hb = JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', approved.machine_id).toArray()[0] as any).last_heartbeat));
-      expect(hb.fleet_routes).toHaveLength(128);
-    });
-    const oversize = JSON.stringify({ type: 'heartbeat', at: iso(), fleet_routes: routes, pad: 'x'.repeat(32768 - body.length + 64) });
-    expect((await call('/api/host/poll', oversize, tokens.access_token)).status).not.toBe(200);
-    // Review 4224a469: the host's overflow fallback for near-limit launcher
-    // telemetry (64 disk aliases to a 476-character path) is delivered and
-    // stored with the telemetry intact.
-    const path = '/' + ['d'.repeat(159), 'e'.repeat(159), 'f'.repeat(155)].join('/');
-    const aliases: Record<string, string> = {};
-    for (let i = 0; i < 63; i++) aliases[(i ? 'ws-' + String(i).padStart(2, '0') : 'ws-00' + 'x'.repeat(32))] = path;
-    const telemetry = { type: 'heartbeat', mem_avail_mb: 32000, disk_free_gb: 80, load: [1, 1, 1], gate: { launch_allowed: true, at: iso() },
-      launcher_resources: { active_mem_mb: 0, observed_at: iso(), active_disk_mb: 0, disk_floor_mb: 20480, next_disk_mb: 512,
-        disk_paths: [{ path, free_gb: 80 }, { path: path + '/.local/tmp', free_gb: 80 }], disk_aliases: aliases, disk_task_ids: [] } };
-    const overflow = JSON.stringify({ ...telemetry, fleet_routes_overflow: 128 });
-    expect(overflow.length).toBeGreaterThan(32768 - 1024);
-    expect(overflow.length).toBeLessThanOrEqual(32768);
-    expect((await call('/api/host/poll', overflow, tokens.access_token)).status).toBe(200);
-    await runInDurableObject(stub, async (hub: Hub) => {
-      const hb = JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', approved.machine_id).toArray()[0] as any).last_heartbeat));
-      expect(hb.fleet_routes_overflow).toBe(128);
-      expect(hb.fleet_routes).toBeUndefined();
-      expect(Object.keys(hb.launcher_resources?.disk_aliases ?? {})).toHaveLength(63);
-    });
+    const routes = Array.from({ length: 128 }, (_, i) => ({ engine: long('e', i), account: long('a', i), profile: long('p', i) }));
+    const body = JSON.stringify({ fleet_routes: routes });
+    expect(body.length).toBeLessThan(32768);
+    const res = await call('/api/host/routes', body, tokens.access_token);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as any).fleet_routes_at).toEqual(expect.any(String));
+    expect((await stored()).fleet_routes).toHaveLength(128);
+    // The reviewer's near-limit heartbeat is accepted unchanged and keeps the routes.
+    const hb = JSON.stringify({ ...nearLimitHb(), cpu_usage: undefined });
+    expect(hb.length).toBeGreaterThan(32768 - 1024);
+    expect(hb.length).toBeLessThanOrEqual(32768);
+    expect((await call('/api/host/poll', hb, tokens.access_token)).status).toBe(200);
+    expect((await stored()).fleet_routes).toHaveLength(128);
+    expect(Object.keys((await stored()).launcher_resources.disk_aliases)).toHaveLength(64);
+    // Overflow and malformed posts.
+    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes_overflow: 300 }), tokens.access_token)).status).toBe(200);
+    expect((await stored()).fleet_routes_overflow).toBe(300);
+    expect((await stored()).fleet_routes).toBeUndefined();
+    expect((await call('/api/host/routes', JSON.stringify({ fleet_routes: [{ engine: 'codex', account: 'bad account' }] }), tokens.access_token)).status).toBe(400);
+    expect((await stored()).fleet_routes_overflow).toBe(300);
   });
 });
 

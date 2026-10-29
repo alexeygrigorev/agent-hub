@@ -477,10 +477,10 @@ class FleetTests(unittest.TestCase):
             self.assertTrue(results[0]['ok'])
             self.assertEqual(results[0]['claims'], 0)
             self.assertEqual(results[0]['messages'], 0)
-        self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/poll', '/api/fleet/probe', '/api/fleet/subscriptions', '/api/fleet/sessions', '/api/sessions/host-bindings', '/api/sessions/host-adoption', '/api/sessions/host-bindings?kind=imported', '/api/fleet/offers'])
-        self.assertEqual(calls[2], ('POST', '/api/fleet/probe', {
+        self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/routes', '/api/host/poll', '/api/fleet/probe', '/api/fleet/subscriptions', '/api/fleet/sessions', '/api/sessions/host-bindings', '/api/sessions/host-adoption', '/api/sessions/host-bindings?kind=imported', '/api/fleet/offers'])
+        self.assertEqual(calls[3], ('POST', '/api/fleet/probe', {
             'engine': 'codex', 'status': 'ok', 'reason': 'admission_configured'}))
-        self.assertTrue(calls[1][2]['gate']['launch_allowed'])
+        self.assertTrue(calls[2][2]['gate']['launch_allowed'])
         self.assertEqual(calls[0][2]['capabilities']['workspaces'], sorted(['demo', '/repo']))
 
     def test_serial_dispatch_refreshes_checkin_between_offers(self):

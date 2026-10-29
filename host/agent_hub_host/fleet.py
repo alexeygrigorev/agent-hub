@@ -533,14 +533,9 @@ def normalize_git_identity(conf) -> dict[str, str]:
 # Routes one heartbeat may advertise; must equal MAX_ADVERTISED_ROUTES in
 # src/registry.ts. Matches Hub's per-machine subscription limit (128).
 MAX_ADVERTISED_ROUTES = 128
-# Hub rejects request bodies over this many bytes (src/hub.ts); a heartbeat
-# with route advertisement never exceeds it.
-HEARTBEAT_BODY_LIMIT = 32768
-
-
-def heartbeat_body_bytes(hb):
-    """Bytes of the POST body bus.request sends for hb."""
-    return len(json.dumps(hb, default=str).encode('utf-8'))
+# Re-post an unchanged route advertisement this often; Hub holds every route
+# of a host whose last advertisement is older than 180 s.
+ROUTE_ADVERTISEMENT_REFRESH_S = 60
 
 
 def load_settings(path=None):
@@ -2346,32 +2341,30 @@ class Dispatcher:
                 routes.append({'engine': route[0], 'account': route[1], 'profile': route[2]})
         return routes
 
-    def attach_route_advertisement(self, hb):
-        """Add the complete route list to a finished heartbeat, never exceeding Hub's body limit.
+    def post_route_advertisement(self):
+        """POST the complete route list (or an explicit overflow) before a heartbeat.
 
-        In order: the complete list when the whole serialized heartbeat stays
-        within HEARTBEAT_BODY_LIMIT (Hub rejects bodies over 32 KiB); else an
-        explicit fleet_routes_overflow=<count>, which Hub holds as
-        route_advertisement_overflow; else (telemetry alone leaves no room)
-        no route field at all, so the heartbeat is byte-identical to one
-        without this advertisement and Hub holds the aged-out list as
-        route_advertisement_stale. Never a partial list.
+        Sent separately from the heartbeat so its size never competes with
+        telemetry for Hub's 32 KiB body limit: the heartbeat body is exactly
+        what it was without advertisement, and the route body is bounded by
+        MAX_ADVERTISED_ROUTES label tuples. Posted whenever the list changes
+        and at least every ROUTE_ADVERTISEMENT_REFRESH_S (Hub treats a list
+        older than 180 s as stale and holds every route). A failed post
+        raises, so the caller skips that heartbeat (and its offers) exactly
+        as if the heartbeat itself had failed.
         """
         routes = self.route_advertisement()
-        hb.pop('fleet_routes', None)
-        hb.pop('fleet_routes_overflow', None)
-        if len(routes) <= MAX_ADVERTISED_ROUTES:
-            hb['fleet_routes'] = routes
-            if heartbeat_body_bytes(hb) <= HEARTBEAT_BODY_LIMIT:
-                return hb
-            del hb['fleet_routes']
-        hb['fleet_routes_overflow'] = len(routes)
-        event = 'fleet_routes_overflow'
-        if heartbeat_body_bytes(hb) > HEARTBEAT_BODY_LIMIT:
-            del hb['fleet_routes_overflow']
-            event = 'fleet_routes_unsent'
-        print(json.dumps({'event': event, 'routes': len(routes)}), flush=True)
-        return hb
+        body = {'fleet_routes': routes} if len(routes) <= MAX_ADVERTISED_ROUTES else {'fleet_routes_overflow': len(routes)}
+        key = json.dumps(body, sort_keys=True)
+        last = getattr(self, '_route_advertisement_posted', None)
+        now = time.monotonic()
+        if last and last[0] == key and now - last[1] < ROUTE_ADVERTISEMENT_REFRESH_S:
+            return body
+        if 'fleet_routes_overflow' in body:
+            print(json.dumps({'event': 'fleet_routes_overflow', 'routes': len(routes)}), flush=True)
+        self.request('POST', '/api/host/routes', body)
+        self._route_advertisement_posted = (key, now)
+        return body
 
     def goal_routes(self):
         """Advertise executable local routes, independent of quota admission."""
@@ -3642,7 +3635,7 @@ class Dispatcher:
         except Exception:
             fresh_hb = hb
         try:
-            self.attach_route_advertisement(fresh_hb)
+            self.post_route_advertisement()
             self.request('POST', '/api/host/poll', fresh_hb)
         except Exception:
             pass
@@ -3931,7 +3924,7 @@ class Dispatcher:
             {'launch_allowed': allowed,
              'reason': 'fleet local admission' if allowed else 'fleet admission unavailable',
              'at': utcnow()}, self.settings)
-        self.attach_route_advertisement(hb)
+        self.post_route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         self._last_hb = hb
         return hb
@@ -3978,7 +3971,7 @@ class Dispatcher:
         for key in ('gate', 'launcher_resources'):
             if key in latest:
                 hb[key] = latest[key]
-        self.attach_route_advertisement(hb)
+        self.post_route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         caps = self.capabilities_put_payload()
         if caps is not None:
@@ -4163,7 +4156,7 @@ class Dispatcher:
                               'error': _sanitized_transport_error(exc)}), flush=True)
         _mark('register')
         hb['gate'] = allowed_gate
-        self.attach_route_advertisement(hb)
+        self.post_route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         _mark('heartbeat')
         for engine in sorted(admitted_engines):

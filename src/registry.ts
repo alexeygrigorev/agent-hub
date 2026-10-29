@@ -85,18 +85,6 @@ function sanitizeHeartbeat(body: any) {
   if (Array.isArray(body.running_jobs)) {
     hb.running_jobs = body.running_jobs.filter((j: any) => typeof j === 'string' && j.length <= 128).slice(0, 50);
   }
-  // Executable routes the host's dispatcher accepts (intake 6cbb862a). Bounded
-  // label tuples only; a malformed list is dropped, never partially kept. A
-  // host whose complete list does not fit (count or heartbeat bytes) sends
-  // fleet_routes_overflow instead, and Hub holds all its routes.
-  if (Number.isInteger(body.fleet_routes_overflow) && body.fleet_routes_overflow >= 0 && body.fleet_routes_overflow <= 100000) {
-    hb.fleet_routes_overflow = body.fleet_routes_overflow;
-  } else if (Array.isArray(body.fleet_routes) && body.fleet_routes.length <= MAX_ADVERTISED_ROUTES && body.fleet_routes.every((r: any) =>
-      r && typeof r === 'object' && typeof r.engine === 'string' && ROUTE_LABEL.test(r.engine)
-      && typeof r.account === 'string' && ROUTE_LABEL.test(r.account)
-      && (r.profile === null || r.profile === undefined || (typeof r.profile === 'string' && ROUTE_LABEL.test(r.profile))))) {
-    hb.fleet_routes = body.fleet_routes.map((r: any) => ({ engine: r.engine, account: r.account, profile: r.profile ?? null }));
-  }
   if (typeof body.sessions_summary === 'object' && body.sessions_summary) {
     hb.sessions_summary = {};
     for (const k of Object.keys(body.sessions_summary)) {
@@ -133,14 +121,58 @@ export function effectiveCheckin(machineId: string, persisted: unknown): string 
   return Number.isFinite(best) ? new Date(best).toISOString() : null;
 }
 
-/** Latest time the host advertised fleet_routes (intake 6cbb862a): an unchanged
- * heartbeat is persisted at most every five minutes, so prefer the newer
- * in-memory observation, exactly as effectiveCheckin does. */
+/** Latest time the host posted its route advertisement (intake 6cbb862a);
+ * prefers the in-memory observation, exactly as effectiveCheckin does. */
 export function effectiveRoutesAt(machineId: string, persisted: unknown): string | null {
   const stored = typeof persisted === 'string' ? Date.parse(persisted) : NaN;
   const seen = machineState.get(machineId)?.routesAt;
   const best = Math.max(Number.isFinite(stored) ? stored : -Infinity, typeof seen === 'number' ? seen : -Infinity);
   return Number.isFinite(best) ? new Date(best).toISOString() : null;
+}
+
+/** Executable routes the host's dispatcher accepts (intake 6cbb862a): either a
+ * complete bounded list of label tuples or an explicit overflow count (the
+ * host's list exceeds MAX_ADVERTISED_ROUTES). Anything else is rejected whole,
+ * never partially kept. */
+export function sanitizeRouteAdvertisement(body: any): { fleet_routes: any[] } | { fleet_routes_overflow: number } | null {
+  if (!body || typeof body !== 'object') return null;
+  const hasList = body.fleet_routes !== undefined, hasOverflow = body.fleet_routes_overflow !== undefined;
+  if (hasList === hasOverflow) return null;
+  if (hasOverflow) {
+    const n = body.fleet_routes_overflow;
+    return Number.isInteger(n) && n > MAX_ADVERTISED_ROUTES && n <= 100000 ? { fleet_routes_overflow: n } : null;
+  }
+  const list = body.fleet_routes;
+  if (!Array.isArray(list) || list.length > MAX_ADVERTISED_ROUTES || !list.every((r: any) =>
+      r && typeof r === 'object' && typeof r.engine === 'string' && ROUTE_LABEL.test(r.engine)
+      && typeof r.account === 'string' && ROUTE_LABEL.test(r.account)
+      && (r.profile === null || r.profile === undefined || (typeof r.profile === 'string' && ROUTE_LABEL.test(r.profile))))) return null;
+  return { fleet_routes: list.map((r: any) => ({ engine: r.engine, account: r.account, profile: r.profile ?? null })) };
+}
+
+/** Store a host's route advertisement (POST /api/host/routes), separate from
+ * the heartbeat so its size never competes with telemetry for the 32 KiB
+ * body limit. It replaces any previous list or overflow, is stamped
+ * fleet_routes_at, and is persisted at once; heartbeats only carry it
+ * forward. */
+export function updateRouteAdvertisement(machineId: string, advert: { fleet_routes: any[] } | { fleet_routes_overflow: number }, sql: SqlStorage, now = Date.now()): string {
+  let st = machineState.get(machineId);
+  let previous: any = st?.hb;
+  if (!previous) {
+    try { previous = JSON.parse(String((sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machineId).toArray()[0] as any)?.last_heartbeat ?? 'null')); } catch { previous = null; }
+  }
+  const { fleet_routes: _l, fleet_routes_overflow: _o, fleet_routes_at: _a, ...rest } = (previous && typeof previous === 'object') ? previous : {} as any;
+  const at = new Date(now).toISOString();
+  const hb = { ...rest, ...advert, fleet_routes_at: at };
+  if (!st) {
+    st = { lastSeenAt: 0, lastPersistedAt: 0, fingerprint: '', hb: null };
+    machineState.set(machineId, st);
+  }
+  st.hb = hb;
+  st.routesAt = now;
+  st.fingerprint = getFingerprint(hb);
+  sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(hb), machineId);
+  return at;
 }
 
 export function updateHeartbeatMemoryOnly(machineId: string) {
@@ -155,25 +187,21 @@ export function updateHeartbeatMemoryOnly(machineId: string) {
   }
 }
 
-export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStorage) {
+export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStorage, now = Date.now()) {
   const hb = sanitizeHeartbeat(rawPayload);
   if (!hb) return;
 
-  const now = Date.now();
   const cpu=hb.cpu_usage;
   if(cpu && cpu.host_oom_kills_delta>0 && now-Date.parse(cpu.observed_at)>=-30000 && now-Date.parse(cpu.observed_at)<=180000
     && sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='resource_choking_events'").toArray().length) {
     sql.exec('INSERT INTO resource_choking_events VALUES(?,?,?) ON CONFLICT(machine_id,reason) DO UPDATE SET observed_at=excluded.observed_at WHERE excluded.observed_at>resource_choking_events.observed_at',machineId,'host_oom',cpu.observed_at);
   }
   let st = machineState.get(machineId);
-  // Route advertisement (a list or an explicit overflow) carries its own
-  // freshness (fleet_routes_at): a heartbeat without either field (e.g. the
-  // role-job poller) keeps the last advertisement and its original time, so
-  // it can age out but never looks newer than it is, and never erases an
-  // overflow.
-  const advertisedNow = !!hb.fleet_routes || hb.fleet_routes_overflow !== undefined;
-  if (advertisedNow) hb.fleet_routes_at = new Date(now).toISOString();
-  else {
+  // Route advertisement (intake 6cbb862a) is written only by
+  // updateRouteAdvertisement; every heartbeat carries the last list or
+  // overflow forward with its original fleet_routes_at, so it ages out but
+  // never looks newer than it is and is never erased by telemetry.
+  {
     let previous: any = st?.hb;
     if (!previous) {
       try { previous = JSON.parse(String((sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machineId).toArray()[0] as any)?.last_heartbeat ?? 'null')); } catch { previous = null; }
@@ -190,7 +218,6 @@ export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStor
     machineState.set(machineId, st);
   }
   st.lastSeenAt = now;
-  if (advertisedNow) st.routesAt = now;
   st.hb = hb;
 
   if (fingerprint !== st.fingerprint || now - st.lastPersistedAt >= 300000) {
@@ -430,6 +457,17 @@ export async function handleRegistryRoutes(
     const res = sql.exec('UPDATE machines SET drained = 0 WHERE id = ?', id);
     if (res.rowsWritten === 0) return Response.json({ error: 'not_found' }, { status: 404 });
     return Response.json({ status: 'undrained' });
+  }
+
+  // Host route advertisement (intake 6cbb862a): the host posts its complete
+  // dispatchable route list (or an explicit overflow) before each heartbeat.
+  if (path === '/api/host/routes') {
+    if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+    const cred = await verifyBearerScope(sql, request.headers.get('Authorization'), 'host', { kind: 'host' });
+    if (!cred || !cred.machine_id) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+    const advert = sanitizeRouteAdvertisement(await safeJson(request));
+    if (!advert) return Response.json({ error: 'invalid_route_advertisement' }, { status: 400 });
+    return Response.json({ status: 'ok', fleet_routes_at: updateRouteAdvertisement(cred.machine_id, advert, sql) });
   }
 
   if (path === '/api/host/poll') {

@@ -116,8 +116,8 @@ function disabledEngines(): Set<string> {
 // route_advertisement_overflow: the host's complete route list did not fit a
 // heartbeat, so no membership is known and every route on it holds (never a
 // fallback to older or registry-only evidence).
-// route_advertisement_stale: the host's last complete list aged out (e.g. its
-// telemetry left no room in the heartbeat body); every route holds.
+// route_advertisement_stale: the host's last complete list aged out (it
+// stopped posting /api/host/routes); every route holds.
 const CAPACITY_REASONS = new Set(['route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
