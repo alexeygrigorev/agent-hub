@@ -317,8 +317,10 @@ export interface TbmAdmissionInput {
  * rules.tbm_floor_percent, e.g. { codex: { hard: 0, soft: 0 } }). They replace
  * the stored pool floors; 0 disables a floor, so only depletion (remaining 0)
  * still blocks. Invalid entries are ignored and the stored floors apply.
+ * Generic over the row type so extended row shapes (e.g. pacing's TbmPoolRow)
+ * pass through with their extra fields.
  */
-export function withPolicyTbmFloors(p: TbmPoolRow, overrides: unknown = (policy.rules as any).tbm_floor_percent): TbmPoolRow {
+export function withPolicyTbmFloors<P extends TbmPoolRow>(p: P, overrides: unknown = (policy.rules as any).tbm_floor_percent): P {
   const entry = overrides && typeof overrides === "object" ? (overrides as any)[normalizeProviderFamily(p.provider) ?? ""] : null;
   if (!entry || typeof entry !== "object") return p;
   const out = { ...p };

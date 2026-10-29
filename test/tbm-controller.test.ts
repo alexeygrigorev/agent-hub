@@ -127,6 +127,65 @@ describe('TBM percentage-only pools and cycle_ms (AC2 / AC6)', () => {
 });
 
 describe('Persisted PID controller, reset ledger, rewards, rollups & routing feedback (AC2 / AC3)', () => {
+  it('paces a configured zero-floor pool toward depletion and keeps it routable at 1% remaining', async () => {
+    await inDO(stub('tbm-zero-floor-tick'), async (h: Hub) => {
+      const sql = h.sql;
+      ensureTbmControllerSchema(sql);
+      // Stored row keeps the schema defaults (hard 5 / soft 20); the deployed
+      // rules.tbm_floor_percent override for codex is what must reach the tick.
+      sql.exec(`INSERT INTO tbm_quota_pools (
+        pool_id, provider, account, total_capacity_tokens, remaining_tokens,
+        headroom_percentage, remaining_percent, capacity_known, quota_unit,
+        reset_at_ms, cycle_ms, window_type, last_updated_ms
+      ) VALUES ('codex:zero:7d', 'codex', 'zero', 0, 0, 1, 1, 0, 'percent', ?, ?, '7d', ?)`,
+      NOW + 6 * HOUR, 7 * DAY, NOW);
+      const summary = tickTbm(sql, NOW);
+      expect(summary.pools_updated).toBe(1);
+      expect(summary.routing_factors['codex:zero']?.halted).toBe(false);
+      const row = sql.exec("SELECT target_burn_rate_tpm FROM tbm_quota_pools WHERE pool_id = 'codex:zero:7d'").one() as any;
+      expect(row.target_burn_rate_tpm).toBeGreaterThan(0);
+    });
+  });
+  it('honors an explicit zero hard floor in reset snapshots: leftover waste counts everything above zero', async () => {
+    await inDO(stub('tbm-zero-floor-reset'), async (h: Hub) => {
+      const sql = h.sql;
+      ensureTbmControllerSchema(sql);
+      sql.exec(`INSERT INTO tbm_quota_pools (
+        pool_id, provider, account, total_capacity_tokens, remaining_tokens,
+        headroom_percentage, remaining_percent, capacity_known, quota_unit,
+        reset_at_ms, cycle_ms, window_type, hard_floor_percent, last_updated_ms
+      ) VALUES ('claude:zero:5h', 'claude', 'zero', 0, 0, 40, 40, 0, 'percent', ?, ?, '5h', 0, ?)`,
+      NOW - MIN, 5 * HOUR, NOW);
+      tickTbm(sql, NOW);
+      const snap = sql.exec("SELECT hard_floor_percent FROM tbm_pool_resets WHERE pool_id = 'claude:zero:5h'").one() as any;
+      expect(snap.hard_floor_percent).toBe(0);
+      const reward = sql.exec("SELECT waste_at_reset_penalty, net_reward FROM tbm_reward_events WHERE event_id = ?", `reset:claude:zero:5h:${NOW - MIN}`).one() as any;
+      expect(reward.waste_at_reset_penalty).toBeCloseTo(500 * Math.pow(0.4, 2));
+      expect(reward.net_reward).toBeCloseTo(-500 * Math.pow(0.4, 2));
+    });
+  });
+  it('does not accrue a floor-breach penalty on a configured zero-floor pool below the stored 5% default', async () => {
+    await inDO(stub('tbm-zero-floor-reward'), async (h: Hub) => {
+      const sql = h.sql;
+      ensureTbmControllerSchema(sql);
+      sql.exec(`INSERT INTO tbm_quota_pools (
+        pool_id, provider, account, total_capacity_tokens, remaining_tokens,
+        headroom_percentage, remaining_percent, capacity_known, quota_unit,
+        reset_at_ms, cycle_ms, window_type, last_updated_ms
+      ) VALUES ('codex:zero:5h', 'codex', 'zero', 0, 0, 3, 3, 0, 'percent', ?, ?, '5h', ?)`,
+      NOW + 4 * HOUR, 5 * HOUR, NOW);
+      const reward = recordSessionOutcomeReward(sql, {
+        session_id: 'sess-zero-floor',
+        provider: 'codex',
+        account: 'zero',
+        pool_id: 'codex:zero:5h',
+        outcome: 'done',
+        tokens_burned: 1000,
+      }, NOW);
+      expect(reward.floor_breach_penalty).toBe(0);
+      expect(reward.useful_work_reward).toBeGreaterThan(0);
+    });
+  });
   it('recomputes persisted urgency and burn rate when an unknown grant gains a real quantity', async () => {
     await inDO(stub('tbm-unknown-to-known'), async (h: Hub) => {
       const sql = h.sql;
