@@ -2317,6 +2317,17 @@ class Dispatcher:
 
         return sorted(qualified)
 
+    def route_advertisement(self):
+        """Every (engine, account, profile) route _route() accepts, for each heartbeat.
+
+        Hub offers only these while the advertisement is fresh, so a route the
+        host dropped (e.g. a failed managed install) holds with
+        route_not_advertised instead of failing dispatch_route_unconfigured on
+        the host (intake 6cbb862a).
+        """
+        return [{'engine': s.get('engine', s['service']), 'account': s['account_label'], 'profile': s.get('profile')}
+                for s in self.settings['subscriptions']][:64]
+
     def goal_routes(self):
         """Advertise executable local routes, independent of quota admission."""
         return [{'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
@@ -3586,6 +3597,7 @@ class Dispatcher:
         except Exception:
             fresh_hb = hb
         try:
+            fresh_hb['fleet_routes'] = self.route_advertisement()
             self.request('POST', '/api/host/poll', fresh_hb)
         except Exception:
             pass
@@ -3874,6 +3886,7 @@ class Dispatcher:
             {'launch_allowed': allowed,
              'reason': 'fleet local admission' if allowed else 'fleet admission unavailable',
              'at': utcnow()}, self.settings)
+        hb['fleet_routes'] = self.route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         self._last_hb = hb
         return hb
@@ -3920,6 +3933,7 @@ class Dispatcher:
         for key in ('gate', 'launcher_resources'):
             if key in latest:
                 hb[key] = latest[key]
+        hb['fleet_routes'] = self.route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         caps = self.capabilities_put_payload()
         if caps is not None:
@@ -4104,6 +4118,7 @@ class Dispatcher:
                               'error': _sanitized_transport_error(exc)}), flush=True)
         _mark('register')
         hb['gate'] = allowed_gate
+        hb['fleet_routes'] = self.route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         _mark('heartbeat')
         for engine in sorted(admitted_engines):

@@ -36,6 +36,7 @@ async function safeJson(req: Request): Promise<any> {
   }
 }
 
+const ROUTE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 function sanitizeHeartbeat(body: any) {
   if (!body || body.type !== 'heartbeat') return null;
   const hb: any = { type: 'heartbeat' };
@@ -81,6 +82,14 @@ function sanitizeHeartbeat(body: any) {
   if (Array.isArray(body.running_jobs)) {
     hb.running_jobs = body.running_jobs.filter((j: any) => typeof j === 'string' && j.length <= 128).slice(0, 50);
   }
+  // Executable routes the host's dispatcher accepts (intake 6cbb862a). Bounded
+  // label tuples only; a malformed list is dropped, never partially kept.
+  if (Array.isArray(body.fleet_routes) && body.fleet_routes.length <= 64 && body.fleet_routes.every((r: any) =>
+      r && typeof r === 'object' && typeof r.engine === 'string' && ROUTE_LABEL.test(r.engine)
+      && typeof r.account === 'string' && ROUTE_LABEL.test(r.account)
+      && (r.profile === null || r.profile === undefined || (typeof r.profile === 'string' && ROUTE_LABEL.test(r.profile))))) {
+    hb.fleet_routes = body.fleet_routes.map((r: any) => ({ engine: r.engine, account: r.account, profile: r.profile ?? null }));
+  }
   if (typeof body.sessions_summary === 'object' && body.sessions_summary) {
     hb.sessions_summary = {};
     for (const k of Object.keys(body.sessions_summary)) {
@@ -92,7 +101,7 @@ function sanitizeHeartbeat(body: any) {
   return hb;
 }
 
-const machineState = new Map<string, { lastSeenAt: number, lastPersistedAt: number, fingerprint: string, hb: any }>();
+const machineState = new Map<string, { lastSeenAt: number, lastPersistedAt: number, fingerprint: string, hb: any, routesAt?: number }>();
 
 function getFingerprint(hb: any): string {
   return JSON.stringify({
@@ -100,7 +109,8 @@ function getFingerprint(hb: any): string {
     gate: hb.gate,
     launcher_resources: hb.launcher_resources,
     running_jobs: hb.running_jobs,
-    sessions_summary: hb.sessions_summary
+    sessions_summary: hb.sessions_summary,
+    fleet_routes: hb.fleet_routes
   });
 }
 
@@ -111,6 +121,16 @@ function getFingerprint(hb: any): string {
 export function effectiveCheckin(machineId: string, persisted: unknown): string | null {
   const stored = typeof persisted === 'string' ? Date.parse(persisted) : NaN;
   const seen = machineState.get(machineId)?.lastSeenAt;
+  const best = Math.max(Number.isFinite(stored) ? stored : -Infinity, typeof seen === 'number' ? seen : -Infinity);
+  return Number.isFinite(best) ? new Date(best).toISOString() : null;
+}
+
+/** Latest time the host advertised fleet_routes (intake 6cbb862a): an unchanged
+ * heartbeat is persisted at most every five minutes, so prefer the newer
+ * in-memory observation, exactly as effectiveCheckin does. */
+export function effectiveRoutesAt(machineId: string, persisted: unknown): string | null {
+  const stored = typeof persisted === 'string' ? Date.parse(persisted) : NaN;
+  const seen = machineState.get(machineId)?.routesAt;
   const best = Math.max(Number.isFinite(stored) ? stored : -Infinity, typeof seen === 'number' ? seen : -Infinity);
   return Number.isFinite(best) ? new Date(best).toISOString() : null;
 }
@@ -137,14 +157,30 @@ export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStor
     && sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='resource_choking_events'").toArray().length) {
     sql.exec('INSERT INTO resource_choking_events VALUES(?,?,?) ON CONFLICT(machine_id,reason) DO UPDATE SET observed_at=excluded.observed_at WHERE excluded.observed_at>resource_choking_events.observed_at',machineId,'host_oom',cpu.observed_at);
   }
-  const fingerprint = getFingerprint(hb);
   let st = machineState.get(machineId);
+  // Route advertisement carries its own freshness (fleet_routes_at): a
+  // heartbeat without the field (e.g. the role-job poller) keeps the last
+  // advertisement and its original time, so it can age out but never looks
+  // newer than it is.
+  const advertisedNow = !!hb.fleet_routes;
+  if (advertisedNow) hb.fleet_routes_at = new Date(now).toISOString();
+  else {
+    let previous: any = st?.hb;
+    if (!previous) {
+      try { previous = JSON.parse(String((sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machineId).toArray()[0] as any)?.last_heartbeat ?? 'null')); } catch { previous = null; }
+    }
+    if (Array.isArray(previous?.fleet_routes) && typeof previous.fleet_routes_at === 'string') {
+      hb.fleet_routes = previous.fleet_routes; hb.fleet_routes_at = previous.fleet_routes_at;
+    }
+  }
+  const fingerprint = getFingerprint(hb);
   
   if (!st) {
     st = { lastSeenAt: now, lastPersistedAt: 0, fingerprint: '', hb: null };
     machineState.set(machineId, st);
   }
   st.lastSeenAt = now;
+  if (advertisedNow) st.routesAt = now;
   st.hb = hb;
 
   if (fingerprint !== st.fingerprint || now - st.lastPersistedAt >= 300000) {

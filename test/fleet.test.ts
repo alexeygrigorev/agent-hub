@@ -784,7 +784,8 @@ describe('generic accounts and launch placement', () => {
     const sessions = new SessionControlService(sql, cb => cb(), () => now); sessions.init();
     sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('claim-retry-show', 'owner', 'claim-retry-show', '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
     const shown: any = await (await sessions.handle(new Request('https://hub.test/api/sessions/' + launch.id), admin)).json();
-    expect(shown.launch_error).toEqual(diagnostic);
+    // Intake 6cbb862a AC c: dispatch-stage errors also name the offered route.
+    expect(shown.launch_error).toEqual({ ...diagnostic, route: { machine: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null } });
     const rejected: any = await (await restarted.handle(request(path + '/reject', { reason: diagnostic.reason, diagnostic }), host('hetzner'))).json();
     expect(rejected).toMatchObject({ id: launch.id, state: 'held', retryable: true });
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('offered');

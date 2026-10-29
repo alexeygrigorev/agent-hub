@@ -960,9 +960,13 @@ export class SessionControlService {
     let modelReason: string | null = null;
     let memoryRejected: any[] = [];
     let holdReason: string | null = null;
+    // Offered route (account/profile labels only, never credentials or paths).
+    let offeredRoute: { machine: string | null; engine: string | null; account: string | null; profile: string | null } | null = null;
     if (row.fleet_launch_id) {
       try {
-        const launch: any = this.sql.exec('SELECT launch_error_json, runtime_json, model_selection_json, exit_reason, native_id,request_json,workspace FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        const launch: any = this.sql.exec('SELECT launch_error_json, runtime_json, model_selection_json, exit_reason, native_id,request_json,workspace,account,profile,machine_id,engine FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        const routeLabel = (v: unknown) => typeof v === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(v) ? v : null;
+        if (launch && (routeLabel(launch.account) || routeLabel(launch.profile))) offeredRoute = { machine: routeLabel(launch.machine_id ?? row.machine_id), engine: routeLabel(launch.engine ?? row.engine), account: routeLabel(launch.account), profile: routeLabel(launch.profile) };
         runtime = parsed(launch?.runtime_json, null);
         modelSelection = parsed(launch?.model_selection_json);
         const cpuTable=this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='resource_cpu_starts'").toArray().length;
@@ -1043,7 +1047,9 @@ export class SessionControlService {
       ...(modelReason ? { reason: modelReason } : {}),
       ...(memoryRejected.length ? { reason: holdReason ?? memoryRejected[0]?.reason ?? 'placement_unknown', rejected: memoryRejected } : holdReason ? { reason: holdReason } : {}),
       ...(['refused', 'held'].includes(row.state) ? { reason: holdReason || memoryRejected[0]?.reason || 'placement_unknown', rejected: memoryRejected } : {}),
-      ...(launchError ? { reason: launchError.reason, message: launchError.message, launch_error: launchError } : {}),
+      ...(offeredRoute ? { offered_route: offeredRoute } : {}),
+      ...(launchError ? { reason: launchError.reason, message: launchError.message,
+        launch_error: launchError.stage === 'dispatch_route' && offeredRoute ? { ...launchError, route: offeredRoute } : launchError } : {}),
       ...(runtime ? { runtime } : {}),
       cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
       binding,
@@ -1163,7 +1169,7 @@ export class SessionControlService {
     if (!this.hooks.reserve) return { promoted, cancelled };
     const transientReasons = new Set([
       'disk_floor', 'launcher_disk_reserve', 'resource_limit', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity',
-      'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking',
+      'route_not_advertised', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking',
     ]);
     try {
       const rows = this.sql.exec(

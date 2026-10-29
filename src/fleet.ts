@@ -8,7 +8,7 @@ import { launcherDiskHeadroom } from './launcher-disk';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
-import { effectiveCheckin } from './registry';
+import { effectiveCheckin, effectiveRoutesAt } from './registry';
 import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
 import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
@@ -110,7 +110,10 @@ function disabledEngines(): Set<string> {
   return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
 }
 /** Reject reasons that mean "no free slot right now" (transient capacity). */
-const CAPACITY_REASONS = new Set(['disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+// route_not_advertised: the host's latest capabilities do not list this
+// (engine, account, profile); it holds until the host re-advertises the route
+// instead of failing dispatch_route_unconfigured on the host (intake 6cbb862a).
+const CAPACITY_REASONS = new Set(['route_not_advertised', 'disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -177,6 +180,33 @@ const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_poli
  * remain visible; without a capacity rejection they never queue alone.
  * Any other class (workspace/mode capability, admission, resources, quota
  * evidence) stays a hard reject with its slug visible. */
+/** Latest host route advertisement (intake 6cbb862a AC a). The heartbeat's
+ * fleet_routes is authoritative while fresh and advertises nothing once
+ * stale; a host that has never sent it (pre-release) is judged by its fresh
+ * routing runners' exact tuples, and by nothing once those are stale. Only a
+ * host with no route evidence at all (no list, no or empty runners) returns
+ * null and keeps registry-only placement. */
+export function advertisedRoutes(hb: any, runners: { runners_json?: unknown; observed_at?: unknown } | null | undefined, nowMs: number): any[] | null {
+  if (Array.isArray(hb?.fleet_routes)) return fresh(hb.fleet_routes_at, nowMs, 180000) ? hb.fleet_routes : [];
+  if (runners) {
+    let list: unknown = null;
+    try { list = JSON.parse(String(runners.runners_json)); } catch { list = null; }
+    if (!Array.isArray(list)) return [];
+    if (!list.length) return null; // no launcher-model runners: no route evidence either way
+    return fresh(runners.observed_at, nowMs, 180000) ? list : [];
+  }
+  return null;
+}
+function routeAdvertised(routes: any[] | null, route: { engine: string; account: string; profile?: string | null }): boolean {
+  return routes === null || hostAdvertisesRoute(routes, route);
+}
+/** Exact (engine, canonical account, profile) membership, as the host's dispatch _route() matches. */
+export function hostAdvertisesRoute(routes: unknown, route: { engine: string; account: string; profile?: string | null }): boolean {
+  if (!Array.isArray(routes)) return false;
+  const account = canonicalAccountLabel(route.account);
+  return routes.some((r: any) => r && r.engine === route.engine && typeof r.account === 'string'
+    && canonicalAccountLabel(r.account) === account && (r.profile ?? null) === (route.profile ?? null));
+}
 export function isCapacityOnlyHold(rejected: unknown): rejected is { machine: string; engine: string; reason: string }[] {
   if (!Array.isArray(rejected) || rejected.length === 0) return false;
   let capacity = false;
@@ -871,6 +901,15 @@ export class FleetService {
         if (Array.isArray(engines)) for (const e of engines) if (typeof e === 'string') liveEngines.add(e);
       }
     } catch { /* fail closed below: empty set keeps capability_unavailable */ }
+    const runnersByMachine = new Map<string, any>();
+    const routingRunners = (machineId: string) => {
+      if (!runnersByMachine.has(machineId)) {
+        let row: any = null;
+        try { row = this.sql.exec('SELECT runners_json, observed_at FROM routing_machines WHERE machine_id = ?', machineId).toArray()[0] ?? null; } catch { row = null; }
+        runnersByMachine.set(machineId, row);
+      }
+      return runnersByMachine.get(machineId);
+    };
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
       if (overrideModels.length) {
@@ -980,6 +1019,8 @@ export class FleetService {
       };
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
+      else if (!routeAdvertised(advertisedRoutes(Array.isArray(hb.fleet_routes) ? { ...hb, fleet_routes_at: effectiveRoutesAt(route.machine_id, hb.fleet_routes_at) } : hb,
+        routingRunners(route.machine_id), this.now()), route)) reason = 'route_not_advertised';
       else if (credentialInvalid.has(route.account)) reason = 'credential_invalid';
       else if (credentialRejected.has(route.machine_id + '\u0000' + route.account) || hostCredentialRefusal) reason = 'credential_rejected';
       else if (gateRefusal) reason = gateRefusal.reason;
@@ -1014,7 +1055,7 @@ export class FleetService {
       else if (!account || account.status === 'blocked') reason = 'account_' + (account?.status || 'unmapped');
       else if (!routeQuota.ok) reason = 'quota_' + routeQuota.reason;
       else if (account.available_slots < 1) reason = 'account_concurrency';
-      if (reason) { evidence(); rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
+      if (reason) { evidence(); rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'route_not_advertised' ? { account: route.account, profile: route.profile ?? null } : {}), ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
