@@ -277,16 +277,23 @@ export class ChecksService {
       case 'delivery_slo': {
         const maxAgeS = p.max_age_s ?? 300;
         const cutoff = this.now() - maxAgeS * 1000;
+        const totals = this.sql.exec(`SELECT COUNT(*) AS n, COUNT(DISTINCT to_actor) AS recipients
+          FROM messages WHERE acked_at IS NULL AND created_at < ? AND expires_at > ? ${p.actor ? 'AND to_actor = ?' : ''}`,
+          cutoff, this.now(), ...(p.actor ? [p.actor] : [])).one() as any;
         const recipients = this.sql.exec(`SELECT to_actor AS actor, COUNT(*) AS n,
           SUM(registry_unbound_to) AS unbound FROM messages WHERE acked_at IS NULL
           AND created_at < ? AND expires_at > ? ${p.actor ? 'AND to_actor = ?' : ''}
-          GROUP BY to_actor ORDER BY to_actor`, cutoff, this.now(), ...(p.actor ? [p.actor] : [])).toArray() as any[];
+          GROUP BY to_actor ORDER BY n DESC, to_actor LIMIT 20`, cutoff, this.now(), ...(p.actor ? [p.actor] : [])).toArray() as any[];
         if (!recipients.length) return { status: 'pass', detail: `delivery SLO met (${maxAgeS}s limit)` };
-        const count = recipients.reduce((n, r) => n + Number(r.n), 0);
+        const count = Number(totals.n);
+        const more = Number(totals.recipients) - recipients.length;
         const noReader = recipients.filter(r => Number(r.unbound) > 0 || !inboxReaderStatus(this.sql, r.actor, this.now()).active_reader);
         const detail = `${count} unacknowledged message(s) older than ${maxAgeS}s (delivery SLO violated); ` +
-          recipients.map(r => `${r.actor}: ${r.n} overdue${Number(r.unbound) ? `, ${r.unbound} registry-unbound` : ''}`).join('; ');
-        return { status: 'fail', detail: (noReader.length ? 'NO_READER: ' + noReader.map(r => r.actor).join(', ') + '; ' : '') + detail };
+          recipients.map(r => `${r.actor}: ${r.n} overdue${Number(r.unbound) ? `, ${r.unbound} registry-unbound` : ''}`).join('; ') + (more ? `; +${more} more recipients (top 20 shown)` : '');
+        const summary = (noReader.length ? 'NO_READER: ' + noReader.map(r => r.actor).join(', ') + '; ' : '') + detail;
+        const bytes = new TextEncoder().encode(summary);
+        return { status: 'fail', detail: bytes.byteLength <= 12000 ? summary :
+          new TextDecoder().decode(bytes.subarray(0, 11900)) + '; further labels omitted; inspect bus backlog' };
 
       }
       case 'dispatch_route': {

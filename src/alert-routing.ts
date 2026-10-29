@@ -10,10 +10,15 @@ export function readerActor(sql: SqlStorage, actor: string): string {
 // A credential is not evidence of a reader. Only successful recipient/host
 // inbox polls count; operator inspections never renew this lease.
 export const READER_FRESH_MS = 15 * 60 * 1000;
+export const BUS_REFRESH_GRACE_MS = 2 * 60 * 1000;
 export const ALERT_SUBJECT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export const ALERT_ROUTING_SCHEMA = `
+CREATE TABLE IF NOT EXISTS bus_auth_pending (subject TEXT PRIMARY KEY, credential_id TEXT NOT NULL, first_failed_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS bus_auth_pending_due ON bus_auth_pending(first_failed_at);
 CREATE TABLE IF NOT EXISTS bus_reader_activity (recipient TEXT NOT NULL, credential_id TEXT NOT NULL, last_read_at INTEGER NOT NULL, PRIMARY KEY(recipient, credential_id));
+CREATE INDEX IF NOT EXISTS bus_reader_activity_age ON bus_reader_activity(last_read_at);
 CREATE TABLE IF NOT EXISTS alert_delivery_receipts (subject_kind TEXT NOT NULL, subject TEXT NOT NULL, target TEXT NOT NULL, alert_id INTEGER NOT NULL, sent_at INTEGER NOT NULL, PRIMARY KEY(subject_kind, subject, target));
+CREATE INDEX IF NOT EXISTS alert_delivery_receipts_age ON alert_delivery_receipts(sent_at);
 `;
 export function initAlertRouting(sql: { exec(query: string, ...values: any[]): unknown }) {
   for (const stmt of ALERT_ROUTING_SCHEMA.split(';')) if (stmt.trim()) sql.exec(stmt);
@@ -27,7 +32,7 @@ export function inboxReaderStatus(sql: SqlStorage, actor: string, now = Date.now
   const active = readers.some(c => {
     if (!(Date.parse(c.expires_at) > now)) return false;
     let scopes: any; try { scopes = JSON.parse(c.scopes); } catch { return false; }
-    if (!Array.isArray(scopes) || !scopes.some(s => ['admin', 'bus:read', 'host'].includes(s))) return false;
+    if (!Array.isArray(scopes) || !scopes.some(s => ['admin', 'bus:read', 'msg:read', 'host'].includes(s))) return false;
     if (c.kind === 'agent') return credentialActor(sql, c) === actor;
     if (c.kind === 'host') {
       // Host bridge authority must still refer to the recipient's current host.
@@ -53,4 +58,9 @@ export function alertDestinations(env: { HUB_ALERT_TO?: string; HUB_ALERT_WEBHOO
     } catch { invalidWebhook = true; }
   }
   return { actors, webhook, invalidWebhook, invalidActors };
+}
+
+export function pruneAlertRouting(sql: SqlStorage, now = Date.now()) {
+  sql.exec('DELETE FROM bus_reader_activity WHERE last_read_at < ?', now - READER_FRESH_MS);
+  sql.exec('DELETE FROM alert_delivery_receipts WHERE sent_at < ?', now - ALERT_SUBJECT_COOLDOWN_MS);
 }
