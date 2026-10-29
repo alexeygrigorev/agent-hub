@@ -95,9 +95,24 @@ def isolate():
         os.environ.pop(name, None)
 
 
+def stabilize_host_load():
+    """Give unit tests a stable host instead of the shared machine's live load.
+
+    Mirrors the pytest autouse fixture ``isolated_host_load`` for every
+    unittest path (bare ``discover -s tests`` never loads conftest): only the
+    module's OS reader is replaced, so the real gate logic runs and samples
+    injected via ``loadavg_fn``/``cpu_count_fn`` or an explicit patch of
+    ``host_load.os`` still decide the dedicated load-admission tests.
+    """
+    from types import SimpleNamespace
+    from . import host_load
+    host_load.os = SimpleNamespace(getloadavg=lambda: (0.0, 0.0, 0.0), cpu_count=lambda: 12)
+
+
 def auto_isolate():
     """Arm the isolation when imported by a test runner process."""
     # CLI subprocesses can inherit an armed guard without importing a runner.
     _remember_guard_environment()
     if under_test_runner():
         isolate()
+        stabilize_host_load()
