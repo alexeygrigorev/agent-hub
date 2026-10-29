@@ -91,8 +91,17 @@ export class ResourceManagement {
     if (tables.some(table=>!this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",table).toArray().length)) return;
     this.sql.exec('CREATE TABLE IF NOT EXISTS resource_catalog_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL,structure_revision TEXT NOT NULL)');
     this.sql.exec("INSERT OR IGNORE INTO resource_catalog_revision VALUES(1,lower(hex(randomblob(16))),lower(hex(randomblob(16))))");
+    // Activity is sampled afresh on every read; observed_at is not canonical
+    // metadata. All other native columns conservatively invalidate the catalog.
+    const nativeChanged = this.sql.exec('PRAGMA table_info(fleet_sessions)').toArray()
+      .map((row:any)=>String(row.name)).filter(name=>!['last_activity_at','observed_at'].includes(name))
+      .map(name=>{const column='"'+name.replaceAll('"','""')+'"';return `OLD.${column} IS NOT NEW.${column}`;}).join(' OR ') || '1';
     for(const table of tables) for(const op of ['INSERT','UPDATE','DELETE']) {
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_catalog_${table}_${op.toLowerCase()} AFTER ${op} ON ${table} ${table === 'machines' && op === 'UPDATE' ? 'WHEN OLD.hostname IS NOT NEW.hostname OR OLD.id IS NOT NEW.id' : ''}
+      const nativeUpdate=table==='fleet_sessions' && op==='UPDATE';
+      // Replace the old unconditional trigger, including on existing databases.
+      // Rebuilding it also includes any newly added native metadata columns.
+      if(nativeUpdate) this.sql.exec('DROP TRIGGER IF EXISTS resource_catalog_fleet_sessions_update');
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_catalog_${table}_${op.toLowerCase()} AFTER ${op} ON ${table} ${nativeUpdate ? 'WHEN '+nativeChanged : table === 'machines' && op === 'UPDATE' ? 'WHEN OLD.hostname IS NOT NEW.hostname OR OLD.id IS NOT NEW.id' : ''}
         BEGIN UPDATE resource_catalog_revision SET revision=lower(hex(randomblob(16)))${table==='fleet_sessions' ? '' : ',structure_revision=lower(hex(randomblob(16)))'} WHERE id=1; END`);
     }
     this.catalogReady=true;
@@ -414,8 +423,8 @@ export class ResourceManagement {
     return [...bound,...fleetOnly];
   }
   private canonicalSessions(machine?: string) {
-    // No time-based authority cache: every source write changes the durable
-    // random generation, including writes followed by rollback and retry.
+    // No time-based authority cache: metadata/authority writes change the
+    // durable random generation, including rollback and retry. Activity is live.
     const raw=this.catalogReady ? this.sql.exec('SELECT revision,structure_revision FROM resource_catalog_revision WHERE id=1').toArray()[0] : null;
     const revision=typeof raw?.revision==='string' && /^[a-f0-9]{32}$/.test(raw.revision) ? raw.revision : null;
     const structure=revision!==null && typeof raw?.structure_revision==='string' && /^[a-f0-9]{32}$/.test(raw.structure_revision) ? raw.structure_revision : null;
@@ -440,8 +449,13 @@ export class ResourceManagement {
         this.catalogCache.set(key,{revision,rows,bytes});
       }
     }
+    // A census activity refresh must not rebuild retained identity/protection
+    // history. Read the live timestamps even when canonical metadata is cached,
+    // including inside transactions and after their rollback.
+    const activity = new Map(this.readRows(`SELECT machine_id,native_id,last_activity_at FROM fleet_sessions ${machine ? 'WHERE machine_id=?' : ''}`,
+      ...(machine ? [machine] : [])).map(row=>[JSON.stringify([row.machine_id,row.native_id]),row.last_activity_at]));
     // Callers cannot mutate a cached protection or alias list.
-    return rows.map(row=>({...row,aliases:[...row.aliases]}));
+    return rows.map(row=>({...row,aliases:[...row.aliases],last_activity_at:activity.get(JSON.stringify([row.machine_id,row.native_id])) ?? null}));
   }
   private buildCanonicalSessions(machine?: string) {
     type Bound = ReturnType<ResourceManagement['boundSessions']>[number];

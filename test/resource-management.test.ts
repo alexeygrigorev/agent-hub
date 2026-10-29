@@ -60,6 +60,33 @@ describe('resource management',()=>{
   expect(read()).toBeUndefined();
  }));
 
+ it('keeps native activity and metadata fresh across independent updates and rollbacks',async()=>fixture(async(r,sql,f)=>{
+  r.initCatalogCache();
+  const read=()=>(r as any).canonicalSessions('host').find((s:any)=>s.native_id==='native');
+  expect(read().last_activity_at).toBe(iso(-3600001));
+  sql.exec("UPDATE fleet_sessions SET last_activity_at=?,observed_at=? WHERE native_id='native'",iso(-1000),iso());
+  expect(read().last_activity_at).toBe(iso(-1000));
+  const tx=(f as any).transaction;
+  expect(()=>tx(()=>{
+   sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='native'",iso(-500));
+   expect(read().last_activity_at).toBe(iso(-500));
+   throw new Error('activity rollback');
+  })).toThrow('activity rollback');
+  expect(read().last_activity_at).toBe(iso(-1000));
+  // Fleet-only identities take their tag and start time from the native row.
+  sql.exec("DELETE FROM session_control_sessions WHERE id='session'");
+  read();
+  sql.exec("UPDATE fleet_sessions SET tag='changed',created_at_ms=? WHERE native_id='native'",now-1234);
+  expect(read()).toMatchObject({tag:'changed',native_created_at_ms:now-1234,started_at:iso(-1234)});
+  expect(()=>tx(()=>{
+   sql.exec("UPDATE fleet_sessions SET tag='transient' WHERE native_id='native'");
+   expect(read().tag).toBe('transient');
+   throw new Error('native metadata rollback');
+  })).toThrow('native metadata rollback');
+  sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='native'",iso(-200));
+  expect(read()).toMatchObject({tag:'changed',last_activity_at:iso(-200),started_at:iso(-1234)});
+ }));
+
  it('bypasses incomplete or oversized canonical caches and does not share nested legacy data',async()=>fixture(async(r,sql)=>{
   r.initCatalogCache();
   let builds=0;const build=(r as any).buildCanonicalSessions.bind(r);
