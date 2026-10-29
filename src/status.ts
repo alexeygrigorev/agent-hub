@@ -518,6 +518,7 @@ export class StatusService {
   private coverageDto(missingHosts: string[], expectedOffline: string[], sessionCoverage: string, now: number): Obj {
     const offlineWindowActive = expectedOfflineWindowActive(now);
     return { sessions: sessionCoverage, missing_hosts: missingHosts, expected_offline: expectedOffline,
+      hosts: this.rows('SELECT id,hostname,last_checkin_at,drained FROM machines ORDER BY id').map(m => ({ ...m, last_checkin_at: effectiveCheckin(String(m.id), m.last_checkin_at) ?? null })),
       expected_offline_until: offlineWindowActive ? EXPECTED_OFFLINE_UNTIL : null,
       expected_offline_reason: offlineWindowActive && expectedOffline.length ? EXPECTED_OFFLINE_REASON : null,
       reason: missingHosts.length ? 'one_or_more_hosts_stale_or_unreachable' : expectedOffline.length ? 'all_unexpected_hosts_fresh_expected_offline_excluded' : 'all_known_hosts_fresh' };

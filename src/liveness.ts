@@ -198,6 +198,33 @@ export class LivenessService {
     return reported.has(machineId + '/' + nativeId);
   }
 
+  /** Mandatory host monitoring, independent of user-configured checks.
+   * Stable machine ids retain incident identity across display-name changes.
+   * Only a fresh checkin proves recovery; draining a host does not.
+   */
+  watchHosts(): any[] {
+    const notifications: any[] = [];
+    for (const m of this.sql.exec('SELECT id,name,last_checkin_at,registered_at,drained FROM machines').toArray() as any[]) {
+      const checkin = effectiveCheckin(String(m.id), m.last_checkin_at);
+      const age = ageSeconds(checkin ?? m.registered_at, this.now());
+      let existing: any = this.sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind='host_watch' AND subject=? AND resolved_at IS NULL", m.id).toArray()[0];
+      // Adopt an already-notified legacy machine incident without resending it.
+      if (!existing) {
+        existing = this.sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind='machine' AND subject IN (?,?) AND resolved_at IS NULL ORDER BY id LIMIT 1", m.id, m.name || m.id).toArray()[0];
+        if (existing) this.sql.exec("UPDATE liveness_alerts SET subject_kind='host_watch',subject=? WHERE id=?", m.id, existing.id);
+      }
+      if (!m.drained && (age === null || age > 900)) {
+        const opened = this.setAlert('host_watch', m.id, { state: 'offline', detail: `${m.name || m.id}: last_checkin_at=${checkin ?? 'never'}; no checkin for ${age ?? 'unknown'}s` });
+        if (opened) notifications.push(opened);
+      } else if (existing && checkin && age !== null && age <= 900) {
+        this.setAlert('host_watch', m.id, null);
+        const recovered = this.setAlert('host_recovery', String(existing.id), { state: 'RECOVERED', detail: `${m.name || m.id}: last_checkin_at=${checkin}; incident ${existing.id}` });
+        if (recovered) notifications.push(recovered);
+      }
+    }
+    return notifications;
+  }
+
   /** Self-reported heartbeat from an agent credential. Status is a short word, summary is plain text. */
   recordHeartbeat(actor: string, machineId: string | null, input: any): { ok: true } | { error: string } {
     if (!ACTOR.test(actor)) return { error: 'invalid_actor' };

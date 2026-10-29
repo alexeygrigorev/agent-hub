@@ -12,6 +12,7 @@ import { sha256, randomString } from './auth/crypto';
 import { effectiveCheckin } from './registry';
 import { sameIntent, sameEditCaller, type EditAuthority } from './claim_admission';
 import { blockedEngines, healthRowsFor, runnerHealth } from './engine-health';
+import { HostGoals } from './host-goals';
 
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const label = (x: unknown): x is string => typeof x === 'string' && LABEL.test(x);
@@ -54,6 +55,8 @@ export class RoutingService {
     // its own clean checkout to it and reports the outcome. The Hub never
     // ships code, only the target SHA, which the host verifies is on main.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS host_release_targets (machine_id TEXT PRIMARY KEY, sha TEXT, set_by TEXT, set_at TEXT, current_sha TEXT, state TEXT, error TEXT, reported_at TEXT)`);
+    if (!this.sql.exec('PRAGMA table_info(host_release_targets)').toArray().some((c: any) => c.name === 'autostart_state')) this.sql.exec('ALTER TABLE host_release_targets ADD COLUMN autostart_state TEXT');
+    new HostGoals(this.sql, this.fleet, this.now).init();
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_artifacts (job_id TEXT NOT NULL, name TEXT NOT NULL, media_type TEXT NOT NULL, data_base64 TEXT NOT NULL, PRIMARY KEY(job_id, name))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_jobs (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, launch_id TEXT, state TEXT NOT NULL, report TEXT NOT NULL DEFAULT '', artifacts_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, selection_json TEXT, UNIQUE(actor, request_key))`);
     this.sql.exec('CREATE INDEX IF NOT EXISTS routing_pending ON routing_jobs(state, launch_id)');
@@ -195,12 +198,23 @@ export class RoutingService {
     const client = routingClient || fleetEditor;
     const host = caller.kind === 'host' && caller.machineId && auth.scopes?.includes('host');
     const path = new URL(request.url).pathname.replace(/^\/api\/fleet\/tasks(?=\/|$)/, '/api/tasks').replace(/^\/api\/fleet\/routing(?=\/|$)/, '/api/routing');
+    const goalMatch = /^\/api\/routing\/host-goal\/([A-Za-z0-9_-]{1,64})$/.exec(path);
+    if (goalMatch) {
+      if (!admin) return reply({ error: 'forbidden' }, 403);
+      const goals = new HostGoals(this.sql, this.fleet, this.now);
+      if (request.method === 'GET') return reply({ goal: goals.view(goalMatch[1]) });
+      if (request.method !== 'PUT') return reply({ error: 'method_not_allowed' }, 405);
+      const input = await jsonBody(request, 4096);
+      const saved = this.transaction(() => goals.set(goalMatch[1], input));
+      return reply(saved, saved?.error ? 400 : 200);
+    }
     if (path === '/api/routing/capabilities' && request.method === 'PUT') {
       if (!host) return reply({ error: 'forbidden' }, 403);
       const data = await jsonBody(request);
       if (!obj(data, ['needs', 'max_agents', 'runners']) || !Array.isArray(data.needs) || data.needs.length > 64 || data.needs.some((n: any) => typeof n !== 'string' || !CAP.test(n)) || new Set(data.needs).size !== data.needs.length || !Number.isInteger(data.max_agents) || data.max_agents < 1 || data.max_agents > 100) return reply({ error: 'invalid_capabilities' }, 400);
       if (!Array.isArray(data.runners) || data.runners.length > 128 || data.runners.some((r: any) => !obj(r, ['engine', 'profile', 'model', 'effort', 'account']) || !label(r.engine) || !label(r.account) || (r.profile !== null && !label(r.profile)) || (r.effort !== null && !['low','medium','high','max','xhigh'].includes(r.effort)) || typeof r.model !== 'string' || r.model.length > 128)) return reply({ error: 'invalid_runners' }, 400);
       this.sql.exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', caller.machineId, JSON.stringify(data.needs), data.max_agents, this.at(), JSON.stringify(data.runners));
+      new HostGoals(this.sql, this.fleet, this.now).reconcile(caller.machineId);
       return reply({ status: 'registered' });
     }
     if (path === '/api/routing/host-release' && request.method === 'GET') {
@@ -211,10 +225,11 @@ export class RoutingService {
     if (path === '/api/routing/host-release/report' && request.method === 'POST') {
       if (!host) return reply({ error: 'forbidden' }, 403);
       const data = await jsonBody(request, 4096);
-      if (!obj(data, ['current_sha', 'state', 'error']) || (data.current_sha !== null && !(typeof data.current_sha === 'string' && SHA.test(data.current_sha))) ||
+      if (!obj(data, ['current_sha', 'state', 'error', 'autostart_state']) || (data.autostart_state !== undefined && !['configured','wrapper_missing','registration_failed'].includes(data.autostart_state)) || (data.current_sha !== null && !(typeof data.current_sha === 'string' && SHA.test(data.current_sha))) ||
         !HOST_RELEASE_STATES.includes(data.state) || (data.error !== undefined && data.error !== null && !(typeof data.error === 'string' && /^[a-z0-9_]{1,64}$/.test(data.error)))) return reply({ error: 'invalid_host_release_report' }, 400);
       this.sql.exec('INSERT INTO host_release_targets (machine_id, current_sha, state, error, reported_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET current_sha = excluded.current_sha, state = excluded.state, error = excluded.error, reported_at = excluded.reported_at',
         caller.machineId, data.current_sha, data.state, data.error ?? null, this.at());
+      if (data.autostart_state !== undefined) this.sql.exec('UPDATE host_release_targets SET autostart_state=? WHERE machine_id=?', data.autostart_state, caller.machineId);
       return reply({ status: 'recorded' });
     }
     const releaseMatch = /^\/api\/routing\/host-release\/([A-Za-z0-9_-]{1,64})$/.exec(path);
@@ -237,7 +252,7 @@ export class RoutingService {
         return this.sql.exec("SELECT engine, machine_id, reason, updated_at FROM fleet_engine_health WHERE status = 'unavailable'").toArray() as any[];
       } catch { return []; } })();
       const releases = new Map((this.sql.exec('SELECT * FROM host_release_targets').toArray() as any[]).map(r => [r.machine_id, { desired_sha: r.sha ?? null, current_sha: r.current_sha ?? null, state: r.state ?? null, error: r.error ?? null, reported_at: r.reported_at ?? null, set_at: r.set_at ?? null }]));
-      return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.os, m.arch, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id').toArray() as any[]).map(m => ({ id: m.machine_id, host_release: releases.get(m.machine_id) ?? null, hostname: m.hostname, os: m.os ?? '', arch: (m as any).arch ?? '', needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json).map((rn: any) => ({ ...rn, ...runnerHealth(healthRowsFor(unavailableRows, rn.engine, m.machine_id), this.now()) })), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
+      return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.os, m.arch, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id').toArray() as any[]).map(m => ({ id: m.machine_id, last_checkin_at: effectiveCheckin(m.machine_id, m.last_checkin_at) ?? null, host_goal: new HostGoals(this.sql, this.fleet, this.now).view(m.machine_id), host_release: releases.get(m.machine_id) ?? null, hostname: m.hostname, os: m.os ?? '', arch: (m as any).arch ?? '', needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json).map((rn: any) => ({ ...rn, ...runnerHealth(healthRowsFor(unavailableRows, rn.engine, m.machine_id), this.now()) })), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
     }
     if (path === '/api/routing/policy/grok') {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);

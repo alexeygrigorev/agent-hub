@@ -14,6 +14,7 @@ smoke test restores the previous commit (the tree was clean, so nothing is
 lost) and keeps the running controller.
 """
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -73,6 +74,52 @@ def current_sha(root, run=subprocess.run):
     return out.lower() if code == 0 and SHA.match(out.lower()) else None
 
 
+def release_sha(package=None):
+    """Immutable releases carry build provenance rather than a .git directory."""
+    root = Path(package or __file__).resolve().parent.parent.parent
+    try:
+        manifest = json.loads((root / 'release-manifest.json').read_text(encoding='utf-8'))
+        sha = manifest.get('release_rev')
+        return sha.lower() if isinstance(sha, str) and SHA.fullmatch(sha.lower()) else None
+    except (OSError, ValueError, TypeError):
+        pass
+    # Zipapp and wheel distributions carry the build stamp instead.
+    try:
+        from . import _build_info
+        sha = _build_info.BUILD_COMMIT
+        return sha.lower() if isinstance(sha, str) and SHA.fullmatch(sha.lower()) else None
+    except (ImportError, AttributeError):
+        return None
+
+
+def ensure_windows_autostart(root, run=subprocess.run):
+    """Upgrade the existing user supervisor task; never request elevation."""
+    if sys.platform != 'win32':
+        return None
+    local = os.environ.get('LOCALAPPDATA')
+    if not local or root is None:
+        return 'wrapper_missing'
+    runner = Path(local) / 'agent-hub' / 'run-session-host.ps1'
+    script = Path(root) / 'scripts' / 'windows-host-autostart.ps1'
+    if not runner.is_file() or not script.is_file():
+        return 'wrapper_missing'
+    marker = runner.parent / 'autostart-version.sha256'
+    digest = hashlib.sha256(script.read_bytes()).hexdigest()
+    try:
+        if marker.read_text(encoding='ascii').strip() == digest:
+            return 'configured'
+    except OSError:
+        pass
+    try:
+        code, _ = _run(run, ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script), '-Runner', str(runner)], root, 90)
+        if code:
+            return 'registration_failed'
+        marker.write_text(digest + '\n', encoding='ascii')
+        return 'configured'
+    except (OSError, subprocess.SubprocessError):
+        return 'registration_failed'
+
+
 def _install_and_smoke(run, root, python):
     env = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1', PIP_DISABLE_PIP_VERSION_CHECK='1')
     code, _ = _run(run, [python, '-m', 'pip', 'install', '--quiet', '-e', str(root)], root, PIP_TIMEOUT_S, env)
@@ -126,13 +173,18 @@ def step_once(request, *, root=None, run=subprocess.run, python=None, log=print)
     target = (request('GET', '/api/fleet/routing/host-release') or {}).get('sha')
     target = target.lower() if isinstance(target, str) and SHA.match(target.lower()) else None
     if root is None:
-        state, error, sha = 'unsupported', 'not_a_git_checkout', None
+        sha = release_sha()
+        state, error = ('current', None) if sha and (target is None or sha == target) else ('unsupported', 'immutable_release' if sha else 'release_provenance_missing')
     elif target is None:
         sha = current_sha(root, run)
         state, error = ('current', None) if sha else ('unsupported', 'not_a_git_checkout')
     else:
         state, error, sha = apply(target, root, run=run, python=python)
-    request('POST', '/api/fleet/routing/host-release/report', {'current_sha': sha, 'state': state, 'error': error})
+    report = {'current_sha': sha, 'state': state, 'error': error}
+    autostart = ensure_windows_autostart(root, run)
+    if autostart is not None:
+        report['autostart_state'] = autostart
+    request('POST', '/api/fleet/routing/host-release/report', report)
     log(json.dumps({'event': 'host_release', 'state': state, 'error': error, 'sha': sha}), flush=True)
     return state == 'updated'
 

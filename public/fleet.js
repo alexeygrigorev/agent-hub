@@ -56,6 +56,7 @@ function render(data) {
   for (const m of data.machines) {
     const section = document.createElement('article'); section.className = 'machine';
     const title = document.createElement('h3'); title.textContent = `${m.name || m.id} · ${m.drained ? 'drained' : fresh(m.last_checkin_at) ? 'online' : 'stale / offline'}${m.alias_of ? ` · alias of ${m.canonical_id || m.alias_of} (same physical host; reporting via ${m.canonical_id || m.alias_of})` : ''}`; section.append(title);
+    const checkin = document.createElement('p'); checkin.textContent = `Last check-in: ${m.last_checkin_at || 'never'}`; section.append(checkin);
     const subscriptions = data.subscriptions.filter(s => s.machine_id === m.id);
     section.append(table(['Service', 'Harness', 'Account label', 'Plan', 'Quota / used allowance / reset'], subscriptions.map(s => [s.service, (s.harness && s.harness.length ? s.harness.join(', ') : 'unknown'), s.account, s.plan, `${s.stale ? 'stale; ' : ''}${s.quota.status}; ` + Object.entries(s.quota.windows || {}).map(([name, w]) => `${name}: ${w.present ? `${w.percent_remaining ?? 'unknown'}% left / ${w.percent_remaining === null ? 'unknown' : 100 - w.percent_remaining}% used; reset ${w.reset_at || 'unknown'}` : 'not present'}`).join(' | ')])));
     if (!subscriptions.length) { const p = document.createElement('p'); p.textContent = 'No subscription report. Configure this machine and enable its metadata collector.'; section.append(p); }

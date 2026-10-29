@@ -161,7 +161,7 @@ describe('running checks', () => {
     checks.replace([row({ name: 'liveness', kind: 'liveness', interval_s: 300 })]);
     const [result] = await checks.runDue(deps);
     expect(result.status).toBe('fail');
-    expect(deps.log).toEqual([['notify', 'machine', 'laptop', 'offline']]);
+    expect(deps.log).toEqual([['notify', 'host_watch', 'laptop', 'offline']]);
     clock.t += 300000;
     await checks.runDue(deps);
     expect(deps.log).toHaveLength(1);

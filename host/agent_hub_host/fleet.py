@@ -3822,7 +3822,14 @@ class Dispatcher:
         """
         if 'capabilities' not in self.settings or 'max_agents' not in self.settings:
             return None
-        return {'needs': self.settings['capabilities'],
+        from .system import get_arch
+        # Operator settings can outlive the interpreter/OS architecture.
+        # The native detection used by registration owns the arch label too.
+        needs = [n for n in self.settings['capabilities'] if not n.startswith('arch:')]
+        arch = get_arch()
+        if arch != 'unknown' and any(n.startswith('arch:') for n in self.settings['capabilities']):
+            needs.append('arch:' + arch)
+        return {'needs': needs,
                 'max_agents': self.settings['max_agents'],
                 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'),
                              'account': s['account_label'], 'model': s['launcher_model'],

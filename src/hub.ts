@@ -34,6 +34,7 @@ import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { ProvisioningService } from './provisioning';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
+import { HostGoals } from './host-goals';
 import { BankedResets } from './banked-resets';
 import { ChecksService, validateCheck, type ActionDeps } from './checks';
 import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
@@ -2043,7 +2044,7 @@ export class Hub extends DurableObject {
     for (const to of targets) {
       if (delivered.has('inbox:' + to)) continue;
       try {
-        this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: `alert-${alert.id}-${to}-${Date.now()}` });
+        this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: `alert-${alert.id}-${to}` });
         delivered.add('inbox:' + to);
       } catch (e: any) { errors.push(`${to}: ${String(e?.message || e).slice(0, 80)}`); }
     }
@@ -2059,7 +2060,7 @@ export class Hub extends DurableObject {
     // A delivered informational digest is not an ongoing incident. Preserve its
     // receipt/history, but keep it out of the unresolved incident queue. Failed
     // targets stay open for the ordinary retry path.
-    if (alert.subject_kind === 'intake_digest' && anyTarget && !errors.length) {
+    if (['intake_digest', 'host_recovery'].includes(alert.subject_kind) && anyTarget && !errors.length) {
       this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
     }
     return { delivered: [...delivered], errors };
@@ -2078,6 +2079,8 @@ export class Hub extends DurableObject {
   }
 
   async runChecks(only?: string) {
+    for (const alert of this.livenessService.watchHosts()) await this.notifyAlert(alert);
+    new HostGoals(this.sql, this.fleetService).reconcile();
     this.runTbmTick();
     if (!only) await this.maintainCredentials();
     for (const alert of new BankedResets(this.sql, this.livenessService).run()) await this.notifyAlert(alert);
