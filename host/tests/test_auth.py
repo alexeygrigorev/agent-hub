@@ -34,14 +34,16 @@ class TestAuth(unittest.TestCase):
         success_resp.headers = {"Content-Type": "application/json"}
         success_resp.read.return_value = json.dumps({
             "access_token": "acc123",
-            "refresh_token": "ref123"
+            "refresh_token": "ref123",
+            "scope": "host health:report"
         }).encode("utf-8")
         success_resp.__enter__.return_value = success_resp
         
         mock_urlopen.side_effect = [code_resp, pending_error, success_resp]
         
-        auth.device_login("https://fake", "host", "agent-hub-host", "host", auth.HOST_SCOPES)
-        mock_update_config.assert_called_once_with(dict(access_token="acc123", refresh_token="ref123", base_url="https://fake", client_kind="host", client_name="agent-hub-host", requested_scopes=auth.HOST_SCOPES))
+        requested = auth.HOST_SCOPES + ['repositories:read']
+        auth.device_login("https://fake", "host", "agent-hub-host", "host", requested)
+        mock_update_config.assert_called_once_with(dict(access_token="acc123", refresh_token="ref123", base_url="https://fake", client_kind="host", client_name="agent-hub-host", requested_scopes=requested, granted_scopes=['host', 'health:report']))
 
     @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.save_config")
@@ -89,6 +91,23 @@ class TestAuth(unittest.TestCase):
         token = auth.refresh_token()
         self.assertEqual(token, "new_acc")
         mock_update_config.assert_called_once_with(dict(base_url="https://fake", access_token="new_acc", refresh_token="new_ref"))
+
+    @patch("urllib.request.OpenerDirector.open")
+    @patch("agent_hub_host.config.save_config")
+    @patch("agent_hub_host.config.load_config")
+    def test_refresh_persists_reduced_granted_scope(self, load, save, urlopen):
+        load.return_value = {'refresh_token': 'ref123', 'base_url': 'https://fake',
+                             'requested_scopes': ['host', 'repositories:read'],
+                             'granted_scopes': ['host', 'repositories:read']}
+        response = MagicMock()
+        response.headers = {'Content-Type': 'application/json'}
+        response.read.return_value = json.dumps({'access_token': 'new_acc',
+                                                'refresh_token': 'new_ref', 'scope': 'host'}).encode()
+        urlopen.return_value.__enter__.return_value = response
+        self.assertEqual(auth.refresh_token(), 'new_acc')
+        saved = save.call_args.args[0]
+        self.assertEqual(saved['granted_scopes'], ['host'])
+        self.assertEqual(saved['requested_scopes'], ['host', 'repositories:read'])
 
     @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.load_config")

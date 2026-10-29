@@ -1,10 +1,13 @@
 import hashlib
+import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 import zipfile
 
@@ -243,6 +246,53 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 b.configure('https://hub.test')
         login.assert_not_called()
+
+    def test_declined_or_legacy_forbidden_repo_access_does_not_strand_host_on_rerun(self):
+        from agent_hub_host import api, auth, config, fleet, provisioning
+        for legacy in (False, True):
+            with self.subTest(legacy_profile=legacy), contextlib.ExitStack() as stack:
+                install_root = self.root / ('legacy' if legacy else 'declined')
+                settings = install_root / 'subscriptions.json'
+                install_root.mkdir()
+                settings.write_text('{}')
+                cfg = {'access_token': 'synthetic', 'base_url': 'https://hub.test',
+                       'machine_id': 'existing', 'requested_scopes': ['host', 'repositories:read']}
+                if not legacy:
+                    cfg['granted_scopes'] = ['host']
+                def forbidden(*args):
+                    raise urllib.error.HTTPError('https://hub.test/api/host/repositories',
+                                                  403, 'Forbidden', {}, io.BytesIO(b'{}'))
+                for obj, name, options in (
+                    (b.sys, 'platform', {'new': 'linux'}),
+                    (b, 'root', {'return_value': install_root}),
+                    (b.Path, 'home', {'return_value': install_root}),
+                    (b, 'validate_persistent_install', {}),
+                    (b, 'validate_side_effect_context', {}),
+                    (config, 'load_host_config', {'return_value': cfg}),
+                    (config, 'get_host_config_path', {'return_value': install_root / 'host.json'}),
+                    (api, 'register_machine', {}),
+                    (fleet, 'subscriptions_path', {'return_value': settings}),
+                    (fleet, 'load_settings', {}),
+                    (b, 'publish_user_path', {}),
+                    (b, 'configure_default_engine', {}),
+                ):
+                    stack.enter_context(patch.object(obj, name, **options))
+                login = stack.enter_context(patch.object(auth, 'device_login'))
+                request = stack.enter_context(patch.object(provisioning, 'host_request', side_effect=forbidden))
+                accounts = stack.enter_context(patch.object(provisioning, 'sync'))
+                service = stack.enter_context(patch.object(b, 'install_service', return_value='systemd_user'))
+                stack.enter_context(patch.dict(os.environ))
+                output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                b.configure('https://hub.test')
+                b.configure('https://hub.test')
+                results = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith('{')]
+                self.assertEqual([r['repository_access'] for r in results],
+                                 ['forbidden' if legacy else 'declined'] * 2)
+                self.assertEqual([r['status'] for r in results], ['installed'] * 2)
+                self.assertEqual(accounts.call_count, 2)
+                self.assertEqual(service.call_count, 2)
+                self.assertEqual(request.call_count, 2 if legacy else 0)
+                login.assert_not_called()
 
     def test_ambient_human_config_is_not_used_for_host_enrollment(self):
         from agent_hub_host import config, auth

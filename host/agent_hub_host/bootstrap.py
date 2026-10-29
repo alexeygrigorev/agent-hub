@@ -17,6 +17,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import urllib.error
 import zipfile
 import shlex
 import plistlib
@@ -592,8 +593,27 @@ def configure(base_url):
     from . import enrollment_repositories
     paired = config.load_host_config()
     repositories = None
-    if 'repositories:read' in paired.get('requested_scopes', []):
-        repositories = enrollment_repositories.sync(install_root)
+    repository_access = 'not_configured'
+    granted = paired.get('granted_scopes')
+    requested = paired.get('requested_scopes', [])
+    if isinstance(granted, list):
+        repository_access = 'declined' if 'repositories:read' in requested else 'not_requested'
+        repository_allowed = 'repositories:read' in granted
+    else:
+        # Older profiles did not save granted scopes. Probe with the host
+        # credential; the server still enforces current consent and family.
+        repository_allowed = 'repositories:read' in requested
+    if repository_allowed:
+        try:
+            repositories = enrollment_repositories.sync(install_root)
+        except urllib.error.HTTPError as error:
+            if error.code != 403:
+                raise
+            # Optional repository consent must not strand an enrolled host
+            # before its controller is installed, including on a repair run.
+            repository_access = 'forbidden'
+        else:
+            repository_access = 'configured' if repositories is not None else 'not_configured'
         if repositories:
             data = json.loads(settings.read_text())
             workspaces = data.setdefault('workspaces', {})
@@ -625,7 +645,7 @@ def configure(base_url):
     service = install_service(install_root, service_command(install_root, settings))
     print(json.dumps({'status': 'installed', 'machine_id': config.load_host_config().get('machine_id'),
                       'service': service, 'elevation_prompts': 0,
-                      'repository_access': 'configured' if repositories is not None else 'not_configured'}), flush=True)
+                      'repository_access': repository_access}), flush=True)
 
 
 def main(argv=None):
