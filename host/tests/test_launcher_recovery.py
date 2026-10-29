@@ -144,7 +144,10 @@ class LauncherRecoveryTests(unittest.TestCase):
         offer = {'id': self.offer, 'engine': 'opencode', 'account': 'muse', 'mode': 'headless', 'workspace': 'main', 'prompt': 'review'}
         dispatcher = Dispatcher(settings, runner=runner, request=lambda *a: requests.append(a) or {})
         with patch.object(dispatcher, '_persist_launch_record', side_effect=OSError('journal unavailable')):
-            self.assertEqual(dispatcher.dispatch(offer)['state'], 'uncertain')
+            with self.assertRaises(OSError):
+                dispatcher.dispatch(offer)
+        # Worktree planning may precede the claim; execution authority may not.
+        self.assertFalse(any(call[1].endswith('/claim') for call in requests))
         self.assertEqual(self.state()[0], 'queued')
         self.assertEqual(dispatcher.dispatch(offer)['state'], 'failed')
         self.assertEqual(self.state()[0], 'failed')

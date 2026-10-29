@@ -15,9 +15,9 @@ from agent_hub_host.launch_diagnostics import LocalCommandError, diagnostic, exc
 class LaunchDiagnosticTests(unittest.TestCase):
     def test_worktree_and_tmpdir_refusals_preserve_fixed_diagnostics(self):
         for raw, reason in (
-            ('worktree_lock_failed: checkout could not be protected', 'worktree_lock_failed'),
-            ('worktree_lock_failed: missing canonical session identity', 'worktree_lock_failed'),
-            ('worktree_identity_failed: original repository could not be recorded', 'worktree_identity_failed'),
+            ('worktree_lock_failed: checkout could not be protected', 'launcher_worktree_lock_failed'),
+            ('worktree_lock_failed: missing canonical session identity', 'launcher_worktree_lock_failed'),
+            ('worktree_identity_failed: original repository could not be recorded', 'launcher_worktree_identity_failed'),
             ('Launcher temporary directory unavailable', 'launcher_tmpdir_unavailable'),
         ):
             with self.subTest(raw=raw):

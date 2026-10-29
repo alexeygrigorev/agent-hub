@@ -219,11 +219,14 @@ def ensure_locked(
     session_id: str,
     intake_id: Any,
     runner: Optional[Callable] = None,
+    *, owner_terminal: Optional[Callable[[str], bool]] = None,
 ) -> bool:
     """Lock the session worktree with the canonical Hub reason.
 
-    Existing locks qualify only with this exact canonical reason. Returns False when the reason
-    is malformed or git declines. Never raises into start/adopt flows.
+    A canonical lock for the same nonempty intake protects a retry only with
+    fresh positive proof that its owner is terminal. Preserve the original
+    owner; reuse grants no release permission. Unknown/live owners refuse.
+    Returns False when the reason is malformed or git declines.
     """
     try:
         reason = lock_reason(session_id, intake_id)
@@ -236,7 +239,15 @@ def ensure_locked(
     if current is True:
         try:
             entry = find_entry(list_entries(git_bin, path, runner), path)
-            return bool(entry and entry.get("reason") == reason)
+            if not entry:
+                return False
+            if entry.get("reason") == reason:
+                return True
+            owner = parse_lock_reason(entry.get("reason"))
+            requested = parse_lock_reason(reason)
+            return bool(owner and requested and requested[1] is not None
+                        and owner[1] == requested[1] and owner_terminal is not None
+                        and owner_terminal(owner[0]) is True)
         except Exception:
             return False
     if current is None:
@@ -394,7 +405,8 @@ def expected_repository(row: Any) -> Optional[dict]:
 
 
 def protect_bound_worktree(git_bin: str, path: str, session_id: Any, intake_id: Any,
-                           runner: Optional[Callable] = None) -> bool:
+                           runner: Optional[Callable] = None, *,
+                           owner_terminal: Optional[Callable[[str], bool]] = None) -> bool:
     """Lock a linked checkout before starting a native session inside it.
 
     A main checkout or non-git workspace needs no worktree lock. For a linked
@@ -417,7 +429,7 @@ def protect_bound_worktree(git_bin: str, path: str, session_id: Any, intake_id: 
     root = max(roots, key=lambda e: len(e["path"]))["path"]
     if not os.path.isfile(os.path.join(root, ".git")):
         return True
-    return ensure_locked(git_bin, root, session_id, intake_id, runner)
+    return ensure_locked(git_bin, root, session_id, intake_id, runner, owner_terminal=owner_terminal)
 
 
 def reuse_stopped_intake_lock(git_bin: str, path: str, session_id: str,

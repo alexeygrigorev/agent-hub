@@ -1,6 +1,7 @@
 """Fixed pre-start reasons plus bounded, redacted typed command evidence."""
 MESSAGES = {
     'host_overload': 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
+    'dispatch_worktree_refused': 'The worktree could not be protected before native start.',
     'cpu_headroom': 'Host CPU usage plus expected session demand exceeds the CPU target.',
     'cpu_pressure': 'Host CPU pressure exceeds the safety cap.',
     'memory_pressure': 'Host memory full pressure exceeds the safety cap.',
@@ -30,6 +31,10 @@ MESSAGES = {
     'codex_quota_gate_quota_check_failed': 'The managed Codex quota check failed.',
 }
 EXACT = {
+    'worktree_lock_failed: missing offer identity': 'dispatch_worktree_refused',
+    'worktree_lock_failed: missing canonical session identity': 'dispatch_worktree_refused',
+    'worktree_lock_failed: checkout could not be protected': 'dispatch_worktree_refused',
+    'worktree_identity_failed: original repository could not be recorded': 'dispatch_worktree_refused',
     'Local account/profile/workspace is not configured': 'dispatch_route_unconfigured',
     'Goal startup requires a trusted local command': 'goal_startup_unconfigured',
     'Invalid trusted startup argv': 'dispatch_startup_invalid',
