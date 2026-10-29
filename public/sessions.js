@@ -55,11 +55,20 @@ function typeBadge(type) {
   return span;
 }
 
+// A cleanly stopped session whose worker reported done is a completion,
+// not a failure (intake 17e774f8); every other stop keeps its own badge.
+function sessionDisplayState(s) {
+  if (s.waiting_confirmation || s.agent_state === 'waiting') return 'waiting-confirmation';
+  if (s.agent_state === 'idle' && s.state === 'running') return 'idle';
+  if (s.state === 'stopped' && s.worker_status === 'done') return 'done';
+  return s.state;
+}
+
 function stateBadge(state) {
   const span = document.createElement('span');
   const s = state || 'unknown';
   let color = 'dk-badge--neutral';
-  if (['running', 'active', 'working', 'acked', 'delivered'].includes(s)) color = 'dk-badge--success';
+  if (['running', 'active', 'working', 'acked', 'delivered', 'done'].includes(s)) color = 'dk-badge--success';
   else if (['stale', 'stalled', 'uncertain', 'offered', 'starting', 'recorded', 'transported', 'claimed', 'held', 'waiting', 'waiting-confirmation', 'waiting_confirmation', 'waiting-idle', 'waiting_until', 'idle'].includes(s)) color = 'dk-badge--warning';
   else if (['failed', 'refused', 'stopped', 'offline', 'error', 'cancelled'].includes(s)) color = 'dk-badge--danger';
   span.className = `dk-badge ${color}`;
@@ -143,7 +152,7 @@ function renderSessionCards(filtered, emptyMessage) {
     chev.className = 'sessions-card-item__chev';
     chev.setAttribute('aria-hidden', 'true');
     chev.textContent = '›';
-    const displayState = (s.waiting_confirmation || s.agent_state === 'waiting') ? 'waiting-confirmation' : (s.agent_state === 'idle' && s.state === 'running' ? 'idle' : s.state);
+    const displayState = sessionDisplayState(s);
     badges.append(stateBadge(displayState), typeBadge(s.session_type), chev);
     head.append(badges);
     card.append(head);
@@ -240,7 +249,7 @@ function renderTable(sessions, filter = '') {
 
     const tdState = document.createElement('td');
     tdState.dataset.label = 'State';
-    const displayState = (s.waiting_confirmation || s.agent_state === 'waiting') ? 'waiting-confirmation' : (s.agent_state === 'idle' && s.state === 'running' ? 'idle' : s.state);
+    const displayState = sessionDisplayState(s);
     tdState.append(stateBadge(displayState));
     tr.append(tdState);
 
@@ -442,7 +451,7 @@ function renderSessionDetail(session, commands = []) {
   const displayTitle = session.qualified_alias || session.name || session.id || 'Session';
   if (titleEl) titleEl.textContent = displayTitle;
   if (badgesEl) {
-    badgesEl.replaceChildren(stateBadge(session.state), typeBadge(session.session_type));
+    badgesEl.replaceChildren(stateBadge(session.state === 'stopped' && session.worker_status === 'done' ? 'done' : session.state), typeBadge(session.session_type));
   }
 
   const isRunning = (session.lifecycle_state || session.state) === 'running';

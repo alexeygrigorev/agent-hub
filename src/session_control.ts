@@ -1,3 +1,4 @@
+import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
 import { IntakeWorktrees, namesWorktree } from './intake-worktrees';
@@ -973,6 +974,15 @@ export class SessionControlService {
     let holdReason: string | null = null;
     // Offered route (account/profile labels only, never credentials or paths).
     let offeredRoute: { machine: string | null; engine: string | null; account: string | null; profile: string | null } | null = null;
+    let workerStatus: string | null = null;
+    if (row.fleet_launch_id) {
+      // Intake 17e774f8: separate read so older fleet tables without the
+      // column cannot hide the launch diagnostics below.
+      try {
+        const done: any = this.sql.exec('SELECT state, worker_status, runtime_json FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        if (done?.state === 'exited' && WORKER_STATUSES.includes(done.worker_status) && cleanReportedExit(parsed(done.runtime_json, null))) workerStatus = done.worker_status;
+      } catch {}
+    }
     if (row.fleet_launch_id) {
       try {
         const launch: any = this.sql.exec('SELECT launch_error_json, runtime_json, model_selection_json, exit_reason, native_id,request_json,workspace,account,profile,machine_id,engine FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
@@ -1062,6 +1072,11 @@ export class SessionControlService {
       ...(launchError ? { reason: launchError.reason, message: launchError.message,
         launch_error: launchError.stage === 'dispatch_route' && offeredRoute ? { ...launchError, route: offeredRoute } : launchError } : {}),
       ...(runtime ? { runtime } : {}),
+      // The worker's reported outcome for a cleanly stopped launch. Lifecycle
+      // state stays 'stopped'; any failure override above suppresses it.
+      ...(workerStatus && row.state === 'stopped' && !terminalError &&
+          launchError?.reason !== 'engine_tool_permission_refused' &&
+          !(row.mode === 'headless' && orphanFailure(native)) ? { worker_status: workerStatus } : {}),
       cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
       binding,
       provenance,

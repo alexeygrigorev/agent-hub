@@ -1,3 +1,4 @@
+import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { observationModel } from './session-observation';
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
@@ -506,7 +507,7 @@ export class FleetService {
     if (!holdColumns.includes('evidence_json')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN evidence_json TEXT');
     initResourceRequestProjection(this.sql, 'fleet_launches');
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
-    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key', 'runtime_json']) {
+    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key', 'runtime_json', 'worker_status']) {
       if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
@@ -2417,6 +2418,16 @@ export class FleetService {
         a === null || typeof a !== 'object' || Array.isArray(a) ||
         typeof (a as any).label !== 'string' || (a as any).label.length > 120 ||
         typeof (a as any).text !== 'string' || (a as any).text.length > 1024))) return;
+      // Intake 17e774f8: keep the worker's own outcome on the launch so the
+      // session view can tell a reported completion from a bare stop. Only an
+      // accepted exit whose runtime proves a clean completion, with a
+      // non-empty worker report, counts; the first value is immutable and the
+      // view re-checks the current runtime (src/worker-outcome.ts).
+      if (data.state === 'exited' && data.confirmed_exit === true && WORKER_STATUSES.includes(data.report_status) &&
+          typeof data.report === 'string' && data.report.trim() && cleanReportedExit(data.runtime)) {
+        this.sql.exec("UPDATE fleet_launches SET worker_status = ? WHERE id = ? AND state = 'exited' AND worker_status IS NULL",
+          data.report_status, launchId);
+      }
       if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length === 0) return;
       if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'intake_tasks'").toArray().length === 0) return;
       const session: any = this.sql.exec('SELECT id, request_json FROM session_control_sessions WHERE fleet_launch_id = ?', launchId).toArray()[0];
