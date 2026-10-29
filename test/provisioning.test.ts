@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { ProvisioningService } from '../src/provisioning';
+import { ProvisioningService, PROVIDER_DEFAULT_MAX_CONCURRENCY } from '../src/provisioning';
 import type { Env } from '../src/env';
 import type { Hub } from '../src/hub';
 const admin = { caller: { isAdmin: true, kind: 'human' }, scopes: ['admin'] };
@@ -85,6 +85,41 @@ describe('central engine provisioning', () => {
   }));
 });
 
+describe('managed account max_concurrency default (intake 40fa0d3e)', () => {
+  const maxOf = (sql: any, label: string) => Number(sql.exec('SELECT max_concurrency FROM fleet_accounts WHERE label=?', label).one().max_concurrency);
+  it('a newly imported account inherits the provider default unless explicitly set', async () => fixture(async (s, sql) => {
+    expect((await s.handle(req('/test-account', 'PUT', bundle), admin)).status).toBe(200);
+    expect(maxOf(sql, 'test-account')).toBe(PROVIDER_DEFAULT_MAX_CONCURRENCY.codex);
+    expect(PROVIDER_DEFAULT_MAX_CONCURRENCY.codex).toBe(8);
+    const explicit = { ...bundle, label: 'explicit-account' };
+    expect((await s.handle(req('/explicit-account?max_concurrency=3', 'PUT', explicit), admin)).status).toBe(200);
+    expect(maxOf(sql, 'explicit-account')).toBe(3);
+    for (const bad of ['0', '101', '2.5', 'x'])
+      expect((await s.handle(req('/bad-account?max_concurrency=' + bad, 'PUT', { ...bundle, label: 'bad-account' }), admin)).status).toBe(400);
+    expect(sql.exec("SELECT 1 FROM fleet_accounts WHERE label='bad-account'").toArray()).toHaveLength(0);
+    // A rotation never resets an operator-chosen limit back to the default.
+    sql.exec("UPDATE fleet_accounts SET max_concurrency=2 WHERE label='test-account'");
+    expect((await s.handle(req('/test-account', 'PUT', bundle), admin)).status).toBe(200);
+    expect(maxOf(sql, 'test-account')).toBe(2);
+  }));
+  it('migrates managed accounts left at the implicit 1 once, flags them, and never touches unmanaged rows', async () => fixture(async (s, sql) => {
+    sql.exec('DELETE FROM engine_migrations');
+    for (const [label, provider] of [['legacy-claude', 'claude'], ['legacy-codex', 'codex'], ['tuned-codex', 'codex']]) {
+      sql.exec("INSERT INTO engine_bundles VALUES (?,?,'1.0.0','r','c')", label, provider);
+      sql.exec('INSERT INTO fleet_accounts VALUES (?,?,?,0,1)', label, provider, label === 'tuned-codex' ? 4 : 1);
+    }
+    sql.exec("INSERT INTO fleet_accounts VALUES ('operator','codex',1,15,1)");
+    s.init();
+    expect([maxOf(sql, 'legacy-claude'), maxOf(sql, 'legacy-codex'), maxOf(sql, 'tuned-codex'), maxOf(sql, 'operator')]).toEqual([8, 8, 4, 1]);
+    const list: any = await (await s.handle(req(), admin)).json();
+    expect(list.account_migrations).toEqual([expect.objectContaining({ name: 'managed_account_max_concurrency_default_v1',
+      migrated: [{ label: 'legacy-claude', from: 1, to: 8 }, { label: 'legacy-codex', from: 1, to: 8 }] })]);
+    // Applied once: a later explicit 1 survives every restart.
+    sql.exec("UPDATE fleet_accounts SET max_concurrency=1 WHERE label='legacy-codex'");
+    s.init();
+    expect(maxOf(sql, 'legacy-codex')).toBe(1);
+  }));
+});
 it('keeps two Codex account profiles separate on two enrolled machines', async () => fixture(async (s, sql) => {
   const a: any = await (await s.handle(req('/test-account', 'PUT', bundle), admin)).json();
   const second = {...bundle, label: 'other-account', files: {'.codex/auth.json': 'different-private-marker'}};
@@ -146,8 +181,8 @@ it('provisions central Z.ai accounts, isolates zcodex routes and supports multip
 
   const accounts = sql.exec("SELECT * FROM fleet_accounts WHERE provider='zai' ORDER BY label").toArray();
   expect(accounts).toEqual([
-    { label: 'zai-personal', provider: 'zai', max_concurrency: 1, reserve_percent: 0, enabled: 1 },
-    { label: 'zai-work', provider: 'zai', max_concurrency: 1, reserve_percent: 0, enabled: 1 },
+    { label: 'zai-personal', provider: 'zai', max_concurrency: 8, reserve_percent: 0, enabled: 1 },
+    { label: 'zai-work', provider: 'zai', max_concurrency: 8, reserve_percent: 0, enabled: 1 },
   ]);
 
   const sync: any = await (await s.handle(req('/sync'), host)).json();
