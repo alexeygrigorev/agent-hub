@@ -217,7 +217,9 @@ describe('Hub-owned credentials: store, refresh, write-back, enrollment', () => 
   });
 
   it('creates a Hub-owned Claude account from a central login; hosts receive it with no login of their own', async () => {
-    await fixture(async ({ provision }) => {
+    await fixture(async ({ provision, sql }) => {
+      const badMax = await provision.handle(new Request('https://hub.test/api/engines/credential-logins', { method: 'POST', body: JSON.stringify({ provider: 'claude', label: 'hub-claude', max_concurrency: 0 }) }), admin);
+      expect(badMax.status).toBe(400);
       const start = await (await provision.handle(new Request('https://hub.test/api/engines/credential-logins', { method: 'POST', body: JSON.stringify({ provider: 'claude', label: 'hub-claude', version: '2.1.304' }) }), admin)).json() as any;
       const url = new URL(start.url);
       expect(url.origin + url.pathname).toBe(CLAUDE_OAUTH.authorize);
@@ -231,6 +233,8 @@ describe('Hub-owned credentials: store, refresh, write-back, enrollment', () => 
       provision.fetchFn = provider.fn as any;
       const done = await (await provision.handle(new Request(`https://hub.test/api/engines/credential-logins/${start.id}`, { method: 'POST', body: JSON.stringify({ code: `the-code#${state}` }) }), admin)).json() as any;
       expect(done).toMatchObject({ status: 'configured', label: 'hub-claude', credential_generation: 1 });
+      // A centrally created account inherits the provider default slot limit (intake 40fa0d3e).
+      expect(sql.exec("SELECT max_concurrency FROM fleet_accounts WHERE label='hub-claude'").one().max_concurrency).toBe(8);
       const e = (await sync(provision, 'tabo')).engines.find((x: any) => x.label === 'hub-claude');
       const oauth = JSON.parse(e.files['.claude/.credentials.json']).claudeAiOauth;
       expect(oauth).toMatchObject({ refreshToken: 'refresh-c1', subscriptionType: 'max' });

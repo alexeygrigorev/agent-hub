@@ -15,7 +15,7 @@ import sys
 import tempfile
 import zipfile
 
-from . import bus, config, private_fs
+from . import bus, config, hook_command, private_fs
 
 LABEL = re.compile(r'[a-z][a-z0-9_-]{0,47}\Z')
 REV = re.compile(r'[a-f0-9-]{36}\Z')
@@ -163,8 +163,8 @@ def install_aplexer_state_hooks(bundle=None, home=None):
             template_hooks = None
 
     if not template_hooks or not isinstance(template_hooks, dict) or 'hooks' not in template_hooks:
-        a_cmd = shutil.which('a') or str(Path.home() / '.local/bin/a')
-        aplexer_cmd = shutil.which('aplexer') or str(Path.home() / '.local/bin/aplexer')
+        a_cmd = hook_command.tool_command('a')
+        aplexer_cmd = hook_command.tool_command('aplexer')
         template_hooks = {
             "hooks": {
                 "PostToolUse": [
@@ -344,6 +344,54 @@ def ensure_toml_trusted_hooks(content: str, hooks_file: Path) -> str:
     return res
 
 
+def read_engine_file(target, limit=131072):
+    """Read a managed-home file the engine CLI may have rewritten itself.
+
+    Codex replaces .codex/config.toml on launch: on Windows the new file
+    inherits the owner-only ACE of its private parent instead of a protected
+    DACL, on POSIX it gets the engine umask. Accept same-owner, owner-only
+    files (POSIX mode re-tightened) instead of failing install, which used to
+    withdraw the route on every launch (intake 6cbb862a). Returns None when
+    absent; a foreign owner/ACE still raises.
+    """
+    try:
+        if os.name == 'nt':
+            try:
+                return private_fs.read_bytes(target, limit)
+            except PermissionError:
+                return private_fs.read_bytes(target, limit, private=False)
+        preserve_managed_file(target)
+        return private_fs.read_bytes(target, limit)
+    except FileNotFoundError:
+        return None
+
+
+def _engine_config(path, parse, default):
+    """Current engine config; unreadable content becomes ``default``, unsafe files raise."""
+    try:
+        raw = read_engine_file(path)
+    except ValueError:  # oversized: replaced, as before
+        return None, default
+    if raw is None:
+        return None, default
+    try:
+        return raw, parse(raw.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        return raw, default
+
+
+def _write_engine_config(path, raw, current):
+    """Write only real changes, so an engine refresh never triggers a rewrite loop."""
+    if raw == current:
+        return
+    private_fs.atomic_write(path, raw, 131072, engine_owned=True)
+    if os.name != 'nt':
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
 def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=None):
     """Ensure managed engine home configuration has approval and sandbox prompts disabled.
 
@@ -376,62 +424,33 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             codex_dir = home / '.codex'
             config_toml = codex_dir / 'config.toml'
             hooks_file = codex_dir / 'hooks.json'
-            content = ''
-            if config_toml.is_file():
-                try:
-                    content = private_fs.read_bytes(config_toml, 131072).decode('utf-8')
-                except Exception:
-                    content = ''
+            current, content = _engine_config(config_toml, str, '')
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, hooks_file)
-            with private_fs.parent(config_toml, create=True):
-                pass
-            private_fs.atomic_write(config_toml, updated.encode('utf-8'), 131072)
-            if os.name != 'nt':
-                try:
-                    os.chmod(config_toml, 0o600)
-                except OSError:
-                    pass
+            _write_engine_config(config_toml, updated.encode('utf-8'), current)
 
         if provider in ('zai', None):
             zcodex_dir = home / '.zcodex'
             zconfig_toml = zcodex_dir / 'config.toml'
             zhooks_file = zcodex_dir / 'hooks.json'
-            content = ''
-            if zconfig_toml.is_file():
-                try:
-                    content = private_fs.read_bytes(zconfig_toml, 131072).decode('utf-8')
-                except Exception:
-                    content = ''
+            current, content = _engine_config(zconfig_toml, str, '')
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, zhooks_file)
-            with private_fs.parent(zconfig_toml, create=True):
-                pass
-            private_fs.atomic_write(zconfig_toml, updated.encode('utf-8'), 131072)
-            if os.name != 'nt':
-                try:
-                    os.chmod(zconfig_toml, 0o600)
-                except OSError:
-                    pass
+            _write_engine_config(zconfig_toml, updated.encode('utf-8'), current)
 
     # Claude Code
     if provider in ('claude', None):
         claude_dir = home / '.claude'
         settings_path = claude_dir / 'settings.json'
-        settings = {}
-        if settings_path.is_file():
-            try:
-                settings = json.loads(private_fs.read_bytes(settings_path, 131072).decode('utf-8'))
-            except Exception:
-                settings = {}
+        current, settings = _engine_config(settings_path, json.loads, {})
         if not isinstance(settings, dict):
             settings = {}
         settings['skipDangerousModePermissionPrompt'] = True
@@ -448,35 +467,34 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         # notification fires while the session rests and its expiring
         # `waiting` push would clobber Stop's durable `idle` (REPORTED_STATE_
         # STALE_MS is 8s), re-creating the same deadlock.
-        a_cmd = shutil.which('a') or str(Path.home() / '.local/bin/a')
+        # Claude runs hook commands through bash (Git Bash on Windows), so the
+        # executable path must be bash-safe: forward slashes, quoted if needed.
+        a_cmd = hook_command.tool_command('a')
         hooks = settings.setdefault('hooks', {})
         if isinstance(hooks, dict):
-            working_hook = {"hooks": [{"command": f"{a_cmd} state-report working || true",
+            working_hook = {"hooks": [{"command": hook_command.state_report_command(a_cmd, 'working'),
                                        "type": "command"}]}
-            idle_hook = {"hooks": [{"command": f"{a_cmd} state-report idle || true",
+            idle_hook = {"hooks": [{"command": hook_command.state_report_command(a_cmd, 'idle'),
                                     "type": "command"}]}
             hooks.setdefault('SessionStart', [dict(working_hook)])
             hooks.setdefault('UserPromptSubmit', [dict(working_hook)])
             hooks.setdefault('Stop', [dict(idle_hook)])
-        with private_fs.parent(settings_path, create=True):
-            pass
-        private_fs.atomic_write(settings_path, json.dumps(settings, indent=2).encode('utf-8'), 131072)
-        if os.name != 'nt':
-            try:
-                os.chmod(settings_path, 0o600)
-            except OSError:
-                pass
+            # Re-bootstrap repairs state-report hooks we generated earlier with
+            # a raw native path (backslashes eaten by bash on Windows).
+            for groups in hooks.values():
+                for group in groups if isinstance(groups, list) else []:
+                    entries = group.get('hooks') if isinstance(group, dict) else None
+                    for entry in entries if isinstance(entries, list) else []:
+                        if isinstance(entry, dict) and 'command' in entry:
+                            entry['command'] = hook_command.repair_state_report_command(
+                                entry['command'], a_cmd)
+        _write_engine_config(settings_path, json.dumps(settings, indent=2).encode('utf-8'), current)
 
     # OpenCode (go)
     if provider in ('go', None):
         opencode_dir = home / '.config' / 'opencode'
         opencode_path = opencode_dir / 'opencode.json'
-        opencode_conf = {}
-        if opencode_path.is_file():
-            try:
-                opencode_conf = json.loads(private_fs.read_bytes(opencode_path, 131072).decode('utf-8'))
-            except Exception:
-                opencode_conf = {}
+        current, opencode_conf = _engine_config(opencode_path, json.loads, {})
         if not isinstance(opencode_conf, dict):
             opencode_conf = {}
         perm = opencode_conf.setdefault('permission', {})
@@ -488,14 +506,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
                 ext.setdefault('~/git/**', 'allow')
                 ext.setdefault('~/tmp/**', 'allow')
                 ext.setdefault('/tmp/**', 'allow')
-        with private_fs.parent(opencode_path, create=True):
-            pass
-        private_fs.atomic_write(opencode_path, json.dumps(opencode_conf, indent=2).encode('utf-8'), 131072)
-        if os.name != 'nt':
-            try:
-                os.chmod(opencode_path, 0o600)
-            except OSError:
-                pass
+        _write_engine_config(opencode_path, json.dumps(opencode_conf, indent=2).encode('utf-8'), current)
 
 
 def preserve_managed_file(target):
@@ -507,7 +518,7 @@ def preserve_managed_file(target):
     """
     try:
         if os.name == 'nt':
-            return bool(private_fs.read_bytes(target, 131072))
+            return bool(read_engine_file(target))
         with private_fs.parent(target, create=True) as anchor:
             fd = private_fs._open(anchor, target, os.O_RDONLY, private=False)
             try:
@@ -566,7 +577,7 @@ def provision_managed_home(bundle=None, home=None, dest=None):
             # revision/home; missing or truncated files are repaired normally.
             if preserve_managed_file(target):
                 continue
-            private_fs.atomic_write(target, value.encode(), 32768)
+            private_fs.atomic_write(target, value.encode(), 32768, engine_owned=True)
             if os.name != 'nt':
                 try:
                     os.chmod(target, 0o600)
@@ -1124,7 +1135,10 @@ def sync(request=None):
         profiles(retained)
         from . import engine_login
         engine_login.cancel_removed(bundles)
-        keep = {b['label'] + '-' + b['revision'] for b in retained}
+        # Keep every bundle dir the Hub still offers: a retry reinstalls in
+        # place, while deleting it under a live session's engine (Windows
+        # holds codex.exe open) half-removed the bundle (intake 6cbb862a).
+        keep = {b['label'] + '-' + b['revision'] for b in bundles}
         for entry in root().iterdir():
             if re.fullmatch(r'[a-z][a-z0-9_-]{0,47}-[a-f0-9-]{36}', entry.name) and entry.name not in keep:
                 # rmtree does not follow directory symlinks; reject them explicitly.
@@ -1142,6 +1156,8 @@ def sync(request=None):
             except Exception as e:
                 failed_bundles.append(b)
                 last_error = e
+                # Exception type only: messages may carry paths or provider output.
+                print(json.dumps({'managed_install_failed': b['label'], 'error': type(e).__name__}), file=sys.stderr)
         if bundles and not installed_bundles:
             if len(bundles) == 1 and last_error:
                 raise last_error

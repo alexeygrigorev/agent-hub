@@ -12,8 +12,8 @@ import urllib.error
 from agent_hub_host import bus
 from agent_hub_host.dispatch_diagnostics import ClaimRefusedError, classify
 from agent_hub_host.fleet import Dispatcher
-import test_preclaim_retry_488b860e as helpers
-from test_preclaim_retry_488b860e import FakeHub, _valid_uuid4
+from host.tests import test_preclaim_retry_488b860e as helpers
+from host.tests.test_preclaim_retry_488b860e import FakeHub, _valid_uuid4
 
 
 class ClaimRefusalTests(unittest.TestCase):

@@ -347,3 +347,31 @@ class SimulatedWindowsTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EngineOwnedExistingTests(unittest.TestCase):
+    def test_engine_owned_target_check_relaxes_only_acl_mode_6cbb862a(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o700)
+            target = Path(tmp) / 'config.toml'
+            target.write_text('engine rewrite\n')
+            target.chmod(0o644)
+            with self.assertRaises(PermissionError):
+                fs.atomic_write(target, b'private\n', 64)
+            fs.atomic_write(target, b'private\n', 64, engine_owned=True)
+            self.assertEqual(target.read_bytes(), b'private\n')
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            os.link(target, Path(tmp) / 'second-link')
+            with self.assertRaises(PermissionError):
+                fs.atomic_write(target, b'x\n', 64, engine_owned=True)
+
+    def test_windows_engine_owned_check_accepts_inherited_owner_only_acl_6cbb862a(self):
+        seen = []
+        def opener(anchor, path, flags, *, private=True):
+            seen.append(private)
+            return os.open(os.devnull, os.O_RDONLY)
+        with patch.object(fs, '_windows', return_value=True), patch.object(fs, '_open', side_effect=opener):
+            fs._existing(None, Path('C:/x/config.toml'), engine_owned=True)
+            fs._existing(None, Path('C:/x/state.json'))
+        # private=False -> win32 private(protected=False, inherited=True): owner + owner-only ACEs still proven.
+        self.assertEqual(seen, [False, True])

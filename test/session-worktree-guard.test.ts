@@ -311,6 +311,34 @@ describe('worktree guard (intake a0f01448)', () => {
     expect((await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), agent())).status).toBe(403);
   }));
 
+  it('releases a terminal session whose pruned native is only unobserved in the census', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'guard-unobserved-release');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    sql.exec("UPDATE session_control_sessions SET state='failed' WHERE id=?", created.id);
+    sql.exec("UPDATE fleet_sessions SET phase='unobserved' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
+    closeFixtureIntake(sql);
+    const facts = async () => {
+      const res = await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), host('hetzner'));
+      expect(res.status).toBe(200);
+      return (await res.json() as any).sessions.find((row: any) => row.session_id === created.id);
+    };
+    // Pruned after a dispatch-false-failure finish: census says not live.
+    expect(await facts()).toMatchObject({ terminal: true, native_terminal: true, linked_intake_open: false });
+    // 'uncertain' is an unconfirmed terminal label, not absence evidence.
+    sql.exec("UPDATE fleet_sessions SET phase='uncertain' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
+    expect(await facts()).toMatchObject({ terminal: true, native_terminal: false });
+  }));
+
+  it('keeps a non-terminal session held even when its census incarnation is unobserved', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'guard-unobserved-live-hold');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    sql.exec("UPDATE fleet_sessions SET phase='unobserved' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
+    closeFixtureIntake(sql);
+    const res = await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), host('hetzner'));
+    const fact = (await res.json() as any).sessions.find((row: any) => row.session_id === created.id);
+    expect(fact).toMatchObject({ terminal: false, native_terminal: true, linked_intake_open: false });
+  }));
+
   it('reuses a proven stopped unbound predecessor without releasing its lock for a live successor', async () => fixture(async (s,sql) => {
     const previous = await startAgentSession(s,'guard-stopped-unbound');
     ensureFleetLaunch(sql,'launch-1',null,'uncertain');
@@ -359,19 +387,18 @@ describe('worktree guard (intake a0f01448)', () => {
 
 
 describe('observed-native adoption requires verified custody and a host lock', () => {
-  it('defers unknown census identity despite spoofed ownership and lock labels, with one durable alert', async () => {
+  it('publishes unknown census identity without trusting ownership and lock labels', async () => {
     await fixture(async (_service, sql) => {
       const native = { native_id: NATIVE_ID, tag: 'hub-spoofed', workspace: NATIVE_WS,
         engine: 'codex', phase: 'running', created_at_ms: NATIVE_CREATED,
         owner: 'demo:assistant', protected: false, worktree_locked: true };
-      for (let i = 0; i < 2; i++) {
-        expect(adoptObservedNativeSessions(sql, 'hetzner', [native], Date.now()).adopted).toBe(0);
-      }
-      expect(sql.exec('SELECT id FROM session_control_sessions WHERE id=?', NATIVE_ID).toArray()).toHaveLength(0);
-      const alerts = sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind='session_adoption' AND subject=? AND resolved_at IS NULL", 'hetzner/' + NATIVE_ID).toArray();
-      expect(alerts).toHaveLength(1);
-      expect(alerts[0].state).toBe('needs_attention');
-      expect(JSON.parse(alerts[0].detail).reason).toBe('adoption_ownership_lock_unverified');
+      expect(adoptObservedNativeSessions(sql, 'hetzner', [native], Date.now()).adopted).toBe(1);
+      expect(adoptObservedNativeSessions(sql, 'hetzner', [native], Date.now()).adopted).toBe(0);
+      const observation: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', NATIVE_ID).toArray()[0];
+      expect(observation).toMatchObject({actor:'unknown',owner_token_id:null,owner_family:null});
+      expect(JSON.parse(observation.request_json).observation_only).toBe(true);
+      expect(JSON.parse(observation.binding_json).adoption_lock).toBeUndefined();
+
     });
   });
 

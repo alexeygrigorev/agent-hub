@@ -989,6 +989,7 @@ def bounded_catalog(raw, limit=CATALOG_LIMIT):
 def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
     from .account_capacity import confirmed_empty
     from .session_progress import event_ms
+    from .session_observation import native_session_model
     sessions = raw if isinstance(raw, list) else raw.get("sessions", [])
     clean = []
     for session in sessions:
@@ -1019,6 +1020,8 @@ def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
                       "cwd": cwd,
                       "last_activity_at": _ms_to_iso(event_ms(session)),
                       "created_at_ms": created_at_ms,
+                      "model": native_session_model(session),
+                      "parent_id": session.get("parent_session") if isinstance(session.get("parent_session"), str) else None,
                       **({'progress': progress[session['id']]} if progress and session['id'] in progress else {})})
         if collect_tokens and session.get('tag', '').startswith(('hub-', 'task-hub-')):
             from .token_usage import native_session_tokens
@@ -1959,9 +1962,18 @@ class Dispatcher:
                 raise ValueError("worktree_lock_failed: missing canonical session identity") from None
             if not guard.remember_repository(offer.get("id"), str(target_path)):
                 raise ValueError("worktree_identity_failed: original repository could not be recorded")
+        def owner_terminal(owner_id):
+            try:
+                fact = self.request('GET', '/api/fleet/worktree-owner/' + owner_id)
+                return (isinstance(fact, dict) and fact.get('session_id') == owner_id
+                        and fact.get('terminal') is True
+                        and fact.get('intake_id') == offer.get('intake_task_id'))
+            except Exception:
+                return False
         if not guard.protect_bound_worktree("git", str(target_path),
                                            offer.get("hub_session_id"),
-                                           offer.get("intake_task_id")):
+                                           offer.get("intake_task_id"),
+                                           owner_terminal=owner_terminal):
             if not guard.reuse_stopped_intake_lock("git", str(target_path), offer.get("hub_session_id"),
                                                   offer.get("intake_task_id"), self.request):
                 if not guard.protect_successor_worktree(
@@ -2523,6 +2535,17 @@ class Dispatcher:
         key = payload.get("claim_key")
         if not isinstance(key, str) or not CLAIM_KEY_RE.fullmatch(key):
             raise ValueError("claim payload requires a per-attempt claim_key")
+        prior_key = self._pending_claim_key(offer_id)
+        # Persist BEFORE sending, including the ordinary successful path. A
+        # controller death after the claim commits must leave a replay key.
+        from .terminal_reports import read_record
+        existing = read_record(self, offer_id) if self.journal_dir else None
+        effect_fenced = bool(existing and existing.get('state') not in
+                             {'claim_pending', 'claim_refused', 'dispatch_refused'})
+        pending_record = {'offer_id': offer_id, 'state': 'claim_pending',
+                          'claim_key': key, 'reason': 'claim_pending', 'settled': False}
+        if not effect_fenced:
+            self._persist_launch_record(pending_record)
         attempts = 0
         ambiguous = False
         while True:
@@ -2552,7 +2575,15 @@ class Dispatcher:
                 from .bus import HttpRequestError
                 from .dispatch_diagnostics import ClaimRefusedError
                 if isinstance(exc, HttpRequestError) or (isinstance(exc, ValueError) and str(exc).startswith('HTTP request failed with status ')):
-                    refused = ClaimRefusedError(exc, no_effects=not ambiguous and self._pending_claim_key(offer_id) is None)
+                    no_effects = not ambiguous and prior_key is None and not effect_fenced
+                    refused = ClaimRefusedError(exc, no_effects=no_effects)
+                    if no_effects:
+                        # A definitive refusal of the first attempt cannot
+                        # have authorized execution. Clear only this attempt's
+                        # pending state; the outer refusal path reports it.
+                        pending_record.update(state='claim_refused',
+                                              diagnostic=refused.diagnostic)
+                        self._persist_launch_record(pending_record)
                     # Separate bounded attempt evidence cannot overwrite a native
                     # effect fence or another loop's terminal launch outbox.
                     if self.journal_dir:
@@ -2620,9 +2651,6 @@ class Dispatcher:
         # server placement (both deliberately choking-only), so the 1-minute
         # load average is checked here: above factor x cores the launch is
         # held (queued, retried next cycle). Nothing running is touched.
-        offer_id = offer.get("id")
-        if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
-            raise ValueError("Invalid offer id")
         from .host_load import check_live_load
         check_live_load(self.settings)
         sub = self._route(offer)
@@ -2635,6 +2663,9 @@ class Dispatcher:
                 raise ValueError('Required capabilities are no longer available locally')
             if not isinstance(selection, dict) or selection.get('model') != sub.get('launcher_model') or selection.get('effort') != sub.get('launcher_effort'):
                 raise ValueError('Selected model/effort is not configured locally')
+        offer_id = offer.get("id")
+        if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
+            raise ValueError("Invalid offer id")
         if offer.get("task_id") is not None:
             if not isinstance(offer["task_id"], str) or not LABEL.fullmatch(offer["task_id"]):
                 raise ValueError("Invalid task id")
@@ -2678,6 +2709,7 @@ class Dispatcher:
             # Intake 4b161918: Hub-planned intake worktree (fail-open), after local refusals.
             from .intake_worktree import launch_cwd
             target_cwd, wt_note, intake_wt = launch_cwd(self.request, offer, workspace, target_cwd)
+            self._lock_session_worktree(offer, target_cwd)
             argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"]] + worker_resource_argv() + ["--json"]
             if offer.get("profile"):
                 argv += ["--profile", offer["profile"]]
@@ -2735,6 +2767,9 @@ class Dispatcher:
             target_cwd, wt_note, intake_wt = launch_cwd(self.request, offer, workspace, target_cwd, make_tmp=True)
             if intake_wt:
                 workspace = target_cwd
+            # Refuse before creating a maintained-launcher task or acquiring
+            # execution authority: a foreign lock must leave no reservation.
+            self._lock_session_worktree(offer, target_cwd)
             task_id = "hub-" + offer_id
             goal = wt_note + compose_prompt(offer["prompt"]) + "\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers."
             curr = workspace
@@ -2930,12 +2965,12 @@ class Dispatcher:
                 # durably BEFORE invoking start/run: a lost native receipt,
                 # result POST, or controller death cannot make this claim
                 # look effect-free again on the next host cycle.
+                # Expected engine/tag are not native identity evidence. Leave
+                # them absent until a qualified receipt establishes the tuple.
                 fence = {'offer_id': offer_id, 'state': 'uncertain',
                          'reason': 'native_start_pending', 'settled': False,
                          'claim_key': pending_key, 'mode': mode,
-                         'workspace': str(workspace), 'target_cwd': str(target_cwd),
-                         'engine': offer.get('engine'),
-                         'tag': ('hub-' if mode == 'interactive' else 'task-hub-') + offer_id}
+                         'workspace': str(workspace), 'target_cwd': str(target_cwd)}
                 if mode == 'headless':
                     fence['task_id'] = task_id
                 self._persist_launch_record(fence)
@@ -3160,7 +3195,10 @@ class Dispatcher:
                     "stage": stage, "error": err, "diagnostic": failure}
         if mode == 'headless' and result.get('confirmed_exit'):
             from .exit_evidence import sanitize, terminal_evidence
+            # Advance the fence we just wrote, without bypassing the outbox's
+            # revision check if another reconciler has since advanced it.
             immediate = {'offer_id': offer_id, 'native_id': native_id,
+                '_journal_revision': fence.get('_journal_revision', 0) if pending_key is not None else 0,
                 'task_id': task_id, 'tag': 'task-'+task_id, 'mode': 'headless',
                 'engine': offer.get('engine') or sub.get('engine') or sub.get('service'),
                 'state': 'running', 'settled': False, 'account': sub.get('account_label'),
@@ -3415,7 +3453,8 @@ class Dispatcher:
         for row in metadata:
             row.update(self._catalog_enrichment.get(self._catalog_identity(row), {}))
         metadata_done = time.monotonic()
-        self.request('PUT', '/api/fleet/sessions', {'sessions': metadata})
+        from .catalog_transport import report_catalog
+        report_catalog(self.request, metadata)
         put_done = time.monotonic()
         # Reconcile Fleet-owned starts into exact Hub session bindings after
         # reporting the observed native catalog. Retry is read-before-write.
@@ -4138,6 +4177,15 @@ class Dispatcher:
         reconciled = self.reconcile_launches()
         self.reconcile_operator_adoptions()
         imported_reconciled = self.reconcile_imported_sessions()
+        # e37b0e83 AC1: stop native trees whose Hub session is terminal or
+        # missing. Bounded per cycle; the server authorizes each incarnation.
+        if self.journal_dir and raw is not None:
+            from .session_reaper import reconcile as reconcile_native_trees
+            native_rows = raw if isinstance(raw, list) else raw.get('sessions') if isinstance(raw, dict) else None
+            reap = reconcile_native_trees(self.request, native_rows, self.journal_dir,
+                                          executable=self.settings.get('aplexer_bin', 'aplexer'))
+            if any(reap.values()):
+                print(json.dumps({'event': 'fleet_native_reconcile', **reap}), flush=True)
         _mark('reconcile')
         # Resource management (intake 4fcd3139): per-session exact sampler +
         # safe watchdog. Best-effort only with durable local state in the

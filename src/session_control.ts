@@ -1,3 +1,4 @@
+import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
 import { IntakeWorktrees } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
@@ -35,7 +36,6 @@ import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, ref
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
 import { redact } from './routing';
-import { getScopeBlock } from './intake_scope';
 import { taskTier } from './model-routing';
 import { engineProvider, evaluateTbmAdmission, normalizeProviderFamily, type TbmPoolRow } from './quota_admission';
 import { ensureTbmQuotaSchema } from './quota';
@@ -1031,7 +1031,7 @@ export class SessionControlService {
       stall_threshold: stallThreshold(this.options.env), lifecycle_state: row.state,
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
-      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? null,
+      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? request.model ?? null,
       expected_cpu_cores:expectedCpu?.expected_cpu_cores ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_cores ?? null,
       expected_cpu_source:expectedCpu?.expected_cpu_source ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_source ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
@@ -1599,7 +1599,12 @@ export class SessionControlService {
         const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
         const nativeTerminal = unstarted || !!(native &&
           native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
-          ['exited', 'dead', 'pruned', 'forgotten'].includes(native.phase));
+          // 'unobserved' is the census writer's positive absence verdict ("an
+          // orphan no longer observed is not a live workload"): a native that
+          // finished and was pruned (the dispatch-false-failure path) never
+          // reports an explicit terminal phase, which would hold the AC1 lock
+          // forever. 'uncertain' stays held — an unconfirmed terminal label.
+          ['exited', 'dead', 'pruned', 'forgotten', 'unobserved'].includes(native.phase));
         const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
           this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
             binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
@@ -1884,8 +1889,6 @@ export class SessionControlService {
           const taskStatus = data?.status;
           if (taskStatus === 'done' || taskStatus === 'cancelled') return response({ error: 'intake_task_closed' }, 409);
           if (typeof ac !== 'string' || !ac.trim()) return response({ error: 'acceptance_criteria_required' }, 400);
-          const scopeBlock = getScopeBlock(data);
-          if (scopeBlock) return response({ error: scopeBlock }, 409);
         }
         // Intake worktrees (4b161918): never share another intake's worktree;
         // resume on the host that holds this intake's recorded worktree.
@@ -2411,8 +2414,14 @@ export class SessionControlService {
             } catch {}
           }
         }
+        if (!session && sub !== 'binding' && sub !== 'retirement') {
+          const matches = observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller));
+          if (matches.length > 1) return response({error:'ambiguous_session_prefix'}, 409);
+          session = matches[0] ?? null;
+        }
       } else if (/^[a-f0-9][a-f0-9-]{7,34}$/i.test(rawRef) && sub !== 'binding' && sub !== 'retirement') {
-        const matches = visibleSessionPrefixMatches(this.sql, rawRef, row => this.ownerOk(row, caller));
+        const matches = [...new Map([...visibleSessionPrefixMatches(this.sql, rawRef, row => this.ownerOk(row, caller)),
+          ...observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller))].map(row => [row.id, row])).values()];
         if (matches.length > 1) return response({ error: 'ambiguous_session_prefix',
           matches: matches.map(row => ({ id: row.id, name: parsed(row.request_json, {}).name ?? null })) }, 409);
         session = matches[0] ?? null;
@@ -3699,29 +3708,28 @@ export function adoptObservedNativeSessions(
     const parentSource = parentId ? 'inferred' : 'unknown_external';
 
     if (!existing) {
-      // A census is observation, never authenticated ownership or authority
-      // to lock another user's checkout. Fleet-owned sessions reconcile via
-      // host-bindings, where the host verifies the exact native/repository
-      // tuple and locks before the canonical binding is accepted. There is
-      // currently no equivalent ownership witness for a new observed native.
-      // Keep it visible in fleet_sessions, but defer the ownership transition.
-      // Caller labels, tags and even an admin adoption request cannot bypass.
-      deferred++;
-      const alertTable = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='liveness_alerts'").toArray().length;
-      const alerts = new LivenessService(sql, undefined, () => nowMs);
-      if (!alertTable) alerts.init();
-      // An unchanged complete catalog must not rewrite every deferred native
-      // on every heartbeat. One unresolved durable alert is sufficient.
-      if (sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='session_adoption' AND subject=? AND resolved_at IS NULL", machineId + '/' + nativeId).toArray().length) continue;
-      alerts.setAlert('session_adoption', machineId + '/' + nativeId, {
-        state: 'needs_attention',
-        detail: JSON.stringify({ reason: 'adoption_ownership_lock_unverified',
-          native_id: nativeId, machine_id: machineId,
-          required: 'authenticated Hub ownership and exact host native/repository worktree lock receipt' }),
-      });
-      continue;
+      // Visibility is independent of operator custody and filesystem locks.
+      insertSessionObservation(sql, machineId, s, state, resolvedFamily, nowMs);
+      adopted++;
+      if (sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='liveness_alerts'").toArray().length) {
+        new LivenessService(sql, undefined, () => nowMs).setAlert('session_adoption', machineId + '/' + nativeId, null);
+      }
     } else {
+      // A census must not mutate another host, incarnation, or canonical intent.
+      const binding = parsed(existing.binding_json, {});
+      if (existing.machine_id !== machineId || binding.provenance !== 'observed_native' ||
+          binding.native_id !== nativeId || binding.tag !== tag || binding.workspace !== workspace ||
+          binding.native_created_at_ms !== createdAtMs || existing.engine !== s.engine) {
+        deferred++;
+        continue;
+      }
       refreshObservedHostFamily(sql, machineId, existing, s, resolvedFamily);
+      const request = parsed(existing.request_json, {});
+      const model = observationModel(s.model);
+      if (model && request.model !== model) {
+        sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', JSON.stringify({...request,model}),nativeId);
+      }
+
       // Update existing adopted session if state or phase changed
       let shouldUpdate = false;
       let nextState = existing.state;
@@ -3747,18 +3755,33 @@ export function adoptObservedNativeSessions(
     }
   }
 
-  // Notes may be appended after initial adoption. Reconcile existing imports too.
-  for (const s of sessions) {
-    if (!s || typeof s.native_id !== 'string') continue;
-    const row: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', s.native_id).toArray()[0];
-    if (!row || row.fleet_launch_id || parsed(row.request_json, {}).intake_task_id) continue;
-    const task = linkedIntake(sql, row, true);
-    if (task) {
-      const intent = { ...parsed(row.request_json, {}), intake_task_id: task.id };
-      sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', JSON.stringify(intent), row.id);
-      row.request_json = JSON.stringify(intent);
-      recordIntakeSessionLink(sql, row, nowMs);
-    }
+  // Reconcile late START notes and exact registered-worktree evidence in
+  // one bounded pass. Linkage never grants ownership or filesystem authority.
+  const linkageRevision = sessions.length ? observationIntakeRevision(sql, machineId) : '';
+  const pending: any[] = [];
+  for (const native of sessions) {
+    if (!native || typeof native.native_id !== 'string') continue;
+    const row: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', native.native_id).toArray()[0];
+    if (!row || row.machine_id !== machineId || row.fleet_launch_id || parsed(row.request_json, {}).intake_task_id) continue;
+    const binding = parsed(row.binding_json, {});
+    if (binding.provenance !== 'observed_native' || binding.native_id !== native.native_id ||
+        binding.tag !== native.tag || binding.workspace !== native.workspace ||
+        binding.native_created_at_ms !== (native.created_at_ms ?? null) || row.engine !== native.engine) continue;
+    const request = parsed(row.request_json, {});
+    const revision = `${linkageRevision}/${row.updated_at}/${request.observation_only === true}/${row.owner_family ?? ''}/${row.owner_token_id ?? ''}`;
+    if (request.observation_link_revision === revision) continue;
+    sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',
+      JSON.stringify({...request, observation_link_revision: revision}), row.id);
+    pending.push(row);
+  }
+  const links = observedIntakeCandidates(sql, machineId, pending);
+  for (const row of pending) {
+    const taskId = links.get(row.id);
+    if (!taskId) continue;
+    const intent = { ...parsed(row.request_json, {}), intake_task_id: taskId };
+    sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', JSON.stringify(intent), row.id);
+    row.request_json = JSON.stringify(intent);
+    recordIntakeSessionLink(sql, row, nowMs);
   }
   return { adopted, updated, deferred };
 }

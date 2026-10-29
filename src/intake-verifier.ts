@@ -166,8 +166,8 @@ export class IntakeVerifier {
     const id = typeof result.body?.id === 'string' ? result.body.id : null;
     if (id) { this.set(task, claim, { state: 'requested', session_id: id, detail: null }); return true; }
     const code = String(result.body?.error || 'admission_refused').slice(0, 128);
-    // Refusals that need a person (missing AC, scope) are escalated; capacity refusals retry next tick.
-    if (['acceptance_criteria_required', 'scope_decision_required', 'scope_out_of_bounds'].includes(code)) await this.escalate(task, claim, 'verifier start refused: ' + code);
+    // Refusals that need a person (missing AC) are escalated; capacity refusals retry next tick.
+    if (['acceptance_criteria_required'].includes(code)) await this.escalate(task, claim, 'verifier start refused: ' + code);
     else this.set(task, claim, { state: result.status >= 500 ? 'starting' : 'pending', detail: 'verifier start refused: ' + code, attempts: result.status >= 500 ? attempt : attempt - 1 });
     return true;
   }

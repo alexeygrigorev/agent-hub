@@ -158,7 +158,7 @@ class DispatchHoldsUnderLoadTests(unittest.TestCase):
 
 # Reuse the real dispatch-path fixtures: no native command or Hub write escapes
 # this in-memory server. Exercise load changing while slow preparation runs.
-import test_preclaim_retry_488b860e as helpers
+from host.tests import test_preclaim_retry_488b860e as helpers
 
 
 class DispatchLoadRecoveryTests(unittest.TestCase):

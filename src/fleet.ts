@@ -1,3 +1,4 @@
+import { observationModel } from './session-observation';
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 import { sanitizeCommandFields } from './command-diagnostics';
@@ -29,6 +30,7 @@ export const LAUNCHER_TELEMETRY_STALE_MS = 180000;
 export const GATE_STALE_MS = 300000;
 /** Engine holds that expire into a single retrial after this cooldown. */
 export const ENGINE_HEALTH_RETRY_MS = 600000;
+export const UNCLAIMED_OFFER_TTL_MS = 15 * 60 * 1000;
 export const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused']);
 
 export const FLEET_SCHEMA = `
@@ -123,6 +125,7 @@ export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'a
  * advertises anymore — e.g. registry routes for engines the current host
  * release stopped running). */
 const DISPATCH_MESSAGES: Record<string, string> = {
+  "dispatch_worktree_refused": "The worktree could not be protected before native start.",
   cpu_headroom: 'Host CPU usage plus expected session demand exceeds the CPU target.',
   cpu_pressure: 'Host CPU pressure exceeds the safety cap.',
   cpu_usage_unknown: 'Fresh real CPU usage is unavailable.',
@@ -401,10 +404,51 @@ export class FleetService {
   reconcileCapacity() {
     return this.withMaintenance(() => {
       if (this.maintenance!.reconciled) return;
+      this.expireUnclaimedOffers();
       this.admission.reconcileOffers();
       reconcileAccountCapacity(this.sql, this.now());
       reconcileUnboundFleetSessions(this.sql, this.now());
       this.maintenance!.reconciled = true;
+    });
+  }
+
+  /** Only an unclaimed offer is effect-free. Starting/uncertain launches
+   * retain their reservations until owning-host reconciliation proves exit. */
+  expireUnclaimedOffers(): number {
+    return this.transaction(() => {
+      const at = new Date(this.now()).toISOString();
+      const cutoff = new Date(this.now() - UNCLAIMED_OFFER_TTL_MS).toISOString();
+      // A claim key appears on the server only when claim commits. If a
+      // claim is in flight, this transaction wins or its late request gets
+      // 409; it can never authorize execution of the retired attempt.
+      const rows = this.sql.exec(`SELECT * FROM fleet_launches l
+        WHERE state='offered' AND updated_at < ? AND native_id IS NULL
+          AND launcher_task_id IS NULL AND claim_key IS NULL
+          AND NOT EXISTS (SELECT 1 FROM routing_jobs j WHERE j.launch_id=l.id)
+        ORDER BY updated_at,id LIMIT 20`, cutoff).toArray() as any[];
+      const diagnostic = JSON.stringify({reason:'launcher_offer_expired',
+        message:'The unclaimed offer expired after 15 minutes; the intent is queued for fresh placement.',
+        error_type:'TimeoutError', stage:'dispatch_route'});
+      const controlStore = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
+      for (const row of rows) {
+        const retry = crypto.randomUUID();
+        // Preserve idempotency and the user's intent while fencing the old
+        // identity. Queued rows hold no execution or disk reservation.
+        this.sql.exec('UPDATE fleet_launches SET request_key=? WHERE id=?', 'expired-offer-' + row.id, row.id);
+        this.sql.exec(`UPDATE fleet_launches SET state='failed', verification_status='not_started',
+          exit_reason='launcher_offer_expired', launch_error_json=?, finished_at=?, updated_at=?
+          WHERE id=? AND state='offered' AND claim_key IS NULL
+            AND native_id IS NULL AND launcher_task_id IS NULL`, diagnostic, at, at, row.id);
+        this.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,parent_id,summary,request_key,request_json,
+          machine_id,engine,account,profile,mode,workspace,prompt,state,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,'','','',NULL,?,?,?,'queued',?,?)`, retry,row.actor,row.requester_kind,
+          row.parent_id,row.summary,row.request_key,row.request_json,row.mode,row.workspace,row.prompt,row.created_at,at);
+        if (controlStore) {
+          this.sql.exec(`UPDATE session_control_sessions SET state='queued', fleet_launch_id=?, machine_id=NULL, updated_at=?
+            WHERE fleet_launch_id=? AND binding_json IS NULL AND state IN ('offered','queued','held')`, retry, at, row.id);
+        }
+      }
+      return rows.length;
     });
   }
 
@@ -1493,6 +1537,19 @@ export class FleetService {
       return response(reserved.value, reserved.status);
     }
 
+    const worktreeOwner = /^\/api\/fleet\/worktree-owner\/([a-fA-F0-9-]{8,64})$/.exec(path);
+    if (worktreeOwner && request.method === 'GET') {
+      if (!host) return response({error:'forbidden'},403);
+      if (!this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length)
+        return response({error:'not_found'},404);
+      const row: any = this.sql.exec(`SELECT s.id,s.state,s.request_json,f.state AS launch_state
+        FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id
+        WHERE s.id=? AND s.machine_id=?`,worktreeOwner[1],caller.machineId!).toArray()[0];
+      if (!row) return response({error:'not_found'},404);
+      return response({session_id:row.id,intake_id:parsed(row.request_json).intake_task_id ?? null,
+        terminal:['stopped','finished','failed','refused','cancelled'].includes(row.state) &&
+          ['failed','exited','cancelled','expired','refused'].includes(row.launch_state)});
+    }
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       return this.withMaintenance(() => this.transaction(() => {
@@ -1582,7 +1639,9 @@ export class FleetService {
       if (!object(data, ['sessions']) || !Array.isArray(data.sessions) || data.sessions.length > 500) return response({ error: 'invalid_sessions' }, 400);
       const ids = new Set();
       for (const s of data.sessions) {
-        if (!object(s, ['native_id', 'tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit', 'progress', 'tokens']) ||
+        if (!object(s, ['native_id', 'tag', 'engine', 'model', 'parent_id', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit', 'progress', 'tokens']) ||
+            (s.model !== undefined && s.model !== null && observationModel(s.model) === null) ||
+            (s.parent_id !== undefined && s.parent_id !== null && (typeof s.parent_id !== 'string' || !/^[a-zA-Z0-9-]{1,160}$/.test(s.parent_id))) ||
             (s.tokens !== undefined && (!object(s.tokens, ['input_tokens', 'output_tokens']) ||
               !['input_tokens', 'output_tokens'].every(k => Number.isInteger(s.tokens[k]) && s.tokens[k] >= 0 && s.tokens[k] <= 1e12))) ||
             (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup', 'terminal_error', 'goal_status', 'sampled_at']) ||
@@ -2009,9 +2068,10 @@ export class FleetService {
         // its terminal lifecycle and history; never restart the original job.
         if (noStart && row.mode === 'headless' && row.state === 'failed' &&
             row.verification_status === 'not_started' && row.exit_reason === 'launcher_command_failed' &&
-            row.launcher_task_id === data.launcher_task_id && data.reason === 'launcher_disk_reserve' &&
+            row.launcher_task_id === data.launcher_task_id &&
             diagnostic?.error_type === 'ValueError' && diagnostic?.stage === 'dispatch_headless' &&
-            diagnostic?.message === 'Host disk headroom after launcher reservations is below the maintained disk floor.') {
+            ((data.reason === 'launcher_disk_reserve' && diagnostic?.message === 'Host disk headroom after launcher reservations is below the maintained disk floor.') ||
+             (data.reason === 'launcher_worktree_lock_failed' && diagnostic?.message === 'The checkout could not be protected; an existing session or operator lock is preserved.'))) {
           this.sql.exec('UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?', JSON.stringify(diagnostic), diagnostic.reason, row.id);
           return response({ id: row.id, state: row.state, replay: true });
         }

@@ -20,6 +20,12 @@ export const PACKAGES: Record<string, { pkg: string; bin: string; engine: string
   go: { pkg: 'opencode-ai', bin: 'opencode', engine: 'opencode' },
   zai: { pkg: 'zcodex', bin: 'zcodex', engine: 'codex' },
 };
+// Provider default slot limit for a Hub-central account created by import or
+// central login (t1248u). An explicit `max_concurrency` on create wins.
+export const PROVIDER_DEFAULT_MAX_CONCURRENCY: Record<string, number> = { codex: 8, claude: 8, gemini: 8, go: 8, zai: 8 };
+export const providerDefaultMaxConcurrency = (provider: string) => PROVIDER_DEFAULT_MAX_CONCURRENCY[provider] ?? 8;
+const IMPLICIT_MAX_MIGRATION = 'managed_account_max_concurrency_default_v1';
+const explicitMax = (v: unknown) => v === undefined || v === null ? undefined : Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 100 ? v as number : NaN;
 const ENV = new Set(['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENCODE_API_KEY', 'ZAI_API_KEY', 'ZAI_BASE_URL', 'ZAI_TOKEN']);
 const headers = { 'Cache-Control': 'private, no-store', 'Pragma': 'no-cache' };
 const reply = (data: unknown, status = 200) => Response.json(data, { status, headers });
@@ -50,6 +56,23 @@ export class ProvisioningService {
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_logins (id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL, url TEXT, code_ciphertext TEXT, expires_at INTEGER NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_installations (machine_id TEXT NOT NULL, label TEXT NOT NULL, revision TEXT NOT NULL, PRIMARY KEY(machine_id,label))');
     for (const ddl of CREDENTIAL_SCHEMA) this.sql.exec(ddl);
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL, detail TEXT NOT NULL)');
+    this.migrateImplicitMaxConcurrency();
+  }
+  /**
+   * Managed accounts used to be created at an implicit max_concurrency of 1.
+   * Once, raise those still at 1 to the provider default and record the
+   * labels so the change is visible (`GET /api/engines` account_migrations).
+   * Unmanaged registry rows and any later explicit 1 are never touched.
+   */
+  private migrateImplicitMaxConcurrency() {
+    if (this.sql.exec('SELECT 1 FROM engine_migrations WHERE name=?', IMPLICIT_MAX_MIGRATION).toArray().length) return;
+    this.tx(() => {
+      const rows = this.sql.exec('SELECT a.label, b.provider FROM fleet_accounts a JOIN engine_bundles b ON b.label=a.label WHERE a.max_concurrency=1 ORDER BY a.label').toArray() as any[];
+      const migrated = rows.map(r => ({ label: r.label, from: 1, to: providerDefaultMaxConcurrency(r.provider) }));
+      for (const m of migrated) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=? WHERE label=? AND max_concurrency=1', m.to, m.label);
+      this.sql.exec('INSERT INTO engine_migrations VALUES (?,?,?)', IMPLICIT_MAX_MIGRATION, this.now(), JSON.stringify({ migrated }));
+    });
   }
   private now() { return Date.now(); }
   private credentialRow(label: string): any { return this.sql.exec('SELECT * FROM engine_credentials WHERE label=?', label).toArray()[0]; }
@@ -101,7 +124,8 @@ export class ProvisioningService {
     if (path === '/api/engines' && request.method === 'GET') {
       if (!admin) return reply({ error: 'forbidden' }, 403);
       return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => ({ ...meta, supports_goal: ['codex', 'zai'].includes(meta.provider) })), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray(),
-        credentials: this.credentialStatus(), credential_rejections: this.sql.exec('SELECT machine_id,label,generation,reason,observed_at FROM engine_credential_rejections ORDER BY label,machine_id').toArray() });
+        credentials: this.credentialStatus(), credential_rejections: this.sql.exec('SELECT machine_id,label,generation,reason,observed_at FROM engine_credential_rejections ORDER BY label,machine_id').toArray(),
+        account_migrations: this.sql.exec('SELECT name,applied_at,detail FROM engine_migrations ORDER BY name').toArray().map((m: any) => ({ name: m.name, applied_at: m.applied_at, ...JSON.parse(m.detail) })) });
     }
     if (path === '/api/engines/sync' && request.method === 'GET') {
       if (!host) return reply({ error: 'forbidden' }, 403);
@@ -222,6 +246,9 @@ export class ProvisioningService {
     let bundle: any;
     try { const bytes = new Uint8Array(size); let offset = 0; for (const c of chunks) { bytes.set(c, offset); offset += c.length; } bundle = JSON.parse(new TextDecoder().decode(bytes)); } catch { return reply({ error: 'invalid_bundle' }, 400); }
     if (!validBundle(bundle) || bundle.label !== label) return reply({ error: 'invalid_bundle' }, 400);
+    const maxParam = new URL(request.url).searchParams.get('max_concurrency');
+    const requestedMax = explicitMax(maxParam === null ? undefined : /^\d{1,3}$/.test(maxParam) ? Number(maxParam) : NaN);
+    if (Number.isNaN(requestedMax)) return reply({ error: 'invalid_max_concurrency' }, 400);
     const revision = crypto.randomUUID(); let ciphertext: string;
     // The imported credential becomes the next Hub-owned generation; the
     // bundle keeps the install snapshot only (intake 5814e109 I1).
@@ -251,7 +278,8 @@ export class ProvisioningService {
       this.sql.exec('DELETE FROM engine_installations WHERE label=?', label);
       this.sql.exec('DELETE FROM fleet_routes WHERE account=?', label);
       this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', label);
-      if (!existing) this.sql.exec('INSERT INTO fleet_accounts VALUES (?,?,?,?,?)', label, bundle.provider, 1, bundle.provider === 'codex' ? 15 : 0, 1);
+      // An existing pool keeps its limits; a new one inherits the provider default.
+      if (!existing) this.sql.exec('INSERT INTO fleet_accounts VALUES (?,?,?,?,?)', label, bundle.provider, requestedMax ?? providerDefaultMaxConcurrency(bundle.provider), bundle.provider === 'codex' ? 15 : 0, 1);
       if (credentialCipher) {
         if (Number(this.credentialRow(label)?.generation ?? 0) + 1 !== generation) return reply({ error: 'credential_changed' }, 409);
         this.writeCredential(label, bundle.provider, generation, credentialCipher, credential, 'import');
@@ -332,13 +360,13 @@ export class ProvisioningService {
     this.sql.exec('DELETE FROM engine_credential_logins WHERE expires_at <= ?', this.now());
     const data = await request.json().catch(() => null) as any;
     if (!m[1]) {
-      if (!data || data.provider !== 'claude' || !LABEL.test(data.label) || (data.version !== undefined && (typeof data.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(data.version)))) return reply({ error: 'invalid_login' }, 400);
+      if (!data || data.provider !== 'claude' || !LABEL.test(data.label) || (data.version !== undefined && (typeof data.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(data.version))) || Number.isNaN(explicitMax(data.max_concurrency))) return reply({ error: 'invalid_login' }, 400);
       const bundle: any = this.sql.exec('SELECT provider FROM engine_bundles WHERE label=?', data.label).toArray()[0];
       if (bundle && bundle.provider !== 'claude') return reply({ error: 'account_provider_mismatch' }, 409);
       const id = crypto.randomUUID();
       const { url, verifier, state } = await claudeAuthorization();
       let sealed: string;
-      try { sealed = await this.seal({ label: data.label, verifier, state, version: data.version ?? null, adopt: data.adopt === true }, 'login:' + id); }
+      try { sealed = await this.seal({ label: data.label, verifier, state, version: data.version ?? null, adopt: data.adopt === true, max_concurrency: explicitMax(data.max_concurrency) ?? null }, 'login:' + id); }
       catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
       this.sql.exec('INSERT INTO engine_credential_logins VALUES (?,?,?,?,?)', id, data.label, 'claude', sealed, this.now() + 600000);
       return reply({ id, url, expires_in: 600 });
@@ -351,15 +379,16 @@ export class ProvisioningService {
     this.sql.exec('DELETE FROM engine_credential_logins WHERE id=?', row.id);
     const result = await claudeExchange(data.code, login.verifier, login.state, this.fetchFn, this.now());
     if (!result.ok) return reply({ error: result.reason }, 400);
-    return this.installCentralCredential(row.label, 'claude', login.version, result.files, login.adopt === true);
+    return this.installCentralCredential(row.label, 'claude', login.version, result.files, login.adopt === true, explicitMax(login.max_concurrency));
   }
 
   /** Store a Hub-minted credential: create the account bundle on first login, else publish a new generation. */
-  private async installCentralCredential(label: string, provider: string, version: string | null, files: CredentialFiles, adopt: boolean): Promise<Response> {
+  private async installCentralCredential(label: string, provider: string, version: string | null, files: CredentialFiles, adopt: boolean, maxConcurrency?: number): Promise<Response> {
     const bundleRow: any = this.sql.exec('SELECT * FROM engine_bundles WHERE label=?', label).toArray()[0];
     if (!bundleRow) {
       const bundle = { label, provider, version: version || '2.1.304', files: { '.claude/settings.json': '{}' }, env: {}, args: [] };
-      const put = new Request('https://hub.internal/api/engines/' + label + (adopt ? '?adopt=true' : ''), { method: 'PUT', body: JSON.stringify(bundle) });
+      const query = new URLSearchParams({ ...(adopt ? { adopt: 'true' } : {}), ...(maxConcurrency ? { max_concurrency: String(maxConcurrency) } : {}) }).toString();
+      const put = new Request('https://hub.internal/api/engines/' + label + (query ? '?' + query : ''), { method: 'PUT', body: JSON.stringify(bundle) });
       const res = await this.handle(put, { caller: { isAdmin: true } });
       if (res.status !== 200) return res;
     }

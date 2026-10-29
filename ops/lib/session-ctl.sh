@@ -13,8 +13,10 @@ case "$ROLE" in
 esac
 BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the run worktree
 SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bot-skills-ops}"   # read-only clone of alexeygrigorev/bot-skills (~/git/bot-skills is NOT a git repo)
-ENGINE="${ORCH_ENGINE:-sonnet}"                          # cost config: sonnet, explicit
-LOOP_INTERVAL="${LOOP_INTERVAL:-1h}"
+if [ "$ROLE" = orchestrator ]; then ENGINE="${ORCH_ENGINE:-opus}"; LOOP_DEFAULT=15m; else ENGINE="${ORCH_ENGINE:-sonnet}"; LOOP_DEFAULT=1h; fi
+LOOP_INTERVAL="${LOOP_INTERVAL:-$LOOP_DEFAULT}"
+TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
+BRIEF="$HOME/tmp/briefs/orchestrator-main.md"
 MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
 STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "$STATE"
 log() { echo "[$(date -u +%FT%TZ)] $ROLE: $*"; }
@@ -114,6 +116,7 @@ start() {
   done
   [ "$ready" = 1 ] || { log "prompt readiness failed: $id"; return 1; }
   local prompt="/loop $LOOP_INTERVAL Run the $ROLE check: follow $RUNDIR/$SUB/hourly-check.md, starting with step 0 (skills sync, handoff, inbox)."
+  [ "$ROLE" = orchestrator ] && prompt="/loop $LOOP_INTERVAL Run the orchestrator tick: follow $BRIEF (durable brief) and $RUNDIR/$SUB/CLAUDE.md; append one line to $TICKS every tick."
   if [ "${LOOP_INTERVAL}" = off ]; then log "LOOP_INTERVAL=off: scheduler is Hub scheduled prompts; no /loop issued"; return 0; fi
   a send "$id" "$prompt" --enter >/dev/null; local rc=$?
   echo "$prompt" > "$STATE/loop_command"
@@ -172,6 +175,16 @@ check() {
   mkdir -p "$HOME/tmp/agent-reports/orchestrator" "$HOME/tmp/agent-reports/oncall/inbox"
   local id
   id=$(find_session) || { log "session census failed"; restart_failed; return 1; }
+  if [ -n "$id" ] && [ "$ROLE" = orchestrator ]; then
+    # progress check: tick log must be fresh (grace = MAX_TICK_AGE after a start)
+    local now ls_ts tk; now=$(date +%s); ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
+    tk=$(stat -c %Y "$TICKS" 2>/dev/null || echo 0); [ "$tk" -lt "$ls_ts" ] && tk=$ls_ts
+    if [ $((now-tk)) -gt "$MAX_TICK_AGE" ]; then
+      log "STALLED session=$id: no tick for $((now-tk))s"
+      if FORCE=1 restart "no tick for $((now-tk))s (stalled)"; then id=$(find_session) || id=""; if [ -n "$id" ]; then echo 0 > "$STATE/restart_failures"; log "recovery verified session=$id"; return 0; fi; fi
+      restart_failed; return 1
+    fi
+  fi
   if [ -n "$id" ]; then
     echo 0 > "$STATE/restart_failures"
     log "OK session=$id"; return 0

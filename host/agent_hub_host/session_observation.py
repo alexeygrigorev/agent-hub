@@ -1,0 +1,99 @@
+"""Bounded model metadata from the existing native transcript binding.
+
+Never read profile credentials or infer a provider default. Only the model
+identifier leaves the host; transcript contents and paths stay local.
+"""
+import json
+from pathlib import Path
+import re
+import time
+
+from .model_contract import native_model
+
+_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,159}\Z")
+_SCAN_BYTES = 256 * 1024
+_CACHE = {}
+
+
+def _model(value):
+    return value if isinstance(value, str) and _MODEL.fullmatch(value) else None
+
+
+def _claude_transcript(row):
+    """Use the native hook's exact conversation id, never newest-by-workspace."""
+    sid = row.get('reported_state_engine_session_id')
+    if (row.get('engine') != 'claude' or not isinstance(sid, str)
+            or not re.fullmatch(r'[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}', sid)
+            or type(row.get('reported_state_at_ms')) is not int
+            or row['reported_state_at_ms'] < row['created_at_ms']):
+        return None
+    cwd = row.get('cwd') or row.get('workspace')
+    if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        return None
+    env = row.get('env') if isinstance(row.get('env'), dict) else {}
+    config, home = env.get('CLAUDE_CONFIG_DIR'), env.get('HOME')
+    if isinstance(config, str) and Path(config).is_absolute():
+        roots = {Path(config)}
+    elif isinstance(home, str) and Path(home).is_absolute():
+        roots = {Path(home) / '.claude'}
+    else:
+        roots = {Path.home() / '.claude'}
+    project = re.sub(r'[^A-Za-z0-9]', '-', cwd)
+    matches = {root / 'projects' / project / (sid + '.jsonl') for root in roots
+               if (root / 'projects' / project / (sid + '.jsonl')).is_file()}
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def native_session_model(row, locator=None):
+    if row.get('engine') == 'shell':
+        return 'not_applicable'
+    published = _model(row.get('model')) or _model(native_model(row.get('command')))
+    if published:
+        return published
+    if row.get('state', row.get('phase')) in ('exited', 'dead', 'pruned', 'forgotten', 'stopped'):
+        return None
+    if (type(row.get('created_at_ms')) is not int or row['created_at_ms'] <= 0
+            or not isinstance(row.get('id'), str)):
+        return None
+    from .native_progress import NativeTranscriptProgress
+    locator = locator or NativeTranscriptProgress()
+    try:
+        path = locator.locate(row) or _claude_transcript(row)
+        if path is None:
+            return None
+        stat = path.stat()
+        key = (row['id'], row['created_at_ms'], stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if key in _CACHE:
+            return _CACHE[key]
+        deadline = time.monotonic() + .05
+        latest = None
+        with path.open('rb') as stream:
+            if stat.st_size > _SCAN_BYTES:
+                stream.seek(-_SCAN_BYTES, 2)
+                stream.readline(_SCAN_BYTES)
+            raw = stream.read(_SCAN_BYTES)
+        for line in raw.splitlines():
+            if not line:
+                continue
+            if time.monotonic() > deadline:
+                return None
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            payload = event.get('payload')
+            candidate = None
+            if event.get('type') in ('turn_context', 'session_meta') and isinstance(payload, dict):
+                candidate = _model(payload.get('model'))
+            elif event.get('type') == 'assistant' and isinstance(event.get('message'), dict):
+                candidate = _model(event['message'].get('model'))
+            if candidate:
+                latest = candidate
+        if len(_CACHE) >= 500:
+            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE[key] = latest
+        return latest
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        return None
