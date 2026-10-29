@@ -22,3 +22,8 @@ intake such as the 173 KiB 95c1862c case can accept new notes and session links.
 Both the prior 128 KiB admission cliff and the 256 KiB task/receipt cliff are
 covered by regression tests. Metadata and aggregate storage failures continue
 to roll back the task, receipt and revision in the surrounding transaction.
+
+Task detail, list and successful mutation responses include `capacity_warning`
+when metadata bytes, full record bytes or event count reaches 80% of its limit.
+The warning reports usage and limits and directs continuation in a linked intake
+before exhaustion. It never deletes history or silently changes lifecycle state.

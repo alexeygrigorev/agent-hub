@@ -1002,6 +1002,24 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(appended.task.status).toBe('open');
   });
 
+  it('warns before event capacity on detail, list and successful append without changing history', async () => {
+    let { task } = await create();
+    expect(task.capacity_warning).toBeNull();
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      while (data.history.length < 102) data.history.push({ kind: 'note', text: 'retained fixture', id: crypto.randomUUID() });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+    });
+    expect((await ok('/tasks/' + task.id)).task.capacity_warning).toBeNull();
+    task = (await append(task.id, task.version, { kind: 'note', text: 'cross warning threshold', source })).task;
+    expect(task.capacity_warning).toMatchObject({ code: 'intake_task_capacity_high', usage: { events: 103 }, limits: { events: 128 } });
+    const listed = await ok('/tasks');
+    expect(listed.items.find((t: any) => t.id === task.id).capacity_warning).toEqual(task.capacity_warning);
+    const detail = (await ok('/tasks/' + task.id)).task;
+    expect(detail.capacity_warning).toEqual(task.capacity_warning);
+    expect(detail.payload_data.history).toEqual(task.payload_data.history);
+  });
+
   it('rolls back oversized-history writes at the separate record safety bound', async () => {
     const { task } = await create();
     const result = await inDO(stub(), (h: any) => {

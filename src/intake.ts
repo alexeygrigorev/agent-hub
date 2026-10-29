@@ -101,6 +101,16 @@ function taskCapacityError(task: Obj): string | null {
   if (encoded(task) > INTAKE_LIMITS.taskRecordBytes) return 'record_byte_capacity';
   return null;
 }
+/** Surface headroom while the ledger is still writable; never mutate retained history. */
+function taskCapacityWarning(task: Obj): Obj | null {
+  const { history, ...metadata } = task;
+  const usage = { metadata_bytes: encoded(metadata), record_bytes: encoded(task), events: history?.length ?? 0 };
+  const limits = { metadata_bytes: INTAKE_LIMITS.taskBytes, record_bytes: INTAKE_LIMITS.taskRecordBytes, events: INTAKE_LIMITS.events };
+  if (Object.entries(usage).every(([key, value]) => value < limits[key as keyof typeof limits] * 0.8)) return null;
+  return { code: 'intake_task_capacity_high', threshold_ratio: 0.8, usage, limits,
+    action: 'continue_in_linked_intake',
+    detail: 'Continue work in a linked intake before capacity is exhausted; preserve this ledger and its original history.' };
+}
 function object(value: any): Obj {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('invalid_object');
   return value;
@@ -593,6 +603,7 @@ export class IntakeService {
       authority: 'hub_ledger_cas', execution_evidence: 'not_verified_by_intake' },
       scope_flag: task.scope?.flag ?? null, scope: this.scopeView(task),
       payload_data: { title, current_state, next_step, owner, uncertainty, acceptance_criteria: acceptance_criteria ?? null, history }, unresolved: this.unresolved(task),
+      capacity_warning: taskCapacityWarning(task),
       assigned_sessions: this.assignedSessions(task, p),
       worktrees: this.worktrees.list(task.id), close_gate: this.worktrees.gate(task.id) };
   }
