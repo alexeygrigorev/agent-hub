@@ -401,39 +401,34 @@ class StalenessBackupFailedModeTest(unittest.TestCase):
         # Never touches the staleness dedupe state.
         self.assertFalse((self.work / "state" / "staleness.state").exists())
 
+    def drill_lines(self, out: str) -> list[str]:
+        return [l for l in out.splitlines() if "[DRILL]" in l]
+
+    def assert_one_drill_line(self, out: str, *needles: str) -> str:
+        lines = self.drill_lines(out)
+        self.assertEqual(len(lines), 1, out)
+        line = lines[0]
+        self.assertRegex(line, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \[DRILL\] ")
+        self.assertIn("result=", line)
+        self.assertIn("mail=none", line)
+        for n in needles:
+            self.assertIn(n, line)
+        return line
+
+    def assert_no_side_files(self) -> None:
+        state = self.work / "state"
+        extra = [p.name for p in state.iterdir() if p.name != "staleness.state"] if state.exists() else []
+        self.assertEqual(extra, [])
+
     def test_backup_failed_drill_never_sends_mail(self) -> None:
-        """Standing rule: drills never send real mail. Drill mode must not
-        invoke any MTA (neither ALERT_TO nor ALERT_OPS_TO); the rendered
-        alert lands only in the local sink."""
-        sink = self.work / "state" / "drill-mail.log"
+        """Standing rule (t1940u): drill/test alerts are never emailed to any
+        recipient; one [DRILL] log line with timestamp + result instead."""
         res = self.run_stale("--backup-failed", "DRILL reason", "--drill")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertEqual(self.mails(), [])
+        self.assert_one_drill_line(res.stdout, "reason='DRILL reason'")
         self.assertNotIn("ALERT stale=", res.stdout)
-        self.assertIn("no mail sent", res.stdout)
-        text = sink.read_text()
-        self.assertIn("Subject: [DRILL] [FAIL] Hub DB backup run failed", text)
-        self.assertIn("Reason: DRILL reason", text)
-        self.assertIn("not sent", text)
-        self.assertEqual(stat.S_IMODE(sink.stat().st_mode), 0o600)
-
-    def test_drill_sink_is_forced_private_and_never_follows_symlinks(self) -> None:
-        sink = self.work / "state" / "drill-mail.log"
-        sink.parent.mkdir(parents=True, exist_ok=True)
-        sink.write_text("old\n")
-        sink.chmod(0o644)
-        res = self.run_stale("--backup-failed", "x", "--drill")
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        self.assertEqual(stat.S_IMODE(sink.stat().st_mode), 0o600)
-        self.assertTrue(sink.read_text().startswith("old\n"))
-        sink.unlink()
-        target = self.work / "target.txt"
-        target.write_text("keep")
-        sink.symlink_to(target)
-        res = self.run_stale("--backup-failed", "x", "--drill")
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertEqual(target.read_text(), "keep")
-        self.assertEqual(self.mails(), [])
+        self.assert_no_side_files()
 
     def test_stale_drill_env_with_backup_failed_never_sends_mail(self) -> None:
         # Review finding on 4934849d: HUB_DB_STALE_DRILL=1 + --backup-failed
@@ -443,13 +438,7 @@ class StalenessBackupFailedModeTest(unittest.TestCase):
                              env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertEqual(self.mails(), [])
-        self.assertIn("Reason: real-looking reason",
-                      (self.work / "state" / "drill-mail.log").read_text())
-
-    def test_drill_flag_alone_is_refused(self) -> None:
-        res = self.run_stale("--drill")
-        self.assertEqual(res.returncode, 1)
-        self.assertEqual(self.mails(), [])
+        self.assert_one_drill_line(res.stdout, "real-looking reason")
 
     def test_stale_drill_never_sends_mail(self) -> None:
         env = {**self.env, "HUB_DB_STALE_DRILL": "1"}
@@ -457,13 +446,24 @@ class StalenessBackupFailedModeTest(unittest.TestCase):
                              text=True, timeout=60)
         self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
         self.assertEqual(self.mails(), [])
-        self.assertIn("[DRILL] [STALE] Hub DB backup drill",
-                      (self.work / "state" / "drill-mail.log").read_text())
+        self.assert_one_drill_line(res.stdout, "staleness alert suppressed")
+        # The closing run clears the drill with one more [DRILL] line, no mail.
+        env.pop("HUB_DB_STALE_DRILL")
+        res = subprocess.run(["bash", str(STALENESS)], env=env, capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(self.mails(), [])
+        if self.drill_lines(res.stdout):
+            self.assert_one_drill_line(res.stdout, "drill cleared")
 
-    def test_full_backup_drill_chain_never_sends_mail(self) -> None:
+    def test_drill_flag_alone_is_refused(self) -> None:
+        res = self.run_stale("--drill")
+        self.assertEqual(res.returncode, 1)
+        self.assertEqual(self.mails(), [])
+
+    def test_full_backup_drill_chain_logs_one_line_and_never_mails(self) -> None:
         """End to end: the real backup script with HUB_DB_BACKUP_FAIL_DRILL=1
-        and its real default alert command (sibling staleness script) must
-        exit 1, render to the sink and invoke no MTA at all."""
+        and its real default alert command must exit 1, print exactly one
+        line ([DRILL] with timestamp + result), invoke no MTA, write no file."""
         token = self.work / "token"
         token.write_text(TOKEN)
         token.chmod(0o600)
@@ -477,17 +477,10 @@ class StalenessBackupFailedModeTest(unittest.TestCase):
         res = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True,
                              text=True, timeout=60)
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn("no mail sent", res.stdout)
         self.assertEqual(self.mails(), [])
-        self.assertIn("DRILL: forced backup failure",
-                      (self.work / "state" / "drill-mail.log").read_text())
-
-    def test_backup_failed_dry_run_sends_nothing(self) -> None:
-        res = self.run_stale("--backup-failed", "x", "--dry-run")
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        self.assertIn("would-alert backup-failed to=stub-alarm@invalid.test", res.stdout)
-        self.assertEqual(self.mails(), [])
-
+        self.assertEqual(len(res.stdout.strip().splitlines()), 1, res.stdout)
+        self.assert_one_drill_line(res.stdout, "backup_run_failed", "HUB_DB_BACKUP_FAIL_DRILL=1")
+        self.assert_no_side_files()
 
 if __name__ == "__main__":
     unittest.main()

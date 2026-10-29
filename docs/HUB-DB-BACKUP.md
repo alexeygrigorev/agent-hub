@@ -171,23 +171,23 @@ still applies, and it never touches the staleness state file. Disable only
 for local experiments with `ALERT_ON_FAIL=0`.
 
 Drill: `HUB_DB_BACKUP_FAIL_DRILL=1` makes the backup script fail at once
-(no Hub request) and passes `--drill`. **Drills never send mail** (standing
-rule: tests and drills never send real mail; a 2026-10-29 05:25 Berlin drill
-of an earlier revision mailed dev@ and was corrected). The fully rendered
-alert is appended to a local mode-600 sink (`HUB_DB_DRILL_SINK`, default
-`/var/lib/hub-db-backup/drill-mail.log`) and no MTA is invoked. This proves
-trap -> alert command -> message rendering; the transport is the same
-`send_mail` used by the staleness alerts.
+(no Hub request) and passes `--drill`. **Drill and test alerts are never
+emailed to anyone** (standing rule, Alexey t1940u; a 2026-10-29 05:25
+Berlin drill of an earlier revision mailed dev@ and was corrected). Each
+drill writes exactly one line to the backup run log instead:
 
-```bash
-sudo -u alexey HUB_DB_BACKUP_FAIL_DRILL=1 /usr/local/sbin/hub-db-backup.sh; echo $?   # expect 1
-tail -n 8 /var/lib/hub-db-backup/drill-mail.log   # "[DRILL] [FAIL] ...", "not sent"
+```
+2026-10-29T06:40:12Z [DRILL] backup-failed alert suppressed result=backup_run_failed reason='forced by HUB_DB_BACKUP_FAIL_DRILL=1, no Hub request made' last_good=/var/backups/hub-do/... mail=none
 ```
 
-Covered by `host/tests/test_hub_db_backup_script.py`
-(`test_backup_failed_drill_never_sends_mail`,
-`test_full_backup_drill_chain_never_sends_mail`: stub MTAs must capture
-nothing).
+```bash
+sudo -u alexey HUB_DB_BACKUP_FAIL_DRILL=1 /usr/local/sbin/hub-db-backup.sh >> /var/log/hub-db-backup.log 2>&1; echo $?   # expect 1
+grep '\[DRILL\]' /var/log/hub-db-backup.log | tail -n 1
+```
+
+Covered by `host/tests/test_hub_db_backup_script.py` (stub MTAs must
+capture nothing; exactly one `[DRILL]` line; no files written) and
+`scripts/test-hub-db-backup-staleness.sh` S8.
 
 ### Mail hygiene (intake 9806fc14)
 
@@ -199,14 +199,12 @@ with the real env and no `--dry-run`, paging alexey@ with test paths
   under `/tmp` or `/var/tmp`, EVERY send (including RECOVERED) is routed to
   `ALERT_OPS_TO` (`dev@dtcdev.click`) only — never `ALERT_TO`. The run logs
   `GUARD: test paths ...` and marks `guard=test-paths` on the ALERT line.
-- **Drill**: `HUB_DB_STALE_DRILL=1` forces one FAIL rendered to the local
-  drill sink (`HUB_DB_DRILL_SINK`, default
-  `/var/lib/hub-db-backup/drill-mail.log`, mode 600) and **never mailed**
-  (standing rule since e27e0f9d: tests and drills never send real mail, not
-  even to dev@). It records `DRILL=1` + `LAST_ALERT=0` in the state file,
-  so a real staleness episode in between is NOT deduped away; the closing
-  RECOVERED is sink-only too. The sink refuses symlinks/non-regular files
-  and is forced to 600 before writing; any failure exits 1 without mailing.
+- **Drill**: `HUB_DB_STALE_DRILL=1` forces one stale FAIL that is **never
+  mailed** (standing rule t1940u: drill and test alerts are never emailed,
+  not even to dev@); it writes one `[DRILL] ... result=... mail=none` line
+  to the staleness log. It records `DRILL=1` + `LAST_ALERT=0` in the state
+  file, so a real staleness episode in between is NOT deduped away; the
+  closing RECOVERED is also a single `[DRILL]` log line.
 - `--dry-run` / `--no-mail` / `--check-only` still send nothing.
 
 Regression suite: `scripts/test-hub-db-backup-staleness.sh` (stub MTAs,
@@ -222,8 +220,8 @@ mkdir -p /tmp/stale-test-local /tmp/stale-test-box /tmp/stale-test-state
 BACKUP_DIR=/tmp/stale-test-local STORAGEBOX_DIR=/tmp/stale-test-box \
   STATE_DIR=/tmp/stale-test-state scripts/hub-db-backup-staleness.sh --dry-run; echo $?
 # expect exit 2 + "would-alert"
-# drill: FAIL rendered to /var/lib/hub-db-backup/drill-mail.log, no mail;
-# cleared on the next fresh run (RECOVERED also sink-only)
+# drill: one [DRILL] log line, no mail; cleared on the next fresh run
+# (also one [DRILL] line, no mail)
 sudo -u alexey HUB_DB_STALE_DRILL=1 /usr/local/sbin/hub-db-backup-staleness.sh
 ```
 

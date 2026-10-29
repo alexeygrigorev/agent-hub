@@ -159,16 +159,14 @@ else
   fail "S7 guard (rc=$rc7) -- $out -- $(head -5 "$mailbox" 2>/dev/null)"
 fi
 
-# ---- S8: drill never mails (standing rule, e27e0f9d): FAIL and the closing
-# RECOVERED render to the local sink only; zero MTA invocations ----
+# ---- S8: drills are never emailed (standing rule t1940u/e27e0f9d): each
+# drill writes exactly one "[DRILL] ... result=... mail=none" log line ----
 new_tree fresh 3600; new_state s8
 reset_mail
-SINK="$STATE_DIR/drill-mail.log"
+drill_count() { grep -c '\[DRILL\].*result=.*mail=none' <<<"$1" || true; }
 set +e; out="$( { export HUB_DB_STALE_DRILL=1; run_stale; } )"; rc8=$?; set -e
-if [[ $rc8 -eq 2 && "$(mail_count)" -eq 0 ]] \
-  && grep -q "Subject: \[DRILL\] \[STALE\] Hub DB backup drill" "$SINK" \
-  && grep -q "no mail sent" <<<"$out" && [[ "$(stat -c%a "$SINK")" == "600" ]]; then
-  pass "S8a drill FAIL renders to sink, sends no mail"
+if [[ $rc8 -eq 2 && "$(mail_count)" -eq 0 && "$(drill_count "$out")" -eq 1 ]]; then
+  pass "S8a drill FAIL: one [DRILL] log line, no mail"
 else
   fail "S8a drill FAIL (rc=$rc8, mails=$(mail_count)) -- $out"
 fi
@@ -176,10 +174,9 @@ grep -q '^DRILL=1$' "$STATE_DIR/staleness.state" && grep -q '^LAST_ALERT=0$' "$S
   && pass "S8b drill state: DRILL=1, LAST_ALERT=0" || fail "S8b drill state -- $(cat "$STATE_DIR/staleness.state" 2>/dev/null)"
 reset_mail
 set +e; out="$(run_stale)"; rc8c=$?; set -e
-if [[ $rc8c -eq 0 && "$(mail_count)" -eq 0 ]] \
-  && grep -q "Subject: \[DRILL\] RECOVERED: Hub DB backup drill cleared" "$SINK" \
+if [[ $rc8c -eq 0 && "$(mail_count)" -eq 0 && "$(drill_count "$out")" -eq 1 ]] \
   && ! grep -q '^DRILL=1$' "$STATE_DIR/staleness.state"; then
-  pass "S8c fresh run clears drill with sink-only RECOVERED, no mail"
+  pass "S8c fresh run clears drill: one [DRILL] line, no mail"
 else
   fail "S8c drill recovery (rc=$rc8c, mails=$(mail_count)) -- $out"
 fi
@@ -188,14 +185,11 @@ reset_mail
 set +e; out="$(run_stale --drill)"; rc8d=$?; set -e
 [[ $rc8d -eq 1 && "$(mail_count)" -eq 0 ]] \
   && pass "S8d --drill without --backup-failed refused, no mail" || fail "S8d (rc=$rc8d) -- $out"
-# S8e: a symlinked sink fails closed (exit 1), target untouched, no mail.
-new_tree fresh 3600; new_state s8e
-echo keep > "$STATE_DIR/target.txt"
-ln -s "$STATE_DIR/target.txt" "$STATE_DIR/drill-mail.log"
+# S8e: backup-failed drill: one [DRILL] line, no mail.
 reset_mail
-set +e; out="$( { export HUB_DB_STALE_DRILL=1; run_stale; } )"; rc8e=$?; set -e
-[[ $rc8e -eq 1 && "$(mail_count)" -eq 0 && "$(cat "$STATE_DIR/target.txt")" == "keep" ]] \
-  && pass "S8e symlinked drill sink fails closed, no mail" || fail "S8e (rc=$rc8e) -- $out"
+set +e; out="$(run_stale --backup-failed "drill reason" --drill)"; rc8e=$?; set -e
+[[ $rc8e -eq 0 && "$(mail_count)" -eq 0 && "$(drill_count "$out")" -eq 1 ]] \
+  && pass "S8e backup-failed drill: one [DRILL] line, no mail" || fail "S8e (rc=$rc8e) -- $out"
 unset HUB_DB_STALE_DRILL
 
 # ---- S9: drill must not suppress a real stale page ----

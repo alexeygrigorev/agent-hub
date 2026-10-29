@@ -44,9 +44,9 @@
 # Failure alerting: any non-zero exit (config, fetch, validation, store)
 # pages on the same run via ALERT_CMD (default: the sibling
 # hub-db-backup-staleness.sh --backup-failed: same mail path and test-path
-# guard). HUB_DB_BACKUP_FAIL_DRILL=1 forces an immediate failure; its alert
-# is rendered to a local drill sink and NEVER mailed (tests and drills never
-# send real mail); no Hub request is made.
+# guard). HUB_DB_BACKUP_FAIL_DRILL=1 forces an immediate failure whose alert
+# is NEVER mailed: the run logs exactly one "[DRILL]" line (timestamp +
+# result) and no Hub request is made.
 #
 # Exit code: 0 only if fetch+validate+store+mirror all succeeded.
 set -euo pipefail
@@ -91,7 +91,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if [[ "$HUB_DB_BACKUP_FAIL_DRILL" == "1" ]]; then
-  fail "DRILL: forced backup failure (HUB_DB_BACKUP_FAIL_DRILL=1); no Hub request made"
+  # No ERROR line here: the alert command logs the drill's single [DRILL] line.
+  FAIL_REASON="forced by HUB_DB_BACKUP_FAIL_DRILL=1, no Hub request made"
+  exit 1
 fi
 
 HUB_BASE_URL="${HUB_BASE_URL:-https://hub.dtcdev.click}"
