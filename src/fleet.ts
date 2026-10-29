@@ -1636,13 +1636,24 @@ export class FleetService {
         // Exact positive terminal evidence releases physical concurrency even
         // if a headless launch journal was lost. Absence is never exit proof.
         // Routed jobs retain their separate task-result contract.
+        // One managed-session lookup per census, keyed by bound native id: a
+        // busy host reports hundreds of exited rows, and a per-row scan made
+        // the PUT exceed the host's 10 s timeout (intake c206f556).
+        let managedByNative: Map<string, any[]> | null = null;
         for (const native of cleanSessions) {
           if (!['exited', 'dead'].includes(native.phase) || !native.created_at_ms) continue;
           // Deleted cwd/workspace is a capacity projection above, not positive
           // native exit evidence. It must never settle a launch reservation.
           if (native.workspace.endsWith(' (deleted)') || native.cwd?.endsWith(' (deleted)')) continue;
-          const managed = this.sql.exec("SELECT * FROM session_control_sessions WHERE machine_id = ? AND fleet_launch_id IS NOT NULL AND binding_json IS NOT NULL", caller.machineId!).toArray() as any[];
-          for (const session of managed) {
+          if (!managedByNative) {
+            managedByNative = new Map();
+            for (const session of this.sql.exec("SELECT id, fleet_launch_id, binding_json, engine FROM session_control_sessions WHERE machine_id = ? AND fleet_launch_id IS NOT NULL AND binding_json IS NOT NULL", caller.machineId!).toArray() as any[]) {
+              const nativeId = parsed(session.binding_json).native_id;
+              if (typeof nativeId !== 'string') continue;
+              managedByNative.set(nativeId, [...(managedByNative.get(nativeId) ?? []), session]);
+            }
+          }
+          for (const session of managedByNative.get(native.native_id) ?? []) {
             const binding = parsed(session.binding_json);
             if (binding.native_id !== native.native_id || binding.tag !== native.tag ||
                 binding.workspace !== native.workspace || binding.native_created_at_ms !== native.created_at_ms ||
