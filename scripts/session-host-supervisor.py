@@ -143,8 +143,15 @@ def main():
         if args.control_dir:
             if not is_windows():
                 raise ValueError('Installer handover is supported only for Windows Job Objects')
-            from agent_hub_host.bootstrap_control import ControllerLease
-            lease = stack.enter_context(ControllerLease(args.control_dir))
+            from agent_hub_host.bootstrap_control import ControllerLease, NeedsAttention
+            try:
+                lease = stack.enter_context(ControllerLease(args.control_dir))
+            except NeedsAttention:
+                # Success exit stops the task's automatic failure/retry loop.
+                # The durable status and log give an actionable recovery path.
+                print(json.dumps({'event': 'needs_attention', 'reason': 'controller_exit_unproven',
+                      'status_file': str(pathlib.Path(args.control_dir) / 'needs-attention.json')}), flush=True)
+                return
         receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
                          '--tag', tag, '--engine', 'shell',
                          *env_args,
@@ -160,12 +167,14 @@ def main():
         if (receipt.get('engine') != 'shell' or receipt.get('command') != command or receipt.get('workspace') != str(workspace)
                 or receipt.get('tag') != tag or not receipt.get('id') or type(receipt.get('created_at_ms')) is not int):
             raise RuntimeError('Native controller receipt mismatch')
+        handing_over = False
         try:
             if lease:
                 lease.publish(receipt)
             print(json.dumps({'event': 'controller_started', 'id': receipt['id']}), flush=True)
             while not stop.wait(5):
                 if lease and lease.stop_requested():
+                    handing_over = True
                     break
                 row = native('status', receipt['id'])
                 if not same_controller(row, receipt):
@@ -200,8 +209,17 @@ def main():
                         if not proven:
                             raise RuntimeError('Owned controller exit is unproven')
                         lease.confirm_exit()
+                elif lease:
+                    raise RuntimeError('Controller identity changed; exit is unproven')
             except Exception:
+                if lease:
+                    lease.mark_unproven()
                 print(json.dumps({'event': 'controller_cleanup_unconfirmed', 'id': receipt['id']}), flush=True)
+        if handing_over:
+            # Restart-on-failure restores the old runner if the installer dies
+            # after shutdown was accepted. A successful installer replaces and
+            # starts the task immediately; the lease also excludes duplicates.
+            raise SystemExit(75)
 
 if __name__ == '__main__':
     main()

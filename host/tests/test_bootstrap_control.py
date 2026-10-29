@@ -159,9 +159,152 @@ class HandoverTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unconfirmed'):
                 c.handover(self.directory, timeout=0)
             self.assertTrue((self.directory / 'owner.json').exists())
-        with self.assertRaisesRegex(RuntimeError, 'exit is unproven'):
-            with c.ControllerLease(self.directory):
+        with self.assertRaisesRegex(c.NeedsAttention, 'exit is unproven'):
+            with c.ControllerLease(self.directory, observe=lambda receipt: None):
                 self.fail('must preserve crashed owner evidence')
+        self.assertEqual(c._read(self.directory / 'needs-attention.json')['status'], 'needs_attention')
+
+    def crash(self, boot='boot-before'):
+        with c.ControllerLease(self.directory, boot_probe=lambda: boot) as lease:
+            lease.publish(self.receipt)
+        return c._read(self.directory / 'owner.json')
+
+    def test_reboot_archives_old_receipt_and_allows_next_controller(self):
+        previous = self.crash()
+        with c.ControllerLease(self.directory, boot_probe=lambda: 'boot-after',
+                               observe=lambda receipt: self.fail('reboot proof needs no native lookup')) as lease:
+            self.assertFalse((self.directory / 'owner.json').exists())
+            archived = [c._read(p) for p in (self.directory / 'archive').iterdir()]
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(archived[0]['owner'], previous)
+            self.assertEqual(archived[0]['proof'], 'boot_changed')
+            lease.publish(dict(self.receipt, id='new-controller'))
+            lease.confirm_exit()
+
+    def test_same_boot_crashed_owner_recovers_only_exact_empty_containment(self):
+        previous = self.crash()
+        calls = []
+        def observe(receipt):
+            calls.append(receipt)
+            return dict(receipt, containment_empty=True)
+        with c.ControllerLease(self.directory, boot_probe=lambda: 'boot-before', observe=observe):
+            self.assertFalse((self.directory / 'owner.json').exists())
+        self.assertEqual(calls, [previous['receipt']])
+        archive = next((self.directory / 'archive').iterdir())
+        self.assertEqual(c._read(archive)['proof'], 'exact_receipt_containment_empty')
+
+    def test_unknown_missing_mismatched_or_nonempty_receipt_never_recovers(self):
+        self.crash()
+        previous = (self.directory / 'owner.json').read_bytes()
+        rows = [None, {}, dict(self.receipt, containment_empty=False),
+                dict(self.receipt, containment_empty=True, id='another-controller'),
+                dict(self.receipt, containment_empty=True, created_at_ms=2)]
+        for row in rows:
+            with self.subTest(row=row), self.assertRaises(c.NeedsAttention):
+                with c.ControllerLease(self.directory, boot_probe=lambda: None, observe=lambda receipt: row):
+                    self.fail('unknown proof cannot start a replacement')
+            self.assertEqual((self.directory / 'owner.json').read_bytes(), previous)
+            self.assertFalse((self.directory / 'archive').exists())
+        with self.assertRaises(c.NeedsAttention):
+            c.handover(self.directory, timeout=0, boot_probe=lambda: 'boot-before', observe=lambda receipt: None)
+        self.assertFalse((self.directory / 'stop.json').exists())
+
+    def test_installer_recovers_stale_owner_without_waiting_for_dead_supervisor(self):
+        self.crash()
+        c.handover(self.directory, timeout=0, boot_probe=lambda: 'boot-after',
+                   observe=lambda receipt: self.fail('must use boot proof'))
+        self.assertFalse((self.directory / 'owner.json').exists())
+        self.assertFalse((self.directory / 'stop.json').exists())
+
+    def test_exit_ack_published_before_interrupted_owner_removal_is_recoverable(self):
+        previous = self.crash()
+        c._write(self.directory / 'stopped.json', {'generation': previous['generation'], 'containment_empty': True})
+        with c.ControllerLease(self.directory, boot_probe=lambda: None,
+                               observe=lambda receipt: self.fail('ack already proves the owned exit')):
+            self.assertFalse((self.directory / 'owner.json').exists())
+        archive = next((self.directory / 'archive').iterdir())
+        self.assertEqual(c._read(archive)['proof'], 'owned_exit_acknowledged')
+
+    def test_recovery_archive_failure_preserves_the_original_owner(self):
+        self.crash()
+        previous = (self.directory / 'owner.json').read_bytes()
+        original = c._write
+        def fail_archive(path, value):
+            if path.parent.name == 'archive':
+                raise OSError('disk full')
+            return original(path, value)
+        with patch.object(c, '_write', side_effect=fail_archive):
+            with self.assertRaisesRegex(OSError, 'disk full'):
+                with c.ControllerLease(self.directory, boot_probe=lambda: 'boot-after'):
+                    self.fail('must retain evidence when archiving fails')
+        self.assertEqual((self.directory / 'owner.json').read_bytes(), previous)
+
+    def test_unknown_startup_reports_needs_attention_without_a_retry_or_new_child(self):
+        self.crash()
+        script = Path(__file__).resolve().parents[2] / 'scripts/session-host-supervisor.py'
+        spec = importlib.util.spec_from_file_location('bootstrap_unknown_startup', script)
+        supervisor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(supervisor)
+        config = Path(self.temp.name) / 'config.json'
+        config.write_text('{}')
+        argv = [str(script), '--workspace', self.temp.name, '--config', str(config),
+                '--credential-config', str(config), '--journal-dir', str(self.directory / 'journal'),
+                '--control-dir', str(self.directory)]
+        import contextlib, io
+        output = io.StringIO()
+        with patch.object(supervisor.sys, 'argv', argv), \
+             patch.object(supervisor, 'is_windows', return_value=True), \
+             patch.object(supervisor.signal, 'signal'), patch.dict(os.environ), \
+             patch.object(c, 'boot_identity', return_value=None), \
+             patch.object(c, 'observe_receipt', return_value=None), \
+             patch.object(supervisor, 'native') as native, contextlib.redirect_stdout(output):
+            self.assertIsNone(supervisor.main(), 'successful process exit stops failure-restart loop')
+        native.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())['event'], 'needs_attention')
+        self.assertTrue((self.directory / 'owner.json').exists())
+
+    def test_live_owner_lock_prevents_boot_based_recovery(self):
+        with c.ControllerLease(self.directory, boot_probe=lambda: 'boot-before') as lease:
+            lease.publish(self.receipt)
+            with self.assertRaisesRegex(RuntimeError, 'unconfirmed'):
+                c.handover(self.directory, timeout=0, boot_probe=lambda: 'boot-after')
+            self.assertTrue((self.directory / 'owner.json').exists())
+            self.assertFalse((self.directory / 'archive').exists())
+            self.assertFalse((self.directory / 'stop.json').exists())
+
+    def test_timed_out_cancelled_and_expired_requests_cannot_stop_a_recovered_owner(self):
+        with c.ControllerLease(self.directory) as lease:
+            lease.publish(self.receipt)
+            with self.assertRaisesRegex(RuntimeError, 'unconfirmed'):
+                c.handover(self.directory, timeout=0)
+            self.assertFalse((self.directory / 'stop.json').exists())
+            self.assertFalse(lease.stop_requested())
+            # Hard-kill residue has an independent monotonic expiry.
+            now = time.monotonic()
+            request = {'generation': lease.generation, 'request_id': 'abandoned',
+                       'created_monotonic': now - 91, 'expires_monotonic': now - 1}
+            c._write(self.directory / 'stop.json', request)
+            self.assertFalse(lease.stop_requested())
+            request.update(created_monotonic=now, expires_monotonic=now + 90)
+            c._write(self.directory / 'stop.json', request)
+            self.assertTrue(lease.stop_requested())
+            with patch.object(c.time, 'sleep', side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    c.handover(self.directory, timeout=2)
+            self.assertFalse((self.directory / 'stop.json').exists())
+            self.assertFalse(lease.stop_requested())
+
+    def test_boot_probe_is_read_only_and_failed_or_malformed_output_is_unknown(self):
+        from types import SimpleNamespace
+        with patch.object(c.os, 'name', 'nt'), patch.object(c.subprocess, 'run') as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout='2026-10-29T12:00:00.1234567Z\n')
+            self.assertEqual(c.boot_identity(), 'windows-boot:2026-10-29T12:00:00.1234567Z')
+            self.assertEqual(run.call_args.kwargs['timeout'], 10)
+            self.assertIn('Get-CimInstance', run.call_args.args[0][-1])
+            for result in (SimpleNamespace(returncode=1, stdout=''),
+                           SimpleNamespace(returncode=0, stdout='unknown')):
+                run.return_value = result
+                self.assertIsNone(c.boot_identity())
 
     def test_supervisor_only_acknowledges_its_exact_child_after_native_exit_proof(self):
         script = Path(__file__).resolve().parents[2] / 'scripts/session-host-supervisor.py'
@@ -196,14 +339,18 @@ class HandoverTests(unittest.TestCase):
                 with patch.object(supervisor.sys, 'argv', argv), \
                      patch.object(supervisor, 'is_windows', return_value=True), \
                      patch.object(supervisor.signal, 'signal'), \
+                     patch.dict(os.environ), \
                      patch.object(supervisor.threading, 'Event', return_value=stop), \
                      patch.object(c.ControllerLease, 'stop_requested', return_value=True), \
                      patch.object(supervisor, 'native', side_effect=native):
-                    supervisor.main()
+                    with self.assertRaises(SystemExit) as exit:
+                        supervisor.main()
+                self.assertEqual(exit.exception.code, 75, 'abandoned accepted handover must let the task restore its runner')
                 kills = [call for call in calls if call[0] == 'kill']
                 self.assertEqual(len(kills), 0 if mode == 'changed_identity' else 1)
                 self.assertEqual((control / 'stopped.json').exists(), mode == 'confirmed')
                 self.assertEqual((control / 'owner.json').exists(), mode != 'confirmed')
+                self.assertEqual((control / 'needs-attention.json').exists(), mode != 'confirmed')
 
 
 if __name__ == '__main__':
