@@ -2614,6 +2614,17 @@ class Dispatcher:
     def dispatch(self, offer):
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
             raise ValueError('Goal work is interactive only')
+        # Intake 0689ce9c AC2: live host load gates every new launch before
+        # any admission subprocess, claim or native start. Test processes
+        # spawned INSIDE sessions are invisible to launcher admission and
+        # server placement (both deliberately choking-only), so the 1-minute
+        # load average is checked here: above factor x cores the launch is
+        # held (queued, retried next cycle). Nothing running is touched.
+        offer_id = offer.get("id")
+        if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
+            raise ValueError("Invalid offer id")
+        from .host_load import check_live_load
+        check_live_load(self.settings)
         sub = self._route(offer)
         device_auth = self.settings.get('opencode_auth') if sub.get('launcher_provider') == 'opencode' else None
         if device_auth:
@@ -2624,9 +2635,6 @@ class Dispatcher:
                 raise ValueError('Required capabilities are no longer available locally')
             if not isinstance(selection, dict) or selection.get('model') != sub.get('launcher_model') or selection.get('effort') != sub.get('launcher_effort'):
                 raise ValueError('Selected model/effort is not configured locally')
-        offer_id = offer.get("id")
-        if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
-            raise ValueError("Invalid offer id")
         if offer.get("task_id") is not None:
             if not isinstance(offer["task_id"], str) or not LABEL.fullmatch(offer["task_id"]):
                 raise ValueError("Invalid task id")
@@ -2876,6 +2884,8 @@ class Dispatcher:
         # Protection failures are definitive pre-start refusals, not an
         # uncertain native launch holding a dispatch reservation forever.
         self._lock_session_worktree(offer, target_cwd)
+        # Re-sample after slow preparation, before any claim.
+        check_live_load(self.settings)
         claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
         self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, offer_workspace)
         from .launch_diagnostics import capture_log_offsets
@@ -3616,6 +3626,18 @@ class Dispatcher:
                 workspace_available = False
             diagnostic = classify(exc, workspace_available=workspace_available)
             reason = diagnostic['reason']
+            if reason == 'host_overload':
+                # Intake 0689ce9c AC2: an overloaded host holds the offer
+                # (stays queued, retried next cycle). A /reject POST would
+                # terminally fail non-task offers, and nothing running may
+                # be touched, so the launch is only parked locally.
+                print(json.dumps({'event': 'dispatch_host_overload',
+                                  'offer_id': offer.get('id'),
+                                  'diagnostic': diagnostic}), flush=True)
+                # Load holds preserve any earlier ambiguous claim and its retry key.
+                results.append({'id': offer.get('id'), 'state': 'held',
+                                'reason': reason, 'diagnostic': diagnostic})
+                return
             if reason == 'dispatch_claim_refused':
                 print(json.dumps({'event': 'dispatch_claim_refused', 'offer_id': offer.get('id'),
                                   'diagnostic': diagnostic}), flush=True)
@@ -3808,7 +3830,11 @@ class Dispatcher:
         caps = {'fleet_modes': ['interactive'] + (['headless'] if self.settings.get('launcher') else []),
                 'fleet_route_rejections': []}
         allowed, _ = self._admission_projection(caps)
-        hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
+        from .host_load import gate_with_live_load
+        hb['gate'] = gate_with_live_load(
+            {'launch_allowed': allowed,
+             'reason': 'fleet local admission' if allowed else 'fleet admission unavailable',
+             'at': utcnow()}, self.settings)
         self.request('POST', '/api/host/poll', hb)
         self._last_hb = hb
         return hb
@@ -3874,7 +3900,8 @@ class Dispatcher:
         Returns (offers_seen, dispatch_max_s); skips (0, 0.0) when a sibling
         is fetching offers. Unrelated in-flight dispatches do not block it.
         """
-        lock = self._acquire_offers_lock()
+        # Explicit offers already passed the fetch lock; retain per-offer locking.
+        lock = self._acquire_offers_lock() if offers is None else None
         if lock is False:
             return 0, 0.0
         try:
@@ -4013,6 +4040,16 @@ class Dispatcher:
             if resources is not None:
                 hb['launcher_resources'] = resources
         allowed, admitted_engines = self._admission_projection(caps)
+        # Intake 0689ce9c AC2: AND the live host-load signal into the
+        # heartbeat gate so the overload is visible in heartbeats and the
+        # dashboard. Enforcement stays in dispatch(), which re-checks live
+        # load before every claim (the server deliberately fails open on
+        # the aggregate gate).
+        from .host_load import gate_with_live_load
+        allowed_gate = gate_with_live_load(
+            {'launch_allowed': allowed,
+             'reason': 'fleet local admission' if allowed else 'fleet admission unavailable',
+             'at': utcnow()}, self.settings)
         # Publish per-account gate truth, not just the OR of every account's
         # gate. Planning can then fail over before offering a refused route.
         _mark('admission')
@@ -4034,7 +4071,7 @@ class Dispatcher:
             print(json.dumps({'event': 'register_skipped',
                               'error': _sanitized_transport_error(exc)}), flush=True)
         _mark('register')
-        hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
+        hb['gate'] = allowed_gate
         self.request('POST', '/api/host/poll', hb)
         _mark('heartbeat')
         for engine in sorted(admitted_engines):

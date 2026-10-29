@@ -35,6 +35,8 @@ RUN_TMP_ABSOLUTE="$(cd "${RUN_TMP}" && pwd)" || exit 1
 DISPOSABLE_HOME="${RUN_TMP_ABSOLUTE}/home"
 mkdir "${DISPOSABLE_HOME}" || exit 1
 
+export AGENT_HUB_HEAVY_TEST_DIR="${AGENT_HUB_HEAVY_TEST_DIR:-/run/user/$(id -u)/agent-hub/heavy-test}"
+
 FAILURES=0
 
 echo "=== Scope boundary (all new commits and working changes) ==="
@@ -72,7 +74,7 @@ case "${VITEST_NODE_OPTIONS}" in
 esac
 UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-1}" GOMAXPROCS="${GOMAXPROCS:-1}" \
 NODE_OPTIONS="${VITEST_NODE_OPTIONS}" \
-npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept || VITEST_RC=$?
+"${REPO_ROOT}/scripts/capped-test-run.sh" -- npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept || VITEST_RC=$?
 if [ "${VITEST_RC}" -ne 0 ]; then
   echo "FAIL: Vitest discovery suite exited with code ${VITEST_RC}"
   FAILURES=$((FAILURES + 1))
@@ -107,7 +109,7 @@ PYTHONUSERBASE="${ORIGINAL_USER_BASE}" \
 DTC_AUTH_HOME="${DTC_AUTH_PATH}" \
 PYTHONPATH="host:host/tests" \
 CODEX_LAUNCH_WRAPPER="" \
-"${PYTHON_ENV[@]}" "${UV_BIN}" run --frozen --with pytest python -m pytest -q \
+"${REPO_ROOT}/scripts/capped-test-run.sh" -- "${PYTHON_ENV[@]}" "${UV_BIN}" run --frozen --with pytest python -m pytest -q \
   --basetemp "${RUN_TMP}/pytest" \
   -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none || PYTEST_RC=$?
 
@@ -122,7 +124,7 @@ echo "=== 6/8: Host canary hermeticity (full suite vs canary HOME, pytest + unit
 # Intake 6b624e65: the suite must never touch the real user Hub profiles.
 # Runs the full host suite twice with HOME pointing at a canary home holding
 # human cli.json + host.json and asserts both stay byte-identical.
-if ! python3 scripts/ci/host_canary_check.py; then
+if ! "${REPO_ROOT}/scripts/capped-test-run.sh" -- python3 scripts/ci/host_canary_check.py; then
   echo "FAIL: Host canary hermeticity check failed (canary mutated or suite failed)"
   FAILURES=$((FAILURES + 1))
 else
@@ -135,7 +137,7 @@ echo "=== 7/8: All standalone browser and static checks ==="
 export TMPDIR="${RUN_TMP_ABSOLUTE}"
 if [ -n "${SKIP_PHONE_UI:-}" ]; then
   echo "SKIP: SKIP_PHONE_UI is set; phone browser UI not executed."
-elif node --test scripts/test-browser-local.test.mjs && node scripts/test-browser-local.mjs; then
+elif "${REPO_ROOT}/scripts/capped-test-run.sh" -- bash -c 'node --test scripts/test-browser-local.test.mjs && node scripts/test-browser-local.mjs'; then
   echo "PASS: Standalone browser and static checks passed"
 else
   PHONE_RC=$?

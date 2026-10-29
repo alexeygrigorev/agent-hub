@@ -46,6 +46,21 @@ def test_claim_not_blocked_by_timer_cycle(tmp_path):
     assert calls == ['fresh-offer', 'timer-offer']
 
 
+def test_already_fetched_offer_does_not_compete_with_next_fetch(tmp_path):
+    cfg = settings(Path(tmp_path))
+    fetcher = fleet.Dispatcher(cfg, lambda *a: {}, lambda *a: {}, journal_dir=str(tmp_path))
+    worker = fleet.Dispatcher(cfg, lambda *a: {}, lambda *a: {}, journal_dir=str(tmp_path))
+    lock = fetcher._acquire_offers_lock()
+    assert lock is not False
+    calls = []
+    try:
+        with patch.object(worker, '_dispatch_one', side_effect=lambda item, results: calls.append(item['id'])):
+            worker.dispatch_offers([], offers=[offer(id='already-fetched')], refresh=False)
+        assert calls == ['already-fetched']
+    finally:
+        if lock is not None:
+            lock.close()
+
 def wait_idle(dispatcher):
     deadline = time.monotonic() + 5
     while offer_claims.has_inflight(dispatcher) and time.monotonic() < deadline:
