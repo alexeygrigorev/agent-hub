@@ -2101,18 +2101,11 @@ def _run_claimed_effect(
     # authority. The tree never gates the stop verdict: kept/uncertain trees
     # ride the stop ack as data while the stop itself still reports its
     # confirmed outcome. Raw evidence text never enters the ack.
-    if confirmed and linked_intake_open is False:
-        # AC1 release: the stop is containment-confirmed (terminal) and the
-        # server reports no open linked intake, so the Hub lock is released
-        # even though no tree removal was authorized. Open/unknown intake
-        # keeps the lock. Best-effort: never gates the stop verdict.
-        try:
-            from . import worktree_guard as _release_guard
-            _release_guard.release_session_lock(
-                "git", target.workspace, command.get("session_id"),
-                terminal=True, intake_state="done")
-        except Exception:
-            pass
+    # Retained locks can also protect a successor of this intake. A stop
+    # claim (including an already-claimed replay) cannot prove current shared
+    # ownership after its native effect. Leave unlocks to worktree_step_once's
+    # authenticated worktree-guards reconciliation, which checks all linked
+    # successors and their native exit/no-start evidence at release time.
     if confirmed and want_tree:
         outcome["tree"] = _run_cleanup_tree_after_stop(
             executable, target, custody=custody, journal_dir=journal_dir,

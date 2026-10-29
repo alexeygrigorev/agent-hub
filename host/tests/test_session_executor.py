@@ -563,8 +563,8 @@ def test_stop_confirms_exit_and_second_stop_reports_gone(env):
     assert again["state"] == "stopped"  # already terminal: idempotent, no new effect
 
 
-def test_ordinary_stop_releases_lock_only_when_intake_closed(env, monkeypatch):
-    """AC1 release: ordinary stop unlocks with closed intake, keeps with open."""
+def test_delayed_stop_defers_lock_release_to_fresh_worktree_reconciliation(env, monkeypatch):
+    """A delayed/replayed stop must not unlock a live successor's retained lock."""
     from agent_hub_host import worktree_guard as guard
     rec = seed_session(env)
     target = make_target(env, "agent1", rec["id"])
@@ -574,7 +574,14 @@ def test_ordinary_stop_releases_lock_only_when_intake_closed(env, monkeypatch):
     out = se._run_claimed_effect(env["fake"], "stop", command, target, custody=custody(),
                                  journal_dir=env["journal"], linked_intake_open=False)
     assert out["confirmed_exit"] is True
-    assert calls == [(("git", env["work"], "a" * 32), {"terminal": True, "intake_state": "done"})]
+    assert calls == []  # Intake closure alone does not prove successor exit.
+    # A second command queued before the first stop (or an already-claimed
+    # delayed effect) sees the same stopped predecessor after successor start.
+    replay = se._run_claimed_effect(env["fake"], "stop", {**command, "command_id": str(uuid.uuid4())},
+                                    target, custody=custody(), journal_dir=env["journal"],
+                                    linked_intake_open=False)
+    assert replay["confirmed_exit"] is True
+    assert calls == []
     calls.clear()
     out2 = se._run_claimed_effect(env["fake"], "stop", {**command, "command_id": str(uuid.uuid4())},
                                   target, custody=custody(), journal_dir=env["journal"],

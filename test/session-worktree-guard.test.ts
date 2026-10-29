@@ -293,6 +293,20 @@ describe('worktree guard (intake a0f01448)', () => {
       JSON.stringify({intake_task_id:stopped.intake_task_id}),new Date().toISOString(),new Date().toISOString());
     expect((await facts()).find((f:any)=>f.session_id===created.id).lock_release_permitted).toBe(false);
     sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?",successor);
+    // A terminal label without native exit/no-start proof cannot release.
+    expect((await facts()).find((f:any)=>f.session_id===created.id).lock_release_permitted).toBe(false);
+    const successorNative = '55555555-5555-4555-8555-555555555555';
+    const successorBinding = {native_id:successorNative, tag:canonTag('successor-proof'),
+      workspace:NATIVE_WS, native_created_at_ms:NATIVE_CREATED, generation:1};
+    ensureFleetLaunch(sql,'successor-proof',successorNative);
+    reportFleetSession(sql,successorNative,successorBinding.tag,NATIVE_WS);
+    sql.exec("UPDATE session_control_sessions SET fleet_launch_id='successor-proof', owner_token_id='cred-1', binding_json=? WHERE id=?",JSON.stringify(successorBinding),successor);
+    expect((await facts()).find((f:any)=>f.session_id===created.id).lock_release_permitted).toBe(false);
+    sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE native_id=?",successorNative);
+    expect((await facts()).find((f:any)=>f.session_id===created.id).lock_release_permitted).toBe(true);
+    // A genuinely never-started successor is also safe with positive no-start evidence.
+    ensureFleetLaunch(sql,'successor-proof',null,'refused');
+    sql.exec("UPDATE session_control_sessions SET binding_json=NULL,state='refused' WHERE id=?",successor);
     expect((await facts()).find((f:any)=>f.session_id===created.id).lock_release_permitted).toBe(true);
     expect((await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), agent())).status).toBe(403);
   }));
@@ -318,6 +332,8 @@ describe('worktree guard (intake a0f01448)', () => {
     sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,mode,state,created_at,updated_at)
       VALUES(?,'demo:assistant',?,?,'hetzner','interactive','starting',?,?)`,successor,successor,
       JSON.stringify({intake_task_id:old.intake_task_id}),at,at);
+    expect((await facts()).find((f:any)=>f.session_id===previous.id)).toMatchObject({native_terminal:true,lock_release_permitted:false});
+    sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?",successor);
     expect((await facts()).find((f:any)=>f.session_id===previous.id)).toMatchObject({native_terminal:true,lock_release_permitted:false});
   }));
 
