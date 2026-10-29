@@ -56,7 +56,7 @@ export type IntakeHooks = { queue?: (tasks: Obj[]) => Obj; forgotten?: (tasks: O
  * count > OPEN_INTAKE_WARN_THRESHOLD emits a warning requiring DONE evidence before close. */
 export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, taskRecordBytes: 896 * 1024, receiptRecordBytes: 1920 * 1024, events: 128,
   // Hot admission budget excludes retained archives and exact replay receipts.
-  // 128 MiB bounds all hot task records including retained history; storage
+  // 128 MiB bounds all hot task records including inline history; storage
   // has a separate 256 MiB planning budget below the Free plan's 1 GB/DO.
   grants: 256, rules: 128, receipts: 8192, totalBytes: 128 * 1024 * 1024, page: 100 };
 export const INTAKE_RETAINED_WARN_BYTES = 256 * 1024 * 1024;
@@ -95,21 +95,62 @@ const encoded = (value: unknown) => new TextEncoder().encode(JSON.stringify(valu
 /** History is a retained ledger, not mutable task metadata. Budget it through
  * event count, bounded input, full-record and aggregate storage limits instead
  * of making a legitimate old note consume the next session link's allowance. */
+// Pending archive writes stay outside JSON and are flushed with the task in
+// the caller's transaction. Failed validation/service capacity checks write nothing.
+const pendingNoteArchives = new WeakMap<object, Obj[]>();
+function prepareIntakeHistory(task: Obj, reserveEvents = 0) {
+  const history: Obj[] = task.history ?? [];
+  const pressured = encoded(task) > INTAKE_LIMITS.taskBytes || history.length + reserveEvents > INTAKE_LIMITS.events;
+  if (!pressured && !task._history_order) return;
+  // Legacy malformed identities cannot be silently rewritten or reordered.
+  if (history.some(e => typeof e.id !== 'string') || new Set(history.map(e => e.id)).size !== history.length) return;
+  const previous = task._history_order ?? {};
+  let next = task._history_next_seq ?? 0;
+  const order: Obj = Object.create(null);
+  for (const e of history) order[e.id] = Object.hasOwn(previous, e.id) ? previous[e.id] : next++;
+  task._history_order = order; task._history_next_seq = next;
+  if (!pressured) return;
+  const pending = pendingNoteArchives.get(task) ?? [];
+  const targetBytes = Math.floor(INTAKE_LIMITS.taskBytes * 0.75);
+  const targetEvents = Math.floor(INTAKE_LIMITS.events * 0.75);
+  while (encoded(task) > targetBytes || history.length + reserveEvents > targetEvents) {
+    // Completion claims and every structured event retain their live semantics.
+    const index = history.findIndex((e, i) => i > 0 && e.kind === 'note' && !/^\s*(?:DONE\b|START(?:ED)?\b|ORIGINAL FINAL STATE\b|TRIAGE (?:ACTUAL|DONE|OBSOLETE|DUPLICATE)\b|VERIFICATION (?:FAILED|SKIPPED)\b)/im.test(e.text ?? ''));
+    if (index < 0) break;
+    const event = history[index];
+    const data = JSON.stringify(event);
+    if (new TextEncoder().encode(data).length > INTAKE_LIMITS.receiptRecordBytes) break;
+    pending.push({ id: task.id + ':' + event.id, task_id: task.id, seq: order[event.id], data });
+    history.splice(index, 1); delete order[event.id];
+    task.history_archive = { count: (task.history_archive?.count ?? 0) + 1,
+      href: '/api/intake/tasks/' + task.id + '/history?archived=1' };
+  }
+  if (pending.length) pendingNoteArchives.set(task, pending);
+}
+function flushIntakeHistory(sql: SqlStorage, task: Obj) {
+  for (const row of pendingNoteArchives.get(task) ?? []) sql.exec(
+    'INSERT INTO intake_note_archive(id,task_id,seq,data) VALUES(?,?,?,?)', row.id, row.task_id, row.seq, row.data);
+  pendingNoteArchives.delete(task);
+}
+function taskCapacityWarning(task: Obj): Obj | null {
+  const { history, ...metadata } = task;
+  const usage = { inline_bytes: encoded(task), metadata_bytes: encoded(metadata), inline_events: history?.length ?? 0 };
+  if (usage.inline_bytes < INTAKE_LIMITS.taskBytes * 0.8 && usage.metadata_bytes < INTAKE_LIMITS.taskBytes * 0.8 &&
+      usage.inline_events < INTAKE_LIMITS.events * 0.8) return null;
+  return { code: 'intake_task_capacity_high', severity: 'warn', subject: 'intake:' + task.id,
+    title: 'Intake history is nearing capacity', threshold_ratio: 0.8, ...usage,
+    inline_target_bytes: INTAKE_LIMITS.taskBytes, metadata_limit_bytes: INTAKE_LIMITS.taskBytes,
+    record_limit_bytes: INTAKE_LIMITS.taskRecordBytes, event_limit: INTAKE_LIMITS.events,
+    archived_notes: task.history_archive?.count ?? 0,
+    detail: 'Intake history is approaching capacity. Ordinary notes are retained in its paged archive; structured events and completion claims remain inline.' };
+}
 function taskCapacityError(task: Obj): string | null {
+  prepareIntakeHistory(task);
+  if ((task.history?.length ?? 0) > INTAKE_LIMITS.events) return 'history_capacity';
   const { history, ...metadata } = task;
   if (encoded(metadata) > INTAKE_LIMITS.taskBytes) return 'task_capacity';
   if (encoded(task) > INTAKE_LIMITS.taskRecordBytes) return 'record_byte_capacity';
   return null;
-}
-/** Surface headroom while the ledger is still writable; never mutate retained history. */
-function taskCapacityWarning(task: Obj): Obj | null {
-  const { history, ...metadata } = task;
-  const usage = { metadata_bytes: encoded(metadata), record_bytes: encoded(task), events: history?.length ?? 0 };
-  const limits = { metadata_bytes: INTAKE_LIMITS.taskBytes, record_bytes: INTAKE_LIMITS.taskRecordBytes, events: INTAKE_LIMITS.events };
-  if (Object.entries(usage).every(([key, value]) => value < limits[key as keyof typeof limits] * 0.8)) return null;
-  return { code: 'intake_task_capacity_high', threshold_ratio: 0.8, usage, limits,
-    action: 'continue_in_linked_intake',
-    detail: 'Continue work in a linked intake before capacity is exhausted; preserve this ledger and its original history.' };
 }
 function object(value: any): Obj {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('invalid_object');
@@ -200,6 +241,7 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   if (rows.length !== 1) return false; // pruned, missing or ambiguous historical task
   const task = JSON.parse(rows[0].data);
   if (task.history.some((e: Obj) => ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
+  prepareIntakeHistory(task, 1);
   if (task.history.length >= INTAKE_LIMITS.events) throw new IntakeSessionLinkError('history_capacity');
   const binding = JSON.parse(session.binding_json || '{}');
   const observed = request.provenance === 'observed_native';
@@ -213,6 +255,7 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   task.version++; task.updated_at = now;
   const capacityError = taskCapacityError(task);
   if (capacityError) throw new IntakeSessionLinkError(capacityError);
+  flushIntakeHistory(sql, task);
   sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(task), task.id);
   if (hotBytes(sql) > INTAKE_LIMITS.totalBytes) throw new IntakeSessionLinkError('storage_capacity');
   sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
@@ -250,6 +293,9 @@ export class IntakeService {
         ON CONFLICT(id) DO UPDATE SET data=excluded.data,links=excluded.links; END`);
       this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_projection_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_task_projection WHERE id=OLD.id; END');
       this.sql.exec("CREATE INDEX IF NOT EXISTS intake_watchdog_open ON intake_task_projection(id) WHERE json_extract(data,'$.status') IN ('open','in_progress','blocked','pending_approval') AND json_extract(data,'$.archived_at') IS NULL");
+      this.sql.exec('CREATE TABLE IF NOT EXISTS intake_note_archive(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,seq INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(task_id,seq))');
+      for (const op of ['UPDATE', 'DELETE']) this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_note_archive_no_' + op.toLowerCase() +
+        ' BEFORE ' + op + " ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
       // Independent, append-only lifecycle ledger. No FK: survives loss of a task row.
       this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, project TEXT NOT NULL,
@@ -263,7 +309,7 @@ export class IntakeService {
       this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_storage_totals (
         kind TEXT PRIMARY KEY, bytes INTEGER NOT NULL, hot INTEGER NOT NULL,
         events INTEGER NOT NULL, original_requests INTEGER NOT NULL, count INTEGER NOT NULL)`);
-      for (const table of ['tasks', 'grants', 'rules', 'receipts', 'audit']) {
+      for (const table of ['tasks', 'grants', 'rules', 'receipts', 'audit', 'note_archive']) {
         const values = (prefix: string) => {
           const c = (name: string) => prefix + name;
           const bytes = table === 'audit'
@@ -276,7 +322,7 @@ export class IntakeService {
           return [bytes, hot, events, original, '1'];
         };
         // Only the first migration reads old retained data. Subsequent cold
-        // starts read five tiny accounting rows, with no backfill scan.
+        // starts read a few tiny accounting rows, with no backfill scan.
         if (!this.sql.exec('SELECT 1 FROM intake_storage_totals WHERE kind=?', table).toArray().length) {
           this.sql.exec(`INSERT INTO intake_storage_totals SELECT ?, ${values('').map(v => `COALESCE(SUM(${v}),0)`).join(',')} FROM intake_${table}`, table);
         }
@@ -332,6 +378,7 @@ export class IntakeService {
     if (table === 'tasks') {
       const capacityError = taskCapacityError(data);
       if (capacityError) fail(capacityError, 507);
+      flushIntakeHistory(this.sql, data);
     } else {
       // Exact task response receipts retain the same history as the task.
       const limit = table === 'receipts' ? INTAKE_LIMITS.receiptRecordBytes : 262144;
@@ -356,9 +403,10 @@ export class IntakeService {
     const counts: Obj = Object.fromEntries([...totals].map(([key, value]) => [key, value.count]));
     const audit = totals.get('audit').bytes;
     const hot = open + grants + rules;
-    const retained = tasks + receipts + grants + rules + audit;
+    const archivedNotes = totals.get('note_archive')?.bytes ?? 0;
+    const retained = tasks + receipts + grants + rules + audit + archivedNotes;
     return { accounting: 'utf8_json_and_primary_key_bytes; audit_json_projection; excludes SQLite overhead',
-      bytes: { open_tasks: open, archived_or_terminal_tasks: tasks - open, receipts, grants, rules, audit,
+      bytes: { open_tasks: open, archived_or_terminal_tasks: tasks - open, receipts, grants, rules, audit, archived_notes: archivedNotes,
         events_within_tasks: Number(history.events), original_requests_within_events: Number(history.original_requests) },
       counts, hot_bytes: hot, hot_limit_bytes: INTAKE_LIMITS.totalBytes,
       retained_bytes: retained, retained_planning_bytes: INTAKE_RETAINED_WARN_BYTES };
@@ -598,12 +646,13 @@ export class IntakeService {
     };
   }
   private taskView(task: Obj, p: Obj): Obj {
-    const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, ...identity } = task;
+    const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, _history_order, _history_next_seq, ...identity } = task;
+    const capacityWarning = taskCapacityWarning(task);
     return { ...identity, control: { version: task.version, status: task.status, continuation_state: this.continuation(task),
       authority: 'hub_ledger_cas', execution_evidence: 'not_verified_by_intake' },
+      ...(capacityWarning ? { capacity_warning: capacityWarning } : {}),
       scope_flag: task.scope?.flag ?? null, scope: this.scopeView(task),
       payload_data: { title, current_state, next_step, owner, uncertainty, acceptance_criteria: acceptance_criteria ?? null, history }, unresolved: this.unresolved(task),
-      capacity_warning: taskCapacityWarning(task),
       assigned_sessions: this.assignedSessions(task, p),
       worktrees: this.worktrees.list(task.id), close_gate: this.worktrees.gate(task.id) };
   }
@@ -792,6 +841,28 @@ export class IntakeService {
     const task = this.get('tasks', match[1]);
     if (!task || !this.allowed(p, task)) fail('not_found', 404);
     if (url.searchParams.has('revision') && integer(Number(url.searchParams.get('revision'))) !== revision) fail('stale_snapshot', 409);
+    if (match[2] === 'history' && url.searchParams.get('archived') === '1') {
+      const limit = url.searchParams.has('limit') ? integer(Number(url.searchParams.get('limit')), 1, INTAKE_LIMITS.page) : INTAKE_LIMITS.page;
+      const after = url.searchParams.has('after') ? integer(Number(url.searchParams.get('after'))) : -1;
+      // Read sizes first: a page must stay bounded even for a large legacy
+      // note. A singleton is returned whole; additional bodies fit 512 KiB.
+      const sizes = this.sql.exec('SELECT seq,length(CAST(data AS BLOB)) AS bytes FROM intake_note_archive WHERE task_id=? AND seq>? ORDER BY seq LIMIT ?', task.id, after, limit + 1).toArray() as any[];
+      let count = 0; let bytes = 0;
+      for (const row of sizes.slice(0, limit)) {
+        if (count && bytes + row.bytes > 512 * 1024) break;
+        count++; bytes += row.bytes;
+      }
+      const page = count ? this.sql.exec('SELECT seq,data FROM intake_note_archive WHERE task_id=? AND seq>? ORDER BY seq LIMIT ?', task.id, after, count).toArray() as any[] : [];
+      // Legacy service writers may append a structured event directly. Expose
+      // its stable next sequence without mutating the ledger during a read.
+      let next = task._history_next_seq ?? 0;
+      const inlineSequences = Object.fromEntries(task.history.map((event: Obj) => [event.id,
+        Object.hasOwn(task._history_order ?? {}, event.id) ? task._history_order[event.id] : next++]));
+      return { snapshot_version: revision, task_id: task.id, task_version: task.version,
+        items: page.map(row => ({ sequence: row.seq, event: JSON.parse(row.data) })),
+        next_after: sizes.length > page.length ? page[page.length - 1].seq : null, total: task.history_archive?.count ?? 0,
+        inline_sequences: inlineSequences, data_notice: DATA_NOTICE };
+    }
     return { snapshot_version: revision, task: this.view(task, p) };
   }
   private event(raw: Obj, task: Obj, p: Obj, now: number): Obj {
@@ -1124,6 +1195,7 @@ export class IntakeService {
     return { task_id: task!.id, commands, refused, worktrees: this.worktrees.list(task!.id) };
   }
   private pushHistory(task: Obj, events: Obj[], actor: string, now: number, key?: string) {
+    prepareIntakeHistory(task, events.length);
     if (task.history.length + events.length > INTAKE_LIMITS.events) fail('history_capacity', 507);
     for (const e of events) task.history.push({ id: crypto.randomUUID(), ...e, actor, captured_at: now, authority: 'hub_worktree_registry',
       ...(key ? { intake_key: key } : {}) });
@@ -1199,6 +1271,7 @@ export class IntakeService {
     if (!match) fail('not_found', 404);
     const task = this.get('tasks', match[1]); if (!task || !this.allowed(p, task, true)) fail('not_found', 404);
     this.expected(b, task.version);
+    prepareIntakeHistory(task, 2);
     if (task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
     if (match[2] === '/continue') {
       keys(b, ['key', 'expected_version']);
@@ -1342,6 +1415,7 @@ export class IntakeService {
       const version = previous?.started_version ?? task.version;
       const ownAdvance = !!ownLink && task.version === version + 1;
       this.expected(b, task.version - (ownAdvance ? 1 : 0));
+      prepareIntakeHistory(task, ownLink ? 0 : 2);
       if (!ownLink && task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
       if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
       const active = this.activeAssignment(task);
@@ -1386,6 +1460,7 @@ export class IntakeService {
       // advance belongs to this assignment; any concurrent edit still conflicts.
       this.expected(b, task.version - (startLink && task.version === pre.version + 1 ? 1 : 0));
       const extraEvents = (startLink ? 0 : 1) + (['current_state', 'next_step', 'owner'].some(field => field in b) ? 1 : 0);
+      prepareIntakeHistory(task, extraEvents);
       if (task.history.length + extraEvents > INTAKE_LIMITS.events) fail('history_capacity', 507);
       // Re-check after the start round-trip: AC cleared mid-flight still fails closed.
       if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
@@ -1555,17 +1630,8 @@ export class IntakeService {
         };
 
         task.history = task.history || [];
-        if (task.history.length >= INTAKE_LIMITS.events) {
-          const intake0 = task.history[0];
-          const remaining = task.history.slice(1);
-          const dropIdx = remaining.findIndex((e: Obj) => typeof e.actor === 'string' && e.actor.startsWith('hub:service:'));
-          if (dropIdx >= 0) {
-            remaining.splice(dropIdx, 1);
-            task.history = [intake0, ...remaining];
-          } else {
-            return { ok: false, error: 'history_capacity' };
-          }
-        }
+        prepareIntakeHistory(task, 1);
+        if (task.history.length >= INTAKE_LIMITS.events) return { ok: false, error: 'history_capacity' };
         task.history.push(newEvent);
       }
 

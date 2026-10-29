@@ -210,18 +210,36 @@ describe('linked start failure and migration boundaries', () => {
     expect((await ok('/tasks/' + task.id)).task.assigned_sessions[0].hub_session_id).toBe(start.data.id);
   });
 
-  it('rolls back session creation and placement when link history has no capacity', async () => {
+  it('rolls back session creation and placement when structured history has no capacity', async () => {
     const { task } = await create('', { acceptance_criteria: 'Synthetic atomic linkage.' });
     await inDO(stub(), (h: any) => {
       const row = h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).toArray()[0];
       const data = JSON.parse(row.data);
-      while (data.history.length < 128) data.history.push({ kind: 'note', id: crypto.randomUUID(), text: 'fixture' });
+      while (data.history.length < 128) data.history.push({ kind: 'decision', id: crypto.randomUUID(), text: 'fixture' });
       h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
     });
     const before = await sessionCount();
     const start = await sessionsCall({ key: 'full-link-' + ++seq, workspace: 'demo', brief: 'Synthetic goal', intake_task_id: task.id });
     expect(start).toMatchObject({ status: 507, data: { error: 'history_capacity' } });
     expect(await sessionCount()).toBe(before);
+  });
+
+  it('keeps canonical session start writable by retaining an exhausted note history', async () => {
+    const { task } = await create('', { acceptance_criteria: 'Synthetic retained note linkage.' });
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      while (data.history.length < 128) data.history.push({ kind: 'note', id: crypto.randomUUID(), text: 'retained fixture' });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+    });
+    const before = await sessionCount();
+    const start = await sessionsCall({ key: 'retained-link-' + ++seq, workspace: 'demo', brief: 'Synthetic goal', intake_task_id: task.id });
+    expect(start.status).toBe(409); // Existing fixture intentionally has no placement hook.
+    expect(start.data).toMatchObject({ state: 'held', hold: 'no_placement_authority' });
+    expect(await sessionCount()).toBe(before + 1);
+    const updated = (await ok('/tasks/' + task.id)).task;
+    expect(updated.history_archive.count).toBeGreaterThan(0);
+    expect(updated.assigned_sessions.some((s: any) => s.hub_session_id === start.data.id)).toBe(true);
+    expect((await ok('/tasks/' + task.id + '/history?archived=1')).items.length).toBeGreaterThan(0);
   });
 
   it('backfills canonical requests idempotently and preserves manual links', async () => {

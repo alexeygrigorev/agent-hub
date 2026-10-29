@@ -1,29 +1,38 @@
-# Intake capacity
+# Intake capacity and retained notes
 
-`INTAKE_LIMITS.taskBytes` (128 KiB) bounds task metadata, excluding the
-append-only `history` ledger. Notes, verified session links, assignment updates,
-worktree receipts and service writes share this accounting. Existing records
-need no migration: every original event remains in the same task row and reads
-and exact replay receipts preserve it.
+Open intakes automatically move ordinary old notes into an append-only SQLite
+archive when inline history exceeds 128 KiB or needs another event slot beyond
+128 events. The original intake, structured events and control notes (DONE, ORIGINAL FINAL STATE, START/STARTED, triage verdicts and
+verification outcomes) remain inline, preserving completion and
+obligation semantics. Compaction targets 75% of the inline limits and occurs
+in the same transaction as the accepted mutation. A failed mutation rolls back
+both archive and task writes; no note body, identity, provenance or retry key
+is deleted or rewritten. Archives have no automatic expiry.
 
-History still counts against the 128-event limit and the full hot storage budget
-(128 MiB). Individual input requests remain bounded at 32 KiB with existing
-field validation. Full task records have a separate 896 KiB safety limit. The SQL projection repeats link/report data in two
-columns, so this leaves room for both within the
-[2 MB SQL row limit](https://developers.cloudflare.com/durable-objects/platform/limits/).
-Exact response receipts have a separate 1920 KiB budget for history, duplicated
-unresolved events and their envelope. Other records retain the 256 KiB bound. These are
-explicit storage safety limits, not unlimited history retention: reaching the
-event, record or aggregate budget still refuses a write without changing the
-existing ledger. There is no automatic deletion or compaction in this change.
+Task responses include `history_archive.count` and an authenticated `href` when
+inline history is partial. Read originals with:
 
-This separates ordinary metadata admission from accumulated history so an open
-intake such as the 173 KiB 95c1862c case can accept new notes and session links.
-Both the prior 128 KiB admission cliff and the 256 KiB task/receipt cliff are
-covered by regression tests. Metadata and aggregate storage failures continue
-to roll back the task, receipt and revision in the surrounding transaction.
+```sh
+hub intake history TASK --archived --limit 100
+hub intake history TASK --archived --after SEQUENCE --limit 100
+```
 
-Task detail, list and successful mutation responses include `capacity_warning`
-when metadata bytes, full record bytes or event count reaches 80% of its limit.
-The warning reports usage and limits and directs continuation in a linked intake
-before exhaustion. It never deletes history or silently changes lifecycle state.
+Pages are bounded by event count and encoded bytes. Each page returns original
+events with stable sequence numbers, a `next_after`
+cursor, and `inline_sequences` for merging the retained inline events in their
+original order. Every page requires the same current task read permission;
+the pointer grants no access. Archives count toward retained storage accounting
+and its existing planning warning, separately from hot task admission.
+
+A `capacity_warning` is included in task reads and mutation results at 80% of
+the inline byte or event target, before a hard capacity refusal. Ordinary notes
+are retained automatically. Structured-event exhaustion, malformed legacy
+identities or exhausted aggregate storage can still refuse a write explicitly,
+with the original ledger intact.
+
+Mutable metadata remains bounded at 128 KiB. Full task records retain an
+896 KiB safety bound, accounting for duplicated SQL projection columns within
+the [2 MB SQL row limit](https://developers.cloudflare.com/durable-objects/platform/limits/).
+Exact response receipts allow 1920 KiB. Request/field validation and the
+128 MiB aggregate hot budget remain enforced. Session links, public appends,
+assignment updates, worktree events and service notes use this retention path.
