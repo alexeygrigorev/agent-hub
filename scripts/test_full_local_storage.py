@@ -25,10 +25,15 @@ with record.open("a") as out:
                           "home": os.environ.get("HOME"), "cache": os.environ.get("UV_CACHE_DIR"),
                           "cap_dir": os.environ.get("AGENT_HUB_HEAVY_TEST_DIR"),
                           "pools": [os.environ.get(k) for k in ("UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS")],
-                          "selectors": sorted(k for k in os.environ if k.startswith(("APLEXER_", "HUB_", "AGENT_HUB_"))
-                            or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR")),
+                          # AGENT_HUB_HEAVY_TEST_HELD is the wrapper's non-secret slot marker; the
+                          # child must keep it so pytest never takes a second heavy-test slot.
+                          "held": os.environ.get("AGENT_HUB_HEAVY_TEST_HELD"),
+                          "selectors": sorted(k for k in os.environ if (k.startswith(("APLEXER_", "HUB_", "AGENT_HUB_"))
+                            or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR"))
+                            and k != "AGENT_HUB_HEAVY_TEST_HELD"),
                           "profile": str(profile),
-                          "hub_env": sorted(k for k in os.environ if k.startswith(("HUB_", "AGENT_HUB_")))}) + "\n")
+                          "hub_env": sorted(k for k in os.environ if k.startswith(("HUB_", "AGENT_HUB_"))
+                                            and k != "AGENT_HUB_HEAVY_TEST_HELD")}) + "\n")
 if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_PROFILE_ISOLATION"):
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text("written by isolated Python fixture")
@@ -171,6 +176,7 @@ class FullLocalStorageTests(unittest.TestCase):
                       if row["tool"] == "uv" and row["args"][0] == "run")
         self.assertEqual(Path(python["profile"]), Path(python["home"]) / ".config/agent-hub/host.json")
         self.assertEqual(python["hub_env"], [])
+        self.assertEqual(python["held"], "1", "pytest child keeps the wrapper's slot marker")
         self.assert_preserved()
 
     def test_early_sync_failure_removes_only_new_run_directory(self):
