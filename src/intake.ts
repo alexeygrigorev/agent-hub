@@ -8,7 +8,7 @@ import { SCOPE_POLICY_VERSION, SCOPE_VERDICTS, classifyScope, getScopeStatus, sc
 type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
-import { WORKER_SCOPE, workerAccessContext } from './worker-access';
+import { WORKER_SCOPE, triageTargets, workerAccessContext } from './worker-access';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
@@ -432,8 +432,10 @@ export class IntakeService {
     const worker = workerAccessContext(this.sql, c.id);
     if (JSON.parse(c.scopes).includes(WORKER_SCOPE)) {
       if (!worker || worker.actor !== binding.actor) fail('forbidden', 403);
-      return { admin: false, worker: true, actor: binding.actor, identity: 'family:' + binding.family_id, caller,
-        grants: [{ scope: 'task', target: worker.task_id, access: 'write', expires_at: worker.expires_at }],
+      const triage = triageTargets(this.sql, worker.session_id);
+      return { admin: false, worker: true, actor: binding.actor, identity: 'family:' + binding.family_id, caller, triage,
+        grants: [{ scope: 'task', target: worker.task_id, access: 'write', expires_at: worker.expires_at },
+          ...[...triage].map(target => ({ scope: 'task', target, access: 'write', expires_at: worker.expires_at }))],
         valid_until: Math.min(Date.parse(c.expires_at), worker.expires_at) };
     }
     const grants = this.rows('grants').filter(g => !g.revoked_at && g.expires_at > Date.now() && canonical(g.binding) === canonical(binding));
@@ -1592,12 +1594,20 @@ export class IntakeService {
         if (!payload) return json(this.read(url, p));
         identifier(payload.key);
         const path = url.pathname.slice('/api/intake'.length);
-        if (p.worker && (!/^\/tasks\/[^/]+\/events$/.test(path) || !['note','report','blocker'].includes(payload.event?.kind))) fail('forbidden', 403);
-        if (p.worker) payload.event = redactClaimData(payload.event);
+        // AC5 triage reviewers may also set AC/project on their requested intakes (never status).
+        const triageUpdate = p.worker && p.triage?.has(/^\/tasks\/([^/]+)$/.exec(path)?.[1]) &&
+          Object.keys(payload).every(k => ['key', 'expected_version', 'acceptance_criteria', 'project'].includes(k)) &&
+          ('acceptance_criteria' in payload || 'project' in payload);
+        if (p.worker && !triageUpdate && (!/^\/tasks\/[^/]+\/events$/.test(path) || !['note','report','blocker'].includes(payload.event?.kind))) fail('forbidden', 403);
+        if (p.worker && !triageUpdate) payload.event = redactClaimData(payload.event);
         // Do not replay a private response after the caller loses its task/operator grant.
         if (path.startsWith('/rules') || path.startsWith('/grants')) this.operator(p);
         const taskMatch = /^\/tasks\/([^/]+)/.exec(path);
-        if (taskMatch) { const t = this.get('tasks', taskMatch[1]); if (!t || !this.allowed(p, t, true)) fail('not_found', 404); }
+        if (taskMatch) {
+          const t = this.get('tasks', taskMatch[1]); if (!t || !this.allowed(p, t, true)) fail('not_found', 404);
+          // Triage reviewers only fill missing AC; existing criteria are never replaced.
+          if (triageUpdate && 'acceptance_criteria' in payload && hasAcceptanceCriteria(t)) fail('forbidden', 403);
+        }
         if (path === '/tasks' && !this.allowed(p, { project: payload.project, id: '' }, true)) fail('forbidden', 403);
         const id = p.identity + ':' + payload.key;
         const previous = this.get('receipts', id); const fingerprint = canonical({ path, payload });

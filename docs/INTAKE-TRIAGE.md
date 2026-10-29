@@ -33,6 +33,7 @@ Each run takes the forgotten intakes that have no triage verdict yet, oldest fir
 - The reviewer appends one verdict per intake, writes missing AC from the verbatim intake text, and corrects wrong projects.
 - An intake is offered again only after 24 h without a verdict, or after an explicit admission refusal (4xx). An unknown outcome (5xx) keeps the hold, so a lost reply never starts a duplicate reviewer.
 - Nothing is closed, cancelled or deleted by triage.
+- Reviewer access: the reviewer's worker credential may read, add notes to, and set `project` and missing `acceptance_criteria` on exactly the intakes in its open request ledger rows. It can never change status or title, and never replace existing AC. Access to an intake ends as soon as a verdict note lands on it, when the request leaves `requested`, or when the reviewer session ends.
 
 ## Human-needed holds alert once (`src/intake-watchdog.ts`)
 

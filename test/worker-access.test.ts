@@ -23,6 +23,37 @@ async function setup(fn: (x:any)=>Promise<void>, mode = 'headless') {
  await fn({stub,id,task,session,other,worker,call});
 }
 describe('scoped durable worker access',()=>{
+ it('AC5 triage reviewer: only live requested intakes, fills missing AC only, access ends on its verdict or session end',()=>setup(async({stub,session,other,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const blank=uuid(), third=uuid(), later=uuid();
+  await runInDurableObject<Hub, any>(stub,(h:any)=>{
+   for (const [id,title] of [[blank,'missing AC'],[third,'not requested'],[later,'second requested']])
+    h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',id,JSON.stringify({id,project:'agent-hub',status:'open',version:1,created_at:Date.now(),updated_at:Date.now(),title,scope:null,history:[],acceptance_criteria:null}));
+   for (const id of [other,blank,later]) h.sql.exec("INSERT INTO intake_triage_requests(task_id,request_key,session_id,state,requested_at) VALUES(?,?,?,'requested',?)",id,'triage-k',session,Date.now()-1000);
+  });
+  expect((await api('/api/intake/tasks/'+blank)).status).toBe(200);
+  expect((await api('/api/intake/tasks/'+blank.slice(0,8))).status).toBe(403); // exact ids only
+  expect((await api('/api/intake/tasks/'+third)).status).toBe(403);
+  // Existing AC is never replaced; missing AC may be filled, together with a project fix.
+  expect((await api('/api/intake/tasks/'+other,{key:'t-over',expected_version:1,acceptance_criteria:'replaced'})).status).toBe(403);
+  const ac=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
+  expect(ac.status,await ac.clone().text()).toBe(200);
+  const v=(await ac.json() as any).task.version;
+  for (const bad of [{key:'t-st',expected_version:v,status:'done'},{key:'t-ti',expected_version:v,title:'renamed'},
+    {key:'t-mix',expected_version:v,project:'aws-infra',status:'cancelled',reason:'x'}])
+   expect((await api('/api/intake/tasks/'+blank,bad)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+blank+'/events',{key:'t-dec',expected_version:v,event:{kind:'decision',text:'x'}})).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+third,{key:'t-3',expected_version:1,project:'aws-infra'})).status).toBe(403);
+  // The verdict note itself revokes access immediately, without waiting for the hourly ledger update.
+  const note=await api('/api/intake/tasks/'+blank+'/events',{key:'t-note',expected_version:v,event:{kind:'note',text:'TRIAGE ACTUAL — backlog triage (hourly, Claude Opus)'}});
+  expect(note.status,await note.clone().text()).toBe(200);
+  expect((await api('/api/intake/tasks/'+blank)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+blank,{key:'t-after',expected_version:v+1,project:'relay'})).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+later)).status).toBe(200);
+  // A reviewer whose session ended keeps no batch access.
+  await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE session_control_sessions SET state='exited' WHERE id=?",session));
+  expect((await api('/api/intake/tasks/'+later)).status).toBe(403);
+ }));
  it('reads only shared usage dimensions without granting other monitoring or writes',()=>setup(async({stub,worker,call}:any)=>{
   await runInDurableObject<Hub, any>(stub,(h:any)=>{
    const now=Date.now();

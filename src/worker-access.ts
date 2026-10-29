@@ -45,6 +45,29 @@ export function workerWakeAllowed(sql: SqlStorage, tokenId: string | undefined, 
 }
 
 /** Route containment runs in addition to existing registry/family checks. */
+/** A triage verdict: a note whose first line starts with TRIAGE <outcome>, or a
+ * DONE note written by a backlog triage (shared with src/intake-triage.ts). */
+export const TRIAGE_VERDICT = /^(?:TRIAGE (?:ACTUAL|DONE|OBSOLETE|DUPLICATE)\b|DONE\b[^\n]*backlog triage)/;
+const TRIAGE_SESSION_ACTIVE = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncertain']);
+/** AC5 backlog triage (intake d8d509d2): the intakes this worker's live session
+ * was asked to triage, from the server-written request ledger. Access to an
+ * intake ends as soon as a verdict note lands on it after the request, when
+ * the request leaves 'requested', or when the reviewer session ends. Exact ids only. */
+export function triageTargets(sql: SqlStorage, sessionId: string | null | undefined): Set<string> {
+  const out = new Set<string>();
+  if (!sessionId) return out;
+  try {
+    const session: any = sql.exec('SELECT state FROM session_control_sessions WHERE id=?', sessionId).toArray()[0];
+    if (!session || !TRIAGE_SESSION_ACTIVE.has(session.state)) return out;
+    for (const r of sql.exec(`SELECT r.task_id, r.requested_at, t.data FROM intake_triage_requests r JOIN intake_tasks t ON t.id=r.task_id
+      WHERE r.session_id=? AND r.state='requested'`, sessionId).toArray() as any[]) {
+      let task: any; try { task = JSON.parse(r.data); } catch { continue; }
+      const verdict = (task.history || []).some((e: any) => e.kind === 'note' && (e.captured_at ?? 0) >= r.requested_at && TRIAGE_VERDICT.test(String(e.text ?? '')));
+      if (!verdict && !['done', 'cancelled'].includes(task.status)) out.add(r.task_id);
+    }
+  } catch { /* ledger absent outside the Hub composition */ }
+  return out;
+}
 export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId: string): boolean {
   const worker = workerAccessContext(sql, tokenId);
   if (!worker) return false;
@@ -58,6 +81,9 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
   const ownIntake = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events)?$/.exec(path);
   if (ownIntake) {
     const id = ownIntake[1];
+    // A triage reviewer may read, note and amend AC/project on its requested intakes.
+    if (id !== worker.task_id && triageTargets(sql, worker.session_id).has(id))
+      return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] !== '/history';
     if (id !== worker.task_id && !(id.length >= 8 && worker.task_id.startsWith(id))) return false;
     return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] === '/events';
   }
