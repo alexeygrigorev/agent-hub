@@ -16,12 +16,13 @@
 #      /tmp or /var/tmp (test values), EVERY send — including RECOVERED — is
 #      routed to ALERT_OPS_TO only, never ALERT_TO. Real recipients require
 #      real paths.
-#   2. Drill mode: HUB_DB_STALE_DRILL=1 forces one FAIL mail to
-#      ALERT_OPS_TO (dev@ only) to prove the mail path; it records a drill
-#      marker in the state file with LAST_ALERT=0, so a real staleness
-#      episode in the following window is NOT deduped away, and the closing
-#      RECOVERED (next fresh run, or the next cron run) also goes to
-#      ALERT_OPS_TO only. Re-run without the flag to clear.
+#   2. Drill mode: HUB_DB_STALE_DRILL=1 forces one FAIL rendered to the
+#      local drill sink (HUB_DB_DRILL_SINK, mode 600) and NEVER mailed
+#      (standing rule, e27e0f9d: tests and drills never send real mail, not
+#      even to dev@). It records a drill marker in the state file with
+#      LAST_ALERT=0, so a real staleness episode in the following window is
+#      NOT deduped away, and the closing RECOVERED is sink-only as well.
+#      Re-run without the flag to clear.
 #   3. --dry-run / --no-mail / --check-only still send nothing.
 #
 # Same-run failure page (intake e27e0f9d): hub-db-backup.sh calls
@@ -91,6 +92,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$FAIL_DRILL" -eq 1 && "$BACKUP_FAILED" -ne 1 ]]; then
+  echo "--drill is only valid with --backup-failed (use HUB_DB_STALE_DRILL=1 for the staleness drill)" >&2
+  exit 1
+fi
 [[ "$STALE_AFTER_HOURS" =~ ^[0-9]+$ ]] || { log "ERROR: STALE_AFTER_HOURS must be an integer"; exit 1; }
 [[ "$ALERT_REPEAT_HOURS" =~ ^[0-9]+$ ]] || { log "ERROR: ALERT_REPEAT_HOURS must be an integer"; exit 1; }
 
@@ -163,6 +168,31 @@ write_state() {
   # on dry-run / no-mail runs (tests must not seed dedupe for prod).
   if [[ "$DRY_RUN" -eq 1 || "$NO_MAIL" -eq 1 ]]; then return 0; fi
   printf 'WAS_STALE=%s\nLAST_ALERT=%s\nDRILL=%s\n' "$1" "$2" "$3" > "$STATE_FILE" 2>/dev/null || true
+}
+
+# Drill sink (standing rule: tests and drills never send real mail). Every
+# drill renders here instead of calling send_mail. Fails closed: refuses a
+# symlink or non-regular sink, forces mode 600 before writing, and exits 1
+# when the sink cannot be secured, so a drill can never fall through to mail.
+drill_sink() {
+  # $1=subject $2=body
+  local sink="$HUB_DB_DRILL_SINK" mode
+  mkdir -p "$(dirname "$sink")" 2>/dev/null || true
+  if [[ -L "$sink" || ( -e "$sink" && ! -f "$sink" ) ]]; then
+    log "ERROR: drill sink must be a regular file, not a symlink: ${sink}"; exit 1
+  fi
+  ( umask 077; : >> "$sink" ) 2>/dev/null || { log "ERROR: drill sink not writable: ${sink}"; exit 1; }
+  chmod 600 "$sink" 2>/dev/null || { log "ERROR: cannot chmod 600 drill sink: ${sink}"; exit 1; }
+  mode="$(stat -c%a "$sink" 2>/dev/null || stat -f%Lp "$sink" 2>/dev/null || echo unknown)"
+  if [[ "$mode" != "600" || -L "$sink" ]]; then
+    log "ERROR: drill sink not secured (mode ${mode}): ${sink}"; exit 1
+  fi
+  { echo "=== DRILL $(date -u '+%Y-%m-%dT%H:%M:%SZ') (not sent; real route would be: $(effective_to))"
+    echo "Subject: [DRILL] $1"
+    echo ""
+    printf '%s\n' "$2"
+  } >> "$sink" || { log "ERROR: drill sink write failed: ${sink}"; exit 1; }
+  log "DRILL rendered to sink=${sink}; no mail sent subject='[DRILL] $1'"
 }
 
 effective_to() {
@@ -245,15 +275,7 @@ Rerun: /usr/local/sbin/hub-db-backup.sh (read-only on the Hub DB); see docs/HUB-
   log "BACKUP_FAILED reason='${BACKUP_FAILED_REASON}' last_good=${LAST_GOOD} drill=${FAIL_DRILL}"
   if [[ "$FAIL_DRILL" -eq 1 ]]; then
     # Drill: render to the local sink only; never call send_mail or any MTA.
-    mkdir -p "$(dirname "$HUB_DB_DRILL_SINK")" 2>/dev/null || true
-    ( umask 077
-      { echo "=== DRILL $(date -u '+%Y-%m-%dT%H:%M:%SZ') (not sent; would go to: $(effective_to))"
-        echo "Subject: [DRILL] ${FAIL_SUBJECT}"
-        echo ""
-        printf '%s\n' "$FAIL_BODY"
-      } >> "$HUB_DB_DRILL_SINK" ) || { log "ERROR: drill sink not writable: ${HUB_DB_DRILL_SINK}"; exit 1; }
-    chmod 600 "$HUB_DB_DRILL_SINK" 2>/dev/null || true
-    log "DRILL backup-failed alert rendered to sink=${HUB_DB_DRILL_SINK}; no mail sent"
+    drill_sink "$FAIL_SUBJECT" "$FAIL_BODY"
     exit 0
   fi
   if [[ "$DRY_RUN" -eq 1 || "$NO_MAIL" -eq 1 ]]; then
@@ -265,17 +287,16 @@ Rerun: /usr/local/sbin/hub-db-backup.sh (read-only on the Hub DB); see docs/HUB-
 fi
 
 if [[ "$HUB_DB_STALE_DRILL" == "1" ]]; then
-  log "DRILL: forcing stale FAIL to ${ALERT_OPS_TO}"
+  log "DRILL: forcing stale FAIL to the drill sink (never mailed)"
   if [[ "$DRY_RUN" -eq 1 || "$NO_MAIL" -eq 1 ]]; then
-    log "would-drill to=${ALERT_OPS_TO} (mail suppressed by flag)"
+    log "would-drill to sink=${HUB_DB_DRILL_SINK} (state untouched by flag)"
     exit 2
   fi
-  send_mail "[STALE] Hub DB backup drill (ops-only)" \
+  drill_sink "[STALE] Hub DB backup drill" \
 "DRILL $(date -u '+%Y-%m-%dT%H:%M:%SZ') from $(hostname): forced Hub DB backup staleness drill (HUB_DB_STALE_DRILL=1).
-Proves the mail path to ${ALERT_OPS_TO} only — never ALERT_TO.
-Run once without the flag on a fresh tree to clear with an ops-only RECOVERED.
-A real staleness episode before that is NOT suppressed by this drill." \
-  "$ALERT_OPS_TO"
+Rendered to the drill sink only; tests and drills never send real mail.
+Run once without the flag on a fresh tree to clear (the closing RECOVERED is also sink-only).
+A real staleness episode before that is NOT suppressed by this drill."
   write_state 1 0 1
   exit 2
 fi
@@ -285,11 +306,10 @@ if [[ "$IS_STALE" -eq 0 ]]; then
   log "fresh: newest export age ${AGE_S}s (~${AGE_H}h) path=${NEWEST_PATH}"
   if [[ "${WAS_STALE:-0}" -eq 1 && "$NO_MAIL" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
     if [[ "${WAS_DRILL:-0}" -eq 1 ]]; then
-      # Close a drill: RECOVERED stays ops-only (9806fc14), like the deadman's
-      # mark_ok_ops — the forced FAIL never pages real recipients backward.
-      send_mail "RECOVERED: Hub DB backup drill cleared" \
-        "Hub DB backup drill state cleared: newest export is fresh (${NEWEST_PATH}, age ${AGE_S}s)." \
-        "$ALERT_OPS_TO"
+      # Close a drill: the RECOVERED is sink-only too (drills never send
+      # real mail); the forced FAIL never pages anyone backward.
+      drill_sink "RECOVERED: Hub DB backup drill cleared" \
+        "Hub DB backup drill state cleared: newest export is fresh (${NEWEST_PATH}, age ${AGE_S}s)."
     else
       send_mail "RECOVERED: Hub DB backup fresh again" \
         "Hub DB backup is fresh again. Newest export: ${NEWEST_PATH} (age ${AGE_S}s)."

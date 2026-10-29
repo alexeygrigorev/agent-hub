@@ -417,6 +417,38 @@ class StalenessBackupFailedModeTest(unittest.TestCase):
         self.assertIn("not sent", text)
         self.assertEqual(stat.S_IMODE(sink.stat().st_mode), 0o600)
 
+    def test_drill_sink_is_forced_private_and_never_follows_symlinks(self) -> None:
+        sink = self.work / "state" / "drill-mail.log"
+        sink.parent.mkdir(parents=True, exist_ok=True)
+        sink.write_text("old\n")
+        sink.chmod(0o644)
+        res = self.run_stale("--backup-failed", "x", "--drill")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(stat.S_IMODE(sink.stat().st_mode), 0o600)
+        self.assertTrue(sink.read_text().startswith("old\n"))
+        sink.unlink()
+        target = self.work / "target.txt"
+        target.write_text("keep")
+        sink.symlink_to(target)
+        res = self.run_stale("--backup-failed", "x", "--drill")
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertEqual(target.read_text(), "keep")
+        self.assertEqual(self.mails(), [])
+
+    def test_drill_flag_alone_is_refused(self) -> None:
+        res = self.run_stale("--drill")
+        self.assertEqual(res.returncode, 1)
+        self.assertEqual(self.mails(), [])
+
+    def test_stale_drill_never_sends_mail(self) -> None:
+        env = {**self.env, "HUB_DB_STALE_DRILL": "1"}
+        res = subprocess.run(["bash", str(STALENESS)], env=env, capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertEqual(self.mails(), [])
+        self.assertIn("[DRILL] [STALE] Hub DB backup drill",
+                      (self.work / "state" / "drill-mail.log").read_text())
+
     def test_full_backup_drill_chain_never_sends_mail(self) -> None:
         """End to end: the real backup script with HUB_DB_BACKUP_FAIL_DRILL=1
         and its real default alert command (sibling staleness script) must

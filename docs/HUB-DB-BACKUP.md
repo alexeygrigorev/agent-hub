@@ -199,11 +199,14 @@ with the real env and no `--dry-run`, paging alexey@ with test paths
   under `/tmp` or `/var/tmp`, EVERY send (including RECOVERED) is routed to
   `ALERT_OPS_TO` (`dev@dtcdev.click`) only — never `ALERT_TO`. The run logs
   `GUARD: test paths ...` and marks `guard=test-paths` on the ALERT line.
-- **Drill**: `HUB_DB_STALE_DRILL=1` forces one FAIL mail to `ALERT_OPS_TO`
-  only and records `DRILL=1` + `LAST_ALERT=0` in the state file, so the
-  closing RECOVERED (next fresh run, i.e. the next cron run after a real
-  backup) also goes to ops only, and a real staleness episode in between is
-  NOT deduped away. Re-run without the flag to clear.
+- **Drill**: `HUB_DB_STALE_DRILL=1` forces one FAIL rendered to the local
+  drill sink (`HUB_DB_DRILL_SINK`, default
+  `/var/lib/hub-db-backup/drill-mail.log`, mode 600) and **never mailed**
+  (standing rule since e27e0f9d: tests and drills never send real mail, not
+  even to dev@). It records `DRILL=1` + `LAST_ALERT=0` in the state file,
+  so a real staleness episode in between is NOT deduped away; the closing
+  RECOVERED is sink-only too. The sink refuses symlinks/non-regular files
+  and is forced to 600 before writing; any failure exits 1 without mailing.
 - `--dry-run` / `--no-mail` / `--check-only` still send nothing.
 
 Regression suite: `scripts/test-hub-db-backup-staleness.sh` (stub MTAs,
@@ -219,8 +222,8 @@ mkdir -p /tmp/stale-test-local /tmp/stale-test-box /tmp/stale-test-state
 BACKUP_DIR=/tmp/stale-test-local STORAGEBOX_DIR=/tmp/stale-test-box \
   STATE_DIR=/tmp/stale-test-state scripts/hub-db-backup-staleness.sh --dry-run; echo $?
 # expect exit 2 + "would-alert"
-# mail-path drill: one FAIL to dev@dtcdev.click only (never alexey@), then
-# clear on the next fresh run (also ops-only)
+# drill: FAIL rendered to /var/lib/hub-db-backup/drill-mail.log, no mail;
+# cleared on the next fresh run (RECOVERED also sink-only)
 sudo -u alexey HUB_DB_STALE_DRILL=1 /usr/local/sbin/hub-db-backup-staleness.sh
 ```
 
