@@ -217,3 +217,77 @@ def test_windows_shared_config_uses_appdata_not_credential_override(tmp_path, mo
     monkeypatch.setenv('APPDATA', str(tmp_path / 'appdata'))
     monkeypatch.setenv('HUB_CONFIG_FILE', str(tmp_path / 'runtime' / 'host.json'))
     assert sc.hub_aws_config_file() == tmp_path / 'appdata' / 'agent-hub' / 'shared' / 'aws' / 'config'
+
+
+def test_worker_sync_omits_main_role_and_alternate_credential_sources(tmp_path):
+    import configparser
+    source = tmp_path / 'source'
+    (source / 'aws').mkdir(parents=True)
+    (source / 'manifest.json').write_text(json.dumps({'version': 2, 'files': ['aws/config']}))
+    raw = ('[DEFAULT]\nrole_arn = arn:aws:iam::387546586013:role/example\n'
+           '[default]\nregion = eu-west-1\noutput = json\n'
+           'credential_source = Environment\nweb_identity_token_file = /operator/token\n'
+           'credential_process = arbitrary-operator-provider\n'
+           '[profile main]\nsource_profile = default\n'
+           'role_arn = arn:aws:iam::387546586013:role/example\n')
+    (source / 'aws/config').write_text(raw)
+    dest = tmp_path / 'worker'
+    sc.sync_shared_config(source=source, dest=dest, hub_bin='/opt/hub')
+    cfg = configparser.RawConfigParser()
+    cfg.read(dest / 'aws/config')
+    assert cfg.sections() == ['default']
+    assert dict(cfg.items('default')) == {
+        'region': 'eu-west-1', 'output': 'json',
+        'credential_process': '/opt/hub aws-gate credential-process',
+    }
+    assert cfg.defaults() == {}
+    assert (source / 'aws/config').read_text() == raw
+
+
+@pytest.mark.parametrize('material', [
+    'aws_session_token = example-session',
+    'aws_security_token = example-security',
+    '# ASIA' + 'A' * 16,
+    '# AKIA' + 'A' * 16,
+])
+def test_sync_refuses_session_credential_material(tmp_path, material):
+    source = tmp_path / 'source'
+    (source / 'aws').mkdir(parents=True)
+    (source / 'manifest.json').write_text(json.dumps({'version': 1, 'files': ['aws/config']}))
+    (source / 'aws/config').write_text('[default]\n' + material + '\n')
+    dest = tmp_path / 'worker'
+    with pytest.raises(ValueError, match='credentials'):
+        sc.sync_shared_config(source=source, dest=dest)
+    assert not dest.exists()
+
+
+def test_shared_config_prose_can_name_geographic_asia(tmp_path):
+    # Credential IDs have fixed shape; ordinary text must not trigger rejection.
+    source = tmp_path / 'source'
+    (source / 'aws').mkdir(parents=True)
+    (source / 'manifest.json').write_text(json.dumps({'version': 1, 'files': ['aws/config']}))
+    (source / 'aws/config').write_text('[default]\nregion = ap-south-1\n# Asia\n')
+    sc.sync_shared_config(source=source, dest=tmp_path / 'worker')
+
+
+@pytest.mark.parametrize('material', ['aws_session_token = example-session', '# ASIA' + 'A' * 16])
+def test_packaged_bundle_build_refuses_session_credentials(tmp_path, monkeypatch, material):
+    import importlib.util
+    script = Path(__file__).resolve().parents[2] / 'scripts/build-hub-cli.py'
+    spec = importlib.util.spec_from_file_location('shared_config_cli_builder', script)
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    repo = tmp_path / 'repo'
+    pkg = repo / 'host/agent_hub_host'
+    pkg.mkdir(parents=True)
+    (pkg / '__init__.py').write_text('')
+    (repo / 'config').mkdir()
+    (repo / 'config/model-routing.json').write_text('{}')
+    (repo / 'shared-config/aws').mkdir(parents=True)
+    (repo / 'shared-config/manifest.json').write_text(json.dumps({'version': 1, 'files': ['aws/config']}))
+    (repo / 'shared-config/aws/config').write_text('[default]\n' + material + '\n')
+    monkeypatch.setattr(builder, 'REPO', repo)
+    monkeypatch.setattr(builder, 'HOST_PKG', pkg)
+    with pytest.raises(SystemExit, match='must not contain'):
+        builder.build(tmp_path / 'out', 'test')
+    assert not (tmp_path / 'out/hub.pyz').exists()

@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -105,7 +106,7 @@ def build(out_dir: Path, version: str):
                     raise SystemExit("build-hub-cli: unsafe shared-config entry")
                 text = (bundle_src / rel).read_text(encoding="utf-8")
                 lowered = text.lower()
-                if "aws_access_key_id" in lowered or "aws_secret_access_key" in lowered or "akia" in lowered:
+                if any(field in lowered for field in ("aws_access_key_id", "aws_secret_access_key", "aws_session_token", "aws_security_token")) or re.search(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", text, re.I):
                     raise SystemExit("build-hub-cli: shared-config bundle must not contain static keys")
                 bundle_files[rel] = text
         except FileNotFoundError:

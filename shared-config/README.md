@@ -12,8 +12,8 @@ engines `sync()` tick (best-effort, never fails the sync).
   `default` profile for sandbox 817685572750 via AWS Gate
   (`credential_process = hub aws-gate credential-process`). NO static keys:
   this bundle must never contain `aws_access_key_id`,
-  `aws_secret_access_key`, bearer tokens, URLs with credentials, or any
-  `AKIA…` value. The Gate bearer token stays per-machine in the host-only
+  `aws_secret_access_key`, `aws_session_token`, `aws_security_token`, bearer
+  tokens, URLs with credentials, or `AKIA…` / `ASIA…` access-key IDs. The Gate bearer token stays per-machine in the host-only
   `~/.config/aws-gate/env` (mode 0600), created by the AWS Gate install/pair
   flow, never copied into this repo.
 - `manifest.json` — `{"version": N, "files": [...]}`. The sync copies exactly
@@ -25,7 +25,10 @@ engines `sync()` tick (best-effort, never fails the sync).
   `provisioning.engine_environment()` therefore sets:
   - `AWS_CONFIG_FILE` → Hub-owned `~/.config/agent-hub/shared/aws/config`
     (the synced copy of this bundle's `aws/config`, with `hub` resolved to an
-    absolute path when discoverable at sync time);
+    absolute path when discoverable at sync time). The synced worker copy
+    contains only `[default]`, its region/output options and the pinned Gate
+    credential process. Other profiles, role chains and provider options from
+    the source bundle are omitted;
   - `AWS_SHARED_CREDENTIALS_FILE` → a nonexistent file inside the managed
     home (`<managed-home>/.aws/credentials`), so per-machine static keys
     (e.g. `main-temp` in the real `~/.aws/credentials`) stay unreachable.
@@ -34,7 +37,7 @@ engines `sync()` tick (best-effort, never fails the sync).
   resolves the real host Gate env WITHOUT trusting `HOME` (which is the
   managed home inside workers): it derives the host config base from
   `AWS_CONFIG_FILE` when that points under `agent-hub/shared/`, else from
-  `HUB_HOST_HOME`, else from `Path.home()` only when that home actually holds
+  `Path.home()` only when that home actually holds
   `.config/aws-gate/env`. It then performs the Gate credential-process HTTP
   call (stdlib only, 10 s timeout) and prints the standard
   `{Version, AccessKeyId, SecretAccessKey, SessionToken, Expiration}` JSON.
@@ -73,7 +76,11 @@ engines `sync()` tick (best-effort, never fails the sync).
    `aws sts get-caller-identity --profile default` must return account
    `817685572750`, and `--profile main-temp` must fail (unknown profile).
 
-## Optional Gate MAIN profile
+## Optional operator Gate MAIN source profile
+
+The source bundle retains this separately configured operator profile. It is
+omitted from the synced managed-worker copy; managed launches receive only the
+sandbox default. Using it outside workers requires separate operator authority.
 
 `aws --profile main sts get-caller-identity` chains from the unchanged default
 Gate credential process to `arn:aws:iam::387546586013:role/aws-gate-main-access`

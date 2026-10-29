@@ -7,8 +7,11 @@ AWS Gate shared config via AWS_CONFIG_FILE.
 """
 from __future__ import annotations
 
+import configparser
+import io
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -156,17 +159,22 @@ def _render_aws_config(text: str, hub_bin: str) -> str:
         prog = '"%s"' % prog.replace('"', '')
     elif os.name != 'nt' and prog != 'hub':
         prog = shlex.quote(prog)
-    out_lines = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith('credential_process') and '=' in line:
-            key, _ = line.split('=', 1)
-            line = '%s= %s aws-gate credential-process' % (key.rstrip(), prog)
-        out_lines.append(line)
-    rendered = '\n'.join(out_lines)
-    if text.endswith('\n'):
-        rendered += '\n'
-    return rendered
+    # The versioned source can contain separately approved operator profiles.
+    # Managed workers receive only the sandbox Gate profile, never role chains
+    # (including the optional MAIN-account profile) or alternate providers.
+    source = configparser.RawConfigParser()
+    source.read_string(text)
+    if not source.has_section('default'):
+        raise ValueError('shared AWS config requires the sandbox default profile')
+    worker = configparser.RawConfigParser()
+    worker.add_section('default')
+    for key in ('region', 'output'):
+        if source.has_option('default', key):
+            worker.set('default', key, source.get('default', key, raw=True))
+    worker.set('default', 'credential_process', '%s aws-gate credential-process' % prog)
+    rendered = io.StringIO()
+    worker.write(rendered)
+    return rendered.getvalue()
 
 
 def sync_shared_config(source=None, dest=None, hub_bin=None, dry_run=False):
@@ -186,10 +194,10 @@ def sync_shared_config(source=None, dest=None, hub_bin=None, dry_run=False):
         if len(raw) > 65536:
             raise ValueError('shared config file unexpectedly large')
         lowered = raw.lower()
-        if 'aws_access_key_id' in lowered or 'aws_secret_access_key' in lowered:
-            raise ValueError('shared config bundle must not contain static keys')
-        if 'akia' in lowered:
-            raise ValueError('shared config bundle must not contain static keys')
+        credential_fields = ('aws_access_key_id', 'aws_secret_access_key',
+                             'aws_session_token', 'aws_security_token')
+        if any(field in lowered for field in credential_fields) or re.search(r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b', raw, re.I):
+            raise ValueError('shared config bundle must not contain static keys or session credentials')
         if rel == 'aws/config':
             raw = _render_aws_config(raw, hub_prog)
         target = dst / rel
