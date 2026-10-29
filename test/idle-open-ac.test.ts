@@ -98,7 +98,10 @@ describe('idle with open acceptance criteria', () => {
     expect(intake(natives[0])).toBe(taskId);
     expect(intake(natives[1])).toBe(taskId);
     expect(intake(natives[2])).toBeUndefined();
-    expect(reads.filter(q=>q==='SELECT id, data FROM intake_tasks')).toHaveLength(1);
+    expect(reads.filter(q=>q==='SELECT id, data FROM intake_tasks LIMIT 101')).toHaveLength(1);
+    reads.length = 0;
+    adoptObservedNativeSessions(counted as any,'idle-host',natives,at+1000);
+    expect(reads.some(q=>q.includes('FROM intake_tasks'))).toBe(false);
   }));
   it('keeps ambiguous intake evidence and foreign-host native links unassigned', async () => fixture(async ({sql,task}: any) => {
     const native={native_id:crypto.randomUUID(),tag:'ambiguous',workspace:'/ambiguous',engine:'codex',created_at_ms:at-1000,phase:'running'};

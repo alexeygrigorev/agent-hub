@@ -24,6 +24,8 @@ def native_session_model(row, locator=None):
     published = _model(row.get('model')) or _model(native_model(row.get('command')))
     if published:
         return published
+    if row.get('state', row.get('phase')) in ('exited', 'dead', 'pruned', 'forgotten', 'stopped'):
+        return None
     if (type(row.get('created_at_ms')) is not int or row['created_at_ms'] <= 0
             or not isinstance(row.get('id'), str)):
         return None

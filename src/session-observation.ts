@@ -61,12 +61,13 @@ export function observedIntakeCandidates(sql: SqlStorage, machine: string, rows:
     if (binding.native_id !== row.id) add(ids, binding.native_id, row);
     add(tags, binding.tag, row); add(paths, binding.workspace, row);
   }
-  const knownTasks = new Set<string>();
-  for (const stored of sql.exec('SELECT id, data FROM intake_tasks')) {
+  // Fail closed on large history sets; census must never parse an unbounded
+  // task ledger or infer uniqueness from a truncated sample.
+  const storedTasks = sql.exec('SELECT id, data FROM intake_tasks LIMIT 101').toArray();
+  for (const stored of storedTasks.length > 100 ? [] : storedTasks) {
     let task: any;
     try { task = JSON.parse(String(stored.data)); } catch { continue; }
     if (!task || typeof task !== 'object') continue;
-    knownTasks.add(String(stored.id));
     if (!Array.isArray(task.history)) continue;
     for (const event of task.history) {
       if (!event || typeof event !== 'object') continue;
@@ -82,8 +83,8 @@ export function observedIntakeCandidates(sql: SqlStorage, machine: string, rows:
   }
   const hasWorktrees = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_worktrees'").toArray().length;
   if (hasWorktrees) {
-    for (const tree of sql.exec("SELECT path,task_id FROM intake_worktrees WHERE machine=? AND state='active'", machine)) {
-      if (knownTasks.has(String(tree.task_id))) mark(paths.get(String(tree.path)), String(tree.task_id));
+    for (const tree of sql.exec("SELECT w.path,w.task_id FROM intake_worktrees w JOIN intake_tasks t ON t.id=w.task_id WHERE w.machine=? AND w.state='active'", machine)) {
+      mark(paths.get(String(tree.path)), String(tree.task_id));
     }
   }
   return new Map([...candidates].filter(([, tasks]) => tasks.size === 1).map(([id, tasks]) => [id, [...tasks][0]]));

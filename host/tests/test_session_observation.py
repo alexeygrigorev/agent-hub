@@ -20,6 +20,13 @@ class SessionObservationTests(unittest.TestCase):
         self.assertNotIn("command", result)
         self.assertNotIn("private goal", str(result))
 
+    def test_terminal_sessions_do_not_locate_transcripts(self):
+        def forbidden(_):
+            self.fail('terminal census must not locate transcripts')
+        for phase in ('exited', 'dead', 'pruned', 'forgotten', 'stopped'):
+            self.assertIsNone(native_session_model({'id':'old','engine':'codex',
+                'state':phase,'created_at_ms':1700000000000}, SimpleNamespace(locate=forbidden)))
+
     def test_census_never_invents_a_default_model(self):
         row = {"id": "native", "tag": "manual", "workspace": "/repo",
                "engine": "codex", "profile": None, "state": "running"}
