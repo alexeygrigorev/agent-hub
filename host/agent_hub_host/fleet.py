@@ -4170,6 +4170,15 @@ class Dispatcher:
         reconciled = self.reconcile_launches()
         self.reconcile_operator_adoptions()
         imported_reconciled = self.reconcile_imported_sessions()
+        # e37b0e83 AC1: stop native trees whose Hub session is terminal or
+        # missing. Bounded per cycle; the server authorizes each incarnation.
+        if self.journal_dir and raw is not None:
+            from .session_reaper import reconcile as reconcile_native_trees
+            native_rows = raw if isinstance(raw, list) else raw.get('sessions') if isinstance(raw, dict) else None
+            reap = reconcile_native_trees(self.request, native_rows, self.journal_dir,
+                                          executable=self.settings.get('aplexer_bin', 'aplexer'))
+            if any(reap.values()):
+                print(json.dumps({'event': 'fleet_native_reconcile', **reap}), flush=True)
         _mark('reconcile')
         # Resource management (intake 4fcd3139): per-session exact sampler +
         # safe watchdog. Best-effort only with durable local state in the
