@@ -27,3 +27,5 @@ Never approve prod deploys or GitHub environment gates. Never delete prod data o
 - Tabo (Windows, shared-codex): until intake 6cbb862a is fixed, run the stopgap `C:\Users\alexe\tmp\fix-shared-codex.ps1` on Tabo before any shared-codex start there. Tabo memory is tight (4.7/15.6 GB free); 3 sessions stuck uncertain on launcher_memory_reserve.
 - Ensure a live fix session exists for: afad40db, 6cbb862a, e37b0e83, Tabo launcher_memory_reserve, and every AC6 item of intake 736ba282. Memres fixer restart 1dd97490 (intake 63a9ee3a) already exists: do not duplicate; restart only if it dies.
 
+- AC6g: intake 34d0271b (src/intake.ts session-token 403) is the single fix for 71c56c6f; session fix-cred403 29785ad9 owns both. Do not duplicate.
+- Watch aplexer session aef8923c (obs-archive-p0, intake bfd84d52); restart only if it dies or stalls, never duplicate.
