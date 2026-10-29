@@ -23,7 +23,7 @@ import urllib.request
 from . import private_fs
 
 STATE_FILE = 'credential-state.json'
-OVERLAY_KEYS = ('credential_generation', 'credential_paths', 'credential_status')
+OVERLAY_KEYS = ('credential_generation', 'credential_paths', 'credential_status', 'refresh_lease')
 MAX_FILE = 16000
 
 
@@ -265,3 +265,82 @@ def probe_quota(provider, home, opener=None, timeout=15):
         # Exceptions may carry provider bodies or credential paths; report nothing.
         return {}
 
+
+# ---------- Leased refresh (Hub egress blocked; one host refreshes for Hub) ----------
+
+CODEX_TOKEN = 'https://auth.openai.com/oauth/token'
+CODEX_CLIENT = 'app_EMoamEEZ73f0CkXaXp7hrann'
+CLAUDE_TOKEN = 'https://platform.claude.com/v1/oauth/token'
+CLAUDE_CLIENT = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+CLAUDE_SCOPES = ['user:profile', 'user:inference', 'user:sessions:claude_code', 'user:mcp_servers', 'user:file_upload']
+
+
+def _post_json(url, body, opener, timeout=20):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method='POST',
+                                 headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+    with opener.open(req, timeout=timeout) as response:
+        value = json.loads(response.read(65536))
+    if not isinstance(value, dict) or not isinstance(value.get('access_token'), str):
+        raise ValueError('invalid token response')
+    return value
+
+
+def refresh_files(provider, files, opener=None, now=None):
+    """Refresh one credential set; returns new files or None. Never raises with content."""
+    opener = opener or urllib.request.build_opener(_NoRedirect())
+    now = now or dt.datetime.now(dt.timezone.utc)
+    try:
+        if provider == 'codex':
+            auth = json.loads(files['.codex/auth.json'])
+            tok = _post_json(CODEX_TOKEN, {'client_id': CODEX_CLIENT, 'grant_type': 'refresh_token',
+                                           'refresh_token': auth['tokens']['refresh_token'], 'scope': 'openid profile email'}, opener)
+            tokens = dict(auth['tokens'], access_token=tok['access_token'])
+            for key in ('id_token', 'refresh_token'):
+                if isinstance(tok.get(key), str):
+                    tokens[key] = tok[key]
+            auth.update(tokens=tokens, last_refresh=now.strftime('%Y-%m-%dT%H:%M:%S.%fZ'))
+            return {'.codex/auth.json': json.dumps(auth, indent=2)}
+        if provider == 'claude':
+            creds = json.loads(files['.claude/.credentials.json'])
+            oauth = creds['claudeAiOauth']
+            tok = _post_json(CLAUDE_TOKEN, {'grant_type': 'refresh_token', 'refresh_token': oauth['refreshToken'],
+                                            'client_id': CLAUDE_CLIENT, 'scope': ' '.join(oauth.get('scopes') or CLAUDE_SCOPES)}, opener)
+            oauth = dict(oauth, accessToken=tok['access_token'])
+            if isinstance(tok.get('refresh_token'), str):
+                oauth['refreshToken'] = tok['refresh_token']
+            if isinstance(tok.get('expires_in'), (int, float)):
+                oauth['expiresAt'] = int(now.timestamp() * 1000 + tok['expires_in'] * 1000)
+            if isinstance(tok.get('scope'), str):
+                oauth['scopes'] = tok['scope'].split()
+            return {'.claude/.credentials.json': json.dumps(dict(creds, claudeAiOauth=oauth))}
+    except Exception:
+        return None
+    return None
+
+
+def leased_refresh(label, bundle, home, request, opener=None):
+    """Perform a Hub-granted refresh lease and publish it by CAS on the generation."""
+    if not isinstance(bundle, dict) or bundle.get('refresh_lease') is not True:
+        return {'status': 'no_lease'}
+    paths = managed_paths(bundle)
+    files = {}
+    for p in paths:
+        data = _local(Path(home) / p)
+        if data is not None:
+            files[p] = data.decode('utf-8', errors='strict')
+    fresh = refresh_files(bundle.get('provider'), files, opener)
+    if not fresh:
+        return {'status': 'refresh_failed'}
+    try:
+        response = request('POST', '/api/engines/%s/credential' % label,
+                           {'base_generation': bundle['credential_generation'], 'files': fresh})
+    except Exception:
+        response = None
+    # Persist locally either way: this copy now holds the only valid refresh token.
+    for p, value in fresh.items():
+        _write_file(Path(home) / p, value.encode('utf-8'))
+    if isinstance(response, dict) and isinstance(response.get('generation'), int):
+        digests = {p: _digest(v.encode('utf-8')) for p, v in (response.get('files') or fresh).items() if p in paths}
+        private_fs.atomic_write(Path(home).parent / STATE_FILE, json.dumps({'generation': response['generation'], 'digests': digests}).encode(), 65536)
+        return {'status': 'refreshed', 'generation': response['generation']}
+    return {'status': 'writeback_pending'}

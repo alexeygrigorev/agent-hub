@@ -107,6 +107,7 @@ export class ProvisioningService {
       if (!host) return reply({ error: 'forbidden' }, 403);
       try { const engines = await Promise.all(rows().map(r => this.open(r)));
         if (!this.hostAllowed(auth.caller.machineId, auth.caller)) return reply({ error: 'forbidden' }, 403);
+        for (const e of engines) if (this.grantRefreshLease(e, auth.caller.machineId)) e.refresh_lease = true;
         return reply({ engines, logins: this.sql.exec("SELECT id,label,status FROM engine_logins WHERE machine_id=? AND expires_at>? AND status IN ('requested','waiting','submitted')", auth.caller.machineId, Date.now()).toArray() }); }
       catch { return reply({ error: 'bundle_decryption_unavailable' }, 503); }
     }
@@ -368,6 +369,23 @@ export class ProvisioningService {
     try { cipher = await this.sealCredential(label, generation, files); } catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
     this.tx(() => this.writeCredential(label, provider, generation, cipher, files, 'hub_login'));
     return reply({ status: 'configured', label, credential_generation: generation });
+  }
+
+  /**
+   * Delegate a due refresh to this host when Hub's own provider egress is
+   * blocked. One lease per label (10 min); the host refreshes and writes back
+   * by CAS on this generation, so the token family keeps a single owner.
+   */
+  private grantRefreshLease(engine: any, machine: string): boolean {
+    const row = this.credentialRow(engine.label);
+    if (!row || row.status === 'invalid' || row.status_reason !== 'refresh_blocked' || engine.credential_generation !== row.generation) return false;
+    if (!needsRefresh(row.provider, credentialSubset(row.provider, engine.files), this.now())) return false;
+    return this.tx(() => {
+      const lease: any = this.sql.exec('SELECT * FROM engine_credential_leases WHERE label=?', engine.label).toArray()[0];
+      if (lease && lease.expires_at > this.now() && lease.generation === row.generation && lease.machine_id !== machine) return false;
+      this.sql.exec('INSERT OR REPLACE INTO engine_credential_leases VALUES (?,?,?,?)', engine.label, machine, row.generation, this.now() + 600000);
+      return true;
+    });
   }
 
   fetchFn: FetchLike = (input, init) => fetch(input, init);

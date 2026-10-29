@@ -326,3 +326,29 @@ def test_central_claude_login_cli_never_prints_the_code(monkeypatch, capsys):
     out = capsys.readouterr()
     assert 'secret-code' not in out.out + out.err
     assert 'https://claude.com/cai/oauth/authorize' in out.err
+
+
+def test_leased_refresh_rotates_once_and_writes_back(home):
+    dest, h = home
+    hub = FakeHub(1, {PATH: auth('a')})
+    b = bundle(1, auth('a'), refresh_lease=True)
+    c.reconcile(LABEL, b, h, dest, hub)
+
+    class TokenOpener:
+        calls = []
+
+        def open(self, req, timeout=None):
+            body = json.loads(req.data)
+            self.calls.append(body)
+            assert body['refresh_token'] == 'refresh-a' and body['grant_type'] == 'refresh_token'
+            return FakeResponse(json.dumps({'access_token': 'acc-b', 'refresh_token': 'refresh-b', 'id_token': 'id-b'}).encode())
+    opener = TokenOpener()
+    result = c.leased_refresh(LABEL, b, h, hub, opener=opener)
+    assert result == {'status': 'refreshed', 'generation': 2}
+    assert len(opener.calls) == 1
+    assert json.loads(read(h))['tokens']['refresh_token'] == 'refresh-b'
+    assert hub.calls[-1][2]['base_generation'] == 1
+    # Without a lease nothing is refreshed.
+    assert c.leased_refresh(LABEL, bundle(2, read(h)), h, hub, opener=opener)['status'] == 'no_lease'
+    assert len(opener.calls) == 1
+    assert 'refresh_lease' in c.OVERLAY_KEYS

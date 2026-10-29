@@ -958,6 +958,7 @@ def install(bundle, request=None):
     if receipt is not None and credentials.install_snapshot(receipt, paths) == credentials.install_snapshot(bundle, paths):
         provision_managed_home(bundle, home, dest)
         credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+        credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
         if receipt != bundle:
             write_json(dest / 'bundle.json', bundle)
         return
@@ -1062,6 +1063,7 @@ def install(bundle, request=None):
             raise ValueError('Native engine verification failed') from None
     provision_managed_home(bundle, home, dest)
     credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+    credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
     write_json(dest / 'bundle.json', bundle)
 
 

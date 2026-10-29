@@ -268,6 +268,29 @@ describe('Hub-owned credentials: store, refresh, write-back, enrollment', () => 
     });
   });
 
+  it('treats a blocked provider (403 challenge) as egress, never as invalid, and leases the refresh to exactly one host', async () => {
+    await fixture(async ({ provision, alerts }) => {
+      const { revision } = await (await put(provision, 'shared-codex', { '.codex/auth.json': codexAuth('a', iso(-4 * DAY), now + 6 * DAY) })).json() as any;
+      for (const host of ['rmthz', 'tabo']) await installed(provision, host, 'shared-codex', revision);
+      provision.fetchFn = (async () => new Response('<html>Just a moment...</html>', { status: 403 })) as any;
+      for (let i = 0; i < 3; i++) {
+        const [r] = await provision.maintainCredentials(now + i * 600000);
+        expect(r.status).toBeUndefined();
+        expect(r.refresh).toBe('refresh_blocked');
+        expect(r.quota).toBe('quota_blocked');
+      }
+      expect(alerts.filter(a => a.problem)).toHaveLength(0);
+      const first = (await sync(provision, 'rmthz')).engines[0];
+      const second = (await sync(provision, 'tabo')).engines[0];
+      expect(first.refresh_lease).toBe(true);
+      expect(second.refresh_lease).toBeUndefined();
+      // The lease holder refreshes and writes back on the current generation.
+      const res = await (await writeBack(provision, 'rmthz', 'shared-codex', first.credential_generation, { '.codex/auth.json': codexAuth('b', iso(), now + 10 * DAY) })).json() as any;
+      expect(res).toMatchObject({ accepted: true, generation: 2 });
+      expect((await sync(provision, 'tabo')).engines[0].refresh_lease).toBeUndefined();
+    });
+  });
+
   it('refuses host credential reads/writes to non-host callers', async () => {
     await fixture(async ({ provision }) => {
       await put(provision, 'codex-orin', { '.codex/auth.json': codexAuth('a', iso(-DAY), now + 9 * DAY) });

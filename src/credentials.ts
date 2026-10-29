@@ -131,8 +131,14 @@ async function postJson(fetchFn: FetchLike, url: string, body: unknown, extra: R
 
 /** Classify a failed token response without retaining its body. */
 function refusal(status: number, text: string): { ok: false; invalid: boolean; reason: string } {
-  if ((status === 400 || status === 401 || status === 403) && INVALID_GRANT.test(text)) return { ok: false, invalid: true, reason: 'refresh_token_rejected' };
-  if (status === 401 || status === 403) return { ok: false, invalid: true, reason: 'refresh_unauthorized' };
+  // Only an OAuth error document from the provider is a verdict about the
+  // credential. An HTML challenge or bare 403 is egress blocking (Cloudflare
+  // Worker IPs are bot-screened by some providers): delegate, never invalidate.
+  const body = parse(text);
+  const oauthError = body && typeof body.error === 'string' ? body.error + ' ' + (typeof body.error_description === 'string' ? body.error_description : '') : null;
+  if (oauthError && (status === 400 || status === 401 || status === 403) && INVALID_GRANT.test(oauthError)) return { ok: false, invalid: true, reason: 'refresh_token_rejected' };
+  if (oauthError && status === 401) return { ok: false, invalid: true, reason: 'refresh_unauthorized' };
+  if (!oauthError && (status === 401 || status === 403 || status === 429)) return { ok: false, invalid: false, reason: 'refresh_blocked' };
   return { ok: false, invalid: false, reason: status >= 500 ? 'refresh_provider_unavailable' : 'refresh_http_' + status };
 }
 
@@ -268,7 +274,8 @@ export async function fetchQuota(provider: string, files: CredentialFiles, fetch
       return { ok: false, unauthorized: false, reason: 'quota_unsupported' };
     }
     const text = (await res.text()).slice(0, 131072);
-    if (res.status === 401) return { ok: false, unauthorized: true, reason: 'quota_unauthorized' };
+    if (res.status === 401 && parse(text)) return { ok: false, unauthorized: true, reason: 'quota_unauthorized' };
+    if (res.status === 401 || res.status === 403 || res.status === 429) return { ok: false, unauthorized: false, reason: 'quota_blocked' };
     if (res.status !== 200) return { ok: false, unauthorized: false, reason: 'quota_http_' + res.status };
     const body = parse(text);
     if (!body) return { ok: false, unauthorized: false, reason: 'quota_invalid_response' };
@@ -289,6 +296,9 @@ export const CREDENTIAL_SCHEMA = [
   // A host that reported a credential as rejected is never offered that
   // account again until Hub publishes a newer credential generation (I5).
   'CREATE TABLE IF NOT EXISTS engine_credential_rejections (machine_id TEXT NOT NULL, label TEXT NOT NULL, generation INTEGER NOT NULL, reason TEXT NOT NULL, observed_at INTEGER NOT NULL, PRIMARY KEY(machine_id,label))',
+  // When Hub's own egress to a provider is blocked, exactly one host at a time
+  // holds the refresh for a label and writes the rotation back by CAS.
+  'CREATE TABLE IF NOT EXISTS engine_credential_leases (label TEXT PRIMARY KEY, machine_id TEXT NOT NULL, generation INTEGER NOT NULL, expires_at INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS engine_credential_logins (id TEXT PRIMARY KEY, label TEXT NOT NULL, provider TEXT NOT NULL, sealed TEXT NOT NULL, expires_at INTEGER NOT NULL)',
 ];
 
