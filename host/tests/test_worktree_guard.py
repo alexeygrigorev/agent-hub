@@ -645,6 +645,13 @@ class TestStoppedIntakeRestart(unittest.TestCase):
                                  lambda *args: {"sessions": [old]}))
                 self.assertTrue(guard.reuse_stopped_intake_lock("git", path, successor, "intake-restart",
                                 lambda *args: {"sessions": [old, new]}))
+                row = {"workspace": path, "tag": "task-hub-" + "c" * 32}
+                session = {"id": successor, "intake_task_id": "intake-restart"}
+                self.assertFalse(guard.protect_adoption(row, session))
+                self.assertFalse(guard.protect_adoption(row, session,
+                    request=lambda *args: {"sessions": [{**old, "native_terminal": False}, new]}))
+                self.assertTrue(guard.protect_adoption(row, session,
+                    request=lambda *args: {"sessions": [old, new]}))
             entry = guard.find_entry(guard.list_entries("git", path), path)
             self.assertEqual(entry["reason"], reason)
             self.assertTrue(entry["locked"])

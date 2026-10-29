@@ -3426,7 +3426,7 @@ class Dispatcher:
             if row is None:
                 continue
             from .worktree_guard import protect_adoption
-            if not protect_adoption(row, session):
+            if not protect_adoption(row, session, request=self.request):
                 continue
             try:
                 self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
