@@ -32,7 +32,7 @@ function fakeReserve() {
   const calls: any[] = [];
   return { calls, hook: (input: any) => {
     calls.push(input);
-    return { value: { id: 'launch-' + calls.length, state: 'offered', machine: input.machine || 'hetzner', engine: input.engine || 'codex' }, status: 201 };
+    return { value: { id: 'launch-' + calls.length, state: 'offered', machine: input.machine || 'hetzner', engine: input.engine || 'claude' }, status: 201 };
   } };
 }
 
@@ -44,6 +44,8 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
     const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: reserve.hook });
     service.init();
     seedFixtureIntake(hub.sql);
+    hub.sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.history',json(?)) WHERE id='fixture-intake'",
+      JSON.stringify([{kind:'note',text:'DONE: synthetic completed cleanup fixture'}]));
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
     hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
@@ -61,14 +63,14 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
 
 function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', nativeId: string | null = NATIVE_ID, launchState = 'running') {  const at = new Date().toISOString();
   sql.exec(`INSERT OR REPLACE INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
-    VALUES (?, 'demo:assistant', 'agent', NULL, 'fixture', ?, '{"workspace":"demo"}', ?, 'codex', 'fixture-acct', NULL, 'headless', 'demo', 'goal', ?, ?, NULL, ?, ?)`,
+    VALUES (?, 'demo:assistant', 'agent', NULL, 'fixture', ?, '{"workspace":"demo"}', ?, 'claude', 'fixture-acct', NULL, 'headless', 'demo', 'goal', ?, ?, NULL, ?, ?)`,
     launchId, 'fleet-' + launchId, machine, launchState, nativeId, at, at);
 }
 
 function reportFleetSession(sql: any, machine: string, nativeId: string, tag: string, workspace: string, phase = 'running') {
   const at = new Date().toISOString();
   sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at)
-    VALUES (?, ?, ?, 'codex', ?, NULL, ?, ?, NULL, NULL, 'fixture-acct', NULL)`,
+    VALUES (?, ?, ?, 'claude', ?, NULL, ?, ?, NULL, NULL, 'fixture-acct', NULL)`,
     machine, nativeId, tag, phase, at, workspace);
 }
 

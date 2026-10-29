@@ -13,6 +13,11 @@ const FAILED = new Set(['failed', 'refused', 'cancelled', 'engine_failed', 'engi
 const OPEN = new Set(['open', 'in_progress', 'blocked', 'pending_approval']);
 export const WATCHDOG_INTERVAL = 1800000;
 const DAY = 86400000;
+/** Hold reasons only a person can clear (AC8, intake d8d509d2): each (intake, reason)
+ * pair is alerted exactly once instead of waiting silently on an operator. */
+export const HUMAN_HOLD_REASONS = new Set(['workspace_configuration_required', 'scope_decision_required', 'scope_out_of_bounds',
+  'reported_completion_requires_operator_review', 'done_evidence_requires_operator_review']);
+const HUMAN_ALERT_LIST = 30;
 const parse = (raw: any): Obj => { try { return JSON.parse(raw || '{}'); } catch { return {}; } };
 const ms = (v: any): number => typeof v === 'number' ? v : (Date.parse(v) || 0);
 export type WatchdogHooks = {
@@ -28,6 +33,39 @@ export class IntakeWatchdog {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_restart_queue(task_id TEXT PRIMARY KEY, state TEXT NOT NULL,
       reason TEXT NOT NULL, request_key TEXT, request_json TEXT, session_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
       next_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    this.sql.exec('CREATE TABLE IF NOT EXISTS intake_human_alerts(task_id TEXT NOT NULL, reason TEXT NOT NULL, alerted_at INTEGER NOT NULL, PRIMARY KEY(task_id, reason))');
+  }
+  /** One aggregated alert per tick for holds that newly need a person. Completion
+   * holds owned by the post-DONE verifier are excluded until it escalates them. */
+  private async alertHumanHolds(tasks: Obj[], now: number): Promise<number> {
+    if (!this.hooks.notify) return 0;
+    let verifierOwned = new Set<string>();
+    try {
+      verifierOwned = new Set(this.rows("SELECT task_id FROM intake_verifications WHERE state<>'needs_human'").map(r => r.task_id));
+    } catch { /* verifier table absent outside the Hub composition */ }
+    const alerted = new Set(this.rows('SELECT task_id,reason FROM intake_human_alerts').map(r => r.task_id + '\n' + r.reason));
+    const byId = new Map(tasks.map(t => [t.id, t]));
+    const fresh = this.rows("SELECT task_id,reason FROM intake_restart_queue WHERE state='queued'")
+      .filter(q => HUMAN_HOLD_REASONS.has(q.reason) && byId.has(q.task_id) && !alerted.has(q.task_id + '\n' + q.reason) &&
+        !(q.reason.includes('completion') || q.reason.includes('done_evidence') ? verifierOwned.has(q.task_id) : false));
+    if (!fresh.length) return 0;
+    const lines = fresh.slice(0, HUMAN_ALERT_LIST).map(q => `${q.task_id} ${q.reason} — ${String(byId.get(q.task_id)?.title ?? '').replace(/[\r\n]/g, ' ').slice(0, 100)}`);
+    const detail = `${fresh.length} intake(s) newly wait on a person (hold reasons that no agent can clear). Review hub intake forgotten.\n` + lines.join('\n') +
+      (fresh.length > HUMAN_ALERT_LIST ? `\n…and ${fresh.length - HUMAN_ALERT_LIST} more` : '');
+    const opened = await this.hooks.notify('intake_human_hold', 'human-hold-' + now, detail);
+    if (opened === false) return 0;
+    for (const q of fresh) {
+      this.sql.exec('INSERT OR IGNORE INTO intake_human_alerts(task_id,reason,alerted_at) VALUES(?,?,?)', q.task_id, q.reason, now);
+      this.audit(byId.get(q.task_id)!, 'human_hold_alert', q.reason + ' alerted once to existing alerts', now);
+    }
+    return fresh.length;
+  }
+  /** A missed wake enters the existing recovery queue. This is not proof of
+   * death: project/restart still require canonical evidence and no live owner. */
+  enqueueWakeRecovery(taskId: string, wakeId: string): void {
+    const now = this.now();
+    this.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,next_at,updated_at)
+      VALUES(?,'queued',?, ?,?) ON CONFLICT(task_id) DO NOTHING`, taskId, 'missed_wake:' + wakeId, now, now);
   }
   status(): Obj {
     const m = this.rows('SELECT last_tick,last_source,last_result FROM intake_watchdog_meta WHERE id=1')[0];
@@ -46,6 +84,9 @@ export class IntakeWatchdog {
     });
     const claims = this.rows("SELECT * FROM claims WHERE released_at IS NULL AND (expires_at>? OR claim_source='native')", now);
     const queue = new Map(this.rows('SELECT * FROM intake_restart_queue').map(q => [q.task_id, q]));
+    let missed: Obj[] = [];
+    try { missed = this.rows("SELECT session_id,intake_task_id FROM session_control_wakes WHERE state='missed'"); } catch { /* optional wakes */ }
+
     return tasks.filter(t => OPEN.has(t.status) && !t.archived_at).map(t => {
       const ids = new Set((t.history || []).map((e: Obj) => e.hub_session_id).filter(Boolean));
       const linked = sessions.filter(s => ids.has(s.id) || parse(s.request_json).intake_task_id === t.id)
@@ -72,6 +113,17 @@ export class IntakeWatchdog {
         else lastEnd = Math.max(lastEnd, ms(n.observed_at));
       }
       for (const s of linked) {
+        // A canonical stop can be stale relative to a newer native incarnation.
+        // Missed wakes never authorize replacing live or unknown native work.
+        if (s.state === 'stopped' && missed.some(w => w.session_id === s.id && w.intake_task_id === t.id)) {
+          const binding = parse(s.binding_json);
+          if (binding.native_id) {
+            const n = nativeById.get(JSON.stringify([s.machine_id, binding.native_id]));
+            if (!catalogs.has(s.machine_id) || !n || !Number.isFinite(binding.native_created_at_ms) || n.created_at_ms !== binding.native_created_at_ms ||
+                n.tag !== binding.tag || n.workspace !== binding.workspace || ['unknown','unobserved'].includes(n.phase)) unknown = true;
+            else if (!['exited','stopped','failed'].includes(n.phase)) live = true;
+          }
+        }
         if (!ACTIVE.has(s.state)) { lastEnd = Math.max(lastEnd, ms(s.updated_at)); continue; }
         const binding = parse(s.binding_json);
         if (!binding.native_id) { live = true; continue; } // queued intent prevents duplicates
@@ -83,12 +135,13 @@ export class IntakeWatchdog {
         else unknown = true; // absence without a terminal receipt cannot authorize a duplicate
       }
       const onlyFailed = linked.length > 0 && linked.every(s => FAILED.has(s.state));
-      const forgotten = !live && !unknown && (onlyFailed || now - lastEnd > 7200000);
+      const wakeRecovery = linked.some(s => missed.some(w => w.session_id === s.id && w.intake_task_id === t.id) && s.state === 'stopped');
+      const forgotten = !live && !unknown && (onlyFailed || wakeRecovery || now - lastEnd > 7200000);
       const q = queue.get(t.id);
       return { id: t.id, title: t.title, project: t.project, age_ms: Math.max(0, now - ms(t.created_at)),
         last_session: linked[0] ? { id: linked[0].id, state: linked[0].state, updated_at: linked[0].updated_at } : null,
         state: forgotten ? (q?.state || 'forgotten') : live ? 'active' : unknown ? 'unknown' : 'waiting',
-        reason: live ? 'live_session_or_pending_intent' : unknown ? 'host_observation_unknown' : onlyFailed ? 'only_failed_sessions' : forgotten ? 'no_live_session_over_two_hours' : 'within_two_hour_grace',
+        reason: live ? 'live_session_or_pending_intent' : unknown ? 'host_observation_unknown' : wakeRecovery ? 'missed_wake_terminal_session' : onlyFailed ? 'only_failed_sessions' : forgotten ? 'no_live_session_over_two_hours' : 'within_two_hour_grace',
         forgotten, restart: q ? { state: q.state, reason: q.reason, session_id: q.session_id, next_at: q.next_at } : null };
     });
   }
@@ -206,7 +259,8 @@ export class IntakeWatchdog {
       return (qa?.updated_at ?? 0) - (qb?.updated_at ?? 0) || a.id.localeCompare(b.id);
     });
     for (const item of ordered.slice(0, 8)) await this.restart(tasks.find(t => t.id === item.id)!, now);
-    const result = { state: 'checked', checked_at: now, forgotten_count: forgotten.length, open_count: items.length };
+    const human_hold_alerts = await this.alertHumanHolds(tasks, now);
+    const result = { state: 'checked', checked_at: now, forgotten_count: forgotten.length, open_count: items.length, human_hold_alerts };
     this.sql.exec('UPDATE intake_watchdog_meta SET last_result=? WHERE id=1', JSON.stringify(result));
     return result;
   }

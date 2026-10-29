@@ -60,7 +60,7 @@ function stateBadge(state) {
   const s = state || 'unknown';
   let color = 'dk-badge--neutral';
   if (['running', 'active', 'working', 'acked', 'delivered'].includes(s)) color = 'dk-badge--success';
-  else if (['stale', 'stalled', 'uncertain', 'offered', 'starting', 'recorded', 'transported', 'claimed', 'held', 'waiting', 'waiting-confirmation', 'waiting_confirmation', 'waiting-idle', 'idle'].includes(s)) color = 'dk-badge--warning';
+  else if (['stale', 'stalled', 'uncertain', 'offered', 'starting', 'recorded', 'transported', 'claimed', 'held', 'waiting', 'waiting-confirmation', 'waiting_confirmation', 'waiting-idle', 'waiting_until', 'idle'].includes(s)) color = 'dk-badge--warning';
   else if (['failed', 'refused', 'stopped', 'offline', 'error', 'cancelled'].includes(s)) color = 'dk-badge--danger';
   span.className = `dk-badge ${color}`;
   span.textContent = s;
@@ -470,6 +470,9 @@ function renderSessionDetail(session, commands = []) {
       addMetaItem(metaEl, 'Native Binding', `${session.binding.tag || '-'} (${session.binding.native_id || '-'})`);
     }
     addMetaItem(metaEl, 'Updated', (session.updated_at || '').slice(0, 19).replace('T', ' ') || '-');
+    if (session.waiting_until) {
+      addMetaItem(metaEl, 'Waiting until', String(session.waiting_until).slice(0, 19).replace('T', ' ') || String(session.waiting_until));
+    }
   }
 
   const sortedCommands = [...commands].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));

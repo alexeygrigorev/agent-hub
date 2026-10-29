@@ -144,7 +144,8 @@ def _active_profile():
     """
     cfg = config.load_config()
     if os.environ.get('HUB_CONFIG_FILE'):
-        return (cfg.get('client_kind') or 'host', cfg, config.load_config, config.save_config)
+        save_fn = config.save_human_config if config.is_human_config(cfg) else config.save_config
+        return (cfg.get('client_kind') or 'host', cfg, config.load_config, save_fn)
     if config.is_human_config(cfg):
         return ('human', cfg, config.load_human_config, config.save_human_config)
     # cfg is host (or empty): keep legacy load/save names so existing

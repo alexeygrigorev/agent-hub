@@ -57,6 +57,33 @@ def canonical_origin(url: str) -> tuple:
     port = int(parsed.port) if parsed.port is not None else (443 if scheme == 'https' else 80)
     return (scheme, host, port)
 
+# Hub DO restarts and overload return an opaque 500/502/503/504 or time out
+# for ~40 s (intake c206f556). Keyed mutations are idempotent server-side.
+HUB_UNAVAILABLE_STATUS = frozenset({500, 502, 503, 504})
+KEYED_REPLAY_DELAYS = (2, 4, 8, 15, 15)
+
+
+def replay_keyed(call, transient, *, delays=None, sleep=None, notify=None):
+    """Replay one keyed operator mutation while the Hub is briefly unavailable.
+
+    Only for explicit operator CLI commands whose payload carries a stable
+    idempotency key: the server returns the original receipt for a replay,
+    so a lost or failed attempt is never duplicated. Never use from
+    host-polled loops; their next poll is the retry and replays there would
+    amplify an overload. Application errors are raised unchanged.
+    """
+    delays = KEYED_REPLAY_DELAYS if delays is None else delays
+    for delay in (*delays, None):
+        try:
+            return call()
+        except Exception as exc:
+            if delay is None or not transient(exc):
+                raise
+            if notify is not None:
+                notify(exc, delay)
+            (sleep or time.sleep)(delay)
+
+
 def safe_http_json(req: urllib.request.Request, timeout: float = 10.0, *, _token_exchange=None):
     if _token_exchange is not None:
         _token_exchange.begin(req)

@@ -1,8 +1,9 @@
 """Intake 59a6f44a AC1/AC3/AC4: managed Codex single root + host-side quota gate.
 
 - Canonical root is provisioning.root() (default ~/.config/agent-hub/managed-engines).
-- provisioning.admission() refuses codex launches when check_codex_quota_gate fails,
-  with reason codex_quota_gate_<slug>.
+- provisioning.admission() refuses codex launches when Hub's admission verdict
+  refuses (intake 5814e109: Hub owns quota; no host probe), with reason
+  codex_quota_gate_<slug>.
 - fleet dispatch propagates the slug so rejected[]/launch_error carry it.
 - dispatch_diagnostics.classify preserves codex_quota_gate_* slugs.
 """
@@ -42,20 +43,24 @@ def _admission_setup(monkeypatch, tmp_path, gate_result):
               'revision': rev, 'files': {}, 'env': {}, 'args': []}
     p.write_json(dest / 'bundle.json', bundle)
     monkeypatch.setattr(p.sys, 'argv', ['provisioning', label])
-    monkeypatch.setattr(p, 'host_request', lambda m, path, payload=None: {
-        'launch_allowed': True, 'profile_supported': True,
-        'account_label': label, 'observed_at': '2026-10-26T00:00:00Z'})
-    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: gate_result)
+    allowed, reason = gate_result
+    verdict = {'launch_allowed': allowed, 'profile_supported': True,
+               'account_label': label, 'observed_at': '2026-10-26T00:00:00Z'}
+    if not allowed:
+        verdict['reason'] = reason
+    elif reason.startswith('quota_probe_warning:'):
+        verdict['quota_warning'] = reason
+    monkeypatch.setattr(p, 'host_request', lambda m, path, payload=None: dict(verdict))
     monkeypatch.setattr(p, 'engine_environment', lambda bundle, home, dest=None: {'HOME': str(home)})
     return label
 
 
 def test_admission_refuses_on_quota_gate(monkeypatch, tmp_path, capsys):
-    _admission_setup(monkeypatch, tmp_path, (False, 'quota_unavailable'))
+    _admission_setup(monkeypatch, tmp_path, (False, 'quota_exhausted'))
     p.admission()
     out = json.loads(capsys.readouterr().out)
     assert out['launch_allowed'] is False
-    assert out['reason'] == 'codex_quota_gate_quota_unavailable'
+    assert out['reason'] == 'codex_quota_gate_codex_reserve_required'
 
 
 def test_admission_allows_when_gate_ok(monkeypatch, tmp_path, capsys):

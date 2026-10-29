@@ -139,6 +139,34 @@ describe('stop delivery for adopted sessions', () => {
       expect(offers.offers).toHaveLength(0);
     });
   });
+  it('acknowledges an already stopped bound session while its host is offline', async () => {
+    await fixture(async (s,sql,advance) => {
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      await s.handle(req('/api/sessions/'+nativeId+'/stop',{key:'terminal-stop'}),admin);
+      advance(9000);
+      const failed = await (await s.handle(req('/api/sessions/'+nativeId+'/commands'),admin)).json() as any;
+      expect(failed.commands[0].ack.reason).toBe('stop_host_unreachable');
+      await s.handle(req('/api/sessions/'+nativeId+'/stop',{key:'confirmed-stop'}),admin);
+      const offered = await (await s.handle(req('/api/session-commands/offers'),host)).json() as any;
+      const offer = offered.offers[0];
+      const claim = await (await s.handle(req('/api/session-commands/'+offer.command_id+'/claim',
+        {correlation:offer.correlation,attempt_id:crypto.randomUUID()}),host)).json() as any;
+      expect((await s.handle(req('/api/session-commands/'+offer.command_id+'/ack',
+        {correlation:offer.correlation,claim_token:claim.claim_token,outcome:'delivered',confirmed_exit:true,
+          native:{native_id:nativeId,tag:'stop-test',workspace:'/srv/stop-test'}}),host)).status).toBe(200);
+      sql.exec("UPDATE machines SET drained = 1, last_checkin_at = NULL WHERE id = 'stop-host'");
+      for (const key of ['terminal-stop', 'terminal-stop', 'new-terminal-stop']) {
+        const res = await s.handle(req('/api/sessions/'+nativeId+'/stop',{key}),admin);
+        expect([200,201]).toContain(res.status);
+        expect((await res.json() as any).state).toBe('acked');
+      }
+      advance(90000);
+      const body = await (await s.handle(req('/api/sessions/'+nativeId+'/commands'),admin)).json() as any;
+      expect(body.commands).toHaveLength(3);
+      expect(body.commands.every((c:any)=>c.state === 'acked' && c.ack.confirmed_exit === true)).toBe(true);
+      expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',nativeId).one().state).toBe('stopped');
+    });
+  });
   it('settles stop on an unbound uncertain session immediately without reporting stop_host_unreachable', async () => {
     await fixture(async (s,sql,advance) => {
       const sessId = crypto.randomUUID(), launchId = crypto.randomUUID(), at = new Date().toISOString();

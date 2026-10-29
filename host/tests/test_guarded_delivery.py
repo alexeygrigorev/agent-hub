@@ -106,7 +106,12 @@ def main():
         if not any(r["tag"] == tag and r["workspace"] == ws for r in rows):
             sys.stderr.write("no session\n")
             sys.exit(1)
-        sys.stdout.write("line-00 captured tail output\n")
+        cap_file = os.environ.get("FAKE_CAPTURE_FILE")
+        if cap_file and os.path.isfile(cap_file):
+            with open(cap_file, "r") as f:
+                sys.stdout.write(f.read())
+        else:
+            sys.stdout.write("line-00 captured tail output\n")
     elif cmd == "status":
         ws = opt(args, "--workspace")
         tag = opt(args, "--tag")
@@ -174,6 +179,14 @@ def main():
             if not os.path.isfile(target_file):
                 sys.stderr.write("no such message\n")
                 sys.exit(1)
+            if os.environ.get("FAKE_ENFORCE_SENDER") == "1":
+                with open(target_file, "r") as f:
+                    m_env = json.load(f)
+                expected_sender = (m_env.get("from") or {}).get("session_id")
+                actual_sender = os.environ.get("APLEXER_SESSION_ID", "")
+                if expected_sender and actual_sender.lower() != str(expected_sender).lower():
+                    sys.stderr.write(f"Error: message {mid} does not belong to current session or workspace\n")
+                    sys.exit(1)
 
             status = DELIVER_STATUS
             rc = DELIVER_RC
@@ -973,3 +986,168 @@ def test_delivered_awaiting_reply_posts_distinct_pending_status(env):
     posted = hub.statuses[cid]
     assert posted["status"] == "delivered; awaiting recipient reply", posted
     assert posted["claim_token"] == claim["claim_token"]
+
+
+def test_headless_send_queues_for_next_turn_and_acknowledges_on_recipient_cursor_ack(env):
+    """Send to a running headless antigravity session (repro 75e87ded / db717cb7):
+    1. Records into native inbox and posts 'delivered; awaiting recipient reply'
+       (never 'waiting in inbox for recipient') so Hub does not expire to recipient_not_ready.
+    2. Does not retract or fail with recipient_not_ready when turn exceeds 60s lease.
+    3. Recognizes 'recipient-acked' from aplexer message deliver (when the headless session
+       acknowledges the message at its next turn via aplexer hook) as proof of delivery,
+       even after controller restart with a new APLEXER_SESSION_ID.
+    """
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "not-ready")
+    env["monkeypatch"].setenv("FAKE_DELIVER_RC", "1")
+    env["monkeypatch"].setenv("FAKE_ENFORCE_SENDER", "1")
+    target = seed_target(env, tag="task-hub-9297f679-34ac-4f99-96cd-d180b51bdec3")
+    cid = "db717cb7-579b-4587-b5a9-bc9a8b8b583e"
+    hub = MockHub()
+    now_ms = 1793234344000
+    claim = make_claim(cid)
+    claim["expires_at_ms"] = now_ms + 60000
+    cmd = {
+        "op": "send", "command_id": cid, "generation": 1, "mode": "headless",
+        "target": {"session_id": target.session_id, "tag": target.tag,
+                   "workspace": target.workspace, "created_at_ms": target.created_at_ms,
+                   "engine": target.engine},
+        "body": "continue headless turn", "await_ack": True,
+    }
+    outcome = se.handle_claimed_command(
+        cmd, claim, custody=custody(), journal_dir=env["journal"],
+        executable=env["fake"], request=hub.request, now_ms=now_ms,
+    )
+    assert outcome["state"] == "unknown"
+    assert outcome["delivery_state"] == "recorded"
+    assert outcome["headless_turn_queued"] is True
+    assert hub.statuses[cid]["status"] == "delivered; awaiting recipient reply"
+    assert "headless session next turn" in hub.statuses[cid]["reason"]
+    assert len(os.listdir(env["msgs"])) == 1
+    orig_id = outcome["original_native_message_id"]
+
+    # After 60s lease expiry while headless session is still running in its turn:
+    # Must NOT retract the inbox message or fail with recipient_not_ready!
+    still_waiting = se.reconcile_pending_command(
+        journal_dir=env["journal"], command_id=cid,
+        executable=env["fake"], request=hub.request, now_ms=now_ms + 70000,
+    )
+    assert still_waiting is None
+    assert len(os.listdir(env["msgs"])) == 1
+    assert cid not in hub.acks
+
+    # Simulate controller restart (new APLEXER_SESSION_ID in environment) and
+    # the headless session acknowledging the message at its next turn (status=recipient-acked).
+    env["monkeypatch"].setenv("APLEXER_SESSION_ID", str(uuid.uuid4()))
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "recipient-acked")
+    env["monkeypatch"].setenv("FAKE_DELIVER_RC", "0")
+
+    reconciled = se.reconcile_pending_command(
+        journal_dir=env["journal"], command_id=cid,
+        executable=env["fake"], request=hub.request, now_ms=now_ms + 75000,
+    )
+    assert reconciled is not None
+    assert reconciled["state"] == "acknowledged"
+    assert reconciled["ack"]["submitted"] is True
+    assert hub.acks[cid]["outcome"] == "delivered"
+    proof = hub.acks[cid]["proof"]
+    assert proof["native_message_id"] == orig_id
+    assert proof["reply_to_native_id"] == f"recipient-ack:{orig_id}"
+    assert proof["sender_native_id"] == target.session_id
+
+
+def test_pending_reconcile_names_skips_completed_or_terminal_and_prioritizes_active_claims(env):
+    """Ensure old cmd-00... journals with ack_submitted=True, terminal ack_error, or
+    old expired leases never starve newly claimed commands in _pending_reconcile_names.
+    """
+    for i in range(15):
+        cid = f"00000000-0000-0000-0000-{i:012d}"
+        se._write_journal(os.path.join(env["journal"], f"cmd-{cid}.json"), {
+            "command_id": cid, "state": "uncertain", "ack_submitted": True,
+            "original_native_message_id": f"mid-{i}",
+            "expires_at_ms": 1793000000000 + i,
+        })
+    for i in range(15, 25):
+        cid = f"00000000-0000-0000-0000-{i:012d}"
+        se._write_journal(os.path.join(env["journal"], f"cmd-{cid}.json"), {
+            "command_id": cid, "state": "unknown", "ack_submitted": False,
+            "original_native_message_id": f"mid-{i}",
+            "ack_error": "server_terminal_400", "expires_at_ms": 1793000000000 + i,
+        })
+    for i in range(25, 35):
+        cid = f"00000000-0000-0000-0000-{i:012d}"
+        se._write_journal(os.path.join(env["journal"], f"cmd-{cid}.json"), {
+            "command_id": cid, "state": "unknown", "ack_submitted": False,
+            "original_native_message_id": f"mid-{i}",
+            "expires_at_ms": 1700000000000 + i,
+        })
+
+    fresh_cid = "db717cb7-579b-4587-b5a9-bc9a8b8b583e"
+    se._write_journal(os.path.join(env["journal"], f"cmd-{fresh_cid}.json"), {
+        "command_id": fresh_cid, "state": "unknown", "ack_submitted": False,
+        "original_native_message_id": "mid-fresh",
+        "expires_at_ms": 1793234404000,
+    })
+
+    selected = rc._pending_reconcile_names(env["journal"], limit=5)
+    assert selected[0] == f"cmd-{fresh_cid}.json"
+    for name in selected:
+        data = se._read_journal(os.path.join(env["journal"], name))
+        assert not data.get("ack_submitted")
+        assert not str(data.get("ack_error") or "").startswith("server_terminal_")
+
+
+def test_full_64kib_capture_journals_and_acks_and_recovers_interrupted_capture(env):
+    """Repro a43c581a on session 75e87ded:
+    1. A 65,536-byte capture with newlines and quotes (>70 KiB JSON ack payload)
+       succeeds without hitting JOURNAL_LIMIT (previously 64 KiB) or MAX_REQUEST (32 KiB).
+    2. An interrupted capture journal (attempted=True, state=None) re-executes on retry.
+    """
+    target = seed_target(env, tag="task-hub-9297f679-34ac-4f99-96cd-d180b51bdec3")
+    cap_file = os.path.join(env["base"], "big-capture.txt")
+    big_text = ('step "output"\n' * 4682)[:65536]
+    assert len(big_text) == 65536
+    with open(cap_file, "w") as f:
+        f.write(big_text)
+    env["monkeypatch"].setenv("FAKE_CAPTURE_FILE", cap_file)
+
+    cid = "a43c581a-d9ca-4fb7-9904-8d760a67d00a"
+    claim = make_claim(cid)
+    # Seed an interrupted capture journal (as happened when _write_journal raised ValueError)
+    jpath = os.path.join(env["journal"], f"cmd-{cid}.json")
+    se._write_journal(jpath, {
+        "op": "capture", "command_id": cid, "claim_token": claim["claim_token"],
+        "holder": "hetzner1", "generation": 1, "attempted": True, "state": None,
+    })
+
+    hub = MockHub()
+    cmd = {
+        "op": "capture", "command_id": cid, "generation": 1,
+        "target": {"session_id": target.session_id, "tag": target.tag,
+                   "workspace": target.workspace, "created_at_ms": target.created_at_ms,
+                   "engine": target.engine},
+        "limit_bytes": 65536,
+    }
+    outcome = se.handle_claimed_command(
+        cmd, claim, custody=custody(), journal_dir=env["journal"],
+        executable=env["fake"], request=hub.request,
+    )
+    assert outcome["state"] == "captured"
+    assert outcome["ack"]["submitted"] is True
+    assert len(hub.acks[cid]["capture"]) == 65536
+
+
+
+def test_pending_reconcile_keeps_retryable_ack_errors_pending(env):
+    """401/408/429 ack failures are retryable: they never close a journal."""
+    for i, err in enumerate(["Session HTTP request failed with status 401 (unauthorized)",
+                             "Session HTTP request failed with status 408",
+                             "Session HTTP request failed with status 409 (claim_required)"]):
+        cid = f"00000000-0000-0000-0000-{i:012d}"
+        se._write_journal(os.path.join(env["journal"], f"cmd-{cid}.json"), {
+            "command_id": cid, "state": "unknown", "ack_submitted": False,
+            "original_native_message_id": f"mid-{i}", "ack_error": err,
+            "expires_at_ms": 1793000000000 + i,
+        })
+    selected = rc._pending_reconcile_names(env["journal"], limit=5)
+    assert selected == ["cmd-00000000-0000-0000-0000-000000000001.json",
+                        "cmd-00000000-0000-0000-0000-000000000000.json"]

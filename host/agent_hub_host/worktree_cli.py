@@ -5,10 +5,11 @@ for the owning host agent (docs/INTAKE-WORKTREES.md). This client only talks
 to the Hub user endpoints; it never touches a worktree on disk itself.
 """
 import re
+import sys
 import time
 import uuid
 
-from . import intake
+from . import api, intake
 
 BASE = intake.BASE
 SESSION_UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z')
@@ -60,9 +61,18 @@ def task_path(task_id):
     return BASE + '/tasks/' + intake.safe_id(task_id)
 
 
+def hub_unavailable(exc):
+    """Opaque Hub-side failure or lost response: replaying the same key is safe."""
+    return isinstance(exc, intake.IntakeTransportError) or (
+        isinstance(exc, intake.IntakeHTTPError) and exc.status in api.HUB_UNAVAILABLE_STATUS
+        and exc.code in ('request_failed', 'internal_error'))
+
+
 def mutate(path, payload):
+    def notice(exc, delay):
+        sys.stderr.write(f'Hub unavailable ({str(exc).split(";")[0]}); replaying key {payload["key"]} in {delay}s\n')
     try:
-        return intake.request('POST', path, payload)
+        return api.replay_keyed(lambda: intake.request('POST', path, payload), hub_unavailable, notify=notice)
     except intake.IntakeTransportError as exc:
         raise intake.IntakeTransportError(f'{exc}; Retry key: {payload["key"]}') from None
 

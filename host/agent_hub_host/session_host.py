@@ -57,7 +57,7 @@ def status_step_once(collector) -> None:
 
 def resolve_quse_cmd():
     """quse argv for the quota collector; the Windows service PATH lacks the venv Scripts."""
-    from .provisioning import quse_argv
+    from .quota_snapshot import quse_argv
     argv = quse_argv(dict(os.environ))
     return argv[0] if len(argv) == 1 else argv + ['--json']
 

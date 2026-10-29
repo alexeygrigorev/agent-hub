@@ -1,4 +1,5 @@
 import { worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
+import { openWorkPreventsIdleReap, type IdleReapCache } from './intake-session';
 /** Live host admission and durable per-session usage; token usage joins by native identity. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import defaults from '../config/resource-management.json';
@@ -66,6 +67,13 @@ export function resourceConfig(value: any = {}): ResourceConfig {
 export function memoryVerdict(available: number, ramp: number, estimate: number, config: ResourceConfig) {
   return finite(available) && finite(ramp) && finite(estimate) && available - ramp - estimate >= config.memory_floor_mb;
 }
+// Idle-reap authority reads only request.intake_task_id; skip copying and
+// re-parsing whole retained prompts per session. Invalid JSON passes through
+// unchanged and still parses as an empty request.
+const SLIM_REQUEST = `CASE WHEN json_valid(request_json) THEN json_object('intake_task_id', json_extract(request_json, '$.intake_task_id')) ELSE request_json END`;
+// Matches the session_control_native index expression (src/hub.ts).
+const NATIVE_KEY = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
+  THEN json_extract(binding_json, '$.native_id') END END`;
 export class ResourceManagement {
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
@@ -463,8 +471,68 @@ export class ResourceManagement {
         terminal:Number(TERMINAL.has(session.state)),at:Date.parse(session.finished_at || session.started_at)};
     }).sort((a,b)=>a.terminal-b.terminal || b.at-a.at).map(row=>row.session);
   }
+  /** Authority rows for idle reaping: `id=session_id OR (machine_id, binding
+   * native_id) = (machine, native)`. One projection loads them in bulk instead
+   * of a json_extract table scan per session. A corrupt binding on a host makes
+   * that host's native authority unreadable, which is never reap permission. */
+  private idleAuthority(sessions: any[]) {
+    const byId = new Map<string, any>(), byNative = new Map<string, any[]>(), corrupt = new Set<string>();
+    const add = (row: any) => {
+      if (byId.has(row.id)) return;
+      byId.set(row.id, row);
+      if (row.native_key !== null) {
+        const key = JSON.stringify([row.machine_id, row.native_key]);
+        byNative.set(key, [...(byNative.get(key) ?? []), row]);
+      }
+    };
+    const columns = `id,machine_id,binding_json,${SLIM_REQUEST} AS request_json,${NATIVE_KEY} AS native_key`;
+    const natives = new Map<string, Set<string>>();
+    for (const s of sessions) if (s.machine_id !== null && s.machine_id !== undefined) {
+      const set = natives.get(s.machine_id) ?? new Set<string>();
+      if (typeof s.native_id === 'string') set.add(s.native_id);
+      natives.set(s.machine_id, set);
+    }
+    for (const [machine, set] of natives) {
+      if (this.sql.exec(`SELECT 1 FROM session_control_sessions WHERE machine_id=? AND binding_json IS NOT NULL
+        AND NOT json_valid(binding_json) LIMIT 1`, machine).toArray().length) { corrupt.add(machine); continue; }
+      const list = [...set];
+      for (let i = 0; i < list.length; i += 100) {
+        const chunk = list.slice(i, i + 100);
+        for (const row of this.sql.exec(`SELECT ${columns} FROM session_control_sessions WHERE machine_id=? AND ${NATIVE_KEY} IN (${chunk.map(() => '?').join(',')})`, machine, ...chunk).toArray()) add(row);
+      }
+    }
+    const ids = [...new Set(sessions.map(s => s.session_id).filter(id => id !== null && id !== undefined && !byId.has(id)))];
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      for (const row of this.sql.exec(`SELECT ${columns} FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray()) add(row);
+    }
+    return (session: any): any[] | null => {
+      if (session.machine_id !== null && session.machine_id !== undefined && corrupt.has(session.machine_id)) return null;
+      const rows = new Map<string, any>();
+      const own = byId.get(session.session_id);
+      if (own) rows.set(own.id, own);
+      if (session.machine_id !== null && session.machine_id !== undefined && typeof session.native_id === 'string') {
+        for (const row of byNative.get(JSON.stringify([session.machine_id, session.native_id])) ?? []) rows.set(row.id, row);
+      }
+      return [...rows.values()];
+    };
+  }
+  private idleReapAllowed(session: any, authority?: (session: any) => any[] | null, cache: IdleReapCache = { intakes: new Map() }): boolean {
+    try {
+      const rows = (authority ?? this.idleAuthority([session]))(session);
+      if (rows === null) return false;
+      if (rows.some(row => openWorkPreventsIdleReap(this.sql,row,this.now(),cache))) return false;
+      return rows.length > 0 || !session.intake_id;
+    } catch { return false; } // corrupt/missing authority is never reap permission
+  }
   sessions(machine?: string) {
-    return this.canonicalSessions(machine).slice(0,1000).map(({aliases,...session})=>session);
+    const canonical = this.canonicalSessions(machine).slice(0,1000);
+    let authority: (session: any) => any[] | null;
+    try { authority = this.idleAuthority(canonical); } catch { authority = () => { throw new Error('idle_authority_unavailable'); }; }
+    const cache: IdleReapCache = { intakes: new Map() };
+    return canonical.map(({aliases,...session}) => {
+      return { ...session, idle_reap_allowed: this.idleReapAllowed(session, authority, cache) };
+    });
   }
   private note(session: any, key: string, text: string) {
     if (!session.intake_id) throw new Error('intake_required');
@@ -476,7 +544,7 @@ export class ResourceManagement {
 
   evidence(machine: string, value: any) {
     const session = this.sessions(machine).find(s => s.session_id===value.session_id && s.native_id===value.native_id);
-    if (!session?.managed || session.keep || !session.intake_id) throw new Error('session_not_reapable');
+    if (!session?.managed || session.keep || (value.reason === 'idle' && !session.idle_reap_allowed) || !session.intake_id) throw new Error('session_not_reapable');
     // Worktree-guard (AC2): never reap for idleness while the linked intake
     // is open. Nudge/replace instead; reaping resumes after DONE/archive.
     if ((session as any).linked_intake_open) throw new Error('session_not_reapable');
@@ -536,7 +604,7 @@ export class ResourceManagement {
     for (const reap of value.reaps) {
       const session=sessions.get(reap.session_id);
       const evidence: any = this.sql.exec('SELECT * FROM resource_evidence WHERE id=?',reap.evidence_id ?? '').toArray()[0];
-      if (!session?.managed || session.keep || !evidence || evidence.session_id!==session.session_id || evidence.native_id!==reap.native_id || evidence.reason!==reap.reason || reap.stopped!==true || (reap.freed_mb!==null && !finite(reap.freed_mb))
+      if (!session?.managed || session.keep || (reap.reason === 'idle' && !this.idleReapAllowed(session)) || !evidence || evidence.session_id!==session.session_id || evidence.native_id!==reap.native_id || evidence.reason!==reap.reason || reap.stopped!==true || (reap.freed_mb!==null && !finite(reap.freed_mb))
         || reap.freed_mb>1e9 || Date.parse(reap.at)>this.now()+30000 || Date.parse(reap.at)<Date.parse(evidence.saved_at)-1000
         || typeof reap.id!=='string' || !/^[\w:-]{1,128}$/.test(reap.id) || !Number.isFinite(Date.parse(reap.at))) throw new Error('invalid_reap');
       const prior:any=this.sql.exec('SELECT * FROM resource_reaps WHERE id=?',reap.id).toArray()[0];

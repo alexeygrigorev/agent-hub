@@ -127,3 +127,23 @@ class CaptureLatency(unittest.TestCase):
             self.assertEqual(commands.call_count,2)
         dispatcher.once.assert_called_once()
         self.assertFalse(release.is_set())
+
+    def test_ack_route_accepts_64kib_capture_payload_while_other_routes_keep_32kib_limit(self):
+        big_capture = ('line "quoted"\n' * 4682)[:65536]
+        ack_payload = {
+            'correlation': '00000000-0000-0000-0000-000000000001',
+            'claim_token': 'tok-1234567890abcdef',
+            'native': {'native_id': 's1', 'tag': 't1', 'workspace': '/tmp/w'},
+            'outcome': 'delivered',
+            'capture': big_capture,
+        }
+        with patch.object(sc.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+             patch.object(sc.auth, 'get_access_token', return_value='synthetic'), \
+             patch.object(sc.api, 'safe_http_json', return_value={'state': 'acked'}) as http:
+            res = sc.request('POST', '/api/session-commands/cmd-1/ack', ack_payload)
+            self.assertEqual(res, {'state': 'acked'})
+            req_obj = http.call_args.args[0]
+            self.assertGreater(len(req_obj.data), sc.MAX_REQUEST)
+            self.assertLessEqual(len(req_obj.data), sc.MAX_ACK_REQUEST)
+            with self.assertRaisesRegex(sc.SessionInputError, 'Session request exceeds capacity'):
+                sc.request('POST', '/api/sessions/owned/send', {'body': big_capture})

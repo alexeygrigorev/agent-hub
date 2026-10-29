@@ -68,3 +68,16 @@ For `docker create` and Compose test workflows, attach the same label. Register
 cleanup in a shell `trap` or `try/finally` before creating resources, and remove
 every resource you create before the session exits, including failed starts.
 Never remove another session's resources or Coolify-managed containers.
+
+## Scheduled wakes (Hub sessions waiting on external events)
+
+Waiting on an external event = register a Hub wake; a passive timer without a
+wake is not allowed. The interim "aplexer wake not installed, use a transient
+timer" path is retired for Hub sessions: use
+`hub sessions wake <session> --at <ISO|now> (--prompt TEXT | --body-file F) [--key K]`
+(REST `POST /api/sessions/:id/wake`, MCP `sessions_wake`). The wake is durable,
+links to the session intake, shows as `waiting_until`, suppresses stall/nudge
+until due, then delivers via the verified send path with a 10-minute ack window;
+misses open a needs_attention alert + intake note and hand off to the
+idle-with-open-AC path. Watchers end with `--at now --body-file <summary>` to
+wake their owner with the result.

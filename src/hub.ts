@@ -1,6 +1,9 @@
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
+import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
+import { IntakeTriage } from './intake-triage';
+import { IntakeVerifier } from './intake-verifier';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
 import { RepoRegistry } from './repos';
 import { IntakeService } from './intake';
@@ -118,6 +121,8 @@ export class Hub extends DurableObject {
   public intakeService: IntakeService;
   private workerAccess: WorkerAccess;
   public intakeWatchdog: IntakeWatchdog;
+  public intakeTriage: IntakeTriage;
+  public intakeVerifier: IntakeVerifier;
   public sessionAudit: SessionAuditService;
   public busService: BusService;
   public jobsService: JobsService;
@@ -135,6 +140,8 @@ export class Hub extends DurableObject {
   public hostHistoryService: HostHistoryService;
   public webhookService: WebhookService;
 
+  private idleWork: IdleWorkService;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
@@ -151,7 +158,7 @@ export class Hub extends DurableObject {
     this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn), {
       forgotten: tasks => {
         const items = this.intakeWatchdog.project(tasks).filter(t => t.forgotten);
-        return { items, forgotten_count: items.length, observed_at: Date.now(), watchdog: this.intakeWatchdog.status() };
+        return { items, forgotten_count: items.length, observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };
       },
       startSession: async (input, auth) => {
         const res = await this.sessionControlService.handle(
@@ -193,6 +200,7 @@ export class Hub extends DurableObject {
         const prepared = this.repoRegistry.prepareLaunch(input);
         return prepared.error ? { value: prepared.error, status: 400 } : this.fleetService.reserve(prepared.input, auth);
       },
+      wakeMissed: (intakeId, wakeId) => this.intakeWatchdog.enqueueWakeRecovery(intakeId, wakeId),
     }, { env: this.env,
       // Worktree-guard AC4: live worktree disappearance opens a
       // needs_attention alert and appends the linked-intake note.
@@ -213,6 +221,9 @@ export class Hub extends DurableObject {
       () => this.sessionControlService,
       validSessionSecret(this.env) ? this.env.SESSION_SECRET : null);
     this.webhookService.init();
+    this.idleWork = new IdleWorkService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.sessionControlService, env);
+    this.idleWork.init();
+    this.statusService.setSessionAttention(() => this.sessionControlService.attention());
     this.fleetService.resources.initCatalogCache();
     this.sql.exec(`CREATE INDEX IF NOT EXISTS session_control_native ON session_control_sessions(machine_id,
       CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
@@ -220,12 +231,22 @@ export class Hub extends DurableObject {
     this.sql.exec('CREATE INDEX IF NOT EXISTS lifecycle_decision_latest ON session_lifecycle_decisions(session_key,created_at DESC,decision_id DESC)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS status_observation_latest ON status_observations(hub_session_id,kind,observed_at DESC,received_at DESC)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_fleet_lookup ON session_control_sessions(fleet_launch_id,machine_id)');
+    // Status attention reads only running sessions; avoid scanning retained prompts.
+    this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_state ON session_control_sessions(state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native ON fleet_launches(machine_id,native_id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_created ON session_control_sessions(created_at DESC,id DESC)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_actor_created ON session_control_sessions(actor,created_at DESC,id DESC)');
     this.provisioningService = new ProvisioningService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env, this.fleetService,
       (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller));
     this.provisioningService.init();
+    // Hub-owned credentials (intake 5814e109): a provider rejection opens one
+    // alert per account; the next successful provider read resolves it.
+    const pendingCredentialAlerts: any[] = [];
+    this.provisioningService.setAlertSink((label, problem) => {
+      const opened = this.livenessService.setAlert('engine_credential', label, problem);
+      if (opened) pendingCredentialAlerts.push(opened);
+    });
+    this.flushCredentialAlerts = async () => { for (const a of pendingCredentialAlerts.splice(0)) await this.notifyAlert(a); };
     // M14b slice2 (narrow STATUS composition): observation writes are gated
     // by the live SessionControlService.hostObservationAllowed (existing
     // fresh host family/approval authority, owned by the cleanup worker).
@@ -264,6 +285,37 @@ export class Hub extends DurableObject {
       },
     });
     this.intakeWatchdog.init();
+    // Hourly backlog triage (intake d8d509d2 AC5): one Claude Opus reviewer
+    // session per slice of forgotten intakes, started through the canonical path.
+    this.intakeTriage = new IntakeTriage(this.sql, this.intakeService, this.intakeWatchdog, fn => this.ctx.storage.transactionSync(fn), {
+      start: async input => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
+          { method: 'POST', body: JSON.stringify(input) }),
+          { caller: { isAdmin: true, actor: 'hub:service:intake-triage', kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+    });
+    this.intakeTriage.init();
+    // Post-DONE verifier (intake d8d509d2, t1936u): a separate verification-only
+    // session per DONE claim; pass closes through the ordinary close rules.
+    const verifierAuth = { caller: { isAdmin: true, actor: 'hub:service:intake-verifier', kind: 'human' }, scopes: ['admin'] } as any;
+    this.intakeVerifier = new IntakeVerifier(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
+      start: async input => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
+          { method: 'POST', body: JSON.stringify(input) }), verifierAuth);
+        return { status: r.status, body: await r.json() as any };
+      },
+      write: async (path, payload) => {
+        const r = await this.intakeService.handle(new Request('https://hub.internal/api/intake' + path,
+          { method: 'POST', body: JSON.stringify(payload) }), async () => verifierAuth);
+        return { status: r.status, body: await r.json() as any };
+      },
+      alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('intake_verifier', subject, { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
+      },
+    });
+    this.intakeVerifier.init();
     // Idle-session audit (intake 27d1e27b): scheduled 30-min continue/kill pass
     // with a durable decision dataset. Actions go through the ordinary
     // session-control command path; never a cleanup flag, never a worktree.
@@ -873,7 +925,15 @@ export class Hub extends DurableObject {
       }
       if (path === '/api/sessions' || path.startsWith('/api/sessions/') ||
           path === '/api/session-commands' || path.startsWith('/api/session-commands/')) {
-        return this.sessionControlService.handle(request, await this.sessionControlAuth(request));
+        const result = await this.sessionControlService.handle(request, await this.sessionControlAuth(request));
+        if (request.method === 'POST' && /\/wakes?$/.test(path) && result.ok) {
+          // Commit the durable wake before arming the existing alarm. Never postpone
+          // an earlier alarm owned by another Hub service.
+          const current = await this.ctx.storage.getAlarm();
+          const next = this.sessionControlService.nextWakeTime();
+          if (next !== null && (current === null || next < current)) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, next));
+        }
+        return result;
       }
       // Inbound webhooks (intake 19ec91c2). Admin management surfaces live
       // under /api/webhooks with the same operator/cookie authority as
@@ -2008,8 +2068,18 @@ export class Hub extends DurableObject {
   protected extraCheckDeps(): Partial<ActionDeps> { return {}; }
 
   /** Cron and manual entry point for scheduled checks. */
+  private flushCredentialAlerts: () => Promise<void> = async () => {};
+
+  /** Central refresh + direct provider quota for Hub-held engine credentials. */
+  async maintainCredentials() {
+    try { return await this.provisioningService.maintainCredentials(); }
+    catch { console.warn('credential_maintenance_failed'); return []; }
+    finally { await this.flushCredentialAlerts().catch(() => console.warn('credential_alert_failed')); }
+  }
+
   async runChecks(only?: string) {
     this.runTbmTick();
+    if (!only) await this.maintainCredentials();
     for (const alert of new BankedResets(this.sql, this.livenessService).run()) await this.notifyAlert(alert);
     this.livenessService.prune();
     const results = await this.checksService.runDue({
@@ -2091,17 +2161,31 @@ export class Hub extends DurableObject {
       return { status: 'refused', reason: 'future_slot_refused', slot: slotDate.toISOString() };
     }
 
+    await this.idleWork.tick();
+    // The verifier registers fresh DONE claims first, so the watchdog never alerts
+    // a person about a completion the verifier owns (AC8).
+    let intakeVerifier: any;
+    try { intakeVerifier = await this.intakeVerifier.tick(source); }
+    catch (e: any) { intakeVerifier = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     const intakeWatchdog = await this.intakeWatchdog.tick(source);
     // The audit must never break the scheduler slot for the jobs/watchdog;
     // failures surface in the tick result and the next run retries.
     let sessionAudit: any;
     try { sessionAudit = await this.sessionAudit.tick(source); }
     catch (e: any) { sessionAudit = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
+    let intakeTriage: any;
+    try { intakeTriage = await this.intakeTriage.tick(source); }
+    catch (e: any) { intakeTriage = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     const slotStartIso = slotDate.toISOString();
     const tickResult = this.jobsService.tickRootSlot(slotStartIso);
 
     // 3. Process alarms & expiry
     const nextAlarm = this.jobsService.processAlarms();
+    try {
+      this.ctx.storage.transactionSync(() => {
+        try { (this.sessionControlService as any).processDueWakes?.(); } catch {}
+      });
+    } catch {}
 
     // 4. Schedule next alarm with bounded free usage guard
     if (cleanup.hasMore) {
@@ -2115,7 +2199,7 @@ export class Hub extends DurableObject {
       }
     }
 
-    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit };
+    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit, intake_triage: intakeTriage, intake_verifier: intakeVerifier };
   }
 
   async sampleHostHistory() {
@@ -2144,6 +2228,9 @@ export class Hub extends DurableObject {
       expireMessageEvents(this.sql, now.getTime());
     });
     this.runTbmTick(now.getTime());
+    // Reuse the existing minute alarm so configured idle delays do not wait
+    // for a root slot. Durable episode/command keys fence duplicate delivery.
+    try { await this.idleWork.tick(); } catch { console.warn('idle_work_tick_failed'); }
     try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
     let nextAlarm = this.jobsService.processAlarms();
@@ -2157,6 +2244,11 @@ export class Hub extends DurableObject {
         nextAlarm = current === undefined ? webhookNext : Math.min(current, webhookNext);
       }
     } catch { console.warn('webhook_delivery_pump_failed'); }
+    try {
+      this.ctx.storage.transactionSync(() => {
+        try { (this.sessionControlService as any).processDueWakes?.(); } catch {}
+      });
+    } catch {}
 
     if (cleanup.hasMore) {
       await this.ctx.storage.setAlarm(Date.now() + 1000);

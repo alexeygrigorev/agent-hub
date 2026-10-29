@@ -19,6 +19,12 @@ class TestSessionControlCli(unittest.TestCase):
     def parse(self, *args):
         return parser().parse_args(['sessions', *args])
 
+    def test_manual_intake_link_uses_canonical_route(self):
+        with patch.object(session_control, 'request', return_value={'intake_id': 'task-fixture'}) as transport:
+            result = session_control.execute(self.parse('link', 'owned-worker', '--intake-task-id', 'task-fixture', '--key', 'link-once'))
+        self.assertEqual(result['intake_id'], 'task-fixture')
+        transport.assert_called_once_with('POST', '/api/sessions/owned-worker/link', {'key': 'link-once', 'intake_task_id': 'task-fixture'})
+
     def test_wait_stops_at_failed_send_instead_of_waiting_until_timeout(self):
         failed = {'id': 'cmd', 'state': 'failed',
                   'ack': {'reason': 'send_unsupported_headless'}}
@@ -632,6 +638,25 @@ class TestSessionControlCli(unittest.TestCase):
                 patch('sys.stderr', new_callable=io.StringIO) as fake_err:
             session_control.execute(args)
             self.assertIn('Warning: target session has no recent reported state', fake_err.getvalue())
+
+    def test_send_notes_headless_next_turn_delivery(self):
+        import io
+        args = self.parse('send', 's1', '--prompt', 'cancel the booking', '--key', 'k-next')
+        with patch.object(session_control, 'request', return_value={'command_id': 'c1', 'state': 'recorded', 'delivery': 'next_turn'}), \
+                patch('sys.stderr', new_callable=io.StringIO) as fake_err:
+            session_control.execute(args)
+            self.assertIn('queued in its inbox for its next turn', fake_err.getvalue())
+
+    def test_send_rejected_at_send_time_for_headless_exec_fails_with_hint(self):
+        args = self.parse('send', 's1', '--prompt', 'cancel the booking', '--key', 'k-exec')
+        refused = session_control.SessionHTTPError(
+            409, code='send_unsupported_headless',
+            message='send_unsupported_headless: headless codex sessions accept no input')
+        with patch.object(session_control, 'request', side_effect=refused):
+            with self.assertRaises(ValueError) as caught:
+                session_control.execute(args)
+        self.assertIn('send_unsupported_headless', str(caught.exception))
+        self.assertIn('accept no input', session_control.diagnostic(caught.exception))
 
     def test_send_require_ready_passes_flag(self):
         args = self.parse('send', 's1', '--prompt', 'hello', '--require-ready', '--key', 'k-ready')

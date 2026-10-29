@@ -846,6 +846,14 @@ def codex_plan():
     return None
 
 
+def _is_quota_cli(argv):
+    """True for the retired host-side quota CLI (any path to quse / quse.exe / -m quse.cli)."""
+    if not isinstance(argv, list) or not argv:
+        return False
+    name = re.split(r"[\\/]", str(argv[0]))[-1].lower()
+    return name in ("quse", "quse.exe") or any(str(a) in ("quse", "quse.cli") for a in argv[1:3])
+
+
 def collect_subscriptions(settings, runner=run_json):
     """Probe default accounts once per service. Alternate accounts require explicit wrappers."""
     subscriptions = settings["subscriptions"]
@@ -855,9 +863,10 @@ def collect_subscriptions(settings, runner=run_json):
         service = sub["service"]
         raw = {}
         profile = sub.get("profile")
-        # quse itself uses existing native authentication. We never open credential files.
-        command = sub.get("quota_argv") or (["quse", service, "--json"] if counts[service] == 1 and sub.get("profile") is None else None)
-        if command:
+        # Quota is Hub's (intake 5814e109 I4): the host runs no quota CLI. An
+        # explicitly configured non-quse adapter argv is still honoured.
+        command = sub.get("quota_argv")
+        if command and not _is_quota_cli(command):
             try:
                 raw = runner(command)
             except Exception:
@@ -946,6 +955,35 @@ def _ms_to_iso(value):
         return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).isoformat().replace("+00:00", "Z")
     except (OverflowError, OSError, ValueError):
         return None
+
+
+CATALOG_LIMIT = 500  # Hub PUT /api/fleet/sessions refuses larger catalogs
+
+
+def bounded_catalog(raw, limit=CATALOG_LIMIT):
+    """Keep the native census within the Hub's row limit, live rows first.
+
+    Intake c206f556: aplexer retains every dead session record, so a busy host
+    passes 500 rows and Hub rejects the whole census (400 invalid_sessions).
+    Bindings, exits and progress then stop for every session on the host.
+    Running natives come first, then other non-terminal rows, then terminal
+    records; each tier newest first. Dropped rows are long-dead history Hub
+    already holds; a missing row is never exit proof on the Hub side.
+    """
+    rows = raw if isinstance(raw, list) else (raw or {}).get('sessions', [])
+    rows = [row for row in rows if isinstance(row, dict)]
+    if len(rows) <= limit:
+        return rows
+
+    def rank(row):
+        phase = row.get('state') or row.get('phase')
+        tier = (0 if phase in ('running', 'starting') and row.get('worker_alive') is not False
+                else 2 if phase in ('exited', 'dead', 'pruned', 'forgotten', 'failed', 'stopped') else 1)
+        recency = max((v for v in (row.get('last_activity_ms'), row.get('updated_at_ms'), row.get('created_at_ms'))
+                       if type(v) is int), default=0)
+        return tier, -recency
+
+    return sorted(rows, key=rank)[:limit]
 
 
 def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
@@ -1924,7 +1962,12 @@ class Dispatcher:
         if not guard.protect_bound_worktree("git", str(target_path),
                                            offer.get("hub_session_id"),
                                            offer.get("intake_task_id")):
-            raise ValueError("worktree_lock_failed: checkout could not be protected")
+            if not guard.reuse_stopped_intake_lock("git", str(target_path), offer.get("hub_session_id"),
+                                                  offer.get("intake_task_id"), self.request):
+                if not guard.protect_successor_worktree(
+                        self.request, "git", str(target_path),
+                        offer.get("hub_session_id"), offer.get("intake_task_id")):
+                    raise ValueError("worktree_lock_failed: checkout could not be protected")
         return True
 
     def _maybe_cleanup_worktree(self, workspace: Path, native_id: Optional[str] = None):
@@ -2830,12 +2873,24 @@ class Dispatcher:
         # Intake 488b860e: the key spans this host attempt (reused across
         # cycles while the claim stays unconfirmed). A timeout retries with
         # the same key, so a late-landing claim replays instead of doubling.
+        # Protection failures are definitive pre-start refusals, not an
+        # uncertain native launch holding a dispatch reservation forever.
+        self._lock_session_worktree(offer, target_cwd)
         claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
         self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, offer_workspace)
         from .launch_diagnostics import capture_log_offsets
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()
         try:
+            if mode == "headless":
+                # Explicit workspaces and fail-open launches skip the planned
+                # worktree path above, so its make_tmp never runs. ZCode and
+                # other engines write their first prompt file directly under
+                # TMPDIR: prepare the exact directory the launcher exports.
+                # A refusal surfaces as launcher_tmpdir_unavailable via the
+                # handler below; no native effect has occurred yet.
+                from .launch_workspace import prepare_tmpdir
+                prepare_tmpdir(workspace)
             if offer.get('worker_credential_required') is True:
                 from .worker_auth import provision
                 try:
@@ -2874,7 +2929,6 @@ class Dispatcher:
                 if mode == 'headless':
                     fence['task_id'] = task_id
                 self._persist_launch_record(fence)
-            self._lock_session_worktree(offer, target_cwd)
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")
@@ -3313,8 +3367,9 @@ class Dispatcher:
                         if record.get('containment_empty') is not row.get('containment_empty'):
                             record['containment_empty'] = row.get('containment_empty')
                             persist_observation(self, record)
-        progress = self._session_progress.sample(rows, active_launches)
-        enriched = session_metadata(raw, self.settings, progress)
+        catalog = bounded_catalog(rows)
+        progress = self._session_progress.sample(catalog, active_launches)
+        enriched = session_metadata(catalog, self.settings, progress)
         with self._catalog_report_lock:
             # Enrichment is never authoritative for identity or lifecycle.
             # Replace, rather than grow, the cache on every complete sample.
@@ -3346,7 +3401,7 @@ class Dispatcher:
         started = time.monotonic()
         raw = self.runner([self.settings.get('aplexer_bin', 'aplexer'), 'list', '--all', '--json'])
         census_done = time.monotonic()
-        metadata = session_metadata(raw, self.settings, collect_tokens=False)
+        metadata = session_metadata(bounded_catalog(raw), self.settings, collect_tokens=False)
         for row in metadata:
             row.update(self._catalog_enrichment.get(self._catalog_identity(row), {}))
         metadata_done = time.monotonic()
@@ -3676,10 +3731,20 @@ class Dispatcher:
                 allowed |= admitted
                 if admitted:
                     admitted_engines.add(sub.get('engine', sub['service']))
+                elif gate.get('reason') in ('credential_rejected', 'credential_invalid'):
+                    # Hub's own credential verdict for this account (any engine).
+                    for mode in caps['fleet_modes']:
+                        caps['fleet_route_rejections'].append({
+                            'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
+                            'profile': sub.get('profile'), 'mode': mode,
+                            'reason': 'credential_rejected', 'observed_at': utcnow()})
                 elif sub.get('service') == 'codex':
                     reason = gate.get('reason', '')
+                    # Only a Hub quota verdict is a refusal; anything else
+                    # (Hub unreachable, local profile repair) carries no
+                    # credential verdict and stays fail-open server-side.
                     if not re.fullmatch(r'codex_quota_gate_[a-z0-9_]{1,64}', reason):
-                        reason = 'codex_quota_gate_quota_unavailable'
+                        reason = 'codex_quota_gate_quota_check_failed'
                     for mode in caps['fleet_modes']:
                         caps['fleet_route_rejections'].append({
                             'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],

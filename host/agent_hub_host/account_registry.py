@@ -11,7 +11,8 @@ renders host files from that catalog and checks them for drift:
 - the `# BEGIN HUB MANAGED ENGINES` block of the aplexer config (hub-*
   profiles for managed-bundle accounts, rendered through provisioning so the
   format always matches what bundle installation writes),
-- Hub fleet_routes for this machine, and live `quse` quota probes.
+- Hub fleet_routes for this machine, and Hub's own quota reading per account
+  (Hub reads quota from the providers; this host runs no quota CLI).
 
 Only stdlib is used. All rendering is atomic (temp file + os.replace via
 private_fs.atomic_write). Nothing here deletes operator data: unknown
@@ -73,10 +74,11 @@ def policy_accounts(policy=None):
             path = credential.get("path")
             if not isinstance(path, str) or not path.startswith("~/") or "\0" in path:
                 raise ValueError("Account %s needs a credential home path" % account)
+        # Legacy catalog field: quota is read by Hub (intake 5814e109), never
+        # by a host-side probe. Accepted for compatibility, never executed.
         probe = entry.get("quota_probe")
-        if (not isinstance(probe, list) or not probe or probe[0] != "quse"
-                or any(not isinstance(x, str) or not x or "\0" in x for x in probe)):
-            raise ValueError("Account %s needs a `quota_probe` argv list starting with quse" % account)
+        if probe is not None and (not isinstance(probe, list) or any(not isinstance(x, str) or not x or "\0" in x for x in probe)):
+            raise ValueError("Account %s has an invalid legacy `quota_probe`" % account)
         if set(entry) - {"account", "harness", "provider", "aplexer_profile", "credential", "quota_probe"}:
             raise ValueError("Account %s has unknown catalog fields" % account)
     return accounts
@@ -256,21 +258,14 @@ def resolve_machine(machines, hostname=None, explicit=None):
     return None
 
 
-def run_probe(argv, timeout=60):
-    """Run one quota probe. Returns (ok, detail) without leaking output."""
-    try:
-        completed = subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError:
-        return False, "quse binary not found"
-    except subprocess.TimeoutExpired:
-        return False, "probe timed out"
-    except OSError as exc:
-        return False, "probe failed: " + type(exc).__name__
-    if completed.returncode != 0:
-        tail = (completed.stderr or completed.stdout or "").strip().splitlines()
-        detail = tail[-1][:160] if tail else "exit %d" % completed.returncode
-        return False, "exit %d: %s" % (completed.returncode, detail)
-    return True, "ok"
+def hub_quota_states(pools):
+    """Map Hub's /api/quota pools to {account: (ok, detail)}; fresh means Hub read it."""
+    states = {}
+    for pool in pools or []:
+        if isinstance(pool, dict) and isinstance(pool.get("account"), str):
+            state = pool.get("state")
+            states[pool["account"]] = (state == "fresh", "hub quota %s" % state)
+    return states
 
 
 def expand_home(path, home=None):
@@ -306,13 +301,14 @@ def doctor_command(settings_path=None, aplexer_path=None, fleet_snapshot_path=No
               if isinstance(r, dict) and (r.get("machine_id") == machine_id)]
     probe_results = None
     if not skip_quse:
-        run = runner or (lambda argv: run_probe(argv, timeout=probe_timeout))
-        probe_results = {}
-        for account in accounts:
-            try:
-                probe_results[account["account"]] = run(list(account["quota_probe"]))
-            except Exception as exc:
-                probe_results[account["account"]] = (False, "probe error: " + type(exc).__name__)
+        # Hub owns quota (intake 5814e109): read its per-account state instead of probing here.
+        if runner is not None:
+            quota = runner()
+        else:
+            from . import session_control
+            quota = session_control.request("GET", "/api/quota")
+        states = hub_quota_states(quota.get("pools") if isinstance(quota, dict) else None)
+        probe_results = {a["account"]: states.get(a["account"], (False, "no Hub quota reading")) for a in accounts}
     if aplexer_text is None:
         aplexer_problems = ["aplexer: config file is missing: %s" % aplexer_file]
         problems_text = None
@@ -399,5 +395,5 @@ def check_drift(accounts, subscriptions, aplexer_text, routes, probe_results=Non
         if probe_results is not None and account["account"] in probe_results:
             ok, detail = probe_results[account["account"]]
             if not ok:
-                problems.append("quse: %s probe failed: %s" % (account["account"], detail))
+                problems.append("quota: %s %s" % (account["account"], detail))
     return problems

@@ -14,6 +14,22 @@ class TestConfig(unittest.TestCase):
         self.patcher = patch("agent_hub_host.config.get_config_path")
         self.mock_get_path = self.patcher.start()
         self.mock_get_path.return_value = Path(self.tmpdir.name) / "host.json"
+        # Worker-profile guard (incident edb71968): save_config/load_config
+        # prefer the worker profile resolved from APLEXER_TAG/
+        # APLEXER_WORKSPACE (or HUB_WORKER_CONFIG_FILE), bypassing the
+        # patched get_config_path. Without this pin, a suite run from an
+        # aplexer session shell writes fixtures into that session's real
+        # hub-worker-auth file and destroys its credential (same failure
+        # as test_machine_binding before its pin).
+        self.worker_path = patch("agent_hub_host.worker_auth.config_path", return_value=None)
+        self.worker_path.start()
+        self.addCleanup(self.worker_path.stop)
+        # Intake 6b624e65 AC3: human-first load_config() must never resolve the
+        # real (or canary) cli.json in tests; pin it to the same temp dir.
+        human_patcher = patch("agent_hub_host.config.get_human_config_path")
+        self.addCleanup(human_patcher.stop)
+        human_patcher.start().return_value = Path(self.tmpdir.name) / "config" / "cli.json"
+
 
     def tearDown(self):
         self.patcher.stop()

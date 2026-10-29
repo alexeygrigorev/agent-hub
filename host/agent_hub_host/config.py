@@ -4,14 +4,14 @@ import copy
 import os
 import sys
 from pathlib import Path
-from . import private_fs
+from . import _test_isolation, private_fs
 
 def get_config_path() -> Path:
     explicit = os.environ.get('HUB_CONFIG_FILE')
     if explicit:
         path = Path(explicit).expanduser()
         if not path.is_absolute(): raise ValueError('HUB_CONFIG_FILE must be absolute')
-        return path
+        return _forbid_real_user_profile(path)
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if not appdata:
@@ -19,7 +19,7 @@ def get_config_path() -> Path:
         base = Path(appdata)
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "agent-hub" / "host.json"
+    return _forbid_real_user_profile(base / "agent-hub" / "host.json")
 
 
 # Baked default hub base URL for fresh human installs (overridable via
@@ -38,7 +38,7 @@ def get_human_config_path() -> Path:
     if explicit:
         path = Path(explicit).expanduser()
         if not path.is_absolute(): raise ValueError('HUB_CONFIG_FILE must be absolute')
-        return path
+        return _forbid_real_user_profile(path)
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if not appdata:
@@ -46,7 +46,7 @@ def get_human_config_path() -> Path:
         base = Path(appdata)
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "agent-hub" / "cli.json"
+    return _forbid_real_user_profile(base / "agent-hub" / "cli.json")
 
 
 def get_host_config_path() -> Path:
@@ -192,6 +192,49 @@ class ConfigPermissionError(PermissionError):
     """Safe diagnostic; never includes profile contents or arbitrary OS text."""
 
 
+# Test hard guard (intake 6b624e65 AC2). host/tests hermetic isolation records
+# where the real user profiles lived before the suite forced a temporary HOME;
+# The bootstrap retains those roots in-process too: clearing or replacing
+# os.environ in a test must not expose the original credential store.
+TEST_GUARD_HOME_ENV = "HUB_TEST_GUARD_HOME"
+TEST_GUARD_USER_HOME_ENV = "HUB_TEST_GUARD_USER_HOME"
+TEST_GUARD_XDG_ENV = "HUB_TEST_GUARD_XDG_CONFIG_HOME"
+TEST_GUARD_APPDATA_ENV = "HUB_TEST_GUARD_APPDATA"
+
+
+def _test_guard_roots():
+    roots = []
+    for environment in (_test_isolation.guard_environment(), os.environ):
+        guarded_home = environment.get(TEST_GUARD_HOME_ENV)
+        if guarded_home:
+            roots.append(Path(guarded_home) / ".config" / "agent-hub")
+        user_home = environment.get(TEST_GUARD_USER_HOME_ENV)
+        if user_home:
+            roots.append(Path(user_home) / ".config" / "agent-hub")
+        guarded_xdg = environment.get(TEST_GUARD_XDG_ENV)
+        if guarded_xdg:
+            roots.append(Path(guarded_xdg) / "agent-hub")
+        guarded_appdata = environment.get(TEST_GUARD_APPDATA_ENV)
+        if guarded_appdata:
+            roots.append(Path(guarded_appdata) / "agent-hub")
+    return roots
+
+
+def _forbid_real_user_profile(path: Path) -> Path:
+    if not (os.environ.get(TEST_GUARD_HOME_ENV)
+            or _test_isolation.guard_environment().get(TEST_GUARD_HOME_ENV)):
+        return path
+    resolved = Path(path).resolve()
+    for root in _test_guard_roots():
+        root = root.resolve()
+        if resolved == root or root in resolved.parents:
+            raise ConfigPermissionError(
+                'Hub test guard: refused to touch the real user profile during tests. '
+                'Host tests are hermetic (host/tests scrub HOME/XDG before agent_hub_host '
+                'is imported); use the isolated home or an explicit temporary path.')
+    return path
+
+
 def _has_symlink(path: Path) -> bool:
     is_junction = getattr(os.path, 'isjunction', lambda _: False)
     try:
@@ -209,6 +252,7 @@ def _has_symlink(path: Path) -> bool:
 
 
 def _load_from(path: Path) -> dict:
+    _forbid_real_user_profile(path)
     if _has_symlink(path):
         raise ConfigPermissionError(
             'Unsafe Hub profile permissions. On POSIX, the profile directory must be owned '
@@ -240,9 +284,13 @@ def _load_from(path: Path) -> dict:
         return {}
 
 
-def _save_to(path: Path, data: dict):
+def _save_to(path: Path, data: dict, *, human_flow: bool = False):
+    _forbid_real_user_profile(path)
     if not isinstance(data, dict):
         raise ValueError("Config data must be a dict")
+    if is_human_config(_load_from(path)) and not (human_flow and is_human_config(data)):
+        raise ConfigPermissionError(
+            'Refusing to replace the human profile outside the human authentication flow.')
     cleaned = {}
     for k, v in data.items():
         if k == "refresh_token" and v is None:
@@ -275,11 +323,19 @@ def load_human_config() -> dict:
 
 
 def save_human_config(data: dict):
-    _save_to(get_human_config_path(), data)
+    """Write the human profile, refusing hostile replacements (AC2).
+
+    A valid human profile (client_kind human with a token) is never replaced
+    by an empty token, a tokenless profile, or a host/agent credential from a
+    different flow. Human logins and refreshes keep client_kind "human", so
+    they pass; `hub auth logout` removes the file via clear_human_config().
+    """
+    path = get_human_config_path()
+    _save_to(path, data, human_flow=True)
 
 
 def clear_human_config():
-    path = get_human_config_path()
+    path = _forbid_real_user_profile(get_human_config_path())
     host_path = get_host_config_path()
     # In single-file override mode both paths coincide: removing it would
     # destroy the host profile too. Human logout in that mode only clears
@@ -337,7 +393,12 @@ def update_config(**kwargs):
     # Host-only (hub login / machine binding). Never reads the human
     # profile: a human login must not change host pairing, and host
     # registration must not mix human tokens into host.json.
-    cfg = load_host_config() if not os.environ.get('HUB_CONFIG_FILE') else load_config()
+    # AC2: resolve exactly ONE profile path up front (host.json, or the
+    # HUB_CONFIG_FILE single-file override) and read and write only that
+    # path - never the human cli.json and never a per-launch worker
+    # profile discovered after the read.
+    path = get_host_config_path()
+    cfg = _load_from(path)
     updates = dict(kwargs)
     if "refresh_token" in updates and updates["refresh_token"] is None:
         updates.pop("refresh_token", None)
@@ -351,10 +412,10 @@ def update_config(**kwargs):
             raise ValueError("Conflicting machine_id for paired host config")
 
     cfg.update(updates)
-    save_config(cfg)
+    _save_to(path, cfg)
 
 def clear_config():
-    path = get_config_path()
+    path = _forbid_real_user_profile(get_config_path())
     if path.exists():
         path.unlink()
 

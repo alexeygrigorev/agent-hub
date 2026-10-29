@@ -70,11 +70,20 @@ describe('quota probe failure placement (b3749cbb)', () => {
       expect(new QuotaStore(sql, undefined, undefined, () => now).getFleetView({host_id:null,provider:null,engine:null,account:null}, now).body.pools.find((p: any) => p.account === 'shared-codex').state).toBe('exhausted');
     });
   });
-  it.each(['quota_unavailable', 'quota_check_failed', 'stale_window_evidence'])('does not hold healthy routes for %s', async reason => {
-    await fixture([{ ...refusal, reason: 'codex_quota_gate_' + reason }], service => {
+  // A probe that crashed carries no verdict about the credential: fail open.
+  it('does not hold healthy routes for quota_check_failed', async () => {
+    await fixture([{ ...refusal, reason: 'codex_quota_gate_quota_check_failed' }], service => {
       const plan = service.plan({ workspace: 'demo', mode: 'interactive', engine: 'codex', prompt: 'test' });
       expect(plan.selected).toBeTruthy();
       expect(plan.candidates?.some((r: any) => r.account === 'shared-codex')).toBe(true);
+    });
+  });
+  // Intake 5814e109 I5: a host that rejected this exact route is never offered it.
+  it.each(['quota_unavailable', 'stale_window_evidence'])('holds a route the host rejected with %s', async reason => {
+    await fixture([{ ...refusal, reason: 'codex_quota_gate_' + reason }], service => {
+      const plan = service.plan({ workspace: 'demo', mode: 'interactive', engine: 'codex', prompt: 'test' });
+      expect(plan.candidates?.some((r: any) => r.account === 'shared-codex')).toBe(false);
+      expect(plan.rejected).toContainEqual(expect.objectContaining({ reason: 'codex_quota_gate_' + reason }));
     });
   });
   it('allows an unknown account with a warning and an unknown balance', async () => {

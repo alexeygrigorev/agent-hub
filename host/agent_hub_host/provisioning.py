@@ -554,8 +554,12 @@ def provision_managed_home(bundle=None, home=None, dest=None):
                 pass
 
     # 2. Bundle files (credentials, etc.)
+    from . import credentials
+    hub_owned = set(credentials.managed_paths(bundle))
     if isinstance(bundle, dict) and isinstance(bundle.get('files'), dict):
         for relative, value in bundle['files'].items():
+            if relative in hub_owned:
+                continue
             target = home / relative
             # Same-revision sync/execute must not restore the original refresh
             # token over a rotated live token. A central import gets a new
@@ -628,8 +632,11 @@ def lock():
 def validate(bundle):
     if not isinstance(bundle, dict) or not LABEL.fullmatch(bundle.get('label', '')) or not REV.fullmatch(bundle.get('revision', '')) or bundle.get('provider') not in PACKAGES:
         raise ValueError('Invalid managed bundle')
-    if bundle['provider'] == 'gemini' and (bundle.get('auth_method') != 'machine-login' or any(re.search('oauth|credential|token', k, re.I) for k in bundle.get('files', {})) or bundle.get('env')):
-        raise ValueError('Gemini uses native per-machine login')
+    if bundle['provider'] == 'gemini' and (bundle.get('env') or (
+            any(re.search('oauth|credential|token', k, re.I) for k in bundle.get('files', {}))
+            if bundle.get('auth_method') == 'machine-login' else
+            bundle.get('auth_method') is not None or not isinstance(bundle.get('files', {}).get('.gemini/oauth_creds.json'), str))):
+        raise ValueError('Gemini needs machine login or a Hub-held OAuth credential')
     if bundle['provider'] == 'go' and (bundle.get('files') or bundle.get('env')):
         raise ValueError('OpenCode uses native device login; credential bundles are unsupported')
     if not isinstance(bundle.get('version'), str) or not re.fullmatch(r'\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?', bundle['version']):
@@ -939,13 +946,21 @@ def engine_argv(bundle, dest, is_windows=None):
     return [str(executable)]
 
 
-def install(bundle):
+def install(bundle, request=None):
+    from . import credentials
     validate(bundle)
     dest = root() / (bundle['label'] + '-' + bundle['revision'])
     home = dest / 'home'
     receipt = read_json(dest / 'bundle.json')
-    if receipt == bundle:
+    # A new Hub credential generation is not a new install: only the
+    # immutable snapshot (engine, version, config) triggers reinstallation.
+    paths = bundle.get('credential_paths') or []
+    if receipt is not None and credentials.install_snapshot(receipt, paths) == credentials.install_snapshot(bundle, paths):
         provision_managed_home(bundle, home, dest)
+        credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+        credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
+        if receipt != bundle:
+            write_json(dest / 'bundle.json', bundle)
         return
     pkg, binary, _ = PACKAGES[bundle['provider']]
     # Credentials are delivered only after package installation; installers never see them.
@@ -1047,6 +1062,8 @@ def install(bundle):
         except (subprocess.SubprocessError, OSError):
             raise ValueError('Native engine verification failed') from None
     provision_managed_home(bundle, home, dest)
+    credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+    credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
     write_json(dest / 'bundle.json', bundle)
 
 
@@ -1120,7 +1137,7 @@ def sync(request=None):
         last_error = None
         for b in bundles:
             try:
-                install(b)
+                install(b, request)
                 installed_bundles.append(b)
             except Exception as e:
                 failed_bundles.append(b)
@@ -1230,16 +1247,6 @@ def managed_subscriptions():
             'admission_argv': module_command('admission', b['label']),
         }
         sub.update(meta)
-        try:
-            # Single source of truth (intake 7fd96369): the canonical catalog
-            # owns the quota probe for every account. Fail soft: a missing or
-            # invalid catalog must never break managed subscription assembly.
-            from .account_registry import policy_accounts
-            for account in policy_accounts():
-                if account["account"] == b["label"]:
-                    sub["quota_argv"] = list(account["quota_probe"])
-        except Exception:
-            pass
         subs.append(sub)
     return subs
 
@@ -1320,8 +1327,14 @@ def probe_native_claude_quota(bundle, dest, model=None):
 
 
 def quotas():
-    """For the dedicated server collector: dynamic isolated accounts, sanitized only."""
+    """For the dedicated server collector: dynamic isolated accounts, sanitized only.
+
+    Reads each provider directly with the Hub-materialized credential; no
+    quota CLI is invoked (intake 5814e109 I4). Hub itself also reads these
+    accounts centrally; this is the backend fallback path.
+    """
     from .fleet import quota_metadata
+    from . import credentials
     accounts = []
     with lock():
         state = read_json(root() / 'state.json', [])
@@ -1334,156 +1347,56 @@ def quotas():
                 if b.get('provider') == 'gemini':
                     from . import native_google_quota
                     raw = native_google_quota.probe(b, dest)
-                elif b.get('provider') == 'claude':
+                elif b.get('provider') == 'claude' and not credentials.managed_paths(b):
                     from . import native_claude_quota
                     raw = native_claude_quota.probe(b, dest)
                 else:
-                    with tempfile.TemporaryFile(dir=root()) as output:
-                        quota_env = engine_environment(b, dest / 'home', dest)
-                        result = subprocess.run(quse_argv(quota_env) + [b['provider'], '--json'], env=quota_env,
-                            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL, timeout=30)
-                        if result.returncode == 0 and output.tell() <= 131072:
-                            output.seek(0)
-                            raw = json.load(output)
+                    raw = credentials.probe_quota(b['provider'], dest / 'home')
+                    raw.pop('unauthorized', None)
             except Exception:
                 pass
+            if not raw:
+                # No direct reading: report nothing rather than an error row
+                # that would mask Hub's own fresh observation.
+                continue
             accounts.append({'account': entry['label'], 'provider': entry['provider'], 'quota': quota_metadata(raw, entry['provider'])})
     return {'accounts': accounts}
 
 
-def quse_argv(env):
-    """Resolve the quse quota probe for a subprocess running with ``env``.
-
-    subprocess resolves a bare name only on the child's PATH. A Windows host
-    service runs the venv interpreter without an activated venv, so quse
-    (a host package dependency) lives in the interpreter's Scripts directory
-    and is not on PATH; a missing probe used to surface as
-    codex_quota_gate_quota_check_failed on every Codex route. Prefer quse on
-    the child PATH, then next to the running interpreter, then the installed
-    module; fall back to the bare name so absence still fails closed.
-    """
-    found = shutil.which('quse', path=env.get('PATH') if isinstance(env, dict) else None)
-    if found:
-        return [found]
-    found = shutil.which('quse', path=str(Path(sys.executable).parent))
-    if found:
-        return [found]
-    import importlib.util
-    try:
-        if importlib.util.find_spec('quse.cli') is not None:
-            return [sys.executable, '-m', 'quse.cli']
-    except (ImportError, ValueError):
-        pass
-    return ['quse']
+# Hub admission reasons that must refuse a launch on this host.
+HUB_REFUSALS = {'credential_invalid', 'credential_rejected', 'quota_exhausted'}
 
 
-def check_codex_quota_gate(env):
-    """Probe failures warn; positive quota exhaustion still refuses execution."""
-    allowed, reason = _probe_codex_quota_gate(env)
-    if not allowed and reason in ('quota_unavailable', 'quota_check_failed', 'stale_window_evidence'):
-        return True, 'quota_probe_warning:' + reason
-    return allowed, reason
+def hub_launch_gate(label, request=None):
+    """Hub decides from its own quota and credential state; the host runs no probe.
 
-
-def _probe_codex_quota_gate(env):
-    """Enforce the configured weekly quota reserve for OpenAI Codex before execution.
-
-    The reserve comes from config/model-routing.json rules.reserve_percent
-    (codex ships 0 since intake c269353c, so the gate blocks only at 0%
-    remaining); missing or malformed configuration fails closed. Fails closed
-    with machine-safe reason codes; never leaks raw stdout/stderr.
+    Returns (allowed, reason). Hub unreachable fails open with a warning: the
+    offer that started this launch already passed Hub admission.
     """
     try:
-        from .model_contract import reserve_percent
-        try:
-            reserve = reserve_percent('codex')
-        except Exception:
-            return False, 'quota_config_invalid'
-        # UTF-8 both ways: the Windows default code page would otherwise make
-        # quse's or our decoding raise on non-ASCII account metadata.
-        env = dict(env, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
-        proc = subprocess.run(quse_argv(env) + ['codex', '--json'], env=env, capture_output=True,
-                              text=True, encoding='utf-8', errors='replace', timeout=30)
-        if proc.returncode != 0 and not proc.stdout:
-            return False, 'quota_unavailable'
-        text = proc.stdout.lstrip()
-        idx = text.find('{')
-        if idx == -1:
-            return False, 'quota_unavailable'
-        data = json.loads(text[idx:])
-        codex_data = data.get('codex')
-        if not isinstance(codex_data, dict):
-            return False, 'quota_unavailable'
-        details = codex_data.get('details')
-        if isinstance(details, dict) and details.get('limit_reached') is True:
-            return False, 'codex_reserve_required'
-        # Preserve positive exhaustion even when status or a sibling window
-        # is unknown. Probe failure cannot erase a known exhausted window.
-        windows = codex_data.get('windows')
-        for win in windows.values() if isinstance(windows, dict) else ():
-            if not isinstance(win, dict) or win.get('present') is False:
-                continue
-            perc = win.get('percent_remaining')
-            if (isinstance(perc, (int, float)) and not isinstance(perc, bool)
-                    and math.isfinite(perc) and 0 <= perc <= reserve):
-                return False, 'codex_reserve_required'
-        if codex_data.get('status') != 'ok':
-            return False, 'quota_unavailable'
-        details = codex_data.get('details')
-        if not isinstance(details, dict) or details.get('limit_reached') is not False:
-            return False, 'quota_unavailable'
-        windows = codex_data.get('windows')
-        if not isinstance(windows, dict):
-            return False, 'quota_unavailable'
-
-        now = dt.datetime.now(dt.timezone.utc)
-        min_remaining = None
-        has_weekly = False
-
-        for win_name, win in windows.items():
-            if not isinstance(win, dict) or win.get('present') is False:
-                continue
-            if (win_name in ('5h', 'monthly')
-                    and win.get('percent_remaining') is None
-                    and win.get('reset_at') is None):
-                continue  # not applicable window for this plan
-
-            if win_name in ('7d', 'weekly'):
-                has_weekly = True
-
-            perc = win.get('percent_remaining')
-            if perc is None or isinstance(perc, bool) or not isinstance(perc, (int, float)) or not math.isfinite(perc):
-                return False, 'quota_unavailable'
-            reset_at = win.get('reset_at')
-            if not isinstance(reset_at, str):
-                return False, 'quota_unavailable'
-            try:
-                reset_text = reset_at[:-1] + '+00:00' if reset_at.endswith('Z') else reset_at
-                reset_dt = dt.datetime.fromisoformat(reset_text)
-                if reset_dt.tzinfo is None:
-                    return False, 'quota_unavailable'
-                if reset_dt <= now:
-                    return False, 'stale_window_evidence'
-            except Exception:
-                return False, 'quota_unavailable'
-
-            val = float(perc)
-            if min_remaining is None or val < min_remaining:
-                min_remaining = val
-
-        if not has_weekly or min_remaining is None:
-            return False, 'quota_unavailable'
-        if min_remaining <= reserve:
-            return False, 'codex_reserve_required'
-        return True, 'ok'
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        # No quse anywhere, or the probe did not finish in time: quota
-        # evidence is unavailable, not a failed check. A slow Windows cold
-        # start (antivirus scan, first run of the venv probe) must not
-        # resurface quota_check_failed for every Codex route.
-        return False, 'quota_unavailable'
+        result = (request or host_request)('POST', '/api/engines/admission', {'label': label})
     except Exception:
-        return False, 'quota_check_failed'
+        return True, 'quota_probe_warning:hub_unreachable'
+    reason = result.get('reason') if isinstance(result, dict) else None
+    if isinstance(result, dict) and result.get('launch_allowed') is False and reason in HUB_REFUSALS:
+        return False, reason
+    if isinstance(result, dict) and result.get('quota_warning'):
+        return True, 'quota_probe_warning:' + str(result['quota_warning'])[:64]
+    return True, 'ok'
+
+
+def refresh_launch_credential(label, b, home, dest, request=None):
+    """I3: materialize Hub's current credential generation right before exec."""
+    from . import credentials
+    if not credentials.managed_paths(b):
+        return None
+    request = request or host_request
+    try:
+        current = credentials.fetch_current(label, request)
+        return credentials.reconcile(label, b, home, dest, request, hub_files=current['files'], hub_generation=current['generation'])
+    except Exception:
+        # Hub unreachable: launch with the copy materialized at the last sync.
+        return {'status': 'hub_unreachable'}
 
 
 def execute():
@@ -1500,6 +1413,7 @@ def execute():
         validate(b)
         home = dest / 'home'
         provision_managed_home(b, home, dest)
+        refresh_launch_credential(label, b, home, dest)
         cwd = str(Path(os.getcwd()).resolve())
         p = Path(cwd)
         git_root = str(p)
@@ -1566,12 +1480,13 @@ def execute():
             from .codex_interactive import isolated_argv
             argv = command + isolated_argv(b['provider'], b['args'] + bypass_flags + extra_argv)
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
-        if b['provider'] == 'codex' and not is_diagnostic:
-            allowed, reason = check_codex_quota_gate(env)
+        if not is_diagnostic:
+            allowed, reason = hub_launch_gate(label)
             if allowed and reason != 'ok':
-                print(json.dumps({'provider': 'codex', 'quota_warning': reason}), file=sys.stderr)
+                print(json.dumps({'provider': b['provider'], 'quota_warning': reason}), file=sys.stderr)
             if not allowed:
-                print(json.dumps({'provider': 'codex', 'launch_allowed': False, 'reason': reason}), file=sys.stderr)
+                gate = 'codex_quota_gate_codex_reserve_required' if reason == 'quota_exhausted' and b['provider'] == 'codex' else reason
+                print(json.dumps({'provider': b['provider'], 'launch_allowed': False, 'reason': gate}), file=sys.stderr)
                 sys.exit(75)
         for var in ('HUB_CONFIG_FILE', 'HUB_TOKEN', 'HUB_JOB_TOKEN', 'AGENT_HUB_MANAGED_DIR'):
             env.pop(var, None)
@@ -1676,31 +1591,11 @@ def admission():
                 result['launch_allowed'] = False
                 result['reason'] = 'model_mismatch'
 
-    # Host-side Codex quota gate (intake 59a6f44a): the managed bundle's
-    # refresh token can go stale independently of ~/.codex. Server-side
-    # accountStatus may still read fresh until the next server probe, so
-    # admission must refuse here with a specific slug. Canonical root is
-    # provisioning.root() (default ~/.config/agent-hub/managed-engines);
-    # both interactive dispatch and launcher headless use this root.
-    if bundle is not None and isinstance(bundle, dict) and bundle.get('provider') == 'codex':
-        try:
-            with lock():
-                state = read_json(root() / 'state.json', [])
-                record = next((b for b in state if b.get('label') == label), None)
-                if record is not None:
-                    dest = root() / (label + '-' + record['revision'])
-                    home = dest / 'home'
-                    env = engine_environment(bundle, home, dest)
-                    allowed, gate_reason = check_codex_quota_gate(env)
-                    if allowed and gate_reason != 'ok':
-                        result['quota_warning'] = gate_reason
-                    if not allowed:
-                        slug = str(gate_reason or 'quota_unavailable')
-                        slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in slug)[:64] or 'quota_unavailable'
-                        result['launch_allowed'] = False
-                        result['reason'] = 'codex_quota_gate_' + slug
-        except Exception:
-            result['quota_warning'] = 'quota_probe_warning:quota_check_failed'
+    # Quota and credential admission is Hub's (intake 5814e109 I4): the
+    # result above already carries Hub's verdict; the host runs no probe.
+    # Map Hub's quota refusal onto the long-standing Codex gate slug.
+    if result.get('reason') == 'quota_exhausted' and isinstance(bundle, dict) and bundle.get('provider') == 'codex':
+        result['reason'] = 'codex_quota_gate_codex_reserve_required'
 
     print(json.dumps(result))
 
@@ -1722,11 +1617,40 @@ def add_commands(sub):
     remove = commands.add_parser('remove')
     remove.add_argument('label')
     commands.add_parser('sync', help='Reconcile this enrolled machine now')
+    login = commands.add_parser('login', help='Hub-central provider login: Hub owns the token; no host ever logs in')
+    login.add_argument('--provider', choices=['claude'], required=True)
+    login.add_argument('--label', required=True)
+    login.add_argument('--version', help='Exact engine version for a new account (default: tested version)')
+    login.add_argument('--adopt', action='store_true', help='Attach to an existing unmanaged quota pool with this label')
+    commands.add_parser('maintain', help='Operator: run central refresh + direct provider quota now')
+
+
+def central_login(args, prompt=None):
+    """Start a Hub-owned login, show the provider URL, submit the pasted code.
+
+    The code is read without echo and sent only to Hub; nothing is printed back.
+    """
+    import getpass
+    if not LABEL.fullmatch(args.label):
+        raise ValueError('Invalid managed label')
+    body = {'provider': args.provider, 'label': args.label}
+    if args.version:
+        body['version'] = args.version
+    if args.adopt:
+        body['adopt'] = True
+    started = bus._do_request('POST', '/api/engines/credential-logins', body)
+    print('Open this URL, approve, then paste the code shown:\n' + started['url'], file=sys.stderr)
+    code = (prompt or getpass.getpass)('Code: ').strip()
+    return bus._do_request('POST', '/api/engines/credential-logins/' + started['id'], {'code': code})
 
 
 def command(args):
     if args.engines_cmd == 'quota':
         return quotas()
+    if args.engines_cmd == 'login':
+        return central_login(args)
+    if args.engines_cmd == 'maintain':
+        return bus._do_request('POST', '/api/engines/maintain', {})
     if args.engines_cmd == 'sync':
         return sync()
     if args.engines_cmd == 'list':
@@ -1752,9 +1676,11 @@ def command(args):
                 raise ValueError('OpenCode uses host-local device login; do not import API keys or credential files')
             files = {}
         elif args.provider == 'gemini':
-            if args.auth_file or getattr(args, 'token_file', None):
-                raise ValueError('Gemini credentials stay local; request native login in Hub')
-            files = {}
+            if getattr(args, 'token_file', None):
+                raise ValueError('Gemini imports its private OAuth cache with --auth-file')
+            # Hub-held Gemini account (intake 5814e109): the OAuth cache is
+            # stored centrally; without it, hosts use native machine login.
+            files = {auth_path: private_fs.read_bytes(Path(args.auth_file).expanduser().absolute(), 16000).decode()} if args.auth_file else {}
         elif args.provider == 'claude':
             if not getattr(args, 'token_file', None) or args.auth_file:
                 raise ValueError('Claude managed subscription import requires a private setup-token file')
@@ -1824,7 +1750,7 @@ def command(args):
         raise ValueError('Invalid managed bundle')
     if bundle.get('provider') == 'go' and (bundle.get('files') or bundle.get('env')):
         raise ValueError('OpenCode uses host-local device login; credential bundles are unsupported')
-    if not args.file and args.provider in ('gemini', 'go'):
+    if not args.file and (args.provider == 'go' or (args.provider == 'gemini' and not args.auth_file)):
         bundle['auth_method'] = 'machine-login'
     return bus._do_request('PUT', '/api/engines/' + bundle['label'], bundle)
 

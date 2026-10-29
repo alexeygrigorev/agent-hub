@@ -203,10 +203,46 @@ def activity_ms(session):
     return session.get('last_activity_ms')
 
 
+CGROUP_ROOT = '/sys/fs/cgroup/'
+BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
+
+
+def kernel_containment_empty(session, *, cgroup_root=CGROUP_ROOT, boot_id_path=BOOT_ID_PATH):
+    """Kernel receipt for a row whose native worker died (intake c206f556).
+
+    A dead worker can never refresh ``containment_empty``; its last value
+    stays False forever and Hub keeps the row running. Only the exact
+    same-boot workload scope reporting ``populated 0`` (or removed by systemd
+    on this boot) is accepted. A live worker's own report stays authoritative.
+    """
+    import os
+    if session.get('worker_alive') is not False:
+        return False
+    path, identity = session.get('containment_cgroup'), session.get('containment_cgroup_identity')
+    if (not isinstance(path, str) or not path.startswith(cgroup_root) or '/../' in path or path.endswith('/..')
+            or not os.path.basename(path).startswith('aplexer-workload-') or not isinstance(identity, dict)):
+        return False
+    try:
+        with open(boot_id_path, encoding='ascii') as handle:
+            boot = handle.read().strip()
+    except OSError:
+        return False
+    if not boot or identity.get('boot_id') != boot:
+        return False
+    try:
+        with open(os.path.join(path, 'cgroup.events'), encoding='ascii') as handle:
+            return 'populated 0' in handle.read().splitlines()
+    except FileNotFoundError:
+        # systemd garbage-collects an empty transient scope on this boot.
+        return not os.path.exists(path)
+    except OSError:
+        return False
+
+
 def confirmed_empty(session):
     """Only a native containment receipt plus absent recorded processes proves exit."""
     import os
-    if session.get('containment_empty') is not True:
+    if session.get('containment_empty') is not True and not kernel_containment_empty(session):
         return False
     pids = [session.get('workload_pid'), session.get('worker_pid')]
     if not any(type(pid) is int and pid > 0 for pid in pids):

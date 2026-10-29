@@ -308,6 +308,7 @@ def run_native(
     args: list[str],
     timeout: float = QUICK_TIMEOUT,
     cwd: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
 ) -> subprocess.CompletedProcess:
     """Run one native CLI call: argv only (no shell), bounded output, no secrets in errors."""
     if not isinstance(executable, str) or not executable:
@@ -319,7 +320,7 @@ def run_native(
     if "--pane" in args or "--no-ack" in args or "--enter" in args:
         raise SessionControlError("--pane/--no-ack/--enter transports are forbidden")
     from .aplexer_client import client_call
-    native = client_call(executable, args)
+    native = client_call(executable, args, env=env)
     if native is not None:
         return _bound_native_response(native, args)
     try:
@@ -332,6 +333,7 @@ def run_native(
             timeout=timeout,
             check=False,
             cwd=cwd,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise SessionUncertain(
@@ -609,6 +611,9 @@ def deliver_recorded(
     executable: str,
     target: NativeTarget,
     envelope_id: str,
+    *,
+    sender_session_id: Optional[str] = None,
+    live_only: bool = True,
 ) -> DeliveryResult:
     """Submit one existing inbox envelope via the native deliver guard.
 
@@ -622,15 +627,21 @@ def deliver_recorded(
     target = target.validated()
     if not isinstance(envelope_id, str) or not envelope_id or len(envelope_id) > 128:
         raise SessionControlError("Envelope id is required for deliver")
-    observed = qualify_target(executable, target)
+    observed = qualify_target(executable, target, live_only=live_only)
     # Reconciliation of an older inbox must obey the same headless input
     # refusal as a new Hub command, before invoking native delivery.
     if observed.headless_exec:
         raise SessionControlError("send_unsupported_headless")
+    call_env: Optional[dict[str, str]] = None
+    if (isinstance(sender_session_id, str) and sender_session_id
+            and os.environ.get("APLEXER_SESSION_ID")
+            and os.environ.get("APLEXER_SESSION_ID") != sender_session_id):
+        call_env = {**os.environ, "APLEXER_SESSION_ID": sender_session_id}
     proc = run_native(
         executable,
         ["message", "deliver", "--workspace", target.workspace, "--json", envelope_id],
         timeout=NATIVE_TIMEOUT,
+        env=call_env,
     )
     outcome: Optional[dict[str, Any]] = None
     if proc.stdout.strip():

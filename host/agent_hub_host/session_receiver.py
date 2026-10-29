@@ -458,6 +458,15 @@ def receive_once(
             "reconciled": reconciled, "relayed": relayed}
 
 
+def _is_terminal_ack_error(err: Any) -> bool:
+    # Only definitive server verdicts close a journal; 401/408/429 and
+    # transport errors stay pending for the next cycle.
+    s = str(err or "")
+    return s.startswith("server_terminal_") or any(
+        s.startswith("Session HTTP request failed with status %d" % code)
+        for code in (400, 404, 409))
+
+
 def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
     """Fair pending scan: completed/terminal journals never consume the cap.
 
@@ -466,10 +475,9 @@ def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
     containment oracle (read-only SAME-claim reconcile, never a second kill),
     or an unsubmitted proven ack for a completed effect (ack_payload present,
     not submitted, no terminal server verdict). Everything else — submitted,
-    terminal, or malformed — is skipped but retained. Names sort for
-    determinism; the cap applies to pending journals only, so 20 completed
-    files can never starve a pending one, and multiple pages/cycles converge
-    without busy retry.
+    terminal, or malformed — is skipped but retained. Active/recent claims sort
+    ahead of older expired journals (tie-broken by name for determinism) so
+    historical journals can never starve a fresh pending command.
     """
     import json as _json
 
@@ -479,7 +487,7 @@ def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
             if name.startswith("cmd-") and name.endswith(".json"))
     except OSError:
         return []
-    pending: list[str] = []
+    candidates: list[tuple[int, str]] = []
     for name in names:
         path = os.path.join(journal_dir, name)
         try:
@@ -489,18 +497,18 @@ def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
             continue  # corrupt journal: fail closed, surface via manual reconcile
         if not isinstance(record, dict):
             continue
+        ack_err = record.get("ack_error")
+        if record.get("ack_submitted") or _is_terminal_ack_error(ack_err):
+            continue
+        expires = record.get("expires_at_ms")
+        sort_ts = -expires if type(expires) is int else 0
         if record.get("state") in ("unknown", "uncertain") and record.get("original_native_message_id"):
-            pending.append(name)
+            candidates.append((sort_ts, name))
         elif (record.get("op") == "stop" and record.get("state") == "uncertain"
                 and isinstance(record.get("stop_oracle"), dict)
-                and record["stop_oracle"].get("session_id")
-                and not record.get("ack_submitted")
-                and not str(record.get("ack_error") or "").startswith("server_terminal_")):
-            pending.append(name)
-        elif (isinstance(record.get("ack_payload"), dict)
-                and not record.get("ack_submitted")
-                and not str(record.get("ack_error") or "").startswith("server_terminal_")):
-            pending.append(name)
-        if len(pending) >= limit:
-            break
-    return pending
+                and record["stop_oracle"].get("session_id")):
+            candidates.append((sort_ts, name))
+        elif isinstance(record.get("ack_payload"), dict):
+            candidates.append((sort_ts, name))
+    candidates.sort()
+    return [name for _, name in candidates[:limit]]

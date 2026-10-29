@@ -131,7 +131,7 @@ def test_credentials_go_to_child_only_not_native_profile_or_argv():
     with patch.object(p.subprocess, 'run', side_effect=installer):
         p.sync(lambda *a: {'engines': [b]})
     with patch.object(p.sys, 'argv', ['wrapper', 'test-account', '--version']), \
-         patch.object(p, 'check_codex_quota_gate', return_value=(True, 'ok')), \
+         patch.object(p, 'hub_launch_gate', return_value=(True, 'ok')), \
          patch.object(p.os, 'execve') as execute:
         p.execute()
     executable, argv, env = execute.call_args.args
@@ -167,9 +167,12 @@ def test_native_auth_import_is_one_command_and_does_not_echo_secret(tmp_path):
 def test_managed_quota_unknown_on_probe_failure_without_stale_success():
     with patch.object(p.subprocess, 'run', side_effect=installer):
         p.sync(lambda *a: {'engines': [bundle()]})
-    with patch.object(p.subprocess, 'run', side_effect=OSError('private-provider-error')):
+    # Direct provider read fails (intake 5814e109: no quse): no row is reported,
+    # so the collector never masks Hub's own fresh observation with an error.
+    from agent_hub_host import credentials
+    with patch.object(credentials.urllib.request.OpenerDirector, 'open', side_effect=OSError('private-provider-error')):
         result = p.quotas()
-    assert result['accounts'][0]['quota']['status'] == 'unknown'
+    assert result == {'accounts': []}
     assert 'private-provider-error' not in json.dumps(result)
     assert 'synthetic-private-marker' not in json.dumps(result)
 
@@ -202,12 +205,18 @@ def test_claude_uses_native_claude_quota():
     assert result['accounts'][0]['quota']['windows']['7d']['percent_remaining'] == 90.0
 
 
-def test_gemini_uses_native_machine_login_and_rejects_cache_copy():
+def test_gemini_machine_login_or_hub_held_oauth_credential():
     b = {**bundle(), 'provider': 'gemini', 'auth_method': 'machine-login', 'files': {}, 'env': {}}
     p.validate(b)
+    # A machine-login bundle never carries a credential cache...
     b['files']['.gemini/oauth_creds.json'] = 'must stay local'
-    with pytest.raises(ValueError, match='native per-machine login'):
+    with pytest.raises(ValueError, match='machine login or a Hub-held'):
         p.validate(b)
+    # ...while a Hub-held Gemini account (intake 5814e109 I1) must carry one.
+    hub_held = {**bundle(), 'provider': 'gemini', 'files': {'.gemini/oauth_creds.json': '{}'}, 'env': {}}
+    p.validate(hub_held)
+    with pytest.raises(ValueError):
+        p.validate({**hub_held, 'files': {}})
 
 
 def test_google_login_url_validation():
@@ -531,7 +540,7 @@ def test_admission_payload_matching(tmp_path, monkeypatch):
     monkeypatch.setattr(p, 'host_request', lambda m, p, pl: {'launch_allowed': True, 'profile_supported': True})
     # Intake 59a6f44a: host-side Codex gate is authoritative; synthetic test
     # bundles have no real quota, so approve the gate explicitly here.
-    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda label, request=None: (True, 'ok'))
 
     # Prepare bundle on disk
     dest = m_dir / f"{b['label']}-{b['revision']}"
@@ -605,10 +614,10 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, 'execve', fake_execve)
 
-    def fake_quse_reject(env):
-        return False, 'codex_reserve_required'
+    def fake_hub_reject(label, request=None):
+        return False, 'quota_exhausted'
 
-    monkeypatch.setattr(p, 'check_codex_quota_gate', fake_quse_reject)
+    monkeypatch.setattr(p, 'hub_launch_gate', fake_hub_reject)
     monkeypatch.setattr(sys, 'argv', ['execute', 'codex-acc', 'run', 'prompt'])
 
     with pytest.raises(SystemExit) as exc:
@@ -619,11 +628,11 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
 
     # Case 2: Diagnostic --version bypasses quota gate
     gate_called = []
-    def fake_gate_tracker(env):
+    def fake_gate_tracker(label, request=None):
         gate_called.append(True)
-        return False, 'should_not_be_called'
+        return False, 'quota_exhausted'
 
-    monkeypatch.setattr(p, 'check_codex_quota_gate', fake_gate_tracker)
+    monkeypatch.setattr(p, 'hub_launch_gate', fake_gate_tracker)
     monkeypatch.setattr(sys, 'argv', ['execute', 'codex-acc', '--version'])
 
     p.execute()
@@ -642,10 +651,10 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
     assert not calls_execve
 
     # Case 3: Guard approves invocation (remaining above the configured reserve)
-    def fake_quse_approve(env):
+    def fake_hub_approve(label, request=None):
         return True, 'ok'
 
-    monkeypatch.setattr(p, 'check_codex_quota_gate', fake_quse_approve)
+    monkeypatch.setattr(p, 'hub_launch_gate', fake_hub_approve)
     monkeypatch.setattr(sys, 'argv', ['execute', 'codex-acc', 'exec', 'task-prompt'])
 
     p.execute()
@@ -664,231 +673,6 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['execute', 'unknown-acc'])
     with pytest.raises(ValueError, match='Managed profile removed'):
         p.execute()
-
-
-def test_check_codex_quota_gate_contract(monkeypatch):
-    """Direct contract verification of check_codex_quota_gate.
-
-    The weekly reserve comes from config/model-routing.json
-    rules.reserve_percent (codex ships 0 since intake c269353c); each case
-    sets it explicitly to prove the gate honours configuration instead of a
-    hardcoded floor.
-
-    1. Real private quse snapshot shape:
-       - 7d present with valid reading & future reset
-       - 5h and monthly both reading+reset null (not applicable)
-       -> passes gate
-    2. Remaining <= configured reserve -> rejected with codex_reserve_required
-       (at reserve 0 only 0% is blocked; 9% remaining is admitted)
-    3. limit_reached True or missing -> rejected with quota_unavailable
-    4. Missing required 7d/weekly window -> rejected with quota_unavailable
-    5. Non-finite or NaN reading -> rejected with quota_unavailable
-    6. Stale reset_at in the past -> rejected with stale_window_evidence
-    7. Missing/malformed reserve configuration -> fails closed quota_unavailable
-    """
-    import agent_hub_host.model_contract as mc
-
-    def mock_proc(stdout_obj, rc=0):
-        class Proc:
-            returncode = rc
-            stdout = json.dumps(stdout_obj) if isinstance(stdout_obj, (dict, list)) else str(stdout_obj)
-        return Proc()
-
-    configured = {'codex': 0.0}
-    monkeypatch.setattr(mc, 'reserve_percent', lambda service: configured[service])
-
-    now = datetime.now(timezone.utc)
-    future_reset = (now + timedelta(days=7)).isoformat()
-    stale_reset = (now - timedelta(days=1)).isoformat()
-
-    env = {'HOME': '/tmp'}
-
-    # 1. Real quse shape: 7d valid, 5h and monthly null (not applicable)
-    quse_real = {
-        'codex': {
-            'status': 'ok',
-            'details': {'limit_reached': False},
-            'windows': {
-                '5h': {'percent_remaining': None, 'reset_at': None},
-                '7d': {'percent_remaining': 82.5, 'reset_at': future_reset},
-                'monthly': {'percent_remaining': None, 'reset_at': None},
-            }
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_real))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is True
-    assert reason == 'ok'
-
-    # 2a. Configured reserve honoured: 9% remaining with reserve 0 is admitted
-    # (intake c269353c AC2), and 0% remaining is blocked.
-    quse_9 = {
-        'codex': {
-            'status': 'ok',
-            'details': {'limit_reached': False},
-            'windows': {
-                '5h': {'percent_remaining': None, 'reset_at': None},
-                '7d': {'percent_remaining': 9.0, 'reset_at': future_reset},
-                'monthly': {'percent_remaining': None, 'reset_at': None},
-            }
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_9))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is True
-    assert reason == 'ok'
-
-    quse_zero = {
-        'codex': {
-            'status': 'ok',
-            'details': {'limit_reached': False},
-            'windows': {
-                '5h': {'percent_remaining': None, 'reset_at': None},
-                '7d': {'percent_remaining': 0.0, 'reset_at': future_reset},
-                'monthly': {'percent_remaining': None, 'reset_at': None},
-            }
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_zero))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is False
-    assert reason == 'codex_reserve_required'
-
-    # 2b. Remaining at or below a non-zero configured reserve is blocked.
-    configured['codex'] = 15.0
-    quse_low = {
-        'codex': {
-            'status': 'ok',
-            'details': {'limit_reached': False},
-            'windows': {
-                '5h': {'percent_remaining': None, 'reset_at': None},
-                '7d': {'percent_remaining': 15.0, 'reset_at': future_reset},
-            }
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_low))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is False
-    assert reason == 'codex_reserve_required'
-
-    # 2c. Malformed reserve configuration fails closed.
-    def broken_reserve(service):
-        raise ValueError('reserve_percent_invalid')
-    configured['codex'] = 0.0
-    monkeypatch.setattr(mc, 'reserve_percent', broken_reserve)
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_real))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is False
-    assert reason == 'quota_config_invalid'
-    monkeypatch.setattr(mc, 'reserve_percent', lambda service: configured[service])
-
-    # 3. limit_reached True
-    quse_limited = {
-        'codex': {
-            'status': 'ok',
-            'details': {'limit_reached': True},
-            'windows': {
-                '7d': {'percent_remaining': 80.0, 'reset_at': future_reset},
-            }
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_limited))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is False
-    assert reason == 'codex_reserve_required'
-
-    # 4. Missing required 7d/weekly window
-    quse_no_weekly = {
-        'codex': {
-            'status': 'ok',
-            'details': {'limit_reached': False},
-            'windows': {
-                '5h': {'percent_remaining': 90.0, 'reset_at': future_reset},
-            }
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_no_weekly))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is False
-    assert reason == 'quota_unavailable'
-
-    # 5. Non-finite / NaN
-    quse_nan = {
-        'codex': {
-            'status': 'ok',
-            'details': {'limit_reached': False},
-            'windows': {
-                '7d': {'percent_remaining': float('nan'), 'reset_at': future_reset},
-            }
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_nan))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is False
-    assert reason == 'quota_unavailable'
-
-    # 6. Stale reset_at in the past
-    quse_stale = {
-        'codex': {
-            'status': 'ok',
-            'details': {'limit_reached': False},
-            'windows': {
-                '7d': {'percent_remaining': 80.0, 'reset_at': stale_reset},
-            }
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_stale))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is False
-    assert reason == 'stale_window_evidence'
-
-
-def test_check_codex_quota_gate_401_error_shape_refuses_with_quota_unavailable(monkeypatch):
-    """Wrong-account-key regression (intake f6709905): the real managed 401
-    payload (status error, all windows null) must refuse closed with the
-    machine-safe quota_unavailable slug, while a fresh 7d window passes."""
-    def mock_proc(stdout_obj, rc=0):
-        class Proc:
-            returncode = rc
-            stdout = json.dumps(stdout_obj) if isinstance(stdout_obj, (dict, list)) else str(stdout_obj)
-        return Proc()
-
-    env = {'HOME': '/tmp'}
-    now = datetime.now(timezone.utc)
-    future_reset = (now + timedelta(days=7)).isoformat()
-
-    quse_401 = {
-        'codex': {
-            'status': 'error',
-            'error': 'HTTP Error 401: Unauthorized',
-            'details': {'limit_reached': False},
-            'windows': {
-                '5h': {'percent_remaining': None, 'reset_at': None},
-                '7d': {'percent_remaining': None, 'reset_at': None},
-                'monthly': {'percent_remaining': None, 'reset_at': None},
-            },
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_401))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is False
-    assert reason == 'quota_unavailable'
-
-    quse_fresh = {
-        'codex': {
-            'status': 'ok',
-            'details': {'limit_reached': False},
-            'windows': {
-                '5h': {'percent_remaining': None, 'reset_at': None},
-                '7d': {'percent_remaining': 54.0, 'reset_at': future_reset},
-                'monthly': {'percent_remaining': None, 'reset_at': None},
-            },
-        }
-    }
-    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_fresh))
-    allowed, reason = p._probe_codex_quota_gate(env)
-    assert allowed is True
-    assert reason == 'ok'
 
 
 def test_gemini_launcher_metadata_defaults_to_native_gemini_2_5_pro():
@@ -1248,7 +1032,7 @@ def test_execute_bypasses_permissions_for_goal_and_interactive(tmp_path, monkeyp
 
     calls = []
     monkeypatch.setattr(p.os, 'execve', lambda cmd, argv, env: calls.append((cmd, argv, env)))
-    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda label, request=None: (True, 'ok'))
 
     # Case 1: --with-goal execution appends --dangerously-bypass-approvals-and-sandbox
     monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', '/goal Fix the flaky binding'])
@@ -1302,7 +1086,7 @@ def test_managed_headless_capture_releases_provisioning_lock_and_keeps_scrubbed_
     monkeypatch.setenv('APLEXER_WORKSPACE', str(tmp_path))
     monkeypatch.setenv('HUB_TOKEN', 'operator-synthetic-token')
     monkeypatch.setenv('HUB_CONFIG_FILE', '/operator/config.json')
-    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda label, request=None: (True, 'ok'))
     # A real child must acquire this same lock immediately. Keeping the parent
     # lock throughout capture would block all other managed launches.
     code = ('import os,fcntl; '
@@ -1401,7 +1185,7 @@ def test_admission_self_heals_missing_aplexer_profile_from_installed_state(tmp_p
         'account_label': 'shared-codex',
         'observed_at': datetime.now(timezone.utc).isoformat(),
     })
-    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda label, request=None: (True, 'ok'))
     monkeypatch.setattr(sys, 'argv', ['admission', 'shared-codex'])
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
     p.admission()

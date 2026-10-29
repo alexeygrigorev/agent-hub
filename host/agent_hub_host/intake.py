@@ -214,6 +214,8 @@ def add_commands(sub):
                         help='Acceptance criteria text (max 8 KiB); required non-empty before assign/start')
     create.add_argument('--acceptance-criteria-file', default=None,
                         help='Read acceptance criteria from a UTF-8 file, or - for stdin (max 8 KiB)')
+    create.add_argument('--verification', choices=['required', 'skip', 'auto'], default=None,
+                        help='Post-DONE verifier policy (default auto: Hub decides from the change)')
     create.add_argument('--key', required=True)
     listing = commands.add_parser('list', help='List one page, or all matching tasks with --all')
     listing.add_argument('--status', default=None)
@@ -243,6 +245,7 @@ def add_commands(sub):
     update.add_argument('--clear', action='append', choices=['current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'], default=[], help='Explicitly clear a context field to unknown (repeatable)')
     for field in ('project', 'status', 'title', 'current-state', 'next-step', 'owner', 'uncertainty', 'acceptance-criteria'):
         update.add_argument('--' + field)
+    update.add_argument('--verification', choices=['required', 'skip', 'auto'], help='Post-DONE verifier policy')
     update.add_argument('--reason', help='Reason for close, cancellation or reopen')
     update.add_argument('--superseded-by', help='Replacement intake id; required for cancel unless dropped by Alexey')
     update.add_argument('--force', action='store_true', help='Override the worktree close gate when closing; requires --reason')
@@ -251,7 +254,9 @@ def add_commands(sub):
     close.add_argument('--version', type=int, help='Explicit CAS version; otherwise fetch and retry version conflicts up to three times')
     close.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     close.add_argument('--force', action='store_true', help='Override the worktree close gate; requires --reason')
-    close.add_argument('--reason', help='Close reason; required with --force')
+    close.add_argument('--reason', help='Close reason; required with --force or --outcome')
+    close.add_argument('--outcome', choices=['closed_unverified'],
+                       help='Operator only: close without DONE evidence, recorded as closed_unverified with --reason (never counted as verified)')
     event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
     event.add_argument('id')
     event.add_argument('--version', type=int, required=True)
@@ -416,6 +421,8 @@ def execute(args):
                        'reference': args.source_reference, 'timestamp': args.source_time}}
         if criteria is not None:
             body['acceptance_criteria'] = criteria
+        if getattr(args, 'verification', None) is not None:
+            body['verification'] = args.verification
         return request('POST', BASE + '/tasks', body)
     if command == 'list':
         params = {'limit': args.limit}
@@ -502,13 +509,18 @@ def execute(args):
         payload['force'] = True
     if command == 'close':
         payload['status'] = 'done'
+        if getattr(args, 'outcome', None):
+            reason = getattr(args, 'reason', None)
+            if not isinstance(reason, str) or not reason.strip():
+                raise IntakeInputError('--outcome closed_unverified requires a non-empty --reason')
+            payload['outcome'] = args.outcome
         if getattr(args, 'reason', None) is not None:
             payload['reason'] = args.reason
         return cas_update(path, payload, args.version is None, key)
     if command == 'update':
         if args.status == 'closed':
             args.status = 'done'
-        for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'reason', 'superseded_by'):
+        for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
                     raise IntakeInputError('Acceptance criteria exceed 8192 UTF-8 bytes')

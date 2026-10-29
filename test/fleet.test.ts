@@ -769,6 +769,31 @@ describe('generic accounts and launch placement', () => {
     expect(replay).toMatchObject({ state: 'starting', replay: true });
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(1);
   }));
+  it('does not poison the winning restart with a rival already_claimed diagnostic', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const previous: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const sessions = new SessionControlService(sql, cb=>cb(), ()=>now); sessions.init();
+    const sessionId = crypto.randomUUID(), intakeId = crypto.randomUUID();
+    sql.exec("UPDATE fleet_launches SET state='uncertain', claim_key='previous-dispatch-claim' WHERE id=?",previous.id);
+    sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,mode,state,created_at,updated_at)
+      VALUES(?,'test-admin',?,? ,?,'hetzner','headless','uncertain',?,?)`,sessionId,sessionId,JSON.stringify({workspace:'demo',intake_task_id:intakeId}),previous.id,iso(),iso());
+    const stopped = await sessions.handle(new Request('https://hub.test/api/sessions/'+sessionId+'/stop',
+      {method:'POST',body:JSON.stringify({key:'stop-before-restart'})}),admin);
+    expect((await stopped.json() as any).state).toBe('acked');
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?',previous.id).one().state).toBe('exited');
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    expect(launch.id).not.toBe(previous.id);
+    expect(launch.state).toBe('offered');
+    const path = '/launches/' + launch.id;
+    const claim = {gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true, claim_key: 'winner-restart-claim'};
+    expect((await s.handle(request(path + '/claim', claim),host('hetzner'))).status).toBe(200);
+    const loser = await s.handle(request(path + '/claim', {...claim, claim_key:'rival-restart-claim'}),host('hetzner'));
+    expect(loser.status).toBe(409);
+    expect((await loser.json() as any).error).toBe('already_claimed');
+    expect(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id=?',launch.id).one().launch_error_json).toBeNull();
+    expect((await s.handle(request(path + '/claim',claim),host('hetzner'))).status).toBe(200);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?',launch.id).one().state).toBe('starting');
+  }));
   it('never accepts secrets or a forged retryable authority refusal', async () => fixture(async (s, sql) => {
     await configure(s);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();

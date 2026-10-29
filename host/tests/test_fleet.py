@@ -177,7 +177,8 @@ class FleetTests(unittest.TestCase):
         self.assertFalse(calls)
 
     def test_collector_whitelists_quota_and_detected_tier_without_email_token_or_error_body(self):
-        cfg = settings(Path('/repo')); cfg['subscriptions'][0].update(service='claude', engine='claude', plan=None)
+        # An explicitly configured non-quse adapter is still sanitized (quse itself never runs: 5814e109).
+        cfg = settings(Path('/repo')); cfg['subscriptions'][0].update(service='claude', engine='claude', plan=None, quota_argv=['/opt/quota-adapter', 'claude'])
         def runner(argv):
             if argv[0] == 'claude':
                 return {'subscriptionType': 'max', 'email': 'private@example.invalid', 'token': 'MUST_NOT_LEAK'}

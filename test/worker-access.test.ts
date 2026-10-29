@@ -23,6 +23,73 @@ async function setup(fn: (x:any)=>Promise<void>, mode = 'headless') {
  await fn({stub,id,task,session,other,worker,call});
 }
 describe('scoped durable worker access',()=>{
+ it.each(['headless','interactive'])('%s reads quota and own resource details without gaining fleet controls', mode=>setup(async({stub,session,task,other,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   const at=new Date().toISOString();
+   for(const id of [session,other]) h.sql.exec(`INSERT INTO session_resource_usage
+    (session_id,machine_id,native_id,project,engine,kind,started_at,state,observed_at)
+    VALUES(?,'worker-host',?,'agent-hub','codex','goal',?,'running',?)`,id,id,at,at);
+  });
+  expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
+  expect((await api('/api/intake/tasks/'+task.slice(0,8))).status).toBe(200);
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
+  for(const path of ['/api/quota?view=fleet','/api/quota?view=fleet&provider=codex&account=codex-orin']) {
+   const res=await api(path);expect(res.status,await res.clone().text()).toBe(200);
+   expect(await res.json()).toHaveProperty('pools');
+   expect((await api(path,{})).status).toBe(403);
+  }
+  for(const path of ['/api/fleet/resources','/api/fleet/resources/sessions']) {
+   const res=await api(path);expect(res.status,await res.clone().text()).toBe(200);
+   const data:any=await res.json();expect(data.sessions.map((s:any)=>s.session_id)).toEqual([session]);
+   expect(JSON.stringify(data)).not.toContain(other);
+   expect((await api(path,{})).status).toBe(403);
+  }
+  for(const path of ['/api/quota','/api/quota?view=fleet&view=host','/api/quota/server',
+   '/api/quota/kill-switch','/api/fleet/resources/watchdog','/api/fleet/resources/config',
+   '/api/fleet/resources/reaps','/api/fleet/resources/throttles','/api/fleet'])
+   expect([403,404]).toContain((await api(path)).status);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE worker_access SET expires_at=?',Date.now()-1));
+  expect((await api('/api/quota?view=fleet')).status).toBe(403);
+  expect((await api('/api/fleet/resources')).status).toBe(403);
+ },mode));
+
+ it('AC5 triage reviewer: only live requested intakes, fills missing AC only, access ends on its verdict or session end',()=>setup(async({stub,session,other,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const blank=uuid(), third=uuid(), later=uuid();
+  await runInDurableObject<Hub, any>(stub,(h:any)=>{
+   for (const [id,title] of [[blank,'missing AC'],[third,'not requested'],[later,'second requested']])
+    h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',id,JSON.stringify({id,project:'agent-hub',status:'open',version:1,created_at:Date.now(),updated_at:Date.now(),title,scope:null,history:[],acceptance_criteria:null}));
+   for (const id of [other,blank,later]) h.sql.exec("INSERT INTO intake_triage_requests(task_id,request_key,session_id,state,requested_at) VALUES(?,?,?,'requested',?)",id,'triage-k',session,Date.now()-1000);
+  });
+  expect((await api('/api/intake/tasks/'+blank)).status).toBe(200);
+  expect((await api('/api/intake/tasks/'+blank.slice(0,8))).status).toBe(403); // exact ids only
+  expect((await api('/api/intake/tasks/'+third)).status).toBe(403);
+  // Existing AC is never replaced; missing AC may be filled, together with a project fix.
+  expect((await api('/api/intake/tasks/'+other,{key:'t-over',expected_version:1,acceptance_criteria:'replaced'})).status).toBe(403);
+  const ac=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
+  expect(ac.status,await ac.clone().text()).toBe(200);
+  const v=(await ac.json() as any).task.version;
+  // A lost reply retried with the same key replays the saved receipt; a new key may not overwrite.
+  const replay=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
+  expect(replay.status,await replay.clone().text()).toBe(200);
+  expect((await replay.json() as any).task.version).toBe(v);
+  expect((await api('/api/intake/tasks/'+blank,{key:'t-ac2',expected_version:v,acceptance_criteria:'second fill'})).status).toBe(403);
+  for (const bad of [{key:'t-st',expected_version:v,status:'done'},{key:'t-ti',expected_version:v,title:'renamed'},
+    {key:'t-mix',expected_version:v,project:'aws-infra',status:'cancelled',reason:'x'}])
+   expect((await api('/api/intake/tasks/'+blank,bad)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+blank+'/events',{key:'t-dec',expected_version:v,event:{kind:'decision',text:'x'}})).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+third,{key:'t-3',expected_version:1,project:'aws-infra'})).status).toBe(403);
+  // The verdict note itself revokes access immediately, without waiting for the hourly ledger update.
+  const note=await api('/api/intake/tasks/'+blank+'/events',{key:'t-note',expected_version:v,event:{kind:'note',text:'TRIAGE ACTUAL — backlog triage (hourly, Claude Opus)'}});
+  expect(note.status,await note.clone().text()).toBe(200);
+  expect((await api('/api/intake/tasks/'+blank)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+blank,{key:'t-after',expected_version:v+1,project:'relay'})).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+later)).status).toBe(200);
+  // A reviewer whose session ended keeps no batch access.
+  await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE session_control_sessions SET state='exited' WHERE id=?",session));
+  expect((await api('/api/intake/tasks/'+later)).status).toBe(403);
+ }));
  it('reads only shared usage dimensions without granting other monitoring or writes',()=>setup(async({stub,worker,call}:any)=>{
   await runInDurableObject<Hub, any>(stub,(h:any)=>{
    const now=Date.now();
@@ -66,7 +133,7 @@ describe('scoped durable worker access',()=>{
   expect((await api('/api/fleet/launches',{})).status).toBe(403);
   expect((await api('/api/bus/claims')).status).toBe(403);
  }, mode));
- it.each(['headless','interactive'])('%s issuance refuses another host, a missing link, and a running launch',(mode)=>setup(async({stub,id,call}:any)=>{
+ it.each(['headless','interactive'])('%s issuance refuses another host, a missing link, and an unbound running launch',(mode)=>setup(async({stub,id,call}:any)=>{
   const issue=()=>call('/api/fleet/launches/'+id+'/worker-credential',{});
   await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE fleet_launches SET machine_id='other-host' WHERE id=?",id));
   expect((await issue()).status).toBe(409);
@@ -78,6 +145,28 @@ describe('scoped durable worker access',()=>{
   await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE fleet_launches SET state='running' WHERE id=?",id));
   expect((await issue()).status).toBe(409);
  }, mode));
+ it.each(['headless','interactive'])('%s host repairs a running exact native profile with the same intake scope', mode=>setup(async({stub,id,session,task,other,worker,call}:any)=>{
+  const native=uuid(), tag=(mode==='headless'?'task-hub-':'hub-')+id;
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   h.sql.exec("UPDATE fleet_launches SET state='running',native_id=? WHERE id=?",native,id);
+   h.sql.exec("UPDATE session_control_sessions SET state='running',binding_json=? WHERE id=?",JSON.stringify({native_id:native,tag,workspace:'/repo'}),session);
+  });
+  const issue=()=>call('/api/fleet/launches/'+id+'/worker-credential',{});
+  expect((await call('/api/fleet/launches/'+id+'/worker-credential',{},worker.access_token)).status).toBe(403);
+  const repaired=await issue(); expect(repaired.status,await repaired.clone().text()).toBe(200);
+  const profile:any=await repaired.json(); expect(profile.worker_launch_id).toBe(id);
+  expect((await call('/api/intake/tasks/'+task,undefined,profile.access_token)).status).toBe(200);
+  expect((await call('/api/intake/tasks/'+other,undefined,profile.access_token)).status).toBe(403);
+  for(const binding of [null, {native_id:uuid(),tag}, {native_id:native,tag:'hub-'+uuid()}]) {
+   await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify(binding),session));
+   expect((await issue()).status).toBe(409);
+  }
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify({native_id:native,tag,workspace:'/repo'}),session));
+  for(const state of ['stopped','failed','finished']) {
+   await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE fleet_launches SET state=? WHERE id=?',state,id));
+   expect((await issue()).status).toBe(409);
+  }
+ },mode));
  it('retains binding through normal refresh and fails closed after scope expiry',()=>setup(async({stub,task,other,worker,call}:any)=>{
   const refreshed=await stub.fetch('https://hub.test/api/token/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grant_type:'refresh_token',refresh_token:worker.refresh_token})});
   expect(refreshed.status,await refreshed.clone().text()).toBe(200);
@@ -101,6 +190,36 @@ describe('scoped durable worker access',()=>{
   const res=await stub.fetch('https://hub.test/api/token/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grant_type:'refresh_token',refresh_token:worker.refresh_token})});
   expect(res.status).toBe(400);
  }));
+ it('registers and reads its own wake without gaining self-stop or foreign access',()=>setup(async({stub,id,session,other,worker,call}:any)=>{
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec("UPDATE session_control_sessions SET state='running' WHERE id=?",session));
+  const api=(path:string,body?:any)=>call(path,body,worker.access_token);
+  const at=new Date(Date.now()+3600000).toISOString();
+  const wake=await api('/api/sessions/'+session+'/wake',{key:'self-wait',at,prompt:'Resume own work'});
+  expect(wake.status,await wake.clone().text()).toBe(201);
+  expect(await (await api('/api/sessions/'+session)).json()).toMatchObject({state:'waiting_until',waiting_until:at});
+  expect((await (await api('/api/sessions/'+session+'/wakes')).json() as any).wakes).toHaveLength(1);
+  expect((await api('/api/sessions/'+session+'/commands')).status).toBe(200);
+  expect((await api('/api/sessions/'+id+'/wake',{key:'launch-ref',at,prompt:'Own launch wake'})).status).toBe(201);
+  expect((await api('/api/sessions/'+id)).status).toBe(200);
+  expect((await api('/api/sessions/'+session+'/stop',{key:'no-self-stop'})).status).toBe(403);
+  expect((await api('/api/sessions/'+other+'/wake',{key:'foreign',at,prompt:'no'})).status).toBe(403);
+ },'interactive'));
+ it('lets a watcher wake only its direct parent on the same intake',()=>setup(async({stub,session,task,other,worker,call}:any)=>{
+  const parent=uuid(), sibling=uuid();
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   for(const id of [parent,sibling]) h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at)
+    VALUES(?,'parent-creator',?,?,'interactive','running',?,?)`,id,id,JSON.stringify({intake_task_id:task,workspace:'/repo'}),new Date().toISOString(),new Date().toISOString());
+   h.sql.exec('UPDATE session_control_sessions SET parent_id=? WHERE id=?',parent,session);
+  });
+  const api=(path:string,body?:any)=>call(path,body,worker.access_token);
+  const at=new Date(Date.now()+3600000).toISOString();
+  expect((await api('/api/sessions/'+parent+'/wake',{key:'watcher-result',at,prompt:'Watcher result'})).status).toBe(201);
+  expect((await api('/api/sessions/'+sibling+'/wake',{key:'sibling',at,prompt:'no'})).status).toBe(403);
+  expect((await api('/api/sessions/'+parent+'/stop',{key:'parent-stop'})).status).toBe(403);
+  expect((await api('/api/sessions/'+parent)).status).toBe(403);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',JSON.stringify({intake_task_id:other}),parent));
+  expect((await api('/api/sessions/'+parent+'/wake',{key:'wrong-task',at,prompt:'no'})).status).toBe(403);
+ },'interactive'));
  it('restricts chained sessions to policy routed headless children on the same intake/workspace',()=>setup(async({stub,session,task,other,worker,call}:any)=>{
   const start=(body:any)=>call('/api/sessions',{key:uuid(),workspace:'/repo',intake_task_id:task,brief:'small real followup',...body},worker.access_token);
   for(const bad of [{workspace:'/else'},{intake_task_id:other},{mode:'interactive'},{parent_id:uuid()},{engine:'opencode',engine_override_reason:'no'},{machine:'worker-host'}]) expect([400,403]).toContain((await start(bad)).status);

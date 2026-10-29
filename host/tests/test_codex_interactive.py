@@ -73,7 +73,7 @@ def test_managed_execute_prepares_workspace_before_isolated_launch(monkeypatch, 
     monkeypatch.setattr(p, 'install_managed_engine_permissions', lambda b, home, trusted_paths: calls.append(('trust', trusted_paths)))
     monkeypatch.setattr(p, 'engine_argv', lambda *args: ['/test/codex'])
     monkeypatch.setattr(p, 'engine_environment', lambda *args: {})
-    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda label, request=None: (True, 'ok'))
     monkeypatch.setattr(p.sys, 'argv', ['provisioning', label, '/goal verify workspace'])
 
     def launched(binary, argv, env):

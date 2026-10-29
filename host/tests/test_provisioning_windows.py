@@ -388,7 +388,7 @@ class TestWindowsProvisioningPortability(unittest.TestCase):
                     return {'engines': [codex_bundle, zai_bundle]}
                 return {}
 
-            def fake_install(bundle):
+            def fake_install(bundle, request=None):
                 if bundle['provider'] == 'zai':
                     raise ValueError('ZCode runtime missing (/opt/ZCode/resources/glm/zcode.cjs)')
                 dest = Path(tmp) / f"{bundle['label']}-{bundle['revision']}"

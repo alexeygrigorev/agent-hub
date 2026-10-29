@@ -8,13 +8,13 @@ import { SCOPE_POLICY_VERSION, SCOPE_VERDICTS, classifyScope, getScopeStatus, sc
 type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
-import { WORKER_SCOPE, workerAccessContext } from './worker-access';
+import { WORKER_SCOPE, triageTargets, workerAccessContext } from './worker-access';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
 
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
-function currentHistory(task: Obj): Obj[] {
+export function currentHistory(task: Obj): Obj[] {
   const history: Obj[] = task.history ?? [];
   const boundary = history.reduce((n, e, i) =>
     e.kind === 'update' && ['status', 'title', 'project', 'acceptance_criteria'].some(k => k in (e.changes ?? {})) ? i : n, -1);
@@ -25,6 +25,11 @@ function currentDoneNote(task: Obj): Obj | undefined {
     /^DONE\b/m.test(e.text ?? '') &&
     (/\b[0-9a-f]{7,40}\b/i.test(e.text) || /https:\/\/[^\s]+\/(?:actions\/runs|deployments)\/[^\s]+/.test(e.text)) &&
     /live check:[ \t]*\S[^\n]*/i.test(e.text) && /result:[ \t]*\S[^\n]*/i.test(e.text));
+}
+export const VERIFICATION_MODES = ['required', 'skip', 'auto'];
+function verificationMode(v: any): string {
+  if (!VERIFICATION_MODES.includes(v)) throw new IntakeError('invalid_verification', 400, 'verification');
+  return v;
 }
 /** Worktree-guard (intake a0f01448): an intake counts as closed for cleanup
  * and reap gating when it carries a qualifying DONE note (live proof of
@@ -177,11 +182,13 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   const task = JSON.parse(rows[0].data);
   if (task.history.some((e: Obj) => ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
   if (task.history.length >= INTAKE_LIMITS.events) throw new IntakeSessionLinkError('history_capacity');
+  const binding = JSON.parse(session.binding_json || '{}');
+  const observed = request.provenance === 'observed_native';
   task.history.push({ id: crypto.randomUUID(), kind: 'link', hub_session_id: session.id,
-    native_id: null, engine: session.engine ?? request.engine ?? null, tier: request.tier ?? null,
+    native_id: observed ? binding.native_id ?? null : null, engine: session.engine ?? request.engine ?? null, tier: request.tier ?? null,
     host: session.machine_id ?? null, hub: null, routing_job_id: null,
-    provenance: { type: 'hub_launch_verified', reference: session.id, timestamp: session.created_at },
-    evidence: 'hub_launch_verified', authority: 'hub_launch_verified', actor: session.actor,
+    provenance: { type: observed ? 'observed_native' : 'hub_launch_verified', reference: session.id, timestamp: session.created_at },
+    evidence: observed ? 'observed_native' : 'hub_launch_verified', authority: observed ? 'untrusted_task_data' : 'hub_launch_verified', actor: session.actor,
     captured_at: now, intake_key: session.request_key,
     ...(session.state === 'held' && hold !== undefined ? { assignment_hold: hold } : {}) });
   task.version++; task.updated_at = now;
@@ -264,10 +271,13 @@ export class IntakeService {
       const auditActor = "COALESCE(json_extract(NEW.data,'$.lifecycle_actor'),json_extract(NEW.data,'$.history[#-1].actor'),'hub:legacy')";
       const auditTime = "COALESCE(json_extract(NEW.data,'$.updated_at'),CAST(strftime('%s','now') AS INTEGER)*1000)";
       const auditReason = "COALESCE(json_extract(NEW.data,'$.lifecycle_reason'),'legacy lifecycle transition')";
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_status AFTER UPDATE ON intake_tasks
+      // v2 (d8d509d2 AC9): an operator close without evidence audits as
+      // close_unverified so it never counts as a verified completion.
+      this.sql.exec('DROP TRIGGER IF EXISTS intake_audit_status');
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_status_v2 AFTER UPDATE ON intake_tasks
         WHEN ${oldStatus} IS NOT ${newStatus} AND (${newStatus} IN ('done','cancelled') OR ${oldStatus} IN ('done','cancelled')) BEGIN
         INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason)
-        VALUES(NEW.id,json_extract(NEW.data,'$.project'),CASE ${newStatus} WHEN 'done' THEN 'close' WHEN 'cancelled' THEN 'cancel' ELSE 'reopen' END,
+        VALUES(NEW.id,json_extract(NEW.data,'$.project'),CASE ${newStatus} WHEN 'done' THEN CASE json_extract(NEW.data,'$.outcome') WHEN 'closed_unverified' THEN 'close_unverified' ELSE 'close' END WHEN 'cancelled' THEN 'cancel' ELSE 'reopen' END,
           ${auditActor},${auditTime},${oldStatus},${newStatus},${auditReason}); END`);
       this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_archive AFTER UPDATE ON intake_tasks
         WHEN json_extract(OLD.data,'$.archived_at') IS NULL AND json_extract(NEW.data,'$.archived_at') IS NOT NULL BEGIN
@@ -367,10 +377,12 @@ export class IntakeService {
   }
 
   private doneNote(task: Obj): Obj | undefined { return currentDoneNote(task); }
-  private transition(task: Obj, status: string, actor: string, now: number, reason?: string, supersededBy?: string, force?: boolean) {
+  private transition(task: Obj, status: string, actor: string, now: number, reason?: string, supersededBy?: string, force?: boolean, unverified = false) {
     if (status === task.status) return;
     if (status === 'done') {
-      const note = this.doneNote(task);
+      // AC9 (d8d509d2): an operator-ordered close without evidence records
+      // outcome=closed_unverified and its reason; no DONE evidence is implied.
+      const note = unverified ? { text: 'closed_unverified: ' + reason } : this.doneNote(task);
       if (!note) fail('done_evidence_required', 409);
       // Close gate (intake 4b161918): every linked worktree merged and removed.
       const gate = this.worktrees.gate(task.id);
@@ -393,6 +405,8 @@ export class IntakeService {
     }
     task.lifecycle_actor = actor;
     task.lifecycle_reason = reason?.trim() || 'reopened for continued work';
+    if (status === 'done') task.outcome = unverified ? 'closed_unverified' : 'completed';
+    else if (OPEN.includes(status)) delete task.outcome;
     task.status = status;
     task.archived_at = OPEN.includes(status) ? null : now;
   }
@@ -418,8 +432,10 @@ export class IntakeService {
     const worker = workerAccessContext(this.sql, c.id);
     if (JSON.parse(c.scopes).includes(WORKER_SCOPE)) {
       if (!worker || worker.actor !== binding.actor) fail('forbidden', 403);
-      return { admin: false, worker: true, actor: binding.actor, identity: 'family:' + binding.family_id, caller,
-        grants: [{ scope: 'task', target: worker.task_id, access: 'write', expires_at: worker.expires_at }],
+      const triage = triageTargets(this.sql, worker.session_id);
+      return { admin: false, worker: true, actor: binding.actor, identity: 'family:' + binding.family_id, caller, triage,
+        grants: [{ scope: 'task', target: worker.task_id, access: 'write', expires_at: worker.expires_at },
+          ...[...triage].map(target => ({ scope: 'task', target, access: 'write', expires_at: worker.expires_at }))],
         valid_until: Math.min(Date.parse(c.expires_at), worker.expires_at) };
     }
     const grants = this.rows('grants').filter(g => !g.revoked_at && g.expires_at > Date.now() && canonical(g.binding) === canonical(binding));
@@ -1087,11 +1103,12 @@ export class IntakeService {
   private write(path: string, b: Obj, p: Obj): Obj {
     const now = Date.now();
     if (path === '/tasks') {
-      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria']);
+      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria', 'verification']);
       const project = identifier(b.project);
       const task: Obj = { id: crypto.randomUUID(), project, title: str(b.title, 256, 'title'), status: 'open', version: 1,
         created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null,
-        acceptance_criteria: acNullable(b.acceptance_criteria), history: [] };
+        acceptance_criteria: acNullable(b.acceptance_criteria), history: [],
+        ...(b.verification !== undefined ? { verification: verificationMode(b.verification) } : {}) };
       if (!this.allowed(p, task, true)) fail('forbidden', 403);
       // t1038u: no hard task-row refuse on create; totalBytes/taskBytes/events still apply.
       // Soft warn when open count is high (surfaced on the response below).
@@ -1180,14 +1197,26 @@ export class IntakeService {
         task.scope = scopeHint(task, (task.scope.basis_version ?? 1) + 1);
       }
     } else {
-      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'reason', 'superseded_by', 'force']);
+      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by', 'force', 'outcome']);
+      // AC5 triage reviewers only fill missing AC; enforced at effect time so an
+      // exact retry of a successful fill replays its receipt instead.
+      if (p.worker && 'acceptance_criteria' in b && hasAcceptanceCriteria(task)) fail('forbidden', 403);
+      const unverified = b.outcome === 'closed_unverified';
+      if ('outcome' in b) {
+        if (!unverified || b.status !== 'done') throw new IntakeError('invalid_outcome', 400, 'outcome');
+        this.operator(p);
+        if (typeof b.reason !== 'string' || !b.reason.trim()) fail('reason_required');
+        // Idempotent: an intake already closed this way is returned unchanged.
+        if (task.status === 'done' && task.outcome === 'closed_unverified') return { task: this.view(task, p) };
+        if (['title', 'project', 'acceptance_criteria', 'verification'].some(k => k in b)) throw new IntakeError('invalid_outcome', 400, 'outcome');
+      }
       if ('force' in b && typeof b.force !== 'boolean') throw new IntakeError('invalid_field', 400, 'force');
       if (b.force === true && (b.status !== 'done' || typeof b.reason !== 'string' || !b.reason.trim())) fail('force_reason_required');
-      if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'].some(k => k in b)) fail('empty_update');
+      if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification'].some(k => k in b)) fail('empty_update');
       const changes: Obj = {};
       const previousStatus = task.status;
       if (b.status === 'done' && ['title', 'project', 'acceptance_criteria'].some(k => k in b && b[k] !== task[k])) fail('done_evidence_required', 409);
-      if ('status' in b) this.transition(task, b.status, p.actor, now, b.reason === undefined ? undefined : str(b.reason, 8192), b.superseded_by, b.force === true);
+      if ('status' in b) this.transition(task, b.status, p.actor, now, b.reason === undefined ? undefined : str(b.reason, 8192), b.superseded_by, b.force === true, unverified);
       for (const field of ['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']) if (field in b) {
         if (field === 'status' && !STATUSES.includes(b[field])) fail('invalid_status');
         const previous = field === 'status' ? previousStatus : task[field];
@@ -1195,6 +1224,13 @@ export class IntakeService {
           : field === 'acceptance_criteria' ? acNullable(b[field])
           : nullable(b[field], field === 'title' ? 256 : 8192);
         if (previous !== task[field]) changes[field] = task[field];
+      }
+      if (unverified && task.outcome === 'closed_unverified') { changes.outcome = 'closed_unverified'; changes.reason = task.lifecycle_reason; }
+      // Post-DONE verification policy (d8d509d2 t1936u): required|skip|auto, default auto.
+      if ('verification' in b) {
+        const mode = verificationMode(b.verification);
+        if ((task.verification ?? 'auto') !== mode) changes.verification = mode;
+        task.verification = mode;
       }
       if (!this.allowed(p, task, true)) fail('forbidden', 403);
       task.history.push({ id: crypto.randomUUID(), kind: 'update', changes, actor: p.actor, captured_at: now, authority: 'untrusted_task_data' });
@@ -1561,8 +1597,12 @@ export class IntakeService {
         if (!payload) return json(this.read(url, p));
         identifier(payload.key);
         const path = url.pathname.slice('/api/intake'.length);
-        if (p.worker && (!/^\/tasks\/[^/]+\/events$/.test(path) || !['note','report','blocker'].includes(payload.event?.kind))) fail('forbidden', 403);
-        if (p.worker) payload.event = redactClaimData(payload.event);
+        // AC5 triage reviewers may also set AC/project on their requested intakes (never status).
+        const triageUpdate = p.worker && p.triage?.has(/^\/tasks\/([^/]+)$/.exec(path)?.[1]) &&
+          Object.keys(payload).every(k => ['key', 'expected_version', 'acceptance_criteria', 'project'].includes(k)) &&
+          ('acceptance_criteria' in payload || 'project' in payload);
+        if (p.worker && !triageUpdate && (!/^\/tasks\/[^/]+\/events$/.test(path) || !['note','report','blocker'].includes(payload.event?.kind))) fail('forbidden', 403);
+        if (p.worker && !triageUpdate) payload.event = redactClaimData(payload.event);
         // Do not replay a private response after the caller loses its task/operator grant.
         if (path.startsWith('/rules') || path.startsWith('/grants')) this.operator(p);
         const taskMatch = /^\/tasks\/([^/]+)/.exec(path);

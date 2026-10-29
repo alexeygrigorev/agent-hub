@@ -622,3 +622,39 @@ class ExplicitOperatorAdoptionTests(unittest.TestCase):
             dispatcher = SimpleNamespace(settings={}, request=request, runner=lambda argv: [row])
             self.assertEqual(Dispatcher.reconcile_operator_adoptions(dispatcher), 1)
             self.assertEqual([c[:2] for c in calls], [('GET', '/api/sessions/host-adoption'), ('POST', '/api/sessions/host-adoption/receipt')])
+
+
+class TestStoppedIntakeRestart(unittest.TestCase):
+    def test_reuses_confirmed_predecessor_protection_without_unlocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = _make_repo(tmp)
+            path = _add_worktree(origin, tmp)
+            previous, successor = "a" * 32, "b" * 32
+            reason = guard.lock_reason(previous, "intake-restart")
+            self.assertTrue(guard.lock_worktree("git", path, reason))
+            evidence = {"workspace": path, "repository": guard.repository_identity(path)}
+            old = {"session_id": previous, "intake_task_id": "intake-restart",
+                   "terminal": True, "native_terminal": True}
+            new = {"session_id": successor, "intake_task_id": "intake-restart", "terminal": False}
+            with patch.object(guard, "expected_repository", return_value=evidence):
+                for change in ({"terminal": False}, {"native_terminal": False},
+                               {"intake_task_id": "another"}):
+                    self.assertFalse(guard.reuse_stopped_intake_lock("git", path, successor, "intake-restart",
+                                     lambda *args: {"sessions": [{**old, **change}, new]}))
+                self.assertFalse(guard.reuse_stopped_intake_lock("git", path, successor, "intake-restart",
+                                 lambda *args: {"sessions": [old]}))
+                self.assertTrue(guard.reuse_stopped_intake_lock("git", path, successor, "intake-restart",
+                                lambda *args: {"sessions": [old, new]}))
+            entry = guard.find_entry(guard.list_entries("git", path), path)
+            self.assertEqual(entry["reason"], reason)
+            self.assertTrue(entry["locked"])
+            self.assertNotEqual(_run(["git", "-C", origin, "worktree", "remove", path], tmp).returncode, 0)
+            self.assertTrue(os.path.isdir(path))
+            self.assertTrue(guard.unlock_worktree("git", path))
+
+    def test_live_successor_release_fence_overrides_unprotected_predecessor(self):
+        facts = [{"session_id": "a" * 32, "terminal": True, "native_terminal": True,
+                  "linked_intake_open": False, "protected": False, "lock_release_permitted": False}]
+        with patch.object(guard, "release_session_lock") as release:
+            self.assertEqual(guard.reconcile_terminal_locks(lambda *args: {"sessions": facts}), 0)
+        release.assert_not_called()

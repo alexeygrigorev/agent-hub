@@ -21,6 +21,7 @@ from pathlib import Path
 from . import api, auth, config
 
 MAX_REQUEST = 32768
+MAX_ACK_REQUEST = 262144
 MAX_BRIEF = 8192
 MAX_BRIEF_CHARS = 8000
 MAX_BODY = 16384
@@ -80,6 +81,31 @@ def diagnostic(exc):
         if msg:
             return msg
     return 'Session operation failed; check authentication, grants, capacity and current versions.'
+
+
+def hub_unavailable(exc):
+    """Opaque Hub-side failure or lost response: a keyed replay is safe."""
+    return isinstance(exc, SessionTransportError) or (
+        isinstance(exc, SessionHTTPError) and exc.status in api.HUB_UNAVAILABLE_STATUS
+        and exc.code in ('request_failed', 'internal_error'))
+
+
+def replay_delays():
+    """Replay delays that fit inside an active request deadline, if any."""
+    deadline = _request_deadline.get()
+    if deadline is None:
+        return api.KEYED_REPLAY_DELAYS
+    delays, remaining = [], deadline - time.monotonic() - 1
+    for delay in api.KEYED_REPLAY_DELAYS:
+        if delay > remaining:
+            break
+        delays.append(delay)
+        remaining -= delay
+    return tuple(delays)
+
+
+def replay_notice(exc, delay):
+    sys.stderr.write(f'Hub unavailable ({diagnostic(exc).split(";")[0]}); replaying the same key in {delay}s\n')
 
 
 def http_error(exc, key=None):
@@ -174,7 +200,8 @@ def request(method, path, payload=None):
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
     api.check_url(base)
     data = json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None
-    if data is not None and len(data) > MAX_REQUEST:
+    max_req = MAX_ACK_REQUEST if (method == 'POST' and path.startswith('/api/session-commands/') and path.endswith('/ack')) else MAX_REQUEST
+    if data is not None and len(data) > max_req:
         raise SessionInputError('Session request exceeds capacity')
     env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
     token = env_token or auth.get_access_token()
@@ -438,6 +465,10 @@ def add_commands(sub):
     listing.add_argument('--tree', action='store_true', help='Display session lineage tree')
     tree = commands.add_parser('tree', help='Display session lineage tree')
     tree.add_argument('--json', action='store_true', help='Output machine-readable JSON')
+    link = commands.add_parser('link', help='Link a session to an intake (operator only)')
+    link.add_argument('session')
+    link.add_argument('--intake-task-id', required=True)
+    link.add_argument('--key')
     start = commands.add_parser('start', help='Record a start intent using auto/policy routing (default). Casual use should prefer auto/policy.')
     start.add_argument('--engine', help='Engine override (operators only; requires --reason explaining why)')
     start.add_argument('--reason', default=None, help='Explanation why this specific model/engine must be chosen (required when --engine is specified)')
@@ -517,6 +548,13 @@ def add_commands(sub):
     show.add_argument('id')
     show.add_argument('--threshold')
     show.add_argument('--json', action='store_true')
+    wake = commands.add_parser('wake', help='Register a durable scheduled wake for a session waiting on an external event (no passive timers)')
+    wake.add_argument('id', help='Session id or friendly name')
+    wake.add_argument('--at', required=True, help='Wake time: ISO-8601 timestamp or "now" (deliver on next tick; watchers use --at now with --body-file result)')
+    wake.add_argument('--key', default=None, help='Stable idempotency key (default: random); same key replays, never duplicates')
+    wake_src = wake.add_mutually_exclusive_group(required=True)
+    wake_src.add_argument('--body-file', help='UTF-8 prompt file, or - for stdin (max 8 KiB)')
+    wake_src.add_argument('--prompt', default=None, help='Inline UTF-8 prompt text (max 8 KiB)')
     warnings = commands.add_parser('warnings', help='Current unsnoozed long-running warnings with output tails')
     warnings.add_argument('--threshold')
     warnings.add_argument('--json', action='store_true')
@@ -633,6 +671,11 @@ def _execute(args):
         # Default grouped needs-action lifecycle projection (M15c). The
         # existing `list` spelling keeps the flat session intent listing.
         return request('GET', '/api/sessions?view=lifecycle')
+    if cmd == 'link':
+        from urllib.parse import quote
+        return request('POST', '/api/sessions/' + quote(args.session, safe='') + '/link',
+                       {'key': getattr(args, 'key', None) or 'link-' + uuid.uuid4().hex,
+                        'intake_task_id': args.intake_task_id})
     if cmd == 'cleanup':
         from urllib.parse import quote
         params = []
@@ -737,6 +780,32 @@ def _execute(args):
     if cmd == 'ack':
         payload = {'snooze': duration_seconds(args.snooze)} if args.snooze else {}
         return request('POST', threshold_path(args, '/api/sessions/' + args.id + '/ack'), payload)
+    if cmd == 'wake':
+        import uuid as _uuid
+        import re as _re
+        if not isinstance(args.id, str) or not _re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', args.id):
+            raise ValueError('Invalid session id or name')
+        if getattr(args, 'prompt', None) is not None and getattr(args, 'body_file', None):
+            raise SessionInputError('Cannot specify both --body-file and --prompt')
+        if getattr(args, 'prompt', None) is not None:
+            prompt_text = read_prompt_text(args.prompt, limit=MAX_BRIEF, max_chars=MAX_BRIEF_CHARS, field='Prompt')
+        elif getattr(args, 'body_file', None):
+            prompt_text = read_file(args.body_file, limit=MAX_BRIEF, field='Body file')
+        else:
+            raise SessionInputError('Either --body-file or --prompt is required')
+        at_value = (getattr(args, 'at', None) or '').strip()
+        if not at_value:
+            raise SessionInputError('Missing --at wake time (ISO-8601 or "now")')
+        key = getattr(args, 'key', None) or str(_uuid.uuid4())
+        try:
+            queued = request('POST', '/api/sessions/' + args.id + '/wake',
+                             {'key': key, 'at': at_value, 'prompt': prompt_text})
+        except ValueError as exc:
+            msg = str(exc)
+            if key and f'reconcile with --key {key}' not in msg:
+                msg = f'{msg} (reconcile with --key {key} via show/commands)'
+            raise ValueError(msg) from None
+        return dict(queued, client_key=key)
     if cmd == 'warnings':
         result = request('GET', threshold_path(args, '/api/sessions/warnings'))
         from concurrent.futures import ThreadPoolExecutor
@@ -854,7 +923,11 @@ def _execute(args):
         else:
             payload = {'key': key}
         try:
-            queued = request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
+            enqueue = lambda: request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
+            # Capture is diagnostic and stays single-shot; keyed mutations
+            # replay, never past the caller's wait budget.
+            queued = (api.replay_keyed(enqueue, hub_unavailable, delays=replay_delays(), notify=replay_notice)
+                      if cmd in ('send', 'stop') else enqueue())
         except ValueError as exc:
             msg = str(exc)
             if cmd == 'stop' and isinstance(exc, SessionTransportError):
@@ -865,6 +938,9 @@ def _execute(args):
         queued = dict(queued, client_key=key)
         if queued.get('warning') == 'target_no_reported_state':
             sys.stderr.write('Warning: target session has no recent reported state\n')
+        if queued.get('delivery') == 'next_turn':
+            sys.stderr.write('Note: headless session; message queued in its inbox for its next turn '
+                             '(acked when the recipient acknowledges it; add --wait to follow)\n')
         if timeout is not None:
             if cmd == 'stop' and queued.get('state') == 'cancelled' and (queued.get('cancellation') or {}).get('effect') == 'no_native_start':
                 queued['stop_wait'] = {'state': 'cancelled', 'effect': 'no_native_start'}
@@ -957,7 +1033,9 @@ def render_table(sessions):
         name = s.get('qualified_alias') or s.get('name') or s.get('id') or '-'
         engine = s.get('engine') or '-'
         state = s.get('state') or '-'
-        if s.get('waiting_confirmation') or s.get('agent_state') == 'waiting':
+        if s.get('waiting_until'):
+            state = 'waiting_until ' + str(s['waiting_until'])
+        elif s.get('waiting_confirmation') or s.get('agent_state') == 'waiting':
             state = 'waiting-conf'
         elif s.get('agent_state') == 'idle' and state == 'running':
             state = 'idle'
@@ -1067,6 +1145,11 @@ def render_output(args, result):
                 *['  | ' + line for line in row.get('output_tail', [])],
                 '  output: ' + row.get('output_status', 'unavailable'),
                 '  ' + row['snooze_command'],
+            ])
+        for alert in result.get('wake_alerts', []):
+            lines.extend([
+                f"{alert.get('session_id')}  missed wake {str(alert.get('wake_id') or '')[:8]}  {alert.get('kind')}",
+                f"  detail={alert.get('detail') or '-'}  intake={alert.get('intake_task_id') or '-'}",
             ])
         return '\n'.join(lines) or 'No long-running warnings.'
     if cmd == 'commands':

@@ -276,7 +276,8 @@ describe('resource management',()=>{
   expect(()=>r.report('other',{samples:[sample()],reaps:[]})).toThrow('resource_binding_mismatch');
   expect(()=>r.report('host',{samples:[sample({native_id:'replacement'})],reaps:[]})).toThrow('resource_binding_mismatch');
  }));
- it('saves evidence and an intake restart note before accepting an idempotent confirmed reap',async()=>fixture(async(r,sql)=>{
+ it('saves evidence and a reap note for completed intake work before accepting an idempotent confirmed reap',async()=>fixture(async(r,sql)=>{
+  sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.history',json(?)) WHERE id='task'",JSON.stringify([{kind:'note',text:'DONE: finished task evidence'}]));
   r.report('host',{samples:[sample()],reaps:[]});
   closeIntake(sql);
   const evidence={id:'saved-output',session_id:'session',native_id:'native',reason:'idle',output:'Final report saved.'};

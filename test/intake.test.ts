@@ -1139,3 +1139,29 @@ describe('intake retention accounting', () => {
     expect((await ok('/storage')).counts.receipts).toBe(8194);
   });
 });
+
+describe('operator close without evidence (d8d509d2 AC9)', () => {
+  it('closes a claim without SHA as closed_unverified, operator only, idempotent, never as a verified close', async () => {
+    let { task } = await create();
+    task = (await append(task.id, task.version, { kind: 'note', text: 'DONE (no sha, no live check)' })).task;
+    const plain = { key: 'plain-close-' + ++seq, expected_version: task.version, status: 'done' };
+    expect((await call('/tasks/' + task.id, plain)).status).toBe(409); // done_evidence_required stays the default
+    const noReason = await call('/tasks/' + task.id, { key: 'nr-' + ++seq, expected_version: task.version, status: 'done', outcome: 'closed_unverified' });
+    expect(await noReason.json()).toMatchObject({ error: 'reason_required' });
+    const badOutcome = await call('/tasks/' + task.id, { key: 'bo-' + ++seq, expected_version: task.version, status: 'done', outcome: 'completed', reason: 'x' });
+    expect(await badOutcome.json()).toMatchObject({ error: 'invalid_outcome' });
+    const agent = await seedAgent(); await grant(agent);
+    const denied = await call('/tasks/' + task.id, { key: 'ag-' + ++seq, expected_version: task.version, status: 'done', outcome: 'closed_unverified', reason: 'agent try' }, agent.token);
+    expect(denied.status).toBe(403);
+    const reason = 'Alexey t1936u: old completion closed without re-verification';
+    const closed = (await ok('/tasks/' + task.id, { key: 'cu-' + ++seq, expected_version: task.version, status: 'done', outcome: 'closed_unverified', reason })).task;
+    expect(closed).toMatchObject({ status: 'done', outcome: 'closed_unverified', lifecycle_reason: reason });
+    expect(closed.payload_data.history.some((e: any) => /\b[0-9a-f]{7,40}\b/.test(e.text ?? '') && /live check:/i.test(e.text ?? ''))).toBe(false); // no fabricated evidence
+    expect(closed.payload_data.history.at(-1)).toMatchObject({ kind: 'update', changes: { status: 'done', outcome: 'closed_unverified', reason } });
+    const again = (await ok('/tasks/' + task.id, { key: 'cu-again-' + ++seq, expected_version: closed.version, status: 'done', outcome: 'closed_unverified', reason })).task;
+    expect(again.version).toBe(closed.version);
+    const events = (await ok('/tasks/' + task.id + '/audit')).items;
+    expect(events.map((e: any) => e.kind)).toContain('close_unverified');
+    expect(events.map((e: any) => e.kind)).not.toContain('close');
+  });
+});

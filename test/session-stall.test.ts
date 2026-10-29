@@ -3,7 +3,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService } from '../src/session_control';
 import { LivenessService } from '../src/liveness';
 import { FleetService } from '../src/fleet';
-import { classifySessionStall, stallThreshold } from '../src/session_stall';
+import { classifySessionStall, nativeObservationFresh, stallThreshold } from '../src/session_stall';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -34,6 +34,22 @@ async function view(s: SessionControlService, path = '/' + id) {
 function native(sql: any) { return sql.exec('SELECT * FROM fleet_sessions').toArray()[0]; }
 
 describe('stalled running sessions', () => {
+  it('reuses host clocks within a projection without sharing native fallback times', async () => fixture(async (_s, _live, sql) => {
+    let reads = 0;
+    const counted = { exec: (...args: any[]) => { reads++; return sql.exec(...args); } } as any;
+    const cache = new Map();
+    const fallback = { machine_id: 'missing-host', observed_at: new Date(start).toISOString() };
+    expect(nativeObservationFresh(counted, fallback, start, cache)).toBe(true);
+    expect(nativeObservationFresh(counted, { ...fallback, observed_at: new Date(start - 180001).toISOString() }, start, cache)).toBe(false);
+    expect(nativeObservationFresh(counted, { ...fallback, observed_at: new Date(start + 60001).toISOString() }, start, cache)).toBe(false);
+    expect(reads).toBe(2);
+    const observed = { machine_id: 'test-host', observed_at: new Date(start - 3600000).toISOString() };
+    expect(nativeObservationFresh(counted, observed, start, cache)).toBe(true);
+    expect(reads).toBe(4);
+    sql.exec('UPDATE machines SET last_checkin_at = ? WHERE id = ?', new Date(start - 180001).toISOString(), 'test-host');
+    expect(nativeObservationFresh(counted, observed, start, new Map())).toBe(false);
+  }));
+
   it('stalls while heartbeats and terminal activity continue but the agent rollout is frozen', async () => fixture(async (s, live, sql, clock) => {
     const fleet = new FleetService(sql, cb => cb(), () => clock.now); fleet.init();
     const progressAt = new Date(start - 4.5 * 3600000).toISOString();

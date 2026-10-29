@@ -3,7 +3,8 @@ import { IntakeWorktrees } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
 import { LivenessService } from './liveness';
 import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
-import { workerAccessContext } from './worker-access';
+import { linkedIntake, hasOpenWork, nativeGoalStatus, sessionWakeState, openWorkPreventsIdleReap } from './intake-session';
+import { workerAccessContext, workerWakeAllowed } from './worker-access';
 import { registeredRepoLabel } from './repos';
 import { initResourceRequestProjection } from './sql-json-projection';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
@@ -27,9 +28,9 @@ import { initResourceRequestProjection } from './sql-json-projection';
  * are reported as `recorded` / `transported` / `uncertain`, never as processed.
  * See docs/SESSION-CONTROL.md.
  */
-import { recordIntakeSessionLink, IntakeSessionLinkError } from './intake';
+import { recordIntakeSessionLink, IntakeSessionLinkError, IntakeService } from './intake';
 import { ResourceManagement } from './resource-management';
-import { classifySessionStall, initSessionStalls, nativeObservationFresh, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold } from './session_stall';
+import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold } from './session_stall';
 import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
@@ -46,6 +47,7 @@ import { isValidMachineId } from './machine-id';
 import type { Env } from './env';
 import {
   buildLifecycleView,
+  buildSessionInputs,
   classifyKey,
   collectCleanupEligible,
   initLifecycleTables,
@@ -53,6 +55,14 @@ import {
   recordDecision,
   recordObservation,
 } from './session_lifecycle_registry';
+
+export const SESSION_CONTROL_WAKE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS session_control_wakes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, wake_at_ms INTEGER NOT NULL, wake_at TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, command_id TEXT, intake_task_id TEXT, owner_token_id TEXT, owner_family TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, delivered_at TEXT, acked_at TEXT, UNIQUE(session_id, actor, request_key));
+CREATE INDEX IF NOT EXISTS session_control_wakes_due ON session_control_wakes(state, wake_at_ms);
+CREATE INDEX IF NOT EXISTS session_control_wakes_session ON session_control_wakes(session_id, state);
+CREATE TABLE IF NOT EXISTS session_control_wake_alerts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, wake_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, intake_task_id TEXT, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS session_control_wake_alerts_session ON session_control_wake_alerts(session_id, created_at);
+`;
 
 export const SESSION_CONTROL_SCHEMA = ADOPTION_SCHEMA + `
 CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, parent_id TEXT, parent_source TEXT, session_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
@@ -95,6 +105,8 @@ const STOPPABLE = new Set(['offered', 'starting', 'running', 'uncertain']);
 export const CLEANUP_APPLY_ALLOWED_STATES = new Set([...STOPPABLE, 'stopped']);
 const BINDABLE = new Set(['offered', 'starting', 'uncertain', 'running']);
 const CLAIMABLE = new Set(['recorded', 'transported']);
+const WAKE_ACK_TIMEOUT_MS = 10 * 60 * 1000;
+const WAKE_PROMPT_MAX = 8000;
 
 export async function deriveCleanupSessionKey(operationKey: string, sessionId: string): Promise<string> {
   const digest = await sha256(`cu:${operationKey}:${sessionId}`);
@@ -172,6 +184,10 @@ export function qualifiedNativeAlias(workspace: string, tag: string): string | n
   if (!base || !tag) return null;
   return `${base}:${tag}`;
 }
+
+// A 64 KiB capture JSON-escapes to well over the 32 KiB default body cap.
+const MAX_ACK_BODY_BYTES = 262144;
+const HEADLESS_NO_INPUT_ENGINES = new Set(['codex', 'zcodex']);
 
 async function body(request: Request, maxBytes = 32768): Promise<any> {
   if (!request.body) return null;
@@ -257,7 +273,7 @@ export class SessionControlService {
     private sql: SqlStorage,
     private transaction: <T>(fn: () => T) => T,
     private now: () => number = Date.now,
-    private hooks: { reserve?: ReserveHook } = {},
+    private hooks: { reserve?: ReserveHook; wakeMissed?: (intakeId: string, wakeId: string) => void } = {},
     private options: SessionControlOptions = {},
   ) {
     this.maxPending = options.maxPendingCommands ?? 2000;
@@ -268,6 +284,9 @@ export class SessionControlService {
   init() {
     initSessionStalls(this.sql);
     for (const stmt of SESSION_CONTROL_SCHEMA.split(';')) {
+      if (stmt.trim()) this.sql.exec(stmt);
+    }
+    for (const stmt of SESSION_CONTROL_WAKE_SCHEMA.split(';')) {
       if (stmt.trim()) this.sql.exec(stmt);
     }
     initResourceRequestProjection(this.sql, 'session_control_sessions');
@@ -564,6 +583,7 @@ export class SessionControlService {
    * tree never authorized). No JSON owner proof is ever trusted: ownership is
    * the live session/command rows plus the M15 canonical joins. */
   private cleanupAuthorized(row: any, session: any): boolean {
+    if (openWorkPreventsIdleReap(this.sql, session)) return false;
     if (!this.cleanupStored(row)) return false;
     if (!session || session.actor !== row.actor) return false;
     if (!this.cleanupCommandOwnerLive(row, session)) return false;
@@ -652,6 +672,221 @@ export class SessionControlService {
     return true;
   }
 
+  private parseWakeAt(raw: unknown): { ok: true; ms: number; iso: string } | { ok: false; error: string } {
+    const nowMs = this.now();
+    if (typeof raw === 'string' && raw.trim().toLowerCase() === 'now') {
+      return { ok: true, ms: nowMs, iso: new Date(nowMs).toISOString() };
+    }
+    if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'invalid_wake_at' };
+    const ms = Date.parse(raw.trim());
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(raw.trim()) || !Number.isFinite(ms)) return { ok: false, error: 'invalid_wake_at' };
+    if (ms > nowMs + 365 * 24 * 3600 * 1000) return { ok: false, error: 'wake_at_too_far' };
+    return { ok: true, ms, iso: new Date(ms).toISOString() };
+  }
+
+  public nextWakeTime(): number | null {
+    const row: any = this.sql.exec(`SELECT MIN(deadline) AS deadline FROM (
+      SELECT wake_at_ms AS deadline FROM session_control_wakes WHERE state='pending'
+      UNION ALL SELECT CAST((julianday(delivered_at)-2440587.5)*86400000 AS INTEGER)+600000
+      FROM session_control_wakes WHERE state='delivered')`).toArray()[0];
+    return typeof row?.deadline === 'number' ? row.deadline : null;
+  }
+
+  private pendingWakeFor(sessionId: string): any | null {
+    try {
+      const rows = this.sql.exec(
+        "SELECT * FROM session_control_wakes WHERE session_id = ? AND state = 'pending' ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 1",
+        sessionId).toArray() as any[];
+      return rows[0] ?? null;
+    } catch { return null; }
+  }
+
+  private appendWakeIntakeNote(intakeTaskId: string | null, text: string, wakeId: string): void {
+    if (!intakeTaskId || !text) return;
+    const result = new IntakeService(this.sql, this.transaction).serviceRecordEvent(intakeTaskId, {
+      event: { kind: 'note', text: text.slice(0, 2000), actor: 'hub:service:wake',
+        sourceRef: wakeId, authority: 'untrusted_task_data' }, now: this.now(),
+    });
+    if (!result.ok) throw new Error('wake_intake_note_' + result.error);
+  }
+
+  private recordWakeAlert(sessionId: string, wakeId: string, kind: string, detail: string, intakeTaskId: string | null): void {
+    const at = this.at();
+    this.sql.exec(
+      'INSERT INTO session_control_wake_alerts (id, session_id, wake_id, kind, detail, intake_task_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      crypto.randomUUID(), sessionId, wakeId, kind, detail.slice(0, 1000), intakeTaskId ?? null, at);
+  }
+
+  private missWake(wake: any, intakeId: string | null, detail: string, text: string): void {
+    this.transaction(() => {
+      this.appendWakeIntakeNote(intakeId, text, wake.id);
+      this.recordWakeAlert(wake.session_id, wake.id, 'missed_wake', detail, intakeId);
+      this.sql.exec("UPDATE session_control_wakes SET state='missed',updated_at=? WHERE id=?", this.at(), wake.id);
+      if (intakeId) this.hooks.wakeMissed?.(intakeId, wake.id);
+    });
+  }
+
+  /** Durable wake sweep: deliver due wakes through the verified send path and
+   * expire unacked deliveries. Survives Worker/host restarts (DO SQLite).
+   * Called opportunistically on session reads and from the Hub tick/alarm. */
+  public processDueWakes(): { delivered: number; acked: number; missed: number } {
+    let delivered = 0, acked = 0, missed = 0;
+    const nowMs = this.now();
+    const at = this.at();
+    let due: any[] = [];
+    try {
+      due = this.sql.exec(
+        "SELECT * FROM session_control_wakes WHERE state = 'pending' AND wake_at_ms <= ? ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 100",
+        nowMs).toArray() as any[];
+    } catch { due = []; }
+    for (const wake of due) {
+      try {
+        const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', wake.session_id).toArray()[0];
+        const req = session ? parsed(session.request_json, {}) : {};
+        const intakeId = wake.intake_task_id ?? req?.intake_task_id ?? null;
+        if (!session || !['running', 'offered', 'starting', 'uncertain'].includes(session.state)) {
+          const detail = !session ? 'wake_session_gone' : `wake_session_not_running:${session.state}`;
+          this.missWake(wake, intakeId, detail,
+            `Wake ${wake.id.slice(0, 8)} missed: session ${!session ? 'gone' : session.state}.`,);
+          missed++;
+          continue;
+        }
+        if (nowMs >= wake.wake_at_ms + WAKE_ACK_TIMEOUT_MS) {
+          this.missWake(wake, intakeId, 'wake_delivery_deadline_exceeded',
+            `Wake ${wake.id.slice(0, 8)} missed: could not queue delivery within 10 min of due time. Handed to idle-with-open-AC recovery.`);
+          missed++;
+          continue;
+        }
+        // A start/binding still in flight is not a gone session. Retry until
+        // the delivery deadline; only a running binding can receive a send.
+        if (session.state !== 'running') continue;
+        const binding = session.binding_json ? parsed(session.binding_json, null) : null;
+        const generation = binding?.generation ?? 0;
+        const pendingCount = Number(this.sql.exec(
+          "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").toArray()[0]?.n ?? 0);
+        if (pendingCount >= this.maxPending) continue;
+        const perSession = Number(this.sql.exec(
+          "SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", session.id).toArray()[0]?.n ?? 0);
+        if (perSession >= this.maxPerSession) continue;
+        const commandId = crypto.randomUUID();
+        const correlation = `cmd:${commandId}:gen:${generation}`;
+        // A user send key cannot alias this service-owned command. The wake
+        // transition and command enqueue commit together, so a retry creates
+        // no second command after an interrupted write.
+        const requestKey = `wake-${wake.id}-${commandId}`;
+        this.transaction(() => {
+          this.sql.exec(
+            'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            commandId, session.id, 'send', wake.actor, requestKey, JSON.stringify({ body: wake.prompt }),
+            'recorded', generation, correlation, wake.owner_token_id ?? null, wake.owner_family ?? null, 0, at, at);
+          this.sql.exec("UPDATE session_control_wakes SET state = 'delivered', command_id = ?, delivered_at = ?, updated_at = ? WHERE id = ? AND state = 'pending'",
+            commandId, at, at, wake.id);
+        });
+        delivered++;
+      } catch { /* next wake */ }
+    }
+    // Ack reconciliation + 10-minute missed-wake expiry.
+    let awaiting: any[] = [];
+    try {
+      awaiting = this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'delivered' ORDER BY delivered_at ASC, id ASC LIMIT 100").toArray() as any[];
+    } catch { awaiting = []; }
+    for (const wake of awaiting) {
+      try {
+        const cmd: any = wake.command_id
+          ? this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', wake.command_id).toArray()[0]
+          : null;
+        const deliveredMs = wake.delivered_at ? Date.parse(wake.delivered_at) : NaN;
+        const deadline = Number.isFinite(deliveredMs) ? deliveredMs + WAKE_ACK_TIMEOUT_MS : wake.wake_at_ms + WAKE_ACK_TIMEOUT_MS;
+        if (cmd && cmd.state === 'acked') {
+          // A late proof resolves attention, but must not erase the missed
+          // deadline when the Worker was asleep before this reconciliation.
+          if (Date.parse(cmd.updated_at) > deadline) {
+            this.missWake(wake, wake.intake_task_id ?? null, 'wake_ack_after_10m',
+              `Wake ${wake.id.slice(0, 8)} missed its 10 min acknowledgement deadline; a late verified acknowledgement has now resolved it.`);
+            missed++;
+          }
+          this.sql.exec("UPDATE session_control_wakes SET state = 'acked', acked_at = ?, updated_at = ? WHERE id = ? AND state IN ('delivered','missed')", at, at, wake.id);
+          acked++;
+          continue;
+        }
+        const current: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', wake.session_id).toArray()[0];
+        if (!current || !['running', 'offered', 'starting', 'uncertain'].includes(current.state)) {
+          this.missWake(wake, wake.intake_task_id ?? null, 'wake_session_gone',
+            `Wake ${wake.id.slice(0, 8)} missed: session is gone before acknowledgement. Handed to idle-with-open-AC recovery.`);
+          missed++;
+          continue;
+        }
+        if (nowMs >= deadline) {
+          const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', wake.session_id).toArray()[0];
+          const req = session ? parsed(session.request_json, {}) : {};
+          const intakeId = wake.intake_task_id ?? req?.intake_task_id ?? null;
+          const reason = !session ? 'wake_session_gone' : `wake_not_acked_within_10m:command_${cmd?.state ?? 'missing'}`;
+          this.missWake(wake, intakeId, reason,
+            `Wake ${wake.id.slice(0, 8)} missed: no ack within 10 min (${cmd?.state ?? 'no command'}). Handed to idle-with-open-AC recovery.`);
+          missed++;
+        }
+      } catch { /* next */ }
+    }
+    const unresolved = this.sql.exec("SELECT * FROM session_control_wakes WHERE state='missed' ORDER BY updated_at LIMIT 100").toArray() as any[];
+    for (const wake of unresolved) {
+      const cmd: any = wake.command_id && this.sql.exec('SELECT state FROM session_control_commands WHERE id=?', wake.command_id).toArray()[0];
+      const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', wake.session_id).toArray()[0];
+      const binding = parsed(session?.binding_json, {});
+      const native: any = binding.native_id && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', session?.machine_id, binding.native_id).toArray()[0];
+      if (cmd?.state === 'acked') {
+        this.sql.exec("UPDATE session_control_wakes SET state='acked',acked_at=?,updated_at=? WHERE id=?", at, at, wake.id);
+      } else if (native && nativeObservationFresh(this.sql, native, nowMs) &&
+          nativeProgress(native) !== null && Number(nativeProgress(native)) > Date.parse(wake.updated_at)) {
+        this.sql.exec("UPDATE session_control_wakes SET state='resolved',updated_at=? WHERE id=?", at, wake.id);
+      }
+    }
+    return { delivered, acked, missed };
+  }
+
+  attention(): any[] {
+    const now = this.now(), result: any[] = [];
+    const episodes = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray().length;
+    const savedStalls = new Set((this.sql.exec('SELECT machine_id,native_id FROM session_stalls').toArray() as any[]).map(r=>JSON.stringify([r.machine_id,r.native_id])));
+    const missed = new Set((this.sql.exec("SELECT DISTINCT session_id FROM session_control_wakes WHERE state='missed'").toArray() as any[]).map(r=>r.session_id));
+    const natives = new Map((this.sql.exec(`SELECT f.* FROM session_control_sessions s LEFT JOIN fleet_sessions f
+      ON f.machine_id=s.machine_id AND f.native_id=json_extract(s.binding_json,'$.native_id') WHERE s.state='running'`).toArray() as any[])
+      .map(r=>[JSON.stringify([r.machine_id,r.native_id]),r]));
+    const freshness: NativeObservationCache = new Map();
+    for (const row of this.sql.exec("SELECT id,machine_id,binding_json,mode,engine,state,created_at,updated_at FROM session_control_sessions WHERE state='running'").toArray() as any[]) {
+      const binding = parsed(row.binding_json, {});
+      const nativeKey = JSON.stringify([row.machine_id,binding.native_id]);
+      const observed: any = natives.get(nativeKey);
+      const same = observed && observed.tag === binding.tag && observed.workspace === binding.workspace &&
+        (!observed.created_at_ms || !binding.native_created_at_ms || observed.created_at_ms === binding.native_created_at_ms);
+      const native = same ? observed : binding.native_id && row.machine_id ? {
+        machine_id: row.machine_id, native_id: binding.native_id, phase: 'unobserved',
+        created_at_ms: binding.native_created_at_ms ?? Date.parse(row.created_at), observed_at: row.updated_at,
+      } : null;
+      const fresh = !!native && nativeObservationFresh(this.sql,native,now,freshness);
+      const progress = parsed(native?.progress_json, {}), lastProgress = nativeProgress(native);
+      const goal = nativeGoalStatus(native);
+      const candidate = fresh && !['exited','dead','pruned','forgotten'].includes(native?.phase) &&
+        ((lastProgress !== null && now-lastProgress > stallThreshold(this.options.env)*1000) ||
+         (progress?.agent_alive === false && progress?.headless === true));
+      if (!candidate && !savedStalls.has(nativeKey) && !missed.has(row.id) &&
+          !(fresh && ['blocked','paused','stalled'].includes(goal || ''))) continue;
+      // Candidate selection avoids retained intake/model/warning histories for
+      // healthy rows; the canonical view still decides every emitted state.
+      const full: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?',row.id).toArray()[0];
+      const v = this.view(full,10800);
+      if (!['idle_with_open_ac','stalled'].includes(v.state)) continue;
+      const state = v.state, idleFor = v.idle_for, lastActivity = v.last_activity_at;
+      const e: any = episodes ? this.sql.exec('SELECT last_nudge_at FROM session_idle_episodes WHERE session_id=?', row.id).toArray()[0] : null;
+      const lastNudge = e?.last_nudge_at ? new Date(e.last_nudge_at).toISOString() : null;
+      const intakeId = v.intake_id;
+      result.push({ session_id: row.id, intake_id: intakeId, state, idle_for: idleFor,
+        goal_status: v.goal_status, waiting_until: v.waiting_until, missed_wake: v.missed_wake, last_activity_at: lastActivity, last_nudge: lastNudge,
+        severity: 'warn', source: 'session_idle', subject: 'session:' + row.id,
+        title: state + ': ' + row.id, detail: `${state}; intake_id=${intakeId || '(unlinked)'}; idle_for=${idleFor}s; last_activity_at=${lastActivity}; last_nudge=${lastNudge || 'none'}` });
+    }
+    return result;
+  }
+
   private warningView(row: any, threshold = 10800) {
     const binding = parsed(row.binding_json, {});
     const intent = parsed(row.request_json, {});
@@ -672,6 +907,7 @@ export class SessionControlService {
          (json_extract(e.value, '$.native_id') = ? AND json_extract(e.value, '$.routing_job_id') IS NOT NULL)) LIMIT 1`, row.id, binding?.native_id ?? '').toArray()[0];
       intakeId = linked?.id ?? null;
     }
+    intakeId = intakeId || linkedIntake(this.sql, row)?.id || null;
     const runtime = Math.max(0, (now - started) / 1000);
     const idleFor = Math.max(0, (now - lastActivity) / 1000);
     const snooze: any = this.sql.exec('SELECT * FROM session_warning_events WHERE session_id = ? ORDER BY rowid DESC LIMIT 1', row.id).toArray()[0];
@@ -701,6 +937,11 @@ export class SessionControlService {
     const hostFresh = nativeObservationFresh(this.sql, native, this.now());
     const terminalError = hostFresh ? sessionTerminalError(row, observed) : null;
     const stall = classifySessionStall(this.sql, native, this.now(), stallThreshold(this.options.env), hostFresh);
+    const intake = linkedIntake(this.sql, row);
+    const goalStatus = nativeGoalStatus(native);
+    const wake = sessionWakeState(this.sql, row.id, this.now());
+    const idleOpen = row.state === 'running' && !terminalError && hasOpenWork(intake) &&
+      (stall.stalled || wake.missed || (hostFresh && ['blocked', 'paused', 'stalled'].includes(goalStatus || '')));
     const isObserved = (row.actor === 'unknown' || request.provenance === 'observed_native') && !row.fleet_launch_id;
     const provenance = isObserved ? 'observed_native' : 'canonical_hub';
     const controllability = isObserved
@@ -761,15 +1002,31 @@ export class SessionControlService {
       if (holdInfo.reason && (row.state === 'refused' || row.state === 'held' || row.state === 'cancelled')) holdReason = holdInfo.reason;
     }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
+    // Scheduled wake: a pending future wake suspends stall/idle classification.
+    // While waiting_until is set the session is waiting on an external event,
+    // not stalled, and idle/nudge logic must not fire before the wake time.
+    let waiting_until: string | null = null;
+    let wake_id: string | null = null;
+    try {
+      const pending = this.pendingWakeFor(row.id);
+      if (pending && pending.state === 'pending') {
+        waiting_until = pending.wake_at ?? new Date(pending.wake_at_ms).toISOString();
+        wake_id = pending.id ?? null;
+      }
+    } catch {}
+    const waitingActive = !!waiting_until && row.state === 'running' && Date.parse(waiting_until) > this.now();
     return {
       ...(threshold === null ? {} : this.warningView(row, threshold)),
       id: row.id, state: terminalError ? 'failed' :
+        waitingActive ? 'waiting_until' :
         row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? 'failed' :
         row.mode === 'headless' && row.state === 'stopped' && orphanFailure(native) ? 'failed' :
         row.mode === 'headless' && row.state === 'running' && ['exited', 'dead'].includes(native?.phase) ? 'failed' :
-        row.state === 'running' && stall.stalled ? 'stalled' : row.state,
-      stalled: row.state === 'running' && !terminalError && stall.stalled,
-      stall_reason: terminalError ?? (orphanFailure(native) ? 'agent_exited_children_running' : stall.reason), stalled_since: stall.since,
+        idleOpen ? 'idle_with_open_ac' : row.state === 'running' && stall.stalled ? 'stalled' : row.state,
+      intake_id: intake?.id || request.intake_task_id || null, goal_status: goalStatus,
+      idle_with_open_ac: idleOpen && !waitingActive, missed_wake: wake.missed,
+      stalled: waitingActive ? false : (row.state === 'running' && !terminalError && stall.stalled),
+      stall_reason: waitingActive ? 'waiting_until' : (terminalError ?? (orphanFailure(native) ? 'agent_exited_children_running' : stall.reason)), stalled_since: waitingActive ? null : stall.since,
       ...(terminalError ? { failure_reason: terminalError, cleanup_pending: true } : {}),
       stall_threshold: stallThreshold(this.options.env), lifecycle_state: row.state,
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
@@ -798,6 +1055,8 @@ export class SessionControlService {
       session_type,
       parent_id,
       parent_source,
+      ...(waitingActive ? { waiting_until, wake_id } : { waiting_until: null }),
+      ...(waitingActive && threshold !== null ? { warning_active: false } : {}),
       created_at: row.created_at, updated_at: row.updated_at,
     };
   }
@@ -1326,11 +1585,16 @@ export class SessionControlService {
         LEFT JOIN credentials c ON c.id=s.owner_token_id LEFT JOIN session_control_protections p ON p.session_id=s.id
         WHERE s.machine_id = ?`, caller.machineId!).toArray();
       const worktreeLinks = worktreeIntakeSnapshot(this.sql);
+      // One immutable read snapshot for the whole response. classifyKey
+      // rebuilds every session's inputs; doing that per row made the host's
+      // stop/restart maintenance exceed its HTTP budget at fleet scale.
+      const guardRefs = buildSessionInputs(this.sql).refs;
       let sessions = rows.filter(row => this.hostOk(row, caller).ok).map(row => {
         const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
-        const unstarted = !binding && !row.guard_launch_native && ['failed', 'refused'].includes(row.guard_launch_state);
+        const unstarted = !binding && !row.guard_launch_native &&
+          (['failed', 'refused'].includes(row.guard_launch_state) || (row.state === 'stopped' && this.confirmedStopRecorded(row)));
         const protectedSession = binding
-          ? classifyKey(this.sql, `${row.machine_id}/${binding.native_id}`, this.now())?.refs?.protected_session !== false
+          ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.protected_session !== false
           : !(unstarted && row.guard_owner_kind === 'agent' && !row.guard_explicit_protection);
         const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
         const nativeTerminal = unstarted || !!(native &&
@@ -1339,7 +1603,7 @@ export class SessionControlService {
         const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
           this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
             binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
-        return { session_id: row.id, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+        return { session_id: row.id, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
           lock_release_permitted: !protectedSession || (adoptedLock && !row.guard_explicit_protection),
           engine: row.engine, adoption_intent_id: binding?.adoption_intent_id ?? null,
           tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),
@@ -1351,12 +1615,12 @@ export class SessionControlService {
       // exact native incarnation. Never unlock through a terminal alias
       // while another linked Hub session is live or human-protected.
       sessions = sessions.map(fact => {
-        if (!fact.native_id) return fact;
-        const aliases = sessions.filter(other => other.native_id === fact.native_id &&
-          other.native_created_at_ms === fact.native_created_at_ms);
+        const aliases = fact.native_id ? sessions.filter(other => other.native_id === fact.native_id &&
+          other.native_created_at_ms === fact.native_created_at_ms) : [fact];
         return { ...fact, terminal: aliases.every(other => other.terminal),
           protected: aliases.some(other => other.protected),
-          lock_release_permitted: aliases.every(other => other.lock_release_permitted),
+          lock_release_permitted: aliases.every(other => other.lock_release_permitted) &&
+            (!fact.intake_task_id || sessions.filter(other => other.intake_task_id === fact.intake_task_id).every(other => other.terminal && other.native_terminal && other.lock_release_permitted)),
           linked_intake_open: aliases.some(other => other.linked_intake_open) };
       });
       return response({ sessions });
@@ -1469,7 +1733,7 @@ export class SessionControlService {
       if (input.needs !== undefined && (!Array.isArray(input.needs) || input.needs.length > 64 || (input.needs as unknown[]).some((n: unknown) => typeof n !== 'string' || !/^[a-z0-9][a-z0-9:_-]{0,95}$/.test(n)) || new Set(input.needs).size !== input.needs.length)) {
         return response({ error: 'invalid_session_request', field: 'needs', detail: 'invalid_needs' }, 400);
       }
-      if (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > 8000)) {
+      if (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > (caller.isAdmin === true && caller.actor === 'hub:service:idle-work' ? 10000 : 8000))) {
         return response({ error: 'invalid_session_request', field: 'brief', detail: 'invalid_brief' }, 400);
       }
       // Tier resolves through the EXISTING model-routing table inside fleet
@@ -1795,12 +2059,21 @@ export class SessionControlService {
 
     if (path === '/api/sessions/warnings' && request.method === 'GET') {
       if (!writer) return response({ error: 'forbidden' }, 403);
-      this.transaction(() => reconcileUnboundFleetSessions(this.sql, this.now()));
+      this.transaction(() => {
+        reconcileUnboundFleetSessions(this.sql, this.now());
+        try { this.processDueWakes(); } catch {}
+      });
       const rows = (admin
         ? this.sql.exec("SELECT * FROM session_control_sessions WHERE state = 'running' ORDER BY created_at, id").toArray()
         : this.sql.exec("SELECT * FROM session_control_sessions WHERE state = 'running' AND actor = ? ORDER BY created_at, id", caller.actor).toArray()) as any[];
       const warnings = rows.filter(row => this.ownerOk(row, caller)).map(row => this.view(row, threshold)).filter(row => row.warning_active);
-      return response({ warnings });
+      let wake_alerts: any[] = [];
+      try {
+        const ownedIds = new Set(rows.filter(row => this.ownerOk(row, caller)).map((r: any) => r.id));
+        const alerts = this.sql.exec("SELECT a.* FROM session_control_wake_alerts a JOIN session_control_wakes w ON w.id=a.wake_id WHERE w.state='missed' ORDER BY a.created_at DESC, a.id DESC LIMIT 100").toArray() as any[];
+        wake_alerts = alerts.filter(a => ownedIds.has(a.session_id) || admin);
+      } catch {}
+      return response({ warnings, wake_alerts });
     }
 
     if (path === '/api/sessions' && request.method === 'GET') {
@@ -1808,6 +2081,7 @@ export class SessionControlService {
       this.transaction(() => {
         reconcileUnboundFleetSessions(this.sql, this.now());
         this.reconcileHeldSessions();
+        try { this.processDueWakes(); } catch {}
       });
       // M15c lifecycle: additive grouped needs-action projection over the
       // canonical stores (never a second registry). Scope is authentication,
@@ -1989,6 +2263,10 @@ export class SessionControlService {
               continue;
             }
             const req = parsed(live.request_json, {});
+            if (openWorkPreventsIdleReap(this.sql, live)) {
+              refused.push({ key: target.session_key, reasons: ['open intake work requires nudge/replacement'] });
+              continue;
+            }
             if (live.actor === 'unknown' || req.provenance === 'observed_native') {
               refused.push({ key: target.session_key, reasons: ['observed_native session protected from automated cleanup'] });
               continue;
@@ -2103,7 +2381,7 @@ export class SessionControlService {
       });
     }
 
-    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel|protect|retirement|ack|events))?$/.exec(path);
+    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel|protect|retirement|ack|events|wake|wakes|link))?$/.exec(path);
     if (sessionMatch) {
       const rawRef = decodeURIComponent(sessionMatch[1]);
       const sub = sessionMatch[3];
@@ -2114,8 +2392,10 @@ export class SessionControlService {
         // their canonical control session, with the same ownership checks.
         // Hosts must keep using the exact session UUID for binding/retirement.
         if (!session && sub !== 'binding' && sub !== 'retirement') {
+          const self = workerAccessContext(this.sql,caller.tokenId,this.now());
           const matches = (this.sql.exec('SELECT * FROM session_control_sessions WHERE fleet_launch_id = ?', rawRef).toArray() as any[])
-            .filter(row => this.ownerOk(row, caller));
+            .filter(row => this.ownerOk(row,caller) || (self?.session_id === row.id &&
+              ((request.method === 'GET' && (!sub || ['commands','wakes'].includes(sub))) || (request.method === 'POST' && sub === 'wake'))));
           if (matches.length > 1) return response({ error: 'ambiguous_name' }, 409);
           session = matches[0] ?? null;
         }
@@ -2144,7 +2424,7 @@ export class SessionControlService {
       } else if (rawRef.includes(':')) {
         if (sub === 'binding' || sub === 'retirement') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack', 'wake', 'wakes', 'link'].includes(sub) ? request.method === 'POST' || (sub === 'wakes' && request.method === 'GET') : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByQualifiedAlias(rawRef, caller);
@@ -2157,12 +2437,34 @@ export class SessionControlService {
         // binding path stays strict Hub UUID (no alias).
         if (sub === 'binding' || sub === 'retirement') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack', 'wake', 'wakes', 'link'].includes(sub) ? request.method === 'POST' || (sub === 'wakes' && request.method === 'GET') : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByName(rawRef, caller);
         if (!resolved.ok) return response({ error: resolved.error }, resolved.status);
         session = resolved.session;
+      }
+      if (sub === 'link' && request.method === 'POST') {
+        if (!admin) return response({ error: 'forbidden' }, 403);
+        const input = await body(request);
+        if (!obj(input, ['key', 'intake_task_id']) || !label(input.key) ||
+            typeof input.intake_task_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{5,127}$/.test(input.intake_task_id)) {
+          return response({ error: 'invalid_intake_link' }, 400);
+        }
+        return this.transaction(() => {
+          const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', session.id).toArray()[0];
+          if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
+          const tasks: any[] = this.sql.exec("SELECT id FROM intake_tasks WHERE id=? OR substr(id,1,?)=? LIMIT 2",
+            input.intake_task_id, input.intake_task_id.length, input.intake_task_id).toArray();
+          if (tasks.length !== 1) return response({ error: tasks.length ? 'ambiguous_intake' : 'unknown_intake_task' }, 409);
+          const intent = parsed(live.request_json, {});
+          if (intent.intake_task_id && intent.intake_task_id !== tasks[0].id) return response({ error: 'intake_link_conflict' }, 409);
+          intent.intake_task_id = tasks[0].id;
+          live.request_json = JSON.stringify(intent);
+          this.sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', live.request_json, live.id);
+          recordIntakeSessionLink(this.sql, live, this.now());
+          return response(this.view(live, threshold));
+        });
       }
       if (sub === 'binding') {
         // Host-only native binding report: the Fleet result -> native binding
@@ -2393,10 +2695,21 @@ export class SessionControlService {
           return response({ ...this.view(updatedRow), id: live.id, state: 'stopped', replay: false });
         });
       }
-      if (!session || !this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
+      const scopedWorker = workerAccessContext(this.sql,caller.tokenId,this.now());
+      const wakeOwnerOk = (row: any) => this.ownerOk(row,caller) ||
+        !!row && workerWakeAllowed(this.sql,caller.tokenId,row.id,this.now());
+      const scopedSelfRead = request.method === 'GET' && scopedWorker?.session_id === session?.id &&
+        (!sub || ['commands','wakes'].includes(sub));
+      if (!session || !(this.ownerOk(session,caller) || scopedSelfRead ||
+          (sub === 'wake' && request.method === 'POST' && wakeOwnerOk(session)))) return response({ error: 'not_found' },404);
+
       // Polling a capacity-queued intent adopts any Fleet-side promotion, so
       // the wait is observable without another placement call.
-      if (!sub && request.method === 'GET') return this.transaction(() => response(this.view(this.syncFleetPlacement(session.id) ?? session, threshold)));
+      if (!sub && request.method === 'GET') return this.transaction(() => {
+        try { this.processDueWakes(); } catch {}
+        const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0] ?? session;
+        return response(this.view(this.syncFleetPlacement(live.id) ?? live, threshold));
+      });
       if (sub === 'events' && request.method === 'GET') {
         return response({ events: this.sql.exec('SELECT * FROM session_warning_events WHERE session_id = ? ORDER BY created_at, id', session.id).toArray() });
       }
@@ -2410,6 +2723,61 @@ export class SessionControlService {
           const event = { id: crypto.randomUUID(), session_id: live.id, kind: 'warning_ack', actor: actorName(caller), created_at: this.at(), until_at: new Date(this.now() + seconds * 1000).toISOString() };
           this.sql.exec('INSERT INTO session_warning_events (id, session_id, kind, actor, created_at, until_at) VALUES (?, ?, ?, ?, ?, ?)', event.id, event.session_id, event.kind, event.actor, event.created_at, event.until_at);
           return response({ ...this.view(live, threshold), event });
+        });
+      }
+      if ((sub === 'wake' || sub === 'wakes') && (request.method === 'POST' || request.method === 'GET')) {
+        if (sub === 'wakes' && request.method === 'GET') {
+          if (!wakeOwnerOk(session)) return response({ error: 'not_found' }, 404);
+          return this.transaction(() => {
+            try { this.processDueWakes(); } catch {}
+            const wakes = this.sql.exec(
+              "SELECT * FROM session_control_wakes WHERE session_id = ? ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 100", session.id).toArray();
+            const alerts = this.sql.exec(
+              'SELECT * FROM session_control_wake_alerts WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT 20', session.id).toArray();
+            return response({ session_id: session.id, wakes, alerts, ...(this.pendingWakeFor(session.id) ? { waiting_until: this.pendingWakeFor(session.id).wake_at } : {}) });
+          });
+        }
+        if (request.method !== 'POST') return response({ error: 'not_found' }, 404);
+        if (!writer || !wakeOwnerOk(session)) return response({ error: 'forbidden' }, 403);
+        const input = await body(request);
+        if (!obj(input, ['key', 'at', 'prompt', 'body']) || !label(input.key)) {
+          return response({ error: 'invalid_wake' }, 400);
+        }
+        const rawPrompt = typeof input.prompt === 'string' ? input.prompt : (typeof input.body === 'string' ? input.body : null);
+        if (typeof rawPrompt !== 'string' || !rawPrompt.trim() || rawPrompt.length > WAKE_PROMPT_MAX) {
+          return response({ error: 'invalid_wake' }, 400);
+        }
+        const atParsed = this.parseWakeAt(input.at);
+        if (!atParsed.ok) return response({ error: atParsed.error }, 400);
+        return this.transaction(() => {
+          const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+          if (!live || !wakeOwnerOk(live)) return response({ error: 'not_found' }, 404);
+          if (!['running', 'offered', 'starting', 'uncertain'].includes(live.state)) {
+            return response({ error: 'session_not_wakeable' }, 409);
+          }
+          const prior: any = this.sql.exec(
+            'SELECT * FROM session_control_wakes WHERE session_id = ? AND actor = ? AND request_key = ?', live.id, actorName(caller), input.key).toArray()[0];
+          if (prior) {
+            if (prior.prompt !== rawPrompt.trim() || (input.at.trim().toLowerCase() !== 'now' && prior.wake_at_ms !== atParsed.ms)) {
+              return response({ error: 'idempotency_conflict' }, 409);
+            }
+            return response({ wake_id: prior.id, session_id: prior.session_id, wake_at: prior.wake_at, wake_state: prior.state, replay: true });
+          }
+          const outstanding = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_wakes WHERE state IN ('pending','delivered')").toArray()[0]?.n ?? 0);
+          const sessionOutstanding = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_wakes WHERE session_id=? AND state IN ('pending','delivered')", live.id).toArray()[0]?.n ?? 0);
+          if (outstanding >= this.maxPending || sessionOutstanding >= this.maxPerSession) return response({ error: 'wake_queue_full' }, 429);
+          const req = parsed(live.request_json, {});
+          const id = crypto.randomUUID();
+          const nowIso = this.at();
+          this.sql.exec(
+            'INSERT INTO session_control_wakes (id, session_id, actor, request_key, wake_at_ms, wake_at, prompt, state, command_id, intake_task_id, owner_token_id, owner_family, created_at, updated_at, delivered_at, acked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            id, live.id, actorName(caller), input.key, atParsed.ms, atParsed.iso, rawPrompt.trim(), 'pending', null,
+            typeof req?.intake_task_id === 'string' ? req.intake_task_id : this.warningView(live).intake_id ?? null,
+            caller.tokenId ?? null, this.presentingFamily(caller), nowIso, nowIso, null, null);
+          try { this.processDueWakes(); } catch {}
+          const stored: any = this.sql.exec('SELECT * FROM session_control_wakes WHERE id = ?', id).toArray()[0];
+          const refreshed: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', live.id).toArray()[0];
+          return response({ ...this.view(refreshed, threshold), wake_id: id, session_id: live.id, wake_at: stored.wake_at, wake_state: stored.state, command_id: stored.command_id ?? null, replay: false }, 201);
         });
       }
       if (sub === 'protect' && request.method === 'POST') {
@@ -2562,7 +2930,7 @@ export class SessionControlService {
         };
         if (kind === 'send') {
           if (!obj(input, ['key', 'body', 'require_ready']) || !label(input.key) ||
-              typeof input.body !== 'string' || !input.body.trim() || new TextEncoder().encode(input.body).length > 16384) {
+              typeof input.body !== 'string' || !input.body.trim() || new TextEncoder().encode(input.body).length > (caller.isAdmin === true && caller.actor === 'hub:service:idle-work' ? 20000 : 16384)) {
             return response({ error: 'invalid_send' }, 400);
           }
           return this.transaction(() => {
@@ -2582,11 +2950,22 @@ export class SessionControlService {
             const nowMs = this.now();
             const hasReported = Boolean(reported?.agent_state) && Number.isFinite(observedMs) &&
               observedMs <= nowMs + 60000 && nowMs - observedMs <= RECENT_STATE_MS;
+            // Headless codex/zcodex run `exec` and never read input or the
+            // inbox: refuse at send time (the host would only fail it later)
+            // instead of returning `recorded` for a message nobody reads.
+            if (live.mode === 'headless' && HEADLESS_NO_INPUT_ENGINES.has(String(live.engine ?? ''))) {
+              return response({ error: 'send_unsupported_headless',
+                message: `headless ${live.engine} sessions accept no input; stop and start a new session with the instruction in its brief` }, 409);
+            }
             if (!hasReported && input.require_ready === true) {
               return response({ error: 'target_not_ready', message: 'target has no recent reported state' }, 409);
             }
             const warning = !hasReported ? 'target_no_reported_state' : undefined;
-            return this.enqueue(live, kind, actorName(caller), caller, input.key, { body: input.body }, warning);
+            // Other headless engines get the message in their native inbox,
+            // surfaced by the awareness hook at their next turn; the command
+            // acks once the recipient acknowledges it.
+            const delivery = live.mode === 'headless' ? 'next_turn' : undefined;
+            return this.enqueue(live, kind, actorName(caller), caller, input.key, { body: input.body }, warning, delivery);
           });
         }
         if (kind === 'capture') {
@@ -2615,7 +2994,24 @@ export class SessionControlService {
           if (!new Set([...STOPPABLE, 'stopped']).has(live.state)) return response({ error: 'session_not_stoppable' }, 409);
           const actor = actorName(caller);
           const resp = this.enqueue(live, kind, actor, caller, input.key, {});
-          if (resp.status >= 400 || live.state !== 'uncertain' || live.binding_json) return resp;
+          if (resp.status >= 400) return resp;
+          // A confirmed terminal session needs no second host delivery. The
+          // native runtime may already have retired its record, or the host
+          // may be offline; neither invalidates the recorded exit proof.
+          // The state label alone is insufficient: legacy stopped rows can
+          // still have a live workload, so require a matching exit receipt.
+          if (live.state === 'stopped' && this.confirmedStopRecorded(live)) {
+            const cmd: any = this.sql.exec('SELECT * FROM session_control_commands WHERE session_id = ? AND actor = ? AND request_key = ?', live.id, actor, input.key).toArray()[0];
+            if (!cmd || !['recorded', 'transported', 'failed'].includes(cmd.state) || cmd.claim_token) return resp;
+            const at = this.at();
+            const binding = parsed(live.binding_json, null);
+            const native = binding ? { native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace }
+              : { native_id: '00000000-0000-0000-0000-000000000000', tag: 'unbound', workspace: '/' };
+            this.sql.exec("UPDATE session_control_commands SET state = 'acked', ack_json = ?, updated_at = ? WHERE id = ?",
+              JSON.stringify({outcome: 'delivered', confirmed_exit: true, native, reason: 'session_already_stopped'}), at, cmd.id);
+            return response({command_id: cmd.id, session_id: live.id, kind, state: 'acked', generation: cmd.generation, correlation: cmd.correlation, replay: resp.status === 200}, resp.status);
+          }
+          if (live.state !== 'uncertain' || live.binding_json) return resp;
           // An unbound uncertain session whose fleet launch never recorded a
           // native start and has no correlated live native row settles to
           // stopped without stranding on stop_host_unreachable or stop_refused.
@@ -2879,7 +3275,7 @@ export class SessionControlService {
     const ackMatch = /^\/api\/session-commands\/([a-f0-9-]{36})\/ack$/.exec(path);
     if (ackMatch && request.method === 'POST') {
       if (!host) return response({ error: 'forbidden' }, 403);
-      const input = await body(request);
+      const input = await body(request, MAX_ACK_BODY_BYTES);
       if (!obj(input, ['correlation', 'outcome', 'native', 'reason', 'capture', 'confirmed_exit', 'claim_token', 'proof', 'tree']) ||
           typeof input.correlation !== 'string' || !ACK_OUTCOMES.has(input.outcome) ||
           typeof input.claim_token !== 'string' || !input.claim_token ||
@@ -2941,9 +3337,11 @@ export class SessionControlService {
               return response({ command_id: row.id, state: row.state });
             }
           }
-          if (row.state === 'uncertain' || (CLAIMABLE.has(row.state) && row.claim_token)) {
+          if (row.state === 'uncertain' || (CLAIMABLE.has(row.state) && row.claim_token) ||
+              (row.state === 'failed' && input.outcome === 'delivered' && !parsed(row.ack_json, null)?.claim_token && parsed(row.ack_json, null)?.reason === 'recipient_not_ready')) {
             const late = this.lateReplyAck(row, input, caller);
             if (late) return late;
+            if (row.state === 'failed') return response({ error: 'claim_required' }, 409);
             return response({ error: 'command_uncertain' }, 409);
           }
           return response({ error: 'claim_required' }, 409);
@@ -3137,7 +3535,25 @@ export class SessionControlService {
     return response({ command_id: row.id, state });
   }
 
-  private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any, warning?: string) {
+  private confirmedStopRecorded(session: any): boolean {
+    const binding = parsed(session.binding_json, null);
+    const receipts = this.sql.exec(`SELECT ack_json FROM session_control_commands
+      WHERE session_id=? AND kind='stop' AND state='acked' AND generation=?
+      ORDER BY updated_at DESC LIMIT 20`, session.id, binding?.generation ?? 0).toArray() as any[];
+    if (receipts.some(row => {
+      const ack = parsed(row.ack_json, {});
+      return ack.outcome === 'delivered' && ack.confirmed_exit === true &&
+        (binding ? ack.native?.native_id === binding.native_id && ack.native?.tag === binding.tag && ack.native?.workspace === binding.workspace
+          : ['unbound_uncertain_no_native_process', 'session_already_stopped'].includes(ack.reason) &&
+            ack.native?.native_id === '00000000-0000-0000-0000-000000000000' &&
+            ack.native?.tag === 'unbound' && ack.native?.workspace === '/');
+    })) return true;
+    if (!binding || !session.fleet_launch_id) return false;
+    const launch: any = this.sql.exec('SELECT state, verification_status, native_id FROM fleet_launches WHERE id=? AND machine_id=?', session.fleet_launch_id, session.machine_id).toArray()[0];
+    return launch?.state === 'exited' && launch.verification_status === 'verified' && launch.native_id === binding.native_id;
+  }
+
+  private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any, warning?: string, delivery?: string) {
     // Post-body ownership inside the mutation txn: a credential revoked,
     // expired, rebound, or re-enrolled while the body streamed must not
     // enqueue or stamp a NULL family. ownerOk re-verifies the live
@@ -3168,7 +3584,7 @@ export class SessionControlService {
       'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       id, session.id, kind, actor, key, JSON.stringify(payload), 'recorded', generation, correlation,
       caller.tokenId ?? null, this.presentingFamily(caller), 0, at, at);
-    return response({ command_id: id, state: 'recorded', ...(warning ? { warning } : {}) }, 201);
+    return response({ command_id: id, state: 'recorded', ...(warning ? { warning } : {}), ...(delivery ? { delivery } : {}) }, 201);
   }
 }
 
@@ -3331,5 +3747,18 @@ export function adoptObservedNativeSessions(
     }
   }
 
+  // Notes may be appended after initial adoption. Reconcile existing imports too.
+  for (const s of sessions) {
+    if (!s || typeof s.native_id !== 'string') continue;
+    const row: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', s.native_id).toArray()[0];
+    if (!row || row.fleet_launch_id || parsed(row.request_json, {}).intake_task_id) continue;
+    const task = linkedIntake(sql, row, true);
+    if (task) {
+      const intent = { ...parsed(row.request_json, {}), intake_task_id: task.id };
+      sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', JSON.stringify(intent), row.id);
+      row.request_json = JSON.stringify(intent);
+      recordIntakeSessionLink(sql, row, nowMs);
+    }
+  }
   return { adopted, updated, deferred };
 }

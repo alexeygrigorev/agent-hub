@@ -154,15 +154,16 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
                 }
             ]
         }
-        reports = fleet.collect_subscriptions(settings, runner=runner)
+        seen = []
+        reports = fleet.collect_subscriptions(settings, runner=lambda argv: seen.append(argv) or runner(argv))
         self.assertEqual(len(reports), 1)
         sub = reports[0]
         self.assertEqual(sub["service"], "claude")
         self.assertEqual(sub["account"], "shared-claude")
         self.assertEqual(sub["plan"], "max")
-        self.assertIsNotNone(sub["quota"])
-        self.assertEqual(sub["quota"]["status"], "ok")
-        self.assertEqual(sub["quota"]["windows"]["5h"]["percent_remaining"], 80.0)
+        # Intake 5814e109 I4: Hub owns quota; the host never runs quse, even when configured.
+        self.assertFalse(any(a[:1] == ["quse"] for a in seen))
+        self.assertEqual(sub["quota"]["status"], "unknown")
 
     def test_supervisor_default_config_path(self):
         supervisor_path = Path(__file__).resolve().parent.parent.parent / "scripts" / "session-host-supervisor.py"

@@ -123,7 +123,7 @@ class GateTests(unittest.TestCase):
     def test_classify_terminal_idle_dead(self):
         now = 10_000_000
         self.assertEqual(rm.classify_reason(_entry(state="failed"), "exited", False, 3_600_000, now), "terminal")
-        idle_entry = _entry(state="running", last_activity_at="1970-01-01T00:00:00Z")
+        idle_entry = _entry(state="running", idle_reap_allowed=True, last_activity_at="1970-01-01T00:00:00Z")
         self.assertEqual(rm.classify_reason(idle_entry, "running", False, 3_600_000, now), "idle")
         recent = _entry(state="running", last_activity_at="1970-01-01T02:46:39Z")
         self.assertIsNone(rm.classify_reason(recent, "running", False, 3_600_000, now))
@@ -560,10 +560,18 @@ class EvidenceGateTests(unittest.TestCase):
             stop_mock.assert_not_called()
             self.assertEqual(out["reaps"], 0)
 
-    def test_idle_quiet_happy_path_stops(self):
+    def test_open_intake_without_fresh_permission_never_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
             native = [_native(phase="running", last_activity_ms=1_000_000)]
             sessions = [_entry(state="running", last_activity_at="1970-01-01T00:00:00Z")]
+            out, _, stop_mock = self._reap_cycle(sessions, native, journal=tmp)
+            stop_mock.assert_not_called()
+            self.assertEqual(out["reaps"], 0)
+
+    def test_idle_quiet_happy_path_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="running", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="running", idle_reap_allowed=True, last_activity_at="1970-01-01T00:00:00Z")]
             out, _, stop_mock = self._reap_cycle(sessions, native, journal=tmp)
             stop_mock.assert_called_once()
             self.assertEqual(out["reaps"], 1)

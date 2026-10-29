@@ -160,10 +160,14 @@ class TestWorktreeCli(unittest.TestCase):
             transport.assert_not_called()
 
     def test_transport_failure_reports_retry_key(self):
-        with patch.object(intake, 'request', side_effect=intake.IntakeTransportError('Intake transport failed')):
+        with patch.object(intake, 'request', side_effect=intake.IntakeTransportError('Intake transport failed')) as transport, \
+                patch('agent_hub_host.api.KEYED_REPLAY_DELAYS', (0, 0, 0, 0, 0)):
             code, _, error = run_cli('worktree', 'refresh', '4b161918', '--key', 'wt-retry')
         self.assertEqual(code, 1)
         self.assertIn('wt-retry', error)
+        # c206f556: a lost response replays the same key before giving up.
+        self.assertEqual(transport.call_count, 6)
+        self.assertEqual({c.args[2]['key'] for c in transport.call_args_list}, {'wt-retry'})
 
 
 if __name__ == '__main__':
