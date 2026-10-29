@@ -641,7 +641,7 @@ export class BusService {
         if (caller.tokenId) {
           this.sql.exec(`INSERT INTO bus_reader_activity(recipient, credential_id, last_read_at) VALUES (?, ?, ?)
             ON CONFLICT(recipient, credential_id) DO UPDATE SET last_read_at=excluded.last_read_at
-            WHERE last_read_at < excluded.last_read_at - 60000`, this.canonicalActor(actor), caller.tokenId, now);
+            WHERE last_read_at < excluded.last_read_at - 60000`, aliases[0], caller.tokenId, now);
         }
         for (const row of rows) {
           if (row.delivered_at || row.to_session_id) continue;

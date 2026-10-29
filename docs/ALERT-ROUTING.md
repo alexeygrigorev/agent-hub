@@ -28,7 +28,10 @@ Notifications use stored receipts and stable idempotency keys. A continuous open
 incident sends once per destination. Reopened incidents for the same subject are
 limited to one successful delivery per destination per rolling 24 hours. Failed
 and rate-limited destinations retry no more frequently than every 15 minutes;
-successful destinations are skipped. Changing the destination configuration
+successful destinations are skipped. Session-audit summary subjects contain distinct
+actionable batches: each distinct payload has its own receipt, and an identical
+payload reuses its successful receipt for 24 hours. This preserves successive
+batches without mailing duplicate summaries. Changing the destination configuration
 retries existing open incidents against the new targets, preserving prior receipts. HTTPS receivers should honor the supplied
 `Idempotency-Key` to cover a crash after receiver acceptance but before recording
 its receipt. Webhook POSTs refuse redirects and time out after ten seconds.

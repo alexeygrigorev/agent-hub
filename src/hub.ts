@@ -2467,17 +2467,25 @@ export class Hub extends DurableObject {
       if (invalidActors) errors.push('invalid alert inbox configuration');
       if (invalidWebhook) errors.push('invalid alert webhook configuration (HTTPS required)');
       if (!actors.length && !webhook) errors.push('no alert target configured');
-      const receipt = (target: string) => this.sql.exec('SELECT * FROM alert_delivery_receipts WHERE subject_kind=? AND subject=? AND target=?', alert.subject_kind, alert.subject, target).toArray()[0] as any;
+      // Audit summaries group distinct actionable batches under one display subject.
+      // Keep their payloads independent while identical batches remain idempotent.
+      const receiptSubject = alert.subject_kind === 'session_audit'
+        ? alert.subject + ':' + await sha256(alert.detail) : alert.subject;
+      const receipt = (target: string) => this.sql.exec('SELECT * FROM alert_delivery_receipts WHERE subject_kind=? AND subject=? AND target=?', alert.subject_kind, receiptSubject, target).toArray()[0] as any;
       const allowed = (target: string) => {
         const last = receipt(target);
         if (last?.alert_id === alert.id) { delivered.add(target); return false; }
-        if (last && Date.now() - last.sent_at < ALERT_SUBJECT_COOLDOWN_MS) { errors.push('subject rate limited for destination'); return false; }
+        if (last && Date.now() - last.sent_at < ALERT_SUBJECT_COOLDOWN_MS) {
+          if (alert.subject_kind === 'session_audit') delivered.add(target);
+          else errors.push('subject rate limited for destination');
+          return false;
+        }
         return true;
       };
       const success = (target: string) => {
         delivered.add(target);
         this.sql.exec(`INSERT INTO alert_delivery_receipts VALUES (?, ?, ?, ?, ?)
-          ON CONFLICT(subject_kind, subject, target) DO UPDATE SET alert_id=excluded.alert_id, sent_at=excluded.sent_at`, alert.subject_kind, alert.subject, target, alert.id, Date.now());
+          ON CONFLICT(subject_kind, subject, target) DO UPDATE SET alert_id=excluded.alert_id, sent_at=excluded.sent_at`, alert.subject_kind, receiptSubject, target, alert.id, Date.now());
       };
       for (const to of actors) {
         const target = 'inbox:' + to;
