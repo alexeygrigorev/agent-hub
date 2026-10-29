@@ -10,7 +10,7 @@ from unittest.mock import patch, Mock
 from agent_hub_host.fleet import Dispatcher
 from agent_hub_host.bus import HttpRequestError
 from agent_hub_host.dispatch_diagnostics import ClaimRefusedError
-import test_preclaim_retry_488b860e as helpers
+from host.tests import test_preclaim_retry_488b860e as helpers
 
 
 class LaunchRetryTests(unittest.TestCase):
