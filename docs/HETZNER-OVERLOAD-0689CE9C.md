@@ -70,10 +70,17 @@ FIFO is defined by registration sequence within a priority class. For the final
 exact-source pre-push run use:
 
 ```bash
-AGENT_HUB_HEAVY_TEST_PRIORITY=final scripts/test-full-local.sh
+scripts/test-full-local.sh --priority final
 # Or an individual command:
 scripts/capped-test-run.sh --priority final -- COMMAND
 ```
+
+Run the full runner directly: it acquires and releases a slot for each heavy
+phase. Never put `test-full-local.sh` inside `capped-test-run.sh`: an outer
+wrapper would hold a slot while its phases queue again. The full runner refuses
+an inherited `AGENT_HUB_HEAVY_TEST_HELD=1` with exit 2 before starting any phase
+and prints the direct invocation above. `--priority normal|final` sets the
+priority for every phase; the existing priority environment variable also works.
 
 `normal` is the default. `final` precedes normal waiters; reserve it for the last
 exact-source pre-push verification, not routine development runs. The shared

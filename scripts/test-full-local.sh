@@ -4,6 +4,20 @@ set -uo pipefail
 # Full local test suite verification for Agent Hub (Alexey 2026-10-17 22:54)
 # Executes all build, validation, Vitest discovery, and Python discovery suites.
 
+# The full runner acquires a slot for each heavy phase. An outer wrapper would
+# retain a slot while these phases wait for another, potentially deadlocking.
+if [ "${AGENT_HUB_HEAVY_TEST_HELD:-}" = "1" ]; then
+  echo "test-full-local: do not wrap this runner in capped-test-run.sh; run scripts/test-full-local.sh --priority final directly" >&2
+  exit 2
+fi
+if [ "$#" -gt 0 ]; then
+  if [ "$#" -ne 2 ] || [ "$1" != "--priority" ] || { [ "$2" != "normal" ] && [ "$2" != "final" ]; }; then
+    echo "Usage: scripts/test-full-local.sh [--priority normal|final]" >&2
+    exit 2
+  fi
+  export AGENT_HUB_HEAVY_TEST_PRIORITY="$2"
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}" || exit 1
 

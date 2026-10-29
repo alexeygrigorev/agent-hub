@@ -30,6 +30,7 @@ with record.open("a") as out:
                           # AGENT_HUB_HEAVY_TEST_HELD is the wrapper's non-secret slot marker; the
                           # child must keep it so pytest never takes a second heavy-test slot.
                           "held": os.environ.get("AGENT_HUB_HEAVY_TEST_HELD"),
+                          "priority": os.environ.get("AGENT_HUB_HEAVY_TEST_PRIORITY"),
                           "selectors": sorted(k for k in os.environ if (k.startswith(("APLEXER_", "HUB_", "AGENT_HUB_"))
                             or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR"))
                             and k != "AGENT_HUB_HEAVY_TEST_HELD"),
@@ -107,7 +108,7 @@ class FullLocalStorageTests(unittest.TestCase):
                 os.killpg(child.pid, signal.SIGKILL)
                 child.communicate(timeout=5)
 
-    def start(self, name, **overrides):
+    def start(self, name, runner_args=(), capped=False, **overrides):
         record = self.root / f"{name}.jsonl"
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
@@ -117,11 +118,16 @@ class FullLocalStorageTests(unittest.TestCase):
                    AGENT_HUB_HEAVY_TEST_DIR=str(self.root / "fixture-heavy-slots"),
                    AGENT_HUB_HEAVY_TEST_SLOTS="2")
         for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
-                    "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS"):
+                    "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS",
+                    "AGENT_HUB_HEAVY_TEST_HELD"):
             env.pop(key, None)
         env.update(AGENT_HUB_HEAVY_TEST_PRIORITY="normal")
         env.update(overrides)
-        child = subprocess.Popen(["bash", str(self.repo / "scripts" / RUNNER.name)],
+        command = ["bash", str(self.repo / "scripts" / RUNNER.name), *runner_args]
+        if capped:
+            command = [str(self.repo / "scripts" / CAPPED_RUNNER.name),
+                       "--priority", "final", "--", *command]
+        child = subprocess.Popen(command,
                                  cwd=self.repo, env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, start_new_session=True)
         self.children.append(child)
@@ -145,6 +151,26 @@ class FullLocalStorageTests(unittest.TestCase):
 
     def assert_preserved(self):
         self.assertEqual(self.sentinel.read_text(), "preserve")
+
+    def test_outer_cap_is_refused_before_any_phase_or_temp_creation(self):
+        child, record = self.start("outer-cap", capped=True,
+                                  AGENT_HUB_HEAVY_TEST_SLOTS="1",
+                                  AGENT_HUB_HEAVY_TEST_WAIT_S="1")
+        code, output = self.finish(child)
+        self.assertEqual(code, 2, output)
+        self.assertIn("do not wrap", output)
+        self.assertIn("test-full-local.sh --priority final", output)
+        self.assertFalse(record.exists(), "no test phase should have started")
+        self.assertEqual(list(self.temp.iterdir()), [self.sentinel])
+        # The rejected runner releases the outer wrapper's only slot.
+        child, record = self.start("direct-final", runner_args=("--priority", "final"),
+                                  AGENT_HUB_HEAVY_TEST_SLOTS="1",
+                                  AGENT_HUB_HEAVY_TEST_WAIT_S="1")
+        code, output = self.finish(child)
+        self.assertEqual(code, 0, output)
+        vitest = next(row for row in self.records(record) if row["tool"] == "npx")
+        self.assertEqual(vitest["priority"], "final")
+        self.assert_preserved()
 
     @unittest.skipUnless(os.name == "posix", "POSIX advisory locks required")
     def test_stubbed_runner_is_isolated_from_occupied_ambient_heavy_slots(self):
