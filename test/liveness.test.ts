@@ -167,13 +167,14 @@ describe('stale alerts', () => {
     const stub = bindings.HUB.get(bindings.HUB.idFromName('notify-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub) => {
       hub.env = { ...hub.env, HUB_ALERT_TO: 'nobody-registered', HUB_ALERT_WEBHOOK: 'https://hooks.example/alert' } as Env;
-      const calls: string[] = []; const original = globalThis.fetch;
-      globalThis.fetch = (async (url: any) => { calls.push(String(url)); return new Response('ok'); }) as any;
+      const calls: string[] = []; const subjects: string[] = []; const original = globalThis.fetch;
+      globalThis.fetch = (async (url: any, init: any) => { calls.push(String(url)); const {alert}=JSON.parse(init.body); subjects.push(alert.subject_kind+':'+alert.subject); return new Response('ok'); }) as any;
       try {
         hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)", new Date().toISOString(), new Date(Date.now() - 3600000).toISOString());
         await hub.runChecks('liveness');
         let [alert]: any[] = hub.livenessService.alerts();
-        expect(calls.length).toBeGreaterThan(0);
+        expect(calls).toEqual(['https://hooks.example/alert','https://hooks.example/alert']);
+        expect(subjects.sort()).toEqual(['alert_routing:destination','machine:m']);
         expect(alert.notify_error).toContain('nobody-registered');
         expect(JSON.parse(alert.delivered_to)[0]).toMatch(/^webhook:/);
         hub.sql.exec('UPDATE liveness_alerts SET notified_at = ?', new Date(Date.now() - 3600000).toISOString());
