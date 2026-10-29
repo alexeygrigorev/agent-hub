@@ -209,8 +209,12 @@ export class AskLedger {
             out.rejected.push({ agent_id: agentId, msg_id: String(m?.msg_id ?? m?.t_id ?? '').slice(0, 32), error: v.error });
             // A rejected user message never reaches the ledger: surface it as an unrecorded range.
             const id = MSG_ID.exec(String(m?.msg_id ?? m?.t_id ?? ''));
-            if (id && source !== 'backfill' && (m?.role === 'user' || (m?.role == null && id[2] === 'u')))
-              this.sql.exec(`INSERT OR IGNORE INTO ask_gaps(scope,from_seq,to_seq,kind,detected_at) VALUES(?,?,?,?,?)`,
+            // A bad re-post of a message already recorded loses nothing.
+            if (id && source !== 'backfill' && (m?.role === 'user' || (m?.role == null && id[2] === 'u'))
+              && !this.rows('SELECT 1 FROM ask_messages WHERE agent_id=? AND t_id=? LIMIT 1', agentId, id[0]).length)
+              this.sql.exec(`INSERT INTO ask_gaps(scope,from_seq,to_seq,kind,detected_at) VALUES(?,?,?,?,?)
+                ON CONFLICT(scope,from_seq,to_seq) DO UPDATE SET kind=excluded.kind,detected_at=excluded.detected_at,resolved_at=NULL,alert_subject=NULL
+                WHERE resolved_at IS NOT NULL AND kind LIKE 'rejected:%'`,
                 this.scopeFor(agentId), Number(id[1]), Number(id[1]), 'rejected:' + v.error, now);
             continue;
           }
@@ -229,7 +233,8 @@ export class AskLedger {
             crypto.randomUUID(), agentId, name, v.msgId, v.seq, v.ts, v.text, v.hash, source, machine, caller.actor, v.hint, now,
             isAsk ? 'pending' : 'record', v.role, v.kind, v.replyTo, v.attachments, batch);
           out.accepted++;
-          this.sql.exec('UPDATE ask_agents SET msg_count=msg_count+1,last_any_at=? WHERE agent_id=?', now, agentId);
+          // Backfilled history is not live traffic for the daily silent check.
+          this.sql.exec('UPDATE ask_agents SET msg_count=msg_count+1,last_any_at=CASE WHEN ? THEN last_any_at ELSE ? END WHERE agent_id=?', source === 'backfill' ? 1 : 0, now, agentId);
           if (isAsk) {
             out.accepted_user++;
             this.sql.exec('UPDATE ask_agents SET last_message_at=MAX(COALESCE(last_message_at,0),?) WHERE agent_id=?', now, agentId);

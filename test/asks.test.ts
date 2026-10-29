@@ -321,6 +321,14 @@ describe('review regressions', () => {
     ingest(l, 'dev', [msg('t1500u', 'shorter, valid')]);
     await l.tick();
     expect(alerts.filter(a => a.kind === 'asks_unrecorded').at(-1)).toMatchObject({ subject: gap.subject, detail: null });
+    // A bad re-post of the now-recorded message is not a new loss.
+    ingest(l, 'dev', [msg('t1500u', 'x'.repeat(131073))]);
+    expect(h.sql.exec('SELECT COUNT(*) AS n FROM ask_gaps WHERE resolved_at IS NULL').toArray()[0].n).toBe(0);
+    // A later rejection of a ref whose earlier rejection was resolved alerts again.
+    ingest(l, 'dev', [msg('t1510u', 'x'.repeat(131073))]);
+    h.sql.exec('UPDATE ask_gaps SET resolved_at=1 WHERE from_seq=1510');
+    ingest(l, 'dev', [msg('t1510u', 'x'.repeat(131074))]);
+    expect(h.sql.exec('SELECT resolved_at,alert_subject FROM ask_gaps WHERE from_seq=1510').toArray()).toEqual([{ resolved_at: null, alert_subject: null }]);
   }));
   it('daily silent-agent alert ignores agents with recorded traffic and resolves when messages arrive', () => fixture(async (h, l, alerts, clock) => {
     ingest(l, 'busy', [msg('t1601a', 'bot talking', { role: 'assistant' })], { window: { first_t_id: 't1600a', last_t_id: 't1601a' } });
