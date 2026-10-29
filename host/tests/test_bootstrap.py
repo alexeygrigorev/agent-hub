@@ -141,11 +141,14 @@ class BootstrapTests(unittest.TestCase):
         python = install_root / 'venv/bin/python'
         python.parent.mkdir(parents=True)
         python.touch()
+        base = install_root / 'python/cpython-3.12'
+        base.mkdir(parents=True)
         settings = self.root / 'subscriptions.json'
         settings.write_text('{}')
         with patch.object(b, 'root', return_value=install_root), \
              patch.object(b.Path, 'home', return_value=self.root), \
              patch.object(b.sys, 'executable', str(python)), \
+             patch.object(b.sys, 'base_prefix', str(base)), \
              patch.object(b, 'validate_side_effect_context'), \
              patch.object(config, 'load_host_config', return_value={'access_token': 'synthetic', 'base_url': 'https://hub.test', 'machine_id': 'existing'}), \
              patch.object(config, 'get_host_config_path', return_value=self.root / 'host.json'), \
@@ -209,6 +212,33 @@ class BootstrapTests(unittest.TestCase):
         with patch.object(b.Path, 'home', return_value=fake_home):
             with self.assertRaisesRegex(ValueError, 'temporary or ambient Python'):
                 b.validate_persistent_install(install_root)
+
+    def test_durable_venv_with_temporary_base_cannot_replace_wrapper(self):
+        from agent_hub_host import config
+        home = self.root / 'home'
+        install_root = home / '.local/share/agent-hub'
+        python = install_root / 'venv/bin/python'
+        python.parent.mkdir(parents=True)
+        python.touch()
+        package = install_root / 'package/host/agent_hub_host'
+        package.mkdir(parents=True)
+        for name in ['cli.py', 'host_supervisor.py']:
+            (package / name).touch()
+        wrapper = home / '.local/bin/hub'
+        wrapper.parent.mkdir()
+        wrapper.write_text('existing working launcher')
+        temporary_base = self.root / 'temporary-python'
+        temporary_base.mkdir()
+        with patch.object(b, 'root', return_value=install_root), \
+             patch.object(b.Path, 'home', return_value=home), \
+             patch.object(b.sys, 'platform', 'linux'), \
+             patch.object(b.sys, 'executable', str(python)), \
+             patch.object(b.sys, 'base_prefix', str(temporary_base)), \
+             patch.object(config, 'load_host_config') as load:
+            with self.assertRaisesRegex(ValueError, 'outside the persistent managed runtime'):
+                b.configure('https://hub.test')
+        load.assert_not_called()
+        self.assertEqual(wrapper.read_text(), 'existing working launcher')
 
     def test_runtime_path_persists_all_engines_and_quse_idempotently(self):
         install_root = self.root / '.local/share/agent-hub'

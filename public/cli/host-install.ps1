@@ -47,7 +47,7 @@ sys.path.insert(0, sys.argv[1])
 from agent_hub_host.bootstrap import main
 main(['--archive', sys.argv[1], '--base-url', sys.argv[2], '--uv', sys.argv[3]])
 '@ | Set-Content -LiteralPath $Entry -Encoding UTF8
-    & $Uv run --no-project --python $Python python $Entry $Archive $Base $Uv
+    & $Uv run --managed-python --no-project --python $Python python $Entry $Archive $Base $Uv
     if ($LASTEXITCODE -ne 0) { throw 'Hub host setup did not complete; rerun the same command to resume.' }
     $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $env:PATH = "$UserPath;$env:PATH"

@@ -35,7 +35,7 @@ export UV_CACHE_DIR="$ROOT/cache/uv"
 export TMPDIR="$ROOT/tmp"
 fetch "$BASE/cli/hub.pyz" "$WORK/hub.pyz"
 fetch "$BASE/cli/hub.pyz.sha256" "$WORK/hub.pyz.sha256"
-"$BIN/uv" run --no-project --python 3.12 python -c '
+"$BIN/uv" run --managed-python --no-project --python 3.12 python -c '
 import hashlib,pathlib,re,sys
 p=pathlib.Path(sys.argv[1]); fields=p.with_suffix(".pyz.sha256").read_text().split()
 if not fields or not re.fullmatch("[0-9a-fA-F]{64}", fields[0]): raise SystemExit("Invalid Hub checksum file")

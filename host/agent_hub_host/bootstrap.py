@@ -77,9 +77,15 @@ def validate_persistent_install(install_root):
         raise ValueError('Persistent Hub package is incomplete; launcher preserved')
     for path in (home / '.local', home / '.local/share', home / '.local/bin',
                  install_root, install_root / 'bin', install_root / 'venv', python.parent,
-                 install_root / 'package', package.parent, package):
+                 install_root / 'python', install_root / 'package', package.parent, package):
         if path.is_symlink():
             raise ValueError('Refusing a linked Hub installation')
+    # A durable venv path can still redirect to a disposable base interpreter.
+    # Check the running interpreter's base too (Windows venv launchers are
+    # regular files, so checking only a POSIX symlink target is insufficient).
+    base = Path(sys.base_prefix).resolve()
+    if not base.is_dir() or not base.is_relative_to((install_root / 'python').resolve()):
+        raise ValueError('Refusing launcher using Python outside the persistent managed runtime')
 
 
 def validate_side_effect_context(install_root):
@@ -348,8 +354,14 @@ def ensure_antigravity(install_root):
 def install_package(archive, install_root, uv):
     venv = install_root / 'venv'
     python = venv / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python')
-    if not python.is_file():
-        run([uv, 'venv', '--allow-existing', '--python', sys.executable, venv])
+    env = dict(os.environ)
+    env['UV_PYTHON_INSTALL_DIR'] = str(install_root / 'python')
+    env['UV_PYTHON_DOWNLOADS'] = 'automatic'
+    env.pop('UV_NO_MANAGED_PYTHON', None)
+    # Never inherit the bootstrap interpreter: it may come from an activated
+    # temporary venv. Reapplying also repairs an existing venv's stale base.
+    requested = 'cpython-3.12-windows-x86_64' if sys.platform == 'win32' else '3.12'
+    run([uv, 'venv', '--allow-existing', '--managed-python', '--python', requested, venv], env=env)
     if sys.platform == 'darwin':
         # The macOS wheels were published on GitHub but not on PyPI.
         cpu = 'x86_64' if architecture() == 'x64' else 'arm64'
