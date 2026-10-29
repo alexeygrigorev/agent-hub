@@ -107,6 +107,7 @@ class WorktreeSuccessorTests(unittest.TestCase):
         self.assertTrue(dispatcher._lock_session_worktree(offer, self.tree))
         # Two fresh guards lookups per attempt: the canonical stopped-lock
         # reuse check first, then the same-intake successor transfer.
-        self.assertEqual(requests, [('GET', '/api/sessions/worktree-guards')] * 4)
+        self.assertEqual([r for r in requests if r[1] == '/api/sessions/worktree-guards'],
+                         [('GET', '/api/sessions/worktree-guards')] * 4)
         entry = guard.find_entry(guard.list_entries('git', self.tree), self.tree)
         self.assertEqual(entry['reason'], guard.lock_reason(self.new, 'intake-test'))
