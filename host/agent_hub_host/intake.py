@@ -254,7 +254,9 @@ def add_commands(sub):
     close.add_argument('--version', type=int, help='Explicit CAS version; otherwise fetch and retry version conflicts up to three times')
     close.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     close.add_argument('--force', action='store_true', help='Override the worktree close gate; requires --reason')
-    close.add_argument('--reason', help='Close reason; required with --force')
+    close.add_argument('--reason', help='Close reason; required with --force or --outcome')
+    close.add_argument('--outcome', choices=['closed_unverified'],
+                       help='Operator only: close without DONE evidence, recorded as closed_unverified with --reason (never counted as verified)')
     event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
     event.add_argument('id')
     event.add_argument('--version', type=int, required=True)
@@ -507,6 +509,11 @@ def execute(args):
         payload['force'] = True
     if command == 'close':
         payload['status'] = 'done'
+        if getattr(args, 'outcome', None):
+            reason = getattr(args, 'reason', None)
+            if not isinstance(reason, str) or not reason.strip():
+                raise IntakeInputError('--outcome closed_unverified requires a non-empty --reason')
+            payload['outcome'] = args.outcome
         if getattr(args, 'reason', None) is not None:
             payload['reason'] = args.reason
         return cas_update(path, payload, args.version is None, key)

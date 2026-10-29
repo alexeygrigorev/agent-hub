@@ -41,3 +41,14 @@ Watchdog holds that only a person can clear are each alerted once per (intake, r
 ## Status
 
 `hub intake forgotten` includes `triage` and `verifier`. The scheduler result carries `intake_triage`, `intake_verifier` and the watchdog's `human_hold_alerts`.
+
+## Operator close without evidence (AC9)
+
+`hub intake close ID --outcome closed_unverified --reason "..."` closes an intake that has no DONE evidence. It exists for operator-ordered bulk closes of old tasks.
+
+- It is operator only and requires a reason.
+- It records `outcome: closed_unverified`, the reason and the actor in the intake history. It never invents a SHA or a live check.
+- The audit kind is `close_unverified`, never `close`, so it does not count as a verified completion.
+- It is idempotent: re-running it on an intake already closed this way changes nothing.
+- The worktree close gate still applies (`--force` with the reason overrides it as usual).
+- Ordinary closes now record `outcome: completed`.

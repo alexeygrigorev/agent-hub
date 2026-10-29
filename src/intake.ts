@@ -271,10 +271,13 @@ export class IntakeService {
       const auditActor = "COALESCE(json_extract(NEW.data,'$.lifecycle_actor'),json_extract(NEW.data,'$.history[#-1].actor'),'hub:legacy')";
       const auditTime = "COALESCE(json_extract(NEW.data,'$.updated_at'),CAST(strftime('%s','now') AS INTEGER)*1000)";
       const auditReason = "COALESCE(json_extract(NEW.data,'$.lifecycle_reason'),'legacy lifecycle transition')";
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_status AFTER UPDATE ON intake_tasks
+      // v2 (d8d509d2 AC9): an operator close without evidence audits as
+      // close_unverified so it never counts as a verified completion.
+      this.sql.exec('DROP TRIGGER IF EXISTS intake_audit_status');
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_status_v2 AFTER UPDATE ON intake_tasks
         WHEN ${oldStatus} IS NOT ${newStatus} AND (${newStatus} IN ('done','cancelled') OR ${oldStatus} IN ('done','cancelled')) BEGIN
         INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason)
-        VALUES(NEW.id,json_extract(NEW.data,'$.project'),CASE ${newStatus} WHEN 'done' THEN 'close' WHEN 'cancelled' THEN 'cancel' ELSE 'reopen' END,
+        VALUES(NEW.id,json_extract(NEW.data,'$.project'),CASE ${newStatus} WHEN 'done' THEN CASE json_extract(NEW.data,'$.outcome') WHEN 'closed_unverified' THEN 'close_unverified' ELSE 'close' END WHEN 'cancelled' THEN 'cancel' ELSE 'reopen' END,
           ${auditActor},${auditTime},${oldStatus},${newStatus},${auditReason}); END`);
       this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_archive AFTER UPDATE ON intake_tasks
         WHEN json_extract(OLD.data,'$.archived_at') IS NULL AND json_extract(NEW.data,'$.archived_at') IS NOT NULL BEGIN
@@ -374,10 +377,12 @@ export class IntakeService {
   }
 
   private doneNote(task: Obj): Obj | undefined { return currentDoneNote(task); }
-  private transition(task: Obj, status: string, actor: string, now: number, reason?: string, supersededBy?: string, force?: boolean) {
+  private transition(task: Obj, status: string, actor: string, now: number, reason?: string, supersededBy?: string, force?: boolean, unverified = false) {
     if (status === task.status) return;
     if (status === 'done') {
-      const note = this.doneNote(task);
+      // AC9 (d8d509d2): an operator-ordered close without evidence records
+      // outcome=closed_unverified and its reason; no DONE evidence is implied.
+      const note = unverified ? { text: 'closed_unverified: ' + reason } : this.doneNote(task);
       if (!note) fail('done_evidence_required', 409);
       // Close gate (intake 4b161918): every linked worktree merged and removed.
       const gate = this.worktrees.gate(task.id);
@@ -400,6 +405,8 @@ export class IntakeService {
     }
     task.lifecycle_actor = actor;
     task.lifecycle_reason = reason?.trim() || 'reopened for continued work';
+    if (status === 'done') task.outcome = unverified ? 'closed_unverified' : 'completed';
+    else if (OPEN.includes(status)) delete task.outcome;
     task.status = status;
     task.archived_at = OPEN.includes(status) ? null : now;
   }
@@ -1188,14 +1195,23 @@ export class IntakeService {
         task.scope = scopeHint(task, (task.scope.basis_version ?? 1) + 1);
       }
     } else {
-      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by', 'force']);
+      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by', 'force', 'outcome']);
+      const unverified = b.outcome === 'closed_unverified';
+      if ('outcome' in b) {
+        if (!unverified || b.status !== 'done') throw new IntakeError('invalid_outcome', 400, 'outcome');
+        this.operator(p);
+        if (typeof b.reason !== 'string' || !b.reason.trim()) fail('reason_required');
+        // Idempotent: an intake already closed this way is returned unchanged.
+        if (task.status === 'done' && task.outcome === 'closed_unverified') return { task: this.view(task, p) };
+        if (['title', 'project', 'acceptance_criteria', 'verification'].some(k => k in b)) throw new IntakeError('invalid_outcome', 400, 'outcome');
+      }
       if ('force' in b && typeof b.force !== 'boolean') throw new IntakeError('invalid_field', 400, 'force');
       if (b.force === true && (b.status !== 'done' || typeof b.reason !== 'string' || !b.reason.trim())) fail('force_reason_required');
       if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification'].some(k => k in b)) fail('empty_update');
       const changes: Obj = {};
       const previousStatus = task.status;
       if (b.status === 'done' && ['title', 'project', 'acceptance_criteria'].some(k => k in b && b[k] !== task[k])) fail('done_evidence_required', 409);
-      if ('status' in b) this.transition(task, b.status, p.actor, now, b.reason === undefined ? undefined : str(b.reason, 8192), b.superseded_by, b.force === true);
+      if ('status' in b) this.transition(task, b.status, p.actor, now, b.reason === undefined ? undefined : str(b.reason, 8192), b.superseded_by, b.force === true, unverified);
       for (const field of ['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']) if (field in b) {
         if (field === 'status' && !STATUSES.includes(b[field])) fail('invalid_status');
         const previous = field === 'status' ? previousStatus : task[field];
@@ -1204,6 +1220,7 @@ export class IntakeService {
           : nullable(b[field], field === 'title' ? 256 : 8192);
         if (previous !== task[field]) changes[field] = task[field];
       }
+      if (unverified && task.outcome === 'closed_unverified') { changes.outcome = 'closed_unverified'; changes.reason = task.lifecycle_reason; }
       // Post-DONE verification policy (d8d509d2 t1936u): required|skip|auto, default auto.
       if ('verification' in b) {
         const mode = verificationMode(b.verification);

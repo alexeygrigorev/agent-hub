@@ -360,6 +360,19 @@ class TestIntakeCli(unittest.TestCase):
         self.assertNotEqual(code, 0)
         transport.assert_not_called()
 
+    def test_close_outcome_closed_unverified_requires_reason(self):
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, _ = self.run_cli('intake', 'close', 'task-1', '--version', '2', '--key', 'cu-no-reason',
+                                      '--outcome', 'closed_unverified')
+        self.assertNotEqual(code, 0)
+        transport.assert_not_called()
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'close', 'task-1', '--version', '2', '--key', 'cu',
+                                          '--outcome', 'closed_unverified', '--reason', 'Alexey: close old task')
+        self.assertEqual(code, 0, error)
+        body = transport.call_args.args[2]
+        self.assertEqual((body['status'], body['outcome'], body['reason']), ('done', 'closed_unverified', 'Alexey: close old task'))
+
     def test_acceptance_criteria_gate_error_code_survives_transport(self):
         raw = b'{"error":"acceptance_criteria_required"}'
         exc = urllib.error.HTTPError('https://fixture.test', 400, 'private', {}, io.BytesIO(raw))
