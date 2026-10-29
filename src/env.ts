@@ -35,6 +35,9 @@ export interface Env {
   // Autonomous queue rollout is off by default. Enabling also requires an
   // explicit project list (or '*'). Invalid settings disable mutations.
   HUB_INTAKE_QUEUE_ENABLED?: string;
+  /** Intake 500fd60b: "false" disables Hub-side ops/backlog liveness, or only the backlog idle kick. */
+  HUB_OPS_LIVENESS?: string;
+  HUB_BACKLOG_IDLE_KICK?: string;
   HUB_INTAKE_QUEUE_PROJECTS?: string;
   HUB_INTAKE_QUEUE_MAX_INFLIGHT?: string;
   HUB_INTAKE_QUEUE_MAX_PER_PROJECT?: string;

@@ -139,7 +139,50 @@ export class IntakeWatchdog {
     const policy = this.policy();
     if (!policy.valid) return 'watchdog_configuration_invalid';
     if (!policy.enabled) return 'watchdog_disabled';
+    if (this.idleOverride === t.id) return null;
     return policy.projects !== null && !policy.projects.includes(t.project) ? 'watchdog_project_not_enabled' : null;
+  }
+  private idleOverride: string | null = null;
+  /** Backlog idle kick (intake 500fd60b AC4): when no intake session has been starting or
+   * running for 30 minutes, start the oldest ready intake through the same canonical
+   * restart path even if its project is not enabled for continuous pickup. Every other
+   * check still applies: explicit disable, AC, workspace, retry backoff and capacity. */
+  async idleKick(now = this.now()): Promise<{ task_id: string | null; reason: string }> {
+    const policy = this.policy();
+    if (!policy.valid) return { task_id: null, reason: 'watchdog_configuration_invalid' };
+    if (!policy.enabled) return { task_id: null, reason: 'watchdog_disabled' };
+    const candidates: Obj[] = [];
+    let after = '';
+    for (let page = 0; page < 4 && candidates.length < 3; page++) {
+      const tasks = typeof this.intake.watchdogTasks === 'function' ? this.intake.watchdogTasks(after, QUEUE_BATCH_SIZE)
+        : this.intake.statusAuthorizedTasks({ admin: true }).filter(t => OPEN.has(t.status) && !t.archived_at && t.id > after)
+          .sort((a, b) => a.id.localeCompare(b.id)).slice(0, QUEUE_BATCH_SIZE);
+      if (!tasks.length) break;
+      after = tasks[tasks.length - 1].id;
+      const context = this.snapshot(tasks, now);
+      if (context.overflow) return { task_id: null, reason: 'observation_budget_exceeded' };
+      const byId = new Map(tasks.map(t => [t.id, t]));
+      for (const item of this.project(tasks, now, context)) {
+        const t = byId.get(item.id)!, q = this.queueRow(item.id);
+        if (item.ready && t.acceptance_criteria?.trim() && q?.state !== 'escalated' && (!q || q.next_at <= now || q.reason === 'watchdog_project_not_enabled')) candidates.push(t);
+      }
+      if (tasks.length < QUEUE_BATCH_SIZE) break;
+    }
+    candidates.sort((a, b) => ms(a.created_at) - ms(b.created_at) || a.id.localeCompare(b.id));
+    let last: { task_id: string | null; reason: string } = { task_id: null, reason: 'no_ready_intake' };
+    for (const t of candidates.slice(0, 3)) {
+      // A project hold's retry delay is for continuous pickup; the idle kick may use it now.
+      this.sql.exec("UPDATE intake_restart_queue SET next_at=? WHERE task_id=? AND state='queued' AND reason='watchdog_project_not_enabled'", now, t.id);
+      this.idleOverride = t.id;
+      try { await this.restart(t, now); } finally { this.idleOverride = null; }
+      const q = this.queueRow(t.id);
+      last = { task_id: t.id, reason: q ? q.state + ':' + q.reason : 'not_admitted' };
+      if (q && (q.state === 'submitted' || q.state === 'starting')) {
+        this.audit(t, 'idle_kick', 'backlog idle 30 min with no working intake session; started through canonical admission', now);
+        return last;
+      }
+    }
+    return last;
   }
   /** Canonical rows plus durable pre-admission reservations bound even awaited
    * or lost replies. Unknown reservations remain occupied until a receipt. */

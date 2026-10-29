@@ -420,6 +420,8 @@ def main():
     dispatch.add_argument('--interval', type=int, default=60)
     from . import webhooks as webhooks_cli
     webhooks_cli.add_parser(sub)
+    from . import ops_liveness
+    ops_liveness.add_parser(sub)
     
     p_login = sub.add_parser("login", help="Login to Agent Hub")
     p_login.add_argument("base_url", help="Base URL of the Agent Hub")
@@ -620,6 +622,10 @@ def main():
         except Exception as exc:
             print(session_control.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
+        return
+    if args.cmd == 'ops':
+        from . import ops_liveness
+        ops_liveness.run(args)
         return
     if args.cmd == 'webhooks':
         from . import webhooks as webhooks_cli

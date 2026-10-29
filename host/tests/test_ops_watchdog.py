@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 CTL = Path(__file__).resolve().parents[2] / 'ops/lib/session-ctl.sh'
@@ -36,7 +37,10 @@ if name=='a':
     elif cmd=='send': sys.exit(s.get('send_error',0))
 elif name=='systemd-run':
     import subprocess
-    sys.exit(subprocess.call(args[args.index('--')+1:]))
+    # Proof timers (--on-active) are only recorded; scope launches run their command.
+    sys.exit(subprocess.call(args[args.index('--')+1:]) if '--' in args else 0)
+elif name=='hub':
+    sys.exit(s.get('hub_error',0))
 elif name=='git':
     if 'rev-parse' in args:
         print(str(p/'exclude') if '--git-path' in args else 'abcdef')
@@ -50,7 +54,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.bin = self.home / 'bin'
         self.bin.mkdir()
-        for cmd in ('a', 'git', 'gh', 'sleep', 'systemd-run'):
+        for cmd in ('a', 'git', 'gh', 'sleep', 'systemd-run', 'hub'):
             file = self.bin / cmd
             file.write_text(ADAPTER)
             file.chmod(0o755)
@@ -92,7 +96,8 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('a forget old --force', self.calls())
-        self.assertIn('recovery verified session=new', result.stdout)
+        self.assertIn('recovery path 1 started', result.stdout)
+        self.assertTrue((self.state / 'proof_due').exists())
         self.assertNotIn('already running', result.stdout)
 
     def test_surviving_workload_blocks_forget_and_launch(self):
@@ -115,15 +120,20 @@ class OpsWatchdogTest(unittest.TestCase):
         needs = self.home / 'tmp/agent-reports/orchestrator/NEEDS_ALEXEY.md'
         self.assertFalse(needs.exists())
         self.assertNotEqual(self.run_ctl().returncode, 0)
-        self.assertIn('restart failed 2 consecutive', needs.read_text())
+        self.assertIn('automatic recovery failed 2 consecutive', needs.read_text())
         inbox = self.home / 'tmp/agent-reports/oncall/inbox'
         self.assertEqual(len(list(inbox.glob('watchdog-*.md'))), 1)
 
-    def test_recovery_resets_consecutive_failures(self):
+    def test_recovery_resets_consecutive_failures_only_after_proof(self):
         self.data['start_error'] = True
         self.run_ctl()
         self.data['start_error'] = False
         self.assertEqual(self.run_ctl().returncode, 0)
+        # A started process is not proof of recovery.
+        self.assertEqual((self.state / 'restart_failures').read_text().strip(), '1')
+        self.tick(after_start=5)
+        result = self.run_ctl()
+        self.assertIn('recovery proven', result.stdout)
         self.assertEqual((self.state / 'restart_failures').read_text().strip(), '0')
 
     def test_census_error_never_starts_duplicate(self):
@@ -154,6 +164,91 @@ class OpsWatchdogTest(unittest.TestCase):
         self.data['send_error'] = 1
         self.assertNotEqual(self.run_ctl().returncode, 0)
         self.assertEqual((self.state / 'restart_failures').read_text().strip(), '1')
+
+
+    # Intake 500fd60b AC2: bounded idle, proven restarts and a second recovery path.
+    def tick(self, after_start=0, age=None):
+        start = int((self.state / 'last_start').read_text()) if (self.state / 'last_start').exists() else 0
+        with self.ticks.open('a') as f: f.write('{"ts":"x"}\n')
+        when = start + after_start if age is None else time.time() - age
+        os.utime(self.ticks, (when, when))
+
+    def due_now(self):
+        due = self.state / 'proof_due'
+        _, path = due.read_text().split()
+        due.write_text(f'{int(time.time()) - 1} {path}\n')
+
+    def starts(self):
+        return [line for line in self.calls().splitlines() if line.startswith('a start')]
+
+    def test_29_oct_live_session_without_ticks_is_restarted_not_ok(self):
+        self.data['sessions'] = [{**self.session(True, os.getpid()), 'id': 'live'}]
+        self.data['kill_ok'] = True
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / 'last_start').write_text(str(int(time.time()) - 33091))
+        self.ticks.unlink()  # the pre-266329ee prompt never wrote the tick log
+        result = self.run_ctl()
+        self.assertIn('STALLED session=live: no tick for 3309', result.stdout)
+        self.assertNotIn('OK session=live', result.stdout)
+        self.assertIn('recovery path 1 started', result.stdout)
+        self.assertIn('hub ops heartbeat --role orchestrator --kind watchdog --state recovering', self.calls())
+
+    def test_idle_bound_is_thirty_minutes(self):
+        self.data['sessions'] = [{**self.session(True, os.getpid()), 'id': 'live'}]
+        self.data['kill_ok'] = True
+        self.tick(age=29 * 60)
+        self.assertIn('OK session=live', self.run_ctl().stdout)
+        self.assertIn('--state ok', self.calls())
+        self.tick(age=31 * 60)
+        self.assertIn('STALLED session=live', self.run_ctl().stdout)
+
+    def test_restart_proven_by_fresh_tick_within_window(self):
+        self.data['sessions'] = [self.session()]
+        self.run_ctl()
+        self.assertIn('--on-active=630', self.calls())  # exact-time proof check is armed
+        result = self.run_ctl()
+        self.assertIn('recovery pending proof: session=new', result.stdout)
+        self.assertEqual(len(self.starts()), 1)  # no second restart inside the window
+        self.tick(after_start=120)
+        result = self.run_ctl()
+        self.assertIn('recovery proven: fresh tick 120s after start (path 1)', result.stdout)
+        self.assertFalse((self.state / 'proof_due').exists())
+        self.assertIn('OK session=new', result.stdout)
+
+    def test_unproven_restart_starts_second_path_then_alerts_after_two(self):
+        self.data['sessions'] = [self.session()]
+        self.data['kill_ok'] = True
+        self.run_ctl()
+        self.assertIn('--engine opus', self.starts()[-1])
+        self.due_now()
+        result = self.run_ctl()
+        self.assertIn('recovery proof FAILED (path 1)', result.stdout)
+        self.assertIn('recovery path 2 started', result.stdout)
+        self.assertIn('--engine sonnet', self.starts()[-1])
+        needs = self.home / 'tmp/agent-reports/orchestrator/NEEDS_ALEXEY.md'
+        self.assertFalse(needs.exists())  # one failed recovery is not an alert
+        self.assertIn('--state proof_failed --recovery-failures 1', self.calls())
+        self.due_now()
+        result = self.run_ctl()
+        self.assertIn('recovery proof FAILED (path 2)', result.stdout)
+        self.assertIn('automatic recovery failed 2 consecutive times', needs.read_text())
+        self.assertIn('--recovery-failures 2', self.calls())
+        self.assertIn('--engine opus', self.starts()[-1])  # keeps recovering after the alert
+        self.assertEqual(len(self.starts()), 3)
+
+    def test_session_dying_inside_proof_window_fails_proof_immediately(self):
+        self.data['sessions'] = [self.session()]
+        self.run_ctl()
+        self.data['sessions'] = [{**self.data['sessions'][0], 'worker_alive': False}]
+        result = self.run_ctl()
+        self.assertIn('recovery proof FAILED (path 1)', result.stdout)
+
+    def test_hub_report_failure_never_blocks_recovery(self):
+        self.data['hub_error'] = 1
+        self.data['sessions'] = [self.session()]
+        result = self.run_ctl()
+        self.assertIn('hub ops report failed', result.stdout)
+        self.assertIn('recovery path 1 started', result.stdout)
 
 
 if __name__ == '__main__':

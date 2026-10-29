@@ -2,6 +2,7 @@ import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES,
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog, queuePolicyFrom } from './intake-watchdog';
+import { OpsLiveness } from './ops-liveness';
 import { IntakeTriage } from './intake-triage';
 import { IntakeVerifier } from './intake-verifier';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
@@ -122,6 +123,7 @@ export class Hub extends DurableObject {
   public intakeService: IntakeService;
   private workerAccess: WorkerAccess;
   public intakeWatchdog: IntakeWatchdog;
+  public opsLiveness: OpsLiveness;
   public intakeTriage: IntakeTriage;
   public intakeVerifier: IntakeVerifier;
   public sessionAudit: SessionAuditService;
@@ -314,6 +316,19 @@ export class Hub extends DurableObject {
       },
     });
     this.intakeWatchdog.init();
+    // Independent orchestrator/backlog liveness (intake 500fd60b): Hub-side, so a dead
+    // ops session, dead host watchdog or dead host is still detected and work restarts.
+    this.opsLiveness = new OpsLiveness(this.sql, {
+      enabled: () => this.env.HUB_OPS_LIVENESS !== 'false',
+      kick: async () => this.env.HUB_BACKLOG_IDLE_KICK === 'false' ? { task_id: null, reason: 'idle_kick_disabled' } : this.intakeWatchdog.idleKick(),
+      holdReasons: () => Object.fromEntries((this.sql.exec("SELECT reason, COUNT(*) AS n FROM intake_restart_queue GROUP BY reason ORDER BY n DESC LIMIT 12").toArray() as any[]).map(r => [r.reason, r.n])),
+      alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('ops_liveness', subject, detail === null ? null : { state: 'recovery_failed', detail });
+        if (alert) await this.notifyAlert(alert);
+        return !!alert;
+      },
+    });
+    this.opsLiveness.init();
     // Hourly backlog triage (intake d8d509d2 AC5): one Claude Opus reviewer
     // session per slice of forgotten intakes, started through the canonical path.
     this.intakeTriage = new IntakeTriage(this.sql, this.intakeService, this.intakeWatchdog, fn => this.ctx.storage.transactionSync(fn), {
@@ -837,7 +852,7 @@ export class Hub extends DurableObject {
       }
 
       if (path === '/api/agents' || path.startsWith('/api/agents/')) return this.handleAgentRegistry(request, path);
-      if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/')) {
+      if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/') || path === '/api/ops/heartbeat' || path === '/api/ops/liveness') {
         return this.handleWatchRoutes(request, path);
       }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
@@ -2042,7 +2057,14 @@ export class Hub extends DurableObject {
       const result = this.livenessService.recordHeartbeat(caller.actor, caller.machineId ?? null, await safeJson(request));
       return 'error' in result ? json(result, 400) : json({ status: 'recorded' });
     }
+    if (path === '/api/ops/heartbeat') {
+      if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+      if (!admin && !(caller.kind === 'agent' && auth.scopes?.includes('health:report'))) return json({ error: 'forbidden' }, 403);
+      const result = this.opsLiveness.record(await safeJson(request));
+      return 'error' in result ? json(result, 400) : json({ status: 'recorded', ops: this.opsLiveness.status() });
+    }
     if (!admin) return json({ error: 'forbidden' }, 403);
+    if (path === '/api/ops/liveness' && request.method === 'GET') return json(this.opsLiveness.status());
     if (path === '/api/liveness' && request.method === 'GET') {
       // Read one subject's retained history even when newer open alerts fill
       // the default page. A history read never reconciles or resolves alerts.
@@ -2268,6 +2290,7 @@ export class Hub extends DurableObject {
 
   async alarm() {
     try { await this.intakeWatchdog.tick('alarm'); } catch { console.warn('intake_queue_tick_failed'); }
+    try { await this.opsLiveness.tick(); } catch { console.warn('ops_liveness_tick_failed'); }
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
     this.ctx.storage.transactionSync(() => {
       expireSessionMessages(this.sql, now.getTime());

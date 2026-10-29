@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Shared control for the two interactive Claude ops sessions.
 #   session-ctl.sh <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync>
-# Watchdog (check) only restarts a dead session; the in-session /loop is the scheduler.
+# Watchdog (check) restarts a dead or tick-stalled session and proves every restart by a fresh
+# tick (intake 500fd60b); the in-session /loop is the scheduler.
 # Needs: a (aplexer), git, gh, python3. Never prints secrets.
 set -uo pipefail
 
@@ -18,9 +19,37 @@ LOOP_INTERVAL="${LOOP_INTERVAL:-$LOOP_DEFAULT}"
 TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
 BRIEF="$HOME/tmp/briefs/orchestrator-main.md"
 MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
+PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produce a fresh tick within 10 min
+FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-sonnet}"        # second recovery path: new session, other engine
 STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "$STATE"
 log() { echo "[$(date -u +%FT%TZ)] $ROLE: $*"; }
 t() { timeout "${T:-60}" "$@"; }
+tick_mtime() { stat -c %Y "$TICKS" 2>/dev/null || echo 0; }
+failures() { local n=0; read -r n < "$STATE/restart_failures" 2>/dev/null || n=0; [[ "$n" =~ ^[0-9]+$ ]] || n=0; echo "$n"; }
+
+# Hub-side liveness (src/ops-liveness.ts) watches these reports independently of this
+# script and of the session; a failed report never changes the local decision.
+hub_report() {  # $1 = state
+  [ "$ROLE" = orchestrator ] || return 0
+  [ "${OPS_HUB_REPORT:-1}" = 1 ] || return 0
+  local tk; tk=$(tick_mtime)
+  local args=(ops heartbeat --role "$ROLE" --kind watchdog --state "$1" --recovery-failures "$(failures)")
+  [ "$tk" -gt 0 ] && args+=(--tick-at "$(date -u -d "@$tk" +%FT%TZ)")
+  T=30 t hub "${args[@]}" >/dev/null 2>&1 || log "hub ops report failed (state=$1)"
+}
+
+# After a restart the new session must append a tick within PROOF_WINDOW. A transient
+# timer re-runs the watchdog right after the window, so the proof does not wait for the
+# next 10-minute slot.
+arm_proof() {  # $1 = recovery path (1 = restart, 2 = new session on the fallback engine)
+  [ "$ROLE" = orchestrator ] || return 0
+  echo "$(( $(date +%s) + PROOF_WINDOW )) $1" > "$STATE/proof_due"
+  if [ "${OPS_PROOF_TIMER:-1}" = 1 ]; then
+    systemd-run --user --collect -q --on-active="$((PROOF_WINDOW + 30))" --unit "ops-proof-$ROLE-$(date +%s)" \
+      /usr/bin/systemctl --user start ops-watchdog.service >/dev/null 2>&1 || log "proof timer not armed; the 10-min timer will check"
+  fi
+  log "recovery path $1 started; proof due: fresh tick within ${PROOF_WINDOW}s"
+}
 
 # List failures are errors, never evidence that no session exists.
 matching_sessions() {
@@ -154,47 +183,81 @@ restart() {  # $1 = reason
   make_handoff "${1:-manual}"; stop_old || return 1; start
 }
 
-restart_failed() {
-  local n=0
-  read -r n < "$STATE/restart_failures" 2>/dev/null || n=0
-  [[ "$n" =~ ^[0-9]+$ ]] || n=0
-  n=$((n+1)); echo "$n" > "$STATE/restart_failures"
-  log "restart FAILED ($n consecutive checks)"
+restart_failed() {  # $1 = Hub report state
+  local n; n=$(( $(failures) + 1 )); echo "$n" > "$STATE/restart_failures"
+  log "recovery FAILED ($n consecutive)"
   if [ "$n" -ge 2 ]; then
-    local alert="ops-watchdog: $TAG restart failed $n consecutive times; inspect $STATE and journalctl --user -u ops-watchdog.service"
+    local alert="ops-watchdog: $TAG automatic recovery failed $n consecutive times; inspect $STATE and journalctl --user -u ops-watchdog.service"
     # Append: preserve unrelated human requests. Durable inbox works even while
     # both sessions are dead; no unsolicited keystrokes into a busy agent pane.
     printf '\n[%s] %s\n' "$(date -u +%FT%TZ)" "$alert" >> "$HOME/tmp/agent-reports/orchestrator/NEEDS_ALEXEY.md"
     printf '%s\n' "$alert" > "$HOME/tmp/agent-reports/oncall/inbox/watchdog-$ROLE-$(date +%s)-$$.md"
     log "ALERT: $alert"
   fi
+  hub_report "${1:-restart_failed}"
+  return 1
+}
+
+# Start recovery path $1 and arm its proof. Path 2 is a different new session: the
+# fallback engine plus a fresh handoff, for a session that starts but never ticks.
+recover() {  # $1 = path, $2 = reason
+  local path="$1" reason="$2" saved="$ENGINE" rc=0
+  [ "$path" = 2 ] && ENGINE="$FALLBACK_ENGINE"
+  if FORCE=1 restart "$reason (recovery path $path, engine $ENGINE)"; then arm_proof "$path"; hub_report recovering
+  else rc=1; fi
+  ENGINE="$saved"
+  [ "$rc" = 0 ] || restart_failed restart_failed
+}
+
+# Returns 0 when no proof is pending or it just passed; 2 while still inside the window;
+# 1 after handling a failed proof (next recovery path started).
+check_proof() {
+  [ -f "$STATE/proof_due" ] || return 0
+  local due path now ls_ts tk; read -r due path < "$STATE/proof_due"; now=$(date +%s)
+  ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0); tk=$(tick_mtime)
+  if [ "$tk" -gt "$ls_ts" ]; then
+    rm -f "$STATE/proof_due"; echo 0 > "$STATE/restart_failures"
+    log "recovery proven: fresh tick $((tk-ls_ts))s after start (path ${path:-1})"; return 0
+  fi
+  local id; id=$(find_session) || id=""
+  if [ "$now" -lt "${due:-0}" ] && [ -n "$id" ]; then log "recovery pending proof: session=$id, $((due-now))s left"; hub_report proof_pending; return 2; fi
+  rm -f "$STATE/proof_due"
+  log "recovery proof FAILED (path ${path:-1}): no tick ${PROOF_WINDOW}s after start${id:+ (session $id alive)}"
+  restart_failed proof_failed
+  local next=2; [ "${path:-1}" = 2 ] && next=1
+  recover "$next" "no tick within ${PROOF_WINDOW}s after recovery path ${path:-1}" || true
   return 1
 }
 
 check() {
   mkdir -p "$HOME/tmp/agent-reports/orchestrator" "$HOME/tmp/agent-reports/oncall/inbox"
   local id
-  id=$(find_session) || { log "session census failed"; restart_failed; return 1; }
+  id=$(find_session) || { log "session census failed"; restart_failed census_failed; return 1; }
+  if [ "$ROLE" = orchestrator ]; then
+    check_proof; case $? in 1) return 1 ;; 2) return 0 ;; esac
+    id=$(find_session) || { log "session census failed"; restart_failed census_failed; return 1; }
+  fi
   if [ -n "$id" ] && [ "$ROLE" = orchestrator ]; then
-    # progress check: tick log must be fresh (grace = MAX_TICK_AGE after a start)
+    # progress check: a live process is not proof of work; the tick log must be fresh
+    # (grace = MAX_TICK_AGE after a start)
     local now ls_ts tk; now=$(date +%s); ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
-    tk=$(stat -c %Y "$TICKS" 2>/dev/null || echo 0); [ "$tk" -lt "$ls_ts" ] && tk=$ls_ts
+    tk=$(tick_mtime); [ "$tk" -lt "$ls_ts" ] && tk=$ls_ts
     if [ $((now-tk)) -gt "$MAX_TICK_AGE" ]; then
       log "STALLED session=$id: no tick for $((now-tk))s"
-      if FORCE=1 restart "no tick for $((now-tk))s (stalled)"; then id=$(find_session) || id=""; if [ -n "$id" ]; then echo 0 > "$STATE/restart_failures"; log "recovery verified session=$id"; return 0; fi; fi
-      restart_failed; return 1
+      recover 1 "no tick for $((now-tk))s (stalled)"; return
     fi
   fi
   if [ -n "$id" ]; then
     echo 0 > "$STATE/restart_failures"
-    log "OK session=$id"; return 0
+    log "OK session=$id"; hub_report ok; return 0
   fi
   log "DEAD (no live worker)"
+  if [ "$ROLE" = orchestrator ]; then recover 1 "session process dead/missing"; return; fi
   if restart "session process dead/missing"; then
     id=$(find_session) || id=""
     if [ -n "$id" ]; then
       echo 0 > "$STATE/restart_failures"
-      log "recovery verified session=$id"; return 0
+      log "restarted session=$id"; return 0
     fi
   fi
   restart_failed
