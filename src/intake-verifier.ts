@@ -163,11 +163,18 @@ export class IntakeVerifier {
     return true;
   }
   /** Verdict notes written after the verification was requested. */
-  private verdict(task: Obj, since: number): { pass: boolean; text: string } | null {
-    const notes = currentHistory(task).filter(e => e.kind === 'note' && (e.captured_at ?? 0) >= since);
+  private verdict(task: Obj, row: Obj): { pass: boolean; text: string } | null {
+    // The launch's worker credential has this server-assigned actor. Session
+    // ownership is the service's identity, not the identity writing the verdict.
+    const session = this.rows('SELECT fleet_launch_id,request_json,created_at FROM session_control_sessions WHERE id=?', row.session_id)[0];
+    const request = parse(session?.request_json);
+    if (!session?.fleet_launch_id || request.intake_task_id !== task.id || request.task_kind !== 'review') return null;
+    const actor = 'hub-workers:worker-' + session.fleet_launch_id;
+    const since = Math.max(row.created_at, ms(session.created_at));
+    const notes = currentHistory(task).filter(e => e.kind === 'note' && e.actor === actor && (e.captured_at ?? 0) >= since);
     for (let i = notes.length - 1; i >= 0; i--) {
       const text = String(notes[i].text ?? '');
-      if (VERIFIED_NOTE.test(text)) return { pass: true, text };
+      if (VERIFIED_NOTE.test(text) && intakeHasDoneEvidence({ history: [notes[i]] })) return { pass: true, text };
       if (FAILED_NOTE.test(text)) return { pass: false, text };
     }
     return null;
@@ -207,16 +214,25 @@ export class IntakeVerifier {
         continue;
       }
       if (row.state === 'skipped') { await this.close(task, claim, `verification skipped (${row.reason})`); continue; }
-      if (row.state === 'pending' || row.state === 'starting') {
+      if (row.state === 'starting') {
+        // An uncertain response may have created a canonical session. Recover
+        // that request before any retry; a fresh UUID could start a duplicate.
+        const session = this.rows('SELECT id FROM session_control_sessions WHERE actor=? AND request_key=?',
+          'hub:service:intake-verifier', row.request_key)[0];
+        if (session) this.set(task, claim, { state: 'requested', session_id: session.id, detail: null });
+        else { await this.escalate(task, claim, 'verifier admission outcome unknown; reconcile request ' + row.request_key + ' before retrying'); counts.escalated++; }
+        counts.waiting++; continue;
+      }
+      if (row.state === 'pending') {
         if (budget <= 0) { counts.waiting++; continue; }
         budget--; if (await this.launch(task, claim, row)) counts.launched++;
         continue;
       }
       if (row.state !== 'requested') continue; // closed, failed or needs_human: terminal for this claim
-      const verdict = this.verdict(task, row.created_at);
+      const verdict = this.verdict(task, row);
       if (verdict?.pass) {
         await this.close(task, claim, 'verified by separate Hub verifier session ' + row.session_id);
-        counts.closed++;
+        if (this.rows('SELECT state FROM intake_verifications WHERE task_id=? AND claim_id=?', task.id, claim.id)[0]?.state === 'closed') counts.closed++;
       } else if (verdict) {
         const gap = (/^gap:[ \t]*(.+)$/im.exec(verdict.text)?.[1] ?? verdict.text.split('\n')[0]).trim().slice(0, 1500);
         const ac = String(task.acceptance_criteria ?? '').trimEnd() + `\nVerification gap (${new Date(now).toISOString().slice(0, 10)}, verifier ${row.session_id}): ${gap}`;
