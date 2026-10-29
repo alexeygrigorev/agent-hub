@@ -292,11 +292,12 @@ describe('scoped durable worker access',()=>{
   expect(peek.status).toBe(403);expect(await code(peek)).toBe('cross_intake_forbidden');
   // Workers cannot author AC/verification (auto-pickup would turn it into launch
   // authority) or forge provenance; refused creates leave no ledger row.
-  for(const extra of [{acceptance_criteria:'do things'},{verification:'manual'},{created_by:{hub_session_id:session2}}]) {
+  for(const extra of [{acceptance_criteria:'do things'},{verification:'required'},{created_by:{hub_session_id:session2}}]) {
    const res=await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'x',text:'x',source:src,...extra});
    expect([400,403]).toContain(res.status);
   }
-  expect((await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'x',text:'x',source:src,acceptance_criteria:'a'}).then(code))).toBe('worker_ac_forbidden');
+  for(const extra of [{acceptance_criteria:'a'},{verification:'required'}])
+   expect(await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'x',text:'x',source:src,...extra}).then(code)).toBe('worker_ac_forbidden');
   await runInDurableObject<Hub,any>(stub,(h:any)=>expect(h.sql.exec('SELECT COUNT(*) AS n FROM worker_created_intakes').toArray()[0].n).toBe(1));
   // Per-session creation cap.
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
