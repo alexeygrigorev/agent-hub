@@ -21,6 +21,7 @@ import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency } from './pacing';
 import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
+import { WORKER_SCOPE, workerAccessContext } from './worker-access';
 // Host telemetry freshness windows (intake 4398ce2a). The host posts a fast
 // heartbeat every TELEMETRY_REFRESH_S (host/agent_hub_host/fleet.py, 45 s);
 // keep LAUNCHER_TELEMETRY_STALE_MS >= 3x that (host regression test parses it).
@@ -1274,6 +1275,19 @@ export class FleetService {
     if (path === '/api/fleet/resources' || path.startsWith('/api/fleet/resources/')) {
       const suffix = path.slice('/api/fleet/resources'.length);
       if (request.method === 'GET') {
+        if (caller.kind === 'agent' && auth.scopes?.includes(WORKER_SCOPE)) {
+          const worker = workerAccessContext(this.sql, caller.tokenId);
+          if (!worker || worker.actor !== caller.actor || !['', '/sessions'].includes(suffix)) return response({error:'forbidden'},403);
+          const own = (row: any) => row.session_id === worker.session_id ||
+            (typeof worker.native_binding?.native_id === 'string' && row.machine_id === worker.machine_id && row.native_id === worker.native_binding.native_id);
+          if (suffix === '/sessions') return response({sessions:this.resources.usage(Object.fromEntries(new URL(request.url).searchParams)).filter(own)});
+          const overview = this.resources.overview();
+          // Host headroom and aggregate usage are sanitized fleet data; session
+          // paths, native identities and receipts stay within this launch.
+          const throttles = overview.throttles.filter(own);
+          return response({...overview, sessions:overview.sessions.filter(own),
+            reaps:overview.reaps.filter(own), throttles, active_throttles:throttles.filter((t:any)=>t.active).length});
+        }
         if (suffix === '/watchdog') {
           if (!host) return response({error:'forbidden'},403);
           return response({config:this.resources.config(), sessions:this.resources.sessions(caller.machineId!), choking:this.resources.resourceChoking(caller.machineId!)});

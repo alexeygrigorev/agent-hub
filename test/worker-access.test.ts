@@ -23,6 +23,37 @@ async function setup(fn: (x:any)=>Promise<void>, mode = 'headless') {
  await fn({stub,id,task,session,other,worker,call});
 }
 describe('scoped durable worker access',()=>{
+ it.each(['headless','interactive'])('%s reads quota and own resource details without gaining fleet controls', mode=>setup(async({stub,session,task,other,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   const at=new Date().toISOString();
+   for(const id of [session,other]) h.sql.exec(`INSERT INTO session_resource_usage
+    (session_id,machine_id,native_id,project,engine,kind,started_at,state,observed_at)
+    VALUES(?,'worker-host',?,'agent-hub','codex','goal',?,'running',?)`,id,id,at,at);
+  });
+  expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
+  expect((await api('/api/intake/tasks/'+task.slice(0,8))).status).toBe(200);
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
+  for(const path of ['/api/quota?view=fleet','/api/quota?view=fleet&provider=codex&account=codex-orin']) {
+   const res=await api(path);expect(res.status,await res.clone().text()).toBe(200);
+   expect(await res.json()).toHaveProperty('pools');
+   expect((await api(path,{})).status).toBe(403);
+  }
+  for(const path of ['/api/fleet/resources','/api/fleet/resources/sessions']) {
+   const res=await api(path);expect(res.status,await res.clone().text()).toBe(200);
+   const data:any=await res.json();expect(data.sessions.map((s:any)=>s.session_id)).toEqual([session]);
+   expect(JSON.stringify(data)).not.toContain(other);
+   expect((await api(path,{})).status).toBe(403);
+  }
+  for(const path of ['/api/quota','/api/quota?view=fleet&view=host','/api/quota/server',
+   '/api/quota/kill-switch','/api/fleet/resources/watchdog','/api/fleet/resources/config',
+   '/api/fleet/resources/reaps','/api/fleet/resources/throttles','/api/fleet'])
+   expect([403,404]).toContain((await api(path)).status);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE worker_access SET expires_at=?',Date.now()-1));
+  expect((await api('/api/quota?view=fleet')).status).toBe(403);
+  expect((await api('/api/fleet/resources')).status).toBe(403);
+ },mode));
+
  it('AC5 triage reviewer: only live requested intakes, fills missing AC only, access ends on its verdict or session end',()=>setup(async({stub,session,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   const blank=uuid(), third=uuid(), later=uuid();

@@ -72,6 +72,10 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
   const worker = workerAccessContext(sql, tokenId);
   if (!worker) return false;
   const url = new URL(request.url), path = url.pathname;
+  // Sanitized admission data is needed by the worker itself. Keep telemetry
+  // writes, raw host snapshots and operator controls outside this capability.
+  if (path === '/api/quota') return request.method === 'GET' && url.searchParams.getAll('view').length === 1 && url.searchParams.get('view') === 'fleet';
+  if (['/api/fleet/resources', '/api/fleet/resources/sessions'].includes(path)) return request.method === 'GET';
   // Usage evidence is shared with TBM. A worker may read only these three
   // sanitized dimensions; this grants no monitoring writes or host telemetry.
   if (path === '/api/monitoring/history') {
