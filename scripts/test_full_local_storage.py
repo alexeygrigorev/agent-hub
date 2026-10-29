@@ -1,5 +1,7 @@
 """Exercise the real full-suite shell with small command stubs, without installs."""
 import json
+from contextlib import ExitStack
+import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -9,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 RUNNER = Path(__file__).with_name("test-full-local.sh")
@@ -100,9 +103,12 @@ class FullLocalStorageTests(unittest.TestCase):
 
     def start(self, name, **overrides):
         record = self.root / f"{name}.jsonl"
+        # These commands are stubs, not heavy suites. Exercise the real cap
+        # without waiting behind or occupying another session's live slots.
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
-                   UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record))
+                   UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record),
+                   AGENT_HUB_HEAVY_TEST_DIR=str(self.root / "stub-heavy-slots"))
         for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
                     "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS"):
             env.pop(key, None)
@@ -131,6 +137,24 @@ class FullLocalStorageTests(unittest.TestCase):
 
     def assert_preserved(self):
         self.assertEqual(self.sentinel.read_text(), "preserve")
+
+    def test_command_stubs_do_not_wait_for_occupied_ambient_heavy_slots(self):
+        ambient = self.root / "ambient-heavy-slots"
+        ambient.mkdir()
+        with ExitStack() as stack:
+            for slot in range(2):
+                holder = stack.enter_context((ambient / f"slot-{slot}.lock").open("w"))
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.dict(os.environ, {
+                "AGENT_HUB_HEAVY_TEST_DIR": str(ambient),
+                "AGENT_HUB_HEAVY_TEST_SLOTS": "2",
+                "AGENT_HUB_HEAVY_TEST_WAIT_S": "0",
+            }):
+                child, record = self.start("occupied-ambient")
+                code, output = self.finish(child)
+            self.assertEqual(code, 0, output)
+            self.assertTrue(any(row["tool"] == "npx" for row in self.records(record)))
+        self.assert_preserved()
 
     def test_python_discovery_does_not_touch_ambient_profiles(self):
         profile = self.root / "ambient-profile.json"
