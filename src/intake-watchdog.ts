@@ -145,13 +145,14 @@ export class IntakeWatchdog {
   }
   private idleOverride: string | null = null;
   /** Triage gate for the idle kick (intake 7736fdaa): outside the continuous-pickup scope
-   * only fresh work (younger than the 24h forgotten threshold) or backlog whose newest
-   * triage verdict is TRIAGE ACTUAL may be kicked. Returns the skip reason, or null. */
+   * only work whose newest triage verdict is TRIAGE ACTUAL, or untriaged fresh work (younger
+   * than the 24h forgotten threshold), may be kicked. A negative verdict always wins, even
+   * on fresh work. Returns the skip reason, or null. */
   private idleKickSkip(t: Obj, policy: QueuePolicy, now: number): string | null {
     if (policy.projects === null || policy.projects.includes(t.project)) return null;
-    if (now - ms(t.created_at) < DAY) return null;
     const verdict = latestTriageVerdict(t);
-    return verdict === 'ACTUAL' ? null : verdict ? 'idle_kick_triage_' + verdict.toLowerCase() : 'idle_kick_untriaged';
+    if (verdict) return verdict === 'ACTUAL' ? null : 'idle_kick_triage_' + verdict.toLowerCase();
+    return now - ms(t.created_at) < DAY ? null : 'idle_kick_untriaged';
   }
   /** Backlog idle kick (intake 500fd60b AC4): when no intake session has been starting or
    * running for 30 minutes, start the oldest ready intake through the same canonical

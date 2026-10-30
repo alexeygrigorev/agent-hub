@@ -270,6 +270,9 @@ describe('ops liveness (intake 500fd60b)', () => {
     // Fresh outside-scope work (younger than the 24h forgotten threshold) needs no triage.
     const fresh = intake(h, 'h-fresh', 'AC', 'open', 'demo', NOW - 23 * 3600000);
     expect((await kick([untriaged, fresh])).started).toEqual(['h-fresh']);
+    // …but a negative verdict on fresh work still wins.
+    const freshObsolete = triaged(intake(h, 'h-fresh-obsolete', 'AC', 'open', 'demo', NOW - 5 * 3600000), 'TRIAGE OBSOLETE — superseded');
+    expect(await kick([freshObsolete])).toEqual({ result: { task_id: null, reason: 'idle_kick_triage_obsolete' }, started: [] });
     // In-scope intakes keep the previous behaviour: kicked even when old and untriaged.
     const inScope = intake(h, 'i-scoped', 'AC', 'open', 'scoped', OLD);
     expect((await kick([untriaged, inScope])).started).toEqual(['i-scoped']);
