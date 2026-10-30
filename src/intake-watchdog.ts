@@ -6,6 +6,7 @@ import { freshCatalogs } from './catalog-freshness';
 import { parseNativeActor } from './work_claim';
 import { nativeTerminalError, sessionTerminalError, nativeProgress } from './session_stall';
 import { externalSessionInCensus } from './intake-external';
+import { latestTriageVerdict } from './worker-access';
 type Obj = Record<string, any>;
 type QueueSnapshot = { native:Obj[]; catalogs:Map<string,number>; sessions:Obj[]; launches:Map<string,Obj>;
   claims:Obj[]; queue:Map<string,Obj>; wakes:Obj[]; overflow:boolean };
@@ -143,15 +144,25 @@ export class IntakeWatchdog {
     return policy.projects !== null && !policy.projects.includes(t.project) ? 'watchdog_project_not_enabled' : null;
   }
   private idleOverride: string | null = null;
+  /** Triage gate for the idle kick (intake 7736fdaa): outside the continuous-pickup scope
+   * only fresh work (younger than the 24h forgotten threshold) or backlog whose newest
+   * triage verdict is TRIAGE ACTUAL may be kicked. Returns the skip reason, or null. */
+  private idleKickSkip(t: Obj, policy: QueuePolicy, now: number): string | null {
+    if (policy.projects === null || policy.projects.includes(t.project)) return null;
+    if (now - ms(t.created_at) < DAY) return null;
+    const verdict = latestTriageVerdict(t);
+    return verdict === 'ACTUAL' ? null : verdict ? 'idle_kick_triage_' + verdict.toLowerCase() : 'idle_kick_untriaged';
+  }
   /** Backlog idle kick (intake 500fd60b AC4): when no intake session has been starting or
    * running for 30 minutes, start the oldest ready intake through the same canonical
-   * restart path even if its project is not enabled for continuous pickup. Every other
-   * check still applies: explicit disable, AC, workspace, retry backoff and capacity. */
+   * restart path even if its project is not enabled for continuous pickup, provided it
+   * passes the triage gate above. Every other check still applies: explicit disable, AC,
+   * workspace, retry backoff and capacity. */
   async idleKick(now = this.now()): Promise<{ task_id: string | null; reason: string }> {
     const policy = this.policy();
     if (!policy.valid) return { task_id: null, reason: 'watchdog_configuration_invalid' };
     if (!policy.enabled) return { task_id: null, reason: 'watchdog_disabled' };
-    const candidates: Obj[] = [];
+    const candidates: Obj[] = [], skipped: Obj[] = [];
     let after = '';
     for (let page = 0; page < 4 && candidates.length < 3; page++) {
       const tasks = typeof this.intake.watchdogTasks === 'function' ? this.intake.watchdogTasks(after, QUEUE_BATCH_SIZE)
@@ -164,12 +175,17 @@ export class IntakeWatchdog {
       const byId = new Map(tasks.map(t => [t.id, t]));
       for (const item of this.project(tasks, now, context)) {
         const t = byId.get(item.id)!, q = this.queueRow(item.id);
-        if (item.ready && t.acceptance_criteria?.trim() && q?.state !== 'escalated' && (!q || q.next_at <= now || q.reason === 'watchdog_project_not_enabled')) candidates.push(t);
+        if (!(item.ready && t.acceptance_criteria?.trim() && q?.state !== 'escalated' && (!q || q.next_at <= now || q.reason === 'watchdog_project_not_enabled'))) continue;
+        const skip = this.idleKickSkip(t, policy, now);
+        if (skip) skipped.push({ t, skip }); else candidates.push(t);
       }
       if (tasks.length < QUEUE_BATCH_SIZE) break;
     }
-    candidates.sort((a, b) => ms(a.created_at) - ms(b.created_at) || a.id.localeCompare(b.id));
-    let last: { task_id: string | null; reason: string } = { task_id: null, reason: 'no_ready_intake' };
+    const age = (a: Obj, b: Obj) => ms(a.created_at) - ms(b.created_at) || a.id.localeCompare(b.id);
+    candidates.sort(age);
+    // Nothing kickable: name the oldest skipped backlog's gate (e.g. idle_kick_untriaged).
+    let last: { task_id: string | null; reason: string } = { task_id: null,
+      reason: skipped.sort((a, b) => age(a.t, b.t))[0]?.skip ?? 'no_ready_intake' };
     for (const t of candidates.slice(0, 3)) {
       // A project hold's retry delay is for continuous pickup; the idle kick may use it now.
       this.sql.exec("UPDATE intake_restart_queue SET next_at=? WHERE task_id=? AND state='queued' AND reason='watchdog_project_not_enabled'", now, t.id);

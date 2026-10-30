@@ -48,6 +48,17 @@ export function workerWakeAllowed(sql: SqlStorage, tokenId: string | undefined, 
 /** A triage verdict: a note whose first line starts with TRIAGE <outcome>, or a
  * DONE note written by a backlog triage (shared with src/intake-triage.ts). */
 export const TRIAGE_VERDICT = /^(?:TRIAGE (?:ACTUAL|DONE|OBSOLETE|DUPLICATE)\b|DONE\b[^\n]*backlog triage)/;
+/** The outcome of an intake's newest triage verdict note (ACTUAL, DONE, OBSOLETE,
+ * DUPLICATE), or null when it was never triaged. A `DONE … backlog triage` note is DONE. */
+export function latestTriageVerdict(task: { history?: any[] }): 'ACTUAL' | 'DONE' | 'OBSOLETE' | 'DUPLICATE' | null {
+  const history = task.history || [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const e = history[i], text = String(e?.text ?? '');
+    if (e?.kind !== 'note' || !TRIAGE_VERDICT.test(text)) continue;
+    return (/^TRIAGE (ACTUAL|DONE|OBSOLETE|DUPLICATE)\b/.exec(text)?.[1] ?? 'DONE') as any;
+  }
+  return null;
+}
 const TRIAGE_SESSION_ACTIVE = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncertain']);
 /** AC5 backlog triage (intake d8d509d2): the intakes this worker's live session
  * was asked to triage, from the server-written request ledger. Access to an

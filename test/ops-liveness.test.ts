@@ -45,6 +45,11 @@ function service(h: Hub, clock: { t: number }, hooks: any = {}) {
   s.init();
   return { s, alerts, open: () => alerts.filter(([, d]) => d !== null) };
 }
+/** Appends a triage note (docs/INTAKE-TRIAGE.md verdict format) to an intake fixture. */
+function triaged(task: any, ...texts: string[]) {
+  task.history.push(...texts.map((text, i) => ({ kind: 'note', text, captured_at: task.created_at + i + 1 })));
+  return task;
+}
 const tick = async (s: OpsLiveness, clock: { t: number }, minutes: number) => { clock.t += minutes * MIN; return s.tick(); };
 
 describe('ops liveness (intake 500fd60b)', () => {
@@ -204,7 +209,7 @@ describe('ops liveness (intake 500fd60b)', () => {
 
   it('idle kick starts a real backlog intake through canonical admission when its project is not enabled', () => fixture(async (h, clock) => {
     h.sql.exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,capabilities) VALUES('ops-host','ops-host','ops-host',?,?)", isoAt(NOW), JSON.stringify({ workspaces: ['demo'] }));
-    const older = intake(h, 'z-older', 'AC', 'open', 'demo', NOW - 2 * 86400000), newer = intake(h, 'a-newer');
+    const older = triaged(intake(h, 'z-older', 'AC', 'open', 'demo', NOW - 2 * 86400000), 'TRIAGE ACTUAL — still needed'), newer = intake(h, 'a-newer');
     const inputs: any[] = [];
     const proofOnly = () => queuePolicyFrom({ HUB_INTAKE_QUEUE_ENABLED: 'true', HUB_INTAKE_QUEUE_PROJECTS: 'agent-hub-queue-proof' });
     const make = (policy: () => any) => {
@@ -234,6 +239,64 @@ describe('ops liveness (intake 500fd60b)', () => {
     expect(await make(() => queuePolicyFrom({ HUB_INTAKE_QUEUE_ENABLED: 'false' })).idleKick()).toEqual({ task_id: null, reason: 'watchdog_disabled' });
     expect(inputs).toHaveLength(1);
   }));
+
+  it('idle kick outside the pickup scope is triage-gated: only TRIAGE ACTUAL backlog or fresh work (intake 7736fdaa)', () => fixture(async (h, clock) => {
+    h.sql.exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,capabilities) VALUES('ops-host','ops-host','ops-host',?,?)", isoAt(NOW), JSON.stringify({ workspaces: ['demo', 'scoped'] }));
+    const OLD = NOW - 3 * 86400000;
+    const scope = () => queuePolicyFrom({ HUB_INTAKE_QUEUE_ENABLED: 'true', HUB_INTAKE_QUEUE_PROJECTS: 'scoped' });
+    const kick = async (tasks: any[], policy = scope) => {
+      const inputs: any[] = [];
+      const w = new IntakeWatchdog(h.sql, { statusAuthorizedTasks: () => tasks } as any, (f: any) => f(), { policy,
+        start: async (input: any) => { inputs.push(input); const id = 'kick-' + input.intake_task_id; session(h, id, input.intake_task_id, 'queued'); return { status: 202, body: { id, state: 'queued' } }; } }, () => clock.t);
+      w.init();
+      const result = await w.idleKick();
+      h.sql.exec("DELETE FROM session_control_sessions WHERE id LIKE 'kick-%'");  // free capacity for the next case
+      return { result, started: inputs.map(i => i.intake_task_id) };
+    };
+    // Untriaged outside-scope backlog is never kicked, and the reason names the skip.
+    const untriaged = intake(h, 'b-untriaged', 'AC', 'open', 'demo', OLD);
+    expect(await kick([untriaged])).toEqual({ result: { task_id: null, reason: 'idle_kick_untriaged' }, started: [] });
+    // OBSOLETE / DUPLICATE / DONE verdicts are never kicked either; the latest verdict wins.
+    const obsolete = triaged(intake(h, 'c-obsolete', 'AC', 'open', 'demo', OLD - 1), 'TRIAGE ACTUAL — needed', 'TRIAGE OBSOLETE — superseded by abc');
+    const duplicate = triaged(intake(h, 'd-duplicate', 'AC', 'open', 'demo', OLD), 'TRIAGE DUPLICATE — of b-untriaged');
+    const done = triaged(intake(h, 'e-done', 'AC', 'open', 'demo', OLD), 'DONE — backlog triage (hourly, Claude Opus)\nevidence: x');
+    const prose = triaged(intake(h, 'f-prose', 'AC', 'open', 'demo', OLD), 'progress: mentions TRIAGE ACTUAL mid-line, not a verdict');
+    expect(await kick([untriaged, obsolete, duplicate, done, prose])).toEqual({ result: { task_id: null, reason: 'idle_kick_triage_obsolete' }, started: [] });
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_audit WHERE kind='idle_kick'").one().n).toBe(0);
+    // A TRIAGE ACTUAL backlog intake is kicked, ahead of older untriaged ones.
+    const actual = triaged(intake(h, 'g-actual', 'AC', 'open', 'demo', OLD + 1), 'TRIAGE OBSOLETE — maybe', 'TRIAGE ACTUAL — still needed');
+    expect(await kick([untriaged, obsolete, duplicate, done, prose, actual])).toEqual({ result: { task_id: 'g-actual', reason: 'submitted:canonical_queued' }, started: ['g-actual'] });
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_audit WHERE task_id='g-actual' AND kind='idle_kick'").one().n).toBe(1);
+    // Fresh outside-scope work (younger than the 24h forgotten threshold) needs no triage.
+    const fresh = intake(h, 'h-fresh', 'AC', 'open', 'demo', NOW - 23 * 3600000);
+    expect((await kick([untriaged, fresh])).started).toEqual(['h-fresh']);
+    // In-scope intakes keep the previous behaviour: kicked even when old and untriaged.
+    const inScope = intake(h, 'i-scoped', 'AC', 'open', 'scoped', OLD);
+    expect((await kick([untriaged, inScope])).started).toEqual(['i-scoped']);
+    // An all-projects scope ('*') has no outside-scope intakes.
+    const star = intake(h, 'j-star', 'AC', 'open', 'demo', OLD);
+    expect((await kick([star], () => queuePolicyFrom({ HUB_INTAKE_QUEUE_ENABLED: 'true', HUB_INTAKE_QUEUE_PROJECTS: '*' }))).started).toEqual(['j-star']);
+  }));
+
+  it('HUB_BACKLOG_IDLE_KICK=false still disables the kick for triaged backlog (intake 7736fdaa)', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('ops-liveness-kick-off-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (h: Hub) => {
+      const prior = h.env.HUB_BACKLOG_IDLE_KICK;
+      h.env.HUB_BACKLOG_IDLE_KICK = 'false';
+      try {
+        intake(h, 'k-actual', 'AC', 'open', 'demo', Date.now() - 3 * 86400000);
+        h.sql.exec("UPDATE intake_task_projection SET data=json_set(data,'$.history',json(?)) WHERE id='k-actual'",
+          JSON.stringify([{ kind: 'note', text: 'TRIAGE ACTUAL — needed', captured_at: Date.now() - 86400000 }]));
+        // An episode already idle for over one window, so this evaluation kicks.
+        h.sql.exec("INSERT INTO ops_backlog_idle(started_at,open_with_ac,reason_json) VALUES(?,1,'{}')", Date.now() - OPS_WINDOW_MS - MIN);
+        h.sql.exec('UPDATE ops_liveness_meta SET last_eval=NULL WHERE id=1');
+        const r = await h.opsLiveness.tick();
+        expect(r.idle).toMatchObject({ state: 'kicked', kick: { task_id: null, reason: 'idle_kick_disabled' } });
+        expect(h.sql.exec("SELECT COUNT(*) AS n FROM session_control_sessions WHERE json_extract(request_json,'$.intake_task_id')='k-actual'").one().n).toBe(0);
+      } finally { h.env.HUB_BACKLOG_IDLE_KICK = prior; }
+    });
+  });
 
   it('serves heartbeat and status over HTTP for admins only, and the minute alarm evaluates it', async () => {
     const bindings = env as unknown as Env;
