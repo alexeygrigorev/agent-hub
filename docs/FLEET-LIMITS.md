@@ -32,9 +32,15 @@ Target resolution:
 
 - An account label (`hub-claude`, or a canonical label that addresses a legacy
   alias row such as `shared-go` -> `urgent-muse`) sets that one account.
-- Otherwise the target is an engine: every account whose canonical provider is
-  that engine, or that serves it through a registry route. `claude` resolves to
-  `hub-claude` and `shared-claude`; `opencode` resolves through its route.
+- Otherwise the target is an engine: every account of that engine's provider
+  (`claude` -> `hub-claude` and `shared-claude`; `opencode` -> provider `go`;
+  `zcodex` -> `zai`; `antigravity` -> `gemini`). Provider matching comes first,
+  so `codex` never includes zai accounts that managed bundles route through
+  engine `codex`. Only when no account has that provider do registry routes
+  for the engine name select the accounts.
+- A legacy alias row and its canonical row (`urgent-muse`, `shared-go`) are one
+  account, as in `show`. A raise moves every row of the account but never
+  lowers a higher alias row; only `--allow-lower` lowers both.
 - No match returns `404 unknown_limit_target`.
 
 Lowering:

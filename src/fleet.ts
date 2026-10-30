@@ -16,7 +16,7 @@ import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './se
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { reconcileAccountCapacity } from './account_capacity';
-import { LIMIT_MAX, LIMIT_MIN, planLimitSet, resolveLimitTarget } from './fleet-limits';
+import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs } from './catalog-freshness';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
@@ -1529,7 +1529,7 @@ export class FleetService {
       const routes = this.sql.exec('SELECT account, engine FROM fleet_routes ORDER BY engine').toArray() as any[];
       const accounts = dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(row => {
         const s = this.accountStatus(row);
-        return { account: s.label, provider: s.provider, engines: [...new Set(routes.filter(r => r.account === row.label).map(r => String(r.engine)))],
+        return { account: s.label, provider: s.provider, engines: [...new Set(routes.filter(r => canonicalAccountLabel(String(r.account)) === s.label).map(r => String(r.engine)))],
           max_concurrency: Number(s.max_concurrency), active: s.active, reserved: s.reserved, observed_sessions: s.observed_sessions,
           native_live: s.native_live, available_slots: s.available_slots, placeable_slots: s.placeable_slots, enabled: s.enabled, status: s.status };
       });
@@ -1556,7 +1556,7 @@ export class FleetService {
         const plan = planLimitSet(resolved.kind, resolved.rows, data.max_concurrency, data.allow_lower === true);
         if (plan.error) return response({ error: plan.error, changes: plan.changes }, 409);
         const changed = plan.changes.filter(c => c.to !== c.from);
-        for (const c of changed) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=? WHERE label=?', c.to, c.label);
+        for (const u of limitRowUpdates(resolved.rows, plan.changes)) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=? WHERE label=?', u.to, u.label);
         if (changed.length) try {
           this.sql.exec('INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)', String(caller.actor ?? 'admin'),
             'fleet_limits_set', 'fleet_account', data.target, JSON.stringify(changed.map(c => ({ account: c.account, from: c.from, to: c.to }))), new Date(this.now()).toISOString());

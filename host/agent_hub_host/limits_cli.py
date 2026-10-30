@@ -62,25 +62,27 @@ def render(args: argparse.Namespace, result: dict) -> str:
     return '\n'.join(out)
 
 
+HINTS = {403: 'admin login required', 404: 'unknown engine or account',
+         409: 'lowering an account cap needs --allow-lower'}
+
+
 def run(args: argparse.Namespace) -> None:
-    import urllib.error
+    from . import session_control
     try:
         print(render(args, execute(args)))
+    # Session errors subclass ValueError, so they must be caught first.
+    except session_control.SessionHTTPError as exc:
+        hint = HINTS.get(exc.status, '')
+        # exc.code is the server error code already sanitized by http_error.
+        print('hub limits failed: HTTP %s %s%s' % (exc.status, exc.code, (' (' + hint + ')') if hint else ''), file=sys.stderr)
+        sys.exit(1)
+    except session_control.SessionTransportError as exc:
+        print(session_control.diagnostic(exc), file=sys.stderr)
+        sys.exit(1)
     except ValueError as exc:
         print('hub limits: ' + str(exc)[:200], file=sys.stderr)
         sys.exit(2)
-    except urllib.error.HTTPError as exc:
-        reason = ''
-        try:
-            reason = str(json.loads(exc.read(4096).decode('utf-8', 'replace')).get('error') or '')[:80]
-        except Exception:
-            pass
-        hint = {403: 'admin login required', 404: 'unknown engine or account',
-                409: 'lowering an account cap needs --allow-lower'}.get(exc.code, '')
-        print('hub limits failed: HTTP %d %s%s' % (exc.code, reason, (' (' + hint + ')') if hint else ''), file=sys.stderr)
-        sys.exit(1)
     except Exception as exc:
-        from . import session_control
         # Never echo credentials or server bodies.
         print(session_control.diagnostic(exc), file=sys.stderr)
         sys.exit(1)

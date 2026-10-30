@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
-import { planLimitSet, resolveLimitTarget } from '../src/fleet-limits';
+import { limitRowUpdates, planLimitSet, resolveLimitTarget } from '../src/fleet-limits';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -25,6 +25,35 @@ describe('cbcadaa1 hub limits', () => {
       .toEqual([['hub-claude', 13, 'raised'], ['shared-claude', 100, 'kept_higher']]);
     expect(planLimitSet('engine', claude, 13, true).changes.map(c => c.result)).toEqual(['raised', 'lowered']);
     expect(planLimitSet('account', [rows[1]], 13, false).error).toBe('account_lowering_requires_allow_lower');
+  });
+
+  it('matches providers before routes so codex never pulls in zai accounts (r1 finding 1)', () => {
+    const rows = [{ label: 'shared-codex', provider: 'codex', max_concurrency: 8 }, { label: 'codex-orin', provider: 'codex', max_concurrency: 8 },
+      { label: 'zai-main', provider: 'zai', max_concurrency: 6 }, { label: 'shared-go', provider: 'go', max_concurrency: 4 },
+      { label: 'hub-gemini', provider: 'gemini', max_concurrency: 8 }, { label: 'odd', provider: 'other', max_concurrency: 2 }];
+    // Managed zai bundles register routes with engine codex.
+    const routes = [{ account: 'zai-main', engine: 'codex' }, { account: 'shared-codex', engine: 'codex' }, { account: 'odd', engine: 'oddengine' }];
+    expect(resolveLimitTarget('codex', rows, routes).rows.map(r => r.label)).toEqual(['shared-codex', 'codex-orin']);
+    expect(resolveLimitTarget('zcodex', rows, routes).rows.map(r => r.label)).toEqual(['zai-main']);
+    expect(resolveLimitTarget('opencode', rows, []).rows.map(r => r.label)).toEqual(['shared-go']);
+    expect(resolveLimitTarget('antigravity', rows, []).rows.map(r => r.label)).toEqual(['hub-gemini']);
+    // Routes decide only when no account has the provider.
+    expect(resolveLimitTarget('oddengine', rows, routes).rows.map(r => r.label)).toEqual(['odd']);
+    expect(planLimitSet('engine', resolveLimitTarget('codex', rows, routes).rows, 4, true).changes.map(c => c.account)).toEqual(['shared-codex', 'codex-orin']);
+  });
+
+  it('plans legacy alias and canonical rows as one account (r1 finding 3)', () => {
+    const rows = [{ label: 'shared-go', provider: 'go', max_concurrency: 8 }, { label: 'urgent-muse', provider: 'go', max_concurrency: 100 }];
+    const resolved = resolveLimitTarget('shared-go', rows, []);
+    expect(resolved.rows).toHaveLength(2);
+    const plan = planLimitSet(resolved.kind, resolved.rows, 13, false);
+    expect(plan.error).toBeUndefined();
+    expect(plan.changes).toEqual([{ label: 'shared-go', account: 'shared-go', provider: 'go', from: 8, to: 13, result: 'raised' }]);
+    // The raise never lowers the higher alias row; an explicit lowering moves both.
+    expect(limitRowUpdates(resolved.rows, plan.changes)).toEqual([{ label: 'shared-go', from: 8, to: 13 }]);
+    const lower = planLimitSet(resolved.kind, resolved.rows, 5, true);
+    expect(limitRowUpdates(resolved.rows, lower.changes)).toEqual([{ label: 'shared-go', from: 8, to: 5 }, { label: 'urgent-muse', from: 100, to: 5 }]);
+    expect(planLimitSet(resolved.kind, resolved.rows, 5, false).error).toBe('account_lowering_requires_allow_lower');
   });
 
   it('shows caps with usage and sets them live and persistently, admin only', async () => {
@@ -72,6 +101,14 @@ describe('cbcadaa1 hub limits', () => {
       expect(cap('hub-claude')).toBe(13);
       expect((await call('PATCH', { target: 'hub-claude', max_concurrency: 10, allow_lower: true })).status).toBe(200);
       expect(cap('hub-claude')).toBe(10);
+
+      // Legacy alias + canonical rows: one account in show and in set.
+      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-go','go',8,5,1)");
+      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('urgent-muse','go',100,5,1)");
+      expect(((await (await call('GET')).json()) as any).accounts.filter((a: any) => a.provider === 'go').map((a: any) => [a.account, a.max_concurrency])).toEqual([['shared-go', 8]]);
+      const goSet: any = await (await call('PATCH', { target: 'shared-go', max_concurrency: 13 })).json();
+      expect(goSet.changes).toEqual([{ label: 'shared-go', account: 'shared-go', provider: 'go', from: 8, to: 13, result: 'raised' }]);
+      expect([cap('shared-go'), cap('urgent-muse')]).toEqual([13, 100]);
 
       // Persisted: a fresh service over the same storage reads the new cap.
       const restarted = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);

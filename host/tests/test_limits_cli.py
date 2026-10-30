@@ -1,5 +1,7 @@
 """`hub limits` operator CLI for fleet concurrency caps (intake cbcadaa1)."""
 import argparse
+import contextlib
+import io
 import unittest
 from unittest import mock
 
@@ -37,6 +39,28 @@ class LimitsCliTest(unittest.TestCase):
         text = limits_cli.render(parse('set', 'claude', '13'), result)
         self.assertTrue(text.startswith('Set claude=13 (engine):'))
         self.assertIn('shared-claude  100   100  kept_higher', text)
+
+    def run_with(self, exc, *argv):
+        err = io.StringIO()
+        with mock.patch('agent_hub_host.session_control.request', side_effect=exc), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as done:
+            limits_cli.run(parse(*argv))
+        return done.exception.code, err.getvalue()
+
+    def test_run_maps_http_and_transport_errors(self):
+        from agent_hub_host import session_control
+        cases = [(403, 'forbidden', 'admin login required'), (404, 'unknown_limit_target', 'unknown engine or account'),
+                 (409, 'account_lowering_requires_allow_lower', 'needs --allow-lower')]
+        for status, code, hint in cases:
+            exit_code, text = self.run_with(session_control.SessionHTTPError(status, code), 'set', 'hub-claude', '5')
+            self.assertEqual(exit_code, 1)
+            self.assertIn('HTTP %d %s' % (status, code), text)
+            self.assertIn(hint, text)
+        exit_code, text = self.run_with(session_control.SessionTransportError('Session transport failed: DNS lookup failed'), 'show')
+        self.assertEqual((exit_code, text.strip()), (1, 'Session transport failed: DNS lookup failed'))
+        exit_code, text = self.run_with(AssertionError('unused'), 'set', 'claude', '0')
+        self.assertEqual(exit_code, 2)
+        self.assertIn('between 1 and 100', text)
 
 
 if __name__ == '__main__':
