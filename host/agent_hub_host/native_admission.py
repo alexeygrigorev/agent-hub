@@ -57,9 +57,11 @@ def probe(payload, service, account, engine, request=None):
             result['reason'] = str(verdict['reason'])[:64]
         if verdict.get('quota_warning'):
             result['quota_warning'] = str(verdict['quota_warning'])[:64]
-    except Exception:
+    except Exception as exc:
+        from .provisioning import HostIdentityMissingError
+        if isinstance(exc, HostIdentityMissingError):
+            result['reason'] = 'host_identity_missing'
         # Exceptions may contain provider or Hub response bodies. Emit fixed booleans.
-        pass
     return result
 
 
