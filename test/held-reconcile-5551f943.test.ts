@@ -96,12 +96,15 @@ describe('held session reconcile (intake 5551f943)', () => {
       sql.exec('DELETE FROM session_control_held_cursor');
       open = true;
       nextPass(clock);
-      expect(s.reconcileHeldSessions().promoted).toBe(0); // 20 permanent holds
+      expect(s.reconcileHeldSessions().promoted).toBe(0); // 5 permanent holds re-evaluated
       expect(stateOf(sql, target)).toBe('held');
       // Inside the interval the background pass is skipped entirely.
       expect(s.reconcileHeldSessions().promoted).toBe(0);
-      nextPass(clock);
-      expect(s.reconcileHeldSessions().promoted).toBe(1);
+      // Every hold is re-evaluated (intake e4123b02), so the rotation reaches
+      // the pressured row after a bounded number of passes.
+      let promoted = 0;
+      for (let i = 0; i < 8 && !promoted; i++) { nextPass(clock); promoted = s.reconcileHeldSessions().promoted; }
+      expect(promoted).toBe(1);
       expect(stateOf(sql, target)).toBe('offered');
       expect((sql.exec("SELECT COUNT(*) AS n FROM session_control_sessions WHERE state = 'held'").toArray()[0] as any).n).toBe(25);
     }, placingReserve(() => open));
@@ -161,11 +164,10 @@ describe('held session reconcile (intake 5551f943)', () => {
     await fixture(async (s, sql, clock, measure) => {
       await createHeld(s, sql, 'pressured', 3, 0);
       await createHeld(s, sql, 'demo', 3, 1);
-      nextPass(clock);
-      s.reconcileHeldSessions(); // settles hold_json and the cursor
+      for (let i = 0; i < 4; i++) { nextPass(clock); s.reconcileHeldSessions(); } // one full rotation settles hold_json and the cursor
       nextPass(clock);
       const idle = await measure(() => s.reconcileHeldSessions());
-      expect(idle.written).toBe(0);
+      expect(idle.written).toBeLessThanOrEqual(1); // only the rotating cursor
       const skipped = await measure(() => s.reconcileHeldSessions()); // inside the interval
       expect(skipped).toEqual({ read: 0, written: 0 });
     }, placingReserve(() => false));
@@ -199,7 +201,7 @@ describe('held session reconcile (intake 5551f943)', () => {
       await createHeld(s, sql, 'demo', 25, 0);
       await createHeld(s, sql, 'pressured', 3, 1);
       // Settle: one full rotation normalizes every hold_json once.
-      for (let i = 0; i < 2; i++) { nextPass(clock); s.reconcileHeldSessions(); }
+      for (let i = 0; i < 8; i++) { nextPass(clock); s.reconcileHeldSessions(); }
 
       const pass = async () => { nextPass(clock); return measure(() => s.reconcileHeldSessions()); };
       for (let i = 0; i < 3; i++) {

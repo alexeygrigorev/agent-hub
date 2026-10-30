@@ -272,9 +272,13 @@ export function validateSendProof(proof: any, expected: SendProofExpectation): {
 export const HELD_UNPLACED_SQL = "SELECT * FROM session_control_sessions INDEXED BY session_control_held_unplaced WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL";
 /** Minimum spacing of the untargeted held-session pass (host polls run it). */
 export const HELD_RECONCILE_INTERVAL_MS = 10_000;
+/** Unplaced holds older than this raise one operator alert / are cancelled (intake e4123b02). */
+export const HELD_ALERT_MS = 6 * 3600_000;
+export const HELD_EXPIRE_MS = 48 * 3600_000;
 
 export class SessionControlService {
   private heldReconcileAt = -Infinity;
+  private heldAlertSignature = '';
   private maxPending: number;
   private maxPerSession: number;
   private claimTtlMs: number;
@@ -1193,6 +1197,9 @@ export class SessionControlService {
   reconcileHeldSessions(limit = 5, targetSessionId?: string): { promoted: number; cancelled: number } {
     let promoted = 0, cancelled = 0;
     if (!this.hooks.reserve) return { promoted, cancelled };
+    // Per-request (targeted) reads keep the original transient-only re-place so
+    // GET /api/sessions/:id gains no new reserve work (intake e4123b02); the
+    // rate-limited rotating pass below re-evaluates every hold reason.
     const transientReasons = new Set([
       'disk_floor', 'launcher_disk_reserve', 'resource_limit', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity',
       'route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking',
@@ -1234,13 +1241,19 @@ export class SessionControlService {
         try {
           const req = parsed(row.request_json, {});
           const holdInfo = this.readHoldInfo(row, req);
-          if (!holdInfo.rejected.length || !holdInfo.rejected.some((r: any) => transientReasons.has(String(r?.reason)))) {
-            continue;
-          }
+          if (targetSessionId && (!holdInfo.rejected.length || !holdInfo.rejected.some((r: any) => transientReasons.has(String(r?.reason))))) continue;
           try {
             const priorCancel = this.sql.exec('SELECT 1 FROM session_control_cancellations WHERE session_id = ? LIMIT 1', row.id).toArray();
             if (priorCancel.length) continue;
           } catch {}
+          if (!targetSessionId && now - Date.parse(row.created_at) > HELD_EXPIRE_MS) {
+            // Intake e4123b02: a hold that outlived every retry is not a
+            // parked intent any more; cancel it with an explicit reason.
+            const expiredHold = JSON.stringify({ error: 'held_expired', reason: 'held_expired', rejected: holdInfo.rejected });
+            this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", expiredHold, this.at(), row.id);
+            cancelled++;
+            continue;
+          }
           let project: string | undefined = undefined;
           if (typeof req.intake_task_id === 'string' && req.intake_task_id) {
             try {
@@ -1335,8 +1348,36 @@ export class SessionControlService {
           'INSERT INTO session_control_held_cursor (id, created_at, session_id) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at, session_id = excluded.session_id',
           last.created_at, last.id);
       }
+      if (!targetSessionId) this.alertStaleHolds(now);
     } catch { /* best-effort inside ambient transaction */ }
     return { promoted, cancelled };
+  }
+
+  /** ONE deduped operator alert (fixed kind/subject) while unplaced holds are
+   * older than HELD_ALERT_MS. Reads only the partial index: a range count and
+   * the 50 oldest rows for the reason breakdown. Cleared when none remain. */
+  private alertStaleHolds(now: number) {
+    const set = this.options.worktreeGuard?.setAlert;
+    if (!set) return;
+    const before = new Date(now - HELD_ALERT_MS).toISOString();
+    const count = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions INDEXED BY session_control_held_unplaced WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL AND created_at < ?`, before).toArray()[0] as any)?.n ?? 0);
+    let signature = 'none';
+    let problem: { state: string; detail: string } | null = null;
+    if (count > 0) {
+      const sample = this.sql.exec(`${HELD_UNPLACED_SQL} AND created_at < ? ORDER BY created_at, id LIMIT 50`, before).toArray() as any[];
+      const reasons = new Map<string, number>();
+      for (const row of sample) {
+        const reason = String(this.readHoldInfo(row).reason ?? 'unknown').replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 60) || 'unknown';
+        reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+      }
+      const oldestH = Math.floor((now - Date.parse(sample[0].created_at)) / 3600_000);
+      const breakdown = [...reasons].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([r, n]) => `${r}=${n}`).join(', ');
+      signature = `${count}|${oldestH}|${breakdown}`;
+      problem = { state: 'held_sessions_stale', detail: `${count} unplaced held session(s) older than ${HELD_ALERT_MS / 3600_000}h (oldest ${oldestH}h); top reasons: ${breakdown}` };
+    }
+    if (signature === this.heldAlertSignature) return;
+    const result = set('held_sessions', 'unplaced', problem);
+    if (result !== false && (result as any)?.ok !== false) this.heldAlertSignature = signature;
   }
 
   /** Launch ids with a routed task on this machine's sessions (routing_launch
