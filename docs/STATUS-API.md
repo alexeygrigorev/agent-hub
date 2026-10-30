@@ -225,3 +225,13 @@ baseline diff); `--limit`/`--after` stay on the readonly paginated GET,
 which never advances the baseline. `--local-only` preserves the old
 local-config diagnostic without any API call. Human output escapes
 terminal controls; `--json` prints the raw DTO.
+
+## Host failover (intake 0f12a181)
+
+`coverage.temporarily_dead` lists hosts with no check-in for >= 60 min
+(`machine_id`, `state: temporarily_dead`, `dead_since`, `reassigned_sessions`,
+`pending_sessions`). `src/host-failover.ts` re-places each running session with
+open intake work through ordinary placement (fresh session, same intake,
+`parent_id` lineage, key `failover-<session>`), and when the host checks in again
+stops the superseded sessions with durable stop commands (fence), then marks the
+host `recovered`. Drained hosts are never marked dead.
