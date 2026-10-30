@@ -30,10 +30,10 @@ def _offers(n):
 
 
 def test_dispatch_concurrency_default_and_bounds():
-    assert fleet.dispatch_concurrency({}) == fleet.DISPATCH_CONCURRENCY == 10
-    assert fleet.dispatch_concurrency({'dispatch_concurrency': 50}) == fleet.DISPATCH_CONCURRENCY_MAX == 10
+    assert fleet.dispatch_concurrency({}) == fleet.DISPATCH_CONCURRENCY == 13
+    assert fleet.dispatch_concurrency({'dispatch_concurrency': 50}) == fleet.DISPATCH_CONCURRENCY_MAX == 13
     assert fleet.dispatch_concurrency({'dispatch_concurrency': 0}) == 1
-    assert fleet.dispatch_concurrency({'dispatch_concurrency': 'x'}) == 10
+    assert fleet.dispatch_concurrency({'dispatch_concurrency': 'x'}) == 13
 
 
 def test_burst_of_ten_dispatches_in_parallel_bounded():

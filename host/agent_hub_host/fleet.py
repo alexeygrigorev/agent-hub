@@ -152,7 +152,7 @@ OFFERS_LOCK_NAME = "fleet-offers.lock"
 # plus a slow Hub can exceed that, so the gate is re-run before claiming when
 # the first observation is older than this.
 CLAIM_ADMISSION_REFRESH_S = 15.0
-# Bounded offer concurrency (settings "dispatch_concurrency", 1..10).
+# Bounded offer concurrency (settings "dispatch_concurrency", 1..13).
 # Intake eff9a5ce burst fix: serial dispatch (30-60 s per offer) made a
 # 10-launch burst take 5+ minutes. The earlier admission_refused failures with
 # 3 parallel starts came from N concurrent admission-gate subprocesses (quota
@@ -160,8 +160,8 @@ CLAIM_ADMISSION_REFRESH_S = 15.0
 # a short-lived shared result (ADMISSION_SHARE_S), so parallel dispatch no
 # longer multiplies gate runs. Host pressure is enforced by the launcher and
 # Hub placement on real choking signals (PSI, MemAvailable, OOM), never here.
-DISPATCH_CONCURRENCY = 10
-DISPATCH_CONCURRENCY_MAX = 10
+DISPATCH_CONCURRENCY = 13
+DISPATCH_CONCURRENCY_MAX = 13
 # An allowed gate observation is shared by concurrent dispatches for the same
 # account/engine/profile/mode/selection for this long. Well inside the Hub's
 # 30 s claim freshness and CLAIM_ADMISSION_REFRESH_S, so a shared observation
