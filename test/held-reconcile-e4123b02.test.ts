@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
-import { HELD_ALERT_MS, HELD_EXPIRE_MS, HELD_RECONCILE_INTERVAL_MS, SessionControlService } from '../src/session_control';
+import { HELD_ALERT_MS, HELD_ALERT_INTERVAL_MS, HELD_EXPIRE_MS, HELD_SLOW_INTERVAL_MS, SessionControlService } from '../src/session_control';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -37,7 +37,7 @@ async function createHeld(s: SessionControlService, sql: any, workspace: string,
   return created.id;
 }
 const row = (sql: any, id: string) => sql.exec('SELECT state, hold_json FROM session_control_sessions WHERE id = ?', id).toArray()[0] as any;
-const pass = (s: SessionControlService, clock: { t: number }) => { clock.t += HELD_RECONCILE_INTERVAL_MS; return s.reconcileHeldSessions(20); };
+const pass = (s: SessionControlService, clock: { t: number }) => { clock.t += HELD_SLOW_INTERVAL_MS; return s.reconcileHeldSessions(20); };
 const pausedReserve = (open: () => boolean) => (input: any) => open()
   ? { status: 201, value: { id: 'launch-' + input.idempotency_key, state: 'offered', machine: 'hetzner', engine: 'claude' } }
   : { status: 409, value: { error: 'no_eligible_route', rejected: [{ machine: 'hetzner', engine: 'claude', reason: input.workspace }] } };
@@ -94,6 +94,97 @@ describe('stale held session reconcile (intake e4123b02)', () => {
       pass(s, clock);
       expect(alerts[alerts.length - 1].problem).toBeNull();
       expect(a).toBeTruthy();
+    }, pausedReserve(() => false));
+  });
+
+  for (const refusal of ['unknown_workspace', 'repo_directory_unavailable', 'parent_not_found', 'invalid_launch_request']) {
+    it(`cancels a hold whose re-placement is refused with ${refusal}`, async () => {
+      let gone = false;
+      await fixture(async (s, sql, clock) => {
+        const id = await createHeld(s, sql, 'provider_disabled', 3600_000, clock);
+        gone = true;
+        expect(pass(s, clock).cancelled).toBe(1);
+        expect(row(sql, id).state).toBe('cancelled');
+        expect(JSON.parse(row(sql, id).hold_json).reason).toBe(refusal);
+      }, input => gone
+        ? { status: 400, value: { error: refusal } }
+        : { status: 409, value: { error: 'no_eligible_route', rejected: [{ machine: 'hetzner', engine: 'claude', reason: 'provider_disabled' }] } });
+    });
+  }
+
+  const link = (sql: any, id: string, patch: Record<string, string>) => {
+    for (const [k, v] of Object.entries(patch)) sql.exec(`UPDATE session_control_sessions SET request_json = json_set(request_json, '$.${k}', ?) WHERE id = ?`, v, id);
+  };
+  const holdReserve = (calls: any[]) => (input: any) => {
+    calls.push(input);
+    return { status: 409, value: { error: 'no_eligible_route', rejected: [{ machine: 'hetzner', engine: 'claude', reason: 'provider_disabled' }] } };
+  };
+
+  it('cancels holds on a worktree another intake owns or that was removed, and pins re-placement to the intake host', async () => {
+    const calls: any[] = [];
+    await fixture(async (s, sql, clock) => {
+      const path = (n: string) => `/home/u/git/app-wt-${n}`;
+      const wt = (task: string, p: string, state: string) => sql.exec(
+        "INSERT INTO intake_worktrees (id, task_id, machine, path, created_at, updated_at, session_ids, origin, state) VALUES (?, ?, 'hetzner', ?, 1, 1, '[]', 'session_cwd', ?)", crypto.randomUUID(), task, p, state);
+      const owned = await createHeld(s, sql, 'provider_disabled', 3600_000, clock);
+      const removed = await createHeld(s, sql, 'provider_disabled', 3500_000, clock);
+      const pinned = await createHeld(s, sql, 'provider_disabled', 3400_000, clock);
+      wt('someone-else', path('owned'), 'active'); link(sql, owned, { intake_task_id: 'fixture-intake', workspace: path('owned') });
+      wt('fixture-intake', path('gone'), 'removed'); link(sql, removed, { intake_task_id: 'fixture-intake', workspace: path('gone') });
+      wt('fixture-intake', path('mine'), 'active'); link(sql, pinned, { intake_task_id: 'fixture-intake' });
+      calls.length = 0;
+      pass(s, clock);
+      expect(JSON.parse(row(sql, owned).hold_json).reason).toBe('worktree_owned_by_other_intake');
+      expect(JSON.parse(row(sql, removed).hold_json).reason).toBe('intake_worktree_removed');
+      expect(row(sql, owned).state).toBe('cancelled');
+      expect(row(sql, removed).state).toBe('cancelled');
+      expect(row(sql, pinned).state).toBe('held');
+      expect(calls.length).toBe(1);
+      expect(calls[0].machine).toBe('hetzner');
+    }, holdReserve(calls));
+  });
+
+  it('re-places with the stored needs constraint', async () => {
+    const calls: any[] = [];
+    await fixture(async (s, sql, clock) => {
+      const id = await createHeld(s, sql, 'provider_disabled', 3600_000, clock);
+      sql.exec("UPDATE session_control_sessions SET request_json = json_set(request_json, '$.needs', json('[\"gpu\"]')) WHERE id = ?", id);
+      calls.length = 0;
+      pass(s, clock);
+      expect(calls[0].needs).toEqual(['gpu']);
+    }, holdReserve(calls));
+  });
+
+  it('does not rewrite hold_json or re-reserve non-transient rows on telemetry drift or inside the slow cadence', async () => {
+    let tick = 0;
+    const calls: any[] = [];
+    await fixture(async (s, sql, clock) => {
+      const id = await createHeld(s, sql, 'provider_disabled', 3600_000, clock);
+      pass(s, clock);
+      const before = sql.exec('SELECT hold_json, updated_at FROM session_control_sessions WHERE id = ?', id).toArray()[0] as any;
+      pass(s, clock); pass(s, clock);
+      const after = sql.exec('SELECT hold_json, updated_at FROM session_control_sessions WHERE id = ?', id).toArray()[0] as any;
+      expect(after).toEqual(before);
+      // Inside the slow interval: no reserve at all.
+      const n = calls.length;
+      clock.t += 10_000; s.reconcileHeldSessions(20);
+      clock.t += 10_000; s.reconcileHeldSessions(20);
+      expect(calls.length).toBe(n);
+      expect(HELD_SLOW_INTERVAL_MS).toBeGreaterThan(10_000);
+    }, input => {
+      calls.push(input);
+      return { status: 409, value: { error: 'no_eligible_route', rejected: [{ machine: 'hetzner', engine: 'claude', reason: 'provider_disabled', memory: ++tick, advertised_at: String(tick) }] } };
+    });
+  });
+
+  it('recomputes the stale alert on a slow cadence and never rewrites it as time passes', async () => {
+    await fixture(async (s, sql, clock, alerts) => {
+      await createHeld(s, sql, 'provider_disabled', HELD_ALERT_MS + 3600_000, clock);
+      pass(s, clock);
+      expect(alerts.filter(x => x.problem).length).toBe(1);
+      for (let i = 0; i < 30; i++) { clock.t += 3600_000 / 6; s.reconcileHeldSessions(20); } // 5 hours of drift
+      expect(alerts.length).toBe(1);
+      expect(HELD_ALERT_INTERVAL_MS).toBeGreaterThan(10_000);
     }, pausedReserve(() => false));
   });
 });

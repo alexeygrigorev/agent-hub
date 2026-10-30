@@ -46,7 +46,7 @@ async function fixture(fn: (s: SessionControlService, sql: any, clock: { t: numb
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
     const clock = { t: Date.UTC(2026, 9, 30, 17, 0, 0) };
     const m = metered(hub.sql);
-    const service = new SessionControlService(m.proxy, (cb) => state.storage.transactionSync(cb), () => clock.t, { reserve }, {});
+    const service = new SessionControlService(m.proxy, (cb) => state.storage.transactionSync(cb), () => clock.t, { reserve }, { worktreeGuard: { setAlert: () => true } as any });
     service.init();
     seedFixtureIntake(hub.sql);
     const at = new Date().toISOString();

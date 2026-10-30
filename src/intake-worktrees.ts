@@ -171,6 +171,12 @@ export class IntakeWorktrees {
     return { row: this.row(row.id)!, fresh };
   }
 
+  /** State of this intake's newest row for a path (any machine); null when never recorded. */
+  lastStateFor(taskId: string, path: string): string | null {
+    const r = this.sql.exec('SELECT state FROM intake_worktrees WHERE task_id = ? AND path = ? ORDER BY updated_at DESC LIMIT 1', taskId, path).toArray()[0] as Obj | undefined;
+    return r ? String(r.state) : null;
+  }
+
   /** Session start: refuse another intake's worktree; pin to the recorded host. */
   startGuard(taskId: string | null | undefined, request: { machine?: string | null; workspace?: string | null; cwd?: string | null; detached?: boolean }):
     { error?: Obj; machine?: string } {

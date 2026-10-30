@@ -1,7 +1,7 @@
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
-import { IntakeWorktrees, namesWorktree } from './intake-worktrees';
+import { IntakeWorktrees, namesWorktree, worktreePathAllowed } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
 import { LivenessService } from './liveness';
 import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
@@ -275,10 +275,28 @@ export const HELD_RECONCILE_INTERVAL_MS = 10_000;
 /** Unplaced holds older than this raise one operator alert / are cancelled (intake e4123b02). */
 export const HELD_ALERT_MS = 6 * 3600_000;
 export const HELD_EXPIRE_MS = 48 * 3600_000;
+/** Non-transient holds (pauses, gates) are re-evaluated far less often than transient ones, a few rows at a time. */
+export const HELD_SLOW_INTERVAL_MS = 5 * 60_000;
+export const HELD_SLOW_LIMIT = 3;
+/** The stale-hold alert is recomputed at most this often. */
+export const HELD_ALERT_INTERVAL_MS = 5 * 60_000;
+
+/** Telemetry-free hold shape so unchanged holds compare equal across heartbeats. */
+function stableHold(value: any): string {
+  const rejected = (Array.isArray(value?.rejected) ? value.rejected : []).map((r: any) => ({
+    machine: typeof r?.machine === 'string' ? r.machine : null,
+    engine: typeof r?.engine === 'string' ? r.engine : null,
+    reason: typeof r?.reason === 'string' ? r.reason : null,
+  }));
+  const reason = [value?.reason, rejected[0]?.reason, value?.error].find(v => typeof v === 'string' && v.trim()) ?? null;
+  return JSON.stringify({ error: typeof value?.error === 'string' ? value.error : null, reason, rejected });
+}
 
 export class SessionControlService {
   private heldReconcileAt = -Infinity;
   private heldAlertSignature = '';
+  private heldAlertAt = -Infinity;
+  private heldSlowAt = -Infinity;
   private maxPending: number;
   private maxPerSession: number;
   private claimTtlMs: number;
@@ -1233,6 +1251,8 @@ export class SessionControlService {
       }
       let last: any = null;
       let attempts = 0;
+      let slowAttempts = 0;
+      const slowDue = now - this.heldSlowAt >= HELD_SLOW_INTERVAL_MS;
       const gates = new Map<string, boolean>();
       for (const row of rows) {
         if (promoted >= limit || attempts >= limit) break;
@@ -1290,20 +1310,54 @@ export class SessionControlService {
               }
             } catch {}
           }
+          // Intake worktree rules from POST /api/sessions apply on re-placement:
+          // a worktree another intake owns or that was removed never clears
+          // (cancel); an intake's recorded host pins the re-placement.
+          let worktreeMachine: string | undefined;
+          if (typeof req.intake_task_id === 'string' && req.intake_task_id) {
+            let guard: { error?: Record<string, unknown>; machine?: string } = {};
+            let removedPath: string | null = null;
+            try {
+              const wt = new IntakeWorktrees(this.sql);
+              guard = wt.startGuard(req.intake_task_id, { machine: req.machine ?? null, workspace: req.workspace, cwd: req.cwd ?? null, detached: req.intake_worktree === 'detached' });
+              if (!guard.error) {
+                for (const path of [req.cwd, req.workspace]) {
+                  if (!worktreePathAllowed(path)) continue;
+                  const wtState = wt.lastStateFor(req.intake_task_id, path);
+                  if (wtState && wtState !== 'active') removedPath = path;
+                }
+              }
+            } catch { /* registry table absent in narrow fixtures */ }
+            const cause = guard.error ? String(guard.error.error ?? 'worktree_owned_by_other_intake') : removedPath ? 'intake_worktree_removed' : null;
+            if (cause) {
+              this.cancelHeld(row.id, cause, holdInfo.rejected);
+              cancelled++;
+              continue;
+            }
+            worktreeMachine = guard.machine;
+          }
           const mode = row.mode || req.mode || 'headless';
           if (mode !== 'interactive') {
             const engineKey = String(req.engine ?? '');
             if (!gates.has(engineKey)) gates.set(engineKey, this.tbmGate(req.engine ?? undefined).ok);
             if (!gates.get(engineKey)) continue;
           }
+          const transient = holdInfo.rejected.some((r: any) => transientReasons.has(String(r?.reason)));
+          if (!targetSessionId && !transient) {
+            // Non-transient reasons re-evaluate on a much slower cadence.
+            if (!slowDue || slowAttempts >= HELD_SLOW_LIMIT) continue;
+            slowAttempts++;
+            this.heldSlowAt = now;
+          }
           attempts++;
           const reserved = this.hooks.reserve({
             ...(req.task_kind !== undefined && req.task_kind !== null ? { task_kind: req.task_kind } : {}),
             ...(project ? { project } : {}),
             mode,
-            ...(req.machine ? { machine: req.machine } : {}),
+            ...(req.machine || worktreeMachine ? { machine: req.machine ?? worktreeMachine } : {}),
             ...(req.engine ? { engine: req.engine } : {}),
             ...(req.tier ? { tier: req.tier } : {}),
+            ...(req.needs !== undefined && req.needs !== null ? { needs: req.needs } : {}),
             workspace: req.workspace,
             cwd: req.cwd ?? null,
             prompt: req.brief || '',
@@ -1332,10 +1386,19 @@ export class SessionControlService {
               row.id,
             );
             promoted++;
-          } else if (reserved.status >= 300 && reserved.value && JSON.stringify(reserved.value) !== row.hold_json) {
+          } else if (reserved.status === 400 && reserved.value) {
+            // The same refusal POST /api/sessions treats as terminal (workspace
+            // or repo gone, parent gone, invalid launch): it cannot clear.
+            const rejected = Array.isArray(reserved.value.rejected) ? reserved.value.rejected : [];
+            const cause = [reserved.value.reason, rejected[0]?.reason, reserved.value.error].find(v => typeof v === 'string' && v.trim()) || 'placement_refused';
+            this.cancelHeld(row.id, String(cause), rejected);
+            cancelled++;
+          } else if (reserved.status >= 300 && reserved.value && stableHold(reserved.value) !== stableHold(parsed(row.hold_json, null))) {
+            const rejected = Array.isArray(reserved.value.rejected) ? reserved.value.rejected : [];
+            const reason = [reserved.value.reason, rejected[0]?.reason, reserved.value.error].find(v => typeof v === 'string' && v.trim()) || 'placement_held';
             this.sql.exec(
               "UPDATE session_control_sessions SET hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'",
-              JSON.stringify(reserved.value),
+              JSON.stringify({ ...reserved.value, reason, rejected }),
               at,
               row.id,
             );
@@ -1353,27 +1416,37 @@ export class SessionControlService {
     return { promoted, cancelled };
   }
 
+  private cancelHeld(id: string, cause: string, rejected: any[]) {
+    const safe = cause.replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 60) || 'placement_refused';
+    this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'",
+      JSON.stringify({ error: safe, reason: safe, rejected }), this.at(), id);
+  }
+
   /** ONE deduped operator alert (fixed kind/subject) while unplaced holds are
-   * older than HELD_ALERT_MS. Reads only the partial index: a range count and
-   * the 50 oldest rows for the reason breakdown. Cleared when none remain. */
+   * older than HELD_ALERT_MS. Recomputed at most every HELD_ALERT_INTERVAL_MS
+   * from at most 50 index-ordered rows reading only created_at and the stored
+   * reason; the signature (count + reason breakdown, no ages) changes only
+   * when the stale set does, so the alert row is not rewritten as time passes.
+   * Cleared when none remain. */
   private alertStaleHolds(now: number) {
     const set = this.options.worktreeGuard?.setAlert;
     if (!set) return;
+    if (now - this.heldAlertAt < HELD_ALERT_INTERVAL_MS) return;
+    this.heldAlertAt = now;
     const before = new Date(now - HELD_ALERT_MS).toISOString();
-    const count = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions INDEXED BY session_control_held_unplaced WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL AND created_at < ?`, before).toArray()[0] as any)?.n ?? 0);
+    const sample = this.sql.exec(`SELECT json_extract(hold_json, '$.reason') AS reason FROM session_control_sessions INDEXED BY session_control_held_unplaced WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL AND created_at < ? ORDER BY created_at, id LIMIT 50`, before).toArray() as any[];
     let signature = 'none';
     let problem: { state: string; detail: string } | null = null;
-    if (count > 0) {
-      const sample = this.sql.exec(`${HELD_UNPLACED_SQL} AND created_at < ? ORDER BY created_at, id LIMIT 50`, before).toArray() as any[];
+    if (sample.length > 0) {
       const reasons = new Map<string, number>();
       for (const row of sample) {
-        const reason = String(this.readHoldInfo(row).reason ?? 'unknown').replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 60) || 'unknown';
+        const reason = String(row.reason ?? 'unknown').replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 60) || 'unknown';
         reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
       }
-      const oldestH = Math.floor((now - Date.parse(sample[0].created_at)) / 3600_000);
-      const breakdown = [...reasons].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([r, n]) => `${r}=${n}`).join(', ');
-      signature = `${count}|${oldestH}|${breakdown}`;
-      problem = { state: 'held_sessions_stale', detail: `${count} unplaced held session(s) older than ${HELD_ALERT_MS / 3600_000}h (oldest ${oldestH}h); top reasons: ${breakdown}` };
+      const count = sample.length >= 50 ? '50+' : String(sample.length);
+      const breakdown = [...reasons].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 5).map(([r, n]) => `${r}=${n}`).join(', ');
+      signature = `${count}|${breakdown}`;
+      problem = { state: 'held_sessions_stale', detail: `${count} unplaced held session(s) older than ${HELD_ALERT_MS / 3600_000}h; top reasons: ${breakdown}` };
     }
     if (signature === this.heldAlertSignature) return;
     const result = set('held_sessions', 'unplaced', problem);
