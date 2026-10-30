@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 from . import bus
 from .session_rules import SESSION_PREAMBLE, compose_prompt
-from .retired_native import verify_native_retirement
+from .retired_native import launch_workspace_targets, verify_native_retirement, verify_retirement_in_targets
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 # Control characters the Hub server rejects in finish-report text
@@ -174,6 +174,10 @@ CLAIM_ADMISSION_REFRESH_S = 15.0
 # a short-lived shared result (ADMISSION_SHARE_S), so parallel dispatch no
 # longer multiplies gate runs. Host pressure is enforced by the launcher and
 # Hub placement on real choking signals (PSI, MemAvailable, OOM), never here.
+# Intake 2a944c3f: per-pass cap on launcher reconcile runs and the pause for a
+# launch whose retirement proof was refused, so wedged rows cannot starve others.
+RECONCILE_LAUNCHER_BATCH = 16
+RECONCILE_BACKOFF_S = 120.0
 DISPATCH_CONCURRENCY = 13
 DISPATCH_CONCURRENCY_MAX = 13
 # An allowed gate observation is shared by concurrent dispatches for the same
@@ -1149,6 +1153,7 @@ class Dispatcher:
         self.journal_dir = journal_dir or settings.get("journal_dir")
         self._imported_sessions_cursor: Optional[str] = None
         self._active_launches: dict[str, dict[str, Any]] = {}
+        self._reconcile_backoff: dict[str, float] = {}
         self._role_jobs_cache: Optional[tuple] = None
         # Intake 488b860e: offers already faulted once this process (fault flag
         # is once-per-offer; the synchronous same-key retry must run clean).
@@ -1692,7 +1697,7 @@ class Dispatcher:
         try:
             started_ms = int(launched_at_ts * 1000) if type(launched_at_ts) in (int, float) else None
             same = (target.tag == 'task-' + task_id
-                    and target.workspace == str(Path(workspace).resolve(strict=True))
+                    and target.workspace in {str(Path(w).resolve(strict=True)) for w in (workspace, target_cwd)}
                     and isinstance(offer.get('engine'), str) and target.engine == offer['engine']
                     and type(target.created_at_ms) is int and started_ms is not None
                     and started_ms - 60_000 <= target.created_at_ms <= int(time.time() * 1000) + 60_000)
@@ -1791,6 +1796,9 @@ class Dispatcher:
         has_launcher = all(launcher.get(k) for k in ["argv", "root", "config_dir"])
 
         from .terminal_reports import guarded_records
+        from . import retired_native
+        pass_catalog = {}
+        launcher_runs = 0
         for offer_id, record in guarded_records(self, offer_ids):
             if record.get("settled") is True:
                 from .late_reports import deliver, cleanup
@@ -1835,7 +1843,7 @@ class Dispatcher:
             # differs from the workspace root for `--cwd` launches (intake
             # 2a944c3f); a tombstone only matches its own exact workspace.
             targets = []
-            for ws in dict.fromkeys(w for w in (record.get("target_cwd"), record.get("workspace")) if w):
+            for ws in launch_workspace_targets(record):
                 try:
                     targets.append(NativeTarget(
                         session_id=record["native_id"],
@@ -1858,25 +1866,49 @@ class Dispatcher:
                     continue
 
             # 2. Positive retirement verification
-            is_retired = False
-            for candidate in targets:
+            # Bounded: at most one live census per kind per pass (shared by
+            # every launch and candidate workspace) and a capped number of
+            # launcher runs; a launch whose launcher release is refused backs
+            # off for a while.
+            if "sessions" not in pass_catalog:
                 try:
-                    is_retired, tombstone, detail = verify_native_retirement(native, candidate, state_dir=state_dir)
+                    pass_catalog["sessions"] = retired_native.list_sessions(native, include_exited=True)
                 except Exception:
-                    continue
-                if is_retired:
-                    target = candidate
-                    break
+                    pass_catalog["sessions"] = None
+            is_retired, found, tombstone, detail = False, None, None, "live_catalog_unavailable"
+            # A failed census is retried (through the verifier) by one launch
+            # per pass only, never by every launch.
+            if pass_catalog["sessions"] is not None:
+                is_retired, found, tombstone, detail = verify_retirement_in_targets(
+                    native, targets, state_dir=state_dir, sessions=pass_catalog["sessions"],
+                    verify=verify_native_retirement)
+            elif not pass_catalog.get("census_retried"):
+                pass_catalog["census_retried"] = True
+                try:
+                    is_retired, tombstone, detail = verify_native_retirement(native, targets[0], state_dir=state_dir)
+                    found = targets[0] if is_retired else None
+                except Exception:
+                    pass
+            if found is not None:
+                target = found
 
             if not is_retired:
-                from .terminal_reports import retained_terminal_exit
+                from .terminal_reports import retained_terminal_exit, native_catalog
+                if "rows" not in pass_catalog:
+                    pass_catalog["rows"] = native_catalog(self)
                 for candidate in targets:
-                    is_retired, tombstone, detail = retained_terminal_exit(self, candidate, record)
+                    is_retired, tombstone, detail = retained_terminal_exit(
+                        self, candidate, record, rows=pass_catalog["rows"])
                     if is_retired:
                         target = candidate
                         break
+                    if detail != 'retained_identity_unavailable':
+                        break
             if not is_retired:
                 continue
+            if time.time() < self._reconcile_backoff.get(offer_id, 0) or launcher_runs >= RECONCILE_LAUNCHER_BATCH:
+                continue
+            launcher_runs += 1
 
             # 3. Maintained Launcher reconcile
             if not has_launcher:
@@ -1901,11 +1933,22 @@ class Dispatcher:
             # binding when no first action validated: a missing (never a
             # different) launcher native_id is accepted for it only.
             launcher_native = reconcile_out.get("native_id")
+            # A `--cwd` launch whose launcher binding failed on the workspace
+            # mismatch (launcher_command_failed, before 1883b769) has no
+            # binding either; the retirement of the host-bound native was
+            # proven above, so a missing (never a different) native_id is
+            # accepted for it too.
+            unbound_ok = (launcher_native is None and reconcile_out.get("task_id") == record["task_id"]
+                          and (record.get("retired_dispatch") is True
+                               or (reconciled_state == "failed"
+                                   and record.get("target_cwd") not in (None, record.get("workspace")))))
             if (resources_reserved is not False
-                    or (launcher_native != record["native_id"]
-                        and not (launcher_native is None and record.get("retired_dispatch") is True
-                                 and reconcile_out.get("task_id") == record["task_id"]))
+                    or (launcher_native != record["native_id"] and not unbound_ok)
                     or reconciled_state not in ("completed-awaiting-review", "accepted", "failed")):
+                if resources_reserved is False:
+                    # Released but not this launch's own proof: do not re-run
+                    # the launcher every pass. Unconfirmed release retries.
+                    self._reconcile_backoff[offer_id] = time.time() + RECONCILE_BACKOFF_S
                 continue
 
             # 4. Own-host Fleet terminal result
@@ -3303,14 +3346,21 @@ class Dispatcher:
                                 cand_engine = s_data.get("engine") or offer.get("engine")
                                 cand_inc = s_data.get("created_at_ms") or s_data.get("incarnation")
                                 if cand_id and cand_inc:
-                                    target = NativeTarget(
+                                    # The native is bound to the engine cwd for `--cwd`
+                                    # launches; the start file names the workspace root.
+                                    cand_targets = [NativeTarget(
                                         session_id=cand_id,
                                         tag=cand_tag,
-                                        workspace=str(Path(cand_ws).resolve(strict=True)),
+                                        workspace=str(Path(w).resolve(strict=True)),
                                         created_at_ms=cand_inc,
                                         engine=cand_engine,
-                                    ).validated()
-                                    is_retired, tomb, retire_detail = verify_native_retirement(native, target, state_dir=self.settings.get("aplexer_state_dir"))
+                                    ).validated() for w in dict.fromkeys([str(target_cwd), cand_ws])]
+                                    target = cand_targets[0]
+                                    is_retired, found, tomb, retire_detail = verify_retirement_in_targets(
+                                        native, cand_targets, state_dir=self.settings.get("aplexer_state_dir"),
+                                        verify=verify_native_retirement)
+                                    if found is not None:
+                                        target = found
                                     if is_retired and failure.get("reason") != "launcher_command_failed":
                                         # Diagnosed model/auth/permission failures keep their policy.
                                         proven_dead = True
@@ -3587,7 +3637,7 @@ class Dispatcher:
                 if (row.get('id') == record.get('native_id')
                         and row.get('created_at_ms') == record.get('incarnation')
                         and row.get('tag') == record.get('tag')
-                        and row.get('workspace') == record.get('workspace')
+                        and row.get('workspace') in launch_workspace_targets(record)
                         and row.get('engine') == record.get('engine')
                         and isinstance(row.get('exit'), dict)):
                     exit_info = row['exit']

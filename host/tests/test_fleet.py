@@ -1358,6 +1358,108 @@ class FleetTests(unittest.TestCase):
             self.assertIn(post[2]['state'], ('exited', 'failed'))
             self.assertTrue(d._active_launches[offer_id]['settled'])
 
+    def _cwd_fixture(self, tmp, count=1, tombstone=True, launcher_native='unbound'):
+        ws = Path(tmp) / 'ws'; (ws / 'docs').mkdir(parents=True)
+        state = Path(tmp) / 'state'
+        cfg = settings(ws); cfg['capabilities'] = []
+        cfg['aplexer_state_dir'] = str(state)
+        cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': str(ws), 'config_dir': str(ws / 'config')}
+        requests, calls = [], []
+        def request(method, path, body=None):
+            requests.append((method, path, body))
+            return {'id': path.split('/')[-2], 'state': (body or {}).get('state')}
+        def runner(argv, **kw):
+            calls.append(argv)
+            if 'reconcile' in argv:
+                tid = argv[argv.index('--id') + 1]
+                nid = None if launcher_native == 'unbound' else launcher_native
+                return {'task_id': tid, 'native_id': nid, 'state': 'failed', 'resources_reserved': False}
+            return []
+        d = fleet.Dispatcher(cfg, request, runner, journal_dir=str(Path(tmp) / 'journal'))
+        offers = []
+        for i in range(count):
+            offer_id = '%08x-e2ab-4733-9a14-26a79884f11c' % (0x02b0ccdf + i)
+            native_id = '%08x-f4b8-4c61-bbf9-2b58fb01fb4e' % (0x8905ad8e + i)
+            task_id = f'hub-{offer_id}'
+            if tombstone:
+                tomb = state / 'retired-sessions' / native_id
+                tomb.mkdir(parents=True)
+                (tomb / 'tombstone.json').write_text(json.dumps({
+                    'cause': 'finished', 'id': native_id, 'tag': f'task-{task_id}',
+                    'workspace': str((ws / 'docs').resolve()), 'finished_at_ms': 1792330700000}))
+            d._active_launches[offer_id] = {
+                'offer_id': offer_id, 'task_id': task_id, 'tag': f'task-{task_id}', 'mode': 'headless',
+                'native_id': native_id, 'engine': 'codex', 'state': 'running', 'settled': False,
+                'workspace': str(ws.resolve()), 'target_cwd': str((ws / 'docs').resolve()),
+                'result_path': str(ws / '.local' / 'hub-results' / (offer_id + '.json')),
+                'incarnation': 1792330666399}
+            offers.append(offer_id)
+        return d, offers, requests, calls
+
+    def test_cwd_launch_with_failed_unbound_launcher_record_reconciles_failed(self):
+        # Intake 2a944c3f review: 2f861946 and the launcher_command_failed
+        # records have no launcher native binding (workspace mismatch at bind).
+        with tempfile.TemporaryDirectory() as tmp:
+            d, offers, requests, calls = self._cwd_fixture(tmp)
+            with patch('agent_hub_host.retired_native.list_sessions', return_value=[]):
+                reconciled = d.reconcile_launches(terminal_only=True)
+            self.assertEqual([r['id'] for r in reconciled], offers, (requests, calls))
+            self.assertTrue(d._active_launches[offers[0]]['settled'])
+
+    def test_cwd_launch_with_different_launcher_native_stays_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, offers, requests, calls = self._cwd_fixture(tmp, launcher_native='11111111-2222-4333-8444-555555555555')
+            with patch('agent_hub_host.retired_native.list_sessions', return_value=[]):
+                self.assertEqual(d.reconcile_launches(terminal_only=True), [])
+            self.assertFalse(d._active_launches[offers[0]]['settled'])
+
+    def test_reconcile_pass_is_bounded_at_production_scale(self):
+        # AC3: 250 wedged unsettled launches (Hetzner journal scale): one
+        # catalog query per kind per pass, a capped batch of launcher runs,
+        # and no re-probing of refused launches inside the backoff window.
+        with tempfile.TemporaryDirectory() as tmp:
+            d, offers, requests, calls = self._cwd_fixture(tmp, count=250)
+            sessions = []
+            with patch('agent_hub_host.retired_native.list_sessions', return_value=sessions) as listing:
+                first = d.reconcile_launches(terminal_only=True)
+                self.assertEqual(listing.call_count, 1)
+            launcher_runs = [c for c in calls if 'reconcile' in c]
+            self.assertEqual(len(launcher_runs), fleet.RECONCILE_LAUNCHER_BATCH)
+            self.assertEqual(len(first), fleet.RECONCILE_LAUNCHER_BATCH)
+            self.assertFalse([c for c in calls if 'list' in c])
+            # Later passes drain the rest, still capped per pass.
+            with patch('agent_hub_host.retired_native.list_sessions', return_value=sessions):
+                d.reconcile_launches(terminal_only=True)
+            self.assertEqual(len([c for c in calls if 'reconcile' in c]), 2 * fleet.RECONCILE_LAUNCHER_BATCH)
+
+    def test_unretired_launches_share_one_catalog_query_per_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, offers, requests, calls = self._cwd_fixture(tmp, count=20, tombstone=False)
+            with patch('agent_hub_host.retired_native.list_sessions', return_value=[]) as listing:
+                self.assertEqual(d.reconcile_launches(terminal_only=True), [])
+                self.assertEqual(listing.call_count, 1)
+                self.assertEqual(len([c for c in calls if 'list' in c]), 1)
+                d.reconcile_launches(terminal_only=True)
+                self.assertEqual(listing.call_count, 2)
+                self.assertEqual([c for c in calls if 'reconcile' in c], [])
+
+    def test_refused_launcher_release_backs_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, offers, requests, calls = self._cwd_fixture(tmp, launcher_native='11111111-2222-4333-8444-555555555555')
+            with patch('agent_hub_host.retired_native.list_sessions', return_value=[]):
+                d.reconcile_launches(terminal_only=True)
+                d.reconcile_launches(terminal_only=True)
+            self.assertEqual(len([c for c in calls if 'reconcile' in c]), 1)
+
+    def test_same_native_matches_engine_cwd_catalog_row(self):
+        from agent_hub_host.exit_evidence import same_native
+        record = {'native_id': 'n', 'incarnation': 1, 'tag': 't', 'engine': 'codex',
+                  'workspace': '/w', 'target_cwd': '/w/docs'}
+        row = {'id': 'n', 'created_at_ms': 1, 'tag': 't', 'engine': 'codex', 'workspace': '/w/docs'}
+        self.assertTrue(same_native(record, row))
+        self.assertTrue(same_native(record, dict(row, workspace='/w')))
+        self.assertFalse(same_native(record, dict(row, workspace='/other')))
+
     def test_midrun_failure_keeps_runtime_cause_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = Path(tmp) / 'ws'
