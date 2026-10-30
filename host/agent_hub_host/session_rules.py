@@ -14,6 +14,24 @@ CPU_LOAD_RULE = (
 )
 SESSION_PREAMBLE = "Hub session rules:\n" + AWS_MAIN_TEMP_RULE + "\n" + CPU_LOAD_RULE
 
+CAPACITY_RETRY_RULE = (
+    "On a host capacity-gate refusal for a heavy step (capped-test-run exit 3, "
+    "'heavy-test slot not acquired', 'host_overload', or 'no heavy-test slot free'), "
+    "wait and retry with backoff instead of exiting: use "
+    "scripts/capped-test-retry.sh (default 5 attempts, 30s base delay doubling to "
+    "600s max) or re-run scripts/capped-test-run.sh with a longer wait budget. "
+    "A refusal is a HOLD, not a code failure. Never abandon the session on a "
+    "refusal; Hub re-places held offers on the next cycle once load clears."
+)
+CLEAN_EXIT_RULE = (
+    "Never exit with an uncommitted or unpushed fix without a Hub note and an "
+    "automatically queued follow-up: run scripts/require-clean-exit.sh, append a "
+    "note with the current state and test output via `hub intake append`, then "
+    "append a `followup` event so Hub re-places the work, and keep the worktree "
+    "while the intake is open."
+)
+SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + CAPACITY_RETRY_RULE + "\n" + CLEAN_EXIT_RULE
+
 # Worktree-guard footer (intake a0f01448, RCA 95c1862c): the 95c1862c session
 # removed its own git worktree while its intake was still open, and the stale
 # " (deleted)" label then hid the recreated tree. Hub locks every session

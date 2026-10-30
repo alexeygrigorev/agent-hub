@@ -52,6 +52,23 @@ mkdir "${DISPOSABLE_HOME}" || exit 1
 export AGENT_HUB_HEAVY_TEST_DIR="${AGENT_HUB_HEAVY_TEST_DIR:-/run/user/$(id -u)/agent-hub/heavy-test}"
 
 FAILURES=0
+HOLDS=0
+
+hold_or_fail() {
+  # $1 = exit code, $2 = label. Exit 3 from a capped heavy phase is a
+  # capacity HOLD (intake 747d5bdf): wait/retry with backoff, do not exit.
+  local rc="$1" label="$2"
+  if [ "$rc" -eq 3 ]; then
+    echo "HOLD: ${label} refused by the host capacity gate (exit 3); wait and retry with backoff via scripts/capped-test-retry.sh — do not abandon an uncommitted fix (see scripts/require-clean-exit.sh)"
+    FAILURES=$((FAILURES + 1))
+    HOLDS=$((HOLDS + 1))
+  elif [ "$rc" -ne 0 ]; then
+    echo "FAIL: ${label} exited with code ${rc}"
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "PASS: ${label} passed"
+  fi
+}
 
 echo "=== Scope boundary (all new commits and working changes) ==="
 if ! python3 scripts/ci/scope_guard.py --working || ! python3 -m unittest discover -s scripts/ci -p "test_scope_guard.py" || ! python3 scripts/test_local_dependencies.py || ! python3 scripts/test_full_local_storage.py; then
@@ -90,8 +107,7 @@ UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-1}" GOMAXPROCS="${GOMAXPROCS:-1}" \
 NODE_OPTIONS="${VITEST_NODE_OPTIONS}" \
 "${REPO_ROOT}/scripts/capped-test-run.sh" -- npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept || VITEST_RC=$?
 if [ "${VITEST_RC}" -ne 0 ]; then
-  echo "FAIL: Vitest discovery suite exited with code ${VITEST_RC}"
-  FAILURES=$((FAILURES + 1))
+  hold_or_fail "${VITEST_RC}" "Vitest discovery suite"
 else
   echo "PASS: Vitest discovery suite passed"
 fi
@@ -129,8 +145,7 @@ CODEX_LAUNCH_WRAPPER="" \
   -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none || PYTEST_RC=$?
 
 if [ "${PYTEST_RC}" -ne 0 ]; then
-  echo "FAIL: Python discovery suite exited with code ${PYTEST_RC}"
-  FAILURES=$((FAILURES + 1))
+  hold_or_fail "${PYTEST_RC}" "Python discovery suite"
 else
   echo "PASS: Python discovery suite passed"
 fi
@@ -139,9 +154,11 @@ echo "=== 6/8: Host canary hermeticity (full suite vs canary HOME, pytest + unit
 # Intake 6b624e65: the suite must never touch the real user Hub profiles.
 # Runs the full host suite twice with HOME pointing at a canary home holding
 # human cli.json + host.json and asserts both stay byte-identical.
-if ! "${REPO_ROOT}/scripts/capped-test-run.sh" -- python3 scripts/ci/host_canary_check.py; then
-  echo "FAIL: Host canary hermeticity check failed (canary mutated or suite failed)"
-  FAILURES=$((FAILURES + 1))
+CANARY_RC=0
+"${REPO_ROOT}/scripts/capped-test-run.sh" -- python3 scripts/ci/host_canary_check.py || CANARY_RC=$?
+if [ "${CANARY_RC}" -ne 0 ]; then
+  hold_or_fail "${CANARY_RC}" "Host canary hermeticity check"
+  if [ "${CANARY_RC}" -ne 3 ]; then echo "(canary mutated or suite failed)"; fi
 else
   echo "PASS: Host canary hermeticity check passed"
 fi
@@ -150,18 +167,27 @@ echo "=== 7/8: All standalone browser and static checks ==="
 # Chromium resolves shared-memory files from a different working directory.
 # Supply an absolute path only here; keep socket-sensitive Python paths short.
 export TMPDIR="${RUN_TMP_ABSOLUTE}"
+PHONE_RC=0
 if [ -n "${SKIP_PHONE_UI:-}" ]; then
   echo "SKIP: SKIP_PHONE_UI is set; phone browser UI not executed."
 elif "${REPO_ROOT}/scripts/capped-test-run.sh" -- bash -c 'node --test scripts/test-browser-local.test.mjs && node scripts/test-browser-local.mjs'; then
   echo "PASS: Standalone browser and static checks passed"
 else
   PHONE_RC=$?
-  echo "FAIL: Standalone browser/static checks exited with code ${PHONE_RC} (needs Playwright Chromium; see docs/TEST-COVERAGE.md)"
-  FAILURES=$((FAILURES + 1))
+  if [ "${PHONE_RC}" -eq 3 ]; then
+    hold_or_fail "${PHONE_RC}" "Standalone browser/static checks"
+  else
+    echo "FAIL: Standalone browser/static checks exited with code ${PHONE_RC} (needs Playwright Chromium; see docs/TEST-COVERAGE.md)"
+    FAILURES=$((FAILURES + 1))
+  fi
 fi
 
 echo "=== 8/8: Summary ==="
 if [ "${FAILURES}" -gt 0 ]; then
+  if [ "${HOLDS}" -gt 0 ] && [ "${HOLDS}" -eq "${FAILURES}" ]; then
+    echo "HOLD: ${HOLDS} suite(s) refused by the host capacity gate (exit 3). Wait and retry with backoff via scripts/capped-test-retry.sh; do not abandon an uncommitted fix (see scripts/require-clean-exit.sh)."
+    exit 3
+  fi
   echo "FAILED: ${FAILURES} suite(s) reported failures. Check logs above."
   exit 1
 else

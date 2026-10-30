@@ -110,6 +110,44 @@ with an `admission refused` diagnostic. Both supported direct-test hooks reject
 that code, so a damaged index cannot start an uncapped suite. CLI usage mistakes
 still return 2; command exit codes remain unchanged.
 
+## Capacity-hold retry (intake 747d5bdf)
+
+Exit 3 from `scripts/capped-test-run.sh` (no slot within the wait budget, or
+admission refused) and `host_overload` from host dispatch are a HOLD, not a
+code failure. Sessions must wait and retry with backoff instead of exiting:
+
+```bash
+scripts/capped-test-retry.sh -- ./my-heavy-step.sh
+scripts/capped-test-retry.sh --attempts 8 --base-delay 60 --max-delay 600 -- scripts/test-full-local.sh
+```
+
+`scripts/test-full-local.sh` reports pure capacity holds as `HOLD` and exits
+3, so the retry wrapper (or a manual re-run after load clears) can tell a
+hold apart from a real failure. Direct `npx vitest` / `pytest` runs that hit
+the in-process hooks (`heavy-test slot not acquired`) must be re-run under
+`capped-test-run.sh` with the same wait budget, not abandoned.
+
+A session must never exit with an uncommitted or unpushed fix without a Hub
+note and an automatically queued follow-up:
+
+```bash
+scripts/require-clean-exit.sh --intake <id> --repo <path>
+# if dirty:
+hub intake show <id>  # read current version
+echo '{"kind":"note","text":"CAPACITY HOLD — <state, output, next step>"}' \
+  | hub intake append <id> --version <v> --key hold-<unique> --event-file -
+echo '{"kind":"followup","text":"Retry heavy step after load clears; fix at <path/branch>"}' \
+  | hub intake append <id> --version <v2> --key followup-<unique> --event-file -
+# keep the worktree while the intake is open
+```
+
+The `followup` event keeps the intake in Hub's unresolved set for the
+forgotten-work projection and restart queue, so Hub re-places the work on
+the next cycle. Host dispatch already parks `host_overload` offers as
+`held` (staying queued, retried next cycle) without touching running
+sessions; the session-side retry above covers heavy steps inside an
+already-running session.
+
 For recovery, stop submitting new runs and notify the participating owners;
 let waiters receive their refusal without signalling other sessions. Running
 suites retain their slots. Under `admission.lock`, verify that every lease is
