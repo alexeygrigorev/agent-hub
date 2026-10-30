@@ -16,6 +16,7 @@ import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './se
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { reconcileAccountCapacity } from './account_capacity';
+import { LIMIT_MAX, LIMIT_MIN, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs } from './catalog-freshness';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
@@ -1519,6 +1520,49 @@ export class FleetService {
         }
         for (const a of updates) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=?, reserve_percent=? WHERE label=?', a.max, a.reserve, a.label);
         return response({status: 'configured', updated_accounts: updates.length});
+      });
+    }
+    // `hub limits`: per-engine/per-account caps with live usage, and a live,
+    // persisted cap set (fleet_accounts is the admission source of truth).
+    if (path === '/api/fleet/limits' && request.method === 'GET') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const routes = this.sql.exec('SELECT account, engine FROM fleet_routes ORDER BY engine').toArray() as any[];
+      const accounts = dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(row => {
+        const s = this.accountStatus(row);
+        return { account: s.label, provider: s.provider, engines: [...new Set(routes.filter(r => r.account === row.label).map(r => String(r.engine)))],
+          max_concurrency: Number(s.max_concurrency), active: s.active, reserved: s.reserved, observed_sessions: s.observed_sessions,
+          native_live: s.native_live, available_slots: s.available_slots, placeable_slots: s.placeable_slots, enabled: s.enabled, status: s.status };
+      });
+      const engines = new Map<string, { engine: string; accounts: string[]; max_concurrency: number; active: number }>();
+      for (const a of accounts) {
+        const e = engines.get(a.provider) ?? { engine: a.provider, accounts: [], max_concurrency: 0, active: 0 };
+        e.accounts.push(a.account); e.max_concurrency += a.max_concurrency; e.active += Number(a.active) || 0;
+        engines.set(a.provider, e);
+      }
+      return response({ engines: [...engines.values()].sort((x, y) => x.engine.localeCompare(y.engine)), accounts });
+    }
+    if (path === '/api/fleet/limits' && request.method === 'PATCH') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      if (!object(data, ['target', 'max_concurrency', 'allow_lower']) || !label(data.target) ||
+          !Number.isInteger(data.max_concurrency) || data.max_concurrency < LIMIT_MIN || data.max_concurrency > LIMIT_MAX ||
+          (data.allow_lower !== undefined && typeof data.allow_lower !== 'boolean'))
+        return response({ error: 'invalid_limit' }, 400);
+      return this.transaction(() => {
+        const rows = this.sql.exec('SELECT label, provider, max_concurrency FROM fleet_accounts ORDER BY label').toArray() as any[];
+        const routes = this.sql.exec('SELECT account, engine FROM fleet_routes').toArray() as any[];
+        const resolved = resolveLimitTarget(data.target, rows, routes);
+        if (!resolved.rows.length) return response({ error: 'unknown_limit_target' }, 404);
+        const plan = planLimitSet(resolved.kind, resolved.rows, data.max_concurrency, data.allow_lower === true);
+        if (plan.error) return response({ error: plan.error, changes: plan.changes }, 409);
+        const changed = plan.changes.filter(c => c.to !== c.from);
+        for (const c of changed) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=? WHERE label=?', c.to, c.label);
+        if (changed.length) try {
+          this.sql.exec('INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)', String(caller.actor ?? 'admin'),
+            'fleet_limits_set', 'fleet_account', data.target, JSON.stringify(changed.map(c => ({ account: c.account, from: c.from, to: c.to }))), new Date(this.now()).toISOString());
+        } catch { /* audit is best-effort; fleet_accounts stays authoritative */ }
+        return response({ status: 'configured', target: data.target, kind: resolved.kind, max_concurrency: data.max_concurrency,
+          allow_lower: data.allow_lower === true, changes: plan.changes });
       });
     }
     if (path === '/api/fleet/accounts' && request.method === 'PUT') {

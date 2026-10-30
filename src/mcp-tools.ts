@@ -94,6 +94,8 @@ tool('fleet_claim_policy_write', 'PUT', '/api/fleet/claim-policy', 'Operator-onl
 tool('monitoring_disk', 'GET', '/api/monitoring/disk', 'Authorized disk monitoring dashboard.');
 tool('monitoring_health', 'GET', '/api/monitoring/health', 'Authorized host health monitoring dashboard.');
 tool('accounts_write', 'PUT', '/api/fleet/accounts', 'Operator-only account registry update.');
+tool('limits', 'GET', '/api/fleet/limits', 'Operator-only per-engine and per-account concurrency caps with current usage.', ['limits show']);
+tool('limits_set', 'PATCH', '/api/fleet/limits', 'Operator-only live, persisted concurrency cap set: payload target (engine or account), max_concurrency 1..100, allow_lower. Raise-only unless allow_lower.', ['limits set']);
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
   'host-release': 'Operator release pin for a checkout-installed host; deliberate CLI step, not an agent tool.',

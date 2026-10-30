@@ -422,6 +422,8 @@ def main():
     webhooks_cli.add_parser(sub)
     from . import ops_liveness
     ops_liveness.add_parser(sub)
+    from . import limits_cli
+    limits_cli.add_parser(sub)
     
     p_login = sub.add_parser("login", help="Login to Agent Hub")
     p_login.add_argument("base_url", help="Base URL of the Agent Hub")
@@ -626,6 +628,10 @@ def main():
     if args.cmd == 'ops':
         from . import ops_liveness
         ops_liveness.run(args)
+        return
+    if args.cmd == 'limits':
+        from . import limits_cli
+        limits_cli.run(args)
         return
     if args.cmd == 'webhooks':
         from . import webhooks as webhooks_cli

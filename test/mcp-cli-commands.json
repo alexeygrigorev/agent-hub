@@ -55,6 +55,8 @@
   "job",
   "jobs",
   "launcher-release",
+  "limits set",
+  "limits show",
   "login",
   "machines available",
   "metrics get",
