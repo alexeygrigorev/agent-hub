@@ -3,6 +3,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { intakeCompletionHoldReason, intakeHasDoneEvidence, type IntakeService } from './intake';
 import { freshCatalogs } from './catalog-freshness';
+import { resolveLabelUnderRoots, workspaceCapable } from './fleet';
 import { parseNativeActor } from './work_claim';
 import { nativeTerminalError, sessionTerminalError, nativeProgress } from './session_stall';
 import { externalSessionInCensus } from './intake-external';
@@ -331,14 +332,20 @@ export class IntakeWatchdog {
       const wakeRecovery = linked.some(s => missed.some(w => w.session_id === s.id && w.intake_task_id === t.id) && s.state === 'stopped');
       const forgotten = !live && !unknown && (onlyFailed || wakeRecovery || now - lastEnd > 7200000);
       const q = queue.get(t.id);
+      // A 'submitted' restart row only describes its admission-time session state.
+      // Once that session is terminal the row is history, not a live restart.
+      const spent = q?.state === 'submitted' && q.session_id ? sessions.find(s => s.id === q.session_id) : undefined;
+      const restart = !q ? null : spent && !ACTIVE.has(spent.state)
+        ? { state: 'queued', reason: this.automationHold(t) ?? 'previous_session_' + spent.state, session_id: q.session_id, next_at: q.next_at }
+        : { state: q.state, reason: q.reason, session_id: q.session_id, next_at: q.next_at };
       const latest = linked[0];
       const terminalError = latest && catalogs.has(latest.machine_id)
         ? sessionTerminalError(latest, nativeById.get(JSON.stringify([latest.machine_id, parse(latest.binding_json).native_id]))) : null;
       return { id: t.id, title: t.title, project: t.project, age_ms: Math.max(0, now - ms(t.created_at)),
         last_session: linked[0] ? { id: linked[0].id, state: terminalError ? 'failed' : linked[0].state, lifecycle_state: linked[0].state, failure_reason: terminalError, updated_at: linked[0].updated_at, hold_reason: parse(linked[0].hold_json).reason ?? parse(linked[0].hold_json).rejected?.[0]?.reason ?? null } : null,
-        state: c.overflow ? 'unknown' : forgotten ? (q?.state || 'forgotten') : live ? 'active' : unknown ? 'unknown' : 'waiting',
+        state: c.overflow ? 'unknown' : forgotten ? (restart?.state || 'forgotten') : live ? 'active' : unknown ? 'unknown' : 'waiting',
         reason: c.overflow ? 'observation_budget_exceeded' : live ? 'live_session_or_pending_intent' : unknown ? 'host_observation_unknown' : wakeRecovery ? 'missed_wake_terminal_session' : onlyFailed ? 'only_failed_sessions' : forgotten ? 'no_live_session_over_two_hours' : 'within_two_hour_grace',
-        ready, forgotten, restart: q ? { state: q.state, reason: q.reason, session_id: q.session_id, next_at: q.next_at } : null };
+        ready, forgotten, restart };
     });
   }
   private audit(task: Obj, kind: string, reason: string, now: number) {
@@ -384,7 +391,10 @@ export class IntakeWatchdog {
     const prior = parse(links[0]?.request_json);
     const configured = this.rows('SELECT capabilities FROM machines LIMIT 65').some(m => {
       const roots = parse(m.capabilities).workspaces;
-      return Array.isArray(roots) ? roots.includes(fresh.project) : !!roots && Object.hasOwn(roots, fresh.project);
+      // A bare project label is also configured when it sits under an advertised root
+      // (e.g. /home/alexey/git), the same resolution placement applies.
+      return Array.isArray(roots) ? roots.includes(fresh.project) || workspaceCapable(roots, resolveLabelUnderRoots(roots, fresh.project))
+        : !!roots && Object.hasOwn(roots, fresh.project);
     });
     const workspace = prior.workspace || (configured ? fresh.project : null);
     if (!workspace) return this.hold(fresh, 'workspace_configuration_required', now);
