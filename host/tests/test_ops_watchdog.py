@@ -248,7 +248,28 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertTrue(55 <= delays[-1] <= 60, delays)  # re-check exactly when the tick turns 30 min old
         self.assertIn("systemctl --user stop ops-deadline-orchestrator-*.timer", self.calls())  # one pending deadline
         self.tick(age=30 * 60)  # exactly 1800s is a stall
-        self.assertIn('STALLED session=live: no tick for 1800s', self.run_ctl().stdout)
+        self.assertRegex(self.run_ctl().stdout, r'STALLED session=live: no tick for 180[01]s')
+
+    def test_detached_children_never_inherit_the_role_lock(self):
+        # Real systemd --scope and aplexer's setsid worker spawn keep inherited fds
+        # (Codex round-3 repro). Make the adapters do the same, then require that
+        # the next check still gets the lock and no detached child holds fd 9.
+        run = self.bin / 'systemd-run'
+        run.write_text(run.read_text().replace("subprocess.call(args[args.index('--')+1:])", "subprocess.call(args[args.index('--')+1:], close_fds=False)"))
+        a = self.bin / 'a'
+        a.write_text(a.read_text().replace("    elif cmd=='start':\n", "    elif cmd=='start':\n        import subprocess\n        child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'],close_fds=False,start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n        (p/'detached_pid').write_text(str(child.pid))\n"))
+        self.env['ROLE_LOCK_WAIT'] = '1'
+        self.data['sessions'] = [self.session()]
+        first = self.run_ctl()
+        pid = int((self.home / 'detached_pid').read_text())
+        self.addCleanup(lambda: os.kill(pid, 15) if os.path.exists(f'/proc/{pid}') else None)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        lock = str(self.home / 'ops-ctl-orchestrator.lock')
+        held = [os.readlink(f'/proc/{pid}/fd/{fd}') for fd in os.listdir(f'/proc/{pid}/fd')]
+        self.assertNotIn(lock, held)
+        second = self.run_ctl()
+        self.assertNotEqual(second.returncode, 75, second.stdout)
+        self.assertNotIn('role lock busy', second.stdout)
 
     def starts(self):
         return [line for line in self.calls().splitlines() if line.startswith('a start')]

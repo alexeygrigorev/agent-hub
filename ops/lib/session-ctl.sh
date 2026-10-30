@@ -23,7 +23,12 @@ PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produc
 FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-sonnet}"        # second recovery path: new session, other engine
 STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "$STATE"
 log() { echo "[$(date -u +%FT%TZ)] $ROLE: $*"; }
-t() { timeout "${T:-60}" "$@"; }
+# fd 9 holds the per-role lock (role_lock). No child may inherit it: a detached aplexer worker,
+# git daemon or session would keep the lock for its lifetime and block every later check.
+t() { timeout "${T:-60}" "$@" 9>&-; }
+a() { command a "$@" 9>&-; }
+git() { command git "$@" 9>&-; }
+gh() { command gh "$@" 9>&-; }
 tick_mtime() { stat -c %Y "$TICKS" 2>/dev/null || echo 0; }
 # Proof needs the tick history, not the newest mtime: is any tick line's "ts" in (start, due]?
 tick_in_window() {  # $1 = start epoch, $2 = due epoch; prints the first in-window tick epoch
@@ -72,7 +77,7 @@ arm_timer() {  # $1 = kind (deadline|proof), $2 = seconds from now
   systemd-run --user --collect -q --on-active="$delay" --timer-property=AccuracySec=1s --unit "$unit-$(date +%s%N)" \
     --setenv=PATH="$PATH" --setenv=HUB_CONFIG_FILE="${HUB_CONFIG_FILE:-}" --setenv=APLEXER_LAUNCH_SYSTEM_SCOPE=system \
     /usr/bin/timeout 900 "$SELF" "$ROLE" check \
-    >/dev/null 2>&1 || log "$1 timer not armed; the 10-min timer will check"
+    >/dev/null 2>&1 9>&- || log "$1 timer not armed; the 10-min timer will check"
 }
 
 # After a restart the new session must append a tick within PROOF_WINDOW of the recorded
@@ -167,7 +172,7 @@ start() {
   date +%s > "$STATE/last_start"
   # own transient scope so the session outlives the (oneshot) watchdog unit cgroup
   systemd-run --user --scope --collect -q -- a start --workspace "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
-    --label "ops.role=$ROLE" --label "hub.intake=$INTAKE" >/dev/null || { log "a start failed"; return 1; }
+    --label "ops.role=$ROLE" --label "hub.intake=$INTAKE" >/dev/null 9>&- || { log "a start failed"; return 1; }
   local id; id=$(find_session); [ -n "$id" ] || { log "session not found after start"; return 1; }
   log "started session $id; waiting for prompt"
   local i s ready=0
@@ -306,7 +311,7 @@ case "$CMD" in
   status) id=$(find_session); [ -n "$id" ] && { log "running $id"; echo "attach: a attach $id   (or: a open $TAG --workspace $RUNDIR)"; } || { log "not running"; exit 1; } ;;
   restart) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; FORCE=1 restart "manual" ;;
   handoff-restart)  # called BY the session itself after writing handoff.md; detaches so it survives the kill
-    FORCE=1 setsid nohup bash -c "sleep 5; '$0' $ROLE restart" >>"$STATE/restart.log" 2>&1 < /dev/null & log "restart scheduled in 5s" ;;
+    FORCE=1 setsid nohup bash -c "sleep 5; '$0' $ROLE restart" >>"$STATE/restart.log" 2>&1 < /dev/null 9>&- & log "restart scheduled in 5s" ;;
   skills-sync) skills_sync ;;
   *) echo "unknown command $CMD" >&2; exit 64 ;;
 esac
