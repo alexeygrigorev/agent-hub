@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { IntakeWatchdog } from '../src/intake-watchdog';
-import { IntakeTriage, TRIAGE_INTERVAL, TRIAGE_BATCH, TRIAGE_RETRY_MS, TRIAGE_INTAKE_ID, hasTriageVerdict, triageBrief } from '../src/intake-triage';
+import { IntakeTriage, sessionLaunchFailure, TRIAGE_INTERVAL, TRIAGE_BATCH, TRIAGE_RETRY_MS, TRIAGE_INTAKE_ID, hasTriageVerdict, triageBrief } from '../src/intake-triage';
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
 const NOW = Date.parse('2026-10-29T12:00:00Z');
@@ -121,6 +121,14 @@ describe('hourly intake backlog triage (d8d509d2 AC5)', () => {
     expect(await t.tick()).toMatchObject({ state: 'reviewer_active', session_id: 'rev-3' });
     expect(alerts).toEqual([['backlog-triage-start', expect.any(String)], ['backlog-triage-start', null]]);
     expect(t.status().start_alert).toBeNull();
+    // A reviewer that ran natively and failed later is not a start failure.
+    const at = new Date(clock.now).toISOString();
+    h.sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at)
+      VALUES ('launch-ran', 'hub:service:intake-triage', 'human', 'triage', 'k-ran', '{}', 'hetzner', 'claude', 'acct', 'p', 'headless', 'agent-hub', '', 'failed', 'native-1', ?, ?)`, at, at);
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,engine,mode,state,created_at,updated_at)
+      VALUES('ran','hub:service:intake-triage','k-ran','{}','launch-ran','claude','headless','failed',?,?)`, at, at);
+    expect(sessionLaunchFailure(h.sql, 'ran')).toBeNull();
+    expect(sessionLaunchFailure(h.sql, 'rev-1')).toBe('dispatch_worktree_refused');
   }));
   it('surfaces an admission refusal once while retrying hourly', async () => fixture(async h => {
     const clock = { now: NOW }; const alerts: any[] = [];

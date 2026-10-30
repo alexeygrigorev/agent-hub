@@ -37,8 +37,10 @@ export function sessionLaunchFailure(sql: SqlStorage, sessionId: string | null |
   if (!s || s.state !== 'failed') return null;
   let launch: Obj | undefined;
   try {
-    launch = s.fleet_launch_id ? sql.exec('SELECT launch_error_json,exit_reason FROM fleet_launches WHERE id=?', s.fleet_launch_id).toArray()[0] as Obj | undefined : undefined;
+    launch = s.fleet_launch_id ? sql.exec('SELECT launch_error_json,exit_reason,native_id FROM fleet_launches WHERE id=?', s.fleet_launch_id).toArray()[0] as Obj | undefined : undefined;
   } catch { launch = undefined; }
+  // A session that started natively and failed later is not a start failure.
+  if (launch?.native_id && !launch.launch_error_json) return null;
   const reason = parse(launch?.launch_error_json).reason ?? launch?.exit_reason;
   return typeof reason === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(reason) ? reason : 'launch_failed';
 }
