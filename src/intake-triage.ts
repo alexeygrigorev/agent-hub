@@ -30,6 +30,18 @@ export type TriageHooks = {
   alert?: (subject: string, detail: string | null) => Promise<void>;
 };
 export const TRIAGE_ALERT_SUBJECT = 'backlog-triage-start';
+/** A reviewer still held/queued for placement after this long blocks triage: alert once (79458f2d). */
+export const REVIEWER_HELD_ALERT_MS = TRIAGE_INTERVAL;
+const HOLD_REASON = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$/;
+/** `reviewer_held:<hold reason>` for a canonical session still waiting for
+ * placement (held/queued) longer than REVIEWER_HELD_ALERT_MS, else null. */
+export function staleHeldReviewer(session: Obj | null | undefined, now: number): string | null {
+  if (!session || (session.state !== 'held' && session.state !== 'queued')) return null;
+  const created = Date.parse(String(session.created_at ?? ''));
+  if (!Number.isFinite(created) || now - created < REVIEWER_HELD_ALERT_MS) return null;
+  const reason = parse(session.hold_json).reason;
+  return 'reviewer_held:' + (typeof reason === 'string' && HOLD_REASON.test(reason) ? reason : session.state);
+}
 /** Diagnostic stages after native start: a failure there is a runtime failure, not a start failure. */
 const RUNTIME_STAGES = new Set(['runtime', 'first_action']);
 const REASON = /^[a-z][a-z0-9_]{0,63}$/;
@@ -89,7 +101,7 @@ export class IntakeTriage {
   private activeSession(): Obj | null {
     const last = this.rows("SELECT session_id FROM intake_triage_requests WHERE session_id IS NOT NULL ORDER BY requested_at DESC LIMIT 1")[0];
     if (!last) return null;
-    const s = this.rows('SELECT id,state FROM session_control_sessions WHERE id=?', last.session_id)[0];
+    const s = this.rows('SELECT id,state,created_at,hold_json FROM session_control_sessions WHERE id=?', last.session_id)[0];
     return s && ACTIVE.has(s.state) ? s : null;
   }
   /** Alert once per distinct failure reason; a healthy reviewer resolves it. */
@@ -140,7 +152,13 @@ export class IntakeTriage {
     }
     const lastFailure = await this.reconcileLastStart();
     const active = this.activeSession();
-    if (active) return finish({ state: 'reviewer_active', checked_at: now, session_id: active.id });
+    // A reviewer stuck waiting for placement still owns its slice (never a
+    // duplicate start, never an auto-cancel) but is surfaced once (79458f2d).
+    const held = staleHeldReviewer(active, now);
+    const alerted = this.rows('SELECT last_alert FROM intake_triage_meta WHERE id=1')[0]?.last_alert;
+    if (held) await this.surface(held, `Hourly backlog triage reviewer ${active!.id} has waited ${Math.round((now - Date.parse(active!.created_at)) / 60000)} min for placement (${held}). Triage is not running until it is placed or cancelled.`);
+    else if (typeof alerted === 'string' && alerted.startsWith('reviewer_held:')) await this.surface(null);
+    if (active) return finish({ state: 'reviewer_active', checked_at: now, session_id: active.id, session_state: active.state, held_alert: held });
     const requested = new Map(this.rows('SELECT task_id,state,requested_at FROM intake_triage_requests').map(r => [r.task_id, r]));
     const candidates = this.watchdog.project(tasks, now).filter(i => i.forgotten).map(i => byId.get(i.id)!)
       // Completion claims belong to the post-DONE verifier, not to relevance triage.

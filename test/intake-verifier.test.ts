@@ -321,6 +321,25 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     const row = h.sql.exec('SELECT state, session_id, detail FROM intake_verifications WHERE task_id = ?', t.id).one();
     expect(row).toMatchObject({ state: 'pending', session_id: null, detail: 'verifier start refused: needs_unmet' });
   }));
+  it('alerts once on a verifier held for placement past an hour, keeps waiting, never relaunches or escalates (79458f2d)', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = []; const alerts: string[] = [];
+    const v = verifier(h, starts, clock, alerts);
+    const t = await task(h, { title: 'Deploy to prod' });
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    const old = new Date(Date.now() - 2 * 3600000).toISOString();
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,hold_json,created_at,updated_at)
+      VALUES('verifier-1','hub:service:intake-verifier','kv1',?,'headless','held',?,?,?)`,
+      JSON.stringify({ intake_task_id: t.id, task_kind: 'review' }), JSON.stringify({ reason: 'claude_dispatch_paused' }), old, old);
+    expect(await tick(v, clock)).toMatchObject({ waiting: 1, launched: 0, escalated: 0 });
+    await tick(v, clock);
+    expect(starts).toHaveLength(1);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain(':verification-held');
+    expect(alerts[0]).toContain('reviewer_held:claude_dispatch_paused');
+    expect(v.status().states).toMatchObject({ requested: 1 });
+  }));
   it('never starts the verifier in a prior session\'s intake worktree path', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
     const v = verifier(h, starts, clock);

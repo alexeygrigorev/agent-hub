@@ -11,7 +11,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { currentHistory, intakeCompletionHoldReason, intakeHasDoneEvidence } from './intake';
 import { namesWorktree } from './intake-worktrees';
-import { sessionLaunchFailure } from './intake-triage';
+import { sessionLaunchFailure, staleHeldReviewer } from './intake-triage';
 type Obj = Record<string, any>;
 export const VERIFIER_INTERVAL = 25 * 60000; // runs from the */30 scheduler slot
 export const VERIFIER_LAUNCH_BUDGET = 3;
@@ -253,8 +253,17 @@ export class IntakeVerifier {
         const r = await this.write(`/tasks/${task.id}`, { key: 'verifier-gap-' + claim.id, expected_version: task.version, acceptance_criteria: ac.slice(-8000) });
         if (r.status < 300) { this.set(task, claim, { state: 'failed', detail: gap.slice(0, 500) }); counts.failed++; }
       } else {
-        const s = this.rows('SELECT state FROM session_control_sessions WHERE id=?', row.session_id)[0];
-        if (s && ACTIVE.has(s.state)) { counts.waiting++; continue; }
+        const s = this.rows('SELECT state,created_at,hold_json FROM session_control_sessions WHERE id=?', row.session_id)[0];
+        if (s && ACTIVE.has(s.state)) {
+          // Held/queued for placement too long: alert once, keep waiting, never a duplicate or cancel (79458f2d).
+          const held = staleHeldReviewer(s, now);
+          const marker = held && `${held} (session ${row.session_id})`.slice(0, 500);
+          if (marker && row.detail !== marker) {
+            this.set(task, claim, { detail: marker });
+            if (this.hooks.alert) await this.hooks.alert(`${task.id}:verification-held`, `Verifier for intake ${task.id} has waited for placement too long: ${marker}`.slice(0, 1000));
+          }
+          counts.waiting++; continue;
+        }
         // A start that failed before running (any launch_error) is surfaced once, never retried silently.
         const failure = sessionLaunchFailure(this.sql, row.session_id);
         if (failure) { await this.escalate(task, claim, `verifier session ${row.session_id} failed to start: ${failure}`); counts.escalated++; continue; }

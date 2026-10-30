@@ -175,6 +175,47 @@ describe('hourly intake backlog triage (d8d509d2 AC5)', () => {
     launch('l-pre', { reason: 'dispatch_worktree_refused', stage: 'dispatch_route' }, null); session('s-pre', 'l-pre');
     expect(['s-runtime', 's-first', 's-bound', 's-pre'].map(id => sessionLaunchFailure(h.sql, id))).toEqual([null, null, null, 'dispatch_worktree_refused']);
   }));
+  it('alerts once on a reviewer held for placement past an hour, never starts a duplicate, resolves when it runs (79458f2d)', async () => fixture(async h => {
+    const clock = { now: NOW }; const alerts: any[] = []; let starts = 0;
+    const t = build(h, [task('x'), task('y', 29 * HOUR)], async () => { starts++; return { status: 202, body: { id: 'held-1', state: 'held' } }; },
+      clock, async (subject: string, detail: string | null) => { alerts.push([subject, detail]); });
+    expect(await t.tick()).toMatchObject({ state: 'reviewer_started', session_id: 'held-1' });
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,hold_json,created_at,updated_at)
+      VALUES('held-1','hub:service:intake-triage','kh','{}',NULL,'headless','held',?,?,?)`,
+      JSON.stringify({ reason: 'p0-9104edb4-hub-claude-token-429-quiet-2' }), new Date(NOW).toISOString(), new Date(NOW).toISOString());
+    clock.now = NOW + TRIAGE_INTERVAL - 60000; // not yet stale: the hourly guard skips this tick anyway
+    expect(await t.tick()).toEqual({ state: 'already_checked' });
+    clock.now = NOW + TRIAGE_INTERVAL;
+    expect(await t.tick()).toMatchObject({ state: 'reviewer_active', session_id: 'held-1', session_state: 'held',
+      held_alert: 'reviewer_held:p0-9104edb4-hub-claude-token-429-quiet-2' });
+    clock.now += TRIAGE_INTERVAL;
+    expect(await t.tick()).toMatchObject({ state: 'reviewer_active', session_id: 'held-1' });
+    expect(alerts).toEqual([['backlog-triage-start', expect.stringContaining('reviewer_held:p0-9104edb4-hub-claude-token-429-quiet-2')]]);
+    expect(t.status().start_alert).toBe('reviewer_held:p0-9104edb4-hub-claude-token-429-quiet-2');
+    h.sql.exec("UPDATE session_control_sessions SET state='running' WHERE id='held-1'");
+    clock.now += TRIAGE_INTERVAL;
+    expect(await t.tick()).toMatchObject({ state: 'reviewer_active', session_id: 'held-1', held_alert: null });
+    expect(alerts.at(-1)).toEqual(['backlog-triage-start', null]);
+    expect(t.status().start_alert).toBeNull();
+    expect(starts).toBe(1); // never a duplicate start, never an auto-cancel
+  }));
+  it('resolves a held alert once the held reviewer is cancelled, then starts a fresh one', async () => fixture(async h => {
+    const clock = { now: NOW }; const alerts: any[] = []; let starts = 0;
+    const tasks = [task('x')];
+    const t = build(h, tasks, async () => { starts++; return { status: 202, body: { id: 'h' + starts, state: 'held' } }; },
+      clock, async (_s: string, detail: string | null) => { alerts.push(detail); });
+    await t.tick();
+    const old = new Date(NOW - 2 * TRIAGE_INTERVAL).toISOString();
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at)
+      VALUES('h1','hub:service:intake-triage','k1','{}','headless','queued',?,?)`, old, old);
+    clock.now += TRIAGE_INTERVAL;
+    expect(await t.tick()).toMatchObject({ held_alert: 'reviewer_held:queued' });
+    h.sql.exec("UPDATE session_control_sessions SET state='cancelled' WHERE id='h1'");
+    tasks.push(task('z', 28 * HOUR)); // x stays in its retry window; a new forgotten intake gets the fresh reviewer
+    clock.now += TRIAGE_INTERVAL;
+    expect(await t.tick()).toMatchObject({ state: 'reviewer_started', session_id: 'h2', requested: ['z'] });
+    expect(alerts).toEqual([expect.stringContaining('reviewer_held:queued'), null]);
+  }));
   it('surfaces an admission refusal once while retrying hourly', async () => fixture(async h => {
     const clock = { now: NOW }; const alerts: any[] = [];
     const t = build(h, [task('x')], async () => ({ status: 409, body: { error: 'no_capacity' } }), clock,
