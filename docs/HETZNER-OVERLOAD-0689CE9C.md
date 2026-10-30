@@ -110,36 +110,59 @@ with an `admission refused` diagnostic. Both supported direct-test hooks reject
 that code, so a damaged index cannot start an uncapped suite. CLI usage mistakes
 still return 2; command exit codes remain unchanged.
 
-## Capacity-hold retry (intake 747d5bdf)
+## Capacity-hold retry (intakes 747d5bdf, 9432731e)
 
-Exit 3 from `scripts/capped-test-run.sh` (no slot within the wait budget, or
-admission refused) and `host_overload` from host dispatch are a HOLD, not a
-code failure. Sessions must wait and retry with backoff instead of exiting:
+A capacity-gate refusal from `scripts/capped-test-run.sh` (no slot within the
+wait budget, or admission refused) and `host_overload` from host dispatch are
+a HOLD, not a code failure. Sessions wait and retry with backoff instead of
+exiting:
 
 ```bash
 scripts/capped-test-retry.sh -- ./my-heavy-step.sh
-scripts/capped-test-retry.sh --attempts 8 --base-delay 60 --max-delay 600 -- scripts/test-full-local.sh
+scripts/capped-test-retry.sh --attempts 8 --base-delay 60 --max-delay 600 -- scripts/test-full-local.sh --priority final
 ```
 
-`scripts/test-full-local.sh` reports pure capacity holds as `HOLD` and exits
-3, so the retry wrapper (or a manual re-run after load clears) can tell a
-hold apart from a real failure. Direct `npx vitest` / `pytest` runs that hit
-the in-process hooks (`heavy-test slot not acquired`) must be re-run under
-`capped-test-run.sh` with the same wait budget, not abandoned.
+Exit 3 alone is ambiguous: the admitted command can exit 3 itself (pytest
+INTERNALERROR). When `AGENT_HUB_HEAVY_TEST_REFUSAL_FILE` names a path, the
+admission gate writes that marker only when it refuses before starting the
+command, and removes the variable from the command's environment. A HOLD is
+exit 3 plus the marker. A command's own exit 3 leaves no marker: the retry
+wrapper reports it as FAIL (exit 1) and does not retry it.
 
-A session must never exit with an uncommitted or unpushed fix without a Hub
+`scripts/test-full-local.sh` gives each heavy phase its own marker. It reports a
+refused phase as `HOLD` and a command's own exit 3 as `FAIL`. It exits 3 and
+writes the caller's marker only when every failure was a hold; any real
+failure makes it exit 1. The retry wrapper runs the full runner directly,
+without an outer slot, because the runner takes a slot per heavy phase.
+`--priority final` and the AGENTS.md push gates are unchanged. Direct
+`npx vitest` / `pytest` runs that hit the in-process hooks (`heavy-test slot
+not acquired`) must be rerun under `capped-test-retry.sh`, not abandoned.
+
+A session must never exit with an uncommitted or unrecorded fix without a Hub
 note and an automatically queued follow-up:
 
 ```bash
 scripts/require-clean-exit.sh --intake <id> --repo <path>
-# if dirty:
+# if it holds: commit on the agent branch, then
 hub intake show <id>  # read current version
+echo '{"kind":"report","reference":"<full sha>","source":"unknown"}' \
+  | hub intake append <id> --version <v> --key commit-<unique> --event-file -
 echo '{"kind":"note","text":"CAPACITY HOLD — <state, output, next step>"}' \
-  | hub intake append <id> --version <v> --key hold-<unique> --event-file -
+  | hub intake append <id> --version <v2> --key hold-<unique> --event-file -
 echo '{"kind":"followup","text":"Retry heavy step after load clears; fix at <path/branch>"}' \
-  | hub intake append <id> --version <v2> --key followup-<unique> --event-file -
+  | hub intake append <id> --version <v3> --key followup-<unique> --event-file -
 # keep the worktree while the intake is open
 ```
+
+The guard fetches `origin main` first. It reports the pushed state as unknown
+and exits 1 when the fetch fails or `origin/main` is missing. Commits ahead
+of `origin/main` count as clean only on a non-main agent branch whose HEAD is
+recorded on the intake as a `commit` or `report` event with the full sha as
+its reference. Worker credentials may append only `note`, `report` and
+`blocker` events, so workers record the sha as `report` and queue the
+follow-up as `blocker` instead of `followup`; both stay in Hub's unresolved
+set. A clean result does not authorize
+pushing to main: push only with the orchestrator-main release slot.
 
 The `followup` event keeps the intake in Hub's unresolved set for the
 forgotten-work projection and restart queue, so Hub re-places the work on

@@ -44,6 +44,10 @@ if name == "python3" and args[:1] == ["-c"]:
     print("/fixture/user-base")
 if name == "npx" and os.environ.get("FAIL_VITEST"):
     sys.exit(7)
+if name == "npx" and os.environ.get("VITEST_EXIT"):
+    sys.exit(int(os.environ["VITEST_EXIT"]))
+if name == "npm" and args[:2] == ["run", "typecheck"] and os.environ.get("FAIL_TYPECHECK"):
+    sys.exit(1)
 if name == "node":
     # Model Chromium's different cwd when opening its shared-memory path.
     os.chdir(record.parent)
@@ -86,8 +90,11 @@ class FullLocalStorageTests(unittest.TestCase):
         # shell under test resolves the same path it uses in production.
         shutil.copyfile(CAPPED_RUNNER, scripts / CAPPED_RUNNER.name)
         shutil.copyfile(CAPPED_RUNNER.with_name("heavy-test-admission.py"), scripts / "heavy-test-admission.py")
+        for name in ("heavy-phase-status.sh", "capped-test-retry.sh"):
+            shutil.copyfile(RUNNER.with_name(name), scripts / name)
         # copyfile drops modes; the runner execs the wrapper directly.
-        (scripts / CAPPED_RUNNER.name).chmod(0o755)
+        for name in (CAPPED_RUNNER.name, RUNNER.name, "capped-test-retry.sh"):
+            (scripts / name).chmod(0o755)
         (scripts / "local-dependencies.py").write_text("# Command stub handles this fixture.\n")
         self.bin = self.root / "bin"
         self.bin.mkdir()
@@ -108,7 +115,7 @@ class FullLocalStorageTests(unittest.TestCase):
                 os.killpg(child.pid, signal.SIGKILL)
                 child.communicate(timeout=5)
 
-    def start(self, name, runner_args=(), capped=False, **overrides):
+    def start(self, name, runner_args=(), capped=False, retry=None, **overrides):
         record = self.root / f"{name}.jsonl"
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
@@ -117,7 +124,8 @@ class FullLocalStorageTests(unittest.TestCase):
                    # shell-storage fixtures out of the real host semaphore.
                    AGENT_HUB_HEAVY_TEST_DIR=str(self.root / "fixture-heavy-slots"),
                    AGENT_HUB_HEAVY_TEST_SLOTS="2")
-        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
+        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "VITEST_EXIT", "FAIL_TYPECHECK",
+                    "AGENT_HUB_HEAVY_TEST_REFUSAL_FILE", "CAPPED_TEST_RETRY_SLEEP", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
                     "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS",
                     "AGENT_HUB_HEAVY_TEST_HELD"):
             env.pop(key, None)
@@ -127,6 +135,10 @@ class FullLocalStorageTests(unittest.TestCase):
         if capped:
             command = [str(self.repo / "scripts" / CAPPED_RUNNER.name),
                        "--priority", "final", "--", *command]
+        if retry is not None:
+            # The documented full-gate retry shape, run from the checkout root.
+            command = ["scripts/capped-test-retry.sh", *retry, "--",
+                       "scripts/test-full-local.sh", *runner_args]
         child = subprocess.Popen(command,
                                  cwd=self.repo, env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, start_new_session=True)
@@ -171,6 +183,95 @@ class FullLocalStorageTests(unittest.TestCase):
         vitest = next(row for row in self.records(record) if row["tool"] == "npx")
         self.assertEqual(vitest["priority"], "final")
         self.assert_preserved()
+
+    def occupy_fixture_slot(self):
+        """Hold the fixture's only slot; with wait 0 every heavy phase is refused."""
+        import fcntl
+        slots = self.root / "fixture-heavy-slots"
+        slots.mkdir(exist_ok=True)
+        lock = (slots / "slot-0.lock").open("a+")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(lock.close)
+        return lock
+
+    HELD_PHASES = dict(AGENT_HUB_HEAVY_TEST_SLOTS="1", AGENT_HUB_HEAVY_TEST_WAIT_S="0")
+
+    def runner_starts(self, record):
+        return sum(1 for row in self.records(record)
+                   if row["tool"] == "python3" and row["args"][:1] == ["scripts/build-hub-cli.py"])
+
+    def test_command_own_exit_three_is_fail_not_hold(self):
+        child, record = self.start("own-exit-3", VITEST_EXIT="3")
+        code, output = self.finish(child)
+        self.assertEqual(code, 1, output)
+        self.assertIn("FAIL: Vitest discovery suite exited with code 3", output)
+        self.assertNotIn("HOLD:", output)
+        self.assertIn("PASS: Python discovery suite passed", output)
+        self.assertIn("PASS: Host canary hermeticity check passed", output)
+        self.assert_preserved()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX advisory locks required")
+    def test_pure_capacity_hold_exits_three(self):
+        self.occupy_fixture_slot()
+        child, record = self.start("pure-hold", **self.HELD_PHASES)
+        code, output = self.finish(child)
+        self.assertEqual(code, 3, output)
+        for label in ("Vitest discovery suite", "Python discovery suite",
+                      "Host canary hermeticity check", "Standalone browser and static checks"):
+            self.assertIn(f"HOLD: {label} refused by the host capacity gate", output)
+        self.assertNotIn("FAIL", output)
+        self.assertFalse(any(row["tool"] in ("npx", "node") for row in self.records(record)))
+        self.assert_preserved()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX advisory locks required")
+    def test_mixed_hold_and_failure_exits_one(self):
+        self.occupy_fixture_slot()
+        child, _ = self.start("mixed", FAIL_TYPECHECK="1", **self.HELD_PHASES)
+        code, output = self.finish(child)
+        self.assertEqual(code, 1, output)
+        self.assertIn("FAIL: Typecheck failed", output)
+        self.assertIn("HOLD: Vitest discovery suite", output)
+        self.assertIn("FAILED: 5 suite(s) reported failures (4 capacity hold(s)", output)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX advisory locks required")
+    def test_documented_retry_command_reruns_full_runner_on_hold(self):
+        lock = self.occupy_fixture_slot()
+        sleeps = self.root / "sleeps"
+        release = self.root / "release-slot"
+        fake_sleep = self.root / "fake-sleep"
+        fake_sleep.write_text(f"#!/usr/bin/env bash\necho \"$1\" >> {sleeps}\n"
+                              f"touch {release}\nwhile [ -e {release} ]; do sleep 0.02; done\n")
+        fake_sleep.chmod(0o755)
+        child, record = self.start("retry-full", runner_args=("--priority", "final"),
+                                  retry=("--base-delay", "9"), CAPPED_TEST_RETRY_SLEEP=str(fake_sleep),
+                                  **self.HELD_PHASES)
+        deadline = time.monotonic() + 15
+        while not release.exists():
+            self.assertIsNone(child.poll(), "retry exited before its first backoff")
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        lock.close()  # load clears while the wrapper backs off
+        release.unlink()
+        code, output = self.finish(child)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("do not wrap", output)
+        self.assertIn("capacity hold (capped-test-run refused", output)
+        self.assertEqual(sleeps.read_text().split(), ["9"])
+        self.assertEqual(self.runner_starts(record), 2)
+        vitest = next(row for row in self.records(record) if row["tool"] == "npx")
+        self.assertEqual(vitest["priority"], "final")
+        self.assertEqual(vitest["held"], "1")
+        self.assert_preserved()
+
+    def test_documented_retry_command_does_not_retry_real_failure(self):
+        child, record = self.start("retry-real-exit-3", runner_args=("--priority", "final"),
+                                  retry=(), VITEST_EXIT="3")
+        code, output = self.finish(child)
+        self.assertEqual(code, 1, output)
+        self.assertIn("FAIL: Vitest discovery suite exited with code 3", output)
+        self.assertIn("FAILED: 1 suite(s) reported failures. Check", output)
+        self.assertNotIn("retrying in", output)
+        self.assertEqual(self.runner_starts(record), 1)
 
     @unittest.skipUnless(os.name == "posix", "POSIX advisory locks required")
     def test_stubbed_runner_is_isolated_from_occupied_ambient_heavy_slots(self):
