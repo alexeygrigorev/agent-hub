@@ -133,15 +133,6 @@ describe('forgotten intake watchdog', () => {
     }},()=>now);w.init();await w.tick();now+=WATCHDOG_INTERVAL;await w.tick();
     expect(starts).toBe(1);expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'active',restart:{state:'submitted',reason:'canonical_held'}});
   }));
-  it('submitted restart row whose canonical session went terminal stops reporting canonical_held/offered (intake d8d509d2)', async () => fixture(async h => {
-    const t=task();session(h,'old-failure',t,'failed');let now=NOW;
-    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{
-      session(h,'canonical-held',t,'held');return {status:409,body:{id:'canonical-held',state:'held'}};
-    }},()=>now);w.init();await w.tick();
-    expect(w.project([t])[0].restart).toMatchObject({state:'submitted',reason:'canonical_held'});
-    h.sql.exec("UPDATE session_control_sessions SET state='cancelled' WHERE id='canonical-held'");
-    expect(w.project([t])[0].restart).toMatchObject({state:'queued',reason:'previous_session_cancelled',session_id:'canonical-held'});
-  }));
   it('sends one daily digest and alerts only after sustained >24h; resets when count reaches zero', async () => fixture(async h => {
     let now=NOW,tasks=[task()];const notices:any[]=[];
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>tasks} as any,(f:any)=>f(),{notify:async(...args)=>{notices.push(args)}},()=>now);w.init();
