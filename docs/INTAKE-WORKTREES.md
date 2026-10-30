@@ -42,6 +42,12 @@ asks Hub for the plan:
 `POST /api/worktree-host/plan {launch_id}` returns one of
 
 - `{mode: "none"}`: no intake, or the start named its own cwd. Launch as before.
+- `{mode: "none", task_id, read_only: true}`: a read-only review session
+  (`task_kind: "review"`: intake verifier, backlog triage). It never creates,
+  resumes or records the intake worktree, so the host never locks a checkout
+  the implementer owns (intake ccc50cca: these starts failed with
+  `dispatch_worktree_refused`). The verifier also never picks an earlier
+  session's `-wt-` workspace; it reads the repo from the main checkout.
 - `{mode: "resume", task_id, worktree_id, path, branch}`: use that worktree. If
   the directory is missing on the host, create it again from fresh
   `origin/main` at the same path (`git worktree add`), then report `recreated`.

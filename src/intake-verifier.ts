@@ -118,7 +118,9 @@ export class IntakeVerifier {
   }
   private workspace(task: Obj): string {
     const prior = this.rows('SELECT request_json FROM session_control_sessions ORDER BY created_at DESC')
-      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace);
+      // Intake ccc50cca: the verifier is read-only; an implementer's intake
+      // worktree is locked by that session, so never start inside one.
+      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && typeof r.workspace === 'string' && r.workspace && !r.workspace.split('/').some((seg: string) => seg.includes('-wt-')));
     if (prior) return prior.workspace;
     const configured = this.rows('SELECT capabilities FROM machines').some(m => {
       const roots = parse(m.capabilities).workspaces;

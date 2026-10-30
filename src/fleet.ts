@@ -1596,13 +1596,87 @@ export class FleetService {
       if (!host) return response({error:'forbidden'},403);
       if (!this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length)
         return response({error:'not_found'},404);
-      const row: any = this.sql.exec(`SELECT s.id,s.state,s.request_json,f.state AS launch_state
+      const row: any = this.sql.exec(`SELECT s.id,s.state,s.machine_id,s.binding_json,s.request_json,s.fleet_launch_id,
+          f.state AS launch_state,f.native_id AS launch_native,f.verification_status AS launch_verification,
+          f.request_json AS launch_request_json,f.created_at AS launch_created_at
         FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id
-        WHERE s.id=? AND s.machine_id=?`,worktreeOwner[1],caller.machineId!).toArray()[0];
+        WHERE s.id=? AND (s.machine_id=? OR (s.machine_id IS NULL AND s.binding_json IS NULL AND (f.machine_id=? OR EXISTS (
+          SELECT 1 FROM fleet_launches p WHERE p.machine_id=? AND p.request_json=f.request_json AND p.created_at=f.created_at))))`,
+        // Intake ccc50cca: a requeue (offer expiry, resource/model retry)
+        // clears the session machine but copies request_json and created_at
+        // into the new launch. An earlier attempt on this host may hold the
+        // checkout lock; without this link a later unplaced failure left that
+        // lock unattestable and every same-intake start was refused.
+        worktreeOwner[1],caller.machineId!,caller.machineId!,caller.machineId!).toArray()[0];
       if (!row) return response({error:'not_found'},404);
-      return response({session_id:row.id,intake_id:parsed(row.request_json).intake_task_id ?? null,
+      const binding = row.binding_json ? parsed(row.binding_json, null) : null;
+      const confirmedStop = row.state === 'stopped' && (() => {
+        try {
+          const receipts = this.sql.exec(`SELECT ack_json FROM session_control_commands
+            WHERE session_id=? AND kind='stop' AND state='acked' AND generation=?
+            ORDER BY updated_at DESC LIMIT 20`, row.id, binding?.generation ?? 0).toArray() as any[];
+          if (receipts.some(r => {
+            const ack = parsed(r.ack_json, {});
+            return ack.outcome === 'delivered' && ack.confirmed_exit === true &&
+              (binding ? ack.native?.native_id === binding.native_id && ack.native?.tag === binding.tag && ack.native?.workspace === binding.workspace
+                : ['unbound_uncertain_no_native_process', 'session_already_stopped'].includes(ack.reason) &&
+                  ack.native?.native_id === '00000000-0000-0000-0000-000000000000' &&
+                  ack.native?.tag === 'unbound' && ack.native?.workspace === '/');
+          })) return true;
+        } catch {}
+        if (binding?.retirement && typeof binding.retirement === 'object' &&
+            binding.retirement.native_id === binding.native_id &&
+            binding.retirement.tag === binding.tag &&
+            binding.retirement.workspace === binding.workspace &&
+            binding.retirement.created_at_ms === binding.native_created_at_ms) return true;
+        return Boolean(binding && row.launch_state === 'exited' && row.launch_verification === 'verified' && row.launch_native === binding.native_id);
+      })();
+      const launchTerminal = ['failed', 'exited', 'cancelled', 'expired', 'refused'].includes(row.launch_state) ||
+        confirmedStop || (!row.fleet_launch_id && row.state === 'stopped');
+      const priorAttemptSpawned = !binding && row.machine_id === null && Boolean(
+        row.launch_request_json && row.launch_created_at &&
+        this.sql.exec(`SELECT 1 FROM fleet_launches p WHERE p.machine_id=? AND p.request_json=? AND p.created_at=? AND (
+          p.native_id IS NOT NULL OR EXISTS (
+            SELECT 1 FROM fleet_sessions fs WHERE fs.machine_id=? AND fs.tag IN ('hub-' || p.id, 'task-hub-' || p.id)
+              AND fs.phase IN ('starting','running','broken','unknown','uncertain')
+          )) LIMIT 1`, caller.machineId!, row.launch_request_json, row.launch_created_at, caller.machineId!).toArray().length
+      );
+      const unstarted = !binding && !row.launch_native && !priorAttemptSpawned && launchTerminal;
+      const native: any = binding && typeof binding === 'object'
+        ? this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', caller.machineId!, binding.native_id).toArray()[0]
+        : null;
+      const nativeTerminal = unstarted || Boolean(binding && (
+        (native && native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
+          ['exited', 'dead', 'pruned', 'forgotten', 'unobserved'].includes(native.phase)) ||
+        (!native && confirmedStop)
+      ));
+      const intakeId = parsed(row.request_json).intake_task_id ?? null;
+      const requesterId = new URL(request.url).searchParams.get('requester');
+      let requesterExclusive = true;
+      if (requesterId !== null) {
+        if (!intakeId || !requesterId || requesterId === row.id) {
+          requesterExclusive = false;
+        } else {
+          const reqRow: any = this.sql.exec(`SELECT id, state, request_json FROM session_control_sessions
+            WHERE id = ? AND machine_id = ?`, requesterId, caller.machineId!).toArray()[0];
+          const reqIntake = parsed(reqRow?.request_json).intake_task_id ?? null;
+          if (!reqRow || reqIntake !== intakeId || ['stopped', 'finished', 'failed', 'refused', 'cancelled'].includes(reqRow.state)) {
+            requesterExclusive = false;
+          }
+        }
+      }
+      const otherContenders = intakeId ? (this.sql.exec(`
+        SELECT id, request_json FROM session_control_sessions s2
+        WHERE s2.machine_id = ? AND s2.id != ? AND (? IS NULL OR s2.id != ?)
+          AND json_extract(s2.request_json, '$.intake_task_id') = ?
+          AND s2.state NOT IN ('stopped', 'finished', 'failed', 'refused', 'cancelled')
+      `, caller.machineId!, row.id, requesterId, requesterId, intakeId).toArray() as any[]).filter(s2 => {
+        const s2Req = parsed(s2.request_json);
+        return s2Req.task_kind !== 'review' || Boolean(s2Req.cwd);
+      }).length : 0;
+      return response({session_id:row.id,intake_id:intakeId,
         terminal:['stopped','finished','failed','refused','cancelled'].includes(row.state) &&
-          ['failed','exited','cancelled','expired','refused'].includes(row.launch_state)});
+          launchTerminal && nativeTerminal && requesterExclusive && otherContenders === 0});
     }
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);

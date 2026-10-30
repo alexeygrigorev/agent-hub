@@ -242,6 +242,38 @@ class RemoveTests(GitSandbox):
         result = self.remove(clean, "other-branch")
         self.assertEqual(result["reason"], "branch mismatch: worktree is on repo-wt-mismatch")
 
+    def test_hub_lock_unlocked_only_when_authorized_and_clean_merged(self):
+        task_id = "9d878e85-f022-4095-8726-25bf7e92da9b"
+        session_id = "795dd70f-6b42-489c-9bc2-168df4384ad1"
+        hub_reason = f"hub-session {session_id} intake {task_id}"
+        locked = self.add_worktree("repo-wt-hub-locked")
+        _git(self.repo, "worktree", "lock", "--reason", hub_reason, locked)
+        # 1. Without unlock_hub_lock=True (intake still open without DONE evidence), refused with 'worktree locked'.
+        refused_open = self.remove(locked, "repo-wt-hub-locked", task_id=task_id, unlock_hub_lock=False)
+        self.assertEqual((refused_open["outcome"], refused_open["reason"]), ("refused", "worktree locked"))
+        self.assertTrue(os.path.isdir(locked))
+        # 2. Foreign intake id in lock reason is refused even when unlock_hub_lock=True.
+        refused_foreign = self.remove(locked, "repo-wt-hub-locked", task_id="da079ce2-128f-4924-a7d7-f9d08b6ee43e", unlock_hub_lock=True)
+        self.assertEqual((refused_foreign["outcome"], refused_foreign["reason"]), ("refused", "worktree locked"))
+        self.assertTrue(os.path.isdir(locked))
+        # 3. Manual git lock (non-Hub reason) is refused even when unlock_hub_lock=True.
+        manual = self.add_worktree("repo-wt-manual-locked")
+        _git(self.repo, "worktree", "lock", "--reason", "operator hold", manual)
+        refused_manual = self.remove(manual, "repo-wt-manual-locked", task_id=task_id, unlock_hub_lock=True)
+        self.assertEqual((refused_manual["outcome"], refused_manual["reason"]), ("refused", "worktree locked"))
+        # 4. Dirty worktree with unlock_hub_lock=True is refused with dirty reason AND retains its Hub git lock.
+        Path(locked, "scratch").write_text("dirty")
+        refused_dirty = self.remove(locked, "repo-wt-hub-locked", task_id=task_id, unlock_hub_lock=True)
+        self.assertEqual((refused_dirty["outcome"], refused_dirty["reason"]), ("refused", "dirty: 1 uncommitted changes"))
+        self.assertIn(f"locked {hub_reason}", _git(self.repo, "worktree", "list", "--porcelain"))
+        os.remove(os.path.join(locked, "scratch"))
+        # 5. Clean, merged worktree with unlock_hub_lock=True (qualifying DONE evidence + no live session) unlocks and removes.
+        removed = self.remove(locked, "repo-wt-hub-locked", task_id=task_id, unlock_hub_lock=True)
+        self.assertEqual(removed["outcome"], "ok", removed)
+        self.assertTrue(removed["removed"])
+        self.assertTrue(removed["branch_deleted"])
+        self.assertFalse(os.path.exists(locked))
+
     def test_merge_unknown_refused(self):
         path = self.add_worktree("repo-wt-offline")
         _git(self.repo, "remote", "set-url", "origin", os.path.join(self.home, "missing.git"))

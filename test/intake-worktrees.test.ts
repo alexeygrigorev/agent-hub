@@ -200,7 +200,7 @@ describe('close gate', () => {
     const remove = await intake(c, '/tasks/' + t.id + '/worktrees/remove', { key: 'rm-' + ++seq });
     expect(remove.body).toMatchObject({ refused: [], commands: [expect.objectContaining({ kind: 'remove', state: 'queued' })] });
     const ran = await hostRun(c, HOST, () => ({ outcome: 'ok', removed: true, branch_deleted: true, status: status({ present: false }) }));
-    expect(ran[0]).toMatchObject({ kind: 'remove', path: WT, branch: 'demo-wt-aaaa1111' });
+    expect(ran[0]).toMatchObject({ kind: 'remove', path: WT, branch: 'demo-wt-aaaa1111', unlock_hub_lock: true });
     const after = (await intake(c, '/tasks/' + t.id + '/worktrees')).body;
     expect(after.worktrees[0]).toMatchObject({ state: 'removed', last_remove: { result: 'ok', branch_deleted: true } });
     expect(after.close_gate).toEqual({ ok: true, blocking: [] });
@@ -264,7 +264,9 @@ describe('remove action', () => {
     expect(bySession.body).toMatchObject({ task_id: t.id, refused: [], commands: [expect.objectContaining({ machine: HOST, kind: 'remove' })] });
     expect((await host(c, OTHER, '/commands')).body.commands).toHaveLength(0);
     // Host refusal reason is recorded verbatim; the worktree stays active.
-    await hostRun(c, HOST, () => ({ outcome: 'refused', reason: 'dirty: 1 uncommitted changes', status: status({ dirty: true, dirty_count: 1 }) }));
+    // Without DONE evidence on the open intake, unlock_hub_lock is false so Hub's git lock stays enforced.
+    const claimedWithoutDone = await hostRun(c, HOST, () => ({ outcome: 'refused', reason: 'dirty: 1 uncommitted changes', status: status({ dirty: true, dirty_count: 1 }) }));
+    expect(claimedWithoutDone[0]).toMatchObject({ kind: 'remove', path: WT, unlock_hub_lock: false });
     const after = (await intake(c, '/tasks/' + t.id + '/worktrees')).body.worktrees[0];
     expect(after).toMatchObject({ state: 'active', last_remove: { result: 'refused', reason: 'dirty: 1 uncommitted changes', by: 'host' } });
     const cmd = (await intake(c, '/worktree-commands/' + bySession.body.commands[0].id)).body.command;

@@ -1586,38 +1586,62 @@ export class SessionControlService {
     if (path === '/api/sessions/worktree-guards' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       const rows: any[] = this.sql.exec(`SELECT s.*, f.state AS guard_launch_state, f.native_id AS guard_launch_native,
+        f.request_json AS guard_launch_request_json, f.created_at AS guard_launch_created_at,
         c.kind AS guard_owner_kind, p.session_id AS guard_explicit_protection
         FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id
         LEFT JOIN credentials c ON c.id=s.owner_token_id LEFT JOIN session_control_protections p ON p.session_id=s.id
-        WHERE s.machine_id = ?`, caller.machineId!).toArray();
+        WHERE s.machine_id = ? OR (s.machine_id IS NULL AND s.binding_json IS NULL AND (f.machine_id = ? OR EXISTS (
+          SELECT 1 FROM fleet_launches p2 WHERE p2.machine_id = ? AND p2.request_json = f.request_json AND p2.created_at = f.created_at)))`,
+        caller.machineId!, caller.machineId!, caller.machineId!).toArray();
       const worktreeLinks = worktreeIntakeSnapshot(this.sql);
       // One immutable read snapshot for the whole response. classifyKey
       // rebuilds every session's inputs; doing that per row made the host's
       // stop/restart maintenance exceed its HTTP budget at fleet scale.
       const guardRefs = buildSessionInputs(this.sql).refs;
-      let sessions = rows.filter(row => this.hostOk(row, caller).ok).map(row => {
+      let sessions = rows.filter(row => this.hostOk({ ...row, machine_id: row.machine_id ?? caller.machineId }, caller).ok).map(row => {
+        const hostRow = { ...row, machine_id: row.machine_id ?? caller.machineId };
         const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
-        const unstarted = !binding && !row.guard_launch_native &&
-          (['failed', 'refused'].includes(row.guard_launch_state) || (row.state === 'stopped' && this.confirmedStopRecorded(row)));
+        const priorHostLaunch: any = (!binding && row.machine_id === null && row.guard_launch_request_json && row.guard_launch_created_at)
+          ? this.sql.exec(`SELECT id, native_id FROM fleet_launches WHERE machine_id = ? AND request_json = ? AND created_at = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1`,
+              caller.machineId!, row.guard_launch_request_json, row.guard_launch_created_at).toArray()[0]
+          : null;
+        const priorAttemptSpawned = (!binding && row.machine_id === null && row.guard_launch_request_json && row.guard_launch_created_at)
+          ? this.sql.exec(`SELECT 1 FROM fleet_launches p
+              WHERE p.machine_id = ? AND p.request_json = ? AND p.created_at = ?
+                AND (p.native_id IS NOT NULL OR EXISTS (
+                  SELECT 1 FROM fleet_sessions fs
+                  WHERE fs.machine_id = p.machine_id AND fs.tag IN ('hub-' || p.id, 'task-hub-' || p.id)
+                    AND fs.phase IN ('starting','running','broken','unknown','uncertain')
+                )) LIMIT 1`, caller.machineId!, row.guard_launch_request_json, row.guard_launch_created_at).toArray().length > 0
+          : false;
+        const confirmedStop = row.state === 'stopped' && this.confirmedStopRecorded(hostRow);
+        const unstarted = !binding && !row.guard_launch_native && !priorAttemptSpawned &&
+          (['failed', 'exited', 'cancelled', 'expired', 'refused'].includes(row.guard_launch_state) || confirmedStop);
         const protectedSession = binding
-          ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.protected_session !== false
+          ? guardRefs.get(`${hostRow.machine_id}/${binding.native_id}`)?.protected_session !== false
           : !(unstarted && row.guard_owner_kind === 'agent' && !row.guard_explicit_protection);
-        const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
-        const nativeTerminal = unstarted || !!(native &&
-          native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
-          // 'unobserved' is the census writer's positive absence verdict ("an
-          // orphan no longer observed is not a live workload"): a native that
-          // finished and was pruned (the dispatch-false-failure path) never
-          // reports an explicit terminal phase, which would hold the AC1 lock
-          // forever. 'uncertain' stays held — an unconfirmed terminal label.
-          ['exited', 'dead', 'pruned', 'forgotten', 'unobserved'].includes(native.phase));
+        const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', hostRow.machine_id, binding.native_id).toArray()[0];
+        const nativeTerminal = unstarted || !!(binding && (
+          (native && native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
+            // 'unobserved' is the census writer's positive absence verdict ("an
+            // orphan no longer observed is not a live workload"): a native that
+            // finished and was pruned (the dispatch-false-failure path) never
+            // reports an explicit terminal phase, which would hold the AC1 lock
+            // forever. 'uncertain' stays held — an unconfirmed terminal label.
+            ['exited', 'dead', 'pruned', 'forgotten', 'unobserved'].includes(native.phase)) ||
+          (!native && confirmedStop)
+        ));
         const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
           this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
-            binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
-        return { session_id: row.id, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+            binding.adoption_intent_id, hostRow.machine_id, binding.native_id).toArray().length > 0;
+        const reqObj = parsed(row.request_json, {});
+        const effectiveLaunchId = priorHostLaunch?.id ?? row.fleet_launch_id;
+        return { session_id: row.id, intake_task_id: reqObj.intake_task_id ?? null,
+          task_kind: reqObj.task_kind ?? null, requested_cwd: reqObj.cwd ?? null,
+          native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
           lock_release_permitted: !protectedSession || (adoptedLock && !row.guard_explicit_protection),
           engine: row.engine, adoption_intent_id: binding?.adoption_intent_id ?? null,
-          tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),
+          tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + effectiveLaunchId),
           workspace: binding?.workspace ?? null, native_created_at_ms: binding?.native_created_at_ms ?? null,
           terminal: ['stopped', 'finished', 'failed', 'refused', 'cancelled'].includes(row.state),
           linked_intake_open: worktreeIntakeProtected(this.sql, row, worktreeLinks), protected: protectedSession };
@@ -1631,7 +1655,7 @@ export class SessionControlService {
         return { ...fact, terminal: aliases.every(other => other.terminal),
           protected: aliases.some(other => other.protected),
           lock_release_permitted: aliases.every(other => other.lock_release_permitted) &&
-            (!fact.intake_task_id || sessions.filter(other => other.intake_task_id === fact.intake_task_id).every(other => other.terminal && other.native_terminal && other.lock_release_permitted)),
+            (!fact.intake_task_id || sessions.filter(other => other.intake_task_id === fact.intake_task_id && (other.task_kind !== 'review' || Boolean(other.requested_cwd))).every(other => other.terminal && other.native_terminal && other.lock_release_permitted)),
           linked_intake_open: aliases.some(other => other.linked_intake_open) };
       });
       return response({ sessions });

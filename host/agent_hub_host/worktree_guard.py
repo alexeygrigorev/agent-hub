@@ -190,13 +190,19 @@ def lock_worktree(
             return False
         run = runner or _default_runner
         proc = run([git_bin, "worktree", "lock", "--reason", reason, path], path, GIT_TIMEOUT)
-        if proc.returncode == 0:
-            return True
-        combined = ((proc.stderr or "") + "\n" + (proc.stdout or "")).lower()
-        if "unknown option" in combined or "unrecognized" in combined or "usage" in combined:
-            fallback = run([git_bin, "worktree", "lock", path], path, GIT_TIMEOUT)
-            return fallback.returncode == 0
-        return False
+        ok = proc.returncode == 0
+        if not ok:
+            combined = ((proc.stderr or "") + "\n" + (proc.stdout or "")).lower()
+            if "unknown option" in combined or "unrecognized" in combined or "usage" in combined:
+                fallback = run([git_bin, "worktree", "lock", path], path, GIT_TIMEOUT)
+                ok = fallback.returncode == 0
+        if ok:
+            parsed = parse_lock_reason(reason)
+            if parsed and parsed[1] is not None:
+                _write_active_owner(path, parsed[0], parsed[1], reason, git_bin, runner)
+            else:
+                _clear_active_owner(path)
+        return ok
     except Exception:
         return False
 
@@ -208,7 +214,10 @@ def unlock_worktree(git_bin: str, path: str, runner: Optional[Callable] = None) 
             return False
         run = runner or _default_runner
         proc = run([git_bin, "worktree", "unlock", path], path, GIT_TIMEOUT)
-        return proc.returncode == 0
+        if proc.returncode == 0:
+            _clear_active_owner(path)
+            return True
+        return False
     except Exception:
         return False
 
@@ -224,9 +233,10 @@ def ensure_locked(
     """Lock the session worktree with the canonical Hub reason.
 
     A canonical lock for the same nonempty intake protects a retry only with
-    fresh positive proof that its owner is terminal. Preserve the original
-    owner; reuse grants no release permission. Unknown/live owners refuse.
-    Returns False when the reason is malformed or git declines.
+    fresh positive proof that its owner (and any prior admitted successor) is
+    terminal. Preserve the original Git lock reason for release authority while
+    recording a fenced active successor owner so no second contender can take
+    over while a successor is live.
     """
     try:
         reason = lock_reason(session_id, intake_id)
@@ -238,16 +248,41 @@ def ensure_locked(
         current = None
     if current is True:
         try:
-            entry = find_entry(list_entries(git_bin, path, runner), path)
-            if not entry:
-                return False
-            if entry.get("reason") == reason:
-                return True
-            owner = parse_lock_reason(entry.get("reason"))
-            requested = parse_lock_reason(reason)
-            return bool(owner and requested and requested[1] is not None
-                        and owner[1] == requested[1] and owner_terminal is not None
-                        and owner_terminal(owner[0]) is True)
+            with _ownership_guard(path):
+                entry = find_entry(list_entries(git_bin, path, runner), path)
+                if not entry:
+                    return False
+                if entry.get("reason") == reason:
+                    active = _read_active_owner(path, reason, intake_id, git_bin, runner)
+                    if active is not None and active != session_id:
+                        if owner_terminal is None or owner_terminal(active) is not True:
+                            return False
+                        after = find_entry(list_entries(git_bin, path, runner), path)
+                        if not after or not after.get("locked") or after.get("reason") != reason:
+                            return False
+                        if _read_active_owner(path, reason, intake_id, git_bin, runner) != active:
+                            return False
+                    _write_active_owner(path, session_id, intake_id, reason, git_bin, runner)
+                    return True
+                owner = parse_lock_reason(entry.get("reason"))
+                requested = parse_lock_reason(reason)
+                if not (owner and requested and requested[1] is not None
+                        and owner[1] == requested[1] and owner_terminal is not None):
+                    return False
+                active = _read_active_owner(path, entry.get("reason"), requested[1], git_bin, runner)
+                owners_to_check = [owner[0]]
+                if active and active not in (owner[0], requested[0]):
+                    owners_to_check.append(active)
+                if not all(owner_terminal(oid) is True for oid in owners_to_check):
+                    return False
+                # Re-verify lock and active owner after remote I/O.
+                after = find_entry(list_entries(git_bin, path, runner), path)
+                active_after = _read_active_owner(path, entry.get("reason"), requested[1], git_bin, runner)
+                if (not after or not after.get("locked")
+                        or after.get("reason") != entry.get("reason")
+                        or active_after != active):
+                    return False
+                return _write_active_owner(path, requested[0], requested[1], entry.get("reason"), git_bin, runner)
         except Exception:
             return False
     if current is None:
@@ -432,37 +467,125 @@ def protect_bound_worktree(git_bin: str, path: str, session_id: Any, intake_id: 
     return ensure_locked(git_bin, root, session_id, intake_id, runner, owner_terminal=owner_terminal)
 
 
+def _active_owner_path(path: str) -> Path:
+    import hashlib
+    key = hashlib.sha256(os.path.realpath(path).encode()).hexdigest()
+    return identity_directory() / ("active-owner-" + key + ".json")
+
+
+def _read_active_owner(path: str, lock_reason_str: Any, intake_id: Any,
+                       git_bin: str = "git", runner: Optional[Callable] = None) -> Optional[str]:
+    from . import private_fs
+    if not isinstance(lock_reason_str, str) or not intake_id or intake_id == "none":
+        return None
+    try:
+        data = json.loads(private_fs.read_bytes(_active_owner_path(path), 8192))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+    identity = repository_identity(path, git_bin, runner)
+    sid = data.get("session_id")
+    if (not identity or data.get("repository") != identity
+            or data.get("workspace") != os.path.normpath(path)
+            or data.get("intake_id") != intake_id
+            or data.get("lock_reason") != lock_reason_str
+            or not isinstance(sid, str) or not SESSION_ID_RE.fullmatch(sid)):
+        return None
+    return sid
+
+
+def _write_active_owner(path: str, session_id: str, intake_id: Any, lock_reason_str: str,
+                        git_bin: str = "git", runner: Optional[Callable] = None) -> bool:
+    from . import private_fs
+    if not intake_id or intake_id == "none":
+        return True
+    identity = repository_identity(path, git_bin, runner)
+    if identity is None:
+        return False
+    record = {
+        "version": 1,
+        "workspace": os.path.normpath(path),
+        "repository": identity,
+        "session_id": session_id,
+        "intake_id": intake_id,
+        "lock_reason": lock_reason_str,
+    }
+    try:
+        private_fs.atomic_write(_active_owner_path(path), json.dumps(record).encode(), 8192)
+        return True
+    except Exception:
+        return False
+
+
+def _clear_active_owner(path: str) -> None:
+    try:
+        _active_owner_path(path).unlink()
+    except OSError:
+        pass
+
+
+def _intake_contenders_clear(facts: list, intake_id: str, allowed_ids: set) -> bool:
+    """True when no other worktree contender for intake_id is non-terminal in facts."""
+    for row in facts:
+        if not isinstance(row, dict) or row.get("intake_task_id") != intake_id:
+            continue
+        if row.get("session_id") in allowed_ids:
+            continue
+        if row.get("task_kind") == "review" and not row.get("requested_cwd"):
+            continue
+        if row.get("terminal") is not True or row.get("native_terminal") is not True:
+            return False
+    return True
+
+
 def reuse_stopped_intake_lock(git_bin: str, path: str, session_id: str,
                              intake_id: Any, request: Callable) -> bool:
     """Reuse protection without unlocking a stopped predecessor's same-intake tree.
 
     The host-scoped ledger must prove both identities and predecessor exit.
     The original lock stays in place; release is fenced by all live sessions
-    linked to the intake. Missing evidence or a foreign/manual lock refuses.
+    linked to the intake, and the active successor owner is recorded under
+    _ownership_guard so no second contender can enter while a successor runs.
     """
     try:
         lock_reason(session_id, intake_id)
         if not intake_id or intake_id == "none":
             return False
         root = bound_worktree_root(path, git_bin)
-        entry = find_entry(list_entries(git_bin, root), root) if root else None
-        owner = parse_lock_reason(entry.get("reason")) if entry else None
-        if not entry or not entry.get("locked") or not owner or owner[1] != intake_id:
+        if not root:
             return False
-        facts = request("GET", "/api/sessions/worktree-guards")["sessions"]
-        successor = [f for f in facts if f.get("session_id") == session_id and f.get("intake_task_id") == intake_id]
-        previous = [f for f in facts if f.get("session_id") == owner[0] and f.get("intake_task_id") == intake_id]
-        if len(successor) != 1 or successor[0].get("terminal") is not False or len(previous) != 1:
-            return False
-        fact = previous[0]
-        expected = expected_repository(fact)
-        if (fact.get("terminal") is not True or fact.get("native_terminal") is not True
-                or not expected or expected.get("workspace") != root
-                or expected.get("repository") != repository_identity(root, git_bin)):
-            return False
-        # Re-read after remote I/O; never silently accept a replaced lock.
-        current = find_entry(list_entries(git_bin, root), root)
-        return bool(current and current.get("locked") and current.get("reason") == entry.get("reason"))
+        with _ownership_guard(root):
+            entry = find_entry(list_entries(git_bin, root), root)
+            owner = parse_lock_reason(entry.get("reason")) if entry else None
+            if not entry or not entry.get("locked") or not owner or owner[1] != intake_id:
+                return False
+            active = _read_active_owner(root, entry.get("reason"), intake_id, git_bin)
+            facts = request("GET", "/api/sessions/worktree-guards")["sessions"]
+            successor = [f for f in facts if isinstance(f, dict) and f.get("session_id") == session_id and f.get("intake_task_id") == intake_id]
+            previous = [f for f in facts if isinstance(f, dict) and f.get("session_id") == owner[0] and f.get("intake_task_id") == intake_id]
+            if len(successor) != 1 or successor[0].get("terminal") is not False or len(previous) != 1:
+                return False
+            fact = previous[0]
+            expected = expected_repository(fact)
+            if (fact.get("terminal") is not True or fact.get("native_terminal") is not True
+                    or not expected or expected.get("workspace") != root
+                    or expected.get("repository") != repository_identity(root, git_bin)):
+                return False
+            if active and active not in (owner[0], session_id):
+                active_rows = [f for f in facts if isinstance(f, dict) and f.get("session_id") == active and f.get("intake_task_id") == intake_id]
+                if len(active_rows) != 1 or active_rows[0].get("terminal") is not True or active_rows[0].get("native_terminal") is not True:
+                    return False
+            if not _intake_contenders_clear(facts, intake_id, {session_id}):
+                return False
+            # Re-read after remote I/O; never silently accept a replaced lock or active owner.
+            current = find_entry(list_entries(git_bin, root), root)
+            active_after = _read_active_owner(root, entry.get("reason"), intake_id, git_bin)
+            if (not current or not current.get("locked")
+                    or current.get("reason") != entry.get("reason")
+                    or active_after != active):
+                return False
+            return _write_active_owner(root, session_id, intake_id, entry.get("reason"), git_bin)
     except Exception:
         return False
 
@@ -500,14 +623,29 @@ def protect_successor_worktree(request, git_bin, path, session_id, intake_id):
             owner = parse_lock_reason(entry.get('reason')) if entry else None
             if not entry or not entry.get('locked') or not owner or owner[1] != intake_id:
                 return False
+            active = _read_active_owner(root, entry.get('reason'), intake_id, git_bin)
             if owner[0] == session_id:
+                if active is not None and active != session_id:
+                    return False
+                _write_active_owner(root, session_id, intake_id, entry.get('reason'), git_bin)
                 return True
             facts = request('GET', '/api/sessions/worktree-guards')['sessions']
             matches = [f for f in facts if isinstance(f, dict) and f.get('session_id') == owner[0]]
             if len(matches) != 1:
                 return False
             fact = matches[0]
-            if fact.get('terminal') is not True or fact.get('native_terminal') is not True:
+            if (fact.get('terminal') is not True or fact.get('native_terminal') is not True
+                    or (fact.get('intake_task_id') is not None and fact.get('intake_task_id') != intake_id)):
+                return False
+            if active and active not in (owner[0], session_id):
+                active_rows = [f for f in facts if isinstance(f, dict) and f.get('session_id') == active]
+                if len(active_rows) != 1 or active_rows[0].get('terminal') is not True or active_rows[0].get('native_terminal') is not True:
+                    return False
+            requester_rows = [f for f in facts if isinstance(f, dict) and f.get('session_id') == session_id]
+            if requester_rows and (requester_rows[0].get('terminal') is not False
+                    or (requester_rows[0].get('intake_task_id') is not None and requester_rows[0].get('intake_task_id') != intake_id)):
+                return False
+            if not _intake_contenders_clear(facts, intake_id, {session_id, owner[0]}):
                 return False
             expected = expected_repository(fact)
             identity = repository_identity(root, git_bin)
@@ -515,6 +653,8 @@ def protect_successor_worktree(request, git_bin, path, session_id, intake_id):
             if (not isinstance(saved_path, str) or not identity
                     or expected.get('repository') != identity
                     or bound_worktree_root(saved_path, git_bin) != root):
+                return False
+            if _read_active_owner(root, entry.get('reason'), intake_id, git_bin) != active:
                 return False
             proc = _default_runner([git_bin, 'rev-parse', '--absolute-git-dir'], root, GIT_TIMEOUT)
             gitdir = Path(proc.stdout.strip())
@@ -545,7 +685,9 @@ def protect_successor_worktree(request, git_bin, path, session_id, intake_id):
                         os.unlink(temporary, dir_fd=directory)
                     except FileNotFoundError:
                         pass
-            return find_entry(list_entries(git_bin, root), root).get('reason') == reason
+            if find_entry(list_entries(git_bin, root), root).get('reason') != reason:
+                return False
+            return _write_active_owner(root, session_id, intake_id, reason, git_bin)
     except Exception:
         return False
 

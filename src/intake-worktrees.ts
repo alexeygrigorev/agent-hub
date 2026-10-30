@@ -5,6 +5,7 @@
  * through the host agent; unknown host state stays null, never invented.
  * Nothing here deletes automatically (auto-GC belongs to intake 1f1f1877). */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import { isIntakeTaskOpen } from './session_lifecycle_registry';
 
 type Obj = Record<string, any>;
 
@@ -197,6 +198,10 @@ export class IntakeWorktrees {
     const taskId = ctx?.request?.intake_task_id;
     if (!ctx || typeof taskId !== 'string' || !taskId) return { plan: { mode: 'none' }, events: [] };
     const request = ctx.request;
+    // Intake ccc50cca: review sessions (intake verifier, backlog triage) read
+    // the repo; they must not resume, create or lock the implementer's
+    // worktree, which a live implementer already holds locked.
+    if (request.task_kind === 'review') return { plan: { mode: 'none', task_id: taskId, read_only: true }, events: [] };
     for (const candidate of [request.cwd, request.workspace]) {
       if (!worktreePathAllowed(candidate)) continue;
       // The start named its own worktree: record it, launch as requested.
@@ -321,11 +326,12 @@ export class IntakeWorktrees {
   /** Host poll: claim queued commands (re-offer stale claims). */
   hostCommands(machine: string): Obj[] {
     const now = this.now();
-    const rows = this.sql.exec(`SELECT c.*, w.path, w.branch FROM intake_worktree_commands c JOIN intake_worktrees w ON w.id = c.worktree_id
+    const rows = this.sql.exec(`SELECT c.*, w.path, w.branch, w.session_ids FROM intake_worktree_commands c JOIN intake_worktrees w ON w.id = c.worktree_id
       WHERE c.machine = ? AND (c.state = 'queued' OR (c.state = 'claimed' AND c.claimed_at < ?)) ORDER BY c.created_at LIMIT 10`,
       machine, now - CLAIM_TIMEOUT_MS).toArray() as Obj[];
     for (const c of rows) this.sql.exec("UPDATE intake_worktree_commands SET state = 'claimed', claimed_at = ? WHERE id = ?", now, c.id);
-    return rows.map(c => ({ id: c.id, kind: c.kind, worktree_id: c.worktree_id, task_id: c.task_id, path: c.path, branch: c.branch ?? null }));
+    return rows.map(c => ({ id: c.id, kind: c.kind, worktree_id: c.worktree_id, task_id: c.task_id, path: c.path, branch: c.branch ?? null,
+      ...(c.kind === 'remove' ? { unlock_hub_lock: !isIntakeTaskOpen(this.sql, c.task_id) && this.liveSessions(c).length === 0 } : {}) }));
   }
 
   /** Host result for one command. Returns history events for the task. */
