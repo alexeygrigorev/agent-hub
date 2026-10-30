@@ -1,6 +1,6 @@
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
-import { IntakeWorktrees } from './intake-worktrees';
+import { IntakeWorktrees, worktreePathAllowed } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
 import { LivenessService } from './liveness';
 import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
@@ -1742,13 +1742,20 @@ export class SessionControlService {
       // null / blank intake_task_id means "missing" so the TBM gate can return
       // intake_task_id_required instead of a generic invalid_session_request.
       if (input.intake_task_id === null || input.intake_task_id === '') delete input.intake_task_id;
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind'])) {
-        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind']);
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree'])) {
+        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree']);
         const field = input && typeof input === 'object' && !Array.isArray(input)
           ? Object.keys(input).find(k => !allowed.has(k)) : undefined;
         return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
       }
       if (input.task_kind !== undefined && !['implement','review','ask','goal'].includes(input.task_kind)) return response({error:'invalid_session_request',field:'task_kind',detail:'invalid_task_kind'},400);
+      // Intake 79458f2d: a detached start (hourly triage, post-DONE verifier) is
+      // linked to an intake for accounting only. It never resumes, creates or
+      // locks that intake's worktree, so it may not name a worktree path itself.
+      if (input.intake_worktree !== undefined && input.intake_worktree !== 'detached') return response({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'invalid_intake_worktree' }, 400);
+      if (input.intake_worktree === 'detached' && (worktreePathAllowed(input.workspace) || worktreePathAllowed(input.cwd))) {
+        return response({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'detached_start_names_worktree' }, 400);
+      }
       if (!label(input.key)) return response({ error: 'invalid_session_request', field: 'key', detail: 'invalid_key' }, 400);
       if (!workspaceOk(input.workspace) && !registeredRepoLabel(this.sql, input.workspace)) return response({ error: 'invalid_session_request', field: 'workspace', detail: 'invalid_workspace' }, 400);
       if (input.engine !== undefined && !label(input.engine)) return response({ error: 'invalid_session_request', field: 'engine', detail: 'invalid_engine' }, 400);
@@ -1862,6 +1869,7 @@ export class SessionControlService {
           ...(input.with_goal === true ? { with_goal: true } : {}),
           mode, access: input.access ?? null, name: input.name ?? null,
           parent_id: parentId ?? null, intake_task_id: input.intake_task_id ?? null,
+          ...(input.intake_worktree === 'detached' ? { intake_worktree: 'detached' } : {}),
         });
 
         const prior: any = this.sql.exec(
@@ -1931,7 +1939,7 @@ export class SessionControlService {
         if (input.intake_task_id) {
           const guard = (() => {
             try {
-              return new IntakeWorktrees(this.sql).startGuard(input.intake_task_id, { machine: input.machine ?? null, workspace: input.workspace, cwd: input.cwd ?? null });
+              return new IntakeWorktrees(this.sql).startGuard(input.intake_task_id, { machine: input.machine ?? null, workspace: input.workspace, cwd: input.cwd ?? null, detached: input.intake_worktree === 'detached' });
             } catch { return {}; } // registry table absent in narrow fixtures
           })() as { error?: Record<string, unknown>; machine?: string };
           if (guard.error) return response(guard.error, 409);

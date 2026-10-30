@@ -135,6 +135,54 @@ describe('intake worktree registry', () => {
   }));
 });
 
+describe('detached intake-linked starts (intake 79458f2d)', () => {
+  it('a triage/verifier start never resumes or pins the linked intake worktree a live owner holds', async () => fixture(async c => {
+    const t = await createTask(c);
+    await register(c, t.id);
+    // A live owner session holds (and on the host has git-locked) the intake worktree.
+    const owner = seedLaunch(c, t.id, HOST, { cwd: WT });
+    c.hub.sql.exec("UPDATE session_control_sessions SET state = 'running' WHERE id = ?", owner.sessionId);
+    const calls: any[] = [];
+    const service = new SessionControlService(c.hub.sql, cb => c.state.storage.transactionSync(cb), Date.now, { reserve: (input: any) => {
+      calls.push(input); return { value: { id: crypto.randomUUID(), state: 'offered', machine: input.machine || HOST, engine: 'claude' }, status: 201 };
+    } });
+    const start = async (body: any) => {
+      const res = await service.handle(new Request('https://hub.test/api/sessions', { method: 'POST', body: JSON.stringify(body) }), admin);
+      return { status: res.status, body: await res.json() as any };
+    };
+    const planFor = async (sessionId: string) => {
+      const row = c.hub.sql.exec('SELECT request_json FROM session_control_sessions WHERE id = ?', sessionId).one() as any;
+      const launch = seedLaunch(c, t.id, HOST, JSON.parse(row.request_json));
+      return (await host(c, HOST, '/plan', { launch_id: launch.launchId })).body.plan;
+    };
+    // Reproduction: an ordinary linked start is pinned to the owner's host and
+    // planned into the locked worktree, which the host refuses as dispatch_worktree_refused.
+    const coupled = await start({ key: 'coupled-1', workspace: 'demo', mode: 'headless', brief: 'x', intake_task_id: t.id, task_kind: 'review' });
+    expect(coupled.status, JSON.stringify(coupled.body)).toBe(201);
+    expect(calls.at(-1).machine).toBe(HOST);
+    expect(await planFor(coupled.body.id)).toMatchObject({ mode: 'resume', path: WT });
+    // Fix: the detached start keeps its intake link but runs in the workspace root.
+    const detached = await start({ key: 'detached-1', workspace: 'demo', mode: 'headless', brief: 'x', intake_task_id: t.id,
+      task_kind: 'review', intake_worktree: 'detached' });
+    expect(detached.status, JSON.stringify(detached.body)).toBe(201);
+    expect(calls.at(-1).machine).toBeUndefined();
+    const stored = JSON.parse((c.hub.sql.exec('SELECT request_json FROM session_control_sessions WHERE id = ?', detached.body.id).one() as any).request_json);
+    expect(stored).toMatchObject({ intake_task_id: t.id, intake_worktree: 'detached', cwd: null });
+    expect(await planFor(detached.body.id)).toEqual({ mode: 'none', task_id: t.id, detached: true });
+    // Live detached sessions are never counted as bound to the intake worktree.
+    c.hub.sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE json_extract(request_json, '$.intake_worktree') IS NOT 'detached'");
+    c.hub.sql.exec("UPDATE session_control_sessions SET state = 'running' WHERE json_extract(request_json, '$.intake_worktree') = 'detached'");
+    const rm = await intake(c, '/tasks/' + t.id + '/worktrees/remove', { key: 'rm-' + ++seq });
+    expect(rm.body.refused ?? [], JSON.stringify(rm.body)).toEqual([]);
+    expect(rm.body.commands).toHaveLength(1);
+    // Detached starts may not name a worktree themselves, and only 'detached' is a valid value.
+    expect((await start({ key: 'detached-2', workspace: 'demo', cwd: WT, mode: 'headless', brief: 'x', intake_task_id: t.id, intake_worktree: 'detached' })).body)
+      .toMatchObject({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'detached_start_names_worktree' });
+    expect((await start({ key: 'detached-3', workspace: 'demo', mode: 'headless', brief: 'x', intake_task_id: t.id, intake_worktree: 'shared' })).body)
+      .toMatchObject({ error: 'invalid_session_request', field: 'intake_worktree' });
+  }));
+});
+
 describe('resume plan + observe (host channel)', () => {
   it('creates once, then resumes in the recorded worktree; a missing one is recreated at the same path', async () => fixture(async c => {
     const t = await createTask(c);

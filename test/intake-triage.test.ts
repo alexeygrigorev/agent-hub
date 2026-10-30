@@ -13,14 +13,14 @@ function task(id: string, age = 30 * HOUR, history: any[] = []): any {
 async function fixture(fn: (h: any) => any) {
   return inDO(stub(), async (h: any) => {
     for (const table of ['intake_triage_requests', 'intake_triage_meta', 'intake_restart_queue', 'intake_watchdog_meta',
-      'session_control_sessions', 'fleet_sessions', 'claims', 'fleet_catalog_seen']) h.sql.exec('DELETE FROM ' + table);
+      'session_control_sessions', 'fleet_sessions', 'claims', 'fleet_catalog_seen', 'fleet_launches']) h.sql.exec('DELETE FROM ' + table);
     return fn(h);
   });
 }
-function build(h: any, tasks: any[], start?: any, clock = { now: NOW }) {
+function build(h: any, tasks: any[], start?: any, clock = { now: NOW }, alert?: any) {
   const svc = { statusAuthorizedTasks: () => tasks } as any;
   const w = new IntakeWatchdog(h.sql, svc, (f: any) => f(), {}, () => clock.now); w.init();
-  const t = new IntakeTriage(h.sql, svc, w, (f: any) => f(), start ? { start } : {}, () => clock.now); t.init();
+  const t = new IntakeTriage(h.sql, svc, w, (f: any) => f(), { ...(start ? { start } : {}), ...(alert ? { alert } : {}) }, () => clock.now); t.init();
   return t;
 }
 describe('hourly intake backlog triage (d8d509d2 AC5)', () => {
@@ -43,6 +43,8 @@ describe('hourly intake backlog triage (d8d509d2 AC5)', () => {
     expect(inputs[0]).toMatchObject({ engine: 'claude', tier: 'review', task_kind: 'review', mode: 'headless', workspace: 'agent-hub' });
     expect(inputs[0].engine_override_reason).toMatch(/Opus/);
     expect(inputs[0].intake_task_id).toBe(TRIAGE_INTAKE_ID); // headless starts link the triage intake, never a triaged one
+    expect(inputs[0].intake_worktree).toBe('detached'); // 79458f2d: never the triage intake's worktree
+    expect(inputs[0].cwd).toBeUndefined();
     expect(inputs[0].brief).toContain(tasks[0].id);
     expect(inputs[0].brief).not.toContain('already');
     expect(inputs[0].brief.length).toBeLessThanOrEqual(8000);
@@ -89,6 +91,43 @@ describe('hourly intake backlog triage (d8d509d2 AC5)', () => {
     clock.now += TRIAGE_INTERVAL;
     expect(await t.tick()).toMatchObject({ state: 'nothing_to_triage' });
     expect(starts).toBe(2);
+  }));
+  it('surfaces a launch_error start failure once, re-offers the slice and resolves on a healthy start (79458f2d AC2)', async () => fixture(async h => {
+    const clock = { now: NOW }; const alerts: any[] = []; let starts = 0;
+    const failed = (id: string) => {
+      const at = new Date(clock.now).toISOString(); const launch = 'launch-' + id;
+      h.sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, launch_error_json, created_at, updated_at)
+        VALUES (?, 'hub:service:intake-triage', 'human', 'triage', ?, '{}', 'hetzner', 'claude', 'acct', 'p', 'headless', 'agent-hub', '', 'failed', ?, ?, ?)`,
+        launch, 'k-' + launch, JSON.stringify({ reason: 'dispatch_worktree_refused', message: 'The worktree could not be protected before native start.' }), at, at);
+      h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,engine,mode,state,created_at,updated_at)
+        VALUES(?,'hub:service:intake-triage',?,'{}',?,'claude','headless','failed',?,?)`, id, 'k-' + id, launch, at, at);
+    };
+    const t = build(h, [task('x'), task('y', 29 * HOUR)], async () => { starts++; return { status: 202, body: { id: 'rev-' + starts, state: 'queued' } }; },
+      clock, async (subject: string, detail: string | null) => { alerts.push([subject, detail]); });
+    expect(await t.tick()).toMatchObject({ state: 'reviewer_started', session_id: 'rev-1' });
+    failed('rev-1');
+    clock.now += TRIAGE_INTERVAL;
+    // The failed start held nothing: the same slice is offered again, and one alert names the reason.
+    expect(await t.tick()).toMatchObject({ state: 'reviewer_started', session_id: 'rev-2', requested: ['x', 'y'], previous_start_failure: 'dispatch_worktree_refused' });
+    expect(alerts).toEqual([['backlog-triage-start', expect.stringContaining('dispatch_worktree_refused')]]);
+    expect(t.status().start_alert).toBe('dispatch_worktree_refused');
+    failed('rev-2');
+    clock.now += TRIAGE_INTERVAL;
+    await t.tick();
+    expect(alerts).toHaveLength(1); // same failure again: not re-alerted every run
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      VALUES('rev-3','hub:service:intake-triage','k3','{}','claude','headless','running',?,?)`, new Date(clock.now).toISOString(), new Date(clock.now).toISOString());
+    clock.now += TRIAGE_INTERVAL;
+    expect(await t.tick()).toMatchObject({ state: 'reviewer_active', session_id: 'rev-3' });
+    expect(alerts).toEqual([['backlog-triage-start', expect.any(String)], ['backlog-triage-start', null]]);
+    expect(t.status().start_alert).toBeNull();
+  }));
+  it('surfaces an admission refusal once while retrying hourly', async () => fixture(async h => {
+    const clock = { now: NOW }; const alerts: any[] = [];
+    const t = build(h, [task('x')], async () => ({ status: 409, body: { error: 'no_capacity' } }), clock,
+      async (subject: string, detail: string | null) => { alerts.push([subject, detail]); });
+    for (let i = 0; i < 3; i++) { expect(await t.tick()).toMatchObject({ state: 'reviewer_refused', error: 'no_capacity' }); clock.now += TRIAGE_INTERVAL; }
+    expect(alerts).toEqual([['backlog-triage-start', expect.stringContaining('no_capacity')]]);
   }));
   it('never closes, edits or deletes intakes itself', async () => fixture(async h => {
     const x = task('x'); const before = JSON.stringify(x);

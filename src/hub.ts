@@ -338,6 +338,11 @@ export class Hub extends DurableObject {
           { caller: { isAdmin: true, actor: 'hub:service:intake-triage', kind: 'human' }, scopes: ['admin'] });
         return { status: r.status, body: await r.json() as any };
       },
+      // Intake 79458f2d: a refused or failed reviewer start is alerted once, never silent.
+      alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('intake_triage', subject, detail === null ? null : { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
+      },
     });
     this.intakeTriage.init();
     // Post-DONE verifier (intake d8d509d2, t1936u): a separate verification-only

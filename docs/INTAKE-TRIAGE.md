@@ -20,16 +20,18 @@ Each run:
 1. Takes every open intake held for a completion claim whose newest DONE note is newer than the verifier's first enablement. Older holds stay with the operator. Verifier verdicts and backlog-triage notes never count as claims.
 2. Records the decision and its reason in `intake_verifications`.
 3. **Skip:** appends `VERIFICATION SKIPPED — <reason>` and closes the intake on its DONE evidence. A skip needs a DONE note with sha, live check and result; without one, the claim is verified instead.
-4. **Required:** starts one headless verification-only session through the canonical session start. It is linked to the intake, uses `tier: review`, and runs on a different model than the implementer: Claude Opus, or Codex when Claude implemented. At most 3 verifiers start per run.
+4. **Required:** starts one headless verification-only session through the canonical session start. It is linked to the intake, uses `tier: review`, and runs on a different model than the implementer: Claude Opus, or Codex when Claude implemented. At most 3 verifiers start per run. The start is detached (`intake_worktree: "detached"`, intake 79458f2d): it runs in the project's workspace root, never in an intake `-wt-` path, so a live owner session holding the intake worktree lock never blocks it.
 5. **Pass** (the verifier's note starts `DONE — VERIFIED by Hub verifier` with evidence, live check and result lines): Hub closes the intake through the ordinary close rules (DONE evidence plus the worktree close gate).
 6. **Fail** (`VERIFICATION FAILED — …` with a `gap:` line): Hub appends `Verification gap (...)` to the AC. That starts a new context, so the DONE claim stops holding the intake and the watchdog re-queues the work.
-7. A verifier that ends without a verdict is retried once and then escalated. A blocked close (worktree gate) or a start refused for missing AC or scope is also escalated, once, as an `intake_verifier` alert.
+7. A verifier that ends without a verdict is retried once and then escalated. A blocked close (worktree gate), a start refused for missing AC or scope, or a verifier session that failed before running (any `launch_error`, for example `dispatch_worktree_refused`) is also escalated, once, as an `intake_verifier` alert. A failed start is never retried silently.
 
 ## Hourly backlog triage (`src/intake-triage.ts`)
 
 Each run takes the forgotten intakes that have no triage verdict yet, oldest first. A verdict is a note starting `TRIAGE ACTUAL|DONE|OBSOLETE|DUPLICATE`, or a `DONE` note mentioning `backlog triage`. Completion claims are skipped, because the verifier owns them.
 
 - One headless Claude Opus reviewer runs at a time (`engine: claude`, `tier: review`, workspace `agent-hub`). It is linked to the triage intake d8d509d2, because headless starts must link an open intake. Its brief carries 10 intakes.
+- The start is detached from d8d509d2's worktree (`intake_worktree: "detached"`, intake 79458f2d). It runs in the `agent-hub` workspace root and never claims or locks an intake worktree, so live owner sessions on `agent-hub-wt-d8d509d2` never block triage.
+- A refused start (4xx/5xx) or a reviewer session that failed before running (any `launch_error`) raises one `intake_triage` alert (subject `backlog-triage-start`) per distinct reason. A failed session's slice is offered again next hour. The alert resolves once a reviewer reaches `running` or ends normally. `hub intake forgotten` shows the open reason as `triage.start_alert`.
 - The reviewer appends one verdict per intake, writes missing AC from the verbatim intake text, and corrects wrong projects.
 - An intake is offered again only after 24 h without a verdict, or after an explicit admission refusal (4xx). An unknown outcome (5xx) keeps the hold, so a lost reply never starts a duplicate reviewer.
 - Nothing is closed, cancelled or deleted by triage.

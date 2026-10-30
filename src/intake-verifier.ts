@@ -10,6 +10,8 @@
  * older held completions belong to the operator. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { currentHistory, intakeCompletionHoldReason, intakeHasDoneEvidence } from './intake';
+import { worktreePathAllowed } from './intake-worktrees';
+import { sessionLaunchFailure } from './intake-triage';
 type Obj = Record<string, any>;
 export const VERIFIER_INTERVAL = 25 * 60000; // runs from the */30 scheduler slot
 export const VERIFIER_LAUNCH_BUDGET = 3;
@@ -118,7 +120,8 @@ export class IntakeVerifier {
   }
   private workspace(task: Obj): string {
     const prior = this.rows('SELECT request_json FROM session_control_sessions ORDER BY created_at DESC')
-      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace);
+      // Never an intake worktree path: the verifier runs detached from it (79458f2d).
+      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace && !worktreePathAllowed(r.workspace));
     if (prior) return prior.workspace;
     const configured = this.rows('SELECT capabilities FROM machines').some(m => {
       const roots = parse(m.capabilities).workspaces;
@@ -159,7 +162,8 @@ export class IntakeVerifier {
     const input = { key: 'verify-' + crypto.randomUUID(), engine, tier: 'review', task_kind: 'review', mode: 'headless',
       engine_override_reason: claudeImplemented ? 'Alexey t1936u: verifier must differ from the Claude implementer'
         : 'Alexey t1936u: separate Claude Opus verifier after DONE',
-      workspace: this.workspace(task), intake_task_id: task.id, brief: verifierBrief(task, claim, attempt) };
+      // Detached (79458f2d): a live owner session on the intake's worktree never blocks the verifier.
+      workspace: this.workspace(task), intake_task_id: task.id, intake_worktree: 'detached', brief: verifierBrief(task, claim, attempt) };
     this.set(task, claim, { state: 'starting', engine, request_key: input.key, attempts: attempt, session_id: null });
     let result: { status: number; body: Obj };
     try { result = await this.hooks.start(input); } catch { result = { status: 502, body: { error: 'admission_outcome_unknown' } }; }
@@ -250,6 +254,9 @@ export class IntakeVerifier {
       } else {
         const s = this.rows('SELECT state FROM session_control_sessions WHERE id=?', row.session_id)[0];
         if (s && ACTIVE.has(s.state)) { counts.waiting++; continue; }
+        // A start that failed before running (any launch_error) is surfaced once, never retried silently.
+        const failure = sessionLaunchFailure(this.sql, row.session_id);
+        if (failure) { await this.escalate(task, claim, `verifier session ${row.session_id} failed to start: ${failure}`); counts.escalated++; continue; }
         if (row.attempts >= VERIFIER_MAX_ATTEMPTS) { await this.escalate(task, claim, `verifier ended ${row.attempts}x without a verdict`); counts.escalated++; }
         else if (budget > 0) { budget--; if (await this.launch(task, claim, row)) counts.launched++; }
       }

@@ -4,7 +4,9 @@
  * start (linked to the triage intake, as every headless start must be). The reviewer appends one ACTUAL/DONE/OBSOLETE/DUPLICATE note per
  * intake and writes missing AC; Hub never closes, deletes or accepts work here.
  * Requests are durable: an intake is offered once, and again only after its
- * request expired without a verdict. */
+ * request expired without a verdict. The start is detached from the triage
+ * intake's worktree (intake 79458f2d): a live owner session on that worktree
+ * never blocks triage, and a refused or failed start raises one alert. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { intakeCompletionHoldReason, type IntakeService } from './intake';
 import type { IntakeWatchdog } from './intake-watchdog';
@@ -22,7 +24,24 @@ const parse = (raw: any): Obj => { try { return JSON.parse(raw || '{}'); } catch
 export function hasTriageVerdict(task: Obj): boolean {
   return (task.history || []).some((e: Obj) => e.kind === 'note' && TRIAGE_VERDICT.test(String(e.text ?? '')));
 }
-export type TriageHooks = { start?: (input: Obj) => Promise<{ status: number; body: Obj }> };
+export type TriageHooks = {
+  start?: (input: Obj) => Promise<{ status: number; body: Obj }>;
+  /** One intake_triage alert per distinct start failure; null resolves it. */
+  alert?: (subject: string, detail: string | null) => Promise<void>;
+};
+export const TRIAGE_ALERT_SUBJECT = 'backlog-triage-start';
+/** Bounded launch_error reason of a canonical session that failed before running, else null. */
+export function sessionLaunchFailure(sql: SqlStorage, sessionId: string | null | undefined): string | null {
+  if (!sessionId) return null;
+  const s = sql.exec('SELECT state,fleet_launch_id FROM session_control_sessions WHERE id=?', sessionId).toArray()[0] as Obj | undefined;
+  if (!s || s.state !== 'failed') return null;
+  let launch: Obj | undefined;
+  try {
+    launch = s.fleet_launch_id ? sql.exec('SELECT launch_error_json,exit_reason FROM fleet_launches WHERE id=?', s.fleet_launch_id).toArray()[0] as Obj | undefined : undefined;
+  } catch { launch = undefined; }
+  const reason = parse(launch?.launch_error_json).reason ?? launch?.exit_reason;
+  return typeof reason === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(reason) ? reason : 'launch_failed';
+}
 export function triageBrief(ids: string[]): string {
   return `Hourly Hub backlog triage (intake d8d509d2 AC5). You are a Claude Opus reviewer. Triage each forgotten intake below, oldest first:
 ${ids.join('\n')}
@@ -41,14 +60,18 @@ export class IntakeTriage {
   init() {
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_triage_meta(id INTEGER PRIMARY KEY CHECK(id=1),last_tick INTEGER,last_source TEXT,last_result TEXT)');
     this.sql.exec('INSERT OR IGNORE INTO intake_triage_meta(id) VALUES(1)');
+    for (const col of ['last_session TEXT', 'last_alert TEXT']) {
+      try { this.sql.exec('ALTER TABLE intake_triage_meta ADD COLUMN ' + col); } catch { /* already present */ }
+    }
     this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_triage_requests(task_id TEXT PRIMARY KEY, request_key TEXT NOT NULL,
       session_id TEXT, state TEXT NOT NULL, requested_at INTEGER NOT NULL)`);
   }
   private rows(query: string, ...args: any[]): Obj[] { return this.sql.exec(query, ...args).toArray() as Obj[]; }
   status(): Obj {
-    const m = this.rows('SELECT last_tick,last_source,last_result FROM intake_triage_meta WHERE id=1')[0] ?? {};
+    const m = this.rows('SELECT last_tick,last_source,last_result,last_alert FROM intake_triage_meta WHERE id=1')[0] ?? {};
     const pending = this.rows("SELECT COUNT(*) AS n FROM intake_triage_requests WHERE state='requested'")[0]?.n ?? 0;
-    return { last_checked_at: m.last_tick ?? null, source: m.last_source ?? null, last_result: parse(m.last_result), pending_requests: pending };
+    return { last_checked_at: m.last_tick ?? null, source: m.last_source ?? null, last_result: parse(m.last_result), pending_requests: pending,
+      start_alert: m.last_alert ?? null };
   }
   /** The newest triage session still owns its slice while its canonical row is active. */
   private activeSession(): Obj | null {
@@ -56,6 +79,31 @@ export class IntakeTriage {
     if (!last) return null;
     const s = this.rows('SELECT id,state FROM session_control_sessions WHERE id=?', last.session_id)[0];
     return s && ACTIVE.has(s.state) ? s : null;
+  }
+  /** Alert once per distinct failure reason; a healthy reviewer resolves it. */
+  private async surface(failure: string | null, detail?: string) {
+    const m = this.rows('SELECT last_alert FROM intake_triage_meta WHERE id=1')[0] ?? {};
+    if ((m.last_alert ?? null) === failure) return;
+    this.sql.exec('UPDATE intake_triage_meta SET last_alert=? WHERE id=1', failure);
+    if (this.hooks.alert) {
+      try { await this.hooks.alert(TRIAGE_ALERT_SUBJECT, failure === null ? null : (detail ?? failure)); } catch { /* the ledger keeps the state */ }
+    }
+  }
+  /** The previous start's outcome: a launch failure releases its slice and alerts. */
+  private async reconcileLastStart(): Promise<string | null> {
+    const m = this.rows('SELECT last_session FROM intake_triage_meta WHERE id=1')[0] ?? {};
+    if (!m.last_session) return null;
+    const failure = sessionLaunchFailure(this.sql, m.last_session);
+    if (failure) {
+      // Nothing ran: offer the slice again instead of holding it for the retry window.
+      this.sql.exec("DELETE FROM intake_triage_requests WHERE session_id=? AND state='requested'", m.last_session);
+      this.sql.exec('UPDATE intake_triage_meta SET last_session=NULL WHERE id=1');
+      await this.surface(failure, `Hourly backlog triage reviewer ${m.last_session} failed to start: ${failure}. Triage is not running until this is fixed; Hub retries hourly.`);
+      return failure;
+    }
+    const s = this.rows('SELECT state FROM session_control_sessions WHERE id=?', m.last_session)[0];
+    if (s && (s.state === 'running' || !ACTIVE.has(s.state))) await this.surface(null);
+    return null;
   }
   async tick(source = 'scheduled'): Promise<Obj> {
     const now = this.now();
@@ -73,6 +121,7 @@ export class IntakeTriage {
       const t = byId.get(r.task_id);
       if (!t || hasTriageVerdict(t)) this.sql.exec("UPDATE intake_triage_requests SET state='triaged' WHERE task_id=?", r.task_id);
     }
+    const lastFailure = await this.reconcileLastStart();
     const active = this.activeSession();
     if (active) return finish({ state: 'reviewer_active', checked_at: now, session_id: active.id });
     const requested = new Map(this.rows('SELECT task_id,state,requested_at FROM intake_triage_requests').map(r => [r.task_id, r]));
@@ -88,7 +137,8 @@ export class IntakeTriage {
     const slice = candidates.slice(0, TRIAGE_BATCH).map(t => t.id);
     const input = { key: 'triage-' + crypto.randomUUID(), engine: 'claude', tier: 'review', task_kind: 'review', mode: 'headless',
       engine_override_reason: 'Alexey d8d509d2 AC5: backlog triage runs on a Claude Opus reviewer', workspace: 'agent-hub',
-      intake_task_id: TRIAGE_INTAKE_ID, brief: triageBrief(slice) };
+      // Linked for accounting only: never the triage intake's worktree (79458f2d).
+      intake_task_id: TRIAGE_INTAKE_ID, intake_worktree: 'detached', brief: triageBrief(slice) };
     // Persist the slice before awaiting so a lost reply never re-offers it within the retry window.
     this.tx(() => {
       for (const id of slice) this.sql.exec(`INSERT INTO intake_triage_requests(task_id,request_key,session_id,state,requested_at) VALUES(?,?,NULL,'requested',?)
@@ -98,12 +148,17 @@ export class IntakeTriage {
     try { result = await this.hooks.start(input); }
     catch { result = { status: 502, body: { error: 'admission_outcome_unknown' } }; }
     const id = typeof result.body?.id === 'string' ? result.body.id : null;
-    if (id) this.sql.exec('UPDATE intake_triage_requests SET session_id=? WHERE request_key=?', id, input.key);
+    const error = id ? null : String(result.body?.error || 'admission_refused').slice(0, 128);
+    if (id) {
+      this.sql.exec('UPDATE intake_triage_requests SET session_id=? WHERE request_key=?', id, input.key);
+      this.sql.exec('UPDATE intake_triage_meta SET last_session=? WHERE id=1', id);
+    }
     // An explicit refusal created nothing: offer the slice again next hour. An
     // unknown outcome (5xx) keeps the hold so a lost reply never duplicates.
     else if (result.status < 500) this.sql.exec('DELETE FROM intake_triage_requests WHERE request_key=?', input.key);
+    if (error) await this.surface(error, `Hourly backlog triage reviewer start was refused: ${error} (HTTP ${result.status}). Triage is not running until this is fixed; Hub retries hourly.`);
     return finish({ state: id ? 'reviewer_started' : 'reviewer_refused', checked_at: now, session_id: id,
-      session_state: result.body?.state ?? null, error: id ? null : String(result.body?.error || 'admission_refused').slice(0, 128),
+      session_state: result.body?.state ?? null, error, previous_start_failure: lastFailure,
       requested: slice, candidates: candidates.length });
   }
 }

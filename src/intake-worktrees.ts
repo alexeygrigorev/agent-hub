@@ -166,9 +166,11 @@ export class IntakeWorktrees {
   }
 
   /** Session start: refuse another intake's worktree; pin to the recorded host. */
-  startGuard(taskId: string | null | undefined, request: { machine?: string | null; workspace?: string | null; cwd?: string | null }):
+  startGuard(taskId: string | null | undefined, request: { machine?: string | null; workspace?: string | null; cwd?: string | null; detached?: boolean }):
     { error?: Obj; machine?: string } {
     if (!taskId) return {}; // unlinked (operator/debug) starts are not intake work
+    // Detached starts (79458f2d) never use the intake's worktree, so they are not pinned to its host.
+    if (request.detached) return {};
     for (const candidate of [request.cwd, request.workspace]) {
       if (!worktreePathAllowed(candidate)) continue;
       const owner = this.ownerOf(request.machine ?? null, candidate);
@@ -197,6 +199,9 @@ export class IntakeWorktrees {
     const taskId = ctx?.request?.intake_task_id;
     if (!ctx || typeof taskId !== 'string' || !taskId) return { plan: { mode: 'none' }, events: [] };
     const request = ctx.request;
+    // Intake 79458f2d: a detached start runs in its workspace root and never
+    // resumes, creates or locks the linked intake's worktree.
+    if (request.intake_worktree === 'detached') return { plan: { mode: 'none', task_id: taskId, detached: true }, events: [] };
     for (const candidate of [request.cwd, request.workspace]) {
       if (!worktreePathAllowed(candidate)) continue;
       // The start named its own worktree: record it, launch as requested.
@@ -253,7 +258,7 @@ export class IntakeWorktrees {
       const req = parsed(s.request_json, {});
       const samePath = req.cwd === r.path || req.workspace === r.path;
       // A live session of the same intake on the same host resumes in this worktree.
-      const sameIntakeHost = req.intake_task_id === r.task_id && (!s.machine_id || s.machine_id === r.machine);
+      const sameIntakeHost = req.intake_task_id === r.task_id && req.intake_worktree !== 'detached' && (!s.machine_id || s.machine_id === r.machine);
       if (ids.includes(s.id) || samePath || sameIntakeHost) out.push({ id: s.id, state: s.state });
     }
     return out;
