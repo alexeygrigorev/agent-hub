@@ -46,7 +46,11 @@ def probe(payload, service, account, engine, request=None):
             return result
         selection = payload.get('selection')
         if selection is not None:
-            model = configured_selection(selection, engine, service)
+            try:
+                model = configured_selection(selection, engine, service)
+            except ValueError:
+                result['reason'] = 'model_unsupported'
+                return result
             result.update(model_supported=True, model=model['model'], effort=model['effort'])
         verdict = request('POST', '/api/engines/admission', {'label': account, 'native': True})
         if not isinstance(verdict, dict) or verdict.get('account_label') != account:

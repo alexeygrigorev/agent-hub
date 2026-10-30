@@ -2835,7 +2835,9 @@ def admission():
             else:
                 result['model_supported'] = False
                 result['launch_allowed'] = False
-                result['reason'] = 'model_mismatch'
+                # A missing host identity is the root cause; keep it dominant.
+                if result.get('reason') != 'host_identity_missing':
+                    result['reason'] = 'model_mismatch'
 
     # Quota and credential admission is Hub's (intake 5814e109 I4): the
     # result above already carries Hub's verdict; the host runs no probe.
