@@ -227,11 +227,11 @@ def _test_guard_roots():
 
 
 def _forbid_real_user_profile(path: Path) -> Path:
-    if not (os.environ.get(TEST_GUARD_HOME_ENV)
-            or _test_isolation.guard_environment().get(TEST_GUARD_HOME_ENV)):
+    roots = _test_guard_roots()
+    if not roots:
         return path
     resolved = Path(path).resolve()
-    for root in _test_guard_roots():
+    for root in roots:
         root = root.resolve()
         if resolved == root or root in resolved.parents:
             raise ConfigPermissionError(

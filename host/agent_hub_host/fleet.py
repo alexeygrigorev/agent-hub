@@ -2996,6 +2996,10 @@ class Dispatcher:
         gate_duration_s = time.monotonic() - gate_started
         if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or canonical_account_label(gate.get("account_label")) != canonical_account_label(sub["account_label"]):
             gate_reason = gate.get("reason") if isinstance(gate.get("reason"), str) else ""
+            if gate_reason == "host_identity_missing":
+                raise ValueError("host_identity_missing: host credential (~/.config/agent-hub/host.json) is missing or not logged in")
+            if gate_reason in ("model_mismatch", "model_unsupported") or gate.get("model_supported") is False:
+                raise ValueError("model_unsupported: admission gate reported model_mismatch for requested selection")
             # Preserve host-side gate slugs (intake 59a6f44a AC3/AC4): a managed
             # Codex quota-gate refusal must surface as codex_quota_gate_* in
             # rejected[]/launch_error, never a silent stopped/session_not_bound.
