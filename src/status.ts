@@ -515,23 +515,9 @@ export class StatusService {
       sessionCoverage: missingHosts.length ? 'partial' : 'complete', reportsCollected, probesCollected };
   }
 
-  /** Hosts without a check-in for >= 60 min (host-failover.ts), with how many
-   * of their sessions were re-placed. Additive table: absent => none. */
-  private temporarilyDead(): Obj[] {
-    try {
-      return this.rows(`SELECT h.machine_id,h.dead_since,
-        (SELECT COUNT(*) FROM host_failover_sessions s WHERE s.machine_id=h.machine_id AND s.replacement_id IS NOT NULL) AS reassigned_sessions,
-        (SELECT COUNT(*) FROM host_failover_sessions s WHERE s.machine_id=h.machine_id AND s.replacement_id IS NULL) AS pending_sessions
-        FROM host_failover h WHERE h.state='temporarily_dead' ORDER BY h.machine_id LIMIT 25`).map((r: Obj) => ({
-        machine_id: r.machine_id, state: 'temporarily_dead', dead_since: new Date(r.dead_since).toISOString(),
-        reassigned_sessions: r.reassigned_sessions, pending_sessions: r.pending_sessions }));
-    } catch { return []; }
-  }
-
   private coverageDto(missingHosts: string[], expectedOffline: string[], sessionCoverage: string, now: number): Obj {
     const offlineWindowActive = expectedOfflineWindowActive(now);
     return { sessions: sessionCoverage, missing_hosts: missingHosts, expected_offline: expectedOffline,
-      temporarily_dead: this.temporarilyDead(),
       expected_offline_until: offlineWindowActive ? EXPECTED_OFFLINE_UNTIL : null,
       expected_offline_reason: offlineWindowActive && expectedOffline.length ? EXPECTED_OFFLINE_REASON : null,
       reason: missingHosts.length ? 'one_or_more_hosts_stale_or_unreachable' : expectedOffline.length ? 'all_unexpected_hosts_fresh_expected_offline_excluded' : 'all_known_hosts_fresh' };

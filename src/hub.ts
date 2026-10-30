@@ -1,6 +1,5 @@
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { IdleWorkService } from './idle-work';
-import { HostFailoverService } from './host-failover';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog, queuePolicyFrom } from './intake-watchdog';
 import { OpsLiveness } from './ops-liveness';
@@ -145,7 +144,6 @@ export class Hub extends DurableObject {
   public webhookService: WebhookService;
 
   private idleWork: IdleWorkService;
-  private hostFailover: HostFailoverService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -229,8 +227,6 @@ export class Hub extends DurableObject {
     this.webhookService.init();
     this.idleWork = new IdleWorkService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.sessionControlService, env);
     this.idleWork.init();
-    this.hostFailover = new HostFailoverService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.sessionControlService);
-    this.hostFailover.init();
     this.statusService.setSessionAttention(() => this.sessionControlService.attention());
     this.fleetService.resources.initCatalogCache();
     this.sql.exec(`CREATE INDEX IF NOT EXISTS session_control_native ON session_control_sessions(machine_id,
@@ -2233,7 +2229,6 @@ export class Hub extends DurableObject {
     }
 
     await this.idleWork.tick();
-    try { await this.hostFailover.tick(); } catch { console.warn('host_failover_tick_failed'); }
     // The verifier registers fresh DONE claims first, so the watchdog never alerts
     // a person about a completion the verifier owns (AC8).
     let intakeVerifier: any;
@@ -2305,7 +2300,6 @@ export class Hub extends DurableObject {
     // Reuse the existing minute alarm so configured idle delays do not wait
     // for a root slot. Durable episode/command keys fence duplicate delivery.
     try { await this.idleWork.tick(); } catch { console.warn('idle_work_tick_failed'); }
-    try { await this.hostFailover.tick(); } catch { console.warn('host_failover_tick_failed'); }
     try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
     let nextAlarm = this.jobsService.processAlarms();
