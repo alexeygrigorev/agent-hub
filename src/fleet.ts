@@ -156,6 +156,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "model_unsupported": "The selected model or effort is unsupported by this local route.",
   "admission_unconfigured": "This local route has no maintained fresh admission adapter.",
   "admission_refused": "Fresh admission refused this account or could not verify its timestamp and model.",
+  "admission_quota_unverified": "The maintained launcher could not read a trusted quota observation for this managed account (probe unavailable or rate-limited).",
   "engine_auth_expired": "The engine authentication is unavailable or expired.",
   "credential_rejected": "The host's copy of the Hub-held engine credential was rejected.",
   "codex_quota_gate_quota_unavailable": "The managed Codex account quota gate refused launch before execution.",
@@ -871,7 +872,7 @@ export class FleetService {
     if (input.tier !== undefined) request.tier = input.tier;
     const needs: string[] = Array.isArray(input.needs) ? [...input.needs] : [];
     if (needs.length) request.needs = needs;
-    const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = [];
+    const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = []; const gateDegraded = new Set<number>();
     // Hub-held credential state (intake 5814e109 I5): an account whose Hub
     // credential the provider rejected is offered nowhere, and a host that
     // reported a generation rejected is not offered that account again until
@@ -1094,10 +1095,14 @@ export class FleetService {
       // is held (loaded, capped or quota-limited). Pinned and os:windows
       // requests are unaffected (intake a3227276 AC3).
       const overflow = overflowMachine(machine, needs);
+      // A failed probe has no credential verdict. Prefer an admitted sibling,
+      // while retaining hard refusals for rejected or stale credentials.
+      if (gateProjection && !gateRefusal) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
         ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, ...(routeQuota.reason !== 'eligible' || (gateProjection && !gateRefusal) ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
     }
-    candidates.sort((a, b) => Number(!!a.overflow) - Number(!!b.overflow) || b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
+    const degraded = new Set(Array.from(gateDegraded, i => candidates[i]));
+    candidates.sort((a, b) => Number(!!a.overflow) - Number(!!b.overflow) || Number(degraded.has(a)) - Number(degraded.has(b)) || b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
     // The stored intent carries the winner's normalized workspace: a bare
     // label that resolved under the selected host's root is persisted and
     // offered as the absolute path the host accepts. Labels that were

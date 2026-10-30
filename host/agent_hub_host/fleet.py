@@ -167,6 +167,8 @@ DISPATCH_CONCURRENCY_MAX = 13
 # 30 s claim freshness and CLAIM_ADMISSION_REFRESH_S, so a shared observation
 # never forces a stale claim. Refusals are never shared.
 ADMISSION_SHARE_S = 8.0
+# Launcher plan rejection for a managed route without trusted quota evidence.
+QUOTA_SOURCE_REJECTION = 'quota source'
 # GET /api/fleet/offers transport retries (timeouts while the Hub is slow).
 # A failed offers read is never a launch failure: the offers simply stay
 # offered for the next tick.
@@ -2948,7 +2950,12 @@ class Dispatcher:
                         sub.get("account_label"),
                         canonical_account_label(sub.get("account_label")),
                     } - {None, ""}
-                    if any(k in rejections for k in keys):
+                    matched = [str(rejections[k]) for k in keys if k in rejections]
+                    if matched:
+                        # Name the launcher's missing quota evidence (fixed slug;
+                        # the free-form launcher text is never forwarded).
+                        if any(QUOTA_SOURCE_REJECTION in r for r in matched):
+                            raise ValueError("admission_quota_unverified: maintained launcher has no trusted quota observation")
                         raise ValueError("Fresh admission refused")
                 raise ValueError("model_unsupported: maintained launcher plan refused requested model")
             # OpenCode, Antigravity, ZAI, Gemini, and named-profile Codex use the maintained native backend:

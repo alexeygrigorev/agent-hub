@@ -10,7 +10,7 @@ import sys
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
-from agent_hub_host import fleet
+from agent_hub_host import dispatch_diagnostics, fleet
 from agent_hub_host.session_rules import AWS_MAIN_TEMP_RULE, SESSION_PREAMBLE, compose_prompt
 
 
@@ -302,6 +302,12 @@ class FleetTests(unittest.TestCase):
             def quota_rejected_plan(argv, **kw): return {'eligible': [], 'rejections': {'codex': 'limit_reached'}} if 'plan' in argv else runner(argv, **kw)
             d.runner = quota_rejected_plan; requests.clear()
             with self.assertRaisesRegex(ValueError, '^Fresh admission refused$'): d.dispatch(offer(mode='headless', prompt='Goal'))
+            # Intake 798f0f8c: a missing/untrusted quota source gets its own fixed slug.
+            def unverified_plan(argv, **kw): return {'eligible': [], 'rejections': {'codex': 'Untrusted or missing Claude quota source: None'}} if 'plan' in argv else runner(argv, **kw)
+            d.runner = unverified_plan; requests.clear()
+            with self.assertRaisesRegex(ValueError, '^admission_quota_unverified:') as raised: d.dispatch(offer(mode='headless', prompt='Goal'))
+            self.assertEqual(dispatch_diagnostics.classify(raised.exception)['reason'], 'admission_quota_unverified')
+            self.assertNotIn('Untrusted', json.dumps(dispatch_diagnostics.classify(raised.exception)))
             # Intake 4b161918: only the worktree plan query; no claim or result.
             self.assertFalse([a for a in requests if not a[1].startswith('/api/worktree-host/')])
 

@@ -4,9 +4,11 @@ Run on the Hub's credential-bearing server every five minutes. Only sanitized
 account observations cross the wire. Provider credentials remain server-local.
 """
 import argparse
+import contextlib
 import datetime
 import http.cookiejar
 import json
+import os
 import re
 from pathlib import Path
 import stat
@@ -20,6 +22,21 @@ from . import config, quota_snapshot
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+@contextlib.contextmanager
+def _managed_dir_env(directory):
+    """Pin AGENT_HUB_MANAGED_DIR for the managed probe subprocess, then restore."""
+    key = 'AGENT_HUB_MANAGED_DIR'
+    previous = os.environ.get(key)
+    os.environ[key] = str(Path(directory).absolute())
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
 def collect_accounts(settings, *, runner=None):
@@ -55,7 +72,13 @@ def collect_accounts(settings, *, runner=None):
             raise ValueError('Invalid managed account catalog')
         argv = settings.get('managed_quota_argv', ['hub', 'engines', 'quota'])
         try:
-            managed = quota_snapshot.execute_quse(argv, runner=runner).get('accounts', [])
+            # Probe the same install whose catalog was just read. Without
+            # this the probe resolved its managed dir from HUB_CONFIG_FILE
+            # and could read an orphaned copy of a rotating OAuth bundle:
+            # intake 798f0f8c, codex-orin read unknown from a stale copy
+            # (last_refresh Oct 18) while the host's live copy was healthy.
+            with _managed_dir_env(state_path.parent):
+                managed = quota_snapshot.execute_quse(argv, runner=runner).get('accounts', [])
         except Exception:
             managed = []
         if not isinstance(managed, list):

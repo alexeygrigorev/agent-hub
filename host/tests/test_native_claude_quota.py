@@ -345,3 +345,43 @@ def test_positive_utilization_with_null_reset_fails_closed(profile):
     result = read(profile, server)
     assert result['status'] == 'unknown'
     assert result['error'] == 'native_claude_malformed_windows'
+
+
+# Intake 798f0f8c: launch bursts (plan + run probe per launch) hit the usage
+# endpoint's rate limit; one good reading is shared per token across processes.
+def test_recent_reading_is_reused_without_another_request(profile, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(q, '_clock', lambda: clock[0])
+    server = Server(usage_payload(u5=30.0))
+    first = read(profile, server)
+    clock[0] += q.USAGE_REUSE_S - 1
+    second = read(profile, server)
+    assert len(server.calls) == 1
+    assert second == first and second['details']['source'] == 'native_claude_oauth_usage'
+    raw = (profile[1] / q.USAGE_CACHE_FILE).read_bytes()
+    assert b'synthetic-claude-token-a' not in raw
+
+
+def test_rate_limit_falls_back_to_recent_reading_only(profile, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(q, '_clock', lambda: clock[0])
+    read(profile, Server(usage_payload(u5=30.0)))
+    clock[0] += q.USAGE_REUSE_S + 1
+    limited = Server(429)
+    result = read(profile, limited)
+    assert len(limited.calls) == 1
+    assert result['status'] == 'ok' and result['windows']['5h']['percent_remaining'] == 70.0
+    clock[0] += q.USAGE_RATE_LIMITED_REUSE_S
+    assert read(profile, Server(429))['error'] == 'native_claude_rate_limited'
+
+
+def test_cached_reading_never_crosses_tokens_or_survives_a_passed_reset(profile, monkeypatch):
+    monkeypatch.setattr(q, '_clock', lambda: 1000.0)
+    bundle, dest = profile
+    q.probe(bundle, dest, opener=Server(usage_payload()), now=NOW)
+    rotated = dict(bundle, env={'CLAUDE_CODE_OAUTH_TOKEN': 'synthetic-claude-token-rotated'})
+    server = Server(usage_payload(u5=50.0))
+    assert q.probe(rotated, dest, opener=server, now=NOW)['claude']['windows']['5h']['percent_remaining'] == 50.0
+    assert len(server.calls) == 1
+    later = NOW + dt.timedelta(days=6)
+    assert q.probe(rotated, dest, opener=Server(429), now=later)['claude']['status'] == 'unknown'

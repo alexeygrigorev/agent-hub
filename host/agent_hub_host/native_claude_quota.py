@@ -9,9 +9,11 @@ tokens lacking user:profile scope, it fails closed cleanly and honestly.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 from pathlib import Path
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +24,14 @@ USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 COUNT_TOKENS_URL = 'https://api.anthropic.com/v1/messages/count_tokens'
 MAX_BODY = 131072
 DEFAULT_MODEL = 'claude-sonnet-4-6'
+# The usage endpoint rate-limits a token after a handful of rapid reads, and
+# every managed launch probes twice (launcher plan + run). One successful
+# reading is shared per token across processes so a launch burst does not
+# turn into 429s and a missing quota source (intake 798f0f8c).
+USAGE_CACHE_FILE = 'claude-usage-cache.json'
+USAGE_REUSE_S = 60
+USAGE_RATE_LIMITED_REUSE_S = 300
+_clock = time.time
 
 
 def resolve_api_model(selected_model):
@@ -291,6 +301,41 @@ def _extract_selected_model(bundle, model=None):
     return None
 
 
+def _usage_cache_path(dest):
+    return Path(dest) / USAGE_CACHE_FILE if dest else None
+
+
+def _token_key(token):
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+def _cached_usage(dest, token, max_age_s, now, selected_model):
+    """Re-parse a recent successful usage reading for this exact token, or None."""
+    path = _usage_cache_path(dest)
+    if path is None:
+        return None
+    try:
+        entry = _json_bytes(private_fs.read_bytes(str(path), MAX_BODY + 4096, private=True))
+        age = _clock() - float(entry['at'])
+        if entry.get('token') != _token_key(token) or not 0 <= age <= max_age_s or not isinstance(entry.get('usage'), dict):
+            return None
+        # Parsed against the current time: a reset that has since passed fails closed.
+        return _parse_usage_payload(entry['usage'], now, selected_model)
+    except Exception:
+        return None
+
+
+def _store_usage(dest, token, data):
+    path = _usage_cache_path(dest)
+    if path is None:
+        return
+    try:
+        raw = json.dumps({'at': _clock(), 'token': _token_key(token), 'usage': data}).encode('utf-8')
+        private_fs.atomic_write(path, raw, MAX_BODY + 4096)
+    except Exception:
+        pass
+
+
 def probe(bundle, dest, opener=None, now=None, model=None, requested_model=None):
     """Probe authoritative managed Claude quota for a portable token bundle."""
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -319,10 +364,15 @@ def probe(bundle, dest, opener=None, now=None, model=None, requested_model=None)
         },
         method='GET',
     )
+    cached = _cached_usage(dest, token, USAGE_REUSE_S, now, selected_model)
+    if cached is not None:
+        return cached
     try:
         with opener.open(req_usage, timeout=15) as resp:
             data = _json_bytes(resp.read(MAX_BODY + 1))
-            return _parse_usage_payload(data, now, selected_model)
+            result = _parse_usage_payload(data, now, selected_model)
+            _store_usage(dest, token, data)
+            return result
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             return {
@@ -338,6 +388,9 @@ def probe(bundle, dest, opener=None, now=None, model=None, requested_model=None)
             # Probe count_tokens preflight for native unified subscription headers.
             pass
         elif exc.code == 429:
+            cached = _cached_usage(dest, token, USAGE_RATE_LIMITED_REUSE_S, now, selected_model)
+            if cached is not None:
+                return cached
             return {
                 'claude': {
                     'status': 'unknown',
