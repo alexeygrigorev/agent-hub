@@ -69,8 +69,6 @@ CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor 
 CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(session_id, actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_cancellations (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_protections (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS session_control_held_cursor (id INTEGER PRIMARY KEY CHECK(id=1), created_at TEXT NOT NULL, session_id TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
 CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL, generation INTEGER NOT NULL, intake_id TEXT NOT NULL, PRIMARY KEY(subject, generation, intake_id));
@@ -267,13 +265,7 @@ export function validateSendProof(proof: any, expected: SendProofExpectation): {
   return { ok: true };
 }
 
-/** Unplaced held sessions; matches the partial index session_control_held_unplaced. */
-export const HELD_UNPLACED_SQL = "SELECT * FROM session_control_sessions INDEXED BY session_control_held_unplaced WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL";
-/** Minimum spacing of the untargeted held-session pass (host polls run it). */
-export const HELD_RECONCILE_INTERVAL_MS = 10_000;
-
 export class SessionControlService {
-  private heldReconcileAt = -Infinity;
   private maxPending: number;
   private maxPerSession: number;
   private claimTtlMs: number;
@@ -1180,142 +1172,112 @@ export class SessionControlService {
       'route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking',
     ]);
     try {
-      // Intake 5551f943: the untargeted pass reads a rotating window over
-      // the partial index session_control_held_unplaced. Always reading the
-      // oldest 20 let never-promotable holds fill the window forever, so
-      // newer memory_pressure holds were never re-placed. It runs on host
-      // polls and list reads, so it is rate-limited and writes its cursor at
-      // most once per pass; a targeted call reads only its own row.
-      const window = Math.max(limit * 4, 20);
-      const now = this.now();
-      let rows: any[];
-      let cursor: any = null;
-      if (targetSessionId) {
-        rows = this.sql.exec(`${HELD_UNPLACED_SQL} AND id = ?`, targetSessionId).toArray() as any[];
-      } else {
-        if (now - this.heldReconcileAt < HELD_RECONCILE_INTERVAL_MS) return { promoted, cancelled };
-        this.heldReconcileAt = now;
-        cursor = this.sql.exec('SELECT created_at, session_id FROM session_control_held_cursor WHERE id = 1').toArray()[0] ?? null;
-        rows = (cursor
-          ? this.sql.exec(`${HELD_UNPLACED_SQL} AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?`,
-              cursor.created_at, cursor.session_id, window).toArray()
-          : this.sql.exec(`${HELD_UNPLACED_SQL} ORDER BY created_at, id LIMIT ?`, window).toArray()) as any[];
-        if (cursor && rows.length < window) {
-          // Wrap: continue from the start, up to (not past) the cursor.
-          rows.push(...this.sql.exec(`${HELD_UNPLACED_SQL} AND (created_at, id) <= (?, ?) ORDER BY created_at, id LIMIT ?`,
-            cursor.created_at, cursor.session_id, window - rows.length).toArray() as any[]);
-        }
+      const rows = this.sql.exec(
+        "SELECT * FROM session_control_sessions WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL ORDER BY created_at ASC, id ASC LIMIT ?",
+        Math.max(limit * 4, 20),
+      ).toArray() as any[];
+      if (targetSessionId && !rows.some((r: any) => r.id === targetSessionId)) {
+        const targetRow = this.sql.exec(
+          "SELECT * FROM session_control_sessions WHERE id = ? AND state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL",
+          targetSessionId,
+        ).toArray()[0] as any;
+        if (targetRow) rows.unshift(targetRow);
       }
-      let last: any = null;
-      let attempts = 0;
-      const gates = new Map<string, boolean>();
       for (const row of rows) {
-        if (promoted >= limit || attempts >= limit) break;
-        if (!targetSessionId) last = row;
-        // One failing row must not abort the pass for every row after it.
+        if (promoted >= limit) break;
+        const req = parsed(row.request_json, {});
+        const holdInfo = this.readHoldInfo(row, req);
+        if (!holdInfo.rejected.length || !holdInfo.rejected.some((r: any) => transientReasons.has(String(r?.reason)))) {
+          continue;
+        }
         try {
-          const req = parsed(row.request_json, {});
-          const holdInfo = this.readHoldInfo(row, req);
-          if (!holdInfo.rejected.length || !holdInfo.rejected.some((r: any) => transientReasons.has(String(r?.reason)))) {
-            continue;
-          }
+          const priorCancel = this.sql.exec('SELECT 1 FROM session_control_cancellations WHERE session_id = ? LIMIT 1', row.id).toArray();
+          if (priorCancel.length) continue;
+        } catch {}
+        let project: string | undefined = undefined;
+        if (typeof req.intake_task_id === 'string' && req.intake_task_id) {
           try {
-            const priorCancel = this.sql.exec('SELECT 1 FROM session_control_cancellations WHERE session_id = ? LIMIT 1', row.id).toArray();
-            if (priorCancel.length) continue;
+            let taskRows: any[] = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id = ?', req.intake_task_id).toArray();
+            if (!taskRows.length && req.intake_task_id.length >= 6) {
+              taskRows = this.sql.exec("SELECT id, data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", req.intake_task_id).toArray();
+            }
+            if (taskRows.length === 1) {
+              const task = parsed(taskRows[0].data, {});
+              project = typeof task?.project === 'string' ? task.project : undefined;
+              if (task?.status === 'done' || task?.status === 'cancelled') {
+                const at = this.at();
+                const closedHold = JSON.stringify({ error: 'intake_task_closed', reason: 'intake_task_closed', rejected: holdInfo.rejected });
+                this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", closedHold, at, row.id);
+                cancelled++;
+                continue;
+              }
+              const links = Array.isArray(task?.history)
+                ? task.history.filter((e: any) => ['link', 'session'].includes(e?.kind) && typeof e?.hub_session_id === 'string' && e.hub_session_id)
+                : [];
+              const ownIdx = links.findIndex((e: any) => e.hub_session_id === row.id);
+              if (ownIdx >= 0 && ownIdx < links.length - 1) {
+                const at = this.at();
+                const supersededHold = JSON.stringify({
+                  error: 'superseded_by_newer_session',
+                  reason: 'superseded_by_newer_session',
+                  superseded_by: links[links.length - 1].hub_session_id,
+                  rejected: holdInfo.rejected,
+                });
+                this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", supersededHold, at, row.id);
+                cancelled++;
+                continue;
+              }
+            }
           } catch {}
-          let project: string | undefined = undefined;
-          if (typeof req.intake_task_id === 'string' && req.intake_task_id) {
-            try {
-              let taskRows: any[] = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id = ?', req.intake_task_id).toArray();
-              if (!taskRows.length && req.intake_task_id.length >= 6) {
-                taskRows = this.sql.exec("SELECT id, data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", req.intake_task_id).toArray();
-              }
-              if (taskRows.length === 1) {
-                const task = parsed(taskRows[0].data, {});
-                project = typeof task?.project === 'string' ? task.project : undefined;
-                if (task?.status === 'done' || task?.status === 'cancelled') {
-                  const at = this.at();
-                  const closedHold = JSON.stringify({ error: 'intake_task_closed', reason: 'intake_task_closed', rejected: holdInfo.rejected });
-                  this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", closedHold, at, row.id);
-                  cancelled++;
-                  continue;
-                }
-                const links = Array.isArray(task?.history)
-                  ? task.history.filter((e: any) => ['link', 'session'].includes(e?.kind) && typeof e?.hub_session_id === 'string' && e.hub_session_id)
-                  : [];
-                const ownIdx = links.findIndex((e: any) => e.hub_session_id === row.id);
-                if (ownIdx >= 0 && ownIdx < links.length - 1) {
-                  const at = this.at();
-                  const supersededHold = JSON.stringify({
-                    error: 'superseded_by_newer_session',
-                    reason: 'superseded_by_newer_session',
-                    superseded_by: links[links.length - 1].hub_session_id,
-                    rejected: holdInfo.rejected,
-                  });
-                  this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", supersededHold, at, row.id);
-                  cancelled++;
-                  continue;
-                }
-              }
-            } catch {}
-          }
-          const mode = row.mode || req.mode || 'headless';
-          if (mode !== 'interactive') {
-            const engineKey = String(req.engine ?? '');
-            if (!gates.has(engineKey)) gates.set(engineKey, this.tbmGate(req.engine ?? undefined).ok);
-            if (!gates.get(engineKey)) continue;
-          }
-          attempts++;
-          const reserved = this.hooks.reserve({
-            ...(req.task_kind !== undefined && req.task_kind !== null ? { task_kind: req.task_kind } : {}),
-            ...(project ? { project } : {}),
-            mode,
-            ...(req.machine ? { machine: req.machine } : {}),
-            ...(req.engine ? { engine: req.engine } : {}),
-            ...(req.tier ? { tier: req.tier } : {}),
-            workspace: req.workspace,
-            cwd: req.cwd ?? null,
-            prompt: req.brief || '',
-            access: req.access ?? undefined,
-            ...(req.with_goal === true ? { with_goal: true } : {}),
-            idempotency_key: 'session-control-' + row.id,
-          }, { caller: { kind: 'agent', actor: row.actor, isAdmin: true }, scopes: ['fleet:launch', 'admin'] });
-          const at = this.at();
-          if (reserved.status === 202 && reserved.value && typeof reserved.value.id === 'string' && reserved.value.state === 'queued') {
-            this.sql.exec(
-              "UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, engine = ?, state = 'queued', hold_json = NULL, updated_at = ? WHERE id = ? AND state = 'held'",
-              reserved.value.id,
-              typeof reserved.value.engine === 'string' && reserved.value.engine ? reserved.value.engine : (req.engine ?? null),
-              at,
-              row.id,
-            );
-            promoted++;
-          } else if (reserved.status >= 200 && reserved.status < 300 && reserved.value && typeof reserved.value.id === 'string') {
-            this.sql.exec(
-              "UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = ?, hold_json = NULL, updated_at = ? WHERE id = ? AND state = 'held'",
-              reserved.value.id,
-              reserved.value.machine ?? null,
-              reserved.value.engine ?? (req.engine ?? null),
-              reserved.value.state || 'offered',
-              at,
-              row.id,
-            );
-            promoted++;
-          } else if (reserved.status >= 300 && reserved.value && JSON.stringify(reserved.value) !== row.hold_json) {
-            this.sql.exec(
-              "UPDATE session_control_sessions SET hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'",
-              JSON.stringify(reserved.value),
-              at,
-              row.id,
-            );
-          }
-        } catch { /* best-effort per row; the cursor still moves past it */ }
-      }
-      // One cursor write per pass, only when it moves.
-      if (last && (last.created_at !== cursor?.created_at || last.id !== cursor?.session_id)) {
-        this.sql.exec(
-          'INSERT INTO session_control_held_cursor (id, created_at, session_id) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at, session_id = excluded.session_id',
-          last.created_at, last.id);
+        }
+        const mode = row.mode || req.mode || 'headless';
+        if (mode !== 'interactive') {
+          const gate = this.tbmGate(req.engine ?? undefined);
+          if (!gate.ok) continue;
+        }
+        const reserved = this.hooks.reserve({
+          ...(req.task_kind !== undefined && req.task_kind !== null ? { task_kind: req.task_kind } : {}),
+          ...(project ? { project } : {}),
+          mode,
+          ...(req.machine ? { machine: req.machine } : {}),
+          ...(req.engine ? { engine: req.engine } : {}),
+          ...(req.tier ? { tier: req.tier } : {}),
+          workspace: req.workspace,
+          cwd: req.cwd ?? null,
+          prompt: req.brief || '',
+          access: req.access ?? undefined,
+          ...(req.with_goal === true ? { with_goal: true } : {}),
+          idempotency_key: 'session-control-' + row.id,
+        }, { caller: { kind: 'agent', actor: row.actor, isAdmin: true }, scopes: ['fleet:launch', 'admin'] });
+        const at = this.at();
+        if (reserved.status === 202 && reserved.value && typeof reserved.value.id === 'string' && reserved.value.state === 'queued') {
+          this.sql.exec(
+            "UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, engine = ?, state = 'queued', hold_json = NULL, updated_at = ? WHERE id = ? AND state = 'held'",
+            reserved.value.id,
+            typeof reserved.value.engine === 'string' && reserved.value.engine ? reserved.value.engine : (req.engine ?? null),
+            at,
+            row.id,
+          );
+          promoted++;
+        } else if (reserved.status >= 200 && reserved.status < 300 && reserved.value && typeof reserved.value.id === 'string') {
+          this.sql.exec(
+            "UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = ?, hold_json = NULL, updated_at = ? WHERE id = ? AND state = 'held'",
+            reserved.value.id,
+            reserved.value.machine ?? null,
+            reserved.value.engine ?? (req.engine ?? null),
+            reserved.value.state || 'offered',
+            at,
+            row.id,
+          );
+          promoted++;
+        } else if (reserved.status >= 300 && reserved.value) {
+          this.sql.exec(
+            "UPDATE session_control_sessions SET hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'",
+            JSON.stringify(reserved.value),
+            at,
+            row.id,
+          );
+        }
       }
     } catch { /* best-effort inside ambient transaction */ }
     return { promoted, cancelled };
@@ -1323,8 +1285,7 @@ export class SessionControlService {
 
   private syncFleetPlacement(sessionId: string): any | null {
     reconcileUnboundFleetSessions(this.sql, this.now());
-    const held = this.sql.exec("SELECT 1 FROM session_control_sessions WHERE id = ? AND state = 'held'", sessionId).toArray().length > 0;
-    if (held) this.reconcileHeldSessions(1, sessionId);
+    this.reconcileHeldSessions(5, sessionId);
     const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
     if (!session || !session.fleet_launch_id) return session;
     if (session.state !== 'queued' && session.state !== 'held') return session;
