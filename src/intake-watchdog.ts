@@ -145,14 +145,13 @@ export class IntakeWatchdog {
   }
   private idleOverride: string | null = null;
   /** Triage gate for the idle kick (intake 7736fdaa): outside the continuous-pickup scope
-   * only work whose newest triage verdict is TRIAGE ACTUAL, or untriaged fresh work (younger
-   * than the 24h forgotten threshold), may be kicked. A negative verdict always wins, even
-   * on fresh work. Returns the skip reason, or null. */
-  private idleKickSkip(t: Obj, policy: QueuePolicy, now: number): string | null {
+   * only an intake whose newest triage verdict is TRIAGE ACTUAL may be kicked; untriaged
+   * work of any age and negative verdicts are skipped (orchestrator decision, 410c "no real
+   * backlog start before triage"). Returns the skip reason, or null. */
+  private idleKickSkip(t: Obj, policy: QueuePolicy): string | null {
     if (policy.projects === null || policy.projects.includes(t.project)) return null;
     const verdict = latestTriageVerdict(t);
-    if (verdict) return verdict === 'ACTUAL' ? null : 'idle_kick_triage_' + verdict.toLowerCase();
-    return now - ms(t.created_at) < DAY ? null : 'idle_kick_untriaged';
+    return verdict === 'ACTUAL' ? null : verdict ? 'idle_kick_triage_' + verdict.toLowerCase() : 'idle_kick_untriaged';
   }
   /** Backlog idle kick (intake 500fd60b AC4): when no intake session has been starting or
    * running for 30 minutes, start the oldest ready intake through the same canonical
@@ -177,7 +176,7 @@ export class IntakeWatchdog {
       for (const item of this.project(tasks, now, context)) {
         const t = byId.get(item.id)!, q = this.queueRow(item.id);
         if (!(item.ready && t.acceptance_criteria?.trim() && q?.state !== 'escalated' && (!q || q.next_at <= now || q.reason === 'watchdog_project_not_enabled'))) continue;
-        const skip = this.idleKickSkip(t, policy, now);
+        const skip = this.idleKickSkip(t, policy);
         if (skip) skipped.push({ t, skip }); else candidates.push(t);
       }
       if (tasks.length < QUEUE_BATCH_SIZE) break;

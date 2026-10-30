@@ -240,7 +240,7 @@ describe('ops liveness (intake 500fd60b)', () => {
     expect(inputs).toHaveLength(1);
   }));
 
-  it('idle kick outside the pickup scope is triage-gated: only TRIAGE ACTUAL backlog or fresh work (intake 7736fdaa)', () => fixture(async (h, clock) => {
+  it('idle kick outside the pickup scope is triage-gated: only TRIAGE ACTUAL intakes, of any age (intake 7736fdaa)', () => fixture(async (h, clock) => {
     h.sql.exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,capabilities) VALUES('ops-host','ops-host','ops-host',?,?)", isoAt(NOW), JSON.stringify({ workspaces: ['demo', 'scoped'] }));
     const OLD = NOW - 3 * 86400000;
     const scope = () => queuePolicyFrom({ HUB_INTAKE_QUEUE_ENABLED: 'true', HUB_INTAKE_QUEUE_PROJECTS: 'scoped' });
@@ -267,10 +267,10 @@ describe('ops liveness (intake 500fd60b)', () => {
     const actual = triaged(intake(h, 'g-actual', 'AC', 'open', 'demo', OLD + 1), 'TRIAGE OBSOLETE — maybe', 'TRIAGE ACTUAL — still needed');
     expect(await kick([untriaged, obsolete, duplicate, done, prose, actual])).toEqual({ result: { task_id: 'g-actual', reason: 'submitted:canonical_queued' }, started: ['g-actual'] });
     expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_audit WHERE task_id='g-actual' AND kind='idle_kick'").one().n).toBe(1);
-    // Fresh outside-scope work (younger than the 24h forgotten threshold) needs no triage.
-    const fresh = intake(h, 'h-fresh', 'AC', 'open', 'demo', NOW - 23 * 3600000);
-    expect((await kick([untriaged, fresh])).started).toEqual(['h-fresh']);
-    // …but a negative verdict on fresh work still wins.
+    // Fresh outside-scope work (younger than 24h) is not exempt: untriaged is skipped too.
+    const fresh = intake(h, 'h-fresh', 'AC', 'open', 'demo', NOW - MIN);
+    expect(await kick([fresh])).toEqual({ result: { task_id: null, reason: 'idle_kick_untriaged' }, started: [] });
+    // A negative verdict on fresh work is skipped as well.
     const freshObsolete = triaged(intake(h, 'h-fresh-obsolete', 'AC', 'open', 'demo', NOW - 5 * 3600000), 'TRIAGE OBSOLETE — superseded');
     expect(await kick([freshObsolete])).toEqual({ result: { task_id: null, reason: 'idle_kick_triage_obsolete' }, started: [] });
     // In-scope intakes keep the previous behaviour: kicked even when old and untriaged.
