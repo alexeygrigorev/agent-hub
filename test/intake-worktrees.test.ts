@@ -178,6 +178,11 @@ describe('detached intake-linked starts (intake 79458f2d)', () => {
     // Detached starts may not name a worktree themselves, and only 'detached' is a valid value.
     expect((await start({ key: 'detached-2', workspace: 'demo', cwd: WT, mode: 'headless', brief: 'x', intake_task_id: t.id, intake_worktree: 'detached' })).body)
       .toMatchObject({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'detached_start_names_worktree' });
+    // Nor any path inside or naming a worktree (review r1).
+    for (const cwd of [WT + '/sub', 'demo-wt-aaaa1111', 'nested/x-wt-y']) {
+      expect((await start({ key: 'detached-sub-' + ++seq, workspace: 'demo', cwd, mode: 'headless', brief: 'x', intake_task_id: t.id, intake_worktree: 'detached' })).body)
+        .toMatchObject({ field: 'intake_worktree', detail: 'detached_start_names_worktree' });
+    }
     expect((await start({ key: 'detached-3', workspace: 'demo', mode: 'headless', brief: 'x', intake_task_id: t.id, intake_worktree: 'shared' })).body)
       .toMatchObject({ error: 'invalid_session_request', field: 'intake_worktree' });
   }));

@@ -38,6 +38,12 @@ export function worktreePathAllowed(path: unknown): path is string {
   return parts.length >= 3 && parts[parts.length - 2] === 'git' && base.includes('-wt-');
 }
 
+/** A path naming an intake worktree anywhere (the tree itself, a subdirectory, a
+ * relative segment): detached starts (79458f2d) must never run inside one. */
+export function namesWorktree(path: unknown): boolean {
+  return typeof path === 'string' && path.split(/[\\/]/).some(seg => seg.includes('-wt-'));
+}
+
 function branchOk(branch: unknown): branch is string {
   return typeof branch === 'string' && branch.length > 0 && branch.length <= 255 && /^[A-Za-z0-9._\/-]+$/.test(branch)
     && !branch.startsWith('-') && !branch.includes('..');
@@ -169,8 +175,6 @@ export class IntakeWorktrees {
   startGuard(taskId: string | null | undefined, request: { machine?: string | null; workspace?: string | null; cwd?: string | null; detached?: boolean }):
     { error?: Obj; machine?: string } {
     if (!taskId) return {}; // unlinked (operator/debug) starts are not intake work
-    // Detached starts (79458f2d) never use the intake's worktree, so they are not pinned to its host.
-    if (request.detached) return {};
     for (const candidate of [request.cwd, request.workspace]) {
       if (!worktreePathAllowed(candidate)) continue;
       const owner = this.ownerOf(request.machine ?? null, candidate);
@@ -178,7 +182,8 @@ export class IntakeWorktrees {
         owner_task_id: owner.task_id, machine: owner.machine,
         detail: 'Two intakes never share a worktree; start this intake in its own worktree.' } };
     }
-    if (request.machine || request.cwd) return {};
+    // Detached starts (79458f2d) never use the intake's worktree, so they are not pinned to its host.
+    if (request.detached || request.machine || request.cwd) return {};
     const pinned = this.sql.exec("SELECT machine FROM intake_worktrees WHERE task_id = ? AND state = 'active' ORDER BY updated_at DESC LIMIT 1",
       taskId).toArray()[0] as Obj | undefined;
     return pinned ? { machine: String(pinned.machine) } : {};

@@ -292,6 +292,35 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     expect(alerts[0]).toContain('dispatch_worktree_refused');
     expect(v.status().states).toMatchObject({ needs_human: 1 });
   }));
+  it('retries a verifier that ran and failed at runtime instead of escalating it as a start failure (review r1)', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = []; const alerts: string[] = [];
+    const v = verifier(h, starts, clock, alerts);
+    const t = await task(h, { title: 'Deploy to prod' });
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    running(h, 'verifier-1', t.id);
+    h.sql.exec("UPDATE session_control_sessions SET state='failed' WHERE id='verifier-1'");
+    h.sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launch_error_json, created_at, updated_at)
+      VALUES ('launch-verifier-1', 'hub:service:intake-verifier', 'human', 'verify', 'k-lv1', '{}', 'hetzner', 'claude', 'acct', 'p', 'headless', 'demo', '', 'failed', 'native-1', ?, ?, ?)`,
+      JSON.stringify({ reason: 'engine_exited_without_result', stage: 'runtime' }), new Date().toISOString(), new Date().toISOString());
+    expect(await tick(v, clock)).toMatchObject({ escalated: 0, launched: 1 });
+    expect(alerts).toHaveLength(0);
+  }));
+  it('treats a 400 refusal carrying a session id as not started (review r1)', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
+    const v = new IntakeVerifier(h.sql, h.intakeService, (f: any) => f(), {
+      start: async (input: any) => { starts.push(input); return { status: 400, body: { id: 'refused-' + starts.length, state: 'refused', reason: 'needs_unmet' } }; },
+      write: (path: string, payload: any) => call(h, path, payload),
+    }, () => clock.now);
+    v.init();
+    const t = await task(h, { title: 'Deploy to prod' });
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    const row = h.sql.exec('SELECT state, session_id, detail FROM intake_verifications WHERE task_id = ?', t.id).one();
+    expect(row).toMatchObject({ state: 'pending', session_id: null, detail: 'verifier start refused: needs_unmet' });
+  }));
   it('never starts the verifier in a prior session\'s intake worktree path', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
     const v = verifier(h, starts, clock);

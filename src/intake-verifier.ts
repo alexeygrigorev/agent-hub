@@ -10,7 +10,7 @@
  * older held completions belong to the operator. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { currentHistory, intakeCompletionHoldReason, intakeHasDoneEvidence } from './intake';
-import { worktreePathAllowed } from './intake-worktrees';
+import { namesWorktree } from './intake-worktrees';
 import { sessionLaunchFailure } from './intake-triage';
 type Obj = Record<string, any>;
 export const VERIFIER_INTERVAL = 25 * 60000; // runs from the */30 scheduler slot
@@ -121,7 +121,7 @@ export class IntakeVerifier {
   private workspace(task: Obj): string {
     const prior = this.rows('SELECT request_json FROM session_control_sessions ORDER BY created_at DESC')
       // Never an intake worktree path: the verifier runs detached from it (79458f2d).
-      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace && !worktreePathAllowed(r.workspace));
+      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace && !namesWorktree(r.workspace));
     if (prior) return prior.workspace;
     const configured = this.rows('SELECT capabilities FROM machines').some(m => {
       const roots = parse(m.capabilities).workspaces;
@@ -167,9 +167,10 @@ export class IntakeVerifier {
     this.set(task, claim, { state: 'starting', engine, request_key: input.key, attempts: attempt, session_id: null });
     let result: { status: number; body: Obj };
     try { result = await this.hooks.start(input); } catch { result = { status: 502, body: { error: 'admission_outcome_unknown' } }; }
-    const id = typeof result.body?.id === 'string' ? result.body.id : null;
+    // Only a 2xx created a startable session; a 400 refusal also carries an id (state "refused").
+    const id = result.status < 300 && typeof result.body?.id === 'string' ? result.body.id : null;
     if (id) { this.set(task, claim, { state: 'requested', session_id: id, detail: null }); return true; }
-    const code = String(result.body?.error || 'admission_refused').slice(0, 128);
+    const code = String(result.body?.reason || result.body?.error || 'admission_refused').slice(0, 128);
     // Refusals that need a person (missing AC) are escalated; capacity refusals retry next tick.
     if (['acceptance_criteria_required'].includes(code)) await this.escalate(task, claim, 'verifier start refused: ' + code);
     else this.set(task, claim, { state: result.status >= 500 ? 'starting' : 'pending', detail: 'verifier start refused: ' + code, attempts: result.status >= 500 ? attempt : attempt - 1 });

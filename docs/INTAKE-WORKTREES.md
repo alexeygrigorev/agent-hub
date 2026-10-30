@@ -47,7 +47,7 @@ asks Hub for the plan:
   runs in its workspace root: Hub never pins it to the worktree's machine,
   resumes, creates or locks the intake worktree for it, and never counts it as
   a live session bound to that worktree. A detached start may not name a
-  `-wt-` workspace or cwd. The hourly backlog triage and the post-DONE
+  workspace or cwd with any `-wt-` path segment (the tree, a subdirectory or a relative name). The hourly backlog triage and the post-DONE
   verifier use it.
 - `{mode: "resume", task_id, worktree_id, path, branch}`: use that worktree. If
   the directory is missing on the host, create it again from fresh

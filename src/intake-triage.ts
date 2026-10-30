@@ -30,19 +30,29 @@ export type TriageHooks = {
   alert?: (subject: string, detail: string | null) => Promise<void>;
 };
 export const TRIAGE_ALERT_SUBJECT = 'backlog-triage-start';
-/** Bounded launch_error reason of a canonical session that failed before running, else null. */
+/** Diagnostic stages after native start: a failure there is a runtime failure, not a start failure. */
+const RUNTIME_STAGES = new Set(['runtime', 'first_action']);
+const REASON = /^[a-z][a-z0-9_]{0,63}$/;
+/** Bounded reason of a canonical session that was refused or failed before
+ * it ever started natively (any pre-start launch_error), else null. */
 export function sessionLaunchFailure(sql: SqlStorage, sessionId: string | null | undefined): string | null {
   if (!sessionId) return null;
-  const s = sql.exec('SELECT state,fleet_launch_id FROM session_control_sessions WHERE id=?', sessionId).toArray()[0] as Obj | undefined;
-  if (!s || s.state !== 'failed') return null;
+  const s = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', sessionId).toArray()[0] as Obj | undefined;
+  if (!s) return null;
+  if (s.state === 'refused') {
+    const reason = parse(s.hold_json).reason;
+    return typeof reason === 'string' && REASON.test(reason) ? reason : 'admission_refused';
+  }
+  if (s.state !== 'failed' || parse(s.binding_json).native_id) return null;
   let launch: Obj | undefined;
   try {
     launch = s.fleet_launch_id ? sql.exec('SELECT launch_error_json,exit_reason,native_id FROM fleet_launches WHERE id=?', s.fleet_launch_id).toArray()[0] as Obj | undefined : undefined;
   } catch { launch = undefined; }
-  // A session that started natively and failed later is not a start failure.
-  if (launch?.native_id && !launch.launch_error_json) return null;
-  const reason = parse(launch?.launch_error_json).reason ?? launch?.exit_reason;
-  return typeof reason === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(reason) ? reason : 'launch_failed';
+  const diagnostic = parse(launch?.launch_error_json);
+  // Started natively and failed later (runtime timeout, exit without result): not a start failure.
+  if (RUNTIME_STAGES.has(diagnostic.stage) || (launch?.native_id && !launch.launch_error_json)) return null;
+  const reason = diagnostic.reason ?? launch?.exit_reason;
+  return typeof reason === 'string' && REASON.test(reason) ? reason : 'launch_failed';
 }
 export function triageBrief(ids: string[]): string {
   return `Hourly Hub backlog triage (intake d8d509d2 AC5). You are a Claude Opus reviewer. Triage each forgotten intake below, oldest first:
@@ -104,7 +114,12 @@ export class IntakeTriage {
       return failure;
     }
     const s = this.rows('SELECT state FROM session_control_sessions WHERE id=?', m.last_session)[0];
-    if (s && (s.state === 'running' || !ACTIVE.has(s.state))) await this.surface(null);
+    // Running (or ended after running) proves the start path works: resolve and
+    // forget it, so an old healthy session never resolves a later refusal's alert.
+    if (!s || s.state === 'running' || !ACTIVE.has(s.state)) {
+      this.sql.exec('UPDATE intake_triage_meta SET last_session=NULL WHERE id=1');
+      if (s) await this.surface(null);
+    }
     return null;
   }
   async tick(source = 'scheduled'): Promise<Obj> {
@@ -149,8 +164,9 @@ export class IntakeTriage {
     let result: { status: number; body: Obj };
     try { result = await this.hooks.start(input); }
     catch { result = { status: 502, body: { error: 'admission_outcome_unknown' } }; }
-    const id = typeof result.body?.id === 'string' ? result.body.id : null;
-    const error = id ? null : String(result.body?.error || 'admission_refused').slice(0, 128);
+    // Only a 2xx created a startable session; a 400 refusal also carries an id (state "refused").
+    const id = result.status < 300 && typeof result.body?.id === 'string' ? result.body.id : null;
+    const error = id ? null : String(result.body?.reason || result.body?.error || 'admission_refused').slice(0, 128);
     if (id) {
       this.sql.exec('UPDATE intake_triage_requests SET session_id=? WHERE request_key=?', id, input.key);
       this.sql.exec('UPDATE intake_triage_meta SET last_session=? WHERE id=1', id);

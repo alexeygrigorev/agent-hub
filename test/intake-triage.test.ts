@@ -130,6 +130,51 @@ describe('hourly intake backlog triage (d8d509d2 AC5)', () => {
     expect(sessionLaunchFailure(h.sql, 'ran')).toBeNull();
     expect(sessionLaunchFailure(h.sql, 'rev-1')).toBe('dispatch_worktree_refused');
   }));
+  it('a reconciled healthy session never resolves a later refusal alert (review r1)', async () => fixture(async h => {
+    const clock = { now: NOW }; const alerts: any[] = []; let reply: any = { status: 202, body: { id: 'rev-0', state: 'queued' } };
+    const tasks = [task('x'), task('y', 29 * HOUR)];
+    const t = build(h, tasks, async () => reply, clock, async (subject: string, detail: string | null) => { alerts.push(detail); });
+    await t.tick();
+    const at = new Date(clock.now).toISOString();
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      VALUES('rev-0','hub:service:intake-triage','k0','{}','claude','headless','stopped',?,?)`, at, at);
+    tasks[0].history.push({ kind: 'note', text: 'TRIAGE ACTUAL — backlog triage' });
+    tasks[1].history.push({ kind: 'note', text: 'TRIAGE ACTUAL — backlog triage' });
+    clock.now += TRIAGE_INTERVAL;
+    expect(await t.tick()).toMatchObject({ state: 'nothing_to_triage' });
+    tasks.push(task('z', 28 * HOUR));
+    reply = { status: 409, body: { error: 'no_capacity' } };
+    for (let i = 0; i < 3; i++) { clock.now += TRIAGE_INTERVAL; expect(await t.tick()).toMatchObject({ state: 'reviewer_refused' }); }
+    tasks.pop();
+    clock.now += TRIAGE_INTERVAL;
+    expect(await t.tick()).toMatchObject({ state: 'nothing_to_triage' });
+    expect(alerts).toEqual([expect.stringContaining('no_capacity')]); // opened once, never resolved and re-opened
+    expect(t.status().start_alert).toBe('no_capacity');
+  }));
+  it('treats a 400 refusal carrying a session id as refused, not started (review r1)', async () => fixture(async h => {
+    const clock = { now: NOW }; const alerts: any[] = [];
+    const t = build(h, [task('x')], async () => ({ status: 400, body: { id: 'refused-1', state: 'refused', reason: 'needs_unmet' } }), clock,
+      async (_s: string, detail: string | null) => { alerts.push(detail); });
+    expect(await t.tick()).toMatchObject({ state: 'reviewer_refused', session_id: null, error: 'needs_unmet' });
+    expect(t.status().pending_requests).toBe(0);
+    expect(alerts).toEqual([expect.stringContaining('needs_unmet')]);
+    const at = new Date(clock.now).toISOString();
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,hold_json,created_at,updated_at)
+      VALUES('refused-2','hub:service:intake-triage','kr','{}','claude','headless','refused',?,?,?)`, JSON.stringify({ reason: 'needs_unmet' }), at, at);
+    expect(sessionLaunchFailure(h.sql, 'refused-2')).toBe('needs_unmet');
+  }));
+  it('never reports a runtime failure of a session that started as a start failure (review r1)', async () => fixture(async h => {
+    const at = new Date(NOW).toISOString();
+    const launch = (id: string, diagnostic: any, native: string | null) => h.sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launch_error_json, created_at, updated_at)
+      VALUES (?, 'hub:service:intake-triage', 'human', 'triage', ?, '{}', 'hetzner', 'claude', 'acct', 'p', 'headless', 'agent-hub', '', 'failed', ?, ?, ?, ?)`, id, 'k-' + id, native, JSON.stringify(diagnostic), at, at);
+    const session = (id: string, launchId: string, binding: any = null) => h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,engine,mode,state,binding_json,created_at,updated_at)
+      VALUES(?,'hub:service:intake-triage',?,'{}',?,'claude','headless','failed',?,?,?)`, id, 'k-' + id, launchId, binding && JSON.stringify(binding), at, at);
+    launch('l-runtime', { reason: 'engine_exited_without_result', stage: 'runtime' }, 'native-1'); session('s-runtime', 'l-runtime');
+    launch('l-first', { reason: 'first_action_missing', stage: 'first_action' }, null); session('s-first', 'l-first');
+    launch('l-bound', { reason: 'engine_runtime_timeout' }, null); session('s-bound', 'l-bound', { native_id: 'native-2' });
+    launch('l-pre', { reason: 'dispatch_worktree_refused', stage: 'dispatch_route' }, null); session('s-pre', 'l-pre');
+    expect(['s-runtime', 's-first', 's-bound', 's-pre'].map(id => sessionLaunchFailure(h.sql, id))).toEqual([null, null, null, 'dispatch_worktree_refused']);
+  }));
   it('surfaces an admission refusal once while retrying hourly', async () => fixture(async h => {
     const clock = { now: NOW }; const alerts: any[] = [];
     const t = build(h, [task('x')], async () => ({ status: 409, body: { error: 'no_capacity' } }), clock,

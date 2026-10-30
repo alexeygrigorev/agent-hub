@@ -1,6 +1,6 @@
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
-import { IntakeWorktrees, worktreePathAllowed } from './intake-worktrees';
+import { IntakeWorktrees, namesWorktree } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
 import { LivenessService } from './liveness';
 import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
@@ -1753,7 +1753,7 @@ export class SessionControlService {
       // linked to an intake for accounting only. It never resumes, creates or
       // locks that intake's worktree, so it may not name a worktree path itself.
       if (input.intake_worktree !== undefined && input.intake_worktree !== 'detached') return response({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'invalid_intake_worktree' }, 400);
-      if (input.intake_worktree === 'detached' && (worktreePathAllowed(input.workspace) || worktreePathAllowed(input.cwd))) {
+      if (input.intake_worktree === 'detached' && (namesWorktree(input.workspace) || namesWorktree(input.cwd))) {
         return response({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'detached_start_names_worktree' }, 400);
       }
       if (!label(input.key)) return response({ error: 'invalid_session_request', field: 'key', detail: 'invalid_key' }, 400);
