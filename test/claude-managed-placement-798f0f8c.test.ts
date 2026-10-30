@@ -31,7 +31,7 @@ describe('managed Claude placement (798f0f8c)', () => {
       expect(response.status).toBe(200);
       for (const machine of machines) {
         const reported = await fleet.handle(new Request('https://hub.test/api/fleet/subscriptions', {
-          method: 'PUT', body: JSON.stringify({ subscriptions: [{ service: 'claude', account: 'hub-claude', quota: {
+          method: 'PUT', body: JSON.stringify({ subscriptions: [{ service: 'claude', account: 'hub-claude', plan: null, quota: {
             status: 'ok', observed_at: iso(), details: { limit_reached: false },
             windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } },
           } }] }),
@@ -69,7 +69,7 @@ describe('managed Claude placement (798f0f8c)', () => {
       }), { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] });
       expect(mixed.status).toBe(200);
       const reported = await fleet.handle(new Request('https://hub.test/api/fleet/subscriptions', {
-        method: 'PUT', body: JSON.stringify({ subscriptions: ['hub-claude', 'shared-claude'].map(account => ({ service: 'claude', account, quota: {
+        method: 'PUT', body: JSON.stringify({ subscriptions: ['hub-claude', 'shared-claude'].map(account => ({ service: 'claude', account, plan: null, quota: {
           status: 'ok', observed_at: iso(), details: { limit_reached: false },
           windows: { weekly: { present: true, percent_remaining: account === 'hub-claude' ? 80 : 99, reset_at: iso(86400000) } },
         } })) }),
