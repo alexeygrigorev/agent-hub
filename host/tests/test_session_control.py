@@ -270,7 +270,7 @@ class TestSessionControlCli(unittest.TestCase):
         args = self.parse('stop', 's1', '--key', 'k3', '--timeout', '2')
         with patch.object(session_control, 'request', return_value={'command_id':'c9','state':'recorded'}), \
                 patch.object(session_control, 'wait_for_command', side_effect=ValueError('Command wait timed out')):
-            with self.assertRaisesRegex(ValueError, 'stop_host_unreachable; command c9'):
+            with self.assertRaisesRegex(ValueError, 'stop_pending; command c9'):
                 session_control.execute(args)
 
     def test_lost_response_keeps_key_for_safe_retry(self):

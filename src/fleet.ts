@@ -12,7 +12,7 @@ import { effectiveCheckin, effectiveRoutesAt } from './registry';
 import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
 import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
-import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './session_control';
+import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { reconcileAccountCapacity } from './account_capacity';
@@ -2213,6 +2213,7 @@ export class FleetService {
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
         if (runtime) this.sql.exec('UPDATE fleet_launches SET runtime_json = ? WHERE id = ?', JSON.stringify(runtime), row.id);
         if (diagnostic) this.sql.exec("UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?", JSON.stringify(diagnostic), diagnostic.reason, row.id);
+        if (data.state === 'running') promoteStartedOffers(this.sql, this.now(), { launchId: row.id });
         if (noStart) this.sql.exec("UPDATE fleet_launches SET exit_reason = ?, verification_status = 'not_started', finished_at = ? WHERE id = ?", data.reason, new Date(this.now()).toISOString(), row.id);
         if (diagnostic?.reason === 'engine_tool_permission_refused' && row.mode === 'headless') {
           this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at, diagnostics_json) VALUES (?, ?, 'unavailable', ?, ?, ?)", row.engine, row.machine_id, diagnostic.reason, new Date(this.now()).toISOString(), JSON.stringify(diagnostic));

@@ -32,7 +32,7 @@ import { initResourceRequestProjection } from './sql-json-projection';
 import { recordIntakeSessionLink, IntakeSessionLinkError, IntakeService } from './intake';
 import { ResourceManagement } from './resource-management';
 import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold } from './session_stall';
-import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, visibleSessionPrefixMatches } from './session_stop';
+import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, stopHostOnline, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
 import { redact } from './routing';
@@ -299,6 +299,9 @@ export class SessionControlService {
     for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['holder_machine', 'TEXT'], ['claim_token', 'TEXT'], ['claim_expires_at', 'TEXT'], ['holder_attempt', 'TEXT'], ['attempts', 'INTEGER DEFAULT 0'], ['host_status', 'TEXT'], ['host_reason', 'TEXT'], ['not_before', 'TEXT']] as const) {
       if (!commandCols.has(col)) this.sql.exec(`ALTER TABLE session_control_commands ADD COLUMN ${col} ${type}`);
     }
+    // Intake 1c8d915e: expireUnclaimedStops runs on every host offers poll, so
+    // its candidates come from live unclaimed stops only (after claim_token exists).
+    this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_unclaimed_stops ON session_control_commands(created_at) WHERE kind = 'stop' AND state IN ('recorded','transported') AND claim_token IS NULL");
     // M15c lifecycle: additive observations/decisions tables. Server-owned
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
@@ -1283,10 +1286,24 @@ export class SessionControlService {
     return { promoted, cancelled };
   }
 
+  /** Launch ids with a routed task on this machine's sessions (routing_launch
+   * index); null when unreadable, which callers treat as routed (fail closed). */
+  private routedLaunchIds(machineId: string): Set<string> | null {
+    try {
+      // CROSS JOIN fixes the order: covering indexes routing_launch then
+      // session_control_fleet_lookup, never the machine's session rows.
+      return new Set((this.sql.exec(`SELECT DISTINCT r.launch_id FROM routing_jobs r
+        CROSS JOIN session_control_sessions s ON s.fleet_launch_id = r.launch_id WHERE s.machine_id = ?`, machineId).toArray() as any[]).map(row => String(row.launch_id)));
+    } catch { return null; }
+  }
+
   private syncFleetPlacement(sessionId: string): any | null {
     reconcileUnboundFleetSessions(this.sql, this.now());
     this.reconcileHeldSessions(5, sessionId);
-    const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
+    let session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
+    if (session?.state === 'offered' && promoteStartedOffers(this.sql, this.now(), { sessionId })) {
+      session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
+    }
     if (!session || !session.fleet_launch_id) return session;
     if (session.state !== 'queued' && session.state !== 'held') return session;
     let launch: any = null;
@@ -1595,15 +1612,26 @@ export class SessionControlService {
       // rebuilds every session's inputs; doing that per row made the host's
       // stop/restart maintenance exceed its HTTP budget at fleet scale.
       const guardRefs = buildSessionInputs(this.sql).refs;
+      // One indexed read per call for receipt proof (null = unreadable: fail closed).
+      const routed = this.routedLaunchIds(caller.machineId!);
       let sessions = rows.filter(row => this.hostOk(row, caller).ok).map(row => {
         const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
         const unstarted = !binding && !row.guard_launch_native &&
           (['failed', 'refused'].includes(row.guard_launch_state) || (row.state === 'stopped' && this.confirmedStopRecorded(row)));
+        // Intake 1c8d915e: a finished headless native is retired from the
+        // host catalog, so its census row can stop short of a terminal phase.
+        // Fleet's own confirmed exit receipt for the exact native (the bound
+        // one, else the launch's own receipt for a never-bound session) is
+        // positive exit proof: receipts require confirmed_exit. Routed task
+        // results are not native receipts and never count here.
+        const receiptNative = binding ? binding.native_id : row.guard_launch_native;
+        const receiptTerminal = !!receiptNative && row.guard_launch_native === receiptNative &&
+          ['exited', 'failed'].includes(row.guard_launch_state) && !!routed && !routed.has(row.fleet_launch_id);
         const protectedSession = binding
           ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.protected_session !== false
-          : !(unstarted && row.guard_owner_kind === 'agent' && !row.guard_explicit_protection);
+          : !((unstarted || receiptTerminal) && row.guard_owner_kind === 'agent' && !row.guard_explicit_protection);
         const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
-        const nativeTerminal = unstarted || !!(native &&
+        const nativeTerminal = unstarted || receiptTerminal || !!(native &&
           native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
           // 'unobserved' is the census writer's positive absence verdict ("an
           // orphan no longer observed is not a live workload"): a native that
@@ -1695,6 +1723,7 @@ export class SessionControlService {
       // headless start must bind even when no client observed the brief
       // offered state before the host claimed it.
       this.transaction(() => this.reconcileHeldSessions());
+      this.transaction(() => promoteStartedOffers(this.sql, this.now(), { machineId: caller.machineId! }));
       const promoted = this.sql.exec("SELECT s.id, s.host_family, f.machine_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE f.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('queued','held') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
       for (const row of promoted) if (this.hostOk(row, caller).ok) this.syncFleetPlacement(row.id);
       const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
@@ -2090,6 +2119,7 @@ export class SessionControlService {
       this.transaction(() => {
         reconcileUnboundFleetSessions(this.sql, this.now());
         this.reconcileHeldSessions();
+        promoteStartedOffers(this.sql, this.now());
         try { this.processDueWakes(); } catch {}
       });
       // M15c lifecycle: additive grouped needs-action projection over the
@@ -2458,6 +2488,15 @@ export class SessionControlService {
         const resolved = this.resolveSessionByName(rawRef, caller);
         if (!resolved.ok) return response({ error: resolved.error }, resolved.status);
         session = resolved.session;
+      }
+      // Intake 1c8d915e: an 'offered' row whose launch has a native receipt
+      // is not an unstarted intent. Settle it first so stop reaches the host
+      // (which stops the correlated native) instead of the no-start
+      // cancellation path. A claim without a native keeps the explicit
+      // session_not_cancellable refusal until no-start is proven.
+      if (session && session.state === 'offered' && (sub === 'stop' || sub === 'cancel') && request.method === 'POST') {
+        this.transaction(() => promoteStartedOffers(this.sql, this.now(), { sessionId: session.id }));
+        session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0] ?? session;
       }
       if (sub === 'link' && request.method === 'POST') {
         if (!admin) return response({ error: 'forbidden' }, 403);
@@ -3222,13 +3261,14 @@ export class SessionControlService {
           if (earlier.length) return response({ error: 'earlier_message_pending' }, 409);
         }
         if (row.kind === 'stop' && !row.claim_token) {
-          const machineRow: any = session.machine_id ? this.sql.exec('SELECT drained, last_checkin_at FROM machines WHERE id = ?', session.machine_id).toArray()[0] : null;
-          const checkinMs = typeof machineRow?.last_checkin_at === 'string' ? Date.parse(machineRow.last_checkin_at) : NaN;
-          const reachable = session.state === 'uncertain' || (machineRow && !machineRow.drained && Number.isFinite(checkinMs) && this.now() - checkinMs <= 180000);
-          const budgetMs = reachable ? REACHABLE_STOP_DELIVERY_MS : STOP_DELIVERY_MS;
+          // The owning host is claiming right now (hostOk above), so it is
+          // reachable; only a drained machine keeps the offline budget.
+          const machineRow: any = session.machine_id ? this.sql.exec('SELECT id, drained, last_checkin_at FROM machines WHERE id = ?', session.machine_id).toArray()[0] : null;
+          const online = stopHostOnline(machineRow, this.now(), caller.machineId);
+          const budgetMs = online || session.state === 'uncertain' ? REACHABLE_STOP_DELIVERY_MS : STOP_DELIVERY_MS;
           if (Date.parse(row.created_at) <= this.now() - budgetMs) {
-            expireUnclaimedStops(this.sql, this.now(), session.id);
-            return response({ error: 'stop_host_unreachable' }, 409);
+            expireUnclaimedStops(this.sql, this.now(), session.id, online ? caller.machineId : undefined);
+            return response({ error: online ? 'stop_not_claimed' : 'stop_host_unreachable' }, 409);
           }
         }
         // Stored-cleanup fence: a cleanup --apply stop whose owner,
@@ -3613,6 +3653,33 @@ function actorName(caller: Caller): string {
  * human authorization controls observed sessions. Normal Hub-started bindings
  * stay completely untouched. Absent records are NOT deleted or stopped.
  */
+/** Intake 1c8d915e: a launch with a native receipt is no longer an offer.
+ * Promote its unbound canonical row to 'starting' (never 'running': that
+ * still requires the exact native binding). Called on the running receipt
+ * and on every host-bindings poll, so a transition lost around a
+ * session-host restart converges within one host cycle. A claim without a
+ * native receipt stays 'offered': until no-start or a native is proven, stop
+ * must keep the explicit session_not_cancellable refusal. */
+export function promoteStartedOffers(sql: SqlStorage, nowMs: number, scope: { launchId?: string; machineId?: string; sessionId?: string } = {}): number {
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (scope.launchId) { where.push('s.fleet_launch_id = ?'); params.push(scope.launchId); }
+  // Unary +: drive from session_control_state ('offered' rows only). Without
+  // ANALYZE statistics the planner would pick the machine_id index instead.
+  if (scope.machineId) { where.push('+s.machine_id = ?'); params.push(scope.machineId); }
+  if (scope.sessionId) { where.push('s.id = ?'); params.push(scope.sessionId); }
+  let rows: any[];
+  // Fleet can run without the session-control tables (tests): nothing to promote.
+  try { rows = sql.exec(`SELECT s.id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id
+    WHERE s.state = 'offered' AND s.binding_json IS NULL AND f.state IN ('starting','running') AND f.native_id IS NOT NULL AND f.machine_id = s.machine_id
+    ${where.length ? 'AND ' + where.join(' AND ') : ''} LIMIT 100`, ...params).toArray() as any[]; } catch { return 0; }
+  const at = new Date(nowMs).toISOString();
+  for (const row of rows) {
+    sql.exec("UPDATE session_control_sessions SET state = 'starting', updated_at = ? WHERE id = ? AND state = 'offered'", at, row.id);
+  }
+  return rows.length;
+}
+
 /** Repair legacy unbound intents from authoritative Fleet terminal receipts.
  * A null session machine is expected for a waitlisted launch. Match by launch
  * identity, never by that stale assignment. Bounded, convergent, and safe to

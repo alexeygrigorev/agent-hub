@@ -3539,6 +3539,7 @@ class Dispatcher:
             pending = []
         pending_done = time.monotonic()
         rows = raw if isinstance(raw, list) else raw.get("sessions", [])
+        skipped = []
         for session in pending:
             if not isinstance(session, dict):
                 continue
@@ -3547,14 +3548,23 @@ class Dispatcher:
                 continue
             from .worktree_guard import protect_adoption
             if not protect_adoption(row, session, request=self.request):
+                # Intake 1c8d915e: a held worktree lock kept a running native
+                # unbound (row stuck offered) with no trace. Report it.
+                skipped.append({'session': str(session.get('id', ''))[:8], 'reason': 'worktree_lock_held'})
                 continue
             try:
                 self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
-            except ValueError:
+            except ValueError as exc:
                 # A refused binding (e.g. server fleet_tag_mismatch for a
                 # launcher-backend tag before the server seam lands) must not
                 # kill the cycle; the entry stays pending for next cycle.
+                code, status = getattr(exc, 'hub_error', None), getattr(exc, 'http_status', None)
+                reason = (code if isinstance(code, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}', code)
+                          else 'binding_http_%d' % status if type(status) is int else 'binding_refused')
+                skipped.append({'session': str(session.get('id', ''))[:8], 'reason': reason})
                 continue
+        if skipped:
+            print(json.dumps({'event': 'bindings_skipped', 'skipped': skipped[:20]}), flush=True)
         print(json.dumps({'event': 'bindings_report_phases', 'sessions': len(metadata),
                           'pending': len(pending), 'phases_s': {
                               'census': round(census_done - started, 3),

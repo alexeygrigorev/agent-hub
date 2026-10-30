@@ -1,34 +1,48 @@
+import { effectiveCheckin } from './registry';
+
 /** Stop delivery is bounded independently of the native execution lease. */
 export const STOP_DELIVERY_MS = 8000;
 export const REACHABLE_STOP_DELIVERY_MS = 60000;
 const HOST_FRESH_CHECKIN_MS = 180000;
 
+/** Intake 1c8d915e: `machines.last_checkin_at` is persisted only on a
+ * changed heartbeat or every five minutes, so freshness must use the
+ * in-memory check-in (effectiveCheckin). The host polling right now is
+ * reachable by definition. stop_host_unreachable is reserved for a host that
+ * is not checking in; an online host that leaves a stop unclaimed past the
+ * reachable budget reports stop_not_claimed instead. */
+export function stopHostOnline(machine: { id?: unknown; drained?: unknown; last_checkin_at?: unknown } | null | undefined, now: number, pollingMachine?: string): boolean {
+  if (!machine || typeof machine.id !== 'string' || machine.drained) return false;
+  if (pollingMachine && machine.id === pollingMachine) return true;
+  const seen = Date.parse(effectiveCheckin(machine.id, machine.last_checkin_at) || '');
+  return Number.isFinite(seen) && now - seen <= HOST_FRESH_CHECKIN_MS;
+}
+
 export function expireUnclaimedStops(sql: SqlStorage, now: number, sessionId?: string, machineId?: string): void {
   const at = new Date(now).toISOString();
   const offlineCutoff = new Date(now - STOP_DELIVERY_MS).toISOString();
   const reachableCutoff = new Date(now - REACHABLE_STOP_DELIVERY_MS).toISOString();
-  const freshCheckinCutoff = new Date(now - HOST_FRESH_CHECKIN_MS).toISOString();
-  sql.exec(`UPDATE session_control_commands SET state = 'failed', ack_json = ?, updated_at = ?
-    WHERE kind = 'stop' AND state IN ('recorded','transported') AND claim_token IS NULL
-    AND (
-      created_at <= ?
-      OR (
-        created_at <= ?
-        AND NOT EXISTS (
-          SELECT 1 FROM session_control_sessions s
-          LEFT JOIN machines m ON m.id = s.machine_id
-          WHERE s.id = session_control_commands.session_id
-            AND (
-              s.state = 'uncertain'
-              OR (m.id IS NOT NULL AND COALESCE(m.drained, 0) = 0 AND m.last_checkin_at IS NOT NULL AND m.last_checkin_at >= ?)
-            )
-        )
-      )
-    )
-    ${sessionId ? 'AND session_id = ?' : ''}
-    ${machineId ? 'AND session_id IN (SELECT id FROM session_control_sessions WHERE machine_id = ?)' : ''}`,
-    JSON.stringify({outcome:'failed', reason:'stop_host_unreachable'}), at, reachableCutoff, offlineCutoff, freshCheckinCutoff,
-    ...(sessionId ? [sessionId] : []), ...(machineId ? [machineId] : []));
+  // A machine-scoped sweep runs inside that host's own offers poll. Candidates
+  // come from the partial index session_control_unclaimed_stops (few rows);
+  // the machine filter rides on the joined session, never a per-poll subquery
+  // scan. Unary + keeps it from driving the join: Durable Object SQLite has no
+  // ANALYZE statistics, so the planner would otherwise prefer machine_id.
+  const rows = sql.exec(`SELECT c.id, c.created_at, s.state AS session_state,
+      m.id AS machine_id, m.drained, m.last_checkin_at
+    FROM session_control_commands c
+    LEFT JOIN session_control_sessions s ON s.id = c.session_id
+    LEFT JOIN machines m ON m.id = s.machine_id
+    WHERE c.kind = 'stop' AND c.state IN ('recorded','transported') AND c.claim_token IS NULL AND c.created_at <= ?
+    ${sessionId ? 'AND c.session_id = ?' : ''}
+    ${machineId ? 'AND +s.machine_id = ?' : ''}`,
+    offlineCutoff, ...(sessionId ? [sessionId] : []), ...(machineId ? [machineId] : [])).toArray() as any[];
+  for (const row of rows) {
+    const online = stopHostOnline(row.machine_id ? { id: row.machine_id, drained: row.drained, last_checkin_at: row.last_checkin_at } : null, now, machineId);
+    if ((online || row.session_state === 'uncertain') && row.created_at > reachableCutoff) continue;
+    sql.exec(`UPDATE session_control_commands SET state = 'failed', ack_json = ?, updated_at = ?
+      WHERE id = ? AND kind = 'stop' AND state IN ('recorded','transported') AND claim_token IS NULL`,
+      JSON.stringify({ outcome: 'failed', reason: online ? 'stop_not_claimed' : 'stop_host_unreachable' }), at, row.id);
+  }
 }
 
 /** A current host observation can renew custody for the SAME adopted tuple.
