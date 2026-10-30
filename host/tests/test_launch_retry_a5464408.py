@@ -115,7 +115,7 @@ class LaunchRetryTests(unittest.TestCase):
                     else:
                         with self.assertRaisesRegex(ValueError, 'worktree_lock_failed'):
                             dispatcher._lock_session_worktree(offer, self.workspace)
-                request.assert_called_once_with('GET', '/api/fleet/worktree-owner/' + owner + '?requester=' + current)
+                request.assert_called_once_with('GET', '/api/fleet/worktree-owner/' + owner)
 
 from agent_hub_host import worktree_guard as guard
 from agent_hub_host.launch_diagnostics import exception_diagnostic

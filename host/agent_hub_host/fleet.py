@@ -1979,9 +1979,7 @@ class Dispatcher:
                 raise ValueError("worktree_identity_failed: original repository could not be recorded")
         def owner_terminal(owner_id):
             try:
-                requester = offer.get("hub_session_id")
-                query = "?requester=" + str(requester) if isinstance(requester, str) and requester else ""
-                fact = self.request('GET', '/api/fleet/worktree-owner/' + owner_id + query)
+                fact = self.request('GET', '/api/fleet/worktree-owner/' + owner_id)
                 return (isinstance(fact, dict) and fact.get('session_id') == owner_id
                         and fact.get('terminal') is True
                         and fact.get('intake_id') == offer.get('intake_task_id'))

@@ -26,8 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .native_sessions import SessionControlError
-from .session_cleanup import BRANCH, _git_common_dir
-from .worktree_guard import _parse_worktree_list, parse_lock_reason
+from .session_cleanup import BRANCH, _git_common_dir, _parse_worktree_list
 
 GIT_TIMEOUT = 30.0
 FETCH_TIMEOUT = 60.0
@@ -281,8 +280,7 @@ def _result(outcome: str, reason: Optional[str], status: Optional[dict], removed
 
 def remove_worktree(path: str, branch: Optional[str] = None, *, live_check: Optional[Callable] = None,
                     git_bin: str = "git", runner: Optional[Callable] = None,
-                    home: Optional[str] = None, fetch: bool = True,
-                    task_id: Optional[str] = None, unlock_hub_lock: bool = False) -> dict[str, Any]:
+                    home: Optional[str] = None, fetch: bool = True) -> dict[str, Any]:
     """Guarded removal: {outcome: ok|refused|error, reason, removed, branch_deleted, status}."""
     runner = runner or default_runner
     try:
@@ -296,13 +294,7 @@ def remove_worktree(path: str, branch: Optional[str] = None, *, live_check: Opti
         return _result("refused", reason, status)
     if entry.get("bare"):
         return _result("refused", "bare repository", status)
-    parsed_lock = parse_lock_reason(entry.get("reason")) if entry.get("locked") else None
-    can_unlock_hub = bool(
-        unlock_hub_lock
-        and parsed_lock is not None
-        and (parsed_lock[1] is None or parsed_lock[1] == task_id)
-    )
-    if entry.get("locked") and not can_unlock_hub:
+    if entry.get("locked"):
         return _result("refused", "worktree locked", status)
     if entry.get("detached") or not status["branch"]:
         return _result("refused", "detached HEAD", status)
@@ -332,14 +324,8 @@ def remove_worktree(path: str, branch: Optional[str] = None, *, live_check: Opti
     main = os.path.dirname(common) if os.path.basename(common) == ".git" else common
     if main == path or main.startswith(path + "/") or not os.path.isdir(main):
         return _result("error", "main repository unknown", status)
-    if entry.get("locked") and can_unlock_hub:
-        _, unlock_err = _git(runner, git_bin, ["worktree", "unlock", path], main)
-        if unlock_err:
-            return _result("error", unlock_err, status)
     _, err = _git(runner, git_bin, ["worktree", "remove", path], main)
     if err:
-        if entry.get("locked") and can_unlock_hub and entry.get("reason"):
-            _git(runner, git_bin, ["worktree", "lock", "--reason", str(entry["reason"]), path], main)
         return _result("error", err, status)
     removed = not os.path.lexists(path)
     _, prune_err = _git(runner, git_bin, ["worktree", "prune"], main)
@@ -490,11 +476,7 @@ def prepare_launch_worktree(request: Callable, launch_id: str, workspace: Any, *
         return None
     if isinstance(plan, dict) and isinstance(plan.get("plan"), dict):
         plan = plan["plan"]  # Hub replies {"plan": {...}}
-    if not isinstance(plan, dict):
-        return None
-    if plan.get("mode") == "none" and plan.get("read_only") is True:
-        return {"action": "read_only", "path": None, "branch": None, "prompt_line": ""}
-    if plan.get("mode") not in ("resume", "create"):
+    if not isinstance(plan, dict) or plan.get("mode") not in ("resume", "create"):
         return None
     try:
         result = ensure_intake_worktree(workspace, plan, git_bin, runner, home=home)
@@ -535,29 +517,6 @@ def launch_cwd(request: Callable, offer: dict, workspace: Any, target_cwd: Any, 
         wt = None
     if wt is None or explicit:
         return target_cwd, "", None
-    if wt.get("action") == "read_only":
-        # Intake ccc50cca: read-only review sessions must never run inside a
-        # linked -wt- checkout (or any subdirectory of one) where _lock_session_worktree
-        # would collide with the implementer's lock. Map back to the main checkout.
-        raw_cwd = str(target_cwd) if target_cwd is not None else ""
-        if raw_cwd and os.path.isdir(raw_cwd):
-            try:
-                proc = _default_runner(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], raw_cwd, GIT_TIMEOUT)
-                if proc.returncode == 0:
-                    common = Path(os.path.realpath(proc.stdout.strip()))
-                    if common.name == ".git" and common.parent.is_dir():
-                        return common.parent, "", None
-            except Exception:  # noqa: BLE001
-                pass
-        parts = Path(raw_cwd).parts if raw_cwd else ()
-        wt_idx = max((i for i, p in enumerate(parts) if "-wt-" in p), default=None)
-        if wt_idx is not None:
-            wt_root = Path(*parts[: wt_idx + 1])
-            main_name = re.sub(r"-wt-[A-Za-z0-9._-]+$", "", wt_root.name)
-            candidate = wt_root.parent / main_name
-            if candidate.is_dir():
-                return candidate, "", None
-        return target_cwd, "", None
     return Path(wt["path"]), wt["prompt_line"] + "\n", wt
 
 
@@ -576,12 +535,8 @@ def _run_command(cmd: dict, *, git_bin: str, runner: Optional[Callable], home: O
         return {"outcome": "ok", "reason": status.get("error"), "status": status,
                 "removed": False, "branch_deleted": False}
     if kind == "remove":
-        return remove_worktree(
-            path, branch, live_check=live_check, git_bin=git_bin,
-            runner=runner, home=home,
-            task_id=cmd.get("task_id") if isinstance(cmd.get("task_id"), str) else None,
-            unlock_hub_lock=cmd.get("unlock_hub_lock") is True,
-        )
+        return remove_worktree(path, branch, live_check=live_check, git_bin=git_bin,
+                               runner=runner, home=home)
     return {"outcome": "error", "reason": f"unsupported command kind {kind!r}", "status": None,
             "removed": False, "branch_deleted": False}
 
