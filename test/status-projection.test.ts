@@ -13,7 +13,10 @@ it('keeps projection and byte totals exact through writes, rollback and cold mig
     {kind: 'link', hub_session_id: 'session'},
   ] };
   const put = (value: any) => h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', 'task', JSON.stringify(value));
+  // Light summaries (3bd2521a) carry only bounded selection fields; anything
+  // event-shaped is hydrated on demand from the bounded id selection.
   const projected = () => h.intakeService.statusTaskSummaries({admin: true})[0];
+  const hydrated = () => h.intakeService.statusTasksByIds({admin: true}, ['task'])[0];
   const verify = () => {
     const usage = h.intakeService.storageUsage();
     const bytes = Number(h.sql.exec('SELECT COALESCE(SUM(length(CAST(data AS BLOB))+length(CAST(id AS BLOB))),0) AS n FROM intake_tasks').one().n);
@@ -28,8 +31,8 @@ it('keeps projection and byte totals exact through writes, rollback and cold mig
     return usage;
   };
   put(task);
-  expect(projected().history.some((e: any) => e.kind === 'note')).toBe(false);
-  expect(h.intakeService.statusContinuation(projected())).toBe('uncertain');
+  expect(projected()).toEqual({ id: 'task', project: 'perf', status: 'open', title: 'Synthetic', version: 1 });
+  expect(h.intakeService.statusContinuation(hydrated())).toBe('uncertain');
   verify();
   for (const kind of ['receipts', 'grants', 'rules']) {
     h.sql.exec(`INSERT INTO intake_${kind}(id,data) VALUES ('fixture',?)`, JSON.stringify({id: 'fixture', text: 'unicode é😀'}));
@@ -41,7 +44,8 @@ it('keeps projection and byte totals exact through writes, rollback and cold mig
   }
   const transcribed = {...task, history: [...task.history, {kind: 'intake', text: 'Transcribed private body'.repeat(200), transcription: 'provided', source: {reference: 'voice'}}]};
   put(transcribed);
-  expect(h.intakeService.statusContinuation(projected())).toBe('blocked');
+  expect(h.intakeService.statusContinuation(hydrated())).toBe('blocked');
+  expect(JSON.stringify(hydrated())).not.toContain('Transcribed private body');
   expect(JSON.stringify(projected())).not.toContain('Transcribed private body');
   const before = verify();
   expect(() => h.ctx.storage.transactionSync(() => { put({...transcribed, status: 'done'}); throw new Error('rollback'); })).toThrow('rollback');
@@ -53,6 +57,7 @@ it('keeps projection and byte totals exact through writes, rollback and cold mig
   // this isolated disposable test DO; all canonical ledger rows survive.
   h.sql.exec('DROP TABLE intake_task_projection');
   h.sql.exec('DROP TABLE intake_storage_totals');
+  h.sql.exec('DROP TABLE intake_status_summary');
   h.intakeService.init();
   const migrated = verify();
   h.intakeService.init();

@@ -696,12 +696,12 @@ export class StatusService {
         const tasks = this.selectTasks(p, project, singleTask, sinceMs, summaries);
         const total = tasks.length;
         const window = tasks.filter(t => !after || t.id > after).slice(0, limit + 1);
-        const page = window.slice(0, limit);
-        const next = window.length > limit ? page[page.length - 1].id : null;
+        const pageIds = window.slice(0, limit).map(t => String(t.id));
+        const next = window.length > limit ? pageIds[pageIds.length - 1] : null;
         const revision = this.intake.statusRevision();
         const now = this.now();
         const nowIso = new Date(now).toISOString();
-        const built = this.buildItems(p, page, hostFilter, sinceMs, now, nowIso);
+        const built = this.buildItems(p, this.intake.statusTasksByIds(p, pageIds), hostFilter, sinceMs, now, nowIso);
         const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
         const agentCounts = this.computeAgentCounts(now);
         const intakeWarn = this.intake.statusIntakeOpenWarning(p, summaries);
@@ -763,7 +763,9 @@ export class StatusService {
         const { project, singleTask, hostFilter, sinceMs } = this.parseViewParams(params, true);
         const summaries = this.intake.statusTaskSummaries(p);
         const selected = this.selectTasks(p, project, singleTask, sinceMs, summaries);
-        const tasks = selected.slice(0, STATUS_BASELINE_CAP);
+        // Hydrate only the capped selection into projected bodies; the summary
+        // scan and this hydration are the task-body work per call (3bd2521a).
+        const tasks = this.intake.statusTasksByIds(p, selected.slice(0, STATUS_BASELINE_CAP).map(t => String(t.id)));
         const revision = this.intake.statusRevision();
         const now = this.now();
         const nowIso = new Date(now).toISOString();
