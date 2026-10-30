@@ -1313,6 +1313,51 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(len(calls), calls_before)
             self.assertEqual(len(requests), requests_before)
 
+    def test_cwd_launch_tombstone_in_engine_cwd_reconciles_and_releases(self):
+        # Intake 2a944c3f: the launcher binds the native session to the engine
+        # cwd, so a --cwd launch's tombstone workspace is target_cwd, not the
+        # workspace root. The record must still settle (no leaked slot).
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / 'ws'; (ws / 'docs').mkdir(parents=True)
+            state = Path(tmp) / 'state'
+            cfg = settings(ws); cfg['capabilities'] = []
+            cfg['aplexer_state_dir'] = str(state)
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': str(ws), 'config_dir': str(ws / 'config')}
+            native_id = '8905ad8e-f4b8-4c61-bbf9-2b58fb01fb4e'
+            offer_id = '02b0ccdf-e2ab-4733-9a14-26a79884f11c'
+            task_id = f'hub-{offer_id}'
+            tomb = state / 'retired-sessions' / native_id
+            tomb.mkdir(parents=True)
+            (tomb / 'tombstone.json').write_text(json.dumps({
+                'cause': 'finished', 'id': native_id, 'tag': f'task-{task_id}',
+                'workspace': str((ws / 'docs').resolve()), 'finished_at_ms': 1792330700000,
+                'exit': {'code': 0, 'signal': None, 'exited_at_ms': 1792330700000}}))
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                return {'id': offer_id, 'state': (body or {}).get('state')}
+            calls = []
+            def runner(argv, **kw):
+                calls.append(argv)
+                if 'reconcile' in argv:
+                    return {'task_id': task_id, 'native_id': native_id, 'state': 'completed-awaiting-review',
+                            'resources_reserved': False}
+                return []
+            d = fleet.Dispatcher(cfg, request, runner, journal_dir=str(Path(tmp) / 'journal'))
+            result_path = ws / '.local' / 'hub-results' / (offer_id + '.json')
+            d._active_launches[offer_id] = {
+                'offer_id': offer_id, 'task_id': task_id, 'tag': f'task-{task_id}', 'mode': 'headless',
+                'native_id': native_id, 'engine': 'codex', 'state': 'running', 'settled': False,
+                'workspace': str(ws.resolve()), 'target_cwd': str((ws / 'docs').resolve()),
+                'result_path': str(result_path), 'incarnation': 1792330666399}
+            with patch('agent_hub_host.retired_native.list_sessions', return_value=[]):
+                reconciled = d.reconcile_launches(terminal_only=True)
+            self.assertEqual([r['id'] for r in reconciled], [offer_id], (requests, calls))
+            post = next(r for r in requests if r[1] == f'/api/fleet/launches/{offer_id}/result')
+            self.assertTrue(post[2]['confirmed_exit'])
+            self.assertIn(post[2]['state'], ('exited', 'failed'))
+            self.assertTrue(d._active_launches[offer_id]['settled'])
+
     def test_midrun_failure_keeps_runtime_cause_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = Path(tmp) / 'ws'

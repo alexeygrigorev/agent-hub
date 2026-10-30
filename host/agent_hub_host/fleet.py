@@ -1831,16 +1831,24 @@ class Dispatcher:
             if not isinstance(engine, str) or not engine:
                 continue
 
-            try:
-                target = NativeTarget(
-                    session_id=record["native_id"],
-                    tag=record["tag"],
-                    workspace=record["workspace"],
-                    created_at_ms=incarnation,
-                    engine=engine,
-                ).validated()
-            except (SessionControlError, KeyError, ValueError, TypeError):
+            # The launcher binds the native session to the engine cwd, which
+            # differs from the workspace root for `--cwd` launches (intake
+            # 2a944c3f); a tombstone only matches its own exact workspace.
+            targets = []
+            for ws in dict.fromkeys(w for w in (record.get("target_cwd"), record.get("workspace")) if w):
+                try:
+                    targets.append(NativeTarget(
+                        session_id=record["native_id"],
+                        tag=record["tag"],
+                        workspace=ws,
+                        created_at_ms=incarnation,
+                        engine=engine,
+                    ).validated())
+                except (SessionControlError, KeyError, ValueError, TypeError):
+                    continue
+            if not targets:
                 continue
+            target = targets[0]
 
             if (not terminal_only and not record.get('health_stop_confirmed')
                     and not record.get('routing_task_id')) and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused'):
@@ -1850,14 +1858,23 @@ class Dispatcher:
                     continue
 
             # 2. Positive retirement verification
-            try:
-                is_retired, tombstone, detail = verify_native_retirement(native, target, state_dir=state_dir)
-            except Exception:
-                continue
+            is_retired = False
+            for candidate in targets:
+                try:
+                    is_retired, tombstone, detail = verify_native_retirement(native, candidate, state_dir=state_dir)
+                except Exception:
+                    continue
+                if is_retired:
+                    target = candidate
+                    break
 
             if not is_retired:
                 from .terminal_reports import retained_terminal_exit
-                is_retired, tombstone, detail = retained_terminal_exit(self, target, record)
+                for candidate in targets:
+                    is_retired, tombstone, detail = retained_terminal_exit(self, candidate, record)
+                    if is_retired:
+                        target = candidate
+                        break
             if not is_retired:
                 continue
 

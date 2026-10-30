@@ -73,7 +73,7 @@ def reconcile_launcher_retired(dispatcher, row, cwd, *, dry_run=False):
             native_workspace = str(workspace)
         if (status.get('state') != 'failed' or payload.get('owner') != 'hub-fleet'
                 or binding.get('task_id') != task_id or binding.get('tag') != 'task-' + task_id
-                or binding.get('workspace') != native_workspace or binding.get('engine') != row.get('engine')):
+                or binding.get('workspace') not in (native_workspace, str(cwd)) or binding.get('engine') != row.get('engine')):
             return False
         target = NativeTarget(session_id=binding['native_id'], tag=binding['tag'], workspace=binding['workspace'],
                               created_at_ms=binding['incarnation'], engine=binding['engine']).validated()
@@ -145,7 +145,8 @@ def reconcile_headless_retired(dispatcher, row, target):
         target_cwd = resolve_offer_cwd(workspace, row.get('cwd'), dispatcher.settings)
     except (ValueError, TypeError, OSError):
         return False
-    if str(workspace) != target.workspace:
+    # The launcher binds the native session to the engine cwd for `--cwd` launches.
+    if target.workspace not in (str(workspace), str(target_cwd)):
         return False
     offer_id = row.get('id')
     if not isinstance(offer_id, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', offer_id):
@@ -157,9 +158,9 @@ def reconcile_headless_retired(dispatcher, row, target):
     if not isinstance(records, dict):
         return False
     exact = dict(offer_id=offer_id, task_id=task_id, native_id=target.session_id,
-                 tag=target.tag, workspace=target.workspace, incarnation=target.created_at_ms,
+                 tag=target.tag, workspace=str(workspace), incarnation=target.created_at_ms,
                  engine=target.engine, mode='headless')
-    result_path = str(Path(target.workspace) / '.local/hub-results' / (offer_id + '.json'))
+    result_path = str(Path(workspace) / '.local/hub-results' / (offer_id + '.json'))
     record = records.get(offer_id)
     if record is None:
         record = {**exact, 'state': 'running', 'settled': False,
