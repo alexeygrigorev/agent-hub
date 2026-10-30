@@ -71,6 +71,9 @@ CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, sessio
 CREATE TABLE IF NOT EXISTS session_control_cancellations (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_protections (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_held_cursor (id INTEGER PRIMARY KEY CHECK(id=1), created_at TEXT NOT NULL, session_id TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS intake_queue_session_task ON session_control_sessions(json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id'));
+CREATE INDEX IF NOT EXISTS session_control_machine_created ON session_control_sessions(machine_id, created_at, id);
+CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sessions(machine_id, state, created_at);
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
@@ -104,6 +107,12 @@ const ACK_OUTCOMES = new Set(['delivered', 'transported', 'refused', 'uncertain'
 const RECENT_STATE_MS = 5 * 60 * 1000;
 const HEADERS = { 'Cache-Control': 'private, no-store' };
 const BOUND_STATES = new Set(['running']);
+/** worktree-guards bounds (intake 4d05302a): every request reads a capped, indexed row set. */
+const GUARD_MAX_IDS = 50;
+const GUARD_PAGE_DEFAULT = 100;
+const GUARD_PAGE_MAX = 200;
+const GUARD_LEGACY_ROWS = 100;
+const GUARD_MAX_CLOSURE = 400;
 const STOPPABLE = new Set(['offered', 'starting', 'running', 'uncertain']);
 export const CLEANUP_APPLY_ALLOWED_STATES = new Set([...STOPPABLE, 'stopped']);
 const BINDABLE = new Set(['offered', 'starting', 'uncertain', 'running']);
@@ -1455,13 +1464,83 @@ export class SessionControlService {
 
   /** Launch ids with a routed task on this machine's sessions (routing_launch
    * index); null when unreadable, which callers treat as routed (fail closed). */
-  private routedLaunchIds(machineId: string): Set<string> | null {
+  private routedLaunchIds(machineId: string, launchIds: string[]): Set<string> | null {
     try {
-      // CROSS JOIN fixes the order: covering indexes routing_launch then
-      // session_control_fleet_lookup, never the machine's session rows.
-      return new Set((this.sql.exec(`SELECT DISTINCT r.launch_id FROM routing_jobs r
-        CROSS JOIN session_control_sessions s ON s.fleet_launch_id = r.launch_id WHERE s.machine_id = ?`, machineId).toArray() as any[]).map(row => String(row.launch_id)));
+      const found = new Set<string>();
+      for (let i = 0; i < launchIds.length; i += 500) {
+        // routing_launch seek per launch id; never the machine's whole history.
+        for (const row of this.sql.exec(`SELECT DISTINCT r.launch_id FROM routing_jobs r
+          WHERE r.launch_id IN (SELECT value FROM json_each(?))`, JSON.stringify(launchIds.slice(i, i + 500))).toArray() as any[]) found.add(String(row.launch_id));
+      }
+      return found;
     } catch { return null; }
+  }
+
+  /**
+   * Bounded read scope for GET /api/sessions/worktree-guards (intake 4d05302a).
+   * Targets are selected by indexed lookup only: explicit `session_id` /
+   * `native_id` / `intake_task_id` (repeatable, at most GUARD_MAX_IDS each), a
+   * keyset page of terminal rows (`cursor` or `limit`), or, for old hosts that
+   * send no parameters, the machine's live rows plus its newest GUARD_LEGACY_ROWS.
+   * The facts for a target also depend on its native aliases and on the other
+   * sessions of its intake, so those rows are loaded too (closure) but never
+   * returned. A closure over GUARD_MAX_CLOSURE fails closed (no unlock).
+   */
+  private worktreeGuardScope(url: URL, caller: Caller): { rows: any[]; targets: Set<string>; nextCursor: string | null;
+    truncated: boolean; snapshot: { sessionIds: string[]; nativeIds: string[] } } {
+    const machineId = caller.machineId!;
+    const NATIVE = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
+      THEN json_extract(binding_json, '$.native_id') END END`;
+    const INTAKE = "json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id')";
+    const list = (name: string): string[] => [...new Set(url.searchParams.getAll(name).flatMap(v => v.split(',')).map(v => v.trim()).filter(Boolean))].slice(0, GUARD_MAX_IDS);
+    const ids = (sql: string, ...args: any[]): string[] => (this.sql.exec(sql, ...args).toArray() as any[]).map(row => String(row.id));
+    const live = ['queued', 'held', 'offered', 'starting', 'running', 'uncertain'];
+    const terminal = ['stopped', 'finished', 'failed', 'refused', 'cancelled'];
+    const sessionIds = list('session_id');
+    const nativeIds = list('native_id');
+    const intakeIds = list('intake_task_id');
+    let nextCursor: string | null = null;
+    const targets = new Set<string>();
+    if (sessionIds.length || nativeIds.length || intakeIds.length) {
+      if (sessionIds.length) for (const id of ids('SELECT id FROM session_control_sessions WHERE id IN (SELECT value FROM json_each(?)) AND +machine_id = ?', JSON.stringify(sessionIds), machineId)) targets.add(id);
+      if (nativeIds.length) for (const id of ids(`SELECT id FROM session_control_sessions WHERE machine_id = ? AND ${NATIVE} IN (SELECT value FROM json_each(?))`, machineId, JSON.stringify(nativeIds))) targets.add(id);
+      if (intakeIds.length) for (const id of ids(`SELECT id FROM session_control_sessions WHERE +machine_id = ? AND ${INTAKE} IN (SELECT value FROM json_each(?)) LIMIT ${GUARD_MAX_CLOSURE}`, machineId, JSON.stringify(intakeIds))) targets.add(id);
+    } else if (url.searchParams.has('cursor') || url.searchParams.has('limit')) {
+      const limit = Math.min(GUARD_PAGE_MAX, Math.max(1, Number(url.searchParams.get('limit')) || GUARD_PAGE_DEFAULT));
+      const params: any[] = [machineId, JSON.stringify(terminal)];
+      const cursorSql = this.cursorClause(url.searchParams.get('cursor'), params, false);
+      const page = this.sql.exec(`SELECT id, created_at FROM session_control_sessions INDEXED BY session_control_machine_created
+        WHERE machine_id = ? AND state IN (SELECT value FROM json_each(?)) ${cursorSql} ORDER BY created_at, id LIMIT ?`, ...params, limit + 1).toArray() as any[];
+      for (const row of page.slice(0, limit)) targets.add(String(row.id));
+      if (page.length > limit) { const last = page[limit - 1]; nextCursor = `${last.created_at}|${last.id}`; }
+    } else {
+      for (const id of ids(`SELECT id FROM session_control_sessions INDEXED BY session_control_machine_state WHERE machine_id = ? AND state IN (SELECT value FROM json_each(?)) LIMIT ${GUARD_LEGACY_ROWS}`, machineId, JSON.stringify(live))) targets.add(id);
+      for (const id of ids(`SELECT id FROM session_control_sessions INDEXED BY session_control_machine_created WHERE machine_id = ? ORDER BY created_at DESC, id DESC LIMIT ${GUARD_LEGACY_ROWS}`, machineId)) targets.add(id);
+    }
+    const select = (where: string, arg: string): any[] => this.sql.exec(`SELECT s.*, f.state AS guard_launch_state, f.native_id AS guard_launch_native,
+      c.kind AS guard_owner_kind, p.session_id AS guard_explicit_protection
+      FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id
+      LEFT JOIN credentials c ON c.id=s.owner_token_id LEFT JOIN session_control_protections p ON p.session_id=s.id
+      WHERE ${where.startsWith('s.id') ? '+s.machine_id' : 's.machine_id'} = ? AND ${where}`, machineId, arg).toArray() as any[];
+    const byId = new Map<string, any>();
+    const load = (where: string, values: string[]) => {
+      for (let i = 0; i < values.length; i += 200) for (const row of select(where, JSON.stringify(values.slice(i, i + 200)))) byId.set(row.id, row);
+    };
+    load('s.id IN (SELECT value FROM json_each(?))', [...targets]);
+    const natives = [...new Set([...byId.values()].map(row => parsed(row.binding_json, null)?.native_id).filter((v: any) => typeof v === 'string' && v))] as string[];
+    const intakes = [...new Set([...byId.values()].map(row => parsed(row.request_json, {})?.intake_task_id).filter((v: any) => typeof v === 'string' && v))] as string[];
+    // Closure: native aliases (expression index) and same-intake siblings.
+    if (natives.length) load(`${NATIVE.replaceAll('binding_json', 's.binding_json')} IN (SELECT value FROM json_each(?))`, natives);
+    let truncated = false;
+    const siblings: string[] = [];
+    for (let i = 0; i < intakes.length; i += 200) {
+      for (const row of this.sql.exec(`SELECT id FROM session_control_sessions WHERE +machine_id = ? AND ${INTAKE} IN (SELECT value FROM json_each(?)) LIMIT ${GUARD_MAX_CLOSURE + 1}`,
+        machineId, JSON.stringify(intakes.slice(i, i + 200))).toArray() as any[]) if (!byId.has(row.id)) siblings.push(String(row.id));
+    }
+    if (siblings.length > GUARD_MAX_CLOSURE) truncated = true;
+    load('s.id IN (SELECT value FROM json_each(?))', siblings.slice(0, GUARD_MAX_CLOSURE));
+    const rows = [...byId.values()].filter(row => this.hostOk(row, caller).ok);
+    return { rows, targets, nextCursor, truncated, snapshot: { sessionIds: rows.map(row => row.id), nativeIds: natives } };
   }
 
   private syncFleetPlacement(sessionId: string): any | null {
@@ -1770,18 +1849,17 @@ export class SessionControlService {
 
     if (path === '/api/sessions/worktree-guards' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
-      const rows: any[] = this.sql.exec(`SELECT s.*, f.state AS guard_launch_state, f.native_id AS guard_launch_native,
-        c.kind AS guard_owner_kind, p.session_id AS guard_explicit_protection
-        FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id
-        LEFT JOIN credentials c ON c.id=s.owner_token_id LEFT JOIN session_control_protections p ON p.session_id=s.id
-        WHERE s.machine_id = ?`, caller.machineId!).toArray();
-      const worktreeLinks = worktreeIntakeSnapshot(this.sql);
+      const scope = this.worktreeGuardScope(url, caller);
+      const rows = scope.rows;
+      const worktreeLinks = worktreeIntakeSnapshot(this.sql, scope.snapshot);
       // One immutable read snapshot for the whole response. classifyKey
       // rebuilds every session's inputs; doing that per row made the host's
       // stop/restart maintenance exceed its HTTP budget at fleet scale.
-      const guardRefs = buildSessionInputs(this.sql).refs;
+      // Scoped to the closure (targets + native aliases + same-intake
+      // siblings): the guard never needs any other session's inputs.
+      const guardRefs = buildSessionInputs(this.sql, new Set(rows.map(row => row.id))).refs;
       // One indexed read per call for receipt proof (null = unreadable: fail closed).
-      const routed = this.routedLaunchIds(caller.machineId!);
+      const routed = this.routedLaunchIds(caller.machineId!, rows.map(row => row.fleet_launch_id).filter(Boolean));
       let sessions = rows.filter(row => this.hostOk(row, caller).ok).map(row => {
         const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
         const unstarted = !binding && !row.guard_launch_native &&
@@ -1830,7 +1908,10 @@ export class SessionControlService {
             (!fact.intake_task_id || sessions.filter(other => other.intake_task_id === fact.intake_task_id).every(other => other.terminal && other.native_terminal && other.lock_release_permitted)),
           linked_intake_open: aliases.some(other => other.linked_intake_open) };
       });
-      return response({ sessions });
+      const wanted = scope.targets; // closure rows inform facts but are never returned
+      const sessions_out = sessions.filter(fact => wanted.has(fact.session_id)).map(fact =>
+        scope.truncated && fact.intake_task_id ? { ...fact, lock_release_permitted: false } : fact);
+      return response({ sessions: sessions_out, next_cursor: scope.nextCursor, bounded: true });
     }
 
     if (path === '/api/sessions/host-bindings' && request.method === 'GET') {

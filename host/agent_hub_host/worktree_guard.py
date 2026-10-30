@@ -28,6 +28,7 @@ import subprocess
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
+from urllib.parse import urlencode
 
 SESSION_ID_RE = re.compile(r"[0-9a-fA-F-]{8,64}\Z")
 INTAKE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -432,6 +433,21 @@ def protect_bound_worktree(git_bin: str, path: str, session_id: Any, intake_id: 
     return ensure_locked(git_bin, root, session_id, intake_id, runner, owner_terminal=owner_terminal)
 
 
+GUARD_PATH = "/api/sessions/worktree-guards"
+GUARD_PAGE = 100
+
+
+def guard_facts(request: Callable, **filters: Any) -> list:
+    """Bounded worktree-guards read (intake 4d05302a).
+
+    `session_id` / `native_id` / `intake_task_id` ask the Worker for just those
+    sessions' facts. An old Worker ignores the parameters and returns its whole
+    list, so callers still select their exact fact locally from the result.
+    """
+    query = urlencode([(k, str(v)) for k, v in filters.items() if v])
+    return request("GET", GUARD_PATH + ("?" + query if query else ""))["sessions"]
+
+
 def reuse_stopped_intake_lock(git_bin: str, path: str, session_id: str,
                              intake_id: Any, request: Callable) -> bool:
     """Reuse protection without unlocking a stopped predecessor's same-intake tree.
@@ -449,7 +465,7 @@ def reuse_stopped_intake_lock(git_bin: str, path: str, session_id: str,
         owner = parse_lock_reason(entry.get("reason")) if entry else None
         if not entry or not entry.get("locked") or not owner or owner[1] != intake_id:
             return False
-        facts = request("GET", "/api/sessions/worktree-guards")["sessions"]
+        facts = guard_facts(request, session_id=",".join([session_id, owner[0]]))
         successor = [f for f in facts if f.get("session_id") == session_id and f.get("intake_task_id") == intake_id]
         previous = [f for f in facts if f.get("session_id") == owner[0] and f.get("intake_task_id") == intake_id]
         if len(successor) != 1 or successor[0].get("terminal") is not False or len(previous) != 1:
@@ -502,7 +518,7 @@ def protect_successor_worktree(request, git_bin, path, session_id, intake_id):
                 return False
             if owner[0] == session_id:
                 return True
-            facts = request('GET', '/api/sessions/worktree-guards')['sessions']
+            facts = guard_facts(request, session_id=owner[0])
             matches = [f for f in facts if isinstance(f, dict) and f.get('session_id') == owner[0]]
             if len(matches) != 1:
                 return False
@@ -676,8 +692,8 @@ def cleanup_permitted(row: Any, request: Callable, git_bin: str = "git") -> bool
         incarnation = row.get("native_created_at_ms", row.get("created_at_ms"))
         if not native_id or type(incarnation) is not int or incarnation <= 0:
             return False
-        result = request("GET", "/api/sessions/worktree-guards")
-        matches = [fact for fact in result["sessions"] if
+        facts = guard_facts(request, native_id=native_id)
+        matches = [fact for fact in facts if
                    fact.get("native_id") == native_id and
                    fact.get("native_created_at_ms") == incarnation and
                    fact.get("tag") == row.get("tag") and
@@ -718,6 +734,7 @@ def protect_adoption(row: dict, session: dict, git_bin: str = "git",
 
 
 _reconcile_offset = 0
+_reconcile_cursor = None
 
 def reconcile_terminal_locks(request: Callable, git_bin: str = "git") -> int:
     """Retry non-destructive lifecycle unlocks, including late DONE/archive.
@@ -725,21 +742,30 @@ def reconcile_terminal_locks(request: Callable, git_bin: str = "git") -> int:
     Server terminal + fresh intake gate, original repo evidence, and exact
     lock ownership are all necessary. Manual/foreign/unknown locks remain.
     """
-    global _reconcile_offset
+    global _reconcile_offset, _reconcile_cursor
     released = 0
     try:
-        facts = request("GET", "/api/sessions/worktree-guards")["sessions"]
+        result = request("GET", GUARD_PATH + "?" + urlencode(
+            [("limit", GUARD_PAGE)] + ([("cursor", _reconcile_cursor)] if _reconcile_cursor else [])))
+        facts = result["sessions"]
+        # A bounded Worker pages terminal sessions with next_cursor (null at
+        # the end: the next pass wraps). An old Worker has no such key and
+        # returns everything: rotate through that list as before.
+        paged = "next_cursor" in result
+        if paged:
+            _reconcile_cursor = result["next_cursor"]
     except Exception:
         return 0
     deadline = time.monotonic() + 20
     if not isinstance(facts, list) or not facts:
         return 0
-    offset = _reconcile_offset % len(facts)
+    offset = 0 if paged else _reconcile_offset % len(facts)
     for index in range(len(facts)):
         if time.monotonic() >= deadline:
             break
         position = (offset + index) % len(facts)
-        _reconcile_offset = position + 1
+        if not paged:
+            _reconcile_offset = position + 1
         fact = facts[position]
         if not isinstance(fact, dict) or fact.get("terminal") is not True or fact.get("native_terminal") is not True or fact.get("linked_intake_open") is not False or fact.get("lock_release_permitted") is False or (fact.get("protected") is not False and fact.get("lock_release_permitted") is not True):
             continue
