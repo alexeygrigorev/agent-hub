@@ -83,6 +83,7 @@ def collect_accounts(settings, *, runner=None):
             if isinstance(row, dict) and isinstance(row.get('account'), str):
                 by_account.setdefault(_canonical_account(row['account']), idx)
         managed_seen = set()
+        unobserved_managed = set()
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ValueError('Invalid managed account catalog')
@@ -93,7 +94,26 @@ def collect_accounts(settings, *, runner=None):
             if key in managed_seen:
                 raise ValueError('Invalid managed account catalog')
             managed_seen.add(key)
-            row = next((r for r in managed if isinstance(r, dict) and r.get('account') == label and r.get('provider') == provider), {})
+            row = next((r for r in managed if isinstance(r, dict) and r.get('account') == label and r.get('provider') == provider), None)
+            if row is None:
+                # quotas() omits a managed account it could not read instead of
+                # masking Hub's own fresh observation with an error row; this
+                # merge must preserve that omission. Publishing a synthesized
+                # observed_at=None error row for a missing reading overwrote the
+                # fresher central row and degraded the pool on every transient
+                # host probe failure (intake b9658e6a: hub-claude flapped
+                # between "unavailable (observed never by hub-server)" and
+                # fresh as the backend collector raced Hub's direct probe).
+                # The managed catalog still owns its canonical account this
+                # cycle (f6709905): a personal row for the same account is
+                # dropped too, never published as a fallback — a healthy
+                # personal token must not mask an unread managed credential.
+                # The stored central row keeps answering: Hub probes managed
+                # credentials directly every few minutes, and a genuinely dead
+                # credential still fails closed there (invalid status, then
+                # staleness) without this host inventing evidence.
+                unobserved_managed.add(key)
+                continue
             quota = quota_snapshot.sanitize_provider(provider, row.get('quota'), now)
             if key in by_account:
                 results[by_account[key]] = {'account': label, 'provider': provider, 'quota': quota}
@@ -103,6 +123,8 @@ def collect_accounts(settings, *, runner=None):
             seen.add(label)
             by_account[key] = len(results)
             results.append({'account': label, 'provider': provider, 'quota': quota})
+        if unobserved_managed:
+            results = [r for r in results if _canonical_account(r.get('account', '')) not in unobserved_managed]
     return {'captured_at': quota_snapshot.format_iso_utc(datetime.datetime.now(datetime.timezone.utc)), 'accounts': results}
 
 
