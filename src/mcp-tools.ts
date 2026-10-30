@@ -135,6 +135,8 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'webhooks show': 'Route administration detail is operator-only product scope; operators use the CLI or dashboard.',
   'webhooks deliveries': 'Delivery inspection is operator-only product scope; operators use the CLI or dashboard.',
   'webhooks test': 'Injects payloads into live sessions; stays an explicit operator action in the CLI, not a model tool.',
+  'ops heartbeat': 'Host ops-watchdog and orchestrator tick reports for Hub-side liveness (intake 500fd60b); a model tool must not fake liveness for the session it runs in.',
+  'ops status': 'Operator view of orchestrator/watchdog liveness and backlog idle episodes; alerts reach operators through the existing alert path.',
 };
 export function publicTools() {
   return routes.map(r => {

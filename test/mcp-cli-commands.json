@@ -69,6 +69,8 @@
   "msg show",
   "msg status",
   "msg whoami",
+  "ops heartbeat",
+  "ops status",
   "plan-agent",
   "quota",
   "release",
