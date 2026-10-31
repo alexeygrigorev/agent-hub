@@ -149,6 +149,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   host_oom: 'A recent host OOM kill requires a placement cooldown.',
   host_runtime_choking: 'Recent session or service failures require a placement cooldown.',
   "workspace_unavailable": "The requested workspace is not available on this host.",
+  "mode_unavailable": "This host does not advertise the requested session mode (e.g. headless without a maintained launcher).",
   "dispatch_route_unconfigured": "The offered account, engine and profile do not match a local route.",
   "goal_startup_unconfigured": "This account has no trusted interactive goal startup command.",
   "dispatch_startup_invalid": "The configured trusted startup command is invalid.",
@@ -1096,7 +1097,8 @@ export class FleetService {
         // fleet actually advertises engines. When nothing live advertises
         // anything (broken/empty registration), keep capability_unavailable.
         reason = (engineMissing && liveEngines.size > 0 && !liveEngines.has(route.engine)) ? 'engine_unavailable'
-          : !engineMissing && !modeMissing && workspaceMissing ? 'workspace_unavailable' : 'capability_unavailable';
+          : !engineMissing && !modeMissing && workspaceMissing ? 'workspace_unavailable'
+          : !engineMissing && modeMissing && !workspaceMissing ? 'mode_unavailable' : 'capability_unavailable';
       }
       // Intake 4398ce2a (Alexey t1523u): the aggregate host gate and launcher
       // telemetry are projections, not refusals. Missing, stale, failed or

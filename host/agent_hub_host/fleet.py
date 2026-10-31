@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import uuid
 import subprocess
 import threading
@@ -608,6 +609,12 @@ def load_settings(path=None):
         raise ValueError("Invalid subscriptions list")
     seen = set()
     for sub in subs:
+        # '{host_python}' resolves to the running host interpreter so configs
+        # never pin a release venv path that breaks on host upgrade.
+        if isinstance(sub, dict):
+            for key in ("quota_argv", "admission_argv", "startup_argv"):
+                if isinstance(sub.get(key), list):
+                    sub[key] = [sys.executable if x == "{host_python}" else x for x in sub[key]]
         if not isinstance(sub, dict) or set(sub) - {"service", "account_label", "plan", "engine", "profile", "quota_argv", "admission_argv", "launcher_provider", "launcher_model", "launcher_effort", "startup_argv", "native_start_argv"}:
             raise ValueError("Subscription accepts metadata and local command references only")
         if "native_start_argv" in sub:
