@@ -340,6 +340,10 @@ export class ProvisioningService {
       // account under provider `codex`, never a separate provider.
       const providerFamily = canonicalQuotaProvider(existing?.provider);
       if (existing && providerFamily !== accountProvider(bundle.provider)) return reply({ error: 'account_provider_mismatch' }, 409);
+      // Same quota family is not enough: a managed label never switches harness
+      // (gemini <-> antigravity), which would strand its credential under other paths.
+      const prior: any = this.sql.exec('SELECT provider FROM engine_bundles WHERE label=?', label).toArray()[0];
+      if (prior && prior.provider !== bundle.provider) return reply({ error: 'account_provider_mismatch' }, 409);
       if (!managed && existing) {
         // An explicit recovery may attach credentials to a stale registry pool,
         // but must neither rename the quota pool nor reset its limits.

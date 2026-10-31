@@ -656,7 +656,7 @@ def validate(bundle):
         raise ValueError('Gemini needs machine login or a Hub-held OAuth credential')
     if bundle['provider'] == 'go' and (bundle.get('files') or bundle.get('env')):
         raise ValueError('OpenCode uses native device login; credential bundles are unsupported')
-    if bundle['provider'] == 'antigravity' and (bundle.get('env') or bundle.get('auth_method') is not None or
+    if bundle['provider'] == 'antigravity' and (bundle.get('env') or 'auth_method' in bundle or
                                                 list(bundle.get('files') or {}) != [ANTIGRAVITY_TOKEN]):
         raise ValueError('Antigravity needs exactly its Hub-held OAuth token')
     if not isinstance(bundle.get('version'), str) or not re.fullmatch(r'\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?', bundle['version']):
@@ -1091,6 +1091,12 @@ def install(bundle, request=None):
     write_json(dest / 'bundle.json', bundle)
 
 
+def managed_model_allowed(provider, model, policy):
+    """Antigravity is a harness on the Gemini policy family (see model_contract)."""
+    family = 'gemini' if provider == 'antigravity' else provider
+    return any(m['provider'] == family and m['model'] == model for m in policy)
+
+
 def antigravity_pinned_version():
     from .bootstrap_pins import ANTIGRAVITY_RELEASES
     versions = {r.get('version') for r in ANTIGRAVITY_RELEASES.values()}
@@ -1102,8 +1108,10 @@ def antigravity_pinned_version():
 def install_antigravity(bundle, dest):
     """The sha512-pinned Antigravity CLI release (bootstrap_pins), into this bundle only."""
     from . import bootstrap
-    if bundle['version'] != antigravity_pinned_version():
-        raise ValueError('Antigravity version is not the pinned release')
+    # Each host installs the release pinned in its own reviewed source, so a pin
+    # bump never strands bundles imported earlier; the bundle version is the
+    # import-time pin, kept for display only.
+    antigravity_pinned_version()
     engine = dest / 'engine'
     for sub in ('bin', 'tmp'):
         (engine / sub).mkdir(parents=True, exist_ok=True)
@@ -1305,7 +1313,7 @@ def launcher_metadata(provider, bundle=None):
     elif provider == 'antigravity':
         return {
             'launcher_provider': 'antigravity',
-            'launcher_model': model or 'gemini-3.8-flash-high',
+            'launcher_model': model or 'gemini-4-argon-high',
             'launcher_effort': effort,
         }
     return {}
@@ -1518,7 +1526,7 @@ def execute():
         requested_model = native_model(extra_argv)
         if requested_model and b['provider'] != 'go':
             from .model_contract import replace_model_args, policy_models
-            if not any(m['provider'] == b['provider'] and m['model'] == requested_model for m in policy_models()):
+            if not managed_model_allowed(b['provider'], requested_model, policy_models()):
                 raise ValueError('model_unsupported: managed provider model')
             b = dict(b, args=replace_model_args(b['args'], requested_model)[:-2])
         if b.get('provider') == 'go' and extra_argv and extra_argv[0] == 'run':

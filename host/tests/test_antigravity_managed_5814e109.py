@@ -30,6 +30,8 @@ def test_validate_accepts_only_the_hub_held_token():
                 agy_bundle(files={TOKEN: 'x', '.gemini/settings.json': '{}'}), agy_bundle(auth_method='machine-login')):
         with pytest.raises(ValueError):
             p.validate(bad)
+    with pytest.raises(ValueError):
+        p.validate(agy_bundle(auth_method=None))
 
 
 def test_install_uses_the_pinned_release_into_the_bundle(tmp_path):
@@ -48,9 +50,11 @@ def test_install_uses_the_pinned_release_into_the_bundle(tmp_path):
     assert p.executable_path(agy_bundle(), tmp_path, is_windows=True) == tmp_path / 'engine/bin/agy.exe'
 
 
-def test_install_refuses_unpinned_versions_and_hides_installer_errors(tmp_path):
-    with pytest.raises(ValueError, match='not the pinned release'):
-        p.install_antigravity(agy_bundle(version='9.9.9'), tmp_path)
+def test_pin_bump_never_strands_older_bundles_and_installer_errors_stay_hidden(tmp_path):
+    seen = []
+    with patch('agent_hub_host.bootstrap.ensure_antigravity', lambda root: seen.append(root)):
+        p.install_antigravity(agy_bundle(version='1.4.9'), tmp_path)
+    assert seen == [tmp_path / 'engine']
 
     def broken(root):
         raise RuntimeError('/private/path token=abc')
@@ -84,3 +88,13 @@ def test_cli_import_sends_only_the_token_file_and_never_echoes_it(tmp_path, caps
     assert 'private-agy-marker' not in capsys.readouterr().out
     with pytest.raises(ValueError, match='only its OAuth token'):
         p.command(SimpleNamespace(**{**vars(args), 'config_file': str(token)}))
+
+
+def test_requested_models_resolve_through_the_gemini_policy_family():
+    from agent_hub_host.model_contract import policy_models
+    policy = policy_models()
+    default = p.launcher_metadata('antigravity', {'args': []})['launcher_model']
+    assert p.managed_model_allowed('antigravity', default, policy)
+    assert p.managed_model_allowed('antigravity', 'gemini-4-argon-high', policy)
+    assert not p.managed_model_allowed('antigravity', 'opus', policy)
+    assert not p.managed_model_allowed('antigravity', 'gemini-0-unknown', policy)

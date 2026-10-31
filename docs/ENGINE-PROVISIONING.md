@@ -305,7 +305,11 @@ hub engines add --provider antigravity --label shared-agy \
 
 Hosts install the sha512-pinned Antigravity CLI release from
 `host/agent_hub_host/bootstrap_pins.py` into the bundle (never npm or a mutable
-latest), and the account joins the Gemini quota pool with engine `antigravity`.
+latest). Each host installs the pin of its own release, so a pin bump never
+strands an account imported earlier; the bundle version is display-only. The
+account joins the Gemini quota pool with engine `antigravity`, requested models
+resolve through the Gemini policy family, and a label never switches between
+`gemini` and `antigravity`.
 No direct quota probe exists for it yet, so admission reports quota unknown.
 
 ## Canonical managed-engine root (intake 59a6f44a AC1)

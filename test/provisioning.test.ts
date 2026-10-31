@@ -108,8 +108,11 @@ describe('central engine provisioning', () => {
     expect(synced.engines[0].files[token]).toBe('synthetic-agy-token');
     expect((await s.handle(req('/shared-agy', 'POST', { revision: add.revision }), host)).status).toBe(200);
     expect(sql.exec('SELECT engine, account, profile FROM fleet_routes').toArray()).toEqual([{ engine: 'antigravity', account: 'shared-agy', profile: 'hub-shared-agy' }]);
-    // Re-import keeps the same pool (no provider mismatch against gemini).
+    // Re-import keeps the same pool (no provider mismatch against gemini)...
     expect((await s.handle(req('/shared-agy', 'PUT', agy), admin)).status).toBe(200);
+    // ...but the label never switches harness within the Gemini family.
+    expect((await s.handle(req('/shared-agy', 'PUT', { ...agy, provider: 'gemini', files: { '.gemini/oauth_creds.json': '{}' } }), admin)).status).toBe(409);
+    expect(sql.exec("SELECT provider FROM engine_bundles WHERE label='shared-agy'").one().provider).toBe('antigravity');
   }));
   it('denies unauthenticated, agents, stale host families and admin download of credentials', async () => fixture(async (s, _sql, allow) => {
     expect((await s.handle(req(), {})).status).toBe(401);
