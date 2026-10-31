@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS session_control_protections (session_id TEXT PRIMARY 
 CREATE TABLE IF NOT EXISTS session_control_held_cursor (id INTEGER PRIMARY KEY CHECK(id=1), created_at TEXT NOT NULL, session_id TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS intake_queue_session_task ON session_control_sessions(json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id'));
 CREATE INDEX IF NOT EXISTS session_control_machine_created ON session_control_sessions(machine_id, created_at, id);
+CREATE INDEX IF NOT EXISTS session_control_machine_created_state ON session_control_sessions(machine_id, created_at, id, state);
 CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sessions(machine_id, state, created_at);
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
@@ -1486,6 +1487,17 @@ export class SessionControlService {
    * sessions of its intake, so those rows are loaded too (closure) but never
    * returned. A closure over GUARD_MAX_CLOSURE fails closed (no unlock).
    */
+  /** hostOk depends only on (machine_id, host_family) per caller: evaluate each distinct pair once per request. */
+  private hostOkMemo(caller: Caller): (row: { machine_id?: string | null; host_family?: string | null }) => boolean {
+    const memo = new Map<string, boolean>();
+    return row => {
+      const key = `${row.machine_id ?? ''}|${row.host_family ?? ''}`;
+      let ok = memo.get(key);
+      if (ok === undefined) { ok = this.hostOk(row, caller).ok; memo.set(key, ok); }
+      return ok;
+    };
+  }
+
   private worktreeGuardScope(url: URL, caller: Caller): { rows: any[]; targets: Set<string>; nextCursor: string | null;
     truncated: boolean; snapshot: { sessionIds: string[]; nativeIds: string[] } } {
     const machineId = caller.machineId!;
@@ -1500,16 +1512,30 @@ export class SessionControlService {
     const nativeIds = list('native_id');
     const intakeIds = list('intake_task_id');
     let nextCursor: string | null = null;
+    let truncated = false;
     const targets = new Set<string>();
+    // Pages one intake's sessions on this machine by (expression index, rowid)
+    // in GUARD_PAGE_MAX steps; stops (returns false) once the visitor says the
+    // budget is exhausted while more rows remain, so a hidden row is never silent.
+    const eachIntakeRow = (taskId: string, visit: (id: string) => boolean): boolean => {
+      let after = -1;
+      for (;;) {
+        const page = this.sql.exec(`SELECT rowid AS rid, id FROM session_control_sessions WHERE ${INTAKE} = ? AND rowid > ? AND +machine_id = ? ORDER BY rowid LIMIT ${GUARD_PAGE_MAX + 1}`,
+          taskId, after, machineId).toArray() as any[];
+        for (const row of page.slice(0, GUARD_PAGE_MAX)) if (!visit(String(row.id))) return false;
+        if (page.length <= GUARD_PAGE_MAX) return true;
+        after = page[GUARD_PAGE_MAX - 1].rid;
+      }
+    };
     if (sessionIds.length || nativeIds.length || intakeIds.length) {
       if (sessionIds.length) for (const id of ids('SELECT id FROM session_control_sessions WHERE id IN (SELECT value FROM json_each(?)) AND +machine_id = ?', JSON.stringify(sessionIds), machineId)) targets.add(id);
       if (nativeIds.length) for (const id of ids(`SELECT id FROM session_control_sessions WHERE machine_id = ? AND ${NATIVE} IN (SELECT value FROM json_each(?))`, machineId, JSON.stringify(nativeIds))) targets.add(id);
-      if (intakeIds.length) for (const id of ids(`SELECT id FROM session_control_sessions WHERE +machine_id = ? AND ${INTAKE} IN (SELECT value FROM json_each(?)) LIMIT ${GUARD_MAX_CLOSURE}`, machineId, JSON.stringify(intakeIds))) targets.add(id);
+      for (const taskId of intakeIds) if (!eachIntakeRow(taskId, id => { targets.add(id); return targets.size <= GUARD_MAX_CLOSURE; })) truncated = true;
     } else if (url.searchParams.has('cursor') || url.searchParams.has('limit')) {
       const limit = Math.min(GUARD_PAGE_MAX, Math.max(1, Number(url.searchParams.get('limit')) || GUARD_PAGE_DEFAULT));
       const params: any[] = [machineId, JSON.stringify(terminal)];
-      const cursorSql = this.cursorClause(url.searchParams.get('cursor'), params, false);
-      const page = this.sql.exec(`SELECT id, created_at FROM session_control_sessions INDEXED BY session_control_machine_created
+      const cursorSql = this.cursorClause(url.searchParams.get('cursor'), params, false, true);
+      const page = this.sql.exec(`SELECT id, created_at FROM session_control_sessions INDEXED BY session_control_machine_created_state
         WHERE machine_id = ? AND state IN (SELECT value FROM json_each(?)) ${cursorSql} ORDER BY created_at, id LIMIT ?`, ...params, limit + 1).toArray() as any[];
       for (const row of page.slice(0, limit)) targets.add(String(row.id));
       if (page.length > limit) { const last = page[limit - 1]; nextCursor = `${last.created_at}|${last.id}`; }
@@ -1531,15 +1557,16 @@ export class SessionControlService {
     const intakes = [...new Set([...byId.values()].map(row => parsed(row.request_json, {})?.intake_task_id).filter((v: any) => typeof v === 'string' && v))] as string[];
     // Closure: native aliases (expression index) and same-intake siblings.
     if (natives.length) load(`${NATIVE.replaceAll('binding_json', 's.binding_json')} IN (SELECT value FROM json_each(?))`, natives);
-    let truncated = false;
-    const siblings: string[] = [];
-    for (let i = 0; i < intakes.length; i += 200) {
-      for (const row of this.sql.exec(`SELECT id FROM session_control_sessions WHERE +machine_id = ? AND ${INTAKE} IN (SELECT value FROM json_each(?)) LIMIT ${GUARD_MAX_CLOSURE + 1}`,
-        machineId, JSON.stringify(intakes.slice(i, i + 200))).toArray() as any[]) if (!byId.has(row.id)) siblings.push(String(row.id));
+    // Fail closed: more than GUARD_MAX_CLOSURE unseen siblings may hide a live
+    // owner, so `truncated` withholds every unlock on those intakes. Counting
+    // happens on the unseen siblings themselves, never on the raw SQL row count.
+    const siblings = new Set<string>();
+    for (const taskId of intakes) {
+      if (!eachIntakeRow(taskId, id => { if (!byId.has(id)) siblings.add(id); return siblings.size <= GUARD_MAX_CLOSURE; })) { truncated = true; break; }
     }
-    if (siblings.length > GUARD_MAX_CLOSURE) truncated = true;
-    load('s.id IN (SELECT value FROM json_each(?))', siblings.slice(0, GUARD_MAX_CLOSURE));
-    const rows = [...byId.values()].filter(row => this.hostOk(row, caller).ok);
+    load('s.id IN (SELECT value FROM json_each(?))', [...siblings].slice(0, GUARD_MAX_CLOSURE));
+    const hostAllowed = this.hostOkMemo(caller);
+    const rows = [...byId.values()].filter(hostAllowed);
     return { rows, targets, nextCursor, truncated, snapshot: { sessionIds: rows.map(row => row.id), nativeIds: natives } };
   }
 
@@ -1568,14 +1595,16 @@ export class SessionControlService {
   }
 
   /** Cursor pagination over (created_at, id): complete pages, no silent truncation. */
-  private cursorClause(cursor: unknown, params: any[], desc: boolean): string {
+  private cursorClause(cursor: unknown, params: any[], desc: boolean, rowValue = false): string {
     if (typeof cursor !== 'string' || !cursor) return '';
     const sep = cursor.indexOf('|');
     if (sep < 0) return '';
     const [at, id] = [cursor.slice(0, sep), cursor.slice(sep + 1)];
     if (!at || !UUID_RE.test(id)) return '';
-    params.push(at, at, id);
     const op = desc ? '<' : '>';
+    // Row-value seek lets SQLite range-scan an index on (created_at, id).
+    if (rowValue) { params.push(at, id); return `AND (created_at, id) ${op} (?, ?)`; }
+    params.push(at, at, id);
     return `AND (created_at ${op} ? OR (created_at = ? AND id ${op} ?))`;
   }
 
@@ -1857,10 +1886,10 @@ export class SessionControlService {
       // stop/restart maintenance exceed its HTTP budget at fleet scale.
       // Scoped to the closure (targets + native aliases + same-intake
       // siblings): the guard never needs any other session's inputs.
-      const guardRefs = buildSessionInputs(this.sql, new Set(rows.map(row => row.id))).refs;
+      const guardRefs = buildSessionInputs(this.sql, new Set(rows.map(row => row.id)), { taskLinks: false }).refs;
       // One indexed read per call for receipt proof (null = unreadable: fail closed).
       const routed = this.routedLaunchIds(caller.machineId!, rows.map(row => row.fleet_launch_id).filter(Boolean));
-      let sessions = rows.filter(row => this.hostOk(row, caller).ok).map(row => {
+      let sessions = rows.map(row => { // scope.rows already passed the per-request host gate
         const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
         const unstarted = !binding && !row.guard_launch_native &&
           (['failed', 'refused'].includes(row.guard_launch_state) || (row.state === 'stopped' && this.confirmedStopRecorded(row)));

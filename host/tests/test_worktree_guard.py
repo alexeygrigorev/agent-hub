@@ -502,10 +502,21 @@ class LifecycleReconciliationTests(unittest.TestCase):
             self.assertEqual(guard.reconcile_terminal_locks(request), 1)
             self.assertEqual(guard.reconcile_terminal_locks(request), 1)
             self.assertEqual(guard.reconcile_terminal_locks(request), 1)
-        self.assertEqual([p.split('&')[-1] for p in paths], ['limit=100'[:0] or paths[0].split('&')[-1], 'cursor=c1', 'limit=100'][:3] if False else [paths[0].split('&')[-1], 'cursor=c1', paths[2].split('&')[-1]])
+        self.assertEqual([p.split('?', 1)[1] for p in paths], ['limit=100', 'limit=100&cursor=c1', 'limit=100'])
         self.assertNotIn('cursor', paths[0])
         self.assertIn('cursor=c1', paths[1])
         self.assertNotIn('cursor', paths[2])  # wrapped after the last page
+        guard._reconcile_cursor = None
+
+    def test_cursor_does_not_advance_when_the_deadline_cuts_a_page(self):
+        guard._reconcile_cursor = None
+        fact = dict(session_id='11111111', terminal=True, native_terminal=True, linked_intake_open=False, protected=False)
+        request = lambda method, path: {'sessions': [fact, fact], 'next_cursor': 'c9'}
+        with patch.object(guard.time, 'monotonic', side_effect=[0, 100, 100, 100]):
+            guard.reconcile_terminal_locks(request)
+        self.assertIsNone(guard._reconcile_cursor)
+        guard.reconcile_terminal_locks(request)
+        self.assertEqual(guard._reconcile_cursor, 'c9')
         guard._reconcile_cursor = None
 
     def test_adoption_does_not_invent_original_repository(self):

@@ -752,16 +752,19 @@ def reconcile_terminal_locks(request: Callable, git_bin: str = "git") -> int:
         # the end: the next pass wraps). An old Worker has no such key and
         # returns everything: rotate through that list as before.
         paged = "next_cursor" in result
-        if paged:
-            _reconcile_cursor = result["next_cursor"]
+        next_cursor = result.get("next_cursor")
     except Exception:
         return 0
     deadline = time.monotonic() + 20
     if not isinstance(facts, list) or not facts:
+        if paged:
+            _reconcile_cursor = next_cursor
         return 0
     offset = 0 if paged else _reconcile_offset % len(facts)
+    completed = True
     for index in range(len(facts)):
         if time.monotonic() >= deadline:
+            completed = False
             break
         position = (offset + index) % len(facts)
         if not paged:
@@ -775,4 +778,7 @@ def reconcile_terminal_locks(request: Callable, git_bin: str = "git") -> int:
             continue
         if release_session_lock(git_bin, path, fact.get("session_id"), terminal=True, intake_state="done"):
             released += 1
+    # Advance only past a fully-walked page: a deadline break re-reads it next pass.
+    if paged and completed:
+        _reconcile_cursor = next_cursor
     return released

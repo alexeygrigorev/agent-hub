@@ -8,7 +8,7 @@ import { SCOPE_POLICY_VERSION, SCOPE_VERDICTS, classifyScope, getScopeStatus, sc
 type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
-import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, initSessionLinks, triageTargets, workerAccessContext, workerCreatedTargets, workerLinkedTargets } from './worker-access';
+import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, initSessionLinks, initLinkRefs, triageTargets, workerAccessContext, workerCreatedTargets, workerLinkedTargets } from './worker-access';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
@@ -303,6 +303,7 @@ export class IntakeService {
       for (const op of ['UPDATE', 'DELETE']) this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_note_archive_no_' + op.toLowerCase() +
         ' BEFORE ' + op + " ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
       initSessionLinks(this.sql);
+      initLinkRefs(this.sql);
       // Independent, append-only lifecycle ledger. No FK: survives loss of a task row.
       this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, project TEXT NOT NULL,

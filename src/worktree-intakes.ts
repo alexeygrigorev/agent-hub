@@ -20,21 +20,13 @@ export type WorktreeIntakeSnapshot = {
 /** Restricts the snapshot to what a bounded set of sessions can reference. */
 export type WorktreeSnapshotScope = { sessionIds: string[]; nativeIds: string[] };
 
+function parseNative(raw: unknown): string | null {
+  try { const v = JSON.parse(String(raw || '{}')); return v && typeof v.native_id === 'string' && v.native_id ? v.native_id : null; } catch { return null; }
+}
+
 export function worktreeIntakeSnapshot(sql: SqlStorage, scope?: WorktreeSnapshotScope): WorktreeIntakeSnapshot {
   try {
     const machines = sql.exec('SELECT id, hostname FROM machines').toArray();
-    // Scoped: only projections whose link events mention a scoped session or
-    // native id can protect a scoped session (openWorktreeIntake matches on
-    // exactly those). The text prefilter keeps unrelated link JSON unparsed.
-    const needles = scope ? JSON.stringify([...scope.sessionIds, ...scope.nativeIds]) : '[]';
-    const projectionRows = scope
-      ? sql.exec('SELECT id, links FROM intake_task_projection WHERE EXISTS (SELECT 1 FROM json_each(?) j WHERE instr(links, j.value) > 0)', needles).toArray()
-      : sql.exec('SELECT id, links FROM intake_task_projection').toArray();
-    const projections = projectionRows.map((row: any) => {
-      const links = JSON.parse(row.links);
-      if (!Array.isArray(links)) throw new Error('invalid intake link projection');
-      return { id: row.id, links };
-    });
     const NATIVE = `CASE WHEN json_valid(s.binding_json) THEN CASE WHEN json_type(s.binding_json, '$.native_id') = 'text'
       THEN json_extract(s.binding_json, '$.native_id') END END`;
     // Scoped: the given sessions plus their native aliases on every machine
@@ -48,6 +40,30 @@ export function worktreeIntakeSnapshot(sql: SqlStorage, scope?: WorktreeSnapshot
       WHERE s.id IN (SELECT value FROM json_each(?) UNION SELECT s2.id FROM json_each(?) j CROSS JOIN machines m CROSS JOIN session_control_sessions s2
         ON s2.machine_id=m.id AND ${NATIVE.replaceAll('s.binding_json', 's2.binding_json')} = j.value)` : ''}`,
       ...(scope ? [JSON.stringify(scope.sessionIds), JSON.stringify(scope.nativeIds)] : [])).toArray();
+    // Scoped: only projections whose link events name a scoped session or
+    // native id (including cross-machine aliases resolved above) can protect a
+    // scoped session. The indexed intake_link_refs side table replaces a
+    // per-row json_each/instr scan; the old text prefilter remains the
+    // fallback only when the side table does not exist yet.
+    const projectionRows = (() => {
+      if (!scope) return sql.exec('SELECT id, links FROM intake_task_projection').toArray();
+      const needles = new Set<string>([...scope.sessionIds, ...scope.nativeIds]);
+      for (const row of sessionRows as any[]) {
+        needles.add(String(row.id));
+        const native = parseNative(row.binding_json);
+        if (native) needles.add(native);
+      }
+      const refs = JSON.stringify([...needles]);
+      try {
+        return sql.exec('SELECT id, links FROM intake_task_projection WHERE id IN (SELECT task_id FROM intake_link_refs WHERE ref IN (SELECT value FROM json_each(?)))', refs).toArray();
+      } catch { /* side table not created yet (pre-init): fall back to the text prefilter */ }
+      return sql.exec('SELECT id, links FROM intake_task_projection WHERE EXISTS (SELECT 1 FROM json_each(?) j WHERE instr(links, j.value) > 0)', refs).toArray();
+    })();
+    const projections = projectionRows.map((row: any) => {
+      const links = JSON.parse(row.links);
+      if (!Array.isArray(links)) throw new Error('invalid intake link projection');
+      return { id: row.id, links };
+    });
     const sessions = sessionRows.map((row: any) => {
       if (!row.request_valid || !row.launch_valid) throw new Error('invalid session request ledger');
       return { ...row, binding: record(row.binding_json), request: { intake_task_id: row.direct_intake },
