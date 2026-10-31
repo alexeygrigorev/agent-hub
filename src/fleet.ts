@@ -655,15 +655,18 @@ export class FleetService {
   /** Intake e8a22f4c: every host polls this each few seconds and the query reads each live launch
    * plus a fleet_sessions probe. Reuse the answer until a launch/session write moves the revision. */
   private reconciliationCandidates(machine: string) {
-    const revision = this.candidateRevision(), at = this.now();
+    // fleet_catalog_seen is not covered by the revision triggers, so its freshness verdict is part of the key.
+    const at = this.now(), catalogFresh = freshCatalogs(this.sql, at).has(machine);
+    const revision = this.candidateRevision();
+    const key = revision ? `${revision}|${catalogFresh ? 1 : 0}` : null;
     const hit = this.candidateCache.get(machine);
-    if (revision && hit && hit.revision === revision && at >= hit.at && at - hit.at < POLL_MAINTENANCE_MS) return hit.value;
-    const value = this.reconciliationCandidatesUncached(machine);
-    if (revision) this.candidateCache.set(machine, { revision, at, value });
+    if (key && hit && hit.revision === key && at >= hit.at && at - hit.at < POLL_MAINTENANCE_MS) return hit.value;
+    const value = this.reconciliationCandidatesUncached(machine, catalogFresh);
+    if (key) this.candidateCache.set(machine, { revision: key, at, value });
     return value;
   }
 
-  private reconciliationCandidatesUncached(machine: string) {
+  private reconciliationCandidatesUncached(machine: string, catalogFresh: boolean) {
     // Intake 0b87eb29: a claim Hub abandoned on the silent-start bound has no
     // exit proof. Keep offering it to its owning host for a bounded window so
     // a fenced no-start, recovered hub-results finish or late native start
@@ -672,7 +675,6 @@ export class FleetService {
     // redundant native retirement probe per fresh live workload each cycle;
     // stale, absent and ambiguous observations still need positive proof.
     const cutoff = new Date(this.now() - 180000).toISOString();
-    const catalogFresh = freshCatalogs(this.sql, this.now()).has(machine);
     // Fleet-only stores need no control table. Probe once, not once per row.
     const controlStore = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
     const bindingProjection = controlStore
