@@ -1626,6 +1626,58 @@ export class QuotaStore {
     };
   }
 
+  /**
+   * Sanitized engine verification for worker-scoped sessions (intake
+   * f28929eb): one read-only row per fleet route with exactly five string
+   * fields — engine, account label, host, health, quota state. Quota state
+   * reuses the fleet-view pool evidence (already free of credentials);
+   * health mirrors placement admission over fleet_engine_health. No operator
+   * surfaces (bundles, logins, credential metadata) and no nulls for known
+   * fields.
+   */
+  public getWorkerEnginesView(nowMs: number = this.now()): Record<string, any> {
+    const { body } = this.getFleetView({ host_id: null, provider: null, engine: null, account: null }, nowMs);
+    const poolState = new Map<string, string>();
+    const poolProviderByLabel = new Map<string, string>();
+    for (const pool of body.pools as Record<string, any>[]) {
+      const account = String(pool.account);
+      poolState.set(account + "\u0000" + String(pool.provider), String(pool.state));
+      if (!poolProviderByLabel.has(account)) poolProviderByLabel.set(account, String(pool.provider));
+    }
+    const registry = new Map<string, { enabled: number; provider: string }>();
+    for (const a of dedupeAccountsByCanonical(this.sql.exec("SELECT * FROM fleet_accounts ORDER BY label").toArray() as any[])) {
+      registry.set(canonicalAccountLabel(a.label), { enabled: Number(a.enabled) === 0 ? 0 : 1, provider: canonicalQuotaProvider(a.provider) });
+    }
+    const health = new Map<string, string>();
+    for (const h of this.sql.exec("SELECT engine, machine_id, status FROM fleet_engine_health").toArray() as any[]) {
+      health.set(String(h.machine_id ?? '') + "\u0000" + String(h.engine), String(h.status));
+    }
+    const engines: Record<string, string>[] = [];
+    for (const r of this.sql.exec("SELECT machine_id, engine, account FROM fleet_routes ORDER BY engine, account, machine_id").toArray() as any[]) {
+      const account = canonicalAccountLabel(String(r.account));
+      const registered = registry.get(account);
+      const provider = registered ? registered.provider : poolProviderByLabel.get(account) ?? "";
+      const state = poolState.get(account + "\u0000" + provider);
+      const specific = health.get(String(r.machine_id) + "\u0000" + String(r.engine));
+      const engineWide = health.get("\u0000" + String(r.engine));
+      engines.push({
+        engine: String(r.engine),
+        account,
+        host: String(r.machine_id),
+        health: specific === "unavailable" || engineWide === "unavailable" ? "unavailable"
+          : specific === "ok" || engineWide === "ok" ? "ok" : "unverified",
+        quota_state: registered?.enabled === 0 ? "disabled"
+          : state === "fresh" ? "ok"
+          : state === "exhausted" ? "exhausted"
+          : state === "unavailable" ? "unavailable"
+          : state === "stale" ? "stale"
+          : state === "unknown" ? "unknown"
+          : "unmapped",
+      });
+    }
+    return { schema_version: "1.0", observed_at: new Date(nowMs).toISOString(), engines };
+  }
+
   /** Central account observations: no machine identity or host enrollment involved. */
   public async putServerSnapshot(request: Request): Promise<Response> {
     const session = await getSession(this.env, request);

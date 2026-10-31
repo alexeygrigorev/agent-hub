@@ -180,6 +180,10 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
   // Sanitized admission data is needed by the worker itself. Keep telemetry
   // writes, raw host snapshots and operator controls outside this capability.
   if (path === '/api/quota') return request.method === 'GET' && url.searchParams.getAll('view').length === 1 && url.searchParams.get('view') === 'fleet';
+  // Sanitized engine verification (intake f28929eb): read-only five-field rows
+  // (engine, account, host, health, quota state). The operator engines surface
+  // (bundles, logins, credentials) stays outside this capability.
+  if (path === '/api/engines') return request.method === 'GET' && url.searchParams.getAll('view').length === 1 && url.searchParams.get('view') === 'worker';
   if (['/api/fleet/resources', '/api/fleet/resources/sessions'].includes(path)) return request.method === 'GET';
   // Usage evidence is shared with TBM. A worker may read only these three
   // sanitized dimensions; this grants no monitoring writes or host telemetry.

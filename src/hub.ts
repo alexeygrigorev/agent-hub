@@ -913,6 +913,18 @@ export class Hub extends DurableObject {
             (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller)))(request);
       }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
+        const url = new URL(request.url);
+        if (path === '/api/engines' && url.searchParams.getAll('view').length === 1 && url.searchParams.get('view') === 'worker') {
+          // Sanitized engine verification view (intake f28929eb): worker scope
+          // only. The operator engines surface (bundles, logins, credential
+          // metadata) stays admin-only behind the same path.
+          const auth = await this.authenticateBusRequest(request);
+          if (auth.error) return auth.error;
+          if (auth.caller?.kind !== 'agent' || !auth.scopes?.includes(WORKER_SCOPE)) {
+            return Response.json({ error: 'forbidden' }, { status: 403 });
+          }
+          return Response.json(this.quotaStore.getWorkerEnginesView(), { headers: { 'Cache-Control': 'private, no-store' } });
+        }
         return this.provisioningService.handle(request, await this.authenticateBusRequest(request));
       }
       if (path === '/api/repos' || path.startsWith('/api/repos/')) {

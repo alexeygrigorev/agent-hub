@@ -54,6 +54,40 @@ describe('scoped durable worker access',()=>{
   expect((await api('/api/fleet/resources')).status).toBe(403);
  },mode));
 
+ it.each(['headless','interactive'])('%s reads a sanitized engines view and nothing else from /api/engines (f28929eb)', mode=>setup(async({stub,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const at=new Date().toISOString();
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   h.sql.exec("INSERT INTO fleet_accounts(label,provider,max_concurrency,reserve_percent,enabled) VALUES('shared-go','go',8,10,1),('paused','codex',4,10,0)");
+   h.sql.exec("INSERT INTO fleet_routes(machine_id,engine,account,profile) VALUES('worker-host','opencode','shared-go',NULL),('worker-host','codex','orin','hub-codex'),('worker-host','codex','paused','hub-paused')");
+   h.sql.exec("INSERT INTO fleet_subscriptions(machine_id,account,service,plan,observed_at,quota_json) VALUES('worker-host','shared-go','go','free',?,?)",at,JSON.stringify({status:'ok',observed_at:at,collector_version:'1',windows:{'5h':{present:true,percent_remaining:50,reset_at:null,error:null}},details:{}}));
+   h.sql.exec("INSERT INTO fleet_engine_health(engine,machine_id,status,reason,updated_at,diagnostics_json) VALUES('codex','worker-host','unavailable','engine_auth_expired',?,NULL),('opencode','','ok','',?,NULL)",at,at);
+  });
+  // The operator surface and every non-view variant stay denied; only the
+  // sanitized worker view opens for worker scope.
+  expect((await api('/api/engines')).status).toBe(403);
+  expect((await api('/api/engines?view=operator')).status).toBe(403);
+  expect((await api('/api/engines?view=worker&view=worker')).status).toBe(403);
+  expect((await api('/api/engines?view=worker',{})).status).toBe(403);
+  expect((await call('/api/engines?view=worker')).status).toBe(403); // host bearer is not worker scope
+  expect((await api('/api/fleet')).status).toBe(403);
+  const res=await api('/api/engines?view=worker');
+  expect(res.status,await res.clone().text()).toBe(200);
+  const body:any=await res.json();
+  expect(body.schema_version).toBe('1.0');
+  expect(typeof body.observed_at).toBe('string');
+  expect(body.engines).toEqual([
+   {engine:'codex',account:'orin',host:'worker-host',health:'unavailable',quota_state:'unmapped'},
+   {engine:'codex',account:'paused',host:'worker-host',health:'unavailable',quota_state:'disabled'},
+   {engine:'opencode',account:'shared-go',host:'worker-host',health:'ok',quota_state:'ok'},
+  ]);
+  for(const row of body.engines) {
+   expect(Object.keys(row).sort()).toEqual(['account','engine','health','host','quota_state']);
+   for(const v of Object.values(row)) expect(typeof v).toBe('string');
+  }
+  expect(JSON.stringify(body)).not.toMatch(/ciphertext|token|credential|logins|installations|bundles/i);
+ },mode));
+
  it('AC5 triage reviewer: only live requested intakes, fills missing AC only, access ends on its verdict or session end',()=>setup(async({stub,session,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   const blank=uuid(), third=uuid(), later=uuid();

@@ -151,6 +151,27 @@ def test_cli_refuses_public_bundle_file(tmp_path):
         request.assert_not_called()
 
 
+def test_engines_list_worker_view_requests_sanitized_endpoint():
+    from types import SimpleNamespace
+    with patch.object(p.bus, '_do_request', return_value={'schema_version': '1.0', 'engines': []}) as request:
+        assert p.command(SimpleNamespace(engines_cmd='list', view='worker')) == {'schema_version': '1.0', 'engines': []}
+        assert p.command(SimpleNamespace(engines_cmd='list', view=None)) == {'schema_version': '1.0', 'engines': []}
+    assert request.call_args_list[0].args == ('GET', '/api/engines?view=worker')
+    assert request.call_args_list[1].args == ('GET', '/api/engines')
+
+
+def test_engines_list_parser_accepts_only_worker_view():
+    import argparse
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    p.add_commands(sub)
+    args = parser.parse_args(['engines', 'list', '--view', 'worker'])
+    assert args.view == 'worker'
+    assert parser.parse_args(['engines', 'list']).view is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(['engines', 'list', '--view', 'operator'])
+
+
 def test_native_auth_import_is_one_command_and_does_not_echo_secret(tmp_path):
     from types import SimpleNamespace
     auth_dir = tmp_path / 'private'; auth_dir.mkdir(mode=0o700)

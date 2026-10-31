@@ -1641,7 +1641,8 @@ def add_commands(sub):
     add.add_argument('--auth-file', help='Private native auth file; contents never printed')
     add.add_argument('--config-file', help='Optional private native config file')
     add.add_argument('--version', help='Exact pinned engine version (defaults to tested version)')
-    commands.add_parser('list')
+    list_cmd = commands.add_parser('list')
+    list_cmd.add_argument('--view', choices=['worker'], default=None, help='Sanitized read-only verification view (worker sessions): engine, account, host, health, quota state')
     commands.add_parser('quota', help='Sanitized managed account observations for the server collector')
     remove = commands.add_parser('remove')
     remove.add_argument('label')
@@ -1750,6 +1751,8 @@ def command(args):
     if args.engines_cmd == 'sync':
         return sync()
     if args.engines_cmd == 'list':
+        if getattr(args, 'view', None) == 'worker':
+            return bus._do_request('GET', '/api/engines?view=worker')
         return bus._do_request('GET', '/api/engines')
     if args.engines_cmd == 'remove':
         if not LABEL.fullmatch(args.label):

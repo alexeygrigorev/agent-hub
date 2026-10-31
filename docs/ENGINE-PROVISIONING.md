@@ -85,6 +85,9 @@ hub engines add --file "$HOME/.config/agent-hub/import/work-codex.json"
 The add command is the only account-add operation. Re-running it rotates the entire bundle
 and causes each machine to replace its installation. `hub engines list` shows
 public metadata and acknowledged installation revisions, never credentials.
+Worker-scoped sessions cannot read this operator surface; they verify their
+engines with `hub engines list --view worker` (sanitized five-field rows —
+see [WORKER-ENGINES-VIEW.md](WORKER-ENGINES-VIEW.md)).
 
 Supported npm engines: `codex` (`@openai/codex`), `claude`
 (`@anthropic-ai/claude-code`), `gemini` (`@google/gemini-cli`), and `go`
