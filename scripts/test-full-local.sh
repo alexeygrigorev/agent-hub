@@ -63,7 +63,7 @@ HOLDS=0
 . "${REPO_ROOT}/scripts/heavy-phase-status.sh"
 
 echo "=== Scope boundary (all new commits and working changes) ==="
-if ! python3 scripts/ci/scope_guard.py --working || ! python3 -m unittest discover -s scripts/ci -p "test_scope_guard.py" || ! python3 scripts/test_local_dependencies.py || ! python3 scripts/test_full_local_storage.py; then
+if ! python3 scripts/ci/scope_guard.py --working || ! python3 -m unittest discover -s scripts/ci -p "test_scope_guard.py" || ! python3 scripts/test_local_dependencies.py || ! python3 scripts/test_full_local_storage.py || ! python3 -m unittest discover -s scripts/ci -p "test_affected_tests.py"; then
   echo "FAIL: Scope boundary checks failed"
   FAILURES=$((FAILURES + 1))
 fi
