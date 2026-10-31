@@ -37,7 +37,7 @@ export const UNCLAIMED_OFFER_TTL_MS = 15 * 60 * 1000;
 export const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused', 'worker_silent_start']);
 /** A headless launch that never leaves `starting` (host claimed, no running
  * receipt, no item after turn.started) is failed after this bound (intake 6c2b2aa2 AC2). */
-export const SILENT_START_MS = 5 * 60 * 1000;
+export const SILENT_START_MS = 15 * 60 * 1000;
 export const SILENT_START_REASON = 'worker_silent_start';
 
 export const FLEET_SCHEMA = `
@@ -502,25 +502,31 @@ export class FleetService {
    * follows via reconcileUnboundFleetSessions, and the (machine, engine) pair
    * is held so auto routing stops placing new work on the silent runtime. */
   expireSilentStarts(): number {
+    return this.transaction(() => this.expireSilentStartsRows());
+  }
+
+  private expireSilentStartsRows(): number {
     const at = new Date(this.now()).toISOString();
     const cutoff = new Date(this.now() - SILENT_START_MS).toISOString();
     const controlStore = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
     const unbound = controlStore
-      ? `(NOT EXISTS (SELECT 1 FROM session_control_sessions s WHERE s.fleet_launch_id=l.id)
-          OR EXISTS (SELECT 1 FROM session_control_sessions s WHERE s.fleet_launch_id=l.id AND s.binding_json IS NULL AND s.state IN ('offered','starting')))`
-      : '1=1';
+      ? `EXISTS (SELECT 1 FROM session_control_sessions s WHERE s.fleet_launch_id=l.id AND s.binding_json IS NULL AND s.state IN ('offered','starting'))`
+      : '0=1';
     const rows = this.sql.exec(`SELECT l.id, l.machine_id, l.engine FROM fleet_launches l
       WHERE l.state IN ('starting','running') AND l.mode='headless' AND l.updated_at < ?
         AND NOT EXISTS (SELECT 1 FROM routing_jobs j WHERE j.launch_id=l.id) AND ${unbound}
       ORDER BY l.updated_at,l.id LIMIT 20`, cutoff).toArray() as any[];
     const diagnostic = JSON.stringify({reason: SILENT_START_REASON,
-      message: 'The headless worker produced no output within 5 minutes of starting; the launch was failed.',
+      message: 'The headless worker produced no output within 15 minutes of starting; the launch was failed.',
       error_type: 'TimeoutError', stage: 'runtime'});
     for (const row of rows) {
       this.sql.exec(`UPDATE fleet_launches SET state='failed', verification_status='unverified', exit_reason=?,
         launch_error_json=?, finished_at=?, updated_at=? WHERE id=? AND state IN ('starting','running')`, SILENT_START_REASON, diagnostic, at, at, row.id);
       if (row.engine && row.machine_id) {
-        this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)",
+        // Never overwrite an existing unavailable hold (account_blocked,
+        // admission_unconfigured, ...) with this retriable one.
+        const held = this.sql.exec("SELECT 1 FROM fleet_engine_health WHERE engine=? AND machine_id=? AND status='unavailable'", row.engine, row.machine_id).toArray().length;
+        if (!held) this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)",
           row.engine, row.machine_id, SILENT_START_REASON, at);
       }
     }

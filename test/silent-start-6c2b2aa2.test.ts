@@ -86,11 +86,11 @@ describe('routing and silent workers (intake 6c2b2aa2)', () => {
   it('AC2: a claimed headless launch with no output is failed with a slug, its session follows, and the engine is held', () => fixture(async ctx => {
     const { f, sql, clock } = ctx;
     const started = await startClaimed(ctx, 'silent-claimed', false);
-    clock.now = START + 4 * 60000;
+    clock.now = START + 14 * 60000;
     f.reconcileCapacity();
     expect(launchRow(sql, started.launchId).state).toBe('starting');
     f.withMaintenance(() => {}); // fresh maintenance scope on the next call
-    clock.now = START + 6 * 60000;
+    clock.now = START + 16 * 60000;
     f.reconcileCapacity();
     expect(launchRow(sql, started.launchId)).toMatchObject({ state: 'failed', exit_reason: 'worker_silent_start' });
     expect(sessionState(sql, started.id)).toBe('failed');
@@ -102,7 +102,7 @@ describe('routing and silent workers (intake 6c2b2aa2)', () => {
   it('AC2: a running receipt whose session never binds is failed as well', () => fixture(async ctx => {
     const { f, sql, clock } = ctx;
     const started = await startClaimed(ctx, 'silent-running', true);
-    clock.now = START + 6 * 60000;
+    clock.now = START + 16 * 60000;
     f.reconcileCapacity();
     expect(launchRow(sql, started.launchId)).toMatchObject({ state: 'failed', exit_reason: 'worker_silent_start' });
     expect(sessionState(sql, started.id)).toBe('failed');
