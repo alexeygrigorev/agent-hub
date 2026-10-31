@@ -593,7 +593,11 @@ class BootstrapTests(unittest.TestCase):
                 with patch.object(api, 'get_heartbeat_payload', return_value={'type': 'heartbeat'}):
                     dispatcher.checkin_tick()
                 self.assertIn(('PUT', '/api/fleet/routing/capabilities'), posts)
-                self.assertEqual(dispatcher.capabilities_put_payload(), {'needs': [], 'max_agents': 1, 'runners': []})
+                # Fresh installs advertise CPU/RAM-sized concurrency (intake 88ff6766).
+                self.assertEqual(original['max_agents'], 'auto')
+                from agent_hub_host import host_sizing
+                with patch.object(host_sizing, 'auto_max_agents', return_value=7):
+                    self.assertEqual(dispatcher.capabilities_put_payload(), {'needs': [], 'max_agents': 7, 'runners': []})
                 # Explicit operator settings must survive repair.
                 original['max_agents'] = 3
                 settings.write_text(json.dumps(original))

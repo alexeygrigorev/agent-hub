@@ -561,6 +561,14 @@ MAX_ADVERTISED_ROUTES = 128
 ROUTE_ADVERTISEMENT_REFRESH_S = 60
 
 
+def resolve_max_agents(value):
+    """Advertised concurrency: explicit int, or 'auto' sized from CPU/RAM (intake 88ff6766)."""
+    if value == 'auto':
+        from .host_sizing import auto_max_agents
+        return auto_max_agents()
+    return value
+
+
 def load_settings(path=None):
     """Explicit non-secret machine configuration, including several accounts per service."""
     default_path = path is None
@@ -666,7 +674,9 @@ def load_settings(path=None):
     if not isinstance(needs, list) or len(needs) > 64 or any(not isinstance(n, str) or not re.fullmatch(r'[a-z0-9][a-z0-9:_-]{0,95}', n) for n in needs) or len(set(needs)) != len(needs):
         raise ValueError('Invalid task capabilities')
     maximum = data.get('max_agents', 1)
-    if type(maximum) is not int or not 1 <= maximum <= 100:
+    # 'auto' stays raw here so settings written back keep it; it is resolved
+    # from CPU/RAM only when advertised (intake 88ff6766).
+    if maximum != 'auto' and (type(maximum) is not int or not 1 <= maximum <= 100):
         raise ValueError('Invalid machine concurrency')
     # A relabel lists ONE side: the local label or its canonical alias, never
     # both. Two subscriptions canonicalizing to the same (engine, profile,
@@ -4170,7 +4180,7 @@ class Dispatcher:
         if arch != 'unknown' and any(n.startswith('arch:') for n in self.settings['capabilities']):
             needs.append('arch:' + arch)
         return {'needs': needs,
-                'max_agents': self.settings['max_agents'],
+                'max_agents': resolve_max_agents(self.settings['max_agents']),
                 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'),
                              'account': s['account_label'], 'model': s['launcher_model'],
                              'effort': s.get('launcher_effort')}

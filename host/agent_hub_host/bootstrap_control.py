@@ -66,6 +66,46 @@ def receipt_absent(receipt):
         return False
 
 
+def pending_tag_absent(tag):
+    """True only when a successful full catalog listing has no row with this tag."""
+    try:
+        result = subprocess.run(['aplexer', 'list', '--all', '--json'],
+                                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+        if result.returncode or len(result.stdout) > 1048576:
+            return False
+        rows = json.loads(result.stdout)
+        return isinstance(rows, list) and all(isinstance(r, dict) for r in rows) and \
+            all(r.get('tag') != tag for r in rows)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+
+# The installer announces a task replacement so a supervisor between retry
+# attempts (no lease held, nothing to hand over) and the controller.ps1 restart
+# loop exit with 76 instead of keeping the task Running (intake 88ff6766).
+REPLACE_MARKER = 'replace-pending'
+REPLACE_MAX_AGE_S = 120
+
+
+def request_replace(directory):
+    _write(Path(directory) / REPLACE_MARKER, {'requested_at': time.time()})
+
+
+def clear_replace(directory):
+    try:
+        (Path(directory) / REPLACE_MARKER).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def replace_pending(directory, now=None):
+    try:
+        age = (now if now is not None else time.time()) - (Path(directory) / REPLACE_MARKER).stat().st_mtime
+    except OSError:
+        return False
+    return -5 <= age <= REPLACE_MAX_AGE_S
+
+
 def _read(path):
     return json.loads(private_fs.read_bytes(path, 16384))
 
@@ -94,7 +134,7 @@ def _attention(directory, generation=None):
     raise NeedsAttention('Previous controller exit is unproven; inspect needs-attention.json and restore native status access before retrying')
 
 
-def recover_stale_owner(directory, current_boot, observe, absent=None):
+def recover_stale_owner(directory, current_boot, observe, absent=None, tag_absent=None):
     """Caller must hold owner.lock: an absent owner process alone is no proof."""
     try:
         owner = _read(directory / 'owner.json')
@@ -132,6 +172,11 @@ def recover_stale_owner(directory, current_boot, observe, absent=None):
                     # Rerun recovery: caller holds owner.lock (no live owner) and a
                     # full catalog listing no longer contains the exact receipt id.
                     proof = 'receipt_absent_from_catalog'
+            elif (receipt is None and isinstance(owner.get('pending_tag'), str)
+                    and tag_absent is not None and tag_absent(owner['pending_tag'])):
+                # A start that failed or timed out before a trusted receipt:
+                # safe only when no catalog row carries the unique tag.
+                proof = 'pending_tag_absent_from_catalog'
     if proof is None:
         _attention(directory, generation)
     # Archive before clearing; recovery never destroys the old receipt.
@@ -161,12 +206,13 @@ class ControllerLease:
         self.boot_probe = boot_probe or boot_identity
         self.observe = observe or observe_receipt
         self.absent = receipt_absent if observe is None else None
+        self.tag_absent = pending_tag_absent if observe is None else None
 
     def __enter__(self):
         try:
             self.stack.enter_context(private_fs.exclusive_lock(self.directory / 'owner.lock'))
             self.boot = self.boot_probe()
-            recover_stale_owner(self.directory, self.boot, self.observe, self.absent)
+            recover_stale_owner(self.directory, self.boot, self.observe, self.absent, self.tag_absent)
             return self
         except BaseException:
             self.stack.close()
@@ -178,6 +224,13 @@ class ControllerLease:
     def publish(self, receipt):
         _write(self.directory / 'owner.json', {'version': 2, 'generation': self.generation,
                'boot_identity': self.boot, 'receipt': {k: receipt[k] for k in IDENTITY_KEYS}})
+
+    def publish_pending(self, tag):
+        # The native start may have created a child we hold no receipt for;
+        # keep the unique tag so recovery never starts a duplicate blindly.
+        _write(self.directory / 'owner.json', {'version': 2, 'generation': self.generation,
+               'boot_identity': self.boot, 'receipt': None, 'pending_tag': tag})
+        _write_attention(self.directory, self.generation)
 
     def stop_requested(self):
         try:
@@ -197,15 +250,16 @@ class ControllerLease:
 
 def handover(directory, *, timeout=90, boot_probe=None, observe=None):
     absent = receipt_absent if observe is None else None
+    tag_absent = pending_tag_absent if observe is None else None
     directory = Path(directory)
     if not 0 <= timeout <= MAX_HANDOVER_SECONDS:
         raise ValueError('Invalid controller handover timeout')
     # Serializes request publication/cancellation; never unlink kernel locks.
     with private_fs.exclusive_lock(directory / 'request.lock'):
-        _handover(directory, timeout, boot_probe or boot_identity, observe or observe_receipt, absent)
+        _handover(directory, timeout, boot_probe or boot_identity, observe or observe_receipt, absent, tag_absent)
 
 
-def _handover(directory, timeout, boot_probe, observe, absent=None):
+def _handover(directory, timeout, boot_probe, observe, absent=None, tag_absent=None):
     stack = ExitStack()
     try:
         stack.enter_context(private_fs.exclusive_lock(directory / 'owner.lock'))
@@ -213,7 +267,7 @@ def _handover(directory, timeout, boot_probe, observe, absent=None):
         stack.close()
     else:
         with stack:
-            recover_stale_owner(directory, boot_probe(), observe, absent)
+            recover_stale_owner(directory, boot_probe(), observe, absent, tag_absent)
         return
     try:
         owner = _read(directory / 'owner.json')

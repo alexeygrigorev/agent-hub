@@ -707,8 +707,17 @@ def install_service(install_root, command):
         env['CLAUDE_CODE_GIT_BASH_PATH'] = str(install_root / 'runtimes' /
             ('git-' + GIT_VERSION + '-' + architecture()) / 'usr/bin/bash.exe')
     if sys.platform == 'win32':
-        from .bootstrap_control import handover
-        handover(state_root(install_root) / 'controller')
+        from .bootstrap_control import REPLACE_MARKER, clear_replace, handover, request_replace
+        control = state_root(install_root) / 'controller'
+        # A supervisor between retries holds no lease to hand over; the marker
+        # makes it and the runner loop exit 76 so the task stops (88ff6766).
+        request_replace(control)
+        try:
+            handover(control)
+        except BaseException:
+            clear_replace(control)
+            raise
+        marker = control / REPLACE_MARKER
         runner = install_root / 'controller.ps1'
         quote = lambda s: "'" + str(s).replace("'", "''") + "'"
         # Windows PowerShell 5.1 turns any native stderr line under 2>&1 into a
@@ -717,9 +726,23 @@ def install_service(install_root, command):
         # kept running (intake bf0863c4 BUG5). Exit codes propagate explicitly.
         lines = ['$ErrorActionPreference = \'Continue\'']
         lines.extend('$env:' + k + ' = ' + quote(v) for k, v in env.items())
+        # Task Scheduler's RestartCount fires only when the action fails to
+        # launch, never on a non-zero exit, so the runner restarts the
+        # supervisor itself. 0 (signal stop) and 76 (accepted installer
+        # handover) end the loop so the installer can replace the task
+        # (intake 88ff6766).
         lines.extend(['Set-Location -LiteralPath ' + quote(install_root / 'package'),
-                      '& ' + ' '.join(quote(x) for x in command) + ' >> ' + quote(log) + ' 2>&1',
-                      'exit $LASTEXITCODE'])
+                      'while ($true) {',
+                      '  & ' + ' '.join(quote(x) for x in command) + ' >> ' + quote(log) + ' 2>&1',
+                      '  $code = $LASTEXITCODE',
+                      '  if ($code -eq 0 -or $code -eq 76) { exit $code }',
+                      '  Add-Content -LiteralPath ' + quote(log) + ' -Value (\'{"event":"controller_process_exit","code":\' + [int]$code + \',"restart_in_s":30}\')',
+                      '  for ($i = 0; $i -lt 30; $i++) {',
+                      '    $m = Get-Item -LiteralPath ' + quote(marker) + ' -ErrorAction SilentlyContinue',
+                      '    if ($m -and $m.LastWriteTime -gt (Get-Date).AddSeconds(-120)) { exit 76 }',
+                      '    Start-Sleep -Seconds 1',
+                      '  }',
+                      '}'])
         write_private(runner, '\n'.join(lines))
         # A per-user logon task requires no password, RunAs or UAC. Task names
         # include the user SID so reruns reuse exactly one registration.
@@ -738,15 +761,21 @@ def install_service(install_root, command):
               ' -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew'
               ' -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable;'
               ' Register-ScheduledTask -TaskName $name -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null;'
+              ' Remove-Item -LiteralPath ' + quote(marker) + ' -ErrorAction SilentlyContinue;'
               ' Start-ScheduledTask -TaskName $name;')
         # The old controller already handed over: if registering the new task
         # fails, restart the existing one so an unattended update never
-        # leaves the host offline until the next logon.
+        # leaves the host offline until the next logon. The replace marker is
+        # removed first, or the restarted runner would exit 76 (88ff6766).
         ps = ('try {' + ps + '} catch { $e=$_;'
+              ' Remove-Item -LiteralPath ' + quote(marker) + ' -ErrorAction SilentlyContinue;'
               ' $id=[Security.Principal.WindowsIdentity]::GetCurrent();'
               ' Start-ScheduledTask -TaskName ("AgentHubController-"+$id.User.Value) -ErrorAction SilentlyContinue;'
               ' throw $e }')
-        run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "$ErrorActionPreference='Stop';" + ps])
+        try:
+            run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "$ErrorActionPreference='Stop';" + ps])
+        finally:
+            clear_replace(control)
         return 'windows_user_logon_task'
     if sys.platform == 'darwin':
         path = Path.home() / 'Library/LaunchAgents/click.dtcdev.agent-hub.plist'
@@ -783,6 +812,25 @@ def install_service(install_root, command):
     return 'systemd_user'
 
 
+def migrate_installer_max_agents(settings, state):
+    """Once per install, lift the old installer default (max_agents 1) to "auto".
+
+    Earlier installers wrote 1 on every host, so 32 GB Windows desktops
+    advertised a single slot (intake 88ff6766). The marker keeps a value an
+    operator sets to 1 afterwards; any other explicit value is never touched.
+    """
+    marker = Path(state) / 'max-agents-auto-migrated'
+    if marker.exists() or not Path(settings).exists():
+        return False
+    data = json.loads(Path(settings).read_text(encoding='utf-8'))
+    changed = isinstance(data, dict) and data.get('max_agents') == 1
+    if changed:
+        data['max_agents'] = 'auto'
+        write_private(settings, json.dumps(data, indent=2) + '\n')
+    write_private(marker, '1\n')
+    return changed
+
+
 def configure(base_url):
     from . import api, auth, config, fleet, provisioning, system
     install_root = root()
@@ -803,8 +851,9 @@ def configure(base_url):
     settings = fleet.subscriptions_path()
     if not settings.exists():
         write_private(settings, json.dumps({'version': 1, 'subscriptions': [],
-                      'capabilities': [], 'max_agents': 1,
+                      'capabilities': [], 'max_agents': 'auto',
                       'workspaces': {'home': str(Path.home())}}))
+    migrate_installer_max_agents(settings, state_root(install_root))
     fleet.load_settings(settings)  # Validate, never overwrite local operator settings.
     # Headless fleet mode needs the maintained launcher; install it here so a
     # plain install never reports launcher_not_configured.

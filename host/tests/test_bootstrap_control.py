@@ -259,7 +259,7 @@ class HandoverTests(unittest.TestCase):
                     self.fail('must retain evidence when archiving fails')
         self.assertEqual((self.directory / 'owner.json').read_bytes(), previous)
 
-    def test_unknown_startup_reports_needs_attention_without_a_retry_or_new_child(self):
+    def test_unknown_startup_logs_needs_attention_and_retries_without_a_new_child(self):
         self.crash()
         script = Path(__file__).resolve().parents[2] / 'scripts/session-host-supervisor.py'
         spec = importlib.util.spec_from_file_location('bootstrap_unknown_startup', script)
@@ -272,16 +272,25 @@ class HandoverTests(unittest.TestCase):
                 '--control-dir', str(self.directory)]
         import contextlib, io
         output = io.StringIO()
+        stop = Mock()
+        stop.is_set.side_effect = [False, True]
+        stop.wait.return_value = True
         with patch.object(supervisor.sys, 'argv', argv), \
              patch.object(supervisor, 'is_windows', return_value=True), \
              patch.object(supervisor.signal, 'signal'), patch.dict(os.environ), \
              patch.object(c, 'boot_identity', return_value=None), \
              patch.object(c, 'observe_receipt', return_value=None), \
              patch.object(c, 'receipt_absent', return_value=False), \
+             patch.object(supervisor.threading, 'Event', return_value=stop), \
              patch.object(supervisor, 'native') as native, contextlib.redirect_stdout(output):
-            self.assertIsNone(supervisor.main(), 'successful process exit stops failure-restart loop')
+            # Intake 88ff6766: Task Scheduler never restarts a finished task, so
+            # the supervisor stays up and retries recovery instead of exiting.
+            self.assertIsNone(supervisor.main())
         native.assert_not_called()
-        self.assertEqual(json.loads(output.getvalue())['event'], 'needs_attention')
+        event = json.loads(output.getvalue())
+        self.assertEqual((event['event'], event['type']), ('controller_retry', 'NeedsAttention'))
+        self.assertEqual(event['retry_in_s'], supervisor.RETRY_DELAYS_S[0])
+        stop.wait.assert_called_once_with(1)
         self.assertTrue((self.directory / 'owner.json').exists())
 
     def test_live_owner_lock_prevents_boot_based_recovery(self):
@@ -357,16 +366,18 @@ class HandoverTests(unittest.TestCase):
                         '--control-dir', str(control)]
                 stop = Mock()
                 stop.wait.return_value = False
+                stop.is_set.return_value = False
                 with patch.object(supervisor.sys, 'argv', argv), \
                      patch.object(supervisor, 'is_windows', return_value=True), \
                      patch.object(supervisor.signal, 'signal'), \
                      patch.dict(os.environ), \
                      patch.object(supervisor.threading, 'Event', return_value=stop), \
                      patch.object(c.ControllerLease, 'stop_requested', return_value=True), \
+                     patch('time.sleep'), \
                      patch.object(supervisor, 'native', side_effect=native):
                     with self.assertRaises(SystemExit) as exit:
                         supervisor.main()
-                self.assertEqual(exit.exception.code, 75, 'abandoned accepted handover must let the task restore its runner')
+                self.assertEqual(exit.exception.code, 76, 'accepted handover ends the controller.ps1 loop')
                 kills = [call for call in calls if call[0] == 'kill']
                 self.assertEqual(len(kills), 0 if mode == 'changed_identity' else 1)
                 self.assertEqual((control / 'stopped.json').exists(), mode == 'confirmed')

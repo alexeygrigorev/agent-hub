@@ -149,7 +149,6 @@ def main():
     command = [sys.executable, '-u', '-m', 'agent_hub_host.session_host',
                '--config', str(config_path),
                '--journal-dir', str(journal)]
-    tag = 'hub-controller-' + uuid.uuid4().hex[:12]
     env_args = [
         '--env', 'HUB_CONFIG_FILE=' + str(cred_path),
         '--env', 'PYTHONPATH=' + str(workspace / 'host'),
@@ -158,40 +157,164 @@ def main():
                 'CLAUDE_CODE_GIT_BASH_PATH', 'UV_PYTHON_INSTALL_DIR'):
         if var in os.environ:
             env_args.extend(['--env', f'{var}={os.environ[var]}'])
+    attempt = lambda: run_controller(args, workspace, command, tag_prefix='hub-controller-',
+                                     env_args=env_args, journal=journal, stop=stop)
+    if args.control_dir and is_windows():
+        # Windows Task Scheduler restarts a task only when it fails to LAUNCH,
+        # never on a non-zero action exit, so one supervisor exception left
+        # the host dead until next logon (intake 88ff6766). Retry in-process.
+        from agent_hub_host.bootstrap_control import replace_pending
+        supervise_windows(attempt, stop, replacing=lambda: replace_pending(args.control_dir))
+    else:
+        attempt()
+
+
+# Planned exits the Windows controller.ps1 loop understands: 75 restarts the
+# supervisor (Hub-pinned release), 76 ends the loop so the installer can
+# replace the accepted handover's task.
+RELEASE_RESTART_EXIT = 75
+HANDOVER_EXIT = 76
+RETRY_DELAYS_S = (5, 15, 30, 60)
+HEALTHY_RUN_S = 300
+
+
+def log_event(event, **fields):
+    print(json.dumps({'event': event, **fields}), flush=True)
+
+
+def failure_reason(error):
+    """Bounded, credential-free reason for controller.log (type + short message)."""
+    text = redact(str(error))[:240]
+    return {'type': type(error).__name__, 'detail': text}
+
+
+_SECRETISH = None
+
+
+def redact(text):
+    global _SECRETISH
+    if _SECRETISH is None:
+        import re
+        _SECRETISH = re.compile(r'(?i)(bearer\s+\S+|(?:token|secret|password|key)["\']?\s*[:=]\s*\S+|[A-Za-z0-9_\-]{32,}(?:\.[A-Za-z0-9_\-]{8,}){0,2})')
+    return _SECRETISH.sub('[redacted]', text)
+
+
+def child_output_tail(receipt, limit=1500):
+    """Best-effort tail of the dead child's own output, which never reaches controller.log."""
+    try:
+        ensure_runtime_bin_on_path()
+        result = subprocess.run(['aplexer', 'capture', receipt['id'], '--plain'], capture_output=True,
+                                text=True, timeout=15, stdin=subprocess.DEVNULL)
+        if result.returncode:
+            return None
+        return redact(result.stdout[-limit:])
+    except Exception:
+        return None
+
+
+def supervise_windows(attempt, stop, *, clock=None, replacing=lambda: False):
+    """Run attempts until a signal or planned exit; failures are logged and retried."""
+    import time
+    clock = clock or time.monotonic
+    failures = 0
+    while not stop.is_set():
+        if replacing():
+            # The installer is replacing the task while no lease is held.
+            log_event('controller_replace_exit')
+            raise SystemExit(HANDOVER_EXIT)
+        started = clock()
+        try:
+            attempt()
+            return
+        except SystemExit:
+            raise
+        except Exception as error:
+            if clock() - started >= HEALTHY_RUN_S:
+                failures = 0
+            delay = RETRY_DELAYS_S[min(failures, len(RETRY_DELAYS_S) - 1)]
+            failures += 1
+            log_event('controller_retry', attempt=failures, retry_in_s=delay, **failure_reason(error))
+            for _ in range(delay):
+                if stop.wait(1) or replacing():
+                    break
+
+
+def confirm_owned_exit(receipt, *, polls=5, interval=2.0, sleep=None):
+    """Positive Job Object exit proof for our exact child, killing it only if needed."""
+    import time
+    sleep = sleep or time.sleep
+    row = native('status', receipt['id'])
+    if not same_controller(row, receipt):
+        raise RuntimeError('Controller identity changed; exit is unproven')
+    if row.get('worker_alive') is not False or row.get('containment_empty') is not True:
+        try:
+            result = native('kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '30000')  # aplexer max 30000; > session_host DRAIN_TIMEOUT_S (4398ce2a)
+            # Pinned aplexer 0.1.23 removes a finished record only after
+            # containment cleanup. An affirmative kill reply is proof.
+            if result.get('id') == receipt['id'] and result.get('record_removed') is True:
+                return
+        except RuntimeError:
+            # An already-exited child can refuse kill; status below decides.
+            pass
+    for index in range(polls):
+        row = native('status', receipt['id'])
+        if not same_controller(row, receipt):
+            raise RuntimeError('Controller identity changed; exit is unproven')
+        if row.get('containment_empty') is True:
+            return
+        if index + 1 < polls:
+            sleep(interval)
+    raise RuntimeError('Owned controller exit is unproven')
+
+
+def start_child(workspace, command, tag, env_args):
+    receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
+                     '--tag', tag, '--engine', 'shell',
+                     *env_args,
+                     *controller_resource_argv(),
+                     '--history-bytes', '262144',
+                     '--', *command)
+    # Windows hosts contain the controller with a Job Object (containment_empty);
+    # Linux hosts use cgroup caps above. Exit proof never reads /sys/fs/cgroup on
+    # Windows: native_sessions._confirm_workload_exit accepts catalog
+    # containment_empty plus dead PIDs instead.
+    # Reuse the receipt only in this process; no user-provided ownership labels
+    # or persisted IDs can select another session for cleanup.
+    if (receipt.get('engine') != 'shell' or receipt.get('command') != command or receipt.get('workspace') != str(workspace)
+            or receipt.get('tag') != tag or not receipt.get('id') or type(receipt.get('created_at_ms')) is not int):
+        raise RuntimeError('Native controller receipt mismatch')
+    return receipt
+
+
+def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, stop):
+    tag = tag_prefix + uuid.uuid4().hex[:12]
     with ExitStack() as stack:
         lease = None
         if args.control_dir:
             if not is_windows():
                 raise ValueError('Installer handover is supported only for Windows Job Objects')
-            from agent_hub_host.bootstrap_control import ControllerLease, NeedsAttention
-            try:
-                lease = stack.enter_context(ControllerLease(args.control_dir))
-            except NeedsAttention:
-                # Success exit stops the task's automatic failure/retry loop.
-                # The durable status and log give an actionable recovery path.
-                print(json.dumps({'event': 'needs_attention', 'reason': 'controller_exit_unproven',
-                      'status_file': str(pathlib.Path(args.control_dir) / 'needs-attention.json')}), flush=True)
-                return
-        receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
-                         '--tag', tag, '--engine', 'shell',
-                         *env_args,
-                         *controller_resource_argv(),
-                         '--history-bytes', '262144',
-                         '--', *command)
-        # Windows hosts contain the controller with a Job Object (containment_empty);
-        # Linux hosts use cgroup caps above. Exit proof never reads /sys/fs/cgroup on
-        # Windows: native_sessions._confirm_workload_exit accepts catalog
-        # containment_empty plus dead PIDs instead.
-        # Reuse the receipt only in this process; no user-provided ownership labels
-        # or persisted IDs can select another session for cleanup.
-        if (receipt.get('engine') != 'shell' or receipt.get('command') != command or receipt.get('workspace') != str(workspace)
-                or receipt.get('tag') != tag or not receipt.get('id') or type(receipt.get('created_at_ms')) is not int):
-            raise RuntimeError('Native controller receipt mismatch')
+            from agent_hub_host.bootstrap_control import ControllerLease
+            # NeedsAttention propagates: the Windows loop logs it and retries
+            # recovery later; it never starts a duplicate child meanwhile.
+            lease = stack.enter_context(ControllerLease(args.control_dir))
+            from agent_hub_host.bootstrap_control import replace_pending
+            if replace_pending(args.control_dir):
+                log_event('controller_replace_exit')
+                raise SystemExit(HANDOVER_EXIT)
+        try:
+            receipt = start_child(workspace, command, tag, env_args)
+        except BaseException:
+            # aplexer may have created the child before a timeout or a bad
+            # receipt; record the unique tag so no duplicate starts blindly.
+            if lease:
+                lease.publish_pending(tag)
+            raise
         handing_over = False
+        child_died = False
         try:
             if lease:
                 lease.publish(receipt)
-            print(json.dumps({'event': 'controller_started', 'id': receipt['id']}), flush=True)
+            log_event('controller_started', id=receipt['id'])
             while not stop.wait(5):
                 if lease and lease.stop_requested():
                     handing_over = True
@@ -200,46 +323,45 @@ def main():
                 if not same_controller(row, receipt):
                     raise RuntimeError('Controller identity changed')
                 if row.get('phase') != 'running' or row.get('worker_alive') is False:
+                    child_died = True
                     marker = journal / 'host-release-restart'
                     if marker.exists():
                         # Planned exit to load a Hub-pinned host release (intake
                         # a3227276): exit so the service restarts this supervisor
                         # on the new code too; not a crash.
                         marker.unlink()
-                        print(json.dumps({'event': 'controller_release_restart', 'id': receipt['id']}), flush=True)
-                        raise SystemExit(75)
+                        log_event('controller_release_restart', id=receipt['id'])
+                        raise SystemExit(RELEASE_RESTART_EXIT)
                     if not stop.is_set():
                         publish_controller_crash(row, receipt, journal / 'host-health.json')
                     raise RuntimeError('Controller exited; supervisor will restart')
+        except BaseException as error:
+            if not isinstance(error, SystemExit):
+                log_event('controller_failed', id=receipt['id'], **failure_reason(error))
+                if child_died:
+                    tail = child_output_tail(receipt)
+                    if tail:
+                        log_event('controller_child_output', id=receipt['id'], tail=tail)
+            raise
         finally:
             # Only our exact receipt qualifies for stop. Missing records are not
             # exit proof, and never cause another tag or PID to be selected.
             try:
-                row = native('status', receipt['id'])
-                if same_controller(row, receipt):
-                    result = native('kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '30000')  # aplexer max 30000; > session_host DRAIN_TIMEOUT_S (4398ce2a)
-                    if lease:
-                        # Pinned aplexer 0.1.23 removes a finished record only
-                        # after containment cleanup. An affirmative kill reply
-                        # is proof; an independently missing record is not.
-                        proven = result.get('id') == receipt['id'] and result.get('record_removed') is True
-                        if not proven:
-                            row = native('status', receipt['id'])
-                            proven = same_controller(row, receipt) and row.get('containment_empty') is True
-                        if not proven:
-                            raise RuntimeError('Owned controller exit is unproven')
-                        lease.confirm_exit()
-                elif lease:
-                    raise RuntimeError('Controller identity changed; exit is unproven')
-            except Exception:
+                if lease:
+                    confirm_owned_exit(receipt)
+                    lease.confirm_exit()
+                else:
+                    row = native('status', receipt['id'])
+                    if same_controller(row, receipt):
+                        native('kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '30000')
+            except Exception as cleanup_error:
                 if lease:
                     lease.mark_unproven()
-                print(json.dumps({'event': 'controller_cleanup_unconfirmed', 'id': receipt['id']}), flush=True)
+                log_event('controller_cleanup_unconfirmed', id=receipt['id'], **failure_reason(cleanup_error))
         if handing_over:
-            # Restart-on-failure restores the old runner if the installer dies
-            # after shutdown was accepted. A successful installer replaces and
-            # starts the task immediately; the lease also excludes duplicates.
-            raise SystemExit(75)
+            # The installer accepted the handover and replaces the task; the
+            # controller.ps1 loop ends on this code instead of restarting.
+            raise SystemExit(HANDOVER_EXIT)
 
 if __name__ == '__main__':
     main()
