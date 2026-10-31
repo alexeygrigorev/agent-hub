@@ -88,3 +88,16 @@ class SyncReportTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_credential_less_bundles_install_but_are_never_advertised(monkeypatch):
+    provisioning = p
+    records = [{'label': 'dummy-sync-5814', 'provider': 'codex', 'revision': 'r1'},
+               {'label': 'shared-codex', 'provider': 'codex', 'revision': 'r2'},
+               {'label': 'shared-go', 'provider': 'go', 'revision': 'r3'}]
+    bundles = {'dummy-sync-5814-r1': {'provider': 'codex', 'files': {}, 'env': {}, 'args': []},
+               'shared-codex-r2': {'provider': 'codex', 'files': {'.codex/auth.json': 'x'}, 'env': {}, 'args': []},
+               'shared-go-r3': {'provider': 'go', 'files': {}, 'env': {}, 'args': []}}
+    monkeypatch.setattr(provisioning, 'read_json', lambda path, fallback=None:
+                        records if path.name == 'state.json' else bundles[path.parent.name])
+    assert [s['account_label'] for s in provisioning.managed_subscriptions()] == ['shared-codex', 'shared-go']

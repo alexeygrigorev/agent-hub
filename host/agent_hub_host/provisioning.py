@@ -1319,6 +1319,12 @@ def launcher_metadata(provider, bundle=None):
     return {}
 
 
+def holds_login(bundle):
+    """A Hub bundle with no credential and no host-login path cannot run work."""
+    return (bundle['provider'] == 'go' or bundle.get('auth_method') == 'machine-login' or 'files' not in bundle
+            or bool(bundle['files']) or bool(bundle.get('env')) or bool(bundle.get('credential_paths')))
+
+
 def managed_subscriptions():
     state = read_json(root() / 'state.json', [])
     subs = []
@@ -1329,6 +1335,10 @@ def managed_subscriptions():
             bundle = read_json(dest / 'bundle.json')
         except Exception:
             pass
+        # Installed for sync proofs (e.g. dummy-sync-5814), never advertised
+        # for placement: no route means no session can land on it.
+        if isinstance(bundle, dict) and not holds_login({**bundle, 'provider': b['provider']}):
+            continue
         meta = launcher_metadata(b['provider'], bundle)
         sub = {
             # Canonical service model: the provider is the service. Orin's
