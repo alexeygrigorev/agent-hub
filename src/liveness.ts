@@ -206,7 +206,22 @@ export class LivenessService {
    */
   watchHosts(): any[] {
     const notifications: any[] = [];
-    for (const m of this.sql.exec('SELECT id,name,last_checkin_at,registered_at,drained FROM machines').toArray() as any[]) {
+    const rows = this.sql.exec('SELECT id,name,hostname,last_checkin_at,registered_at,drained FROM machines').toArray() as any[];
+    // A duplicate registration of one physical host is watched through its
+    // canonical id; alerting on the alias would report a live host offline.
+    let aliasOf = new Map<string, string>();
+    try {
+      aliasOf = resolveMachineAliases(rows.map((m: any) => {
+        const seen = Date.parse(effectiveCheckin(String(m.id), m.last_checkin_at) || '');
+        return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(seen) ? seen : null };
+      })).aliasOf;
+    } catch { aliasOf = new Map(); }
+    for (const m of rows) {
+      if (aliasOf.has(String(m.id))) {
+        // Close a false incident quietly: no recovery notice for a host that never went down.
+        this.setAlert('host_watch', String(m.id), null);
+        continue;
+      }
       const checkin = effectiveCheckin(String(m.id), m.last_checkin_at);
       const age = ageSeconds(checkin ?? m.registered_at, this.now());
       let existing: any = this.sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind='host_watch' AND subject=? AND resolved_at IS NULL", m.id).toArray()[0];
