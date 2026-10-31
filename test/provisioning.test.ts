@@ -83,6 +83,10 @@ describe('central engine provisioning', () => {
     expect(cell(await status(), 'test-machine').online).toBe(false);
     sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id='test-machine'", new Date().toISOString());
     expect(cell(await status(), 'test-machine').online).toBe(true);
+    // A later successful install clears the stored failure.
+    await report('synced', [{ label: 'test-account', revision: rev.revision, state: 'installed' }]);
+    expect(sql.exec('SELECT * FROM engine_sync_status').toArray()).toHaveLength(0);
+    await report('held', [{ label: 'test-account', revision: rev.revision, state: 'failed', error: 'OSError' }]);
     await s.handle(req('/test-account', 'DELETE'), admin);
     expect(sql.exec('SELECT * FROM engine_sync_status').toArray()).toHaveLength(0);
     expect(cell(await status(), 'test-machine').accounts).toHaveLength(0);

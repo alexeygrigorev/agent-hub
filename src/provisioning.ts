@@ -253,8 +253,13 @@ export class ProvisioningService {
           if (!row || it.revision !== row.revision) continue;
           // Error is a bounded exception-type name, never provider output.
           const error = it.state === 'failed' && typeof it.error === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(it.error) ? it.error : null;
-          // Write only on change: Free-plan Durable Object row writes are a daily budget.
+          // Only failures are stored (synced comes from engine_installations), and only
+          // on change: Free-plan Durable Object row writes are a daily budget.
           const prior: any = this.sql.exec('SELECT revision,state,error FROM engine_sync_status WHERE machine_id=? AND label=?', machine, it.label).toArray()[0];
+          if (it.state === 'installed') {
+            if (prior) this.sql.exec('DELETE FROM engine_sync_status WHERE machine_id=? AND label=?', machine, it.label);
+            continue;
+          }
           if (prior && prior.revision === row.revision && prior.state === it.state && (prior.error ?? null) === error) continue;
           this.sql.exec('INSERT OR REPLACE INTO engine_sync_status VALUES (?,?,?,?,?,?)', machine, it.label, row.revision, it.state, error, now);
         }

@@ -122,7 +122,9 @@ def test_install_failure_does_not_publish_profile_or_ack():
     with patch.object(p.subprocess, 'run', side_effect=OSError('secret stderr')):
         with pytest.raises(ValueError, match='^Managed engine installation failed$'):
             p.sync(request)
-    assert len(calls) == 1
+    acks = [c for c in calls if c[1] != "/api/engines/sync-report"]  # failure report is not an ack (5814e109 AC9)
+    assert len(acks) == 1
+    assert "secret stderr" not in repr(calls)
     assert not p.managed_subscriptions()
     assert 'hub-test-account' not in p.profile_path().read_text()
 

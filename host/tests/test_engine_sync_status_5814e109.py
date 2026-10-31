@@ -42,7 +42,7 @@ class SyncReportTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 3)
 
     def test_failure_carries_exception_type_only(self):
-        p.report_sync(self.request, 'synced', [B1], [B2], OSError('/secret/path: token=abc'), clock=self.clock)
+        p.report_sync(self.request, 'synced', [B1], [B2], {B2['label']: OSError('/secret/path: token=abc')}, clock=self.clock)
         items = self.calls[-1][2]['items']
         self.assertEqual(items[1], dict(B2, state='failed', error='OSError'))
         self.assertNotIn('secret', repr(self.calls))
@@ -54,6 +54,29 @@ class SyncReportTest(unittest.TestCase):
             raise OSError('down')
         self.assertFalse(p.report_sync(down, 'synced', [B1], clock=self.clock))
         self.assertTrue(p.report_sync(self.request, 'synced', [B1], clock=self.clock))
+
+    def test_sync_reports_failures_even_when_every_install_fails(self):
+        from unittest import mock
+        bundles = [dict(B1, provider='codex', version='0.162.1', files={}, env={}, args=[]),
+                   dict(B2, provider='claude', version='2.1.304', files={}, env={}, args=[])]
+
+        def hub(method, path, payload=None):
+            self.calls.append((method, path, payload))
+            return {'engines': bundles, 'logins': []} if path == '/api/engines/sync' else {}
+
+        def broken(b, request=None):
+            raise (OSError if b['label'] == B1['label'] else PermissionError)('/private/path')
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as managed, mock.patch.dict(os.environ, {'AGENT_HUB_MANAGED_DIR': managed}), \
+                mock.patch.object(p, 'install', broken), mock.patch.object(p, 'profiles'):
+            with self.assertRaises(ValueError):
+                p.sync(hub)
+        report = [c for c in self.calls if c[1] == '/api/engines/sync-report'][-1][2]
+        self.assertEqual(report['state'], 'held')
+        self.assertEqual([(i['label'], i['state'], i['error']) for i in report['items']],
+                         [(B1['label'], 'failed', 'OSError'), (B2['label'], 'failed', 'PermissionError')])
+        self.assertNotIn('/private/path', repr(self.calls))
 
     def test_status_view_is_compact(self):
         listing = {'sync_status': [{'machine_id': 'm1', 'machine': 'RMTHZ', 'online': True, 'host_state': 'synced',

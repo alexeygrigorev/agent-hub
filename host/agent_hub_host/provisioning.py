@@ -1151,6 +1151,7 @@ def sync(request=None):
         write_json(root() / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']} for b in retained])
         installed_bundles = []
         failed_bundles = []
+        errors = {}
         last_error = None
         for b in bundles:
             try:
@@ -1158,10 +1159,12 @@ def sync(request=None):
                 installed_bundles.append(b)
             except Exception as e:
                 failed_bundles.append(b)
-                last_error = e
+                errors[b['label']] = last_error = e
                 # Exception type only: messages may carry paths or provider output.
                 print(json.dumps({'managed_install_failed': b['label'], 'error': type(e).__name__}), file=sys.stderr)
         if bundles and not installed_bundles:
+            # Hub still learns which accounts failed, and why, before the sync is held.
+            report_sync(request, 'held', (), failed_bundles, errors)
             if len(bundles) == 1 and last_error:
                 raise last_error
             raise ValueError('Managed engine installation failed')
@@ -1172,7 +1175,7 @@ def sync(request=None):
             request('POST', '/api/engines/' + b['label'], {'revision': b['revision'], 'authenticated': authenticated})
         from . import engine_login
         engine_login.tick(response.get('logins', []), installed_bundles, request)
-    report_sync(request, 'synced', installed_bundles, failed_bundles, last_error)
+    report_sync(request, 'synced', installed_bundles, failed_bundles, errors)
     result = {'status': 'synced', 'profiles': ['hub-' + b['label'] for b in installed_bundles]}
     if failed_bundles:
         result['failed_labels'] = [b['label'] for b in failed_bundles]
@@ -1185,11 +1188,12 @@ SYNC_REPORT_REFRESH_S = 1800
 _last_sync_report = {'body': None, 'at': 0.0}
 
 
-def report_sync(request, state, installed=(), failed=(), error=None, clock=time.monotonic):
+def report_sync(request, state, installed=(), failed=(), errors=None, clock=time.monotonic):
     """Best-effort per-host sync status for Hub (exception type only, never messages)."""
+    errors = errors or {}
     items = [{'label': b['label'], 'revision': b['revision'], 'state': 'installed'} for b in installed]
     items += [{'label': b['label'], 'revision': b['revision'], 'state': 'failed',
-               'error': type(error).__name__ if error else 'InstallFailed'} for b in failed]
+               'error': type(errors[b['label']]).__name__ if b['label'] in errors else 'InstallFailed'} for b in failed]
     body = {'state': state, 'items': items}
     now = clock()
     if body == _last_sync_report['body'] and now - _last_sync_report['at'] < SYNC_REPORT_REFRESH_S:
