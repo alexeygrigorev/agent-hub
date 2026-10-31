@@ -94,7 +94,12 @@ class ReleaseCompletenessTests(unittest.TestCase):
         ]
         for expression in approved:
             self.assertEqual(updater.count(expression), 1)
-        self.assertEqual(anchor_uses, direct + len(approved))
+        # Windows PATH repair walks up from the venv interpreter, not from the
+        # release tree, so it reads no release-relative file.
+        venv_anchor = 'Path(sys.executable).resolve().parent.parent.parent / "bin"'
+        native = (HOST_PKG / "native_sessions.py").read_text(encoding="utf-8")
+        self.assertEqual(native.count(venv_anchor), 1)
+        self.assertEqual(anchor_uses, direct + len(approved) + 1)
         self.assertTrue({"scripts/build-host-release.py", "scripts/verify-host-release.py",
                          "scripts/switch-host-release.py"}.issubset(manifest["files"]))
         for name in found:
