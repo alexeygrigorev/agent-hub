@@ -55,6 +55,13 @@ CREATE TABLE IF NOT EXISTS placement_rejections (id TEXT PRIMARY KEY, created_at
 CREATE INDEX IF NOT EXISTS idx_placement_rejections_recent ON placement_rejections(created_at_ms);
 `;
 type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
+/** Periodic host reports and read-only probes cannot change capacity or the placement queue. They arrive many times a
+ * minute per host; counting them as writes made every offers poll re-run planning (intake e8a22f4c). */
+const QUIET_FLEET_WRITES = /^\/api\/(?:fleet\/(?:sessions|subscriptions|probe)$|fleet\/resources(?:\/|$)|(?:fleet\/)?routing\/(?:capabilities|host-release|host-goal)(?:\/|$))/;
+export function marksMaintenanceDirty(method: string, path: string): boolean {
+  return method !== 'GET' && !QUIET_FLEET_WRITES.test(path);
+}
+
 /** Longest an idle offers poll may reuse the previous capacity maintenance pass (intake e8a22f4c). */
 const POLL_MAINTENANCE_MS = 20000;
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -1538,8 +1545,7 @@ export class FleetService {
   async handle(request: Request, auth: Auth): Promise<Response> {
     if (auth.error) return auth.error;
     const path = new URL(request.url).pathname; const caller = auth.caller;
-    // Writes other than the periodic host reports can change what maintenance sees.
-    if (request.method !== 'GET' && path !== '/api/fleet/sessions' && path !== '/api/fleet/subscriptions') this.maintenanceDirty = true;
+    if (marksMaintenanceDirty(request.method, path)) this.maintenanceDirty = true;
     if (path === '/api/fleet/tasks' || path.startsWith('/api/fleet/tasks/') || path.startsWith('/api/fleet/routing/')) return this.routing.handle(request, auth);
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
