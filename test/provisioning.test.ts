@@ -93,6 +93,24 @@ describe('central engine provisioning', () => {
     expect((await s.handle(req('/sync-report', 'POST', { state: 'bad', items: [] }), host)).status).toBe(400);
     expect((await s.handle(req('/sync-report', 'POST', { state: 'synced', items: [] }), admin)).status).toBe(403);
   }));
+  it('registers an Antigravity account as a new engine type every host installs (5814e109 AC8)', async () => fixture(async (s, sql) => {
+    const token = '.gemini/antigravity-cli/antigravity-oauth-token';
+    const agy = { label: 'shared-agy', provider: 'antigravity', version: '1.4.10', files: { [token]: 'synthetic-agy-token' }, env: {}, args: [] };
+    for (const bad of [{ ...agy, files: {} }, { ...agy, env: { GEMINI_API_KEY: 'x' } }, { ...agy, files: { [token]: 'x', '.gemini/settings.json': '{}' } }, { ...agy, auth_method: 'machine-login' }])
+      expect((await s.handle(req('/shared-agy', 'PUT', bad), admin)).status).toBe(400);
+    const add: any = await (await s.handle(req('/shared-agy', 'PUT', agy), admin)).json();
+    expect(add.status).toBe('configured');
+    // The harness is Antigravity; the quota pool is the Google (Gemini) family.
+    expect(sql.exec("SELECT provider FROM fleet_accounts WHERE label='shared-agy'").one().provider).toBe('gemini');
+    expect(JSON.stringify(sql.exec('SELECT * FROM engine_credentials').toArray())).not.toContain('synthetic-agy-token');
+    const synced: any = await (await s.handle(req('/sync'), host)).json();
+    expect(synced.engines[0]).toMatchObject({ provider: 'antigravity', version: '1.4.10', credential_paths: [token] });
+    expect(synced.engines[0].files[token]).toBe('synthetic-agy-token');
+    expect((await s.handle(req('/shared-agy', 'POST', { revision: add.revision }), host)).status).toBe(200);
+    expect(sql.exec('SELECT engine, account, profile FROM fleet_routes').toArray()).toEqual([{ engine: 'antigravity', account: 'shared-agy', profile: 'hub-shared-agy' }]);
+    // Re-import keeps the same pool (no provider mismatch against gemini).
+    expect((await s.handle(req('/shared-agy', 'PUT', agy), admin)).status).toBe(200);
+  }));
   it('denies unauthenticated, agents, stale host families and admin download of credentials', async () => fixture(async (s, _sql, allow) => {
     expect((await s.handle(req(), {})).status).toBe(401);
     for (const caller of [{ caller: {kind: 'agent'}, scopes: ['host'] }, admin]) expect((await s.handle(req('/sync'), caller)).status).toBe(403);

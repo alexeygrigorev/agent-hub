@@ -285,6 +285,29 @@ Its protocol and UI are tested with synthetic consent; no real Google consent is
 claimed. Existing per-provider credential expiry or provider revocation can require
 renewal. Codex and Claude refresh-token rotation is centralized (see above).
 
+## Sync to every host, and per-host status (intake 5814e109 AC7-AC9)
+
+Every host reconciles with Hub on each heartbeat (about once a minute) and on
+reconnect: an account added in Hub is installed and its `hub-<label>` aplexer
+profile appears, and a removed account's profile and bundle are withdrawn, with
+no per-host step. `hub engines status` shows, per registered host, whether it is
+online (machine check-in within 10 minutes) and each account's state: `synced`
+(current revision installed), `failed:<ExceptionType>` or `pending`. Hosts send
+the sync report only when it changes (plus a 30-minute refresh), and Hub stores
+only failures, so the status costs almost no Durable Object row writes.
+
+Antigravity is a Hub engine type too. Import its token once:
+
+```
+hub engines add --provider antigravity --label shared-agy \
+  --auth-file ~/.gemini/antigravity-cli/antigravity-oauth-token
+```
+
+Hosts install the sha512-pinned Antigravity CLI release from
+`host/agent_hub_host/bootstrap_pins.py` into the bundle (never npm or a mutable
+latest), and the account joins the Gemini quota pool with engine `antigravity`.
+No direct quota probe exists for it yet, so admission reports quota unknown.
+
 ## Canonical managed-engine root (intake 59a6f44a AC1)
 
 One source of truth: `host/agent_hub_host/provisioning.py::root()`.

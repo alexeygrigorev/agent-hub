@@ -26,10 +26,15 @@ export const PACKAGES: Record<string, { pkg: string; bin: string; engine: string
   gemini: { pkg: '@google/gemini-cli', bin: 'gemini', engine: 'gemini' },
   go: { pkg: 'opencode-ai', bin: 'opencode', engine: 'opencode' },
   zai: { pkg: 'zcodex', bin: 'zcodex', engine: 'codex' },
+  // Antigravity is a native binary: hosts install the release pinned in
+  // host/agent_hub_host/bootstrap_pins.py (sha512-checked), never npm (AC8).
+  antigravity: { pkg: 'antigravity-cli', bin: 'agy', engine: 'antigravity' },
 };
+// The Antigravity harness spends the Google (Gemini) quota pool.
+export const accountProvider = (provider: string) => provider === 'antigravity' ? 'gemini' : provider;
 // Provider default slot limit for a Hub-central account created by import or
 // central login (t1248u). An explicit `max_concurrency` on create wins.
-export const PROVIDER_DEFAULT_MAX_CONCURRENCY: Record<string, number> = { codex: 8, claude: 8, gemini: 8, go: 8, zai: 8 };
+export const PROVIDER_DEFAULT_MAX_CONCURRENCY: Record<string, number> = { codex: 8, claude: 8, gemini: 8, go: 8, zai: 8, antigravity: 8 };
 export const providerDefaultMaxConcurrency = (provider: string) => PROVIDER_DEFAULT_MAX_CONCURRENCY[provider] ?? 8;
 const IMPLICIT_MAX_MIGRATION = 'managed_account_max_concurrency_default_v1';
 const explicitMax = (v: unknown) => v === undefined || v === null ? undefined : Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 100 ? v as number : NaN;
@@ -44,6 +49,9 @@ export function validBundle(v: any): boolean {
     : v.auth_method !== undefined || typeof v.files?.['.gemini/oauth_creds.json'] !== 'string'))) return false;
   if (!object(v.files) || Object.keys(v.files).length > 24 || !object(v.env) || Object.keys(v.env).length > 12) return false;
   if (v.provider === 'go' && (Object.keys(v.files).length || Object.keys(v.env).length)) return false;
+  // Antigravity: exactly the Hub-held OAuth token file, no env secrets.
+  if (v.provider === 'antigravity' && (Object.keys(v.env).length || v.auth_method !== undefined ||
+    JSON.stringify(Object.keys(v.files)) !== JSON.stringify(CREDENTIAL_PATHS.antigravity))) return false;
   for (const [path, value] of Object.entries(v.files)) {
     if (path.length > 200 || !path.split('/').every(p => /^[A-Za-z0-9_.-]+$/.test(p) && p !== '.' && p !== '..') || typeof value !== 'string' || value.length > 16000) return false;
   }
@@ -331,7 +339,7 @@ export class ProvisioningService {
       // Canonical provider family: `codex-orin` rows are the second Codex
       // account under provider `codex`, never a separate provider.
       const providerFamily = canonicalQuotaProvider(existing?.provider);
-      if (existing && providerFamily !== bundle.provider) return reply({ error: 'account_provider_mismatch' }, 409);
+      if (existing && providerFamily !== accountProvider(bundle.provider)) return reply({ error: 'account_provider_mismatch' }, 409);
       if (!managed && existing) {
         // An explicit recovery may attach credentials to a stale registry pool,
         // but must neither rename the quota pool nor reset its limits.
@@ -345,7 +353,7 @@ export class ProvisioningService {
       this.sql.exec('DELETE FROM fleet_routes WHERE account=?', label);
       this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', label);
       // An existing pool keeps its limits; a new one inherits the provider default.
-      if (!existing) this.sql.exec('INSERT INTO fleet_accounts VALUES (?,?,?,?,?)', label, bundle.provider, requestedMax ?? providerDefaultMaxConcurrency(bundle.provider), bundle.provider === 'codex' ? 15 : 0, 1);
+      if (!existing) this.sql.exec('INSERT INTO fleet_accounts VALUES (?,?,?,?,?)', label, accountProvider(bundle.provider), requestedMax ?? providerDefaultMaxConcurrency(bundle.provider), bundle.provider === 'codex' ? 15 : 0, 1);
       if (credentialCipher) {
         if (Number(this.credentialRow(label)?.generation ?? 0) + 1 !== generation) return reply({ error: 'credential_changed' }, 409);
         this.writeCredential(label, bundle.provider, generation, credentialCipher, credential, 'import');

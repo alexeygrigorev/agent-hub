@@ -24,6 +24,7 @@ export const CREDENTIAL_PATHS: Record<string, string[]> = {
   claude: ['.claude/.credentials.json'],
   zai: ['.zcode/v2/credentials.json'],
   gemini: ['.gemini/oauth_creds.json'],
+  antigravity: ['.gemini/antigravity-cli/antigravity-oauth-token'],
   go: [],
 };
 

@@ -26,7 +26,10 @@ PACKAGES = {
     'gemini': ('@google/gemini-cli', 'gemini', 'gemini'),
     'go': ('opencode-ai', 'opencode', 'opencode'),
     'zai': ('codex-zcode', 'zcodex', 'codex'),
+    # Native binary from the reviewed release pin, never npm (intake 5814e109 AC8).
+    'antigravity': ('antigravity-cli', 'agy', 'antigravity'),
 }
+ANTIGRAVITY_TOKEN = '.gemini/antigravity-cli/antigravity-oauth-token'
 ENV = {'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
        'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENCODE_API_KEY',
        'ZAI_API_KEY', 'ZAI_BASE_URL', 'ZAI_TOKEN'}
@@ -653,6 +656,9 @@ def validate(bundle):
         raise ValueError('Gemini needs machine login or a Hub-held OAuth credential')
     if bundle['provider'] == 'go' and (bundle.get('files') or bundle.get('env')):
         raise ValueError('OpenCode uses native device login; credential bundles are unsupported')
+    if bundle['provider'] == 'antigravity' and (bundle.get('env') or bundle.get('auth_method') is not None or
+                                                list(bundle.get('files') or {}) != [ANTIGRAVITY_TOKEN]):
+        raise ValueError('Antigravity needs exactly its Hub-held OAuth token')
     if not isinstance(bundle.get('version'), str) or not re.fullmatch(r'\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?', bundle['version']):
         raise ValueError('Invalid managed version')
     if not isinstance(bundle.get('files'), dict) or len(bundle['files']) > 24 or not isinstance(bundle.get('env'), dict):
@@ -908,6 +914,8 @@ def executable_path(bundle, dest, is_windows=None):
         if native and Path(native).is_file():
             return Path(native)
         raise ValueError('Native zcodex binary missing')
+    if bundle['provider'] == 'antigravity':
+        return dest / 'engine/bin' / ('agy.exe' if is_windows else 'agy')
     modules = dest / 'engine/node_modules'
     if bundle['provider'] in ('claude', 'go'):
         system = {'linux': 'linux', 'darwin': 'darwin', 'win32': 'win32'}.get('win32' if is_windows else sys.platform)
@@ -1060,6 +1068,8 @@ def install(bundle, request=None):
         runtime = ensure_zcode_runtime(dest)
         if not runtime:
             raise ValueError('ZCode runtime missing (/opt/ZCode/resources/glm/zcode.cjs)')
+    elif bundle['provider'] == 'antigravity':
+        install_antigravity(bundle, dest)
     else:
         npm_cmd = resolve_npm_command()
         try:
@@ -1079,6 +1089,28 @@ def install(bundle, request=None):
     credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
     credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
     write_json(dest / 'bundle.json', bundle)
+
+
+def antigravity_pinned_version():
+    from .bootstrap_pins import ANTIGRAVITY_RELEASES
+    versions = {r.get('version') for r in ANTIGRAVITY_RELEASES.values()}
+    if len(versions) != 1:
+        raise ValueError('Antigravity release pins disagree on the version')
+    return versions.pop()
+
+
+def install_antigravity(bundle, dest):
+    """The sha512-pinned Antigravity CLI release (bootstrap_pins), into this bundle only."""
+    from . import bootstrap
+    if bundle['version'] != antigravity_pinned_version():
+        raise ValueError('Antigravity version is not the pinned release')
+    engine = dest / 'engine'
+    for sub in ('bin', 'tmp'):
+        (engine / sub).mkdir(parents=True, exist_ok=True)
+    try:
+        bootstrap.ensure_antigravity(engine)
+    except (subprocess.SubprocessError, OSError, ValueError, RuntimeError, KeyError):
+        raise ValueError('Managed engine installation failed') from None
 
 
 def _rmtree_managed(entry: Path) -> None:
@@ -1270,6 +1302,12 @@ def launcher_metadata(provider, bundle=None):
             'launcher_model': model or 'gemini-2.5-pro',
             'launcher_effort': effort or 'high',
         }
+    elif provider == 'antigravity':
+        return {
+            'launcher_provider': 'antigravity',
+            'launcher_model': model or 'gemini-3.8-flash-high',
+            'launcher_effort': effort,
+        }
     return {}
 
 
@@ -1288,7 +1326,8 @@ def managed_subscriptions():
             # Canonical service model: the provider is the service. Orin's
             # second Codex home reports service `codex` (account `codex-orin`,
             # its label), never a separate `codex-orin` provider.
-            'service': b['provider'],
+            # Antigravity spends the Google (Gemini) quota pool.
+            'service': 'gemini' if b['provider'] == 'antigravity' else b['provider'],
             'account_label': b['label'],
             'engine': PACKAGES[b['provider']][2],
             'profile': 'hub-' + b['label'],
@@ -1522,7 +1561,7 @@ def execute():
                 elif b['provider'] == 'claude':
                     if '--dangerously-skip-permissions' not in extra_argv and '--dangerously-skip-permissions' not in b.get('args', []):
                         bypass_flags = ['--dangerously-skip-permissions']
-                elif b['provider'] == 'gemini':
+                elif b['provider'] in ('gemini', 'antigravity'):
                     if '--dangerously-skip-permissions' not in extra_argv and '--dangerously-skip-permissions' not in b.get('args', []):
                         bypass_flags = ['--dangerously-skip-permissions']
             from .codex_interactive import isolated_argv
@@ -1809,7 +1848,8 @@ def command(args):
                  'claude': ('.claude/.credentials.json', '.claude/settings.json', '2.1.304'),
                  'gemini': ('.gemini/oauth_creds.json', '.gemini/settings.json', '0.64.0'),
                  'go': ('.local/share/opencode/auth.json', '.config/opencode/opencode.json', '1.19.3'),
-                 'zai': ('.zcode/v2/credentials.json', '.zcodex/config.toml', '0.155.1')}
+                 'zai': ('.zcode/v2/credentials.json', '.zcodex/config.toml', '0.155.1'),
+                 'antigravity': (ANTIGRAVITY_TOKEN, None, antigravity_pinned_version())}
         auth_path, config_path, version = paths[args.provider]
         env = {}
         if args.provider == 'go':
@@ -1880,6 +1920,8 @@ def command(args):
             if getattr(args, 'token_file', None) or not args.auth_file:
                 raise ValueError('Native import requires auth-file')
             files = {auth_path: private_fs.read_bytes(Path(args.auth_file).expanduser().absolute(), 16000).decode()}
+        if args.config_file and not config_path:
+            raise ValueError('Antigravity imports only its OAuth token file')
         if args.config_file:
             files[config_path] = private_fs.read_bytes(Path(args.config_file).expanduser().absolute(), 16000).decode()
         elif args.provider == 'codex':
