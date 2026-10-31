@@ -1332,7 +1332,7 @@ export class QuotaStore {
     // registration can never show as a missing machine.
     let aliasOf = new Map<string, string>();
     try {
-      const aliasRows = this.sql.exec("SELECT id, hostname, drained, last_checkin_at FROM machines").toArray() as any[];
+      const aliasRows = this.sql.exec("SELECT id, hostname, drained, last_checkin_at FROM machines WHERE revoked_at IS NULL").toArray() as any[];
       aliasOf = resolveMachineAliases(aliasRows.map((m: any) => {
         const seen = typeof m.last_checkin_at === 'string' ? Date.parse(m.last_checkin_at) : NaN;
         return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(seen) ? seen : null };
@@ -1340,7 +1340,7 @@ export class QuotaStore {
     } catch { aliasOf = new Map(); }
     // A filter naming an alias reads the canonical machine it resolves to.
     const effectiveHostId = filters.host_id && aliasOf.has(filters.host_id) ? aliasOf.get(filters.host_id)! : filters.host_id;
-    const machines = (this.sql.exec("SELECT id FROM machines ORDER BY id").toArray() as any[])
+    const machines = (this.sql.exec("SELECT id FROM machines WHERE revoked_at IS NULL ORDER BY id").toArray() as any[])
       .map((m: any) => m.id)
       .filter((id: string) => !aliasOf.has(id) && (!effectiveHostId || id === effectiveHostId));
 

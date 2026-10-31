@@ -740,7 +740,7 @@ export class FleetService {
     const liveIds = new Set<string>();
     const liveEnginesByMachine = new Map<string, Set<string>>();
     try {
-      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines').toArray() as any[]) {
+      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines WHERE revoked_at IS NULL').toArray() as any[]) {
         if (m.drained) continue;
         if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000)) continue;
         liveIds.add(String(m.id));
@@ -1019,7 +1019,7 @@ export class FleetService {
     // capacity queueing for the engines the live fleet actually runs.
     const liveEngines = new Set<string>();
     try {
-      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines').toArray() as any[]) {
+      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines WHERE revoked_at IS NULL').toArray() as any[]) {
         if (m.drained) continue;
         if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000)) continue;
         const engines = parsed(m.capabilities)?.engines;
@@ -1599,14 +1599,14 @@ export class FleetService {
       // alias resolve to the canonical host for display and liveness.
       let machineAliases: Record<string, string> = {};
       try {
-        const aliasRows = this.sql.exec('SELECT id, hostname, drained, last_checkin_at FROM machines').toArray() as any[];
+        const aliasRows = this.sql.exec('SELECT id, hostname, drained, last_checkin_at FROM machines WHERE revoked_at IS NULL').toArray() as any[];
         const resolution = resolveMachineAliases(aliasRows.map((m: any) => {
           const persisted = typeof m.last_checkin_at === 'string' ? Date.parse(m.last_checkin_at) : NaN;
           return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(persisted) ? persisted : null };
         }));
         machineAliases = Object.fromEntries(resolution.aliasOf.entries());
       } catch { machineAliases = {}; }
-      const machines = this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray().map((m: any) => {
+      const machines = this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL ORDER BY id').toArray().map((m: any) => {
         const canonical = machineAliases[String(m.id)] ?? null;
         return { ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at), alias_of: canonical, canonical_id: canonical ?? String(m.id) };
       });
@@ -1622,6 +1622,26 @@ export class FleetService {
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
           harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() })),
         launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
+    }
+    const revokeMatch = /^\/api\/fleet\/machines\/([A-Za-z0-9_-]{1,64})\/revoke$/.exec(path);
+    if (revokeMatch && request.method === 'POST') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      const reason = typeof data?.reason === 'string' ? data.reason.trim() : '';
+      if (!object(data, ['confirm', 'reason']) || data.confirm !== true || !reason || reason.length > 500) return response({ error: 'confirm_and_reason_required' }, 400);
+      const machineId = revokeMatch[1];
+      return this.transaction(() => {
+        const m: any = this.sql.exec('SELECT id, credential_id, revoked_at FROM machines WHERE id = ?', machineId).toArray()[0];
+        if (!m) return response({ error: 'unknown_machine' }, 404);
+        if (m.revoked_at) return response({ status: 'already_revoked', machine_id: machineId, revoked_at: m.revoked_at });
+        const at = new Date(this.now()).toISOString(); const actor = String(caller.actor ?? 'admin');
+        const families = this.sql.exec('SELECT DISTINCT family_id FROM credentials WHERE kind = ? AND (machine_id = ? OR id = ?) AND family_id IS NOT NULL', 'host', machineId, m.credential_id ?? '').toArray().map((r: any) => r.family_id);
+        let revoked = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE kind = ? AND revoked_at IS NULL AND (machine_id = ? OR id = ?)', at, 'host', machineId, m.credential_id ?? '').rowsWritten;
+        for (const f of families) revoked += this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', at, f).rowsWritten;
+        this.sql.exec('UPDATE machines SET revoked_at = ?, revoked_reason = ?, revoked_by = ?, drained = 1 WHERE id = ?', at, reason, actor, machineId);
+        this.sql.exec('INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)', actor, 'machine_revoke', 'machine', machineId, JSON.stringify({ reason, credentials_revoked: revoked }), at);
+        return response({ status: 'revoked', machine_id: machineId, revoked_at: at, revoked_by: actor, reason, credentials_revoked: revoked });
+      });
     }
     if (path === '/api/fleet/claim-policy' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);

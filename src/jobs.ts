@@ -659,7 +659,7 @@ export class JobsService {
   }
 
   private getCandidates(now: Date, excludeIds: string[], slotKeyOrDate?: string | Date): Machine[] {
-    const machines = this.sql.exec("SELECT * FROM machines").toArray() as unknown as Machine[];
+    const machines = this.sql.exec("SELECT * FROM machines WHERE revoked_at IS NULL").toArray() as unknown as Machine[];
     const candidates: Machine[] = [];
     const nowMs = now.getTime();
 

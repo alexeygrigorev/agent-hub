@@ -431,7 +431,7 @@ export async function handleRegistryRoutes(
     if (!cred) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
     const now = Date.now();
-    const machines = sql.exec('SELECT * FROM machines WHERE drained = 0').toArray() as any[];
+    const machines = sql.exec('SELECT * FROM machines WHERE drained = 0 AND revoked_at IS NULL').toArray() as any[];
     const available = machines.filter((m: any) => {
       const memState = machineState.get(m.id);
       let lastSeen = 0;
@@ -460,7 +460,7 @@ export async function handleRegistryRoutes(
     const session = await getSession(env, request);
     if (!session || !session.isAdmin) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const machines = sql.exec('SELECT * FROM machines').toArray() as any[];
+    const machines = sql.exec('SELECT * FROM machines WHERE revoked_at IS NULL').toArray() as any[];
     return Response.json({ machines: machines.map((m: any) => ({ ...m, roles: JSON.parse(m.roles as string || '[]'), capabilities: JSON.parse(m.capabilities as string || '{}') })) });
   }
 

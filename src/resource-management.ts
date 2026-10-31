@@ -697,7 +697,7 @@ export class ResourceManagement {
     return rows.map((r:any)=>({...r,active:latest.get(r.machine_id+':'+r.native_id)?.id===r.id && r.action==='throttled'}));
   }
   overview() {
-    const rows=this.sql.exec('SELECT id,hostname,drained,capabilities,last_heartbeat,last_checkin_at FROM machines WHERE drained=0').toArray() as any[];
+    const rows=this.sql.exec('SELECT id,hostname,drained,capabilities,last_heartbeat,last_checkin_at FROM machines WHERE drained=0 AND revoked_at IS NULL').toArray() as any[];
     // Intake 4398ce2a: a stale re-registered record of the same physical host
     // (SnV2 for live DEFLf4, hostname RMTHZ) has no telemetry and showed up as
     // a second host with CPU/memory 'unknown'. Mark-never-delete aliasing:

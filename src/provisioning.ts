@@ -102,7 +102,7 @@ export class ProvisioningService {
   syncStatus() {
     const now = this.now();
     const engines = this.sql.exec('SELECT label, provider, revision FROM engine_bundles ORDER BY label').toArray() as any[];
-    const machines = this.sql.exec('SELECT id, name, last_checkin_at FROM machines WHERE registered_at IS NOT NULL ORDER BY id').toArray() as any[];
+    const machines = this.sql.exec('SELECT id, name, last_checkin_at FROM machines WHERE registered_at IS NOT NULL AND revoked_at IS NULL ORDER BY id').toArray() as any[];
     const hosts = new Map((this.sql.exec('SELECT * FROM engine_sync_hosts').toArray() as any[]).map(h => [h.machine_id, h]));
     const installed = new Set((this.sql.exec('SELECT machine_id,label,revision FROM engine_installations').toArray() as any[]).map(i => i.machine_id + '|' + i.label + '|' + i.revision));
     const status = new Map((this.sql.exec('SELECT * FROM engine_sync_status').toArray() as any[]).map(r => [r.machine_id + '|' + r.label, r]));

@@ -60,7 +60,7 @@ export type HostInfo = { id: string; label: string; hostname: string | null; ali
 /** Canonical host per machine id plus display labels (name when unique, else id). */
 export function machineHosts(sql: SqlStorage): { canonical: (id: string) => string; info: Map<string, HostInfo> } {
   let rows: any[] = [];
-  try { rows = sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray() as any[]; } catch { rows = []; }
+  try { rows = sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL ORDER BY id').toArray() as any[]; } catch { rows = []; }
   const counts = new Map<string, number>();
   for (const m of rows) if (m.name) counts.set(String(m.name), (counts.get(String(m.name)) || 0) + 1);
   const labelOf = (m: any) => m.name && counts.get(String(m.name)) === 1 ? String(m.name) : String(m.id);

@@ -83,7 +83,7 @@ export class LivenessService {
   evaluate(): { thresholds: Thresholds; subjects: Subject[] } {
     const now = this.now(); const t = this.thresholds; const subjects: Subject[] = [];
     const machines = new Map<string, Subject>();
-    const rows = this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray() as any[];
+    const rows = this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL ORDER BY id').toArray() as any[];
     // Show enrolled names; fall back to the opaque id when a name is missing or shared.
     const counts = new Map<string, number>();
     for (const m of rows) if (m.name) counts.set(m.name, (counts.get(m.name) || 0) + 1);
@@ -206,7 +206,7 @@ export class LivenessService {
    */
   watchHosts(): any[] {
     const notifications: any[] = [];
-    const rows = this.sql.exec('SELECT id,name,hostname,last_checkin_at,registered_at,drained FROM machines').toArray() as any[];
+    const rows = this.sql.exec('SELECT id,name,hostname,last_checkin_at,registered_at,drained FROM machines WHERE revoked_at IS NULL').toArray() as any[];
     // A duplicate registration of one physical host is watched through its
     // canonical id; alerting on the alias would report a live host offline.
     let aliasOf = new Map<string, string>();

@@ -620,7 +620,10 @@ export class Hub extends DurableObject {
       last_heartbeat: 'JSON',
       drained: 'INTEGER DEFAULT 0',
       notes: 'TEXT',
-      approval_seq: 'INTEGER'
+      approval_seq: 'INTEGER',
+      revoked_at: 'TEXT',
+      revoked_reason: 'TEXT',
+      revoked_by: 'TEXT'
     });
 
     // R5 R2: server-owned enrollment authority migration.
@@ -1565,6 +1568,7 @@ export class Hub extends DurableObject {
               this.sql.exec("UPDATE device_pairings SET status = 'consumed' WHERE device_code_hash = ?", deviceCodeHash);
               return { expires, scopes: ['admin'] as string[], machineId: null as string | null };
             }
+            if (current.client_kind === 'host' && current.machine_id && this.sql.exec('SELECT 1 FROM machines WHERE id = ? AND revoked_at IS NOT NULL', current.machine_id).toArray().length) return null;
             const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
             this.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, approval_seq)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, credId, current.client_kind, tokens.accessHash, tokens.refreshHash, familyId, current.name, current.machine_id, current.actor, current.granted_scopes, current.approved_by_sub, new Date().toISOString(), expires, issuanceSeq);
@@ -1595,7 +1599,7 @@ export class Hub extends DurableObject {
           if (state !== 'pending') return new Response(deviceResult(state, session.email), {headers:UI_HEADERS});
           return new Response(deviceReviewHuman(pairing, session.email, Date.now()), {headers:UI_HEADERS});
         }
-        const machines = this.sql.exec('SELECT id, name FROM machines WHERE registered_at IS NOT NULL ORDER BY id').toArray() as any[];
+        const machines = this.sql.exec('SELECT id, name FROM machines WHERE registered_at IS NOT NULL AND revoked_at IS NULL ORDER BY id').toArray() as any[];
         let address = registryAddress(pairing.actor || '');
         if (address && !address.project) {
           const registered = this.sql.exec('SELECT project FROM agents WHERE tag = ?', address.tag).toArray() as any[];

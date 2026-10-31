@@ -218,6 +218,31 @@ def cmd_auth_logout(args):
     else:
         print("Logged out. Human profile removed; host profile preserved.")
 
+def cmd_machines_revoke(args):
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.machine_id or ""):
+        print("Invalid machine id", file=sys.stderr)
+        sys.exit(1)
+    if not args.confirm:
+        print("--confirm is required: revoking a machine permanently kills its credentials.", file=sys.stderr)
+        sys.exit(1)
+    if not args.reason or not args.reason.strip():
+        print("A non-empty --reason is required (the action is audited).", file=sys.stderr)
+        sys.exit(1)
+    from . import bus
+    try:
+        result = bus._do_request(
+            "POST", f"/api/fleet/machines/{args.machine_id}/revoke", {"confirm": True, "reason": args.reason.strip()}
+        )
+    except Exception as e:
+        print(f"Failed to revoke machine: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{result.get('machine_id', args.machine_id)} {result.get('status', 'revoked')} (credentials revoked: {result.get('credentials_revoked', 0)})")
+
+
 def cmd_machines_available(args):
     try:
         cfg = config.load_config()
@@ -450,6 +475,12 @@ def main():
     m_sub = p_machines.add_subparsers(dest="m_cmd", required=True)
     p_available = m_sub.add_parser("available", help="List available machines")
     p_available.add_argument("--json", action="store_true", help="Output JSON")
+    for _name in ("revoke", "remove"):
+        p_revoke = m_sub.add_parser(_name, help="Admin only: hard-revoke a machine (credentials dead, hidden from routing/fleet)")
+        p_revoke.add_argument("machine_id")
+        p_revoke.add_argument("--confirm", action="store_true", help="Required acknowledgement")
+        p_revoke.add_argument("--reason", default=None, help="Required audit reason")
+        p_revoke.add_argument("--json", action="store_true", help="Output JSON")
     
     p_status = sub.add_parser("status", help="One-call authorized status (single GET /api/status)")
     p_status.add_argument("--since", default=None, help="Filter to changes since duration (e.g. 2h) or ISO time")
@@ -793,6 +824,8 @@ def main():
     elif args.cmd == "machines":
         if args.m_cmd == "available":
             cmd_machines_available(args)
+        elif args.m_cmd in ("revoke", "remove"):
+            cmd_machines_revoke(args)
     elif args.cmd == "status":
         if getattr(args, 'local_only', False):
             cmd_status(args)
