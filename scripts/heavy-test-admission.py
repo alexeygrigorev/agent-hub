@@ -13,6 +13,22 @@ import sys
 import time
 
 NORMAL_AGE_S = 300
+# Refusal channel (intake 9432731e): exit 3 alone is ambiguous because the
+# admitted command may itself exit 3 (pytest INTERNALERROR). When this names a
+# path, a refusal before the command starts writes it; the command never sees
+# the variable, so its own exit 3 leaves no marker.
+REFUSAL_FILE_ENV = 'AGENT_HUB_HEAVY_TEST_REFUSAL_FILE'
+COMMAND_STARTED = False
+
+
+def refuse(reason):
+    path = os.environ.get(REFUSAL_FILE_ENV)
+    if path and not COMMAND_STARTED:
+        try:
+            Path(path).write_text(f'capped-test-run refused: {reason}\n')
+        except OSError as error:
+            print(f'capped-test-run: cannot write refusal marker: {error}', file=sys.stderr)
+    return 3
 
 
 def lock_available(handle):
@@ -89,14 +105,17 @@ class Queue:
 
 
 def run_command(command, slot, interrupted):
+    global COMMAND_STARTED
     # Reserve/inherit the historical FD9. Parent retains its own descriptor
     # even when the command closes FD9. Descendants retaining it also keep
     # the slot after an uncatchable wrapper-only crash.
     os.dup2(slot.fileno(), 9)
+    env = dict(os.environ, AGENT_HUB_HEAVY_TEST_HELD='1')
+    env.pop(REFUSAL_FILE_ENV, None)
+    COMMAND_STARTED = True
     try:
         try:
-            child = subprocess.Popen(command, pass_fds=(9,),
-                                     env=dict(os.environ, AGENT_HUB_HEAVY_TEST_HELD='1'))
+            child = subprocess.Popen(command, pass_fds=(9,), env=env)
         except OSError as error:
             print(f'capped-test-run: {error}', file=sys.stderr)
             return 127 if isinstance(error, FileNotFoundError) else 126
@@ -197,7 +216,7 @@ def main():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         print(f'capped-test-run: no heavy-test slot free after {args.wait}s ({args.slots} slots)', file=sys.stderr)
-                        return 3
+                        return refuse(f'no heavy-test slot free after {args.wait}s')
                     if not announced:
                         print(f'capped-test-run: all {args.slots} heavy-test slots busy; waiting up to {args.wait}s ({args.priority} ticket {sequence})', file=sys.stderr, flush=True)
                         announced = True
@@ -216,4 +235,4 @@ if __name__ == '__main__':
         # 2 as an unavailable wrapper. Queue corruption must never uncap them.
         # argparse usage errors still exit 2; command errors retain their code.
         print(f'capped-test-run: admission refused: {error}; inspect queue state/permissions under admission.lock; never remove lock files (see docs/HETZNER-OVERLOAD-0689CE9C.md)', file=sys.stderr)
-        sys.exit(3)
+        sys.exit(refuse('admission refused'))

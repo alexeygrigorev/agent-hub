@@ -58,8 +58,71 @@ class ServerQuotaTests(unittest.TestCase):
                 if isinstance(argv, list):
                     raise TimeoutError()
                 return {}
+            # A failed managed probe publishes nothing for the managed label:
+            # a synthesized error row would mask Hub's own fresh central
+            # observation (intake b9658e6a), so the account is omitted.
             payload = quota_server.collect_accounts(settings, runner=broken)
-            self.assertEqual(payload['accounts'][1]['quota']['status'], 'error')
+            self.assertEqual([row['account'] for row in payload['accounts']], ['go'])
+
+    def test_managed_probe_gap_omits_account_instead_of_error_row(self):
+        """Intake b9658e6a regression: a transient managed-probe failure must
+        not publish an observed_at=None error row. That row replaced the
+        fresher central hub-direct observation, so `hub quota` flapped between
+        fresh and "unavailable (observed never by hub-server)" on every bad
+        window. The managed catalog owns its canonical account for the cycle
+        (f6709905): when the managed probe produced no reading, the account is
+        omitted entirely — a personal row on the same canonical account is
+        dropped as well, so a healthy personal token can never mask an unread
+        managed credential."""
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps([
+                {'label': 'hub-claude', 'provider': 'claude', 'revision': 'rev-a'},
+                {'label': 'shared-codex', 'provider': 'codex', 'revision': 'rev-b'},
+            ]))
+            future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)).isoformat()
+            personal_claude = {'status': 'ok', 'error': None, 'details': {'limit_reached': False},
+                               'windows': {'7d': {'percent_remaining': 80.0, 'reset_at': future}}}
+            personal_codex = {'status': 'ok', 'error': None, 'details': {'limit_reached': False},
+                              'windows': {'7d': {'percent_remaining': 55.0, 'reset_at': future}}}
+            # Realistic quotas() shapes: probe_quota emits a row only on a
+            # healthy 200; any failure (401 included) omits the account.
+            # hub-claude missing entirely (probe failure); shared-codex observed.
+            managed_rows = [{'account': 'shared-codex', 'provider': 'codex', 'quota': {
+                'status': 'ok', 'error': None, 'details': {'limit_reached': False},
+                'windows': {'7d': {'percent_remaining': 5.0, 'reset_at': future}}}}]
+            def runner(argv, **kwargs):
+                if isinstance(argv, str):
+                    return {'claude': personal_claude, 'codex': personal_codex}
+                return {'accounts': managed_rows}
+            settings = {'accounts': [{'provider': 'claude', 'account': 'shared-claude'},
+                                     {'provider': 'codex', 'account': 'shared-codex'}],
+                        'managed_state_file': str(state)}
+            payload = quota_server.collect_accounts(settings, runner=runner)
+            by_account = {row['account']: row for row in payload['accounts']}
+            self.assertNotIn('hub-claude', by_account)
+            self.assertEqual(by_account['shared-codex']['quota']['windows']['7d']['percent_remaining'], 5.0)
+            self.assertEqual(by_account['shared-codex']['quota']['status'], 'ok')
+            self.assertEqual(by_account['shared-claude']['quota']['windows']['7d']['percent_remaining'], 80.0)
+            # Managed observation missing on the colliding account too: no
+            # personal fallback survives for it (f6709905), and no error row
+            # is invented for any omitted account (b9658e6a).
+            def runner_gap(argv, **kwargs):
+                if isinstance(argv, str):
+                    return {'claude': personal_claude, 'codex': personal_codex}
+                return {'accounts': []}
+            payload = quota_server.collect_accounts(settings, runner=runner_gap)
+            by_account = {row['account']: row for row in payload['accounts']}
+            self.assertEqual(sorted(by_account), ['shared-claude'])
+            self.assertNotIn('unauthorized', json.dumps(payload))
+            # Managed rows that DO exist still replace the personal probe on
+            # the same canonical account (intake f6709905 semantics).
+            managed_rows.append({'account': 'hub-claude', 'provider': 'claude', 'quota': {
+                'status': 'ok', 'error': None, 'details': {'limit_reached': False},
+                'windows': {'7d': {'percent_remaining': 79.0, 'reset_at': future}}}})
+            payload = quota_server.collect_accounts(settings, runner=runner)
+            by_account = {row['account']: row for row in payload['accounts']}
+            self.assertEqual(by_account['hub-claude']['quota']['windows']['7d']['percent_remaining'], 79.0)
 
     def test_managed_claude_account_discovery_and_sanitization(self):
         with tempfile.TemporaryDirectory() as directory:

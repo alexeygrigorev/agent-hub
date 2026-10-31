@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Agent-session rm guard (incident 504d662b: an agent ran `rm -rf "$HOME"` with
+# HOME still /home/alexey and deleted ~/.local/bin). Refuses RECURSIVE removal of
+# the home, /home/*, critical home subtrees, git main checkouts, or any ancestor
+# of them, resolving symlinks and relative paths; everything else execs /bin/rm.
+#   rm --guard-check PATH...   print allow/refuse per path; removes nothing.
+set -u
+real_rm=/bin/rm; [ -x "$real_rm" ] || real_rm=/usr/bin/rm
+
+home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+[ -n "$home" ] || home=${HOME:-/nonexistent}
+protected=("$home" "$home/.local" "$home/.local/bin" "$home/.local/lib" "$home/.local/state"
+  "$home/.local/share" "$home/prod" "$home/git" "$home/.config" "$home/.ssh" "$home/.claude"
+  "$home/.codex" "$home/.gemini" "$home/.nvm" "$home/bin" "$home/storagebox")
+[ -n "${HOME:-}" ] && protected+=("$HOME")
+
+verdict() {  # 0 allow, 1 refuse (reason on stderr)
+  local r p
+  r=$(realpath -m -- "$1" 2>/dev/null) || r=$1
+  case "$r" in
+    /|/home|/root|/home/*/) echo "rm-guard: refusing recursive removal of $1 ($r)" >&2; return 1 ;;
+  esac
+  [[ "$r" =~ ^/home/[^/]+$ ]] && { echo "rm-guard: refusing recursive removal of user home $1 ($r)" >&2; return 1; }
+  for p in "${protected[@]}"; do
+    p=$(realpath -m -- "$p" 2>/dev/null) || continue
+    if [ "$r" = "$p" ] || [[ "$p" == "$r"/* ]]; then
+      echo "rm-guard: refusing recursive removal of protected $1 ($r covers $p)" >&2; return 1
+    fi
+  done
+  if [[ "$r" == "$home/git/"* ]] && [ -d "$r/.git" ]; then
+    echo "rm-guard: refusing recursive removal of git main checkout $1 ($r)" >&2; return 1
+  fi
+  return 0
+}
+
+if [ "${1:-}" = "--guard-check" ]; then
+  shift; rc=0
+  for a in "$@"; do if verdict "$a"; then echo "allow $a"; else echo "refuse $a"; rc=1; fi; done
+  exit $rc
+fi
+
+recursive=0; opts=1; operands=()
+for a in "$@"; do
+  if [ $opts = 1 ] && [ "$a" = "--" ]; then opts=0; continue; fi
+  if [ $opts = 1 ] && [[ "$a" == --* ]]; then
+    case "$a" in --recursive|--recursive=*) recursive=1 ;; esac; continue
+  fi
+  if [ $opts = 1 ] && [[ "$a" == -?* ]]; then
+    [[ "$a" == *[rR]* ]] && recursive=1; continue
+  fi
+  operands+=("$a")
+done
+if [ $recursive = 1 ]; then
+  for a in "${operands[@]}"; do verdict "$a" || exit 1; done
+fi
+exec "$real_rm" "$@"

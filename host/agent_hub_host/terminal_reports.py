@@ -181,7 +181,7 @@ def native_catalog(dispatcher):
         return None
 
 
-def retained_terminal_exit(dispatcher, target, record=None):
+def retained_terminal_exit(dispatcher, target, record=None, rows=None):
     """Positive exit proof for native --keep-record, without deleting its row.
 
     A terminal phase alone is insufficient. Require the exact native birth,
@@ -196,7 +196,8 @@ def retained_terminal_exit(dispatcher, target, record=None):
             return False, None, 'retained_identity_unavailable'
     except Exception:
         return False, None, 'retained_identity_unavailable'
-    rows = native_catalog(dispatcher)
+    if rows is None:
+        rows = native_catalog(dispatcher)
     if rows is None:
         return False, None, 'retained_catalog_unavailable'
     matches = []

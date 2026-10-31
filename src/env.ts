@@ -21,6 +21,8 @@ export interface Env {
   SESSION_SECRET: string;
   // Optional: SHA-256 hex of a high-entropy admin sign-in token (POST /auth/token)
   HUB_ADMIN_TOKEN_SHA256?: string;
+  // Optional existing GitHub App key and explicit repository allowlist (secret).
+  HOST_REPO_ACCESS_POLICY?: string;
 
   // Liveness and alerts (optional)
   // Comma-separated inbox actors for alert delivery; defaults to ['grok-bot'] when unset.
@@ -32,4 +34,13 @@ export interface Env {
   HUB_IDLE_OPEN_AC_NUDGE_MINUTES?: string;
   HUB_HEARTBEAT_STALE_S?: string;
   HUB_LAUNCH_STUCK_S?: string;
+  // Autonomous queue rollout is off by default. Enabling also requires an
+  // explicit project list (or '*'). Invalid settings disable mutations.
+  HUB_INTAKE_QUEUE_ENABLED?: string;
+  /** Intake 500fd60b: "false" disables Hub-side ops/backlog liveness, or only the backlog idle kick. */
+  HUB_OPS_LIVENESS?: string;
+  HUB_BACKLOG_IDLE_KICK?: string;
+  HUB_INTAKE_QUEUE_PROJECTS?: string;
+  HUB_INTAKE_QUEUE_MAX_INFLIGHT?: string;
+  HUB_INTAKE_QUEUE_MAX_PER_PROJECT?: string;
 }

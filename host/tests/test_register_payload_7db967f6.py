@@ -141,7 +141,8 @@ class RegisterBudgetTests(unittest.TestCase):
                     results = fleet.Dispatcher(cfg, request, runner).once()
         # The cycle completed: register was attempted, the heartbeat and the
         # rest of the slow cycle (subscriptions, census, offers) still ran.
-        self.assertEqual([c[1] for c in calls[:2]],
+        # (The route advertisement precedes each heartbeat, intake 6cbb862a.)
+        self.assertEqual([c[1] for c in calls if c[1] != '/api/host/routes'][:2],
                          ['/api/machines/register', '/api/host/poll'])
         self.assertTrue(any(c[1] == '/api/fleet/offers' for c in calls))
         self.assertEqual(len(results), 1)

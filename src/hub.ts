@@ -1,7 +1,8 @@
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { IdleWorkService } from './idle-work';
-import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
-import { IntakeWatchdog } from './intake-watchdog';
+import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
+import { IntakeWatchdog, queuePolicyFrom } from './intake-watchdog';
+import { OpsLiveness } from './ops-liveness';
 import { IntakeTriage } from './intake-triage';
 import { IntakeVerifier } from './intake-verifier';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
@@ -34,6 +35,8 @@ import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
 import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { ProvisioningService } from './provisioning';
+import { hostRepositoryAccess } from './host-repo-access';
+import { hostRepositoryAuthorizer } from './host-repo-authority';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
 import { HostGoals } from './host-goals';
 import { BankedResets } from './banked-resets';
@@ -123,6 +126,7 @@ export class Hub extends DurableObject {
   public intakeService: IntakeService;
   private workerAccess: WorkerAccess;
   public intakeWatchdog: IntakeWatchdog;
+  public opsLiveness: OpsLiveness;
   public intakeTriage: IntakeTriage;
   public intakeVerifier: IntakeVerifier;
   public sessionAudit: SessionAuditService;
@@ -158,6 +162,7 @@ export class Hub extends DurableObject {
     // The closure resolves sessionControlService at call time (it is
     // constructed just below); intake records only the returned real id.
     this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn), {
+      queue: tasks => ({ items: this.intakeWatchdog.queue(tasks), observed_at: Date.now(), watchdog: this.intakeWatchdog.status() }),
       forgotten: tasks => {
         const items = this.intakeWatchdog.project(tasks).filter(t => t.forgotten);
         return { items, forgotten_count: items.length, observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };
@@ -274,11 +279,38 @@ export class Hub extends DurableObject {
     this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
     this.livenessService.init();
     this.intakeWatchdog = new IntakeWatchdog(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
+      policy: () => queuePolicyFrom(env as unknown as Record<string, unknown>),
       start: async input => {
         const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
           { method: 'POST', body: JSON.stringify(input) }),
           { caller: { isAdmin: true, actor: 'hub:service:intake-watchdog', kind: 'human' }, scopes: ['admin'] });
         return { status: r.status, body: await r.json() as any };
+      },
+      observe: async id => {
+        const row: any = this.sql.exec('SELECT actor FROM session_control_sessions WHERE id=?', id).toArray()[0];
+        if (!row) return { status: 404, body: { error: 'not_found' } };
+        const r = await this.sessionControlService.handle(new Request(`https://hub.internal/api/sessions/${id}`),
+          { caller: { isAdmin: true, actor: row.actor, kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+      command: async (id, action, key) => {
+        const row: any = this.sql.exec('SELECT actor FROM session_control_sessions WHERE id=?', id).toArray()[0];
+        if (!row) return { status: 404, body: { error: 'not_found' } };
+        if (row.actor !== 'hub:service:intake-watchdog')
+          return { status: 403, body: { error: 'watchdog_session_not_owned' } };
+        // Canonical retry preserves the stored intent's actor/key; stop retains
+        // native-incarnation fences and requires the normal host exit receipt.
+        const r = await this.sessionControlService.handle(new Request(`https://hub.internal/api/sessions/${id}/${action}`,
+          { method: 'POST', body: JSON.stringify(action === 'retry' ? {} : { key }) }),
+          { caller: { isAdmin: true, actor: row.actor, kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+      note: async (task, text, key) => {
+        if ((task.history || []).some((e: any) => e.intake_key === key)) return true;
+        const r = await this.intakeService.handle(new Request(`https://hub.internal/api/intake/tasks/${task.id}/events`,
+          { method: 'POST', body: JSON.stringify({ key, expected_version: task.version, event: { kind: 'note', text } }) }),
+          async () => ({ caller: { isAdmin: true, actor: 'hub:service:intake-watchdog', kind: 'human' }, scopes: ['admin'] }));
+        return r.ok;
       },
       notify: async (kind, subject, detail) => {
         if (kind === 'intake_digest' && this.sql.exec('SELECT id FROM liveness_alerts WHERE subject_kind=? AND subject=? LIMIT 1', kind, subject).toArray().length) return false;
@@ -288,6 +320,19 @@ export class Hub extends DurableObject {
       },
     });
     this.intakeWatchdog.init();
+    // Independent orchestrator/backlog liveness (intake 500fd60b): Hub-side, so a dead
+    // ops session, dead host watchdog or dead host is still detected and work restarts.
+    this.opsLiveness = new OpsLiveness(this.sql, {
+      enabled: () => this.env.HUB_OPS_LIVENESS !== 'false',
+      kick: async () => this.env.HUB_BACKLOG_IDLE_KICK === 'false' ? { task_id: null, reason: 'idle_kick_disabled' } : this.intakeWatchdog.idleKick(),
+      holdReasons: () => Object.fromEntries((this.sql.exec("SELECT reason, COUNT(*) AS n FROM intake_restart_queue GROUP BY reason ORDER BY n DESC LIMIT 12").toArray() as any[]).map(r => [r.reason, r.n])),
+      alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('ops_liveness', subject, detail === null ? null : { state: 'recovery_failed', detail });
+        if (alert) await this.notifyAlert(alert);
+        return !!alert;
+      },
+    });
+    this.opsLiveness.init();
     // Hourly backlog triage (intake d8d509d2 AC5): one Claude Opus reviewer
     // session per slice of forgotten intakes, started through the canonical path.
     this.intakeTriage = new IntakeTriage(this.sql, this.intakeService, this.intakeWatchdog, fn => this.ctx.storage.transactionSync(fn), {
@@ -296,6 +341,11 @@ export class Hub extends DurableObject {
           { method: 'POST', body: JSON.stringify(input) }),
           { caller: { isAdmin: true, actor: 'hub:service:intake-triage', kind: 'human' }, scopes: ['admin'] });
         return { status: r.status, body: await r.json() as any };
+      },
+      // Intake 79458f2d: a refused or failed reviewer start is alerted once, never silent.
+      alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('intake_triage', subject, detail === null ? null : { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
       },
     });
     this.intakeTriage.init();
@@ -811,8 +861,16 @@ export class Hub extends DurableObject {
       }
 
       if (path === '/api/agents' || path.startsWith('/api/agents/')) return this.handleAgentRegistry(request, path);
-      if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/')) {
+      if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/') || path === '/api/ops/heartbeat' || path === '/api/ops/liveness') {
         return this.handleWatchRoutes(request, path);
+      }
+      if (path === '/api/host/repositories' || path === '/api/host/repositories/token') {
+        if (request.headers.has('Cookie')) return Response.json({ error: 'mixed_authority' }, { status: 403 });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        return hostRepositoryAccess(() => this.env.HOST_REPO_ACCESS_POLICY,
+          hostRepositoryAuthorizer(this.sql, auth.caller,
+            (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller)))(request);
       }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
         return this.provisioningService.handle(request, await this.authenticateBusRequest(request));
@@ -1259,13 +1317,14 @@ export class Hub extends DurableObject {
           return Response.json({ error: 'Invalid payload' }, { status: 400 });
         }
         
-        const allowedScopes = ['host', 'bus:send', 'bus:read', 'health:report', 'jobs:create', 'lease:root', 'fleet:launch'];
+        const allowedScopes = ['host', 'bus:send', 'bus:read', 'health:report', 'jobs:create', 'lease:root', 'fleet:launch', 'repositories:read'];
         for (const scope of body.requested_scopes) {
           if (!allowedScopes.includes(scope)) {
             return Response.json({ error: 'invalid_scope' }, { status: 400 });
           }
         }
         if (body.client_kind === 'host' && body.requested_scopes.includes('fleet:launch')) return Response.json({ error: 'invalid_scope' }, { status: 400 });
+        if (body.client_kind !== 'host' && body.requested_scopes.includes('repositories:read')) return Response.json({ error: 'invalid_scope' }, { status: 400 });
         
         if (body.requested_scopes.includes('lease:root') || body.requested_scopes.includes('jobs:create') || (body.client_kind === 'agent' && body.requested_scopes.includes('host'))) return Response.json({ error: 'invalid_scope' }, { status: 400 });
         
@@ -1470,6 +1529,20 @@ export class Hub extends DurableObject {
           ? deviceReview(pairing, session.email, address, registeredMachine, machines, Date.now(), displayedActor)
           : deviceResult(state, session.email);
         return new Response(html, {headers:UI_HEADERS});
+      }
+
+      // Operator listing of pending host/agent pairings registered by
+      // /api/device/code, so a code printed to an invisible console is still
+      // discoverable. Admin only; the device secret hash is never returned.
+      if (path === '/api/device/pending') {
+        if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        if (!auth.caller?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+        const rows = this.sql.exec(
+          "SELECT user_code, client_kind, name, hostname, ip_country, requested_scopes, created_at, expires_at FROM device_pairings WHERE status = 'pending' AND client_kind != 'human' AND expires_at > ? ORDER BY created_at DESC LIMIT 50",
+          new Date().toISOString()).toArray();
+        return Response.json({ pending: rows });
       }
 
       if (path.startsWith('/api/device/approve') || path.startsWith('/api/device/deny') || path.startsWith('/api/device/info')) {
@@ -2016,7 +2089,14 @@ export class Hub extends DurableObject {
       const result = this.livenessService.recordHeartbeat(caller.actor, caller.machineId ?? null, await safeJson(request));
       return 'error' in result ? json(result, 400) : json({ status: 'recorded' });
     }
+    if (path === '/api/ops/heartbeat') {
+      if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+      if (!admin && !(caller.kind === 'agent' && auth.scopes?.includes('health:report'))) return json({ error: 'forbidden' }, 403);
+      const result = this.opsLiveness.record(await safeJson(request));
+      return 'error' in result ? json(result, 400) : json({ status: 'recorded', ops: this.opsLiveness.status() });
+    }
     if (!admin) return json({ error: 'forbidden' }, 403);
+    if (path === '/api/ops/liveness' && request.method === 'GET') return json(this.opsLiveness.status());
     if (path === '/api/liveness' && request.method === 'GET') {
       // Read one subject's retained history even when newer open alerts fill
       // the default page. A history read never reconciles or resolves alerts.
@@ -2243,6 +2323,8 @@ export class Hub extends DurableObject {
   }
 
   async alarm() {
+    try { await this.intakeWatchdog.tick('alarm'); } catch { console.warn('intake_queue_tick_failed'); }
+    try { await this.opsLiveness.tick(); } catch { console.warn('ops_liveness_tick_failed'); }
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
     this.ctx.storage.transactionSync(() => {
       expireSessionMessages(this.sql, now.getTime());
@@ -2417,7 +2499,7 @@ export class Hub extends DurableObject {
     }
 
     if (scopes.includes(WORKER_SCOPE) && !workerRequestAllowed(this.sql, request, cred.id)) {
-      return { error: Response.json({ error: 'worker_scope_forbidden' }, { status: 403 }) };
+      return { error: Response.json({ error: workerDenialCode(this.sql, request, cred.id) }, { status: 403 }) };
     }
 
     const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;

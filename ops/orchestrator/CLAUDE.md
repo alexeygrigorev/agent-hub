@@ -12,7 +12,7 @@ Alexey standing order t1756u (corrected t1760u): the orchestrator owns execution
 - (c) Finished work gets a DONE note with proof; close intakes only when every AC is verified (736ba282). Never delete intakes.
 - (d) NEEDS_ALEXEY is only for prod/GitHub environment approvals, secrets, deletions, or Alexey's own 2FA. Never approve prod gates.
 
-Cadence: every 15 min via Hub scheduled pings once Hub schedules exist; until then `/loop 15m` (watchdog every 10 min restarts on dead session or tick log >30 min stale).
+Cadence: every 15 min via Hub scheduled pings once Hub schedules exist; until then `/loop 15m` (watchdog every 10 min restarts on dead session or tick log >30 min stale; every restart must show a fresh tick within 10 min or a second recovery path starts; Hub-side `hub ops status` checks ticks, the watchdog and the backlog independently, intake 500fd60b).
 
 ## Skills (AC14)
 Developer's skills (bot-skills repo) are linked into `.claude/skills/` of this run dir and auto-discovered. Start of every session and every loop iteration: `~/.local/share/agent-hub-ops/session-ctl.sh orchestrator skills-sync` (git pull + relink). **Read and follow the relevant ones before acting**: `hub-sessions`, `fix-on-failure`, `alert-triage`, `self-reflect`, `alexey-standing-corrections`, `aplexer`, `developer-scope`, `email-rules` (read-only context: you never send mail), plus any other whose description matches the situation. Operator rules from skills apply unless they contradict "Standing rules" below (those win).

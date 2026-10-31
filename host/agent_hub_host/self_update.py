@@ -195,7 +195,7 @@ def step_once(request, *, root=None, run=subprocess.run, python=None, log=print)
     return state == 'updated'
 
 
-def loop(request, stop, *, root=None, interval=POLL_S, clock=time.monotonic):
+def loop(request, stop, *, root=None, interval=POLL_S, clock=time.monotonic, launcher_settings=None):
     """Daemon body: poll until an update lands, then set ``stop`` so the
     controller drains and exits; the supervisor restarts it on the new code."""
     while not stop.is_set():
@@ -206,4 +206,9 @@ def loop(request, stop, *, root=None, interval=POLL_S, clock=time.monotonic):
                 return
         except Exception as exc:
             print(json.dumps({'event': 'host_release_error', 'type': type(exc).__name__}), flush=True)
+        try:
+            from . import fleet, launcher_update
+            launcher_update.step_once(request, launcher_settings() if launcher_settings else fleet.load_settings())
+        except Exception as exc:
+            print(json.dumps({'event': 'launcher_release_error', 'type': type(exc).__name__}), flush=True)
         stop.wait(max(1.0, interval - (clock() - started)))

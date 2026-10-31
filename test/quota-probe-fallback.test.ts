@@ -86,6 +86,15 @@ describe('quota probe failure placement (b3749cbb)', () => {
       expect(plan.rejected).toContainEqual(expect.objectContaining({ reason: 'codex_quota_gate_' + reason }));
     });
   });
+  it('prefers an admitted sibling when a probe crashes without a credential verdict (798f0f8c)', async () => {
+    for (const account of ['codex-orin', 'shared-codex']) {
+      await fixture([{ ...refusal, account, profile: 'hub-' + account, reason: 'codex_quota_gate_quota_check_failed' }], service => {
+        const plan = service.plan({ workspace: 'demo', mode: 'interactive', engine: 'codex', prompt: 'test' });
+        expect(plan.selected?.account).not.toBe(account);
+        expect(plan.candidates?.some((r: any) => r.account === account)).toBe(true);
+      });
+    }
+  });
   it('allows an unknown account with a warning and an unknown balance', async () => {
     await fixture([], (service, sql) => {
       sql.exec('DELETE FROM fleet_subscriptions');

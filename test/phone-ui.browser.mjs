@@ -138,6 +138,8 @@ try {
   await page.getByLabel('New status').selectOption('in_progress');
   await page.getByRole('button', { name: 'Save status', exact: true }).click();
   await page.getByText('Status saved.', { exact: false }).waitFor();
+  // The save acknowledgement precedes the asynchronous detail refresh.
+  await page.locator('.intake-history-card').nth(2).waitFor();
   checks.push('Intake status action works from phone width');
 
   // Opening never started a session: no link events, no assigned sessions.

@@ -20,7 +20,7 @@ from .disk_monitor import DiskMonitor
 from .host_health_monitor import HostHealthMonitor
 from .jobs import JobDispatcher
 from .metrics_producer import MetricsProducer
-from .native_sessions import qualify_sender_binding
+from .native_sessions import ensure_runtime_bin_on_path, qualify_sender_binding
 from .quota_snapshot import QuotaCollector
 from .token_usage import TokenCollector
 from .role_dispatch import TrustedRoleConfig, load_role_config
@@ -697,6 +697,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
     with (journal / 'host.lock').open('a') as lock, acquire_journal_lock(lock):
         settings = fleet.load_settings(settings_path)
         native = settings.get('aplexer_bin', 'aplexer')
+        ensure_runtime_bin_on_path()
         binding = qualify_sender_binding(native, str(Path.cwd().resolve()))
         # M15d narrow plumbing: surface the trusted cleanup-root allowlist
         # size (no auto-delete daemon here; tree removal is explicit CLI only).
@@ -828,7 +829,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             # (Windows hosts without ssh). An applied update sets ``stop``;
             # the supervisor restarts the controller on the new code.
             maybe_start_named_thread(
-                None, self_update.loop, (lambda *a: dispatcher.request(*a), release_stop), 'host-release')
+                None, lambda *args: self_update.loop(*args, launcher_settings=lambda: dispatcher.settings),
+                (lambda *a: dispatcher.request(*a), release_stop), 'host-release')
             while not stop.is_set() and (cycles is None or count < cycles):
                 if release_stop.is_set():
                     (journal / RELEASE_RESTART_MARKER).write_text('restart\n', encoding='utf-8')

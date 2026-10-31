@@ -93,6 +93,9 @@ def build(out_dir: Path, version: str):
         pkg_dst = staging / "agent_hub_host"
         shutil.copytree(HOST_PKG, pkg_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         shutil.copyfile(REPO / "config" / "model-routing.json", pkg_dst / "model-routing.json")
+        # The hosted host installer uses the same maintained supervisor as
+        # checkout installations; do not maintain a second controller loop.
+        shutil.copyfile(REPO / "scripts" / "session-host-supervisor.py", pkg_dst / "host_supervisor.py")
         (pkg_dst / "_build_info.py").write_text(
             f'"""Build information stamped during zipapp creation."""\nBUILD_COMMIT = "{sha}"\nBUILD_DATE = "{build_date}"\n',
             encoding="utf-8",
@@ -154,7 +157,7 @@ def build(out_dir: Path, version: str):
             "built_from_commit": sha,
             "build_date": build_date,
             "built_at_ms": built_at_ms,
-            "files": ["install.sh", "install.ps1", "hub.pyz", "hub.pyz.sha256", "manifest.json"],
+            "files": ["install.sh", "install.ps1", "host-install.sh", "host-install.ps1", "hub.pyz", "hub.pyz.sha256", "manifest.json"],
         }
         manifest_path = out_dir / "manifest.json"
         manifest_tmp = out_dir / "manifest.json.tmp"

@@ -87,7 +87,25 @@ export default {
     // Public CLI installer seam (server routing only; CLI worker owns artifacts).
     // Anonymous READ ONLY for exactly these static assets; nothing else under
     // /cli/ is exposed and no API/static private artifact is opened up.
-    if (url.pathname === '/cli/install.sh' || url.pathname === '/cli/install.ps1' || url.pathname === '/cli/hub.pyz' ||
+    // Short one-liner aliases: irm .../host/install.ps1 | iex, curl .../host/install.sh | sh.
+    const HOST_ALIASES: Record<string, string> = { '/host/install.ps1': '/cli/host-install.ps1', '/host/install.sh': '/cli/host-install.sh' };
+    const hostAlias = HOST_ALIASES[url.pathname];
+    if (hostAlias) {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
+      }
+      if (!env.ASSETS) return new Response('Not found', { status: 404 });
+      const target = new URL(url);
+      target.pathname = hostAlias;
+      const asset = await env.ASSETS.fetch(new Request(target, request));
+      if (!asset.ok) return new Response('Not found', { status: 404 });
+      const headers = new Headers(asset.headers);
+      headers.set('Cache-Control', 'public, max-age=300');
+      headers.set('X-Content-Type-Options', 'nosniff');
+      return new Response(asset.body, { status: asset.status, headers });
+    }
+    if (url.pathname === '/cli/install.sh' || url.pathname === '/cli/install.ps1' ||
+        url.pathname === '/cli/host-install.sh' || url.pathname === '/cli/host-install.ps1' || url.pathname === '/cli/hub.pyz' ||
         url.pathname === '/cli/hub.pyz.sha256' || url.pathname === '/cli/manifest.json') {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });

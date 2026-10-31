@@ -522,6 +522,56 @@ def _sanitize_cli_error_line(line: str) -> str | None:
     return s[:220]
 
 
+def launcher_record_cause(failure, workspace, task_id, launched_at):
+    """Keep the launcher's own saved cause for an empty-pipe exit (intake 17e774f8).
+
+    The maintained launcher can exit 1 with empty stdout/stderr on Windows
+    while its .local/launch-<task>.json names the cause. Only this launch's
+    record counts: exact task_id, started_at_ts within this dispatch's
+    window, no-follow bounded read with no linked .local. Text is redacted
+    and path-free. Never native-exit or success evidence. Returns a new dict.
+    """
+    if (not isinstance(failure, dict) or not isinstance(task_id, str)
+            or not re.fullmatch(r'hub-[A-Za-z0-9][A-Za-z0-9_-]{0,127}', task_id)
+            or type(launched_at) not in (int, float)):
+        return failure
+    try:
+        from . import private_fs
+        from .command_diagnostics import output_tail
+        local = Path(workspace) / '.local'
+        if local.is_symlink() or not local.is_dir():
+            return failure
+        doc = json.loads(private_fs.read_bytes(str(local / ('launch-' + task_id + '.json')),
+                                               262144, private=False).decode('utf-8'))
+        started = doc.get('started_at_ts') if isinstance(doc, dict) else None
+        if (not isinstance(doc, dict) or doc.get('task_id') != task_id
+                or type(started) not in (int, float) or not launched_at - 5 <= started <= launched_at + 300):
+            return failure
+
+        def clean(value):
+            text = output_tail(value)
+            text = re.sub(r'(?:\b[A-Za-z]:[\\/]|\\\\)[^|;,]*', '[path]', text)
+            return re.sub(r'\S*[/\\]\S*', '[path]', text).strip()[:400]
+
+        found = {}
+        reason, stderr = clean(doc.get('reason')), clean(doc.get('aplexer_stderr'))
+        if reason:
+            found['tail'] = reason
+        if stderr:
+            found['stderr_tail'] = stderr
+        if not found and doc.get('outcome') in ('failed', 'stalled'):
+            found['tail'] = ('No first action was validated before native exit.' if doc['outcome'] == 'failed'
+                             else 'No first action was validated before the launcher deadline.')
+        if not found:
+            return failure
+        code = failure.get('exit_code')
+        prefix = ('The launcher command failed with exit code %d: ' % code
+                  if type(code) is int else 'The launcher command failed: ')
+        return {**failure, **found, 'message': (prefix + found.get('tail', found.get('stderr_tail', '')))[:300]}
+    except (OSError, ValueError, TypeError, UnicodeDecodeError):
+        return failure
+
+
 def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='launcher_run', engine=None, cwd=None, task_id=None, launched_at=None, start_offsets=None):
     reason, message = 'launcher_command_failed', 'The launcher command failed; unrecognized output was withheld.'
     refusal_found = False
@@ -538,7 +588,10 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         candidate = re.sub(r'^(?:ValueError|RuntimeError|PermissionError|OSError|FileNotFoundError|TimeoutError|JSONDecodeError): ', '', clean_line)
         # Current launcher resource policy uses a configurable MiB floor.
         # Accept only its complete numeric grammar, never arbitrary exception text.
-        if re.fullmatch(r'host MemAvailable below [0-9]{1,7}MiB floor after reservation \(launcher_memory_reserve\)', candidate):
+        # Intake 63a9ee3a: newer launchers append the numeric
+        # available/reserved/required/floor breakdown.
+        if re.fullmatch(r'host MemAvailable below [0-9]{1,7}MiB floor after reservation \(launcher_memory_reserve\)'
+                        r'(?:: available_mb=[0-9]{1,9} reserved_mb=[0-9]{1,9} required_mb=[0-9]{1,9} floor_mb=[0-9]{1,7})?', candidate):
             reason, message = REFUSALS['launcher_memory_reserve']
             surfaced_tail = error_type + ': ' + candidate
             refusal_found = True

@@ -38,6 +38,12 @@ export function worktreePathAllowed(path: unknown): path is string {
   return parts.length >= 3 && parts[parts.length - 2] === 'git' && base.includes('-wt-');
 }
 
+/** A path naming an intake worktree anywhere (the tree itself, a subdirectory, a
+ * relative segment): detached starts (79458f2d) must never run inside one. */
+export function namesWorktree(path: unknown): boolean {
+  return typeof path === 'string' && path.split(/[\\/]/).some(seg => seg.includes('-wt-'));
+}
+
 function branchOk(branch: unknown): branch is string {
   return typeof branch === 'string' && branch.length > 0 && branch.length <= 255 && /^[A-Za-z0-9._\/-]+$/.test(branch)
     && !branch.startsWith('-') && !branch.includes('..');
@@ -165,8 +171,14 @@ export class IntakeWorktrees {
     return { row: this.row(row.id)!, fresh };
   }
 
+  /** State of this intake's newest row for a path (any machine); null when never recorded. */
+  lastStateFor(taskId: string, path: string): string | null {
+    const r = this.sql.exec('SELECT state FROM intake_worktrees WHERE task_id = ? AND path = ? ORDER BY updated_at DESC LIMIT 1', taskId, path).toArray()[0] as Obj | undefined;
+    return r ? String(r.state) : null;
+  }
+
   /** Session start: refuse another intake's worktree; pin to the recorded host. */
-  startGuard(taskId: string | null | undefined, request: { machine?: string | null; workspace?: string | null; cwd?: string | null }):
+  startGuard(taskId: string | null | undefined, request: { machine?: string | null; workspace?: string | null; cwd?: string | null; detached?: boolean }):
     { error?: Obj; machine?: string } {
     if (!taskId) return {}; // unlinked (operator/debug) starts are not intake work
     for (const candidate of [request.cwd, request.workspace]) {
@@ -176,7 +188,8 @@ export class IntakeWorktrees {
         owner_task_id: owner.task_id, machine: owner.machine,
         detail: 'Two intakes never share a worktree; start this intake in its own worktree.' } };
     }
-    if (request.machine || request.cwd) return {};
+    // Detached starts (79458f2d) never use the intake's worktree, so they are not pinned to its host.
+    if (request.detached || request.machine || request.cwd) return {};
     const pinned = this.sql.exec("SELECT machine FROM intake_worktrees WHERE task_id = ? AND state = 'active' ORDER BY updated_at DESC LIMIT 1",
       taskId).toArray()[0] as Obj | undefined;
     return pinned ? { machine: String(pinned.machine) } : {};
@@ -197,6 +210,9 @@ export class IntakeWorktrees {
     const taskId = ctx?.request?.intake_task_id;
     if (!ctx || typeof taskId !== 'string' || !taskId) return { plan: { mode: 'none' }, events: [] };
     const request = ctx.request;
+    // Intake 79458f2d: a detached start runs in its workspace root and never
+    // resumes, creates or locks the linked intake's worktree.
+    if (request.intake_worktree === 'detached') return { plan: { mode: 'none', task_id: taskId, detached: true }, events: [] };
     for (const candidate of [request.cwd, request.workspace]) {
       if (!worktreePathAllowed(candidate)) continue;
       // The start named its own worktree: record it, launch as requested.
@@ -253,7 +269,7 @@ export class IntakeWorktrees {
       const req = parsed(s.request_json, {});
       const samePath = req.cwd === r.path || req.workspace === r.path;
       // A live session of the same intake on the same host resumes in this worktree.
-      const sameIntakeHost = req.intake_task_id === r.task_id && (!s.machine_id || s.machine_id === r.machine);
+      const sameIntakeHost = req.intake_task_id === r.task_id && req.intake_worktree !== 'detached' && (!s.machine_id || s.machine_id === r.machine);
       if (ids.includes(s.id) || samePath || sameIntakeHost) out.push({ id: s.id, state: s.state });
     }
     return out;

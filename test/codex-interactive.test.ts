@@ -34,7 +34,11 @@ it('reports a dead Codex TUI as failed while retaining lifecycle and capacity un
     const watchdog = new IntakeWatchdog(hub.sql, {} as any, tx, {}, () => now); watchdog.init();
     const task = { id: 'synthetic-task', title: 'Synthetic', project: 'demo', status: 'open', created_at: now - 60000,
       history: [{ kind: 'link', hub_session_id: id }] };
-    expect(watchdog.project([task])[0]).toMatchObject({ forgotten: true, reason: 'only_failed_sessions', last_session: { state: 'failed' } });
+    // Failure is a diagnostic, not native exit: keep it visible without making
+    // this still-bound process eligible for a duplicate launch.
+    expect(watchdog.project([task])[0]).toMatchObject({ forgotten: false, ready: false,
+      last_session: { state: 'failed', lifecycle_state: 'running', failure_reason: 'codex_reconnect_failed' } });
+    expect(watchdog.queue([task])[0]).toMatchObject({ state: 'needs_attention', reason: 'codex_reconnect_failed' });
     for (const phase of ['running', 'starting', 'broken']) {
       expect((await report({ ...row, phase })).status).toBe(200);
       const absent = await fleet.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions: [] }) }),

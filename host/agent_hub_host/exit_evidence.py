@@ -69,9 +69,12 @@ def sanitize(text, limit=2048):
 
 
 def same_native(record, row):
-    return all(row.get(a) == record.get(b) for a, b in (
-        ('id', 'native_id'), ('created_at_ms', 'incarnation'), ('tag', 'tag'),
-        ('workspace', 'workspace'), ('engine', 'engine')))
+    # The catalog row carries the engine cwd for `--cwd` launches.
+    from .retired_native import launch_workspace_targets
+    return (row.get('workspace') in launch_workspace_targets(record)
+            and all(row.get(a) == record.get(b) for a, b in (
+                ('id', 'native_id'), ('created_at_ms', 'incarnation'), ('tag', 'tag'),
+                ('engine', 'engine'))))
 
 
 def _tail(path):

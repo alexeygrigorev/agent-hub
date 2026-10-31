@@ -54,21 +54,8 @@ def _shared_device_login():
 
 
 def _post_device(url, body, _token_exchange=None):
-    request = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"},
-    )
-    try:
-        if _token_exchange is not None and url == _token_exchange.url:
-            return 200, api.safe_http_json(request, _token_exchange=_token_exchange)
-        return 200, api.safe_http_json(request)
-    except urllib.error.HTTPError as exc:
-        try:
-            payload = json.loads(exc.read().decode("utf-8"))
-        except Exception as error:
-            raise RuntimeError("Token error: malformed response") from error
-        if not isinstance(payload, dict):
-            payload = {}
-        return exc.code, payload
+    from .device_transport import poster
+    return poster(_token_exchange)(url, body)
 
 
 def device_login(base_url: str, client_kind: str, name: str, hostname: str, requested_scopes: list):
@@ -105,11 +92,33 @@ def device_login(base_url: str, client_kind: str, name: str, hostname: str, requ
     print("Login successful.")
 
 
+def _publish_device_prompt(text):
+    """Show the code on stdout, stderr and a private file for hidden/redirected runs."""
+    print(text, end="", flush=True)
+    try:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        if sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
+            target = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "agent-hub" / "device-code.txt"
+        else:
+            target = Path.home() / ".local/share/agent-hub/device-code.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _run_device_login(flow, exchange, base_url, client_kind, name, hostname, requested_scopes):
+    from .device_transport import poster
+    device_poster = poster(exchange)
     try:
         return flow.device_login(
             base_url,
-            lambda url, body: _post_device(url, body, exchange),
+            device_poster,
+            prompt=_publish_device_prompt,
             start_path="/api/device/code",
             token_path="/api/device/token",
             start_body={

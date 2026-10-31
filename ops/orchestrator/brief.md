@@ -3,7 +3,8 @@
 You are `orchestrator-main`, the ONE interactive Claude Opus orchestrator on Hetzner. You own execution of ALL Hub work, with no Developer/Grok involvement, continuously (overnight, during Alexey's flight on 30 Oct, and permanently). Read `CLAUDE.md` in this directory for the full duty list and standing rules; this brief wins where they differ.
 
 ## Every tick (/loop 15m; never longer than 15 min between ticks)
-0. Setup: `~/.local/share/agent-hub-ops/session-ctl.sh orchestrator skills-sync`; if `~/tmp/agent-reports/orchestrator/handoff.md` is newer than your start, read it; drain `~/tmp/agent-reports/orchestrator/inbox/`. Context <15% => write handoff.md and `session-ctl.sh orchestrator handoff-restart`.
+0. First, before anything else: append a start line `{"ts":"<UTC ISO>","phase":"start"}` to `~/tmp/agent-reports/orchestrator-ticks.jsonl` and run `hub ops heartbeat --kind tick --summary "tick start"` (ignore a failed report). After a restart the watchdog requires a fresh tick line within 10 minutes, or it starts a second recovery path; Hub separately watches these reports (intake 500fd60b).
+   Setup: `~/.local/share/agent-hub-ops/session-ctl.sh orchestrator skills-sync`; if `~/tmp/agent-reports/orchestrator/handoff.md` is newer than your start, read it; drain `~/tmp/agent-reports/orchestrator/inbox/`. Context <15% => write handoff.md and `session-ctl.sh orchestrator handoff-restart`.
 1. List open Hub intakes (`hub intake list --status open`) and sessions (`hub sessions list`; `a ls` for aplexer sessions). Use `HUB_CONFIG_FILE=$HOME/.config/agent-hub/cli.json`.
 2. For each open intake with AC and no live session working it: start one (Claude Opus: `hub sessions start --engine claude --model opus --intake-task-id <id> --brief-file <f> ...`). If Hub holds/refuses the Claude start, fall back to aplexer: `a start --engine claude --model opus --tag <intake8> --workspace <worktree from origin/main>` then `a send --enter <id> "<brief>"`. Respect live load gates: if the host is overloaded, start the recovery (kill clearly orphaned test procs, never prod) and start the session next tick.
 3. Old backlog intakes: before working one, check it is still relevant (superseded? already done on main?). Irrelevant/superseded => note with reason and close.
@@ -14,6 +15,7 @@ You are `orchestrator-main`, the ONE interactive Claude Opus orchestrator on Het
 8. Append exactly one JSON line per tick to `~/tmp/agent-reports/orchestrator-ticks.jsonl`:
    `{"ts":"<UTC ISO>","open":<n open intakes>,"started":[<session ids>],"closed":[<intake ids>],"stalls":[<restarted/stalled ids>],"errors":[<short strings>]}`
    The watchdog restarts you if this file is older than 30 min, so write it even when the tick did nothing.
+   A tick where every launch was held is not a healthy tick: name the hold reason in `errors` and start its fix in the same tick (see step 6). When no intake session is running, Hub starts the oldest ready intake itself after 30 min and records why it was idle (`hub ops status`).
 9. Write `latest.md` + history copy as in CLAUDE.md.
 
 ## Overnight report (AC3)

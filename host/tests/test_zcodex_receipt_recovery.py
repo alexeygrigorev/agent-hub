@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -72,14 +73,15 @@ class ZcodexReceiptRecoveryTests(unittest.TestCase):
             "tag": tag or ("task-" + self.task_id),
             "workspace": str(self.workspace),
             "engine": engine,
-            "created_at_ms": 1793107533693,
+            # A dispatch only binds its own fresh native (intake 17e774f8).
+            "created_at_ms": int(time.time() * 1000),
             "phase": "starting",
         }
         path = self.workspace / ".local" / f"launch-{self.task_id}-start.json"
         path.write_text(json.dumps(doc))
         return doc
 
-    def _dispatch(self, run_exc, retirement):
+    def _dispatch(self, run_exc, retirement, reconcile=None):
         requests = []
 
         def fake_request(method, path, payload=None):
@@ -101,6 +103,8 @@ class ZcodexReceiptRecoveryTests(unittest.TestCase):
             if "plan" in cmd:
                 return {"eligible": [{"provider": "zai", "model": "glm-5.3-flash",
                                       "task_fit": 1.0}]}
+            if " reconcile " in cmd:
+                return dict(reconcile or {})
             if "run" in cmd:
                 raise run_exc
             return {}
@@ -111,6 +115,8 @@ class ZcodexReceiptRecoveryTests(unittest.TestCase):
                                 runner=fake_runner, journal_dir=str(self.journal))
         with patch("agent_hub_host.headless_health.inspect", return_value=None), \
                 patch("agent_hub_host.retired_native.verify_native_retirement",
+                      return_value=retirement), \
+                patch("agent_hub_host.fleet.verify_native_retirement",
                       return_value=retirement):
             result = dispatcher.dispatch(offer)
         return result, requests, dispatcher
@@ -135,11 +141,24 @@ class ZcodexReceiptRecoveryTests(unittest.TestCase):
         self.assertEqual(record["tag"], "task-" + self.task_id)
         self.assertEqual(record["engine"], "zcodex")
 
-    def test_native_death_after_receipt_loss_settles_failed_with_native_id(self):
+    def test_native_death_after_receipt_loss_holds_until_launcher_release(self):
+        # Intake 17e774f8: retirement alone never releases the reservation.
         self._write_start_receipt()
         result, requests, _ = self._dispatch(
             RuntimeError("Local command failed or exceeded resource limit"),
             (True, {"id": NATIVE_ID}, "retired_tombstone_verified"))
+        self.assertEqual(result["state"], "uncertain")
+        posted = [p for (_m, path, p) in requests
+                  if path.endswith("/" + self.offer_id + "/result") and isinstance(p, dict)]
+        self.assertEqual(posted[-1]["state"], "uncertain")
+        self.assertEqual(posted[-1]["native_id"], NATIVE_ID)
+
+    def test_native_death_after_receipt_loss_settles_failed_with_native_id(self):
+        self._write_start_receipt()
+        result, requests, _ = self._dispatch(
+            RuntimeError("Local command failed or exceeded resource limit"),
+            (True, {"id": NATIVE_ID}, "retired_tombstone_verified"),
+            reconcile={"task_id": self.task_id, "state": "failed", "resources_reserved": False})
         self.assertEqual(result["state"], "failed")
         posted = [p for (_m, path, p) in requests
                   if path.endswith("/" + self.offer_id + "/result") and isinstance(p, dict)]

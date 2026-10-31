@@ -51,6 +51,12 @@ class AccountCapacityTests(unittest.TestCase):
             with self.subTest(entry=entry):
                 self._assert_persisted_failure_recovers(cwd='nested', entry=entry)
 
+    def test_nested_cwd_recovers_when_launcher_binds_native_to_engine_cwd(self):
+        # Intake 2a944c3f: tombstone/binding workspace is the engine cwd.
+        for entry in ['launcher', 'server']:
+            with self.subTest(entry=entry):
+                self._assert_persisted_failure_recovers(cwd='nested', entry=entry, native_at_cwd=True)
+
     def test_retained_first_action_failure_recovers_through_both_exact_bindings(self):
         for entry in ['launcher', 'server']:
             with self.subTest(entry=entry):
@@ -96,22 +102,23 @@ class AccountCapacityTests(unittest.TestCase):
             self.assertEqual(posts[0]['runtime']['log_tail'],'Partial spawned task')
             self.assertEqual(posts[0]['diagnostic'],original['diagnostic'])
 
-    def _assert_persisted_failure_recovers(self, cwd=None, entry='launcher', retained=False):
+    def _assert_persisted_failure_recovers(self, cwd=None, entry='launcher', retained=False, native_at_cwd=False):
         from agent_hub_host.fleet import Dispatcher
         with tempfile.TemporaryDirectory() as tmp:
             settings, offer, original = self._real_failed_dispatch(tmp, cwd)
             native = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+            native_ws = original['target_cwd'] if native_at_cwd else tmp
             binding = dict(task_id='hub-' + offer, native_id=native, tag='task-hub-' + offer,
-                           workspace=tmp, incarnation=1000, engine='opencode')
+                           workspace=native_ws, incarnation=1000, engine='opencode')
             status = {'state': 'failed', 'payload': {'owner': 'hub-fleet', 'cwd': original['target_cwd']}, 'native_binding': binding}
             row = {'id': offer, 'engine': 'opencode', 'mode': 'headless', 'workspace': 'main', 'cwd': cwd}
             if entry == 'server':
                 row.update(native_id=native, binding={'native_id': native, 'tag': binding['tag'],
-                    'workspace': tmp, 'native_created_at_ms': 1000})
+                    'workspace': native_ws, 'native_created_at_ms': 1000})
             def recover(dispatcher):
                 return (reconcile_retired(dispatcher, row) if entry == 'server' else
                         reconcile_launcher_retired(dispatcher, row, Path(original['target_cwd'])))
-            native_row = dict(id=native,tag=binding['tag'],workspace=tmp,engine='opencode',
+            native_row = dict(id=native,tag=binding['tag'],workspace=native_ws,engine='opencode',
                               created_at_ms=1000,phase='exited',worker_alive=False,
                               containment_empty=True,processes=0,worker_pid=99999999,workload_pid=99999998,
                               exit=dict(code=0,signal=None,exited_at_ms=2300))
@@ -223,8 +230,10 @@ class AccountCapacityTests(unittest.TestCase):
                     elif conflict == 'offer_cwd':
                         row['cwd'] = 'other'
                     elif conflict == 'native_workspace':
-                        binding['workspace'] = original['target_cwd']
-                        row['binding']['workspace'] = original['target_cwd']
+                        # The engine cwd is a valid native workspace (intake
+                        # 2a944c3f); an unrelated directory is not.
+                        binding['workspace'] = other
+                        row['binding']['workspace'] = other
                     elif conflict == 'payload_cwd':
                         status['payload']['cwd'] = other
                     elif conflict == 'argument_cwd':

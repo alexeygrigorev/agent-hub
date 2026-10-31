@@ -70,7 +70,7 @@ def reconcile_claimed_launch(dispatcher, row, *, dry_run=False):
             if not isinstance(binding, dict):
                 return None
             if (binding.get('task_id') != task_id or binding.get('tag') != 'task-' + task_id
-                    or binding.get('workspace') != str(workspace) or binding.get('engine') != row.get('engine')):
+                    or binding.get('workspace') not in (str(workspace), str(cwd)) or binding.get('engine') != row.get('engine')):
                 return None
             target = NativeTarget(session_id=binding['native_id'], tag=binding['tag'],
                                   workspace=binding['workspace'], engine=binding['engine'],

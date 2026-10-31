@@ -1534,7 +1534,37 @@ export class QuotaStore {
     }
 
     const hosts: Record<string, any>[] = [];
-    const coverage = { machines_total: machines.length, fresh: [] as string[], stale: [] as string[], missing: [] as string[] };
+    const coverage = { machines_total: machines.length, fresh: [] as string[], stale: [] as string[], missing: [] as string[],
+      // Machines counted fresh through their own per-account route reports
+      // (no fresh host-wide quse snapshot); see routeReportCoverage below.
+      route_reports: [] as string[] };
+    const coverageAccounts = new Set(accounts.map((a: any) => a.label));
+    const accountFiltered = Boolean(filters.provider || filters.account);
+    // A machine's own fleet subscription reports (one per routed account,
+    // posted every fleet cycle) are quota reports for exactly the accounts
+    // it can serve. A host without a host-wide quse snapshot (e.g. the
+    // Windows tablet serving only managed Codex bundles) is still a covered
+    // machine when every account routed to it has a fresh report from it;
+    // some-but-not-all is stale, none is missing.
+    const routeReportCoverage = (machineId: string): { routed: number; reported: number } => {
+      const routed = [...new Set(allRoutes
+        .filter((r) => r.machine_id === machineId && (!filters.engine || r.engine === filters.engine) &&
+          (!accountFiltered || coverageAccounts.has(r.account)))
+        .map((r) => r.account as string))];
+      let reported = 0;
+      for (const account of routed) {
+        const sub: any = this.sql
+          .exec("SELECT observed_at, quota_json FROM fleet_subscriptions WHERE machine_id = ? AND account = ?", machineId, account)
+          .toArray()[0];
+        if (!sub || !isFreshTs(sub.observed_at, nowMs, QUOTA_STALE_MS)) continue;
+        let quota: any = null;
+        try { quota = JSON.parse(sub.quota_json); } catch { quota = null; }
+        if (!quota || typeof quota !== "object") continue;
+        if (quota.observed_at !== undefined && quota.observed_at !== null && !isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS)) continue;
+        reported += 1;
+      }
+      return { routed: routed.length, reported };
+    };
     for (const machineId of machines) {
       const snap = this.getSnapshot(machineId, nowMs);
       const body = snap.body as Record<string, any>;
@@ -1560,8 +1590,14 @@ export class QuotaStore {
         });
       hosts.push({ host_id: machineId, snapshot: body, subscriptions: subs });
       if (snap.status === 200 && body.status === "ok") coverage.fresh.push(machineId);
-      else if (snap.status === 404) coverage.missing.push(machineId);
-      else coverage.stale.push(machineId);
+      else {
+        const { routed, reported } = routeReportCoverage(machineId);
+        if (routed > 0 && reported === routed) {
+          coverage.fresh.push(machineId);
+          coverage.route_reports.push(machineId);
+        } else if (snap.status === 404 && reported === 0) coverage.missing.push(machineId);
+        else coverage.stale.push(machineId);
+      }
     }
 
     return {

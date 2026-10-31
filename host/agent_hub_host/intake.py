@@ -234,6 +234,10 @@ def add_commands(sub):
     for name in ('show', 'history', 'links', 'context'):
         command = commands.add_parser(name)
         command.add_argument('id')
+        if name == 'history':
+            command.add_argument('--archived', action='store_true', help='Read one page of losslessly retained note history')
+            command.add_argument('--after', type=int)
+            command.add_argument('--limit', type=int, default=100)
     start = commands.add_parser('continue', help='CAS ready -> active context only; does not start a session')
     start.add_argument('id')
     start.add_argument('--version', type=int, required=True)
@@ -457,6 +461,14 @@ def execute(args):
                        json_file(args.payload_file) if args.payload_file else None)
     path = BASE + '/tasks/' + safe_id(args.id)
     if command in ('show', 'history', 'links', 'context'):
+        if command == 'history' and getattr(args, 'archived', False):
+            limit, after = getattr(args, 'limit', 100), getattr(args, 'after', None)
+            if not 1 <= limit <= 100 or (after is not None and after < 0):
+                raise IntakeInputError('Invalid archive page: limit is 1-100 and after is a nonnegative sequence')
+            params = {'archived': '1', 'limit': limit}
+            if after is not None:
+                params['after'] = after
+            return request('GET', path + '/history?' + urlencode(params))
         return request('GET', path + ('' if command == 'show' else '/' + command))
     if command == 'revoke':
         return request('POST', BASE + '/grants/' + safe_id(args.id) + '/revoke', json_file(args.payload_file))

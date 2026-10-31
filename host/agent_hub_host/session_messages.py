@@ -205,9 +205,11 @@ def relay_replies(*, journal_dir: str, executable: str, request: Callable,
                         or reply_id in record.get("relayed", []) or not isinstance(env.get("body"), str)):
                     continue
                 try:
+                    # The bus limits UTF-8 bytes; drop a partial trailing code point.
+                    body = env["body"].encode("utf-8", "replace")[:16384].decode("utf-8", "ignore")
                     sent = request("POST", "/api/bus/send", {
                         "from_actor": "session:" + record["hub_session_id"], "to_actor": record["from_actor"],
-                        "kind": "reply", "body": env["body"][:16000], "reply_to": record["message_id"],
+                        "kind": "reply", "body": body, "reply_to": record["message_id"],
                         "idempotency_key": "native-" + reply_id})
                 except Exception as exc:
                     relayed.append({"message_id": record["message_id"], "error": type(exc).__name__})

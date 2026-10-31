@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -303,6 +305,24 @@ def _bound_native_response(proc, args):
     return proc
 
 
+def ensure_runtime_bin_on_path() -> None:
+    """Windows venv layout: <root>/venv/Scripts/python.exe, <root>/bin/aplexer.exe.
+
+    The scheduled task / aplexer shell may not carry the installer's PATH, so
+    the native CLI would be found nowhere. Prepend the sibling bin directory.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        candidate = Path(sys.executable).resolve().parent.parent.parent / "bin"
+    except OSError:
+        return
+    if (candidate / "aplexer.exe").is_file():
+        parts = os.environ.get("PATH", "").split(os.pathsep)
+        if str(candidate) not in parts:
+            os.environ["PATH"] = os.pathsep.join([str(candidate), *parts])
+
+
 def run_native(
     executable: str,
     args: list[str],
@@ -320,6 +340,7 @@ def run_native(
     if "--pane" in args or "--no-ack" in args or "--enter" in args:
         raise SessionControlError("--pane/--no-ack/--enter transports are forbidden")
     from .aplexer_client import client_call
+    ensure_runtime_bin_on_path()
     native = client_call(executable, args, env=env)
     if native is not None:
         return _bound_native_response(native, args)
@@ -341,7 +362,9 @@ def run_native(
             # evidence intentionally minimal: no stdout/stderr exfiltration
         ) from exc
     except OSError as exc:
-        raise SessionControlError(f"Native executable failed: {type(exc).__name__}") from exc
+        raise SessionControlError(
+            f"Native executable failed: {type(exc).__name__}"
+            f" (resolved={'yes' if shutil.which(executable) else 'no'})") from exc
     return _bound_native_response(proc, args)
 
 

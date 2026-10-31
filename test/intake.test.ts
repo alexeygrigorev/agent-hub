@@ -39,12 +39,27 @@ async function grant(agent: any, scope = 'project', target: string | null = 'dem
 async function append(id: string, version: number, event: any, bearer?: string, key = 'event-' + ++seq) {
   return ok('/tasks/' + id + '/events', { key, expected_version: version, event }, bearer);
 }
-async function state() { return inDO(stub(), (h: any) => Object.fromEntries(['tasks','rules','grants','receipts','meta'].map(t => [t, h.sql.exec('SELECT * FROM intake_' + t + ' ORDER BY id').toArray()]))); }
+async function fullHistory(id: string): Promise<any[]> {
+  const { task } = await ok('/tasks/' + id);
+  if (!task.history_archive?.count) return task.payload_data.history;
+  const archived: any[] = []; let after: number | null = null; let order: any;
+  do {
+    const page = await ok('/tasks/' + id + '/history?archived=1&limit=7' + (after === null ? '' : '&after=' + after));
+    archived.push(...page.items); order = page.inline_sequences; after = page.next_after;
+  } while (after !== null);
+  return [...archived, ...task.payload_data.history.map((event: any) => ({ sequence: order[event.id], event }))]
+    .sort((a, b) => a.sequence - b.sequence).map(item => item.event);
+}
+async function state() { return inDO(stub(), (h: any) => Object.fromEntries(['tasks','rules','grants','receipts','meta','note_archive'].map(t => [t, h.sql.exec('SELECT * FROM intake_' + t + ' ORDER BY id').toArray()]))); }
 
 beforeEach(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
   await inDO(stub(), (h: any) => {
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
+    // Only fixture-owned archive rows are reset; production archives are append-only.
+    h.sql.exec('DROP TRIGGER IF EXISTS intake_note_archive_no_delete');
+    h.sql.exec('DELETE FROM intake_note_archive');
+    h.sql.exec("CREATE TRIGGER intake_note_archive_no_delete BEFORE DELETE ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
     for (const t of ['tasks','grants','rules','receipts']) h.sql.exec('DELETE FROM intake_' + t);
     h.sql.exec('UPDATE intake_meta SET revision=0');
     h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
@@ -189,7 +204,7 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(created.task.payload_data.history[0].intake_key).toBe('immutable-intake-key');
     await inDO(stub(), (h: any) => {
       const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', created.task.id).one().data);
-      while (data.history.length < INTAKE_LIMITS.events) data.history.push({ id: 'fixture-event-' + data.history.length, kind: 'note', text: 'Synthetic bounded history', source });
+      while (data.history.length < INTAKE_LIMITS.events) data.history.push({ id: 'fixture-event-' + data.history.length, kind: 'decision', text: 'Synthetic bounded history', source });
       h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), created.task.id);
     });
     const before = await state();
@@ -916,6 +931,241 @@ describe('private durable intake HTTP/SQLite', () => {
     await inDO(stub(), (h: any) => h.sql.exec('DROP TRIGGER intake_fixture_fault'));
     expect((await ok('/tasks/' + task.id, payload)).task.version).toBe(2);
   });
+  it('accepts both session links and notes on an existing 173 KiB open ledger', async () => {
+    const { task } = await create();
+    const seeded = await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      for (let i = 0; i < 95; i++) data.history.push({ id: crypto.randomUUID(), kind: 'note',
+        text: 'legacy note ' + i + '界'.repeat(570), source, actor: 'fixture', captured_at: Date.now(),
+        authority: 'untrusted_task_data' });
+      data.version = 96;
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      let linkError: string | null = null;
+      try { h.ctx.storage.transactionSync(() => recordIntakeSessionLink(h.sql, { id: crypto.randomUUID(),
+        actor: 'fixture', request_json: JSON.stringify({ intake_task_id: task.id }) }, Date.now())); }
+      catch (e: any) { linkError = e.code; }
+      const after = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      return { linkError, version: after.version, bytes: new TextEncoder().encode(JSON.stringify(data)).length,
+        history: data.history };
+    });
+    expect(seeded.bytes).toBeGreaterThan(173000);
+    const response = await call('/tasks/' + task.id + '/events', { key: 'legacy-oversized', expected_version: seeded.version,
+      event: { kind: 'note', text: 'driver marker', source } });
+    const result: any = await response.json();
+    expect({ linkError: seeded.linkError, appendStatus: response.status, appendError: result.error ?? null })
+      .toEqual({ linkError: null, appendStatus: 200, appendError: null });
+    expect(result.task.history_archive.count).toBeGreaterThan(0);
+    expect((await fullHistory(task.id)).slice(0, seeded.history.length)).toEqual(seeded.history);
+    expect(result.task.status).toBe('open');
+  });
+
+  it('keeps a 95c1862c-shaped open intake writable beyond taskBytes and the old receipt cap', async () => {
+    let { task } = await create();
+    const originals: any[] = [...task.payload_data.history];
+    // Legitimate bounded notes grow retained history past both former caps.
+    // Ordinary older notes move to the archive while the inline task stays bounded.
+    for (let i = 0; i < 34; i++) {
+      const result = await append(task.id, task.version, { kind: 'note', text: String(i) + '界'.repeat(2700), source });
+      task = result.task;
+      originals.push(task.payload_data.history.at(-1));
+    }
+    const size = await inDO(stub(), (h: any) => {
+      const row = h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one();
+      const archived = h.sql.exec('SELECT COALESCE(SUM(length(CAST(data AS BLOB))),0) AS n FROM intake_note_archive WHERE task_id=?', task.id).one().n;
+      return { inline: new TextEncoder().encode(row.data).length, total: new TextEncoder().encode(row.data).length + archived };
+    });
+    expect(size.total).toBeGreaterThan(262144);
+    expect(size.inline).toBeLessThanOrEqual(INTAKE_LIMITS.taskBytes);
+    expect(task.history_archive.count).toBeGreaterThan(0);
+    expect(task.status).toBe('open');
+    const sessionId = crypto.randomUUID();
+    const linked = await inDO(stub(), (h: any) => h.ctx.storage.transactionSync(() =>
+      recordIntakeSessionLink(h.sql, { id: sessionId, actor: 'fixture', engine: 'codex',
+        request_json: JSON.stringify({ intake_task_id: task.id }), created_at: new Date().toISOString() }, Date.now())));
+    expect(linked).toBe(true);
+    task = (await ok('/tasks/' + task.id)).task;
+    expect((await fullHistory(task.id)).slice(0, originals.length)).toEqual(originals);
+    expect(task.payload_data.history.at(-1)).toMatchObject({ kind: 'link', hub_session_id: sessionId });
+    const payload = { key: 'oversized-replay', expected_version: task.version,
+      event: { kind: 'note', text: 'driver-posted marker after link', source } };
+    const first = await ok('/tasks/' + task.id + '/events', payload);
+    expect(await ok('/tasks/' + task.id + '/events', payload)).toEqual(first);
+    expect((await fullHistory(task.id)).slice(0, originals.length)).toEqual(originals);
+    expect(first.task.payload_data.history.at(-1).text).toBe(payload.event.text);
+    expect(first.task.status).toBe('open');
+  }, 30000);
+
+  it('archives exhausted note history atomically, preserving claims, order, permissions and storage accounting', async () => {
+    const { task } = await create();
+    const original = await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      data.history.push({ id: crypto.randomUUID(), kind: 'blocker', text: 'Retain this obligation', source });
+      data.history.push({ id: crypto.randomUUID(), kind: 'note', text: 'DONE abcdef1\nlive check: fixture\nresult: claim only', source });
+      for (const text of ['STARTED fixture', 'TRIAGE ACTUAL — fixture', 'VERIFICATION FAILED — fixture'])
+        data.history.push({ id: crypto.randomUUID(), kind: 'note', text, source });
+      while (data.history.length < INTAKE_LIMITS.events) data.history.push({ id: crypto.randomUUID(), kind: 'note', text: 'old note ' + data.history.length, source });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      return data.history;
+    });
+    const before = await state();
+    await inDO(stub(), (h: any) => h.sql.exec("CREATE TRIGGER intake_archive_fixture_fault BEFORE INSERT ON intake_receipts BEGIN SELECT RAISE(ABORT,'fixture fault'); END"));
+    const payload = { key: 'archive-atomic', expected_version: 1, event: { kind: 'note', text: 'new marker', source } };
+    try {
+      expect((await call('/tasks/' + task.id + '/events', payload)).status).toBe(500);
+      expect(await state()).toEqual(before);
+    } finally {
+      await inDO(stub(), (h: any) => h.sql.exec('DROP TRIGGER intake_archive_fixture_fault'));
+    }
+    const result = await ok('/tasks/' + task.id + '/events', payload);
+    expect(result.task.history_archive.count).toBeGreaterThan(0);
+    expect(result.task.payload_data.history.some((e: any) => /^DONE/.test(e.text))).toBe(true);
+    for (const text of ['STARTED fixture', 'TRIAGE ACTUAL — fixture', 'VERIFICATION FAILED — fixture'])
+      expect(result.task.payload_data.history.some((e: any) => e.text === text)).toBe(true);
+    expect(result.task.unresolved[0].id).toBe(original[1].id);
+    expect((await fullHistory(task.id)).slice(0, original.length)).toEqual(original);
+    const stats = await ok('/storage');
+    expect(stats.bytes.archived_notes).toBeGreaterThan(0);
+    expect(stats.counts.note_archive).toBe(result.task.history_archive.count);
+    expect(stats.retained_bytes).toBe(['open_tasks', 'archived_or_terminal_tasks', 'receipts', 'grants', 'rules', 'audit', 'archived_notes']
+      .reduce((sum, key) => sum + stats.bytes[key], 0));
+    const other = await seedAgent('other:archive-reader'); await grant(other, 'project', 'other', 'read');
+    expect((await call('/tasks/' + task.id + '/history?archived=1', undefined, other.token)).status).toBe(404);
+    await grant(other, 'task', task.id, 'read');
+    expect((await ok('/tasks/' + task.id + '/history?archived=1&limit=2', undefined, other.token)).items).toHaveLength(2);
+    await inDO(stub(), (h: any) => {
+      expect(() => h.sql.exec('DELETE FROM intake_note_archive WHERE task_id=?', task.id)).toThrow(/append_only_note_archive/);
+      expect(() => h.sql.exec('UPDATE intake_note_archive SET data=data WHERE task_id=?', task.id)).toThrow(/append_only_note_archive/);
+    });
+    expect((await call('/tasks/' + task.id + '/history?archived=1&limit=101')).status).toBe(400);
+  });
+
+  it('bounds archive pages by bytes and preserves every event across cursors', async () => {
+    const { task } = await create();
+    const original = await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      const events = [];
+      for (let i = 1; i <= 100; i++) {
+        const event = { id: crypto.randomUUID(), kind: 'note', text: '界'.repeat(2700), source };
+        events.push(event);
+        h.sql.exec('INSERT INTO intake_note_archive(id,task_id,seq,data) VALUES(?,?,?,?)', task.id + ':' + event.id, task.id, i, JSON.stringify(event));
+      }
+      data.history_archive = { count: events.length, href: '/api/intake/tasks/' + task.id + '/history?archived=1' };
+      data._history_order = { [data.history[0].id]: 0 }; data._history_next_seq = 101;
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      return events;
+    });
+    const before = await state();
+    const first = await ok('/tasks/' + task.id + '/history?archived=1&limit=100');
+    expect(first.items.length).toBeGreaterThan(0); expect(first.items.length).toBeLessThan(100);
+    expect(first.items.reduce((sum: number, item: any) => sum + new TextEncoder().encode(JSON.stringify(item.event)).length, 0)).toBeLessThanOrEqual(512 * 1024);
+    const second = await ok('/tasks/' + task.id + '/history?archived=1&limit=100&after=' + first.next_after);
+    expect([...first.items, ...second.items].map((item: any) => item.event)).toEqual(original);
+    expect(second.next_after).toBeNull();
+    expect(await state()).toEqual(before);
+  });
+
+  it('retains service-owned notes without eviction and writes no archives on a failed service mutation', async () => {
+    const { task } = await create();
+    const original = await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      while (data.history.length < INTAKE_LIMITS.events) data.history.push({ id: crypto.randomUUID(), kind: 'note',
+        text: 'service note ' + data.history.length, actor: 'hub:service:fixture', source });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      return data.history;
+    });
+    const before = await state();
+    const denied = await inDO(stub(), (h: any) => {
+      const limit = INTAKE_LIMITS.totalBytes;
+      try {
+        INTAKE_LIMITS.totalBytes = 1;
+        return h.intakeService.serviceRecordEvent(task.id, { event: { kind: 'note', text: 'service marker' } });
+      } finally { INTAKE_LIMITS.totalBytes = limit; }
+    });
+    expect(denied).toMatchObject({ ok: false, error: 'storage_capacity' });
+    expect(await state()).toEqual(before);
+    const accepted = await inDO(stub(), (h: any) => h.intakeService.serviceRecordEvent(task.id,
+      { event: { kind: 'note', text: 'service marker', actor: 'hub:service:fixture' } }));
+    expect(accepted.ok).toBe(true);
+    const history = await fullHistory(task.id);
+    expect(history.slice(0, original.length)).toEqual(original);
+    expect(history.at(-1).text).toBe('service marker');
+  });
+
+  it('warns before byte or structured-event capacity is exhausted', async () => {
+    const { task } = await create();
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      for (let i = 0; i < 13; i++) data.history.push({ id: crypto.randomUUID(), kind: 'decision', text: '界'.repeat(2700), source });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+    });
+    const view = (await ok('/tasks/' + task.id)).task;
+    expect(view.capacity_warning).toMatchObject({ code: 'intake_task_capacity_high', threshold_ratio: 0.8 });
+    expect(view.capacity_warning.inline_bytes).toBeLessThan(INTAKE_LIMITS.taskBytes);
+    expect(view.capacity_warning.inline_events).toBeLessThan(INTAKE_LIMITS.events);
+    const appended = await append(task.id, task.version, { kind: 'note', text: 'Still writable', source });
+    expect(appended.task.status).toBe('open');
+    const other = (await create()).task;
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', other.id).one().data);
+      while (data.history.length < 103) data.history.push({ id: crypto.randomUUID(), kind: 'decision', text: 'Small structured event', source });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), other.id);
+    });
+    const eventWarning = (await ok('/tasks/' + other.id)).task.capacity_warning;
+    expect(eventWarning.inline_events).toBe(103);
+    expect(eventWarning.inline_bytes).toBeLessThan(INTAKE_LIMITS.taskBytes * 0.8);
+  });
+
+  it('keeps link-heavy task projections below the SQL row limit', async () => {
+    const { task } = await create();
+    const result = await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      // Every variable field respects link-event input limits. Escaped text
+      // exercises encoded-byte accounting and the projection's duplicate links.
+      while (data.history.length < INTAKE_LIMITS.events - 2) {
+        const link = { id: crypto.randomUUID(), kind: 'link', native_id: '\n'.repeat(512),
+          engine: '\n'.repeat(128), tier: '\n'.repeat(128), host: '\n'.repeat(512), hub: '\n'.repeat(2048),
+          provenance: { type: 'unknown', reference: '\n'.repeat(2048), timestamp: null },
+          routing_job_id: null, hub_session_id: null, actor: 'fixture', captured_at: Date.now(),
+          authority: 'untrusted_task_data', evidence: 'external_unverified_not_launch_proof' };
+        if (new TextEncoder().encode(JSON.stringify({ ...data, history: [...data.history, link] })).length >
+          INTAKE_LIMITS.taskRecordBytes - 4096) break;
+        data.history.push(link);
+      }
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      const projection = h.sql.exec('SELECT length(CAST(data AS BLOB))+length(CAST(links AS BLOB))+length(CAST(id AS BLOB)) AS bytes FROM intake_task_projection WHERE id=?', task.id).one();
+      return { bytes: projection.bytes, taskBytes: new TextEncoder().encode(JSON.stringify(data)).length };
+    });
+    expect(result.taskBytes).toBeGreaterThan(INTAKE_LIMITS.taskRecordBytes * 0.9);
+    expect(result.bytes).toBeLessThan(2000000);
+    const appended = await append(task.id, task.version, { kind: 'note', text: 'bounded marker', source });
+    expect(appended.task.status).toBe('open');
+  });
+
+  it('rolls back oversized-history writes at the separate record safety bound', async () => {
+    const { task } = await create();
+    const result = await inDO(stub(), (h: any) => {
+      const row = h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one();
+      const data = JSON.parse(row.data);
+      data.history.push({ kind: 'link', text: 'x'.repeat(INTAKE_LIMITS.taskRecordBytes) });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      const before = h.sql.exec('SELECT revision FROM intake_meta WHERE id=1').one().revision;
+      let error: string | undefined;
+      try { h.ctx.storage.transactionSync(() => recordIntakeSessionLink(h.sql, {
+        id: crypto.randomUUID(), actor: 'fixture', request_json: JSON.stringify({ intake_task_id: task.id }),
+      }, Date.now())); } catch (e: any) { error = e.code; }
+      return { error, same: h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data === JSON.stringify(data),
+        revisionUnchanged: before === h.sql.exec('SELECT revision FROM intake_meta WHERE id=1').one().revision };
+    });
+    expect(result).toEqual({ error: 'record_byte_capacity', same: true, revisionUnchanged: true });
+    const before = await state();
+    const response = await call('/tasks/' + task.id + '/events', {
+      key: 'record-capacity', expected_version: task.version, event: { kind: 'note', text: 'bounded note', source },
+    });
+    expect(response.status).toBe(507);
+    expect(await response.json()).toMatchObject({ error: 'record_byte_capacity' });
+    expect(await state()).toEqual(before);
+  });
+
   it('refuses global/task/count/history caps explicitly and preserves prior work', async () => {
     const { task } = await create();
     await inDO(stub(), (h: any) => {

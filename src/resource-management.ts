@@ -10,6 +10,14 @@ import { resolveMachineAliases } from './machine-alias';
 import { jsonFields, resourceRequest } from './sql-json-projection';
 export const MEMORY_FLOOR_MB = defaults.memory_floor_mb;
 export const NEXT_SLOT_MB = defaults.ramp_reserve_default_mb;
+// Intake 63a9ee3a / 736ba282: an offered, starting or uncertain launch holds
+// its full estimate only this long after its claim (or creation when never
+// claimed). Parked offers (host_overload) and stuck uncertain rows otherwise
+// reserved memory forever: 15 unclaimed Hetzner offers held 38 GiB and
+// refused every new placement. A worker that is really alive past this
+// window is already counted in the host's MemAvailable, and the host re-runs
+// its own memory gate before every claim.
+export const IN_FLIGHT_RESERVE_SECONDS = 600;
 export const CPU_LOAD_FACTOR = defaults.cpu_load_factor;
 export type ResourceConfig = typeof defaults;
 const parse = (s: any): any => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
@@ -217,16 +225,18 @@ export class ResourceManagement {
     const now = this.snapshotNow ?? this.now();
     const m:any=this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine)[0];
     const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
+    const inFlightCutoff=new Date(now-IN_FLIGHT_RESERVE_SECONDS*1000).toISOString();
     const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal');
-    // Expose the common state range to the machine/state index; the OR below
-    // still applies the exact running-ramp cutoff.
+    // Expose the common state range to the machine/state index; the CASE below
+    // applies the running-ramp cutoff or the bounded in-flight window and is
+    // NULL (no reservation) for any other state, so the index filter stays
+    // an optimisation only.
     const pending=this.readRows(`SELECT l.id,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,
       c.current_cpu_cores,c.observed_at AS cpu_observed_at FROM fleet_launches l
       LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_cpu_samples c ON c.launch_id=l.id WHERE machine_id=?
       AND l.state IN ('offered','starting','running','uncertain')
-      AND (state IN ('offered','starting','uncertain') OR (state='running' AND
-      COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),created_at)>=?))`,machine,cutoff) as any[];
-    const pendingKey=JSON.stringify([machine,cutoff,now]);
+      AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),created_at)>=CASE WHEN state='running' THEN ? WHEN state IN ('offered','starting','uncertain') THEN ? END`,machine,cutoff,inFlightCutoff) as any[];
+    const pendingKey=JSON.stringify([machine,cutoff,inFlightCutoff,now]);
     let commitments=this.cpuPendingSnapshot?.get(pendingKey);
     if (!commitments) {
       commitments=pending.map(row=>{
@@ -285,13 +295,14 @@ export class ResourceManagement {
     const machineRow: any = this.readRows('SELECT last_heartbeat FROM machines WHERE id=?', machine)[0];
     const hb = parse(machineRow?.last_heartbeat); const config = this.config();
     const cutoff = new Date(now - config.ramp_seconds * 1000).toISOString();
+    const inFlightCutoff = new Date(now - IN_FLIGHT_RESERVE_SECONDS * 1000).toISOString();
     // Only launch ramps are additional commitments. Resident usage is already in MemAvailable.
     // The explicit state range lets SQLite skip retained terminal history.
     const pending = this.readRows(`SELECT l.id,l.engine,l.workspace,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb FROM fleet_launches l
       LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
       WHERE l.machine_id=? AND l.state IN ('offered','starting','running','uncertain')
-      AND (l.state IN ('offered','starting','uncertain') OR (l.state='running'
-      AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),l.created_at)>=?))`, cutoff, machine, cutoff) as any[];
+      AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),l.created_at)
+        >=CASE WHEN l.state='running' THEN ? WHEN l.state IN ('offered','starting','uncertain') THEN ? END`, cutoff, machine, cutoff, inFlightCutoff) as any[];
     let reserved = 0;
     for (const row of pending) {
       const req = parse(row.request_json);

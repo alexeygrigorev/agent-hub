@@ -484,6 +484,41 @@ class LifecycleReconciliationTests(unittest.TestCase):
             self.assertEqual(guard.reconcile_terminal_locks(request), 0)
             self.assertEqual(release.call_count, 2)
 
+    def test_bounded_worker_pages_terminal_sessions_with_a_cursor(self):
+        guard._reconcile_cursor = None
+        fact = dict(session_id='11111111', terminal=True, native_terminal=True, linked_intake_open=False,
+                    protected=False, tag='hub-22222222')
+        expected = dict(workspace='/tree', repository={'common_dir': '/repo/.git'})
+        paths = []
+        pages = {None: ('c1', [fact]), 'c1': (None, [fact])}
+        def request(method, path):
+            paths.append(path)
+            query = dict(p.split('=', 1) for p in path.split('?', 1)[1].split('&'))
+            nxt, sessions = pages[query.get('cursor')]
+            return {'sessions': sessions, 'next_cursor': nxt}
+        with patch.object(guard, 'expected_repository', return_value=expected), \
+             patch.object(guard, 'repository_identity', return_value=expected['repository']), \
+             patch.object(guard, 'release_session_lock', return_value=True):
+            self.assertEqual(guard.reconcile_terminal_locks(request), 1)
+            self.assertEqual(guard.reconcile_terminal_locks(request), 1)
+            self.assertEqual(guard.reconcile_terminal_locks(request), 1)
+        self.assertEqual([p.split('?', 1)[1] for p in paths], ['limit=100', 'limit=100&cursor=c1', 'limit=100'])
+        self.assertNotIn('cursor', paths[0])
+        self.assertIn('cursor=c1', paths[1])
+        self.assertNotIn('cursor', paths[2])  # wrapped after the last page
+        guard._reconcile_cursor = None
+
+    def test_cursor_does_not_advance_when_the_deadline_cuts_a_page(self):
+        guard._reconcile_cursor = None
+        fact = dict(session_id='11111111', terminal=True, native_terminal=True, linked_intake_open=False, protected=False)
+        request = lambda method, path: {'sessions': [fact, fact], 'next_cursor': 'c9'}
+        with patch.object(guard.time, 'monotonic', side_effect=[0, 100, 100, 100]):
+            guard.reconcile_terminal_locks(request)
+        self.assertIsNone(guard._reconcile_cursor)
+        guard.reconcile_terminal_locks(request)
+        self.assertEqual(guard._reconcile_cursor, 'c9')
+        guard._reconcile_cursor = None
+
     def test_adoption_does_not_invent_original_repository(self):
         row = dict(workspace='/tree', tag='hub-22222222')
         session = dict(id='11111111', intake_task_id='intake')

@@ -42,6 +42,13 @@ asks Hub for the plan:
 `POST /api/worktree-host/plan {launch_id}` returns one of
 
 - `{mode: "none"}`: no intake, or the start named its own cwd. Launch as before.
+- `{mode: "none", task_id, detached: true}`: the start set
+  `intake_worktree: "detached"` (intake 79458f2d). It keeps the intake link but
+  runs in its workspace root: Hub never pins it to the worktree's machine,
+  resumes, creates or locks the intake worktree for it, and never counts it as
+  a live session bound to that worktree. A detached start may not name a
+  workspace or cwd with any `-wt-` path segment (the tree, a subdirectory or a relative name). The hourly backlog triage and the post-DONE
+  verifier use it.
 - `{mode: "resume", task_id, worktree_id, path, branch}`: use that worktree. If
   the directory is missing on the host, create it again from fresh
   `origin/main` at the same path (`git worktree add`), then report `recreated`.

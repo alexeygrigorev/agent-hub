@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 from . import bus
 from .session_rules import SESSION_PREAMBLE, compose_prompt
-from .retired_native import verify_native_retirement
+from .retired_native import launch_workspace_targets, verify_native_retirement, verify_retirement_in_targets
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 # Control characters the Hub server rejects in finish-report text
@@ -43,6 +43,20 @@ def _terminal_fleet_state(reconciled_state, has_result, diagnostic_reason=None):
     if not has_result:
         return 'failed'
     return 'exited'
+
+
+def _clean_native_success(report, evidence):
+    """A receipt-less launcher failure is superseded only by clean completion.
+
+    Intake 17e774f8: the worker's done report plus a native exit code of
+    exactly 0 and no signal. Missing exit evidence, any nonzero code (137)
+    or signal (9) keeps the launch failed; the report is still forwarded.
+    """
+    return (isinstance(report, dict) and report.get('report_status') == 'done'
+            and isinstance(evidence, dict) and type(evidence.get('exit_code')) is int
+            and evidence['exit_code'] == 0
+            and (evidence.get('exit_signal') is None
+                 or (type(evidence.get('exit_signal')) is int and evidence['exit_signal'] == 0)))
 
 
 def _sanitize_launcher_slug(text, limit=64):
@@ -152,7 +166,7 @@ OFFERS_LOCK_NAME = "fleet-offers.lock"
 # plus a slow Hub can exceed that, so the gate is re-run before claiming when
 # the first observation is older than this.
 CLAIM_ADMISSION_REFRESH_S = 15.0
-# Bounded offer concurrency (settings "dispatch_concurrency", 1..10).
+# Bounded offer concurrency (settings "dispatch_concurrency", 1..13).
 # Intake eff9a5ce burst fix: serial dispatch (30-60 s per offer) made a
 # 10-launch burst take 5+ minutes. The earlier admission_refused failures with
 # 3 parallel starts came from N concurrent admission-gate subprocesses (quota
@@ -160,13 +174,19 @@ CLAIM_ADMISSION_REFRESH_S = 15.0
 # a short-lived shared result (ADMISSION_SHARE_S), so parallel dispatch no
 # longer multiplies gate runs. Host pressure is enforced by the launcher and
 # Hub placement on real choking signals (PSI, MemAvailable, OOM), never here.
-DISPATCH_CONCURRENCY = 10
-DISPATCH_CONCURRENCY_MAX = 10
+# Intake 2a944c3f: per-pass cap on launcher reconcile runs and the pause for a
+# launch whose retirement proof was refused, so wedged rows cannot starve others.
+RECONCILE_LAUNCHER_BATCH = 16
+RECONCILE_BACKOFF_S = 120.0
+DISPATCH_CONCURRENCY = 13
+DISPATCH_CONCURRENCY_MAX = 13
 # An allowed gate observation is shared by concurrent dispatches for the same
 # account/engine/profile/mode/selection for this long. Well inside the Hub's
 # 30 s claim freshness and CLAIM_ADMISSION_REFRESH_S, so a shared observation
 # never forces a stale claim. Refusals are never shared.
 ADMISSION_SHARE_S = 8.0
+# Launcher plan rejection for a managed route without trusted quota evidence.
+QUOTA_SOURCE_REJECTION = 'quota source'
 # GET /api/fleet/offers transport retries (timeouts while the Hub is slow).
 # A failed offers read is never a launch failure: the offers simply stay
 # offered for the next tick.
@@ -528,6 +548,14 @@ def normalize_git_identity(conf) -> dict[str, str]:
             else:
                 res[f"user.{k}"] = str(v)
     return res
+
+
+# Routes one heartbeat may advertise; must equal MAX_ADVERTISED_ROUTES in
+# src/registry.ts. Matches Hub's per-machine subscription limit (128).
+MAX_ADVERTISED_ROUTES = 128
+# Re-post an unchanged route advertisement this often; Hub holds every route
+# of a host whose last advertisement is older than 180 s.
+ROUTE_ADVERTISEMENT_REFRESH_S = 60
 
 
 def load_settings(path=None):
@@ -1125,6 +1153,7 @@ class Dispatcher:
         self.journal_dir = journal_dir or settings.get("journal_dir")
         self._imported_sessions_cursor: Optional[str] = None
         self._active_launches: dict[str, dict[str, Any]] = {}
+        self._reconcile_backoff: dict[str, float] = {}
         self._role_jobs_cache: Optional[tuple] = None
         # Intake 488b860e: offers already faulted once this process (fault flag
         # is once-per-offer; the synchronous same-key retry must run clean).
@@ -1144,6 +1173,11 @@ class Dispatcher:
         self._dispatching_guard = threading.Lock()
         self._bindings_lock = threading.Lock()
         self._catalog_report_lock = threading.Lock()
+        # Intake 6cbb862a: telemetry and check-in threads both post the route
+        # advertisement; snapshot, send and cache update are serialized.
+        self._route_advertisement_lock = threading.Lock()
+        self._route_advertisement_seq = 0
+        self._route_advertisement_posted = None
         self._catalog_enrichment = {}
         self._catalog_sampled_at = 0.0
         self._catalog_raw = None
@@ -1644,6 +1678,60 @@ class Dispatcher:
         self.request('POST', '/api/fleet/launches/' + offer_id + '/result', payload)
         return {'id': offer_id, **payload, 'reason': diagnostic['reason']}
 
+    def _settle_retired_dispatch(self, *, offer_id, task_id, workspace, target_cwd, target,
+                                 offer, sub, launched_at_ts, log_offsets, record, failure):
+        """Intake 17e774f8: a retired native after a receipt-less launcher exit.
+
+        The maintained launcher can exit 1 with empty pipes when the engine
+        finishes before any first action validates (Windows headless Claude,
+        b99fab81) although the worker completed and wrote its result. Native
+        retirement alone neither proves success nor releases the launcher's
+        reservation, so bind the exact native in the ordinary headless shape
+        and let reconcile_launches settle it: launcher release confirmed,
+        exited only for a clean native exit with a done report, failed (with
+        any worker report forwarded) otherwise. Unconfirmed release keeps the
+        reservation and reports uncertain; reconciliation finishes it later.
+        """
+        # Only this launch's own native may settle it: a foreign or stale
+        # start file must never qualify an unrelated retirement.
+        try:
+            started_ms = int(launched_at_ts * 1000) if type(launched_at_ts) in (int, float) else None
+            same = (target.tag == 'task-' + task_id
+                    and target.workspace in {str(Path(w).resolve(strict=True)) for w in (workspace, target_cwd)}
+                    and isinstance(offer.get('engine'), str) and target.engine == offer['engine']
+                    and type(target.created_at_ms) is int and started_ms is not None
+                    and started_ms - 60_000 <= target.created_at_ms <= int(time.time() * 1000) + 60_000)
+        except (OSError, ValueError, TypeError):
+            same = False
+        if not same:
+            return None
+        native_id = str(target.session_id)
+        record.update(state='running', settled=False, native_id=native_id, tag=target.tag,
+                      engine=target.engine, incarnation=target.created_at_ms,
+                      account=sub.get('account_label'), profile=offer.get('profile') or sub.get('profile'),
+                      launched_at_ts=launched_at_ts if type(launched_at_ts) in (int, float) else time.time(),
+                      log_offsets=log_offsets, retired_dispatch=True, dispatch_failure=failure,
+                      result_path=str(Path(workspace) / '.local' / 'hub-results' / (offer_id + '.json')))
+        record.pop('reason', None)
+        record.pop('diagnostic', None)
+        self._persist_launch_record(record)
+        self._active_launches[offer_id] = record
+        self.reconcile_launches([offer_id], terminal_only=True)
+        current = self._active_launches.get(offer_id) or record
+        if current.get('settled') is True and current.get('state') in ('exited', 'failed'):
+            return {'id': offer_id, 'state': current['state'], 'native_id': native_id,
+                    'launcher_task_id': task_id, 'recovered_receipt': True,
+                    **({'diagnostic': failure} if current['state'] == 'failed' else {})}
+        if not isinstance(current.get('terminal_payload'), dict):
+            # Nothing terminal was sent: expose the bound native as uncertain.
+            # A pending terminal payload is replayed by reconciliation instead.
+            self.request('POST', '/api/fleet/launches/' + offer_id + '/result',
+                         {'state': 'uncertain', 'native_id': native_id,
+                          'launcher_task_id': task_id, 'diagnostic': failure})
+        return {'id': offer_id, 'state': 'uncertain', 'native_id': native_id,
+                'launcher_task_id': task_id, 'reason': failure['reason'],
+                'diagnostic': failure, 'pending_release': True}
+
     def _recover_live_native_after_lost_receipt(self, *, offer_id, task_id, workspace, target,
                                                 start_engine, retire_detail, sub, offer,
                                                 launched_at_ts, log_offsets):
@@ -1708,6 +1796,9 @@ class Dispatcher:
         has_launcher = all(launcher.get(k) for k in ["argv", "root", "config_dir"])
 
         from .terminal_reports import guarded_records
+        from . import retired_native
+        pass_catalog = {}
+        launcher_runs = 0
         for offer_id, record in guarded_records(self, offer_ids):
             if record.get("settled") is True:
                 from .late_reports import deliver, cleanup
@@ -1748,16 +1839,24 @@ class Dispatcher:
             if not isinstance(engine, str) or not engine:
                 continue
 
-            try:
-                target = NativeTarget(
-                    session_id=record["native_id"],
-                    tag=record["tag"],
-                    workspace=record["workspace"],
-                    created_at_ms=incarnation,
-                    engine=engine,
-                ).validated()
-            except (SessionControlError, KeyError, ValueError, TypeError):
+            # The launcher binds the native session to the engine cwd, which
+            # differs from the workspace root for `--cwd` launches (intake
+            # 2a944c3f); a tombstone only matches its own exact workspace.
+            targets = []
+            for ws in launch_workspace_targets(record):
+                try:
+                    targets.append(NativeTarget(
+                        session_id=record["native_id"],
+                        tag=record["tag"],
+                        workspace=ws,
+                        created_at_ms=incarnation,
+                        engine=engine,
+                    ).validated())
+                except (SessionControlError, KeyError, ValueError, TypeError):
+                    continue
+            if not targets:
                 continue
+            target = targets[0]
 
             if (not terminal_only and not record.get('health_stop_confirmed')
                     and not record.get('routing_task_id')) and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused'):
@@ -1767,16 +1866,49 @@ class Dispatcher:
                     continue
 
             # 2. Positive retirement verification
-            try:
-                is_retired, tombstone, detail = verify_native_retirement(native, target, state_dir=state_dir)
-            except Exception:
-                continue
+            # Bounded: at most one live census per kind per pass (shared by
+            # every launch and candidate workspace) and a capped number of
+            # launcher runs; a launch whose launcher release is refused backs
+            # off for a while.
+            if "sessions" not in pass_catalog:
+                try:
+                    pass_catalog["sessions"] = retired_native.list_sessions(native, include_exited=True)
+                except Exception:
+                    pass_catalog["sessions"] = None
+            is_retired, found, tombstone, detail = False, None, None, "live_catalog_unavailable"
+            # A failed census is retried (through the verifier) by one launch
+            # per pass only, never by every launch.
+            if pass_catalog["sessions"] is not None:
+                is_retired, found, tombstone, detail = verify_retirement_in_targets(
+                    native, targets, state_dir=state_dir, sessions=pass_catalog["sessions"],
+                    verify=verify_native_retirement)
+            elif not pass_catalog.get("census_retried"):
+                pass_catalog["census_retried"] = True
+                try:
+                    is_retired, tombstone, detail = verify_native_retirement(native, targets[0], state_dir=state_dir)
+                    found = targets[0] if is_retired else None
+                except Exception:
+                    pass
+            if found is not None:
+                target = found
 
             if not is_retired:
-                from .terminal_reports import retained_terminal_exit
-                is_retired, tombstone, detail = retained_terminal_exit(self, target, record)
+                from .terminal_reports import retained_terminal_exit, native_catalog
+                if "rows" not in pass_catalog:
+                    pass_catalog["rows"] = native_catalog(self)
+                for candidate in targets:
+                    is_retired, tombstone, detail = retained_terminal_exit(
+                        self, candidate, record, rows=pass_catalog["rows"])
+                    if is_retired:
+                        target = candidate
+                        break
+                    if detail != 'retained_identity_unavailable':
+                        break
             if not is_retired:
                 continue
+            if time.time() < self._reconcile_backoff.get(offer_id, 0) or launcher_runs >= RECONCILE_LAUNCHER_BATCH:
+                continue
+            launcher_runs += 1
 
             # 3. Maintained Launcher reconcile
             if not has_launcher:
@@ -1797,9 +1929,26 @@ class Dispatcher:
             resources_reserved = reconcile_out.get("resources_reserved")
 
             # Require confirmed physical release of the same native execution.
+            # A retired dispatch (intake 17e774f8) may hold no launcher
+            # binding when no first action validated: a missing (never a
+            # different) launcher native_id is accepted for it only.
+            launcher_native = reconcile_out.get("native_id")
+            # A `--cwd` launch whose launcher binding failed on the workspace
+            # mismatch (launcher_command_failed, before 1883b769) has no
+            # binding either; the retirement of the host-bound native was
+            # proven above, so a missing (never a different) native_id is
+            # accepted for it too.
+            unbound_ok = (launcher_native is None and reconcile_out.get("task_id") == record["task_id"]
+                          and (record.get("retired_dispatch") is True
+                               or (reconciled_state == "failed"
+                                   and record.get("target_cwd") not in (None, record.get("workspace")))))
             if (resources_reserved is not False
-                    or reconcile_out.get("native_id") != record["native_id"]
+                    or (launcher_native != record["native_id"] and not unbound_ok)
                     or reconciled_state not in ("completed-awaiting-review", "accepted", "failed")):
+                if resources_reserved is False:
+                    # Released but not this launch's own proof: do not re-run
+                    # the launcher every pass. Unconfirmed release retries.
+                    self._reconcile_backoff[offer_id] = time.time() + RECONCILE_BACKOFF_S
                 continue
 
             # 4. Own-host Fleet terminal result
@@ -1827,12 +1976,19 @@ class Dispatcher:
                 if acknowledge(self, record, cached, cached.get('runtime', {}).get('outcome') == 'reported'):
                     reconciled.append({'id': offer_id, 'state': 'exited', 'reconciled': True})
                 continue
-            fleet_state = cached['state'] if cached else _terminal_fleet_state(
-                reconciled_state, bool(_peeked),
-                (record.get('diagnostic') or {}).get('reason')
-                if isinstance(record.get('diagnostic'), dict) else None)
             from .exit_evidence import terminal_evidence, bound_finish_fields
             evidence = dict(cached['runtime']) if cached and isinstance(cached.get('runtime'), dict) else terminal_evidence(record, tombstone or {}, state_dir=state_dir)
+            if cached:
+                fleet_state = cached['state']
+            elif record.get('retired_dispatch') is True:
+                # The launcher's own state is failed (no first action); only a
+                # clean native completion with a done report supersedes it.
+                fleet_state = 'exited' if _clean_native_success(_peeked, evidence) else 'failed'
+            else:
+                fleet_state = _terminal_fleet_state(
+                    reconciled_state, bool(_peeked),
+                    (record.get('diagnostic') or {}).get('reason')
+                    if isinstance(record.get('diagnostic'), dict) else None)
             evidence['outcome'] = ('reported' if _peeked else
                 'failed-with-partial-work' if evidence['observed_commits'] or evidence['dirty_paths'] or evidence['log_tail'] else
                 'failed-without-report')
@@ -1906,6 +2062,9 @@ class Dispatcher:
                 result_payload['diagnostic'] = record['dispatch_diagnostic']
             elif record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
                 result_payload['diagnostic'] = record['diagnostic']
+            elif (fleet_state == 'failed' and record.get('retired_dispatch') is True
+                    and isinstance(record.get('dispatch_failure'), dict)):
+                result_payload['diagnostic'] = record['dispatch_failure']
             # AC a19cac9e: missing result JSON now forces failed above, so
             # every exit-without-result carries exit code/signal/wall-time/
             # tail here. Exited-with-result receipts keep no failure
@@ -2316,6 +2475,57 @@ class Dispatcher:
             qualified.append(kind)
 
         return sorted(qualified)
+
+    def route_advertisement(self):
+        """Every distinct (engine, account, profile) route _route() accepts.
+
+        Hub offers only these while the advertisement is fresh, so a route the
+        host dropped (e.g. a failed managed install) holds with
+        route_not_advertised instead of failing dispatch_route_unconfigured on
+        the host (intake 6cbb862a). Never truncated.
+        """
+        routes, seen = [], set()
+        for s in self.settings['subscriptions']:
+            route = (s.get('engine', s['service']), s['account_label'], s.get('profile'))
+            if route not in seen:
+                seen.add(route)
+                routes.append({'engine': route[0], 'account': route[1], 'profile': route[2]})
+        return routes
+
+    def post_route_advertisement(self):
+        """POST the complete route list (or an explicit overflow) before a heartbeat.
+
+        Sent separately from the heartbeat so its size never competes with
+        telemetry for Hub's 32 KiB body limit: the heartbeat body is exactly
+        what it was without advertisement, and the route body is bounded by
+        MAX_ADVERTISED_ROUTES label tuples. Posted whenever the list changes
+        and at least every ROUTE_ADVERTISEMENT_REFRESH_S (Hub treats a list
+        older than 180 s as stale and holds every route). A failed post
+        raises, so the caller skips that heartbeat (and its offers) exactly
+        as if the heartbeat itself had failed.
+
+        Concurrent producers (telemetry and check-in threads) are fenced: the
+        lock serializes snapshot, send and cache update, and every post carries
+        a strictly increasing seq (wall-clock microseconds, so it also orders
+        posts across restarts) that Hub requires to exceed the stored one, so a
+        delayed older request can never replace newer route state.
+        """
+        with self._route_advertisement_lock:
+            routes = self.route_advertisement()
+            body = {'fleet_routes': routes} if len(routes) <= MAX_ADVERTISED_ROUTES else {'fleet_routes_overflow': len(routes)}
+            key = json.dumps(body, sort_keys=True)
+            last = self._route_advertisement_posted
+            now = time.monotonic()
+            if last and last[0] == key and now - last[1] < ROUTE_ADVERTISEMENT_REFRESH_S:
+                return body
+            if 'fleet_routes_overflow' in body:
+                print(json.dumps({'event': 'fleet_routes_overflow', 'routes': len(routes)}), flush=True)
+            seq = max(time.time_ns() // 1000, self._route_advertisement_seq + 1)
+            self._route_advertisement_seq = seq
+            self._route_advertisement_posted = None  # an unacknowledged post never suppresses the next one
+            self.request('POST', '/api/host/routes', {**body, 'seq': seq})
+            self._route_advertisement_posted = (key, now)
+            return body
 
     def goal_routes(self):
         """Advertise executable local routes, independent of quota admission."""
@@ -2884,7 +3094,12 @@ class Dispatcher:
                         sub.get("account_label"),
                         canonical_account_label(sub.get("account_label")),
                     } - {None, ""}
-                    if any(k in rejections for k in keys):
+                    matched = [str(rejections[k]) for k in keys if k in rejections]
+                    if matched:
+                        # Name the launcher's missing quota evidence (fixed slug;
+                        # the free-form launcher text is never forwarded).
+                        if any(QUOTA_SOURCE_REJECTION in r for r in matched):
+                            raise ValueError("admission_quota_unverified: maintained launcher has no trusted quota observation")
                         raise ValueError("Fresh admission refused")
                 raise ValueError("model_unsupported: maintained launcher plan refused requested model")
             # OpenCode, Antigravity, ZAI, Gemini, and named-profile Codex use the maintained native backend:
@@ -3087,6 +3302,14 @@ class Dispatcher:
             l_at = locals().get("launched_at_ts")
             failure = exception_diagnostic(exc, "dispatch_headless" if mode == "headless" else "dispatch_interactive",
                                            engine=engine_name, cwd=t_cwd, task_id=t_id, launched_at=l_at, start_offsets=l_offsets)
+            if mode == "headless" and t_id and failure.get("reason") == "launcher_command_failed":
+                # Intake 17e774f8: an empty-pipe launcher exit still saved its
+                # cause in this launch's own record; keep it, sanitized.
+                try:
+                    from .launch_diagnostics import launcher_record_cause
+                    failure = launcher_record_cause(failure, workspace, t_id, l_at)
+                except Exception:
+                    pass
             if mode == "headless" and not offer.get("task_id") and t_id:
                 try:
                     health = self._check_headless_health(offer_id, t_id, workspace, engine_name)
@@ -3123,17 +3346,35 @@ class Dispatcher:
                                 cand_engine = s_data.get("engine") or offer.get("engine")
                                 cand_inc = s_data.get("created_at_ms") or s_data.get("incarnation")
                                 if cand_id and cand_inc:
-                                    target = NativeTarget(
+                                    # The native is bound to the engine cwd for `--cwd`
+                                    # launches; the start file names the workspace root.
+                                    cand_targets = [NativeTarget(
                                         session_id=cand_id,
                                         tag=cand_tag,
-                                        workspace=str(Path(cand_ws).resolve(strict=True)),
+                                        workspace=str(Path(w).resolve(strict=True)),
                                         created_at_ms=cand_inc,
                                         engine=cand_engine,
-                                    ).validated()
-                                    is_retired, tomb, retire_detail = verify_native_retirement(native, target, state_dir=self.settings.get("aplexer_state_dir"))
-                                    if is_retired:
+                                    ).validated() for w in dict.fromkeys([str(target_cwd), cand_ws])]
+                                    target = cand_targets[0]
+                                    is_retired, found, tomb, retire_detail = verify_retirement_in_targets(
+                                        native, cand_targets, state_dir=self.settings.get("aplexer_state_dir"),
+                                        verify=verify_native_retirement)
+                                    if found is not None:
+                                        target = found
+                                    if is_retired and failure.get("reason") != "launcher_command_failed":
+                                        # Diagnosed model/auth/permission failures keep their policy.
                                         proven_dead = True
                                         native_session_id = cand_id
+                                    elif is_retired:
+                                        settled = self._settle_retired_dispatch(
+                                            offer_id=offer_id, task_id=task_id, workspace=workspace,
+                                            target_cwd=target_cwd, target=target, offer=offer,
+                                            sub=sub if isinstance(locals().get("sub"), dict) else {},
+                                            launched_at_ts=l_at, log_offsets=l_offsets,
+                                            record=record, failure=failure)
+                                        if settled is not None:
+                                            return settled
+                                        # Foreign/stale start identity: keep uncertain.
                                     else:
                                         recovered = self._recover_live_native_after_lost_receipt(
                                             offer_id=offer_id, task_id=task_id, workspace=workspace,
@@ -3396,7 +3637,7 @@ class Dispatcher:
                 if (row.get('id') == record.get('native_id')
                         and row.get('created_at_ms') == record.get('incarnation')
                         and row.get('tag') == record.get('tag')
-                        and row.get('workspace') == record.get('workspace')
+                        and row.get('workspace') in launch_workspace_targets(record)
                         and row.get('engine') == record.get('engine')
                         and isinstance(row.get('exit'), dict)):
                     exit_info = row['exit']
@@ -3468,6 +3709,7 @@ class Dispatcher:
             pending = []
         pending_done = time.monotonic()
         rows = raw if isinstance(raw, list) else raw.get("sessions", [])
+        skipped = []
         for session in pending:
             if not isinstance(session, dict):
                 continue
@@ -3476,14 +3718,23 @@ class Dispatcher:
                 continue
             from .worktree_guard import protect_adoption
             if not protect_adoption(row, session, request=self.request):
+                # Intake 1c8d915e: a held worktree lock kept a running native
+                # unbound (row stuck offered) with no trace. Report it.
+                skipped.append({'session': str(session.get('id', ''))[:8], 'reason': 'worktree_lock_held'})
                 continue
             try:
                 self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
-            except ValueError:
+            except ValueError as exc:
                 # A refused binding (e.g. server fleet_tag_mismatch for a
                 # launcher-backend tag before the server seam lands) must not
                 # kill the cycle; the entry stays pending for next cycle.
+                code, status = getattr(exc, 'hub_error', None), getattr(exc, 'http_status', None)
+                reason = (code if isinstance(code, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}', code)
+                          else 'binding_http_%d' % status if type(status) is int else 'binding_refused')
+                skipped.append({'session': str(session.get('id', ''))[:8], 'reason': reason})
                 continue
+        if skipped:
+            print(json.dumps({'event': 'bindings_skipped', 'skipped': skipped[:20]}), flush=True)
         print(json.dumps({'event': 'bindings_report_phases', 'sessions': len(metadata),
                           'pending': len(pending), 'phases_s': {
                               'census': round(census_done - started, 3),
@@ -3586,6 +3837,7 @@ class Dispatcher:
         except Exception:
             fresh_hb = hb
         try:
+            self.post_route_advertisement()
             self.request('POST', '/api/host/poll', fresh_hb)
         except Exception:
             pass
@@ -3874,6 +4126,7 @@ class Dispatcher:
             {'launch_allowed': allowed,
              'reason': 'fleet local admission' if allowed else 'fleet admission unavailable',
              'at': utcnow()}, self.settings)
+        self.post_route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         self._last_hb = hb
         return hb
@@ -3927,6 +4180,7 @@ class Dispatcher:
         for key in ('gate', 'launcher_resources'):
             if key in latest:
                 hb[key] = latest[key]
+        self.post_route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         caps = self.capabilities_put_payload()
         if caps is not None:
@@ -4111,6 +4365,7 @@ class Dispatcher:
                               'error': _sanitized_transport_error(exc)}), flush=True)
         _mark('register')
         hb['gate'] = allowed_gate
+        self.post_route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         _mark('heartbeat')
         for engine in sorted(admitted_engines):

@@ -111,6 +111,9 @@ values only, never a real credential.
   staleness alert, restore drill): [docs/HUB-DB-BACKUP.md](docs/HUB-DB-BACKUP.md).
 - Inbound webhooks delivering payloads into Hub sessions (authenticated
   routes, rate limits, size caps, durable queue): [docs/WEBHOOKS.md](docs/WEBHOOKS.md).
+- Per-engine/per-account concurrency caps and live usage, changed live
+  without a redeploy (`hub limits show`, `hub limits set <engine> <n>`):
+  [docs/FLEET-LIMITS.md](docs/FLEET-LIMITS.md).
 
 ## License
 

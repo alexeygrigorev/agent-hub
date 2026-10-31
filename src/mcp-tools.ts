@@ -51,6 +51,7 @@ tool('claims_create', 'POST', '/api/bus/claims', 'Claim a scope using project, s
 tool('claims_release', 'POST', '/api/bus/claims/{id}/release', 'Release a claim; id may be project:scope (encoded as one segment).', ['release']);
 tool('tasks_submit', 'POST', '/api/fleet/tasks', 'Submit authorized work; payload prompt, approved_action, needs, workspace, idempotency_key and routing preferences, or tasks batch.', ['submit']);
 tool('routing_machines', 'GET', '/api/fleet/routing/machines', 'Capability and model advertisements.', ['routing-machines']);
+tool('device_pending', 'GET', '/api/device/pending', 'Pending host/agent device approvals (admin).', ['device-pending']);
 tool('model_policy', 'GET', '/api/fleet/routing/policy', 'Configured model policy.', ['model-policy']);
 tool('jobs_list', 'GET', '/api/fleet/tasks', 'Recent routed tasks.', ['jobs']);
 tool('jobs_show', 'GET', '/api/fleet/tasks/{id}', 'Task state, report and artifacts.', ['job']);
@@ -94,9 +95,12 @@ tool('fleet_claim_policy_write', 'PUT', '/api/fleet/claim-policy', 'Operator-onl
 tool('monitoring_disk', 'GET', '/api/monitoring/disk', 'Authorized disk monitoring dashboard.');
 tool('monitoring_health', 'GET', '/api/monitoring/health', 'Authorized host health monitoring dashboard.');
 tool('accounts_write', 'PUT', '/api/fleet/accounts', 'Operator-only account registry update.');
+tool('limits', 'GET', '/api/fleet/limits', 'Operator-only per-engine and per-account concurrency caps with current usage.', ['limits show']);
+tool('limits_set', 'PATCH', '/api/fleet/limits', 'Operator-only live, persisted concurrency cap set: payload target (engine or account), max_concurrency 1..100, allow_lower. Raise-only unless allow_lower.', ['limits set']);
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
   'host-release': 'Operator release pin for a checkout-installed host; deliberate CLI step, not an agent tool.',
+  'launcher-release': 'Operator release pin for a checkout-installed launcher; deliberate CLI step, not an agent tool.',
   'msg agent-credential': 'Writes a new private local credential file; MCP cannot write host files.',
   'msg agent-delegate': 'Operator grant of named-agent delegation to an MCP client; deliberate CLI step.',
   'msg readdress': 'Operator re-address of an undelivered session message; deliberate CLI step.',
@@ -134,6 +138,8 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'webhooks show': 'Route administration detail is operator-only product scope; operators use the CLI or dashboard.',
   'webhooks deliveries': 'Delivery inspection is operator-only product scope; operators use the CLI or dashboard.',
   'webhooks test': 'Injects payloads into live sessions; stays an explicit operator action in the CLI, not a model tool.',
+  'ops heartbeat': 'Host ops-watchdog and orchestrator tick reports for Hub-side liveness (intake 500fd60b); a model tool must not fake liveness for the session it runs in.',
+  'ops status': 'Operator view of orchestrator/watchdog liveness and backlog idle episodes; alerts reach operators through the existing alert path.',
 };
 export function publicTools() {
   return routes.map(r => {
