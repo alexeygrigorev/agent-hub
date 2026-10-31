@@ -1669,8 +1669,75 @@ def central_login(args, prompt=None):
         body['adopt'] = True
     started = bus._do_request('POST', '/api/engines/credential-logins', body)
     print('Open this URL, approve, then paste the code shown:\n' + started['url'], file=sys.stderr)
+    print('This login expires at ' + login_expiry_text(started) + '; paste the code before then.', file=sys.stderr)
     code = (prompt or getpass.getpass)('Code: ').strip()
-    return bus._do_request('POST', '/api/engines/credential-logins/' + started['id'], {'code': code})
+    path = '/api/engines/credential-logins/' + started['id']
+    result = bus._do_request('POST', path, {'code': code, 'host_fallback': True})
+    if isinstance(result, dict) and result.get('status') == 'host_exchange_required':
+        # Hub's egress to the provider is blocked: exchange from this host and
+        # upload the credential; Hub still owns the resulting token family.
+        from . import credentials
+        print('Hub could not reach the provider (provider HTTP %s, %s); exchanging the code from this host.'
+              % (result.get('provider_status') or '-', result.get('reason') or 'unknown'), file=sys.stderr)
+        files = credentials.exchange_login_code(code, result.get('exchange'))
+        result = bus._do_request('POST', path, {'files': files})
+    return result
+
+
+def login_expiry_text(started, now=None):
+    """Wall-clock expiry of a pending Hub-central login, from the server reply."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    expires = None
+    raw = started.get('expires_at') if isinstance(started, dict) else None
+    if isinstance(raw, str):
+        try:
+            expires = dt.datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        except ValueError:
+            expires = None
+    if expires is None:
+        seconds = started.get('expires_in') if isinstance(started, dict) else None
+        if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or seconds <= 0:
+            seconds = 600
+        expires = now + dt.timedelta(seconds=seconds)
+    minutes = max(0, round((expires - now).total_seconds() / 60))
+    local = expires.astimezone().strftime('%Y-%m-%d %H:%M:%S')
+    return '%s local / %s UTC (in %d min)' % (local, expires.astimezone(dt.timezone.utc).strftime('%H:%M:%S'), minutes)
+
+
+_SECRETISH = re.compile(r'[A-Za-z0-9_\-#.~/+=]{24,}')
+
+
+def engine_error_message(exc, engines_cmd=None):
+    """One sanitized line for a failed `hub engines` command (intake 8ff6b3d8).
+
+    Shows the HTTP status plus the server's token-shaped error/reason slugs and
+    the provider status; never response bodies, codes, verifiers or tokens.
+    """
+    rerun = 'rerun hub engines login'
+    status = getattr(exc, 'http_status', None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        code = getattr(exc, 'error_code', None) or getattr(exc, 'hub_error', None) or 'unknown'
+        reason = getattr(exc, 'error_reason', None) or getattr(exc, 'hub_reason', None)
+        pstatus = getattr(exc, 'provider_status', None)
+        pstatus = pstatus if pstatus is not None else '-'
+        if code == 'login_expired' or (engines_cmd == 'login' and code == 'not_found'):
+            return 'login expired (%s, HTTP %d) -- %s' % (code, status, rerun)
+        if code == 'login_code_rejected':
+            return 'login code rejected (HTTP %d %s; provider HTTP %s, %s) -- %s' % (status, code, pstatus, reason or 'unknown', rerun)
+        if code == 'login_exchange_blocked':
+            return 'Hub cannot reach the provider (HTTP %d %s; provider HTTP %s, %s) -- %s' % (status, code, pstatus, reason or 'unknown', rerun)
+        hint = ' -- check hub login and admin rights' if status in (401, 403) else ''
+        return 'Hub engine operation failed: HTTP %d %s%s%s' % (status, code, ' (%s)' % reason if reason else '', hint)
+    from . import credentials
+    if isinstance(exc, credentials.LoginExchangeError):
+        return 'host code exchange failed: %s -- %s' % (exc, rerun)
+    import urllib.error
+    if isinstance(exc, urllib.error.URLError):
+        return 'Hub engine operation failed: Hub unreachable (%s)' % type(exc).__name__
+    if isinstance(exc, (ValueError, OSError, KeyError)):
+        text = _SECRETISH.sub('[redacted]', str(exc))[:200]
+        return 'Hub engine operation failed: %s%s' % (type(exc).__name__, ': ' + text if text else '')
+    return 'Hub engine operation failed: %s; check authentication, bundle permissions and host prerequisites.' % type(exc).__name__
 
 
 def command(args):

@@ -6,11 +6,13 @@ import type { FleetService } from './fleet';
 import { GOAL_PROVIDERS } from './goal-engines';
 import { canonicalQuotaProvider, canonicalAccountLabel, validateQuotaSnapshotPayload } from './quota';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
-import { CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claudeAuthorization, claudeExchange, credentialFreshness, credentialSubset,
+import { CLAUDE_OAUTH, CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claudeAuthorization, claudeExchange, credentialFreshness, credentialSubset,
   fetchQuota, needsRefresh, refreshCredential, refreshable, structurallyValid, validCredentialFiles, type CredentialFiles, type FetchLike } from './credentials';
 
 const LABEL = /^[a-z][a-z0-9_-]{0,47}$/;
 const MIGRATION_GRACE_MS = 2 * 3600000;
+// A Hub-central login waits this long for the pasted code (intake 8ff6b3d8).
+export const CREDENTIAL_LOGIN_TTL_MS = 30 * 60000;
 // One maintenance pass per isolate: overlapping cron/manual runs would refresh
 // the same single-use token twice and raise a false rejection.
 let maintaining = false;
@@ -369,18 +371,39 @@ export class ProvisioningService {
       let sealed: string;
       try { sealed = await this.seal({ label: data.label, verifier, state, version: data.version ?? null, adopt: data.adopt === true, max_concurrency: explicitMax(data.max_concurrency) ?? null }, 'login:' + id); }
       catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
-      this.sql.exec('INSERT INTO engine_credential_logins VALUES (?,?,?,?,?)', id, data.label, 'claude', sealed, this.now() + 600000);
-      return reply({ id, url, expires_in: 600 });
+      const expiresAt = this.now() + CREDENTIAL_LOGIN_TTL_MS;
+      this.sql.exec('INSERT INTO engine_credential_logins VALUES (?,?,?,?,?)', id, data.label, 'claude', sealed, expiresAt);
+      return reply({ id, url, expires_in: CREDENTIAL_LOGIN_TTL_MS / 1000, expires_at: new Date(expiresAt).toISOString() });
     }
     const row: any = this.sql.exec('SELECT * FROM engine_credential_logins WHERE id=?', m[1]).toArray()[0];
-    if (!row) return reply({ error: 'not_found' }, 404);
-    if (!data || typeof data.code !== 'string' || data.code.length > 4096 || !/^[A-Za-z0-9_\-#.~]+$/.test(data.code.trim())) return reply({ error: 'invalid_code' }, 400);
+    // Expired rows were purged above, so a missing row is an expired (or
+    // already used) login: tell the operator to start over.
+    if (!row) return reply({ error: 'login_expired' }, 410);
     let login: any;
     try { login = await this.open({ label: row.label, revision: 'login:' + row.id, ciphertext: row.sealed }); } catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
+    const install = (files: CredentialFiles) => this.installCentralCredential(row.label, 'claude', login.version, files, login.adopt === true, explicitMax(login.max_concurrency));
+    // Host fallback upload: the CLI host exchanged the code itself because
+    // Worker egress to the provider was blocked (like grantRefreshLease).
+    if (data && data.files !== undefined) {
+      if (!validCredentialFiles('claude', data.files) || !structurallyValid('claude', data.files)) return reply({ error: 'invalid_credential' }, 400);
+      this.sql.exec('DELETE FROM engine_credential_logins WHERE id=?', row.id);
+      return install(data.files);
+    }
+    if (!data || typeof data.code !== 'string' || data.code.length > 4096 || !/^[A-Za-z0-9_\-#.~]+$/.test(data.code.trim())) return reply({ error: 'invalid_code' }, 400);
     this.sql.exec('DELETE FROM engine_credential_logins WHERE id=?', row.id);
     const result = await claudeExchange(data.code, login.verifier, login.state, this.fetchFn, this.now());
-    if (!result.ok) return reply({ error: result.reason }, 400);
-    return this.installCentralCredential(row.label, 'claude', login.version, result.files, login.adopt === true, explicitMax(login.max_concurrency));
+    if (result.ok) return install(result.files);
+    if (result.blocked) {
+      // The provider never judged the code: keep the login so the CLI host can
+      // exchange it from its own network and upload the credential.
+      this.sql.exec('INSERT OR REPLACE INTO engine_credential_logins VALUES (?,?,?,?,?)', row.id, row.label, row.provider, row.sealed, row.expires_at);
+      const sanitized = { provider_status: result.providerStatus ?? null, reason: result.detail ?? null };
+      if (data.host_fallback !== true) return reply({ error: 'login_exchange_blocked', ...sanitized }, 502);
+      return reply({ status: 'host_exchange_required', ...sanitized, expires_at: new Date(row.expires_at).toISOString(),
+        exchange: { token_url: CLAUDE_OAUTH.token, profile_url: CLAUDE_OAUTH.profile, client_id: CLAUDE_OAUTH.client, redirect_uri: CLAUDE_OAUTH.redirect,
+          scopes: CLAUDE_OAUTH.scopes, state: login.state, code_verifier: login.verifier } }, 202);
+    }
+    return reply({ error: result.reason, provider_status: result.providerStatus ?? null, reason: result.detail ?? null }, 400);
   }
 
   /** Store a Hub-minted credential: create the account bundle on first login, else publish a new generation. */

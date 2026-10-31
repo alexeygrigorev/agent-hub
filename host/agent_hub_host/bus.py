@@ -45,6 +45,11 @@ class HttpRequestError(ValueError):
             data = {}
         self.hub_error = data.get('error') if isinstance(data.get('error'), str) and data['error'] in HTTP_SLUGS else None
         self.hub_reason = data.get('reason') if isinstance(data.get('reason'), str) and data['reason'] in HTTP_SLUGS else None
+        # Token-shaped server slugs for operator CLIs (never raw bodies).
+        self.error_code = data.get('error') if isinstance(data.get('error'), str) and _SAFE_BODY_TOKEN.match(data['error']) else None
+        self.error_reason = data.get('reason') if isinstance(data.get('reason'), str) and _SAFE_BODY_TOKEN.match(data['reason']) else None
+        ps = data.get('provider_status')
+        self.provider_status = ps if isinstance(ps, int) and not isinstance(ps, bool) and 100 <= ps <= 599 else None
         super().__init__(f"HTTP request failed with status {status}{_sanitized_body_detail(body)}")
 
 

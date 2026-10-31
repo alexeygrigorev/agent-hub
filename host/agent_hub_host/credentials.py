@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import urllib.error
 import urllib.request
 
@@ -316,6 +317,77 @@ def refresh_files(provider, files, opener=None, now=None):
     except Exception:
         return None
     return None
+
+
+CLAUDE_REDIRECT = 'https://platform.claude.com/oauth/code/callback'
+CLAUDE_PROFILE = 'https://api.anthropic.com/api/oauth/profile'
+_OAUTH_SLUG = re.compile(r'[a-z][a-z0-9_.-]{0,63}\Z')
+
+
+class LoginExchangeError(ValueError):
+    """A refused host-side code exchange: provider HTTP status + sanitized reason only."""
+
+    def __init__(self, provider_status, reason):
+        self.provider_status = provider_status
+        self.reason = reason
+        super().__init__('provider HTTP %s (%s)' % (provider_status if provider_status is not None else 'unreachable', reason))
+
+
+def exchange_login_code(pasted, exchange, opener=None, now=None):
+    """Host fallback for a Hub-central Claude login (intake 8ff6b3d8).
+
+    When Worker egress to the provider is blocked, Hub hands the CLI host the
+    PKCE verifier of the operator's own pending login; the host exchanges the
+    pasted code from its own network and returns credential files for upload.
+    Endpoints and client are pinned locally, never taken from the server.
+    Never raises or prints with token, code or verifier content.
+    """
+    opener = opener or urllib.request.build_opener(_NoRedirect())
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if not isinstance(exchange, dict) or not isinstance(exchange.get('code_verifier'), str) or not isinstance(exchange.get('state'), str):
+        raise LoginExchangeError(None, 'invalid_exchange')
+    if exchange.get('client_id', CLAUDE_CLIENT) != CLAUDE_CLIENT or exchange.get('redirect_uri', CLAUDE_REDIRECT) != CLAUDE_REDIRECT \
+            or exchange.get('token_url', CLAUDE_TOKEN) != CLAUDE_TOKEN:
+        raise LoginExchangeError(None, 'unexpected_provider_endpoint')
+    code, _, returned_state = pasted.strip().partition('#')
+    if not code or (returned_state and returned_state != exchange['state']):
+        raise LoginExchangeError(None, 'login_state_mismatch')
+    body = {'grant_type': 'authorization_code', 'code': code, 'state': exchange['state'], 'redirect_uri': CLAUDE_REDIRECT,
+            'client_id': CLAUDE_CLIENT, 'code_verifier': exchange['code_verifier']}
+    req = urllib.request.Request(CLAUDE_TOKEN, data=json.dumps(body).encode(), method='POST',
+                                 headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+    try:
+        with opener.open(req, timeout=20) as response:
+            tok = json.loads(response.read(65536))
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read(65536)).get('error')
+        except Exception:
+            err = None
+        raise LoginExchangeError(e.code, err if isinstance(err, str) and _OAUTH_SLUG.match(err) else 'http_%d' % e.code) from None
+    except Exception:
+        raise LoginExchangeError(None, 'provider_unreachable') from None
+    if not isinstance(tok, dict) or not isinstance(tok.get('access_token'), str):
+        raise LoginExchangeError(200, 'invalid_token_response')
+    oauth = {'accessToken': tok['access_token'], 'scopes': list(CLAUDE_SCOPES)}
+    if isinstance(tok.get('refresh_token'), str):
+        oauth['refreshToken'] = tok['refresh_token']
+    if isinstance(tok.get('expires_in'), (int, float)):
+        oauth['expiresAt'] = int(now.timestamp() * 1000 + tok['expires_in'] * 1000)
+    if isinstance(tok.get('scope'), str):
+        oauth['scopes'] = tok['scope'].split()
+    try:
+        preq = urllib.request.Request(CLAUDE_PROFILE, headers={'Authorization': 'Bearer ' + oauth['accessToken'], 'anthropic-beta': 'oauth-2025-04-20'})
+        with opener.open(preq, timeout=15) as response:
+            org = (json.loads(response.read(65536)) or {}).get('organization') or {}
+        sub = {'claude_max': 'max', 'claude_pro': 'pro'}.get(org.get('organization_type'))
+        if sub:
+            oauth['subscriptionType'] = sub
+        if isinstance(org.get('rate_limit_tier'), str):
+            oauth['rateLimitTier'] = org['rate_limit_tier']
+    except Exception:
+        pass
+    return {'.claude/.credentials.json': json.dumps({'claudeAiOauth': oauth})}
 
 
 def leased_refresh(label, bundle, home, request, opener=None):

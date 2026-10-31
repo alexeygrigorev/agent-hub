@@ -256,6 +256,20 @@ hub engines list        # credentials[]: generation, status, expiry - never secr
 hub engines maintain    # operator: run central refresh + direct quota now
 ```
 
+A pending login stays open for 30 minutes (`expires_in: 1800`); the CLI prints
+the expiry time next to the URL. A code submitted after that, or twice, gets
+`410 login_expired` and the CLI says `login expired (login_expired, HTTP 410) --
+rerun hub engines login`. A code the provider refuses returns
+`login_code_rejected` with the provider HTTP status and a sanitized reason (the
+OAuth error slug, never the body). When Worker egress to `platform.claude.com`
+is blocked (bot challenge or unreachable), Hub keeps the login and, because the
+CLI opts in with `host_fallback`, answers `202 host_exchange_required` with the
+PKCE verifier of that login; the CLI host exchanges the code from its own
+network (endpoints pinned locally) and uploads the resulting credential files to
+the same login id, as with a refresh lease. Every `hub engines` failure prints
+one sanitized line: HTTP status plus the server's error/reason slugs, never
+codes, verifiers or tokens.
+
 Gemini accounts may import their OAuth cache (`--provider gemini --auth-file
 ~/.gemini/oauth_creds.json`); Google refresh tokens do not rotate. OpenCode Go
 keeps host-local device login (see OPENCODE-AUTH.md). Bundles imported before

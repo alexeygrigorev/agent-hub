@@ -563,8 +563,8 @@ def main():
     if args.cmd == 'engines':
         try:
             print(json.dumps(provisioning.command(args)))
-        except Exception:
-            print('Hub engine operation failed; check authentication, bundle permissions and host prerequisites.', file=sys.stderr)
+        except Exception as exc:
+            print(provisioning.engine_error_message(exc, getattr(args, 'engines_cmd', None)), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'update':
