@@ -322,7 +322,7 @@ def test_central_claude_login_cli_never_prints_the_code(monkeypatch, capsys):
     args = SimpleNamespace(provider='claude', label='hub-claude', version=None, adopt=False)
     result = p.central_login(args, prompt=lambda _: 'secret-code#s')
     assert result['credential_generation'] == 1
-    assert sent[1][2] == {'code': 'secret-code#s'}
+    assert sent[1][2] == {'code': 'secret-code#s', 'host_fallback': True}
     out = capsys.readouterr()
     assert 'secret-code' not in out.out + out.err
     assert 'https://claude.com/cai/oauth/authorize' in out.err
@@ -352,3 +352,138 @@ def test_leased_refresh_rotates_once_and_writes_back(home):
     assert c.leased_refresh(LABEL, bundle(2, read(h)), h, hub, opener=opener)['status'] == 'no_lease'
     assert len(opener.calls) == 1
     assert 'refresh_lease' in c.OVERLAY_KEYS
+
+
+# ---- intake 8ff6b3d8: sanitized engines errors, 30-min login expiry, host PKCE fallback ----
+
+LOGIN_ID = '0' * 8 + '-0000-4000-8000-' + '0' * 12
+
+
+def _login_args():
+    from types import SimpleNamespace
+    return SimpleNamespace(provider='claude', label='hub-claude', version=None, adopt=False)
+
+
+def test_central_login_prompt_prints_the_expiry_time(monkeypatch, capsys):
+    def fake(method, path, body=None):
+        if path == '/api/engines/credential-logins':
+            return {'id': LOGIN_ID, 'url': 'https://claude.com/cai/oauth/authorize?state=s', 'expires_in': 1800, 'expires_at': '2026-10-31T12:30:00.000Z'}
+        return {'status': 'configured', 'label': 'hub-claude', 'credential_generation': 1}
+    monkeypatch.setattr(p.bus, '_do_request', fake)
+    p.central_login(_login_args(), prompt=lambda _: 'secret-code#s')
+    err = capsys.readouterr().err
+    assert 'This login expires at' in err and '12:30:00 UTC' in err
+    assert 'secret-code' not in err
+
+
+def test_login_expiry_text_falls_back_to_expires_in():
+    import datetime as dt
+    now = dt.datetime(2026, 10, 31, 12, 0, tzinfo=dt.timezone.utc)
+    assert '12:30:00 UTC (in 30 min)' in p.login_expiry_text({'expires_in': 1800}, now=now)
+    assert '12:30:00 UTC (in 30 min)' in p.login_expiry_text({'expires_at': '2026-10-31T12:30:00Z'}, now=now)
+
+
+def test_central_login_falls_back_to_host_exchange_when_hub_egress_is_blocked(monkeypatch, capsys):
+    sent = []
+    exchange = {'token_url': c.CLAUDE_TOKEN, 'client_id': c.CLAUDE_CLIENT, 'redirect_uri': c.CLAUDE_REDIRECT, 'state': 's', 'code_verifier': 'verifier-xyz'}
+
+    def fake(method, path, body=None):
+        sent.append((path, body))
+        if path == '/api/engines/credential-logins':
+            return {'id': LOGIN_ID, 'url': 'https://claude.com/cai/oauth/authorize?state=s', 'expires_in': 1800}
+        if 'code' in body:
+            return {'status': 'host_exchange_required', 'provider_status': 403, 'reason': 'egress_blocked', 'exchange': exchange}
+        return {'status': 'configured', 'label': 'hub-claude', 'credential_generation': 1}
+    files = {'.claude/.credentials.json': '{"claudeAiOauth":{"accessToken":"acc-secret"}}'}
+    seen = []
+    monkeypatch.setattr(p.bus, '_do_request', fake)
+    monkeypatch.setattr(c, 'exchange_login_code', lambda code, ex: seen.append((code, ex)) or files)
+    result = p.central_login(_login_args(), prompt=lambda _: 'secret-code#s')
+    assert result['status'] == 'configured'
+    assert seen == [('secret-code#s', exchange)]
+    assert sent[-1] == ('/api/engines/credential-logins/' + LOGIN_ID, {'files': files})
+    out = capsys.readouterr()
+    assert 'provider HTTP 403, egress_blocked' in out.err
+    for secret in ('secret-code', 'verifier-xyz', 'acc-secret'):
+        assert secret not in out.out + out.err
+
+
+class _TokenOpener:
+    def __init__(self, status=200, body=None, profile=None):
+        self.status, self.body, self.profile, self.requests = status, body, profile, []
+
+    def open(self, req, timeout=None):
+        self.requests.append(req)
+        if req.full_url == c.CLAUDE_PROFILE:
+            return io.BytesIO(json.dumps(self.profile or {}).encode())
+        if self.status != 200:
+            raw = self.body.encode() if isinstance(self.body, str) else json.dumps(self.body).encode()
+            raise urllib.error.HTTPError(req.full_url, self.status, 'x', {}, io.BytesIO(raw))
+        return io.BytesIO(json.dumps(self.body).encode())
+
+
+EXCHANGE = {'token_url': 'https://platform.claude.com/v1/oauth/token', 'client_id': '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+            'redirect_uri': 'https://platform.claude.com/oauth/code/callback', 'state': 'st', 'code_verifier': 'ver'}
+
+
+def test_host_exchange_builds_a_hub_owned_claude_credential():
+    opener = _TokenOpener(body={'access_token': 'acc-1', 'refresh_token': 'refresh-1', 'expires_in': 3600, 'scope': 'user:profile user:inference'},
+                          profile={'organization': {'organization_type': 'claude_max', 'rate_limit_tier': 'tier'}})
+    files = c.exchange_login_code('the-code#st', EXCHANGE, opener=opener)
+    oauth = json.loads(files['.claude/.credentials.json'])['claudeAiOauth']
+    assert oauth['refreshToken'] == 'refresh-1' and oauth['subscriptionType'] == 'max' and oauth['scopes'] == ['user:profile', 'user:inference']
+    sent = json.loads(opener.requests[0].data)
+    assert sent == {'grant_type': 'authorization_code', 'code': 'the-code', 'state': 'st', 'redirect_uri': EXCHANGE['redirect_uri'],
+                    'client_id': EXCHANGE['client_id'], 'code_verifier': 'ver'}
+    assert opener.requests[0].full_url == EXCHANGE['token_url']
+
+
+def test_host_exchange_refusal_carries_provider_status_and_sanitized_reason_only():
+    opener = _TokenOpener(status=400, body={'error': 'invalid_grant', 'error_description': 'the-code is bad'})
+    with pytest.raises(c.LoginExchangeError) as e:
+        c.exchange_login_code('the-code#st', EXCHANGE, opener=opener)
+    assert (e.value.provider_status, e.value.reason) == (400, 'invalid_grant')
+    assert 'the-code' not in str(e.value) and 'ver' not in str(e.value)
+    with pytest.raises(c.LoginExchangeError) as e:
+        c.exchange_login_code('the-code#st', EXCHANGE, opener=_TokenOpener(status=403, body='<html>challenge the-code</html>'))
+    assert (e.value.provider_status, e.value.reason) == (403, 'http_403')
+    with pytest.raises(c.LoginExchangeError) as e:
+        c.exchange_login_code('the-code#other', EXCHANGE, opener=_TokenOpener())
+    assert e.value.reason == 'login_state_mismatch'
+    with pytest.raises(c.LoginExchangeError) as e:
+        c.exchange_login_code('the-code#st', dict(EXCHANGE, token_url='https://evil.example/token'), opener=_TokenOpener())
+    assert e.value.reason == 'unexpected_provider_endpoint'
+
+
+def _http_error(status, body):
+    from agent_hub_host.bus import HttpRequestError
+    return HttpRequestError(status, json.dumps(body).encode())
+
+
+def test_engine_error_message_shows_status_and_server_code_never_secrets():
+    m = p.engine_error_message
+    assert m(_http_error(410, {'error': 'login_expired'}), 'login') == 'login expired (login_expired, HTTP 410) -- rerun hub engines login'
+    assert m(_http_error(404, {'error': 'not_found'}), 'login') == 'login expired (not_found, HTTP 404) -- rerun hub engines login'
+    rejected = m(_http_error(400, {'error': 'login_code_rejected', 'provider_status': 400, 'reason': 'invalid_grant'}), 'login')
+    assert rejected == 'login code rejected (HTTP 400 login_code_rejected; provider HTTP 400, invalid_grant) -- rerun hub engines login'
+    assert m(_http_error(404, {'error': 'not_found'}), 'remove') == 'Hub engine operation failed: HTTP 404 not_found'
+    assert m(_http_error(403, {'error': 'forbidden'}), 'list') == 'Hub engine operation failed: HTTP 403 forbidden -- check hub login and admin rights'
+    # Server-controlled non-slug bodies are never echoed.
+    leaked = m(_http_error(500, {'error': 'sk-ant-oat01-SECRET token with spaces'}), 'sync')
+    assert leaked == 'Hub engine operation failed: HTTP 500 unknown' and 'SECRET' not in leaked
+    assert 'provider HTTP 400 (invalid_grant)' in m(c.LoginExchangeError(400, 'invalid_grant'), 'login')
+    assert '[redacted]' in m(ValueError('bad token sk-ant-oat01-AAAAAAAAAAAAAAAAAAAAAAAAAAAA'), 'add')
+    assert m(RuntimeError('sk-ant-oat01-AAAAAAAAAAAAAAAAAAAAAAAAAAAA'), 'add').startswith('Hub engine operation failed: RuntimeError;')
+
+
+def test_cli_engines_failure_prints_the_sanitized_server_error(monkeypatch, capsys):
+    from agent_hub_host import cli
+
+    def boom(args):
+        raise _http_error(410, {'error': 'login_expired'})
+    monkeypatch.setattr(p, 'command', boom)
+    monkeypatch.setattr(sys, 'argv', ['hub', 'engines', 'login', '--provider', 'claude', '--label', 'hub-claude'])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 1
+    assert capsys.readouterr().err.strip() == 'login expired (login_expired, HTTP 410) -- rerun hub engines login'

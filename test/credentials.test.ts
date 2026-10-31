@@ -31,7 +31,7 @@ function fakeProvider(script: Record<string, (body: any, n: number) => { status:
     const handler = script[url];
     if (!handler) return new Response('{}', { status: 404 });
     const r = handler(body, counts[url]);
-    return new Response(JSON.stringify(r.json), { status: r.status });
+    return new Response(typeof r.json === 'string' ? r.json : JSON.stringify(r.json), { status: r.status });
   };
   return { fn, calls };
 }
@@ -241,7 +241,8 @@ describe('Hub-owned credentials: store, refresh, write-back, enrollment', () => 
       expect(oauth.expiresAt).toBeGreaterThan(now);
       // The one-time login id cannot be replayed.
       const replay = await provision.handle(new Request(`https://hub.test/api/engines/credential-logins/${start.id}`, { method: 'POST', body: JSON.stringify({ code: `the-code#${state}` }) }), admin);
-      expect(replay.status).toBe(404);
+      expect(replay.status).toBe(410);
+      expect(await replay.json()).toEqual({ error: 'login_expired' });
     });
   });
 
@@ -300,6 +301,89 @@ describe('Hub-owned credentials: store, refresh, write-back, enrollment', () => 
       await put(provision, 'codex-orin', { '.codex/auth.json': codexAuth('a', iso(-DAY), now + 9 * DAY) });
       const res = await provision.handle(new Request('https://hub.test/api/engines/codex-orin/credential'), admin);
       expect(res.status).toBe(403);
+    });
+  });
+  describe('central login expiry, sanitized refusals and host exchange fallback (intake 8ff6b3d8)', () => {
+    const start = async (provision: ProvisioningService) => {
+      const res = await provision.handle(new Request('https://hub.test/api/engines/credential-logins', { method: 'POST', body: JSON.stringify({ provider: 'claude', label: 'hub-claude' }) }), admin);
+      const body = await res.json() as any;
+      return { ...body, state: new URL(body.url).searchParams.get('state') };
+    };
+    const submit = (provision: ProvisioningService, id: string, payload: unknown) =>
+      provision.handle(new Request(`https://hub.test/api/engines/credential-logins/${id}`, { method: 'POST', body: JSON.stringify(payload) }), admin);
+
+    it('keeps a pending login for 30 minutes and reports its expiry', async () => {
+      await fixture(async ({ provision, sql }) => {
+        const before = Date.now();
+        const s = await start(provision);
+        expect(s.expires_in).toBe(1800);
+        const expiresAt = Date.parse(s.expires_at);
+        expect(expiresAt).toBeGreaterThanOrEqual(before + 1800000);
+        expect(expiresAt).toBeLessThanOrEqual(Date.now() + 1800000);
+        expect(sql.exec('SELECT expires_at FROM engine_credential_logins WHERE id=?', s.id).one().expires_at).toBe(expiresAt);
+      });
+    });
+
+    it('answers a code for an expired or unknown login with login_expired', async () => {
+      await fixture(async ({ provision, sql }) => {
+        const s = await start(provision);
+        sql.exec('UPDATE engine_credential_logins SET expires_at=? WHERE id=?', Date.now() - 1, s.id);
+        const expired = await submit(provision, s.id, { code: `c#${s.state}` });
+        expect(expired.status).toBe(410);
+        expect(await expired.json()).toEqual({ error: 'login_expired' });
+        const unknown = await submit(provision, crypto.randomUUID(), { code: 'c#s' });
+        expect(unknown.status).toBe(410);
+        expect(await unknown.json()).toEqual({ error: 'login_expired' });
+      });
+    });
+
+    it('reports a provider-refused code with the provider HTTP status and sanitized reason only', async () => {
+      await fixture(async ({ provision }) => {
+        const s = await start(provision);
+        provision.fetchFn = fakeProvider({ [CLAUDE_OAUTH.token]: () => ({ status: 400, json: { error: 'invalid_grant', error_description: 'secret-detail the-code' } }) }).fn as any;
+        const res = await submit(provision, s.id, { code: `the-code#${s.state}`, host_fallback: true });
+        expect(res.status).toBe(400);
+        const text = await res.text();
+        expect(JSON.parse(text)).toEqual({ error: 'login_code_rejected', provider_status: 400, reason: 'invalid_grant' });
+        expect(text).not.toContain('the-code');
+        expect(text).not.toContain('secret-detail');
+      });
+    });
+
+    it('falls back to a host-side PKCE exchange when Worker egress to the provider is blocked', async () => {
+      await fixture(async ({ provision, sql }) => {
+        const s = await start(provision);
+        provision.fetchFn = fakeProvider({ [CLAUDE_OAUTH.token]: () => ({ status: 403, json: '<html>Just a moment...</html>' }) }).fn as any;
+        // Without opt-in the CLI gets a sanitized error and the login survives.
+        const blocked = await submit(provision, s.id, { code: `the-code#${s.state}` });
+        expect(blocked.status).toBe(502);
+        expect(await blocked.json()).toEqual({ error: 'login_exchange_blocked', provider_status: 403, reason: 'egress_blocked' });
+        const fallback = await submit(provision, s.id, { code: `the-code#${s.state}`, host_fallback: true });
+        expect(fallback.status).toBe(202);
+        const offer = await fallback.json() as any;
+        expect(offer).toMatchObject({ status: 'host_exchange_required', provider_status: 403, reason: 'egress_blocked',
+          exchange: { token_url: CLAUDE_OAUTH.token, client_id: CLAUDE_OAUTH.client, redirect_uri: CLAUDE_OAUTH.redirect, state: s.state } });
+        expect(typeof offer.exchange.code_verifier).toBe('string');
+        expect(sql.exec('SELECT COUNT(*) AS n FROM engine_credential_logins WHERE id=?', s.id).one().n).toBe(1);
+        // Torn uploads are refused and keep the login.
+        const bad = await submit(provision, s.id, { files: { '.claude/.credentials.json': '{}' } });
+        expect(bad.status).toBe(400);
+        const files = { '.claude/.credentials.json': JSON.stringify({ claudeAiOauth: { accessToken: 'acc-h', refreshToken: 'refresh-h', expiresAt: now + DAY, scopes: CLAUDE_OAUTH.scopes } }) };
+        const done = await (await submit(provision, s.id, { files })).json() as any;
+        expect(done).toMatchObject({ status: 'configured', label: 'hub-claude', credential_generation: 1 });
+        const replay = await submit(provision, s.id, { files });
+        expect(replay.status).toBe(410);
+      });
+    });
+
+    it('treats an unreachable provider as blocked egress too', async () => {
+      await fixture(async ({ provision }) => {
+        const s = await start(provision);
+        provision.fetchFn = (async () => { throw new Error('connect failed'); }) as any;
+        const res = await submit(provision, s.id, { code: `the-code#${s.state}`, host_fallback: true });
+        expect(res.status).toBe(202);
+        expect(await res.json()).toMatchObject({ status: 'host_exchange_required', provider_status: null, reason: 'egress_unreachable' });
+      });
     });
   });
 });

@@ -118,7 +118,7 @@ export function needsRefresh(provider: string, files: CredentialFiles, nowMs: nu
   return exp === null || exp - nowMs <= CLAUDE_MIN_VALIDITY_MS;
 }
 
-export type RefreshResult = { ok: true; files: CredentialFiles } | { ok: false; invalid: boolean; reason: string };
+export type RefreshResult = { ok: true; files: CredentialFiles } | { ok: false; invalid: boolean; reason: string; providerStatus?: number; detail?: string; blocked?: boolean };
 
 const INVALID_GRANT = /invalid_grant|refresh_token_(?:expired|reused|invalidated)|invalid_refresh_token|token_revoked/;
 
@@ -195,7 +195,7 @@ export async function claudeExchange(pasted: string, verifier: string, state: st
   if (!code || (returnedState && returnedState !== state)) return { ok: false, invalid: true, reason: 'login_state_mismatch' };
   try {
     const r = await postJson(fetchFn, CLAUDE_OAUTH.token, { grant_type: 'authorization_code', code, state, redirect_uri: CLAUDE_OAUTH.redirect, client_id: CLAUDE_OAUTH.client, code_verifier: verifier });
-    if (r.status !== 200 || typeof r.json?.access_token !== 'string') return r.status === 200 ? { ok: false, invalid: false, reason: 'login_invalid_response' } : { ...refusal(r.status, r.text), reason: 'login_code_rejected' };
+    if (r.status !== 200 || typeof r.json?.access_token !== 'string') return r.status === 200 ? { ok: false, invalid: false, reason: 'login_invalid_response', providerStatus: 200, detail: 'invalid_token_response' } : loginRefusal(r.status, r.text);
     const oauth: any = claudeOauthFrom(r.json, { scopes: CLAUDE_OAUTH.scopes }, nowMs);
     try {
       const p = await fetchFn(CLAUDE_OAUTH.profile, { headers: { Authorization: 'Bearer ' + oauth.accessToken, 'anthropic-beta': 'oauth-2025-04-20' }, signal: AbortSignal.timeout(TIMEOUT_MS) });
@@ -207,8 +207,26 @@ export async function claudeExchange(pasted: string, verifier: string, state: st
     } catch {}
     return { ok: true, files: { '.claude/.credentials.json': JSON.stringify({ claudeAiOauth: oauth }) } };
   } catch {
-    return { ok: false, invalid: false, reason: 'login_unreachable' };
+    // Worker egress to the provider failed outright: the code was never seen
+    // by the provider, so the CLI host may still exchange it (I8 fallback).
+    return { ok: false, invalid: false, reason: 'login_unreachable', detail: 'egress_unreachable', blocked: true };
   }
+}
+
+const OAUTH_SLUG = /^[a-z][a-z0-9_.-]{0,63}$/;
+
+/**
+ * Classify a refused authorization-code exchange without retaining its body:
+ * the provider HTTP status plus a sanitized reason (the OAuth `error` slug, or
+ * a fixed label). A bot challenge (no OAuth error document on 401/403/429) is
+ * Worker egress blocking, which the CLI host can bypass with its own exchange.
+ */
+export function loginRefusal(status: number, text: string): { ok: false; invalid: boolean; reason: string; providerStatus: number; detail: string; blocked: boolean } {
+  const body = parse(text);
+  const oauth = body && typeof body.error === 'string' && OAUTH_SLUG.test(body.error) ? body.error : null;
+  const blocked = !oauth && (status === 401 || status === 403 || status === 429);
+  const detail = oauth ?? (blocked ? 'egress_blocked' : status >= 500 ? 'provider_unavailable' : 'http_' + status);
+  return { ok: false, invalid: !!oauth, reason: 'login_code_rejected', providerStatus: status, detail, blocked };
 }
 
 // ---------- Direct provider quota (no host, no quse) ----------
