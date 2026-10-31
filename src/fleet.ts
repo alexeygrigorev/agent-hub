@@ -17,6 +17,7 @@ import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
+import { SILENT_START_MS, SILENT_START_REASON, ABANDONED_RECOVERY_MS, abandonedLaunch, expireSilentStartRows } from './silent-start';
 import { reconcileAccountCapacity } from './account_capacity';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
@@ -36,10 +37,7 @@ export const GATE_STALE_MS = 300000;
 export const ENGINE_HEALTH_RETRY_MS = 600000;
 export const UNCLAIMED_OFFER_TTL_MS = 15 * 60 * 1000;
 export const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused', 'worker_silent_start']);
-/** A headless launch that never leaves `starting` (host claimed, no running
- * receipt, no item after turn.started) is failed after this bound (intake 6c2b2aa2 AC2). */
-export const SILENT_START_MS = 15 * 60 * 1000;
-export const SILENT_START_REASON = 'worker_silent_start';
+export { SILENT_START_MS, SILENT_START_REASON };
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
@@ -517,31 +515,7 @@ export class FleetService {
   }
 
   private expireSilentStartsRows(): number {
-    const at = new Date(this.now()).toISOString();
-    const cutoff = new Date(this.now() - SILENT_START_MS).toISOString();
-    const controlStore = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
-    const unbound = controlStore
-      ? `EXISTS (SELECT 1 FROM session_control_sessions s WHERE s.fleet_launch_id=l.id AND s.binding_json IS NULL AND s.state IN ('offered','starting'))`
-      : '0=1';
-    const rows = this.sql.exec(`SELECT l.id, l.machine_id, l.engine FROM fleet_launches l
-      WHERE l.state IN ('starting','running') AND l.mode='headless' AND l.updated_at < ?
-        AND NOT EXISTS (SELECT 1 FROM routing_jobs j WHERE j.launch_id=l.id) AND ${unbound}
-      ORDER BY l.updated_at,l.id LIMIT 20`, cutoff).toArray() as any[];
-    const diagnostic = JSON.stringify({reason: SILENT_START_REASON,
-      message: 'The headless worker produced no output within 15 minutes of starting; the launch was failed.',
-      error_type: 'TimeoutError', stage: 'runtime'});
-    for (const row of rows) {
-      this.sql.exec(`UPDATE fleet_launches SET state='failed', verification_status='unverified', exit_reason=?,
-        launch_error_json=?, finished_at=?, updated_at=? WHERE id=? AND state IN ('starting','running')`, SILENT_START_REASON, diagnostic, at, at, row.id);
-      if (row.engine && row.machine_id) {
-        // Never overwrite an existing unavailable hold (account_blocked,
-        // admission_unconfigured, ...) with this retriable one.
-        const held = this.sql.exec("SELECT 1 FROM fleet_engine_health WHERE engine=? AND machine_id=? AND status='unavailable'", row.engine, row.machine_id).toArray().length;
-        if (!held) this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)",
-          row.engine, row.machine_id, SILENT_START_REASON, at);
-      }
-    }
-    return rows.length;
+    return expireSilentStartRows(this.sql, this.now());
   }
 
   constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) {
@@ -616,6 +590,10 @@ export class FleetService {
   }
 
   private reconciliationCandidates(machine: string) {
+    // Intake 0b87eb29: a claim Hub abandoned on the silent-start bound has no
+    // exit proof. Keep offering it to its owning host for a bounded window so
+    // a fenced no-start, recovered hub-results finish or late native start
+    // still lands instead of being lost behind the abandonment.
     // Hosts report their complete catalog before polling offers. Avoid one
     // redundant native retirement probe per fresh live workload each cycle;
     // stale, absent and ambiguous observations still need positive proof.
@@ -627,11 +605,12 @@ export class FleetService {
       ? '(SELECT binding_json FROM session_control_sessions c WHERE c.fleet_launch_id=l.id AND c.machine_id=l.machine_id LIMIT 1)'
       : 'NULL';
     return this.sql.exec(`SELECT l.id, l.workspace, ${jsonFields('l.request_json',['cwd'])} AS request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id, ${bindingProjection} AS binding_json
-      FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain')
+      FROM fleet_launches l WHERE l.machine_id = ? AND (l.state IN ('starting','running','uncertain')
+        OR (l.state = 'failed' AND l.mode = 'headless' AND l.exit_reason = ? AND l.verification_status = 'unverified' AND l.finished_at > ?))
       AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
         WHERE s.machine_id = l.machine_id AND s.native_id = l.native_id AND s.engine = l.engine
         AND s.phase IN ('starting','running') AND (s.observed_at >= ? OR ?)))
-      ORDER BY l.updated_at LIMIT 100`, machine, cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
+      ORDER BY l.updated_at LIMIT 100`, machine, SILENT_START_REASON, new Date(this.now() - ABANDONED_RECOVERY_MS).toISOString(), cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
       const binding = controlStore ? parsed(r.binding_json) : null;
       return { id: r.id, workspace: r.workspace, cwd: parsed(r.request_json).cwd ?? null, diagnostic: parsed(r.launch_error_json), native_id: r.native_id, engine: r.engine, mode: r.mode, launcher_task_id: r.launcher_task_id, binding };
     });
@@ -2275,7 +2254,17 @@ export class FleetService {
           }
         }
         if (noStart && row.state === 'failed' && row.exit_reason === data.reason && row.launcher_task_id === data.launcher_task_id) return response({ id: row.id, state: row.state, replay: true });
-        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts', 'runtime'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
+        // Intake 0b87eb29: Hub abandoned this claim on the silent-start bound
+        // without any exit proof. The owning host's later exact receipt (a
+        // fenced no-start, a recovered completion with its hub-results report,
+        // or a late native start) supersedes the abandonment, so a real
+        // winning start is tracked again and a real finish is recorded.
+        const abandoned = abandonedLaunch(row) &&
+          ['running', 'failed', 'exited'].includes(data.state) &&
+          (!row.native_id || data.native_id === undefined || data.native_id === row.native_id) &&
+          (!row.launcher_task_id || data.launcher_task_id === undefined || data.launcher_task_id === row.launcher_task_id) &&
+          !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length;
+        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts', 'runtime'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || (!['starting', 'running', 'uncertain'].includes(row.state) && !abandoned)) return response({ error: 'invalid_transition' }, 409);
         if (['exited', 'failed'].includes(data.state) && this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
         if (['exited', 'failed'].includes(data.state) && data.confirmed_exit !== true) return response({ error: 'confirmed_exit_required' }, 409);
         if (data.state === 'running' && (typeof data.native_id !== 'string' || data.native_id.length < 1 || data.native_id.length > 160 || (row.mode === 'headless' && !label(data.launcher_task_id)))) return response({ error: 'native_receipt_required' }, 409);
@@ -2290,6 +2279,27 @@ export class FleetService {
           typeof (a as any).text !== 'string' || (a as any).text.length > 1024))) return response({ error: 'invalid_finish_report' }, 400);
         if (!['failed', 'exited'].includes(data.state) && (data.report_status !== undefined || data.report !== undefined || data.artifacts !== undefined)) return response({ error: 'invalid_finish_report' }, 400);
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
+        if (abandoned) {
+          // Drop the abandonment's synthetic verdict; the host receipt below
+          // (diagnostic, no-start proof, finish report) now owns the outcome.
+          this.sql.exec("UPDATE fleet_launches SET verification_status = NULL, exit_reason = NULL, launch_error_json = NULL, finished_at = NULL WHERE id = ?", row.id);
+          if (data.state !== 'failed') {
+            // The runtime was not silent after all: lift only its own hold.
+            this.sql.exec("DELETE FROM fleet_engine_health WHERE engine = ? AND machine_id = ? AND reason = ?", row.engine, row.machine_id, SILENT_START_REASON);
+          }
+          if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+            const at = new Date(this.now()).toISOString();
+            // Only the abandonment's own unbound terminal verdict is revised.
+            // An operator cancellation stays a cancellation; a late native
+            // start behind it is surfaced instead of silently stranded.
+            const next = data.state === 'running' ? 'starting' : data.state === 'exited' ? 'stopped' : 'failed';
+            this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state = 'failed'", next, at, row.id);
+            if (data.state === 'running' && this.sql.exec("SELECT id FROM session_control_sessions WHERE fleet_launch_id = ? AND state = 'cancelled'", row.id).toArray().length) {
+              const alerts = new LivenessService(this.sql); alerts.init();
+              alerts.setAlert('launch', row.id, { state: 'late_native_start', detail: JSON.stringify({ machine: row.machine_id, native_id: data.native_id ?? null, message: 'A native session started after its abandoned launch was cancelled; it is tracked as running until the host reports exit.' }) });
+            }
+          }
+        }
         if (runtime) this.sql.exec('UPDATE fleet_launches SET runtime_json = ? WHERE id = ?', JSON.stringify(runtime), row.id);
         if (diagnostic) this.sql.exec("UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?", JSON.stringify(diagnostic), diagnostic.reason, row.id);
         if (data.state === 'running') promoteStartedOffers(this.sql, this.now(), { launchId: row.id });

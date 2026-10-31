@@ -17,7 +17,14 @@ def reconcile_claimed_launch(dispatcher, row, *, dry_run=False):
     from .launcher_recovery import settle_unstarted
     from .native_sessions import NativeTarget, SessionControlError
 
-    if not isinstance(row, dict) or row.get('mode') != 'headless' or row.get('native_id'):
+    if not isinstance(row, dict) or row.get('mode') != 'headless':
+        return None
+    # Intake 0b87eb29: a running receipt can land while the native binding and
+    # finish receipt are lost. Such a row carries Hub's native id but no server
+    # binding; recover it from the launcher's exact binding for that id. A
+    # server-bound row keeps the dedicated retirement path.
+    known_native = row.get('native_id')
+    if known_native and (row.get('binding') or not isinstance(known_native, str)):
         return None
     launcher = dispatcher.settings.get('launcher', {})
     if not all(launcher.get(k) for k in ('argv', 'root', 'config_dir')):
@@ -60,9 +67,11 @@ def reconcile_claimed_launch(dispatcher, row, *, dry_run=False):
         # the two-minute reporting deadline for short lost-receipt launches.
         if age < 0 or (age < CLAIM_TIMEOUT_SECONDS and not status.get('native_binding')):
             return None
+        if known_native and not status.get('native_binding'):
+            return None  # Hub saw a native start: never fence it as no-start.
         if dry_run:
             return {'id': offer_id, 'state': 'probe_required'}
-        if age >= CLAIM_TIMEOUT_SECONDS and settle_unstarted(launcher, task_id, workspace, cwd):
+        if not known_native and age >= CLAIM_TIMEOUT_SECONDS and settle_unstarted(launcher, task_id, workspace, cwd):
             result = {'state': 'failed', 'confirmed_exit': True,
                       'launcher_task_id': task_id, 'reason': 'launcher_not_started'}
         else:
@@ -70,6 +79,7 @@ def reconcile_claimed_launch(dispatcher, row, *, dry_run=False):
             if not isinstance(binding, dict):
                 return None
             if (binding.get('task_id') != task_id or binding.get('tag') != 'task-' + task_id
+                    or (known_native and binding.get('native_id') != known_native)
                     or binding.get('workspace') not in (str(workspace), str(cwd)) or binding.get('engine') != row.get('engine')):
                 return None
             target = NativeTarget(session_id=binding['native_id'], tag=binding['tag'],

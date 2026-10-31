@@ -1197,7 +1197,10 @@ def render_output(args, result):
         return render_breakdown(result)
     if cmd == 'list':
         sessions = result.get('sessions', []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
-        return render_table(sessions)
+        text = render_table(sessions)
+        if isinstance(result, dict) and 'active_count' in result:
+            text += f"\nActive sessions: {result['active_count']}"
+        return text
     if cmd == 'warnings':
         lines = []
         for row in result.get('warnings', []):

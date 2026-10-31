@@ -9,6 +9,7 @@ import { linkedIntake, linkedTaskIds, hasOpenWork, nativeGoalStatus, sessionWake
 import { workerAccessContext, workerWakeAllowed } from './worker-access';
 import { registeredRepoLabel } from './repos';
 import { initResourceRequestProjection } from './sql-json-projection';
+import { abandonedLaunch, expireSilentStartRows } from './silent-start';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
  *
  * Placement itself is never reimplemented here: starts delegate to the existing
@@ -115,6 +116,22 @@ const GUARD_PAGE_DEFAULT = 100;
 const GUARD_PAGE_MAX = 200;
 const GUARD_LEGACY_ROWS = 100;
 const GUARD_MAX_CLOSURE = 400;
+/** A host heartbeat (fleet_sessions.observed_at) older than this means the process is gone. */
+const ACTIVE_HEARTBEAT_MS = 10 * 60 * 1000;
+/** Single server-side definition of "active", shared by web and CLI (hub-1101-outage-20261031):
+ * pending (queued/held/offered) rows, or starting/running/uncertain rows whose host reported a
+ * fresh heartbeat. Used by the list filter, the tree and `active_count`. */
+function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
+  const cutoff = new Date(nowMs - ACTIVE_HEARTBEAT_MS).toISOString();
+  return {
+    sql: `(state IN ('queued','held','offered') OR (state IN ('starting','running','uncertain') AND EXISTS (
+      SELECT 1 FROM fleet_sessions f WHERE f.machine_id = session_control_sessions.machine_id
+      AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id') AND f.observed_at >= ?)))`,
+    params: [cutoff],
+  };
+}
+const TREE_LIMIT_DEFAULT = 200;
+const TREE_LIMIT_MAX = 500;
 const STOPPABLE = new Set(['offered', 'starting', 'running', 'uncertain']);
 export const CLEANUP_APPLY_ALLOWED_STATES = new Set([...STOPPABLE, 'stopped']);
 const BINDABLE = new Set(['offered', 'starting', 'uncertain', 'running']);
@@ -416,6 +433,15 @@ export class SessionControlService {
     const expires = Date.parse(cred.expires_at);
     if (!Number.isFinite(expires) || expires <= this.now()) return false;
     return credentialActor(this.sql, cred) !== null;
+  }
+
+  /** Cancellation receipt detail for an abandoned (never proven) start. */
+  private abandonedCancellation(session: any): { launch?: string } {
+    if (!session?.fleet_launch_id) return {};
+    try {
+      const launch = this.sql.exec('SELECT state, mode, exit_reason, verification_status FROM fleet_launches WHERE id = ?', session.fleet_launch_id).toArray()[0];
+      return abandonedLaunch(launch) ? { launch: 'abandoned_unverified' } : {};
+    } catch { return {}; }
   }
 
   private cancelOwnerLive(row: any, caller: Caller, operatorStop = false): boolean {
@@ -2374,10 +2400,19 @@ export class SessionControlService {
 
     if ((path === '/api/sessions/tree' || (path === '/api/sessions' && (url.searchParams.get('view') === 'tree' || url.searchParams.get('tree') === 'true'))) && request.method === 'GET') {
       if (!writer) return response({ error: 'forbidden' }, 403);
-      const allRows = (admin
-        ? this.sql.exec('SELECT * FROM session_control_sessions ORDER BY created_at ASC, id ASC').toArray()
-        : this.sql.exec('SELECT * FROM session_control_sessions WHERE actor = ? ORDER BY created_at ASC, id ASC', caller.actor).toArray()
-      ).filter((r: any) => this.ownerOk(r, caller));
+      // Bounded (hub-1101-outage-20261031): live-only by default, newest
+      // `limit` rows; `include=all` adds terminal sessions but stays capped.
+      const treeLimit = Math.min(TREE_LIMIT_MAX, Math.max(1, Number(url.searchParams.get('limit')) || TREE_LIMIT_DEFAULT));
+      const treeAll = url.searchParams.get('include') === 'all';
+      const activeFrag = activeSessionsSql(this.now());
+      const stateSql = treeAll ? '' : `AND ${activeFrag.sql}`;
+      const stateArgs: any[] = treeAll ? [] : activeFrag.params;
+      const treeRows = (admin
+        ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE 1 = 1 ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...stateArgs, treeLimit + 1).toArray()
+        : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...stateArgs, treeLimit + 1).toArray()
+      ) as any[];
+      const truncatedTree = treeRows.length > treeLimit;
+      const allRows = treeRows.slice(0, treeLimit).reverse().filter((r: any) => this.ownerOk(r, caller));
 
       const views = allRows.map((r: any) => ({ ...this.view(r), children: [] }));
       const map = new Map<string, any>();
@@ -2393,7 +2428,15 @@ export class SessionControlService {
           roots.push(v);
         }
       }
-      return response({ tree: roots, total: views.length });
+      return response({ tree: roots, total: views.length, truncated: truncatedTree, live_only: !treeAll });
+    }
+
+    // One-time historical cleanup (hub-1101-outage-20261031): non-terminal sessions with no
+    // fresh heartbeat are marked stopped with a recorded reason. Rows are never deleted.
+    // Bounded per call; repeat until `remaining` is 0.
+    if (path === '/api/sessions/reconcile-stale' && request.method === 'POST') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      return response(this.transaction(() => reconcileStaleSessions(this.sql, this.now())));
     }
 
     if (path === '/api/sessions/warnings' && request.method === 'GET') {
@@ -2459,14 +2502,24 @@ export class SessionControlService {
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
       const cursor = url.searchParams.get('cursor');
       const params: any[] = [];
-      const cursorSql = this.cursorClause(cursor, params, true);
+      let cursorSql = this.cursorClause(cursor, params, true);
+      if (url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1') {
+        const frag = activeSessionsSql(this.now());
+        cursorSql += ` AND ${frag.sql}`;
+        params.push(...frag.params);
+      }
       const rows = (admin
         ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE 1 = 1 ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...params, limit + 1).toArray()
         : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...params, limit + 1).toArray()
       ).filter((r: any) => this.ownerOk(r, caller));
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
-      return response({ sessions: page.map(r => this.view(r, threshold)), next_cursor: next });
+      const countFrag = activeSessionsSql(this.now());
+      const activeCount = Number((admin
+        ? this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE ${countFrag.sql}`, ...countFrag.params)
+        : this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE actor = ? AND ${countFrag.sql}`, caller.actor, ...countFrag.params)
+      ).toArray()[0]?.n ?? 0);
+      return response({ sessions: page.map(r => this.view(r, threshold)), next_cursor: next, active_count: activeCount });
     }
 
     // M15c lifecycle durable seams (narrow; command auth/effect code untouched).
@@ -2812,6 +2865,19 @@ export class SessionControlService {
       // session_not_cancellable refusal until no-start is proven.
       if (session && session.state === 'offered' && (sub === 'stop' || sub === 'cancel') && request.method === 'POST') {
         this.transaction(() => promoteStartedOffers(this.sql, this.now(), { sessionId: session.id }));
+        session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0] ?? session;
+      }
+      // Intake 0b87eb29: a claimed launch that never bound a native within the
+      // silent-start bound is abandoned now, not on the next maintenance pass,
+      // so stop can cancel the wedged intent instead of refusing forever.
+      // Younger claims keep the session_not_cancellable refusal below.
+      if (session && session.fleet_launch_id && !session.binding_json && ['offered', 'starting'].includes(session.state) &&
+          (sub === 'stop' || sub === 'cancel') && request.method === 'POST') {
+        this.transaction(() => {
+          try {
+            if (expireSilentStartRows(this.sql, this.now(), session.fleet_launch_id)) reconcileUnboundFleetSessions(this.sql, this.now());
+          } catch { /* Fleet-less stores keep the ordinary refusal. */ }
+        });
         session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0] ?? session;
       }
       if (sub === 'link' && request.method === 'POST') {
@@ -3185,19 +3251,23 @@ export class SessionControlService {
           const prior: any = this.sql.exec('SELECT * FROM session_control_cancellations WHERE session_id = ?', live.id).toArray()[0];
           if (prior) {
             if (prior.actor !== actorName(caller) || prior.request_key !== input.key) return response({ error: 'idempotency_conflict' }, 409);
-            return response({ ...this.view(live), cancellation: { key: prior.request_key, created_at: prior.created_at, effect: 'no_native_start' }, replay: true });
+            return response({ ...this.view(live), cancellation: { key: prior.request_key, created_at: prior.created_at, effect: 'no_native_start', ...this.abandonedCancellation(live) }, replay: true });
           }
           const pending = this.sql.exec('SELECT id FROM session_control_commands WHERE session_id = ? LIMIT 1', live.id).toArray();
           const original = parsed(live.request_json, {});
           // Queued and offered launches have no start authorization. Cancel
           // atomically against claim; never treat missing binding as no spawn.
           const queuedFleet = ['queued', 'held', 'offered', 'failed'].includes(live.state) && live.fleet_launch_id && !live.binding_json && !pending.length && original.provenance !== 'observed_native'
-            ? (() => { try { return this.sql.exec('SELECT state, native_id, launcher_task_id, verification_status FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0] ?? null; } catch { return null; } })()
+            ? (() => { try { return this.sql.exec('SELECT state, mode, native_id, launcher_task_id, verification_status, exit_reason FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0] ?? null; } catch { return null; } })()
             : null;
           // A host-fenced no-start failure retains its failed attempt; an
           // operator may now cancel the intent without claiming native exit.
-          const provenNoStart = queuedFleet && queuedFleet.state === 'failed' &&
-            queuedFleet.verification_status === 'not_started' && !queuedFleet.native_id;
+          // So may a claim Hub abandoned on the silent-start bound (intake
+          // 0b87eb29): no native was ever bound and capacity is released. The
+          // cancellation never claims exit; a late real start still reaches
+          // the launch through the owning host's result and stays tracked.
+          const provenNoStart = queuedFleet && queuedFleet.state === 'failed' && !queuedFleet.native_id &&
+            (queuedFleet.verification_status === 'not_started' || abandonedLaunch(queuedFleet));
           if (queuedFleet && !provenNoStart && (!['queued', 'offered'].includes(String(queuedFleet.state)) || queuedFleet.native_id || queuedFleet.launcher_task_id)) return response({ error: 'session_not_cancellable' }, 409);
           if ((live.state !== 'held' || live.fleet_launch_id || live.binding_json || pending.length || original.provenance === 'observed_native') && !queuedFleet) {
             return response({ error: 'session_not_cancellable' }, 409);
@@ -3227,7 +3297,7 @@ export class SessionControlService {
             }
           } catch {}
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', live.id).toArray()[0];
-          return response({ ...this.view(row), cancellation: { key: input.key, created_at: at, effect: 'no_native_start' }, replay: false });
+          return response({ ...this.view(row), cancellation: { key: input.key, created_at: at, effect: 'no_native_start', ...this.abandonedCancellation(row) }, replay: false });
         });
       }
       if (sub === 'retry' && request.method === 'POST') {
@@ -4000,6 +4070,22 @@ export function promoteStartedOffers(sql: SqlStorage, nowMs: number, scope: { la
  * A null session machine is expected for a waitlisted launch. Match by launch
  * identity, never by that stale assignment. Bounded, convergent, and safe to
  * repeat: live/uncertain launches and bound sessions are never reaped. */
+export function reconcileStaleSessions(sql: SqlStorage, nowMs: number, batch = 200): { reconciled: number; remaining: number } {
+  sql.exec('CREATE TABLE IF NOT EXISTS session_stale_reconciliations (session_id TEXT PRIMARY KEY, previous_state TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL)');
+  const frag = activeSessionsSql(nowMs);
+  // Grace: never touch rows updated in the last hour (fresh launches that have not reported yet).
+  const grace = new Date(nowMs - 3600_000).toISOString();
+  const where = `state IN ('starting','running','uncertain','offered') AND updated_at < ? AND NOT ${frag.sql}`;
+  const rows = sql.exec(`SELECT id, state FROM session_control_sessions WHERE ${where} LIMIT ?`, grace, ...frag.params, batch).toArray() as any[];
+  const at = new Date(nowMs).toISOString();
+  for (const row of rows) {
+    sql.exec("INSERT OR IGNORE INTO session_stale_reconciliations (session_id, previous_state, reason, at) VALUES (?, ?, 'stale_no_heartbeat', ?)", row.id, row.state, at);
+    sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, row.id);
+  }
+  const remaining = Number((sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE ${where}`, grace, ...frag.params).toArray()[0] as any)?.n ?? 0);
+  return { reconciled: rows.length, remaining };
+}
+
 export function reconcileUnboundFleetSessions(sql: SqlStorage, nowMs: number): void {
   if (sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('fleet_launches','session_control_sessions')").toArray().length !== 2) return;
   const rows = sql.exec(`SELECT s.id, f.state FROM session_control_sessions s
