@@ -623,6 +623,11 @@ export class IntakeWatchdog {
           this.audit(tasks.find(t=>t.id===item.id)!,'daily_digest','daily bounded-batch digest recorded; receipt not confirmed',now);
         }
         this.sql.exec('UPDATE intake_watchdog_meta SET digest_day=? WHERE id=1',day);
+      } else if(meta.digest_day!==day) {
+        // Nothing due today: the ask ledger line still goes out once.
+        const asksLine=this.hooks.asksDigest?.();
+        if(asksLine)await this.hooks.notify('intake_digest',day+'-asks','Daily open intake digest '+day+'\n'+asksLine);
+        this.sql.exec('UPDATE intake_watchdog_meta SET digest_day=? WHERE id=1',day);
       }
     }
     // Persist one projection before awaited mutations. Their specific movement

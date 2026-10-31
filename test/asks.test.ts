@@ -344,6 +344,34 @@ describe('review regressions', () => {
   it('"nothing done" is not met', () => {
     expect(noteMarks('AC2: nothing done yet').ac.get(2)).toBe(false);
   });
+  it('a verdict binds to its own AC/ref token, separators share the next verdict', () => {
+    const m = noteMarks('AC1: met (AC4 deferred)\nAC5, AC6: met\nAC7-AC8 passed\nt1u: met, t2u: not met');
+    expect(m.ac.get(1)).toBe(true);
+    expect(m.ac.has(4)).toBe(false);
+    expect([m.ac.get(5), m.ac.get(6), m.ac.get(7), m.ac.get(8)]).toEqual([true, true, true, true]);
+    expect([m.refs.get('t1u'), m.refs.get('t2u')]).toEqual([true, false]);
+  });
+  it('scheduled tick and status reads stay bounded however much history exists', () => fixture(async (h, l) => {
+    const t = await intake(h, '1. Done long ago');
+    for (let i = 0; i < 1500; i++) {
+      const id = 'hist-' + i;
+      h.sql.exec(`INSERT INTO ask_messages(id,agent_id,t_id,seq,text,text_hash,source,received_at,split_state,role) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+        id, 'dev', 't' + (10000 + i) + 'u', 10000 + i, 'old ask ' + i, 'h' + i, 'backfill', 1, 'split', 'user');
+      h.sql.exec(`INSERT INTO asks(id,message_id,part,text,state,intake_id,created_at,updated_at,alert_subject) VALUES(?,?,0,?,?,?,1,1,?)`,
+        'ask-' + i, id, 'old ask ' + i, i % 2 ? 'verified' : 'closed_unverified', t.id, 'resolved:asks_unmapped-' + i);
+    }
+    let read = 0;
+    const sql = { exec: (...a: any[]) => { const c = h.sql.exec(...a); const toArray = c.toArray.bind(c); c.toArray = () => { const r = toArray(); read += c.rowsRead; return r; }; return c; } };
+    const scans: string[] = [];
+    const svc = new Proxy(h.intakeService, { get: (o: any, k: string) => { if (k === 'statusAuthorizedTasks') scans.push(k); const v = o[k]; return typeof v === 'function' ? v.bind(o) : v; } });
+    const bounded = new AskLedger(sql as any, svc, (f: any) => f(), { notify: async () => true }, () => Date.now());
+    expect(bounded.counts()).toMatchObject({ verified: 750, closed_unverified: 750, messages: 1500 });
+    expect(read).toBeLessThan(50);
+    read = 0;
+    await bounded.tick();
+    expect(scans).toEqual([]);
+    expect(read).toBeLessThan(200);
+  }));
   it('hosts cannot post backfill', () => fixture(async (h, l) => {
     expect(() => l.ingest({ source: 'backfill', machine_id: 'tabo', agents: [] }, { admin: false, actor: 'host:tabo', machineId: 'tabo' })).toThrow('backfill_requires_operator');
   }));

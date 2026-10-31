@@ -14,7 +14,7 @@ Alexey's asks kept getting dropped. Each fix so far was a prose rule that only w
    - Bare acknowledgements ("ок", "thanks") are recorded as `not_an_ask`.
 3. **Map.** Each ask is mapped to an intake and an AC line, in this order:
    - an explicit `intake_id`;
-   - an intake whose title, AC or history cites the message ref (`tNNNNu`);
+   - an intake whose title, AC or history cites the message ref (`tNNNNu`). The scheduled tick searches open intakes only (at most 512, read from the open-intake index). The operator's `hub asks check` also searches closed intakes, which the history backfill needs;
    - `hub asks map <ask> --intake <id> [--ac N]`.
 
    Within an intake, the AC line is the one citing the ref, else the line with at least 50% word overlap, else none.
@@ -32,7 +32,8 @@ Alexey's asks kept getting dropped. Each fix so far was a prose rule that only w
      - Each range is alerted once. Holes and rejected messages close when they are recorded. Overflow and rejected ranges age out a day after the alert.
    - **Silent source** (`asks_source_silent`): a watcher source (`grok-bot-replica`, `tabo-replica`) has not posted for more than 2 hours while its host heartbeat is fresh. Fallback writers (`bot`, `cli`) are not tracked. The alert resolves on the first tick after the next ingest.
    - **Daily** (`asks_agent_silent`): an agent whose chat window advanced in the last 24 hours with zero messages of either side recorded in that time. The alert resolves when messages arrive.
-   - Counts appear in `hub status` (`asks`), in the daily intake digest, and on `/asks`.
+   - Counts appear in `hub status` (`asks`), in the daily intake digest (on its own line when no intake is due), and on `/asks`.
+   - **Bounded reads.** `/api/status` is polled, so the counts come from `ask_counts`, which triggers keep current on every write. Open gaps and conflicts are counted through partial indexes. The tick reads at most 500 rows per step, and it reads intakes by primary key. `verified` and `closed_unverified` are terminal for the tick. A reopened intake's close gate still checks its `closed_unverified` and dropped asks. Ingest writes nothing for a re-posted window or agent name that has not changed, and it refreshes a watcher heartbeat at most every 5 minutes.
 6. **Close gate (AC5).** This sits beside DONE evidence and the worktree gate in `IntakeService.transition`, and is the hook that done-gate f0b21a52 shares.
    - `status=done` is refused with `asks_unverified` while any mapped ask is unproven.
    - A mapped ask is proven when a DONE note in the closing context marks it, in one of these forms:
@@ -42,6 +43,7 @@ Alexey's asks kept getting dropped. Each fix so far was a prose rule that only w
      - a Hub verifier PASS note covers every mapped ask of the intake
    - An ask can also be proven explicitly with `hub asks verify <ask> --evidence TEXT`.
    - A "not met" mark beats "met".
+   - A verdict binds to its own token: `AC1: met (AC4 deferred)` proves AC1 only. A token followed only by a separator shares the next verdict (`AC1, AC2: met`).
    - The operator's `closed_unverified` close is not refused; its asks are marked `closed_unverified`.
 
 ## Gap scope
