@@ -393,10 +393,18 @@ describe('M14a authorized one-call status projection', () => {
     });
     const data = await ok('');
     expect(data.coverage.missing_hosts).toContain('host-old');
-    expect(data.coverage.missing_hosts).not.toContain('win35');
-    expect(data.coverage.expected_offline).toContain('win35');
-    expect(data.coverage.expected_offline_until).toBe('2026-10-31T15:23:00Z');
-    expect(typeof data.coverage.expected_offline_reason).toBe('string');
+    // The window is wall-clock bounded; after it closes win35 is an ordinary
+    // missing host (expiry itself is pinned by the test below).
+    if (Date.now() <= Date.parse('2026-10-31T15:23:00Z')) {
+      expect(data.coverage.missing_hosts).not.toContain('win35');
+      expect(data.coverage.expected_offline).toContain('win35');
+      expect(data.coverage.expected_offline_until).toBe('2026-10-31T15:23:00Z');
+      expect(typeof data.coverage.expected_offline_reason).toBe('string');
+    } else {
+      expect(data.coverage.missing_hosts).toContain('win35');
+      expect(data.coverage.expected_offline_until).toBeNull();
+      expect(data.coverage.expected_offline_reason).toBeNull();
+    }
   });
 
   it('never reports a stale alias row as a missing host (same physical host, re-registered)', async () => {

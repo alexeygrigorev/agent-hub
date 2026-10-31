@@ -50,7 +50,7 @@ class TestMachineBinding(unittest.TestCase):
         flow = auth._device_flow()
         real_login = flow.device_login
         patch.object(flow, "device_login", side_effect=lambda *a, **kw: real_login(
-            *a, **kw, sleeper=lambda _: None, prompt=lambda _: None)).start()
+            *a, **{**kw, "sleeper": lambda _: None, "prompt": lambda _: None})).start()
         self.old = {
             "base_url": "https://hub.example", "access_token": "fixture-old-access",
             "refresh_token": "fixture-old-refresh", "machine_id": "old-machine",
