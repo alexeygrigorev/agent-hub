@@ -14,7 +14,7 @@ import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
 import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
-import { isValidMachineId } from './machine-id';
+import { isValidMachineId, resolveMachineRef } from './machine-id';
 import { LivenessService } from './liveness';
 import { reconcileAccountCapacity } from './account_capacity';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
@@ -917,6 +917,9 @@ export class FleetService {
     const needs: string[] = Array.isArray(input.needs) ? [...input.needs] : [];
     if (needs.length) request.needs = needs;
     const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = []; const gateDegraded = new Set<number>();
+    // Intake 6cb8890f AC2: `--machine DESKTOP-FP4OP26` names a host by its
+    // enrolled hostname; the canonical intent keeps the caller's selector.
+    const machineFilter = request.machine ? resolveMachineRef(this.sql, request.machine) : null;
     // Hub-held credential state (intake 5814e109 I5): an account whose Hub
     // credential the provider rejected is offered nowhere, and a host that
     // reported a generation rejected is not offered that account again until
@@ -961,7 +964,7 @@ export class FleetService {
       return runnersByMachine.get(machineId);
     };
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
-      if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
+      if ((request.account && route.account !== request.account) || (machineFilter && route.machine_id !== machineFilter) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
       if (overrideModels.length) {
         const provider = definitions.get(route.account)?.provider;
         const family = canonicalQuotaProvider(provider as string);
@@ -1144,6 +1147,11 @@ export class FleetService {
       if (gateProjection && !gateRefusal) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
         ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, ...(routeQuota.reason !== 'eligible' || (gateProjection && !gateRefusal) ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+    }
+    // An unknown or route-less --machine otherwise holds with an empty rejected[].
+    if (machineFilter && !candidates.length && !rejected.some(r => r.machine === machineFilter)) {
+      const known = this.sql.exec('SELECT id FROM machines WHERE id = ?', machineFilter).toArray().length > 0;
+      rejected.push({ machine: machineFilter, engine: request.engine || '*', reason: known ? 'machine_no_routes' : 'machine_unknown' });
     }
     const degraded = new Set(Array.from(gateDegraded, i => candidates[i]));
     candidates.sort((a, b) => Number(!!a.overflow) - Number(!!b.overflow) || Number(degraded.has(a)) - Number(degraded.has(b)) || b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));

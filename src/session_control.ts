@@ -44,7 +44,7 @@ import { ensureTbmControllerSchema, recordSessionOutcomeReward } from './tbm-con
 import { approvalAuthorityMatches } from './host_enrollment';
 import { sha256 } from './auth/crypto';
 import { validateHumanCredentialRecord } from './auth/human-credential';
-import { isValidMachineId } from './machine-id';
+import { isValidMachineId, resolveMachineRef } from './machine-id';
 import type { Env } from './env';
 import {
   buildLifecycleView,
@@ -2044,6 +2044,9 @@ export class SessionControlService {
       // prior lookup so legacy engine rows without a stored reason can still
       // replay/retry under their original key).
       if (input.machine !== undefined && !isValidMachineId(input.machine)) return response({ error: 'invalid_session_request', field: 'machine', detail: 'invalid_machine' }, 400);
+      // Hostname/name targeting (intake 6cb8890f AC2): store the Hub id so the
+      // worktree guard, offer and replays all see one machine identity.
+      if (input.machine !== undefined) input.machine = resolveMachineRef(this.sql, input.machine);
       if (input.name !== undefined && !nameOk(input.name)) return response({ error: 'invalid_session_request', field: 'name', detail: 'invalid_name' }, 400);
       if (input.cwd !== undefined && !cwdOk(input.cwd)) return response({ error: 'invalid_session_request', field: 'cwd', detail: 'invalid_cwd' }, 400);
       if (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) {

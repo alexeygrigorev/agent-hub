@@ -33,6 +33,7 @@
   "fleet-host",
   "handoff",
   "heartbeat",
+  "host-capabilities",
   "host-release",
   "inbox",
   "intake append",

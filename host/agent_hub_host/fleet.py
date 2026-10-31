@@ -558,6 +558,40 @@ MAX_ADVERTISED_ROUTES = 128
 ROUTE_ADVERTISEMENT_REFRESH_S = 60
 
 
+CAPABILITY_TAG = re.compile(r'[a-z0-9][a-z0-9:_-]{0,95}')
+
+
+def edit_capabilities(path=None, add=(), remove=()):
+    """Add/remove host capability tags (Hub `--needs` labels) in the settings file.
+
+    Tags such as ``browser:orin-chrome`` or ``tool:smscli`` are advertised to
+    Hub as routing needs; a running host hot-reloads the file. Only the
+    ``capabilities`` key changes, and the result must still load.
+    """
+    path = Path(path) if path else subscriptions_path()
+    for tag in list(add) + list(remove):
+        if not isinstance(tag, str) or not CAPABILITY_TAG.fullmatch(tag):
+            raise ValueError('Invalid capability tag (lowercase [a-z0-9:_-], e.g. tool:smscli)')
+    current = list(load_settings(str(path)).get('capabilities', []))
+    if not add and not remove:
+        return current
+    data = json.loads(path.read_text(encoding='utf-8'))
+    tags = [t for t in current if t not in set(remove)] + [t for t in dict.fromkeys(add) if t not in current]
+    data['capabilities'] = tags
+    text = json.dumps(data, indent=2) + '\n'
+    staging = path.with_name('.' + path.name + '.capabilities-' + uuid.uuid4().hex)
+    try:
+        staging.write_text(text, encoding='utf-8')
+        load_settings(str(staging))
+        if os.name != 'nt':
+            os.chmod(staging, stat.S_IMODE(path.stat().st_mode))
+        os.replace(staging, path)
+    finally:
+        if staging.exists():
+            staging.unlink()
+    return tags
+
+
 def load_settings(path=None):
     """Explicit non-secret machine configuration, including several accounts per service."""
     default_path = path is None

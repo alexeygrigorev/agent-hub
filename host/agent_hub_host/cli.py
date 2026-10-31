@@ -414,6 +414,10 @@ def main():
     subscriptions = sub.add_parser('subscriptions', help='Inspect safe machine subscription metadata')
     subscriptions.add_argument('--config')
     subscriptions.add_argument('--report', action='store_true', help='Post metadata to the hub using this host credential')
+    host_caps = sub.add_parser('host-capabilities', help='List/add/remove capability tags this host advertises for --needs (e.g. tool:smscli)')
+    host_caps.add_argument('--config', help='Host settings file (default subscriptions.json)')
+    host_caps.add_argument('--add', action='append', default=[], metavar='TAG', help='Advertise a tag (repeatable)')
+    host_caps.add_argument('--remove', action='append', default=[], metavar='TAG', help='Stop advertising a tag (repeatable)')
     dispatch = sub.add_parser('fleet-host', help='Opt-in bounded host polling; no service is installed')
     dispatch.add_argument('--config')
     dispatch.add_argument('--cycles', type=int, default=1)
@@ -855,6 +859,14 @@ def main():
     elif args.cmd == "activity":
         from . import bus
         print(json.dumps(bus.activity(workspace=getattr(args, 'workspace', None), project=getattr(args, 'project', None), holder=getattr(args, 'holder', None), actor=getattr(args, 'actor', None), limit=getattr(args, 'limit', 20), active=not getattr(args, 'all', False))))
+    elif args.cmd == "host-capabilities":
+        from . import fleet
+        try:
+            tags = fleet.edit_capabilities(args.config, add=args.add, remove=args.remove)
+        except ValueError as error:
+            print(f"host-capabilities: {error}", file=sys.stderr)
+            sys.exit(2)
+        print(json.dumps({'capabilities': tags, 'changed': bool(args.add or args.remove)}))
     elif args.cmd == "workclaim-sync":
         from . import bus, workclaim
         from .fleet import load_settings

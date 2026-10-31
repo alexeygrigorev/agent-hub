@@ -122,6 +122,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'auth logout': 'Use OAuth revocation or hub auth logout outside tools; revoking the current connection is transport account management.',
   'run': 'Local foreground host daemon; remote MCP must not install or start another host executor.',
   'fleet-host': 'Local host dispatcher; existing enrolled hosts own execution.',
+  'host-capabilities': 'Local host settings edit (advertised --needs tags) requires host files; the advertisement is visible in routing_machines.',
   'subscriptions': 'Local subscription collection/reporting requires host files and host identity; safe reported subscriptions are in fleet.',
   'bridge': 'Local native mailbox bridge; existing hosts own it.',
   'bridge-resume': 'Local journal acknowledgement, no server API.',

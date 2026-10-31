@@ -85,6 +85,36 @@ describe('session needs routing (Tabo AC4)', () => {
     expect(missing.selected).toBeNull();
     expect(missing.rejected).toContainEqual(expect.objectContaining({ reason: 'needs_unmet' }));
   }));
+
+  // Intake 6cb8890f AC2: Orin bank/desktop tasks target DESKTOP-FP4OP26 by
+  // hostname and/or host-advertised custom capability tags.
+  const desktopTags = ['browser:orin-chrome', 'phone:adb', 'tool:smscli', 'tool:agent-browser'];
+  it('routes custom desktop capability tags and hostname --machine', async () => fixture(async (service, sql) => {
+    sql.exec(`UPDATE machines SET hostname = 'DESKTOP-FP4OP26', name = 'DESKTOP-FP4OP26' WHERE id = 'tabo'`);
+    sql.exec(`INSERT OR REPLACE INTO routing_machines (machine_id, needs_json, max_agents, observed_at, runners_json) VALUES ('tabo', ?, 2, ?, ?)`,
+      JSON.stringify(desktopTags), iso(), JSON.stringify([]));
+    const tagged = service.plan(intent({ mode: 'interactive', needs: ['os:windows', 'browser:orin-chrome', 'tool:agent-browser'] }));
+    expect(tagged.selected?.machine).toBe('tabo');
+    expect(tagged.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'needs_unmet' }));
+    for (const ref of ['DESKTOP-FP4OP26', 'desktop-fp4op26', 'tabo']) {
+      const byName = service.plan(intent({ mode: 'interactive', machine: ref, needs: desktopTags }));
+      expect(byName.selected?.machine).toBe('tabo');
+      // The canonical intent keeps the caller's selector for idempotency.
+      expect(byName.request.machine).toBe(ref);
+    }
+    const missing = service.plan(intent({ mode: 'interactive', machine: 'DESKTOP-FP4OP26', needs: ['tool:acy'] }));
+    expect(missing.selected).toBeNull();
+    expect(missing.rejected).toEqual([expect.objectContaining({ machine: 'tabo', reason: 'needs_unmet' })]);
+  }));
+
+  it('explains unknown or route-less --machine instead of an empty rejected[]', async () => fixture(async (service, sql) => {
+    const unknown = service.plan(intent({ machine: 'DESKTOP-NOPE' }));
+    expect(unknown.selected).toBeNull();
+    expect(unknown.rejected).toEqual([{ machine: 'DESKTOP-NOPE', engine: '*', reason: 'machine_unknown' }]);
+    sql.exec(`DELETE FROM fleet_routes WHERE machine_id = 'tabo'`);
+    const noRoutes = service.plan(intent({ machine: 'tabo' }));
+    expect(noRoutes.rejected).toEqual([{ machine: 'tabo', engine: '*', reason: 'machine_no_routes' }]);
+  }));
 });
 
 describe('session start needs validation (Tabo AC4)', () => {
@@ -117,6 +147,13 @@ describe('session start needs validation (Tabo AC4)', () => {
     const res = await s.handle(sessionRequest({ key: 'k-needs-1', workspace: 'demo', brief: 'goal', needs: ['os:windows', 'arch:arm64'] }), agentAuth);
     expect(res.status).toBe(201);
     expect(calls[0].needs).toEqual(['os:windows', 'arch:arm64']);
+  }));
+  it('stores the Hub machine id for a hostname --machine', async () => sessionFixture(async (s, sql, calls) => {
+    sql.exec(`INSERT INTO machines (id, name, hostname, os, arch, registered_at, capabilities) VALUES ('desk-id', 'DESKTOP-FP4OP26', 'DESKTOP-FP4OP26', 'Windows', 'amd64', ?, '{}')`, new Date().toISOString());
+    const res = await s.handle(sessionRequest({ key: 'k-needs-host', workspace: 'demo', brief: 'goal', machine: 'desktop-fp4op26', needs: ['tool:agent-browser'] }), agentAuth);
+    expect(res.status).toBe(201);
+    expect(calls[0].machine).toBe('desk-id');
+    expect(calls[0].needs).toEqual(['tool:agent-browser']);
   }));
   it('rejects invalid and duplicate needs', async () => sessionFixture(async (s) => {
     const bad = await s.handle(sessionRequest({ key: 'k-needs-2', workspace: 'demo', brief: 'goal', needs: ['BAD'] }), agentAuth);

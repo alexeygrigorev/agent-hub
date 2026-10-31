@@ -118,6 +118,16 @@ Extend each host's private `subscriptions.json` with `capabilities` and `max_age
 
 Advertise only capabilities physically verified on that host. Hetzner normally advertises `[]`; browser profiles and phone/ADB belong on hosts where they actually work. CPU, available memory, disk, freshness and load come from the existing machine/heartbeat registry. No Windows inbound port is needed: hosts poll outbound.
 
+Manage the tags without hand-editing (the running host hot-reloads the file and re-advertises within a minute; on Windows the file is `%APPDATA%\agent-hub\subscriptions.json`):
+
+```bash
+hub host-capabilities                                   # list
+hub host-capabilities --add browser:orin-chrome --add phone:adb --add tool:smscli --add tool:agent-browser
+hub host-capabilities --remove phone:adb
+```
+
+Managed sessions use the same tags: `hub sessions start --needs tool:agent-browser ...` places only on hosts advertising every tag (plus synthesized `os:`/`arch:` labels), else holds with `rejected[]` reason `needs_unmet`. `--machine` accepts the Hub machine id or a unique enrolled hostname/name such as `DESKTOP-FP4OP26` (case-insensitive); an unknown or route-less target holds with `machine_unknown` / `machine_no_routes` instead of an empty `rejected[]`.
+
 `hub fleet-host --config PATH --cycles 10 --interval 60` registers, heartbeats and publishes exact supported runner/model/effort/account routes before asking for offers. Capability advertisements expire after 3 minutes. Machine admission and quota evidence remain mandatory; shared account reservations span machines. Both task routing and the fleet transaction enforce the machine concurrency limit. Existing active native sessions count toward machine and account occupancy; sessions already linked to a live hub launch are counted once. The selected account is pinned through launch creation even when several accounts share a runner. Hetzner is preferred among eligible machines, except that explicit machine preference wins. Required browser/phone capabilities filter candidates before preference.
 
 The admission adapter must prove `model_supported: true`, `model` and `effort` matching the selected model, in addition to the existing fresh account/resource/profile gate. The configured maintained launcher plan must identify the same account/profile/provider/model; missing proof holds the task. Existing older host configs continue legacy fleet polling but do not advertise routed-task execution.
