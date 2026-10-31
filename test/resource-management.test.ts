@@ -173,7 +173,7 @@ describe('resource management',()=>{
   expect(JSON.parse(read()).keep).toBe(true);
   sql.exec('DELETE FROM resource_request_projection WHERE source=? AND id=?',table,id);
   expect(r.sessions('host')[0].keep).toBe(true); // Missing projection falls back safely.
-  initResourceRequestProjection(sql,table);
+  initResourceRequestProjection(sql,table,{repair:true}); // backfill runs once per DB; repair reruns it
   expect(JSON.parse(read()).keep).toBe(true);
   expect(read().length).toBeLessThan(300);
   sql.exec(`UPDATE ${table} SET id=? WHERE id=?`,id+'-renamed',id);

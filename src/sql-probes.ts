@@ -37,22 +37,13 @@ export function rewriteSchemaProbe(query: string): string | null {
  * idempotent but scan their whole source table each time the DO wakes;
  * after the first complete run the table's triggers keep the target current.
  * A one-row stamp (point lookup) records that the backfill has completed.
+ * (A whole-table COUNT(*) is not free: workerd bills every row it counts.)
  */
-export function backfillOnce(sql: { exec: (q: string, ...a: any[]) => any }, key: string, backfill: () => void): void {
+export function backfillOnce(sql: { exec: (q: string, ...a: any[]) => any }, key: string, backfill: () => void, repair = false): void {
   sql.exec('CREATE TABLE IF NOT EXISTS hub_init_stamps (key TEXT PRIMARY KEY, at INTEGER NOT NULL)');
-  if (sql.exec('SELECT 1 FROM hub_init_stamps WHERE key=?', key).toArray().length) return;
+  // `repair` reruns the idempotent backfill on demand (tests, operator repair).
+  if (!repair && sql.exec('SELECT 1 FROM hub_init_stamps WHERE key=?', key).toArray().length) return;
   backfill();
   sql.exec('INSERT OR IGNORE INTO hub_init_stamps VALUES(?,?)', key, Date.now());
 }
 
-/**
- * Backfill a 1:1 trigger-maintained projection only when its row count no
- * longer matches its sources. COUNT(*) over a whole table is answered from
- * the b-tree without reading rows, so the per-cold-start check is free,
- * yet a projection that lost rows still repairs itself on the next wake.
- */
-export function backfillWhenCountsDiffer(sql: { exec: (q: string, ...a: any[]) => any }, target: string, sources: string[], backfill: () => void): void {
-  const count = (table: string) => Number(sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).one().n);
-  const present = sources.filter(t => sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name=?", t).toArray().length);
-  if (count(target) !== present.reduce((n, t) => n + count(t), 0)) backfill();
-}

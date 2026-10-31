@@ -4,7 +4,7 @@
  * JSON behaves like the existing parse-or-empty-object helpers.
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import { backfillWhenCountsDiffer } from './sql-probes';
+import { backfillOnce } from './sql-probes';
 
 export function jsonFields(column: string, fields: readonly string[]): string {
   const valid = `(CASE WHEN json_valid(${column}) THEN ${column} ELSE '{}' END)`;
@@ -20,7 +20,7 @@ type RequestTable = 'fleet_launches' | 'session_control_sessions';
 
 /** Compact immutable request facts are projected once per write, in the same
  * SQLite transaction. Live bindings, protection rows and telemetry stay live. */
-export function initResourceRequestProjection(sql: SqlStorage, table: RequestTable): void {
+export function initResourceRequestProjection(sql: SqlStorage, table: RequestTable, opts: { repair?: boolean } = {}): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS resource_request_projection (
     source TEXT NOT NULL,id TEXT NOT NULL,request_json TEXT NOT NULL,PRIMARY KEY(source,id))`);
   const insert = `INSERT OR REPLACE INTO resource_request_projection(source,id,request_json)
@@ -30,9 +30,9 @@ export function initResourceRequestProjection(sql: SqlStorage, table: RequestTab
     DELETE FROM resource_request_projection WHERE source='${table}' AND id=OLD.id; ${insert} END`);
   sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_request_${table}_delete AFTER DELETE ON ${table} BEGIN
     DELETE FROM resource_request_projection WHERE source='${table}' AND id=OLD.id; END`);
-  backfillWhenCountsDiffer(sql, 'resource_request_projection', ['fleet_launches', 'session_control_sessions'], () => sql.exec(`INSERT INTO resource_request_projection(source,id,request_json)
+  backfillOnce(sql, 'resource_request_projection:' + table, () => sql.exec(`INSERT INTO resource_request_projection(source,id,request_json)
     SELECT '${table}',s.id,${jsonFields('s.request_json',RESOURCE_FIELDS)} FROM ${table} s
-    WHERE NOT EXISTS(SELECT 1 FROM resource_request_projection p WHERE p.source='${table}' AND p.id=s.id)`));
+    WHERE NOT EXISTS(SELECT 1 FROM resource_request_projection p WHERE p.source='${table}' AND p.id=s.id)`), opts.repair);
 }
 
 export function resourceRequest(table: RequestTable, id: string, raw: string): string {

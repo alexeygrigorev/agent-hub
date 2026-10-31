@@ -136,6 +136,18 @@ describe('per-step rows-read budgets', () => {
   }));
 });
 
+describe('rows-read budget alert', () => {
+  it('the alarm checks the hourly budget even when a request flushed just before', () => withHub(async hub => {
+    const hour = Math.floor(Date.now() / 3_600_000) - 1;
+    hub.sql.exec("INSERT INTO rows_read_stats(slot,scope,hour,calls,rows_read,rows_written,max_read) VALUES(?,?,?,1,?,0,0)", hour % 192, '__total__', hour, 1_000_000);
+    await hub.fetch(new Request('https://hub/api/metrics/rows-read')); // 401, but flushes the meter
+    await hub.alarm();
+    const open: any = hub.sql.exec("SELECT state, detail FROM liveness_alerts WHERE subject_kind='do_rows_read_budget' AND resolved_at IS NULL").toArray()[0];
+    expect(open?.state).toBe('over_budget');
+    expect(open.detail).toContain('24000000/day');
+  }));
+});
+
 describe('route normalization', () => {
   it('keeps meter scopes bounded', () => {
     expect(normalizeRoute('get', '/api/sessions/3f2a1b4c-1111-4111-8111-111111111111/send')).toBe('GET /api/sessions/:id/send');

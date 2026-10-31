@@ -2438,11 +2438,15 @@ export class Hub extends DurableObject {
    * a liveness alert. An open alert notifies once; later hours only refresh its
    * projected number and top scopes until the budget is met and it resolves. */
   private async flushRowsMeter() {
-    if (Date.now() - this.lastMeterFlush < METER_FLUSH_INTERVAL_MS) return;
-    this.lastMeterFlush = Date.now();
-    this.meter.flush(this.sql);
-    const hour = Math.floor(Date.now() / 3_600_000);
-    if (hour === this.rowsAlertCheckedHour) return;
+    // The hourly budget check is independent of the flush gate: request and
+    // WebSocket flushes share lastMeterFlush and would otherwise starve it.
+    const now = Date.now(), hour = Math.floor(now / 3_600_000);
+    const checkDue = hour !== this.rowsAlertCheckedHour;
+    if (checkDue || now - this.lastMeterFlush >= METER_FLUSH_INTERVAL_MS) {
+      this.lastMeterFlush = now;
+      this.meter.flush(this.sql);
+    }
+    if (!checkDue) return;
     this.rowsAlertCheckedHour = hour;
     const alert = this.meter.runSync('meter:alert', () => {
       const report = rowsReadReport(this.sql, Date.now(), 2);
