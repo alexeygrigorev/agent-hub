@@ -135,6 +135,7 @@ export default {
       '/inbox', '/inbox.html', '/inbox.js', '/inbox.css',
       '/fleet', '/fleet.html', '/fleet.js', '/fleet.css',
       '/engines', '/engines.html', '/engines.js', '/engines.css',
+      '/webhooks', '/webhooks.html', '/webhooks.js', '/webhooks.css',
       '/banked-resets.html', '/banked-resets.js',
       '/conversations', '/conversations.html', '/conversations.js', '/conversations.css',
       '/metrics', '/metrics.html', '/metrics.js', '/metrics-charts.js', '/metrics.css', '/host-health-charts.js', '/tbm.js', '/tbm.css', '/usage-history.js',
@@ -167,6 +168,7 @@ export default {
     if (url.pathname === '/fleet') url.pathname = '/fleet.html';
     if (url.pathname === '/conversations') url.pathname = '/conversations.html';
     if (url.pathname === '/engines') url.pathname = '/engines.html';
+    if (url.pathname === '/webhooks') url.pathname = '/webhooks.html';
     if (url.pathname === '/intake' || INTAKE_DETAIL.test(url.pathname)) url.pathname = '/intake.html';
     const asset = await env.ASSETS.fetch(new Request(url, request));
     const headers = new Headers(asset.headers);

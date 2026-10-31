@@ -21,6 +21,22 @@ describe('private fleet assets', () => {
       expect(r.status).toBe(303); expect(r.headers.get('Location')).toBe('/auth/login');
     }
   });
+  it('serves the webhooks admin page and its assets only behind the session check (audit e2501fde)', async () => {
+    for (const path of ['/webhooks', '/webhooks.html', '/webhooks.js', '/webhooks.css']) {
+      const r = await doFetch(new Request('https://hub.test' + path, { headers: { Cookie: 'hub_session=fake' } }));
+      expect(r.status).toBe(303); expect(r.headers.get('Location')).toBe('/auth/login');
+    }
+    const cookie = await createSessionCookie(defaultEnv, { sub: 'human-test', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test', exp: Math.floor(Date.now() / 1000) + 60 });
+    for (const [path, expected] of [['/webhooks', '/webhooks.html'], ['/webhooks.html', '/webhooks.html'], ['/webhooks.js', '/webhooks.js'], ['/webhooks.css', '/webhooks.css']]) {
+      const requested: string[] = [];
+      const bindings = { ...defaultEnv, ASSETS: { fetch: async (req: Request) => { requested.push(new URL(req.url).pathname); return new Response('webhooks asset'); } } };
+      const ctx = createExecutionContext();
+      const r = await worker.fetch(new Request('https://hub.test' + path, { headers: { Cookie: cookie } }), bindings as any, ctx);
+      await waitOnExecutionContext(ctx);
+      expect(r.status).toBe(200); expect(requested).toEqual([expected]);
+      expect(r.headers.get('Cache-Control')).toBe('private, no-store');
+    }
+  });
   it('serves only the exact auth resource list before sign-in, never fleet data or kit tools', async () => {
     for (const path of ['/auth.css','/auth.js','/vendor/dakit/device-code.js','/vendor/dakit/dakit.css','/vendor/dakit/shell.js','/vendor/dakit/fonts/inter-var.woff2','/vendor/dakit/fonts/ibm-plex-mono-400.woff2','/vendor/dakit/fonts/ibm-plex-mono-500.woff2']) {
       const bindings = {...defaultEnv, ASSETS:{fetch:async () => new Response('static public resource')}};

@@ -226,14 +226,18 @@ def cmd_machines_available(args):
             sys.exit(1)
         machines = api.get_available_machines(cfg["base_url"])
         
-        # machines.py compatible output:
-        # {"reachable": [ {machine} ], "count": N}
+        # machines.py compatible output: {"reachable": [ {machine} ], "count": N}.
+        # The Worker returns {"machines": [...]} (src/registry.ts); a bare list
+        # and an already-shaped {"reachable": [...]} are accepted too.
         if isinstance(machines, list):
-            output = {"reachable": machines, "count": len(machines)}
-        elif isinstance(machines, dict) and "reachable" in machines:
-            output = machines
+            reachable = machines
+        elif isinstance(machines, dict) and isinstance(machines.get("reachable"), list):
+            reachable = machines["reachable"]
+        elif isinstance(machines, dict) and isinstance(machines.get("machines"), list):
+            reachable = machines["machines"]
         else:
-            output = {"reachable": machines, "count": len(machines)} if isinstance(machines, list) else machines
+            raise RuntimeError("unexpected /api/machines/available response shape")
+        output = {"reachable": reachable, "count": len(reachable)}
 
         if args.json:
             print(json.dumps(output, indent=2, sort_keys=True))
