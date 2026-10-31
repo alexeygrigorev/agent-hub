@@ -388,6 +388,9 @@ export class SessionControlService {
     // Intake 1c8d915e: expireUnclaimedStops runs on every host offers poll, so
     // its candidates come from live unclaimed stops only (after claim_token exists).
     this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_unclaimed_stops ON session_control_commands(created_at) WHERE kind = 'stop' AND state IN ('recorded','transported') AND claim_token IS NULL");
+    // Intake e8a22f4c: host command polls filter by state; without this each poll walked the machine's whole
+    // session history. Callers must not count index writes in rowsWritten (see the claim, which uses RETURNING).
+    this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_commands_state ON session_control_commands(state, session_id)");
     // M15c lifecycle: additive observations/decisions tables. Server-owned
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
@@ -3556,7 +3559,7 @@ export class SessionControlService {
         // CURRENT bound family may age its own machine's claims: foreign or
         // superseded families neither read payloads nor mutate transport here.
         for (const stale of this.sql.exec(
-          `SELECT c.id, c.claim_expires_at, s.host_family, s.machine_id FROM session_control_commands c JOIN session_control_sessions s ON s.id = c.session_id
+          `SELECT c.id, c.claim_expires_at, s.host_family, s.machine_id FROM session_control_commands c INDEXED BY session_control_commands_state CROSS JOIN session_control_sessions s ON s.id = c.session_id
            WHERE s.machine_id = ? AND c.state IN ('claimed','recorded','transported') AND c.claim_token IS NOT NULL AND c.ack_json IS NULL AND c.holder_machine = ? AND (c.claim_expires_at IS NULL OR c.claim_expires_at <= ?) LIMIT 100`, caller.machineId!, caller.machineId!, at).toArray() as any[]) {
           const session = { machine_id: stale.machine_id, host_family: stale.host_family };
           if (!this.hostOk(session, caller).ok) continue;
@@ -3571,14 +3574,14 @@ export class SessionControlService {
           `UPDATE session_control_commands SET state = 'recorded', poll_at = NULL, updated_at = ?
            WHERE state = 'transported' AND ack_json IS NULL AND holder_machine IS NULL
            AND poll_at IS NOT NULL AND poll_at < ?
-           AND session_id IN (SELECT id FROM session_control_sessions WHERE machine_id = ?)`,
+           AND EXISTS (SELECT 1 FROM session_control_sessions s WHERE s.id = session_control_commands.session_id AND s.machine_id = ?)`,
           at, cutoff, caller.machineId!);
         expireSessionMessages(this.sql, this.now(), caller.machineId!);
         // Session messages (kind 'message', docs/SESSION-MESSAGING.md §5.1):
         // offered after stops and before ordinary sends, one at a time per
         // session in send order, and not before a not-ready backoff ends.
         const rows = this.sql.exec(
-          `SELECT c.* FROM session_control_commands c JOIN session_control_sessions s ON s.id = c.session_id
+          `SELECT c.* FROM session_control_commands c INDEXED BY session_control_commands_state CROSS JOIN session_control_sessions s ON s.id = c.session_id
            WHERE s.machine_id = ? AND c.state = 'recorded'
            AND (c.not_before IS NULL OR c.not_before <= ?)
            AND (c.kind <> 'message' OR NOT EXISTS (SELECT 1 FROM session_control_commands e WHERE e.session_id = c.session_id
@@ -3751,9 +3754,10 @@ export class SessionControlService {
         const expires = new Date(this.now() + this.claimTtlMs).toISOString();
         const attempt = row.claim_token ? row.attempts : (row.attempts ?? 0) + 1;
         const written = this.sql.exec(
-          "UPDATE session_control_commands SET state = 'claimed', holder_machine = ?, claim_token = ?, claim_expires_at = ?, holder_attempt = ?, attempts = ?, updated_at = ? WHERE id = ? AND state IN ('recorded', 'transported')",
+          "UPDATE session_control_commands SET state = 'claimed', holder_machine = ?, claim_token = ?, claim_expires_at = ?, holder_attempt = ?, attempts = ?, updated_at = ? WHERE id = ? AND state IN ('recorded', 'transported') RETURNING id",
           caller.machineId, token, expires, input.attempt_id, attempt, this.at(), row.id);
-        if (written.rowsWritten !== 1) return response({ error: 'claim_conflict' }, 409);
+        // Matched rows, not rowsWritten: the state index adds index writes to rowsWritten.
+        if (written.toArray().length !== 1) return response({ error: 'claim_conflict' }, 409);
         this.adoptHostFamily(session.id, caller);
         if (row.kind === 'message') {
           const messageId = parsed(row.payload_json, {})?.message_id;
