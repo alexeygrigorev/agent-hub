@@ -498,27 +498,25 @@ def in_init_pid_namespace(status_path: str = "/proc/self/status", ns_path: str =
     return None
 
 
-def root_lock_held(lock_path: pathlib.Path) -> Optional[bool]:
-    """Whether root.lock is flock-held, without ever taking the lock. None = unknown.
+def read_proc_locks_snapshot() -> str:
+    """One ``/proc/locks`` snapshot.
 
-    ``/proc/locks`` omits a lock whose owner pid cannot be translated into the reader's PID
-    namespace (the real script's lock helper process exits at once, so the recorded owner is
-    dead). Outside the initial PID namespace "not listed" therefore does not mean "free": only an
-    init-namespace reader may answer, everywhere else the answer is unknown (HOLD).
+    A snapshot that does not list a held lock is possible: the kernel serves the file through a
+    seq file whose passes hold ``file_rwsem`` only per pass and resume the next pass at the flat
+    position reached so far across the per-CPU lock lists. Concurrent lock insert/removal between
+    passes shifts those positions, so a pass can start past a held lock (or re-show an already
+    emitted one). Under churn this is measurable as duplicate / reordered lines, and a held lock
+    missing from one snapshot while present in the next. A "not listed" verdict therefore needs
+    confirmation from a fresh snapshot; "listed" and unreadable stay single-read answers.
     """
-    try:
-        st = os.stat(lock_path)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return None
-    if in_init_pid_namespace() is not True:
-        return None
-    try:
-        with open("/proc/locks", "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        return None
+    with open("/proc/locks", "r", encoding="utf-8") as f:
+        return f.read()
+
+
+PROC_LOCKS_NOT_HELD_RETRY_DELAYS_SEC = (0.002, 0.01)
+
+
+def _snapshot_lists_lock(lines: List[str], st: os.stat_result) -> bool:
     want = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
     for line in lines:
         parts = line.split()
@@ -530,6 +528,44 @@ def root_lock_held(lock_path: pathlib.Path) -> Optional[bool]:
                 return True
         except ValueError:
             continue
+    return False
+
+
+def root_lock_held(
+    lock_path: pathlib.Path,
+    snapshot_reader: Optional[Callable[[], str]] = None,
+) -> Optional[bool]:
+    """Whether root.lock is flock-held, without ever taking the lock. None = unknown.
+
+    ``/proc/locks`` omits a lock whose owner pid cannot be translated into the reader's PID
+    namespace (the real script's lock helper process exits at once, so the recorded owner is
+    dead). Outside the initial PID namespace "not listed" therefore does not mean "free": only an
+    init-namespace reader may answer, everywhere else the answer is unknown (HOLD).
+
+    Even for an init-namespace reader a single snapshot can omit a held lock (seq-file resume
+    under concurrent churn, see read_proc_locks_snapshot), which would misreport a held lock as
+    free. A "not listed" snapshot is therefore re-read (bounded, PROC_LOCKS_NOT_HELD_RETRY_DELAYS_SEC)
+    before answering False; "listed" answers True at once and an unreadable snapshot stays
+    unknown (HOLD). Retries only ever strengthen "held": they never delay or weaken a True.
+    """
+    try:
+        st = os.stat(lock_path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    if in_init_pid_namespace() is not True:
+        return None
+    read_snapshot = snapshot_reader or read_proc_locks_snapshot
+    for attempt in range(1 + len(PROC_LOCKS_NOT_HELD_RETRY_DELAYS_SEC)):
+        try:
+            lines = read_snapshot().splitlines()
+        except OSError:
+            return None
+        if _snapshot_lists_lock(lines, st):
+            return True
+        if attempt < len(PROC_LOCKS_NOT_HELD_RETRY_DELAYS_SEC):
+            time.sleep(PROC_LOCKS_NOT_HELD_RETRY_DELAYS_SEC[attempt])
     return False
 
 

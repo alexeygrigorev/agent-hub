@@ -714,6 +714,87 @@ class TestCanonicalIncumbent(TempStateCase):
         finally:
             os.close(fd)
 
+    def test_b7_snapshot_omission_is_retried_and_still_reports_starting(self):
+        """Regression (intake d97c0973, stage-6 flake): a single /proc/locks snapshot can
+        omit a held lock (the kernel's seq file releases file_rwsem between passes and
+        resumes at a flat per-CPU list position, so concurrent churn can move the held
+        lock's entry past the resume point). root_lock_held must confirm a "not listed"
+        snapshot before answering free, so the incumbent stays "starting"."""
+        fd = os.open(self.state_dir / "root.lock", os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            st = os.stat(self.state_dir / "root.lock")
+            entry = (f"7: FLOCK  ADVISORY  WRITE 424242 "
+                     f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino} 0 EOF")
+            omitted = "9: POSIX  ADVISORY  READ 424243 00:0f:1 0 0\n"
+            listed = f"{entry}\n{omitted}"
+            for snaps, want_calls in (((omitted, listed), 2), ((omitted, omitted, listed), 3)):
+                calls = {"n": 0}
+
+                def counting(snaps=list(snaps)):
+                    calls["n"] += 1
+                    return snaps[calls["n"] - 1]
+
+                self.assertIs(rd.root_lock_held(self.state_dir / "root.lock", snapshot_reader=counting), True)
+                self.assertEqual(calls["n"], want_calls, "a held lock is confirmed on a fresh snapshot")
+                self.assertEqual(
+                    self.status(lock_probe=lambda p, s=list(snaps):
+                                rd.root_lock_held(p, snapshot_reader=iter(s).__next__)),
+                    "starting",
+                )
+        finally:
+            os.close(fd)
+
+    def test_b7_free_lock_stays_free_and_retries_are_bounded(self):
+        fd = os.open(self.state_dir / "root.lock", os.O_CREAT | os.O_RDWR)
+        try:
+            omitted = "9: POSIX  ADVISORY  READ 424243 00:0f:1 0 0\n"
+            calls = {"n": 0}
+
+            def counting():
+                calls["n"] += 1
+                return omitted
+
+            self.assertIs(rd.root_lock_held(self.state_dir / "root.lock", snapshot_reader=counting), False)
+            self.assertEqual(calls["n"], 1 + len(rd.PROC_LOCKS_NOT_HELD_RETRY_DELAYS_SEC),
+                             "retries are bounded even when the lock is genuinely free")
+            self.assertEqual(self.status(lock_probe=lambda p: rd.root_lock_held(p, snapshot_reader=counting)), "none")
+        finally:
+            os.close(fd)
+
+    def test_b7_listed_snapshot_answers_true_without_a_retry(self):
+        fd = os.open(self.state_dir / "root.lock", os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            st = os.stat(self.state_dir / "root.lock")
+            listed = (f"7: FLOCK  ADVISORY  WRITE {os.getpid()} "
+                      f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino} 0 EOF\n")
+            calls = {"n": 0}
+
+            def counting():
+                calls["n"] += 1
+                return listed
+
+            self.assertIs(rd.root_lock_held(self.state_dir / "root.lock", snapshot_reader=counting), True)
+            self.assertEqual(calls["n"], 1, "a listed lock is answered from the first snapshot")
+        finally:
+            os.close(fd)
+
+    def test_b7_unreadable_proc_locks_snapshot_still_holds_unknown(self):
+        self.write_state({"status": "finished", "run_id": "prev"})
+        fd = os.open(self.state_dir / "root.lock", os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def failing():
+                raise OSError("snapshot unavailable")
+
+            self.assertIsNone(rd.root_lock_held(self.state_dir / "root.lock", snapshot_reader=failing))
+            self.assertEqual(self.status(lock_probe=lambda p: rd.root_lock_held(p, snapshot_reader=failing)),
+                             "unknown")
+        finally:
+            os.close(fd)
+
     def test_b7_unknown_lock_state_holds(self):
         self.write_state({"status": "finished", "run_id": "prev"})
         self.assertEqual(self.status(lock_probe=lambda p: None), "unknown")
