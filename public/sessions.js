@@ -3,6 +3,26 @@ const byId = id => document.getElementById(id);
 let activeTab = 'list';
 let cachedSessions = [];
 let cachedTree = { tree: [] };
+// Live-only by default; "Show finished" and "Load more" are explicit (hub-1101-outage-20261031).
+let showAll = false;
+let nextCursor = null;
+let activeCount = null;
+
+function updateMoreButton() {
+  const more = byId('sessions-more');
+  if (more) more.hidden = !nextCursor;
+  const toggle = byId('sessions-show-all');
+  if (toggle) toggle.textContent = showAll ? 'Live only' : 'Show finished';
+}
+
+async function loadMore() {
+  if (!nextCursor) return;
+  const data = await api(`/api/sessions?limit=50${showAll ? '' : '&live=1'}&cursor=${encodeURIComponent(nextCursor)}`);
+  cachedSessions = cachedSessions.concat(data.sessions || []);
+  nextCursor = data.next_cursor || null;
+  updateMoreButton();
+  updateView();
+}
 let selectedSessionId = null;
 let detailPollTimer = null;
 const autoCapturedSessions = new Set();
@@ -837,19 +857,22 @@ async function loadData() {
       if (e && e.message === 'Sign-in required') return;
     }
     const [sessionsData, treeData, auditData] = await Promise.all([
-      api('/api/sessions?limit=100'),
-      api('/api/sessions/tree'),
+      api(`/api/sessions?limit=50${showAll ? '' : '&live=1'}`),
+      api(`/api/sessions/tree?limit=200${showAll ? '&include=all' : ''}`),
       // Admin-only; a 403 just means the panel stays hidden.
       api('/api/sessions/audit?last=5').catch(() => null)
     ]);
     cachedSessions = sessionsData.sessions || [];
+    nextCursor = sessionsData.next_cursor || null;
+    activeCount = sessionsData.active_count;
+    updateMoreButton();
     cachedTree = treeData || { tree: [] };
     renderAudit(auditData);
     updateView();
     if (selectedSessionId) {
       await refreshSessionDetail(selectedSessionId);
     }
-    status.textContent = `Authenticated · ${cachedSessions.length} session${cachedSessions.length === 1 ? '' : 's'}`;
+    status.textContent = `Authenticated · ${activeCount ?? cachedSessions.length} active`;
   } catch (err) {
     status.textContent = 'Sessions could not be refreshed.';
     updateView();
@@ -971,6 +994,8 @@ function setupEvents() {
   refreshBtn?.addEventListener('click', () => {
     loadData();
   });
+  byId('sessions-show-all')?.addEventListener('click', () => { showAll = !showAll; updateMoreButton(); loadData(); });
+  byId('sessions-more')?.addEventListener('click', () => { loadMore().catch(() => {}); });
 
   byId('session-detail-back')?.addEventListener('click', () => {
     closeSessionDetail();

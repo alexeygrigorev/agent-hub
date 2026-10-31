@@ -94,12 +94,14 @@
           <input type="search" id="sessions-filter" class="dk-input" placeholder="Filter by name, alias, engine, state…" aria-label="Filter sessions">
         </div>
         <button class="dk-button dk-button--secondary" type="button" id="sessions-refresh">Refresh</button>
+        <button class="dk-button dk-button--secondary" type="button" id="sessions-show-all">Show finished</button>
         <span id="status" role="status" class="dk-muted">Loading sessions…</span>
       </div>
 
       <section class="dk-card dk-stack sessions-card" id="list-section">
-        <h2 class="sessions-section-title">All Sessions</h2>
+        <h2 class="sessions-section-title">Sessions</h2>
         <div id="sessions-table-container"></div>
+        <button class="dk-button dk-button--secondary" type="button" id="sessions-more" hidden>Load more</button>
       </section>
 
       <section class="dk-card dk-stack sessions-card" id="tree-section" hidden>
