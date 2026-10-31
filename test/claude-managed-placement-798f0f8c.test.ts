@@ -81,13 +81,15 @@ describe('managed Claude placement (798f0f8c)', () => {
       expect(plan.selected?.mode).toBeUndefined();
       expect(plan.request.mode).toBe('headless');
 
-      // /goal has Codex semantics. Merely advertising a Claude goal route
-      // must not make an unpinned deep/review goal become a plain prompt.
+      // Claude Code supports /goal (intake bf0863c4): a host-advertised Claude
+      // goal route takes an interactive goal; the managed route this host did
+      // not advertise for goals stays goal-ineligible.
       for (const tier of ['deep', 'review']) {
         for (const engine of [undefined, 'claude']) {
           const goal = fleet.plan({ ...intent, engine, tier, mode: 'interactive', with_goal: true });
-          expect(goal.selected, JSON.stringify(goal.rejected)).toBeNull();
-          expect(goal.rejected).toContainEqual(expect.objectContaining({ machine, engine: 'claude', reason: 'goal_unsupported' }));
+          expect(goal.selected, JSON.stringify(goal.rejected)).toMatchObject({ machine, engine: 'claude', account: 'shared-claude' });
+          expect(goal.request.with_goal).toBe(true);
+          expect(goal.rejected).not.toContainEqual(expect.objectContaining({ machine, account: 'shared-claude', reason: 'goal_unsupported' }));
         }
       }
 

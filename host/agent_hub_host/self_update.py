@@ -211,4 +211,11 @@ def loop(request, stop, *, root=None, interval=POLL_S, clock=time.monotonic, lau
             launcher_update.step_once(request, launcher_settings() if launcher_settings else fleet.load_settings())
         except Exception as exc:
             print(json.dumps({'event': 'launcher_release_error', 'type': type(exc).__name__}), flush=True)
+        try:
+            # Windows package installs are not checkouts: rerun the public
+            # installer when the served archive changes (intake bf0863c4).
+            from . import package_update
+            package_update.maybe_update()
+        except Exception as exc:
+            print(json.dumps({'event': 'package_update_error', 'type': type(exc).__name__}), flush=True)
         stop.wait(max(1.0, interval - (clock() - started)))

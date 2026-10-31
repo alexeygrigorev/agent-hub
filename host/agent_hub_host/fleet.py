@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import uuid
 import subprocess
 import threading
@@ -166,6 +167,8 @@ OFFERS_LOCK_NAME = "fleet-offers.lock"
 # plus a slow Hub can exceed that, so the gate is re-run before claiming when
 # the first observation is older than this.
 CLAIM_ADMISSION_REFRESH_S = 15.0
+# Engines whose native CLI starts from a '/goal ...' prompt (src/fleet.ts GOAL_ENGINES).
+GOAL_ENGINES = frozenset({'codex', 'zcodex', 'claude'})
 # Bounded offer concurrency (settings "dispatch_concurrency", 1..13).
 # Intake eff9a5ce burst fix: serial dispatch (30-60 s per offer) made a
 # 10-launch burst take 5+ minutes. The earlier admission_refused failures with
@@ -606,6 +609,12 @@ def load_settings(path=None):
         raise ValueError("Invalid subscriptions list")
     seen = set()
     for sub in subs:
+        # '{host_python}' resolves to the running host interpreter so configs
+        # never pin a release venv path that breaks on host upgrade.
+        if isinstance(sub, dict):
+            for key in ("quota_argv", "admission_argv", "startup_argv"):
+                if isinstance(sub.get(key), list):
+                    sub[key] = [sys.executable if x == "{host_python}" else x for x in sub[key]]
         if not isinstance(sub, dict) or set(sub) - {"service", "account_label", "plan", "engine", "profile", "quota_argv", "admission_argv", "launcher_provider", "launcher_model", "launcher_effort", "startup_argv", "native_start_argv"}:
             raise ValueError("Subscription accepts metadata and local command references only")
         if "native_start_argv" in sub:
@@ -2532,7 +2541,7 @@ class Dispatcher:
         return [{'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
                  'profile': sub.get('profile')}
                 for sub in self.settings['subscriptions']
-                if sub.get('engine', sub['service']) in {'codex', 'zcodex'}
+                if sub.get('engine', sub['service']) in GOAL_ENGINES
                 and sub.get('admission_argv')
                 and (sub['account_label'] in self._managed_labels or
                      (isinstance(sub.get('startup_argv'), list) and sub['startup_argv']
@@ -2649,6 +2658,7 @@ class Dispatcher:
     def _dispatch_admission(self, sub, admission_payload, selection, offer):
         """Run the local admission gate; return its fresh observed_at."""
         from .model_contract import canonical_account_label
+        from .dispatch_diagnostics import AdmissionRefusedError
         gate = self._admission_gate(sub, admission_payload)
         if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or canonical_account_label(gate.get("account_label")) != canonical_account_label(sub["account_label"]):
             gate_reason = gate.get("reason") if isinstance(gate.get("reason"), str) else ""
@@ -2658,9 +2668,12 @@ class Dispatcher:
             if gate_reason.startswith("codex_quota_gate_"):
                 slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in gate_reason)[:64]
                 raise ValueError(slug + ": managed Codex quota gate refused launch before execution")
-            raise ValueError("Fresh admission refused")
+            if not gate_reason:
+                gate_reason = ("account_label_mismatch" if gate.get("launch_allowed") is True and gate.get("profile_supported") is True
+                               else "profile_unsupported" if gate.get("launch_allowed") is True else "gate_refused")
+            raise AdmissionRefusedError("Fresh admission refused", gate_reason)
         if (offer.get('task_id') or (selection and sub.get("account_label") in self._managed_labels)) and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
-            raise ValueError('Selected model/effort requires verified admission')
+            raise AdmissionRefusedError('Selected model/effort requires verified admission', 'model_unverified')
         at = gate.get("observed_at")
         try:
             observed = dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
@@ -2668,7 +2681,7 @@ class Dispatcher:
             if not 0 <= age <= 30:
                 raise ValueError()
         except Exception:
-            raise ValueError("Fresh admission timestamp required") from None
+            raise AdmissionRefusedError("Fresh admission timestamp required", "admission_timestamp_stale") from None
         return at
 
     def _pending_claim_key(self, offer_id):
@@ -2912,8 +2925,8 @@ class Dispatcher:
                 if support.get('supported') is not True or support.get('provider') != sub['launcher_provider'] or support.get('model') != selection['model']:
                     raise ValueError('model_unsupported: maintained adapter refused requested model')
             with_goal = offer.get('with_goal') is True
-            if with_goal and (offer.get('engine') not in {'codex', 'zcodex'} or not isinstance(offer.get('prompt'), str) or not offer['prompt'].strip()):
-                raise ValueError('Interactive goal requires a Codex-family engine and goal text')
+            if with_goal and (offer.get('engine') not in GOAL_ENGINES or not isinstance(offer.get('prompt'), str) or not offer['prompt'].strip()):
+                raise ValueError('Interactive goal requires a goal-capable engine and goal text')
             if offer.get("prompt") and not with_goal:
                 raise ValueError("Interactive task injection is unsupported; start an empty native session")
             # Intake 4b161918: Hub-planned intake worktree (fail-open), after local refusals.
@@ -3951,7 +3964,16 @@ class Dispatcher:
             self._persist_launch_record(record)
             if not offer.get('task_id'):
                 try:
-                    rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
+                    try:
+                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
+                    except Exception as reject_exc:
+                        # A Hub older than gate_reason (intake bf0863c4)
+                        # answers 400 invalid_rejection; settle without it.
+                        if 'gate_reason' not in diagnostic or '400' not in str(reject_exc):
+                            raise
+                        diagnostic = {k: v for k, v in diagnostic.items() if k != 'gate_reason'}
+                        record['diagnostic'] = diagnostic
+                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
                     record['settled'] = rejected.get('retryable') is not True
                     self._persist_launch_record(record)
                     results.append(rejected)

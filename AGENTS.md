@@ -17,7 +17,7 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 1. Work through Agent Branches, the project's own tool (`~/git/agent-branches`, CLI `agent-branches`). Each implementer works in its own Agent Branches workspace. No git worktrees or long-lived git branches.
 2. Claim edit scope on the agents bus before editing; release when done. Claims are never written into documents.
 3. A task is done when a reviewer (same model allowed) approved the exact version and the head integrated it.
-4. Verification before every push (Alexey 2026-10-17 22:54): run the FULL test suite on Hetzner before every push (`scripts/test-full-local.sh` covering unfiltered Vitest discovery, full Python discovery with clean disposable HOME and DTC_AUTH_HOME, workflow validations, dry-run build). Investigate and report all failures honestly; required CI checks must pass with zero new regressions, and documented pre-existing debt is tracked rather than silently excluded. Never rely on focused-only tests or speculative CI runs.
+4. Verification before every push (Alexey 2026-10-31, supersedes the 2026-10-17 full-suite-per-push rule; intake cb5c362e): run `scripts/test-affected-local.sh` on Hetzner. It runs scope guard, typecheck, workflow validation when touched, dry-run build, and only the Vitest/pytest files affected by the diff vs origin/main (disposable HOME, one short heavy-test slot, ~40 s). Do NOT run `scripts/test-full-local.sh` before every push: 12 sessions queued behind 2 slots for 10+ min each blocked all pushes. The FULL suite runs once per push in the deploy CI job (and in `scripts/test-full-local.sh`, which you run only when the selector reports BROAD: dependencies, vitest/pytest config, conftest, the admission gate; or when a reviewer or the head asks for a final gate). Investigate and report all failures honestly; required CI checks must pass with zero new regressions, and documented pre-existing debt is tracked rather than silently excluded. A red post-push CI full suite is fixed forward immediately by the pusher. See [docs/PREPUSH-TARGETED-TESTS.md](docs/PREPUSH-TARGETED-TESTS.md).
 5. Batch related commits into one finished feature. Nondeploy/docs/checkpoint commits must use `[skip ci]`. Exactly ONE deploy push for the finished feature, only after required CI test suites pass on the exact final source. Normal fast-forward integration, no force pushes, no PRs. Keep Agent Branches and GitHub main in sync after every integration.
 6. Post each milestone's accepted result on the tracking issue (see the issue labelled `tracking`).
 
@@ -48,7 +48,7 @@ OpenCode (`oc`, `--engine opencode`) always runs Muse Spark 1.3 (`opencode-go/mu
 ## Local test storage
 
 Heavy suites share a host-wide cap of two runs per user. The full runner acquires it
-automatically. Wrap ad-hoc Vitest/workerd (including `npm test`), Playwright and
+automatically. `scripts/test-affected-local.sh` is the pre-push lane and takes its own slot. Wrap ad-hoc Vitest/workerd (including `npm test`), Playwright and
 full pytest commands with `scripts/capped-test-run.sh -- <command>`; use the
 same `AGENT_HUB_HEAVY_TEST_DIR` and `AGENT_HUB_HEAVY_TEST_SLOTS` across sessions.
 Defaults are `/run/user/<uid>/agent-hub/heavy-test` and two slots. Never unlink

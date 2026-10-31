@@ -179,6 +179,18 @@ describe('fleet reserve capacity queue', () => {
     expect(replay.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
   }));
 
+  it('names mode_unavailable (not capability_unavailable) when a host lacks only the requested mode', () => fleetFixture(async (f, sql) => {
+    await configure(f);
+    const caps = JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id = 'win35'").one().capabilities);
+    caps.fleet_modes = ['interactive'];
+    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'win35'", JSON.stringify(caps));
+    const res = await f.handle(fleetReq('/launches', intent({ machine: 'win35', mode: 'headless', idempotency_key: 'mode-missing' })), admin);
+    expect(res.status).toBe(409);
+    const body: any = await res.json();
+    expect(body.error).toBe('no_eligible_route');
+    expect(body.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'mode_unavailable' });
+  }));
+
   it('keeps mixed capacity+capability failures as visible 409 rejects without queueing', () => fleetFixture(async (f, sql) => {
     await configure(f);
     const first: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();

@@ -7,7 +7,7 @@ $proc=Get-CimInstance Win32_Process | ?{ $_.CommandLine -match 'agent_hub_host\.
 if(-not $proc){ $proc=Get-CimInstance Win32_Process | ?{ $_.CommandLine -match 'agent_hub_host' } | select -First 1 }
 $py=$proc.ExecutablePath; $env:PYTHONPATH=(Join-Path (Split-Path (Split-Path (Split-Path $py))) "package\host"); "host python: $py (PYTHONPATH=$env:PYTHONPATH)"
 function Find($names){ foreach($n in $names){ $c=Get-Command $n -ea 0 | select -First 1; if($c){ return $c.Source }; foreach($d in "$env:USERPROFILE\bin","$env:USERPROFILE\.local\bin","$env:USERPROFILE\.grok\bin","$env:APPDATA\npm","$env:LOCALAPPDATA\Programs\Antigravity\bin","$env:LOCALAPPDATA\Programs\agy"){ foreach($e in '.exe','.cmd',''){ if(Test-Path "$d\$n$e"){ return "$d\$n$e" } } } }; $null }
-function Adm($svc,$acct,$eng){ ,@($py,'-c',"import sys,json; from agent_hub_host.native_admission import probe; print(json.dumps(probe(json.loads(sys.stdin.read(32769) or 'null'),'$svc','$acct','$eng')))") }
+function Adm($svc,$acct,$eng){ ,@('{host_python}','-c',"import sys,json; from agent_hub_host.native_admission import probe; print(json.dumps(probe(json.loads(sys.stdin.read(32769) or 'null'),'$svc','$acct','$eng')))") }
 $defs=@{
  zcodex=@{service='zai';account_label='shared-zai';engine='zcodex';bin=@('zcodex');launcher_provider='zai';launcher_model='glm-5.3-flash';launcher_effort='high';extra=@('--dangerously-bypass-approvals-and-sandbox','-c','check_for_update_on_startup=false')}
  grok=@{service='grok';account_label='shared-grok';engine='grok';bin=@('grok')}

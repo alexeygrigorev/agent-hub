@@ -596,6 +596,8 @@ def provision_managed_home(bundle=None, home=None, dest=None):
 
 
 WINDOWS_LOCK_WAIT_S = 900.0
+# Under the 30 s fleet runner timeout for the admission subprocess.
+ADMISSION_LOCK_WAIT_S = 10.0
 
 
 def _windows_wait_lock(fd, timeout=None, sleep=None):
@@ -624,14 +626,14 @@ def _windows_wait_lock(fd, timeout=None, sleep=None):
 
 
 @contextlib.contextmanager
-def lock():
+def lock(timeout=None):
     """One reconciler/exec reader; owner-only lock stays on disk across processes."""
     path = root() / 'reconcile.lock'
     with private_fs.parent(path, create=True) as anchor:
         fd = private_fs._open(anchor, path, os.O_CREAT | os.O_RDWR)
         try:
             if os.name == 'nt':
-                _windows_wait_lock(fd)
+                _windows_wait_lock(fd, timeout)
             else:
                 import fcntl
                 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -1530,26 +1532,37 @@ def admission():
                 payload = json.loads(raw_in)
     except Exception:
         payload = {}
+    def installed_bundle():
+        state = read_json(root() / 'state.json', [])
+        record = next((b for b in state if b['label'] == label), None)
+        return read_json(root() / (label + '-' + record['revision']) / 'bundle.json') if record else None
+
+    bundle = None
+    lock_failed = False
+    try:
+        # Runs before Hub stamps its verdict, so a lock wait never ages the
+        # verdict past the 30 s admission window. Bounded on Windows, where a
+        # reconcile holds the lock through npm installs.
+        with lock(timeout=ADMISSION_LOCK_WAIT_S):
+            bundle = installed_bundle()
+    except Exception:
+        # state.json and bundle.json are replaced atomically, so an unlocked
+        # read is consistent; a lock that cannot be opened or taken (Windows
+        # ACL/msvcrt) must not read as a missing bundle and refuse every launch.
+        lock_failed = True
+        try:
+            bundle = installed_bundle()
+        except Exception:
+            bundle = None
     try:
         result = host_request('POST', '/api/engines/admission', {'label': label})
     except Exception:
-        result = {'launch_allowed': False, 'profile_supported': False, 'account_label': label}
-
-    bundle = None
-    try:
-        with lock():
-            state = read_json(root() / 'state.json', [])
-            record = next((b for b in state if b['label'] == label), None)
-            if record:
-                dest = root() / (label + '-' + record['revision'])
-                bundle = read_json(dest / 'bundle.json')
-    except Exception:
-        pass
+        result = {'launch_allowed': False, 'profile_supported': False, 'account_label': label, 'reason': 'hub_unreachable'}
 
     if bundle is None and result.get('launch_allowed'):
         result['launch_allowed'] = False
         result['profile_supported'] = False
-        result['reason'] = 'local_bundle_missing'
+        result['reason'] = 'local_lock_unavailable' if lock_failed else 'local_bundle_missing'
     elif bundle is not None and result.get('launch_allowed') and profile_path().is_file():
         expected_header = f'[profiles.hub-{label}]'
         try:
@@ -1558,7 +1571,7 @@ def admission():
             text = ''
         if expected_header not in text:
             try:
-                with lock():
+                with lock(timeout=ADMISSION_LOCK_WAIT_S):
                     state = read_json(root() / 'state.json', [])
                     installed = []
                     for item in state:

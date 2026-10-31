@@ -772,6 +772,22 @@ describe('generic accounts and launch placement', () => {
     const shown: any = await (await sessions.handle(new Request('https://hub.test/api/sessions/' + launch.id), admin)).json();
     expect(shown).toMatchObject({ reason: diagnostic.reason, message: diagnostic.message, launch_error: diagnostic });
   }));
+  const ADMISSION_MESSAGE = 'Fresh admission refused this account or could not verify its timestamp and model.';
+  const GOAL_MESSAGE = 'This account has no trusted interactive goal startup command.';
+  it.each([
+    ['admission_refused', ADMISSION_MESSAGE, 'local_lock_unavailable', 200],
+    ['admission_refused', ADMISSION_MESSAGE, 'token sk-ant-secret', 400],
+    ['goal_startup_unconfigured', GOAL_MESSAGE, 'local_bundle_missing', 400],
+  ])('stores only a fixed admission gate_reason (intake bf0863c4): %s %s', async (reason, message, gate_reason, status) => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const diagnostic = { reason, message, stage: 'dispatch_route', error_type: 'AdmissionRefusedError', gate_reason };
+    const res = await s.handle(request('/launches/' + launch.id + '/reject', { reason, diagnostic }), host('hetzner'));
+    expect(res.status).toBe(status);
+    const stored = sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', launch.id).one().launch_error_json;
+    if (status === 200) expect(JSON.parse(String(stored))).toEqual(diagnostic);
+    else expect(stored).toBeNull();
+  }));
   it('retains a stale claim cause across service restart and safely retries the same offer', async () => fixture(async (s, sql) => {
     await configure(s);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();

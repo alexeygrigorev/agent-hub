@@ -1,6 +1,6 @@
 # Heavy tests and host load admission
 
-Use `scripts/test-full-local.sh` for the full verification gate. Its Vitest,
+Pre-push verification is the targeted `scripts/test-affected-local.sh` (docs/PREPUSH-TARGETED-TESTS.md); use `scripts/test-full-local.sh` only for broad changes and final gates. Its Vitest,
 Python, host-canary, and standalone browser phases acquire a host-wide heavy-test slot.
 For ad-hoc suites use:
 
