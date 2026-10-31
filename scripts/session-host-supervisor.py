@@ -12,7 +12,19 @@ import uuid
 from contextlib import ExitStack
 
 
+def ensure_runtime_bin_on_path():
+    """The logon task may lack the installer PATH; find <root>/bin next to venv/Scripts."""
+    if sys.platform != 'win32':
+        return
+    candidate = pathlib.Path(sys.executable).resolve().parent.parent.parent / 'bin'
+    if (candidate / 'aplexer.exe').is_file():
+        parts = os.environ.get('PATH', '').split(os.pathsep)
+        if str(candidate) not in parts:
+            os.environ['PATH'] = os.pathsep.join([str(candidate), *parts])
+
+
 def native(*argv):
+    ensure_runtime_bin_on_path()
     command = ['aplexer', *argv]
     command.insert(command.index('--') if '--' in command else len(command), '--json')
     result = subprocess.run(command, capture_output=True, text=True, timeout=35)

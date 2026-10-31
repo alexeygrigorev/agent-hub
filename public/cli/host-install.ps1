@@ -19,7 +19,11 @@ try {
             if ((Get-FileHash $UvInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd00580051699bee58a2e2d9b925f45788b35f7e0fff7966fd5bedfc3c547dc7d') {
                 throw 'uv installer checksum mismatch'
             }
-            Get-Content -LiteralPath $UvInstaller -Raw | Invoke-Expression
+            # uv's installer may call exit; run it in a child process so a
+            # piped `irm | iex` bootstrap is not terminated with it.
+            $Child = (Get-Process -Id $PID).Path
+            & $Child -NoProfile -ExecutionPolicy Bypass -File $UvInstaller
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Uv)) { throw 'uv installation failed' }
         } finally { $env:UV_UNMANAGED_INSTALL = $OldUvInstall }
     }
     $env:PATH = "$Bin;$env:PATH"

@@ -92,6 +92,25 @@ def device_login(base_url: str, client_kind: str, name: str, hostname: str, requ
     print("Login successful.")
 
 
+def _publish_device_prompt(text):
+    """Show the code on stdout, stderr and a private file for hidden/redirected runs."""
+    print(text, end="", flush=True)
+    try:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        if sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
+            target = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "agent-hub" / "device-code.txt"
+        else:
+            target = Path.home() / ".local/share/agent-hub/device-code.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _run_device_login(flow, exchange, base_url, client_kind, name, hostname, requested_scopes):
     from .device_transport import poster
     device_poster = poster(exchange)
@@ -99,6 +118,7 @@ def _run_device_login(flow, exchange, base_url, client_kind, name, hostname, req
         return flow.device_login(
             base_url,
             device_poster,
+            prompt=_publish_device_prompt,
             start_path="/api/device/code",
             token_path="/api/device/token",
             start_body={

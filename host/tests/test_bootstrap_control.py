@@ -209,6 +209,26 @@ class HandoverTests(unittest.TestCase):
             c.handover(self.directory, timeout=0, boot_probe=lambda: 'boot-before', observe=lambda receipt: None)
         self.assertFalse((self.directory / 'stop.json').exists())
 
+    def test_rerun_recovers_needs_attention_when_receipt_absent_from_catalog(self):
+        self.crash()
+        c._write_attention(self.directory)
+        with c.ControllerLease(self.directory, boot_probe=lambda: None) as lease, \
+                patch.object(c, 'observe_receipt', return_value=None), \
+                patch.object(c, 'receipt_absent', return_value=True):
+            pass
+        self.assertFalse((self.directory / 'needs-attention.json').exists())
+        self.assertFalse((self.directory / 'owner.json').exists())
+
+    def test_receipt_absent_requires_successful_complete_listing(self):
+        ok = Mock(returncode=0, stdout=json.dumps([{'id': 'other'}]))
+        with patch.object(c.subprocess, 'run', return_value=ok):
+            self.assertTrue(c.receipt_absent({'id': 'mine'}))
+            self.assertFalse(c.receipt_absent({'id': 'other'}))
+        with patch.object(c.subprocess, 'run', return_value=Mock(returncode=1, stdout='[]')):
+            self.assertFalse(c.receipt_absent({'id': 'mine'}))
+        with patch.object(c.subprocess, 'run', side_effect=FileNotFoundError):
+            self.assertFalse(c.receipt_absent({'id': 'mine'}))
+
     def test_installer_recovers_stale_owner_without_waiting_for_dead_supervisor(self):
         self.crash()
         c.handover(self.directory, timeout=0, boot_probe=lambda: 'boot-after',
@@ -257,6 +277,7 @@ class HandoverTests(unittest.TestCase):
              patch.object(supervisor.signal, 'signal'), patch.dict(os.environ), \
              patch.object(c, 'boot_identity', return_value=None), \
              patch.object(c, 'observe_receipt', return_value=None), \
+             patch.object(c, 'receipt_absent', return_value=False), \
              patch.object(supervisor, 'native') as native, contextlib.redirect_stdout(output):
             self.assertIsNone(supervisor.main(), 'successful process exit stops failure-restart loop')
         native.assert_not_called()

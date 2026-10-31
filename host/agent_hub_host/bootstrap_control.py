@@ -50,6 +50,20 @@ def observe_receipt(receipt):
     return json.loads(result.stdout)
 
 
+def receipt_absent(receipt):
+    """True only when a successful full catalog listing has no row for the receipt id."""
+    try:
+        result = subprocess.run(['aplexer', 'list', '--all', '--json'],
+                                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+        if result.returncode or len(result.stdout) > 1048576:
+            return False
+        rows = json.loads(result.stdout)
+        return isinstance(rows, list) and all(isinstance(r, dict) for r in rows) and \
+            all(r.get('id') != receipt['id'] for r in rows)
+    except (OSError, ValueError, subprocess.TimeoutExpired, KeyError):
+        return False
+
+
 def _read(path):
     return json.loads(private_fs.read_bytes(path, 16384))
 
@@ -78,7 +92,7 @@ def _attention(directory, generation=None):
     raise NeedsAttention('Previous controller exit is unproven; inspect needs-attention.json and restore native status access before retrying')
 
 
-def recover_stale_owner(directory, current_boot, observe):
+def recover_stale_owner(directory, current_boot, observe, absent=None):
     """Caller must hold owner.lock: an absent owner process alone is no proof."""
     try:
         owner = _read(directory / 'owner.json')
@@ -112,6 +126,10 @@ def recover_stale_owner(directory, current_boot, observe):
                 if (isinstance(row, dict) and all(row.get(k) == receipt[k] for k in IDENTITY_KEYS)
                         and row.get('containment_empty') is True):
                     proof = 'exact_receipt_containment_empty'
+                elif row is None and absent is not None and absent(receipt):
+                    # Rerun recovery: caller holds owner.lock (no live owner) and a
+                    # full catalog listing no longer contains the exact receipt id.
+                    proof = 'receipt_absent_from_catalog'
     if proof is None:
         _attention(directory, generation)
     # Archive before clearing; recovery never destroys the old receipt.
@@ -140,12 +158,13 @@ class ControllerLease:
         self.stack = ExitStack()
         self.boot_probe = boot_probe or boot_identity
         self.observe = observe or observe_receipt
+        self.absent = receipt_absent if observe is None else None
 
     def __enter__(self):
         try:
             self.stack.enter_context(private_fs.exclusive_lock(self.directory / 'owner.lock'))
             self.boot = self.boot_probe()
-            recover_stale_owner(self.directory, self.boot, self.observe)
+            recover_stale_owner(self.directory, self.boot, self.observe, self.absent)
             return self
         except BaseException:
             self.stack.close()
@@ -175,15 +194,16 @@ class ControllerLease:
 
 
 def handover(directory, *, timeout=90, boot_probe=None, observe=None):
+    absent = receipt_absent if observe is None else None
     directory = Path(directory)
     if not 0 <= timeout <= MAX_HANDOVER_SECONDS:
         raise ValueError('Invalid controller handover timeout')
     # Serializes request publication/cancellation; never unlink kernel locks.
     with private_fs.exclusive_lock(directory / 'request.lock'):
-        _handover(directory, timeout, boot_probe or boot_identity, observe or observe_receipt)
+        _handover(directory, timeout, boot_probe or boot_identity, observe or observe_receipt, absent)
 
 
-def _handover(directory, timeout, boot_probe, observe):
+def _handover(directory, timeout, boot_probe, observe, absent=None):
     stack = ExitStack()
     try:
         stack.enter_context(private_fs.exclusive_lock(directory / 'owner.lock'))
@@ -191,7 +211,7 @@ def _handover(directory, timeout, boot_probe, observe):
         stack.close()
     else:
         with stack:
-            recover_stale_owner(directory, boot_probe(), observe)
+            recover_stale_owner(directory, boot_probe(), observe, absent)
         return
     try:
         owner = _read(directory / 'owner.json')

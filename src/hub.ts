@@ -1529,6 +1529,20 @@ export class Hub extends DurableObject {
         return new Response(html, {headers:UI_HEADERS});
       }
 
+      // Operator listing of pending host/agent pairings registered by
+      // /api/device/code, so a code printed to an invisible console is still
+      // discoverable. Admin only; the device secret hash is never returned.
+      if (path === '/api/device/pending') {
+        if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        if (!auth.caller?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+        const rows = this.sql.exec(
+          "SELECT user_code, client_kind, name, hostname, ip_country, requested_scopes, created_at, expires_at FROM device_pairings WHERE status = 'pending' AND client_kind != 'human' AND expires_at > ? ORDER BY created_at DESC LIMIT 50",
+          new Date().toISOString()).toArray();
+        return Response.json({ pending: rows });
+      }
+
       if (path.startsWith('/api/device/approve') || path.startsWith('/api/device/deny') || path.startsWith('/api/device/info')) {
         const session = await getSession(this.env, request);
         if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });

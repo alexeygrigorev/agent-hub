@@ -22,6 +22,7 @@ def add_commands(sub):
     submit.add_argument('--runner', dest='preferred_runner')
     submit.add_argument('--machine', dest='preferred_machine')
     submit.add_argument('--key', help='Reuse this idempotency key for safe retries')
+    sub.add_parser('device-pending', help='List pending host/agent device approvals (admin)')
     sub.add_parser('routing-machines', help='List capability advertisements, model routes and host health')
     policy = sub.add_parser('model-policy', help='Show routing policy or save Grok preference (global policy keeps routing disabled)')
     policy.add_argument('provider', nargs='?', choices=['grok'])
@@ -94,6 +95,8 @@ def execute(args):
         return bus._do_request('GET', path)
     if args.cmd == 'model-policy' and (args.action or args.mode or args.reason):
         raise ValueError('Use model-policy grok set MODE --reason TEXT')
+    if args.cmd == 'device-pending':
+        return bus._do_request('GET', '/api/device/pending')
     if args.cmd in ('routing-machines', 'model-policy'):
         return bus._do_request('GET', '/api/fleet/routing/' + ('machines' if args.cmd == 'routing-machines' else 'policy'))
     if args.cmd in ('host-release', 'launcher-release'):
