@@ -394,6 +394,17 @@ path) — so machine + tag + native id + state + the sessions report carry the
 reconciliation instead, and the host still re-qualifies
 the exact target (UUID + tag + workspace + incarnation) before every effect.
 
+### Native delivery receipt (no model reply required)
+
+A guarded pane delivery of the original envelope (`submitted`,
+`already-submitted` or `recipient-acked` from the native deliver guard, or a
+`pane` entry for that exact envelope in the native log) acks `delivered` with
+a `proof.kind = "native_delivery"` receipt. It proves delivery to the exact
+recipient incarnation, not processing. The receipt is journaled so a lost ack
+POST or host restart replays the identical ack; the proof id is prefixed
+`delivery:` so it dedups per envelope and cannot collide with reply ids. A
+busy recipient stays `waiting in inbox`; a later receipt promotes it, once.
+
 ### Correlated delivery proof (host-verified native reply provenance)
 
 Deliberately NOT cryptographic target authentication: the hub cannot verify

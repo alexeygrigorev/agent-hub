@@ -270,6 +270,11 @@ export type SendProof = {
   sender_created_at_ms: number;
 };
 
+export type NativeDeliveryProof = Omit<SendProof, 'reply_to_native_id' | 'reply_digest'> & {
+  kind: 'native_delivery';
+  status: 'submitted' | 'already-submitted' | 'recipient-acked';
+};
+
 export type SendProofExpectation = {
   native_id: string;
   tag: string;
@@ -283,15 +288,21 @@ const HEX64 = /^[0-9a-f]{64}$/i;
 export function validateSendProof(proof: any, expected: SendProofExpectation): { ok: true } | { ok: false; error: string } {
   const fail = (error: string) => ({ ok: false as const, error });
   if (!proof || typeof proof !== 'object' || Array.isArray(proof)) return fail('proof_required');
-  const keys = ['native_message_id', 'reply_to_native_id', 'reply_digest', 'sender_native_id',
-    'sender_tag', 'sender_workspace', 'sender_generation', 'sender_created_at_ms'];
+  const delivery = proof.kind === 'native_delivery';
+  const keys = ['native_message_id', 'sender_native_id', 'sender_tag', 'sender_workspace',
+    'sender_generation', 'sender_created_at_ms', ...(delivery ? ['kind', 'status'] : ['reply_to_native_id', 'reply_digest'])];
   if (!obj(proof, keys)) return fail('invalid_proof_shape');
-  if (typeof proof.native_message_id !== 'string' || !proof.native_message_id || proof.native_message_id.length > 256 ||
-      typeof proof.reply_to_native_id !== 'string' || !proof.reply_to_native_id || proof.reply_to_native_id.length > 256 ||
-      typeof proof.reply_digest !== 'string' || !HEX64.test(proof.reply_digest)) return fail('invalid_proof_shape');
-  // A message is never its own reply; the reply envelope must reference the
-  // delivered message envelope as retrieved from the native log by the host.
-  if (proof.reply_to_native_id === proof.native_message_id) return fail('proof_reply_mismatch');
+  if (typeof proof.native_message_id !== 'string' || !proof.native_message_id || proof.native_message_id.length > 256) return fail('invalid_proof_shape');
+  if (delivery) {
+    // An exact native guard receipt proves delivery to the recipient, not processing.
+    if (!['submitted', 'already-submitted', 'recipient-acked'].includes(proof.status)) return fail('invalid_proof_shape');
+  } else {
+    if (typeof proof.reply_to_native_id !== 'string' || !proof.reply_to_native_id || proof.reply_to_native_id.length > 256 ||
+        typeof proof.reply_digest !== 'string' || !HEX64.test(proof.reply_digest)) return fail('invalid_proof_shape');
+    // A message is never its own reply; the reply envelope must reference the
+    // delivered message envelope as retrieved from the native log by the host.
+    if (proof.reply_to_native_id === proof.native_message_id) return fail('proof_reply_mismatch');
+  }
   if (typeof proof.sender_native_id !== 'string' || !UUID_V4.test(proof.sender_native_id) ||
       typeof proof.sender_tag !== 'string' || !proof.sender_tag ||
       typeof proof.sender_workspace !== 'string' || !proof.sender_workspace ||
@@ -302,6 +313,14 @@ export function validateSendProof(proof: any, expected: SendProofExpectation): {
   if (proof.sender_generation !== expected.generation ||
       proof.sender_created_at_ms !== expected.native_created_at_ms) return fail('proof_generation_stale');
   return { ok: true };
+}
+
+// Prefix native delivery receipts so they cannot collide with reply envelope ids.
+function sendProofId(proof: any): string | null {
+  if (proof?.kind === 'native_delivery' && typeof proof.native_message_id === 'string' && proof.native_message_id) {
+    return 'delivery:' + proof.native_message_id;
+  }
+  return typeof proof?.reply_to_native_id === 'string' && proof.reply_to_native_id ? proof.reply_to_native_id : null;
 }
 
 /** Unplaced held sessions; matches the partial index session_control_held_unplaced. */
@@ -1856,7 +1875,7 @@ export class SessionControlService {
     this.sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?',
       'acked', JSON.stringify(ack), at, row.id);
     this.sql.exec('INSERT OR IGNORE INTO session_control_proofs (reply_envelope_id, command_id, session_id, created_at) VALUES (?, ?, ?, ?)',
-      input.proof.reply_to_native_id, row.id, row.session_id, at);
+      sendProofId(input.proof), row.id, row.session_id, at);
     return response({ command_id: row.id, state: 'acked' });
   }
 
@@ -1876,7 +1895,9 @@ export class SessionControlService {
     if (stored.proof || input.proof) {
       const p = stored.proof || {};
       const q = input.proof || {};
-      if (p.native_message_id !== q.native_message_id ||
+      if (p.kind !== q.kind || p.status !== q.status ||
+          p.sender_native_id !== q.sender_native_id || p.sender_created_at_ms !== q.sender_created_at_ms ||
+          p.native_message_id !== q.native_message_id ||
           p.reply_to_native_id !== q.reply_to_native_id ||
           p.reply_digest !== q.reply_digest) return false;
     }
@@ -3774,9 +3795,9 @@ export class SessionControlService {
         // (concurrent or lost-ack re-submit, no new effect), while reuse
         // across commands is replay.
         if (row.kind === 'send' && input.outcome === 'delivered' && input.proof &&
-            typeof input.proof.reply_to_native_id === 'string' && input.proof.reply_to_native_id) {
+            sendProofId(input.proof)) {
           const seen: any = this.sql.exec('SELECT command_id FROM session_control_proofs WHERE reply_envelope_id = ?',
-            input.proof.reply_to_native_id).toArray()[0];
+            sendProofId(input.proof)).toArray()[0];
           if (seen) {
             if (seen.command_id === row.id) return response({ command_id: row.id, state: 'acked' });
             return response({ error: 'proof_replayed' }, 409);
@@ -3929,7 +3950,7 @@ export class SessionControlService {
         this.sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?', state, JSON.stringify(ack), at, row.id);
         if (state === 'acked' && row.kind === 'send' && input.proof) {
           this.sql.exec('INSERT INTO session_control_proofs (reply_envelope_id, command_id, session_id, created_at) VALUES (?, ?, ?, ?)',
-            input.proof.reply_to_native_id, row.id, row.session_id, at);
+            sendProofId(input.proof), row.id, row.session_id, at);
         }
         if (state === 'acked' && row.kind === 'stop') {
           this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, session.id);

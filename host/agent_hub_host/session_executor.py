@@ -384,6 +384,50 @@ def _delivered_ack_payload(
     }
 
 
+def _native_delivery_payload(command_id, generation, target, original_id, evidence):
+    """Native guard receipt proves delivery, independently of model replies."""
+    created = evidence.get("recipient_created_at_ms")
+    status = evidence.get("status")
+    if type(created) is not int or created <= 0 or status not in (
+            "submitted", "already-submitted", "recipient-acked"):
+        raise SessionControlError("Native delivery receipt unavailable")
+    return {
+        "correlation": _server_correlation(command_id, generation),
+        "outcome": "delivered",
+        "native": {"native_id": target.session_id, "tag": target.tag, "workspace": target.workspace},
+        "reason": "native envelope delivery confirmed; agent processing not asserted",
+        "proof": {
+            "kind": "native_delivery", "status": status,
+            "native_message_id": original_id,
+            "sender_native_id": target.session_id, "sender_tag": target.tag,
+            "sender_workspace": target.workspace, "sender_generation": generation,
+            "sender_created_at_ms": created,
+        },
+    }
+
+
+def _ack_native_delivery(journal_file, prior, command_id, target, evidence, request):
+    rejected = str(prior.get("ack_error") or "")
+    uncertainty_rejected = (rejected == "server_terminal_command_uncertain"
+                            and (prior.get("ack_payload") or {}).get("outcome") == "uncertain")
+    if rejected.startswith("server_terminal_") and not uncertainty_rejected:
+        return {**prior, "replayed": True}
+    payload = _native_delivery_payload(command_id, int(prior.get("generation", 0)),
+                                       target, prior["original_native_message_id"], evidence)
+    updated = {**prior, "state": "acknowledged", "delivery_state": "transported",
+               "delivery_receipt": evidence, "ack_payload": payload, "ack_submitted": False,
+               "reason": payload["reason"]}
+    updated.pop("ack_pending", None)
+    updated.pop("ack_error", None)
+    _write_journal(journal_file, updated)  # receipt survives lost POST/restart
+    if request is not None:
+        submitted = _resubmit_ack_locked(journal_file, updated, command_id,
+                                         str(prior.get("claim_token") or ""), request=request)
+        if submitted is not None:
+            return submitted
+    return {**updated, "ack": {"submitted": False, "payload": payload}}
+
+
 def _target_from_offer_result(offer: dict[str, Any], result: dict[str, Any],
                                workspace_path: str) -> Optional[NativeTarget]:
     native_id = result.get("native_id")
@@ -760,6 +804,9 @@ def _reconcile_unknown_locked(
             engine=raw_target.get("engine")).validated()
     except (KeyError, TypeError, SessionControlError):
         return None
+    if isinstance(prior.get("delivery_receipt"), dict):
+        return _ack_native_delivery(journal_file, prior, command_id, target,
+                                    prior["delivery_receipt"], request)
     # Reconciliation reads the JOURNALED genuine sender mailbox (the binding
     # observed before the send). Without it the reply is honestly unverifiable;
     # the sender workspace is never re-derived from the target.
@@ -833,6 +880,13 @@ def _reconcile_unknown_locked(
     if proof.state == "acknowledged" and proof.reply_envelope_id:
         return _finish_acknowledged(proof)
 
+    # A native log pane receipt is sufficient for delivery. Validate the exact
+    # original envelope, command digest and current recipient incarnation.
+    from .native_sessions import verify_delivery_from_log
+    receipt = verify_delivery_from_log(executable, target, original_id, command_id, body_digest)
+    if receipt is not None:
+        return _ack_native_delivery(journal_file, prior, command_id, target, receipt, request)
+
     # No correlated reply yet: check if target session has become confirmed terminal.
     # Confirmed terminal target can fail pending delivery honestly (never hang forever).
     try:
@@ -856,6 +910,9 @@ def _reconcile_unknown_locked(
                     sender_session_id=sender_binding.session_id,
                     live_only=False,
                 )
+                if del_term.state == "transported" and (del_term.evidence or {}).get("recipient_created_at_ms"):
+                    return _ack_native_delivery(journal_file, prior, command_id, target,
+                                                del_term.evidence, request)
                 if del_term.state == "transported" and (del_term.evidence or {}).get("status") == "recipient-acked":
                     ack_proof = _recipient_cursor_ack_proof(
                         executable, target, original_id, body_digest, command_id)
@@ -1022,6 +1079,9 @@ def _reconcile_unknown_locked(
                 executable, target, original_id,
                 sender_session_id=sender_binding.session_id,
             )
+            if del_res.state == "transported" and (del_res.evidence or {}).get("recipient_created_at_ms"):
+                return _ack_native_delivery(journal_file, prior, command_id, target,
+                                            del_res.evidence, request)
             if del_res.state == "transported":
                 if (del_res.evidence or {}).get("status") == "recipient-acked":
                     ack_proof = _recipient_cursor_ack_proof(
@@ -1611,6 +1671,8 @@ def handle_claimed_command(
             record["sender_binding"] = outcome["sender_binding"]
         if outcome.get("headless_turn_queued") is True:
             record["headless_turn_queued"] = True
+        if isinstance(outcome.get("delivery_receipt"), dict):
+            record["delivery_receipt"] = outcome["delivery_receipt"]
 
         # A send whose recipient reply has not arrived yet is journaled as
         # pending WITHOUT any server ack: the command stays claimed under its
@@ -1658,6 +1720,10 @@ def handle_claimed_command(
                 reply_envelope_id=str(outcome.get("reply_envelope_id")),
                 evidence=evidence, reason=str(outcome.get("reason", "")),
             )["proof"]
+        if op == "send" and isinstance(outcome.get("delivery_receipt"), dict):
+            ack_payload["proof"] = _native_delivery_payload(
+                command_id, proved["generation"], target,
+                str(outcome["original_native_message_id"]), outcome["delivery_receipt"])["proof"]
         if op == "capture" and outcome.get("ack_outcome") == "delivered":
             text = str(outcome.get("capture_text", ""))
             ack_payload["capture"] = text[:65536]
@@ -1957,6 +2023,13 @@ def _run_claimed_effect(
                 native_id=original_id,
                 reason=sent.get("reason", "inbox recorded; transport=inbox requested"),
             )
+
+        if delivered.state == "transported" and delivered.evidence.get("recipient_created_at_ms"):
+            return {"state": "acknowledged", "ack_outcome": "delivered",
+                    "native_id": original_id, "original_native_message_id": original_id,
+                    "delivery_state": "transported", "delivery_receipt": delivered.evidence,
+                    "reason": "native envelope delivery confirmed; agent processing not asserted",
+                    "sender_binding": sent.get("sender_binding")}
 
         reply_id: Optional[str] = None
         headless_turn_queued = bool(

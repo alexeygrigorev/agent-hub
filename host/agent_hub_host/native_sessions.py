@@ -687,7 +687,8 @@ def deliver_recorded(
                     state="transported",
                     native_id=envelope_id,
                     reason=detail or f"native deliver guard reports {status_lower}; processing NOT proven",
-                    evidence={"status": status_lower, "detail": detail},
+                    evidence={"status": status_lower, "detail": detail,
+                              "recipient_created_at_ms": observed.created_at_ms},
                 )
             if status_lower in ("not-ready", "busy", "draft", "menu", "unknown"):
                 # rc0 not-ready is not transported: readiness gate refused.
@@ -777,6 +778,29 @@ def reconcile_delivery_from_log(
                 return "recorded"
     except (SessionControlError, SessionUncertain):
         return None
+    return None
+
+
+def verify_delivery_from_log(executable, target, envelope_id, command_id, digest):
+    """Read-only recovery of a pane-submitted original envelope; inbox alone is not proof."""
+    try:
+        observed = qualify_target(executable, target, live_only=False)
+        if type(observed.created_at_ms) is not int or observed.created_at_ms <= 0:
+            return None
+        for env in fetch_message_log(executable, target.workspace):
+            if env.get("id") != envelope_id or env.get("delivery") != "pane":
+                continue
+            recipient = env.get("to") or {}
+            correlation = (env.get("data") or {}).get("hub_session_control") or {}
+            if (env.get("workspace") == target.workspace
+                    and recipient.get("session_id") == target.session_id
+                    and recipient.get("tag") == target.tag
+                    and correlation.get("correlation_id") == command_id
+                    and correlation.get("body_digest") == digest
+                    and body_digest(str(env.get("body", ""))) == digest):
+                return {"status": "already-submitted", "recipient_created_at_ms": observed.created_at_ms}
+    except (SessionControlError, SessionUncertain, TypeError, AttributeError):
+        pass
     return None
 
 

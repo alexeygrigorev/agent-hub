@@ -650,6 +650,18 @@ describe('send proof validator (host-verified native reply provenance)', () => {
     expect(validateSendProof({ ...good, reply_digest: 'short' }, expected))
       .toMatchObject({ ok: false, error: 'invalid_proof_shape' });
   });
+  it('accepts an exact native delivery receipt without a reply envelope, never a malformed one', () => {
+    const receipt = { kind: 'native_delivery', status: 'submitted', native_message_id: 'nmsg-1',
+      sender_native_id: NATIVE_ID, sender_tag: NATIVE_TAG, sender_workspace: NATIVE_WS,
+      sender_generation: 1, sender_created_at_ms: NATIVE_CREATED };
+    expect(validateSendProof(receipt, expected)).toEqual({ ok: true });
+    expect(validateSendProof({ ...receipt, status: 'busy' }, expected))
+      .toMatchObject({ ok: false, error: 'invalid_proof_shape' });
+    expect(validateSendProof({ ...receipt, reply_digest: 'b'.repeat(64) }, expected))
+      .toMatchObject({ ok: false, error: 'invalid_proof_shape' });
+    expect(validateSendProof({ ...receipt, sender_created_at_ms: 1 }, expected))
+      .toMatchObject({ ok: false, error: 'proof_generation_stale' });
+  });
 });
 
 describe('absolute workspace identifiers and friendly names', () => {

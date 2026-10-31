@@ -429,9 +429,13 @@ def test_idle_guard_submits_original_once(env):
     # Target was idle, so native deliver submitted the original envelope
     orig_id = outcome["original_native_message_id"]
     assert orig_id
-    assert outcome["state"] == "unknown"  # awaiting recipient reply
+    # A native guard receipt acknowledges delivery without waiting for a model reply
+    assert outcome["state"] == "acknowledged"
     assert outcome["delivery_state"] == "transported"
     assert outcome["ack"]["submitted"] is False
+    assert outcome["ack"]["payload"]["outcome"] == "delivered"
+    assert outcome["ack"]["payload"]["proof"]["kind"] == "native_delivery"
+    assert outcome["ack"]["payload"]["proof"]["native_message_id"] == orig_id
 
     # Check deliver was called exactly once on the original envelope ID
     with open(env["deliver_log"]) as f:
@@ -480,6 +484,7 @@ def test_blocked_busy_draft_menu_no_input(env, status_name):
 
 # Case 3: successful correlated model reply proves delivery
 def test_successful_correlated_model_reply_proves_delivery(env):
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "not-ready")
     target = seed_target(env)
     cid = str(uuid.uuid4())
     hub = MockHub()
@@ -621,6 +626,7 @@ def test_replay_old_inbox_only_journal_remains_compatible(env):
 
 # Case 7: confirmed terminal target can fail pending delivery honestly
 def test_confirmed_terminal_target_fails_pending_delivery_honestly(env):
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "not-ready")
     target = seed_target(env)
     cid = str(uuid.uuid4())
     claim = make_claim(cid)
@@ -667,6 +673,7 @@ def test_confirmed_terminal_target_fails_pending_delivery_honestly(env):
 
 # Case 8: pending send does not prevent stop/capture processing
 def test_pending_send_does_not_prevent_stop_capture_processing(env):
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "not-ready")
     target = seed_target(env)
     cid_send = str(uuid.uuid4())
     cid_cap = str(uuid.uuid4())
@@ -713,6 +720,7 @@ def test_pending_send_does_not_prevent_stop_capture_processing(env):
 
 # Case 9: controller restart retains honest unknown/recorded state if sender unbound
 def test_controller_restart_retains_honest_unknown_if_sender_unbound(env):
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "not-ready")
     target = seed_target(env)
     cid = str(uuid.uuid4())
     claim = make_claim(cid)
@@ -824,6 +832,7 @@ def test_reconcile_uncertain_send_without_positive_log_does_not_retry_deliver(en
 
 
 def test_target_terminal_matcher_requires_workspace_engine_and_created_at_ms(env):
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "not-ready")
     target = seed_target(env)
     cid = str(uuid.uuid4())
     claim = make_claim(cid)
@@ -854,7 +863,7 @@ def test_target_terminal_matcher_requires_workspace_engine_and_created_at_ms(env
         journal_dir=env["journal"], command_id=cid,
         executable=env["fake"], request=None,
     )
-    assert reconciled["state"] == "unknown"  # Not failed as refused
+    assert reconciled is None or reconciled["state"] != "refused"  # Not failed as refused
     jdata = json.load(open(os.path.join(env["journal"], f"cmd-{cid}.json")))
     assert jdata["state"] == "unknown"  # Not failed
 
@@ -959,33 +968,67 @@ def test_expired_claim_retracts_undelivered_inbox_and_fails_recipient_not_ready(
     assert len(os.listdir(env["msgs"])) == 0
 
 
-def test_delivered_awaiting_reply_posts_distinct_pending_status(env):
-    """A pane-delivered send pending its reply must NOT report inbox-waiting.
-
-    "waiting in inbox for recipient" is absence-class: the hub expires it to
-    failed recipient_not_ready, which is terminal and can never be promoted by
-    the late reply. "delivered; awaiting recipient reply" expires to uncertain,
-    keeping lateReplyAck available (intake 4f6cf562 AC4).
-    """
-    target = seed_target(env, "awaiting-reply-target")
+def test_pane_delivered_send_acks_delivered_without_model_reply(env):
+    """A guarded pane delivery acks `delivered` immediately (intake 7357a629):
+    the native receipt proves delivery; the optional model reply is not awaited."""
+    target = seed_target(env, "delivered-no-reply-target")
     cid = str(uuid.uuid4())
     hub = MockHub()
     claim = make_claim(cid)
     cmd = {"op": "send", "command_id": cid, "generation": 1,
            "target": {"session_id": target.session_id, "tag": target.tag,
                       "workspace": target.workspace, "created_at_ms": target.created_at_ms,
-                      "engine": target.engine}, "body": "delivered, reply pending",
+                      "engine": target.engine}, "body": "delivered, no reply",
            "await_ack": True}
     outcome = se.handle_claimed_command(
         cmd, claim, custody=custody(), journal_dir=env["journal"],
         executable=env["fake"], request=hub.request)
-    # Guard submitted (transported) but no reply yet: pending, ack not submitted.
-    assert outcome["state"] == "unknown"
-    assert outcome["delivery_state"] == "transported"
-    assert hub.ack_calls == 0
-    posted = hub.statuses[cid]
-    assert posted["status"] == "delivered; awaiting recipient reply", posted
-    assert posted["claim_token"] == claim["claim_token"]
+    assert outcome["state"] == "acknowledged"
+    assert outcome["ack"]["submitted"] is True
+    assert hub.acks[cid]["outcome"] == "delivered"
+    proof = hub.acks[cid]["proof"]
+    assert proof["kind"] == "native_delivery"
+    assert proof["native_message_id"] == outcome["original_native_message_id"]
+    assert "reply_to_native_id" not in proof
+    # Reconcile never re-delivers or re-posts a settled send.
+    again = se.reconcile_pending_command(
+        journal_dir=env["journal"], command_id=cid,
+        executable=env["fake"], request=hub.request)
+    assert hub.ack_calls == 1
+    with open(env["deliver_log"]) as f:
+        assert len(f.read().strip().splitlines()) == 1
+
+
+@pytest.mark.parametrize("later_status", ["submitted", "recipient-acked"])
+def test_busy_then_native_delivery_without_reply_is_acked_once(env, later_status):
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "not-ready")
+    target = seed_target(env)
+    cid = str(uuid.uuid4())
+    claim = make_claim(cid)
+    cmd = {"op": "send", "command_id": cid, "generation": 1,
+           "target": {"session_id": target.session_id, "tag": target.tag,
+                      "workspace": target.workspace, "created_at_ms": target.created_at_ms,
+                      "engine": target.engine},
+           "body": "queued work", "await_ack": True}
+    hub = MockHub()
+    first = se.handle_claimed_command(cmd, claim, custody=custody(),
+                journal_dir=env["journal"], executable=env["fake"], request=hub.request)
+    original_id = first["original_native_message_id"]
+    assert first["state"] == "unknown"
+    assert not hub.acks
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", later_status)
+    later = se.reconcile_pending_command(journal_dir=env["journal"], command_id=cid,
+                executable=env["fake"], request=hub.request)
+    assert later["state"] == "acknowledged"
+    assert later["ack_submitted"] is True
+    proof = hub.acks[cid]["proof"]
+    assert proof["kind"] == "native_delivery"
+    assert proof["status"] == later_status
+    assert proof["native_message_id"] == original_id
+    assert "reply_to_native_id" not in proof
+    se.reconcile_pending_command(journal_dir=env["journal"], command_id=cid,
+                executable=env["fake"], request=hub.request)
+    assert hub.ack_calls == 1
 
 
 def test_headless_send_queues_for_next_turn_and_acknowledges_on_recipient_cursor_ack(env):
