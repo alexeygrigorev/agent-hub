@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS placement_rejections (id TEXT PRIMARY KEY, created_at
 CREATE INDEX IF NOT EXISTS idx_placement_rejections_recent ON placement_rejections(created_at_ms);
 `;
 type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
+/** Longest an idle offers poll may reuse the previous capacity maintenance pass (intake e8a22f4c). */
+const POLL_MAINTENANCE_MS = 20000;
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 // Idempotency key for same-host claim retries (intake 488b860e): per launch
 // plus host attempt, so a late-landing original claim plus a retry replays
@@ -444,6 +446,20 @@ export class FleetService {
   // The cursor is a value in the ORDER BY key (updated_at, id), never a
   // row position, so concurrent inserts, removals and wraps stay exact.
   private reofferCursors = new Map<string, [string, string]>();
+  // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
+  private linkRevisions = new Map<string, string>();
+  private pollMaintenanceAt = 0;
+  private maintenanceDirty = true;
+
+  /** Run `query(placeholders)` over `ids` in bounded chunks: reads only matching rows. */
+  private byChunks(ids: string[], query: (marks: string) => string, ...lead: any[]): any[] {
+    const out: any[] = [];
+    for (let i = 0; i < ids.length; i += 50) {
+      const chunk = ids.slice(i, i + 50);
+      out.push(...this.sql.exec(query(chunk.map(() => '?').join(',')), ...lead, ...chunk).toArray());
+    }
+    return out;
+  }
 
   /** Synchronous operation scope: nested routing/reserve/plan calls share work,
    * never capacity snapshots. No await may cross this scope. */
@@ -543,6 +559,8 @@ export class FleetService {
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_expiry ON fleet_launches(state,created_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state ON fleet_launches(account,state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_account_phase ON fleet_sessions(account,phase)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_machine_phase ON fleet_sessions(machine_id,phase)');
+    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_recent ON fleet_launches(machine_id,finished_at) WHERE state = 'failed' AND mode = 'headless' AND verification_status = 'unverified'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native_state ON fleet_launches(machine_id,native_id,state)');
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_inflight_identity ON fleet_launches(machine_id,engine,account,profile) WHERE native_id IS NULL AND state IN ('starting','uncertain')");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_incarnation ON fleet_sessions(machine_id,tag,engine,account,profile,workspace,phase)');
@@ -604,13 +622,18 @@ export class FleetService {
     const bindingProjection = controlStore
       ? '(SELECT binding_json FROM session_control_sessions c WHERE c.fleet_launch_id=l.id AND c.machine_id=l.machine_id LIMIT 1)'
       : 'NULL';
-    return this.sql.exec(`SELECT l.id, l.workspace, ${jsonFields('l.request_json',['cwd'])} AS request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id, ${bindingProjection} AS binding_json
-      FROM fleet_launches l WHERE l.machine_id = ? AND (l.state IN ('starting','running','uncertain')
-        OR (l.state = 'failed' AND l.mode = 'headless' AND l.exit_reason = ? AND l.verification_status = 'unverified' AND l.finished_at > ?))
-      AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
+    // One indexed branch per state: an OR across states made SQLite read the machine's whole launch history.
+    const columns = `l.id, l.workspace, ${jsonFields('l.request_json',['cwd'])} AS request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id, l.updated_at, ${bindingProjection} AS binding_json`;
+    const unobserved = `AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
         WHERE s.machine_id = l.machine_id AND s.native_id = l.native_id AND s.engine = l.engine
-        AND s.phase IN ('starting','running') AND (s.observed_at >= ? OR ?)))
-      ORDER BY l.updated_at LIMIT 100`, machine, SILENT_START_REASON, new Date(this.now() - ABANDONED_RECOVERY_MS).toISOString(), cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
+        AND s.phase IN ('starting','running') AND (s.observed_at >= ? OR ?)))`;
+    return this.sql.exec(`SELECT * FROM (
+      SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain') ${unobserved}
+      UNION ALL
+      SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state = 'failed' AND l.mode = 'headless' AND l.exit_reason = ?
+        AND l.verification_status = 'unverified' AND l.finished_at > ? ${unobserved}
+    ) ORDER BY updated_at LIMIT 100`, machine, cutoff, catalogFresh ? 1 : 0,
+      machine, SILENT_START_REASON, new Date(this.now() - ABANDONED_RECOVERY_MS).toISOString(), cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
       const binding = controlStore ? parsed(r.binding_json) : null;
       return { id: r.id, workspace: r.workspace, cwd: parsed(r.request_json).cwd ?? null, diagnostic: parsed(r.launch_error_json), native_id: r.native_id, engine: r.engine, mode: r.mode, launcher_task_id: r.launcher_task_id, binding };
     });
@@ -1425,6 +1448,8 @@ export class FleetService {
   async handle(request: Request, auth: Auth): Promise<Response> {
     if (auth.error) return auth.error;
     const path = new URL(request.url).pathname; const caller = auth.caller;
+    // Writes other than the periodic host reports can change what maintenance sees.
+    if (request.method !== 'GET' && path !== '/api/fleet/sessions' && path !== '/api/fleet/subscriptions') this.maintenanceDirty = true;
     if (path === '/api/fleet/tasks' || path.startsWith('/api/fleet/tasks/') || path.startsWith('/api/fleet/routing/')) return this.routing.handle(request, auth);
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
@@ -1709,10 +1734,17 @@ export class FleetService {
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       return this.withMaintenance(() => this.transaction(() => {
-        this.routing.dispatchNow();
-        this.reconcileCapacity();
-        // One re-plan per host poll; durable cursors preserve backlog progress.
-        try { this.drainCapacityQueue(1); } catch { /* best-effort */ };
+        // Intake e8a22f4c: capacity maintenance is queue-driven. Any fleet write marks it
+        // dirty; otherwise polls repeat it at most every POLL_MAINTENANCE_MS, because every
+        // host polls offers every few seconds and the sweeps scale with live launches.
+        const polledAt = this.now();
+        if (this.maintenanceDirty || polledAt - this.pollMaintenanceAt >= POLL_MAINTENANCE_MS || polledAt < this.pollMaintenanceAt) {
+          this.pollMaintenanceAt = polledAt; this.maintenanceDirty = false;
+          this.routing.dispatchNow();
+          this.reconcileCapacity();
+          // One re-plan per host poll; durable cursors preserve backlog progress.
+          try { this.drainCapacityQueue(1); } catch { /* best-effort */ };
+        }
         const valid: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
@@ -1817,17 +1849,23 @@ export class FleetService {
         // Write only rows that changed: hosts report every minute and Durable Object row writes
         // are metered. observed_at therefore means "last changed"; host freshness comes from heartbeats.
         const fields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'progress_json'];
-        const existing = new Map((this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ?', caller.machineId!).toArray() as any[]).map(r => [r.native_id, r]));
+        // Intake e8a22f4c: read only the reported rows (PK lookups) and the live-phase rows
+        // that may have vanished, never the retained history of the machine.
+        const reportedIds: string[] = data.sessions.map((s: any) => s.native_id);
+        const existing = new Map<string, any>();
+        for (const r of this.byChunks(reportedIds, (marks) => `SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id IN (${marks})`, caller.machineId!)) existing.set(r.native_id, r);
+        const reportedSet = new Set(reportedIds);
+        const liveUnreported = (this.sql.exec("SELECT native_id FROM fleet_sessions WHERE machine_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!).toArray() as any[])
+          .map(r => String(r.native_id)).filter(id => !reportedSet.has(id));
 
         // Stopped same-incarnation native sessions cannot resurrect from late live-catalog snapshots:
         // do not insert or resurrect in fleet_sessions or adoptObservedNativeSessions if already canonically stopped for the same incarnation.
         const stoppedSessions = new Map<string, number | null>();
         try {
-          const stoppedRows = this.sql.exec(
-            "SELECT id, binding_json FROM session_control_sessions WHERE machine_id = ? AND state = 'stopped'",
-            caller.machineId!
-          ).toArray() as any[];
-          for (const r of stoppedRows) {
+          // Primary-key lookups only: with machine_id/state in the WHERE the planner prefers the
+          // (machine_id,state) index and reads the machine's whole stopped history per chunk.
+          for (const r of this.byChunks(reportedIds, (marks) => `SELECT id, machine_id, state, binding_json FROM session_control_sessions WHERE id IN (${marks})`)) {
+            if (r.machine_id !== caller.machineId || r.state !== 'stopped') continue;
             try {
               const b = JSON.parse(r.binding_json || '{}');
               stoppedSessions.set(r.id, b.native_created_at_ms ?? null);
@@ -1839,6 +1877,8 @@ export class FleetService {
 
         let written = 0;
         const cleanSessions: any[] = [];
+        const changedSessions: any[] = [];
+        const seen = new Set<string>();
         for (const s of data.sessions) {
           if (s.tokens) recordSessionTokens(this.sql, { session_id: `${caller.machineId}:${s.native_id}`,
             native_id: s.native_id, tag: s.tag, engine: s.engine, account: s.account, ...s.tokens }, this.now());
@@ -1853,16 +1893,19 @@ export class FleetService {
             s.phase = 'uncertain';
           }
           cleanSessions.push(s);
-          const prior = existing.get(s.native_id); existing.delete(s.native_id);
+          const prior = existing.get(s.native_id); seen.add(s.native_id);
           const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null, progress_json: s.progress ? JSON.stringify(s.progress) : null };
           if (prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
+          changedSessions.push(s);
           this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms, progress_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, row.cwd, s.profile, s.account, row.last_activity_at, row.created_at_ms, row.progress_json);
           written++;
         }
         // Preserve historical observations. A missing catalog row is not exit
         // proof, but an orphan no longer observed is not a live workload.
-        for (const gone of existing.keys()) {
-          this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!, gone); written++;
+        // A reported row skipped as already-stopped is not "seen" and falls through here, as before.
+        const gone = [...liveUnreported, ...reportedIds.filter(id => existing.has(id) && !seen.has(id))];
+        for (const id of gone) {
+          this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!, id); written++;
         }
         // Exact positive terminal evidence releases physical concurrency even
         // if a headless launch journal was lost. Absence is never exit proof.
@@ -1871,14 +1914,19 @@ export class FleetService {
         // busy host reports hundreds of exited rows, and a per-row scan made
         // the PUT exceed the host's 10 s timeout (intake c206f556).
         let managedByNative: Map<string, any[]> | null = null;
-        for (const native of cleanSessions) {
+        // Only rows that changed in this census can newly prove an exit; unchanged
+        // terminal rows were settled when they changed, and reconcileAccountCapacity
+        // below settles late-bound launches from the stored fleet_sessions rows.
+        for (const native of changedSessions) {
           if (!['exited', 'dead'].includes(native.phase) || !native.created_at_ms) continue;
           // Deleted cwd/workspace is a capacity projection above, not positive
           // native exit evidence. It must never settle a launch reservation.
           if (native.workspace.endsWith(' (deleted)') || native.cwd?.endsWith(' (deleted)')) continue;
           if (!managedByNative) {
             managedByNative = new Map();
-            for (const session of this.sql.exec("SELECT id, fleet_launch_id, binding_json, engine FROM session_control_sessions WHERE machine_id = ? AND fleet_launch_id IS NOT NULL AND binding_json IS NOT NULL", caller.machineId!).toArray() as any[]) {
+            const exitedIds = changedSessions.filter(n => ['exited', 'dead'].includes(n.phase) && n.created_at_ms).map(n => n.native_id as string);
+            for (const session of this.byChunks(exitedIds, (marks) => `SELECT id, fleet_launch_id, binding_json, engine FROM session_control_sessions WHERE machine_id = ? AND fleet_launch_id IS NOT NULL AND binding_json IS NOT NULL
+              AND (CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text' THEN json_extract(binding_json, '$.native_id') END END) IN (${marks})`, caller.machineId!)) {
               const nativeId = parsed(session.binding_json).native_id;
               if (typeof nativeId !== 'string') continue;
               managedByNative.set(nativeId, [...(managedByNative.get(nativeId) ?? []), session]);
@@ -1895,7 +1943,14 @@ export class FleetService {
             this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ? AND state IN ('starting','running','uncertain')", at, session.id);
           }
         }
-        adoptObservedNativeSessions(this.sql, caller.machineId!, cleanSessions, this.now());
+        // Adoption and late-link work is per changed native; the link pass over every
+        // reported native reruns only when the intake linkage revision moved.
+        let revision = '';
+        try { revision = String((this.sql.exec('SELECT revision FROM session_observation_intake_meta WHERE id=1').toArray()[0] as any)?.revision ?? ''); } catch { /* table not created yet */ }
+        const revisionMoved = !revision || this.linkRevisions.get(caller.machineId!) !== revision;
+        this.linkRevisions.set(caller.machineId!, revision);
+        adoptObservedNativeSessions(this.sql, caller.machineId!, changedSessions, this.now(), undefined, revisionMoved ? cleanSessions : changedSessions);
+        if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
         // A refreshed catalog can free machine_capacity: promote waiters.
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }

@@ -368,9 +368,6 @@ export class SessionControlService {
     // Intake 1c8d915e: expireUnclaimedStops runs on every host offers poll, so
     // its candidates come from live unclaimed stops only (after claim_token exists).
     this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_unclaimed_stops ON session_control_commands(created_at) WHERE kind = 'stop' AND state IN ('recorded','transported') AND claim_token IS NULL");
-    // Intake e8a22f4c: host polls, wake dispatch and the pending-command counters
-    // filter by state; without this every poll scanned the whole command history.
-    this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_commands_state ON session_control_commands(state, session_id)");
     // M15c lifecycle: additive observations/decisions tables. Server-owned
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
@@ -4120,6 +4117,9 @@ export function adoptObservedNativeSessions(
   sessions: any[],
   nowMs: number,
   hostFamily?: string | null,
+  // Intake e8a22f4c: `sessions` may be only the rows whose census entry changed.
+  // `linkSessions` is the (possibly larger) set the late-link pass covers.
+  linkSessions: any[] = sessions,
 ): { adopted: number; updated: number; deferred: number } {
   const hasTable = sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length > 0;
   if (!hasTable || !Array.isArray(sessions) || !machineId) return { adopted: 0, updated: 0, deferred: 0 };
@@ -4166,17 +4166,13 @@ export function adoptObservedNativeSessions(
     }
 
     // Check if any Hub-started session has binding_json pointing to this nativeId
+    // Intake e8a22f4c: answered by the session_control_native expression index
+    // (src/hub.ts) instead of scanning every managed session per reported native.
     let hubManaged = false;
     try {
-      for (const row of sql.exec('SELECT id, binding_json FROM session_control_sessions WHERE fleet_launch_id IS NOT NULL AND machine_id = ?', machineId).toArray() as any[]) {
-        try {
-          const b = JSON.parse(row.binding_json || '{}');
-          if (b.native_id === nativeId) {
-            hubManaged = true;
-            break;
-          }
-        } catch {}
-      }
+      hubManaged = sql.exec(`SELECT 1 FROM session_control_sessions WHERE machine_id = ? AND fleet_launch_id IS NOT NULL
+        AND (CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
+          THEN json_extract(binding_json, '$.native_id') END END) = ? LIMIT 1`, machineId, nativeId).toArray().length > 0;
     } catch {}
     if (hubManaged) continue;
 
@@ -4235,9 +4231,9 @@ export function adoptObservedNativeSessions(
 
   // Reconcile late START notes and exact registered-worktree evidence in
   // one bounded pass. Linkage never grants ownership or filesystem authority.
-  const linkageRevision = sessions.length ? observationIntakeRevision(sql, machineId) : '';
+  const linkageRevision = linkSessions.length ? observationIntakeRevision(sql, machineId) : '';
   const pending: any[] = [];
-  for (const native of sessions) {
+  for (const native of linkSessions) {
     if (!native || typeof native.native_id !== 'string') continue;
     const row: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', native.native_id).toArray()[0];
     if (!row || row.machine_id !== machineId || row.fleet_launch_id || parsed(row.request_json, {}).intake_task_id) continue;
