@@ -19,7 +19,7 @@ export const WORKER_CREATED_INDEX = 'CREATE INDEX IF NOT EXISTS worker_created_i
 /** Per-session cap on follow-up intakes; also bounds the per-request lookup. */
 export const WORKER_CREATE_LIMIT = 25;
 /** Server-verified session links (operator verify_live or Hub launch), indexed
- * by Hub session id or native id. Maintained by an intake_tasks trigger. */
+ * by Hub session id or native id. Maintained by intake_task_projection triggers. */
 export const SESSION_LINKS_SCHEMA = `CREATE TABLE IF NOT EXISTS intake_session_links (
   session_key TEXT NOT NULL, task_id TEXT NOT NULL, authority TEXT NOT NULL, PRIMARY KEY(session_key, task_id))`;
 const TRUSTED_LINK = `json_extract(e.value,'$.kind')='link' AND json_extract(e.value,'$.authority') IN ('hub_launch_verified','host_census_verified')`;
@@ -35,8 +35,13 @@ export function initSessionLinks(sql: SqlStorage) {
   if (!exists) sql.exec(`INSERT INTO intake_session_links(session_key,task_id,authority)
     ${linkRows('p.id', 'intake_task_projection p, json_each(p.links) e', "json_extract(p.data,'$.status') NOT IN ('done','cancelled')")}
     ON CONFLICT DO NOTHING`);
-  for (const op of ['INSERT', 'UPDATE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_session_links_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN
-    INSERT INTO intake_session_links(session_key,task_id,authority) ${linkRows('NEW.id', "json_each(NEW.data,'$.history') e")}
+  // Driven by the projection's small link/report column, and only when it changes,
+  // so ordinary note writes do not rescan the whole history. The first release
+  // put full-history triggers on intake_tasks under the old names; drop them.
+  for (const op of ['insert', 'update']) sql.exec(`DROP TRIGGER IF EXISTS intake_session_links_${op}`);
+  for (const [op, when] of [['INSERT', ''], ['UPDATE OF links', 'WHEN NEW.links IS NOT OLD.links']]) sql.exec(
+    `CREATE TRIGGER IF NOT EXISTS intake_session_links_projection_${op.split(' ')[0].toLowerCase()} AFTER ${op} ON intake_task_projection ${when} BEGIN
+    INSERT INTO intake_session_links(session_key,task_id,authority) ${linkRows('NEW.id', 'json_each(NEW.links) e')}
     ON CONFLICT DO NOTHING; END`);
   sql.exec('CREATE TRIGGER IF NOT EXISTS intake_session_links_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_session_links WHERE task_id=OLD.id; END');
 }

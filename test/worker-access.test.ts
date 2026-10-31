@@ -314,7 +314,7 @@ describe('scoped durable worker access',()=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   const code=async(r:Response)=>((await r.json()) as any).error;
   const src={type:'unknown',reference:'test'};
-  const native=uuid(), [cont,other2,launched]=[uuid(),uuid(),uuid()];
+  const native=uuid(), [cont,other2,launched,later]=[uuid(),uuid(),uuid(),uuid()];
   const link=(extra:any)=>({id:uuid(),kind:'link',engine:'codex',tier:null,host:null,hub:null,routing_job_id:null,provenance:src,actor:'tester',captured_at:Date.now(),...extra});
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify({native_id:native,tag:'hub-x',workspace:'/repo'}),session);
@@ -323,8 +323,14 @@ describe('scoped durable worker access',()=>{
    put(cont,[link({native_id:native,hub_session_id:null,evidence:'external_live_verified',authority:'host_census_verified'})]);
    put(launched,[link({native_id:null,hub_session_id:session,evidence:'hub_launch_verified',authority:'hub_launch_verified'})]);
    put(other2,[link({native_id:native,hub_session_id:session,evidence:'external_unverified_not_launch_proof',authority:'untrusted_task_data'})]);
+   // A verified link that arrives in a later write is indexed by the projection update trigger.
+   put(later,[]);
+   const row=JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',later).one().data as string);
+   expect(h.sql.exec('SELECT count(*) AS n FROM intake_session_links WHERE task_id=?',later).one().n).toBe(0);
+   row.history.push(link({native_id:native,hub_session_id:null,evidence:'external_live_verified',authority:'host_census_verified'}));
+   h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(row),later);
   });
-  for(const id of [cont,launched]) {
+  for(const id of [cont,launched,later]) {
    for(const sfx of ['','/history']) expect((await api('/api/intake/tasks/'+id+sfx)).status).toBe(200);
    const note=await api('/api/intake/tasks/'+id+'/events',{key:uuid(),expected_version:1,event:{kind:'note',text:'owner note on continuation',source:src}});
    expect(note.status,await note.clone().text()).toBe(200);
@@ -340,7 +346,12 @@ describe('scoped durable worker access',()=>{
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    h.sql.exec('DROP TABLE intake_session_links');h.intakeService.init();
    const rows=h.sql.exec('SELECT task_id FROM intake_session_links WHERE session_key IN (?,?)',native,session).toArray().map((r:any)=>r.task_id);
-   expect(new Set(rows)).toEqual(new Set([cont,launched]));
+   expect(new Set(rows)).toEqual(new Set([cont,launched,later]));
+   // Upgrade from the first release: its full-history triggers on intake_tasks are replaced.
+   for(const op of ['insert','update']) h.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_session_links_${op} AFTER ${op.toUpperCase()} ON intake_tasks BEGIN SELECT 1; END`);
+   h.intakeService.init();
+   const triggers=h.sql.exec("SELECT name,tbl_name FROM sqlite_master WHERE type='trigger' AND name LIKE 'intake_session_links%' ORDER BY name").toArray().map((r:any)=>r.name+'@'+r.tbl_name);
+   expect(triggers).toEqual(['intake_session_links_delete@intake_tasks','intake_session_links_projection_insert@intake_task_projection','intake_session_links_projection_update@intake_task_projection']);
   });
   expect((await api('/api/intake/tasks/'+cont)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
