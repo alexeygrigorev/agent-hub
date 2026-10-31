@@ -1435,7 +1435,14 @@ export class SessionControlService {
     });
 
     if (matches.length === 0) return { ok: false, error: 'not_found', status: 404 };
-    if (matches.length > 1) return { ok: false, error: 'ambiguous_name', status: 409 };
+    if (matches.length > 1) {
+      // A reused tag usually leaves stopped/failed rows of earlier incarnations
+      // next to the one live session. Control must reach the live one; it stays
+      // ambiguous only when several live sessions share the alias.
+      const live = matches.filter(r => BOUND_STATES.has(r.state));
+      if (live.length === 1) return { ok: true, session: live[0] };
+      return { ok: false, error: 'ambiguous_name', status: 409 };
+    }
     return { ok: true, session: matches[0] };
   }
 

@@ -925,6 +925,27 @@ describe('absolute workspace identifiers and friendly names', () => {
       });
     });
 
+    it('resolves a reused alias to the single live session when earlier incarnations are stopped (intake bb3109c2)', async () => {
+      await fixture(async (s, sql) => {
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
+        const REUSED_ID = '44444444-4444-4444-8444-444444444444';
+        seedLegacyObservedSessions(sql, 'hetzner', [{
+          native_id: REUSED_ID, tag: 'batching', workspace: '/srv/other/dataops',
+          engine: 'argon', phase: 'running', created_at_ms: 1792258000000,
+        }], Date.now());
+        // Both live: still ambiguous.
+        expect((await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin)).status).toBe(409);
+        // Earlier incarnation stopped: the alias reaches the live one.
+        sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", NATIVE_DATAOPS_ID);
+        const res = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin);
+        expect(res.status).toBe(200);
+        expect(((await res.json()) as any).id).toBe(REUSED_ID);
+        // Nothing live: refused, not latest-wins.
+        sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", REUSED_ID);
+        expect((await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin)).status).toBe(409);
+      });
+    });
+
     it('enforces admin human control and denies foreign agent access with 404/403', async () => {
       await fixture(async (s, sql) => {
         seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
