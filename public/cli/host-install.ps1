@@ -20,7 +20,7 @@ try {
                 throw 'uv installer checksum mismatch'
             }
             # uv's installer calls exit, which would terminate a piped
-            # `irm | iex` session; run it in a child process so the bootstrap continues.
+            # `irm | iex` session; run it in a child process so the bootstrap keeps running.
             $Child = (Get-Process -Id $PID).Path
             & $Child -NoProfile -ExecutionPolicy Bypass -File $UvInstaller
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Uv)) { throw 'uv installation failed' }
