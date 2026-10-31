@@ -202,14 +202,17 @@ function canonical(value: any): string {
   return JSON.stringify(value);
 }
 function source(raw: any): Obj {
+  // `schedule` is the launch-scheduler provenance (intake a839dfb6): cron
+  // launch schedules stamp every tick intake they create.
+  const SOURCE_TYPES = ['chat', 'voice', 'forwarded', 'schedule', 'unknown'];
   if (typeof raw === 'string') {
-    if (['chat', 'voice', 'forwarded', 'unknown'].includes(raw)) {
+    if (SOURCE_TYPES.includes(raw)) {
       return { type: raw, reference: null, timestamp: null };
     }
     return { type: 'unknown', reference: nullable(raw, 2048), timestamp: null };
   }
   const s = object(raw); keys(s, ['type', 'reference', 'timestamp']);
-  if (!['chat', 'voice', 'forwarded', 'unknown'].includes(s.type)) fail('invalid_source');
+  if (!SOURCE_TYPES.includes(s.type)) fail('invalid_source');
   const timestamp = nullable(s.timestamp, 64);
   if (timestamp !== null && !Number.isFinite(Date.parse(timestamp))) fail('invalid_timestamp');
   return { type: s.type, reference: nullable(s.reference, 2048), timestamp };

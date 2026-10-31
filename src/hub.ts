@@ -53,6 +53,7 @@ import { MetricsStore, handleMetricsRoutes } from './metrics';
 import { MonitoringService } from './monitoring';
 import { BackupService } from './backup';
 import { WebhookService } from './webhooks';
+import { LaunchSchedulesService } from './launch_schedules';
 import { isValidMachineId } from './machine-id';
 import { HostHistoryService } from './host-history';
 import { HISTORY_RETENTION_MS } from './host-history';
@@ -149,6 +150,7 @@ export class Hub extends DurableObject {
   public backupService: BackupService;
   public hostHistoryService: HostHistoryService;
   public webhookService: WebhookService;
+  public launchSchedules: LaunchSchedulesService;
 
   private idleWork: IdleWorkService;
   readonly meter = new RowsMeter();
@@ -239,6 +241,25 @@ export class Hub extends DurableObject {
       () => this.sessionControlService,
       validSessionSecret(this.env) ? this.env.SESSION_SECRET : null);
     this.webhookService.init();
+    // Cron launch schedules (intake a839dfb6): each due tick creates a Hub
+    // intake (source schedule) and starts the linked headless session through
+    // the canonical admission path below; placement/capacity gates are never
+    // bypassed, and tick outcomes land in the per-schedule run history.
+    this.launchSchedules = new LaunchSchedulesService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, {
+      createIntake: async payload => {
+        const r = await this.intakeService.handle(new Request('https://hub.internal/api/intake/tasks',
+          { method: 'POST', body: JSON.stringify(payload) }),
+          async () => ({ caller: { isAdmin: true, actor: 'hub:service:launch-schedules', kind: 'human' }, scopes: ['admin'] }));
+        return { status: r.status, body: await r.json() as any };
+      },
+      startSession: async input => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
+          { method: 'POST', body: JSON.stringify(input) }),
+          { caller: { isAdmin: true, actor: 'hub:service:launch-schedules', kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+    });
+    this.launchSchedules.init();
     this.idleWork = new IdleWorkService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.sessionControlService, env);
     this.idleWork.init();
     this.statusService.setSessionAttention(() => this.sessionControlService.attention());
@@ -1072,6 +1093,12 @@ export class Hub extends DurableObject {
       }
       if (path === '/webhooks' || path.startsWith('/webhooks/')) {
         return this.webhookService.handleIngest(request, path);
+      }
+      // Cron launch schedules (intake a839dfb6). Admin management under
+      // /api/schedules with the same operator/cookie authority as webhooks;
+      // ticks run on the existing 5-minute checks cron.
+      if (path === '/api/schedules' || path.startsWith('/api/schedules/')) {
+        return this.launchSchedules.handle(request, await this.sessionControlAuth(request));
       }
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
@@ -2234,6 +2261,13 @@ export class Hub extends DurableObject {
 
   private async runChecksMetered(only?: string) {
     const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('checks:' + step, fn);
+    // Cron launch schedules (intake a839dfb6): due ticks create intakes and
+    // enqueue sessions through the canonical admission path. Runs on both
+    // crons (every 5 minutes); a manual single-check run never fires them.
+    if (!only) {
+      try { await m('launch_schedules', () => this.launchSchedules.tick('cron')); }
+      catch { console.warn('launch_schedule_tick_failed'); }
+    }
     for (const alert of await m('watch_hosts', () => this.livenessService.watchHosts())) await this.notifyAlert(alert);
     await m('host_goals', () => new HostGoals(this.sql, this.fleetService).reconcile());
     await m('tbm', () => this.runTbmTick());

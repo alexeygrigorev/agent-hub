@@ -101,6 +101,7 @@ export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
   'host-goal': 'Operator set/inspect of durable host bring-up state; deliberate CLI step, not an agent tool.',
   'host-release': 'Operator release pin for a checkout-installed host; deliberate CLI step, not an agent tool.',
+  'host-goal': 'Operator bring-up state pin for a host; deliberate CLI step, not an agent tool.',
   'launcher-release': 'Operator release pin for a checkout-installed launcher; deliberate CLI step, not an agent tool.',
   'msg agent-credential': 'Writes a new private local credential file; MCP cannot write host files.',
   'msg agent-delegate': 'Operator grant of named-agent delegation to an MCP client; deliberate CLI step.',
@@ -139,6 +140,14 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'webhooks show': 'Route administration detail is operator-only product scope; operators use the CLI or dashboard.',
   'webhooks deliveries': 'Delivery inspection is operator-only product scope; operators use the CLI or dashboard.',
   'webhooks test': 'Injects payloads into live sessions; stays an explicit operator action in the CLI, not a model tool.',
+  'schedule create': 'Operator-owned cron configuration launches sessions on a timer; deliberate CLI/UI step, not a model tool.',
+  'schedule delete': 'Operator-only destructive schedule administration stays in the explicit CLI workflow.',
+  'schedule list': 'Schedule administration inventory is operator-only product scope; operators use the CLI or dashboard.',
+  'schedule show': 'Schedule administration detail is operator-only product scope; operators use the CLI or dashboard.',
+  'schedule pause': 'Operator cron lifecycle control stays an explicit operator action in the CLI.',
+  'schedule resume': 'Operator cron lifecycle control stays an explicit operator action in the CLI.',
+  'schedule runs': 'Run history inspection is operator-only product scope; operators use the CLI or dashboard.',
+  'schedule tick': 'A manual tick fires sessions outside their cron; stays an explicit operator action in the CLI.',
   'ops heartbeat': 'Host ops-watchdog and orchestrator tick reports for Hub-side liveness (intake 500fd60b); a model tool must not fake liveness for the session it runs in.',
   'ops status': 'Operator view of orchestrator/watchdog liveness and backlog idle episodes; alerts reach operators through the existing alert path.',
 };

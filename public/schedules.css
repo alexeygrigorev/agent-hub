@@ -1,0 +1,8 @@
+/* Schedules page (intake a839dfb6) — layout only, dakit provides the theme. */
+.sc-form { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; align-items: end; }
+.sc-form label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.85rem; }
+.sc-form input, .sc-form select, .sc-form textarea { min-width: 10rem; }
+.sc-form .sc-wide { flex-basis: 100%; }
+.sc-form textarea { min-width: 24rem; width: 100%; }
+.sc-hint { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.sc-status { min-height: 1.5rem; color: var(--dk-muted, #666); }

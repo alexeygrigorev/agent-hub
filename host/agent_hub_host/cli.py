@@ -424,6 +424,8 @@ def main():
     dispatch.add_argument('--interval', type=int, default=60)
     from . import webhooks as webhooks_cli
     webhooks_cli.add_parser(sub)
+    from . import schedules as schedules_cli
+    schedules_cli.add_parser(sub)
     from . import ops_liveness
     ops_liveness.add_parser(sub)
     from . import limits_cli
@@ -648,6 +650,19 @@ def main():
                 print(json.dumps(rendered, indent=2, ensure_ascii=True))
         except Exception as exc:
             print(webhooks_cli.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'schedule':
+        from . import schedules as schedules_cli
+        try:
+            result = schedules_cli.execute(args)
+            rendered = schedules_cli.render_output(args, result)
+            if isinstance(rendered, str):
+                print(rendered)
+            else:
+                print(json.dumps(rendered, indent=2, ensure_ascii=True))
+        except Exception as exc:
+            print(schedules_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'msg':
