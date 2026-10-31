@@ -86,6 +86,8 @@ CREATE INDEX IF NOT EXISTS intake_queue_session_task ON session_control_sessions
 CREATE INDEX IF NOT EXISTS session_control_machine_created ON session_control_sessions(machine_id, created_at, id);
 CREATE INDEX IF NOT EXISTS session_control_machine_created_state ON session_control_sessions(machine_id, created_at, id, state);
 CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sessions(machine_id, state, created_at);
+CREATE INDEX IF NOT EXISTS session_control_live_created ON session_control_sessions(created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
+CREATE INDEX IF NOT EXISTS session_control_live_actor_created ON session_control_sessions(actor, created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
@@ -157,6 +159,13 @@ function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
       AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id') AND f.observed_at >= ?)))`,
     params: [cutoff],
   };
+}
+/** Literal must match the partial indexes session_control_live_created / _live_actor_created. */
+const LIVE_STATES_SQL = `state IN ('queued','held','offered','starting','running','uncertain')`;
+const ACTIVE_COUNT_CAP = 1000;
+/** FROM clause for live-only reads: forces the partial live index so only non-terminal rows are walked. */
+function liveFrom(admin: boolean): string {
+  return `session_control_sessions INDEXED BY ${admin ? 'session_control_live_created' : 'session_control_live_actor_created'}`;
 }
 const TREE_LIMIT_DEFAULT = 200;
 const TREE_LIMIT_MAX = 500;
@@ -2624,11 +2633,12 @@ export class SessionControlService {
       const treeLimit = Math.min(TREE_LIMIT_MAX, Math.max(1, Number(url.searchParams.get('limit')) || TREE_LIMIT_DEFAULT));
       const treeAll = url.searchParams.get('include') === 'all';
       const activeFrag = activeSessionsSql(this.now());
-      const stateSql = treeAll ? '' : `AND ${activeFrag.sql}`;
+      const stateSql = treeAll ? '' : `AND ${LIVE_STATES_SQL} AND ${activeFrag.sql}`;
+      const treeFrom = treeAll ? 'session_control_sessions' : liveFrom(admin);
       const stateArgs: any[] = treeAll ? [] : activeFrag.params;
       const treeRows = (admin
-        ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE 1 = 1 ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...stateArgs, treeLimit + 1).toArray()
-        : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...stateArgs, treeLimit + 1).toArray()
+        ? this.sql.exec(`SELECT * FROM ${treeFrom} WHERE 1 = 1 ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...stateArgs, treeLimit + 1).toArray()
+        : this.sql.exec(`SELECT * FROM ${treeFrom} WHERE actor = ? ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...stateArgs, treeLimit + 1).toArray()
       ) as any[];
       const truncatedTree = treeRows.length > treeLimit;
       const allRows = treeRows.slice(0, treeLimit).reverse().filter((r: any) => this.ownerOk(r, caller));
@@ -2722,23 +2732,27 @@ export class SessionControlService {
       const cursor = url.searchParams.get('cursor');
       const params: any[] = [];
       let cursorSql = this.cursorClause(cursor, params, true);
-      if (url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1') {
+      const liveOnly = url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1';
+      const listFrom = liveOnly ? liveFrom(admin) : 'session_control_sessions';
+      if (liveOnly) {
         const frag = activeSessionsSql(this.now());
-        cursorSql += ` AND ${frag.sql}`;
+        cursorSql += ` AND ${LIVE_STATES_SQL} AND ${frag.sql}`;
         params.push(...frag.params);
       }
       const rows = (admin
-        ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE 1 = 1 ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...params, limit + 1).toArray()
-        : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...params, limit + 1).toArray()
+        ? this.sql.exec(`SELECT * FROM ${listFrom} WHERE 1 = 1 ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...params, limit + 1).toArray()
+        : this.sql.exec(`SELECT * FROM ${listFrom} WHERE actor = ? ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...params, limit + 1).toArray()
       ).filter((r: any) => this.ownerOk(r, caller));
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
       const countFrag = activeSessionsSql(this.now());
+      // Capped count over the partial live index: bounded by ACTIVE_COUNT_CAP matches, never a base-table scan.
+      const countFrom = liveFrom(admin);
       const activeCount = Number((admin
-        ? this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE ${countFrag.sql}`, ...countFrag.params)
-        : this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE actor = ? AND ${countFrag.sql}`, caller.actor, ...countFrag.params)
+        ? this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, ...countFrag.params, ACTIVE_COUNT_CAP)
+        : this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE actor = ? AND ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, caller.actor, ...countFrag.params, ACTIVE_COUNT_CAP)
       ).toArray()[0]?.n ?? 0);
-      return response({ sessions: page.map(r => this.view(r, threshold)), next_cursor: next, active_count: activeCount });
+      return response({ sessions: page.map(r => this.view(r, threshold)), next_cursor: next, active_count: activeCount, active_count_capped: activeCount >= ACTIVE_COUNT_CAP });
     }
 
     // M15c lifecycle durable seams (narrow; command auth/effect code untouched).
@@ -4381,7 +4395,8 @@ export function reconcileStaleSessions(sql: SqlStorage, nowMs: number, batch = 2
     sql.exec("INSERT OR IGNORE INTO session_stale_reconciliations (session_id, previous_state, reason, at) VALUES (?, ?, 'stale_no_heartbeat', ?)", row.id, row.state, at);
     sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, row.id);
   }
-  const remaining = Number((sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE ${where}`, grace, ...frag.params).toArray()[0] as any)?.n ?? 0);
+  // LIMIT 1 probe: 1 means "at least one more batch", 0 means converged.
+  const remaining = sql.exec(`SELECT 1 AS n FROM session_control_sessions WHERE ${where} LIMIT 1`, grace, ...frag.params).toArray().length;
   return { reconciled: rows.length, remaining };
 }
 
