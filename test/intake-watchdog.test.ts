@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom, WATCHDOG_INTERVAL, QUEUE_RETRY_BASE_MS } from '../src/intake-watchdog';
+import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom, WATCHDOG_INTERVAL, QUEUE_RETRY_BASE_MS, QUEUE_HOLD_TTL_MS } from '../src/intake-watchdog';
 // Forgotten-work dispatch cases opt in explicitly; the queue suite checks the disabled default.
 class IntakeWatchdog extends BaseIntakeWatchdog {
   constructor(...args: ConstructorParameters<typeof BaseIntakeWatchdog>) {
@@ -166,6 +166,61 @@ describe('forgotten intake watchdog', () => {
       starts++;session(h,'canonical-held',t,'held');return {status:409,body:{id:'canonical-held',state:'held'}};
     }},()=>now);w.init();await w.tick();now+=WATCHDOG_INTERVAL;await w.tick();
     expect(starts).toBe(1);expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'active',restart:{state:'submitted',reason:'canonical_held'}});
+  }));
+  it('requeues a spent submission whose offered session expired and re-admits (0841a966 AC2)', async () => fixture(async h => {
+    const t=task();session(h,'old-failure',t,'failed');let now=NOW,starts=0;
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{
+      starts++;const id='offer-'+starts;session(h,id,t,'offered');return {status:202,body:{id,state:'offered'}};
+    }},()=>now);w.init();await w.tick();
+    expect(starts).toBe(1);
+    expect(w.project([t])[0].restart).toMatchObject({state:'submitted',reason:'canonical_offered'});
+    h.sql.exec("UPDATE session_control_sessions SET state='cancelled' WHERE id='offer-1'");
+    now+=WATCHDOG_INTERVAL;await w.tick();
+    expect(starts).toBe(2);
+    expect(h.sql.exec("SELECT reason FROM intake_queue_movement WHERE task_id=? AND reason='previous_session_cancelled'",t.id).toArray()).toHaveLength(1);
+    expect(h.sql.exec('SELECT COUNT(*) AS n FROM intake_restart_queue').one().n).toBe(1);
+  }));
+  it('closes restart rows whose intake no longer accepts restarts (0841a966 AC1)', async () => fixture(async h => {
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[task('alive')]} as any,(f:any)=>f(),{},()=>NOW);w.init();
+    h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
+      VALUES('gone-task','queued','workspace_configuration_required',?,?,?)`,NOW,NOW,NOW);
+    await w.tick();
+    expect(h.sql.exec('SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id=?','gone-task').one().n).toBe(0);
+    expect(h.sql.exec("SELECT reason FROM intake_audit WHERE task_id=? AND kind='restart_closed'",'gone-task').toArray()[0].reason).toContain('intake_missing');
+  }));
+  it('escalates a hold that outlives the bounded TTL exactly once (0841a966 AC2)', async () => fixture(async h => {
+    const t=task('ttl-hold');let now=NOW;const notes:string[]=[],alerts:any[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      note:async(_t,text)=>{notes.push(text);return true},notify:async(...args)=>{alerts.push(args);return true}},()=>now);w.init();
+    await w.tick();
+    expect(w.queue([t])[0]).toMatchObject({state:'queued',reason:'workspace_configuration_required'});
+    expect(alerts.some(a=>a[0]==='intake_human_hold')).toBe(true);
+    now+=QUEUE_HOLD_TTL_MS+WATCHDOG_INTERVAL;await w.tick();
+    expect(w.queue([t])[0]).toMatchObject({state:'escalated',reason:'hold_ttl_workspace_configuration_required'});
+    expect(notes.some(n=>n.includes('hold_ttl_workspace_configuration_required'))).toBe(true);
+    const alertKinds=alerts.filter(a=>a[0]==='intake_queue').map(a=>a[1]);
+    expect(alertKinds).toContain(t.id);
+    now+=QUEUE_RETRY_BASE_MS;await w.tick();
+    expect(alerts.filter(a=>a[0]==='intake_queue'&&a[1]===t.id)).toHaveLength(1);
+  }));
+  it.each(['watchdog_project_not_enabled','reported_completion_requires_operator_review'])('keeps %s out of the hold TTL', async reason => fixture(async h => {
+    const t=task('exempt');let now=NOW;const notes:string[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      note:async(_t,text)=>{notes.push(text);return true}},()=>now);w.init();
+    h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
+      VALUES(?,'queued',?,?,?,?)`,t.id,reason,NOW-QUEUE_HOLD_TTL_MS-60000,NOW,NOW);
+    await w.tick();
+    expect(h.sql.exec('SELECT state FROM intake_restart_queue WHERE task_id=?',t.id).one().state).toBe('queued');
+    expect(notes).toHaveLength(0);
+  }));
+  it('auto-configures a bare project label under an advertised absolute root (0841a966 AC2)', async () => fixture(async h => {
+    const t={...task(),project:'subrepo'};let input:any=null;
+    h.sql.exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,capabilities) VALUES('root-host','root-host','root-host','2026-10-26T12:00:00Z',?)",
+      JSON.stringify({workspaces:['/home/alexey/git']}));
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async i=>{
+      input=i;return {status:202,body:{id:'rooted-start',state:'queued'}}}},()=>NOW);w.init();await w.tick();
+    expect(input).toMatchObject({intake_task_id:t.id,workspace:'subrepo',with_goal:true});
+    expect(h.sql.exec('SELECT reason FROM intake_restart_queue').one().reason).toBe('canonical_queued');
   }));
   it('sends one daily digest and alerts only after sustained >24h; resets when count reaches zero', async () => fixture(async h => {
     let now=NOW,tasks=[task()];const notices:any[]=[];
