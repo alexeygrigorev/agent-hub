@@ -126,3 +126,35 @@ it('GET /api/fleet/offers reuses reconciliation candidates until a launch or ses
   hub.sql.exec("UPDATE fleet_launches SET state = 'exited' WHERE id = ?", candidate);
   expect((await get()).reconciliation.map((r: any) => r.id)).not.toContain(candidate);
 }));
+
+/** A measured session reward row with the columns the efficiency aggregation reads. */
+function reward(hub: Hub, id: string, pool: string, ts: number, eta: number) {
+  hub.sql.exec(`INSERT INTO tbm_reward_events (event_id, timestamp_ms, pool_id, intake_task_id, active_mode, swarm_concurrency,
+      useful_work_reward, pacing_error_penalty, floor_breach_penalty, engine_mix_penalty, waste_at_reset_penalty, banked_waste_penalty,
+      net_reward, token_efficiency_eta, tokens_known, efficiency_known, tokens_burned, session_id, work_units, event_kind)
+    VALUES (?, ?, ?, 't', 'high', 1, 1, 0, 0, 0, 0, 0, 1, ?, 1, 1, 1000, ?, 1, 'session')`, id, ts, pool, eta, 's-' + id);
+}
+
+it('the plan-time and choking lookups on fleet_launches use their partial indexes', withFleet(async (_s, _t, hub) => {
+  const plan = (q: string, ...b: any[]) => (hub.sql.exec('EXPLAIN QUERY PLAN ' + q, ...b).toArray() as any[]).map(r => String(r.detail)).join(' | ');
+  const unsupported = plan("SELECT id FROM fleet_launches WHERE machine_id = ? AND engine = ? AND account = ? AND profile IS ? AND mode = ? AND exit_reason = 'model_unsupported' AND COALESCE(finished_at, updated_at) > ? AND json_extract(model_selection_json, '$.model') = ? AND json_extract(model_selection_json, '$.effort') IS ? LIMIT 1",
+    'h0', 'codex', 'a', null, 'headless', iso(), 'm', null);
+  expect(unsupported).toContain('fleet_launch_model_unsupported');
+  const runtime = plan(`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
+      AND state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')
+      ORDER BY updated_at DESC LIMIT 1`, 'h0', iso());
+  expect(runtime).toContain('fleet_launch_runtime_exit');
+}));
+
+it('provider efficiencies are reused until a reward event is added', withFleet(async (_s, t, hub) => {
+  const { loadProviderEfficiencies } = await import('../src/pacing');
+  for (let i = 0; i < 300; i++) reward(hub, 'ev' + i, 'codex:a:5h', now - 1000 - i, 60);
+  const first = loadProviderEfficiencies(t.proxy, now);
+  expect(first.size).toBeGreaterThan(0);
+  const from = t.mark();
+  const second = loadProviderEfficiencies(t.proxy, now + 1000);
+  expect([...second]).toEqual([...first]);
+  expect(t.report(from).total, JSON.stringify(t.report(from).top)).toBeLessThanOrEqual(5);
+  reward(hub, 'evx', 'codex:b:5h', now, 10);
+  expect(loadProviderEfficiencies(t.proxy, now + 2000).has('codex:b')).toBe(true);
+}));

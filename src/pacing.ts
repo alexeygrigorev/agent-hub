@@ -455,10 +455,19 @@ export function loadActiveTranches(sql: SqlStorage, nowMs: number): TbmTrancheRo
     : [];
 }
 
+// Intake e8a22f4c: plan() runs this on every placement pass and it aggregates a day of reward events
+// (thousands of rows). The answer moves slowly, so reuse it while no reward row was added, at most a minute.
+const efficiencyCache = new WeakMap<object, { key: string; at: number; value: Map<string, number> }>();
+const EFFICIENCY_CACHE_MS = 60_000;
+
 /** Compute bounded routing efficiency multipliers from measured native-token reward events. */
 export function loadProviderEfficiencies(sql: SqlStorage, nowMs: number): Map<string, number> {
   const out = new Map<string, number>();
   if (!hasTable(sql, 'tbm_reward_events')) return out;
+  let key = '';
+  try { key = String((sql.exec('SELECT COALESCE(MAX(rowid),0) AS m FROM tbm_reward_events').toArray()[0] as any)?.m ?? ''); } catch { /* no rowid: do not cache */ }
+  const hit = key ? efficiencyCache.get(sql as any) : undefined;
+  if (key && hit && hit.key === key && nowMs >= hit.at && nowMs - hit.at < EFFICIENCY_CACHE_MS) return new Map(hit.value);
   try {
     const cols = new Set(sql.exec('PRAGMA table_info(tbm_reward_events)').toArray().map((c: any) => String(c.name)));
     const knownFilter = cols.has('tokens_known') ? 'AND tokens_known = 1' : 'AND token_efficiency_eta > 0';
@@ -493,6 +502,7 @@ export function loadProviderEfficiencies(sql: SqlStorage, nowMs: number): Map<st
       const mult = Math.max(0.75, Math.min(1.25, 0.75 + 0.5 * (avgEta / (avgEta + 50))));
       out.set(prov, mult);
     }
+    if (key) efficiencyCache.set(sql as any, { key, at: nowMs, value: new Map(out) });
   } catch {
     /* ignore if schema not yet migrated */
   }
