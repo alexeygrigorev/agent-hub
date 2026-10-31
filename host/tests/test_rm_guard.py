@@ -45,8 +45,13 @@ def test_symlink_to_home_is_refused(tmp_path):
     assert rm("--guard-check", str(link)).returncode == 1
 
 
-def test_relative_dotdot_resolving_to_home_is_refused(tmp_path):
-    assert rm("--guard-check", "..", cwd=str(HOME / ".local")).returncode == 1
+def test_relative_dotdot_resolving_to_home_is_refused():
+    # --guard-check removes nothing, so pointing it at the real home is safe.
+    if (HOME / ".local").is_dir():
+        assert rm("--guard-check", "..", cwd=str(HOME / ".local")).returncode == 1
+    # CI runners have no ~/.local; a cwd must exist for subprocess, so also
+    # cover the relative resolution against the home, which always exists.
+    assert rm("--guard-check", ".", cwd=str(HOME)).returncode == 1
 
 
 def test_temp_dir_removal_still_works(tmp_path):
