@@ -34,6 +34,7 @@
   "fleet-host",
   "handoff",
   "heartbeat",
+  "host-goal",
   "host-release",
   "inbox",
   "intake append",
