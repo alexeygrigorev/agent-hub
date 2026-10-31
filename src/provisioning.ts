@@ -10,6 +10,8 @@ import { CLAUDE_OAUTH, CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claude
   fetchQuota, needsRefresh, refreshCredential, refreshable, structurallyValid, validCredentialFiles, type CredentialFiles, type FetchLike } from './credentials';
 
 const LABEL = /^[a-z][a-z0-9_-]{0,47}$/;
+// A host heartbeats about every minute; silence beyond this reads as offline.
+const SYNC_STALE_MS = 5 * 60000;
 const MIGRATION_GRACE_MS = 2 * 3600000;
 // A Hub-central login waits this long for the pasted code (intake 8ff6b3d8).
 export const CREDENTIAL_LOGIN_TTL_MS = 30 * 60000;
@@ -58,6 +60,9 @@ export class ProvisioningService {
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_bundles (label TEXT PRIMARY KEY, provider TEXT NOT NULL, version TEXT NOT NULL, revision TEXT NOT NULL, ciphertext TEXT NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_logins (id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL, url TEXT, code_ciphertext TEXT, expires_at INTEGER NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_installations (machine_id TEXT NOT NULL, label TEXT NOT NULL, revision TEXT NOT NULL, PRIMARY KEY(machine_id,label))');
+    // Per-host sync visibility (AC9): what each host last reported per account.
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_sync_status (machine_id TEXT NOT NULL, label TEXT NOT NULL, revision TEXT NOT NULL, state TEXT NOT NULL, error TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(machine_id,label))');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_sync_hosts (machine_id TEXT PRIMARY KEY, state TEXT NOT NULL, last_sync_at INTEGER NOT NULL)');
     for (const ddl of CREDENTIAL_SCHEMA) this.sql.exec(ddl);
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL, detail TEXT NOT NULL)');
     this.migrateImplicitMaxConcurrency();
@@ -78,6 +83,30 @@ export class ProvisioningService {
     });
   }
   private now() { return Date.now(); }
+  /**
+   * One row per registered host and managed account: `synced` (current revision
+   * installed), `failed` (host reported an install error for it), `pending`
+   * (not yet acknowledged). A host silent for SYNC_STALE_MS is `offline`, and it
+   * reconciles on reconnect.
+   */
+  syncStatus() {
+    const now = this.now();
+    const engines = this.sql.exec('SELECT label, provider, revision FROM engine_bundles ORDER BY label').toArray() as any[];
+    const machines = this.sql.exec('SELECT id, name FROM machines WHERE registered_at IS NOT NULL ORDER BY id').toArray() as any[];
+    const hosts = new Map((this.sql.exec('SELECT * FROM engine_sync_hosts').toArray() as any[]).map(h => [h.machine_id, h]));
+    const installed = new Set((this.sql.exec('SELECT machine_id,label,revision FROM engine_installations').toArray() as any[]).map(i => i.machine_id + '|' + i.label + '|' + i.revision));
+    const status = new Map((this.sql.exec('SELECT * FROM engine_sync_status').toArray() as any[]).map(r => [r.machine_id + '|' + r.label, r]));
+    return machines.map(m => {
+      const h: any = hosts.get(m.id);
+      const online = !!h && now - h.last_sync_at <= SYNC_STALE_MS;
+      return { machine_id: m.id, machine: m.name, last_sync_at: h?.last_sync_at ?? null, host_state: h?.state ?? 'never', online,
+        accounts: engines.map(e => {
+          const r: any = status.get(m.id + '|' + e.label);
+          const state = installed.has(m.id + '|' + e.label + '|' + e.revision) ? 'synced' : r?.revision === e.revision && r.state === 'failed' ? 'failed' : 'pending';
+          return { label: e.label, provider: e.provider, state, ...(state === 'failed' && r.error ? { error: r.error } : {}) };
+        }) };
+    });
+  }
   private credentialRow(label: string): any { return this.sql.exec('SELECT * FROM engine_credentials WHERE label=?', label).toArray()[0]; }
   private async sealCredential(label: string, generation: number, files: CredentialFiles) {
     return this.seal({ label, files }, 'credential:' + generation);
@@ -127,6 +156,7 @@ export class ProvisioningService {
     if (path === '/api/engines' && request.method === 'GET') {
       if (!admin) return reply({ error: 'forbidden' }, 403);
       return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => ({ ...meta, supports_goal: GOAL_PROVIDERS.has(meta.provider) })), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray(),
+        sync_status: this.syncStatus(),
         credentials: this.credentialStatus(), credential_rejections: this.sql.exec('SELECT machine_id,label,generation,reason,observed_at FROM engine_credential_rejections ORDER BY label,machine_id').toArray(),
         account_migrations: this.sql.exec('SELECT name,applied_at,detail FROM engine_migrations ORDER BY name').toArray().map((m: any) => ({ name: m.name, applied_at: m.applied_at, ...JSON.parse(m.detail) })) });
     }
@@ -205,6 +235,26 @@ export class ProvisioningService {
     }
     const credentialLogin = await this.handleCredentialLogin(request, path, admin);
     if (credentialLogin) return credentialLogin;
+    if (path === '/api/engines/sync-report' && request.method === 'POST') {
+      if (!host) return reply({ error: 'forbidden' }, 403);
+      const data = await request.json().catch(() => null) as any;
+      if (!object(data) || !['synced', 'held'].includes(data.state) || !Array.isArray(data.items) || data.items.length > 32) return reply({ error: 'invalid_report' }, 400);
+      return this.tx(() => {
+        const machine = auth.caller.machineId as string;
+        if (!this.hostAllowed(machine, auth.caller)) return reply({ error: 'forbidden' }, 403);
+        const now = this.now();
+        for (const it of data.items) {
+          if (!object(it) || !LABEL.test(it.label) || !['installed', 'failed'].includes(it.state)) continue;
+          const row: any = this.sql.exec('SELECT revision FROM engine_bundles WHERE label=?', it.label).toArray()[0];
+          if (!row || it.revision !== row.revision) continue;
+          // Error is a bounded exception-type name, never provider output.
+          const error = it.state === 'failed' && typeof it.error === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(it.error) ? it.error : null;
+          this.sql.exec('INSERT OR REPLACE INTO engine_sync_status VALUES (?,?,?,?,?,?)', machine, it.label, row.revision, it.state, error, now);
+        }
+        this.sql.exec('INSERT OR REPLACE INTO engine_sync_hosts VALUES (?,?,?)', machine, data.state, now);
+        return reply({ status: 'recorded' });
+      });
+    }
     const credentialMatch = /^\/api\/engines\/([a-z][a-z0-9_-]{0,47})\/(credential|rejection)$/.exec(path);
     if (credentialMatch) {
       if (!host) return reply({ error: 'forbidden' }, 403);
@@ -235,6 +285,7 @@ export class ProvisioningService {
       this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', label);
       this.sql.exec('DELETE FROM engine_logins WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_installations WHERE label=?', label);
+      this.sql.exec('DELETE FROM engine_sync_status WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_bundles WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_credentials WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_credential_rejections WHERE label=?', label);

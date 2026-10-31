@@ -55,6 +55,32 @@ describe('central engine provisioning', () => {
     expect((await s.handle(req('/test-account', 'DELETE'), admin)).status).toBe(200);
     for (const t of ['engine_bundles', 'engine_installations', 'fleet_routes', 'fleet_accounts']) expect(sql.exec('SELECT * FROM ' + t).toArray()).toHaveLength(0);
   }));
+  it('reports per-host sync status: pending, failed, synced, offline, and clears it on removal', async () => fixture(async (s, sql) => {
+    sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('test-machine','Test','t','2026-01-01'), ('other-machine','Other','o','2026-01-01')");
+    const rev: any = await (await s.handle(req('/test-account', 'PUT', bundle), admin)).json();
+    const status = async () => ((await (await s.handle(req(), admin)).json()) as any).sync_status;
+    const cell = (st: any[], m: string) => st.find(h => h.machine_id === m);
+    expect(cell(await status(), 'test-machine').accounts[0].state).toBe('pending');
+    expect(cell(await status(), 'test-machine').host_state).toBe('never');
+    const report = (state: string, items: any[]) => s.handle(req('/sync-report', 'POST', { state, items }), host);
+    expect((await report('held', [{ label: 'test-account', revision: rev.revision, state: 'failed', error: 'OSError' }])).status).toBe(200);
+    let st = await status();
+    expect(cell(st, 'test-machine').accounts[0]).toMatchObject({ state: 'failed', error: 'OSError' });
+    expect(cell(st, 'test-machine').online).toBe(true);
+    expect(cell(st, 'other-machine').accounts[0].state).toBe('pending');
+    // Free-text errors and stale revisions are never stored.
+    await report('held', [{ label: 'test-account', revision: 'old', state: 'failed', error: 'x' }, { label: 'test-account', revision: rev.revision, state: 'failed', error: 'secret /path: text' }]);
+    expect(cell(await status(), 'test-machine').accounts[0].error).toBeUndefined();
+    await s.handle(req('/test-account', 'POST', { revision: rev.revision }), host);
+    expect(cell(await status(), 'test-machine').accounts[0].state).toBe('synced');
+    sql.exec("UPDATE engine_sync_hosts SET last_sync_at = last_sync_at - 600000");
+    expect(cell(await status(), 'test-machine').online).toBe(false);
+    await s.handle(req('/test-account', 'DELETE'), admin);
+    expect(sql.exec('SELECT * FROM engine_sync_status').toArray()).toHaveLength(0);
+    expect(cell(await status(), 'test-machine').accounts).toHaveLength(0);
+    expect((await s.handle(req('/sync-report', 'POST', { state: 'bad', items: [] }), host)).status).toBe(400);
+    expect((await s.handle(req('/sync-report', 'POST', { state: 'synced', items: [] }), admin)).status).toBe(403);
+  }));
   it('denies unauthenticated, agents, stale host families and admin download of credentials', async () => fixture(async (s, _sql, allow) => {
     expect((await s.handle(req(), {})).status).toBe(401);
     for (const caller of [{ caller: {kind: 'agent'}, scopes: ['host'] }, admin]) expect((await s.handle(req('/sync'), caller)).status).toBe(403);

@@ -1171,10 +1171,22 @@ def sync(request=None):
             request('POST', '/api/engines/' + b['label'], {'revision': b['revision'], 'authenticated': authenticated})
         from . import engine_login
         engine_login.tick(response.get('logins', []), installed_bundles, request)
+    report_sync(request, 'synced', installed_bundles, failed_bundles, last_error)
     result = {'status': 'synced', 'profiles': ['hub-' + b['label'] for b in installed_bundles]}
     if failed_bundles:
         result['failed_labels'] = [b['label'] for b in failed_bundles]
     return result
+
+
+def report_sync(request, state, installed=(), failed=(), error=None):
+    """Best-effort per-host sync status for Hub (exception type only, never messages)."""
+    items = [{'label': b['label'], 'revision': b['revision'], 'state': 'installed'} for b in installed]
+    items += [{'label': b['label'], 'revision': b['revision'], 'state': 'failed',
+               'error': type(error).__name__ if error else 'InstallFailed'} for b in failed]
+    try:
+        request('POST', '/api/engines/sync-report', {'state': state, 'items': items})
+    except Exception:
+        pass
 
 
 def host_request(method, path, payload=None):
@@ -1195,6 +1207,7 @@ def tick():
         return sync()
     except Exception:
         # Never stringify provider output, paths, request bodies or secret-bearing exceptions.
+        report_sync(host_request, 'held')
         return {'status': 'held', 'reason': 'managed_engine_sync_failed'}
 
 
@@ -1652,6 +1665,7 @@ def add_commands(sub):
     login.add_argument('--label', required=True)
     login.add_argument('--version', help='Exact engine version for a new account (default: tested version)')
     login.add_argument('--adopt', action='store_true', help='Attach to an existing unmanaged quota pool with this label')
+    commands.add_parser('status', help='Operator: per-host sync state of every managed account')
     commands.add_parser('maintain', help='Operator: run central refresh + direct provider quota now')
 
 
@@ -1741,6 +1755,15 @@ def engine_error_message(exc, engines_cmd=None):
     return 'Hub engine operation failed: %s; check authentication, bundle permissions and host prerequisites.' % type(exc).__name__
 
 
+def sync_status(listing):
+    """Compact per-host view of the sanitized `GET /api/engines` sync_status."""
+    hosts = []
+    for h in listing.get('sync_status', []):
+        hosts.append({'machine': h.get('machine') or h['machine_id'], 'online': h['online'], 'host_state': h['host_state'],
+                      'last_sync_at': h['last_sync_at'], 'accounts': {a['label']: a['state'] + (':' + a['error'] if a.get('error') else '') for a in h['accounts']}})
+    return {'hosts': hosts}
+
+
 def command(args):
     if args.engines_cmd == 'quota':
         return quotas()
@@ -1754,6 +1777,8 @@ def command(args):
         if getattr(args, 'view', None) == 'worker':
             return bus._do_request('GET', '/api/engines?view=worker')
         return bus._do_request('GET', '/api/engines')
+    if args.engines_cmd == 'status':
+        return sync_status(bus._do_request('GET', '/api/engines'))
     if args.engines_cmd == 'remove':
         if not LABEL.fullmatch(args.label):
             raise ValueError('Invalid managed label')
