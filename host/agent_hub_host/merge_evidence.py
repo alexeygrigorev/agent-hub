@@ -74,7 +74,8 @@ def deploy_state(repo: str, sha: str, runner: Callable = subprocess.run) -> dict
     return {'state': 'missing', 'sha': sha}
 
 
-def collect(repo: str, shas: Optional[list] = None, runner: Callable = subprocess.run, fetch: bool = True) -> dict:
+def collect(repo: str, shas: Optional[list] = None, runner: Callable = subprocess.run, fetch: bool = True,
+            deploy: bool = True) -> dict:
     """Evidence body for POST /api/intake/tasks/<id>/merge-evidence."""
     out: dict[str, Any] = {}
     if fetch:
@@ -102,12 +103,16 @@ def collect(repo: str, shas: Optional[list] = None, runner: Callable = subproces
         if not SHA.match(resolved):
             commits.append({'sha': sha, 'in_main': False, 'subject': 'not found in this repository'})
             continue
+        if any(c['sha'] == resolved for c in commits):
+            continue
         in_main = _is_ancestor(runner, repo, resolved, 'origin/main')
         subject = _run(runner, ['git', 'log', '-1', '--format=%s', resolved], repo)
         commits.append({'sha': resolved, 'in_main': in_main is True,
                         **({'subject': subject.stdout.strip()[:160]} if subject is not None and subject.returncode == 0 else {})})
     if commits:
         out['commits'] = commits
+        if not deploy:
+            return out
         merged = [c for c in commits if c['in_main']]
         # The deploy that matters is the newest merged commit named in the evidence.
         if merged and len(merged) == len(commits):

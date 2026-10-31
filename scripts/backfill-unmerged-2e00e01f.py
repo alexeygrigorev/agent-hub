@@ -51,19 +51,24 @@ def main():
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--root', default=str(Path.home() / 'git'))
     args = ap.parse_args()
-    report, cache = [], {}
+    report, cache, fetched = [], {}, set()
     for path in sorted(Path(args.root).glob('*-wt-*')):
         if not (path / '.git').exists():
             continue
+        # Worktrees of one repository share refs: fetch origin/main once per repository.
+        common = git(path, 'rev-parse', '--git-common-dir')
+        common = str((path / common).resolve()) if common and not os.path.isabs(common) else common
+        if common and common not in fetched:
+            fetched.add(common)
+            git(path, 'fetch', '--quiet', 'origin', 'main')
         item = {'worktree': str(path), 'branch': git(path, 'rev-parse', '--abbrev-ref', 'HEAD')}
         try:
-            evidence = merge_evidence.collect(str(path), [])
+            evidence = merge_evidence.collect(str(path), [], fetch=False, deploy=False)
         except RuntimeError as exc:
             item.update(state='fetch_failed', error=str(exc)); report.append(item); continue
         task = find_intake(path, cache)
         dirty = bool(git(path, 'status', '--porcelain'))
-        item.update(head=evidence.get('head'), unmerged=evidence.get('unmerged'), dirty=dirty,
-                    deploy=(evidence.get('deploy') or {}).get('state'))
+        item.update(head=evidence.get('head'), unmerged=evidence.get('unmerged'), dirty=dirty)
         if not task:
             item['state'] = 'no_intake' if evidence.get('unmerged') or dirty else 'merged_no_intake'
             report.append(item); continue
@@ -73,7 +78,7 @@ def main():
         item['intake_status'] = status
         if status in ('done', 'cancelled'):
             item['state'] = 'closed_intake' + ('_unmerged' if evidence.get('unmerged') else '')
-        elif not evidence.get('unmerged') and not dirty and (evidence.get('deploy') or {}).get('state') in ('success', 'skipped', 'not_required'):
+        elif not evidence.get('unmerged') and not dirty:
             item['state'] = 'merged'
         else:
             item['state'] = 'unmerged'
