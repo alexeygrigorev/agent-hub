@@ -127,11 +127,11 @@ class HandoverTests(unittest.TestCase):
 
     def test_exact_generation_handover_requires_exit_ack_and_released_lock(self):
         errors = []
-        with c.ControllerLease(self.directory) as lease:
+        with c.ControllerLease(self.directory, boot_probe=lambda: None, observe=lambda receipt: None) as lease:
             lease.publish(self.receipt)
             def request():
                 try:
-                    c.handover(self.directory, timeout=2)
+                    c.handover(self.directory, timeout=30, boot_probe=lambda: None, observe=lambda receipt: None)
                 except BaseException as error:
                     errors.append(error)
             thread = threading.Thread(target=request)
@@ -151,16 +151,16 @@ class HandoverTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_wrong_generation_and_missing_exit_proof_preserve_owner(self):
-        with c.ControllerLease(self.directory) as lease:
+        with c.ControllerLease(self.directory, boot_probe=lambda: None, observe=lambda receipt: None) as lease:
             lease.publish(self.receipt)
             c._write(self.directory / 'stop.json', {'generation': '0' * 32})
             self.assertFalse(lease.stop_requested())
             c._write(self.directory / 'stopped.json', {'generation': '0' * 32, 'containment_empty': True})
             with self.assertRaisesRegex(RuntimeError, 'unconfirmed'):
-                c.handover(self.directory, timeout=0)
+                c.handover(self.directory, timeout=0, boot_probe=lambda: None, observe=lambda receipt: None)
             self.assertTrue((self.directory / 'owner.json').exists())
         with self.assertRaisesRegex(c.NeedsAttention, 'exit is unproven'):
-            with c.ControllerLease(self.directory, observe=lambda receipt: None):
+            with c.ControllerLease(self.directory, boot_probe=lambda: None, observe=lambda receipt: None):
                 self.fail('must preserve crashed owner evidence')
         self.assertEqual(c._read(self.directory / 'needs-attention.json')['status'], 'needs_attention')
 
@@ -307,24 +307,29 @@ class HandoverTests(unittest.TestCase):
             self.assertFalse((self.directory / 'stop.json').exists())
 
     def test_timed_out_cancelled_and_expired_requests_cannot_stop_a_recovered_owner(self):
-        with c.ControllerLease(self.directory) as lease:
+        doubles = dict(boot_probe=lambda: None, observe=lambda receipt: None)
+        with c.ControllerLease(self.directory, **doubles) as lease:
             lease.publish(self.receipt)
             with self.assertRaisesRegex(RuntimeError, 'unconfirmed'):
-                c.handover(self.directory, timeout=0)
+                c.handover(self.directory, timeout=0, **doubles)
             self.assertFalse((self.directory / 'stop.json').exists())
             self.assertFalse(lease.stop_requested())
-            # Hard-kill residue has an independent monotonic expiry.
-            now = time.monotonic()
+            # Hard-kill residue has an independent monotonic expiry. Use exactly
+            # representable offsets so float rounding cannot change the span.
+            now = float(int(time.monotonic()) + 1000)
             request = {'generation': lease.generation, 'request_id': 'abandoned',
-                       'created_monotonic': now - 91, 'expires_monotonic': now - 1}
-            c._write(self.directory / 'stop.json', request)
-            self.assertFalse(lease.stop_requested())
-            request.update(created_monotonic=now, expires_monotonic=now + 90)
-            c._write(self.directory / 'stop.json', request)
-            self.assertTrue(lease.stop_requested())
-            with patch.object(c.time, 'sleep', side_effect=KeyboardInterrupt):
-                with self.assertRaises(KeyboardInterrupt):
-                    c.handover(self.directory, timeout=2)
+                       'created_monotonic': now - 60, 'expires_monotonic': now - 1}
+            with patch.object(c.time, 'monotonic', return_value=now):
+                c._write(self.directory / 'stop.json', request)
+                self.assertFalse(lease.stop_requested())
+                request.update(created_monotonic=now, expires_monotonic=now + 60)
+                c._write(self.directory / 'stop.json', request)
+                self.assertTrue(lease.stop_requested())
+                # Frozen clock: a stalled runner cannot expire the 2s deadline
+                # before the wait loop reaches the interrupted sleep.
+                with patch.object(c.time, 'sleep', side_effect=KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        c.handover(self.directory, timeout=2, **doubles)
             self.assertFalse((self.directory / 'stop.json').exists())
             self.assertFalse(lease.stop_requested())
 
