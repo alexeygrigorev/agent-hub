@@ -3392,14 +3392,24 @@ export class SessionControlService {
             if (!BOUND_STATES.has(live.state)) return response({ error: 'session_not_bound' }, 409);
             const binding = live.binding_json ? parsed(live.binding_json, null) : null;
             const reported: any = (live.machine_id && binding?.native_id) ? this.sql.exec(
-              'SELECT agent_state, observed_at FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
+              'SELECT agent_state, observed_at, phase FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
               live.machine_id, binding.native_id
             ).toArray()[0] : null;
+            // fleet_sessions.observed_at means "last changed" (the census PUT
+            // skips unchanged rows), so an idle-waiting session's row ages out
+            // while its state is still being reported. The host's last census
+            // proves the row is still current for a session that stays in the
+            // live catalog; a dead/unobserved phase gets no such credit.
+            const seen: any = (reported && live.machine_id)
+              ? this.sql.exec('SELECT observed_at FROM fleet_catalog_seen WHERE machine_id = ?', live.machine_id).toArray()[0] : null;
+            const seenMs = typeof seen?.observed_at === 'string' ? Date.parse(seen.observed_at) : NaN;
+            const catalogLive = ['starting', 'running'].includes(String(reported?.phase ?? ''));
 
             // Recency (AC4): agent_state alone is not enough — a stale report
             // must warn/refuse. observed_at must parse, not be in the future,
             // and be within RECENT_STATE_MS of now.
-            const observedMs = typeof reported?.observed_at === 'string' ? Date.parse(reported.observed_at) : NaN;
+            const changedMs = typeof reported?.observed_at === 'string' ? Date.parse(reported.observed_at) : NaN;
+            const observedMs = catalogLive && Number.isFinite(seenMs) && seenMs > changedMs ? seenMs : changedMs;
             const nowMs = this.now();
             const hasReported = Boolean(reported?.agent_state) && Number.isFinite(observedMs) &&
               observedMs <= nowMs + 60000 && nowMs - observedMs <= RECENT_STATE_MS;
