@@ -24,6 +24,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import { freshCatalogs } from './catalog-freshness';
 import { nativeProgress } from './session_stall';
 import { sanitizeCpuUsage } from './cpu-headroom';
+import { linkedTaskIds } from './intake-session';
 
 type Obj = Record<string, any>;
 const parse = (raw: any): Obj => { try { return JSON.parse(raw || '{}'); } catch { return {}; } };
@@ -249,6 +250,17 @@ export class SessionAuditService {
     try { this.sql.exec('ALTER TABLE session_audit_decisions ADD COLUMN dispatched INTEGER NOT NULL DEFAULT 1'); } catch { /* column exists */ }
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_audit_decisions_session ON session_audit_decisions(session_id, at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_audit_decisions_run ON session_audit_decisions(run_id)');
+    // Partial indexes for every per-tick selection (intake 8081a05a): each one
+    // reads only its matching rows instead of the whole 7-day decision log,
+    // which is dominated by 'observe' rows none of these queries want.
+    for (const [name, where] of [
+      ['pending', "outcome IS NULL AND action IN ('keystroke','nudge','stop','capture')"],
+      ['stop_timeout', "action = 'stop' AND outcome = 'stop_timeout'"],
+      ['enqueue_failed', "action = 'nudge' AND dispatched = 0 AND outcome = 'enqueue_failed'"],
+      ['nudge_dispatched', "action = 'nudge' AND dispatched = 1"],
+      ['escalate_dispatched', "action = 'escalate' AND dispatched = 1"],
+    ]) this.sql.exec(`CREATE INDEX IF NOT EXISTS session_audit_decisions_${name} ON session_audit_decisions(id) WHERE ${where}`);
+    this.sql.exec('CREATE INDEX IF NOT EXISTS session_audit_decisions_at ON session_audit_decisions(at, id)');
   }
 
   status(): Obj {
@@ -296,11 +308,9 @@ export class SessionAuditService {
   }
 
   private linkedIntakeId(session: Obj): string | null {
-    const row = this.rows(`SELECT i.id FROM intake_task_projection i, json_each(i.links) e
-      WHERE json_extract(e.value, '$.kind') = 'link' AND
-      (json_extract(e.value, '$.hub_session_id') = ? OR json_extract(e.value, '$.native_id') = ?) LIMIT 1`,
-      session.id, parse(session.binding_json)?.native_id ?? '')[0];
-    return row?.id ?? null;
+    const sid = session.id, native = parse(session.binding_json)?.native_id ?? '';
+    const textEq = (v: unknown, want: unknown) => typeof v === 'string' && v === want;
+    return linkedTaskIds(this.sql, [sid, native], e => e.kind === 'link' && (textEq(e.hub_session_id, sid) || textEq(e.native_id, native)), 1)[0] ?? null;
   }
 
   private screenFor(sessionId: string): { tail: string | null; ageS: number | null } {
@@ -631,7 +641,7 @@ export class SessionAuditService {
    * (a decision's run carries the same at, so both age out together). */
   private prune(now: number) {
     const cutoff = new Date(now - RETENTION_MS).toISOString();
-    this.sql.exec(`DELETE FROM session_audit_decisions WHERE id IN (SELECT id FROM session_audit_decisions WHERE at < ? ORDER BY id LIMIT ?)`, cutoff, RETENTION_DELETE);
+    this.sql.exec(`DELETE FROM session_audit_decisions WHERE id IN (SELECT id FROM session_audit_decisions INDEXED BY session_audit_decisions_at WHERE at < ? ORDER BY id LIMIT ?)`, cutoff, RETENTION_DELETE);
     this.sql.exec(`DELETE FROM session_audit_runs WHERE id IN (SELECT id FROM session_audit_runs WHERE at < ? ORDER BY id LIMIT ?)`, cutoff, RETENTION_DELETE);
   }
 }

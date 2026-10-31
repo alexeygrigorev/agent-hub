@@ -223,5 +223,8 @@ CREATE TABLE IF NOT EXISTS claims (
   session_state TEXT,
   native_claim_id TEXT
 );
+
+CREATE INDEX IF NOT EXISTS messages_expires_at ON messages(expires_at);
+CREATE INDEX IF NOT EXISTS claims_expires_at ON claims(expires_at);
 `;
 

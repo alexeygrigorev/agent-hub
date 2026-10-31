@@ -5,7 +5,7 @@ import { IntakeWorktrees, namesWorktree, worktreePathAllowed } from './intake-wo
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
 import { LivenessService } from './liveness';
 import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
-import { linkedIntake, hasOpenWork, nativeGoalStatus, sessionWakeState, openWorkPreventsIdleReap } from './intake-session';
+import { linkedIntake, linkedTaskIds, hasOpenWork, nativeGoalStatus, sessionWakeState, openWorkPreventsIdleReap } from './intake-session';
 import { workerAccessContext, workerWakeAllowed } from './worker-access';
 import { registeredRepoLabel } from './repos';
 import { initResourceRequestProjection } from './sql-json-projection';
@@ -890,7 +890,9 @@ export class SessionControlService {
   attention(): any[] {
     const now = this.now(), result: any[] = [];
     const episodes = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray().length;
-    const savedStalls = new Set((this.sql.exec('SELECT machine_id,native_id FROM session_stalls').toArray() as any[]).map(r=>JSON.stringify([r.machine_id,r.native_id])));
+    // Point lookups per running session instead of reading every retained stall.
+    const savedStall = (machine: unknown, native: unknown) => machine != null && native != null &&
+      this.sql.exec('SELECT 1 FROM session_stalls WHERE machine_id=? AND native_id=? LIMIT 1', machine, native).toArray().length > 0;
     const missed = new Set((this.sql.exec("SELECT DISTINCT session_id FROM session_control_wakes WHERE state='missed'").toArray() as any[]).map(r=>r.session_id));
     const natives = new Map((this.sql.exec(`SELECT f.* FROM session_control_sessions s LEFT JOIN fleet_sessions f
       ON f.machine_id=s.machine_id AND f.native_id=json_extract(s.binding_json,'$.native_id') WHERE s.state='running'`).toArray() as any[])
@@ -912,7 +914,7 @@ export class SessionControlService {
       const candidate = fresh && !['exited','dead','pruned','forgotten'].includes(native?.phase) &&
         ((lastProgress !== null && now-lastProgress > stallThreshold(this.options.env)*1000) ||
          (progress?.agent_alive === false && progress?.headless === true));
-      if (!candidate && !savedStalls.has(nativeKey) && !missed.has(row.id) &&
+      if (!candidate && !missed.has(row.id) && !savedStall(row.machine_id, binding.native_id) &&
           !(fresh && ['blocked','paused','stalled'].includes(goal || ''))) continue;
       // Candidate selection avoids retained intake/model/warning histories for
       // healthy rows; the canonical view still decides every emitted state.
@@ -945,11 +947,11 @@ export class SessionControlService {
     // Imported native sessions can be linked after launch through intake.
     let intakeId = intent.intake_task_id ?? null;
     if (!intakeId) {
-      const linked: any = this.sql.exec(`SELECT i.id FROM intake_task_projection i, json_each(i.links) e
-        WHERE json_extract(e.value, '$.kind') = 'link' AND
-        (json_extract(e.value, '$.hub_session_id') = ? OR
-         (json_extract(e.value, '$.native_id') = ? AND json_extract(e.value, '$.routing_job_id') IS NOT NULL)) LIMIT 1`, row.id, binding?.native_id ?? '').toArray()[0];
-      intakeId = linked?.id ?? null;
+      // Indexed candidates, exact link predicate re-checked (intake 8081a05a).
+      const sid = row.id, native = binding?.native_id ?? '';
+      const textEq = (v: unknown, want: unknown) => typeof v === 'string' && v === want;
+      intakeId = linkedTaskIds(this.sql, [sid, native], e => e.kind === 'link' && (textEq(e.hub_session_id, sid) ||
+        (textEq(e.native_id, native) && e.routing_job_id !== undefined && e.routing_job_id !== null)), 1)[0] ?? null;
     }
     intakeId = intakeId || linkedIntake(this.sql, row)?.id || null;
     const runtime = Math.max(0, (now - started) / 1000);

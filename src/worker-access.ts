@@ -59,6 +59,25 @@ export function initLinkRefs(sql: SqlStorage) {
   for (const op of ['INSERT', 'UPDATE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_link_refs_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN
     INSERT INTO intake_link_refs(ref,task_id) ${rows('NEW.id', "json_each(NEW.data,'$.history') e")} ON CONFLICT DO NOTHING; END`);
   sql.exec('CREATE TRIGGER IF NOT EXISTS intake_link_refs_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_link_refs WHERE task_id=OLD.id; END');
+  initProjectionLinkRefs(sql);
+}
+
+/** Indexed (ref -> task) side table over every entry of the projection's
+ * link/report column (any kind), keyed by hub_session_id and native_id text
+ * values (intake 8081a05a). Session-to-intake lookups read candidate tasks by
+ * ref instead of running json_each over the whole projection per session.
+ * Insert-only like intake_link_refs: stale refs only widen the candidate set,
+ * and callers re-check the exact link entries. */
+export function initProjectionLinkRefs(sql: SqlStorage) {
+  const exists = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_projection_link_refs'").toArray().length > 0;
+  sql.exec('CREATE TABLE IF NOT EXISTS intake_projection_link_refs (ref TEXT NOT NULL, task_id TEXT NOT NULL, PRIMARY KEY(ref, task_id)) WITHOUT ROWID');
+  const rows = (id: string, from: string) => ['hub_session_id', 'native_id'].map(field =>
+    `SELECT json_extract(e.value,'$.${field}'), ${id} FROM ${from} WHERE json_type(e.value,'$.${field}')='text'`).join(' UNION ');
+  if (!exists) sql.exec(`INSERT INTO intake_projection_link_refs(ref,task_id) ${rows('p.id', 'intake_task_projection p, json_each(p.links) e')} ON CONFLICT DO NOTHING`);
+  for (const [op, when] of [['INSERT', 'WHEN json_valid(NEW.links)'], ['UPDATE OF links', 'WHEN NEW.links IS NOT OLD.links AND json_valid(NEW.links)']]) sql.exec(
+    `CREATE TRIGGER IF NOT EXISTS intake_projection_link_refs_${op.split(' ')[0].toLowerCase()} AFTER ${op} ON intake_task_projection ${when} BEGIN
+    INSERT INTO intake_projection_link_refs(ref,task_id) ${rows('NEW.id', 'json_each(NEW.links) e')} ON CONFLICT DO NOTHING; END`);
+  sql.exec('CREATE TRIGGER IF NOT EXISTS intake_projection_link_refs_delete AFTER DELETE ON intake_task_projection BEGIN DELETE FROM intake_projection_link_refs WHERE task_id=OLD.id; END');
 }
 
 export function workerAccessContext(sql: SqlStorage, tokenId: string | undefined, now = Date.now(), allowExpiredAccess = false): any | null {

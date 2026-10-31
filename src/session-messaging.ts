@@ -16,6 +16,7 @@
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { generateUlid } from './bus';
+import { backfillOnce } from './sql-probes';
 
 export const SESSION_PROJECT = 'session';
 export const NAMED_AGENT_PROJECT = 'agent';
@@ -56,13 +57,16 @@ export function initSessionMessaging(sql: SqlStorage): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS named_agents (name TEXT PRIMARY KEY, project TEXT, display TEXT NOT NULL,
     credential_family TEXT, delegates_json TEXT NOT NULL DEFAULT '[]', forward_session_id TEXT,
     created_by TEXT NOT NULL, created_at TEXT NOT NULL, disabled_at TEXT)`);
-  sql.exec(`INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at)
-    SELECT tag, tag, 'hub:migration', COALESCE(registered_at, '') FROM agents WHERE project = 'agent'`);
+  backfillOnce(sql, 'named_agents:agents', () => sql.exec(`INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at)
+    SELECT tag, tag, 'hub:migration', COALESCE(registered_at, '') FROM agents WHERE project = 'agent'`));
   sql.exec(`CREATE TRIGGER IF NOT EXISTS named_agent_registry_insert AFTER INSERT ON agents WHEN NEW.project = 'agent' BEGIN
     INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at) VALUES (NEW.tag, NEW.tag, 'hub:registry', COALESCE(NEW.registered_at, ''));
     END`);
   sql.exec('CREATE INDEX IF NOT EXISTS messages_recipient_seq ON messages(to_actor, recipient_seq)');
   sql.exec('CREATE INDEX IF NOT EXISTS messages_delivery_deadline ON messages(state, deliver_by)');
+  // The per-alarm expiry sweep reads only pending session-addressed rows,
+  // not every queued bus message (intake 8081a05a).
+  sql.exec("CREATE INDEX IF NOT EXISTS messages_session_pending ON messages(deliver_by, id) WHERE to_session_id IS NOT NULL AND state IN ('accepted','dispatched','uncertain')");
   sql.exec('CREATE TABLE IF NOT EXISTS message_thread_status (thread_id TEXT NOT NULL, reason TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(thread_id, reason))');
   // Metadata only, never bodies; retained longer than bodies (180 days).
   sql.exec(`CREATE TABLE IF NOT EXISTS message_events (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL,
@@ -331,7 +335,7 @@ export function notReadyDelay(count: number): number {
 /** Messages past deliver_by, or whose session ended, stop being offered:
  * the native inbox copy (if any) and the Hub inbox stay authoritative. */
 export function expireSessionMessages(sql: SqlStorage, now: number, machineId?: string, sessionId?: string): void {
-  const rows = sql.exec(`SELECT m.*, s.state AS session_state, s.machine_id FROM messages m
+  const rows = sql.exec(`SELECT m.*, s.state AS session_state, s.machine_id FROM messages m INDEXED BY messages_session_pending
     LEFT JOIN session_control_sessions s ON s.id = m.to_session_id
     WHERE m.to_session_id IS NOT NULL AND m.state IN ('accepted','dispatched','uncertain')
     AND (s.id IS NULL OR s.state NOT IN (${LIVE_SESSION_STATES.map(() => '?').join(',')}) OR m.deliver_by <= ?)

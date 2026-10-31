@@ -40,7 +40,10 @@ export class IdleWorkService {
     if (this.busy) return;
     this.busy = true;
     try {
-      for (const item of this.sessions.attention()) {
+      // One attention census per tick (intake 8081a05a): it also decides
+      // which episodes stay active below, instead of recomputing it.
+      const attention = this.sessions.attention();
+      for (const item of attention) {
         try {
         const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', item.session_id).toArray()[0];
         const task = row && linkedIntake(this.sql, row);
@@ -134,7 +137,7 @@ export class IdleWorkService {
         }
         } catch { console.warn('idle_work_session_failed', item.session_id); }
       }
-      const active = new Set(this.sessions.attention().map(s => s.session_id));
+      const active = new Set(attention.map(s => s.session_id));
       for (const e of this.sql.exec('SELECT session_id FROM session_idle_episodes WHERE active=1').toArray() as any[]) {
         if (!active.has(e.session_id)) this.sql.exec('UPDATE session_idle_episodes SET active=0 WHERE session_id=?', e.session_id);
       }

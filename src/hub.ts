@@ -58,6 +58,9 @@ import { HostHistoryService } from './host-history';
 import { HISTORY_RETENTION_MS } from './host-history';
 import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validateTokenPayload } from './token-history';
 import { placementPressureSubjects } from './host-pressure';
+import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
+
+const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -147,12 +150,19 @@ export class Hub extends DurableObject {
   public webhookService: WebhookService;
 
   private idleWork: IdleWorkService;
+  readonly meter = new RowsMeter();
+  private rowsAlertCheckedHour = -1;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
-    this.sql = ctx.storage.sql;
-    this.initDb();
+    // DO rows-read meter (intake 8081a05a): every cursor is attributed to
+    // the current alarm step / route scope and flushed once per alarm.
+    this.sql = this.meter.wrap(ctx.storage.sql);
+    this.meter.runSync('init:schema', () => {
+      this.initDb();
+      for (const stmt of ROWS_STATS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
+    });
 
     const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
     // M12b intake assignment (narrow seam, owned by platform-intake-live):
@@ -664,9 +674,37 @@ export class Hub extends DurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
+    let scope = 'route:?';
+    try { scope = 'route:' + normalizeRoute(request.method, new URL(request.url).pathname); } catch {}
+    try { return await this.meter.run(scope, () => this.routeFetch(request)); }
+    finally { this.maybeFlushRowsMeter(); }
+  }
+
+  private lastMeterFlush = 0;
+
+  /** A hibernating DO can be evicted before its next alarm, so request and
+   * WebSocket work also persists meter totals, at most every 30s. The first
+   * call after a cold start flushes the constructor's schema reads. */
+  private maybeFlushRowsMeter() {
+    const now = Date.now();
+    if (now - this.lastMeterFlush < 30_000) return;
+    this.lastMeterFlush = now;
+    try { this.meter.flush(this.sql); } catch { console.warn('rows_meter_flush_failed'); }
+  }
+
+  private async routeFetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
-    
+    if (path === '/api/metrics/rows-read') {
+      const auth = await this.sessionControlAuth(request);
+      if (auth.error) return auth.error;
+      if (!(auth.caller as any)?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const hours = Number(url.searchParams.get('hours') || 24);
+      const report = rowsReadReport(this.sql, Date.now(), Number.isFinite(hours) ? hours : 24, this.meter.snapshot());
+      return Response.json({ ...report, target_per_day: ROWS_READ_TARGET_PER_DAY, alert_per_day: rowsReadAlertThreshold(this.env), meter_started_at: new Date(this.meter.startedAt).toISOString() });
+    }
+
     try {
       if (path === '/api/intake' || path.startsWith('/api/intake/')) {
         return this.intakeService.handle(request, async () => {
@@ -2177,13 +2215,18 @@ export class Hub extends DurableObject {
   }
 
   async runChecks(only?: string) {
-    for (const alert of this.livenessService.watchHosts()) await this.notifyAlert(alert);
-    new HostGoals(this.sql, this.fleetService).reconcile();
-    this.runTbmTick();
-    if (!only) await this.maintainCredentials();
-    for (const alert of new BankedResets(this.sql, this.livenessService).run()) await this.notifyAlert(alert);
-    this.livenessService.prune();
-    const results = await this.checksService.runDue({
+    try { return await this.meter.run('rpc:runChecks', () => this.runChecksMetered(only)); } finally { this.maybeFlushRowsMeter(); }
+  }
+
+  private async runChecksMetered(only?: string) {
+    const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('checks:' + step, fn);
+    for (const alert of await m('watch_hosts', () => this.livenessService.watchHosts())) await this.notifyAlert(alert);
+    await m('host_goals', () => new HostGoals(this.sql, this.fleetService).reconcile());
+    await m('tbm', () => this.runTbmTick());
+    if (!only) await m('credentials', () => this.maintainCredentials());
+    for (const alert of await m('banked_resets', () => new BankedResets(this.sql, this.livenessService).run())) await this.notifyAlert(alert);
+    await m('liveness_prune', () => this.livenessService.prune());
+    const results = await m('run_due', () => this.checksService.runDue({
       liveness: this.livenessService,
       notify: alert => this.notifyAlert(alert).then(() => undefined),
       message: async (to, body, key) => this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body, idempotencyKey: 'check-' + key }).id,
@@ -2197,20 +2240,25 @@ export class Hub extends DurableObject {
       fetch: (url, init) => fetch(url, init),
       evaluateQuota: () => dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => this.fleetService.accountStatus(a)),
       ...this.extraCheckDeps(),
-    }, only);
+    }, only));
     // Retry alerts whose delivery failed or had no target yet, at most every 15 minutes each.
     for (const alert of this.livenessService.undelivered(900)) await this.notifyAlert(alert);
     return results;
   }
 
   async scheduledTick(slotOverride?: string, source = 'scheduled') {
+    try { return await this.meter.run('tick:' + source, () => this.scheduledTickMetered(slotOverride, source)); } finally { this.maybeFlushRowsMeter(); }
+  }
+
+  private async scheduledTickMetered(slotOverride?: string, source = 'scheduled') {
+    const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('tick:' + step, fn);
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
     // 1. Bus retention cleanup
-    const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
+    const cleanup = await m('bus_retention', () => this.busService.retentionCleanup(now.getTime(), 100));
 
     // 1b. Webhook delivery pump (intake 19ec91c2): safety net beside the DO
     // alarm so queued deliveries also advance on the cron cadence.
-    try { await this.webhookService.pump(); } catch { console.warn('webhook_delivery_pump_failed'); }
+    try { await m('webhooks', () => this.webhookService.pump()); } catch { console.warn('webhook_delivery_pump_failed'); }
 
     // 2. Jobs root slot tick
     let slotDate: Date;
@@ -2262,23 +2310,23 @@ export class Hub extends DurableObject {
       return { status: 'refused', reason: 'future_slot_refused', slot: slotDate.toISOString() };
     }
 
-    await this.idleWork.tick();
+    await m('idle_work', () => this.idleWorkTick());
     // The verifier registers fresh DONE claims first, so the watchdog never alerts
     // a person about a completion the verifier owns (AC8).
     let intakeVerifier: any;
-    try { intakeVerifier = await this.intakeVerifier.tick(source); }
+    try { intakeVerifier = await m('intake_verifier', () => this.intakeVerifier.tick(source)); }
     catch (e: any) { intakeVerifier = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
-    const intakeWatchdog = await this.intakeWatchdog.tick(source);
+    const intakeWatchdog = await m('intake_watchdog', () => this.intakeWatchdog.tick(source));
     // The audit must never break the scheduler slot for the jobs/watchdog;
     // failures surface in the tick result and the next run retries.
     let sessionAudit: any;
-    try { sessionAudit = await this.sessionAudit.tick(source); }
+    try { sessionAudit = await m('session_audit', () => this.sessionAudit.tick(source)); }
     catch (e: any) { sessionAudit = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     let intakeTriage: any;
-    try { intakeTriage = await this.intakeTriage.tick(source); }
+    try { intakeTriage = await m('intake_triage', () => this.intakeTriage.tick(source)); }
     catch (e: any) { intakeTriage = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     const slotStartIso = slotDate.toISOString();
-    const tickResult = this.jobsService.tickRootSlot(slotStartIso);
+    const tickResult = await m('root_slot', () => this.jobsService.tickRootSlot(slotStartIso));
 
     // 3. Process alarms & expiry
     const nextAlarm = this.jobsService.processAlarms();
@@ -2323,43 +2371,83 @@ export class Hub extends DurableObject {
   }
 
   async alarm() {
-    try { await this.intakeWatchdog.tick('alarm'); } catch { console.warn('intake_queue_tick_failed'); }
-    try { await this.opsLiveness.tick(); } catch { console.warn('ops_liveness_tick_failed'); }
+    // Every step is metered (intake 8081a05a); totals flush once per alarm.
+    const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('alarm:' + step, fn);
+    try { await m('intake_watchdog', () => this.intakeWatchdog.tick('alarm')); } catch { console.warn('intake_queue_tick_failed'); }
+    try { await m('ops_liveness', () => this.opsLiveness.tick()); } catch { console.warn('ops_liveness_tick_failed'); }
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
-    this.ctx.storage.transactionSync(() => {
+    await m('expire_messages', () => this.ctx.storage.transactionSync(() => {
       expireSessionMessages(this.sql, now.getTime());
       expireMessageEvents(this.sql, now.getTime());
-    });
-    this.runTbmTick(now.getTime());
+    }));
+    await m('tbm', () => this.runTbmTick(now.getTime()));
     // Reuse the existing minute alarm so configured idle delays do not wait
     // for a root slot. Durable episode/command keys fence duplicate delivery.
-    try { await this.idleWork.tick(); } catch { console.warn('idle_work_tick_failed'); }
-    try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
-    const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
-    let nextAlarm = this.jobsService.processAlarms();
+    try { await m('idle_work', () => this.idleWorkTick()); } catch { console.warn('idle_work_tick_failed'); }
+    try { await m('host_history', () => this.hostHistoryService.sample()); } catch { console.warn('resource_history_sampling_failed'); }
+    const cleanup = await m('bus_retention', () => this.busService.retentionCleanup(now.getTime(), 100));
+    let nextAlarm = await m('jobs_alarms', () => this.jobsService.processAlarms());
     // Webhook delivery pump (intake 19ec91c2): pending redeliveries pull the
     // next alarm forward so a returning session is served without waiting
     // for the full cadence.
     try {
-      const webhookNext = await this.webhookService.pump();
+      const webhookNext = await m('webhooks', () => this.webhookService.pump());
       if (webhookNext !== undefined) {
         const current = nextAlarm ?? undefined;
         nextAlarm = current === undefined ? webhookNext : Math.min(current, webhookNext);
       }
     } catch { console.warn('webhook_delivery_pump_failed'); }
     try {
-      this.ctx.storage.transactionSync(() => {
+      await m('due_wakes', () => this.ctx.storage.transactionSync(() => {
         try { (this.sessionControlService as any).processDueWakes?.(); } catch {}
-      });
+      }));
     } catch {}
+    try { await this.flushRowsMeter(); } catch { console.warn('rows_meter_flush_failed'); }
 
-    if (cleanup.hasMore) {
+    // A backlog drains fast, but a stuck hasMore must never pin the DO to a
+    // 1s alarm forever: at most 30 consecutive 1s re-arms, then the minute cadence.
+    this.fastRearms = cleanup.hasMore ? this.fastRearms + 1 : 0;
+    if (cleanup.hasMore && this.fastRearms <= 30) {
       await this.ctx.storage.setAlarm(Date.now() + 1000);
     } else {
+      if (cleanup.hasMore) console.warn(JSON.stringify({ event: 'bus_retention_rearm_capped', consecutive: this.fastRearms }));
       try {
         await this.ctx.storage.setAlarm(Math.max(Date.now(), Math.min(nextAlarm || Infinity, Date.now() + 60000)));
       } catch {}
     }
+  }
+
+  private fastRearms = 0;
+  private idleWorkAt = 0;
+
+  /** Idle recovery acts on 30-minute nudge delays, so a census at most every
+   * 5 minutes is enough; the minute alarm used to rerun it (intake 8081a05a). */
+  private async idleWorkTick() {
+    const now = Date.now();
+    if (now - this.idleWorkAt < IDLE_WORK_INTERVAL_MS) return;
+    this.idleWorkAt = now;
+    await this.idleWork.tick();
+  }
+
+  /** Persist meter totals; once per hour compare the last full hour, x24,
+   * with the rows-read/day budget and open or resolve a liveness alert. */
+  private async flushRowsMeter() {
+    this.lastMeterFlush = Date.now();
+    this.meter.flush(this.sql);
+    const hour = Math.floor(Date.now() / 3_600_000);
+    if (hour === this.rowsAlertCheckedHour) return;
+    this.rowsAlertCheckedHour = hour;
+    const alert = this.meter.runSync('meter:alert', () => {
+      const report = rowsReadReport(this.sql, Date.now(), 2);
+      const projected = report.projected_rows_read_per_day;
+      if (projected === null) return null;
+      const limit = rowsReadAlertThreshold(this.env);
+      const top = report.scopes.slice(0, 3).map(s => `${s.scope}=${s.rows_read}`).join(', ');
+      return this.livenessService.setAlert('do_rows_read_budget', 'hub', projected > limit
+        ? { state: 'over_budget', detail: `DO rows read projected ${projected}/day (last full hour x24) > budget ${limit}/day; top: ${top}` }
+        : null);
+    });
+    if (alert) await this.notifyAlert(alert);
   }
 
   /** M12e session control auth (narrow seam, owned by platform-session-api-r2):
@@ -4484,14 +4572,14 @@ export class Hub extends DurableObject {
   }
 
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    handleWebSocketMessageRegistry(ws, message, this.sql);
+    try { return this.meter.runSync('ws:message', () => handleWebSocketMessageRegistry(ws, message, this.sql)); } finally { this.maybeFlushRowsMeter(); }
   }
 
   webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
-    handleWebSocketCloseRegistry(ws, this.sql);
+    try { return this.meter.runSync('ws:close', () => handleWebSocketCloseRegistry(ws, this.sql)); } finally { this.maybeFlushRowsMeter(); }
   }
 
   webSocketError(ws: WebSocket, error: any) {
-    handleWebSocketCloseRegistry(ws, this.sql);
+    try { return this.meter.runSync('ws:error', () => handleWebSocketCloseRegistry(ws, this.sql)); } finally { this.maybeFlushRowsMeter(); }
   }
 }

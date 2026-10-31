@@ -14,6 +14,8 @@ export const LIVENESS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_heartbeats (actor TEXT PRIMARY KEY, machine_id TEXT, status TEXT NOT NULL, summary TEXT, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS liveness_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_kind TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL, opened_at TEXT NOT NULL, resolved_at TEXT, notified_at TEXT, notify_error TEXT, delivered_to TEXT NOT NULL DEFAULT '[]');
 CREATE INDEX IF NOT EXISTS liveness_alerts_open ON liveness_alerts (subject_kind, subject, resolved_at);
+CREATE INDEX IF NOT EXISTS liveness_alerts_open_kind ON liveness_alerts (subject_kind) WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS liveness_alerts_resolved ON liveness_alerts (resolved_at) WHERE resolved_at IS NOT NULL;
 `;
 
 export type Thresholds = { machineStaleS: number; machineOfflineS: number; agentStallS: number; heartbeatStaleS: number; launchStuckS: number };

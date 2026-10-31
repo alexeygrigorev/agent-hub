@@ -26,6 +26,37 @@ export function historyReferencesSession(task: any, session: any, binding: any):
   });
 }
 
+/** Ids of intakes whose projection link/report entries satisfy `match`, in
+ * projection scan order, at most `limit`. Candidates come from the indexed
+ * intake_projection_link_refs table (intake 8081a05a), so a lookup reads a
+ * few rows instead of json_each over every intake. `refs` must cover every
+ * hub_session_id/native_id value `match` can accept. */
+export function linkedTaskIds(sql: SqlStorage, refs: unknown[], match: (e: any) => boolean, limit: number): string[] {
+  const keys = [...new Set(refs.filter((r): r is string => typeof r === 'string'))];
+  if (!keys.length) return [];
+  const rows = sql.exec(`SELECT i.id, i.links FROM intake_task_projection i WHERE i.id IN
+    (SELECT task_id FROM intake_projection_link_refs WHERE ref IN (${keys.map(() => '?').join(',')})) ORDER BY i.rowid`, ...keys).toArray() as any[];
+  const ids: string[] = [];
+  for (const row of rows) {
+    let links: any; try { links = JSON.parse(row.links); } catch { continue; }
+    if (!Array.isArray(links) || !links.some(e => e && typeof e === 'object' && !Array.isArray(e) && match(e))) continue;
+    ids.push(row.id);
+    if (ids.length >= limit) break;
+  }
+  return ids;
+}
+
+/** json_extract(...)=? semantics: only a JSON string equals a text parameter. */
+const textEq = (v: unknown, want: unknown) => typeof v === 'string' && v === want;
+const absent = (v: unknown) => v === undefined || v === null;
+
+/** The session/native link predicate shared by intake linkage and idle reaping. */
+export function sessionLinkIds(sql: SqlStorage, session: any, binding: any, limit: number): string[] {
+  const sid = session.id || '', native = binding.native_id || '', machine = session.machine_id || '';
+  return linkedTaskIds(sql, [sid, native], e => textEq(e.hub_session_id, sid) ||
+    (textEq(e.native_id, native) && (absent(e.host) || textEq(e.host, machine))), limit);
+}
+
 export function linkedIntake(sql: SqlStorage, session: any, inferHistory = false): any | null {
   const request = parseObject(session.request_json), binding = parseObject(session.binding_json);
   if (request.intake_task_id) {
@@ -33,12 +64,9 @@ export function linkedIntake(sql: SqlStorage, session: any, inferHistory = false
     return row ? parseObject(row.data) : null;
   }
   if (!inferHistory) {
-    const ids: any[] = sql.exec(`SELECT DISTINCT i.id FROM intake_task_projection i, json_each(i.links) e
-      WHERE json_extract(e.value,'$.hub_session_id')=? OR
-      (json_extract(e.value,'$.native_id')=? AND (json_extract(e.value,'$.host') IS NULL OR json_extract(e.value,'$.host')=?)) LIMIT 2`,
-      session.id || '', binding.native_id || '', session.machine_id || '').toArray();
+    const ids = sessionLinkIds(sql, session, binding, 2);
     if (ids.length !== 1) return null;
-    const row: any = sql.exec('SELECT data FROM intake_tasks WHERE id=?', ids[0].id).toArray()[0];
+    const row: any = sql.exec('SELECT data FROM intake_tasks WHERE id=?', ids[0]).toArray()[0];
     return row ? parseObject(row.data) : null;
   }
   const matches = sql.exec('SELECT data FROM intake_tasks').toArray()
@@ -77,12 +105,9 @@ function cachedIntakeFacts(sql: SqlStorage, session: any, request: any, cache: I
   let id: any = request.intake_task_id;
   if (!id) {
     const binding = parseObject(session.binding_json);
-    const ids: any[] = sql.exec(`SELECT DISTINCT i.id FROM intake_task_projection i, json_each(i.links) e
-      WHERE json_extract(e.value,'$.hub_session_id')=? OR
-      (json_extract(e.value,'$.native_id')=? AND (json_extract(e.value,'$.host') IS NULL OR json_extract(e.value,'$.host')=?)) LIMIT 2`,
-      session.id || '', binding.native_id || '', session.machine_id || '').toArray();
+    const ids = sessionLinkIds(sql, session, binding, 2);
     if (ids.length !== 1) return null;
-    id = ids[0].id;
+    id = ids[0];
   }
   const key = JSON.stringify([typeof id, String(id)]);
   if (cache.intakes.has(key)) return cache.intakes.get(key)!;
@@ -103,10 +128,7 @@ export function openWorkPreventsIdleReap(sql: SqlStorage, session: any, now = Da
       const binding = parseObject(session.binding_json);
       // Ambiguous retained links still establish an obligation even though they
       // cannot pick one intake for automatic recovery.
-      return sql.exec(`SELECT 1 FROM intake_task_projection i,json_each(i.links) e WHERE
-        json_extract(e.value,'$.hub_session_id')=? OR
-        (json_extract(e.value,'$.native_id')=? AND (json_extract(e.value,'$.host') IS NULL OR json_extract(e.value,'$.host')=?)) LIMIT 1`,
-        session.id || '',binding.native_id || '',session.machine_id || '').toArray().length > 0;
+      return sessionLinkIds(sql, session, binding, 1).length > 0;
     }
     if (task && (cache ? (task as { done: boolean }).done : intakeHasDone(task))) return false;
     if (cache && cache.episodes === undefined) {
