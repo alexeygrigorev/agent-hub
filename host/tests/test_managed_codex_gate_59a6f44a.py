@@ -40,7 +40,8 @@ def _admission_setup(monkeypatch, tmp_path, gate_result):
     p.write_json(tmp_path / 'state.json', [{'label': label, 'revision': rev, 'provider': 'codex'}])
     dest = tmp_path / (label + '-' + rev)
     bundle = {'label': label, 'provider': 'codex', 'version': '0.163.0',
-              'revision': rev, 'files': {}, 'env': {}, 'args': []}
+              'revision': rev, 'files': {'.codex/auth.json': '{"synthetic": true}'}, 'env': {}, 'args': []}
+    # A logged-in profile: the 06d2a0ac login probe refuses one without a credential.
     p.write_json(dest / 'bundle.json', bundle)
     monkeypatch.setattr(p.sys, 'argv', ['provisioning', label])
     allowed, reason = gate_result

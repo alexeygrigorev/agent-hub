@@ -1609,6 +1609,28 @@ def execute():
         os.execve(command[0], argv, env)
 
 
+# Provider -> native credential file inside the managed home. Providers not
+# listed have no reliable file probe and are not judged here.
+LOGIN_FILES = {'codex': ('.codex/auth.json',)}
+
+
+def profile_logged_in(bundle, dest):
+    """True unless the managed profile provably has no credential."""
+    paths = LOGIN_FILES.get(bundle.get('provider'))
+    if not paths:
+        return True
+    files = bundle.get('files') if isinstance(bundle.get('files'), dict) else {}
+    for rel in paths:
+        if files.get(rel):
+            return True
+        try:
+            if (Path(dest) / 'home' / rel).stat().st_size > 0:
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def admission():
     label = sys.argv[1]
     payload = {}
@@ -1646,6 +1668,12 @@ def admission():
     except Exception:
         result = {'launch_allowed': False, 'profile_supported': False, 'account_label': label, 'reason': 'hub_unreachable'}
 
+    # Login probe (intake 06d2a0ac AC2): a managed Codex profile without a
+    # credential opens at the "Sign in with ChatGPT" screen and never runs a
+    # turn. Refuse it as not_logged_in so Hub re-places on another route.
+    if bundle is not None and result.get('launch_allowed') and not profile_logged_in(bundle, root() / (label + '-' + str(bundle.get('revision', '')))):
+        result['launch_allowed'] = False
+        result['reason'] = 'not_logged_in'
     if bundle is None and result.get('launch_allowed'):
         result['launch_allowed'] = False
         result['profile_supported'] = False

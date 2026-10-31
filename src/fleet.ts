@@ -167,6 +167,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "admission_quota_unverified": "The maintained launcher could not read a trusted quota observation for this managed account (probe unavailable or rate-limited).",
   "engine_auth_expired": "The engine authentication is unavailable or expired.",
   "credential_rejected": "The host's copy of the Hub-held engine credential was rejected.",
+  "not_logged_in": "The engine profile on this host is not logged in (no credential).",
   "codex_quota_gate_quota_unavailable": "The managed Codex account quota gate refused launch before execution.",
   "codex_quota_gate_codex_reserve_required": "The managed Codex account is below the configured weekly reserve.",
   "codex_quota_gate_stale_window_evidence": "The managed Codex quota evidence is stale.",
@@ -186,14 +187,14 @@ function claimFieldsValid(d: any): boolean {
 const GATE_REASONS = new Set(['local_bundle_missing', 'local_lock_unavailable', 'local_profile_missing',
   'profile_mismatch', 'account_mismatch', 'model_mismatch', 'hub_unreachable', 'profile_not_installed',
   'account_unmapped', 'credential_invalid', 'credential_rejected', 'quota_exhausted', 'profile_unsupported',
-  'account_label_mismatch', 'admission_timestamp_stale', 'model_unverified', 'gate_refused']);
+  'account_label_mismatch', 'admission_timestamp_stale', 'model_unverified', 'gate_refused', 'not_logged_in']);
 function gateReasonValid(d: any): boolean {
   return d.gate_reason === undefined || (d.reason === 'admission_refused' && GATE_REASONS.has(d.gate_reason));
 }
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
 // tier exclusion or a recorded route refusal); it never frees up, so it must not
 // turn a capacity wait into a hard 409.
-const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured']);
+const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'account_unknown', 'not_logged_in']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
@@ -755,6 +756,7 @@ export class FleetService {
     const placeableMachines = new Set<string>();
     const placementReasons = new Set<string>();
     if (!routes.length) placementReasons.add('no_routes');
+    if (!account.enabled) placementReasons.add('account_disabled');
     if (!availableSlots) placementReasons.add('account_concurrency');
     let placeableRoutes = 0;
     for (const route of routes) {
@@ -1071,6 +1073,16 @@ export class FleetService {
       const hostCredentialRefusal = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.find((r: any) =>
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
         && r.reason === 'credential_rejected' && fresh(r.observed_at, this.now(), 300000));
+      // Host login probe (intake 06d2a0ac AC1/AC2): the host found no
+      // credential for this exact profile, so a session would sit at a
+      // sign-in screen. Never offer the route while that report is fresh.
+      // A dispatch refusal for the same reason holds the route until the
+      // host's next advertisement carries the probe (no re-offer loop).
+      const hostLoginRefusal = () => (Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.some((r: any) =>
+        r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
+        && r.reason === 'not_logged_in' && fresh(r.observed_at, this.now(), 300000)))
+        || this.sql.exec("SELECT 1 FROM fleet_launches WHERE machine_id = ? AND engine = ? AND account = ? AND profile IS ? AND exit_reason = 'not_logged_in' AND COALESCE(finished_at, updated_at) > ? LIMIT 1",
+          route.machine_id, route.engine, route.account, route.profile, new Date(this.now() - ENGINE_HEALTH_RETRY_MS).toISOString()).toArray().length > 0;
       const routeProv = definition ? this.observationProvenance(definition, route) : null;
       const routeQuota = evaluateLaunchQuota({ provider: String(definition?.provider ?? ''), quota: routeProv?.quota ?? null,
         subscriptionObservedAt: routeProv?.subscriptionObservedAt ?? null, nowMs: this.now(),
@@ -1110,6 +1122,7 @@ export class FleetService {
         routingRunners(route.machine_id), this.now()), route)) reason = 'route_not_advertised';
       else if (credentialInvalid.has(route.account)) reason = 'credential_invalid';
       else if (credentialRejected.has(route.machine_id + '\u0000' + route.account) || hostCredentialRefusal) reason = 'credential_rejected';
+      else if (hostLoginRefusal()) reason = 'not_logged_in';
       else if (gateRefusal) reason = gateRefusal.reason;
       else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, effectiveWorkspace) || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd))) {
         const engineMissing = !Array.isArray(caps.engines) || !caps.engines.includes(route.engine);
@@ -1181,7 +1194,20 @@ export class FleetService {
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
         ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, ...(routeQuota.reason !== 'eligible' || (gateProjection && !gateRefusal) ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
     }
+    // Intake 06d2a0ac AC1: an account with no quota verdict at all (status
+    // unknown: never observed, or only "unknown"/unavailable reports) is
+    // never auto-placed while the fleet holds verdicts for other accounts.
+    // Only a fleet-wide probe outage (no account known) keeps the fail-open
+    // projection rule (intake 4398ce2a); an explicit --account pin is the
+    // operator's override.
     const degraded = new Set(Array.from(gateDegraded, i => candidates[i]));
+    if (!request.account && [...accounts.values()].some(a => a.status !== 'unknown')) {
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        if (accounts.get(candidates[i].account)?.status !== 'unknown') continue;
+        rejected.push({ machine: candidates[i].machine, engine: candidates[i].engine, reason: 'account_unknown' });
+        candidates.splice(i, 1);
+      }
+    }
     candidates.sort((a, b) => Number(!!a.overflow) - Number(!!b.overflow) || Number(degraded.has(a)) - Number(degraded.has(b)) || b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
     // The stored intent carries the winner's normalized workspace: a bare
     // label that resolved under the selected host's root is persisted and
@@ -1646,6 +1672,33 @@ export class FleetService {
         } catch { /* audit is best-effort; fleet_accounts stays authoritative */ }
         return response({ status: 'configured', target: data.target, kind: resolved.kind, max_concurrency: data.max_concurrency,
           allow_lower: data.allow_lower === true, changes: plan.changes });
+      });
+    }
+    // Reversible per-account routing switch (intake 06d2a0ac AC3): a
+    // disabled account keeps its registry row, routes, credentials and
+    // history, but accountStatus() reports it blocked so plan() never offers
+    // it. Re-enabling restores placement; nothing is deleted.
+    const accountToggle = /^\/api\/fleet\/accounts\/([^/]+)$/.exec(path);
+    if (accountToggle && request.method === 'PATCH') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      let target = '';
+      try { target = decodeURIComponent(accountToggle[1]); } catch { target = ''; }
+      if (!label(target) || !object(data, ['enabled', 'reason']) || typeof data.enabled !== 'boolean' ||
+          (data.reason !== undefined && (typeof data.reason !== 'string' || data.reason.length > 200 || /[\x00-\x1f\x7f]/.test(data.reason))))
+        return response({ error: 'invalid_account_toggle' }, 400);
+      return this.transaction(() => {
+        const row: any = this.sql.exec('SELECT label, enabled FROM fleet_accounts WHERE label = ?', target).toArray()[0];
+        if (!row) return response({ error: 'unknown_account' }, 404);
+        const from = !!row.enabled;
+        if (from !== data.enabled) {
+          this.sql.exec('UPDATE fleet_accounts SET enabled = ? WHERE label = ?', Number(data.enabled), target);
+          try {
+            this.sql.exec('INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)', String(caller.actor ?? 'admin'),
+              data.enabled ? 'fleet_account_enabled' : 'fleet_account_disabled', 'fleet_account', target, JSON.stringify({ from, to: data.enabled, reason: data.reason ?? null }), new Date(this.now()).toISOString());
+          } catch { /* audit is best-effort; fleet_accounts stays authoritative */ }
+        }
+        return response({ status: data.enabled ? 'enabled' : 'disabled', account: target, changed: from !== data.enabled });
       });
     }
     if (path === '/api/fleet/accounts' && request.method === 'PUT') {
@@ -2124,7 +2177,7 @@ export class FleetService {
             // Retain the same intent; next offer repeats every admission/authority gate.
             return response({ id: row.id, state: 'held', reason: data.reason, diagnostic, retryable: true });
           }
-          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
+          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || data.reason === 'not_logged_in' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
             if (data.reason === 'engine_auth_expired') {
               this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
             }

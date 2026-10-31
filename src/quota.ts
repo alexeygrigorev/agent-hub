@@ -1510,7 +1510,9 @@ export class QuotaStore {
       pools.push({
         provider: canonicalQuotaProvider(account.provider),
         account: canonicalAccountLabel(account.label),
-
+        // Operator-disabled (intake 06d2a0ac AC3): excluded from routing,
+        // reversible; the quota row stays visible.
+        ...(Number(account.enabled) === 0 ? { routing: "disabled" } : {}),
         state,
         source,
         windows: displayObs?.quota.windows || {},

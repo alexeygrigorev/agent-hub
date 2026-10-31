@@ -9,6 +9,8 @@ and persists across Hub restarts and deploys. Both commands are admin-only
 ```
 hub limits show [--json]
 hub limits set <engine|account> <n> [--allow-lower] [--json]
+hub limits disable <account> [--reason TEXT] [--json]
+hub limits enable <account> [--reason TEXT] [--json]
 ```
 
 ## show
@@ -72,3 +74,12 @@ transaction.
   host-local setting, not managed by `hub limits`.
 - `PUT /api/fleet/accounts` replaces the whole registry and remains the path
   for adding or removing accounts and routes.
+
+## Disabling an account (intake 06d2a0ac)
+
+`hub limits disable <account>` takes one account out of routing without
+deleting anything: its registry row, routes, credentials, quota rows and
+history stay, `hub fleet` shows `enabled: false` with placement reason
+`account_disabled`, and `hub quota` marks it `[DISABLED: excluded from
+routing]`. `hub limits enable <account>` restores placement. Both write an
+audit row (`fleet_account_disabled` / `fleet_account_enabled`).

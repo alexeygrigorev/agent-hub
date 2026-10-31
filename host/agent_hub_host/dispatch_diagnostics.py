@@ -26,6 +26,7 @@ MESSAGES = {
     'admission_refused': 'Fresh admission refused this account or could not verify its timestamp and model.',
     'admission_quota_unverified': 'The maintained launcher could not read a trusted quota observation for this managed account (probe unavailable or rate-limited).',
     'engine_auth_expired': 'The engine authentication is unavailable or expired.',
+    'not_logged_in': 'The engine profile on this host is not logged in (no credential).',
     'codex_quota_gate_quota_unavailable': 'The managed Codex account quota gate refused launch before execution.',
     'codex_quota_gate_codex_reserve_required': 'The managed Codex account is below the configured weekly reserve.',
     'codex_quota_gate_stale_window_evidence': 'The managed Codex quota evidence is stale.',
@@ -61,7 +62,7 @@ GATE_REASONS = frozenset({
     'profile_not_installed', 'account_unmapped', 'credential_invalid',
     'credential_rejected', 'quota_exhausted', 'profile_unsupported',
     'account_label_mismatch', 'admission_timestamp_stale', 'model_unverified',
-    'gate_refused',
+    'gate_refused', 'not_logged_in',
 })
 
 
@@ -86,7 +87,7 @@ def classify(exc, *, workspace_available=True):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'host_overload', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'host_overload', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
         if value.startswith('HTTP request failed with status '):
             reason = 'dispatch_claim_refused'
     elif isinstance(exc, (RuntimeError, OSError)):

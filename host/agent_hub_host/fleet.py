@@ -2675,6 +2675,8 @@ class Dispatcher:
             # Preserve host-side gate slugs (intake 59a6f44a AC3/AC4): a managed
             # Codex quota-gate refusal must surface as codex_quota_gate_* in
             # rejected[]/launch_error, never a silent stopped/session_not_bound.
+            if gate_reason == "not_logged_in":
+                raise ValueError("not_logged_in: the engine profile has no credential on this host")
             if gate_reason.startswith("codex_quota_gate_"):
                 slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in gate_reason)[:64]
                 raise ValueError(slug + ": managed Codex quota gate refused launch before execution")
@@ -4090,13 +4092,15 @@ class Dispatcher:
                 allowed |= admitted
                 if admitted:
                     admitted_engines.add(sub.get('engine', sub['service']))
-                elif gate.get('reason') in ('credential_rejected', 'credential_invalid'):
-                    # Hub's own credential verdict for this account (any engine).
+                elif gate.get('reason') in ('credential_rejected', 'credential_invalid', 'not_logged_in'):
+                    # Hub's own credential verdict for this account (any engine),
+                    # or the local login probe found no credential (06d2a0ac).
                     for mode in caps['fleet_modes']:
                         caps['fleet_route_rejections'].append({
                             'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
                             'profile': sub.get('profile'), 'mode': mode,
-                            'reason': 'credential_rejected', 'observed_at': utcnow()})
+                            'reason': 'not_logged_in' if gate.get('reason') == 'not_logged_in' else 'credential_rejected',
+                            'observed_at': utcnow()})
                 elif sub.get('service') == 'codex':
                     reason = gate.get('reason', '')
                     # Only a Hub quota verdict is a refusal; anything else

@@ -96,6 +96,7 @@ tool('monitoring_disk', 'GET', '/api/monitoring/disk', 'Authorized disk monitori
 tool('monitoring_health', 'GET', '/api/monitoring/health', 'Authorized host health monitoring dashboard.');
 tool('accounts_write', 'PUT', '/api/fleet/accounts', 'Operator-only account registry update.');
 tool('limits', 'GET', '/api/fleet/limits', 'Operator-only per-engine and per-account concurrency caps with current usage.', ['limits show']);
+tool('account_routing', 'PATCH', '/api/fleet/accounts/{label}', 'Operator-only reversible routing switch for one account: payload enabled (bool), reason. A disabled account keeps its routes, credentials and history but is never placed.', ['limits disable', 'limits enable']);
 tool('limits_set', 'PATCH', '/api/fleet/limits', 'Operator-only live, persisted concurrency cap set: payload target (engine or account), max_concurrency 1..100, allow_lower. Raise-only unless allow_lower.', ['limits set']);
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {

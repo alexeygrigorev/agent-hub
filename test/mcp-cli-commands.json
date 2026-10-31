@@ -58,6 +58,8 @@
   "job",
   "jobs",
   "launcher-release",
+  "limits disable",
+  "limits enable",
   "limits set",
   "limits show",
   "login",

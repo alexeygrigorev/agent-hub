@@ -21,12 +21,24 @@ def add_parser(sub) -> None:
     st.add_argument('--allow-lower', action='store_true',
                     help='Also lower caps above n; without it an engine set keeps higher caps and an account set refuses')
     st.add_argument('--json', action='store_true', help='Print the raw JSON response')
+    for verb, text in (('disable', 'Exclude one account from routing, reversibly (admin; nothing is deleted)'),
+                       ('enable', 'Return a disabled account to routing (admin)')):
+        tg = lsub.add_parser(verb, help=text)
+        tg.add_argument('account', help='Account label (e.g. dummy-sync-5814)')
+        tg.add_argument('--reason', help='Short audit reason')
+        tg.add_argument('--json', action='store_true', help='Print the raw JSON response')
 
 
 def execute(args: argparse.Namespace) -> dict:
     from . import session_control
     if args.limits_cmd == 'show':
         return session_control.request('GET', '/api/fleet/limits')
+    if args.limits_cmd in ('disable', 'enable'):
+        from urllib.parse import quote
+        payload = {'enabled': args.limits_cmd == 'enable'}
+        if args.reason:
+            payload['reason'] = args.reason
+        return session_control.request('PATCH', '/api/fleet/accounts/' + quote(args.account, safe=''), payload)
     if not 1 <= args.n <= 100:
         raise ValueError('n must be between 1 and 100')
     payload = {'target': args.target, 'max_concurrency': args.n}
@@ -55,6 +67,8 @@ def render(args: argparse.Namespace, result: dict) -> str:
                         a.get('observed_sessions'), a.get('native_live'), a.get('sessions', '-'), a.get('available_slots'),
                         a.get('status') if a.get('enabled') else 'disabled'] for a in result.get('accounts') or []])
         return '\n'.join(out)
+    if args.limits_cmd in ('disable', 'enable'):
+        return '%s %s%s' % (result.get('account'), result.get('status'), '' if result.get('changed') else ' (unchanged)')
     out = ['Set %s=%s (%s%s):' % (result.get('target'), result.get('max_concurrency'), result.get('kind'),
                                    ', allow-lower' if result.get('allow_lower') else '')]
     out += _table(['ACCOUNT', 'FROM', 'TO', 'RESULT'],
