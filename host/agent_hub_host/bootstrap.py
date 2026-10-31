@@ -612,7 +612,11 @@ def install_service(install_root, command):
         handover(state_root(install_root) / 'controller')
         runner = install_root / 'controller.ps1'
         quote = lambda s: "'" + str(s).replace("'", "''") + "'"
-        lines = ['$ErrorActionPreference = \'Stop\'']
+        # Windows PowerShell 5.1 turns any native stderr line under 2>&1 into a
+        # terminating NativeCommandError when EAP is Stop: the wrapper died on the
+        # first traceback, the log lost it and the task ended while the controller
+        # kept running (intake bf0863c4 BUG5). Exit codes propagate explicitly.
+        lines = ['$ErrorActionPreference = \'Continue\'']
         lines.extend('$env:' + k + ' = ' + quote(v) for k, v in env.items())
         lines.extend(['Set-Location -LiteralPath ' + quote(install_root / 'package'),
                       '& ' + ' '.join(quote(x) for x in command) + ' >> ' + quote(log) + ' 2>&1',

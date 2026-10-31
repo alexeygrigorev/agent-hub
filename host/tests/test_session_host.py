@@ -46,6 +46,15 @@ class SessionHostTests(unittest.TestCase):
             changed=dict(receipt);changed[key]=value
             self.assertFalse(module.same_controller(changed,receipt))
 
+    def test_supervisor_identity_ignores_observed_workspace_drift(self):
+        # aplexer 0.1.23 moved a live Windows controller's workspace to %TEMP%
+        # (DESKTOP-FP4OP26, intake bf0863c4); that is not a different controller.
+        path=pathlib.Path(__file__).resolve().parents[2]/'scripts/session-host-supervisor.py'
+        spec=importlib.util.spec_from_file_location('host_supervisor',path)
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        receipt=dict(id='synthetic-id',tag='controller',workspace='/synthetic',engine='shell',created_at_ms=1,command=['python','host'])
+        self.assertTrue(module.same_controller(dict(receipt,workspace='C:/Users/u/AppData/Local/Temp'),receipt))
+
     def test_session_host_loads_role_config_independently_of_disabled_consumer(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = pathlib.Path(directory)

@@ -57,9 +57,17 @@ def controller_resource_argv() -> list[str]:
             '--cpu-quota-us', '100000', '--cpu-period-us', '100000']
 
 
+# aplexer 0.1.23 reports `workspace` as an observed, mutable field (on Windows it
+# moved to %TEMP% seconds after session_host started), so it is not identity.
+# The immutable receipt is id + created_at_ms + tag + engine + command. Matching
+# on workspace made a healthy controller look "changed": the supervisor exited
+# without killing it, the orphan kept the journal lock, every restart died on
+# PermissionError and the lease stayed controller_exit_unproven (intake bf0863c4).
+CONTROLLER_MATCH_KEYS = ('id', 'tag', 'engine', 'created_at_ms', 'command')
+
+
 def same_controller(row, receipt):
-    return all(row.get(key) == receipt.get(key) for key in
-               ('id', 'tag', 'workspace', 'engine', 'created_at_ms', 'command'))
+    return all(row.get(key) == receipt.get(key) for key in CONTROLLER_MATCH_KEYS)
 
 
 def controller_crash_service(row, receipt):

@@ -15,6 +15,8 @@ import uuid
 from . import private_fs
 
 IDENTITY_KEYS = ('id', 'workspace', 'tag', 'engine', 'created_at_ms', 'command')
+# Native `workspace` is observed and mutable (aplexer 0.1.23); never match on it.
+MATCH_KEYS = tuple(k for k in IDENTITY_KEYS if k != 'workspace')
 MAX_HANDOVER_SECONDS = 90
 
 
@@ -123,7 +125,7 @@ def recover_stale_owner(directory, current_boot, observe, absent=None):
                     row = observe(receipt)
                 except Exception:
                     row = None
-                if (isinstance(row, dict) and all(row.get(k) == receipt[k] for k in IDENTITY_KEYS)
+                if (isinstance(row, dict) and all(row.get(k) == receipt[k] for k in MATCH_KEYS)
                         and row.get('containment_empty') is True):
                     proof = 'exact_receipt_containment_empty'
                 elif row is None and absent is not None and absent(receipt):

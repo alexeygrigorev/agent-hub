@@ -376,3 +376,16 @@ class HandoverTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ObservedWorkspaceDriftTest(unittest.TestCase):
+    def test_recovery_accepts_exact_receipt_with_drifted_workspace(self):
+        from agent_hub_host import bootstrap_control as bc
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            receipt = dict(id='owned', workspace='/release/package', tag='t', engine='shell',
+                           created_at_ms=1, command=['python'])
+            bc._write(d / 'owner.json', {'version': 2, 'generation': 'a' * 32, 'boot_identity': 'b', 'receipt': receipt})
+            row = dict(receipt, workspace='C:/Temp', containment_empty=True)
+            bc.recover_stale_owner(d, 'b', lambda r: row)
+            self.assertFalse((d / 'owner.json').exists())
