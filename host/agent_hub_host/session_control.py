@@ -484,6 +484,9 @@ def add_commands(sub):
     start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
     start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier for policy routing')
     start.add_argument('--cwd')
+    start.add_argument('--intake-worktree', dest='intake_worktree', choices=['detached', 'successor'], default=None,
+                       help='detached: keep the intake link but never resume, create or lock its worktree (79458f2d). '
+                            'successor: replacement of a live predecessor; Hub plans a fresh sibling worktree and a named --cwd is refused (afab8367)')
     start.add_argument('--name', default=None,
                        help='Friendly session name (stored, shown in list/show; exact-match alias, never identity)')
     start.add_argument('--parent', default=None,
@@ -859,6 +862,10 @@ def _execute(args):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        if getattr(args, 'intake_worktree', None):
+            if payload.get('cwd'):
+                raise ValueError('--intake-worktree successor keeps Hub in charge of the cwd; drop --cwd (a detached start never names one either)')
+            payload['intake_worktree'] = args.intake_worktree
         needs = getattr(args, 'needs', None)
         if needs:
             if not isinstance(needs, list) or len(needs) > 64 or any(
