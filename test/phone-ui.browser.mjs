@@ -28,7 +28,7 @@ const checks = [], shots = [];
 const key = randomBytes(32).toString('hex');
 const secret = randomBytes(32).toString('hex');
 const adminToken = randomBytes(32).toString('hex');
-const bundle = await build({ entryPoints: [resolve(root, 'test/existing-ui-worker.ts')], bundle: true, write: false, format: 'esm', platform: 'browser', external: ['cloudflare:workers'] });
+const bundle = await build({ entryPoints: [resolve(root, 'test/existing-ui-worker.ts')], bundle: true, write: false, format: 'esm', platform: 'browser', external:['cloudflare:workers','node:async_hooks'] });
 const mime = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.woff2': 'font/woff2' };
 const mf = new Miniflare(convertV4MiniflareOptions({
   host: '127.0.0.1', port: 0, log: new Log(LogLevel.ERROR), workers: [{
