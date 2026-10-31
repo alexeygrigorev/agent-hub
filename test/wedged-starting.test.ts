@@ -37,6 +37,8 @@ async function fixture(fn: (s: SessionControlService, f: FleetService, sql: any,
 
 describe('wedged claimed launches', () => {
   it('accepts owning host fenced no-start, terminalizes offered session, and permits stop with replay', () => fixture(async (s, f, sql, session, launch) => {
+    // A claim younger than the silent-start bound is not yet abandonable.
+    sql.exec('UPDATE fleet_launches SET updated_at=? WHERE id=?', new Date().toISOString(), launch);
     expect((await s.handle(req(`/api/sessions/${session.id}/stop`, { key: 'too-early' }), admin)).status).toBe(409);
     const receipt = { state: 'failed', confirmed_exit: true, launcher_task_id: 'hub-' + launch, reason: 'launcher_not_started' };
     expect((await f.handle(req(`/api/fleet/launches/${launch}/result`, receipt), host)).status).toBe(200);

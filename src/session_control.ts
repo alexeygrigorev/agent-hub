@@ -9,6 +9,7 @@ import { linkedIntake, linkedTaskIds, hasOpenWork, nativeGoalStatus, sessionWake
 import { workerAccessContext, workerWakeAllowed } from './worker-access';
 import { registeredRepoLabel } from './repos';
 import { initResourceRequestProjection } from './sql-json-projection';
+import { abandonedLaunch, expireSilentStartRows } from './silent-start';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
  *
  * Placement itself is never reimplemented here: starts delegate to the existing
@@ -416,6 +417,15 @@ export class SessionControlService {
     const expires = Date.parse(cred.expires_at);
     if (!Number.isFinite(expires) || expires <= this.now()) return false;
     return credentialActor(this.sql, cred) !== null;
+  }
+
+  /** Cancellation receipt detail for an abandoned (never proven) start. */
+  private abandonedCancellation(session: any): { launch?: string } {
+    if (!session?.fleet_launch_id) return {};
+    try {
+      const launch = this.sql.exec('SELECT state, mode, exit_reason, verification_status FROM fleet_launches WHERE id = ?', session.fleet_launch_id).toArray()[0];
+      return abandonedLaunch(launch) ? { launch: 'abandoned_unverified' } : {};
+    } catch { return {}; }
   }
 
   private cancelOwnerLive(row: any, caller: Caller, operatorStop = false): boolean {
@@ -2814,6 +2824,19 @@ export class SessionControlService {
         this.transaction(() => promoteStartedOffers(this.sql, this.now(), { sessionId: session.id }));
         session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0] ?? session;
       }
+      // Intake 0b87eb29: a claimed launch that never bound a native within the
+      // silent-start bound is abandoned now, not on the next maintenance pass,
+      // so stop can cancel the wedged intent instead of refusing forever.
+      // Younger claims keep the session_not_cancellable refusal below.
+      if (session && session.fleet_launch_id && !session.binding_json && ['offered', 'starting'].includes(session.state) &&
+          (sub === 'stop' || sub === 'cancel') && request.method === 'POST') {
+        this.transaction(() => {
+          try {
+            if (expireSilentStartRows(this.sql, this.now(), session.fleet_launch_id)) reconcileUnboundFleetSessions(this.sql, this.now());
+          } catch { /* Fleet-less stores keep the ordinary refusal. */ }
+        });
+        session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0] ?? session;
+      }
       if (sub === 'link' && request.method === 'POST') {
         if (!admin) return response({ error: 'forbidden' }, 403);
         const input = await body(request);
@@ -3185,19 +3208,23 @@ export class SessionControlService {
           const prior: any = this.sql.exec('SELECT * FROM session_control_cancellations WHERE session_id = ?', live.id).toArray()[0];
           if (prior) {
             if (prior.actor !== actorName(caller) || prior.request_key !== input.key) return response({ error: 'idempotency_conflict' }, 409);
-            return response({ ...this.view(live), cancellation: { key: prior.request_key, created_at: prior.created_at, effect: 'no_native_start' }, replay: true });
+            return response({ ...this.view(live), cancellation: { key: prior.request_key, created_at: prior.created_at, effect: 'no_native_start', ...this.abandonedCancellation(live) }, replay: true });
           }
           const pending = this.sql.exec('SELECT id FROM session_control_commands WHERE session_id = ? LIMIT 1', live.id).toArray();
           const original = parsed(live.request_json, {});
           // Queued and offered launches have no start authorization. Cancel
           // atomically against claim; never treat missing binding as no spawn.
           const queuedFleet = ['queued', 'held', 'offered', 'failed'].includes(live.state) && live.fleet_launch_id && !live.binding_json && !pending.length && original.provenance !== 'observed_native'
-            ? (() => { try { return this.sql.exec('SELECT state, native_id, launcher_task_id, verification_status FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0] ?? null; } catch { return null; } })()
+            ? (() => { try { return this.sql.exec('SELECT state, mode, native_id, launcher_task_id, verification_status, exit_reason FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0] ?? null; } catch { return null; } })()
             : null;
           // A host-fenced no-start failure retains its failed attempt; an
           // operator may now cancel the intent without claiming native exit.
-          const provenNoStart = queuedFleet && queuedFleet.state === 'failed' &&
-            queuedFleet.verification_status === 'not_started' && !queuedFleet.native_id;
+          // So may a claim Hub abandoned on the silent-start bound (intake
+          // 0b87eb29): no native was ever bound and capacity is released. The
+          // cancellation never claims exit; a late real start still reaches
+          // the launch through the owning host's result and stays tracked.
+          const provenNoStart = queuedFleet && queuedFleet.state === 'failed' && !queuedFleet.native_id &&
+            (queuedFleet.verification_status === 'not_started' || abandonedLaunch(queuedFleet));
           if (queuedFleet && !provenNoStart && (!['queued', 'offered'].includes(String(queuedFleet.state)) || queuedFleet.native_id || queuedFleet.launcher_task_id)) return response({ error: 'session_not_cancellable' }, 409);
           if ((live.state !== 'held' || live.fleet_launch_id || live.binding_json || pending.length || original.provenance === 'observed_native') && !queuedFleet) {
             return response({ error: 'session_not_cancellable' }, 409);
@@ -3227,7 +3254,7 @@ export class SessionControlService {
             }
           } catch {}
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', live.id).toArray()[0];
-          return response({ ...this.view(row), cancellation: { key: input.key, created_at: at, effect: 'no_native_start' }, replay: false });
+          return response({ ...this.view(row), cancellation: { key: input.key, created_at: at, effect: 'no_native_start', ...this.abandonedCancellation(row) }, replay: false });
         });
       }
       if (sub === 'retry' && request.method === 'POST') {

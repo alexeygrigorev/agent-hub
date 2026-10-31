@@ -647,6 +647,21 @@ also recovers a lost finish receipt and forwards the bounded `hub-results`
 report. A result file alone cannot prove exit. Recovery does not launch or
 stop a native session, delete data, or clean a worktree.
 
+Hub itself abandons a claimed headless launch that bound no native within
+15 minutes (`worker_silent_start`, verification `unverified`); its unbound
+session leaves `offered`/`starting` as `failed`. `sessions stop` applies the
+same bound immediately, so a wedged claim no longer returns
+`session_not_cancellable` once it is older than 15 minutes; the receipt is
+`effect: no_native_start` with `launch: abandoned_unverified`, because the
+abandonment is not exit proof. For 24 hours the abandoned launch stays a
+reconciliation candidate for its owning host only. The host's later exact
+receipt supersedes the abandonment: a fenced no-start becomes
+`not_started`; a recovered completion (also when the running receipt landed
+but the binding and finish were lost) is recorded as the finish with its
+`hub-results` report and the session becomes `stopped`; a late native start
+is tracked as `running` again, and if the operator already cancelled the
+session a `launch`/`late_native_start` alert opens instead of stranding it.
+
 MCP exposes the same guarded operation as `sessions_cancel` with arguments
 `{"id":"SESSION","payload":{"key":"STABLE_KEY"}}`. It re-enters ordinary
 Hub authentication and returns the API cancellation receipt.
