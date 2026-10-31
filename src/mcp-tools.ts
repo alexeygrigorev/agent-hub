@@ -117,6 +117,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'engines maintain': 'Operator trigger for Hub credential refresh and direct provider quota; the cron already runs it.',
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',
   'engines remove': 'Operator credential withdrawal stays in the explicit credential-management CLI/UI workflow.',
+  'engines status': 'Operator read of per-host engine sync status; deliberate CLI step, not an agent tool.',
   'engines sync': 'Local enrolled-host engine installation; no second remote executor.',
   'engines quota': 'Local private-account probes for the server collector; model tools read sanitized server quota instead.',
   'login': 'Host/agent pairing is performed outside model tools using hub login and explicit device approval; never return credentials in tool output.',

@@ -29,6 +29,7 @@
   "engines maintain",
   "engines quota",
   "engines remove",
+  "engines status",
   "engines sync",
   "fleet",
   "fleet-host",
