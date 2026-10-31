@@ -56,6 +56,7 @@ const SPENT_SESSION_STATES = new Set(['failed', 'refused', 'cancelled', 'engine_
  * designed idle pool, and completion holds owned by the post-DONE verifier. */
 const HOLD_TTL_EXEMPT = new Set(['watchdog_disabled', 'watchdog_configuration_invalid', 'watchdog_project_not_enabled',
   'reported_completion_requires_operator_review', 'done_evidence_requires_operator_review']);
+const HOLD_TTL_EXEMPT_PLACEHOLDERS = [...HOLD_TTL_EXEMPT].map(() => '?').join(',');
 /** Hold reasons only a person can clear (AC8, intake d8d509d2): each (intake, reason)
  * pair is alerted exactly once instead of waiting silently on an operator. */
 export const HUMAN_HOLD_REASONS = new Set(['workspace_configuration_required',
@@ -108,6 +109,8 @@ export class IntakeWatchdog {
     this.sql.exec('CREATE INDEX IF NOT EXISTS intake_queue_movement_task ON intake_queue_movement(task_id,seq)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_cursor(id INTEGER PRIMARY KEY CHECK(id=1),after_id TEXT NOT NULL,forgotten_seen INTEGER NOT NULL DEFAULT 0)');
     this.sql.exec("INSERT OR IGNORE INTO intake_queue_cursor(id,after_id) VALUES(1,'')");
+    const cursorCols = (this.sql.exec('PRAGMA table_info(intake_queue_cursor)').toArray() as any[]).map(c => c.name);
+    if (!cursorCols.includes('sweep_after')) this.sql.exec('ALTER TABLE intake_queue_cursor ADD COLUMN sweep_after TEXT');
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_digest(task_id TEXT PRIMARY KEY,day TEXT NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_budget_meta(id INTEGER PRIMARY KEY CHECK(id=1),overflow_ticks INTEGER NOT NULL DEFAULT 0,last_limited_at INTEGER)');
     this.sql.exec('INSERT OR IGNORE INTO intake_queue_budget_meta(id) VALUES(1)');
@@ -658,20 +661,29 @@ export class IntakeWatchdog {
       }
     }
     // Rows for tasks outside the batch (done, archived, deleted intakes) never
-    // reappear in a cursor range; resolve them from the projection, then bound
-    // the remaining queued holds by TTL.
-    const stale = this.rows(`SELECT q.task_id,q.state,q.reason,q.held_since,json_extract(p.data,'$.status') AS status,
-        json_extract(p.data,'$.archived_at') AS archived_at,json_extract(p.data,'$.project') AS project
+    // reappear in a cursor range; the actionable condition lives in SQL so a
+    // front of young or open rows can never hide them behind the LIMIT, and a
+    // persisted task_id cursor rotates coverage across ticks instead of
+    // rereading the same head rows (review of intake 0841a966).
+    const after = () => this.rows('SELECT sweep_after FROM intake_queue_cursor WHERE id=1')[0]?.sweep_after ?? '';
+    const fetchPage = (from: string, upto: string | null, limit: number): Obj[] => this.rows(`SELECT q.task_id,q.state,q.reason,q.held_since,
+        json_extract(p.data,'$.status') AS status,json_extract(p.data,'$.archived_at') AS archived_at,json_extract(p.data,'$.project') AS project
       FROM intake_restart_queue q LEFT JOIN intake_task_projection p ON p.id=q.task_id
-      WHERE q.task_id NOT IN (${tasks.map(() => '?').join(',') || "''"})
-      ORDER BY q.held_since LIMIT ?`, ...tasks.map(t => t.id), QUEUE_SWEEP_LIMIT * 2).filter(r => {
-      if (!r.status || r.archived_at || !OPEN.has(r.status)) return true; // gone: close
-      return r.state === 'queued' && !HOLD_TTL_EXEMPT.has(r.reason) &&
-        (r.held_since === null || r.held_since === undefined || r.held_since <= now - QUEUE_HOLD_TTL_MS);
-    });
-    let escalations = 0;
-    for (const r of stale) {
+      WHERE q.task_id > ? ${upto !== null ? 'AND q.task_id <= ?' : ''}
+        AND q.task_id NOT IN (${tasks.map(() => '?').join(',') || "''"})
+        AND (p.id IS NULL OR json_extract(p.data,'$.archived_at') IS NOT NULL
+          OR json_extract(p.data,'$.status') NOT IN ('open','in_progress','blocked','pending_approval')
+          OR (q.state='queued' AND q.reason NOT IN (${HOLD_TTL_EXEMPT_PLACEHOLDERS})
+            AND (q.held_since IS NULL OR q.held_since <= ?)))
+      ORDER BY q.task_id LIMIT ?`,
+      ...(upto !== null ? [from, upto] : [from]), ...tasks.map(t => t.id), ...HOLD_TTL_EXEMPT,
+      now - QUEUE_HOLD_TTL_MS, limit);
+    let page = fetchPage(after(), null, QUEUE_SWEEP_LIMIT * 2);
+    if (page.length < QUEUE_SWEEP_LIMIT * 2) page.push(...fetchPage('', after(), QUEUE_SWEEP_LIMIT * 2 - page.length));
+    let escalations = 0, lastProcessed: string | null = null;
+    for (const r of page) {
       if (actions >= QUEUE_SWEEP_LIMIT) break;
+      lastProcessed = r.task_id;
       if (!r.status || r.archived_at || !OPEN.has(r.status)) {
         actions++;
         const t = { id: r.task_id, project: r.project ?? 'unknown', status: r.status ?? 'missing', title: '' };
@@ -686,6 +698,7 @@ export class IntakeWatchdog {
       actions++; escalations++;
       await this.escalate(t, 'hold_ttl_' + r.reason, now);
     }
+    if (page.length) this.sql.exec('UPDATE intake_queue_cursor SET sweep_after=? WHERE id=1', lastProcessed ?? page[page.length - 1].task_id);
   }
   private closeRestart(t: Obj, q: Obj, why: string, now: number) {
     this.movement(t, 'closed', q.reason + ' closed: ' + why, now);

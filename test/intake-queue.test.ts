@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom as parseQueuePolicy, WATCHDOG_INTERVAL, QUEUE_STALL_MS, QUEUE_RETRY_LIMIT, QUEUE_RETRY_MAX_MS } from '../src/intake-watchdog';
+import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom as parseQueuePolicy, WATCHDOG_INTERVAL, QUEUE_STALL_MS, QUEUE_RETRY_LIMIT, QUEUE_RETRY_MAX_MS, QUEUE_HOLD_TTL_MS, QUEUE_SWEEP_LIMIT } from '../src/intake-watchdog';
 // Existing dispatch/recovery cases explicitly opt in; production-default tests use the base class.
 const queuePolicyFrom = (settings: Record<string, unknown> = {}) => parseQueuePolicy({HUB_INTAKE_QUEUE_ENABLED:'true',HUB_INTAKE_QUEUE_PROJECTS:'*',...settings});
 class IntakeWatchdog extends BaseIntakeWatchdog {
@@ -332,4 +332,25 @@ describe('autonomous intake queue',()=>{
     return measured;
   }).then((result:any)=>{console.log('QUEUE_BUDGET_TICK',JSON.stringify(result))}),30000);
   it('refuses unauthenticated queue reads',async()=>{const r=await SELF.fetch('https://hub.test/api/intake/queue');expect([401,403]).toContain(r.status)});
+  it('rotating SQL sweep: 150 young open rows never hide 150 closable done-task rows (review of 0841a966)',()=>fixture(async h=>{
+    let now=NOW;
+    const insert=(id:string,status:string,heldSince:number)=>{
+      h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',id,JSON.stringify({...task(id),status}));
+      h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
+        VALUES(?,'queued','watchdog_global_capacity',?,?,?)`,id,heldSince,NOW,NOW);
+    };
+    for(let i=0;i<150;i++)insert('zz-young-'+String(i).padStart(3,'0'),'open',NOW);
+    for(let i=0;i<150;i++)insert('aa-done-'+String(i).padStart(3,'0'),'done',NOW);
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[task('batch-only')]} as any,(f:any)=>f(),{},()=>now);w.init();
+    h.sql.exec("UPDATE intake_queue_cursor SET sweep_after=''");
+    await w.tick();
+    // Bounded work per tick: the first sweep closed at most QUEUE_SWEEP_LIMIT rows, and
+    // the young open rows (SQL-excluded, not TTL-due) were never mistaken for progress.
+    const first=h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id LIKE 'aa-done-%'").one().n;
+    expect(first).toBeLessThanOrEqual(150-QUEUE_SWEEP_LIMIT);
+    for(let t=0;t<4;t++){now+=WATCHDOG_INTERVAL;await w.tick();}
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id LIKE 'aa-done-%'").one().n).toBe(0);
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id LIKE 'zz-young-%'").one().n).toBe(150);
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_audit WHERE kind='restart_closed' AND reason LIKE '%closed (intake_done)%'").one().n).toBe(150);
+  }));
 });
