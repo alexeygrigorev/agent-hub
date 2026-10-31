@@ -35,14 +35,16 @@ def _admit(monkeypatch, tmp_path, capsys, bundles):
     monkeypatch.setenv('APLEXER_CONFIG', str(cfg))
     monkeypatch.setattr(sys, 'argv', ['x', 'claude'])
     monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
-    monkeypatch.setattr(p, 'root', lambda: tmp_path)
+    managed = tmp_path / 'managed'
+    managed.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: managed)
     state = []
     for b in bundles:
         state.append({'label': b['label'], 'revision': '1'})
-        d = tmp_path / (b['label'] + '-1')
-        d.mkdir()
-        (d / 'bundle.json').write_text(json.dumps(b))
-    (tmp_path / 'state.json').write_text(json.dumps(state))
+        d = managed / (b['label'] + '-1')
+        d.mkdir(mode=0o700)
+        p.private_fs.atomic_write(d / 'bundle.json', json.dumps(b).encode(), 1048576)
+    p.private_fs.atomic_write(managed / 'state.json', json.dumps(state).encode(), 1048576)
     monkeypatch.setattr(p, 'host_request', lambda *a, **k: {'launch_allowed': True, 'profile_supported': True})
     p.admission()
     return json.loads(capsys.readouterr().out), cfg
