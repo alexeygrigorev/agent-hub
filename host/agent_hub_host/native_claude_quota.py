@@ -166,10 +166,16 @@ def _parse_usage_payload(data, now, selected_model=None):
     """
     five_hour = data.get('five_hour')
     seven_day = data.get('seven_day')
-    if not isinstance(five_hour, dict) or not isinstance(seven_day, dict):
+    # An explicit null five_hour means no 5-hour session window is active
+    # (nothing used since the last reset); treat it like the inactive window
+    # below. A missing or non-dict value, or any bad seven_day, still fails closed.
+    if 'five_hour' not in data or not isinstance(seven_day, dict) or (five_hour is not None and not isinstance(five_hour, dict)):
         raise ProbeError('native_claude_malformed_windows')
 
-    win_5h = _parse_window(five_hour, now, required_reset=False)
+    if five_hour is None:
+        win_5h = {'percent_remaining': 100.0, 'reset_at': None, 'inactive': True}
+    else:
+        win_5h = _parse_window(five_hour, now, required_reset=False)
     win_7d = _parse_window(seven_day, now, required_reset=True)
 
     windows = {

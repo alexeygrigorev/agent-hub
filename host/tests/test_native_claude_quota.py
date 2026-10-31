@@ -486,3 +486,30 @@ def test_parallel_probe_lock_contender_never_calls_provider(profile, monkeypatch
         server = Server(usage_payload())
         assert read(profile, server)['error'] == 'native_claude_rate_limited'
         assert not server.calls
+
+def test_null_five_hour_is_an_inactive_window(profile):
+    # Anthropic returns "five_hour": null when no 5-hour session window is active.
+    payload = {
+        'five_hour': None,
+        'seven_day': {
+            'utilization': 36.0,
+            'resets_at': (NOW + dt.timedelta(days=5)).isoformat().replace('+00:00', 'Z'),
+        },
+        'seven_day_opus': None,
+    }
+    server = Server(payload)
+    result = read(profile, server, model='claude-opus-4-8')
+    assert result['status'] == 'ok'
+    assert result['windows']['5h'] == {'percent_remaining': 100.0, 'reset_at': None, 'inactive': True}
+    assert result['windows']['7d']['percent_remaining'] == 64.0
+
+
+@pytest.mark.parametrize('payload', [
+    {'seven_day': {'utilization': 10.0, 'resets_at': '2099-01-01T00:00:00Z'}},
+    {'five_hour': None, 'seven_day': None},
+    {'five_hour': 'x', 'seven_day': {'utilization': 10.0, 'resets_at': '2099-01-01T00:00:00Z'}},
+])
+def test_missing_or_bad_windows_still_fail_closed(profile, payload):
+    server = Server(payload)
+    result = read(profile, server)
+    assert result['status'] != 'ok'
