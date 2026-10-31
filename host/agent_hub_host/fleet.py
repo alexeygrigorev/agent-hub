@@ -3997,6 +3997,19 @@ class Dispatcher:
                             "reason": reason, "stage": "dispatch_route",
                             "error": err, "diagnostic": diagnostic})
 
+    def _merge_native_subscriptions(self):
+        """Advertise catalog host-home accounts whose CLI and login exist here (intake 608a2f9a)."""
+        previous = getattr(self, '_native_labels', set())
+        base = [s for s in self.settings['subscriptions'] if s['account_label'] not in previous]
+        try:
+            from .account_registry import native_subscriptions
+            native = native_subscriptions({'subscriptions': base})
+        except Exception as exc:
+            print(json.dumps({'event': 'native_subscriptions_skipped', 'error': type(exc).__name__}), flush=True)
+            native = [s for s in self.settings['subscriptions'] if s['account_label'] in previous]
+        self.settings['subscriptions'] = base + native
+        self._native_labels = {s['account_label'] for s in native}
+
     def once(self):
         # AC1: per-phase timings, published as a fleet_cycle_phases event.
         phases: dict[str, float] = {}
@@ -4020,6 +4033,7 @@ class Dispatcher:
         managed = provisioning.managed_subscriptions()
         self.settings['subscriptions'] = [s for s in self.settings['subscriptions'] if s['account_label'] not in self._managed_labels] + managed
         self._managed_labels = {s['account_label'] for s in managed}
+        self._merge_native_subscriptions()
         _mark('provisioning')
         # AC2: exactly one of the 60s timer loop and the 20s session-host
         # loop owns offers per cycle. The loser skips with a receipt instead

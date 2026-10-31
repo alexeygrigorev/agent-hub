@@ -64,7 +64,7 @@ def probe(payload, service, account, engine, request=hub_request):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--service', required=True, choices=('codex', 'claude', 'zai', 'grok'))
+    parser.add_argument('--service', required=True, choices=('codex', 'claude', 'zai', 'grok', 'gemini', 'go'))
     parser.add_argument('--account', required=True)
     parser.add_argument('--engine', required=True)
     args = parser.parse_args()

@@ -25,8 +25,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
+import sys
 from pathlib import Path
 
 from . import private_fs
@@ -137,6 +139,81 @@ def diff_subscriptions(settings, accounts):
             raise ValueError("Refusing to render an ambiguous canonical route: " + str(key[0]))
         canonical_routes.add(key)
     return entries, changes
+
+
+# Native (host-home) catalog accounts a host renders by itself when the engine
+# CLI and its login are present locally (intake 608a2f9a). Claude is covered by
+# the managed hub-claude bundle and Grok is a disabled provider, so neither is
+# auto-rendered.
+NATIVE_BINARIES = {"zcodex": "zcodex", "antigravity": "agy", "opencode": "opencode"}
+NATIVE_LAUNCHER = {"zai": "zai", "gemini": "antigravity", "go": "opencode"}
+NATIVE_CREDENTIAL_MARKERS = {"go": "auth.json"}
+
+
+def _default_launcher_model(provider, harness):
+    from .model_contract import policy_models
+    for model in policy_models():
+        if model.get("provider") == provider and model.get("engine") == harness:
+            return model
+    return None
+
+
+def _find_binary(name, which=shutil.which, home=None):
+    found = which(name)
+    if found:
+        return found
+    local = Path(expand_home("~/.local/bin", home)) / name
+    for candidate in ([local.with_suffix(".cmd"), local.with_suffix(".exe")] if sys.platform == "win32" else []) + [local]:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def native_subscriptions(settings, accounts=None, which=shutil.which, home=None, python=None):
+    """Subscription entries for catalog host-home accounts usable on this host.
+
+    An account is rendered only when no configured entry already maps to it,
+    its provider is enabled, the engine CLI resolves locally and its
+    credential home exists. Operator entries always win; nothing is written.
+    """
+    if accounts is None:
+        accounts = policy_accounts()
+    from .native_admission import routing_rules
+    disabled = set(routing_rules().get("disabled_providers", []))
+    configured = {canonical_account_label(s.get("account_label")) for s in settings.get("subscriptions", [])
+                  if isinstance(s, dict)}
+    python = python or sys.executable
+    subs = []
+    for account in accounts:
+        provider, harness = account["provider"], account["harness"]
+        if (account["credential"]["mode"] != "host-home" or provider not in NATIVE_LAUNCHER
+                or provider in disabled or account["account"] in configured):
+            continue
+        binary = _find_binary(NATIVE_BINARIES.get(harness, harness), which=which, home=home)
+        credential = Path(expand_home(account["credential"]["path"], home))
+        marker = NATIVE_CREDENTIAL_MARKERS.get(provider)
+        if not binary or not credential.is_dir() or (marker and not (credential / marker).is_file()):
+            continue
+        sub = {
+            "service": provider,
+            "account_label": account["account"],
+            "engine": harness,
+            "profile": None,
+            "admission_argv": [python, "-m", "agent_hub_host.native_admission", "--service", provider,
+                               "--account", account["account"], "--engine", harness],
+            "launcher_provider": NATIVE_LAUNCHER[provider],
+        }
+        model = _default_launcher_model(provider, harness)
+        if model:
+            sub["launcher_model"] = model["model"]
+            if model.get("effort"):
+                sub["launcher_effort"] = model["effort"]
+        if harness == "zcodex":
+            # Goal routes need a trusted local start command (same as RMTHZ).
+            sub["startup_argv"] = [binary, "--dangerously-bypass-approvals-and-sandbox",
+                                   "-c", "check_for_update_on_startup=false"]
+        subs.append(sub)
+    return subs
 
 
 def read_text(path, limit=262144):
