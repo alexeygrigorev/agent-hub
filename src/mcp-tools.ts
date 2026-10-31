@@ -99,6 +99,7 @@ tool('limits', 'GET', '/api/fleet/limits', 'Operator-only per-engine and per-acc
 tool('limits_set', 'PATCH', '/api/fleet/limits', 'Operator-only live, persisted concurrency cap set: payload target (engine or account), max_concurrency 1..100, allow_lower. Raise-only unless allow_lower.', ['limits set']);
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
+  'device-pending': 'Admin listing of pending host/agent device approvals; operator enrollment step, not an agent tool.',
   'host-release': 'Operator release pin for a checkout-installed host; deliberate CLI step, not an agent tool.',
   'launcher-release': 'Operator release pin for a checkout-installed launcher; deliberate CLI step, not an agent tool.',
   'msg agent-credential': 'Writes a new private local credential file; MCP cannot write host files.',
