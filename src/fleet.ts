@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id T
 CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, runtime_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS fleet_engine_health (engine TEXT NOT NULL, machine_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL, diagnostics_json TEXT, PRIMARY KEY(engine, machine_id));
 CREATE TABLE IF NOT EXISTS operator_notices (notice_key TEXT PRIMARY KEY, engine TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS fleet_login_holds (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT NOT NULL DEFAULT '', held_at_ms INTEGER NOT NULL, PRIMARY KEY(machine_id, engine, account, profile));
 CREATE TABLE IF NOT EXISTS placement_rejections (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, created_at_ms INTEGER NOT NULL, actor TEXT NOT NULL, reasons_json TEXT NOT NULL, detail TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_placement_rejections_recent ON placement_rejections(created_at_ms);
 `;
@@ -959,6 +960,7 @@ export class FleetService {
     // reported a generation rejected is not offered that account again until
     // Hub publishes a newer generation.
     const credentialInvalid = invalidLabels(this.sql); const credentialRejected = rejectedPairs(this.sql);
+
     this.reconcileCapacity();
     // Planning below is read-only after reconciliation. Drop the snapshot
     // before reserve/promotion writes so the next plan sees every commitment.
@@ -1081,8 +1083,9 @@ export class FleetService {
       const hostLoginRefusal = () => (Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.some((r: any) =>
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
         && r.reason === 'not_logged_in' && fresh(r.observed_at, this.now(), 300000)))
-        || this.sql.exec("SELECT 1 FROM fleet_launches WHERE machine_id = ? AND engine = ? AND account = ? AND profile IS ? AND exit_reason = 'not_logged_in' AND COALESCE(finished_at, updated_at) > ? LIMIT 1",
-          route.machine_id, route.engine, route.account, route.profile, new Date(this.now() - ENGINE_HEALTH_RETRY_MS).toISOString()).toArray().length > 0;
+        // Primary-key read of fleet_login_holds (one row per route), never launch history.
+        || this.sql.exec('SELECT 1 FROM fleet_login_holds WHERE machine_id = ? AND engine = ? AND account = ? AND profile = ? AND held_at_ms > ?',
+          route.machine_id, route.engine, route.account, route.profile ?? '', this.now() - ENGINE_HEALTH_RETRY_MS).toArray().length > 0;
       const routeProv = definition ? this.observationProvenance(definition, route) : null;
       const routeQuota = evaluateLaunchQuota({ provider: String(definition?.provider ?? ''), quota: routeProv?.quota ?? null,
         subscriptionObservedAt: routeProv?.subscriptionObservedAt ?? null, nowMs: this.now(),
@@ -1201,7 +1204,8 @@ export class FleetService {
     // projection rule (intake 4398ce2a); an explicit --account pin is the
     // operator's override.
     const degraded = new Set(Array.from(gateDegraded, i => candidates[i]));
-    if (!request.account && [...accounts.values()].some(a => a.status !== 'unknown')) {
+    // A disabled account reports blocked but carries no quota verdict.
+    if (!request.account && [...accounts.values()].some(a => a.enabled && a.status !== 'unknown')) {
       for (let i = candidates.length - 1; i >= 0; i--) {
         if (accounts.get(candidates[i].account)?.status !== 'unknown') continue;
         rejected.push({ machine: candidates[i].machine, engine: candidates[i].engine, reason: 'account_unknown' });
@@ -2178,6 +2182,9 @@ export class FleetService {
             return response({ id: row.id, state: 'held', reason: data.reason, diagnostic, retryable: true });
           }
           if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || data.reason === 'not_logged_in' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
+            if (data.reason === 'not_logged_in') {
+              this.sql.exec('INSERT OR REPLACE INTO fleet_login_holds (machine_id, engine, account, profile, held_at_ms) VALUES (?, ?, ?, ?, ?)', row.machine_id, row.engine, row.account, row.profile ?? '', this.now());
+            }
             if (data.reason === 'engine_auth_expired') {
               this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
             }

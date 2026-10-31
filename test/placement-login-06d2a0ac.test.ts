@@ -63,6 +63,22 @@ describe('placement never picks unknown or logged-out accounts (intake 06d2a0ac)
     expect(plan.rejected.map((r: any) => r.reason)).not.toContain('account_unknown');
   }));
 
+  it('a disabled account carries no verdict: a probe outage with it disabled still fails open (review fb40dd01)', async () => fixture(async (service, sql) => {
+    sql.exec('DELETE FROM server_quota_snapshots');
+    sql.exec(`INSERT INTO fleet_accounts (label, provider, max_concurrency, reserve_percent, enabled) VALUES ('codex-off', 'codex', 4, 15, 0)`);
+    sql.exec(`INSERT INTO fleet_routes (machine_id, engine, account, profile) VALUES ('rmthz', 'codex', 'codex-off', 'hub-codex-off')`);
+    const plan: any = service.plan(intent());
+    expect(plan.selected).not.toBeNull();
+    expect(plan.rejected.map((r: any) => r.reason)).not.toContain('account_unknown');
+  }));
+
+  it('the not_logged_in route hold is a primary-key read, never a launch-history scan (review fb40dd01)', async () => fixture(async (_service, sql) => {
+    const plan = sql.exec("EXPLAIN QUERY PLAN SELECT 1 FROM fleet_login_holds WHERE machine_id = ? AND engine = ? AND account = ? AND profile = ? AND held_at_ms > ?",
+      'rmthz', 'codex', 'dummy-sync-5814', 'hub-dummy-sync-5814', 0).toArray().map((r: any) => String(r.detail)).join(' | ');
+    expect(plan).not.toMatch(/\bSCAN\b/);
+    expect(plan).toMatch(/SEARCH fleet_login_holds USING PRIMARY KEY|USING INDEX sqlite_autoindex_fleet_login_holds/);
+  }));
+
   it('an explicit --account pin is the operator override', async () => fixture(async (service) => {
     const plan: any = service.plan(intent({ account: 'dummy-sync-5814' }));
     expect(plan.selected?.account).toBe('dummy-sync-5814');
@@ -91,6 +107,7 @@ describe('placement never picks unknown or logged-out accounts (intake 06d2a0ac)
     const body: any = await res.json();
     expect(body.id).not.toBe(id);
     expect(sql.exec('SELECT state, exit_reason FROM fleet_launches WHERE id = ?', id).one()).toMatchObject({ state: 'failed', exit_reason: 'not_logged_in' });
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_login_holds WHERE machine_id = ? AND account = ?', 'rmthz', 'dummy-sync-5814').one().n).toBe(1);
     const next: any = sql.exec('SELECT state, account FROM fleet_launches WHERE id = ?', body.id).one();
     expect(next.account).not.toBe('dummy-sync-5814');
     const pinned: any = service.plan(intent({ account: 'dummy-sync-5814' }));
