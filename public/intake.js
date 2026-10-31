@@ -228,8 +228,21 @@ function renderCloseGate(task) {
   const el = byId('intake-close-gate');
   if (!el) return;
   el.replaceChildren();
+  const merge = task.merge_state;
+  if (merge && typeof merge === 'object' && merge.state !== 'closed') {
+    const chip = document.createElement('span');
+    chip.className = `dk-badge ${merge.state === 'merged' ? 'dk-badge--success' : 'dk-badge--warning'}`;
+    chip.textContent = `merge: ${merge.state}`;
+    el.append(chip);
+    if (Array.isArray(merge.problems) && merge.problems.length) {
+      const why = document.createElement('span');
+      why.className = 'meta-dim';
+      why.textContent = ' ' + merge.problems.join('; ') + ' ';
+      el.append(why);
+    }
+  }
   const gate = task.close_gate;
-  if (!gate || typeof gate !== 'object') { el.hidden = true; return; }
+  if (!gate || typeof gate !== 'object') { el.hidden = !(task.merge_state && task.merge_state.state !== 'closed'); return; }
   el.hidden = false;
   const badge = document.createElement('span');
   badge.className = `dk-badge ${gate.ok ? 'dk-badge--success' : 'dk-badge--warning'}`;
@@ -371,8 +384,19 @@ function renderCloseRefusal(body) {
   el.hidden = false;
   const head = document.createElement('p');
   head.className = 'intake-close-refusal__title';
-  head.textContent = 'Close refused: these worktrees still block it.';
+  const merge = body.error === 'merge_gate';
+  head.textContent = merge ? 'Close refused: the work is not merged and deployed.' : 'Close refused: these worktrees still block it.';
   el.append(head);
+  if (merge) {
+    const list = document.createElement('ul');
+    list.className = 'intake-close-refusal__list';
+    for (const problem of Array.isArray(body.problems) ? body.problems : []) {
+      const li = document.createElement('li');
+      li.textContent = String(problem);
+      list.append(li);
+    }
+    el.append(list);
+  }
   const ul = document.createElement('ul');
   ul.className = 'intake-close-refusal__list';
   for (const w of Array.isArray(body.worktrees) ? body.worktrees : []) {
@@ -397,7 +421,7 @@ function renderCloseRefusal(body) {
 }
 
 function isGateRefusal(err) {
-  return err && err.status === 409 && err.body && err.body.error === 'worktree_close_gate';
+  return err && err.status === 409 && err.body && ['worktree_close_gate', 'merge_gate'].includes(err.body.error);
 }
 
 function commandIds(resp) {

@@ -12,6 +12,7 @@ import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, initSessionLi
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
+import { MergeGate, MergeGateError, mergeGateTick, type MergeGateHooks } from './merge-gate';
 
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
 export function currentHistory(task: Obj): Obj[] {
@@ -273,12 +274,19 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
 
 export class IntakeService {
   public worktrees: IntakeWorktrees;
+  public mergeGate: MergeGate;
   constructor(public sql: SqlStorage, private tx: Tx = <T>(fn: () => T) => fn(), private hooks: IntakeHooks = {}) {
     this.worktrees = new IntakeWorktrees(sql);
+    this.mergeGate = new MergeGate(sql);
+    this.worktrees.listener = {
+      record: (taskId, row) => this.mergeGate.noteWorktree(taskId, this.get('tasks', taskId)?.project ?? null, row as any),
+      status: (taskId, status) => this.mergeGate.noteStatus(taskId, status),
+    };
   }
   init() {
     this.tx(() => {
       this.worktrees.init();
+      this.mergeGate.init();
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_meta (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)');
       this.sql.exec('INSERT OR IGNORE INTO intake_meta VALUES(1,0)');
       for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
@@ -481,6 +489,18 @@ export class IntakeService {
           captured_at: now, authority: 'untrusted_task_data' });
         reason = 'force: ' + reason;
       } else reason = reason || note.text;
+      // Merge gate (2e00e01f): commits reachable from origin/main AND the deploy green.
+      if (!unverified) {
+        const merge = this.mergeGate.check(task.id);
+        if (!merge.ok) {
+          if (!force) throw new IntakeError('merge_gate', 409, undefined, undefined, { state: merge.state, problems: merge.problems,
+            unmerged_commits: merge.commits.filter(c => c.in_main !== true).map(c => c.sha),
+            hint: 'Merge to main, wait for the Deploy workflow, run hub intake merge-check <intake>; operator override: --force --reason TEXT' });
+          if (task.history.length >= INTAKE_LIMITS.events - 1) fail('history_capacity', 507);
+          task.history.push({ id: crypto.randomUUID(), kind: 'close_gate_override', reason, blocking: [{ gate: 'merge', problems: merge.problems }], actor,
+            captured_at: now, authority: 'untrusted_task_data' });
+        }
+      }
     }
     if (status === 'cancelled') {
       if (!reason?.trim() || (!supersededBy && !/\bdropped by Alexey\b/i.test(reason))) fail('cancel_reason_required', 409);
@@ -496,6 +516,7 @@ export class IntakeService {
     else if (OPEN.includes(status)) delete task.outcome;
     task.status = status;
     task.archived_at = OPEN.includes(status) ? null : now;
+    if (status === 'done' || status === 'cancelled') this.mergeGate.closed(task.id); else if (OPEN.includes(status)) this.mergeGate.reopened(task.id);
   }
   /** Fresh credential, binding and grant checks run in the same synchronous transaction as the effect. */
   private principal(auth: Auth): Obj {
@@ -670,7 +691,7 @@ export class IntakeService {
       scope_flag: task.scope?.flag ?? null, scope: this.scopeView(task),
       payload_data: { title, current_state, next_step, owner, uncertainty, acceptance_criteria: acceptance_criteria ?? null, history }, unresolved: this.unresolved(task),
       assigned_sessions: this.assignedSessions(task, p),
-      worktrees: this.worktrees.list(task.id), close_gate: this.worktrees.gate(task.id) };
+      worktrees: this.worktrees.list(task.id), close_gate: this.worktrees.gate(task.id), merge_state: this.mergeGate.get(task.id) };
   }
   private view(task: Obj, p: Obj): Obj { return { ...this.taskView(task, p), operator_rules: this.rules([task]), data_notice: DATA_NOTICE }; }
   private page(url: URL, items: Obj[], revision: number): Obj {
@@ -845,6 +866,17 @@ export class IntakeService {
       const owner = command && this.get('tasks', command.task_id);
       if (!command || !owner || !this.allowed(p, owner)) fail('not_found', 404);
       return { snapshot_version: revision, command };
+    }
+    if (path === '/merge-state') {
+      const visible = this.mergeGate.unmerged(100).filter(m => { const t = this.get('tasks', m.task_id); return t && this.allowed(p, t); })
+        .map(m => ({ ...m, title: this.get('tasks', m.task_id)?.title ?? null, project: this.get('tasks', m.task_id)?.project ?? null }));
+      return { snapshot_version: revision, counts: this.mergeGate.counts(), unmerged: visible };
+    }
+    const mergeMatch = /^\/tasks\/([A-Za-z0-9._:-]+)\/merge-state$/.exec(path);
+    if (mergeMatch) {
+      const task = this.get('tasks', mergeMatch[1]);
+      if (!task || !this.allowed(p, task)) fail('not_found', 404);
+      return { snapshot_version: revision, task_id: task.id, status: task.status, merge_state: this.mergeGate.get(task.id), gate: this.mergeGate.check(task.id) };
     }
     const worktreesMatch = /^\/tasks\/([A-Za-z0-9._:-]+)\/worktrees$/.exec(path);
     if (worktreesMatch) {
@@ -1296,6 +1328,15 @@ export class IntakeService {
       rule.version++; this.put('rules', rule); return { operator_rule: rule };
     }
     if (path === '/worktrees/remove' || /^\/tasks\/[A-Za-z0-9._:-]+\/worktrees(\/(refresh|remove|register))?$/.test(path)) return this.writeWorktrees(path, b, p, now);
+    const evidenceMatch = /^\/tasks\/([A-Za-z0-9._:-]+)\/merge-evidence$/.exec(path);
+    if (evidenceMatch) {
+      const task = this.get('tasks', evidenceMatch[1]); if (!task || !this.allowed(p, task, true)) fail('not_found', 404);
+      let merge: Obj;
+      try { merge = this.mergeGate.submit(task.id, task.project ?? null, b, p.actor, { operator: !!p.admin }); }
+      catch (e) { if (e instanceof MergeGateError) throw new IntakeError(e.code, e.status, undefined, undefined, e.detail); throw e; }
+      this.pushHistory(task, [{ kind: 'merge_evidence', state: merge.state, head: merge.head, problems: merge.problems, deploy: merge.deploy?.state ?? null }], p.actor, now, b.key);
+      return { task_id: task.id, merge_state: merge, gate: this.mergeGate.check(task.id) };
+    }
     const match = /^\/tasks\/([A-Za-z0-9._:-]+)(\/(?:events|continue))?$/.exec(path);
     if (!match) fail('not_found', 404);
     const task = this.get('tasks', match[1]); if (!task || !this.allowed(p, task, true)) fail('not_found', 404);
@@ -1678,6 +1719,44 @@ export class IntakeService {
     });
   }
   /** Host-agent worktree channel (machine already authenticated by the Hub). */
+  /** Merge-gate watcher (2e00e01f): flag unmerged intakes idle >= 60 min and requeue a
+   * finish-merge session. Indexed due-queue only; called from the scheduled tick. */
+  async mergeGateRun(extra: { alert?: MergeGateHooks['alert'] } = {}): Promise<Obj> {
+    const admin = async () => ({ caller: { isAdmin: true, actor: 'hub:service:merge-gate', kind: 'human' }, scopes: ['admin'] } as any);
+    const call = async (path: string, payload: Obj) => {
+      const r = await this.handle(new Request('https://hub.internal/api/intake' + path, { method: 'POST', body: JSON.stringify(payload) }), admin);
+      return { status: r.status, body: await r.json().catch(() => ({})) as Obj };
+    };
+    const hooks: MergeGateHooks = {
+      task: id => this.get('tasks', id),
+      sessionStates: ids => ids.length ? (this.sql.exec(`SELECT state FROM session_control_sessions WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids.slice(0, 64)).toArray() as Obj[]).map(r => String(r.state)) : [],
+      sessionIds: id => this.worktrees.sessionIdsFor(id),
+      refresh: id => { try { return this.tx(() => this.worktrees.enqueue(id, 'status', null, 'hub:service:merge-gate').commands.length > 0); } catch { return false; } },
+      note: (task, text, key) => {
+        this.tx(() => {
+          const fresh = this.get('tasks', task.id);
+          if (!fresh || fresh.history.some((e: Obj) => e.intake_key === key)) return;
+          this.pushHistory(fresh, [{ kind: 'note', text }], 'hub:service:merge-gate', Date.now(), key);
+        });
+      },
+      start: async input => {
+        if (!this.hooks.startSession) return { status: 503, body: { error: 'assignment_unavailable' } };
+        return this.hooks.startSession(input, await admin());
+      },
+      blocker: async (task, title, text, key) => {
+        const fresh = this.get('tasks', task.id);
+        const made = await call(`/tasks/${task.id}/blocker`, { key, expected_version: fresh?.version, title, text,
+          acceptance_criteria: 'The work of the original intake reaches origin/main with a green Deploy, evidenced by hub intake merge-check.' });
+        const id = made.body?.blocker?.id ?? made.body?.follow_up?.id ?? made.body?.prerequisite?.id ?? made.body?.task?.id ?? null;
+        if (made.status < 300 && typeof id === 'string' && id !== task.id) return id;
+        await call(`/tasks/${task.id}/events`, { key: key + '-event', expected_version: this.get('tasks', task.id)?.version, event: { kind: 'blocker', text: title + '\n' + text } });
+        return null;
+      },
+      blockerOpen: id => { const t = this.get('tasks', id); return !!t && OPEN.includes(t.status) && !intakeHasDoneEvidence(t); },
+      alert: extra.alert ?? (async () => {}),
+    };
+    return mergeGateTick(this.mergeGate, hooks);
+  }
   async handleWorktreeHost(request: Request, machine: string, actor: string): Promise<Response> {
     const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store' } });
     const path = new URL(request.url).pathname.slice('/api/worktree-host'.length);
@@ -1739,8 +1818,9 @@ export class IntakeService {
           Object.keys(payload).every(k => ['key', 'expected_version', 'acceptance_criteria', 'project'].includes(k)) &&
           ('acceptance_criteria' in payload || 'project' in payload);
         const workerCreate = p.worker && path === '/tasks';
-        if (p.worker && !triageUpdate && !workerCreate && (!/^\/tasks\/[^/]+\/events$/.test(path) || !['note','report','blocker'].includes(payload.event?.kind))) fail('forbidden', 403);
-        if (p.worker && !triageUpdate && !workerCreate) payload.event = redactClaimData(payload.event);
+        if (p.worker && !triageUpdate && !workerCreate && (!(/^\/tasks\/[^/]+\/merge-evidence$/.test(path) || (/^\/tasks\/[^/]+\/events$/.test(path) && ['note','report','blocker'].includes(payload.event?.kind))))) fail('forbidden', 403);
+        if (p.worker && /\/merge-evidence$/.test(path)) payload.event = undefined;
+        if (p.worker && !triageUpdate && !workerCreate && payload.event) payload.event = redactClaimData(payload.event);
         // Do not replay a private response after the caller loses its task/operator grant.
         if (path.startsWith('/rules') || path.startsWith('/grants')) this.operator(p);
         const taskMatch = /^\/tasks\/([^/]+)/.exec(path);

@@ -82,6 +82,19 @@ def _bounded_text(value, limit=1024):
     return value[:limit] if isinstance(value, str) else None
 
 
+def merge_gate_refusal(body):
+    """Sanitized merge-gate refusal: the problems and the unmerged commit ids."""
+    problems = body.get('problems') if isinstance(body.get('problems'), list) else []
+    commits = body.get('unmerged_commits') if isinstance(body.get('unmerged_commits'), list) else []
+    result = {'error': 'merge_gate', 'state': _bounded_text(body.get('state'), 32),
+              'problems': [_bounded_text(p, 300) for p in problems[:32] if isinstance(p, str)],
+              'unmerged_commits': [c[:40] for c in commits[:64] if isinstance(c, str) and re.fullmatch(r'[0-9a-f]{7,40}', c)]}
+    hint = _bounded_text(body.get('hint'), 512)
+    if hint:
+        result['hint'] = hint
+    return result
+
+
 def close_gate_refusal(body):
     """Keep only the documented gate fields; json.dumps escapes controls."""
     worktrees = body.get('worktrees') if isinstance(body.get('worktrees'), list) else []
@@ -118,6 +131,8 @@ def http_error(exc, method, payload):
     if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', key):
         key = None
     gate = close_gate_refusal(body) if code == 'worktree_close_gate' and isinstance(body, dict) else None
+    if code == 'merge_gate' and isinstance(body, dict):
+        gate = merge_gate_refusal(body)
     result = IntakeHTTPError(exc.code, code, key, gate)
     detail = ''
     if isinstance(body, dict):
@@ -138,6 +153,8 @@ def http_error(exc, method, payload):
         detail += '; provide --reason and --superseded-by, or reason containing dropped by Alexey'
     if code == 'worktree_close_gate':
         detail += '; worktrees block close: hub worktree refresh <intake> | hub worktree remove <intake> | --force --reason TEXT'
+    if code == 'merge_gate':
+        detail += '; commits must be in origin/main with a green Deploy: merge, wait for CI, then hub intake merge-check <intake> (operator override: --force --reason TEXT)'
     if code == 'invalid_event_kind':
         detail += '; valid kinds: ' + ', '.join(EVENT_KINDS)
     # Only locally generated wording is printed, never arbitrary server messages.
@@ -261,6 +278,14 @@ def add_commands(sub):
     close.add_argument('--reason', help='Close reason; required with --force or --outcome')
     close.add_argument('--outcome', choices=['closed_unverified'],
                        help='Operator only: close without DONE evidence, recorded as closed_unverified with --reason (never counted as verified)')
+    merge_check = commands.add_parser('merge-check', help='Collect git ancestry + Deploy evidence for this intake and record it in Hub (merge gate)')
+    merge_check.add_argument('id')
+    merge_check.add_argument('--repo', default='.', help='Git checkout holding the work (default: current directory)')
+    merge_check.add_argument('--sha', action='append', default=[], help='Extra commit to verify (the DONE note commits and HEAD are always checked)')
+    merge_check.add_argument('--key', help='Stable retry key; generated automatically when omitted')
+    merge_check.add_argument('--dry-run', action='store_true', help='Print the evidence without recording it')
+    merge_state = commands.add_parser('merge-state', help='Merge state of one intake, or the list of unmerged intakes')
+    merge_state.add_argument('id', nargs='?')
     event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
     event.add_argument('id')
     event.add_argument('--version', type=int, required=True)
@@ -456,6 +481,23 @@ def execute(args):
             if getattr(args, field, None) is not None:
                 params[field] = getattr(args, field)
         return request('GET', BASE + '/grantees?' + urlencode(params))
+    if command == 'merge-state':
+        return request('GET', BASE + ('/tasks/' + safe_id(args.id) + '/merge-state' if args.id else '/merge-state'))
+    if command == 'merge-check':
+        from . import merge_evidence
+        shown = request('GET', BASE + '/tasks/' + safe_id(args.id))
+        history = ((shown.get('task') or {}).get('payload_data') or {}).get('history') or []
+        text = '\n'.join(e.get('text', '') for e in history if isinstance(e, dict) and e.get('kind') == 'note' and str(e.get('text', '')).lstrip().startswith('DONE'))
+        wanted = merge_evidence.shas_from_text(text) + [x for x in args.sha if isinstance(x, str)]
+        try:
+            evidence = merge_evidence.collect(str(Path(args.repo).resolve()), wanted)
+        except RuntimeError as exc:
+            raise IntakeInputError(str(exc)) from None
+        if args.dry_run:
+            return {'dry_run': True, 'evidence': evidence}
+        key = args.key or 'merge-check-' + uuid.uuid4().hex
+        valid_key(key)
+        return request('POST', BASE + '/tasks/' + safe_id(args.id) + '/merge-evidence', {'key': key, **evidence})
     if command in ('rules', 'grants'):
         return request('POST' if args.payload_file else 'GET', BASE + '/' + command,
                        json_file(args.payload_file) if args.payload_file else None)

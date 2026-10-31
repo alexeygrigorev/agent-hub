@@ -65,7 +65,11 @@ function cleanStatus(raw: any): Obj | null {
 
 const shortReason = (v: unknown, fallback: string) => typeof v === 'string' && v.trim() ? v.trim().slice(0, 1024) : fallback;
 
+export type WorktreeListener = { record?: (taskId: string, row: Obj) => void; status?: (taskId: string, status: Obj) => void };
+
 export class IntakeWorktrees {
+  /** Merge gate (2e00e01f) follows every recorded worktree and host status result. */
+  public listener: WorktreeListener = {};
   constructor(private sql: SqlStorage, private now: () => number = Date.now) {}
 
   init() {
@@ -108,6 +112,10 @@ export class IntakeWorktrees {
     return { id: r.id, task_id: r.task_id, machine: r.machine, path: r.path, branch: r.branch ?? null, created_at: r.created_at,
       updated_at: r.updated_at, session_ids: parsed(r.session_ids, []), origin: r.origin, state: r.state,
       status: parsed(r.status_json, null), status_at: r.status_at ?? null, last_remove: parsed(r.last_remove_json, null), pending };
+  }
+  /** Hub sessions that ever used this intake's worktrees (bounded). */
+  sessionIdsFor(taskId: string): string[] {
+    return [...new Set(this.rows(taskId).flatMap(r => parsed(r.session_ids, []) as string[]))].slice(-32);
   }
   list(taskId: string): Obj[] { return this.rows(taskId).map(r => this.view(r)); }
 
@@ -169,7 +177,9 @@ export class IntakeWorktrees {
         this.sql.exec('UPDATE intake_worktrees SET session_ids = ?, updated_at = ? WHERE id = ?', JSON.stringify(ids), now, row.id);
       }
     }
-    return { row: this.row(row.id)!, fresh };
+    const out = this.row(row.id)!;
+    this.listener.record?.(taskId, out);
+    return { row: out, fresh };
   }
 
   /** State of this intake's newest row for a path (any machine); null when never recorded. */
@@ -366,6 +376,7 @@ export class IntakeWorktrees {
         const gone = status.present === false && status.merged === true && r.state === 'active';
         this.sql.exec('UPDATE intake_worktrees SET status_json = ?, status_at = ?, state = ?, updated_at = ? WHERE id = ?',
           JSON.stringify(status), now, gone ? 'gone' : r.state, now, r.id);
+        this.listener.status?.(c.task_id, status);
       }
       if (c.kind === 'remove') {
         const removed = outcome === 'ok' && result.removed;

@@ -41,6 +41,8 @@ async function doneNote(c: Ctx, id: string) {
     note: { text: 'DONE abc1234 Live check: synthetic Result: ok' } });
   expect(r.status, JSON.stringify(r.body)).toBe(200);
 }
+/** Merge gate (2e00e01f): merged and deployed evidence so only the worktree gate is under test. */
+const green = (c: Ctx, id: string) => intake(c, '/tasks/' + id + '/merge-evidence', { key: 'green-' + ++seq, unmerged: 0, deploy: { state: 'success' } });
 async function close(c: Ctx, id: string, extra: any = {}) {
   const t = (await intake(c, '/tasks/' + id)).body.task;
   return intake(c, '/tasks/' + id, { key: 'close-' + ++seq, expected_version: t.version, status: 'done', ...extra });
@@ -257,6 +259,7 @@ describe('close gate', () => {
     const after = (await intake(c, '/tasks/' + t.id + '/worktrees')).body;
     expect(after.worktrees[0]).toMatchObject({ state: 'removed', last_remove: { result: 'ok', branch_deleted: true } });
     expect(after.close_gate).toEqual({ ok: true, blocking: [] });
+    await green(c, t.id);
     await doneNote(c, t.id);
     const closed = await close(c, t.id);
     expect(closed.status, JSON.stringify(closed.body)).toBe(200);
@@ -269,6 +272,7 @@ describe('close gate', () => {
     await intake(c, '/tasks/' + t.id + '/worktrees/refresh', { key: 'refresh-' + ++seq });
     await hostRun(c, HOST, () => ({ outcome: 'ok', status: status({ present: false, merged: true }) }));
     expect((await intake(c, '/tasks/' + t.id + '/worktrees')).body.worktrees[0].state).toBe('gone');
+    await green(c, t.id);
     await doneNote(c, t.id);
     expect((await close(c, t.id)).status).toBe(200);
   }));

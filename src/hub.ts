@@ -178,7 +178,7 @@ export class Hub extends DurableObject {
       queue: tasks => ({ items: this.intakeWatchdog.queue(tasks), observed_at: Date.now(), watchdog: this.intakeWatchdog.status() }),
       forgotten: tasks => {
         const items = this.intakeWatchdog.project(tasks).filter(t => t.forgotten);
-        return { items, forgotten_count: items.length, observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };
+        return { items, forgotten_count: items.length, unmerged: this.intakeService.mergeGate.counts(), observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };
       },
       startSession: async (input, auth) => {
         const res = await this.sessionControlService.handle(
@@ -2377,6 +2377,14 @@ export class Hub extends DurableObject {
     let intakeTriage: any;
     try { intakeTriage = await m('intake_triage', () => this.intakeTriage.tick(source)); }
     catch (e: any) { intakeTriage = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
+    // Merge gate (2e00e01f): unmerged intakes idle >= 60 min are flagged and requeued.
+    let mergeGate: any;
+    try {
+      mergeGate = await this.intakeService.mergeGateRun({ alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('intake_unmerged', subject, detail === null ? null : { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
+      } });
+    } catch (e: any) { mergeGate = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     const slotStartIso = slotDate.toISOString();
     const tickResult = await m('root_slot', () => this.jobsService.tickRootSlot(slotStartIso));
 
@@ -2400,7 +2408,7 @@ export class Hub extends DurableObject {
       }
     }
 
-    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit, intake_triage: intakeTriage, intake_verifier: intakeVerifier };
+    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit, intake_triage: intakeTriage, intake_verifier: intakeVerifier, merge_gate: mergeGate };
   }
 
   async sampleHostHistory() {

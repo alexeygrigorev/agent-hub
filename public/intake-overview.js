@@ -11,6 +11,29 @@
       node.textContent = 'Forgotten: ' + data.forgotten_count;
     } catch { node.textContent = 'Forgotten: unavailable — sign in or retry'; }
   }
+  /* Merge gate (2e00e01f): intakes whose work is not merged and deployed. */
+  const unmergedNode = document.getElementById('intake-unmerged'), unmergedList = document.getElementById('intake-unmerged-list');
+  async function updateUnmerged() {
+    if (!unmergedNode) return;
+    try {
+      const response = await fetch('/api/intake/merge-state', {credentials: 'same-origin', cache: 'no-store'});
+      if (!response.ok) throw new Error('unavailable');
+      const data = await response.json();
+      if (!Number.isInteger(data.counts?.total_unmerged) || !Array.isArray(data.unmerged)) throw new Error('invalid');
+      unmergedNode.textContent = 'Unmerged: ' + data.counts.total_unmerged;
+      unmergedList.replaceChildren();
+      for (const item of data.unmerged) {
+        const row = document.createElement('p');
+        const link = document.createElement('a');
+        link.href = '/intake/' + encodeURIComponent(item.task_id);
+        link.textContent = item.title || item.task_id;
+        row.append(link, ` · ${item.state} · requeues ${item.requeues} · ${(item.problems || []).join('; ')}`);
+        unmergedList.append(row);
+      }
+    } catch { unmergedNode.textContent = 'Unmerged: unavailable — sign in or retry'; }
+  }
+  updateUnmerged();
+  setInterval(updateUnmerged, 60000);
   const queue = document.getElementById('intake-queue');
   let queueCursor = '', queueGeneration = 0;
   async function updateQueue(cursor = queueCursor) {
