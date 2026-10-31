@@ -60,8 +60,6 @@ tool('artifact', 'GET', '/api/fleet/tasks/{id}/artifacts/{name}', 'Fetch a sanit
 tool('intake_create', 'POST', '/api/intake/tasks', 'File verbatim task: payload key, project, title, text, transcription, source {type,reference,timestamp}, optional acceptance_criteria (nullable bounded text; required non-empty before assign/start).', ['intake create']);
 tool('intake_list', 'GET', '/api/intake/tasks', 'One revision-pinned page: query status, project, archived=true (archived only), all=true (include archived), after, revision, authorization_valid_until, limit. Default hides archives. limit accepts a positive integer or numeric string, defaults to 25, clamps above max 100; response effective_limit states the applied size. Follow next as after with snapshot_version as revision and non-null authorization_valid_until from the first page; restart on stale_snapshot. CLI hub intake list --all follows all pages automatically.', ['intake list']);
 tool('intake_forgotten', 'GET', '/api/intake/forgotten', 'Authorized forgotten open intakes: id, title, age_ms, last_session, state, reason, restart queue; optional project query.', ['intake forgotten']);
-tool('intake_merge_state', 'GET', '/api/intake/merge-state', 'Merge gate (2e00e01f): counts and list of intakes whose work is unmerged, requeued or blocked (not in origin/main or deploy not green).', ['intake merge-state']);
-tool('intake_merge_evidence', 'POST', '/api/intake/tasks/{id}/merge-evidence', 'Record merge evidence for an intake: key, optional head, branch, unmerged, commits [{sha,in_main}], deploy {state: success|skipped|not_required|failure|pending|missing|unknown, sha, run}. Closing an intake with tracked code needs every commit in origin/main and a green deploy; CLI hub intake merge-check collects it.', ['intake merge-check']);
 tool('intake_audit', 'GET', '/api/intake/tasks/{id}/audit', 'Append-only lifecycle audit for full id or prefix; survives task row.', ['intake audit']);
 tool('intake_audit_recent', 'GET', '/api/intake/audit', 'Recent authorized lifecycle events; query limit, after, revision.');
 for (const action of ['show', 'history', 'links', 'context']) tool(`intake_${action}`, 'GET', `/api/intake/tasks/{id}${action === 'show' ? '' : '/' + action}`, `Read task ${action}.`, [`intake ${action}`]);
@@ -101,6 +99,10 @@ tool('limits', 'GET', '/api/fleet/limits', 'Operator-only per-engine and per-acc
 tool('limits_set', 'PATCH', '/api/fleet/limits', 'Operator-only live, persisted concurrency cap set: payload target (engine or account), max_concurrency 1..100, allow_lower. Raise-only unless allow_lower.', ['limits set']);
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
+  'intake merge-check': 'Host-local: runs git and gh in a checkout, then records merge evidence; deliberate CLI step. The close gate itself is enforced for MCP intake_update (intake 2e00e01f).',
+  'intake merge-state': 'Read of the merge gate; shown on intake_show (merge_state) and GET /api/intake/merge-state.',
+  'machines remove': 'Operator-only machine retirement; deliberate CLI step, not an agent tool.',
+  'machines revoke': 'Admin-only hard hide of a machine with credential kill; deliberate CLI step, not an agent tool.',
   'host-goal': 'Operator set/inspect of durable host bring-up state; deliberate CLI step, not an agent tool.',
   'limits disable': 'Operator-only reversible account routing switch; deliberate CLI step, not an agent tool.',
   'limits enable': 'Operator-only reversible account routing switch; deliberate CLI step, not an agent tool.',

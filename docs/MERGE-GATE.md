@@ -18,7 +18,8 @@ Hub stores one row per intake in `intake_merge_state`: tracked worktree
   DONE-note commits plus HEAD, and `gh run list --workflow deploy.yml` for the
   exact commits (a later green Deploy that contains the commit counts; `[skip ci]`
   commits are `skipped`; `gh` failure is `unknown`, never green). It posts
-  `POST /api/intake/tasks/ID/merge-evidence` (MCP `intake_merge_evidence`).
+  `POST /api/intake/tasks/ID/merge-evidence` (CLI/REST only: it runs git and gh locally, and the MCP
+  tool surface is at its compact-schema budget).
 
 Deploy states: `success`, `skipped`, `not_required` are green; `failure`,
 `pending`, `missing`, `unknown` block.
@@ -71,7 +72,7 @@ brief say so. Nobody waits for orchestrator push permission.
 ## AC6 visibility
 
 `hub intake merge-state [id]` / `GET /api/intake/merge-state` /
-`GET /api/intake/tasks/ID/merge-state` / MCP `intake_merge_state`; the Intake
+`GET /api/intake/tasks/ID/merge-state` (and `merge_state` on every intake view, so MCP `intake_show` carries it); the Intake
 overview card shows `Unmerged: N` with the list; the intake page shows the merge
 chip and the close refusal; `GET /api/intake/forgotten` carries `unmerged`
 counts; the daily intake digest lists unmerged intakes.
