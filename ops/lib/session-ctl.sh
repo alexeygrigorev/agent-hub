@@ -13,7 +13,10 @@ case "$ROLE" in
   *) echo "usage: $0 <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync>" >&2; exit 64 ;;
 esac
 BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the run worktree
-SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bot-skills-ops}"   # read-only clone of alexeygrigorev/bot-skills (~/git/bot-skills is NOT a git repo)
+[ -f "$HOME/.local/share/agent-hub-ops/guard-bin/env.sh" ] && . "$HOME/.local/share/agent-hub-ops/guard-bin/env.sh"  # agent rm guard (504d662b): sessions inherit it via --setenv=PATH
+SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bots-management-ops}"   # read-only clone of alexeygrigorev/bots-management (bot-skills is archived)
+SKILLS_REMOTE="${SKILLS_REMOTE:-alexeygrigorev/bots-management}"
+SKILLS_DIR="${SKILLS_DIR:-$SKILLS_REPO/.agents/skills}"   # skills live under .agents/skills
 if [ "$ROLE" = orchestrator ]; then ENGINE="${ORCH_ENGINE:-opus}"; LOOP_DEFAULT=15m; else ENGINE="${ORCH_ENGINE:-sonnet}"; LOOP_DEFAULT=1h; fi
 LOOP_INTERVAL="${LOOP_INTERVAL:-$LOOP_DEFAULT}"
 TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
@@ -134,20 +137,20 @@ for k in ("worker_cgroup", "workload_cgroup"):
 
 skills_sync() {
   if [ ! -d "$SKILLS_REPO/.git" ]; then
-    T=180 t gh repo clone alexeygrigorev/bot-skills "$SKILLS_REPO" >/dev/null 2>&1 || { log "skills clone FAILED"; return 1; }
+    T=180 t gh repo clone "$SKILLS_REMOTE" "$SKILLS_REPO" >/dev/null 2>&1 || { log "skills clone FAILED"; return 1; }
   fi
   T=90 t git -C "$SKILLS_REPO" pull --ff-only -q 2>&1 | tail -2 || log "skills pull failed (using last checkout)"
   # link every skill dir into the session's .claude/skills so Claude Code auto-discovers it
   local d="$RUNDIR/.claude/skills" n=0
   [ -d "$RUNDIR" ] || return 0
   mkdir -p "$d"
-  for s in "$SKILLS_REPO"/*/; do
+  for s in "$SKILLS_DIR"/*/; do
     s="${s%/}"; [ -f "$s/SKILL.md" ] || continue
     ln -sfn "$s" "$d/$(basename "$s")"; n=$((n+1))
   done
   grep -qxF '.claude/skills' "$(git -C "$RUNDIR" rev-parse --git-path info/exclude)" 2>/dev/null || \
     echo '.claude/skills' >> "$(git -C "$RUNDIR" rev-parse --git-path info/exclude)"
-  log "skills synced: $n linked from $SKILLS_REPO @ $(git -C "$SKILLS_REPO" rev-parse --short HEAD)"
+  log "skills synced: $n linked from $SKILLS_DIR @ $(git -C "$SKILLS_REPO" rev-parse --short HEAD)"
 }
 
 prep_worktree() {

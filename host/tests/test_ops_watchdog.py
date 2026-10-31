@@ -59,7 +59,7 @@ class OpsWatchdogTest(unittest.TestCase):
             file = self.bin / cmd
             file.write_text(ADAPTER)
             file.chmod(0o755)
-        (self.home / 'git/bot-skills-ops/.git').mkdir(parents=True)
+        (self.home / 'git/bots-management-ops/.git').mkdir(parents=True)
         self.workspace = self.home / 'git/agent-hub-wt-orchestrator-run/ops/orchestrator'
         self.workspace.mkdir(parents=True)
         (self.workspace.parents[1] / '.git').touch()
