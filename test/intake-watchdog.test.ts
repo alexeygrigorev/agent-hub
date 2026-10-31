@@ -78,6 +78,40 @@ describe('forgotten intake watchdog', () => {
     h.sql.exec('DELETE FROM fleet_catalog_seen');
     expect(w.project([t])[0]).toMatchObject({state:'unknown',forgotten:false});
   }));
+  it('77f492ed via the operator registration path: verify_live append plus failed headless session never spawns', async () => fixture(async h => {
+    // Replay the incident through the supported registration flow instead of a
+    // hand-written history entry: the watchdog must honor the stored verified
+    // link contract (kind link, host, native_id) produced by intake append.
+    const auth = async () => ({caller:{kind:'human',isAdmin:true,actor:'human:fixture'},scopes:['admin']});
+    const call = (path: string, payload?: any) => h.intakeService.handle(new Request('https://hub.test/api/intake'+path,
+      {method:payload?'POST':'GET',...(payload?{body:JSON.stringify(payload)}:{})}),auth);
+    const created = await (await call('/tasks',{key:'iw-verified-create',project:'demo',title:'Verified external owner',
+      text:'Synthetic task',source:{type:'unknown'},acceptance_criteria:'Synthetic criterion'})).json();
+    const id = created.task.id;
+    const native = '3261084c-1f4f-4d9d-b88c-1eb74aa1810a';
+    // The host census must be fresh for the registration API's real wall clock,
+    // so this test anchors its census rows and watchdog clock to Date.now();
+    // the intake itself keeps the file's aged frozen timestamps (the incident
+    // was an old intake), which only feeds the watchdog's aging logic.
+    const LIVE = Date.now();
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('fixture',?,'autoreset','running',?,'isolated-autoreset-workspace')",native,new Date(LIVE).toISOString());
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(LIVE).toISOString());
+    const append = await call('/tasks/'+id+'/events',{key:'register-live',expected_version:1,
+      event:{kind:'session',native_id:native,host:'fixture',verify_live:true}});
+    expect(append.status,await append.clone().text()).toBe(200);
+    session(h, 'ebbf4374', {id}, 'failed');
+    let starts=0;
+    const w = new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{start:async()=>{starts++;return {status:202,body:{id:'8ecfdacc'}}}},()=>LIVE);w.init();
+    await w.tick();
+    expect(starts).toBe(0);
+    const shown = await (await call('/tasks/'+id)).json();
+    expect(shown.task.payload_data.history.at(-1)).toMatchObject({kind:'link',evidence:'external_live_verified',host:'fixture',native_id:native});
+    expect(shown.task.assigned_sessions).toContainEqual(expect.objectContaining({native_id:native,machine:'fixture',liveness:'live',linkage:'external_session'}));
+    // Project the same internal task shape the tick consumed (history lives on
+    // the canonical row, not on the API view).
+    const stored = h.intakeService.statusTaskById({admin:true},id);
+    expect(w.project([stored])[0]).toMatchObject({state:'active',forgotten:false,reason:'live_session_or_pending_intent'});
+  }));
   it('does not interpret an unreachable bound worker as dead', async () => fixture(h => {
     const t=task();session(h,'bound',t,'running',{machine:'fixture',binding:{native_id:'native'}});
     const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'unknown'});
