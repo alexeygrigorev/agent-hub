@@ -89,6 +89,39 @@ class BootstrapTests(unittest.TestCase):
         for package in b.ENGINES.values():
             self.assertRegex(package, r'@[0-9]+\.[0-9]+\.[0-9]+$')
 
+    def write_engine(self, package):
+        name, version = package.rsplit('@', 1)
+        meta = self.root / 'engines/node_modules' / name / 'package.json'
+        meta.parent.mkdir(parents=True, exist_ok=True)
+        meta.write_text(json.dumps({'version': version}))
+
+    def test_ensure_engines_installs_only_missing_pins_in_user_prefix(self):
+        packages = list(b.ENGINES.values())
+        for package in packages[1:]:
+            self.write_engine(package)
+        with patch.object(b, 'ensure_node', return_value=(self.root / 'bin/node', self.root / 'npm-cli.js')), \
+                patch.object(b, 'run') as run:
+            installed = b.ensure_engines(self.root)
+        self.assertEqual(installed, [packages[0]])
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[-1], packages[0])
+        self.assertIn(str(self.root / 'engines'), [str(x) for x in argv])
+
+    def test_ensure_engines_is_a_noop_when_every_pin_is_present(self):
+        for package in b.ENGINES.values():
+            self.write_engine(package)
+        with patch.object(b, 'ensure_node') as node, patch.object(b, 'run') as run:
+            self.assertEqual(b.ensure_engines(self.root), [])
+        node.assert_not_called()
+        run.assert_not_called()
+
+    def test_stale_engine_version_counts_as_missing(self):
+        for package in b.ENGINES.values():
+            self.write_engine(package)
+        name = next(iter(b.ENGINES.values())).rsplit('@', 1)[0]
+        (self.root / 'engines/node_modules' / name / 'package.json').write_text(json.dumps({'version': '0.0.1'}))
+        self.assertEqual(len(b.missing_engines(self.root)), 1)
+
     def prepare_aplexer_alias(self):
         binary_dir = self.root / 'bin'
         binary_dir.mkdir()

@@ -84,6 +84,35 @@ def python_install_root(install_root):
     return state_root(install_root) / 'python'
 
 
+def missing_engines(install_root):
+    """Pinned engine packages absent or at another version under install_root."""
+    missing = []
+    for package in ENGINES.values():
+        name, version = package.rsplit('@', 1)
+        try:
+            data = json.loads((install_root / 'engines/node_modules' / name / 'package.json').read_text())
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict) or data.get('version') != version:
+            missing.append(package)
+    return missing
+
+
+def ensure_engines(install_root):
+    """Install only missing pinned engine CLIs in user scope; no-op when complete."""
+    missing = missing_engines(install_root)
+    if not missing:
+        return []
+    (install_root / 'tmp').mkdir(parents=True, exist_ok=True, mode=0o700)
+    node, npm = ensure_node(install_root)
+    prefix = install_root / 'engines'
+    env = dict(os.environ, npm_config_prefix=str(prefix), npm_config_cache=str(install_root / 'cache/npm'))
+    engine_bin = prefix if sys.platform == 'win32' else prefix / 'bin'
+    env['PATH'] = os.pathsep.join([str(node.parent), str(engine_bin), env.get('PATH', '')])
+    run([node, npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', '--', *missing], env=env)
+    return missing
+
+
 def windows_release(archive, base):
     """Reuse completed releases read-only; partial repairs always get a new tree.
 
@@ -113,15 +142,7 @@ def windows_release(archive, base):
                              git / 'cmd/git.exe', git / 'usr/bin/bash.exe'])
             if any(not p.is_file() or p.is_symlink() for p in required):
                 continue
-            packages_ok = True
-            for package in ENGINES.values():
-                name, version = package.rsplit('@', 1)
-                metadata = candidate / 'engines/node_modules' / name / 'package.json'
-                data = json.loads(metadata.read_text())
-                if not isinstance(data, dict) or data.get('version') != version:
-                    packages_ok = False
-                    break
-            if not packages_ok:
+            if missing_engines(candidate):
                 continue
             env = dict(os.environ, PYTHONPATH=str(candidate / 'package/host'))
             run([python, '-c', 'import aplexer, quse, agent_hub_host.bootstrap'], env=env, capture=True, timeout=30)
@@ -926,6 +947,10 @@ def configure(base_url):
 def main(argv=None):
     if argv is None and len(sys.argv) == 3 and sys.argv[1] == '--configure':
         return configure(sys.argv[2])
+    if argv is None and len(sys.argv) == 2 and sys.argv[1] == '--ensure-engines':
+        root_dir = Path(os.environ.get('HUB_INSTALL_RELEASE') or user_install_root())
+        print(json.dumps({'installed': ensure_engines(root_dir)}), flush=True)
+        return None
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--archive', required=True, type=Path)
     parser.add_argument('--base-url', default='https://hub.dtcdev.click')
@@ -952,6 +977,8 @@ def _install(args):
         (install_root / name).mkdir(parents=True, exist_ok=True, mode=0o700)
     print('Installing runtimes in user scope (0 elevation prompts).', flush=True)
     if ready:
+        # A matching release marker must not hide an engine that is missing.
+        ensure_engines(install_root)
         python = install_root / 'venv/Scripts/python.exe'
         package = install_root / 'package/host'
         env = dict(os.environ)
