@@ -89,12 +89,21 @@ def main():
             print(r['ref'], r['case'], (r.get('intake_id') or '-'), r['text'][:80].replace('\n', ' '))
         return
     from agent_hub_host import session_control
-    for start in range(0, len(rows), 100):
-        chunk = rows[start:start + 100]
-        messages = [{'msg_id': r['ref'], 'role': 'user', 'kind': 'message', 'ts': r['ts'], 'text': r['text'],
-                     **({'intake_id': r['intake_id']} if r.get('intake_id') else {})} for r in chunk]
-        out = session_control.request('POST', '/api/asks/ingest', {'source': 'backfill', 'agents': [
-            {'agent_id': DEVELOPER, 'agent_name': 'Developer', 'messages': messages}]})
+    body = lambda messages: {'source': 'backfill', 'agents': [{'agent_id': DEVELOPER, 'agent_name': 'Developer', 'messages': messages}]}
+    size = lambda messages: len(json.dumps(body(messages), ensure_ascii=False).encode('utf-8'))
+    # The CLI refuses bodies over session_control.MAX_REQUEST, so batches are cut by encoded size.
+    batches, current = [], []
+    for r in rows:
+        m = {'msg_id': r['ref'], 'role': 'user', 'kind': 'message', 'ts': r['ts'], 'text': r['text'],
+             **({'intake_id': r['intake_id']} if r.get('intake_id') else {})}
+        if current and size(current + [m]) > session_control.MAX_REQUEST * 0.9:
+            batches.append(current)
+            current = []
+        current.append(m)
+    if current:
+        batches.append(current)
+    for messages in batches:
+        out = session_control.request('POST', '/api/asks/ingest', body(messages))
         print(json.dumps({k: out.get(k) for k in ('accepted', 'duplicates', 'conflicts', 'rejected')}, ensure_ascii=False), file=sys.stderr)
     session_control.request('POST', '/api/asks/check', {})
     asks = session_control.request('GET', '/api/asks?limit=500')['asks']
