@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { AskLedger, splitAsks, acLines, matchAcLine, noteMarks, ASK_GRACE_MS } from '../src/asks';
+import { toolRequest } from '../src/mcp-tools';
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
 const admin = { caller: { isAdmin: true, actor: 'human:operator', kind: 'human' }, scopes: ['admin'] } as any;
@@ -106,6 +107,29 @@ describe('ingest contract (290b935a watcher)', () => {
     expect((await l.handle(new Request('https://hub.test/api/asks'), host)).status).toBe(403);
     expect((await l.handle(new Request('https://hub.test/api/asks'), null)).status).toBe(401);
     expect((await l.handle(new Request('https://hub.test/api/asks'), op)).status).toBe(200);
+  }));
+  it('MCP asks_read/asks_write reach every ask route through the view/op slot', () => fixture(async (h, l) => {
+    const mcp = async (name: string, args: any) => {
+      const r = await l.handle(toolRequest('https://hub.test', name, args, 'Bearer x'), op);
+      return { status: r.status, body: await r.json() as any };
+    };
+    const t = await intake(h, '1. Export the usage report as CSV');
+    const w = await mcp('asks_write', { op: 'ingest', payload: { source: 'bot', agents: [{ agent_id: 'dev', agent_name: 'Developer',
+      messages: [{ msg_id: 't70u', role: 'user', ts: Date.now(), text: 'Export the usage report as CSV' }, { msg_id: 't71u', role: 'user', ts: Date.now(), text: 'Rename the tab' }] }] } });
+    expect(w.body).toMatchObject({ accepted: 2 });
+    expect((await mcp('asks_write', { op: 'check' })).status).toBe(200);
+    const list = await mcp('asks_read', { view: 'list', query: { agent_id: 'dev' } });
+    expect(list.status).toBe(200);
+    expect(list.body.asks).toHaveLength(2);
+    const [a, b] = list.body.asks.sort((x: any, y: any) => x.t_id.localeCompare(y.t_id));
+    expect((await mcp('asks_write', { op: 'map', payload: { intake_id: t.id } })).body.error).toBe('ask_id_required');
+    expect((await mcp('asks_write', { op: 'map', payload: { ask_id: a.id, intake_id: t.id, ac_line: 1 } })).body.ask).toMatchObject({ state: 'mapped', ac_line: 1 });
+    expect((await mcp('asks_write', { op: 'verify', payload: { ask_id: a.id, evidence: 'csv endpoint live' } })).body.ask.state).toBe('verified');
+    expect((await mcp('asks_write', { op: 'dismiss', payload: { ask_id: b.id, reason: 'duplicate' } })).body.ask.state).toBe('not_an_ask');
+    expect((await mcp('asks_read', { view: 'messages', query: { agent_id: 'dev' } })).status).toBe(200);
+    expect((await mcp('asks_read', { view: 'summary' })).status).toBe(200);
+    expect((await mcp('asks_write', { op: 'settings', payload: { gap_scope: 'window' } })).status).toBe(200);
+    expect(() => toolRequest('https://hub.test', 'asks_write', { op: 'x/map' }, 'Bearer x')).toThrow('invalid_path_argument');
   }));
 });
 

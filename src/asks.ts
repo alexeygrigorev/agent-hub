@@ -783,7 +783,8 @@ export class AskLedger {
       if (path === '/api/asks/ingest' && request.method === 'POST') return json(this.ingest(await body(), caller));
       if (path === '/api/asks/cursor' && request.method === 'GET') return json(this.cursor(url.searchParams.get('agent_id')));
       if (!caller.admin) return json({ error: 'forbidden' }, 403);
-      if (path === '/api/asks' && request.method === 'GET') return json(this.list(url.searchParams));
+      // '/api/asks/list' and POST /api/asks/(map|dismiss|verify) with ask_id are the asks_read/asks_write MCP forms.
+      if ((path === '/api/asks' || path === '/api/asks/list') && request.method === 'GET') return json(this.list(url.searchParams));
       if (path === '/api/asks/messages' && request.method === 'GET') return json(this.messages(url.searchParams));
       if (path === '/api/asks/messages.jsonl' && request.method === 'GET')
         return new Response(this.jsonl(url.searchParams), { headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'private, no-store' } });
@@ -791,10 +792,11 @@ export class AskLedger {
       if (path === '/api/asks/settings' && request.method === 'POST') return json(this.settings(await body()));
       if (path === '/api/asks/check' && request.method === 'POST') return json(await this.tick(this.now(), { full: true }));
       if (path === '/api/asks/reconcile' && request.method === 'POST') return json(await this.reconcileDue());
-      const m = /^\/api\/asks\/([A-Za-z0-9-]{6,64})\/(map|dismiss|verify)$/.exec(path);
+      const m = /^\/api\/asks\/(?:([A-Za-z0-9-]{6,64})\/)?(map|dismiss|verify)$/.exec(path);
       if (m && request.method === 'POST') {
         const b = await body();
-        return json(m[2] === 'map' ? this.map(m[1], b, caller.actor) : m[2] === 'dismiss' ? this.dismiss(m[1], b, caller.actor) : this.verify(m[1], b, caller.actor));
+        const id = m[1] ?? (typeof b.ask_id === 'string' && /^[A-Za-z0-9-]{6,64}$/.test(b.ask_id) ? b.ask_id : fail('ask_id_required'));
+        return json(m[2] === 'map' ? this.map(id, b, caller.actor) : m[2] === 'dismiss' ? this.dismiss(id, b, caller.actor) : this.verify(id, b, caller.actor));
       }
       return json({ error: 'not_found' }, 404);
     } catch (e: any) {

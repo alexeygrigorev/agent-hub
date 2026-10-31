@@ -6,7 +6,7 @@ Alexey's asks kept getting dropped. Each fix so far was a prose rule that only w
 
 1. **Record.** Every message lands in `ask_messages` verbatim, both user and assistant sides.
    - The primary writer is the Tabo watcher (intake 290b935a), which reads Grok Bot replica blobs. It does not spend bot tokens.
-   - The fallback is `hub asks record --ref tNNNNu --agent <bot> [--intake <id>] --text-file -`, or MCP `asks_record`.
+   - The fallback is `hub asks record --ref tNNNNu --agent <bot> [--intake <id>] --text-file -`, or MCP `asks_write` with `op: ingest`.
    - Both are idempotent on (agent_id, msg_id). Text is never trimmed, rewritten or truncated: over-long items are rejected.
 2. **Split.** Each user message becomes one or more asks.
    - Rules-v1: list items, else paragraphs, else the whole message.
@@ -59,6 +59,7 @@ The `tNNNN` counter also numbers non-user entries: `t1985u` is a user message an
 | `GET /api/asks?state=&agent_id=&intake=` | operator | asks with ref, intake + AC line, state |
 | `GET /api/asks/messages`, `/api/asks/messages.jsonl?after=&since=&agent_id=&role=&q=` | operator | both sides; JSONL has `ts_utc` and `ts_berlin` |
 | `POST /api/asks/:id/map\|dismiss\|verify` | operator | mapping and resolution |
+| `GET /api/asks/list`, `POST /api/asks/map\|dismiss\|verify` (`ask_id` in the body) | operator | the forms MCP `asks_read` (`view` list, messages, summary) and `asks_write` (`op` ingest, map, dismiss, verify, check, settings) call |
 | `GET /api/asks/summary`, `POST /api/asks/check`, `POST /api/asks/reconcile`, `POST /api/asks/settings` | operator | maintenance |
 
 ## What still relies on discipline
