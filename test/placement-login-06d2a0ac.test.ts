@@ -91,9 +91,10 @@ describe('placement never picks unknown or logged-out accounts (intake 06d2a0ac)
     expect((service.plan(intent()) as any).selected?.account).toBe('shared-codex');
   }, { routeRejections: ['headless', 'interactive'].map(mode => ({ engine: 'codex', account: 'dummy-sync-5814', profile: 'hub-dummy-sync-5814', mode, reason: 'not_logged_in', observed_at: iso() })) }));
 
-  it('account_unknown and not_logged_in never turn a capacity hold into a hard reject', () => {
-    expect(isCapacityOnlyHold([{ machine: 'm', engine: 'codex', reason: 'account_concurrency' }, { machine: 'm', engine: 'codex', reason: 'account_unknown' }, { machine: 'm', engine: 'codex', reason: 'not_logged_in' }])).toBe(true);
-    expect(isCapacityOnlyHold([{ machine: 'm', engine: 'codex', reason: 'account_unknown' }])).toBe(false);
+  it('not_logged_in is incidental to a capacity hold; account_unknown stays a hard class like account_blocked', () => {
+    expect(isCapacityOnlyHold([{ machine: 'm', engine: 'codex', reason: 'account_concurrency' }, { machine: 'm', engine: 'codex', reason: 'not_logged_in' }])).toBe(true);
+    expect(isCapacityOnlyHold([{ machine: 'm', engine: 'codex', reason: 'not_logged_in' }])).toBe(false);
+    expect(isCapacityOnlyHold([{ machine: 'm', engine: 'codex', reason: 'account_concurrency' }, { machine: 'm', engine: 'codex', reason: 'account_unknown' }])).toBe(false);
   });
 
   it('AC2: a not_logged_in dispatch refusal fails that launch and re-places the intent, holding the route', async () => fixture(async (service, sql) => {

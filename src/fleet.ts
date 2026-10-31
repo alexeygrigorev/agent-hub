@@ -195,7 +195,7 @@ function gateReasonValid(d: any): boolean {
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
 // tier exclusion or a recorded route refusal); it never frees up, so it must not
 // turn a capacity wait into a hard 409.
-const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'account_unknown', 'not_logged_in']);
+const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'not_logged_in']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
