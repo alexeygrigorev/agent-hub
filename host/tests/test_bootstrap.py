@@ -302,6 +302,10 @@ class BootstrapTests(unittest.TestCase):
         unit = (self.root / '.config/systemd/user/agent-hub-controller.service').read_text()
         self.assertIn('ExecStart="/a $$ path/python" "-m" "controller"', unit)
         self.assertIn('a user %% $ space', unit)
+        # systemd takes WorkingDirectory= verbatim; quotes would make the
+        # absolute path "not absolute" and fail the whole unit (KVM VM E2E).
+        self.assertIn('WorkingDirectory=' + str(unusual / 'package').replace('%', '%%'), unit)
+        self.assertNotIn('WorkingDirectory="', unit)
         self.assertNotIn('/transient/', unit)
         self.assertEqual(run.call_args.args[0][:3], ['systemctl', '--user', 'restart'])
         self.assertNotIn('sudo', unit)
