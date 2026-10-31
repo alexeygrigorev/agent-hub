@@ -22,6 +22,7 @@
   "conversations participants",
   "conversations read",
   "conversations send",
+  "device-pending",
   "engines add",
   "engines list",
   "engines login",
