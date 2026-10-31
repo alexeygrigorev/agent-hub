@@ -69,6 +69,27 @@ class NativeProgressTests(unittest.TestCase):
         path.unlink()
         self.assertIsNone(self.sampler(self.row))
 
+    def test_claude_without_hook_state_uses_exact_native_id_transcript(self):
+        # Windows aplexer reports no hook state; the exact <id>.jsonl is the only signal.
+        sid = 'fab3652f-b4c5-4507-a51c-d8821660c32e'
+        home = self.root / 'home'
+        workspace = self.root / 'work' / '0b87eb29' / 'agent-hub'
+        row = dict(id=sid, engine='claude', created_at_ms=self.start, cwd=str(workspace),
+                   workspace=str(workspace), env={'HOME': str(home)})
+        self.assertIsNone(self.sampler(row))
+        project = home / '.claude/projects' / ''.join(c if c.isalnum() else '-' for c in str(workspace))
+        project.mkdir(parents=True)
+        (project / 'other.jsonl').write_text('{}\n')
+        (project / '11111111-1111-1111-1111-111111111111.jsonl').write_text('{}\n')
+        self.assertIsNone(self.sampler(row))
+        path = project / (sid + '.jsonl')
+        path.write_text('{"type":"user"}\n')
+        os.utime(path, (self.start / 1000 + 90, self.start / 1000 + 90))
+        self.assertEqual(self.sampler(row), self.start + 90000)
+        path.write_text(path.read_text() + '{"type":"assistant"}\n')
+        os.utime(path, (self.start / 1000 + 900, self.start / 1000 + 900))
+        self.assertEqual(self.sampler(row), self.start + 900000)
+
     def test_opencode_uses_exact_session_message_events_not_database_churn(self):
         db = self.root / 'opencode/opencode.db'
         db.parent.mkdir()

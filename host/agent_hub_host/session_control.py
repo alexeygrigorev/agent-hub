@@ -968,7 +968,7 @@ def _execute(args):
                 except ValueError as exc:
                     if cmd != 'capture':
                         raise
-                    reason = 'host_unreachable' if isinstance(exc, SessionTransportError) and time.monotonic() < _request_deadline.get() else 'capture_not_acked'
+                    reason = 'hub_unreachable' if isinstance(exc, SessionTransportError) and time.monotonic() < _request_deadline.get() else 'capture_not_acked'
                     raise SessionInputError(f'{reason}; command {command_id}; inspect commands before retrying with the same key') from None
                 if cmd == 'capture':
                     entry = queued['command_wait']

@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import time
 
@@ -110,6 +111,36 @@ def goal_requested_as_text(path, lines=64):
     except OSError:
         return False
     return False
+
+
+_UUID = re.compile(r'[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}')
+
+
+def claude_transcript(row):
+    """Exact <projects>/<cwd-slug>/<conversation-id>.jsonl, never newest-by-workspace.
+
+    Hosts without native hook state (Windows) report no conversation id, so the
+    native id is also tried; only a file named by the id counts as progress.
+    """
+    cwd = row.get('cwd') or row.get('workspace')
+    if not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute():
+        return None
+    ids = [v for v in (row.get('reported_state_engine_session_id'), row.get('id'))
+           if isinstance(v, str) and _UUID.fullmatch(v)]
+    env = row.get('env') if isinstance(row.get('env'), dict) else {}
+    config, home = env.get('CLAUDE_CONFIG_DIR'), env.get('HOME') or env.get('USERPROFILE')
+    if isinstance(config, str) and Path(config).is_absolute():
+        root = Path(config)
+    elif isinstance(home, str) and Path(home).is_absolute():
+        root = Path(home) / '.claude'
+    else:
+        root = Path.home() / '.claude'
+    project = root / 'projects' / re.sub(r'[^A-Za-z0-9]', '-', cwd)
+    for sid in ids:
+        path = project / (sid + '.jsonl')
+        if path.is_file():
+            return path
+    return None
 
 
 class NativeTranscriptProgress:
@@ -228,6 +259,8 @@ class NativeTranscriptProgress:
                         return path
                 except (OSError, ValueError, KeyError, TypeError):
                     pass
+        if row.get('engine') == 'claude':
+            return claude_transcript(row)
         if row.get('engine') not in ('codex', 'zcodex'):
             return None
         roots = self.roots(row)
