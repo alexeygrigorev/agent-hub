@@ -3,7 +3,12 @@ import { effectiveCheckin } from './registry';
 /** Stop delivery is bounded independently of the native execution lease. */
 export const STOP_DELIVERY_MS = 8000;
 export const REACHABLE_STOP_DELIVERY_MS = 60000;
-const HOST_FRESH_CHECKIN_MS = 180000;
+/** Storage persists an unchanged heartbeat only every 300 s (registry.ts), so a
+ * Durable Object that lost its in-memory check-in sees a persisted time up to
+ * that old for a host that is heartbeating right now. Freshness must exceed the
+ * persist interval or such a host is falsely reported stop_host_unreachable
+ * (intake 6c2b2aa2 AC3). */
+const HOST_FRESH_CHECKIN_MS = 300000 + 120000;
 
 /** Intake 1c8d915e: `machines.last_checkin_at` is persisted only on a
  * changed heartbeat or every five minutes, so freshness must use the
