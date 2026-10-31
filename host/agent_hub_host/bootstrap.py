@@ -940,9 +940,15 @@ def install_service(install_root, command):
         if any(c in value for c in ('\n', '\r', '\0')):
             raise ValueError('Invalid service path')
         return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+    def systemd_path(value):
+        # WorkingDirectory= takes the raw line value: systemd never strips
+        # quotes here, so a quoted absolute path fails as "not absolute".
+        if any(c in value for c in ('\n', '\r', '\0')):
+            raise ValueError('Invalid service path')
+        return value.replace('%', '%%')
     unit = Path.home() / '.config/systemd/user/agent-hub-controller.service'
     lines = ['[Unit]', 'Description=Agent Hub user controller', 'After=network-online.target',
-             '[Service]', 'Type=simple', 'WorkingDirectory=' + systemd_quote(str(install_root / 'package')),
+             '[Service]', 'Type=simple', 'WorkingDirectory=' + systemd_path(str(install_root / 'package')),
              'ExecStart=' + ' '.join(systemd_quote(str(x).replace('$', '$$')) for x in command),
              'Restart=on-failure', 'RestartSec=10', 'TimeoutStopSec=45']
     lines.extend('Environment=' + systemd_quote(k + '=' + v) for k, v in env.items())
