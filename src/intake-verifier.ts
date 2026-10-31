@@ -1,9 +1,9 @@
 /** Post-DONE verification (intake d8d509d2, Alexey t1936u–t1937u). When an
  * intake's work reports DONE, Hub decides from the intake's `verification`
  * field (required|skip|auto, default auto) whether a SEPARATE verifier agent
- * must check it. The verifier only verifies: it never implements, and it runs
- * on a different model than the implementer (Claude Opus by default, Codex
- * when Claude implemented). A pass closes the intake through the ordinary
+ * must check it. The verifier only verifies: it never implements. It may run
+ * on the same model as the implementer (Claude Opus by default; no forced
+ * engine switch). A pass closes the intake through the ordinary
  * close rules (DONE evidence + worktree gate); a fail appends the gap to the
  * AC, which invalidates the DONE claim so the watchdog re-queues the work.
  * Only DONE claims made after this service was first enabled are handled;
@@ -99,25 +99,6 @@ export class IntakeVerifier {
     const counts = Object.fromEntries(this.rows('SELECT state, COUNT(*) AS n FROM intake_verifications GROUP BY state').map(r => [r.state, r.n]));
     return { enabled_at: m.enabled_at ?? null, last_checked_at: m.last_tick ?? null, last_result: parse(m.last_result), states: counts };
   }
-  /** Engine of the implementation behind this DONE claim. The claim's author
-   * wins when it is a canonical launch worker (hub-workers:worker-<launch id>);
-   * otherwise the newest non-review session for the intake created before the
-   * claim. Review sessions (verifiers, triage) never count, and unverified
-   * history links are never trusted for routing (null => Claude Opus default). */
-  private implementerEngine(task: Obj, claim: Obj): string | null {
-    const author = /^hub-workers:worker-(.+)$/.exec(String(claim.actor ?? ''))?.[1];
-    if (author) {
-      const s = this.rows('SELECT engine,request_json FROM session_control_sessions WHERE fleet_launch_id=?', author)[0];
-      const req = parse(s?.request_json);
-      if (s && typeof s.engine === 'string' && req.intake_task_id === task.id && req.task_kind !== 'review') return s.engine;
-    }
-    const at = claim.captured_at ?? Number.MAX_SAFE_INTEGER;
-    const ids = new Set((task.history || []).map((e: Obj) => e.hub_session_id).filter(Boolean));
-    const sessions = this.rows('SELECT id,engine,request_json,created_at FROM session_control_sessions').map((s): Obj => ({ ...s, req: parse(s.request_json) }))
-      .filter(s => (ids.has(s.id) || s.req.intake_task_id === task.id) && s.req.task_kind !== 'review' && typeof s.engine === 'string' && ms(s.created_at) <= at)
-      .sort((a, b) => ms(b.created_at) - ms(a.created_at));
-    return sessions.length ? sessions[0].engine : null;
-  }
   private workspace(task: Obj): string {
     const prior = this.rows('SELECT request_json FROM session_control_sessions ORDER BY created_at DESC')
       // Never an intake worktree path: the verifier runs detached from it (79458f2d).
@@ -156,12 +137,10 @@ export class IntakeVerifier {
   }
   private async launch(task: Obj, claim: Obj, row: Obj): Promise<boolean> {
     if (!this.hooks.start) return false;
-    const claudeImplemented = this.implementerEngine(task, claim) === 'claude';
-    const engine = claudeImplemented ? 'codex' : 'claude';
+    const engine = 'claude';
     const attempt = (row.attempts ?? 0) + 1;
     const input = { key: 'verify-' + crypto.randomUUID(), engine, tier: 'review', task_kind: 'review', mode: 'headless',
-      engine_override_reason: claudeImplemented ? 'Alexey t1936u: verifier must differ from the Claude implementer'
-        : 'Alexey t1936u: separate Claude Opus verifier after DONE',
+      engine_override_reason: 'Alexey t1936u: separate Claude Opus verifier after DONE',
       // Detached (79458f2d): a live owner session on the intake's worktree never blocks the verifier.
       workspace: this.workspace(task), intake_task_id: task.id, intake_worktree: 'detached', brief: verifierBrief(task, claim, attempt) };
     this.set(task, claim, { state: 'starting', engine, request_key: input.key, attempts: attempt, session_id: null });

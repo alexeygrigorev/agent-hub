@@ -129,7 +129,7 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     expect(after.payload_data.acceptance_criteria).toMatch(/Verification gap \(.*\): bucket x still holds 40 objects$/);
     expect(latestDoneClaim({ ...after, ...after.payload_data })).toBeNull(); // AC change starts a new context
   }));
-  it('uses a different model than a Claude implementer', async () => fixture(async h => {
+  it('does not force an engine switch for a Claude implementer', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
     const v = verifier(h, starts, clock);
     const t = await task(h, { title: 'Change session placement' });
@@ -139,43 +139,9 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await note(h, t.id, DONE_EVIDENCE);
     clock.now = Date.now();
     await tick(v, clock);
-    expect(starts[0]).toMatchObject({ engine: 'codex', workspace: 'demo' });
+    expect(starts[0]).toMatchObject({ engine: 'claude', workspace: 'demo' });
   }));
-  it('picks the newest non-review implementer before the claim: old Claude review + latest Codex work gets Claude', async () => fixture(async h => {
-    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
-    const v = verifier(h, starts, clock);
-    const t = await task(h, { title: 'Change session placement' });
-    const row = (id: string, engine: string, kind: string | null, ageMs: number) => h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
-      VALUES(?,'fixture',?,?,?,'headless','exited',?,?)`, id, id, JSON.stringify({ intake_task_id: t.id, workspace: 'demo', ...(kind ? { task_kind: kind } : {}) }),
-      engine, new Date(Date.now() - ageMs).toISOString(), new Date(Date.now() - ageMs).toISOString());
-    row('old-claude-impl', 'claude', null, 3 * 3600000);
-    row('claude-review', 'claude', 'review', 2 * 3600000);
-    row('latest-codex-impl', 'codex', null, 3600000);
-    await note(h, t.id, DONE_EVIDENCE);
-    row('later-claude-after-claim', 'claude', null, -60000); // after the claim: not the implementer of it
-    clock.now = Date.now();
-    await tick(v, clock);
-    expect(starts[0]).toMatchObject({ engine: 'claude' });
-  }));
-  it('the DONE author (canonical launch worker) decides the implementer over a newer different-model session', async () => fixture(async h => {
-    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
-    const v = verifier(h, starts, clock);
-    const t = await task(h, { title: 'Change session placement' });
-    const row = (id: string, launch: string, engine: string, ageMs: number) => h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,engine,mode,state,created_at,updated_at)
-      VALUES(?,'fixture',?,?,?,?,'headless','running',?,?)`, id, id, JSON.stringify({ intake_task_id: t.id, workspace: 'demo' }), launch, engine,
-      new Date(Date.now() - ageMs).toISOString(), new Date(Date.now() - ageMs).toISOString());
-    row('claude-author', 'launch-claude', 'claude', 2 * 3600000);
-    row('newer-codex', 'launch-codex', 'codex', 3600000);
-    await note(h, t.id, DONE_EVIDENCE);
-    // Attribute the claim to the older Claude worker, as its worker credential would.
-    const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', t.id).one().data);
-    data.history[data.history.length - 1].actor = 'hub-workers:worker-launch-claude';
-    h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), t.id);
-    clock.now = Date.now();
-    await tick(v, clock);
-    expect(starts[0]).toMatchObject({ engine: 'codex' });
-  }));
-  it('never routes on unverified history link engines', async () => fixture(async h => {
+  it('ignores history link engines for verifier routing', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
     const v = verifier(h, starts, clock);
     const t = await task(h, { title: 'Change session placement' });
