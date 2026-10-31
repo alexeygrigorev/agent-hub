@@ -353,4 +353,25 @@ describe('autonomous intake queue',()=>{
     expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id LIKE 'zz-young-%'").one().n).toBe(150);
     expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_audit WHERE kind='restart_closed' AND reason LIKE '%closed (intake_done)%'").one().n).toBe(150);
   }));
+  it('bounded raw window: one closable row behind 130 non-actionable rows is reached (review F2 of 0841a966)',()=>fixture(async h=>{
+    let now=NOW;
+    const insert=(id:string,status:string)=>{
+      h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',id,JSON.stringify({...task(id),status}));
+      h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
+        VALUES(?,'queued','watchdog_global_capacity',?,?,?)`,id,NOW,NOW,NOW);
+    };
+    for(let i=0;i<130;i++)insert('aa-young-'+String(i).padStart(3,'0'),'open');
+    insert('zz-done-000','done');
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[task('batch-only')]} as any,(f:any)=>f(),{},()=>now);w.init();
+    h.sql.exec("UPDATE intake_queue_cursor SET sweep_after=''");
+    await w.tick();
+    // The window is 128 raw rows: the closable row sorts behind all of them, so the
+    // first tick must NOT have walked past its bound to find it (and must not have
+    // closed it by scanning the whole table either).
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id='zz-done-000'").one().n).toBe(1);
+    now+=WATCHDOG_INTERVAL;await w.tick();
+    now+=WATCHDOG_INTERVAL;await w.tick();
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id='zz-done-000'").one().n).toBe(0);
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id LIKE 'aa-young-%'").one().n).toBe(130);
+  }));
 });
