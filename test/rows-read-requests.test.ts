@@ -42,3 +42,19 @@ describe('host poll queries ignore history', () => {
     expect(r.read).toBeLessThanOrEqual(10);
   }));
 });
+
+describe('per-statement attribution', () => {
+  it('names the SQL behind a scope and sums its rows', () => withHub(async hub => {
+    hub.meter.runSync('probe:stmt', () => {
+      hub.sql.exec('SELECT id FROM jobs ORDER BY id LIMIT 5').toArray();
+      hub.sql.exec('SELECT id FROM jobs WHERE id IN (?, ?, ?)', 'j1', 'j2', 'j3').toArray();
+      hub.sql.exec('SELECT id FROM jobs WHERE id IN (?, ?)', 'j4', 'j5').toArray();
+    });
+    const top = hub.meter.statementTop(500).filter(s => s.scope === 'probe:stmt');
+    // IN lists of any width fold into one statement shape.
+    expect(top.map(s => s.sql).sort()).toEqual(['SELECT id FROM jobs ORDER BY id LIMIT 5', 'SELECT id FROM jobs WHERE id IN (?...)']);
+    const byShape = Object.fromEntries(top.map(s => [s.sql, s]));
+    expect(byShape['SELECT id FROM jobs WHERE id IN (?...)'].calls).toBe(2);
+    expect(byShape['SELECT id FROM jobs ORDER BY id LIMIT 5'].rows_read).toBe(5);
+  }));
+});

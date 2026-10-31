@@ -728,7 +728,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
       const hours = Number(url.searchParams.get('hours') || 24);
       const report = rowsReadReport(this.sql, Date.now(), Number.isFinite(hours) ? hours : 24, this.meter.snapshot());
-      return Response.json({ ...report, target_per_day: ROWS_READ_TARGET_PER_DAY, alert_per_day: rowsReadAlertThreshold(this.env), meter_started_at: new Date(this.meter.startedAt).toISOString() });
+      return Response.json({ ...report, statements: this.meter.statementTop(Math.min(100, Number(url.searchParams.get('statements')) || 30)), target_per_day: ROWS_READ_TARGET_PER_DAY, alert_per_day: rowsReadAlertThreshold(this.env), meter_started_at: new Date(this.meter.startedAt).toISOString() });
     }
 
     try {

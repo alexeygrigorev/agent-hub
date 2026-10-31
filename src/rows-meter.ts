@@ -24,6 +24,7 @@ type Scope = { name: string; cursors: any[]; queries: string[] };
 
 export const RING_HOURS = 192;
 const MAX_SCOPES = 300;
+const MAX_STATEMENTS = 1500;
 const SLOW_SCOPE_LOG_ROWS = 50_000;
 // Statements reading at least this many rows are logged with their SQL.
 // Overridable for local replays via globalThis.__ROWS_METER_STATEMENT_LOG.
@@ -109,6 +110,7 @@ export class RowsMeter {
     scope.cursors.forEach((c, i) => {
       let r = 0;
       try { r = Number(c.rowsRead) || 0; read += r; written += Number(c.rowsWritten) || 0; } catch {}
+      this.addStatement(scope.name, scope.queries[i], r);
       // Name the statement behind a heavy read so the hot path is visible in logs.
       if (r >= statementLogRows()) console.warn(JSON.stringify({ event: 'do_rows_read_statement', scope: scope.name, rows_read: r, sql: String(scope.queries[i] ?? '').replace(/\s+/g, ' ').slice(0, 160) }));
     });
@@ -117,6 +119,27 @@ export class RowsMeter {
     scope.queries = [];
     if (!calls) return;
     this.add(scope.name, calls, read, written);
+  }
+
+  /** In-memory rows read per (scope, normalized SQL), bounded; the live answer to "which statement". */
+  private statements = new Map<string, { scope: string; sql: string; calls: number; rows_read: number; max_read: number }>();
+
+  private addStatement(scope: string, query: string | undefined, read: number) {
+    const sql = String(query ?? '').replace(/\s+/g, ' ').replace(/\((?:\?,\s?)+\?\)/g, '(?...)').slice(0, 140);
+    const key = scope + '\u0000' + sql;
+    let t = this.statements.get(key);
+    if (!t) {
+      if (this.statements.size >= MAX_STATEMENTS) return;
+      t = { scope, sql, calls: 0, rows_read: 0, max_read: 0 };
+      this.statements.set(key, t);
+    }
+    t.calls++; t.rows_read += read; if (read > t.max_read) t.max_read = read;
+  }
+
+  /** Statements with the most rows read since this instance started. */
+  statementTop(limit = 30) {
+    this.settle(this.unscoped);
+    return [...this.statements.values()].sort((a, b) => b.rows_read - a.rows_read).slice(0, limit).map(t => ({ ...t }));
   }
 
   private add(name: string, calls: number, read: number, written: number) {
