@@ -82,3 +82,23 @@ it('GET /api/fleet/offers with no offers reads a bounded number of rows', withFl
   const second = after.total;
   expect(second, `idle offers top statements: ${JSON.stringify(after.top)}`).toBeLessThanOrEqual(400);
 }));
+
+it('PUT /api/fleet/sessions still writes changed rows, retires vanished live rows and skips stopped sessions', withFleet(async (s, _t, hub) => {
+  const row = (i: number, phase: string, extra: any = {}) => ({
+    native_id: uuid(3, i), tag: 'hub-' + uuid(1, i), engine: 'codex', phase, confirmed_exit: phase === 'exited', agent_state: null,
+    workspace: '/w', cwd: '/w', profile: null, account: null, last_activity_at: null, created_at_ms: now - 1000 - i, ...extra });
+  const put = async (sessions: any[]) => { const r = await s.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions }) }), host); expect(r.status).toBe(200); return r.json() as Promise<any>; };
+  const phaseOf = (i: number) => (hub.sql.exec('SELECT phase FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', 'h0', uuid(3, i)).toArray()[0] as any)?.phase;
+  // Seeded rows 0-4 are live (running) and the rest are exited history; the census reports 0-2 only.
+  expect((await put([row(0, 'running'), row(1, 'running'), row(2, 'running')])).written).toBeGreaterThan(0);
+  expect(phaseOf(2)).toBe('running');
+  // Unchanged census: nothing written.
+  expect((await put([row(0, 'running'), row(1, 'running'), row(2, 'running')])).written).toBe(0);
+  // Row 1 vanished from the catalog (live -> unobserved); row 2 changed phase.
+  expect((await put([row(0, 'running'), row(2, 'exited')])).written).toBe(2);
+  expect(phaseOf(1)).toBe('unobserved');
+  expect(phaseOf(2)).toBe('exited');
+  // Unreported live rows (3, 4) were retired by the first census; unreported exited history is untouched.
+  expect(phaseOf(3)).toBe('unobserved');
+  expect(phaseOf(10)).toBe('exited');
+}));
