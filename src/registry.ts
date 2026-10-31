@@ -182,6 +182,27 @@ export function updateRouteAdvertisement(machineId: string, advert: RouteAdverti
   return at;
 }
 
+// Native (host-home) engines per catalog provider (intake 608a2f9a). Managed
+// bundles get their fleet_routes on install; native accounts only had routes
+// an operator wrote into the registry, so Windows hosts that advertise a
+// logged-in zcodex/antigravity/opencode were never offered work.
+const NATIVE_ROUTE_ENGINES: Record<string, string> = { zai: 'zcodex', gemini: 'antigravity', go: 'opencode' };
+
+/** Register advertised native routes (profile null) for enabled catalog
+ * accounts. Insert-only: removal stays with the registry PUT and a dropped
+ * route already holds as route_not_advertised. Returns rows added. */
+export function registerAdvertisedNativeRoutes(machineId: string, routes: { engine: string; account: string; profile: string | null }[], sql: SqlStorage): number {
+  if (!sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='fleet_routes'").toArray().length) return 0;
+  let added = 0;
+  for (const r of routes) {
+    if (r.profile !== null) continue;
+    const account = sql.exec('SELECT provider, enabled FROM fleet_accounts WHERE label = ?', r.account).toArray()[0] as any;
+    if (!account || !Number(account.enabled) || NATIVE_ROUTE_ENGINES[String(account.provider)] !== r.engine) continue;
+    added += sql.exec('INSERT OR IGNORE INTO fleet_routes VALUES (?, ?, ?, NULL)', machineId, r.engine, r.account).rowsWritten > 0 ? 1 : 0;
+  }
+  return added;
+}
+
 export function updateHeartbeatMemoryOnly(machineId: string) {
   const now = Date.now();
 
@@ -477,6 +498,7 @@ export async function handleRegistryRoutes(
     if (!advert) return Response.json({ error: 'invalid_route_advertisement' }, { status: 400 });
     const at = updateRouteAdvertisement(cred.machine_id, advert, sql);
     if (!at) return Response.json({ error: 'stale_route_advertisement' }, { status: 409 });
+    if ('fleet_routes' in advert) registerAdvertisedNativeRoutes(cred.machine_id, advert.fleet_routes, sql);
     return Response.json({ status: 'ok', fleet_routes_at: at });
   }
 
