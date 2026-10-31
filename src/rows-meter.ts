@@ -52,7 +52,7 @@ export function normalizeRoute(method: string, path: string): string {
     if (!seg) return seg;
     if (/^[0-9]+$/.test(seg)) return ':n';
     if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(seg)) return ':id';
-    if (/[0-9]/.test(seg) && seg.length >= 12) return ':id';
+    if (/[0-9]/.test(seg)) return ':id'; // ids, short ids, slugs: scopes stay a fixed set of route templates
     if (seg.length > 40 || /[^A-Za-z0-9_.-]/.test(seg)) return ':id';
     return seg;
   });

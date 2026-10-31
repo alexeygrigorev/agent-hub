@@ -61,6 +61,7 @@ import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
 
 const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
+const METER_FLUSH_INTERVAL_MS = 5 * 60_000;
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -682,12 +683,13 @@ export class Hub extends DurableObject {
 
   private lastMeterFlush = 0;
 
-  /** A hibernating DO can be evicted before its next alarm, so request and
-   * WebSocket work also persists meter totals, at most every 30s. The first
-   * call after a cold start flushes the constructor's schema reads. */
+  /** Meter totals are persisted at most every 5 minutes (each flush writes one
+   * row per active scope). A hibernating DO can be evicted before its next
+   * alarm, so requests and WebSocket messages flush too, and the first call
+   * after a cold start flushes the constructor's schema reads at once. */
   private maybeFlushRowsMeter() {
     const now = Date.now();
-    if (now - this.lastMeterFlush < 30_000) return;
+    if (now - this.lastMeterFlush < METER_FLUSH_INTERVAL_MS) return;
     this.lastMeterFlush = now;
     try { this.meter.flush(this.sql); } catch { console.warn('rows_meter_flush_failed'); }
   }
@@ -2421,7 +2423,9 @@ export class Hub extends DurableObject {
   private idleWorkAt = 0;
 
   /** Idle recovery acts on 30-minute nudge delays, so a census at most every
-   * 5 minutes is enough; the minute alarm used to rerun it (intake 8081a05a). */
+   * 5 minutes is enough; the minute alarm used to rerun it (intake 8081a05a).
+   * The gate is in memory and on the wall clock: a cold start runs a census at
+   * once, and HUB_IDLE_OPEN_AC_NUDGE_MINUTES below 5 acts within ~5 minutes. */
   private async idleWorkTick() {
     const now = Date.now();
     if (now - this.idleWorkAt < IDLE_WORK_INTERVAL_MS) return;
@@ -2430,8 +2434,11 @@ export class Hub extends DurableObject {
   }
 
   /** Persist meter totals; once per hour compare the last full hour, x24,
-   * with the rows-read/day budget and open or resolve a liveness alert. */
+   * with the rows-read/day budget (AC: alert at 20,000/day) and open or resolve
+   * a liveness alert. An open alert notifies once; later hours only refresh its
+   * projected number and top scopes until the budget is met and it resolves. */
   private async flushRowsMeter() {
+    if (Date.now() - this.lastMeterFlush < METER_FLUSH_INTERVAL_MS) return;
     this.lastMeterFlush = Date.now();
     this.meter.flush(this.sql);
     const hour = Math.floor(Date.now() / 3_600_000);

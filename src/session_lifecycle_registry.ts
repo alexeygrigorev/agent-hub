@@ -1,5 +1,5 @@
 import { jsonFields } from './sql-json-projection';
-import { backfillOnce } from './sql-probes';
+import { backfillWhenCountsDiffer } from './sql-probes';
 import { intakeHasDoneEvidence } from './intake';
 /** M15c live durable lifecycle registry (server authority).
  *
@@ -145,7 +145,7 @@ export function initLifecycleRequestProjection(sql: SqlStorage): void {
     DELETE FROM lifecycle_request_projection WHERE id=OLD.id; ${put} END`);
   sql.exec(`CREATE TRIGGER IF NOT EXISTS lifecycle_request_delete AFTER DELETE ON session_control_sessions BEGIN
     DELETE FROM lifecycle_request_projection WHERE id=OLD.id; END`);
-  backfillOnce(sql, 'lifecycle_request_projection', () => sql.exec(`INSERT INTO lifecycle_request_projection SELECT c.id,
+  backfillWhenCountsDiffer(sql, 'lifecycle_request_projection', ['session_control_sessions'], () => sql.exec(`INSERT INTO lifecycle_request_projection SELECT c.id,
     ${jsonFields('c.request_json',['provenance','workspace','cwd'])},${brief('c.request_json')}
     FROM session_control_sessions c WHERE NOT EXISTS(SELECT 1 FROM lifecycle_request_projection p WHERE p.id=c.id)`));
 }

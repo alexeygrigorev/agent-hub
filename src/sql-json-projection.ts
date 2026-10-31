@@ -4,7 +4,7 @@
  * JSON behaves like the existing parse-or-empty-object helpers.
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import { backfillOnce } from './sql-probes';
+import { backfillWhenCountsDiffer } from './sql-probes';
 
 export function jsonFields(column: string, fields: readonly string[]): string {
   const valid = `(CASE WHEN json_valid(${column}) THEN ${column} ELSE '{}' END)`;
@@ -30,7 +30,7 @@ export function initResourceRequestProjection(sql: SqlStorage, table: RequestTab
     DELETE FROM resource_request_projection WHERE source='${table}' AND id=OLD.id; ${insert} END`);
   sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_request_${table}_delete AFTER DELETE ON ${table} BEGIN
     DELETE FROM resource_request_projection WHERE source='${table}' AND id=OLD.id; END`);
-  backfillOnce(sql, 'resource_request_projection:' + table, () => sql.exec(`INSERT INTO resource_request_projection(source,id,request_json)
+  backfillWhenCountsDiffer(sql, 'resource_request_projection', ['fleet_launches', 'session_control_sessions'], () => sql.exec(`INSERT INTO resource_request_projection(source,id,request_json)
     SELECT '${table}',s.id,${jsonFields('s.request_json',RESOURCE_FIELDS)} FROM ${table} s
     WHERE NOT EXISTS(SELECT 1 FROM resource_request_projection p WHERE p.source='${table}' AND p.id=s.id)`));
 }

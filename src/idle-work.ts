@@ -41,7 +41,8 @@ export class IdleWorkService {
     this.busy = true;
     try {
       // One attention census per tick (intake 8081a05a): it also decides
-      // which episodes stay active below, instead of recomputing it.
+      // which episodes stay active below, instead of recomputing it. A session
+      // that recovers during this loop is marked inactive on the next census.
       const attention = this.sessions.attention();
       for (const item of attention) {
         try {

@@ -14,7 +14,7 @@
  */
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const PROBE = /^\s*SELECT\s+(name|1)\s+FROM\s+sqlite_master\s+WHERE\s+type\s*=\s*'table'\s+AND\s+name\s*(=\s*(\?|'[A-Za-z0-9_]+')|IN\s*\(([^)]*)\))\s*(?:LIMIT\s+1\s*)?;?\s*$/i;
+const PROBE = /^\s*SELECT\s+(name|1)\s+FROM\s+sqlite_master\s+WHERE\s+type\s*=\s*'table'\s+AND\s+name\s*(=\s*(\?|'[A-Za-z0-9_]+')|IN\s*\(([^)]*)\))\s*(LIMIT\s+1\s*)?;?\s*$/i;
 
 const one = (column: string, arg: string) =>
   `SELECT ${column} FROM pragma_table_list(${arg}) WHERE schema='main' AND type='table'`;
@@ -27,7 +27,8 @@ export function rewriteSchemaProbe(query: string): string | null {
   if (m[3]) return one(column, m[3]);
   const names = m[4].split(',').map(s => s.trim());
   if (!names.length || names.some(n => !/^'[A-Za-z0-9_]+'$/.test(n) || !IDENT.test(n.slice(1, -1)))) return null;
-  return names.map(n => one(column, n)).join(' UNION ALL ');
+  const union = names.map(n => one(column, n)).join(' UNION ALL ');
+  return m[5] ? `SELECT * FROM (${union}) LIMIT 1` : union;
 }
 
 /**
@@ -42,4 +43,16 @@ export function backfillOnce(sql: { exec: (q: string, ...a: any[]) => any }, key
   if (sql.exec('SELECT 1 FROM hub_init_stamps WHERE key=?', key).toArray().length) return;
   backfill();
   sql.exec('INSERT OR IGNORE INTO hub_init_stamps VALUES(?,?)', key, Date.now());
+}
+
+/**
+ * Backfill a 1:1 trigger-maintained projection only when its row count no
+ * longer matches its sources. COUNT(*) over a whole table is answered from
+ * the b-tree without reading rows, so the per-cold-start check is free,
+ * yet a projection that lost rows still repairs itself on the next wake.
+ */
+export function backfillWhenCountsDiffer(sql: { exec: (q: string, ...a: any[]) => any }, target: string, sources: string[], backfill: () => void): void {
+  const count = (table: string) => Number(sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).one().n);
+  const present = sources.filter(t => sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name=?", t).toArray().length);
+  if (count(target) !== present.reduce((n, t) => n + count(t), 0)) backfill();
 }

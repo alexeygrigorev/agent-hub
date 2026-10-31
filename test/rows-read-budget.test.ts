@@ -65,6 +65,7 @@ describe('schema probe rewrite', () => {
     expect(rewriteSchemaProbe("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"))
       .toBe("SELECT 1 FROM pragma_table_list(?) WHERE schema='main' AND type='table'");
     expect(rewriteSchemaProbe("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('a','b')")).toContain('UNION ALL');
+    expect(rewriteSchemaProbe("SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('a','b') LIMIT 1")).toMatch(/^SELECT \* FROM \(.*\) LIMIT 1$/);
     expect(rewriteSchemaProbe("SELECT name FROM sqlite_master WHERE type='index' AND name='x'")).toBeNull();
     expect(rewriteSchemaProbe('SELECT name, sql FROM sqlite_master ORDER BY name')).toBeNull();
     expect(rewriteSchemaProbe("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'x%'")).toBeNull();
@@ -138,7 +139,8 @@ describe('per-step rows-read budgets', () => {
 describe('route normalization', () => {
   it('keeps meter scopes bounded', () => {
     expect(normalizeRoute('get', '/api/sessions/3f2a1b4c-1111-4111-8111-111111111111/send')).toBe('GET /api/sessions/:id/send');
-    expect(normalizeRoute('POST', '/api/intake/tasks/8081a05a/events')).toBe('POST /api/intake/tasks/8081a05a/events');
+    expect(normalizeRoute('POST', '/api/intake/tasks/8081a05a/events')).toBe('POST /api/intake/tasks/:id/events');
+    expect(normalizeRoute('GET', '/api/fleet/launches')).toBe('GET /api/fleet/launches');
     expect(normalizeRoute('GET', '/api/machines/123')).toBe('GET /api/machines/:n');
   });
 });
