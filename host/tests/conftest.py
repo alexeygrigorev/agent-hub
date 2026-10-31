@@ -119,6 +119,14 @@ def isolated_host_load(monkeypatch):
         getloadavg=lambda: (0.0, 0.0, 0.0), cpu_count=lambda: 12))
 
 
+@pytest.fixture(autouse=True)
+def fresh_sync_report_cache():
+    """The host suppresses unchanged engine sync reports per process (5814e109 AC9);
+    each test starts as a fresh host process."""
+    from agent_hub_host import provisioning
+    provisioning._last_sync_report.update(body=None, at=0.0)
+
+
 # Host-wide heavy-test cap for direct pytest runs (736ba282 AC6h): hold one
 # scripts/capped-test-run.sh slot for the session unless already under the
 # wrapper (AGENT_HUB_HEAVY_TEST_HELD=1). The holder exits, releasing the

@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 from . import bus, config, hook_command, private_fs
@@ -1178,15 +1179,27 @@ def sync(request=None):
     return result
 
 
-def report_sync(request, state, installed=(), failed=(), error=None):
+# Sync reports go out on change, plus a slow refresh: hosts tick every heartbeat
+# and Hub's Durable Object row writes are a daily Free-plan budget.
+SYNC_REPORT_REFRESH_S = 1800
+_last_sync_report = {'body': None, 'at': 0.0}
+
+
+def report_sync(request, state, installed=(), failed=(), error=None, clock=time.monotonic):
     """Best-effort per-host sync status for Hub (exception type only, never messages)."""
     items = [{'label': b['label'], 'revision': b['revision'], 'state': 'installed'} for b in installed]
     items += [{'label': b['label'], 'revision': b['revision'], 'state': 'failed',
                'error': type(error).__name__ if error else 'InstallFailed'} for b in failed]
+    body = {'state': state, 'items': items}
+    now = clock()
+    if body == _last_sync_report['body'] and now - _last_sync_report['at'] < SYNC_REPORT_REFRESH_S:
+        return False
     try:
-        request('POST', '/api/engines/sync-report', {'state': state, 'items': items})
+        request('POST', '/api/engines/sync-report', body)
     except Exception:
-        pass
+        return False
+    _last_sync_report.update(body=body, at=now)
+    return True
 
 
 def host_request(method, path, payload=None):

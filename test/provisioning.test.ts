@@ -66,15 +66,23 @@ describe('central engine provisioning', () => {
     expect((await report('held', [{ label: 'test-account', revision: rev.revision, state: 'failed', error: 'OSError' }])).status).toBe(200);
     let st = await status();
     expect(cell(st, 'test-machine').accounts[0]).toMatchObject({ state: 'failed', error: 'OSError' });
-    expect(cell(st, 'test-machine').online).toBe(true);
     expect(cell(st, 'other-machine').accounts[0].state).toBe('pending');
     // Free-text errors and stale revisions are never stored.
     await report('held', [{ label: 'test-account', revision: 'old', state: 'failed', error: 'x' }, { label: 'test-account', revision: rev.revision, state: 'failed', error: 'secret /path: text' }]);
     expect(cell(await status(), 'test-machine').accounts[0].error).toBeUndefined();
     await s.handle(req('/test-account', 'POST', { revision: rev.revision }), host);
     expect(cell(await status(), 'test-machine').accounts[0].state).toBe('synced');
-    sql.exec("UPDATE engine_sync_hosts SET last_sync_at = last_sync_at - 600000");
+    // An unchanged report rewrites no account row (Free-plan row-write budget).
+    const before: any = sql.exec("SELECT updated_at FROM engine_sync_status WHERE machine_id='test-machine'").toArray()[0];
+    sql.exec("UPDATE engine_sync_status SET updated_at = 1 WHERE machine_id='test-machine'");
+    await report('synced', [{ label: 'test-account', revision: rev.revision, state: 'failed', error: 'secret /path: text' }]);
+    expect(sql.exec("SELECT updated_at FROM engine_sync_status WHERE machine_id='test-machine'").toArray()[0]).toMatchObject({ updated_at: 1 });
+    expect(before.updated_at).toBeGreaterThan(1);
+    // Online follows the machine check-in, not report frequency.
+    sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id='test-machine'", new Date(Date.now() - 3600000).toISOString());
     expect(cell(await status(), 'test-machine').online).toBe(false);
+    sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id='test-machine'", new Date().toISOString());
+    expect(cell(await status(), 'test-machine').online).toBe(true);
     await s.handle(req('/test-account', 'DELETE'), admin);
     expect(sql.exec('SELECT * FROM engine_sync_status').toArray()).toHaveLength(0);
     expect(cell(await status(), 'test-machine').accounts).toHaveLength(0);

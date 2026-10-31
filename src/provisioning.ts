@@ -6,12 +6,14 @@ import type { FleetService } from './fleet';
 import { GOAL_PROVIDERS } from './goal-engines';
 import { canonicalQuotaProvider, canonicalAccountLabel, validateQuotaSnapshotPayload } from './quota';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
+import { effectiveCheckin } from './registry';
 import { CLAUDE_OAUTH, CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claudeAuthorization, claudeExchange, credentialFreshness, credentialSubset,
   fetchQuota, needsRefresh, refreshCredential, refreshable, structurallyValid, validCredentialFiles, type CredentialFiles, type FetchLike } from './credentials';
 
 const LABEL = /^[a-z][a-z0-9_-]{0,47}$/;
-// A host heartbeats about every minute; silence beyond this reads as offline.
-const SYNC_STALE_MS = 5 * 60000;
+// Hosts check in about every minute (persisted at least every 5 min); silence
+// beyond this reads as offline, and the host reconciles on reconnect.
+const SYNC_STALE_MS = 10 * 60000;
 const MIGRATION_GRACE_MS = 2 * 3600000;
 // A Hub-central login waits this long for the pasted code (intake 8ff6b3d8).
 export const CREDENTIAL_LOGIN_TTL_MS = 30 * 60000;
@@ -92,13 +94,15 @@ export class ProvisioningService {
   syncStatus() {
     const now = this.now();
     const engines = this.sql.exec('SELECT label, provider, revision FROM engine_bundles ORDER BY label').toArray() as any[];
-    const machines = this.sql.exec('SELECT id, name FROM machines WHERE registered_at IS NOT NULL ORDER BY id').toArray() as any[];
+    const machines = this.sql.exec('SELECT id, name, last_checkin_at FROM machines WHERE registered_at IS NOT NULL ORDER BY id').toArray() as any[];
     const hosts = new Map((this.sql.exec('SELECT * FROM engine_sync_hosts').toArray() as any[]).map(h => [h.machine_id, h]));
     const installed = new Set((this.sql.exec('SELECT machine_id,label,revision FROM engine_installations').toArray() as any[]).map(i => i.machine_id + '|' + i.label + '|' + i.revision));
     const status = new Map((this.sql.exec('SELECT * FROM engine_sync_status').toArray() as any[]).map(r => [r.machine_id + '|' + r.label, r]));
     return machines.map(m => {
       const h: any = hosts.get(m.id);
-      const online = !!h && now - h.last_sync_at <= SYNC_STALE_MS;
+      // Liveness comes from the machine check-in, so sync reports need only be sent on change.
+      const seen = Date.parse(effectiveCheckin(m.id, m.last_checkin_at) || '');
+      const online = Number.isFinite(seen) && now - seen <= SYNC_STALE_MS;
       return { machine_id: m.id, machine: m.name, last_sync_at: h?.last_sync_at ?? null, host_state: h?.state ?? 'never', online,
         accounts: engines.map(e => {
           const r: any = status.get(m.id + '|' + e.label);
@@ -249,6 +253,9 @@ export class ProvisioningService {
           if (!row || it.revision !== row.revision) continue;
           // Error is a bounded exception-type name, never provider output.
           const error = it.state === 'failed' && typeof it.error === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(it.error) ? it.error : null;
+          // Write only on change: Free-plan Durable Object row writes are a daily budget.
+          const prior: any = this.sql.exec('SELECT revision,state,error FROM engine_sync_status WHERE machine_id=? AND label=?', machine, it.label).toArray()[0];
+          if (prior && prior.revision === row.revision && prior.state === it.state && (prior.error ?? null) === error) continue;
           this.sql.exec('INSERT OR REPLACE INTO engine_sync_status VALUES (?,?,?,?,?,?)', machine, it.label, row.revision, it.state, error, now);
         }
         this.sql.exec('INSERT OR REPLACE INTO engine_sync_hosts VALUES (?,?,?)', machine, data.state, now);

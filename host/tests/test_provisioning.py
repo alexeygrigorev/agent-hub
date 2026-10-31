@@ -88,7 +88,8 @@ def test_add_rotate_remove_and_preserve_operator_profile(monkeypatch):
     assert not p.managed_subscriptions()
     assert '[profiles.operator]' in path.read_text()
     assert 'hub-test-account' not in path.read_text()
-    assert requests[-2][0] == 'POST'
+    hub_calls = [r for r in requests if r[1] != '/api/engines/sync-report']  # AC9 status report is separate
+    assert hub_calls[-2][0] == 'POST'
 
 
 @pytest.mark.parametrize('relative', ['../escape', '/absolute', 'a/../../escape', 'a//b', 'a/./b'])

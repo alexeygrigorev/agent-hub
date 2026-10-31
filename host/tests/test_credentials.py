@@ -306,7 +306,9 @@ def test_new_host_sync_installs_every_hub_account_without_login(tmp_path, monkey
     result = p.sync(hub)
     assert installed == [LABEL, 'hub-claude']
     assert result['profiles'] == ['hub-' + LABEL, 'hub-hub-claude']
-    assert [x[0] for x in posts] == ['/api/engines/' + LABEL, '/api/engines/hub-claude']
+    assert [x[0] for x in posts if x[0] != '/api/engines/sync-report'] == ['/api/engines/' + LABEL, '/api/engines/hub-claude']
+    assert posts[-1] == ('/api/engines/sync-report', {'state': 'synced', 'items': [
+        {'label': b['label'], 'revision': b['revision'], 'state': 'installed'} for b in (bundle(2, auth('a')), claude)]})
 
 
 def test_central_claude_login_cli_never_prints_the_code(monkeypatch, capsys):
