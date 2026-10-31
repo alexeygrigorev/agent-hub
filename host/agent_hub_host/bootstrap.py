@@ -25,7 +25,7 @@ import plistlib
 import uuid
 import tomllib
 import stat
-from .bootstrap_pins import NODE_SHA256, APLEXER_SHA256, ANTIGRAVITY_RELEASES, ENGINE_PACKAGES, PYTHON_WHEELS
+from .bootstrap_pins import NODE_SHA256, APLEXER_SHA256, ANTIGRAVITY_RELEASES, ENGINE_PACKAGES, PYTHON_WHEELS, LAUNCHER_RELEASE
 
 
 NODE_VERSION = '22.23.4'
@@ -500,6 +500,100 @@ def install_package(archive, install_root, uv):
     return python, package
 
 
+def ensure_launcher(install_root):
+    """Immutable maintained-launcher release; without it the host offers no headless mode.
+
+    Lives beside, not inside, a Windows runtime release so a runtime upgrade
+    keeps it. An existing complete release is reused read-only.
+    """
+    sha = LAUNCHER_RELEASE['sha']
+    releases = state_root(install_root) / 'launcher-releases'
+    target = releases / sha
+    if (target / 'launcher/cli.py').is_file():
+        return target
+    releases.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.TemporaryDirectory(prefix='.launcher-', dir=releases) as tmp:
+        archive = Path(tmp) / 'launcher.zip'
+        download(LAUNCHER_RELEASE['url'], archive)
+        verify(archive, LAUNCHER_RELEASE['sha256'] + '  launcher.zip', 'launcher.zip')
+        unpack(archive, Path(tmp) / 'src')
+        staged = Path(tmp) / 'src' / ('agent-quota-launcher-' + sha)
+        if not (staged / 'launcher/cli.py').is_file():
+            raise ValueError('Unexpected launcher archive layout')
+        if target.exists():
+            # An interrupted earlier attempt; keep it for owner-led cleanup.
+            os.replace(target, releases / ('.incomplete-' + sha[:12] + '-' + uuid.uuid4().hex[:8]))
+        os.replace(staged, target)
+    return target
+
+
+def installer_launcher(launcher, releases):
+    """Whether a launcher setting is this installer's own (safe to refresh)."""
+    if not isinstance(launcher, dict) or set(launcher) != {'argv', 'root', 'config_dir'}:
+        return False
+    argv = launcher['argv']
+    try:
+        return (isinstance(argv, list) and len(argv) == 3 and argv[1:] == ['-m', 'launcher']
+                and Path(launcher['root']).parent == Path(releases))
+    except TypeError:
+        return False
+
+
+# Platforms where the pinned launcher's resource gate works (macOS has no
+# /proc MemAvailable at the pin, so every headless launch would be refused).
+LAUNCHER_PLATFORMS = ('linux', 'win32')
+
+
+def launcher_smoke(launcher_root, run=subprocess.run):
+    """The release imports and answers on this interpreter, cwd at its root."""
+    try:
+        res = run([sys.executable, '-m', 'launcher', '--help'], cwd=str(launcher_root),
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.returncode == 0
+
+
+def configure_launcher(settings, install_root, launcher_root):
+    """Enable headless mode; an operator-configured launcher is never replaced."""
+    from . import fleet
+    data = json.loads(Path(settings).read_text(encoding='utf-8'))
+    releases = state_root(install_root) / 'launcher-releases'
+    current = data.get('launcher')
+    if current is not None and not installer_launcher(current, releases):
+        return 'operator'
+    config_dir = state_root(install_root) / 'launcher-config'
+    config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # cwd is the release root on every launcher call, so -m resolves it there.
+    desired = {'argv': [sys.executable, '-m', 'launcher'], 'root': str(launcher_root),
+               'config_dir': str(config_dir)}
+    if current != desired:
+        data['launcher'] = desired
+        text = json.dumps(data, indent=2)
+        # Validate a copy before replacing the operator's settings file.
+        with tempfile.TemporaryDirectory(dir=Path(settings).parent) as tmp:
+            candidate = Path(tmp) / 'subscriptions.json'
+            write_private(candidate, text)
+            fleet.load_settings(candidate)
+        write_private(settings, text)
+    return 'configured'
+
+
+def setup_launcher(settings, install_root):
+    """Headless is optional: a failed download or smoke keeps interactive mode."""
+    if sys.platform not in LAUNCHER_PLATFORMS:
+        return 'unsupported_platform'
+    try:
+        release = ensure_launcher(install_root)
+        if not launcher_smoke(release):
+            print('Launcher smoke check failed; headless sessions stay off.', flush=True)
+            return 'unavailable'
+        return configure_launcher(settings, install_root, release)
+    except Exception as exc:
+        print('Launcher unavailable (' + type(exc).__name__ + '); headless sessions stay off.', flush=True)
+        return 'unavailable'
+
+
 def write_private(path, text, *, mode=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -555,7 +649,12 @@ def publish_user_path(install_root):
               '[Environment]::SetEnvironmentVariable("Path",($parts -join ";"),"User");'
               '[Environment]::SetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH",' +
               quote(git_root / 'usr/bin/bash.exe') + ',"User")')
-        run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', ps])
+        try:
+            run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', ps])
+        except RuntimeError:
+            # An OpenSSH network logon may not write HKCU\Environment. Services
+            # and hub.cmd carry their own PATH, so this convenience is optional.
+            print('User PATH not updated in this logon session; open a new terminal after the next interactive logon.', flush=True)
     else:
         path_script = install_root / 'path.sh'
         write_private(path_script, 'export PATH=' + shlex.quote(':'.join(map(str, directories))) + ':"$PATH"\n')
@@ -640,6 +739,13 @@ def install_service(install_root, command):
               ' -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable;'
               ' Register-ScheduledTask -TaskName $name -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null;'
               ' Start-ScheduledTask -TaskName $name;')
+        # The old controller already handed over: if registering the new task
+        # fails, restart the existing one so an unattended update never
+        # leaves the host offline until the next logon.
+        ps = ('try {' + ps + '} catch { $e=$_;'
+              ' $id=[Security.Principal.WindowsIdentity]::GetCurrent();'
+              ' Start-ScheduledTask -TaskName ("AgentHubController-"+$id.User.Value) -ErrorAction SilentlyContinue;'
+              ' throw $e }')
         run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "$ErrorActionPreference='Stop';" + ps])
         return 'windows_user_logon_task'
     if sys.platform == 'darwin':
@@ -700,6 +806,9 @@ def configure(base_url):
                       'capabilities': [], 'max_agents': 1,
                       'workspaces': {'home': str(Path.home())}}))
     fleet.load_settings(settings)  # Validate, never overwrite local operator settings.
+    # Headless fleet mode needs the maintained launcher; install it here so a
+    # plain install never reports launcher_not_configured.
+    launcher = setup_launcher(settings, install_root)
     publish_user_path(install_root)
     configure_default_engine()
     from . import enrollment_repositories
@@ -761,7 +870,7 @@ def configure(base_url):
     provisioning.sync()
     service = install_service(install_root, service_command(install_root, settings))
     print(json.dumps({'status': 'installed', 'machine_id': config.load_host_config().get('machine_id'),
-                      'service': service, 'elevation_prompts': 0,
+                      'service': service, 'elevation_prompts': 0, 'launcher': launcher,
                       'repository_access': repository_access}), flush=True)
 
 

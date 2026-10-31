@@ -72,3 +72,10 @@ PYTHON_WHEELS = {'aplexer-client': {'requires_dist': None,
  'quse': {'requires_dist': ['click>=8.2.0'],
           'wheels': {'quse-0.0.17-py3-none-any.whl': {'sha256': '4baff11a89650db44d89908fd43cdac3357f369a062a9f6eb0f7d581f62884ea',
                                                       'url': 'https://files.pythonhosted.org/packages/64/6c/57797a165d2a27d3f9cd1e6d2a7e07dfe582b6cfc8ed6209376c22e14ff5/quse-0.0.17-py3-none-any.whl'}}}}
+
+# Maintained Agent Quota Launcher (public alexeygrigorev/agent-quota-launcher),
+# the headless fleet-mode backend. Immutable release named by its source SHA;
+# the GitHub commit archive is pinned by content, not by its mutable URL alone.
+LAUNCHER_RELEASE = {'sha': '1883b769b5298309cbbaef680cdc601af553f860',
+                    'url': 'https://codeload.github.com/alexeygrigorev/agent-quota-launcher/zip/1883b769b5298309cbbaef680cdc601af553f860',
+                    'sha256': '928119cb307052ee6fd6e8233dfe4e7bec1bd00fd30a5edad5f67fc27043783e'}

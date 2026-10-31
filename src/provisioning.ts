@@ -3,6 +3,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import type { Env } from './env';
 import { validSessionSecret } from './auth/session';
 import type { FleetService } from './fleet';
+import { GOAL_PROVIDERS } from './goal-engines';
 import { canonicalQuotaProvider, canonicalAccountLabel, validateQuotaSnapshotPayload } from './quota';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claudeAuthorization, claudeExchange, credentialFreshness, credentialSubset,
@@ -123,7 +124,7 @@ export class ProvisioningService {
     const rows = () => this.sql.exec('SELECT * FROM engine_bundles ORDER BY label').toArray() as any[];
     if (path === '/api/engines' && request.method === 'GET') {
       if (!admin) return reply({ error: 'forbidden' }, 403);
-      return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => ({ ...meta, supports_goal: ['codex', 'zai'].includes(meta.provider) })), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray(),
+      return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => ({ ...meta, supports_goal: GOAL_PROVIDERS.has(meta.provider) })), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray(),
         credentials: this.credentialStatus(), credential_rejections: this.sql.exec('SELECT machine_id,label,generation,reason,observed_at FROM engine_credential_rejections ORDER BY label,machine_id').toArray(),
         account_migrations: this.sql.exec('SELECT name,applied_at,detail FROM engine_migrations ORDER BY name').toArray().map((m: any) => ({ name: m.name, applied_at: m.applied_at, ...JSON.parse(m.detail) })) });
     }

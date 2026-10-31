@@ -26,6 +26,10 @@ We install Python, Node and Git in your account, then add aplexer to manage sess
 
 Your engine commands include Claude Code, Codex and OpenCode. We also install Gemini CLI, Grok and Antigravity. On Windows we supply Git Bash so Claude can run without another install.
 
+On Windows the host keeps itself current: when Hub serves a new `hub.pyz`, the host schedules a one-off task for your account that reruns the same install command (no admin, at most one attempt per release every six hours). Each update builds a new release beside the old one; older releases stay until you remove them.
+
+We also install the pinned Agent Quota Launcher in `launcher-releases/<commit>`, so the host accepts headless (`--prompt`) sessions as well as interactive ones. A launcher you configured yourself is never replaced. Over an ssh logon the user PATH can't always be saved; installation still completes, and the services carry their own PATH.
+
 We select Claude with Opus when no default exists, preserving your later choices on repairs. Your host then receives the engine accounts configured centrally in Hub. Account delivery and a successful model session are separate from installing an executable.
 
 The installer targets Linux with glibc 2.28 or newer, macOS 11 or newer, and Windows 10/11 on x64 and ARM64. macOS uses the matching aplexer binary and client from release `0.1.22`. Linux and Windows use `0.1.23`. ZCode/ZAI installation across these platforms remains unfinished.

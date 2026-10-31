@@ -1,4 +1,5 @@
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
+import { GOAL_ENGINES, GOAL_PROVIDERS } from './goal-engines';
 import { observationModel } from './session-observation';
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
@@ -152,7 +153,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "goal_startup_unconfigured": "This account has no trusted interactive goal startup command.",
   "dispatch_startup_invalid": "The configured trusted startup command is invalid.",
   "dispatch_cwd_invalid": "The requested working directory is not confined to the workspace.",
-  "dispatch_goal_invalid": "Goal work requires an interactive Codex-family route and nonempty text.",
+  "dispatch_goal_invalid": "Goal work requires an interactive goal-capable (Codex-family or Claude) route and nonempty text.",
   "dispatch_prompt_unsupported": "Interactive prompt injection requires an explicit goal start.",
   "dispatch_offer_invalid": "The offered launch or task identifier is invalid.",
   "dispatch_capability_unavailable": "The required task capabilities are unavailable on this host.",
@@ -178,6 +179,15 @@ function claimFieldsValid(d: any): boolean {
   if (d.http_status !== undefined && (!Number.isInteger(d.http_status) || d.http_status < 400 || d.http_status > 599)) return false;
   if (['hub_error', 'hub_reason'].some(k => d[k] !== undefined && !CLAIM_HTTP_SLUGS.has(d[k]))) return false;
   return d.retryable === undefined || (typeof d.retryable === 'boolean' && (!d.retryable || (d.http_status === 409 && RETRYABLE_CLAIM_ERRORS.has(d.hub_error))));
+}
+// Fixed host admission-gate causes (host dispatch_diagnostics.GATE_REASONS),
+// only on admission_refused, so a refusing host is diagnosable remotely.
+const GATE_REASONS = new Set(['local_bundle_missing', 'local_lock_unavailable', 'local_profile_missing',
+  'profile_mismatch', 'account_mismatch', 'model_mismatch', 'hub_unreachable', 'profile_not_installed',
+  'account_unmapped', 'credential_invalid', 'credential_rejected', 'quota_exhausted', 'profile_unsupported',
+  'account_label_mismatch', 'admission_timestamp_stale', 'model_unverified', 'gate_refused']);
+function gateReasonValid(d: any): boolean {
+  return d.gate_reason === undefined || (d.reason === 'admission_refused' && GATE_REASONS.has(d.gate_reason));
 }
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
 // tier exclusion or a recorded route refusal); it never frees up, so it must not
@@ -728,7 +738,7 @@ export class FleetService {
         placeableMachines.add(String(route.machine_id));
       } else placementReasons.add(liveIds.has(String(route.machine_id)) ? 'engine_unavailable' : 'machine_unavailable');
     }
-    return { label: canonicalAccountLabel(account.label), provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: ['codex', 'zai'].includes(provider),
+    return { label: canonicalAccountLabel(account.label), provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: GOAL_PROVIDERS.has(provider),
       remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || remaining === null || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
       // Counted vs live: active splits into launch reservations + orphan
       // observed sessions; native_live is the host-catalog verified live
@@ -977,7 +987,7 @@ export class FleetService {
           continue;
         }
       }
-      if (request.with_goal && !['codex', 'zcodex'].includes(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue; }
+      if (request.with_goal && !GOAL_ENGINES.has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue; }
       // A disabled execution engine holds all new candidate planning, whatever the account label.
       if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
       // Auth/permission holds are only cleared by a successful launch, which a
@@ -2039,7 +2049,7 @@ export class FleetService {
         if (match[2] === 'reject') {
           if (!object(data, ['reason', 'diagnostic']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
-          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable']) || !claimFieldsValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
+          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable', 'gate_reason']) || !claimFieldsValid(diagnostic) || !gateReasonValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
               diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
               typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
               !sanitizeCommandFields(diagnostic)) return response({ error: 'invalid_rejection' }, 400);

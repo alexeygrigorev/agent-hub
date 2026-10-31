@@ -31,13 +31,16 @@ it('advertises goal capability and filters non-Codex routes without requiring a 
     for (const provider of ['codex', 'codex-orin', 'zai', 'claude', 'gemini', 'go']) {
       // Canonical provider model: a legacy `codex-orin` row reads as provider
       // `codex`, so both Codex accounts advertise goal support.
-      expect(s.accountStatus({ label: provider, provider, max_concurrency: 1, reserve_percent: 15, enabled: true }).supports_goal).toBe(['codex', 'codex-orin', 'zai'].includes(provider));
+      expect(s.accountStatus({ label: provider, provider, max_concurrency: 1, reserve_percent: 15, enabled: true }).supports_goal).toBe(['codex', 'codex-orin', 'zai', 'claude'].includes(provider));
       expect(s.accountStatus({ label: provider, provider, max_concurrency: 1, reserve_percent: 15, enabled: true }).provider).toBe(provider === 'codex-orin' ? 'codex' : provider);
     }
     hub.sql.exec("INSERT INTO fleet_routes VALUES ('hetzner','claude','claude',NULL)");
+    hub.sql.exec("INSERT INTO fleet_routes VALUES ('hetzner','gemini','gemini',NULL)");
     const p = s.plan({ mode: 'interactive', with_goal: true, workspace: 'demo', prompt: 'Fix binding' });
     expect(p.error).toBeUndefined();
+    // Claude is goal-capable but this host advertised no goal route for it.
     expect(p.rejected).toContainEqual({ machine: 'hetzner', engine: 'claude', reason: 'goal_unsupported' });
+    expect(p.rejected).toContainEqual({ machine: 'hetzner', engine: 'gemini', reason: 'goal_unsupported' });
     expect(s.plan({ mode: 'headless', with_goal: true, workspace: 'demo', prompt: 'Fix' }).error).toBe('invalid_launch_request');
     expect(s.plan({ mode: 'interactive', with_goal: true, workspace: 'demo', prompt: 42 }).error).toBe('invalid_launch_request');
   });
@@ -53,7 +56,7 @@ it('advertises supports_goal in hub engines list without exposing credentials', 
     }
     const response = await service.handle(new Request('https://hub.test/api/engines'), admin);
     const data = await response.json() as any;
-    for (const engine of data.engines) expect(engine.supports_goal).toBe(['codex', 'zai'].includes(engine.provider));
+    for (const engine of data.engines) expect(engine.supports_goal).toBe(['codex', 'zai', 'claude'].includes(engine.provider));
     expect(JSON.stringify(data)).not.toContain('private-marker');
   });
 });

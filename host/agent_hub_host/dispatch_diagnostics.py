@@ -13,7 +13,7 @@ MESSAGES = {
     'goal_startup_unconfigured': 'This account has no trusted interactive goal startup command.',
     'dispatch_startup_invalid': 'The configured trusted startup command is invalid.',
     'dispatch_cwd_invalid': 'The requested working directory is not confined to the workspace.',
-    'dispatch_goal_invalid': 'Goal work requires an interactive Codex-family route and nonempty text.',
+    'dispatch_goal_invalid': 'Goal work requires an interactive goal-capable (Codex-family or Claude) route and nonempty text.',
     'dispatch_prompt_unsupported': 'Interactive prompt injection requires an explicit goal start.',
     'dispatch_offer_invalid': 'The offered launch or task identifier is invalid.',
     'dispatch_capability_unavailable': 'The required task capabilities are unavailable on this host.',
@@ -40,7 +40,7 @@ EXACT = {
     'Goal startup requires a trusted local command': 'goal_startup_unconfigured',
     'Invalid trusted startup argv': 'dispatch_startup_invalid',
     'Goal work is interactive only': 'dispatch_goal_invalid',
-    'Interactive goal requires a Codex-family engine and goal text': 'dispatch_goal_invalid',
+    'Interactive goal requires a goal-capable engine and goal text': 'dispatch_goal_invalid',
     'Interactive task injection is unsupported; start an empty native session': 'dispatch_prompt_unsupported',
     'Invalid offer id': 'dispatch_offer_invalid', 'Invalid task id': 'dispatch_offer_invalid',
     'Required capabilities are no longer available locally': 'dispatch_capability_unavailable',
@@ -51,6 +51,25 @@ EXACT = {
     'Fresh admission timestamp required': 'admission_refused',
     'Selected model/effort requires verified admission': 'admission_refused',
 }
+
+# Fixed admission-gate causes carried as gate_reason on admission_refused, so
+# a refused host is diagnosable remotely; any other gate text maps to
+# gate_refused and is never forwarded.
+GATE_REASONS = frozenset({
+    'local_bundle_missing', 'local_lock_unavailable', 'local_profile_missing',
+    'profile_mismatch', 'account_mismatch', 'model_mismatch', 'hub_unreachable',
+    'profile_not_installed', 'account_unmapped', 'credential_invalid',
+    'credential_rejected', 'quota_exhausted', 'profile_unsupported',
+    'account_label_mismatch', 'admission_timestamp_stale', 'model_unverified',
+    'gate_refused',
+})
+
+
+class AdmissionRefusedError(ValueError):
+    """admission_refused with a fixed gate_reason slug."""
+    def __init__(self, message, gate_reason):
+        super().__init__(message)
+        self.gate_reason = gate_reason if gate_reason in GATE_REASONS else 'gate_refused'
 
 
 def classify(exc, *, workspace_available=True):
@@ -76,6 +95,8 @@ def classify(exc, *, workspace_available=True):
         reason = 'workspace_unavailable'
     value = {'reason': reason, 'message': MESSAGES[reason], 'stage': 'dispatch_route',
             'error_type': type(exc).__name__ if type(exc).__name__.isalpha() and len(type(exc).__name__) <= 64 else 'Error'}
+    if isinstance(exc, AdmissionRefusedError) and reason == 'admission_refused':
+        value['gate_reason'] = exc.gate_reason
     from .launch_diagnostics import LocalCommandError
     if isinstance(exc, LocalCommandError):
         value.update(exc.command_diagnostic)
