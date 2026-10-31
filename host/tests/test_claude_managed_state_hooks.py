@@ -21,6 +21,7 @@ import tempfile
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from agent_hub_host import private_fs
 from agent_hub_host import provisioning as p
 
 REPO_TMP = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".local", "tmp"))
@@ -28,6 +29,18 @@ REPO_TMP = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 
 def _settings(home):
     return json.load(open(os.path.join(home, ".claude", "settings.json")))
+
+
+def _seed_settings(home, payload):
+    """Write a pre-existing settings.json the way provisioning itself does.
+
+    private_fs writes keep the owner-only DACL that Windows read-back
+    verification requires; a plain open()+chmod leaves inherited ACLs that
+    private_fs rightly rejects (and POSIX chmod does not provide).
+    """
+    private_fs.atomic_write(
+        os.path.join(home, ".claude", "settings.json"),
+        json.dumps(payload).encode(), 65536)
 
 
 def test_claude_managed_home_gets_state_hooks_without_notification():
@@ -56,14 +69,9 @@ def test_existing_claude_settings_are_preserved():
     base = tempfile.mkdtemp(dir=REPO_TMP, prefix="claude-hooks-")
     try:
         home = os.path.join(base, "managed-home")
-        claude_dir = os.path.join(home, ".claude")
-        os.makedirs(claude_dir, mode=0o700)
         existing = {"model": "sonnet", "customKey": {"keep": True},
                     "permissions": {"deny": ["AskUserQuestion", "ExtraDeny"]}}
-        settings_path = os.path.join(claude_dir, "settings.json")
-        with open(settings_path, "w") as f:
-            json.dump(existing, f)
-        os.chmod(settings_path, 0o600)
+        _seed_settings(home, existing)
         p.install_managed_engine_permissions(
             bundle={"provider": "claude"}, home=home, trusted_paths=[])
         settings = _settings(home)
@@ -79,13 +87,8 @@ def test_existing_custom_stop_hook_is_not_clobbered():
     base = tempfile.mkdtemp(dir=REPO_TMP, prefix="claude-hooks-")
     try:
         home = os.path.join(base, "managed-home")
-        claude_dir = os.path.join(home, ".claude")
-        os.makedirs(claude_dir, mode=0o700)
         custom_stop = {"hooks": [{"command": "/usr/bin/custom-stop-hook", "type": "command"}]}
-        settings_path = os.path.join(claude_dir, "settings.json")
-        with open(settings_path, "w") as f:
-            json.dump({"hooks": {"Stop": custom_stop}}, f)
-        os.chmod(settings_path, 0o600)
+        _seed_settings(home, {"hooks": {"Stop": custom_stop}})
         p.install_managed_engine_permissions(
             bundle={"provider": "claude"}, home=home, trusted_paths=[])
         hooks = _settings(home)["hooks"]

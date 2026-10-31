@@ -16,18 +16,44 @@ import sys
 import tempfile
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agent_hub_host import hook_command as hc
+from agent_hub_host import private_fs
 from agent_hub_host import provisioning as p
 
 REPO_TMP = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".local", "tmp"))
 WIN_A = "C:\\Users\\alexe\\.local\\bin\\a.EXE"
 
 
+def _bash_exe():
+    """Locate the bash that would actually run engine hooks on this host.
+
+    Claude Code resolves Git Bash itself on Windows; a pytest process spawned
+    from a Git Bash session inherits a POSIX-formatted PATH that Windows
+    ``subprocess`` cannot search, so fall back to the override Claude uses and
+    then the standard Git for Windows install locations.
+    """
+    override = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+    if override and os.path.isfile(override):
+        return override
+    found = shutil.which("bash")
+    if found:
+        return found
+    for candidate in (r"C:\Program Files\Git\bin\bash.exe",
+                      r"C:\Program Files\Git\usr\bin\bash.exe",
+                      r"C:\Program Files (x86)\Git\bin\bash.exe",
+                      r"C:\Program Files (x86)\Git\usr\bin\bash.exe"):
+        if os.path.isfile(candidate):
+            return candidate
+    pytest.skip("no bash available to verify hook word splitting")
+
+
 def _bash_words(command):
     """What bash would pass as argv for ``command`` (without running it)."""
-    out = subprocess.run(["bash", "-c", 'printf "%s\\n" ' + command],
+    out = subprocess.run([_bash_exe(), "-c", 'printf "%s\\n" ' + command],
                          capture_output=True, text=True, check=True)
     return out.stdout.splitlines()
 
@@ -80,12 +106,16 @@ def test_claude_managed_home_on_windows_gets_bash_safe_hooks_and_repairs_old_one
     try:
         home = os.path.join(base, "managed-home")
         claude_dir = os.path.join(home, ".claude")
-        os.makedirs(claude_dir, mode=0o700)
         broken = {"hooks": [{"command": f"{WIN_A} state-report idle || true", "type": "command"}]}
         custom = {"hooks": [{"command": "/usr/bin/custom-hook", "type": "command"}]}
-        with open(os.path.join(claude_dir, "settings.json"), "w") as f:
-            json.dump({"hooks": {"Stop": [broken], "PreToolUse": [custom]}}, f)
-        os.chmod(os.path.join(claude_dir, "settings.json"), 0o600)
+        # Seed the file the way provisioning itself does: private_fs writes keep
+        # the owner-only DACL Windows read-back verification requires (a plain
+        # open()+chmod leaves inherited ACLs that private_fs rightly rejects).
+        settings_path = os.path.join(claude_dir, "settings.json")
+        private_fs.atomic_write(
+            settings_path,
+            json.dumps({"hooks": {"Stop": [broken], "PreToolUse": [custom]}}).encode(),
+            65536)
         with mock.patch.object(hc.shutil, "which", return_value=WIN_A):
             p.install_managed_engine_permissions(
                 bundle={"provider": "claude"}, home=home, trusted_paths=[])
