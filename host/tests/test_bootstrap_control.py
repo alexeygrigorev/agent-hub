@@ -212,9 +212,13 @@ class HandoverTests(unittest.TestCase):
     def test_rerun_recovers_needs_attention_when_receipt_absent_from_catalog(self):
         self.crash()
         c._write_attention(self.directory)
-        with c.ControllerLease(self.directory, boot_probe=lambda: None) as lease, \
-                patch.object(c, 'observe_receipt', return_value=None), \
-                patch.object(c, 'receipt_absent', return_value=True):
+        # The doubles must be active while ControllerLease is constructed:
+        # __init__ binds self.observe/self.absent to the module functions, so
+        # patches entered after the lease has no effect and the real
+        # `aplexer` subprocess runs (absent off-host: NeedsAttention ERROR).
+        with patch.object(c, 'observe_receipt', return_value=None), \
+                patch.object(c, 'receipt_absent', return_value=True), \
+                c.ControllerLease(self.directory, boot_probe=lambda: None) as lease:
             pass
         self.assertFalse((self.directory / 'needs-attention.json').exists())
         self.assertFalse((self.directory / 'owner.json').exists())
