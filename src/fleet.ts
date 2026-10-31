@@ -419,6 +419,7 @@ function workspaceCapable(capsWorkspaces: any, request: any): boolean {
 export function resolveLabelUnderRoots(capsWorkspaces: any, request: any): string {
   if (typeof request !== 'string' || !request) return request;
   if (!LABEL.test(request)) return request;
+  if (decodeRepoWorkspace(request)) return request; // repo identity, never a path under a root
   if (workspaceCapable(capsWorkspaces, request)) return request;
   if (!Array.isArray(capsWorkspaces)) return request;
   for (const w of capsWorkspaces) {
@@ -436,6 +437,41 @@ export function resolveLabelUnderRoots(capsWorkspaces: any, request: any): strin
     if (workspaceCapable(capsWorkspaces, candidate)) return candidate;
   }
   return request;
+}
+
+/** Repo-identity workspace (intake 8028bb06). A start that names a repository
+ * (`owner/name`) instead of a host path carries a label-safe workspace id,
+ * `repo-<id8>-<owner>__<name>` (`.` in the name is written `_d_`). It names no
+ * filesystem path: each host that advertises `repo_workspaces` clones the repo
+ * into its own work root (Windows: %USERPROFILE%\work\<id8>\<name>) at dispatch,
+ * so placement never needs a host-specific (e.g. Linux) path. */
+const REPO_WORKSPACE = /^repo-([0-9a-f]{8})-([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))__([A-Za-z0-9_-]{1,60})$/;
+const REPO_OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const REPO_NAME = /^[A-Za-z0-9._-]{1,100}$/;
+export function decodeRepoWorkspace(value: unknown): { id: string; repo: string } | null {
+  if (typeof value !== 'string') return null;
+  const m = REPO_WORKSPACE.exec(value);
+  if (!m) return null;
+  const name = m[3].replace(/_d_/g, '.');
+  if (!REPO_NAME.test(name) || name === '.' || name === '..' || name.startsWith('.')) return null;
+  return { id: m[1], repo: m[2] + '/' + name };
+}
+export function encodeRepoWorkspace(repo: unknown, id: unknown): string | null {
+  if (typeof repo !== 'string' || typeof id !== 'string' || !/^[0-9a-f]{8}$/.test(id)) return null;
+  const parts = repo.split('/');
+  if (parts.length !== 2 || !REPO_OWNER.test(parts[0]) || !REPO_NAME.test(parts[1])) return null;
+  if (parts[1].includes('_d_') || parts[1].includes('__') || parts[1].startsWith('.')) return null;
+  const out = `repo-${id}-${parts[0]}__${parts[1].replace(/\./g, '_d_')}`;
+  const back = decodeRepoWorkspace(out);
+  return LABEL.test(out) && back && back.repo === repo && back.id === id ? out : null;
+}
+
+/** A host can take the workspace when it advertises the path/label, or when the
+ * workspace is a repo identity and the host advertises it clones its own work
+ * tree (`repo_workspaces`), on any OS. */
+function workspaceReady(caps: any, workspace: any): boolean {
+  if (decodeRepoWorkspace(workspace)) return caps?.repo_workspaces === true;
+  return workspaceCapable(caps?.workspaces, workspace);
 }
 
 export class FleetService {
@@ -1127,10 +1163,10 @@ export class FleetService {
       else if (credentialRejected.has(route.machine_id + '\u0000' + route.account) || hostCredentialRefusal) reason = 'credential_rejected';
       else if (hostLoginRefusal()) reason = 'not_logged_in';
       else if (gateRefusal) reason = gateRefusal.reason;
-      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, effectiveWorkspace) || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd))) {
+      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceReady(caps, effectiveWorkspace) || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd))) {
         const engineMissing = !Array.isArray(caps.engines) || !caps.engines.includes(route.engine);
         const modeMissing = !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode);
-        const workspaceMissing = !workspaceCapable(caps.workspaces, effectiveWorkspace)
+        const workspaceMissing = !workspaceReady(caps, effectiveWorkspace)
           || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd));
         // A route for an engine no live host advertises anymore is stale
         // registry debt, not a workspace/mode defect — but only when the live

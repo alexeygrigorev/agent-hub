@@ -479,7 +479,8 @@ def add_commands(sub):
     start.add_argument('--machine')
     start.add_argument('--needs', action='append', default=None,
                        help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64); eligible machines must satisfy all needs, else held with rejected[] reason needs_unmet')
-    start.add_argument('--workspace', required=True)
+    start.add_argument('--workspace', default=None, help='Configured workspace label or absolute path on the target host (omit with --repo)')
+    start.add_argument('--repo', default=None, help='Repository owner/name; the placed host (any OS) clones its own fresh work tree from origin/main, so no host path is needed')
     start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
     start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier for policy routing')
     start.add_argument('--cwd')
@@ -503,7 +504,8 @@ def add_commands(sub):
     override.add_argument('--machine')
     override.add_argument('--needs', action='append', default=None,
                           help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64)')
-    override.add_argument('--workspace', required=True)
+    override.add_argument('--workspace', default=None)
+    override.add_argument('--repo', default=None, help='Repository owner/name (host clones its own work tree)')
     override.add_argument('--tier', choices=TIERS)
     override.add_argument('--cwd')
     override.add_argument('--name', default=None, help='Friendly session name')
@@ -843,7 +845,16 @@ def _execute(args):
             if not reason or not reason.strip():
                 raise ValueError('Engine override requires an explanation why this specific model/engine must be chosen (use --reason). Casual use should prefer auto/policy without --engine.')
         key = getattr(args, 'key', None) or str(uuid.uuid4())
-        payload = {'key': key, 'workspace': args.workspace}
+        repo = getattr(args, 'repo', None)
+        if bool(repo) == bool(getattr(args, 'workspace', None)):
+            raise ValueError('Give exactly one of --workspace or --repo')
+        payload = {'key': key}
+        if repo:
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', repo):
+                raise ValueError('--repo must be owner/name')
+            payload['repo'] = repo
+        else:
+            payload['workspace'] = args.workspace
         for field in ('engine', 'machine', 'tier', 'cwd'):
             value = getattr(args, field, None)
             if value:

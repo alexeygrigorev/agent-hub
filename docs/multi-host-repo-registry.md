@@ -689,3 +689,9 @@ Generated via `rg` across `agent-hub` (`origin/main` at `29dd647` / `6b129ed` pl
 | `docs/METRICS-PRODUCER.md:23-24` | Example config `/home/alexey/git/agent-dashboard/src`, `/home/alexey/private/metrics` |
 | `docs/MONITORING-INVENTORY.md:5,42` | `/home/alexey/git/cloudflare-agent-git`, `/home/alexey/git/aplexer/tools/esc-zcodex/esc_zcodex` |
 | `docs/proposals/CONVERSATION-PINGS.md:29,72`, `docs/proposals/CONVERSATION-INTEGRATION.md:93,98`, `docs/proposals/WINDOWS-INTEGRATION.md:100`, `docs/proposals/CONVERSATION-INTEGRATION.patch:18253,18366,22735,25716` | Historical integration proposal notes |
+
+---
+
+## Addendum: repo-identity starts (intake 8028bb06)
+
+`hub sessions start --intake-task-id X --repo owner/name` carries no host path. The Hub stores the workspace as the label-safe repo-identity id `repo-<id8>-<owner>__<name>` (`.` in the name is `_d_`; `src/fleet.ts` `encodeRepoWorkspace`, `host/agent_hub_host/repo_workspace.py`). Placement accepts it on any host that advertises `repo_workspaces: true` (all OSes, no `workspace_unavailable` for Linux paths). The target host clones the repo into its own work root, `<work_root>/<id8>/<name>` (default `<home>/work`, Windows `%USERPROFILE%\work\<id8>\<name>`; override with the `work_root` setting), checks out branch `wt-<id8>` from `origin/main`, and launches there. Existing checkouts are reused; nothing is deleted. Hosts that do not yet advertise `repo_workspaces` are still refused with `workspace_unavailable`.

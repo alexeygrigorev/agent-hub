@@ -1,5 +1,6 @@
 /** Private repository registry. Human fields are insert-only during discovery. */
 import { boundedText } from './mcp';
+import { decodeRepoWorkspace } from './fleet';
 import type { SqlStorage } from '@cloudflare/workers-types';
 
 type Auth = { caller?: { kind?: string; isAdmin?: boolean; machineId?: string }; scopes?: string[]; error?: Response };
@@ -71,7 +72,8 @@ export class RepoRegistry {
   }
   /** Resolve before Fleet placement, pinning the owning host and keeping Fleet/host confinement. */
   prepareLaunch(input: any): { input?: any; error?: any } {
-    if (typeof input.workspace !== 'string' || pathOk(input.workspace)) return { input };
+    // Repo-identity workspaces (intake 8028bb06) are resolved by each host, not by this registry.
+    if (typeof input.workspace !== 'string' || pathOk(input.workspace) || decodeRepoWorkspace(input.workspace)) return { input };
     const rows = this.all();
     // Empty installations preserve configured legacy workspaces until seeded.
     if (!rows.length) return { input };

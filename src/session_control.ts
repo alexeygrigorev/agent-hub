@@ -8,6 +8,7 @@ import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } f
 import { linkedIntake, linkedTaskIds, hasOpenWork, nativeGoalStatus, sessionWakeState, openWorkPreventsIdleReap } from './intake-session';
 import { workerAccessContext, workerWakeAllowed } from './worker-access';
 import { registeredRepoLabel } from './repos';
+import { encodeRepoWorkspace } from './fleet';
 import { initResourceRequestProjection } from './sql-json-projection';
 import { abandonedLaunch, expireSilentStartRows } from './silent-start';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
@@ -2061,8 +2062,8 @@ export class SessionControlService {
       // null / blank intake_task_id means "missing" so the TBM gate can return
       // intake_task_id_required instead of a generic invalid_session_request.
       if (input.intake_task_id === null || input.intake_task_id === '') delete input.intake_task_id;
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree'])) {
-        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree']);
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo'])) {
+        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo']);
         const field = input && typeof input === 'object' && !Array.isArray(input)
           ? Object.keys(input).find(k => !allowed.has(k)) : undefined;
         return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
@@ -2076,6 +2077,18 @@ export class SessionControlService {
         return response({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'detached_start_names_worktree' }, 400);
       }
       if (!label(input.key)) return response({ error: 'invalid_session_request', field: 'key', detail: 'invalid_key' }, 400);
+      // Intake 8028bb06: `repo` (owner/name) replaces a host path. The workspace
+      // becomes a repo-identity id; the placed host clones its own work tree.
+      if (input.repo !== undefined) {
+        if (input.workspace !== undefined) return response({ error: 'invalid_session_request', field: 'repo', detail: 'repo_and_workspace' }, 400);
+        const seed = typeof input.intake_task_id === 'string' && /[0-9a-f]{8}/.test(input.intake_task_id.toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 8))
+          ? input.intake_task_id.toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 8).padEnd(8, '0') : null;
+        const id = seed ?? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(input.key))))).slice(0, 4).map(b => b.toString(16).padStart(2, '0')).join('');
+        const ws = encodeRepoWorkspace(input.repo, id);
+        if (!ws) return response({ error: 'invalid_session_request', field: 'repo', detail: 'invalid_repo' }, 400);
+        input.workspace = ws;
+        delete input.repo;
+      }
       if (!workspaceOk(input.workspace) && !registeredRepoLabel(this.sql, input.workspace)) return response({ error: 'invalid_session_request', field: 'workspace', detail: 'invalid_workspace' }, 400);
       if (input.engine !== undefined && !label(input.engine)) return response({ error: 'invalid_session_request', field: 'engine', detail: 'invalid_engine' }, 400);
       if (input.engine_override_reason !== undefined && (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) {

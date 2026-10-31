@@ -346,6 +346,11 @@ def _path_under_root(path: Path, root: Path) -> bool:
 
 def _workspace_roots(settings) -> list[str]:
     roots: list[str] = list(settings.get("workspace_roots") or [])
+    # Repo-identity checkouts live under the host work root (intake 8028bb06).
+    from . import repo_workspace
+    work = repo_workspace.work_root(settings)
+    if work.is_dir() and absolute_workspace_ok(str(work)):
+        roots.append(str(work))
     ws = settings.get("workspaces") or {}
     for item, value in ws.items():
         for candidate in (item, value):
@@ -464,6 +469,9 @@ def resolve_workspace_path(settings, name: str) -> Path:
     ws = settings.get("workspaces") or {}
     if name in ws:
         return Path(ws[name]).resolve(strict=True)
+    from . import repo_workspace
+    if repo_workspace.decode(name):
+        return repo_workspace.resolve_existing(settings, name)
     if not isinstance(name, str) or not absolute_workspace_ok(name):
         raise ValueError("Local account/profile/workspace is not configured")
     path = Path(name)
@@ -2564,7 +2572,10 @@ class Dispatcher:
         if len(matches) != 1:
             raise ValueError("Local account/profile/workspace is not configured")
         # Validates map membership or workspace_roots / worktrees identity paths.
-        resolve_workspace_path(self.settings, offer.get("workspace"))
+        # A repo-identity workspace is cloned by this host at dispatch (after the claim).
+        from . import repo_workspace
+        if not repo_workspace.decode(offer.get("workspace")):
+            resolve_workspace_path(self.settings, offer.get("workspace"))
         sub = dict(matches[0])
         if offer.get('mode') == 'headless' and sub.get('launcher_provider') == 'claude' and not sub.get('profile'):
             raise ValueError('model_unsupported: Claude headless route requires managed profile')
@@ -2918,7 +2929,12 @@ class Dispatcher:
         # validated above. A literal offer string must never become a
         # filesystem path on its own (label "demo" is not ./demo, and an
         # unconfigured "/abs/path" is refused before any claim or effect).
-        workspace = resolve_workspace_path(self.settings, offer["workspace"])
+        from . import repo_workspace
+        if repo_workspace.decode(offer["workspace"]):
+            # Repo identity (intake 8028bb06): this host clones its own fresh work tree.
+            workspace = repo_workspace.ensure_repo_workspace(self.settings, offer["workspace"])
+        else:
+            workspace = resolve_workspace_path(self.settings, offer["workspace"])
         offer_workspace = workspace
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"), self.settings)
         native = self.settings.get("aplexer_bin", "aplexer")
@@ -3937,7 +3953,9 @@ class Dispatcher:
             from .dispatch_diagnostics import classify
             workspace_available = True
             try:
-                resolve_workspace_path(self.settings, offer.get('workspace'))
+                from . import repo_workspace
+                if not repo_workspace.decode(offer.get('workspace')):
+                    resolve_workspace_path(self.settings, offer.get('workspace'))
             except (ValueError, OSError):
                 workspace_available = False
             diagnostic = classify(exc, workspace_available=workspace_available)
@@ -4359,6 +4377,7 @@ class Dispatcher:
                     workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count())
         caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
         caps['launcher_resources'] = bool(self.settings.get('launcher'))
+        caps['repo_workspaces'] = True  # intake 8028bb06: clones repo-identity workspaces itself
         caps['fleet_goal_routes'] = self.goal_routes()
         # The maintained launcher admits Claude headless work only through a
         # managed profile. Its global model-support list alone does not prove

@@ -5,6 +5,7 @@
  * through the host agent; unknown host state stays null, never invented.
  * Nothing here deletes automatically (auto-GC belongs to intake 1f1f1877). */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import { decodeRepoWorkspace } from './fleet';
 
 type Obj = Record<string, any>;
 
@@ -213,6 +214,8 @@ export class IntakeWorktrees {
     // Intake 79458f2d: a detached start runs in its workspace root and never
     // resumes, creates or locks the linked intake's worktree.
     if (request.intake_worktree === 'detached') return { plan: { mode: 'none', task_id: taskId, detached: true }, events: [] };
+    // Repo-identity start (intake 8028bb06): the host clones its own fresh work tree.
+    if (decodeRepoWorkspace(request.workspace)) return { plan: { mode: 'none', task_id: taskId, repo_workspace: true }, events: [] };
     for (const candidate of [request.cwd, request.workspace]) {
       if (!worktreePathAllowed(candidate)) continue;
       // The start named its own worktree: record it, launch as requested.
