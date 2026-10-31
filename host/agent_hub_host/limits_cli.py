@@ -50,9 +50,9 @@ def render(args: argparse.Namespace, result: dict) -> str:
                       [[e.get('engine'), e.get('max_concurrency'), e.get('active'), ','.join(e.get('accounts') or [])]
                        for e in result.get('engines') or []])
         out += ['', 'Accounts:']
-        out += _table(['ACCOUNT', 'ENGINE', 'CAP', 'ACTIVE', 'RESERVED', 'OBSERVED', 'LIVE', 'FREE', 'STATUS'],
+        out += _table(['ACCOUNT', 'ENGINE', 'CAP', 'ACTIVE', 'RESERVED', 'OBSERVED', 'LIVE', 'SESSIONS', 'FREE', 'STATUS'],
                       [[a.get('account'), a.get('provider'), a.get('max_concurrency'), a.get('active'), a.get('reserved'),
-                        a.get('observed_sessions'), a.get('native_live'), a.get('available_slots'),
+                        a.get('observed_sessions'), a.get('native_live'), a.get('sessions', '-'), a.get('available_slots'),
                         a.get('status') if a.get('enabled') else 'disabled'] for a in result.get('accounts') or []])
         return '\n'.join(out)
     out = ['Set %s=%s (%s%s):' % (result.get('target'), result.get('max_concurrency'), result.get('kind'),

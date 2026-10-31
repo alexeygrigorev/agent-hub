@@ -39,7 +39,8 @@ import { credentialActor } from './agent_registry';
 import { redact } from './routing';
 import { taskTier } from './model-routing';
 import { engineProvider, evaluateTbmAdmission, normalizeProviderFamily, type TbmPoolRow } from './quota_admission';
-import { ensureTbmQuotaSchema } from './quota';
+import { ensureTbmQuotaSchema, canonicalAccountLabel } from './quota';
+import { buildSessionBreakdown, parseBreakdownDims, LIVE_STORED_STATES } from './session-breakdown';
 import { ensureTbmControllerSchema, recordSessionOutcomeReward } from './tbm-controller';
 import { approvalAuthorityMatches } from './host_enrollment';
 import { sha256 } from './auth/crypto';
@@ -127,6 +128,13 @@ export async function deriveCleanupSessionKey(operationKey: string, sessionId: s
 }
 
 const label = (x: unknown): x is string => typeof x === 'string' && LABEL.test(x);
+const ACCOUNT_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+/** Account label and its provenance for one session view (labels only, never credentials). */
+export function sessionAccount(launchAccount: unknown, nativeAccount: unknown): { account: string | null; account_source: 'launch' | 'native' | null } {
+  if (typeof launchAccount === 'string' && ACCOUNT_LABEL.test(launchAccount)) return { account: canonicalAccountLabel(launchAccount), account_source: 'launch' };
+  if (typeof nativeAccount === 'string' && ACCOUNT_LABEL.test(nativeAccount)) return { account: canonicalAccountLabel(nativeAccount), account_source: 'native' };
+  return { account: null, account_source: null };
+}
 const response = (value: unknown, status = 200) => Response.json(value, { status, headers: HEADERS });
 const obj = (x: any, keys: string[]) => x !== null && typeof x === 'object' && !Array.isArray(x) && Object.keys(x).every(k => keys.includes(k));
 const parsed = (value: any, fallback: any = null) => { try { return JSON.parse(value); } catch { return fallback; } };
@@ -1009,6 +1017,9 @@ export class SessionControlService {
     // Offered route (account/profile labels only, never credentials or paths).
     let offeredRoute: { machine: string | null; engine: string | null; account: string | null; profile: string | null } | null = null;
     let workerStatus: string | null = null;
+    // Account label the session runs on (intake 93e7817b): the placed launch
+    // records it; adopted/observed natives carry the host-reported account.
+    let launchAccount: string | null = null;
     if (row.fleet_launch_id) {
       // Intake 17e774f8: separate read so older fleet tables without the
       // column cannot hide the launch diagnostics below.
@@ -1021,6 +1032,7 @@ export class SessionControlService {
       try {
         const launch: any = this.sql.exec('SELECT launch_error_json, runtime_json, model_selection_json, exit_reason, native_id,request_json,workspace,account,profile,machine_id,engine FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
         const routeLabel = (v: unknown) => typeof v === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(v) ? v : null;
+        launchAccount = routeLabel(launch?.account);
         if (launch && (routeLabel(launch.account) || routeLabel(launch.profile))) offeredRoute = { machine: routeLabel(launch.machine_id ?? row.machine_id), engine: routeLabel(launch.engine ?? row.engine), account: routeLabel(launch.account), profile: routeLabel(launch.profile) };
         runtime = parsed(launch?.runtime_json, null);
         modelSelection = parsed(launch?.model_selection_json);
@@ -1090,6 +1102,7 @@ export class SessionControlService {
       stall_threshold: stallThreshold(this.options.env), lifecycle_state: row.state,
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
+      ...sessionAccount(launchAccount, observed?.account),
       model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? request.model ?? null,
       expected_cpu_cores:expectedCpu?.expected_cpu_cores ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_cores ?? null,
       expected_cpu_source:expectedCpu?.expected_cpu_source ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_source ?? null,
@@ -2427,6 +2440,21 @@ export class SessionControlService {
         return response(buildLifecycleView(this.sql, scope, {
           limit, cursor: url.searchParams.get('cursor'), now_ms: this.now(),
         }));
+      }
+      // Intake 93e7817b: live session counts by host x engine x account over
+      // the same projected views the list shows (same scope rules).
+      if (url.searchParams.get('view') === 'breakdown') {
+        const dims = parseBreakdownDims(url.searchParams.get('by'));
+        if (!dims) return response({ error: 'invalid_breakdown', allowed: ['host', 'engine', 'account'] }, 400);
+        const cap = 1000;
+        const states = LIVE_STORED_STATES.map(() => '?').join(',');
+        const live = (admin
+          ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE state IN (${states}) ORDER BY created_at DESC, id DESC LIMIT ?`, ...LIVE_STORED_STATES, cap + 1).toArray()
+          : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? AND state IN (${states}) ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...LIVE_STORED_STATES, cap + 1).toArray()
+        ).filter((r: any) => this.ownerOk(r, caller));
+        const scanned = live.slice(0, cap);
+        return response(buildSessionBreakdown(this.sql, scanned.map(r => this.view(r)), dims,
+          { now_ms: this.now(), scanned: scanned.length, truncated: live.length > cap }));
       }
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
       const cursor = url.searchParams.get('cursor');

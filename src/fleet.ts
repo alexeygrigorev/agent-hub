@@ -637,6 +637,28 @@ export class FleetService {
     });
   }
 
+  /** Live Hub sessions per canonical account (intake 93e7817b): one row per
+   * non-terminal session, attributed to the placed launch's account or, for
+   * adopted natives, the host-reported account. Read-only, display only:
+   * admission keeps its own reserved/observed accounting. */
+  liveSessionsByAccount(): Map<string, number> {
+    const out = new Map<string, number>();
+    try {
+      for (const r of this.sql.exec(`SELECT COALESCE(l.account, n.account) AS account, COUNT(*) AS n
+          FROM session_control_sessions s
+          LEFT JOIN fleet_launches l ON l.id = s.fleet_launch_id
+          LEFT JOIN fleet_sessions n ON s.fleet_launch_id IS NULL AND n.machine_id = s.machine_id
+            AND n.native_id = json_extract(CASE WHEN json_valid(s.binding_json) THEN s.binding_json ELSE '{}' END, '$.native_id')
+          WHERE s.state IN ('recorded','held','queued','offered','starting','running','uncertain')
+          GROUP BY COALESCE(l.account, n.account)`).toArray() as any[]) {
+        if (typeof r.account !== 'string' || !r.account) continue;
+        const key = canonicalAccountLabel(r.account);
+        out.set(key, (out.get(key) ?? 0) + Number(r.n));
+      }
+    } catch { /* session-control store is optional in isolated fleet installs */ }
+    return out;
+  }
+
   accountStatus(account: any) {
     return this.withMaintenance(() => this.accountStatusWithinMaintenance(account));
   }
@@ -1519,7 +1541,8 @@ export class FleetService {
         return { ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at), alias_of: canonical, canonical_id: canonical ?? String(m.id) };
       });
       const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
-      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = parsed(this.sql.exec('SELECT capabilities FROM machines WHERE id = ?', r.machine_id).toArray()[0]?.capabilities); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
+      const liveSessions = this.liveSessionsByAccount();
+      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => { const s = this.accountStatus(a); return { ...s, sessions: liveSessions.get(s.label) ?? 0 }; }), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = parsed(this.sql.exec('SELECT capabilities FROM machines WHERE id = ?', r.machine_id).toArray()[0]?.capabilities); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
         machines, machine_aliases: machineAliases,
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions,
@@ -1582,11 +1605,12 @@ export class FleetService {
     if (path === '/api/fleet/limits' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
       const routes = this.sql.exec('SELECT account, engine FROM fleet_routes ORDER BY engine').toArray() as any[];
+      const liveSessions = this.liveSessionsByAccount();
       const accounts = dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(row => {
         const s = this.accountStatus(row);
         return { account: s.label, provider: s.provider, engines: [...new Set(routes.filter(r => canonicalAccountLabel(String(r.account)) === s.label).map(r => String(r.engine)))],
           max_concurrency: Number(s.max_concurrency), active: s.active, reserved: s.reserved, observed_sessions: s.observed_sessions,
-          native_live: s.native_live, available_slots: s.available_slots, placeable_slots: s.placeable_slots, enabled: s.enabled, status: s.status };
+          native_live: s.native_live, sessions: liveSessions.get(s.label) ?? 0, available_slots: s.available_slots, placeable_slots: s.placeable_slots, enabled: s.enabled, status: s.status };
       });
       const engines = new Map<string, { engine: string; accounts: string[]; max_concurrency: number; active: number }>();
       for (const a of accounts) {

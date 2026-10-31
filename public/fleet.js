@@ -27,9 +27,10 @@ async function api(path, method = 'GET', data) {
 }
 function slotCell(a) {
   // Counted vs live: active splits into launch reservations + orphan observed
-  // sessions; live is the host-catalog verified native process count.
+  // sessions; live is the host-catalog verified native process count;
+  // sessions is the number of live Hub sessions recorded on this account.
   if (a && (a.reserved !== undefined || a.observed_sessions !== undefined || a.native_live !== undefined)) {
-    const base = `${a.active} (res ${a.reserved ?? '?'} + orph ${a.observed_sessions ?? '?'}; live ${a.native_live ?? '?'}) / ${a.max_concurrency}`;
+    const base = `${a.active} (res ${a.reserved ?? '?'} + orph ${a.observed_sessions ?? '?'}; live ${a.native_live ?? '?'}${a.sessions !== undefined ? `; sessions ${a.sessions}` : ''}) / ${a.max_concurrency}`;
     return a.placeable_slots !== undefined ? `${base}; placeable ${a.placeable_slots}` : base;
   }
   return `${a.active} / ${a.max_concurrency}`;
@@ -373,6 +374,41 @@ function renderHostHealth(health, fleet) {
     root.append(p);
   }
 }
+/* Live sessions by host x engine x account (intake 93e7817b). */
+const BREAKDOWN_LABELS = { host: 'Host', engine: 'Engine', account: 'Account' };
+function breakdownDims() {
+  const dims = [...document.querySelectorAll('input[name="breakdown-dim"]:checked')].map(i => i.value).filter(d => d in BREAKDOWN_LABELS);
+  return dims.length ? dims : ['host'];
+}
+function hostText(row) {
+  const aliases = (row.host_aliases || []).map(a => a.label || a.id).filter(Boolean);
+  const base = row.host === 'unplaced' ? 'unplaced (not yet on a host)' : (row.host_label || row.host);
+  return base + (row.hostname && row.hostname !== base ? ` · ${row.hostname}` : '') + (aliases.length ? ` (also reported as ${aliases.join(', ')})` : '');
+}
+function renderBreakdown(data) {
+  const root = byId('live-sessions-panel'); if (!root) return;
+  root.replaceChildren();
+  if (!data || data.error) { const p = document.createElement('p'); p.className = 'error'; p.textContent = 'Live session counts unavailable. ' + ((data && data.error) || ''); root.append(p); return; }
+  const t = data.totals || {};
+  const summary = document.createElement('p');
+  summary.className = 'fleet-breakdown-summary';
+  summary.textContent = `${t.total ?? 0} live sessions: ${t.running ?? 0} running, ${t.queued ?? 0} queued, ${t.stalled ?? 0} stalled · ${(data.hosts || []).length} hosts` + (data.truncated ? ` · first ${data.scanned} only` : '');
+  root.append(summary);
+  const dims = (data.by || []).filter(d => d in BREAKDOWN_LABELS);
+  const columns = [...dims.map(d => BREAKDOWN_LABELS[d]), 'Running', 'Queued', 'Stalled', 'Total'];
+  const rows = (data.rows || []).map(r => [...dims.map(d => d === 'host' ? hostText(r) : (r[d] || 'unknown')), String(r.running ?? 0), String(r.queued ?? 0), String(r.stalled ?? 0), String(r.total ?? 0)]);
+  if (rows.length) rows.push([...dims.map((d, i) => i === 0 ? 'All' : ''), String(t.running ?? 0), String(t.queued ?? 0), String(t.stalled ?? 0), String(t.total ?? 0)]);
+  const view = table(columns, rows);
+  view.querySelector('table').classList.add('fleet-breakdown');
+  const last = view.querySelector('tbody tr:last-child');
+  if (rows.length && last) last.classList.add('fleet-breakdown-total');
+  root.append(view);
+}
+async function refreshBreakdown() {
+  try { renderBreakdown(await api('/api/sessions?view=breakdown&by=' + breakdownDims().join(','))); }
+  catch (e) { renderBreakdown({ error: e.message }); }
+}
+for (const input of document.querySelectorAll('input[name="breakdown-dim"]')) input.addEventListener('change', () => refreshBreakdown());
 async function refresh() {
   if (refreshing) return;
   refreshing = true; byId('fleet-refresh').disabled = true;
@@ -383,6 +419,7 @@ async function refresh() {
     document.querySelector('.dk-avatar__initials').textContent = me.email.slice(0,1).toUpperCase();
     const [fleet, live, checks] = await Promise.all([api('/api/fleet'), api('/api/liveness'), api('/api/checks')]);
     render(fleet); renderWatch(live, checks);
+    await refreshBreakdown();
     try {
       renderQuota(await api('/api/quota?view=fleet'));
     } catch (e) {

@@ -22,7 +22,7 @@ for (const [name, mode] of [['start_agent', 'headless'], ['start_session', 'inte
   tool(name, 'POST', mode === 'plan' ? '/api/fleet/plan' : '/api/fleet/launches', `Legacy fleet ${mode}: provide the same JSON as the CLI; placement/admission unchanged.`, [name.replaceAll('_', '-')]);
 }
 tool('sessions_link', 'POST', '/api/sessions/{id}/link', 'Operator manual intake linkage; payload key, intake_task_id. Existing different linkage is refused.', ['sessions link']);
-tool('sessions_list', 'GET', '/api/sessions', 'List sessions; query view=lifecycle gives grouped lifecycle; state, limit, cursor filter.', ['sessions', 'sessions list']);
+tool('sessions_list', 'GET', '/api/sessions', 'List sessions; query view=lifecycle grouped, view=breakdown&by=host,engine,account counts; state, limit, cursor filter.', ['sessions', 'sessions list', 'sessions count']);
 tool('sessions_tree', 'GET', '/api/sessions/tree', 'Session requester/parent tree.', ['sessions tree']);
 tool('sessions_start', 'POST', '/api/sessions', 'Queue durable session intent: workspace, brief, name, mode=headless|interactive, parent_id, intake_task_id, key, with_goal. Omit engine for tier policy; explicit engine REQUIRES engine_override_reason. Non-interactive starts REQUIRE intake_task_id and nonempty AC. Scope flags are informational only and never hold a start. needs filters advertised machine labels; unmet needs hold with needs_unmet. Quota/admission unchanged. Use interactive with_goal for follow-ups; headless uses native resume. Poll sessions_show/commands: queued or transported is not acknowledged execution.', ['sessions start', 'sessions override']);
 tool('sessions_show', 'GET', '/api/sessions/{id}', 'Session binding and observed state.', ['sessions show']);

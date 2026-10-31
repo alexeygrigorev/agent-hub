@@ -95,6 +95,7 @@
   "sessions capture",
   "sessions cleanup",
   "sessions commands",
+  "sessions count",
   "sessions events",
   "sessions host-receive",
   "sessions link",

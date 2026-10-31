@@ -29,10 +29,10 @@ class LimitsCliTest(unittest.TestCase):
     def test_render(self):
         shown = {'engines': [{'engine': 'claude', 'accounts': ['hub-claude', 'shared-claude'], 'max_concurrency': 113, 'active': 4}],
                  'accounts': [{'account': 'hub-claude', 'provider': 'claude', 'max_concurrency': 13, 'active': 4, 'reserved': 1,
-                               'observed_sessions': 3, 'native_live': 4, 'available_slots': 9, 'enabled': True, 'status': 'ok'}]}
+                               'observed_sessions': 3, 'native_live': 4, 'sessions': 4, 'available_slots': 9, 'enabled': True, 'status': 'ok'}]}
         text = limits_cli.render(parse('show'), shown)
         self.assertIn('claude  113  4       hub-claude,shared-claude', text)
-        self.assertIn('hub-claude  claude  13   4       1         3         4     9     ok', text)
+        self.assertIn('hub-claude  claude  13   4       1         3         4     4         9     ok', text)
         result = {'target': 'claude', 'max_concurrency': 13, 'kind': 'engine', 'allow_lower': False,
                   'changes': [{'account': 'hub-claude', 'from': 8, 'to': 13, 'result': 'raised'},
                               {'account': 'shared-claude', 'from': 100, 'to': 100, 'result': 'kept_higher'}]}

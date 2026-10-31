@@ -463,6 +463,10 @@ def add_commands(sub):
     listing.add_argument('--limit', type=int, default=50)
     listing.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     listing.add_argument('--tree', action='store_true', help='Display session lineage tree')
+    count = commands.add_parser('count', help='Count live sessions (running/queued/stalled) grouped by host, engine and/or account')
+    count.add_argument('--by', default='host,engine,account',
+                       help='Comma-separated grouping: any of host,engine,account (default host,engine,account)')
+    count.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     tree = commands.add_parser('tree', help='Display session lineage tree')
     tree.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     link = commands.add_parser('link', help='Link a session to an intake (operator only)')
@@ -740,6 +744,10 @@ def _execute(args):
         if getattr(args, 'export', False):
             return request('GET', '/api/sessions/audit/export?limit=%d' % max(1, min(20000, int(getattr(args, 'limit', None) or 5000))))
         return request('GET', '/api/sessions/audit?last=%d' % max(1, min(50, int(getattr(args, 'last', None) or 5))))
+    if cmd == 'count':
+        from urllib.parse import quote
+        by = normalize_breakdown_dims(getattr(args, 'by', None))
+        return request('GET', '/api/sessions?view=breakdown&by=' + quote(','.join(by), safe=','))
     if cmd == 'tree' or (cmd == 'list' and getattr(args, 'tree', False)):
         return request('GET', '/api/sessions/tree')
     if cmd == 'list':
@@ -1020,13 +1028,64 @@ def format_duration(seconds):
     return f'{seconds // 3600}h{seconds % 3600 // 60:02d}m{seconds % 60:02d}s'
 
 
+BREAKDOWN_DIMS = ('host', 'engine', 'account')
+
+
+def normalize_breakdown_dims(value):
+    """Validate `--by host,engine,account` (order kept, duplicates dropped)."""
+    if value is None or not str(value).strip():
+        return list(BREAKDOWN_DIMS)
+    dims = []
+    for part in str(value).split(','):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part not in BREAKDOWN_DIMS:
+            raise SessionInputError('--by accepts only host, engine and account (comma-separated)')
+        if part not in dims:
+            dims.append(part)
+    if not dims:
+        raise SessionInputError('--by needs at least one of host, engine, account')
+    return dims
+
+
+def render_breakdown(result):
+    """Text table for `hub sessions count`: one row per group plus totals."""
+    if not isinstance(result, dict):
+        return str(result)
+    dims = [d for d in (result.get('by') or BREAKDOWN_DIMS) if d in BREAKDOWN_DIMS]
+    totals = result.get('totals') or {}
+    rows = []
+    for r in result.get('rows') or []:
+        cells = []
+        for d in dims:
+            value = r.get(d) or '-'
+            if d == 'host':
+                label = r.get('host_label') or value
+                aliases = [a.get('label') or a.get('id') for a in (r.get('host_aliases') or []) if isinstance(a, dict)]
+                value = label + (' (aka ' + ','.join(aliases) + ')' if aliases else '')
+            cells.append(str(value))
+        cells += [str(r.get('running', 0)), str(r.get('queued', 0)), str(r.get('stalled', 0)), str(r.get('total', 0))]
+        rows.append(cells)
+    headers = [d.upper() for d in dims] + ['RUNNING', 'QUEUED', 'STALLED', 'TOTAL']
+    footer = ['TOTAL'] + [''] * (len(dims) - 1) + [str(totals.get(k, 0)) for k in ('running', 'queued', 'stalled', 'total')]
+    widths = [max(len(str(x[i])) for x in [headers, footer] + rows) for i in range(len(headers))]
+    line = lambda cells: '  '.join(str(c).ljust(widths[i]) for i, c in enumerate(cells)).rstrip()
+    out = [line(headers), '  '.join('-' * w for w in widths)]
+    out += [line(r) for r in rows]
+    out += ['  '.join('-' * w for w in widths), line(footer)]
+    if result.get('truncated'):
+        out.append('note: truncated at %s live sessions' % result.get('scanned'))
+    return '\n'.join(out)
+
+
 def render_table(sessions):
     """Render a compact table for `hub sessions list` with columns:
-    TYPE, NAME, ENGINE, MODEL, STATE, WORKSPACE, UPDATED and runtime warnings.
+    TYPE, NAME, HOST, ENGINE, ACCOUNT, MODEL, STATE, WORKSPACE, UPDATED and runtime warnings.
     """
     if not sessions:
         return 'No sessions found.'
-    headers = ['TYPE', 'NAME', 'ENGINE', 'MODEL', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
+    headers = ['TYPE', 'NAME', 'HOST', 'ENGINE', 'ACCOUNT', 'MODEL', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
     rows = []
     for s in sessions:
         stype = s.get('session_type') or ('aplexer' if s.get('mode') == 'interactive' else 'headless')
@@ -1041,7 +1100,9 @@ def render_table(sessions):
             state = 'idle'
         ws = s.get('workspace') or '-'
         upd = (s.get('updated_at') or '')[:19].replace('T', ' ')
-        rows.append([stype, name, engine, s.get('model_id') or s.get('model') or '-', state, ws, upd, str(s.get('long_running', False)).lower(),
+        host = s.get('machine') or '-'
+        account = s.get('account') or '-'
+        rows.append([stype, name, host, engine, account, s.get('model_id') or s.get('model') or '-', state, ws, upd, str(s.get('long_running', False)).lower(),
                      format_duration(s.get('runtime')), format_duration(s.get('idle_for')), s.get('activity_state', '-')])
 
     widths = [len(h) for h in headers]
@@ -1132,6 +1193,8 @@ def render_output(args, result):
     cmd = getattr(args, 'sessions_cmd', None)
     if cmd == 'tree' or (cmd == 'list' and getattr(args, 'tree', False)):
         return render_tree(result)
+    if cmd == 'count':
+        return render_breakdown(result)
     if cmd == 'list':
         sessions = result.get('sessions', []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
         return render_table(sessions)
