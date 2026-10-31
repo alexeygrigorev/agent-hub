@@ -486,6 +486,7 @@ export class FleetService {
   private reofferCursors = new Map<string, [string, string]>();
   // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
   private linkRevisions = new Map<string, string>();
+  private candidateCache = new Map<string, { revision: string; at: number; value: any[] }>();
   private pollMaintenanceAt = 0;
   private maintenanceDirty = true;
 
@@ -645,7 +646,24 @@ export class FleetService {
     return this.observationProvenance(account, route)?.quota ?? null;
   }
 
+  /** One-row generation of every table the candidates read (written by StatusService triggers); null when absent. */
+  private candidateRevision(): string | null {
+    try { return String((this.sql.exec('SELECT revision FROM status_lifecycle_revision WHERE id=1').toArray()[0] as any)?.revision ?? '') || null; }
+    catch { return null; }
+  }
+
+  /** Intake e8a22f4c: every host polls this each few seconds and the query reads each live launch
+   * plus a fleet_sessions probe. Reuse the answer until a launch/session write moves the revision. */
   private reconciliationCandidates(machine: string) {
+    const revision = this.candidateRevision(), at = this.now();
+    const hit = this.candidateCache.get(machine);
+    if (revision && hit && hit.revision === revision && at >= hit.at && at - hit.at < POLL_MAINTENANCE_MS) return hit.value;
+    const value = this.reconciliationCandidatesUncached(machine);
+    if (revision) this.candidateCache.set(machine, { revision, at, value });
+    return value;
+  }
+
+  private reconciliationCandidatesUncached(machine: string) {
     // Intake 0b87eb29: a claim Hub abandoned on the silent-start bound has no
     // exit proof. Keep offering it to its owning host for a bounded window so
     // a fenced no-start, recovered hub-results finish or late native start

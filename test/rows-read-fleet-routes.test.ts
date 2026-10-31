@@ -102,3 +102,27 @@ it('PUT /api/fleet/sessions still writes changed rows, retires vanished live row
   expect(phaseOf(3)).toBe('unobserved');
   expect(phaseOf(10)).toBe('exited');
 }));
+
+it('GET /api/fleet/offers reuses reconciliation candidates until a launch or session write', withFleet(async (s, t, hub) => {
+  // 60 extra running launches on h0, each with a fresh live native (probed by the candidates query),
+  // except launch 0, whose native is unobserved so it is a reconciliation candidate.
+  for (let i = 0; i < 60; i++) {
+    const n = 10000 + i, launch = uuid(5, n), native = uuid(6, n);
+    hub.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, launch, 'owner', 'agent', 's', 'kx' + n, '{}', 'h0', 'codex', 'a', 'interactive', '/w', 'p', 'running', native, iso(-1000), iso(-1000));
+    if (i > 0) hub.sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,cwd,created_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      'h0', native, 'hub-' + launch, 'codex', 'running', null, iso(-1000), '/w', '/w', now - 1000);
+  }
+  const get = async () => { const r = await s.handle(new Request('https://hub.test/api/fleet/offers'), host); expect(r.status).toBe(200); return r.json() as Promise<any>; };
+  const candidate = uuid(5, 10000);
+  const first = await get();
+  expect(first.reconciliation.map((r: any) => r.id)).toContain(candidate);
+  const from = t.mark();
+  const second = await get();
+  const reads = t.report(from);
+  expect(second.reconciliation).toEqual(first.reconciliation);
+  expect(reads.total, `second poll top statements: ${JSON.stringify(reads.top)}`).toBeLessThanOrEqual(60);
+  // A launch write moves the revision: the next poll recomputes and no longer lists it.
+  hub.sql.exec("UPDATE fleet_launches SET state = 'exited' WHERE id = ?", candidate);
+  expect((await get()).reconciliation.map((r: any) => r.id)).not.toContain(candidate);
+}));
