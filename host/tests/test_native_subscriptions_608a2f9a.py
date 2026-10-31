@@ -4,13 +4,15 @@ A host renders shared-zai/shared-gemini/shared-go only when the engine CLI
 and the credential home exist locally; operator entries always win and
 disabled providers (grok) and claude are never auto-rendered.
 """
+import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host import account_registry, fleet
+from agent_hub_host import account_registry, fleet, native_admission
 
 REPO = Path(__file__).resolve().parents[2]
 ACCOUNTS = json.loads((REPO / "config" / "model-routing.json").read_text())["accounts"]
@@ -24,8 +26,10 @@ class NativeSubscriptionsTest(unittest.TestCase):
     def which(self, name):
         return self.bins.get(name)
 
-    def login(self, *parts):
-        Path(self.home, *parts).mkdir(parents=True, exist_ok=True)
+    def login(self, *parts, content='{"token": "x"}'):
+        path = Path(self.home, *parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
 
     def render(self, subs=()):
         return account_registry.native_subscriptions(
@@ -39,9 +43,9 @@ class NativeSubscriptionsTest(unittest.TestCase):
     def test_renders_installed_logged_in_accounts(self):
         self.bins = {"zcodex": "/bin/zcodex", "agy": "/bin/agy", "opencode": "/bin/opencode",
                      "grok": "/bin/grok", "claude": "/bin/claude"}
-        for path in (".zcode", ".gemini", ".grok", ".claude", ".local/share/opencode"):
+        for path in (".zcode/v2/credentials.json", ".gemini/oauth_creds.json", ".grok/auth.json",
+                     ".claude/.credentials.json", ".local/share/opencode/auth.json"):
             self.login(*path.split("/"))
-        Path(self.home, ".local/share/opencode/auth.json").write_text("{}")
         subs = {s["account_label"]: s for s in self.render()}
         self.assertEqual(sorted(subs), ["shared-gemini", "shared-go", "shared-zai"])
         zai = subs["shared-zai"]
@@ -58,18 +62,38 @@ class NativeSubscriptionsTest(unittest.TestCase):
         path.write_text(json.dumps({"version": 1, "subscriptions": list(subs.values()), "workspaces": {"home": self.home}}))
         self.assertEqual(len(fleet.load_settings(str(path))["subscriptions"]), 3)
 
-    def test_opencode_needs_auth_file(self):
-        self.bins = {"opencode": "/bin/opencode"}
-        self.login(".local", "share", "opencode")
+    def test_logged_out_homes_are_not_advertised(self):
+        # The CLIs create these directories (config, history) before any login.
+        self.bins = {"zcodex": "/bin/zcodex", "agy": "/bin/agy", "opencode": "/bin/opencode"}
+        self.login(".zcode", "cli", "config.json")
+        self.login(".gemini", "settings.json")
+        self.login(".local", "share", "opencode", "log.txt")
+        self.assertEqual(self.render(), [])
+        # An empty login file is a logged-out placeholder too.
+        self.login(".zcode", "v2", "credentials.json", content="{}")
+        self.login(".gemini", "oauth_creds.json", content="")
+        self.login(".local", "share", "opencode", "auth.json", content="{}")
         self.assertEqual(self.render(), [])
 
     def test_operator_entry_wins_including_legacy_label(self):
         self.bins = {"zcodex": "/bin/zcodex"}
-        self.login(".zcode")
+        self.login(".zcode", "v2", "credentials.json")
         self.assertEqual(self.render([{"account_label": "shared-zai", "service": "zai"}]), [])
 
+    def test_windows_user_install_dirs(self):
+        self.login(".gemini", "oauth_creds.json")
+        appdata = Path(self.home, "AppData", "Local")
+        agy = appdata / "Programs" / "agy" / "agy.exe"
+        agy.parent.mkdir(parents=True)
+        agy.write_text("")
+        agy.chmod(0o700)
+        with patch.object(account_registry.sys, "platform", "win32"), \
+                patch.dict(os.environ, {"LOCALAPPDATA": str(appdata)}):
+            subs = self.render()
+        self.assertEqual([(s["account_label"], s["engine"]) for s in subs], [("shared-gemini", "antigravity")])
+
     def test_local_bin_fallback(self):
-        self.login(".zcode")
+        self.login(".zcode", "v2", "credentials.json")
         local = Path(self.home, ".local", "bin")
         local.mkdir(parents=True)
         (local / "zcodex").write_text("#!/bin/sh\n")
@@ -77,6 +101,22 @@ class NativeSubscriptionsTest(unittest.TestCase):
         subs = self.render()
         self.assertEqual([s["account_label"] for s in subs], ["shared-zai"])
         self.assertEqual(subs[0]["startup_argv"][0], str(local / "zcodex"))
+
+
+class NativeAdmissionServicesTest(unittest.TestCase):
+    def test_gemini_and_go_are_accepted(self):
+        for service, account, engine in (("gemini", "shared-gemini", "antigravity"), ("go", "shared-go", "opencode")):
+            verdict = {"account_label": account, "launch_allowed": True}
+            payload = {"account": account, "engine": engine, "profile": None, "mode": "interactive"}
+            argv = ["native_admission", "--service", service, "--account", account, "--engine", engine]
+            out = io.StringIO()
+            with patch.object(native_admission.sys, "argv", argv), \
+                    patch.object(native_admission.sys, "stdin", io.StringIO(json.dumps(payload))), \
+                    patch.object(native_admission, "hub_request", return_value=verdict) as request, \
+                    patch.object(native_admission.sys, "stdout", out):
+                native_admission.main()
+            self.assertTrue(json.loads(out.getvalue())["launch_allowed"], service)
+            request.assert_called_once_with("POST", "/api/engines/admission", {"label": account, "native": True})
 
 
 class DispatcherMergeTest(unittest.TestCase):

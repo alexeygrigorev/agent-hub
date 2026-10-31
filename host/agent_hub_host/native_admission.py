@@ -27,7 +27,8 @@ def hub_request(method, path, payload=None):
     return host_request(method, path, payload)
 
 
-def probe(payload, service, account, engine, request=hub_request):
+def probe(payload, service, account, engine, request=None):
+    request = request or hub_request
     now = dt.datetime.now(dt.timezone.utc)
     result = dict(launch_allowed=False, profile_supported=False, account_label=account,
                   observed_at=now.isoformat(), model_supported=False)

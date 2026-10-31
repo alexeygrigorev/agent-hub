@@ -150,7 +150,10 @@ NATIVE_BINARIES = {"zcodex": ("zcodex",), "antigravity": ("agy", "antigravity"),
 NATIVE_BINARY_DIRS = ("~/.local/bin", "~/bin")
 WINDOWS_BINARY_DIRS = (("APPDATA", "npm"), ("LOCALAPPDATA", "Programs/Antigravity/bin"), ("LOCALAPPDATA", "Programs/agy"))
 NATIVE_LAUNCHER = {"zai": "zai", "gemini": "antigravity", "go": "opencode"}
-NATIVE_CREDENTIAL_MARKERS = {"go": "auth.json"}
+# The login file inside the credential home (same paths provisioning imports).
+# The CLIs create the home directories themselves, so a directory alone is not
+# a login (intake 06d2a0ac: never advertise logged-out accounts).
+NATIVE_CREDENTIAL_MARKERS = {"zai": "v2/credentials.json", "gemini": "oauth_creds.json", "go": "auth.json"}
 
 
 def _default_launcher_model(provider, harness):
@@ -182,8 +185,8 @@ def native_subscriptions(settings, accounts=None, which=shutil.which, home=None,
     """Subscription entries for catalog host-home accounts usable on this host.
 
     An account is rendered only when no configured entry already maps to it,
-    its provider is enabled, the engine CLI resolves locally and its
-    credential home exists. Operator entries always win; nothing is written.
+    its provider is enabled, the engine CLI resolves locally and its login
+    file is present and non-empty. Operator entries always win; nothing is written.
     """
     if accounts is None:
         accounts = policy_accounts()
@@ -200,8 +203,12 @@ def native_subscriptions(settings, accounts=None, which=shutil.which, home=None,
             continue
         binary = _find_binary(NATIVE_BINARIES.get(harness, (harness,)), which=which, home=home)
         credential = Path(expand_home(account["credential"]["path"], home))
-        marker = NATIVE_CREDENTIAL_MARKERS.get(provider)
-        if not binary or not credential.is_dir() or (marker and not (credential / marker).is_file()):
+        marker = credential / NATIVE_CREDENTIAL_MARKERS[provider]
+        try:
+            logged_in = marker.is_file() and marker.stat().st_size > 2
+        except OSError:
+            logged_in = False
+        if not binary or not logged_in:
             continue
         sub = {
             "service": provider,
