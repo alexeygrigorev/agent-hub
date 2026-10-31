@@ -147,10 +147,22 @@ export function publicTools() {
     const slots = [...r.path.matchAll(/\{(\w+)\}/g)].map(m => m[1]);
     const properties: Record<string, unknown> = Object.fromEntries(slots.map(s => [s, { type: 'string', minLength: 1, maxLength: 256 }]));
     if (r.method === 'GET' || r.name === 'sessions_cleanup') properties.query = { type: 'object', additionalProperties: { type: ['string', 'number', 'boolean'] } };
-    if (r.method !== 'GET') properties.payload = { type: 'object', description: 'JSON request body.', additionalProperties: true };
+    // JSON Schema already admits any object keys; additionalProperties:true would only add bytes.
+    if (r.method !== 'GET') properties.payload = { type: 'object', description: 'JSON request body.' };
     return { name: r.name, description: r.description, inputSchema: { type: 'object', properties, ...(slots.length ? { required: slots } : {}), additionalProperties: false },
-      annotations: { readOnlyHint: r.method === 'GET', destructiveHint: r.method !== 'GET' && r.name !== 'sessions_capture', idempotentHint: r.method === 'GET', openWorldHint: false } };
+      annotations: toolAnnotations(r) };
   });
+}
+/** Tools that POST only to queue a read of native state; they never type into or alter a session. */
+const READ_ONLY_POSTS = new Set(['sessions_capture']);
+/** MCP annotation hints, emitting only values that differ from the spec's conservative defaults
+ * (readOnlyHint=false, idempotentHint=false) or that clients must see explicitly. destructiveHint
+ * stays explicit on every tool; idempotentHint is meaningful only for non-read-only tools and no
+ * write route is advertised as idempotent, so it is never emitted. */
+export function toolAnnotations(r: Pick<ToolRoute, 'name' | 'method'>) {
+  const readOnly = r.method === 'GET' || READ_ONLY_POSTS.has(r.name);
+  return readOnly ? { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+    : { destructiveHint: true, openWorldHint: false };
 }
 export function toolRequest(origin: string, name: string, args: unknown, authorization: string): Request {
   const route = routes.find(r => r.name === name);

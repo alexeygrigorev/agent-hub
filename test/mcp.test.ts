@@ -58,13 +58,19 @@ describe('Hub MCP protocol and parity', () => {
     // per tool is ~0.55 KB of fixed skeleton, so the compact budget moves
     // 45000 -> 48000 rather than shrinking the advertised contracts. Scheduled
     // wakes (intake 0405f52b) add sessions_link and sessions_wake, moving the
-    // budget 48000 -> 50000 on the same terms.
-    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(50000);
+    // budget 48000 -> 50000 on the same terms. Intake 1e0bc141 restores the
+    // 45000 budget for the whole 110-tool surface (49922 -> 44922 bytes) by
+    // dropping schema keys that only restate JSON Schema / MCP annotation
+    // defaults; descriptions and argument contracts are unchanged.
+    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(45000);
     for (const route of MCP_ROUTES) {
       const tool = tools.find(tool => tool.name === route.name)!;
-      expect(tool.annotations.destructiveHint).toBe(route.method !== 'GET' && route.name !== 'sessions_capture');
+      const readOnly = route.method === 'GET' || route.name === 'sessions_capture';
+      expect(tool.annotations).toEqual(readOnly
+        ? { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+        : { destructiveHint: true, openWorldHint: false });
       if (route.method !== 'GET') {
-        expect(tool.inputSchema.properties.payload).toMatchObject({ description: 'JSON request body.' });
+        expect(tool.inputSchema.properties.payload).toEqual({ type: 'object', description: 'JSON request body.' });
         if (route.name === 'sessions_cleanup') {
           expect(tool.inputSchema.properties).toHaveProperty('query');
           const request = toolRequest(origin, route.name, { query: { host: 'fixture-host', task: 'fixture-task', owner: 'fixture-owner' }, payload: { dry_run: true } }, 'Bearer fixture');
@@ -75,6 +81,16 @@ describe('Hub MCP protocol and parity', () => {
         expect(() => toolRequest(origin, route.name, { ...args, query: {}, payload: {} }, 'Bearer fixture')).not.toThrow();
       }
     }
+  });
+  it('annotates sessions_capture as a read-only, non-destructive queued read', async () => {
+    // Capture only queues a sanitized read of the native screen; it never types
+    // into or stops the session, unlike its send/stop siblings on the same route shape.
+    const listed: any = await (await rpc('tools/list')).json();
+    const byName = (name: string) => listed.result.tools.find((t: any) => t.name === name);
+    expect(byName('sessions_capture').annotations).toEqual({ readOnlyHint: true, destructiveHint: false, openWorldHint: false });
+    for (const name of ['sessions_send', 'sessions_stop'])
+      expect(byName(name).annotations).toEqual({ destructiveHint: true, openWorldHint: false });
+    expect(byName('sessions_capture').annotations).not.toHaveProperty('idempotentHint');
   });
   it('counts authenticated list/call attempts in bounded buckets without payloads', async () => {
     await inHub(h => h.sql.exec('DELETE FROM mcp_tool_usage'));
