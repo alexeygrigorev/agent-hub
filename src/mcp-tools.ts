@@ -51,6 +51,7 @@ tool('claims_create', 'POST', '/api/bus/claims', 'Claim a scope using project, s
 tool('claims_release', 'POST', '/api/bus/claims/{id}/release', 'Release a claim; id may be project:scope (encoded as one segment).', ['release']);
 tool('tasks_submit', 'POST', '/api/fleet/tasks', 'Submit authorized work; payload prompt, approved_action, needs, workspace, idempotency_key and routing preferences, or tasks batch.', ['submit']);
 tool('routing_machines', 'GET', '/api/fleet/routing/machines', 'Capability and model advertisements.', ['routing-machines']);
+tool('device_pending', 'GET', '/api/device/pending', 'Pending host/agent device approvals (admin).', ['device-pending']);
 tool('model_policy', 'GET', '/api/fleet/routing/policy', 'Configured model policy.', ['model-policy']);
 tool('jobs_list', 'GET', '/api/fleet/tasks', 'Recent routed tasks.', ['jobs']);
 tool('jobs_show', 'GET', '/api/fleet/tasks/{id}', 'Task state, report and artifacts.', ['job']);
