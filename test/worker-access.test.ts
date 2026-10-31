@@ -352,6 +352,11 @@ describe('scoped durable worker access',()=>{
    h.intakeService.init();
    const triggers=h.sql.exec("SELECT name,tbl_name FROM sqlite_master WHERE type='trigger' AND name LIKE 'intake_session_links%' ORDER BY name").toArray().map((r:any)=>r.name+'@'+r.tbl_name);
    expect(triggers).toEqual(['intake_session_links_delete@intake_tasks','intake_session_links_projection_insert@intake_task_projection','intake_session_links_projection_update@intake_task_projection']);
+   // A malformed projection is skipped by the index, never thrown into the writer.
+   h.sql.exec("INSERT INTO intake_task_projection(id,data,links) VALUES('corrupt','{}','not json')");
+   h.sql.exec("UPDATE intake_task_projection SET links='still not json' WHERE id='corrupt'");
+   expect(h.sql.exec("SELECT count(*) AS n FROM intake_session_links WHERE task_id='corrupt'").one().n).toBe(0);
+   h.sql.exec("DELETE FROM intake_task_projection WHERE id='corrupt'");
   });
   expect((await api('/api/intake/tasks/'+cont)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);

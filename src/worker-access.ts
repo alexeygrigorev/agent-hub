@@ -36,10 +36,11 @@ export function initSessionLinks(sql: SqlStorage) {
     ${linkRows('p.id', 'intake_task_projection p, json_each(p.links) e', "json_extract(p.data,'$.status') NOT IN ('done','cancelled')")}
     ON CONFLICT DO NOTHING`);
   // Driven by the projection's small link/report column, and only when it changes,
-  // so ordinary note writes do not rescan the whole history. The first release
+  // so ordinary note writes do not rescan the whole history. A malformed links
+  // value is skipped, never thrown: readers already fail closed on it. The first release
   // put full-history triggers on intake_tasks under the old names; drop them.
   for (const op of ['insert', 'update']) sql.exec(`DROP TRIGGER IF EXISTS intake_session_links_${op}`);
-  for (const [op, when] of [['INSERT', ''], ['UPDATE OF links', 'WHEN NEW.links IS NOT OLD.links']]) sql.exec(
+  for (const [op, when] of [['INSERT', 'WHEN json_valid(NEW.links)'], ['UPDATE OF links', 'WHEN NEW.links IS NOT OLD.links AND json_valid(NEW.links)']]) sql.exec(
     `CREATE TRIGGER IF NOT EXISTS intake_session_links_projection_${op.split(' ')[0].toLowerCase()} AFTER ${op} ON intake_task_projection ${when} BEGIN
     INSERT INTO intake_session_links(session_key,task_id,authority) ${linkRows('NEW.id', 'json_each(NEW.links) e')}
     ON CONFLICT DO NOTHING; END`);
