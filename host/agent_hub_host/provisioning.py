@@ -678,7 +678,15 @@ def validate(bundle):
 
 
 def profile_path():
-    return Path(os.environ.get('APLEXER_CONFIG', Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'aplexer' / 'config.toml'))
+    override = os.environ.get('APLEXER_CONFIG')
+    if override:
+        return Path(override)
+    # Native aplexer reads %APPDATA% on Windows and XDG elsewhere.
+    if sys.platform == 'win32' and os.environ.get('APPDATA'):
+        base = Path(os.environ['APPDATA'])
+    else:
+        base = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+    return base / 'aplexer' / 'config.toml'
 
 
 def module_command(handler, label, managed_dir=None):
@@ -1692,12 +1700,15 @@ def admission():
                     for item in state:
                         b_path = root() / f"{item['label']}-{item['revision']}" / 'bundle.json'
                         loaded = read_json(b_path)
-                        if isinstance(loaded, dict):
+                        # A partial bundle must not block profiles for the others.
+                        if isinstance(loaded, dict) and loaded.get('provider') in PACKAGES and isinstance(loaded.get('label'), str):
                             installed.append(loaded)
                     if installed:
                         profiles(installed)
                 text = profile_path().read_text(encoding='utf-8')
-            except Exception:
+            except Exception as exc:
+                # Credential-free: exception type only, never the message.
+                result['profile_error'] = type(exc).__name__
                 text = ''
             if expected_header not in text:
                 result['launch_allowed'] = False
