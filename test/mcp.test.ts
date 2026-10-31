@@ -61,8 +61,10 @@ describe('Hub MCP protocol and parity', () => {
     // budget 48000 -> 50000 on the same terms. Intake 1e0bc141 restores the
     // 45000 budget for the whole 110-tool surface (49922 -> 44922 bytes) by
     // dropping schema keys that only restate JSON Schema / MCP annotation
-    // defaults; descriptions and argument contracts are unchanged.
-    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(45000);
+    // defaults; descriptions and argument contracts are unchanged. The ask
+    // ledger (intake 55c10deb) adds six asks_* tools (2397 bytes, merged from
+    // nine: resolve/admin take an action slot), moving it 45000 -> 48000.
+    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(48000);
     for (const route of MCP_ROUTES) {
       const tool = tools.find(tool => tool.name === route.name)!;
       const readOnly = route.method === 'GET' || route.name === 'sessions_capture';
