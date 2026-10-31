@@ -15,6 +15,14 @@ describe('host installer public delivery', () => {
       expect(assets.fetch).toHaveBeenCalledTimes(1);
     });
   }
+  for (const [alias, target] of [['/host/install.ps1', '/cli/host-install.ps1'], ['/host/install.sh', '/cli/host-install.sh']]) {
+    it(`${alias} aliases ${target}`, async () => {
+      const assets = { fetch: vi.fn(async (r: Request) => new Response(new URL(r.url).pathname, { status: 200 })) };
+      const response = await worker.fetch(new Request(`https://hub.test${alias}`), { ASSETS: assets } as any, {} as any);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(target);
+    });
+  }
   it('keeps unlisted cli assets private', async () => {
     const assets = { fetch: vi.fn() };
     const response = await worker.fetch(new Request('https://hub.test/cli/host.json'), { ASSETS: assets } as any, {} as any);

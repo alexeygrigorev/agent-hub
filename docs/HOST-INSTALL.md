@@ -1,13 +1,13 @@
 # Install a Hub session host
 
-We're still reviewing this installer: the commands aren't published yet, and fresh Windows enrollment remains unverified. The macOS runtime can't enforce Hub's required resource limits, so its controller won't start.
+Fresh native Windows enrollment is still being verified. The macOS runtime can't enforce Hub's required resource limits, so its controller won't start.
 
 Run one command in your ordinary user account. You don't need an administrator terminal.
 
 On Windows, including ARM64, use PowerShell:
 
 ```powershell
-irm https://hub.dtcdev.click/cli/host-install.ps1 | iex
+irm https://hub.dtcdev.click/host/install.ps1 | iex
 ```
 
 On Windows, you'll find the installation in `%LOCALAPPDATA%\Programs\agent-hub`. Your logon task runs the controller with limited privileges.
@@ -15,7 +15,7 @@ On Windows, you'll find the installation in `%LOCALAPPDATA%\Programs\agent-hub`.
 On Linux or macOS, including ARM64:
 
 ```bash
-curl -fsSL https://hub.dtcdev.click/cli/host-install.sh | sh
+curl -fsSL https://hub.dtcdev.click/host/install.sh | sh
 ```
 
 On Linux and macOS, you'll find the installation in `~/.local/share/agent-hub`. On Linux, we run the controller through your systemd user service. On macOS, we use your LaunchAgent.

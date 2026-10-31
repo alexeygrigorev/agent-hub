@@ -1,4 +1,4 @@
-# irm https://hub.dtcdev.click/cli/host-install.ps1 | iex
+# irm https://hub.dtcdev.click/host/install.ps1 | iex
 # Per-user only: no RunAs, machine PATH, MSI or elevated scheduled task.
 $ErrorActionPreference = 'Stop'
 $Base = if ($env:HUB_BASE_URL) { $env:HUB_BASE_URL.TrimEnd('/') } else { 'https://hub.dtcdev.click' }

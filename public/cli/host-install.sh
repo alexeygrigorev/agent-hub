@@ -1,5 +1,5 @@
 #!/bin/sh
-# curl -fsSL https://hub.dtcdev.click/cli/host-install.sh | sh
+# curl -fsSL https://hub.dtcdev.click/host/install.sh | sh
 # All writes and runtimes are per-user. Never invokes sudo.
 set -eu
 umask 077
