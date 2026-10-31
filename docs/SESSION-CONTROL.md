@@ -403,7 +403,7 @@ a `proof.kind = "native_delivery"` receipt. It proves delivery to the exact
 recipient incarnation, not processing. The receipt is journaled so a lost ack
 POST or host restart replays the identical ack; the proof id is prefixed
 `delivery:` so it dedups per envelope and cannot collide with reply ids. A
-busy recipient stays `waiting in inbox`; a later receipt promotes it, once.
+busy recipient stays `waiting in inbox`; a later receipt promotes it, once. A terminal target with no receipt ends `refused`, never `delivered`.
 
 ### Correlated delivery proof (host-verified native reply provenance)
 
