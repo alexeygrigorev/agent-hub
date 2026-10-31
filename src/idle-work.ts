@@ -3,6 +3,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { SessionControlService } from './session_control';
 import { IntakeService } from './intake';
+import { IntakeWorktrees } from './intake-worktrees';
 import { nativeObservationFresh } from './session_stall';
 import { linkedIntake, hasOpenWork, parseObject } from './intake-session';
 
@@ -106,13 +107,25 @@ export class IdleWorkService {
             continue;
           }
           this.sql.exec('UPDATE session_idle_episodes SET replacement_key=? WHERE session_id=?', key, row.id);
+          // Intake afab8367: the predecessor is live by design (it stops only
+          // after the replacement runs), so its worktree lock can never move
+          // and a same-worktree replacement is refused as
+          // dispatch_worktree_refused. The replacement requests a fresh
+          // sibling worktree instead; the held tree's uncommitted state is
+          // reported on the intake, never copied or force-taken.
+          try {
+            const trees = new IntakeWorktrees(this.sql);
+            const linked = trees.bySession(row.id);
+            if (linked && linked.taskId === task.id)
+              for (const id of linked.worktreeIds) trees.enqueue(task.id, 'status', id, 'hub:service:idle-work');
+          } catch { /* registry may be absent; the replacement note still reports the tree */ }
           const result = await this.command('', { key, intake_task_id: task.id, workspace: binding.workspace,
-            ...(request.cwd ? { cwd: request.cwd } : {}), ...(request.access ? { access: request.access } : {}),
-            parent_id: row.id, mode: 'interactive', with_goal: true,
-            brief: `Replace stalled session ${row.id} for intake ${task.id}. Read hub intake show ${task.id}. Complete all open acceptance criteria:\n${ac}\nKeep intake OPEN. Append DONE only with accepted evidence. Preserve other sessions and the existing workspace.` });
+            ...(request.access ? { access: request.access } : {}),
+            parent_id: row.id, mode: 'interactive', with_goal: true, intake_worktree: 'successor',
+            brief: `Replace stalled session ${row.id} for intake ${task.id}. Read hub intake show ${task.id}. Complete all open acceptance criteria:\n${ac}\nKeep intake OPEN. Append DONE only with accepted evidence. Hub starts you in a fresh sibling worktree prepared for this replacement; never enter, commit in or unlock the previous session's workspace - its uncommitted state stays there and is reported on the intake. Preserve other sessions and the existing workspace.` });
           if (result.body?.id) this.tx(() => {
             this.sql.exec('UPDATE session_idle_episodes SET replacement_id=? WHERE session_id=?', result.body.id, row.id);
-            if (!this.note(task, 'idle-replacement:' + episode.episode, `Replacement ${result.body.id} submitted for ${row.id}; lineage parent=${row.id}. Old session stays until replacement is running.`)) throw new Error('idle_lineage_note_failed');
+            if (!this.note(task, 'idle-replacement:' + episode.episode, `Replacement ${result.body.id} submitted for ${row.id}; lineage parent=${row.id}. Old session stays until replacement is running. The replacement starts in its own fresh worktree (intake_worktree=successor) because the predecessor is live and its lock must not move; the predecessor's workspace stays locked and untouched, and its uncommitted state is reported via the worktree status command (hub worktree list ${task.id}).`)) throw new Error('idle_lineage_note_failed');
           });
           continue;
         }

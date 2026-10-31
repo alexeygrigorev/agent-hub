@@ -2093,9 +2093,15 @@ export class SessionControlService {
       // Intake 79458f2d: a detached start (hourly triage, post-DONE verifier) is
       // linked to an intake for accounting only. It never resumes, creates or
       // locks that intake's worktree, so it may not name a worktree path itself.
-      if (input.intake_worktree !== undefined && input.intake_worktree !== 'detached') return response({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'invalid_intake_worktree' }, 400);
+      // Intake afab8367: a successor start (idle-work replacement of a live
+      // predecessor) runs in a fresh sibling worktree Hub plans for it; a named
+      // cwd would resolve against the live-held tree and defeat the sibling.
+      if (input.intake_worktree !== undefined && !['detached', 'successor'].includes(input.intake_worktree)) return response({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'invalid_intake_worktree' }, 400);
       if (input.intake_worktree === 'detached' && (namesWorktree(input.workspace) || namesWorktree(input.cwd))) {
         return response({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'detached_start_names_worktree' }, 400);
+      }
+      if (input.intake_worktree === 'successor' && input.cwd !== undefined) {
+        return response({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'successor_start_names_cwd' }, 400);
       }
       if (!label(input.key)) return response({ error: 'invalid_session_request', field: 'key', detail: 'invalid_key' }, 400);
       // Intake 8028bb06: `repo` (owner/name) replaces a host path. The workspace
@@ -2222,7 +2228,7 @@ export class SessionControlService {
           ...(input.with_goal === true ? { with_goal: true } : {}),
           mode, access: input.access ?? null, name: input.name ?? null,
           parent_id: parentId ?? null, intake_task_id: input.intake_task_id ?? null,
-          ...(input.intake_worktree === 'detached' ? { intake_worktree: 'detached' } : {}),
+          ...(input.intake_worktree === 'detached' || input.intake_worktree === 'successor' ? { intake_worktree: input.intake_worktree } : {}),
         });
 
         const prior: any = this.sql.exec(

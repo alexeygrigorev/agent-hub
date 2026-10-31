@@ -54,7 +54,26 @@ asks Hub for the plan:
   `origin/main` at the same path (`git worktree add`), then report `recreated`.
 - `{mode: "create", task_id, suffix}`: create `<dirname(ws)>/<basename(ws)>-<suffix>`
   on branch `<basename(ws)>-<suffix>` from fresh `origin/main`, where `ws` is
-  the resolved workspace repo and `suffix` is `wt-<first 8 of intake id>`.
+  the resolved workspace repo and `suffix` is `wt-<first 8 of intake id>` for
+  ordinary starts, or `wt-r-<first 8 of the session id>` for successor starts.
+
+### Successor starts (intake afab8367)
+
+A successor start (`intake_worktree: "successor"`) is the idle-work
+replacement of a LIVE predecessor. Idle-work keeps the predecessor running
+until the replacement itself is running, but the host worktree lock only
+moves to a proven-terminal owner (intake 1c8d915e), so a replacement into the
+same worktree is always refused as `dispatch_worktree_refused`. Instead Hub
+plans a fresh sibling worktree (create mode above): the replacement runs in
+its own workspace, the predecessor's tree stays locked and untouched, and no
+lock is ever stolen or force-unlocked. A successor start may not name a `cwd`
+(it would resolve against the live-held tree). The predecessor's uncommitted
+state is reported, never copied or force-taken: when idle-work submits the
+replacement it queues a `status` command for the held worktree and notes the
+situation on the intake; the dirty/unpushed/unmerged report lands in the
+worktree registry row (visible via `hub worktree list`). Successors of the
+same intake therefore leave several active worktree rows; the close gate and
+the remove guards cover all of them.
 
 The host then launches with cwd = the worktree and reports
 `POST /api/worktree-host/observe {launch_id, action, path, branch, error?}`

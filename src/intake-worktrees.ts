@@ -226,6 +226,13 @@ export class IntakeWorktrees {
     if (request.intake_worktree === 'detached') return { plan: { mode: 'none', task_id: taskId, detached: true }, events: [] };
     // Repo-identity start (intake 8028bb06): the host clones its own fresh work tree.
     if (decodeRepoWorkspace(request.workspace)) return { plan: { mode: 'none', task_id: taskId, repo_workspace: true }, events: [] };
+    // Intake afab8367: a successor start replaces a LIVE predecessor that keeps
+    // its worktree lock until the replacement itself is running, so the lock
+    // can never move (dispatch_worktree_refused). Plan a fresh sibling
+    // worktree instead of the held tree; the predecessor's uncommitted state
+    // stays in its own tree and is never inherited.
+    if (request.intake_worktree === 'successor')
+      return { plan: { mode: 'create', task_id: taskId, suffix: 'wt-r-' + String(ctx.session.id).replace(/-/g, '').slice(0, 8).toLowerCase() }, events: [] };
     for (const candidate of [request.cwd, request.workspace]) {
       if (!worktreePathAllowed(candidate)) continue;
       // The start named its own worktree: record it, launch as requested.

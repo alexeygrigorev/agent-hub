@@ -190,6 +190,43 @@ describe('detached intake-linked starts (intake 79458f2d)', () => {
   }));
 });
 
+describe('successor intake-linked starts (intake afab8367)', () => {
+  it('an idle-work replacement of a live predecessor plans a fresh sibling worktree, never the held one', async () => fixture(async c => {
+    const t = await createTask(c);
+    await register(c, t.id);
+    // A live owner session holds (and on the host has git-locked) the intake worktree.
+    const owner = seedLaunch(c, t.id, HOST, { cwd: WT });
+    c.hub.sql.exec("UPDATE session_control_sessions SET state = 'running' WHERE id = ?", owner.sessionId);
+    const calls: any[] = [];
+    const service = new SessionControlService(c.hub.sql, cb => c.state.storage.transactionSync(cb), Date.now, { reserve: (input: any) => {
+      calls.push(input); return { value: { id: crypto.randomUUID(), state: 'offered', machine: input.machine || HOST, engine: 'claude' }, status: 201 };
+    } });
+    const start = async (body: any) => {
+      const res = await service.handle(new Request('https://hub.test/api/sessions', { method: 'POST', body: JSON.stringify(body) }), admin);
+      return { status: res.status, body: await res.json() as any };
+    };
+    // The successor keeps the intake link and the machine pin (the sibling is
+    // created where the repository lives), but plans a fresh sibling instead
+    // of the held tree even though its workspace names the predecessor's.
+    const successor = await start({ key: 'successor-1', workspace: WT, mode: 'headless', brief: 'x', intake_task_id: t.id,
+      task_kind: 'implement', intake_worktree: 'successor' });
+    expect(successor.status, JSON.stringify(successor.body)).toBe(201);
+    expect(calls.at(-1).machine).toBe(HOST);
+    const stored = JSON.parse((c.hub.sql.exec('SELECT request_json FROM session_control_sessions WHERE id = ?', successor.body.id).one() as any).request_json);
+    expect(stored).toMatchObject({ intake_task_id: t.id, intake_worktree: 'successor', cwd: null });
+    // The sibling suffix is unique per replacement session (seedLaunch binds a
+    // fresh session id to the same request, so the plan derives from that id).
+    const seeded = seedLaunch(c, t.id, HOST, stored);
+    expect((await host(c, HOST, '/plan', { launch_id: seeded.launchId })).body.plan)
+      .toEqual({ mode: 'create', task_id: t.id, suffix: 'wt-r-' + seeded.sessionId.replace(/-/g, '').slice(0, 8) });
+    // A named cwd would resolve against the live-held tree and defeat the sibling.
+    for (const cwd of ['sub/dir', WT]) {
+      expect((await start({ key: 'successor-cwd-' + ++seq, workspace: WT, cwd, mode: 'headless', brief: 'x', intake_task_id: t.id, intake_worktree: 'successor' })).body)
+        .toMatchObject({ error: 'invalid_session_request', field: 'intake_worktree', detail: 'successor_start_names_cwd' });
+    }
+  }));
+});
+
 describe('resume plan + observe (host channel)', () => {
   it('creates once, then resumes in the recorded worktree; a missing one is recreated at the same path', async () => fixture(async c => {
     const t = await createTask(c);
