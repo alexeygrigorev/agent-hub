@@ -368,6 +368,9 @@ export class SessionControlService {
     // Intake 1c8d915e: expireUnclaimedStops runs on every host offers poll, so
     // its candidates come from live unclaimed stops only (after claim_token exists).
     this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_unclaimed_stops ON session_control_commands(created_at) WHERE kind = 'stop' AND state IN ('recorded','transported') AND claim_token IS NULL");
+    // Intake e8a22f4c: host polls, wake dispatch and the pending-command counters
+    // filter by state; without this every poll scanned the whole command history.
+    this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_commands_state ON session_control_commands(state, session_id)");
     // M15c lifecycle: additive observations/decisions tables. Server-owned
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
