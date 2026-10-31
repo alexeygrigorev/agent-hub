@@ -145,7 +145,10 @@ def diff_subscriptions(settings, accounts):
 # CLI and its login are present locally (intake 608a2f9a). Claude is covered by
 # the managed hub-claude bundle and Grok is a disabled provider, so neither is
 # auto-rendered.
-NATIVE_BINARIES = {"zcodex": "zcodex", "antigravity": "agy", "opencode": "opencode"}
+NATIVE_BINARIES = {"zcodex": ("zcodex",), "antigravity": ("agy", "antigravity"), "opencode": ("opencode",)}
+# User-scope install locations outside PATH (scripts/windows/add-hub-engines.ps1).
+NATIVE_BINARY_DIRS = ("~/.local/bin", "~/bin")
+WINDOWS_BINARY_DIRS = (("APPDATA", "npm"), ("LOCALAPPDATA", "Programs/Antigravity/bin"), ("LOCALAPPDATA", "Programs/agy"))
 NATIVE_LAUNCHER = {"zai": "zai", "gemini": "antigravity", "go": "opencode"}
 NATIVE_CREDENTIAL_MARKERS = {"go": "auth.json"}
 
@@ -158,14 +161,20 @@ def _default_launcher_model(provider, harness):
     return None
 
 
-def _find_binary(name, which=shutil.which, home=None):
-    found = which(name)
-    if found:
-        return found
-    local = Path(expand_home("~/.local/bin", home)) / name
-    for candidate in ([local.with_suffix(".cmd"), local.with_suffix(".exe")] if sys.platform == "win32" else []) + [local]:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
+def _find_binary(names, which=shutil.which, home=None):
+    dirs = [Path(expand_home(d, home)) for d in NATIVE_BINARY_DIRS]
+    if sys.platform == "win32":
+        dirs += [Path(os.environ[var]) / sub for var, sub in WINDOWS_BINARY_DIRS if os.environ.get(var)]
+    suffixes = (".exe", ".cmd", "") if sys.platform == "win32" else ("",)
+    for name in names:
+        found = which(name)
+        if found:
+            return found
+        for directory in dirs:
+            for suffix in suffixes:
+                candidate = directory / (name + suffix)
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
     return None
 
 
@@ -189,7 +198,7 @@ def native_subscriptions(settings, accounts=None, which=shutil.which, home=None,
         if (account["credential"]["mode"] != "host-home" or provider not in NATIVE_LAUNCHER
                 or provider in disabled or account["account"] in configured):
             continue
-        binary = _find_binary(NATIVE_BINARIES.get(harness, harness), which=which, home=home)
+        binary = _find_binary(NATIVE_BINARIES.get(harness, (harness,)), which=which, home=home)
         credential = Path(expand_home(account["credential"]["path"], home))
         marker = NATIVE_CREDENTIAL_MARKERS.get(provider)
         if not binary or not credential.is_dir() or (marker and not (credential / marker).is_file()):
