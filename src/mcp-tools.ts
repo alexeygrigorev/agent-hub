@@ -101,7 +101,6 @@ export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
   'host-goal': 'Operator set/inspect of durable host bring-up state; deliberate CLI step, not an agent tool.',
   'host-release': 'Operator release pin for a checkout-installed host; deliberate CLI step, not an agent tool.',
-  'host-goal': 'Operator bring-up state pin for a host; deliberate CLI step, not an agent tool.',
   'launcher-release': 'Operator release pin for a checkout-installed launcher; deliberate CLI step, not an agent tool.',
   'msg agent-credential': 'Writes a new private local credential file; MCP cannot write host files.',
   'msg agent-delegate': 'Operator grant of named-agent delegation to an MCP client; deliberate CLI step.',
