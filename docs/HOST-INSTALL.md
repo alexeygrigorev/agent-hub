@@ -1,6 +1,6 @@
 # Install a Hub session host
 
-Fresh native Windows enrollment is still being verified. The macOS runtime can't enforce Hub's required resource limits, so its controller won't start.
+Fresh native Windows enrollment is still being verified on a real desktop. The macOS runtime can't enforce Hub's required resource limits, so its controller won't start.
 
 Run one command in your ordinary user account. You don't need an administrator terminal.
 
