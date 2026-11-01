@@ -652,7 +652,7 @@ def main():
                       'Retry create/send with the same key and payload after uncertain results.', file=sys.stderr)
             sys.exit(1)
         return
-    if args.cmd == 'sessions':
+    if args.cmd in ('sessions', 'loop'):
         try:
             result = session_control.execute(args)
             rendered = session_control.render_output(args, result)

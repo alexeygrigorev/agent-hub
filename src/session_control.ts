@@ -161,6 +161,13 @@ const STOPPABLE = new Set(['offered', 'starting', 'running', 'uncertain']);
 export const CLEANUP_APPLY_ALLOWED_STATES = new Set([...STOPPABLE, 'stopped']);
 const BINDABLE = new Set(['offered', 'starting', 'uncertain', 'running']);
 const CLAIMABLE = new Set(['recorded', 'transported']);
+export const SESSION_CONTROL_PING_SCHEMA = `
+CREATE TABLE IF NOT EXISTS session_control_pings (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, actor TEXT NOT NULL, every_ms INTEGER NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, next_at_ms INTEGER NOT NULL, last_command_id TEXT, last_delivered_at TEXT, last_acked_at TEXT, delivered_count INTEGER NOT NULL DEFAULT 0, skipped_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, intake_task_id TEXT, owner_token_id TEXT, owner_family TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT, ended_by TEXT, ended_reason TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS session_control_pings_active ON session_control_pings(session_id) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS session_control_pings_due ON session_control_pings(state, next_at_ms)
+`;
+const PING_MIN_MS = 60 * 1000;
+const PING_MAX_MS = 7 * 24 * 3600 * 1000;
 const WAKE_ACK_TIMEOUT_MS = 10 * 60 * 1000;
 const WAKE_PROMPT_MAX = 8000;
 
@@ -397,6 +404,9 @@ export class SessionControlService {
       if (stmt.trim()) this.sql.exec(stmt);
     }
     for (const stmt of SESSION_CONTROL_WAKE_SCHEMA.split(';')) {
+      if (stmt.trim()) this.sql.exec(stmt);
+    }
+    for (const stmt of SESSION_CONTROL_PING_SCHEMA.split(';')) {
       if (stmt.trim()) this.sql.exec(stmt);
     }
     initResourceRequestProjection(this.sql, 'session_control_sessions');
@@ -813,8 +823,85 @@ export class SessionControlService {
     const row: any = this.sql.exec(`SELECT MIN(deadline) AS deadline FROM (
       SELECT wake_at_ms AS deadline FROM session_control_wakes WHERE state='pending'
       UNION ALL SELECT CAST((julianday(delivered_at)-2440587.5)*86400000 AS INTEGER)+600000
-      FROM session_control_wakes WHERE state='delivered')`).toArray()[0];
+      FROM session_control_wakes WHERE state='delivered'
+      UNION ALL SELECT next_at_ms AS deadline FROM session_control_pings WHERE state='active')`).toArray()[0];
     return typeof row?.deadline === 'number' ? row.deadline : null;
+  }
+
+  /** Active ping for a session (external /loop), or null. */
+  private activePingFor(sessionId: string): any | null {
+    try {
+      return this.sql.exec("SELECT * FROM session_control_pings WHERE session_id = ? AND state = 'active'", sessionId).toArray()[0] ?? null;
+    } catch { return null; }
+  }
+
+  private pingView(row: any): any {
+    if (!row) return null;
+    return { id: row.id, session_id: row.session_id, state: row.state, every_seconds: Math.round(row.every_ms / 1000),
+      prompt: row.prompt, next_at: row.state === 'active' ? new Date(row.next_at_ms).toISOString() : null,
+      delivered_count: row.delivered_count, skipped_count: row.skipped_count, failure_count: row.failure_count,
+      last_error: row.last_error ?? null, last_delivered_at: row.last_delivered_at ?? null, last_acked_at: row.last_acked_at ?? null,
+      created_by: row.actor, created_at: row.created_at, ended_at: row.ended_at ?? null, ended_by: row.ended_by ?? null, ended_reason: row.ended_reason ?? null };
+  }
+
+  private pingFailure(ping: any, intakeId: string | null, detail: string, text: string): void {
+    this.sql.exec("UPDATE session_control_pings SET failure_count = failure_count + 1, last_error = ?, updated_at = ? WHERE id = ?", detail.slice(0, 200), this.at(), ping.id);
+    this.recordWakeAlert(ping.session_id, ping.id, 'ping_failed', detail, intakeId);
+    try { this.appendWakeIntakeNote(intakeId, text, ping.id); } catch { /* alert row still records it */ }
+  }
+
+  /** Sweep external pings: reconcile the last delivery, end pings of finished
+   * sessions, deliver due ticks through the normal send command path and
+   * coalesce ticks while the session still has an unfinished command. */
+  public processPings(): { delivered: number; skipped: number; failed: number; ended: number } {
+    const out = { delivered: 0, skipped: 0, failed: 0, ended: 0 };
+    const nowMs = this.now(), at = this.at();
+    let pings: any[] = [];
+    try { pings = this.sql.exec("SELECT * FROM session_control_pings WHERE state = 'active' ORDER BY next_at_ms ASC, id ASC LIMIT 200").toArray() as any[]; } catch { return out; }
+    for (const ping of pings) {
+      try {
+        const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', ping.session_id).toArray()[0];
+        const intakeId = ping.intake_task_id ?? (session ? parsed(session.request_json, {})?.intake_task_id : null) ?? null;
+        const last: any = ping.last_command_id ? this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', ping.last_command_id).toArray()[0] : null;
+        if (!session || !['running', 'offered', 'starting', 'uncertain'].includes(session.state)) {
+          this.sql.exec("UPDATE session_control_pings SET state='ended', ended_at=?, ended_by='hub', ended_reason=?, updated_at=? WHERE id=?",
+            at, !session ? 'session_gone' : `session_${session.state}`, at, ping.id);
+          out.ended++;
+          continue;
+        }
+        if (last?.state === 'acked' && ping.last_acked_at === null) {
+          this.sql.exec('UPDATE session_control_pings SET last_acked_at=?, last_error=NULL, updated_at=? WHERE id=?', at, at, ping.id);
+        } else if (last && ['failed', 'uncertain'].includes(last.state) && ping.last_error === null) {
+          this.pingFailure(ping, intakeId, `ping_delivery_${last.state}`,
+            `Ping ${ping.id.slice(0, 8)} delivery to session ${ping.session_id} ended ${last.state}; the ping stays active and retries next tick.`);
+          out.failed++;
+        }
+        if (ping.next_at_ms > nowMs) continue;
+        // Coalesce: at most one tick is ever outstanding, never a catch-up burst.
+        const next = nowMs + ping.every_ms;
+        if (session.state !== 'running') { this.sql.exec('UPDATE session_control_pings SET next_at_ms=?, updated_at=? WHERE id=?', nowMs + 15000, at, ping.id); continue; }
+        const busy = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", session.id).toArray()[0]?.n ?? 0);
+        const pendingAll = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").toArray()[0]?.n ?? 0);
+        if (busy > 0 || pendingAll >= this.maxPending) {
+          this.sql.exec('UPDATE session_control_pings SET skipped_count = skipped_count + 1, next_at_ms=?, updated_at=? WHERE id=?', next, at, ping.id);
+          out.skipped++;
+          continue;
+        }
+        const binding = session.binding_json ? parsed(session.binding_json, null) : null;
+        const generation = binding?.generation ?? 0;
+        const commandId = crypto.randomUUID();
+        this.transaction(() => {
+          this.sql.exec(
+            'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            commandId, session.id, 'send', ping.actor, `ping-${ping.id}-${commandId}`, JSON.stringify({ body: ping.prompt }),
+            'recorded', generation, `cmd:${commandId}:gen:${generation}`, ping.owner_token_id ?? null, ping.owner_family ?? null, 0, at, at);
+          this.sql.exec('UPDATE session_control_pings SET last_command_id=?, last_delivered_at=?, last_acked_at=NULL, last_error=NULL, delivered_count=delivered_count+1, next_at_ms=?, updated_at=? WHERE id=?',
+            commandId, at, next, at, ping.id);
+        });
+        out.delivered++;
+      } catch { /* next ping */ }
+    }
+    return out;
   }
 
   private pendingWakeFor(sessionId: string): any | null {
@@ -965,6 +1052,7 @@ export class SessionControlService {
         this.sql.exec("UPDATE session_control_wakes SET state='resolved',updated_at=? WHERE id=?", at, wake.id);
       }
     }
+    try { this.processPings(); } catch { /* ping sweep never breaks wakes */ }
     return { delivered, acked, missed };
   }
 
@@ -1011,6 +1099,13 @@ export class SessionControlService {
         severity: 'warn', source: 'session_idle', subject: 'session:' + row.id,
         title: state + ': ' + row.id, detail: `${state}; intake_id=${intakeId || '(unlinked)'}; idle_for=${idleFor}s; last_activity_at=${lastActivity}; last_nudge=${lastNudge || 'none'}` });
     }
+    try {
+      for (const p of this.sql.exec("SELECT * FROM session_control_pings WHERE state='active' AND last_error IS NOT NULL").toArray() as any[]) {
+        result.push({ session_id: p.session_id, intake_id: p.intake_task_id, state: 'ping_failed', severity: 'warn', source: 'session_ping',
+          subject: 'session:' + p.session_id, title: 'ping_failed: ' + p.session_id,
+          detail: `ping ${p.id} last delivery failed (${p.last_error}); failures=${p.failure_count}; clear with hub loop clear` });
+      }
+    } catch { /* attention is best effort */ }
     return result;
   }
 
@@ -1216,6 +1311,7 @@ export class SessionControlService {
       parent_id,
       parent_source,
       ...(waitingActive ? { waiting_until, wake_id } : { waiting_until: null }),
+      ping: this.pingView(this.activePingFor(row.id)),
       ...(waitingActive && threshold !== null ? { warning_active: false } : {}),
       created_at: row.created_at, updated_at: row.updated_at,
     };
@@ -2883,7 +2979,7 @@ export class SessionControlService {
       });
     }
 
-    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel|protect|retirement|ack|events|wake|wakes|link))?$/.exec(path);
+    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel|protect|retirement|ack|events|wake|wakes|link|ping|ping-clear|pings))?$/.exec(path);
     if (sessionMatch) {
       const rawRef = decodeURIComponent(sessionMatch[1]);
       const sub = sessionMatch[3];
@@ -2897,7 +2993,7 @@ export class SessionControlService {
           const self = workerAccessContext(this.sql,caller.tokenId,this.now());
           const matches = (this.sql.exec('SELECT * FROM session_control_sessions WHERE fleet_launch_id = ?', rawRef).toArray() as any[])
             .filter(row => this.ownerOk(row,caller) || (self?.session_id === row.id &&
-              ((request.method === 'GET' && (!sub || ['commands','wakes'].includes(sub))) || (request.method === 'POST' && sub === 'wake'))));
+              ((request.method === 'GET' && (!sub || ['commands','wakes','pings'].includes(sub))) || (request.method === 'POST' && ['wake','ping','ping-clear'].includes(sub as string)))));
           if (matches.length > 1) return response({ error: 'ambiguous_name' }, 409);
           session = matches[0] ?? null;
         }
@@ -2932,7 +3028,7 @@ export class SessionControlService {
       } else if (rawRef.includes(':')) {
         if (sub === 'binding' || sub === 'retirement') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack', 'wake', 'wakes', 'link'].includes(sub) ? request.method === 'POST' || (sub === 'wakes' && request.method === 'GET') : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack', 'wake', 'wakes', 'link', 'ping', 'ping-clear', 'pings'].includes(sub) ? request.method === 'POST' || (['wakes', 'pings'].includes(sub) && request.method === 'GET') : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByQualifiedAlias(rawRef, caller);
@@ -2945,7 +3041,7 @@ export class SessionControlService {
         // binding path stays strict Hub UUID (no alias).
         if (sub === 'binding' || sub === 'retirement') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack', 'wake', 'wakes', 'link'].includes(sub) ? request.method === 'POST' || (sub === 'wakes' && request.method === 'GET') : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack', 'wake', 'wakes', 'link', 'ping', 'ping-clear', 'pings'].includes(sub) ? request.method === 'POST' || (['wakes', 'pings'].includes(sub) && request.method === 'GET') : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByName(rawRef, caller);
@@ -3229,9 +3325,9 @@ export class SessionControlService {
       const wakeOwnerOk = (row: any) => this.ownerOk(row,caller) ||
         !!row && workerWakeAllowed(this.sql,caller.tokenId,row.id,this.now());
       const scopedSelfRead = request.method === 'GET' && scopedWorker?.session_id === session?.id &&
-        (!sub || ['commands','wakes'].includes(sub));
+        (!sub || ['commands','wakes','pings'].includes(sub));
       if (!session || !(this.ownerOk(session,caller) || scopedSelfRead ||
-          (sub === 'wake' && request.method === 'POST' && wakeOwnerOk(session)))) return response({ error: 'not_found' },404);
+          (['wake','ping','ping-clear'].includes(sub as string) && request.method === 'POST' && wakeOwnerOk(session)))) return response({ error: 'not_found' },404);
 
       // Polling a capacity-queued intent adopts any Fleet-side promotion, so
       // the wait is observable without another placement call.
@@ -3253,6 +3349,51 @@ export class SessionControlService {
           const event = { id: crypto.randomUUID(), session_id: live.id, kind: 'warning_ack', actor: actorName(caller), created_at: this.at(), until_at: new Date(this.now() + seconds * 1000).toISOString() };
           this.sql.exec('INSERT INTO session_warning_events (id, session_id, kind, actor, created_at, until_at) VALUES (?, ?, ?, ?, ?, ?)', event.id, event.session_id, event.kind, event.actor, event.created_at, event.until_at);
           return response({ ...this.view(live, threshold), event });
+        });
+      }
+      if (sub === 'pings' && request.method === 'GET') {
+        if (!wakeOwnerOk(session)) return response({ error: 'not_found' }, 404);
+        return this.transaction(() => {
+          try { this.processPings(); } catch {}
+          const rows = this.sql.exec('SELECT * FROM session_control_pings WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT 20', session.id).toArray() as any[];
+          const alerts = this.sql.exec("SELECT * FROM session_control_wake_alerts WHERE session_id = ? AND kind LIKE 'ping_%' ORDER BY created_at DESC, id DESC LIMIT 20", session.id).toArray();
+          return response({ session_id: session.id, active: this.pingView(rows.find(r => r.state === 'active')), pings: rows.map(r => this.pingView(r)), alerts });
+        });
+      }
+      if (sub === 'ping' && request.method === 'POST') {
+        if (!writer || !wakeOwnerOk(session)) return response({ error: 'forbidden' }, 403);
+        const input = await body(request);
+        if (!obj(input, ['every_seconds', 'prompt']) || !Number.isSafeInteger(input.every_seconds) ||
+            input.every_seconds * 1000 < PING_MIN_MS || input.every_seconds * 1000 > PING_MAX_MS ||
+            typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > WAKE_PROMPT_MAX) {
+          return response({ error: 'invalid_ping' }, 400);
+        }
+        return this.transaction(() => {
+          const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+          if (!live || !wakeOwnerOk(live)) return response({ error: 'not_found' }, 404);
+          if (!['running', 'offered', 'starting', 'uncertain'].includes(live.state)) return response({ error: 'session_not_pingable' }, 409);
+          const nowIso = this.at(), everyMs = input.every_seconds * 1000;
+          const prior: any = this.activePingFor(live.id);
+          if (prior) this.sql.exec("UPDATE session_control_pings SET state='ended', ended_at=?, ended_by=?, ended_reason='replaced', updated_at=? WHERE id=?", nowIso, actorName(caller), nowIso, prior.id);
+          const req = parsed(live.request_json, {});
+          const id = crypto.randomUUID();
+          this.sql.exec(
+            'INSERT INTO session_control_pings (id, session_id, actor, every_ms, prompt, state, next_at_ms, intake_task_id, owner_token_id, owner_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            id, live.id, actorName(caller), everyMs, input.prompt.trim(), 'active', this.now() + everyMs,
+            typeof req?.intake_task_id === 'string' ? req.intake_task_id : null, caller.tokenId ?? null, this.presentingFamily(caller), nowIso, nowIso);
+          return response({ ping: this.pingView(this.sql.exec('SELECT * FROM session_control_pings WHERE id = ?', id).toArray()[0]), session_id: live.id, replaced: prior?.id ?? null }, 201);
+        });
+      }
+      if (sub === 'ping-clear' && request.method === 'POST') {
+        if (!writer || !wakeOwnerOk(session)) return response({ error: 'forbidden' }, 403);
+        const input = await body(request);
+        if (!obj(input, ['reason']) || (input.reason !== undefined && (typeof input.reason !== 'string' || input.reason.length > 500))) return response({ error: 'invalid_ping' }, 400);
+        return this.transaction(() => {
+          const prior: any = this.activePingFor(session.id);
+          const nowIso = this.at();
+          if (prior) this.sql.exec("UPDATE session_control_pings SET state='ended', ended_at=?, ended_by=?, ended_reason=?, updated_at=? WHERE id=?",
+            nowIso, actorName(caller), String(input.reason || 'cleared').slice(0, 500), nowIso, prior.id);
+          return response({ session_id: session.id, cleared: !!prior, ping_id: prior?.id ?? null });
         });
       }
       if ((sub === 'wake' || sub === 'wakes') && (request.method === 'POST' || request.method === 'GET')) {

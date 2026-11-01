@@ -238,6 +238,18 @@ describe('scoped durable worker access',()=>{
   expect((await api('/api/sessions/'+session+'/stop',{key:'no-self-stop'})).status).toBe(403);
   expect((await api('/api/sessions/'+other+'/wake',{key:'foreign',at,prompt:'no'})).status).toBe(403);
  },'interactive'));
+ it('lets a session create and clear its own ping but not a foreign one',()=>setup(async({stub,session,other,worker,call}:any)=>{
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec("UPDATE session_control_sessions SET state='running' WHERE id=?",session));
+  const api=(path:string,body?:any)=>call(path,body,worker.access_token);
+  const made=await api('/api/sessions/'+session+'/ping',{every_seconds:900,prompt:'status?'});
+  expect(made.status,await made.clone().text()).toBe(201);
+  expect(await (await api('/api/sessions/'+session)).json()).toMatchObject({ping:{every_seconds:900,state:'active'}});
+  expect((await (await api('/api/sessions/'+session+'/pings')).json() as any).active.prompt).toBe('status?');
+  expect((await api('/api/sessions/'+other+'/ping',{every_seconds:900,prompt:'no'})).status).toBe(403);
+  const cleared=await api('/api/sessions/'+session+'/ping-clear',{reason:'goal reached'});
+  expect(await cleared.json()).toMatchObject({cleared:true});
+  expect(await (await api('/api/sessions/'+session)).json()).toMatchObject({ping:null});
+ },'interactive'));
  it('lets a watcher wake only its direct parent on the same intake',()=>setup(async({stub,session,task,other,worker,call}:any)=>{
   const parent=uuid(), sibling=uuid();
   await runInDurableObject<Hub,any>(stub,(h:any)=>{

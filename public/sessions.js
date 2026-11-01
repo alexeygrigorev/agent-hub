@@ -499,6 +499,12 @@ function renderSessionDetail(session, commands = []) {
       addMetaItem(metaEl, 'Native Binding', `${session.binding.tag || '-'} (${session.binding.native_id || '-'})`);
     }
     addMetaItem(metaEl, 'Updated', (session.updated_at || '').slice(0, 19).replace('T', ' ') || '-');
+    if (session.ping && session.ping.state === 'active') {
+      const ping = session.ping;
+      let text = `every ${Math.round(ping.every_seconds / 60)} min, next ${String(ping.next_at || '').slice(0, 19).replace('T', ' ')}, sent ${ping.delivered_count}, skipped ${ping.skipped_count}`;
+      if (ping.last_error) text += `, FAILING: ${ping.last_error}`;
+      addMetaItem(metaEl, 'Ping', text);
+    }
     if (session.waiting_until) {
       addMetaItem(metaEl, 'Waiting until', String(session.waiting_until).slice(0, 19).replace('T', ' ') || String(session.waiting_until));
     }

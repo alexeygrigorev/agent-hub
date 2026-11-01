@@ -1115,7 +1115,7 @@ export class Hub extends DurableObject {
       if (path === '/api/sessions' || path.startsWith('/api/sessions/') ||
           path === '/api/session-commands' || path.startsWith('/api/session-commands/')) {
         const result = await this.sessionControlService.handle(request, await this.sessionControlAuth(request));
-        if (request.method === 'POST' && /\/wakes?$/.test(path) && result.ok) {
+        if (request.method === 'POST' && /\/(wakes?|ping|ping-clear)$/.test(path) && result.ok) {
           // Commit the durable wake before arming the existing alarm. Never postpone
           // an earlier alarm owned by another Hub service.
           const current = await this.ctx.storage.getAlarm();

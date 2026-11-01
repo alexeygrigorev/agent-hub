@@ -204,11 +204,11 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
     return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] === '/events';
   }
   if (path === '/api/sessions') return ['GET', 'POST'].includes(request.method);
-  const session = /^\/api\/sessions\/([0-9a-f-]{36})(?:\/(commands|capture|send|stop|wake|wakes))?$/.exec(path);
+  const session = /^\/api\/sessions\/([0-9a-f-]{36})(?:\/(commands|capture|send|stop|wake|wakes|ping|ping-clear|pings))?$/.exec(path);
   if (session) {
-    if ([worker.session_id,worker.launch_id,worker.native_binding?.native_id].includes(session[1])) return (request.method === 'GET' && (!session[2] || ['commands','wakes'].includes(session[2]))) ||
-      (request.method === 'POST' && session[2] === 'wake');
-    if (session[2] === 'wake' && request.method === 'POST' && workerWakeAllowed(sql,tokenId,session[1])) return true;
+    if ([worker.session_id,worker.launch_id,worker.native_binding?.native_id].includes(session[1])) return (request.method === 'GET' && (!session[2] || ['commands','wakes','pings'].includes(session[2]))) ||
+      (request.method === 'POST' && ['wake','ping','ping-clear'].includes(session[2]));
+    if (['wake','ping','ping-clear'].includes(session[2]) && request.method === 'POST' && workerWakeAllowed(sql,tokenId,session[1])) return true;
     const child: any = sql.exec('SELECT actor,parent_id FROM session_control_sessions WHERE id=?',session[1]).toArray()[0];
     return !!child && child.actor === worker.actor && child.parent_id === worker.session_id;
   }

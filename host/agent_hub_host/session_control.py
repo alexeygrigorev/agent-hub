@@ -454,6 +454,64 @@ def wait_for_command(session_id, command_id, timeout, interval):
                      'Command wait')
 
 
+PING_PROMPT_LIMIT = 8000
+
+
+def add_ping_arguments(node, name, required_id):
+    if required_id:
+        node.add_argument('id', help='Session id or friendly name')
+    else:
+        node.add_argument('id', nargs='?', default=None, help='Session id or name (default: this session from HUB_SESSION_ID or aplexer whoami)')
+    if name in ('create', 'set'):
+        node.add_argument('--every', required=True, help='Interval, e.g. 15m, 1h (min 1m, max 7d)')
+        src = node.add_mutually_exclusive_group(required=True)
+        src.add_argument('--prompt', default=None, help='Message delivered each tick (max 8 KiB)')
+        src.add_argument('--body-file', default=None, help='UTF-8 prompt file, or - for stdin')
+    if name in ('disable', 'clear'):
+        node.add_argument('--reason', default=None, help='Why the ping is cleared (recorded)')
+    node.add_argument('--json', action='store_true')
+
+
+def current_session_ref():
+    for key in ('HUB_SESSION_ID', 'AGENT_HUB_SESSION_ID'):
+        value = os.environ.get(key, '').strip()
+        if value:
+            return value
+    try:
+        import subprocess as _sp
+        out = _sp.run(['aplexer', 'whoami', '--json'], capture_output=True, text=True, timeout=15, check=True).stdout
+        value = json.loads(out).get('id')
+        if isinstance(value, str) and value:
+            return value
+    except Exception:
+        pass
+    raise SessionInputError('Cannot determine this session; pass the session id or set HUB_SESSION_ID')
+
+
+def execute_ping(args):
+    import re as _re
+    ref = getattr(args, 'id', None) or current_session_ref()
+    if not isinstance(ref, str) or not _re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}', ref):
+        raise ValueError('Invalid session id or name')
+    action = args.ping_cmd
+    base = '/api/sessions/' + ref
+    if action in ('create', 'set'):
+        if getattr(args, 'prompt', None) is not None:
+            text = read_prompt_text(args.prompt, limit=MAX_BRIEF, max_chars=MAX_BRIEF_CHARS, field='Prompt')
+        else:
+            text = read_file(args.body_file, limit=MAX_BRIEF, field='Body file')
+        if not text or not text.strip() or len(text) > PING_PROMPT_LIMIT:
+            raise SessionInputError('Prompt must be 1-8000 characters')
+        seconds = duration_seconds(args.every)
+        if seconds < 60 or seconds > 7 * 86400:
+            raise SessionInputError('--every must be between 1m and 7d')
+        return request('POST', base + '/ping', {'every_seconds': seconds, 'prompt': text})
+    if action in ('disable', 'clear'):
+        payload = {'reason': args.reason} if getattr(args, 'reason', None) else {}
+        return request('POST', base + '/ping-clear', payload)
+    return request('GET', base + '/pings')
+
+
 def duration_seconds(value):
     match = re.fullmatch(r'([1-9][0-9]*)([smhd])', str(value))
     if not match:
@@ -581,6 +639,21 @@ def add_commands(sub):
     wake_src = wake.add_mutually_exclusive_group(required=True)
     wake_src.add_argument('--body-file', help='UTF-8 prompt file, or - for stdin (max 8 KiB)')
     wake_src.add_argument('--prompt', default=None, help='Inline UTF-8 prompt text (max 8 KiB)')
+    ping = commands.add_parser('ping', help='External /loop: Hub delivers a message to a live session every interval (any engine); the session or owner clears it')
+    ping_cmds = ping.add_subparsers(dest='ping_cmd', required=True)
+    for name, helptext in (('create', 'Create or replace the recurring ping of a session'),
+                           ('disable', 'Clear the recurring ping (the session itself may do this when its goal is reached)'),
+                           ('show', 'Show the active ping, history and delivery failures')):
+        node = ping_cmds.add_parser(name, help=helptext)
+        add_ping_arguments(node, name, required_id=True)
+    loop = sub.add_parser('loop', help='Alias of sessions ping for the current session: set/clear/show a recurring Hub ping')
+    loop_cmds = loop.add_subparsers(dest='ping_cmd', required=True)
+    for name, helptext in (('set', 'Ping this session (or the given one) every interval'),
+                           ('clear', 'Clear the ping; run from inside the session when the goal is reached'),
+                           ('show', 'Show the ping state')):
+        node = loop_cmds.add_parser(name, help=helptext)
+        add_ping_arguments(node, name, required_id=False)
+        node.set_defaults(sessions_cmd='ping')
     warnings = commands.add_parser('warnings', help='Current unsnoozed long-running warnings with output tails')
     warnings.add_argument('--threshold')
     warnings.add_argument('--json', action='store_true')
@@ -828,6 +901,8 @@ def _execute(args):
     if cmd == 'ack':
         payload = {'snooze': duration_seconds(args.snooze)} if args.snooze else {}
         return request('POST', threshold_path(args, '/api/sessions/' + args.id + '/ack'), payload)
+    if cmd == 'ping':
+        return execute_ping(args)
     if cmd == 'wake':
         import uuid as _uuid
         import re as _re

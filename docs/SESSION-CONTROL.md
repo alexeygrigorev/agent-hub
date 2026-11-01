@@ -517,6 +517,34 @@ The host claims offers on a dedicated thread (`offers_loop`, every
 `OFFERS_POLL_S` = 2 s), independent of the main loop, and logs one
 `offer_dispatch_stages` event per claimed offer with the seconds spent in the
 admission, workspace, worktree, submit/plan and claim stages.
+### Session pings (external /loop, engine-agnostic)
+
+Hub, not the engine, delivers a message to an existing live session every
+interval through the normal verified send path. Works for claude, codex,
+zcodex, antigravity and opencode. This is not `hub schedule` (new session per
+tick) and not `hub sessions wake` (one shot).
+
+```
+hub sessions ping create <session> --every 15m (--prompt TEXT | --body-file F)   # alias: hub loop set
+hub sessions ping disable <session> [--reason TEXT]                               # alias: hub loop clear
+hub sessions ping show <session>                                                  # alias: hub loop show
+```
+
+- `hub loop ...` without a session id targets the current session
+  (`HUB_SESSION_ID`, else `aplexer whoami`). The session clears its own ping
+  with its worker/agent credential when the goal is reached; the owner can too.
+- Interval 1m..7d; one active ping per session (create replaces).
+- Ticks coalesce: while the session still has an unfinished command the tick is
+  skipped (counted), never queued up.
+- The ping ends automatically when the session ends.
+- Failed or uncertain deliveries are never silent: a `ping_failed` alert row,
+  an intake note when the session is linked to an intake, and a
+  `session_ping` attention item until the next delivery is acknowledged.
+- Visible as `ping` in `hub sessions show` / the session detail page.
+- REST: `POST /api/sessions/:id/ping {every_seconds, prompt}`,
+  `POST /api/sessions/:id/ping-clear {reason}`, `GET /api/sessions/:id/pings`.
+  MCP: `sessions_ping`, `sessions_ping_clear`, `sessions_pings`.
+- Storage: `session_control_pings` (one row per ping, `state` active|ended).
 
 ### Scheduled wakes (waiting on an external event = register a Hub wake)
 
