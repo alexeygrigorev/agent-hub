@@ -469,7 +469,7 @@ describe('bounded queue maintenance', () => {
     writes=0;
     for(let i=0;i<3;i++) {
       const result:any=await (await restarted.handle(fleetReq('/offers',undefined,'GET'),host('hetzner'))).json();
-      expect(result).toEqual({offers:[],reconciliation:[]});
+      expect(result).toEqual({offers:[],reconciliation:[],engine_epoch:'0'});
     }
     expect(writes).toBe(0);
   }));
