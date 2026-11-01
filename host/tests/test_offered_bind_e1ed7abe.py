@@ -125,7 +125,7 @@ class PendingCapture(unittest.TestCase):
                 patch.object(sc.time, 'monotonic', side_effect=lambda: clock[0]), \
                 patch.object(sc.time, 'sleep', side_effect=lambda s: clock.__setitem__(0, clock[0] + s)), \
                 patch.object(sc, 'BIND_WAIT_TIMEOUT', 6.0), contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaisesRegex(sc.SessionInputError, 'session_not_bound; session owned did not reach running'):
+            with self.assertRaisesRegex(ValueError, 'session_not_bound; session owned did not reach running'):
                 sc.execute(self.args())
 
     def test_capture_stops_waiting_when_the_session_is_terminal(self):
@@ -135,7 +135,7 @@ class PendingCapture(unittest.TestCase):
             return {'state': 'failed'}
         with patch.object(sc, 'request', side_effect=fake), patch.object(sc.time, 'sleep') as sleep, \
                 contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaisesRegex(sc.SessionInputError, 'session_not_bound'):
+            with self.assertRaisesRegex(ValueError, 'session_not_bound'):
                 sc.execute(self.args())
         sleep.assert_not_called()
 
