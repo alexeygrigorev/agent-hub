@@ -5,6 +5,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { CallerContext } from './bus';
 import { generateTokenPair } from './auth/token';
+import { formatNativeActor } from './work_claim';
 
 export const WORKER_SCOPE = 'worker:own-intake';
 export const WORKER_ACCESS_SCHEMA = `CREATE TABLE IF NOT EXISTS worker_access (
@@ -193,6 +194,9 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
   }
   // Filing a follow-up intake; the intake service records provenance and caps volume.
   if (path === '/api/intake/tasks') return request.method === 'POST';
+  // Only the release handler opens: it rechecks the exact claim owner under
+  // the effect transaction. This grants no claim listing or creation scope.
+  if (/^\/api\/bus\/claims\/[^/]+\/release$/.test(path)) return request.method === 'POST';
   const ownIntake = INTAKE_TASK_PATH.exec(path);
   if (ownIntake) {
     const id = ownIntake[1];
@@ -218,6 +222,29 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
 export class WorkerAccess {
   constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private hostAllowed: (caller: CallerContext) => boolean) {}
   init() { this.sql.exec(WORKER_ACCESS_SCHEMA); this.sql.exec(WORKER_CREATED_SCHEMA); this.sql.exec(WORKER_CREATED_INDEX); }
+  releaseClaim(caller: CallerContext, target: string): Response {
+    return this.tx(() => {
+      const worker = workerAccessContext(this.sql, caller.tokenId);
+      const deny = () => Response.json({ error: 'worker_claim_forbidden' }, { status: 403 });
+      if (!worker || worker.actor !== caller.actor || worker.token_hash !== caller.tokenHash) return deny();
+      let claim: any;
+      if (target.includes(':')) {
+        const [project, ...parts] = target.split(':');
+        const scope = parts.join(':');
+        if (scope.includes('..')) return deny();
+        const normalized = scope.split('/').filter(p => p && p !== '.').join('/');
+        if (!normalized) return deny();
+        claim = this.sql.exec('SELECT * FROM claims WHERE project=? AND scope=? AND released_at IS NULL ORDER BY created_at DESC LIMIT 1', project, normalized).toArray()[0];
+      } else claim = this.sql.exec('SELECT * FROM claims WHERE id=?', target).toArray()[0];
+      const binding = worker.native_binding;
+      const ownNative = claim?.claim_source === 'native' && binding?.native_id && binding?.tag &&
+        binding.workspace === worker.workspace && claim.worktree === worker.workspace &&
+        claim.holder === formatNativeActor(worker.machine_id, binding.tag, binding.native_id);
+      if (!claim || claim.project !== worker.task_project || (claim.holder !== worker.actor && !ownNative)) return deny();
+      if (!claim.released_at) this.sql.exec('UPDATE claims SET released_at=? WHERE id=?', Date.now(), claim.id);
+      return Response.json({ status: 'ok' });
+    });
+  }
   async issue(request: Request, caller: CallerContext | undefined, scopes: string[] | undefined): Promise<Response> {
     const id = /^\/api\/fleet\/launches\/([0-9a-f-]{36})\/worker-credential$/.exec(new URL(request.url).pathname)?.[1];
     const reply = (data: any, status=200) => Response.json(data,{status,headers:{'Cache-Control':'no-store'}});

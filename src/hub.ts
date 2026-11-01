@@ -3579,7 +3579,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin') && !auth.scopes?.includes(WORKER_SCOPE)) {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
@@ -3598,6 +3598,7 @@ export class Hub extends DurableObject {
       }
 
       try {
+        if (auth.scopes?.includes(WORKER_SCOPE)) return this.workerAccess.releaseClaim(auth.caller!, target);
         this.busService.releaseClaim(auth.caller!, target, Date.now(), leaseEpoch);
         return Response.json({ status: 'ok' });
       } catch (e: any) {

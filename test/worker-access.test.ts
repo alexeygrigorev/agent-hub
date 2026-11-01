@@ -3,6 +3,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { sha256 } from '../src/auth/crypto';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
+import { formatNativeActor } from '../src/work_claim';
 const uuid=()=>crypto.randomUUID();
 async function setup(fn: (x:any)=>Promise<void>, mode = 'headless') {
  const stub=(env as unknown as Env).HUB.get((env as unknown as Env).HUB.idFromName('worker-'+uuid()));
@@ -23,6 +24,62 @@ async function setup(fn: (x:any)=>Promise<void>, mode = 'headless') {
  await fn({stub,id,task,session,other,worker,call});
 }
 describe('scoped durable worker access',()=>{
+ it.each(['headless','interactive'])('%s normalizes own-intake note aliases before checking worker event kinds (238103ed)', mode=>setup(async({task,other,worker,call}:any)=>{
+  const api=(id:string,b:any)=>call('/api/intake/tasks/'+id+'/events',b,worker.access_token);
+  let version=1;
+  const aliases=[{note:'original failing worker shape'}, {note:{text:'note object'}}, {text:'top-level text'},
+   {event:{note:'wrapped note string'}}, {event:{note:{text:'wrapped note object'}}},
+   {event:{event:{kind:'note',text:'wrapped event'}}}, {event:{kind:'note',text:'canonical note'}}];
+  for(const alias of aliases) {
+   const body={key:uuid(),expected_version:version,...alias};
+   const res=await api(task,body);expect(res.status,await res.clone().text()).toBe(200);
+   const data:any=await res.json();version++;
+   expect(data.task.version).toBe(version);
+   expect(data.task.payload_data.history.at(-1).kind).toBe('note');
+   const replay=await api(task,body);expect(replay.status).toBe(200);
+   expect((await replay.json() as any).task.version).toBe(version);
+   const cross=await api(other,{...body,key:uuid(),expected_version:1});
+   expect(cross.status).toBe(403);expect(await cross.json()).toEqual({error:'cross_intake_forbidden'});
+  }
+  const stale=await api(task,{key:uuid(),expected_version:1,note:'stale'});expect(stale.status).toBe(409);
+  for(const event of [{kind:'decision',text:'no'}, {event:{kind:'decision',text:'no'}}, {kind:'note',text:'yes',event:{kind:'decision',text:'no'}}]) {
+   const res=await api(task,{key:uuid(),expected_version:version,event});
+   expect([400,403]).toContain(res.status);
+   if(res.status===403) expect(await res.json()).toEqual({error:'worker_event_forbidden'});
+  }
+  const ambiguous=await api(task,{key:uuid(),expected_version:version,note:'yes',event:{kind:'decision',text:'no'}});
+  expect(ambiguous.status).toBe(400);
+  expect((await api(task,{key:uuid(),expected_version:version,note:{kind:'decision',text:'no'}})).status).toBe(400);
+ },mode));
+
+ it('releases only claims held by the worker actor or its exact attested native workspace',()=>setup(async({stub,id,session,worker,call}:any)=>{
+  const native=uuid(), tag='hub-own-claim', own=uuid(), bridged=uuid(), byScope=uuid(), peer=uuid(), old=uuid(), wrongWorkspace=uuid(), wrongProject=uuid(), wrongHost=uuid();
+  const actor='hub-workers:worker-'+id;
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify({native_id:native,tag,workspace:'/repo'}),session);
+   for(const [id,holder,project,worktree,source] of [
+    [own,actor,'agent-hub','/repo','hub'],[byScope,actor,'agent-hub','/repo','hub'],[bridged,formatNativeActor('worker-host',tag,native),'agent-hub','/repo','native'],
+    [peer,'someone-else','agent-hub','/repo','hub'],[old,formatNativeActor('worker-host',tag,uuid()),'agent-hub','/repo','native'],
+    [wrongWorkspace,formatNativeActor('worker-host',tag,native),'agent-hub','/other','native'],[wrongProject,actor,'other-project','/repo','hub'],
+    [wrongHost,formatNativeActor('another-host',tag,native),'agent-hub','/repo','native']])
+    h.sql.exec('INSERT INTO claims(id,project,scope,holder,created_at,expires_at,worktree,claim_source) VALUES(?,?,?,?,?,?,?,?)',id,project,'src/'+id,holder,Date.now(),Date.now()+60000,worktree,source);
+  });
+  const release=(target:string)=>call('/api/bus/claims/'+encodeURIComponent(target)+'/release',{},worker.access_token);
+  for(const id of [own,bridged]) {expect((await release(id)).status).toBe(200);expect((await release(id)).status).toBe(200);}
+  expect((await release('agent-hub:src/'+byScope)).status).toBe(200);
+  for(const id of [peer,old,wrongWorkspace,wrongProject,wrongHost,uuid()]) {
+   const res=await release(id);expect(res.status).toBe(403);expect(await res.json()).toEqual({error:'worker_claim_forbidden'});
+  }
+  expect((await release('agent-hub:src/'+peer)).status).toBe(403);
+  expect((await call('/api/bus/claims',undefined,worker.access_token)).status).toBe(403);
+  expect((await call('/api/bus/claims',{project:'agent-hub',scope:'x',holder:actor},worker.access_token)).status).toBe(403);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   for(const id of [own,bridged,byScope]) expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?',id).toArray()[0].released_at).toBeTruthy();
+   for(const id of [peer,old,wrongWorkspace,wrongProject,wrongHost]) expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?',id).toArray()[0].released_at).toBeNull();
+   h.sql.exec('UPDATE worker_access SET expires_at=?',Date.now()-1);
+  });
+  expect((await release(own)).status).toBe(403);
+ }));
  it.each(['headless','interactive'])('%s reads quota and own resource details without gaining fleet controls', mode=>setup(async({stub,session,task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   await runInDurableObject<Hub,any>(stub,(h:any)=>{

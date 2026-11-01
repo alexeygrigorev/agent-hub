@@ -157,6 +157,8 @@ def http_error(exc, method, payload):
         detail += '; commits must be in origin/main with a green Deploy: merge, wait for CI, then hub intake merge-check <intake> (operator override: --force --reason TEXT)'
     if code == 'invalid_event_kind':
         detail += '; valid kinds: ' + ', '.join(EVENT_KINDS)
+    if code == 'worker_event_forbidden':
+        detail += '; workers may append only note, report, or blocker events; pass JSON like {"kind":"note","text":"..."} to --event-file (use - for stdin)'
     # Only locally generated wording is printed, never arbitrary server messages.
     result.args = (str(result) + detail,)
     return result

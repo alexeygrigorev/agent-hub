@@ -535,14 +535,15 @@ class TestIntakeCli(unittest.TestCase):
             self.assertNotIn('private-token', error)
 
     def test_http_field_limits_and_invalid_event_kinds_are_actionable(self):
-        for body, expected in [({'error': 'invalid_field', 'field': 'text', 'max_bytes': 8192}, 'field: text; max 8192 UTF-8 bytes'),
-                               ({'error': 'invalid_event_kind', 'message': 'private-token'}, 'valid kinds: ' + ', '.join(intake.EVENT_KINDS))]:
-            exc = urllib.error.HTTPError('https://fixture.test', 400, 'private-token', {}, io.BytesIO(json.dumps(body).encode()))
+        for body, status, expected in [({'error': 'invalid_field', 'field': 'text', 'max_bytes': 8192}, 400, 'field: text; max 8192 UTF-8 bytes'),
+                                       ({'error': 'invalid_event_kind', 'message': 'private-token'}, 400, 'valid kinds: ' + ', '.join(intake.EVENT_KINDS)),
+                                       ({'error': 'worker_event_forbidden', 'message': 'private-token'}, 403, 'workers may append only note, report, or blocker events; pass JSON like {"kind":"note","text":"..."} to --event-file (use - for stdin)')]:
+            exc = urllib.error.HTTPError('https://fixture.test', status, 'private-token', {}, io.BytesIO(json.dumps(body).encode()))
             with patch.object(intake, 'request', side_effect=intake.http_error(exc, 'POST', {'key': 'good'})), \
                  patch.object(intake, 'json_file', return_value={'kind': 'update'}):
                 code, _, error = self.run_cli('intake', 'append', 'task-1', '--version', '1', '--key', 'good', '--event-file', '-')
             self.assertEqual(code, 1)
-            self.assertIn('Intake HTTP 400: ' + body['error'], error)
+            self.assertIn(f'Intake HTTP {status}: ' + body['error'], error)
             self.assertIn(expected, error)
             self.assertNotIn('private-token', error)
         exc = urllib.error.HTTPError('https://fixture.test', 400, 'private', {}, io.BytesIO(b'{"error":"invalid_field","field":"private-token","message":"private-token"}'))

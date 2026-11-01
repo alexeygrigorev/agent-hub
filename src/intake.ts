@@ -98,6 +98,33 @@ function worktreeFail(e: unknown): never {
   throw e;
 }
 function fail(code: string, status = 400): never { throw new IntakeError(code, status); }
+/** Resolve all documented append spellings once, before worker authorization.
+ * An explicit kind remains authoritative; aliases never turn a decision into a note. */
+function appendEvent(b: Obj): Obj {
+  if ('note' in b && 'event' in b) throw new IntakeError('invalid_field', 400, 'note');
+  if ('text' in b && ('note' in b || 'event' in b)) throw new IntakeError('invalid_field', 400, 'text');
+  if (!('note' in b) && !('event' in b) && !('text' in b)) fail('event_or_note_required');
+  let rawNoteOrEvent: any = 'note' in b ? b.note : ('event' in b ? b.event : { text: b.text });
+  let isNote = 'note' in b || 'text' in b;
+  if (rawNoteOrEvent && typeof rawNoteOrEvent === 'object' && !Array.isArray(rawNoteOrEvent)) {
+    if ('note' in rawNoteOrEvent && !('kind' in rawNoteOrEvent)) {
+      rawNoteOrEvent = rawNoteOrEvent.note;
+      isNote = true;
+    } else if ('event' in rawNoteOrEvent && !('kind' in rawNoteOrEvent)) {
+      rawNoteOrEvent = rawNoteOrEvent.event;
+    }
+  }
+  if (typeof rawNoteOrEvent === 'string') {
+    if (!isNote) fail('invalid_object');
+    rawNoteOrEvent = { text: rawNoteOrEvent };
+  }
+  let event = object(rawNoteOrEvent);
+  if (isNote) {
+    keys(event, ['text', 'source']);
+    event = { ...event, kind: 'note' };
+  }
+  return event;
+}
 const encoded = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 /** History is a retained ledger, not mutable task metadata. Budget it through
  * event count, bounded input, full-record and aggregate storage limits instead
@@ -1388,28 +1415,7 @@ export class IntakeService {
       // on the same validation/authorization path. Never silently pick one.
       // Also accept note as a UTF-8 string and top-level text as note text so
       // common agent payloads do not flake as opaque invalid_object.
-      if ('note' in b && 'event' in b) throw new IntakeError('invalid_field', 400, 'note');
-      if ('text' in b && ('note' in b || 'event' in b)) throw new IntakeError('invalid_field', 400, 'text');
-      if (!('note' in b) && !('event' in b) && !('text' in b)) fail('event_or_note_required');
-      let rawNoteOrEvent: any = 'note' in b ? b.note : ('event' in b ? b.event : { text: b.text });
-      let isNote = 'note' in b || 'text' in b;
-      if (rawNoteOrEvent && typeof rawNoteOrEvent === 'object' && !Array.isArray(rawNoteOrEvent)) {
-        if ('note' in rawNoteOrEvent && !('kind' in rawNoteOrEvent)) {
-          rawNoteOrEvent = rawNoteOrEvent.note;
-          isNote = true;
-        } else if ('event' in rawNoteOrEvent && !('kind' in rawNoteOrEvent)) {
-          rawNoteOrEvent = rawNoteOrEvent.event;
-        }
-      }
-      if (typeof rawNoteOrEvent === 'string') {
-        if (!isNote) fail('invalid_object');
-        rawNoteOrEvent = { text: rawNoteOrEvent };
-      }
-      let event = object(rawNoteOrEvent);
-      if (isNote) {
-        keys(event, ['text', 'source']);
-        event = { ...event, kind: 'note' };
-      }
+      const event = appendEvent(b);
       task.history.push(this.event(event, task, p, now));
       // F2: new intake text changes the decision basis -> re-hint. Other
       // event kinds (notes, scope decisions themselves) never change the flag.
@@ -1852,7 +1858,14 @@ export class IntakeService {
           Object.keys(payload).every(k => ['key', 'expected_version', 'acceptance_criteria', 'project'].includes(k)) &&
           ('acceptance_criteria' in payload || 'project' in payload);
         const workerCreate = p.worker && path === '/tasks';
-        if (p.worker && !triageUpdate && !workerCreate && (!(/^\/tasks\/[^/]+\/merge-evidence$/.test(path) || (/^\/tasks\/[^/]+\/events$/.test(path) && ['note','report','blocker'].includes(payload.event?.kind))))) fail('forbidden', 403);
+        if (p.worker && !triageUpdate && !workerCreate && !/^\/tasks\/[^/]+\/merge-evidence$/.test(path)) {
+          if (!/^\/tasks\/[^/]+\/events$/.test(path)) fail('forbidden', 403);
+          const event = appendEvent(payload);
+          if (!['note', 'report', 'blocker'].includes(event.kind)) fail('worker_event_forbidden', 403);
+          payload.event = event;
+          delete payload.note;
+          delete payload.text;
+        }
         if (p.worker && /\/merge-evidence$/.test(path)) payload.event = undefined;
         if (p.worker && !triageUpdate && !workerCreate && payload.event) payload.event = redactClaimData(payload.event);
         // Do not replay a private response after the caller loses its task/operator grant.
