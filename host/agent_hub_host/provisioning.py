@@ -702,12 +702,21 @@ def profiles(bundles, path=None):
     """Replace only our marked block; refuse a collision with operator profiles."""
     path = Path(path) if path else profile_path()
     # aplexer's ordinary TOML may originally be 0644. Tighten only this owned file
-    # and its containing directory after no-follow ownership checks.
-    with private_fs.parent(path, create=True, private=False) as anchor:
+    # and its containing directory after no-follow ownership checks. On Windows
+    # the same applies to an ACL inherited from e.g. MSYS/Cygwin mkdir (Everyone,
+    # NULL SID deny ACEs): without tightening, every sync died here before it
+    # installed engines or reported host state (intake 8d006dc3).
+    with private_fs.parent(path, create=True, private=False, owned=os.name == 'nt') as anchor:
         if os.name != 'nt':
             if os.fstat(anchor).st_uid != os.getuid():
                 raise PermissionError('Unowned aplexer directory')
             os.fchmod(anchor, 0o700)
+        else:
+            from . import win32_fs
+            try:
+                win32_fs.restrict_file(path)
+            except FileNotFoundError:
+                pass
         try:
             fd = private_fs._open(anchor, path, os.O_RDONLY, private=False)
         except FileNotFoundError:

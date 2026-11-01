@@ -24,10 +24,12 @@ def _private(info, directory=False):
 
 
 @contextmanager
-def parent(path, *, create=False, private=True):
+def parent(path, *, create=False, private=True, owned=False):
+    # owned=True (Windows): restrict the user-owned leaf directory to an
+    # owner-only protected DACL first; POSIX callers fchmod the anchor instead.
     if _windows():
         from . import win32_fs
-        with win32_fs.parent(path, create=create, private=private, native=not private) as anchor:
+        with win32_fs.parent(path, create=create, private=private, native=not private, owned=owned) as anchor:
             yield anchor
         return
     path = Path(os.path.abspath(path))

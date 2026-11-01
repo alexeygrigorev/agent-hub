@@ -16,6 +16,7 @@ TRUSTED_DIRECTORY_SIDS = ('S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')
 BOOL = C.c_int
 FULL = 0x1f01ff
 READ_CONTROL = 0x20000
+WRITE_DAC = 0x40000
 REPARSE = 0x400
 DIRECTORY = 0x10
 
@@ -63,6 +64,8 @@ class API:
         bind(adv, 'ConvertStringSecurityDescriptorToSecurityDescriptorW', [C.c_wchar_p, U32, C.POINTER(PTR), PTR])
         bind(adv, 'GetSecurityInfo', [PTR, U32, U32, C.POINTER(PTR), PTR, C.POINTER(PTR), PTR, C.POINTER(PTR)], U32)
         bind(adv, 'GetSecurityDescriptorControl', [PTR, C.POINTER(U16), C.POINTER(U32)])
+        bind(adv, 'GetSecurityDescriptorDacl', [PTR, C.POINTER(BOOL), C.POINTER(PTR), C.POINTER(BOOL)])
+        bind(adv, 'SetSecurityInfo', [PTR, U32, U32, PTR, PTR, PTR, PTR], U32)
         bind(adv, 'GetAce', [PTR, U32, C.POINTER(PTR)])
         bind(adv, 'EqualSid', [PTR, PTR])
         bind(adv, 'ConvertStringSidToSidW', [C.c_wchar_p, C.POINTER(PTR)])
@@ -147,6 +150,33 @@ class API:
             if sd:
                 self.LocalFree(sd)
 
+    def restrict(self, handle, directory=False):
+        """Windows analogue of fchmod 0700/0600 on an object the user already owns.
+
+        Replaces the DACL with the protected owner-only descriptor used for
+        objects we create. Refuses objects owned by anyone else. Inheritable
+        ACEs propagate to existing children (SetSecurityInfo semantics).
+        """
+        owner, sd = PTR(), PTR()
+        error = self.GetSecurityInfo(handle, 1, 1, C.byref(owner), None, None, None, C.byref(sd))
+        if error:
+            raise OSError(error, 'Cannot verify owner')
+        try:
+            if not owner or not self.EqualSid(owner, self.user_sid):
+                raise PermissionError('Refusing to restrict an object owned by another principal')
+        finally:
+            if sd:
+                self.LocalFree(sd)
+        with self.security(directory=directory) as sa:
+            present, dacl, defaulted = BOOL(), PTR(), BOOL()
+            self.check(self.GetSecurityDescriptorDacl(sa.descriptor, C.byref(present), C.byref(dacl), C.byref(defaulted)))
+            if not present.value or not dacl:
+                raise PermissionError('Owner-only DACL unavailable')
+            # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+            error = self.SetSecurityInfo(handle, 1, 0x4 | 0x80000000, None, None, dacl, None)
+            if error:
+                raise OSError(error, 'Cannot restrict ACL')
+
     def info(self, handle, directory=False):
         info = FileInfo()
         self.check(self.GetFileInformationByHandle(handle, C.byref(info)))
@@ -207,8 +237,14 @@ def local_path(path):
 
 
 @contextmanager
-def parent(path, *, create=False, private=True, native=False):
+def parent(path, *, create=False, private=True, native=False, owned=False):
+    """Pin every ancestor of path. owned=True restricts the user-owned leaf
+    directory to the protected owner-only DACL before any ACL proof, exactly as
+    POSIX callers fchmod(0o700) a directory they own (e.g. %APPDATA%\aplexer
+    created by an MSYS/Cygwin tool with a POSIX-mapped ACL)."""
     root, parts = local_path(path)
+    if owned and len(parts) < 2:
+        raise PermissionError('Refusing to restrict a drive root')
     a = api()
     with ExitStack() as stack:
         current = root
@@ -216,7 +252,8 @@ def parent(path, *, create=False, private=True, native=False):
         handle = a.open(current, 0, directory=True)
         stack.callback(a.CloseHandle, handle)
         handles.append(handle)
-        for component in parts[:-1]:
+        leaf = len(parts) - 2
+        for index, component in enumerate(parts[:-1]):
             current = ntpath.join(current, component)
             if create:
                 with a.security(directory=True) as sa:
@@ -224,9 +261,11 @@ def parent(path, *, create=False, private=True, native=False):
                         error = C.get_last_error()
                         if error != 183:  # ERROR_ALREADY_EXISTS; still verify opened object
                             raise C.WinError(error)
-            handle = a.open(current, 0, directory=True)
+            handle = a.open(current, WRITE_DAC if owned and index == leaf else 0, directory=True)
             stack.callback(a.CloseHandle, handle)
             handles.append(handle)
+        if owned:
+            a.restrict(handle, directory=True)
         if native:
             # Native Rust files may inherit their sole owner ACE. Verify the
             # complete owner-only suffix back to a protected directory while
@@ -258,6 +297,20 @@ def open_file(path, flags, *, private=True):
         a.CloseHandle(handle)
         raise
     return fd  # CRT fd now owns the handle
+
+
+def restrict_file(path):
+    """fchmod(0o600) analogue for an existing user-owned regular file.
+
+    The caller holds pinned ancestors (parent()). Reparse points, directories
+    and multiply linked files are refused by API.open/info. Missing files raise
+    FileNotFoundError."""
+    a = api()
+    handle = a.open(path, WRITE_DAC)
+    try:
+        a.restrict(handle)
+    finally:
+        a.CloseHandle(handle)
 
 
 def replace(source, target):
