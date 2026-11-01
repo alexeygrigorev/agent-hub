@@ -56,6 +56,58 @@ def write_json(path, value):
     private_fs.atomic_write(path, json.dumps(value).encode(), 1048576)
 
 
+def native_antigravity_token_path():
+    """The host's own agy login file (%USERPROFILE%\\.gemini\\... on Windows)."""
+    return Path.home().joinpath(*ANTIGRAVITY_TOKEN.split('/'))
+
+
+def sync_native_antigravity(bundle):
+    """Install the central store's Antigravity token where the host's own `agy` reads it.
+
+    Hosts never log in: the maintained launcher's admission probe and any native
+    run use the default home, which has no token unless the store provides one
+    (intake 5814e109: no token -> agy opened an OAuth browser tab every probe).
+    A local file is replaced only when it is missing or still exactly what this
+    sync wrote last; a token the engine rotated locally is never clobbered.
+    Returns a non-secret status string.
+    """
+    if bundle.get('provider') != 'antigravity':
+        return 'not_antigravity'
+    token = (bundle.get('files') or {}).get(ANTIGRAVITY_TOKEN)
+    if not isinstance(token, str) or not token:
+        return 'no_store_credential'
+    import hashlib
+    raw = token.encode('utf-8')
+    digest = hashlib.sha256(raw).hexdigest()
+    target = native_antigravity_token_path()
+    marker = root() / 'native-antigravity.json'
+    last = (read_json(marker, {}) or {}).get('sha256')
+    try:
+        current = target.read_bytes() if target.is_file() else None
+    except OSError:
+        current = None
+    if current == raw:
+        status = 'current'
+    elif current is not None and hashlib.sha256(current).hexdigest() != last:
+        return 'local_token_kept'
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging = target.with_name(target.name + '.hub-%d.tmp' % os.getpid())
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+        fd = os.open(staging, flags, 0o600)
+        try:
+            with os.fdopen(fd, 'wb') as out:
+                out.write(raw)
+            os.replace(staging, target)
+        finally:
+            if staging.exists():
+                staging.unlink()
+        status = 'installed'
+    if last != digest:
+        write_json(marker, {'sha256': digest})
+    return status
+
+
 def normalize_git_identity(conf) -> dict[str, str]:
     if not isinstance(conf, dict):
         return {}
@@ -1295,6 +1347,10 @@ def sync(request=None):
         profiles(installed_bundles)
         write_json(root() / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']} for b in installed_bundles])
         for b in installed_bundles:
+            try:
+                sync_native_antigravity(b)
+            except Exception as e:
+                print(json.dumps({'native_antigravity_sync_failed': type(e).__name__}), file=sys.stderr)
             authenticated = b['provider'] != 'gemini' or (root() / (b['label'] + '-' + b['revision']) / 'home/.gemini/oauth_creds.json').is_file()
             request('POST', '/api/engines/' + b['label'], {'revision': b['revision'], 'authenticated': authenticated})
         from . import engine_login
