@@ -137,10 +137,15 @@ describe('private durable intake HTTP/SQLite', () => {
       h.sql.exec("UPDATE intake_tasks SET data=json_insert(data,'$.history[#]',json(?)) WHERE id=?",
         JSON.stringify({ kind: 'link', hub_session_id: id }), task.id);
     });
-    expect((await ok('/summary')).recent[0].session).toMatchObject({ id, state: 'running' });
-    expect((await ok('/summary', undefined, agent.token)).recent[0].session).toEqual({ id, linkage: 'not_visible' });
-    await inDO(stub(), (h: any) => h.sql.exec("UPDATE session_control_sessions SET state='exited',updated_at='second' WHERE id=?", id));
-    expect((await ok('/summary')).recent[0].session).toMatchObject({ state: 'exited', updated_at: 'second' });
+    try {
+      expect((await ok('/summary')).recent[0].session).toMatchObject({ id, state: 'running' });
+      expect((await ok('/summary', undefined, agent.token)).recent[0].session).toEqual({ id, linkage: 'not_visible' });
+      await inDO(stub(), (h: any) => h.sql.exec("UPDATE session_control_sessions SET state='exited',updated_at='second' WHERE id=?", id));
+      expect((await ok('/summary')).recent[0].session).toMatchObject({ state: 'exited', updated_at: 'second' });
+    } finally {
+      // This file retains sessions between tests; remove only this fixture.
+      await inDO(stub(), (h: any) => h.sql.exec('DELETE FROM session_control_sessions WHERE id=?', id));
+    }
   });
 
   it.each([1, 25, 26, 100, 101, 1000, "999999999999999999999999999999999999"])('accepts limit %s and reports the effective clamped limit', async limit => {
