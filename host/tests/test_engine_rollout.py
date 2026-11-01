@@ -165,6 +165,32 @@ def test_check_host_shape(monkeypatch):
         assert 'last_result' in row
 
 
+def test_installed_version_uses_active_revision_not_retained_old_bundle(monkeypatch):
+    managed = Path(os.environ['AGENT_HUB_MANAGED_DIR'])
+    managed.mkdir(parents=True, mode=0o700)
+    os.chmod(managed, 0o700)
+    old_revision = '11111111-1111-4111-8111-111111111111'
+    active_revision = '22222222-2222-4222-8222-222222222222'
+    old_dir = managed / f'codex-main-{old_revision}'
+    active_dir = managed / f'codex-main-{active_revision}'
+    old_bundle = {'label': 'codex-main', 'provider': 'codex', 'version': '0.163.0', 'revision': old_revision}
+    active_bundle = {'label': 'codex-main', 'provider': 'codex', 'version': '0.166.0', 'revision': active_revision}
+    p.write_json(old_dir / 'bundle.json', old_bundle)
+    p.write_json(active_dir / 'bundle.json', active_bundle)
+    p.write_json(managed / 'state.json', [{'label': 'codex-main', 'provider': 'codex', 'revision': active_revision}])
+
+    original_glob = Path.glob
+
+    def old_revision_first(path, pattern):
+        if path == managed and pattern == 'codex-main-*/bundle.json':
+            return iter([old_dir / 'bundle.json', active_dir / 'bundle.json'])
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, 'glob', old_revision_first)
+    monkeypatch.setattr(p, 'engine_argv', lambda bundle, dest: ['/bin/echo', bundle['version']])
+    assert er.installed_version('codex') == '0.166.0'
+
+
 def test_record_and_last_result():
     er.record_result('codex', {'state': 'green', 'version': '0.166.0', 'error': None})
     assert er.last_result('codex')['state'] == 'green'

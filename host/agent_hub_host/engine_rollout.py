@@ -129,20 +129,20 @@ def installed_version(engine: str, timeout: int = 30) -> str | None:
     try:
         from . import provisioning
         state = provisioning.read_json(provisioning.root() / 'state.json', [])
-        labels = [b['label'] for b in state if isinstance(b, dict) and b.get('provider') == provider]
+        bundles = [(b['label'], b['revision']) for b in state
+                   if isinstance(b, dict) and b.get('provider') == provider
+                   and isinstance(b.get('label'), str) and provisioning.LABEL.fullmatch(b['label'])
+                   and isinstance(b.get('revision'), str) and provisioning.REV.fullmatch(b['revision'])]
     except Exception:
-        labels = []
-    for label in labels:
+        bundles = []
+    for label, revision in bundles:
         try:
             from . import provisioning
-            dest = provisioning.root() / label
-            candidates = list(provisioning.root().glob(label + '-*/bundle.json'))
-            if not candidates:
+            dest = provisioning.root() / (label + '-' + revision)
+            bundle = provisioning.read_json(dest / 'bundle.json')
+            if (not isinstance(bundle, dict) or bundle.get('label') != label
+                    or bundle.get('revision') != revision or bundle.get('provider') != provider):
                 continue
-            bundle = provisioning.read_json(candidates[0])
-            if not isinstance(bundle, dict):
-                continue
-            dest = candidates[0].parent
             argv = provisioning.engine_argv(bundle, dest) + ['--version']
             proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, timeout=timeout)
