@@ -387,6 +387,41 @@ class TestStopAndCleanupEndToEnd(unittest.TestCase):
         self.assertEqual(res.state, "stopped")
         self.assertIn("already confirmed retired: finished tombstone at 1792266525291", res.reason)
 
+    @patch("agent_hub_host.native_sessions.list_sessions")
+    def test_stop_session_tombstone_subdir_of_target_workspace_stops(self, mock_list):
+        mock_list.return_value = []
+        sub = self.ws / "docs"
+        sub.mkdir()
+        self._setup_retired_session(make_target(str(sub), session_id=self.target.session_id,
+                                                tag=self.target.tag))
+        with patch.dict(os.environ, {"APLEXER_STATE_DIR": str(self.state_dir)}), \
+                patch("agent_hub_host.retired_native.list_sessions", return_value=[]), \
+                patch("agent_hub_host.native_sessions.run_native", side_effect=AssertionError("native effect forbidden")):
+            res = stop_session("aplexer", self.target)
+        self.assertEqual(res.state, "stopped")
+
+    @patch("agent_hub_host.native_sessions.list_sessions")
+    def test_stop_session_unrelated_workspace_or_tag_still_refused(self, mock_list):
+        mock_list.return_value = []
+        other = self.tmp / "elsewhere"
+        other.mkdir()
+        self._setup_retired_session(make_target(str(other), session_id=self.target.session_id,
+                                                tag=self.target.tag))
+        with patch.dict(os.environ, {"APLEXER_STATE_DIR": str(self.state_dir)}), \
+                patch("agent_hub_host.retired_native.list_sessions", return_value=[]):
+            with self.assertRaises(SessionControlError):
+                stop_session("aplexer", self.target)
+
+    def test_validate_default_still_rejects_nested_workspace(self):
+        sub = self.ws / "docs"
+        sub.mkdir()
+        self._setup_retired_session(make_target(str(sub), session_id=self.target.session_id,
+                                                tag=self.target.tag))
+        tpath = str(self.state_dir / "retired-sessions" / self.target.session_id.lower() / "tombstone.json")
+        with self.assertRaises(SessionControlError):
+            validate_retired_tombstone(tpath, self.target)
+        validate_retired_tombstone(tpath, self.target, allow_nested_workspace=True)
+
     @patch("agent_hub_host.session_executor.capture_session_output")
     @patch("agent_hub_host.session_executor.stop_controlled_session")
     @patch("agent_hub_host.session_executor._run_cleanup_tree_after_stop")

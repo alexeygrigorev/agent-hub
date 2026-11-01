@@ -66,9 +66,16 @@ def resolve_aplexer_state_dir(state_dir: Optional[str] = None) -> str:
     return canonicalize_workspace(os.path.expanduser("~/.local/state/aplexer"))
 
 
+def _workspaces_nested(a: str, b: str) -> bool:
+    """True when one canonical workspace is the other or lies inside it."""
+    a, b = canonicalize_workspace(a), canonicalize_workspace(b)
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep) or b.startswith(a.rstrip(os.sep) + os.sep)
+
+
 def validate_retired_tombstone(
     tombstone_path: str,
     target: NativeTarget,
+    allow_nested_workspace: bool = False,
 ) -> dict[str, Any]:
     """Validate a genuine retired native tombstone against target expectations.
 
@@ -79,7 +86,9 @@ def validate_retired_tombstone(
     - `cause` must equal "finished" (clean exit / accepted completion; forgotten/pruned refuse).
     - `id` must match target.session_id (case-insensitive normalized UUID).
     - `tag` must match target.tag exactly.
-    - `workspace` canonical realpath must match target.workspace canonical realpath.
+    - `workspace` canonical realpath must match target.workspace canonical realpath
+      (stop only: `allow_nested_workspace` also accepts a subdirectory/parent of it;
+      UUID, tag and cause still bind the tombstone).
     - `finished_at_ms` must be a non-negative integer (fractions/floats/booleans rejected).
       If target carries created_at_ms, finished_at_ms must be >= target.created_at_ms.
     """
@@ -153,7 +162,8 @@ def validate_retired_tombstone(
         raw_ws = raw_ws[:-10]
     canonical_tombstone_ws = canonicalize_workspace(raw_ws)
     from .native_sessions import _stop_workspace_matches
-    if not _stop_workspace_matches(raw_ws, target.workspace):
+    if not _stop_workspace_matches(raw_ws, target.workspace) and not (
+            allow_nested_workspace and _workspaces_nested(raw_ws, target.workspace)):
         raise SessionControlError(
             f"Tombstone workspace mismatch (tombstone: {canonical_tombstone_ws!r}, target: {target.workspace!r})"
         )
@@ -179,6 +189,7 @@ def verify_native_retirement(
     target: NativeTarget,
     state_dir: Optional[str] = None,
     sessions: Optional[list] = None,
+    allow_nested_workspace: bool = False,
 ) -> tuple[bool, Optional[dict[str, Any]], str]:
     """Verify natural retirement of an owned native session.
 
@@ -230,7 +241,7 @@ def verify_native_retirement(
         return False, None, f"retired_tombstone_absent: {tombstone_path}"
 
     try:
-        tombstone = validate_retired_tombstone(tombstone_path, target)
+        tombstone = validate_retired_tombstone(tombstone_path, target, allow_nested_workspace)
     except SessionControlError as exc:
         return False, None, f"retired_tombstone_invalid: {exc}"
 

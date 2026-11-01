@@ -1294,7 +1294,8 @@ def stop_session(
               and _stop_workspace_matches(s.workspace, target.workspace)]
     if not before:
         from .retired_native import verify_native_retirement
-        is_retired, tombstone, reason = verify_native_retirement(executable, target)
+        is_retired, tombstone, reason = verify_native_retirement(
+            executable, target, allow_nested_workspace=True)
         if is_retired and isinstance(tombstone, dict):
             return StopResult(
                 state="stopped",
