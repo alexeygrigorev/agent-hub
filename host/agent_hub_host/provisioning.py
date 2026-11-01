@@ -2195,6 +2195,9 @@ def host_request(method, path, payload=None):
 
 
 def tick():
+    # Hub-owned gh token, shared git SSH key and commit identity (intake 54d5b703); never raises.
+    from . import host_credentials
+    host_credentials.tick()
     try:
         return sync()
     except Exception:
