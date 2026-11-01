@@ -11,13 +11,13 @@ const settings = { HUB_INTAKE_QUEUE_ENABLED:'true', HUB_INTAKE_QUEUE_PROJECTS:'*
   HUB_INTAKE_QUEUE_MAX_INFLIGHT:'auto', HUB_INTAKE_QUEUE_MAX_PER_PROJECT:'auto' };
 async function fixture(fn: (s: FleetService, sql: any, queries: {query:string,args:any[]}[]) => void) {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('bounded-capacity-' + crypto.randomUUID()));
-  await (runInDurableObject as any)(stub, (h: any) => {
+  await (runInDurableObject as any)(stub, (h: any, state: DurableObjectState) => {
     const queries: {query:string,args:any[]}[] = [];
     const sql = {exec(query:string,...args:any[]) {
       expect(args.length).toBeLessThanOrEqual(100);
       queries.push({query,args}); return h.sql.exec(query,...args);
     }};
-    const s = new FleetService(sql as any, fn=>fn(), ()=>now); s.init();
+    const s = new FleetService(sql as any, fn=>state.storage.transactionSync(fn), ()=>now); s.init();
     sql.exec("INSERT INTO fleet_accounts(label,provider,max_concurrency,reserve_percent,enabled) VALUES('zai-main','zai',10,15,1)");
     machine(sql,'online');
     sql.exec("INSERT INTO fleet_routes(machine_id,engine,account,profile) VALUES('online','zcodex','zai-main',NULL)");
@@ -101,6 +101,37 @@ describe('bounded real Fleet autonomous capacity snapshot',()=>{
       const p=sql.exec('EXPLAIN QUERY PLAN '+q.query,...q.args).toArray().map((r:any)=>r.detail).join('\n');
       expect(p).toMatch(/SEARCH l USING INDEX fleet_launch_machine_state/);
     }
+  }));
+  it('atomically upgrades the legacy runtime index while preserving its lookup identity and bounded reads',()=>fixture((s,sql,queries)=>{
+    sql.exec('DROP INDEX fleet_launch_runtime_exit');
+    sql.exec("CREATE INDEX fleet_launch_runtime_exit ON fleet_launches(machine_id,updated_at) WHERE exit_reason IN ('engine_runtime_timeout','engine_signal_exit')");
+    sql.exec("CREATE INDEX IF NOT EXISTS fleet_queue_runtime_exit ON fleet_launches(machine_id,updated_at DESC) WHERE state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')");
+    s.init();
+    const schema=String(sql.exec("SELECT sql FROM sqlite_master WHERE name='fleet_launch_runtime_exit'").one().sql);
+    expect(schema).toContain("WHERE state IN ('failed','exited') AND exit_reason");
+    expect(sql.exec("SELECT name FROM sqlite_master WHERE name='fleet_queue_runtime_exit'").toArray()).toEqual([]);
+    for(let i=0;i<400;i++) launch(sql,'runtime-'+i,'running');
+    sql.exec("UPDATE fleet_launches SET exit_reason='engine_runtime_timeout',updated_at=?",iso());
+    sql.exec("UPDATE fleet_launches SET state='failed',updated_at=? WHERE id='runtime-399'",iso(-1));
+    const query=`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
+      AND state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')
+      ORDER BY updated_at DESC LIMIT 1`;
+    const plan=sql.exec('EXPLAIN QUERY PLAN '+query,'online',iso(-60000)).toArray().map((r:any)=>r.detail).join('\n');
+    expect(plan).toContain('fleet_launch_runtime_exit');
+    expect(plan).not.toMatch(/SCAN fleet_launches|TEMP B-TREE/);
+    const cursor=sql.exec(query,'online',iso(-60000));
+    expect(cursor.toArray()).toEqual([{exit_reason:'engine_runtime_timeout',updated_at:iso(-1)}]);
+    expect(Number(cursor.rowsRead)).toBeLessThanOrEqual(8);
+    expect(s.resources.capacityCpuAdmitted('online')).toBe(false);
+    sql.exec("UPDATE fleet_launches SET state='running' WHERE id='runtime-399'");
+    expect(s.resources.capacityCpuAdmitted('online')).toBe(true);
+    queries.length=0; s.init();
+    expect(queries.some(q=>q.query==='DROP INDEX fleet_launch_runtime_exit')).toBe(false);
+    sql.exec('DROP INDEX fleet_launch_runtime_exit');
+    sql.exec("CREATE INDEX fleet_launch_runtime_exit ON fleet_launches(updated_at,machine_id) WHERE state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')");
+    s.init();
+    const repairedPlan=sql.exec('EXPLAIN QUERY PLAN '+query,'online',iso(-60000)).toArray().map((r:any)=>r.detail).join('\n');
+    expect(repairedPlan).toMatch(/machine_id=\?.*updated_at>\?/);
   }));
   it('retains hard PSI/OOM admission while ordinary busy CPU remains advisory',()=>fixture((s,sql)=>{
     const update=(cpu:any)=>sql.exec("UPDATE machines SET last_heartbeat=? WHERE id='online'",JSON.stringify({mem_avail_mb:32000,disk_free_gb:80,cpu_usage:cpu}));

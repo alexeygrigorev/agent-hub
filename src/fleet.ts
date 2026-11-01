@@ -625,12 +625,21 @@ export class FleetService {
     // Intake e8a22f4c: plan() and the choking watchdog look for these rare exit reasons on every poll;
     // partial indexes keep both lookups independent of the machine's retained launch history.
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_model_unsupported ON fleet_launches(machine_id,engine,account) WHERE exit_reason = 'model_unsupported'");
-    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_runtime_exit ON fleet_launches(machine_id,updated_at) WHERE exit_reason IN ('engine_runtime_timeout','engine_signal_exit')");
+    // Preserve the established lookup identity and upgrade legacy definitions
+    // atomically to the exact terminal-state range used by choking admission.
+    const runtimeDDL = "CREATE INDEX fleet_launch_runtime_exit ON fleet_launches(machine_id,updated_at DESC) WHERE state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')";
+    const normalizeIndex = (ddl: string) => ddl.replace(/\s+/g, '').replace('IFNOTEXISTS', '');
+    this.transaction(() => {
+      const runtime: any = this.sql.exec("SELECT sql FROM sqlite_master WHERE type='index' AND name='fleet_launch_runtime_exit'").toArray()[0];
+      if (runtime && normalizeIndex(String(runtime.sql)) !== normalizeIndex(runtimeDDL))
+        this.sql.exec('DROP INDEX fleet_launch_runtime_exit');
+      this.sql.exec('DROP INDEX IF EXISTS fleet_queue_runtime_exit');
+      this.sql.exec(runtimeDDL.replace('CREATE INDEX ', 'CREATE INDEX IF NOT EXISTS '));
+    });
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_inflight_identity ON fleet_launches(machine_id,engine,account,profile) WHERE native_id IS NULL AND state IN ('starting','uncertain')");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_incarnation ON fleet_sessions(machine_id,tag,engine,account,profile,workspace,phase)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_route_account ON fleet_routes(account)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_queue_live_machines ON machines(last_checkin_at,id) WHERE drained=0 AND revoked_at IS NULL');
-    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_queue_runtime_exit ON fleet_launches(machine_id,updated_at DESC) WHERE state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')");
     this.sql.exec('CREATE INDEX IF NOT EXISTS routing_launch ON routing_jobs(launch_id)');
     const columns = this.sql.exec('PRAGMA table_info(fleet_sessions)').toArray().map((c: any) => c.name);
     if (!columns.includes('last_activity_at')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN last_activity_at TEXT');
@@ -838,8 +847,8 @@ export class FleetService {
       ? (!isIdle(row) && !isUnobserved(row))
       : row.state === 'uncertain' ? !isUnobserved(row) : true).length;
     const orphans = snapshot ? snapshot.natives.filter(n => n.account === account.label && n.unreserved)
-      : this.byChunks(liveList, marks => `SELECT s.machine_id,s.phase,s.last_activity_at FROM fleet_sessions s
-          WHERE s.account=? AND s.phase IN ('starting','running','broken','unknown','uncertain')
+      : this.byChunks(liveList, marks => `SELECT s.machine_id,s.phase,s.last_activity_at
+          FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain')
           AND s.machine_id IN (${marks}) AND ${NATIVE_UNRESERVED}`, account.label);
     const observedSessions = orphans.filter(row => !isIdle(row)).length;
     const active = reserved + observedSessions;
