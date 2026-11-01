@@ -37,6 +37,7 @@ import { recordIntakeSessionLink, recordWorkerChildStart, IntakeSessionLinkError
 /** Child/smoke session limits per worker parent (dfe494fe). */
 export const WORKER_CHILD_CONCURRENT = 4;
 export const WORKER_CHILD_PER_HOUR = 12;
+export const WORKER_CHILD_PER_INTAKE = 8;
 import { ResourceManagement } from './resource-management';
 import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold } from './session_stall';
 import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, stopHostOnline, visibleSessionPrefixMatches } from './session_stop';
@@ -2185,7 +2186,10 @@ export class SessionControlService {
           : ![worker.workspace, worker.native_workspace].includes(input.workspace) ? 'workspace_mismatch'
           : mode !== 'headless' ? 'mode_not_headless'
           : (input.parent_id !== undefined && input.parent_id !== worker.session_id) ? 'parent_mismatch' : null;
-        if (denied) return response({ error: 'worker_scope_forbidden', detail: denied }, 403);
+        // Depth 1: a child that itself has a parent may not spawn override children.
+        const overrides = input.engine !== undefined || input.machine !== undefined;
+        const deniedFinal = denied ?? (overrides && worker.parent_id ? 'child_depth' : null);
+        if (deniedFinal) return response({ error: 'worker_scope_forbidden', detail: deniedFinal }, 403);
         input.intake_task_id = worker.task_id;
         input.parent_id = worker.session_id;
       }
@@ -2264,6 +2268,8 @@ export class SessionControlService {
         if (!prior && worker) {
           const live: any = this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id = ? AND state NOT IN ('exited','stopped','failed','cancelled','dead','forgotten','pruned')`, worker.session_id).toArray()[0];
           if (live.n >= WORKER_CHILD_CONCURRENT) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'concurrent', max: WORKER_CHILD_CONCURRENT }, 429);
+          const perIntake: any = this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id IS NOT NULL AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id') = ? AND state NOT IN ('exited','stopped','failed','cancelled','dead','forgotten','pruned')`, worker.task_id).toArray()[0];
+          if (perIntake.n >= WORKER_CHILD_PER_INTAKE) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'per_intake', max: WORKER_CHILD_PER_INTAKE }, 429);
           const hourly: any = this.sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id = ? AND created_at > ?', worker.session_id, new Date(this.now() - 3600000).toISOString()).toArray()[0];
           if (hourly.n >= WORKER_CHILD_PER_HOUR) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'per_hour', max: WORKER_CHILD_PER_HOUR }, 429);
         }

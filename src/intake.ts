@@ -280,8 +280,10 @@ export function recordWorkerChildStart(sql: SqlStorage, session: Obj, parentSess
   if (rows.length !== 1) return;
   const task = JSON.parse(rows[0].data);
   prepareIntakeHistory(task, 1);
-  if (task.history.length >= INTAKE_LIMITS.events) return; // audit is best effort at capacity; the session row carries parent_id
-  task.history.push({ id: crypto.randomUUID(), kind: 'note', actor: 'hub:service:worker-child-start', authority: 'operator_record',
+  // Fail closed: the start is refused (and rolled back) when the audit cannot be written.
+  if (task.history.length >= INTAKE_LIMITS.events) throw new IntakeSessionLinkError('history_capacity');
+  task.history.push({ id: crypto.randomUUID(), kind: 'note', actor: 'worker_session:' + parentSessionId, authority: 'untrusted_task_data',
+    parent_session_id: parentSessionId, child_session_id: session.id, engine: request.engine ?? null, machine: request.machine ?? null,
     text: `child session start: parent=${parentSessionId} child=${session.id} engine=${request.engine ?? 'auto'} machine=${request.machine ?? 'auto'}`,
     captured_at: now, intake_key: 'child-start-' + session.id });
   task.version++; task.updated_at = now;

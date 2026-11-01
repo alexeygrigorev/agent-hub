@@ -285,6 +285,19 @@ describe('scoped durable worker access',()=>{
   });
   const over=await start({});expect(over.status).toBe(429);
   expect(await over.json()).toMatchObject({error:'worker_scope_forbidden',detail:'child_limit',limit:'concurrent'});
+  // Operator-only routes stay closed to the worker credential.
+  for(const path of ['/api/engines','/api/intake/tasks/'+other+'/close','/api/intake/tasks/'+task+'/close']) expect((await call(path,{key:uuid(),expected_version:1},worker.access_token)).status,path).toBe(403);
+  // Per-hour cap: finished children still count within the hour.
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   h.sql.exec("UPDATE session_control_sessions SET state='exited' WHERE parent_id=?",session);
+   const n=h.sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id=?',session).toArray()[0].n;
+   for(let i=n;i<12;i++) h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,parent_id,created_at,updated_at) VALUES(?,'t',?,'{}','headless','exited',?,?,?)`,uuid(),uuid(),session,new Date().toISOString(),new Date().toISOString());
+  });
+  const hourly=await start({});expect(hourly.status).toBe(429);
+  expect(await hourly.json()).toMatchObject({detail:'child_limit',limit:'per_hour'});
+  // Depth 1: a child may not spawn override children.
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET parent_id=? WHERE id=?',uuid(),session));
+  expect(await detail(await start({}))).toBe('child_depth');
  }));
  it('files follow-up intakes with provenance, reads/notes only its own creations, and names cross-intake denials (34d0271b)',()=>setup(async({stub,id,session,task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
