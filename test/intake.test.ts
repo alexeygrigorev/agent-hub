@@ -68,6 +68,81 @@ beforeEach(async () => {
 });
 
 describe('private durable intake HTTP/SQLite', () => {
+  it('summarizes 1083 retained histories without reading ledgers and hydrates only one export page', async () => {
+    await inDO(stub(), (h: any) => {
+      for (let i = 0; i < 1083; i++) {
+        const id = 'export-' + String(i).padStart(4, '0');
+        h.sql.exec('INSERT INTO intake_tasks VALUES (?,?)', id, JSON.stringify({ id, project: 'export-fixture',
+          title: 'Task ' + i, status: i % 2 ? 'done' : 'open', version: 1, created_at: i, updated_at: i,
+          archived_at: i % 2 ? 1 : null, history: [{ id: 'note', kind: 'note', text: 'x'.repeat(8192), captured_at: i }] }));
+      }
+      // Guard actual SQL, not a wall-clock assertion affected by shared-host load.
+      const queries: string[] = [];
+      const sql = { exec: (query: string, ...args: any[]) => { queries.push(query); return h.sql.exec(query, ...args); } };
+      const service = new IntakeService(sql as any);
+      const p = { admin: true };
+      const summary = (service as any).read(new URL('https://hub.test/api/intake/summary'), p);
+      expect(summary).toMatchObject({ total: 1083, counts: { open: 542, done: 541 }, archived_count: 541, open_non_terminal_count: 542 });
+      expect(summary.recent.map((t: any) => t.id)).toEqual(['export-1082','export-1081','export-1080','export-1079','export-1078']);
+      expect(JSON.stringify(summary)).not.toContain('xxxxxxxx');
+      expect(queries.some(q => /FROM intake_tasks|FROM intake_task_projection/.test(q))).toBe(false);
+      queries.length = 0;
+      const page = (service as any).read(new URL('https://hub.test/api/intake/tasks?all=true&limit=25'), p);
+      expect(page.total).toBe(1083); expect(page.items).toHaveLength(25);
+      expect(page.items[0].payload_data.history[0].text).toHaveLength(8192);
+      expect(queries.filter(q => /SELECT data FROM intake_tasks/.test(q))).toHaveLength(25);
+      expect(queries.some(q => /SELECT data FROM intake_tasks ORDER/.test(q))).toBe(false);
+      const plan = h.sql.exec('EXPLAIN QUERY PLAN SELECT data FROM intake_export ORDER BY updated_at DESC,id LIMIT 5').toArray();
+      expect(JSON.stringify(plan)).toContain('intake_export_recent');
+      // Rollback updates both metadata and counters; session state is read live.
+      let rollback: string | null = null;
+      try { h.ctx.storage.transactionSync(() => {
+        h.sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.status','blocked') WHERE id='export-1082'");
+        throw new Error('fixture rollback');
+      }); } catch (e: any) { rollback = e.message; }
+      expect(rollback).toBe('fixture rollback');
+      expect((service as any).read(new URL('https://hub.test/api/intake/summary'), p).counts.blocked).toBe(0);
+    });
+  });
+
+  it('keeps summary counts fresh across project/status/archive changes and overlapping grants', async () => {
+    const task = (await create()).task;
+    const agent = await seedAgent();
+    await grant(agent); await grant(agent, 'task', task.id);
+    await create('private');
+    let result = await ok('/summary', undefined, agent.token);
+    expect(result.total).toBe(1); expect(result.counts.open).toBe(1);
+    expect(result.recent[0].id).toBe(task.id);
+    await append(task.id, task.version, { kind: 'note', text: 'Current progress' });
+    result = await ok('/summary', undefined, agent.token);
+    expect(result.recent[0]).toMatchObject({ version: task.version + 1, last_event_kind: 'note' });
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.project','moved','$.status','done','$.archived_at',123) WHERE id=?", task.id);
+    });
+    // Task grant still applies after project move; count it once.
+    result = await ok('/summary', undefined, agent.token);
+    expect(result).toMatchObject({ total: 1, counts: { open: 0, done: 1 }, archived_count: 1, open_non_terminal_count: 0 });
+    expect((await ok('/summary?project=demo', undefined, agent.token)).total).toBe(0);
+    const hidden = await seedAgent('elsewhere:viewer'); await grant(hidden, 'project', 'elsewhere', 'read');
+    expect((await ok('/summary', undefined, hidden.token)).total).toBe(0);
+    expect((await ok('/tasks?all=true', undefined, hidden.token)).items).toEqual([]);
+  });
+
+  it('returns current linked session state with the same disclosure boundary as task views', async () => {
+    const task = (await create()).task; const agent = await seedAgent(); await grant(agent);
+    const id = '00000000-0000-4000-8000-000000000001';
+    await inDO(stub(), (h: any) => {
+      h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at)
+        VALUES (?,?,?,'{}','headless','running','start','first')`, id, 'another:owner', 'summary-fixture');
+      h.sql.exec("UPDATE intake_tasks SET data=json_insert(data,'$.history[#]',json(?)) WHERE id=?",
+        JSON.stringify({ kind: 'link', hub_session_id: id }), task.id);
+    });
+    expect((await ok('/summary')).recent[0].session).toMatchObject({ id, state: 'running' });
+    expect((await ok('/summary', undefined, agent.token)).recent[0].session).toEqual({ id, linkage: 'not_visible' });
+    await inDO(stub(), (h: any) => h.sql.exec("UPDATE session_control_sessions SET state='exited',updated_at='second' WHERE id=?", id));
+    expect((await ok('/summary')).recent[0].session).toMatchObject({ state: 'exited', updated_at: 'second' });
+  });
+
   it.each([1, 25, 26, 100, 101, 1000, "999999999999999999999999999999999999"])('accepts limit %s and reports the effective clamped limit', async limit => {
     const result = await ok('/tasks?limit=' + limit);
     expect(result.effective_limit).toBe(Math.min(Number(limit), 100));
