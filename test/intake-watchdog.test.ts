@@ -55,6 +55,23 @@ describe('forgotten intake watchdog', () => {
     expect(started).toHaveLength(2); // Canonical pre-admission reservations retain the default cap.
     expect(h.sql.exec("SELECT reason FROM intake_restart_queue WHERE task_id=?",fresh[1].id).one().reason).toBe('watchdog_global_capacity');
   }));
+  it('advances the indexed due lane past exempt holds outside the normal cursor', async () => fixture(h => {
+    const normal=Array.from({length:192},(_,i)=>task('a-'+String(i).padStart(3,'0')));
+    const exempt=Array.from({length:8},(_,i)=>task('z-exempt-'+i)), ready=task('z-ready');
+    const all=[...normal,...exempt,ready];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>all} as any,(f:any)=>f(),{},()=>NOW);w.init();
+    h.sql.exec("UPDATE intake_queue_cursor SET after_id='' WHERE id=1");
+    for(const t of exempt)h.sql.exec("INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at) VALUES(?,'queued','watchdog_project_not_enabled',?,?,?)",t.id,NOW-60000,NOW-60000,NOW);
+    h.sql.exec("INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at) VALUES(?,'queued','watchdog_global_capacity',?,?,?)",ready.id,NOW-30000,NOW-30000,NOW);
+    expect((w as any).batch(NOW).tasks.slice(64).map((t:any)=>t.id)).toEqual(exempt.map(t=>t.id));
+    // A new watchdog instance resumes the durable lane, despite unchanged holds.
+    const resumed=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>all} as any,(f:any)=>f(),{},()=>NOW);resumed.init();
+    expect((resumed as any).batch(NOW).tasks.slice(64).map((t:any)=>t.id)).toEqual([ready.id]);
+    expect((resumed as any).batch(NOW).tasks.slice(64).map((t:any)=>t.id)).toEqual(exempt.map(t=>t.id));
+    const plan=h.sql.exec("EXPLAIN QUERY PLAN SELECT next_at,task_id FROM intake_restart_queue WHERE state='queued' AND (next_at,task_id)>(?,?) AND next_at<=? ORDER BY next_at,task_id LIMIT 8",NOW-60000,exempt[7].id,NOW).toArray();
+    expect(JSON.stringify(plan)).toContain('intake_queue_due');
+    expect(JSON.stringify(plan)).not.toContain('TEMP B-TREE');
+  }));
   it('does not renew the hold deadline when admission gates alternate', async () => fixture(async h => {
     const t=task('alternating-gates');let now=NOW;
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{},()=>now);w.init();

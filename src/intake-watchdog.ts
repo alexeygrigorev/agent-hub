@@ -106,6 +106,8 @@ export class IntakeWatchdog {
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_movement(seq INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL,state TEXT NOT NULL,reason TEXT NOT NULL,at INTEGER NOT NULL)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS intake_queue_movement_task ON intake_queue_movement(task_id,seq)');
     this.sql.exec("CREATE INDEX IF NOT EXISTS intake_queue_due ON intake_restart_queue(next_at,task_id) WHERE state='queued'");
+    this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_due_cursor(id INTEGER PRIMARY KEY CHECK(id=1),next_at INTEGER NOT NULL,task_id TEXT NOT NULL)');
+    this.sql.exec("INSERT OR IGNORE INTO intake_queue_due_cursor VALUES(1,-1,'')");
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_cursor(id INTEGER PRIMARY KEY CHECK(id=1),after_id TEXT NOT NULL,forgotten_seen INTEGER NOT NULL DEFAULT 0)');
     this.sql.exec("INSERT OR IGNORE INTO intake_queue_cursor(id,after_id) VALUES(1,'')");
     const cursorCols = (this.sql.exec('PRAGMA table_info(intake_queue_cursor)').toArray() as any[]).map(c => c.name);
@@ -415,7 +417,12 @@ export class IntakeWatchdog {
     // Give overdue restarts a bounded lane independent of the intake cursor.
     // The partial index avoids scanning quiet/submitted queue history per tick.
     const ids = new Set(tasks.map(t => t.id));
-    const due = this.rows("SELECT task_id FROM intake_restart_queue WHERE state='queued' AND next_at<=? ORDER BY next_at,task_id LIMIT 8", now);
+    // Advance past every observed row, including exempt or live-owner holds,
+    // so an ineligible prefix cannot monopolize the priority lane.
+    const cursor = this.rows('SELECT next_at,task_id FROM intake_queue_due_cursor WHERE id=1')[0];
+    const due = this.rows("SELECT next_at,task_id FROM intake_restart_queue WHERE state='queued' AND (next_at,task_id)>(?,?) AND next_at<=? ORDER BY next_at,task_id LIMIT 8", cursor.next_at, cursor.task_id, now);
+    const last = due.length === 8 ? due[due.length - 1] : {next_at:-1,task_id:''};
+    this.sql.exec('UPDATE intake_queue_due_cursor SET next_at=?,task_id=? WHERE id=1',last.next_at,last.task_id);
     for (const row of due) {
       if (ids.has(row.task_id)) continue;
       const t = this.task(row.task_id);
