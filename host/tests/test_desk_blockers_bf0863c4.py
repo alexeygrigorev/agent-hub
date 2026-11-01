@@ -165,6 +165,80 @@ def test_admission_stamps_hub_verdict_after_local_lock(tmp_path, monkeypatch):
     assert json.loads(out.getvalue())['launch_allowed'] is True
 
 
+def test_admission_repairs_missing_profile_before_hub_stamp(tmp_path, monkeypatch):
+    # LAPTOP-PHA6TCNC b499fe0f: the profile repair waited on reconcile.lock
+    # after Hub stamped observed_at, so the verdict arrived stale.
+    os.chmod(tmp_path, 0o700)
+    m_dir = tmp_path / 'managed-engines'
+    m_dir.mkdir(mode=0o700)
+    config = tmp_path / 'aplexer/config.toml'
+    config.parent.mkdir(mode=0o700)
+    config.write_text('[profiles.other]\n', encoding='utf-8')
+    monkeypatch.setenv('APLEXER_CONFIG', str(config))
+    monkeypatch.setattr(p, 'root', lambda: m_dir)
+    b = dict(label='hub-claude', provider='claude', version='2.1.304', args=[], files={}, env={},
+             revision='11111111-1111-4111-8111-111111111111')
+    dest = m_dir / (b['label'] + '-' + b['revision'])
+    dest.mkdir(mode=0o700)
+    p.write_json(dest / 'bundle.json', b)
+    p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
+    events = []
+
+    @contextlib.contextmanager
+    def slow_lock(timeout=None):
+        assert timeout == p.ADMISSION_LOCK_WAIT_S
+        events.append('lock')
+        yield
+    monkeypatch.setattr(p, 'lock', slow_lock)
+    monkeypatch.setattr(p, 'profiles', lambda bundles, path=None: (events.append('repair'), config.write_text(
+        '[profiles.hub-hub-claude]\n', encoding='utf-8')))
+
+    def hub(method, path, body):
+        events.append('hub')
+        return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'hub-claude',
+                'observed_at': '2026-11-01T03:31:00.000Z'}
+    monkeypatch.setattr(p, 'host_request', hub)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps({'profile': 'hub-hub-claude', 'account': 'hub-claude'})))
+    monkeypatch.setattr(sys, 'argv', ['admission', 'hub-claude'])
+    out = io.StringIO()
+    monkeypatch.setattr(sys, 'stdout', out)
+    p.admission()
+    assert events == ['lock', 'lock', 'repair', 'hub']
+    assert json.loads(out.getvalue())['launch_allowed'] is True
+
+
+def test_admission_missing_profile_still_refuses_after_failed_repair(tmp_path, monkeypatch):
+    os.chmod(tmp_path, 0o700)
+    m_dir = tmp_path / 'managed-engines'
+    m_dir.mkdir(mode=0o700)
+    config = tmp_path / 'aplexer/config.toml'
+    config.parent.mkdir(mode=0o700)
+    config.write_text('[profiles.other]\n', encoding='utf-8')
+    monkeypatch.setenv('APLEXER_CONFIG', str(config))
+    monkeypatch.setattr(p, 'root', lambda: m_dir)
+    b = dict(label='hub-claude', provider='claude', version='2.1.304', args=[], files={}, env={},
+             revision='11111111-1111-4111-8111-111111111111')
+    dest = m_dir / (b['label'] + '-' + b['revision'])
+    dest.mkdir(mode=0o700)
+    p.write_json(dest / 'bundle.json', b)
+    p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
+    monkeypatch.setattr(p, 'lock', lambda timeout=None: contextlib.nullcontext())
+
+    def broken(bundles, path=None):
+        raise PermissionError('acl')
+    monkeypatch.setattr(p, 'profiles', broken)
+    monkeypatch.setattr(p, 'host_request', lambda *a: {'launch_allowed': True, 'profile_supported': True,
+                                                       'account_label': 'hub-claude', 'observed_at': 'x'})
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
+    monkeypatch.setattr(sys, 'argv', ['admission', 'hub-claude'])
+    out = io.StringIO()
+    monkeypatch.setattr(sys, 'stdout', out)
+    p.admission()
+    result = json.loads(out.getvalue())
+    assert result['reason'] == 'local_profile_missing' and result['profile_error'] == 'PermissionError'
+    assert result['launch_allowed'] is False
+
+
 def test_windows_installer_never_stops_on_native_stderr():
     script = (REPO / 'public/cli/host-install.ps1').read_text()
     assert "$ErrorActionPreference = 'Stop'" not in script

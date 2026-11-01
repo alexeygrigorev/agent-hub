@@ -1744,22 +1744,12 @@ def admission():
             bundle = installed_bundle()
         except Exception:
             bundle = None
-    try:
-        result = host_request('POST', '/api/engines/admission', {'label': label})
-    except Exception:
-        result = {'launch_allowed': False, 'profile_supported': False, 'account_label': label, 'reason': 'hub_unreachable'}
-
-    # Login probe (intake 06d2a0ac AC2): a managed Codex profile without a
-    # credential opens at the "Sign in with ChatGPT" screen and never runs a
-    # turn. Refuse it as not_logged_in so Hub re-places on another route.
-    if bundle is not None and result.get('launch_allowed') and not profile_logged_in(bundle, root() / (label + '-' + str(bundle.get('revision', '')))):
-        result['launch_allowed'] = False
-        result['reason'] = 'not_logged_in'
-    if bundle is None and result.get('launch_allowed'):
-        result['launch_allowed'] = False
-        result['profile_supported'] = False
-        result['reason'] = 'local_lock_unavailable' if lock_failed else 'local_bundle_missing'
-    elif bundle is not None and result.get('launch_allowed') and profile_path().is_file():
+    # The managed profile is checked, and repaired under the lock, before Hub
+    # stamps its verdict too: a repair waiting on a Windows reconcile after the
+    # stamp aged the verdict past the 30 s window (admission_timestamp_stale).
+    profile_error = None
+    profile_missing = False
+    if bundle is not None and profile_path().is_file():
         expected_header = f'[profiles.hub-{label}]'
         try:
             text = profile_path().read_text(encoding='utf-8')
@@ -1781,12 +1771,31 @@ def admission():
                 text = profile_path().read_text(encoding='utf-8')
             except Exception as exc:
                 # Credential-free: exception type only, never the message.
-                result['profile_error'] = type(exc).__name__
+                profile_error = type(exc).__name__
                 text = ''
-            if expected_header not in text:
-                result['launch_allowed'] = False
-                result['profile_supported'] = False
-                result['reason'] = 'local_profile_missing'
+            profile_missing = expected_header not in text
+
+    try:
+        result = host_request('POST', '/api/engines/admission', {'label': label})
+    except Exception:
+        result = {'launch_allowed': False, 'profile_supported': False, 'account_label': label, 'reason': 'hub_unreachable'}
+
+    # Login probe (intake 06d2a0ac AC2): a managed Codex profile without a
+    # credential opens at the "Sign in with ChatGPT" screen and never runs a
+    # turn. Refuse it as not_logged_in so Hub re-places on another route.
+    if bundle is not None and result.get('launch_allowed') and not profile_logged_in(bundle, root() / (label + '-' + str(bundle.get('revision', '')))):
+        result['launch_allowed'] = False
+        result['reason'] = 'not_logged_in'
+    if bundle is None and result.get('launch_allowed'):
+        result['launch_allowed'] = False
+        result['profile_supported'] = False
+        result['reason'] = 'local_lock_unavailable' if lock_failed else 'local_bundle_missing'
+    elif bundle is not None and result.get('launch_allowed') and profile_missing:
+        if profile_error:
+            result['profile_error'] = profile_error
+        result['launch_allowed'] = False
+        result['profile_supported'] = False
+        result['reason'] = 'local_profile_missing'
 
     if isinstance(payload, dict) and bundle:
         offered_profile = payload.get('profile')
