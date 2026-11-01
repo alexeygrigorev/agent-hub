@@ -3813,10 +3813,11 @@ class Dispatcher:
             'account', 'created_at_ms', 'phase', 'confirmed_exit'))
 
     def report_native_bindings(self):
-        """Report a complete fresh census without reading transcripts or tokens.
+        """Report a bounded fresh census and its completeness verdict.
 
-        The server still verifies the catalog before accepting a binding. A
-        separate short lock orders complete reports, independent of sampling.
+        The server still verifies the catalog before accepting a binding. The
+        completeness flag is true only when no omitted row is potentially
+        live. A separate short lock orders reports, independent of sampling.
         """
         with self._catalog_report_lock:
             return self._report_native_bindings()
@@ -3825,12 +3826,28 @@ class Dispatcher:
         started = time.monotonic()
         raw = self.runner([self.settings.get('aplexer_bin', 'aplexer'), 'list', '--all', '--json'])
         census_done = time.monotonic()
-        metadata = session_metadata(bounded_catalog(raw), self.settings, collect_tokens=False)
+        if isinstance(raw, list):
+            raw_rows = raw
+            valid_envelope = True
+        elif isinstance(raw, dict) and isinstance(raw.get('sessions'), list):
+            raw_rows = raw['sessions']
+            valid_envelope = True
+        else:
+            raw_rows = []
+            valid_envelope = False
+        # Keep this full normalized list for the completeness verdict and
+        # binding lookups; only the wire catalog is bounded to Hub's 500 rows.
+        catalog = bounded_catalog(raw_rows)
+        from .account_capacity import confirmed_empty
+        from .catalog_completeness import census_is_complete
+        census_complete = valid_envelope and census_is_complete(
+            raw_rows, catalog, limit=CATALOG_LIMIT, confirmed_exit=confirmed_empty)
+        metadata = session_metadata(catalog, self.settings, collect_tokens=False)
         for row in metadata:
             row.update(self._catalog_enrichment.get(self._catalog_identity(row), {}))
         metadata_done = time.monotonic()
         from .catalog_transport import report_catalog
-        report_catalog(self.request, metadata)
+        report_catalog(self.request, metadata, census_complete=census_complete)
         put_done = time.monotonic()
         # Reconcile Fleet-owned starts into exact Hub session bindings after
         # reporting the observed native catalog. Retry is read-before-write.
@@ -3843,7 +3860,7 @@ class Dispatcher:
                 raise
             pending = []
         pending_done = time.monotonic()
-        rows = raw if isinstance(raw, list) else raw.get("sessions", [])
+        rows = raw_rows
         skipped = []
         for session in pending:
             if not isinstance(session, dict):
