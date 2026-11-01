@@ -629,11 +629,21 @@ def main():
     p_workclaim.add_argument("--machine-id", default=None, help="Attested machine id (default: configured machine_id)")
     p_workclaim.add_argument("--dry-run", action="store_true", help="Scan and redact without POSTing to Hub")
 
+    from . import host_credentials
+    host_credentials.add_parser(sub)
+
     args = parser.parse_args()
     if args.cmd in ("run", "fleet-host", "bridge"):
         # Long-running host commands: no console window for any child process.
         from . import windows_no_window
         windows_no_window.install()
+    if args.cmd == 'host-credentials':
+        try:
+            print(json.dumps(host_credentials.command(args)))
+        except Exception as exc:
+            print(host_credentials.error_message(exc), file=sys.stderr)
+            sys.exit(1)
+        return
     if args.cmd == 'engines':
         try:
             print(json.dumps(provisioning.command(args)))
