@@ -90,6 +90,48 @@ describe('private durable intake HTTP/SQLite', () => {
     });
   });
 
+  it.each(['/tasks?status=open', '/handoff'])('protects %s counters immediately after first installation', async (path) => {
+    await inDO(stub(), async (h: any) => {
+      // Seed valid ledgers before any export schema/triggers exist. Each route
+      // gets its own first installation, so neither can hide behind the other.
+      const prefix = path === '/handoff' ? 'r1_handoff_' : 'r1_open_';
+      const sql: any = { exec: (q: string, ...args: any[]) => h.sql.exec(q.replaceAll('intake_', prefix), ...args) };
+      sql.exec('CREATE TABLE intake_tasks(id TEXT PRIMARY KEY,data TEXT NOT NULL)');
+      for (let i = 0; i < 61; i++) {
+        const id = 'r1-' + String(i).padStart(3, '0');
+        sql.exec('INSERT INTO intake_tasks VALUES(?,?)', id, JSON.stringify({ id, project: 'demo', status: 'open',
+          title: 'Retained task', version: 1, created_at: 1, updated_at: 1, archived_at: null,
+          acceptance_criteria: 'Retain complete counts.', history: [] }));
+      }
+      const service = new IntakeService(sql, (fn: any) => h.ctx.storage.transactionSync(fn));
+      service.init();
+      expect(sql.exec('SELECT COUNT(*) AS n FROM intake_export').toArray()[0].n).toBe(25);
+      const auth: any = async () => ({ caller: { kind: 'human', isAdmin: true, actor: 'fixture' }, scopes: ['admin'] });
+      const read = () => service.handle(new Request('https://hub.test/api/intake' + path), auth);
+      const migrating = await read();
+      expect(migrating.status).toBe(503);
+      expect(await migrating.json()).toEqual({ error: 'intake_export_migrating', retry_after: 1 });
+      expect(sql.exec('SELECT COUNT(*) AS n FROM intake_export').toArray()[0].n).toBe(50);
+      expect(() => service.openNonTerminalCount()).toThrow('intake_export_migrating');
+
+      // Writes remain successful and explicitly identify unavailable warnings.
+      const payload = { key: 'create-during-migration', project: 'demo', title: 'New task', text: 'New request', source,
+        acceptance_criteria: 'Creation remains available.' };
+      const created = await service.handle(new Request('https://hub.test/api/intake/tasks', {
+        method: 'POST', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' },
+      }), auth);
+      expect(created.status).toBe(200);
+      const creation: any = await created.json();
+      expect(creation.intake_open_warning).toMatchObject({ code: 'intake_export_migrating', retry_after: 1 });
+      expect(creation.intake_open_warning).not.toHaveProperty('open_count');
+
+      const complete = await read();
+      expect(complete.status).toBe(200);
+      expect(await complete.json()).toMatchObject({ total: 62, open_non_terminal_count: 62 });
+      expect(sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').toArray()[0].n).toBe(62);
+    });
+  });
+
   it('commits migration progress before returning a retryable response', async () => {
     await inDO(stub(), (h: any) => {
       for (let i = 0; i < 51; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'resume-' + String(i).padStart(3, '0'), JSON.stringify({ project: 'demo', status: 'open', history: [] }));

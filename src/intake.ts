@@ -520,14 +520,22 @@ export class IntakeService {
       action: 'expand_retention_storage', threshold_ratio: 0.8, ...usage };
   }
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
+  private intakeExportReady(): boolean {
+    return !!(this.sql.exec('SELECT done FROM intake_export_migration WHERE id=1').toArray()[0] as Obj).done;
+  }
   /** Non-terminal task count used for soft open-intake warnings (never blocks create). */
   openNonTerminalCount(principal?: Obj, summaries?: Obj[]): number {
+    if (!summaries && !this.intakeExportReady()) throw new IntakeError('intake_export_migrating', 503, undefined, undefined, { retry_after: 1 });
     if (!summaries) return intakeExportCounts(this.sql, principal ?? { admin: true }, null).filter(r => !r.archived && OPEN.includes(r.status)).reduce((n, r) => n + Number(r.n), 0);
     const rows = summaries;
     return rows.filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t))).length;
   }
   /** Operator-visible soft warning when open intake is high. Null when under threshold. */
   intakeOpenWarning(principal?: Obj, summaries?: Obj[]): Obj | null {
+    // Creation remains available while the bounded backfill is incomplete.
+    // Never turn a partial counter into an apparently complete soft warning.
+    if (!summaries && !this.intakeExportReady()) return { code: 'intake_export_migrating', retry_after: 1,
+      message: 'Open intake warning is unavailable until intake export migration completes.' };
     const p = principal ?? { admin: true };
     const supplied = summaries?.filter(t => !t.archived_at && OPEN.includes(t.status) && this.allowed(p, t));
     const open_count = supplied?.length ?? this.openNonTerminalCount(p);
@@ -1929,8 +1937,7 @@ export class IntakeService {
         : null;
       if (assignMatch) return await this.assign(assignMatch[1], payload, auth, json);
       const exportUrl = new URL(request.url);
-      if (request.method === 'GET' && (exportUrl.pathname === '/api/intake/summary' ||
-          (exportUrl.pathname === '/api/intake/tasks' && exportUrl.searchParams.get('status') !== 'open')) &&
+      if (request.method === 'GET' && ['/api/intake/summary', '/api/intake/tasks', '/api/intake/handoff'].includes(exportUrl.pathname) &&
           !this.tx(() => advanceIntakeExport(this.sql))) return json({ error: 'intake_export_migrating', retry_after: 1 }, 503);
       return this.tx(() => {
         const p = this.principal(auth); const url = new URL(request.url);
