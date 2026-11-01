@@ -1236,7 +1236,10 @@ export class FleetService {
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
-      const model = policy.models.find(m => !modelDisabledByPolicy(m) && members.includes(m.id) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
+      const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) && (anyTier || members.includes(m.id)) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
+      // An engine named without a tier (e.g. antigravity, whose models sit in deep/review only)
+      // falls back to that engine's models in any tier instead of the default tier alone.
+      const model = pick(false) ?? (input.tier == null && request.engine && !overrideModels.length ? pick(true) : undefined);
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       // Host adapter refusals are scoped to the exact route, mode and model
       // within the engine health retry window so transient historical launch
