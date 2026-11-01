@@ -89,7 +89,7 @@ describe('private durable intake HTTP/SQLite', () => {
       expect(summary).toMatchObject({ total: 1083, counts: { open: 542, done: 541 }, archived_count: 541, open_non_terminal_count: 542 });
       expect(summary.recent.map((t: any) => t.id)).toEqual(['export-1082','export-1081','export-1080','export-1079','export-1078']);
       expect(JSON.stringify(summary)).not.toContain('xxxxxxxx');
-      expect(queries.some(q => /FROM intake_tasks|FROM intake_task_projection/.test(q))).toBe(false);
+      expect(queries.some(q => /FROM intake_tasks|FROM intake_task_projection|FROM intake_export_counts/.test(q))).toBe(false);
       queries.length = 0;
       const page = (service as any).read(new URL('https://hub.test/api/intake/tasks?all=true&limit=25'), p);
       expect(page.total).toBe(1083); expect(page.items).toHaveLength(25);
@@ -106,6 +106,16 @@ describe('private durable intake HTTP/SQLite', () => {
       expect(mixedPage.total).toBe(1083); expect(mixedPage.items.map((t: any) => t.id)).toEqual(page.items.map((t: any) => t.id));
       expect(JSON.stringify(plans)).not.toMatch(/MULTI-INDEX OR|TEMP B-TREE/);
 
+      for (const principal of [p, mixed]) for (const [query, expectedTotal] of [
+        ['all=true', 1083], ['all=true&project=export-fixture', 1083],
+        ['status=done', 541], ['archived=true', 541], ['status=done&archived=true', 541], ['', 542],
+      ] as const) {
+        plans.length = 0;
+        const selected = (service as any).read(new URL('https://hub.test/api/intake/tasks?limit=25&' + query), principal);
+        expect(selected.total).toBe(expectedTotal);
+        expect(selected.items).toHaveLength(Math.min(25, expectedTotal));
+        expect(JSON.stringify(plans)).not.toMatch(/MULTI-INDEX OR|TEMP B-TREE/);
+      }
       const plan = h.sql.exec('EXPLAIN QUERY PLAN SELECT data FROM intake_export ORDER BY updated_at DESC,id LIMIT 5').toArray();
       expect(JSON.stringify(plan)).toContain('intake_export_recent');
       // Rollback updates both metadata and counters; session state is read live.
