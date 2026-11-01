@@ -1,3 +1,4 @@
+import { initIntakeExport, advanceIntakeExport } from '../src/intake-export';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie, tokenAdminSubject, TOKEN_ADMIN_EMAIL } from '../src/auth/session';
@@ -68,6 +69,40 @@ beforeEach(async () => {
 });
 
 describe('private durable intake HTTP/SQLite', () => {
+  it('migrates sparse retained rows in resumable batches and maintains counters during writes', async () => {
+    await inDO(stub(), (h: any) => {
+      // Independent fixture namespace simulates the first schema installation.
+      const sql: any = { exec: (q: string, ...args: any[]) => h.sql.exec(q.replaceAll('intake_', 'migration_fixture_'), ...args) };
+      sql.exec('CREATE TABLE migration_fixture_tasks(id TEXT PRIMARY KEY,data TEXT NOT NULL)');
+      for (let i = 0; i < 61; i++) sql.exec('INSERT INTO intake_tasks VALUES(?,?)', String(i).padStart(3, '0'), JSON.stringify({ history: [], project: i % 2 ? null : 'demo' }));
+      initIntakeExport(sql);
+      expect(sql.exec('SELECT COUNT(*) AS n FROM intake_export').toArray()[0].n).toBe(25);
+      sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify({ project: 'changed', status: 'done' }), '030');
+      sql.exec('DELETE FROM intake_tasks WHERE id=?', '031');
+      expect(advanceIntakeExport(sql)).toBe(false);
+      expect(advanceIntakeExport(sql)).toBe(true);
+      expect(advanceIntakeExport(sql)).toBe(true);
+      initIntakeExport(sql);
+      expect(sql.exec('SELECT COUNT(*) AS n FROM intake_export').toArray()[0].n).toBe(60);
+      expect(sql.exec('SELECT SUM(n) AS n FROM intake_export_totals').toArray()[0].n).toBe(60);
+      expect(sql.exec('SELECT project,status FROM intake_export WHERE id=?', '001').toArray()[0]).toEqual({ project: '', status: 'open' });
+      expect(sql.exec('SELECT project,status FROM intake_export WHERE id=?', '030').toArray()[0]).toEqual({ project: 'changed', status: 'done' });
+    });
+  });
+
+  it('commits migration progress before returning a retryable response', async () => {
+    await inDO(stub(), (h: any) => {
+      for (let i = 0; i < 51; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'resume-' + String(i).padStart(3, '0'), JSON.stringify({ project: 'demo', status: 'open', history: [] }));
+      h.sql.exec('UPDATE intake_export_migration SET after_id=NULL,done=0 WHERE id=1');
+    });
+    expect((await call('/summary')).status).toBe(503);
+    const cursor = await inDO(stub(), (h: any) => h.sql.exec('SELECT after_id FROM intake_export_migration WHERE id=1').toArray()[0].after_id);
+    expect(cursor).toBe('resume-024');
+    expect((await call('/summary')).status).toBe(503);
+    const res = await call('/summary');
+    expect(res.status).toBe(200);
+  });
+
   it('summarizes 1083 retained histories without reading ledgers and hydrates only one export page', async () => {
     await inDO(stub(), (h: any) => {
       for (let i = 0; i < 1083; i++) {

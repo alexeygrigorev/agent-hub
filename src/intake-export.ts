@@ -1,9 +1,20 @@
 /** Small, transactionally maintained read model. Never stores history bodies.
- * Bootstrap scans retained ledgers once; reads never do. */
+ * Bootstrap advances a durable cursor in bounded batches. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 type Obj = Record<string, any>;
+const select = (prefix: string) => {
+    const d = prefix + 'data';
+    const j = (key: string) => `json_extract(${d},'$.${key}')`;
+    return `${prefix}id,COALESCE(${j('project')},''),COALESCE(${j('status')},'open'),CASE WHEN ${j('archived_at')} IS NULL THEN 0 ELSE 1 END,COALESCE(${j('updated_at')},0),
+      json_object('id',${prefix}id,'project',${j('project')},'status',${j('status')},'version',${j('version')},
+        'title',${j('title')},'owner',${j('owner')},'current_state',${j('current_state')},'next_step',${j('next_step')},
+        'created_at',${j('created_at')},'updated_at',${j('updated_at')},'archived_at',${j('archived_at')},
+        'last_event_kind',${j('history[#-1].kind')},'last_event_at',${j('history[#-1].captured_at')},
+        'last_session_id',(SELECT json_extract(value,'$.hub_session_id') FROM json_each(${d},'$.history')
+          WHERE json_extract(value,'$.kind')='link' AND json_extract(value,'$.hub_session_id') IS NOT NULL ORDER BY CAST(key AS INTEGER) DESC LIMIT 1))`;
+  };
+
 export function initIntakeExport(sql: SqlStorage) {
-  const exists = sql.exec("SELECT 1 FROM sqlite_master WHERE name='intake_export'").toArray().length;
   sql.exec(`CREATE TABLE IF NOT EXISTS intake_export (
     id TEXT PRIMARY KEY, project TEXT NOT NULL, status TEXT NOT NULL,
     archived INTEGER NOT NULL, updated_at INTEGER NOT NULL, data TEXT NOT NULL)`);
@@ -16,39 +27,36 @@ export function initIntakeExport(sql: SqlStorage) {
     ['project_archive', 'project,archived,id'], ['project_status', 'project,status,id'],
     ['project_status_archive', 'project,status,archived,id'],
   ]) sql.exec(`CREATE INDEX IF NOT EXISTS intake_export_${name} ON intake_export(${columns})`);
-  const select = (prefix: string) => {
-    const d = prefix + 'data';
-    const j = (key: string) => `json_extract(${d},'$.${key}')`;
-    return `${prefix}id,${j('project')},${j('status')},CASE WHEN ${j('archived_at')} IS NULL THEN 0 ELSE 1 END,COALESCE(${j('updated_at')},0),
-      json_object('id',${prefix}id,'project',${j('project')},'status',${j('status')},'version',${j('version')},
-        'title',${j('title')},'owner',${j('owner')},'current_state',${j('current_state')},'next_step',${j('next_step')},
-        'created_at',${j('created_at')},'updated_at',${j('updated_at')},'archived_at',${j('archived_at')},
-        'last_event_kind',${j('history[#-1].kind')},'last_event_at',${j('history[#-1].captured_at')},
-        'last_session_id',(SELECT json_extract(value,'$.hub_session_id') FROM json_each(${d},'$.history')
-          WHERE json_extract(value,'$.kind')='link' AND json_extract(value,'$.hub_session_id') IS NOT NULL ORDER BY CAST(key AS INTEGER) DESC LIMIT 1))`;
-  };
-  if (!exists) sql.exec(`INSERT INTO intake_export SELECT ${select('')} FROM intake_tasks`);
+  sql.exec('CREATE TABLE IF NOT EXISTS intake_export_migration(id INTEGER PRIMARY KEY CHECK(id=1), after_id TEXT, done INTEGER NOT NULL)');
+  sql.exec('INSERT OR IGNORE INTO intake_export_migration VALUES(1,NULL,0)');
   for (const op of ['INSERT','UPDATE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_export_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN
     INSERT INTO intake_export SELECT ${select('NEW.')} ON CONFLICT(id) DO UPDATE SET
       project=excluded.project,status=excluded.status,archived=excluded.archived,updated_at=excluded.updated_at,data=excluded.data; END`);
   sql.exec('CREATE TRIGGER IF NOT EXISTS intake_export_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_export WHERE id=OLD.id; END');
-  const countsExist = sql.exec("SELECT 1 FROM sqlite_master WHERE name='intake_export_counts'").toArray().length;
   sql.exec(`CREATE TABLE IF NOT EXISTS intake_export_counts(project TEXT NOT NULL,status TEXT NOT NULL,archived INTEGER NOT NULL,n INTEGER NOT NULL,
     PRIMARY KEY(project,status,archived))`);
-  if (!countsExist) sql.exec('INSERT INTO intake_export_counts SELECT project,status,archived,COUNT(*) FROM intake_export GROUP BY project,status,archived');
   for (const op of ['INSERT','UPDATE','DELETE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_export_count_${op.toLowerCase()} AFTER ${op} ON intake_export BEGIN
     ${op !== 'INSERT' ? 'UPDATE intake_export_counts SET n=n-1 WHERE project=OLD.project AND status=OLD.status AND archived=OLD.archived; DELETE FROM intake_export_counts WHERE project=OLD.project AND status=OLD.status AND archived=OLD.archived AND n=0;' : ''}
     ${op !== 'DELETE' ? 'INSERT INTO intake_export_counts VALUES(NEW.project,NEW.status,NEW.archived,1) ON CONFLICT(project,status,archived) DO UPDATE SET n=n+1;' : ''}
     END`);
 
-  const totalsExist = sql.exec("SELECT 1 FROM sqlite_master WHERE name='intake_export_totals'").toArray().length;
   sql.exec(`CREATE TABLE IF NOT EXISTS intake_export_totals(status TEXT NOT NULL,archived INTEGER NOT NULL,n INTEGER NOT NULL,
     PRIMARY KEY(status,archived))`);
-  if (!totalsExist) sql.exec('INSERT INTO intake_export_totals SELECT status,archived,SUM(n) FROM intake_export_counts GROUP BY status,archived');
   for (const op of ['INSERT','UPDATE','DELETE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_export_total_${op.toLowerCase()} AFTER ${op} ON intake_export BEGIN
     ${op !== 'INSERT' ? 'UPDATE intake_export_totals SET n=n-1 WHERE status=OLD.status AND archived=OLD.archived; DELETE FROM intake_export_totals WHERE status=OLD.status AND archived=OLD.archived AND n=0;' : ''}
     ${op !== 'DELETE' ? 'INSERT INTO intake_export_totals VALUES(NEW.status,NEW.archived,1) ON CONFLICT(status,archived) DO UPDATE SET n=n+1;' : ''}
     END`);
+  advanceIntakeExport(sql);
+}
+/** Caller must wrap the batch and cursor in one storage transaction. */
+export function advanceIntakeExport(sql: SqlStorage): boolean {
+  const state = sql.exec('SELECT after_id,done FROM intake_export_migration WHERE id=1').toArray()[0] as Obj;
+  if (state.done) return true;
+  const rows = sql.exec('SELECT id FROM intake_tasks WHERE id>? ORDER BY id LIMIT 25', state.after_id ?? '').toArray() as Obj[];
+  for (const row of rows) sql.exec(`INSERT OR IGNORE INTO intake_export SELECT ${select('')} FROM intake_tasks WHERE id=?`, row.id);
+  const done = rows.length < 25;
+  sql.exec('UPDATE intake_export_migration SET after_id=?,done=? WHERE id=1', rows.at(-1)?.id ?? state.after_id, done ? 1 : 0);
+  return done;
 }
 /** Exact project buckets and task primary keys keep both work and binding
  * count bounded. Callers combine bucket parts in memory; no SQL GROUP sort. */

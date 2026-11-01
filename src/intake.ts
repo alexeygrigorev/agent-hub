@@ -9,7 +9,7 @@ type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
 import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, initSessionLinks, initLinkRefs, triageTargets, workerAccessContext, workerCreatedTargets, workerLinkedTargets } from './worker-access';
-import { initIntakeExport, intakeExportCounts, intakeExportRecent, intakeExportPageIds, intakeExportMatches, type IntakeExportFilter } from './intake-export';
+import { advanceIntakeExport, initIntakeExport, intakeExportCounts, intakeExportRecent, intakeExportPageIds, intakeExportMatches, type IntakeExportFilter } from './intake-export';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
@@ -1928,6 +1928,10 @@ export class IntakeService {
         ? /^\/tasks\/([A-Za-z0-9._:-]+)\/assign$/.exec(new URL(request.url).pathname.slice('/api/intake'.length))
         : null;
       if (assignMatch) return await this.assign(assignMatch[1], payload, auth, json);
+      const exportUrl = new URL(request.url);
+      if (request.method === 'GET' && (exportUrl.pathname === '/api/intake/summary' ||
+          (exportUrl.pathname === '/api/intake/tasks' && exportUrl.searchParams.get('status') !== 'open')) &&
+          !this.tx(() => advanceIntakeExport(this.sql))) return json({ error: 'intake_export_migrating', retry_after: 1 }, 503);
       return this.tx(() => {
         const p = this.principal(auth); const url = new URL(request.url);
         if (!payload) return json(this.read(url, p));
