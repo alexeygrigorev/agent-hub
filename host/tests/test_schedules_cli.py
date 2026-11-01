@@ -16,18 +16,23 @@ from unittest.mock import patch
 
 
 class ScheduleCliPayloads(unittest.TestCase):
-    def _run(self, argv, request):
+    def _run_with_status(self, argv, request):
         from agent_hub_host import cli, session_control
         stdout = io.StringIO()
         stderr = io.StringIO()
+        exit_code = 0
         with patch.object(sys, 'argv', ['hub'] + argv), \
                 patch.object(session_control, 'request', side_effect=request), \
                 redirect_stdout(stdout), redirect_stderr(stderr):
             try:
                 cli.main()
-            except SystemExit:
-                pass
-        return stdout.getvalue(), stderr.getvalue()
+            except SystemExit as exc:
+                exit_code = exc.code if isinstance(exc.code, int) else 1
+        return stdout.getvalue(), stderr.getvalue(), exit_code
+
+    def _run(self, argv, request):
+        stdout, stderr, _ = self._run_with_status(argv, request)
+        return stdout, stderr
 
     def test_create_minimal_payload_uses_defaults(self):
         calls = []
@@ -145,6 +150,49 @@ class ScheduleCliPayloads(unittest.TestCase):
         out, err = self._run(['schedule', 'list'], request)
         self.assertIn('2026-10-31T11:00:00Z', out)
         self.assertIn('paused', out)
+
+    def test_http_errors_render_bounded_cli_diagnostics_without_tracebacks(self):
+        from agent_hub_host import session_control
+
+        for status, code in ((403, 'worker_scope_forbidden'), (404, 'not_found'), (409, 'schedule_conflict')):
+            with self.subTest(status=status):
+                secret_body = 'private response body with credential=hidden'
+
+                def request(*_args, **_kwargs):
+                    raise session_control.SessionHTTPError(status, code=code, message=secret_body)
+
+                out, err, exit_code = self._run_with_status(['schedule', 'show', 'daily-writer'], request)
+                self.assertEqual(out, '')
+                self.assertEqual(exit_code, 1)
+                self.assertIn(f'HTTP {status} ({code})', err)
+                self.assertNotIn(secret_body, err)
+                self.assertNotIn('Traceback', err)
+
+    def test_transport_error_does_not_echo_exception_details(self):
+        from agent_hub_host import session_control
+
+        def request(*_args, **_kwargs):
+            raise session_control.SessionTransportError('transport failed; credential=hidden')
+
+        out, err, exit_code = self._run_with_status(['schedule', 'show', 'daily-writer'], request)
+        self.assertEqual(out, '')
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(err.strip(), 'schedule operation failed: Hub transport error')
+        self.assertNotIn('credential', err)
+        self.assertNotIn('Traceback', err)
+
+    def test_input_error_uses_cli_error_path_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_path = os.path.join(tmp, 'missing-prompt.txt')
+            out, err, exit_code = self._run_with_status(
+                ['schedule', 'create', '--name', 'writer', '--project', 'agent-hub',
+                 '--cron', '0 9 * * *', '--prompt-file', missing_path],
+                lambda *_args, **_kwargs: self.fail('input validation must fail before making an HTTP request'))
+
+        self.assertEqual(out, '')
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(err.strip(), 'schedule operation failed: Prompt: file not found')
+        self.assertNotIn('Traceback', err)
 
 
 if __name__ == '__main__':

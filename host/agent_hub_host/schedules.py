@@ -118,9 +118,17 @@ def render_output(args: argparse.Namespace, result):
 
 def diagnostic(exc: Exception) -> str:
     if isinstance(exc, session_control.SessionHTTPError):
-        return f'schedule operation failed: HTTP {exc.status}: {exc.message or exc.code}'
-    if isinstance(exc, (session_control.SessionInputError, session_control.SessionTransportError)):
+        # SessionHTTPError exposes status and code; its explanatory message is
+        # stored as exception text, not as a `.message` attribute. The message
+        # may contain details inappropriate for CLI output, so render only the
+        # bounded status and parser-validated error code.
+        status = exc.status if isinstance(exc.status, int) and 100 <= exc.status <= 599 else 'unknown'
+        code = exc.code if isinstance(exc.code, str) and session_control.SAFE_ERROR.fullmatch(exc.code) else 'request_failed'
+        return f'schedule operation failed: HTTP {status} ({code})'
+    if isinstance(exc, session_control.SessionInputError):
         return f'schedule operation failed: {exc}'
+    if isinstance(exc, session_control.SessionTransportError):
+        return 'schedule operation failed: Hub transport error'
     return 'schedule operation failed; check authentication and inputs (details withheld)'
 
 
