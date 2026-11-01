@@ -483,6 +483,50 @@ def _write_engine_config(path, raw, current):
             pass
 
 
+def claude_project_keys(path):
+    """Keys Claude Code may use for a project: native form and forward-slash form (Windows)."""
+    native = str(path)
+    return list(dict.fromkeys([native, native.replace('\\', '/')]))
+
+
+def ensure_claude_trusted_projects(config_path, paths):
+    """Mark paths trusted in a managed Claude config (projects[<path>].hasTrustDialogAccepted).
+
+    The Claude equivalent of ensure_toml_trusted_projects (intake 7833bf13): a
+    Hub-created work tree otherwise opens at the folder-trust dialog and the
+    session never runs. The file also holds Claude's own account and session
+    state, so it is only rewritten when it parsed as an object (or is absent)
+    and something actually changes; oversized or unreadable content is kept.
+    """
+    try:
+        raw = read_engine_file(config_path)
+    except ValueError:
+        return
+    if raw is None:
+        config = {}
+    else:
+        try:
+            config = json.loads(raw.decode('utf-8'))
+        except (UnicodeDecodeError, ValueError):
+            return
+        if not isinstance(config, dict):
+            return
+    projects = config.setdefault('projects', {})
+    if not isinstance(projects, dict):
+        return
+    changed = False
+    for path in paths:
+        for key in claude_project_keys(path):
+            entry = projects.setdefault(key, {})
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('hasTrustDialogAccepted') is not True:
+                entry['hasTrustDialogAccepted'] = True
+                changed = True
+    if changed:
+        _write_engine_config(config_path, json.dumps(config, indent=2).encode('utf-8'), raw)
+
+
 def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=None):
     """Ensure managed engine home configuration has approval and sandbox prompts disabled.
 
@@ -590,6 +634,11 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
                             entry['command'] = hook_command.repair_state_report_command(
                                 entry['command'], a_cmd)
         _write_engine_config(settings_path, json.dumps(settings, indent=2).encode('utf-8'), current)
+        try:
+            ensure_claude_trusted_projects(claude_dir / '.claude.json', paths_to_trust)
+        except (OSError, ValueError) as exc:
+            # Trust is a convenience: a refused write must not block the launch.
+            print(json.dumps({'event': 'claude_trust_skipped', 'type': type(exc).__name__}), file=sys.stderr, flush=True)
 
     # OpenCode (go)
     if provider in ('go', None):
