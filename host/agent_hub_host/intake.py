@@ -242,9 +242,11 @@ def add_commands(sub):
     listing.add_argument('--after')
     listing.add_argument('--revision', type=int)
     listing.add_argument('--authorization-valid-until', type=int)
-    listing.add_argument('--limit', type=int, default=25, help='Positive integer; default 25, server clamps above max 100')
+    listing.add_argument('--limit', type=int, default=None, help='Positive integer; default 25 (100 with --all), server clamps above max 100')
     listing.add_argument('--all', action='store_true', help='Follow all pages with a pinned snapshot; restart if it changes')
     listing.add_argument('--archived', action='store_true', help='List archived intakes')
+    summary = commands.add_parser('summary', help='Current authorized task counts and five recent tasks; no histories')
+    summary.add_argument('--project')
     audit = commands.add_parser('audit', help='Durable lifecycle events for one intake, or recent events')
     audit.add_argument('id', nargs='?')
     audit.add_argument('--limit', type=int, default=25)
@@ -455,8 +457,11 @@ def execute(args):
         if getattr(args, 'verification', None) is not None:
             body['verification'] = args.verification
         return request('POST', BASE + '/tasks', body)
+    if command == 'summary':
+        params = {'project': args.project} if args.project is not None else {}
+        return request('GET', BASE + '/summary?' + urlencode(params))
     if command == 'list':
-        params = {'limit': args.limit}
+        params = {'limit': args.limit if args.limit is not None else (100 if args.all else 25)}
         if args.status is not None:
             params['status'] = args.status
         if args.archived:

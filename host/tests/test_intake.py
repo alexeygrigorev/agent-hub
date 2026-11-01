@@ -43,6 +43,21 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(query, {'all': ['true'], 'project': ['demo'], 'limit': ['1'],
                                 'after': ['a'], 'revision': ['7'], 'authorization_valid_until': ['12345']})
 
+    def test_summary_is_one_history_free_request(self):
+        with patch.object(intake, 'request', return_value={'total': 1083, 'counts': {'open': 42}}) as transport:
+            code, out, error = self.run_cli('intake', 'summary', '--project', 'demo')
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(out)['total'], 1083)
+        transport.assert_called_once_with('GET', '/api/intake/summary?project=demo')
+
+    def test_complete_export_uses_maximum_default_page_but_preserves_explicit_limit(self):
+        page = {'items': [], 'next': None, 'snapshot_version': 1, 'total': 0}
+        for arguments, limit in [(('--all',), 100), (('--all', '--limit', '25'), 25), ((), 25)]:
+            with patch.object(intake, 'request', return_value=page) as transport:
+                code, out, error = self.run_cli('intake', 'list', *arguments)
+            self.assertEqual(code, 0, error)
+            self.assertIn('limit=' + str(limit), transport.call_args.args[1])
+
     def test_forgotten(self):
         with patch.object(intake, 'request', return_value={'items': [], 'forgotten_count': 0}) as transport:
             code, out, error = self.run_cli('intake', 'forgotten', '--project', 'demo')

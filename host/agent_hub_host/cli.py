@@ -381,6 +381,21 @@ def add_bridge_resume_command(sub):
 
 
 def main():
+    # Summary is a latency-sensitive single read. Avoid importing/registering
+    # every unrelated command (and computing version metadata) on this path.
+    if sys.argv[1:3] == ['intake', 'summary']:
+        from . import intake
+        parser = argparse.ArgumentParser(prog='hub intake summary', description='Current task counts and five recent tasks; no histories')
+        parser.add_argument('--project')
+        args = parser.parse_args(sys.argv[3:])
+        args.cmd = 'intake'
+        args.intake_cmd = 'summary'
+        try:
+            print(json.dumps(intake.execute(args), ensure_ascii=True))
+        except Exception as exc:
+            print(intake.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     parser.add_argument("--version", action="version", version=f"%(prog)s {format_version()}")
     parser.add_argument("--profile", default=None, help="Named agent profile for messaging commands (e.g. developer; see hub msg --help)")
