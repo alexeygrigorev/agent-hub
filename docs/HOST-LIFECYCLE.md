@@ -58,11 +58,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows-host-aut
   -Runner "$env:LOCALAPPDATA\agent-hub\run-session-host.ps1"
 ```
 
-The task uses S4U (no stored password, no interactive desktop), limited privileges,
-a persistent one-minute time trigger, `StartWhenAvailable`, battery support and
-`IgnoreNew`. Its name is scoped to the current user's SID; it preserves legacy
-tasks and records the chosen name beside the supervisor wrapper. It avoids BootTrigger, whose registration requires administrator
-membership. A Windows policy denying S4U/batch logon is an explicit failure; the
-installer never elevates or substitutes a logon-only task. A Linux fixture cannot
-prove Windows scheduler execution: acceptance still requires a real reboot/wake
-cycle and resumed checkin within two minutes on Tabo.
+The task uses limited privileges, a persistent one-minute time trigger,
+`StartWhenAvailable`, battery support and `IgnoreNew`. Its name is scoped to the
+current user's SID; it preserves other users' legacy tasks and records the
+chosen name beside the supervisor wrapper. When the legacy
+`AgentHubSessionHost` task already belongs to the current user, it is upgraded
+in place so the machine keeps one supervisor loop (two loops would fight over
+the host journal lock). It avoids BootTrigger, whose registration requires
+administrator membership. Registration tries the S4U logon type (no stored
+password, survives logout) first; on locked-down hosts a non-elevated S4U
+registration is denied (intake c964dbd6, Tabo), so the same per-user Limited
+task then falls back to an Interactive logon type in this user's logon
+session. The installer never elevates or requests a password; a policy denying
+both logon types is an explicit failure. A Linux fixture cannot prove Windows
+scheduler execution: acceptance still requires a real reboot/wake cycle and
+resumed checkin within two minutes on Tabo.
