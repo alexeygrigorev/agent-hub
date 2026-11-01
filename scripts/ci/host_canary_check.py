@@ -119,9 +119,15 @@ def run_suite(name: str, cwd: Path, args: list, env: dict, log_path: Path = None
 
 
 def unittest_failures(log_path: Path):
+    """Failure headers plus each block's traceback (a bare name hides the cause)."""
     lines = []
+    block = False
     for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
         if line.startswith(("FAIL: ", "ERROR: ")):
+            block = True
+        elif line.startswith(("Ran ", "FAILED (")):
+            block = False
+        if block and not line.startswith("====="):
             lines.append(line)
     return lines
 
