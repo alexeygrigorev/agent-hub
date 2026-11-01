@@ -2393,6 +2393,9 @@ def add_commands(sub):
     update.add_argument('--smoke', action='store_true', default=None, help='Run the real-prompt smoke after install (default: on unless --check-only)')
     update.add_argument('--no-smoke', dest='smoke', action='store_false', help='Skip the real-prompt smoke')
     update.set_defaults(smoke=True)
+    cancel = commands.add_parser('cancel', help='Admin: cancel a pending rollout and restore its prior engine version')
+    cancel.add_argument('rollout_id', help='Full rollout UUID')
+    cancel.add_argument('--reason', default='operator_cancelled', help='Short nonsecret audit reason')
     versions = commands.add_parser('versions', help='Per-engine installed / desired / latest versions from a check run on this host (intake 8cc9e31a AC5)')
     versions.add_argument('--json', dest='json', action='store_true', help='Machine-readable output (default)')
     versions.add_argument('--fleet', action='store_true', help='Fleet-wide per-host versions from Hub version reports instead of this host')
@@ -2641,6 +2644,13 @@ def command(args):
                 # Fleet unreachable: fall back to the local check run.
                 return engine_rollout.check_host()
         return engine_rollout.check_host()
+    if args.engines_cmd == 'cancel':
+        if not REV.fullmatch(args.rollout_id):
+            raise ValueError('Invalid rollout id')
+        reason = args.reason
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or re.search(r'[\x00-\x1f\x7f]', reason):
+            raise ValueError('Invalid cancellation reason')
+        return bus._do_request('POST', '/api/engines/rollouts/' + args.rollout_id + '/cancel', {'reason': reason.strip()})
     if args.engines_cmd == 'update':
         from . import engine_rollout
         return engine_update_command(args)

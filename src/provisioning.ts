@@ -8,6 +8,7 @@ import { canonicalQuotaProvider, canonicalAccountLabel, validateQuotaSnapshotPay
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { effectiveCheckin } from './registry';
 import { bumpEngineEpoch } from './engine-epoch';
+import { cancelEngineRollout } from './engine-rollout-cancel';
 import { CLAUDE_OAUTH, CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claudeAuthorization, claudeExchange, credentialFreshness, credentialSubset,
   fetchQuota, needsRefresh, refreshCredential, refreshable, structurallyValid, validCredentialFiles, type CredentialFiles, type FetchLike } from './credentials';
 
@@ -317,6 +318,17 @@ export class ProvisioningService {
     // Hub-managed engine version rollout (intake 8cc9e31a). These paths sort
     // before the generic /api/engines/<label> match below ('versions' and
     // 'update' would otherwise parse as labels).
+    const cancel = /^\/api\/engines\/rollouts\/([^/]+)\/cancel$/.exec(path);
+    if (cancel && request.method === 'POST') {
+      if (!admin) return reply({ error: 'forbidden' }, 403);
+      const result = await cancelEngineRollout({ sql: this.sql, tx: this.tx, now: () => this.now(),
+        open: row => this.open(row), seal: (bundle, revision) => this.seal(bundle, revision) },
+        cancel[1], await request.json().catch(() => null));
+      const status = 'error' in result ? result.error === 'rollout_not_found' ? 404
+        : result.error === 'bundle_decryption_unavailable' ? 503
+        : ['invalid_rollout_id', 'invalid_cancel_request', 'invalid_cancel_reason'].includes(result.error) ? 400 : 409 : 200;
+      return reply(result, status);
+    }
     if (path === '/api/engines/versions' && request.method === 'GET') {
       if (!admin && !host) return reply({ error: 'forbidden' }, 403);
       const machine = new URL(request.url).searchParams.get('machine') || undefined;
