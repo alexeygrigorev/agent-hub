@@ -126,6 +126,8 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',
   'engines remove': 'Operator credential withdrawal stays in the explicit credential-management CLI/UI workflow.',
   'engines status': 'Operator read of per-host engine sync status; deliberate CLI step, not an agent tool.',
+  'engines update': 'Operator rollout of Hub-managed engine versions to hosts (intake 8cc9e31a); a fleet-wide change, never an agent tool.',
+  'engines versions': 'Operator read of the Hub-managed engine version catalog and per-host rollout state (intake 8cc9e31a); CLI view.',
   'engines sync': 'Local enrolled-host engine installation; no second remote executor.',
   'engines quota': 'Local private-account probes for the server collector; model tools read sanitized server quota instead.',
   'login': 'Host/agent pairing is performed outside model tools using hub login and explicit device approval; never return credentials in tool output.',
