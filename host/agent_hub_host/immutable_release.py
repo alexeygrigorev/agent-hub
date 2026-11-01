@@ -4,6 +4,9 @@ The Git checkout supplies objects only. The running release supplies the trusted
 builder/switcher; activation preserves the current user service configuration.
 The normal supervisor restart marker loads the new unit after the report lands.
 """
+import ctypes
+import errno
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -58,22 +61,68 @@ def legacy_switches(dropins, unit_dir, root):
                  'release_dropin_precedence')
         backup = path.with_suffix('.conf.disabled')
         _require(not backup.exists() and not backup.is_symlink(), 'release_dropin_backup_conflict')
-        legacy.append((path, backup))
+        legacy.append((path, backup, path.stat(), text))
     return legacy
 
 
+@contextmanager
+def migration_lock(unit_dir, inherited=None):
+    """Serialize updater and operator migrations, including verification/build."""
+    import fcntl
+    lock = unit_dir / '.hub-release-migration.lock'
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if inherited is None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            a, b = os.fstat(fd), os.fstat(inherited)
+            _require((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino), 'release_lock_invalid')
+        yield fd
+    except BlockingIOError:
+        raise UpdateRefused('release_migration_busy')
+    finally:
+        os.close(fd)
+
+
+def validate_switches(legacy):
+    for path, backup, identity, text in legacy:
+        _require(not backup.exists() and not backup.is_symlink(), 'release_dropin_backup_conflict')
+        _require(not path.is_symlink() and path.is_file(), 'release_dropin_source_changed')
+        current = path.stat()
+        _require((current.st_dev, current.st_ino, current.st_uid, current.st_mtime_ns,
+                  current.st_ctime_ns, current.st_size) ==
+                 (identity.st_dev, identity.st_ino, identity.st_uid, identity.st_mtime_ns,
+                  identity.st_ctime_ns, identity.st_size) and
+                 path.read_text(encoding='utf-8') == text, 'release_dropin_source_changed')
+
+
 def retire_switches(legacy, journal):
-    """Write ahead before each reversible rename; never delete an override."""
+    """Revalidate and atomically rename without replacing any existing backup.
+
+    Caller holds migration_lock. Linux renameat2(RENAME_NOREPLACE) fails closed
+    if unsupported; unlike Path.rename it cannot clobber a racing backup.
+    """
     if not legacy:
         return
+    validate_switches(legacy)
     journal.parent.mkdir(parents=True, exist_ok=True)
+    rename = ctypes.CDLL(None, use_errno=True).renameat2
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
     with journal.open('a', encoding='utf-8') as handle:
-        for path, backup in legacy:
+        for entry in legacy:
+            path, backup, _, _ = entry
+            validate_switches([entry])
             handle.write(json.dumps({'action': 'disable_operator_switch',
                                      'source': str(path), 'backup': str(backup)}) + '\n')
             handle.flush()
             os.fsync(handle.fileno())
-            path.rename(backup)
+            if rename(-100, os.fsencode(path), -100, os.fsencode(backup), 1):
+                error = ctypes.get_errno()
+                if error == errno.EEXIST:
+                    raise UpdateRefused('release_dropin_backup_conflict')
+                raise OSError(error, os.strerror(error))
+
 
 
 def apply(target, before, request, *, root, source=None, run=subprocess.run,
@@ -116,10 +165,16 @@ def _apply(target, before, request, *, root, source, run, python, disk_usage):
     unit_dir = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'systemd' / 'user' / (SERVICE + '.d')
     unit_dir = unit_dir.resolve()
     _require(unit_dir.is_relative_to(Path.home().resolve()), 'unsafe_release_unit_directory')
+    with migration_lock(unit_dir) as lock_fd:
+        return _activate(target, before, request, root=root, source=source, run=run,
+                         python=python, unit_dir=unit_dir, scripts=scripts, lock_fd=lock_fd)
+
+
+def _activate(target, before, request, *, root, source, run, python, unit_dir, scripts, lock_fd):
     code, paths = _run(run, ['systemctl', '--user', 'show', SERVICE,
                             '--property=DropInPaths', '--value'], root, 30)
     _require(code == 0, 'release_service_unavailable')
-    dropins = [Path(p) for p in shlex.split(paths)]
+    dropins = set(Path(p) for p in shlex.split(paths)) | set(unit_dir.glob('*.conf'))
     candidates = []
     for path in dropins:
         if path.parent.resolve() != unit_dir or path.is_symlink() or not path.is_file():
@@ -152,6 +207,7 @@ def _apply(target, before, request, *, root, source, run, python, disk_usage):
     # A superseded goal must not activate after a long build.
     _require((request('GET', '/api/fleet/routing/host-release') or {}).get('sha') == target,
              'release_target_changed')
+    validate_switches(legacy)
     temporary = root / '.local' / 'tmp'
     temporary.mkdir(parents=True, exist_ok=True)
     _require(temporary.resolve().is_relative_to(root.resolve()), 'unsafe_release_tmp')
@@ -160,18 +216,17 @@ def _apply(target, before, request, *, root, source, run, python, disk_usage):
         path = Path(handle.name)
         handle.write(template if template.startswith(MARKER) else MARKER + template)
     try:
-        code, _ = _run(run, [python, str(scripts / 'switch-host-release.py'),
-                             '--release', str(release), '--template', str(path),
-                             '--dropin', str(destination)], root, 120, umask=0o077)
+        result = run([python, str(scripts / 'switch-host-release.py'),
+                      '--release', str(release), '--template', str(path),
+                      '--dropin', str(destination), '--migration-lock-fd', str(lock_fd)],
+                     cwd=str(root), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, text=True, timeout=120, umask=0o077,
+                     pass_fds=(lock_fd,))
+        code = result.returncode
     finally:
         path.unlink()
     if code:
         return 'failed', 'release_switch_failed', before
-    retire_switches(legacy, root / '.local' / 'host-release-switch-journal.jsonl')
-    if legacy:
-        code, _ = _run(run, ['systemctl', '--user', 'daemon-reload'], root, 30)
-        if code:
-            return 'failed', 'release_reload_failed', before
     # The currently running module is still the old release until the normal
     # restart marker drains the controller and the supervisor restarts the unit.
     return 'updated', None, before

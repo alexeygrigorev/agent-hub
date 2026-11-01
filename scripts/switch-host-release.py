@@ -17,12 +17,17 @@ Usage:
 then waits for it to report active.
 """
 import argparse
+import shlex
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'host'))
+from agent_hub_host.immutable_release import (legacy_switches, migration_lock,
+    retire_switches, validate_switches, UpdateRefused)
+
 VERIFY = REPO / "scripts" / "verify-host-release.py"
 DROPIN = 'zz~~hub-desired-release.conf'
 MARKER = '# Managed by Agent Hub desired host release.\n'
@@ -62,6 +67,7 @@ def main():
     parser.add_argument("--dropin", required=True)
     parser.add_argument("--service", default="agent-hub-session-host.service")
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument('--migration-lock-fd', type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     dropin = Path(args.dropin)
     if dropin.name != DROPIN:
@@ -69,6 +75,28 @@ def main():
     if dropin.is_symlink() or (dropin.exists() and
             (not dropin.is_file() or not dropin.read_text(encoding='utf-8').startswith(MARKER))):
         raise SystemExit('switch-host-release: REFUSED: unmanaged destination')
+    dropin.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with migration_lock(dropin.parent.resolve(), args.migration_lock_fd):
+            return activate(args, dropin)
+    except UpdateRefused as exc:
+        raise SystemExit('switch-host-release: REFUSED: ' + exc.reason)
+
+
+def activate(args, dropin):
+    if dropin.is_symlink() or (dropin.exists() and
+            (not dropin.is_file() or not dropin.read_text(encoding='utf-8').startswith(MARKER))):
+        raise SystemExit('switch-host-release: REFUSED: unmanaged destination')
+    template_text = Path(args.template).read_text(encoding='utf-8')
+    old_dirs = sorted(set(m.group(0) for m in SHA.finditer(template_text)))
+    if len(old_dirs) != 1:
+        raise SystemExit('switch-host-release: REFUSED: template must reference exactly one release dir')
+    old_root = Path(old_dirs[0])
+    paths = run('systemctl', '--user', 'show', args.service,
+                '--property=DropInPaths', '--value').stdout
+    # Include files not yet loaded by systemd as well as reported search paths.
+    dropins = set(Path(p) for p in shlex.split(paths)) | set(dropin.parent.glob('*.conf'))
+    legacy = legacy_switches(dropins, dropin.parent.resolve(), old_root)
     release = Path(args.release).resolve()
     rc = subprocess.run([sys.executable, str(VERIFY), str(release)]).returncode
     if rc != 0:
@@ -84,8 +112,9 @@ def main():
         insert_at = next((i for i, line in enumerate(lines) if line.startswith("ExecStart=")), len(lines))
         lines.insert(insert_at, "Environment=PYTHONDONTWRITEBYTECODE=1\n")
         new_text = "".join(lines)
-    dropin.parent.mkdir(parents=True, exist_ok=True)
+    validate_switches(legacy)
     dropin.write_text(new_text, encoding="utf-8")
+    retire_switches(legacy, release.parent / '.host-release-switch-journal.jsonl')
     print("switch-host-release: wrote " + str(dropin))
     run("systemctl", "--user", "daemon-reload")
     if args.restart:

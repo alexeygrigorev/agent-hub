@@ -64,6 +64,8 @@ class ImmutableReleaseTest(unittest.TestCase):
         elif len(argv) > 1 and argv[1].endswith('switch-host-release.py'):
             template = Path(argv[argv.index('--template') + 1]).read_text()
             destination = Path(argv[argv.index('--dropin') + 1])
+            legacy = update.legacy_switches(list(self.unit_dir.glob('*.conf')), self.unit_dir, self.root)
+            update.retire_switches(legacy, self.root.parent / '.host-release-switch-journal.jsonl')
             destination.write_text(template.replace(str(self.root), str(self.root.parent / self.target)))
         return subprocess.CompletedProcess(argv, code, output, '')
 
@@ -122,7 +124,7 @@ class ImmutableReleaseTest(unittest.TestCase):
         self.assertEqual(self.apply(), ('updated', None, self.before))
         self.assertFalse(original.exists())
         self.assertEqual(original.with_suffix('.conf.disabled').read_text(), self.text)
-        journal = self.root / '.local' / 'host-release-switch-journal.jsonl'
+        journal = self.root.parent / '.host-release-switch-journal.jsonl'
         self.assertEqual(json.loads(journal.read_text())['source'], str(original))
         self.before = self.target
         self.root = self.root.parent / self.target
@@ -154,6 +156,90 @@ class ImmutableReleaseTest(unittest.TestCase):
         self.template.write_text(self.text)
         self.assertEqual(self.apply(), ('refused', 'release_dropin_precedence', self.before))
         self.assertEqual(self.template.read_text(), self.text)
+
+    def test_backup_created_during_build_is_preserved(self):
+        self.template = self.unit_dir / ('zz~~~~' + self.before[:8] + '-switch-release.conf')
+        self.template.write_text(self.text)
+        original_run = self.run_command
+        def run(argv, **kwargs):
+            result = original_run(argv, **kwargs)
+            if len(argv) > 1 and argv[1].endswith('build-host-release.py'):
+                self.template.with_suffix('.conf.disabled').write_text('sentinel')
+            return result
+        with patch.object(self, 'run_command', side_effect=run):
+            self.assertEqual(self.apply(), ('refused', 'release_dropin_backup_conflict', self.before))
+        self.assertEqual(self.template.read_text(), self.text)
+        self.assertEqual(self.template.with_suffix('.conf.disabled').read_text(), 'sentinel')
+
+    def test_source_changed_during_build_is_preserved(self):
+        self.template = self.unit_dir / ('zz~~~~' + self.before[:8] + '-switch-release.conf')
+        self.template.write_text(self.text)
+        original_run = self.run_command
+        def run(argv, **kwargs):
+            result = original_run(argv, **kwargs)
+            if len(argv) > 1 and argv[1].endswith('build-host-release.py'):
+                self.template.write_text(self.text + '# operator edit\n')
+            return result
+        with patch.object(self, 'run_command', side_effect=run):
+            self.assertEqual(self.apply(), ('refused', 'release_dropin_source_changed', self.before))
+        self.assertTrue(self.template.exists())
+        self.assertFalse(self.template.with_suffix('.conf.disabled').exists())
+
+    def test_migration_lock_rejects_competing_writer_and_accepts_inherited_fd(self):
+        with update.migration_lock(self.unit_dir) as fd:
+            with self.assertRaisesRegex(update.UpdateRefused, 'release_migration_busy'):
+                with update.migration_lock(self.unit_dir):
+                    self.fail('competing migration acquired lock')
+            with update.migration_lock(self.unit_dir, fd):
+                pass
+
+    def test_backup_appearing_at_atomic_rename_is_never_overwritten(self):
+        self.template = self.unit_dir / ('zz~~~~' + self.before[:8] + '-switch-release.conf')
+        self.template.write_text(self.text)
+        backup = self.template.with_suffix('.conf.disabled')
+        legacy = update.legacy_switches([self.template], self.unit_dir, self.root)
+        real_validate = update.validate_switches
+        validations = 0
+        def validate(entries):
+            nonlocal validations
+            real_validate(entries)
+            validations += 1
+            if validations == 2:
+                backup.write_text('racing sentinel')
+        with update.migration_lock(self.unit_dir), patch.object(update, 'validate_switches', side_effect=validate):
+            with self.assertRaisesRegex(update.UpdateRefused, 'release_dropin_backup_conflict'):
+                update.retire_switches(legacy, self.root.parent / 'journal.jsonl')
+        self.assertEqual(backup.read_text(), 'racing sentinel')
+        self.assertEqual(self.template.read_text(), self.text)
+
+    def manual_switch(self):
+        spec = importlib.util.spec_from_file_location('switch_release',
+            Path(__file__).resolve().parents[2] / 'scripts' / 'switch-host-release.py')
+        switch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(switch)
+        argv = ['switch', '--release', str(self.root.parent / self.target),
+                '--template', str(self.template), '--dropin', str(self.unit_dir / update.DROPIN)]
+        def command(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0,
+                str(self.template) if 'show' in argv else '', '')
+        with patch('sys.argv', argv), patch.object(switch.subprocess, 'run', side_effect=command):
+            return switch.main()
+
+    def test_manual_bootstrap_changes_effective_execstart(self):
+        self.template = self.unit_dir / ('zz~~~~' + self.before[:8] + '-switch-release.conf')
+        self.template.write_text(self.text)
+        self.assertEqual(self.manual_switch(), 0)
+        effective = sorted(self.unit_dir.glob('*.conf'))[-1].read_text()
+        self.assertIn(str(self.root.parent / self.target), effective)
+        self.assertEqual(self.template.with_suffix('.conf.disabled').read_text(), self.text)
+
+    def test_manual_bootstrap_refuses_foreign_later_override(self):
+        self.template = self.unit_dir / 'zz~~~~foreign.conf'
+        self.template.write_text(self.text)
+        with self.assertRaisesRegex(SystemExit, 'release_dropin_precedence'):
+            self.manual_switch()
+        self.assertEqual(self.template.read_text(), self.text)
+        self.assertFalse((self.unit_dir / update.DROPIN).exists())
 
     def test_manual_switch_uses_managed_marker_and_rejects_legacy_destination(self):
         spec = importlib.util.spec_from_file_location('switch_release',

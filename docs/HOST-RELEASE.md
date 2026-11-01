@@ -93,28 +93,49 @@ new SHA only when the new release reports `current`.
 
 ### Operator switches and legacy overrides
 
-Use `scripts/switch-host-release.py --release <verified-release-dir>
---template <active-drop-in> --dropin <unit-drop-in-dir>/zz~~hub-desired-release.conf`
-for manual switches. The switcher writes the same ownership marker as the
-desired-state updater and refuses other destination names or an unmarked
-existing destination. Do not add more tildes to override precedence.
+For a running release that predates the migration kit, build a verified release
+containing this fix, then run **that new release's switcher**, not the old running
+release's script. During an approved maintenance window:
 
-The updater recognizes legacy `zz~<7-to-40-hex-sha>-switch-release.conf`
+```sh
+python3 <new-release-dir>/scripts/switch-host-release.py \
+  --release <new-release-dir> \
+  --template <active-legacy-drop-in> \
+  --dropin <unit-drop-in-dir>/zz~~hub-desired-release.conf --restart
+systemctl --user show agent-hub-session-host.service --property=ExecStart --value
+```
+
+The switcher and desired-state updater share the same managed filename and
+ownership marker. They refuse an unmarked existing destination. Do not add
+more tildes to override precedence. The switcher inspects both systemd's
+DropInPaths and files on disk before mutation, so the bootstrap works even
+when the old running host cannot migrate its own overrides.
+
+Both paths recognize legacy `zz~<7-to-40-hex-sha>-switch-release.conf`
 names (including repeated tildes) only for regular, user-owned files in the
 unit's user drop-in directory, referencing a single manifested release whose
-SHA matches the filename. After a successful verified switch it renames these
-to `.conf.disabled`, preserving their contents. Before each rename it fsyncs
-a source/backup record to the old release's
-`.local/host-release-switch-journal.jsonl`. Existing backups cause refusal;
-foreign later overrides remain `release_dropin_precedence` errors.
+SHA matches the filename. They preserve these as `.conf.disabled` before
+reloading the unit; foreign later overrides cause refusal.
 
-For rollback, inspect that private journal and the preserved overrides, restore
-the recorded backup to its source name only when the source is absent, then
-reload user units and restart during an approved maintenance window. No file
-is deleted. Older running releases need one operator bootstrap onto this kit
-before they can perform the migration. After release, verify the next Hub pin
-reaches `host_release.state=current` and the unit's ExecStart references that
-same SHA; a successful build alone does not prove live acceptance.
+The updater holds `.hub-release-migration.lock` in the unit drop-in directory
+through fetch, build and activation; the switcher inherits that lock or acquires
+it for a manual invocation. Contending migrations refuse with
+`release_migration_busy`; retry after the other migration finishes. Source
+identity and content are revalidated after the build and before retirement.
+Existing backups, including ones appearing during build, cause refusal without
+replacing them. Linux `renameat2(RENAME_NOREPLACE)` also prevents a backup
+appearing at the final rename from being overwritten. Unsupported rename
+operations fail closed. Operators editing drop-ins should use the same lock
+with `flock`, and never edit them while a migration holds it.
+
+Before each retirement the switcher fsyncs a source/backup record to
+`<releases-dir>/.host-release-switch-journal.jsonl`. For rollback, inspect this
+private journal and the preserved overrides, restore a recorded backup only
+when its source name is absent, then reload user units and restart during an
+approved maintenance window. No override is deleted. After bootstrap, verify
+the next Hub pin reaches `host_release.state=current` and the unit's ExecStart
+references that same SHA. Build success and an active service alone do not
+prove live acceptance.
 
 Hosts that run the session host straight from a git checkout and have no
 inbound channel (Tabo: Windows, no ssh) take releases from the Hub instead
