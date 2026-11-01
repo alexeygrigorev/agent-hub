@@ -286,9 +286,43 @@ def set_toml_top_level_keys(content: str, keys: dict[str, str]) -> str:
     return header.rstrip('\n') + '\n'
 
 
+def collapse_duplicate_toml_tables(content: str, prefix: str) -> str:
+    """Drop later duplicates of a ``<prefix>...]`` table header and normalize CRLF.
+
+    The engine CLI replaces its config.toml on launch and writes CRLF on
+    Windows; the line-anchored ``[ \\t]*$`` matches below do not match a
+    trailing ``\\r``, so an earlier run re-appended tables that were already
+    present. TOML forbids duplicate table headers and the engine then
+    refuses the whole file (codex: ``duplicate key`` at startup, exit 1
+    with stderr only — intake 61bba72f). Keeping the first occurrence heals
+    files that already carry duplicates, and the CRLF normalization keeps
+    the recurring rewrite from creating new ones.
+    """
+    content = content.replace('\r\n', '\n')
+    header = re.compile(r'^[ \t]*' + re.escape(prefix) + r'.*?\][ \t]*$', re.M)
+    seen: set[str] = set()
+    spans: list[tuple[int, int]] = []
+    for match in header.finditer(content):
+        if match.group().strip() in seen:
+            nxt = re.search(r'^[ \t]*\[', content[match.end():], re.M)
+            end = match.end() + nxt.start() if nxt else len(content)
+            spans.append((match.start(), end))
+        else:
+            seen.add(match.group().strip())
+    if not spans:
+        return content
+    out: list[str] = []
+    pos = 0
+    for start, end in spans:
+        out.append(content[pos:start])
+        pos = end
+    out.append(content[pos:])
+    return ''.join(out)
+
+
 def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
     """Ensure paths have [projects."<path>"] trust_level = "trusted" in TOML content."""
-    res = content
+    res = collapse_duplicate_toml_tables(content, '[projects.')
     for p in paths:
         if not p:
             continue
@@ -330,7 +364,7 @@ KNOWN_HOOK_HASHES = {
 
 def ensure_toml_trusted_hooks(content: str, hooks_file: Path) -> str:
     """Ensure installed hooks in hooks_file are trusted in TOML content to prevent hook review prompts."""
-    res = content
+    res = collapse_duplicate_toml_tables(content, '[hooks.state.')
     try:
         h_str = str(hooks_file.resolve())
     except Exception:
