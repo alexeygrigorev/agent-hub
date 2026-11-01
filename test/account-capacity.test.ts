@@ -291,14 +291,33 @@ describe('phantom account reservations', () => {
     expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).active).toBe(0);
   }));
 
-  it('keeps a live native reservation despite conflicting terminal control state', () => fixture(async (f, sql) => {
+  it('reports a live-native/terminal-control lifecycle mismatch once under its real account', () => fixture(async (f, sql) => {
     await configure(f);
-    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("INSERT INTO fleet_accounts VALUES ('shared-claude', 'claude', 13, 15, 1)");
+    sql.exec("INSERT INTO fleet_routes VALUES ('hetzner', 'claude', 'shared-claude', NULL)");
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner', engine: 'claude', account: 'shared-claude' })), admin)).json();
+    expect(launch).toMatchObject({ state: 'offered', machine: 'hetzner', engine: 'claude', account: 'shared-claude' });
     sql.exec("UPDATE fleet_launches SET state = 'running', native_id = 'live-native' WHERE id = ?", launch.id);
-    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','live-native','task','codex','running',?,'/repo','shared-codex',?)", iso(), now);
+    const report = (machine: string, sessions: any[]) => f.handle(request('/sessions', { sessions, census_complete: true }, 'PUT'), host(machine));
+    expect((await report('hetzner', [{ native_id: 'live-native', tag: 'task', engine: 'claude', phase: 'running', agent_state: 'idle', workspace: 'demo', profile: null, account: 'shared-claude' }])).status).toBe(200);
+    expect((await report('win35', [])).status).toBe(200);
+    const oldNativeAt = now - 30 * 86400000;
+    sql.exec('UPDATE fleet_sessions SET created_at_ms = ? WHERE native_id = ?', oldNativeAt, 'live-native');
     const control = new SessionControlService(sql, cb => cb(), () => now); control.init();
-    sql.exec("INSERT INTO session_control_sessions (id,actor,request_key,request_json,state,mode,fleet_launch_id,created_at,updated_at) VALUES ('control','test-admin','test','{}','failed','headless',?,?,?)", launch.id, iso(), iso());
+    sql.exec("INSERT INTO session_control_sessions (id,actor,request_key,request_json,state,mode,machine_id,engine,fleet_launch_id,binding_json,created_at,updated_at) VALUES ('control','test-admin','test','{}','stopped','headless','hetzner','claude',?,?,?,?)",
+      launch.id, JSON.stringify({ native_id: 'live-native', native_created_at_ms: oldNativeAt }), iso(-30 * 86400000), iso(-30 * 86400000));
+
+    const fleet = async () => await (await f.handle(new Request('https://hub.test/api/fleet'), admin)).json();
+    const snapshot: any = await fleet();
+    const account = snapshot.accounts.find((row: any) => row.label === 'shared-claude');
+    expect(account).toMatchObject({ active: 1, reserved: 1, observed_sessions: 0, native_live: 1 }); // One reservation, no orphan double count.
+    expect(snapshot.accounts.find((row: any) => row.label === 'shared-codex').active).toBe(0);
+    expect(snapshot.sessions.find((row: any) => row.native_id === 'live-native')).toMatchObject({ phase: 'running', account: 'shared-claude' });
+    expect(snapshot.launches.find((row: any) => row.id === launch.id)).toMatchObject({ state: 'running', hub_session_id: 'control' });
+    expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'control'").one().state).toBe('stopped');
     expect(reconcileAccountCapacity(sql, now)).toEqual([]);
+    expect(sql.exec("SELECT phase FROM fleet_sessions WHERE native_id = 'live-native'").one().phase).toBe('running');
+    expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'control'").one().state).toBe('stopped');
     sql.exec("UPDATE fleet_sessions SET phase = 'exited' WHERE native_id = 'live-native'");
     expect(reconcileAccountCapacity(sql, now)).toHaveLength(1);
   }));
