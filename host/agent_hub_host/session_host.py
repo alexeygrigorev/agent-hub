@@ -685,6 +685,31 @@ def acquire_journal_lock(lock):
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def ensure_private_journal(journal) -> None:
+    """Re-protect an inherited-DACL journal tree we own before first use.
+
+    mkdir(mode=0o700) applies a protected owner DACL only to a NEW directory;
+    a journal that predates it (Windows hosts: created while os.mkdir ignored
+    the mode) inherits ambient ACEs and then fails every private_fs journal
+    operation forever, so session commands are never claimed (intake
+    61bba72f: stop_not_claimed with 0 attempts). Best-effort and bounded: an
+    unrepairable journal keeps the previous fail-closed per-operation
+    behavior, surfacing as the bounded commands_error log.
+    """
+    if os.name != 'nt':
+        return
+    try:
+        from . import win32_fs
+        repaired = win32_fs.repair_private_tree(str(journal))
+    except Exception as error:
+        print(json.dumps({'event': 'journal_repair_failed',
+                          'type': type(error).__name__}), flush=True)
+        return
+    if repaired:
+        print(json.dumps({'event': 'journal_repaired',
+                          'entries': repaired}), flush=True)
+
+
 def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=None):
     if interval < 1 or fleet_interval < interval:
         raise ValueError('Invalid host polling intervals')
@@ -693,6 +718,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         raise ValueError('An enrolled private host configuration is required')
     journal = Path(journal_dir).resolve()
     journal.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ensure_private_journal(journal)
     # One controller per journal; a supervisor restart cannot duplicate effects.
     with (journal / 'host.lock').open('a') as lock, acquire_journal_lock(lock):
         settings = fleet.load_settings(settings_path)
