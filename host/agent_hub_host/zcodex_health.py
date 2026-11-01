@@ -66,8 +66,22 @@ class ZcodexHealth:
 
     def observe(self, catalog, progress):
         """catalog rows + sampler progress -> hold on new failure, probe to release."""
-        failed = {(r.get('id'), r.get('created_at_ms')) for r in catalog
-                  if r.get('engine') == ENGINE and (progress.get(r.get('id')) or {}).get('terminal_error') in FAILURES}
+        failed = set()
+        for row in catalog:
+            if row.get('engine') != ENGINE:
+                continue
+            terminal = (progress.get(row.get('id')) or {}).get('terminal_error') in FAILURES
+            # Headless sessions use the ordinary Fleet exit projection, not
+            # the interactive-only terminal_error producer. A confirmed exit
+            # 75 is reconnect exhaustion; a confirmed OOM is a runtime failure.
+            # Capture silence, a live process and an operator SIGTERM are not.
+            exit_fact = row.get('exit')
+            confirmed = (row.get('phase') or row.get('state')) in ('exited', 'exiting')
+            runtime_exit = (confirmed and isinstance(exit_fact, dict)
+                            and ((type(exit_fact.get('code')) is int and exit_fact['code'] == 75)
+                                 or exit_fact.get('oom_killed') is True))
+            if terminal or runtime_exit:
+                failed.add((row.get('id'), row.get('created_at_ms')))
         new = failed - self.seen
         if not self.baselined:
             # Corpses that predate this monitor must not hold routing.
