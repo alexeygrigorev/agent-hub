@@ -19,6 +19,9 @@ READ_CONTROL = 0x20000
 WRITE_DAC = 0x40000
 REPARSE = 0x400
 DIRECTORY = 0x10
+SE_FILE_OBJECT = 1
+DACL_SECURITY_INFORMATION = 0x4
+PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 
 
 class FileInfo(C.Structure):
@@ -63,6 +66,8 @@ class API:
         bind(adv, 'ConvertSidToStringSidW', [PTR, C.POINTER(PTR)])
         bind(adv, 'ConvertStringSecurityDescriptorToSecurityDescriptorW', [C.c_wchar_p, U32, C.POINTER(PTR), PTR])
         bind(adv, 'GetSecurityInfo', [PTR, U32, U32, C.POINTER(PTR), PTR, C.POINTER(PTR), PTR, C.POINTER(PTR)], U32)
+        bind(adv, 'SetSecurityInfo', [PTR, U32, U32, PTR, PTR, PTR, PTR], U32)
+        bind(adv, 'GetSecurityDescriptorDacl', [PTR, C.POINTER(BOOL), C.POINTER(PTR), C.POINTER(BOOL)])
         bind(adv, 'GetSecurityDescriptorControl', [PTR, C.POINTER(U16), C.POINTER(U32)])
         bind(adv, 'GetSecurityDescriptorDacl', [PTR, C.POINTER(BOOL), C.POINTER(PTR), C.POINTER(BOOL)])
         bind(adv, 'SetSecurityInfo', [PTR, U32, U32, PTR, PTR, PTR, PTR], U32)
@@ -278,6 +283,81 @@ def parent(path, *, create=False, private=True, native=False, owned=False):
         if private:
             a.private(handle, directory=True)
         yield handle
+
+
+def repair_private_tree(root, *, max_entries=1024, max_depth=8):
+    """Re-protect an existing owner-owned directory tree; protected entries
+    are left untouched. Returns the number of re-protected entries.
+
+    An older journal directory may predate CPython's os.mkdir(mode=0o700)
+    protected-DACL behavior and inherit ambient ancestors' ACEs; every
+    private_fs operation on it then fails closed forever because applying a
+    new protected parent DACL never rewrites children's inherited entries.
+    Each entry is therefore re-protected from its own pinned WRITE_DAC handle
+    and re-verified in place. Bounded; every failure is an error (never a
+    silent partial repair). Non-owner entries refuse the repair: another
+    principal's tree is not ours to fix.
+    """
+    local_path(root)
+    a = api()
+    repaired, visited = 0, 0
+
+    def bound():
+        nonlocal visited
+        visited += 1
+        if visited > max_entries:
+            raise PermissionError('Private repair exceeded entry bound')
+
+    def repair_entry(path, directory):
+        nonlocal repaired
+        handle = a.open(path, READ_CONTROL | WRITE_DAC, directory=directory)
+        try:
+            try:
+                a.private(handle, directory=directory)
+                return  # already protected: nothing to rewrite
+            except PermissionError:
+                pass
+            owner = PTR()
+            error = a.GetSecurityInfo(handle, SE_FILE_OBJECT, 1, C.byref(owner),
+                                      None, None, None, None)
+            if error:
+                raise OSError(error, 'Cannot verify private ACL')
+            if not owner or not a.EqualSid(owner, a.user_sid):
+                raise PermissionError('Private repair requires owner access')
+            with a.security(directory=directory) as sa:
+                dacl, present, defaulted = PTR(), BOOL(), BOOL()
+                a.check(a.GetSecurityDescriptorDacl(
+                    sa.descriptor, C.byref(present), C.byref(dacl), C.byref(defaulted)))
+                if not present.value or not dacl.value:
+                    raise PermissionError('Security descriptor lacks a private DACL')
+                error = a.SetSecurityInfo(handle, SE_FILE_OBJECT,
+                                          DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                          None, None, dacl, None)
+                if error:
+                    raise OSError(error, 'Cannot apply private DACL')
+            a.private(handle, directory=directory)  # final proof, raises
+            repaired += 1
+        finally:
+            a.CloseHandle(handle)
+
+    def walk(path, depth):
+        if depth > max_depth:
+            raise PermissionError('Private repair exceeded depth bound')
+        bound()
+        repair_entry(path, True)
+        with os.scandir(path) as entries:
+            for entry in entries:
+                bound()
+                child = ntpath.join(str(path), entry.name)
+                if entry.is_dir(follow_symlinks=False):
+                    walk(child, depth + 1)
+                elif entry.is_file(follow_symlinks=False):
+                    repair_entry(child, False)
+                else:
+                    raise PermissionError('Refusing repair of non-regular journal entry')
+
+    walk(root, 0)
+    return repaired
 
 
 def open_file(path, flags, *, private=True):
