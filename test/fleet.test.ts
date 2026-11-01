@@ -996,7 +996,11 @@ describe('generic accounts and launch placement', () => {
     expect(deep.selected?.engine, JSON.stringify(deep.rejected)).toBe('antigravity');
     expect(deep.selected?.selection).toMatchObject({ id: 'argon' });
     expect(deep.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
-    expect((await s.handle(request('/subscriptions', { subscriptions: [{account:'shared-gemini',service:'gemini',plan:'pro',quota:quota(0)}] }, 'PUT'), host('hetzner'))).status).toBe(200);
+    // Subscription reports replace the entire host snapshot; retain the healthy
+    // fallback accounts while reporting Gemini's known exhausted quota.
+    expect((await s.handle(request('/subscriptions', { subscriptions: entries.map(([account, service, , pct]) => ({
+      account, service, plan:'pro', quota:quota(account === 'shared-gemini' ? 0 : Number(pct)),
+    })) }, 'PUT'), host('hetzner'))).status).toBe(200);
     const fallback = s.plan(intent({ mode: 'headless' }));
     expect(fallback.selected?.engine, JSON.stringify(fallback.rejected)).toBe('zcodex');
     expect(fallback.selected?.account).toBe('shared-zai');
