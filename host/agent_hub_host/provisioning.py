@@ -951,6 +951,14 @@ def executable_path(bundle, dest, is_windows=None):
             metadata = package / 'package.json'
             if metadata.is_file() and json.loads(metadata.read_text()).get('version') == bundle['version']:
                 executable = package / relative
+                if not executable.is_file():
+                    # A session-side updater can leave exactly one renamed
+                    # leftover (<binary>.old.<epoch-ms>); restoring it is
+                    # deterministic and version-checked above. Anything else
+                    # stays a missing binary (fail closed).
+                    stale = sorted(package.glob(Path(relative).name + '.old.*'))
+                    if len(stale) == 1:
+                        os.replace(stale[0], executable)
                 if executable.is_file() and executable.resolve().is_relative_to(dest.resolve()):
                     return executable
         raise ValueError('Packaged native engine binary missing')
@@ -1475,6 +1483,11 @@ def engine_environment(bundle, home, dest=None):
         env['GIT_AUTHOR_EMAIL'] = email
         env['GIT_COMMITTER_EMAIL'] = email
     if bundle.get('provider') == 'claude':
+        # Managed engine installs are provisioned centrally; a session-side
+        # Claude Code auto-update renames the shared native binary to
+        # .old.<epoch-ms> and can leave the package with no engine at all
+        # (Tabo, intake 61bba72f). Sessions never update the install.
+        env['DISABLE_AUTOUPDATER'] = '1'
         for k in (
             'CLAUDE_CODE_USE_BEDROCK',
             'CLAUDE_CODE_USE_VERTEX',
