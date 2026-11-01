@@ -3655,7 +3655,21 @@ class Dispatcher:
 
     def _report_subscriptions(self):
         from .quota_snapshot import parse_iso_utc, STALE_AGE_THRESHOLD
-        reports = collect_subscriptions(self.settings, self.runner)
+        from .native_admission import routing_rules
+        # Hub maps a subscription report all-or-nothing: one entry without a
+        # route for this machine 400s the whole batch (unmapped). A provider
+        # disabled by routing policy (Grok) is never routed, so a lingering
+        # operator entry for it hid every other quota observation on
+        # DESKTOP-FP4OP26 (intake 8d006dc3). Disabled providers are neither
+        # probed nor reported; re-enabling the provider re-includes them.
+        disabled = set(routing_rules().get('disabled_providers', []))
+        subscriptions = self.settings.get('subscriptions', [])
+        skipped = sorted(s.get('account_label') for s in subscriptions if s.get('service') in disabled)
+        if skipped:
+            print(json.dumps({'event': 'fleet_subscription_skipped', 'reason': 'provider_disabled',
+                              'accounts': skipped}), flush=True)
+        settings = dict(self.settings, subscriptions=[s for s in subscriptions if s.get('service') not in disabled])
+        reports = collect_subscriptions(settings, self.runner)
         now = dt.datetime.now(dt.timezone.utc)
         downgraded = []
         for sub in reports:
