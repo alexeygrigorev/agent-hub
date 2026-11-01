@@ -13,6 +13,7 @@ if [ "${AGENT_HUB_HEAVY_TEST_HELD:-}" = "1" ]; then
   echo "test-affected-local: do not wrap in capped-test-run.sh; it takes its own slot" >&2
   exit 2
 fi
+ORIGINAL_ARGS=("$@")
 BASE="origin/main"; DRY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -95,9 +96,14 @@ if [ "${RC}" -eq 3 ] && [ -f "${MARKER}" ]; then
   if [ -n "${AGENT_HUB_HEAVY_TEST_REFUSAL_FILE:-}" ]; then
     printf '%s\n' "$(cat "${MARKER}")" > "${AGENT_HUB_HEAVY_TEST_REFUSAL_FILE}"
   fi
-  RETRY_COMMAND="scripts/capped-test-retry.sh -- scripts/test-affected-local.sh"
+  RETRY_ARGS=""
+  if [ "${#ORIGINAL_ARGS[@]}" -gt 0 ]; then
+    printf -v RETRY_ARGS ' %q' "${ORIGINAL_ARGS[@]}"
+  fi
+  RETRY_COMMAND="scripts/capped-test-retry.sh -- scripts/test-affected-local.sh${RETRY_ARGS}"
   if [ -n "${AGENT_HUB_HEAVY_TEST_PRIORITY:-}" ]; then
-    RETRY_COMMAND="AGENT_HUB_HEAVY_TEST_PRIORITY=${AGENT_HUB_HEAVY_TEST_PRIORITY} ${RETRY_COMMAND}"
+    printf -v PRIORITY_ASSIGNMENT 'AGENT_HUB_HEAVY_TEST_PRIORITY=%q ' "${AGENT_HUB_HEAVY_TEST_PRIORITY}"
+    RETRY_COMMAND="${PRIORITY_ASSIGNMENT}${RETRY_COMMAND}"
   fi
   echo "HOLD: $(cat "${MARKER}"); retry with: ${RETRY_COMMAND}"; exit 3
 fi
