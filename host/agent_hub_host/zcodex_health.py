@@ -84,16 +84,22 @@ class ZcodexHealth:
     def __init__(self, request, state_path=None, probe=real_probe, now=time.time, threaded=True):
         self.request, self.probe, self.now, self.threaded = request, probe, now, threaded
         self._thread, self._result = None, None
+        self._generation = 0
+        self.pending = False
         self._lock = threading.RLock()
         self.state_path = Path(state_path) if state_path else None
         self.seen, self.held, self.last_probe, self.baselined = set(), False, 0.0, False
         if self.state_path and self.state_path.exists():
             try:
-                saved = json.loads(self.state_path.read_text())
+                from . import private_fs
+                saved = json.loads(private_fs.read_bytes(self.state_path, 128 * 1024, private=False))
                 self.seen = {tuple(x) for x in saved.get('seen', [])[-MAX_SEEN:]
                              if isinstance(x, list) and len(x) == 2 and isinstance(x[0], str)
+                             and 0 < len(x[0]) <= 160 and x[0].isascii()
+                             and all(c.isalnum() or c in '-_.:' for c in x[0])
                              and type(x[1]) is int and x[1] > 0}
                 self.held = saved.get('held') is True
+                self.pending = saved.get('pending') is True
                 self.baselined = True
             except (OSError, ValueError, TypeError):
                 pass
@@ -101,8 +107,10 @@ class ZcodexHealth:
     def _save(self):
         if self.state_path:
             try:
-                self.state_path.write_text(json.dumps({'seen': sorted(self.seen), 'held': self.held}))
-            except OSError:
+                from . import private_fs
+                raw = json.dumps({'seen': sorted(self.seen), 'held': self.held, 'pending': self.pending}).encode()
+                private_fs.atomic_write(self.state_path, raw, 128 * 1024, engine_owned=True)
+            except (OSError, ValueError):
                 pass
 
     @staticmethod
@@ -118,6 +126,8 @@ class ZcodexHealth:
             for row in catalog:
                 sid, incarnation = row.get('id'), row.get('created_at_ms')
                 if (row.get('engine') == ENGINE and isinstance(sid, str)
+                        and 0 < len(sid) <= 160 and sid.isascii()
+                        and all(c.isalnum() or c in '-_.:' for c in sid)
                         and type(incarnation) is int and incarnation > 0
                         and (row.get('phase') or row.get('state')) in ('exited', 'exiting', 'failed', 'dead')
                         and self._runtime_failure(row.get('exit'))):
@@ -139,28 +149,35 @@ class ZcodexHealth:
             self.baselined = True
         # Retired identities must survive catalog disappearance and ACK replay.
         self.seen = set(sorted(self.seen | failed, key=lambda key: (key[1], key[0]))[-MAX_SEEN:])
-        if new and not self.held:
+        if new:
+            self._generation += 1
+            self.held, self.pending = True, True
+            # The owned launch may settle immediately after this observation.
+            # Persist the publication obligation before attempting the RPC.
+            self._save()
+        if self.pending:
             try:
                 self.request('POST', '/api/fleet/probe', {'engine': ENGINE, 'status': 'unavailable', 'reason': FAIL_REASON})
-                self.held = True
+                self.pending = False
             except Exception:
-                self.seen -= new  # retry next cycle
+                pass  # durable pending hold is retried even without the old receipt
         elif self.held:
             if self._result is None and self._thread is None and self.now() - self.last_probe >= PROBE_INTERVAL_S:
                 self.last_probe = self.now()
                 if self.threaded:
                     # The probe can take minutes; never stall the catalog cycle.
+                    generation = self._generation
                     def run():
-                        self._result = bool(self.probe())
+                        self._result = (generation, bool(self.probe()))
                     self._thread = threading.Thread(target=run, daemon=True)
                     self._thread.start()
                 else:
-                    self._result = bool(self.probe())
+                    self._result = (self._generation, bool(self.probe()))
             if self._thread is not None and not self._thread.is_alive():
                 self._thread = None
             if self._result is not None and self._thread is None:
-                passed, self._result = self._result, None
-                if passed:
+                (generation, passed), self._result = self._result, None
+                if passed and generation == self._generation:
                     try:
                         self.request('POST', '/api/fleet/probe', {'engine': ENGINE, 'status': 'ok', 'reason': PASS_REASON})
                         self.held = False

@@ -155,3 +155,54 @@ def test_vanished_native_qualified_retirement_holds_once_and_recovers_only_by_pr
     again = ZcodexHealth(lambda *args: calls.append(args), tmp_path / 'retired-health.json', threaded=False)
     assert not observe_verified_terminal(SimpleNamespace(_zcodex_health=again), record, target, evidence)
     assert len(calls) == 2
+
+
+def test_verified_failure_hold_retries_after_rpc_failure_without_receipt_replay(tmp_path):
+    from types import SimpleNamespace
+    from agent_hub_host.native_sessions import NativeTarget
+    from agent_hub_host.zcodex_health import observe_verified_terminal
+
+    sid = 'ab7ac540-f991-4543-8580-5cce7136da1b'
+    target = NativeTarget(sid, 'task-hub-proof', str(tmp_path), 1000, 'zcodex').validated()
+    record = {'native_id': sid, 'tag': target.tag, 'workspace': str(tmp_path),
+              'incarnation': 1000, 'engine': 'zcodex'}
+    evidence = {'finished_at_ms': 5000, 'exit': {'code': 75}}
+    def unavailable(*args):
+        raise OSError('synthetic transport failure')
+    state = tmp_path / 'pending.json'
+    h = ZcodexHealth(unavailable, state, threaded=False)
+    assert not h.observe([], {})
+    assert observe_verified_terminal(SimpleNamespace(_zcodex_health=h), record, target, evidence)
+    assert h.pending
+    calls = []
+    again = ZcodexHealth(lambda m, path, body=None: calls.append(body), state,
+                         probe=lambda: False, threaded=False)
+    assert again.observe([], {})  # no native row or receipt has to reappear
+    assert not again.pending
+    assert calls == [{'engine': 'zcodex', 'status': 'unavailable', 'reason': 'zcodex_session_failed'}]
+
+
+def test_probe_started_before_new_failure_cannot_clear_the_new_hold(tmp_path):
+    import threading
+    calls, clock = [], [1000.0]
+    started, release = threading.Event(), threading.Event()
+    def probe():
+        started.set()
+        return release.wait(timeout=10)
+    h = ZcodexHealth(lambda m, path, body=None: calls.append(body), tmp_path / 'generation.json',
+                     now=lambda: clock[0], probe=probe, threaded=True)
+    try:
+        assert not h.observe([], {})
+        assert h.observe([row('old', exit={'code': 75})], {})
+        clock[0] += 400
+        assert h.observe([], {})
+        assert started.wait(timeout=5)
+        assert h.observe([row('new', exit={'code': 75})], {})
+        release.set()
+        h._thread.join(timeout=5)
+        assert h.observe([], {})
+        assert all(c['status'] == 'unavailable' for c in calls)
+    finally:
+        release.set()
+        if h._thread is not None:
+            h._thread.join(timeout=12)
