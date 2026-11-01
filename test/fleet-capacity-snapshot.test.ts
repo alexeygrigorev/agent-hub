@@ -119,19 +119,23 @@ describe('bounded real Fleet autonomous capacity snapshot',()=>{
     expect(liveQueuePolicy(settings,sql,s,now)).toMatchObject({max_inflight:0,capacity:{machine_slots:0,available_slots:0}});
     expect(sql.exec("SELECT max_agents FROM routing_machines WHERE machine_id='online'").one().max_agents).toBe(1);
   }));
-  it('bounds duplicate control-binding reads while holding the ambiguous reservation',()=>fixture((s,sql)=>{
+  it('bounds duplicate binding reads despite retained terminal controls',()=>fixture((s,sql)=>{
     absentBoundLaunch(sql);
-    for(let i=0;i<199;i++) controlBinding(sql,'duplicate-'+i);
+    for(let i=0;i<400;i++) controlBinding(sql,'history-'+i);
+    sql.exec("UPDATE session_control_sessions SET state='exited'");
+    for(let i=0;i<200;i++) controlBinding(sql,'duplicate-'+i);
     const measured:any[]=[]; const exec=sql.exec.bind(sql);
     sql.exec=(query:string,...args:any[])=>{
       const cursor=exec(query,...args);
-      if(query.includes('FROM fleet_launches l') && query.includes('FROM session_control_sessions c')) measured.push(cursor);
+      if(query.includes('FROM fleet_launches l') && query.includes('FROM session_control_sessions c')) measured.push({cursor,query,args});
       return cursor;
     };
     const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
     expect(s.accountStatus(a,s.queueCapacitySnapshot(now))).toMatchObject({active:1,reserved:1});
     expect(measured).toHaveLength(1);
-    expect(Number(measured[0].rowsRead)).toBeLessThan(40);
+    expect(Number(measured[0].cursor.rowsRead)).toBeLessThan(40);
+    const plan=exec('EXPLAIN QUERY PLAN '+measured[0].query,...measured[0].args).toArray().map((r:any)=>r.detail).join('\n');
+    expect(plan).toMatch(/SEARCH c USING INDEX session_control_capacity_binding/);
   }));
   it('fails closed on 99 live hosts before account status and keeps every binding batch below 100',()=>fixture((s,sql,queries)=>{
     for(let i=0;i<98;i++) machine(sql,'live-'+i);
