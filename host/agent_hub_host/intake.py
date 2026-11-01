@@ -616,3 +616,17 @@ def cas_update(path, payload, automatic, key):
             version_info = f'; attempted version: {attempted}' if attempted is not None else ''
             raise IntakeTransportError(f'{diagnostic(exc)}; Intake update outcome unknown; inspect the task before retrying. Retry key: {key}{version_info}') from None
     raise IntakeInputError('Intake update did not complete')
+
+
+def summary_main():
+    """Small shared entry point; skip unrelated CLI imports/registration."""
+    import argparse
+    parser = argparse.ArgumentParser(prog='hub intake summary', description='Current task counts and five recent tasks; no histories')
+    parser.add_argument('--project')
+    args = parser.parse_args(sys.argv[3:])
+    args.cmd, args.intake_cmd = 'intake', 'summary'
+    try:
+        print(json.dumps(execute(args), ensure_ascii=True))
+    except Exception as exc:
+        print(diagnostic(exc), file=sys.stderr)
+        sys.exit(1)
