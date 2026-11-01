@@ -909,6 +909,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         previous_output = getattr(_output_context, 'state', None)
         output_stopped, output_lock = threading.Event(), threading.Lock()
         _output_context.state = (output_stopped, output_lock)
+        release_thread = None
         try:
             bindings_thread = maybe_start_named_thread(
                 None, bindings_loop, (dispatcher, stop), 'fleet-bindings')
@@ -917,8 +918,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             # Intake a3227276: Hub-pinned host release for checkout installs
             # (Windows hosts without ssh). An applied update sets ``stop``;
             # the supervisor restarts the controller on the new code.
-            maybe_start_named_thread(
-                None, lambda *args: self_update.loop(*args, launcher_settings=lambda: dispatcher.settings),
+            release_thread = maybe_start_named_thread(
+                None, lambda *args: self_update.loop(*args, launcher_settings=lambda: dispatcher.settings, log=_log),
                 (lambda *a: dispatcher.request(*a), release_stop), 'host-release')
             while not stop.is_set() and (cycles is None or count < cycles):
                 if release_stop.is_set():
@@ -1021,6 +1022,11 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 drain_inflight_dispatch(dispatcher)
             except Exception:
                 pass
+            # The release poller wakes on ``release_stop``; give it a moment to
+            # exit so its own error line is not written after the fence closes
+            # (bounded: it may be inside a network call).
+            if release_thread is not None:
+                release_thread.join(timeout=2)
             # Fence output instead of joining daemons that may be blocked on
             # network, subprocess or filesystem I/O. The lock also completes
             # any cycle line already being written before returning.

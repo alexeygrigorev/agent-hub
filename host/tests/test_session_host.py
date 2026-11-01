@@ -66,6 +66,28 @@ class SessionHostTests(unittest.TestCase):
             for thread in threads:
                 thread.join(2)
 
+    def test_release_poller_error_line_after_exit_does_not_reach_stdout(self):
+        # self_update.loop's error lines used plain print, so a poller still
+        # inside a network call when run() returned wrote into whatever owned
+        # stdout next (Host canary flake, intake 26fc40d3).
+        import io
+        import threading
+        from contextlib import redirect_stdout
+        gate = threading.Event()
+        finished = threading.Event()
+
+        def late_loop(request, stop, *, log=print, **kwargs):
+            gate.wait(timeout=10)
+            log('LATE-RELEASE-LINE', flush=True)
+            finished.set()
+
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',return_value=SimpleNamespace(session_id='test-native',workspace=str(pathlib.Path.cwd()))), patch.object(session_host.fleet,'Dispatcher'), patch.object(session_host.session_control,'execute'), patch.object(session_host.self_update,'loop',late_loop), redirect_stdout(buf):
+            session_host.run('synthetic-settings',directory,cycles=1)
+            gate.set()
+            self.assertTrue(finished.wait(timeout=5))
+        self.assertNotIn('LATE-RELEASE-LINE', buf.getvalue())
+
     def test_unbound_controller_has_no_fleet_or_command_effects(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',side_effect=ValueError('unbound')), patch.object(session_host.fleet,'Dispatcher') as dispatcher, patch.object(session_host.session_control,'execute') as execute:
             with self.assertRaises(ValueError):session_host.run('synthetic-settings',directory,cycles=1)
