@@ -2314,6 +2314,13 @@ export class Hub extends DurableObject {
     // A10 (290b935a/55c10deb): the 5-min slot starts the ask reconciler when new asks wait.
     if (!only) { try { await m('ask_reconcile', () => this.askLedger.reconcileDue()); } catch (e) { console.error('ask reconcile', e); } }
     if (!only) await m('credentials', () => this.maintainCredentials());
+    // Engine rollout daily check (intake 8cc9e31a AC1): compares upstream
+    // latest vs desired pins; at most one actionable alert per day. Runs on
+    // the 5-minute cron but rate-limits internally to ~daily.
+    if (!only) for (const p of await m('engine_rollout', () => this.provisioningService.tickEngineRollout())) {
+      const alert = this.livenessService.setAlert('engine_rollout', p.subject, p.problem);
+      if (alert) await this.notifyAlert(alert);
+    }
     for (const alert of await m('banked_resets', () => new BankedResets(this.sql, this.livenessService).run())) await this.notifyAlert(alert);
     await m('liveness_prune', () => this.livenessService.prune());
     const results = await m('run_due', () => this.checksService.runDue({

@@ -401,11 +401,16 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
     """Ensure managed engine home configuration has approval and sandbox prompts disabled.
 
     Reconciles on every bootstrap/re-bootstrap and execution to match operator config:
-    - codex / zai: approval_policy = "never", sandbox_mode = "danger-full-access" in .codex/config.toml
+    - codex / zai: approval_policy = "never", sandbox_mode = "danger-full-access",
+      check_for_update_on_startup = "false" in .codex/.zcodex config.toml
       plus [projects."<path>"] trust_level = "trusted" for workspaces and operator roots,
       and [hooks.state."..."] trusted_hash to bypass hook review prompts.
-    - claude: skipDangerousModePermissionPrompt = True in .claude/settings.json
-    - go (opencode): permission.* = "allow" in .config/opencode/opencode.json
+    - claude: skipDangerousModePermissionPrompt = True, autoUpdates = False
+      in .claude/settings.json (plus DISABLE_AUTOUPDATER=1 in session env).
+    - go (opencode): permission.* = "allow", autoupdate = False
+      in .config/opencode/opencode.json.
+    - antigravity/agy: pinned binary only moves with the reviewed pin; no
+      self-update channel is enabled in managed homes.
     """
     if home is None:
         return
@@ -433,6 +438,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
+                'check_for_update_on_startup': 'false',
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, hooks_file)
@@ -446,6 +452,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
+                'check_for_update_on_startup': 'false',
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, zhooks_file)
@@ -459,6 +466,9 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         if not isinstance(settings, dict):
             settings = {}
         settings['skipDangerousModePermissionPrompt'] = True
+        # In-engine self-update prompts must never block a session (AC4):
+        # the session env also carries DISABLE_AUTOUPDATER=1.
+        settings['autoUpdates'] = False
         perms = settings.setdefault('permissions', {})
         if isinstance(perms, dict):
             perms.setdefault('deny', ['AskUserQuestion'])
@@ -511,6 +521,8 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
                 ext.setdefault('~/git/**', 'allow')
                 ext.setdefault('~/tmp/**', 'allow')
                 ext.setdefault('/tmp/**', 'allow')
+        # In-engine self-update prompts must never block a session (AC4).
+        opencode_conf['autoupdate'] = False
         _write_engine_config(opencode_path, json.dumps(opencode_conf, indent=2).encode('utf-8'), current)
 
 
@@ -1207,7 +1219,19 @@ def sync(request=None):
         # Keep every bundle dir the Hub still offers: a retry reinstalls in
         # place, while deleting it under a live session's engine (Windows
         # holds codex.exe open) half-removed the bundle (intake 6cbb862a).
+        # AC2 (intake 8cc9e31a): a version update installs side by side and
+        # never interrupts running sessions -- the previous revision dir of a
+        # label with live sessions is kept until those sessions drain, while
+        # new sessions resolve the profile to the new revision.
         keep = {b['label'] + '-' + b['revision'] for b in bundles}
+        try:
+            from . import engine_rollout
+            for label in engine_rollout.deferred_labels():
+                for old in root().glob(label + '-*'):
+                    if old.is_dir() and re.fullmatch(r'[a-z][a-z0-9_-]{0,47}-[a-f0-9-]{36}', old.name):
+                        keep.add(old.name)
+        except Exception:
+            pass
         for entry in root().iterdir():
             if re.fullmatch(r'[a-z][a-z0-9_-]{0,47}-[a-f0-9-]{36}', entry.name) and entry.name not in keep:
                 # rmtree does not follow directory symlinks; reject them explicitly.
@@ -1488,6 +1512,7 @@ def engine_environment(bundle, home, dest=None):
         # .old.<epoch-ms> and can leave the package with no engine at all
         # (Tabo, intake 61bba72f). Sessions never update the install.
         env['DISABLE_AUTOUPDATER'] = '1'
+        env['CLAUDE_CODE_DISABLE_AUTOUPDATER'] = '1'
         for k in (
             'CLAUDE_CODE_USE_BEDROCK',
             'CLAUDE_CODE_USE_VERTEX',
@@ -1497,6 +1522,18 @@ def engine_environment(bundle, home, dest=None):
             'ANTHROPIC_CUSTOM_HEADERS',
         ):
             env.pop(k, None)
+    if bundle.get('provider') == 'codex':
+        # Belt and suspenders with the config.toml key: never prompt.
+        env['CODEX_DISABLE_UPDATE_CHECK'] = '1'
+    if bundle.get('provider') == 'zai':
+        env['CODEX_DISABLE_UPDATE_CHECK'] = '1'
+        env['ZCODEX_DISABLE_UPDATE_CHECK'] = '1'
+    if bundle.get('provider') == 'go':
+        env['OPENCODE_DISABLE_AUTOUPDATE'] = '1'
+    if bundle.get('provider') == 'antigravity':
+        # The managed agy binary only moves with the reviewed pin.
+        env['ANTIGRAVITY_DISABLE_AUTO_UPDATE'] = '1'
+        env['AGY_DISABLE_AUTO_UPDATE'] = '1'
     return env
 
 
@@ -1862,6 +1899,18 @@ def add_commands(sub):
     login.add_argument('--adopt', action='store_true', help='Attach to an existing unmanaged quota pool with this label')
     commands.add_parser('status', help='Operator: per-host sync state of every managed account')
     commands.add_parser('maintain', help='Operator: run central refresh + direct provider quota now')
+    update = commands.add_parser('update', help='Hub-owned engine version rollout (intake 8cc9e31a): canary + smoke, never interrupts live sessions')
+    update.add_argument('--engine', choices=['codex', 'claude', 'opencode', 'agy', 'zcodex'], default=None, help='Only this engine (default: all supported)')
+    update.add_argument('--machine', default=None, help='Only this registered host (default: this host; use with Hub routing for fleet rollout)')
+    update.add_argument('--canary', default=None, help='Canary host for fleet rollout (default: RMTHZ)')
+    update.add_argument('--check-only', action='store_true', help='Report installed/desired/latest without installing or smoking')
+    update.add_argument('--smoke', action='store_true', default=None, help='Run the real-prompt smoke after install (default: on unless --check-only)')
+    update.add_argument('--no-smoke', dest='smoke', action='store_false', help='Skip the real-prompt smoke')
+    update.set_defaults(smoke=True)
+    versions = commands.add_parser('versions', help='Per-engine installed / desired / latest versions from a check run on this host (intake 8cc9e31a AC5)')
+    versions.add_argument('--json', dest='json', action='store_true', help='Machine-readable output (default)')
+    versions.add_argument('--fleet', action='store_true', help='Fleet-wide per-host versions from Hub version reports instead of this host')
+    versions.add_argument('--machine', default=None, help='With --fleet: only this registered host')
 
 
 def central_login(args, prompt=None):
@@ -1964,6 +2013,126 @@ def sync_status(listing):
     return {'hosts': hosts}
 
 
+def engine_update_command(args):
+    """On-demand engine rollout (AC1-3): disable self-updates, sync, smoke, report.
+
+    Fleet targeting (``--machine`` for another host) is routed through Hub
+    (``POST /api/engines/update``); this host never SSHes anywhere. The local
+    path converges via the normal managed ``sync`` (side-by-side installs,
+    previous revision kept while live sessions use it) and runs one real
+    smoke session per engine.
+    """
+    from . import engine_rollout
+    only = getattr(args, 'engine', None)
+    engines = [only] if only else list(engine_rollout.ENGINE_ORDER)
+    machine = getattr(args, 'machine', None)
+    if machine:
+        try:
+            import socket
+            local_names = {socket.gethostname()}
+        except Exception:
+            local_names = set()
+        try:
+            from . import config as _config
+            local_id = (_config.load_host_config() or {}).get('machine_id')
+            if local_id:
+                local_names.add(str(local_id))
+        except Exception:
+            pass
+        if machine not in local_names:
+            body: dict = {}
+            if only:
+                body['engine'] = only
+            body['machine'] = machine
+            if getattr(args, 'canary', None):
+                body['canary'] = args.canary
+            return bus._do_request('POST', '/api/engines/update', body)
+    # Local path: self-update prompts off first so nothing blocks (AC4).
+    disabled_files: list[str] = []
+    try:
+        state = read_json(root() / 'state.json', [])
+        seen_homes = set()
+        for entry in state:
+            if not isinstance(entry, dict):
+                continue
+            for home in root().glob(entry.get('label', '') + '-*/home'):
+                if home.is_dir() and str(home) not in seen_homes:
+                    seen_homes.add(str(home))
+                    try:
+                        disabled_files.extend(engine_rollout.ensure_self_update_disabled(home, entry.get('provider')))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    check = engine_rollout.check_host()
+    check['self_update_files_updated'] = sorted(set(disabled_files))
+    if getattr(args, 'check_only', False):
+        if only:
+            check['engines'] = {only: check['engines'].get(only, {})}
+        return check
+    # Converge to Hub's current bundles (side-by-side; live sessions keep the
+    # old revision until they drain). Best-effort: report sync errors sanitized.
+    sync_result: dict = {}
+    try:
+        sync_result = sync()
+    except Exception as exc:
+        sync_result = {'status': 'held', 'error': type(exc).__name__}
+    check['sync'] = sync_result
+    # One real smoke session per engine (AC3): version + a real prompt.
+    live = engine_rollout.live_engines()
+    check['live_engines_deferred'] = sorted(live)
+    smokes: dict[str, dict] = {}
+    if getattr(args, 'smoke', True):
+        for engine in engines:
+            try:
+                smoke = engine_rollout.smoke_engine(engine)
+            except Exception as exc:
+                smoke = {'engine': engine, 'state': 'failed', 'error': type(exc).__name__}
+            engine_rollout.record_result(engine, {'state': smoke.get('state'),
+                                                 'version': smoke.get('version'),
+                                                 'error': smoke.get('error'),
+                                                 'at': check.get('checked_at')})
+            smokes[engine] = {'state': smoke.get('state'), 'version': smoke.get('version'),
+                              'error': smoke.get('error'),
+                              'deferred': engine in live}
+        check['smokes'] = smokes
+        # Canary gate: with --canary, decide fleet rollout vs rollback + 1 alert.
+        canary_host = getattr(args, 'canary', None)
+        if canary_host:
+            rest = []
+            try:
+                fleet = bus._do_request('GET', '/api/fleet')
+                rest = [m.get('id') for m in fleet.get('machines', [])
+                        if isinstance(m, dict) and m.get('id') and m.get('id') != canary_host]
+            except Exception:
+                rest = []
+            first = smokes.get(engines[0], {}) if len(engines) == 1 else {'state': 'green' if all(
+                s.get('state') == 'green' for s in smokes.values()) else 'failed',
+                'engine': ','.join(engines), 'error': 'smoke_failed'}
+            gate = engine_rollout.decide_canary(first, rest)
+            check['canary_gate'] = {'decision': gate['decision'], 'hosts': gate['hosts']}
+            if gate['alert']:
+                # Recorded locally and attached to the version report below;
+                # Hub raises the single actionable alert from the report.
+                check['alert'] = gate['alert']
+    else:
+        check['smokes'] = {}
+    # Best-effort version report so `hub engines versions --fleet` reflects
+    # this host's check run (AC5). Never fails the command.
+    try:
+        report = {'engines': {e: {'installed': (check['engines'].get(e) or {}).get('installed'),
+                                  'latest': (check['engines'].get(e) or {}).get('latest'),
+                                  'result': ((smokes.get(e) or {}).get('state')
+                                             if e in smokes else ((check['engines'].get(e) or {}).get('last_result') or {}).get('state'))}
+                              for e in engines}}
+        if isinstance(check.get('alert'), dict):
+            report['alert'] = check['alert']
+        bus._do_request('POST', '/api/engines/version-report', report)
+    except Exception:
+        pass
+    return check
+
+
 def command(args):
     if args.engines_cmd == 'quota':
         return quotas()
@@ -1973,12 +2142,36 @@ def command(args):
         return bus._do_request('POST', '/api/engines/maintain', {})
     if args.engines_cmd == 'sync':
         return sync()
+    if args.engines_cmd == 'versions':
+        from . import engine_rollout
+        if getattr(args, 'fleet', False) or getattr(args, 'machine', None):
+            params = ''
+            if getattr(args, 'machine', None):
+                import urllib.parse
+                params = '?machine=' + urllib.parse.quote(str(args.machine), safe='')
+            try:
+                return bus._do_request('GET', '/api/engines/versions' + params)
+            except Exception:
+                # Fleet unreachable: fall back to the local check run.
+                return engine_rollout.check_host()
+        return engine_rollout.check_host()
+    if args.engines_cmd == 'update':
+        from . import engine_rollout
+        return engine_update_command(args)
     if args.engines_cmd == 'list':
         if getattr(args, 'view', None) == 'worker':
             return bus._do_request('GET', '/api/engines?view=worker')
         return bus._do_request('GET', '/api/engines')
     if args.engines_cmd == 'status':
-        return sync_status(bus._do_request('GET', '/api/engines'))
+        listing = sync_status(bus._do_request('GET', '/api/engines'))
+        # AC5: per host per engine installed / latest / last result, taken
+        # from a check run on that host. Best-effort: status stays usable
+        # when version reports are unavailable.
+        try:
+            listing['engine_versions'] = bus._do_request('GET', '/api/engines/versions')
+        except Exception:
+            pass
+        return listing
     if args.engines_cmd == 'remove':
         if not LABEL.fullmatch(args.label):
             raise ValueError('Invalid managed label')
