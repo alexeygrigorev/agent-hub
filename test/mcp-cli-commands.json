@@ -41,6 +41,8 @@
   "engines remove",
   "engines status",
   "engines sync",
+  "engines update",
+  "engines versions",
   "fleet",
   "fleet-host",
   "handoff",
