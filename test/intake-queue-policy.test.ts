@@ -15,7 +15,7 @@ async function fixture(fn: (h: any, fleet: any, account: any) => void | Promise<
     h.sql.exec(`INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained)
       VALUES('online','online','online',?,?,?,0)`, new Date(NOW).toISOString(), new Date(NOW).toISOString(), JSON.stringify({disk_free_gb: 100}));
     const account = { provider: 'zai', enabled: true, supports_goal: true, status: 'ok', placeable_machines: ['online'], placeable_slots: 26 };
-    const fleet = { accountStatus: () => account, resources: {
+    const fleet = { withMaintenance: (fn: any) => fn(), accountStatus: () => account, resources: {
       config: () => ({ disk_floor_gb: 15 }), cpuHeadroom: () => ({ admitted: true }),
       headroom: () => ({ mem_available_mb: 20480, reserved_mb: 1024, floor_mb: 10240, requested_mb: 512 }) } };
     await fn(h, fleet, account);
@@ -35,10 +35,10 @@ describe('live autonomous queue policy', () => {
     const tasks = Array.from({length:4}, (_, i) => ({id:'real-' + i, project:'real-project', title:'Real work',
       status:'open', version:1, created_at:NOW, updated_at:NOW, acceptance_criteria:'Verify actual outcome', history:[]}));
     h.sql.exec('UPDATE machines SET capabilities=?', JSON.stringify({workspaces:['real-project']}));
-    let starts = 0;
+    let starts = 0, policyReads = 0;
     account.placeable_slots = 3;
     const w = new IntakeWatchdog(h.sql, {statusAuthorizedTasks:()=>tasks} as any, (fn:any)=>fn(), {
-      policy: () => liveQueuePolicy(settings, h.sql, fleet, NOW),
+      policy: () => { policyReads++; return liveQueuePolicy(settings, h.sql, fleet, NOW); },
       start: async input => {
         const id = 'automatic-' + starts++;
         account.placeable_slots--;
@@ -51,7 +51,10 @@ describe('live autonomous queue policy', () => {
     w.init(); await w.tick();
     expect(starts).toBe(3);
     expect(w.status().automation).toMatchObject({projects:null,max_inflight:3,max_per_project:3,capacity:{available_slots:0}});
+    await Promise.resolve();
+    policyReads = 0;
     expect(w.queue(tasks).find(t=>t.id==='real-3')).toMatchObject({reason:'watchdog_global_capacity'});
+    expect(policyReads).toBe(1);
   }));
   it('honors the existing machine ceiling without raising it', () => fixture((h, fleet) => {
     h.sql.exec("INSERT OR REPLACE INTO routing_machines(machine_id,needs_json,max_agents,observed_at) VALUES('online','[]',1,?)", new Date(NOW).toISOString());

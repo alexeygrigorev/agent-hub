@@ -16,15 +16,15 @@ const finite = (n: any): n is number => typeof n === 'number' && Number.isFinite
  * No new slots are inferred from stale/offline hosts or unknown quota/resource data.
  */
 export function liveQueuePolicy(env: Record<string, unknown>, sql: SqlStorage,
-  fleet: Pick<FleetService, 'accountStatus' | 'resources'>, now = Date.now()) {
+  fleet: Pick<FleetService, 'accountStatus' | 'resources' | 'withMaintenance'>, now = Date.now()) {
   if (env.HUB_INTAKE_QUEUE_MAX_INFLIGHT !== 'auto') return queuePolicyFrom(env);
   let active = 0, machineSlots = 0, accountSlots = 0;
   try {
     active = Number(sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE ${OWNED_ACTIVE}`).one().n);
     const definitions = sql.exec('SELECT * FROM fleet_accounts LIMIT 129').toArray() as any[];
     if (definitions.length > 128) throw new Error('capacity_observation_limited');
-    const accounts = dedupeAccountsByCanonical(definitions)
-      .map(a => fleet.accountStatus(a)).filter(a => a.enabled && a.supports_goal && a.status === 'ok' &&
+    const accounts = fleet.withMaintenance(() => dedupeAccountsByCanonical(definitions)
+      .map(a => fleet.accountStatus(a))).filter(a => a.enabled && a.supports_goal && a.status === 'ok' &&
         !routingPolicy.rules.disabled_providers.includes(a.provider) &&
         !routingPolicy.rules.explicit_only_providers.includes(a.provider));
     const reachable = new Set(accounts.flatMap(a => a.placeable_machines));

@@ -181,9 +181,18 @@ export class IntakeWatchdog {
       checked_batch_count: result.open_count ?? null,overflow_tick_count:budget.overflow_ticks,last_limited_at:budget.last_limited_at,
       automation: this.policy() };
   }
-  private policy(): QueuePolicy { return this.hooks.policy?.() ?? queuePolicyFrom(); }
-  private automationHold(t: Obj): string | null {
-    const policy = this.policy();
+  private policySnapshot?: QueuePolicy;
+  private policy(): QueuePolicy {
+    // Repeated projection/filter calls in one synchronous turn share the fleet
+    // read. Every awaited admission/observation clears it before continuation,
+    // so subsequent starts re-read account/resource usage after the receipt.
+    if (!this.policySnapshot) {
+      this.policySnapshot = this.hooks.policy?.() ?? queuePolicyFrom();
+      queueMicrotask(() => { this.policySnapshot = undefined; });
+    }
+    return this.policySnapshot;
+  }
+  private automationHold(t: Obj, policy = this.policy()): string | null {
     if (!policy.valid) return 'watchdog_configuration_invalid';
     if (!policy.enabled) return 'watchdog_disabled';
     if (this.idleOverride === t.id) return null;
@@ -250,7 +259,7 @@ export class IntakeWatchdog {
    * or lost replies. Unknown reservations remain occupied until a receipt. */
   private admissionHold(t: Obj): string | null {
     const policy = this.policy();
-    const rollout = this.automationHold(t);
+    const rollout = this.automationHold(t, policy);
     if (rollout) return rollout;
     const active = this.rows(`SELECT id,${requestIntake} AS task_id,request_json FROM session_control_sessions
       WHERE ${OWNED} AND state IN ('queued','held','offered','starting','running','uncertain') LIMIT ?`, policy.max_inflight + 1);
@@ -520,6 +529,8 @@ export class IntakeWatchdog {
     const projections = projection||this.project(tasks, now,c);
     const byId = new Map(tasks.map(t => [t.id, t]));
     const queueRows = c.queue;
+    // One capacity projection per read, rather than one fleet scan per intake.
+    const policy = this.policy();
     const items = projections.map(p => {
       const t = byId.get(p.id)!, q = queueRows.get(p.id);
       const s = p.last_session;
@@ -531,7 +542,7 @@ export class IntakeWatchdog {
       if (state === 'running') reason = s ? 'canonical_' + s.state : 'live_native_owner';
       if (state === 'queued' && s?.hold_reason) reason = s.hold_reason;
       else if (state === 'queued' && s && q?.state !== 'recovering') reason = 'canonical_' + s.state;
-      if (state === 'queued') reason = this.automationHold(t) ?? reason;
+      if (state === 'queued') reason = this.automationHold(t, policy) ?? reason;
       const history = this.rows('SELECT state,reason,at FROM intake_queue_movement WHERE task_id=? ORDER BY seq DESC LIMIT ?', p.id, includeHistory ? 32 : 1).reverse();
       const last = history[history.length - 1];
       const at = last?.at ?? ms(t.created_at);
@@ -542,7 +553,7 @@ export class IntakeWatchdog {
     }).sort((a,b) => Number(a.next_at > now) - Number(b.next_at > now) ||
       (queueRows.get(a.id)?.updated_at ?? 0) - (queueRows.get(b.id)?.updated_at ?? 0) || a.id.localeCompare(b.id));
     let position = 0;
-    for (const item of items) if (item.state === 'queued' && !this.automationHold(byId.get(item.id)!)) item.queue_position = ++position;
+    for (const item of items) if (item.state === 'queued' && !this.automationHold(byId.get(item.id)!, policy)) item.queue_position = ++position;
     return items;
   }
   private async escalate(t: Obj, reason: string, now: number) {
