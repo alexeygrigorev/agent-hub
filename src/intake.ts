@@ -85,6 +85,22 @@ export const INTAKE_EVENT_KINDS = ['intake', 'note', 'decision', 'followup', 'bl
  * second dispatcher. */
 const ASSIGNMENT_ACTIVE = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncertain']);
 const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Return the history event IDs that back the current live assignment.
+ * Callers attach `_active_assignment_session_ids` from the canonical session
+ * rows they already read; this helper is deliberately pure and never queries
+ * or writes storage. A later historical link for a terminal session therefore
+ * cannot hide an older still-live assignment from history compaction. */
+export function activeAssignmentEventIds(task: Obj): Set<string> {
+  const active = new Set(Array.isArray(task?._active_assignment_session_ids)
+    ? task._active_assignment_session_ids.filter((id: unknown): id is string => typeof id === 'string' && SESSION_UUID.test(id))
+    : []);
+  const protectedIds = new Set<string>();
+  for (const event of Array.isArray(task?.history) ? task.history : []) {
+    if (event?.kind === 'link' && typeof event.id === 'string' && event.id &&
+        typeof event.hub_session_id === 'string' && active.has(event.hub_session_id)) protectedIds.add(event.id);
+  }
+  return protectedIds;
+}
 /** Scoped worker denials keep their specific code; everything else stays generic (no oracle). */
 async function denialCode(error: Response): Promise<string> {
   if (error.status !== 403) return 'unauthorized_or_forbidden';
@@ -273,8 +289,11 @@ export class IntakeSessionLinkError extends Error {
 }
 /** Service-only linkage. Call inside the transaction creating/updating the session.
  * It proves the Hub accepted a launch intent, never that the native process ran.
- * Manual links are preserved and counted as already linked during backfill. */
-export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: number, hold?: any): boolean {
+ * Manual links are preserved and counted as already linked during backfill.
+ * `extra` carries operator manual-link provenance (27505f04 AC8): who linked,
+ * and the retained row's state/timestamp at link time — for an ended session
+ * that is historical evidence, never a live-verification claim. */
+export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: number, hold?: any, extra?: Obj): boolean {
   const request = JSON.parse(session.request_json);
   const taskId = request.intake_task_id;
   if (typeof taskId !== 'string' || !taskId) return false;
@@ -288,12 +307,15 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   const binding = JSON.parse(session.binding_json || '{}');
   const observed = request.provenance === 'observed_native';
   task.history.push({ id: crypto.randomUUID(), kind: 'link', hub_session_id: session.id,
-    native_id: observed ? binding.native_id ?? null : null, engine: session.engine ?? request.engine ?? null, tier: request.tier ?? null,
+    // The native binding receipt is verified identity for hub launches too,
+    // not just for observed census rows.
+    native_id: binding.native_id ?? null, engine: session.engine ?? request.engine ?? null, tier: request.tier ?? null,
     host: session.machine_id ?? null, hub: null, routing_job_id: null,
     provenance: { type: observed ? 'observed_native' : 'hub_launch_verified', reference: session.id, timestamp: session.created_at },
     evidence: observed ? 'observed_native' : 'hub_launch_verified', authority: observed ? 'untrusted_task_data' : 'hub_launch_verified', actor: session.actor,
     captured_at: now, intake_key: session.request_key,
-    ...(session.state === 'held' && hold !== undefined ? { assignment_hold: hold } : {}) });
+    ...(session.state === 'held' && hold !== undefined ? { assignment_hold: hold } : {}),
+    ...(extra && typeof extra === 'object' ? extra : {}) });
   task.version++; task.updated_at = now;
   const capacityError = taskCapacityError(task);
   if (capacityError) throw new IntakeSessionLinkError(capacityError);
@@ -671,14 +693,19 @@ export class IntakeService {
     } catch { return null; }
   }
   /** The live Hub session id keeping this task assigned, if any. Guards (not
-   * disclosure): the row is read regardless of actor, only its id is used. */
+   * disclosure): the row is read regardless of actor, only its id is used.
+   * A manual link of an already ended session (intake 27505f04 AC8) appends
+   * its link event after live work's, so the scan skips known-terminal rows
+   * and keeps looking: a historical link never masks a live assignment, and
+   * when only ended sessions remain the task is free for new work. */
   private activeAssignment(task: Obj): string | null {
     for (let i = task.history.length - 1; i >= 0; i--) {
       const e = task.history[i];
       if (e?.kind === 'link' && typeof e.hub_session_id === 'string' && SESSION_UUID.test(e.hub_session_id)) {
         const row = this.sessionRow(e.hub_session_id);
-        if (row && ASSIGNMENT_ACTIVE.has(row.state)) return e.hub_session_id;
-        return null;
+        // A missing row is unreadable custody: fail closed to unassigned, as before.
+        if (!row) return null;
+        if (ASSIGNMENT_ACTIVE.has(row.state)) return e.hub_session_id;
       }
     }
     return null;

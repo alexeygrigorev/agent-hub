@@ -544,7 +544,7 @@ def add_commands(sub):
     count.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     tree = commands.add_parser('tree', help='Display session lineage tree')
     tree.add_argument('--json', action='store_true', help='Output machine-readable JSON')
-    link = commands.add_parser('link', help='Link a session to an intake (operator only)')
+    link = commands.add_parser('link', help='Link a session to an intake (operator only; works while it runs and after it ended, from the retained session record; repeats are idempotent, a different existing linkage is refused)')
     link.add_argument('session')
     link.add_argument('--intake-task-id', required=True)
     link.add_argument('--key')

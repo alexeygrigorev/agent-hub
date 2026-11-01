@@ -1498,16 +1498,31 @@ export class SessionControlService {
                   cancelled++;
                   continue;
                 }
-                const links = Array.isArray(task?.history)
-                  ? task.history.filter((e: any) => ['link', 'session'].includes(e?.kind) && typeof e?.hub_session_id === 'string' && e.hub_session_id)
-                  : [];
-                const ownIdx = links.findIndex((e: any) => e.hub_session_id === row.id);
-                if (ownIdx >= 0 && ownIdx < links.length - 1) {
+                const seenLinks = new Set<string>();
+                const linkIds: string[] = [];
+                if (Array.isArray(task?.history)) for (const e of task.history) {
+                  if (['link', 'session'].includes(e?.kind) && typeof e?.hub_session_id === 'string' && e.hub_session_id &&
+                      !seenLinks.has(e.hub_session_id)) { seenLinks.add(e.hub_session_id); linkIds.push(e.hub_session_id); }
+                }
+                // Supersession is live work replacing live work. A manual link
+                // of an already ended session (27505f04 AC8) sits later in the
+                // ledger than older links but names a terminal row, so it must
+                // never cancel a held intent that still waits for placement.
+                // Only a known-terminal row is historical; a missing row keeps
+                // the old fail-closed yield, and one indexed read covers the batch.
+                const terminalStates = ['stopped', 'finished', 'failed', 'refused', 'cancelled'];
+                const rowState = new Map<string, string>();
+                for (let i = 0; i < linkIds.length; i += 200) {
+                  for (const s of this.sql.exec('SELECT id, state FROM session_control_sessions WHERE id IN (SELECT value FROM json_each(?))',
+                    JSON.stringify(linkIds.slice(i, i + 200))).toArray() as any[]) rowState.set(String(s.id), String(s.state));
+                }
+                const newer = linkIds.filter(id => id !== row.id && !(rowState.get(id) && terminalStates.includes(rowState.get(id)!)));
+                if (linkIds.includes(row.id) && newer.length) {
                   const at = this.at();
                   const supersededHold = JSON.stringify({
                     error: 'superseded_by_newer_session',
                     reason: 'superseded_by_newer_session',
-                    superseded_by: links[links.length - 1].hub_session_id,
+                    superseded_by: newer[newer.length - 1],
                     rejected: holdInfo.rejected,
                   });
                   this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", supersededHold, at, row.id);
@@ -3072,6 +3087,8 @@ export class SessionControlService {
       }
       if (sub === 'link' && request.method === 'POST') {
         if (!admin) return response({ error: 'forbidden' }, 403);
+        // Unknown or foreign refs resolve to no row: render not_found, never a 500 oracle.
+        if (!session) return response({ error: 'not_found' }, 404);
         const input = await body(request);
         if (!obj(input, ['key', 'intake_task_id']) || !label(input.key) ||
             typeof input.intake_task_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{5,127}$/.test(input.intake_task_id)) {
@@ -3083,13 +3100,35 @@ export class SessionControlService {
           const tasks: any[] = this.sql.exec("SELECT id FROM intake_tasks WHERE id=? OR substr(id,1,?)=? LIMIT 2",
             input.intake_task_id, input.intake_task_id.length, input.intake_task_id).toArray();
           if (tasks.length !== 1) return response({ error: tasks.length ? 'ambiguous_intake' : 'unknown_intake_task' }, 409);
+          // AC8 (27505f04): manual linkage also works after the session ended
+          // — the retained canonical row is the identity evidence, no live
+          // process or host heartbeat required. Repeats are idempotent; a
+          // different task, whether in the start intent or an earlier ledger
+          // link event, is refused auditable-conflict style (409), never
+          // silently rewritten.
+          const bound = parsed(live.binding_json, {})?.native_id;
+          let ledgerTasks: string[] = [];
+          try {
+            ledgerTasks = linkedTaskIds(this.sql, [live.id, ...(typeof bound === 'string' ? [bound] : [])],
+              (e: any) => e.hub_session_id === live.id ||
+                (!e.hub_session_id && typeof bound === 'string' && e.native_id === bound && e.host === live.machine_id), 5);
+          } catch { /* projection tables absent: the start-intent check below still applies */ }
+          if (ledgerTasks.some((id: string) => id !== tasks[0].id)) return response({ error: 'intake_link_conflict' }, 409);
           const intent = parsed(live.request_json, {});
           if (intent.intake_task_id && intent.intake_task_id !== tasks[0].id) return response({ error: 'intake_link_conflict' }, 409);
-          intent.intake_task_id = tasks[0].id;
-          live.request_json = JSON.stringify(intent);
-          this.sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', live.request_json, live.id);
-          recordIntakeSessionLink(this.sql, live, this.now());
-          return response(this.view(live, threshold));
+          const ledgerAlready = ledgerTasks.includes(tasks[0].id);
+          const already = intent.intake_task_id === tasks[0].id || ledgerAlready;
+          if (intent.intake_task_id !== tasks[0].id && !ledgerAlready) {
+            intent.intake_task_id = tasks[0].id;
+            live.request_json = JSON.stringify(intent);
+            this.sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', live.request_json, live.id);
+          }
+          const appended = ledgerAlready ? false : recordIntakeSessionLink(this.sql, live, this.now(), undefined, {
+            link_source: 'manual', linked_by: caller.actor ?? 'operator',
+            session_state_at_link: live.state, session_updated_at: live.updated_at ?? null,
+          });
+          return response({ ...this.view(live, threshold), already_linked: already || !appended,
+            link: { intake_task_id: tasks[0].id, source: 'manual' } });
         });
       }
       if (sub === 'binding') {
@@ -4398,11 +4437,93 @@ export function adoptObservedNativeSessions(
       createdAtMs = s.created_at_ms;
     }
 
-    // Do not adopt if this native session is already bound to an active Fleet launch
+    // Resolve exact Fleet identity before classifying a census row as an
+    // externally observed native. The tag carries the launch UUID directly;
+    // the native-id path uses Fleet's machine/native index. If both witnesses
+    // exist they must name the same launch, and a recorded native id may not
+    // disagree with a tag match.
+    let launch: any = null;
+    let launchEvidence: 'tag' | 'native_id' | null = null;
     try {
-      const hasLaunch = sql.exec('SELECT id FROM fleet_launches WHERE machine_id = ? AND native_id = ?', machineId, nativeId).toArray().length > 0;
-      if (hasLaunch) continue;
-    } catch {}
+      const tagLaunchId = typeof tag === 'string' && /^(?:task-hub-|hub-)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tag)
+        ? tag.replace(/^(?:task-hub-|hub-)/i, '') : null;
+      const tagged: any = tagLaunchId
+        ? sql.exec('SELECT * FROM fleet_launches WHERE id = ?', tagLaunchId).toArray()[0]
+        : null;
+      const nativeMatches = sql.exec('SELECT * FROM fleet_launches WHERE machine_id = ? AND native_id = ? LIMIT 2', machineId, nativeId).toArray() as any[];
+      const byNative = nativeMatches.length === 1 ? nativeMatches[0] : null;
+      const tagMatchesMachine = tagged?.machine_id === machineId ? tagged : null;
+      if (tagged && !tagMatchesMachine) { deferred++; continue; }
+      if (nativeMatches.length > 1 && !tagMatchesMachine) { deferred++; continue; }
+      if (tagMatchesMachine && tagged.native_id && tagged.native_id !== nativeId) {
+        deferred++;
+        continue;
+      }
+      if (tagMatchesMachine && nativeMatches.some(row => row.id !== tagged.id)) {
+        deferred++;
+        continue;
+      }
+      if (tagMatchesMachine && byNative && byNative.id !== tagged.id) {
+        deferred++;
+        continue;
+      }
+      launch = tagMatchesMachine ?? byNative;
+      if (launch) launchEvidence = tagMatchesMachine ? 'tag' : 'native_id';
+    } catch { /* an unavailable launch table keeps observation conservative */ }
+
+    if (launch && launchEvidence) {
+      const launchRows: any[] = sql.exec('SELECT * FROM session_control_sessions WHERE fleet_launch_id = ? AND machine_id = ? LIMIT 2', launch.id, machineId).toArray() as any[];
+      if (launchRows.length > 1) { deferred++; continue; }
+      const launchRow: any = launchRows[0];
+      const observedRow: any = sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', nativeId).toArray()[0];
+      const rows = [...new Map([launchRow, observedRow].filter(Boolean).map(row => [row.id, row])).values()];
+      if (rows.length) {
+        const bindings = new Map<any, any>();
+        for (const row of rows) {
+          const prior = parsed(row.binding_json, null);
+          if (row.fleet_launch_id && row.fleet_launch_id !== launch.id) { deferred++; continue; }
+          if (prior && (prior.native_id !== nativeId || prior.tag !== tag || prior.workspace !== workspace ||
+              (prior.native_created_at_ms ?? null) !== createdAtMs)) { deferred++; continue; }
+          bindings.set(row, prior);
+        }
+        if (bindings.size !== rows.length) continue;
+        const state = TERMINAL_PHASES.has(s.phase) && s.confirmed_exit === true
+          ? 'stopped' : (s.phase === 'starting' ? 'starting' : s.phase === 'running' ? 'running' : null);
+        for (const row of rows) {
+          const prior = bindings.get(row);
+          const nextState = state ?? row.state;
+          const binding = { ...(prior ?? {}), native_id: nativeId, tag, workspace,
+            native_created_at_ms: createdAtMs, generation: prior?.generation ?? 1,
+            provenance: 'fleet_launch', evidence: { source: 'fleet_launch', evidence: launchEvidence } };
+          const request = parsed(row.request_json, {});
+          if (request.provenance === 'observed_native') request.provenance = 'hub_launch_verified';
+          sql.exec(`UPDATE session_control_sessions SET fleet_launch_id=?, machine_id=?, engine=COALESCE(engine,?),
+            request_json=?, binding_json=?, state=?, updated_at=? WHERE id=?`, launch.id, machineId, s.engine ?? null,
+            JSON.stringify(request), JSON.stringify(binding), nextState, isoNow, row.id);
+        }
+        if (!launch.native_id) {
+          sql.exec('UPDATE fleet_launches SET native_id=?, updated_at=? WHERE id=? AND machine_id=? AND native_id IS NULL',
+            nativeId, isoNow, launch.id, machineId);
+        }
+        updated += rows.length;
+        continue;
+      }
+      // Preserve a durable session row even if an older launch record lacks
+      // its paired control row. Its identity remains the observed native UUID.
+      insertSessionObservation(sql, machineId, s,
+        TERMINAL_PHASES.has(s.phase) && s.confirmed_exit === true ? 'stopped' :
+          s.phase === 'starting' ? 'starting' : s.phase === 'running' ? 'running' : 'uncertain',
+        resolvedFamily, nowMs);
+      const inserted = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', nativeId).toArray()[0] as any;
+      const binding = { ...parsed(inserted.binding_json, {}), provenance: 'fleet_launch',
+        evidence: { source: 'fleet_launch', evidence: launchEvidence } };
+      const request = parsed(inserted.request_json, {});
+      request.provenance = 'hub_launch_verified';
+      sql.exec('UPDATE session_control_sessions SET fleet_launch_id=?, request_json=?, binding_json=? WHERE id=?',
+        launch.id, JSON.stringify(request), JSON.stringify(binding), nativeId);
+      adopted++;
+      continue;
+    }
 
     // Check if an existing Hub-started session (with fleet_launch_id) manages this native_id
     const existing: any = sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', nativeId).toArray()[0];
