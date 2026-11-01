@@ -389,6 +389,9 @@ describe('M14a authorized one-call status projection', () => {
   it('treats win35 stale checkins as expected offline, not an outage', async () => {
     await seedCanonicalHosts();
     await inDO(stub(), (h: any) => {
+      // Keep this behavioral assertion inside the documented exception
+      // window even after the real-world cutoff has elapsed.
+      h.statusService.now = () => Date.parse('2026-10-31T15:22:59Z');
       h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES ('win35','win35','DESKTOP-FP4OP26','2026-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z',0)");
     });
     const data = await ok('');

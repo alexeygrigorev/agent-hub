@@ -1460,20 +1460,18 @@ export class QuotaStore {
           }
           const quotaObs = quota?.observed_at || sub.observed_at;
           if (quota && isFreshTs(sub.observed_at, nowMs, QUOTA_STALE_MS) && isFreshTs(quotaObs, nowMs, QUOTA_STALE_MS)) {
-            // A fresh but empty/unknown managed-account probe is not quota
-            // evidence. Let the host-wide collector snapshot fill the gap
-            // below; this is especially important for device-login providers
-            // whose account probe can fail while the normal host collector
-            // still has a valid reading. Preserve positive exhaustion and
-            // cooldown evidence from the account probe.
+            // Retain every fresh report as provenance, but do not let an
+            // empty/unknown managed-account probe mask a healthy host-wide
+            // collector snapshot below. This matters for device-login
+            // providers whose direct account probe can fail while the host
+            // collector still has a valid reading. Positive exhaustion and
+            // cooldown evidence remains authoritative.
             const hasActiveCooldown = typeof quota.details?.cooldown_until === "string" &&
               Date.parse(quota.details.cooldown_until) > nowMs;
             const hasExhaustedWindow = windowMinPercent(quota) === 0;
-            if (!observationUnavailable(quota) || quota.details?.limit_reached === true || hasActiveCooldown || hasExhaustedWindow) {
-              freshObs.push({ machine: route.machine_id, quota: quota.observed_at ? quota : { ...quota, observed_at: quotaObs }, kind: "subscription" });
-              continue;
-            }
-            hasStale = true;
+            freshObs.push({ machine: route.machine_id, quota: quota.observed_at ? quota : { ...quota, observed_at: quotaObs }, kind: "subscription" });
+            if (observationUnavailable(quota) && quota.details?.limit_reached !== true && !hasActiveCooldown && !hasExhaustedWindow) hasStale = true;
+            if (!observationUnavailable(quota) || quota.details?.limit_reached === true || hasActiveCooldown || hasExhaustedWindow) continue;
           } else {
             hasStale = true;
             continue;
@@ -1515,8 +1513,13 @@ export class QuotaStore {
         }
       }
 
-      if (freshObs.length === 0) {
+      const hasHealthyObservation = freshObs.some((o) => !observationUnavailable(o.quota));
+      const hasPositiveHold = freshObs.some((o) => o.quota.details?.limit_reached === true || windowMinPercent(o.quota) === 0 ||
+        (typeof o.quota.details?.cooldown_until === "string" && Date.parse(o.quota.details.cooldown_until) > nowMs));
+      if (!hasHealthyObservation && !hasPositiveHold) {
+        const snapshotSources = new Set(freshObs.filter((o) => o.kind === "snapshot").map((o) => o.machine));
         for (const machineId of machines) {
+          if (snapshotSources.has(machineId)) continue;
           const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", machineId).toArray()[0];
           if (!snap || !isFreshTs(snap.captured_at, nowMs, QUOTA_STALE_MS)) continue;
           let snapRoutes: any = null;

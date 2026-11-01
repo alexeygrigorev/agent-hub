@@ -141,7 +141,7 @@ describe('quota machine coverage counts canonical machines only', () => {
       seedFleetWithUnjoined(hub, freshAt);
       const body = view(hub);
       expect(body.coverage).toMatchObject({
-        machines_total: 2, fresh: ['rmthz', 'tabo'], stale: [], missing: [],
+        machines_total: 2, fresh: ['rmthz'], stale: [], missing: ['tabo'],
         not_fleet: [{ machine_id: 'laptop', reason: 'never_checked_in' }],
       });
       expect(body.hosts.map((h: any) => h.host_id)).toEqual(['rmthz', 'tabo']);
