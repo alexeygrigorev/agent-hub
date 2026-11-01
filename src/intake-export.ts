@@ -11,6 +11,11 @@ export function initIntakeExport(sql: SqlStorage) {
   sql.exec('CREATE INDEX IF NOT EXISTS intake_export_project_recent ON intake_export(project,updated_at DESC,id)');
   sql.exec('CREATE INDEX IF NOT EXISTS intake_export_status ON intake_export(status,archived,id)');
   sql.exec('CREATE INDEX IF NOT EXISTS intake_export_project ON intake_export(project,id)');
+  for (const [name, columns] of [
+    ['archive', 'archived,id'], ['status_id', 'status,id'],
+    ['project_archive', 'project,archived,id'], ['project_status', 'project,status,id'],
+    ['project_status_archive', 'project,status,archived,id'],
+  ]) sql.exec(`CREATE INDEX IF NOT EXISTS intake_export_${name} ON intake_export(${columns})`);
   const select = (prefix: string) => {
     const d = prefix + 'data';
     const j = (key: string) => `json_extract(${d},'$.${key}')`;
@@ -36,22 +41,20 @@ export function initIntakeExport(sql: SqlStorage) {
     ${op !== 'DELETE' ? 'INSERT INTO intake_export_counts VALUES(NEW.project,NEW.status,NEW.archived,1) ON CONFLICT(project,status,archived) DO UPDATE SET n=n+1;' : ''}
     END`);
 
+  const totalsExist = sql.exec("SELECT 1 FROM sqlite_master WHERE name='intake_export_totals'").toArray().length;
+  sql.exec(`CREATE TABLE IF NOT EXISTS intake_export_totals(status TEXT NOT NULL,archived INTEGER NOT NULL,n INTEGER NOT NULL,
+    PRIMARY KEY(status,archived))`);
+  if (!totalsExist) sql.exec('INSERT INTO intake_export_totals SELECT status,archived,SUM(n) FROM intake_export_counts GROUP BY status,archived');
+  for (const op of ['INSERT','UPDATE','DELETE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_export_total_${op.toLowerCase()} AFTER ${op} ON intake_export BEGIN
+    ${op !== 'INSERT' ? 'UPDATE intake_export_totals SET n=n-1 WHERE status=OLD.status AND archived=OLD.archived; DELETE FROM intake_export_totals WHERE status=OLD.status AND archived=OLD.archived AND n=0;' : ''}
+    ${op !== 'DELETE' ? 'INSERT INTO intake_export_totals VALUES(NEW.status,NEW.archived,1) ON CONFLICT(status,archived) DO UPDATE SET n=n+1;' : ''}
+    END`);
 }
-/** Parameterized authorization identical to IntakeService.allowed, including
- * union/overlap grants. Never count a task twice or reveal denied ids. */
-export function intakeExportScope(p: Obj): { where: string; args: any[] } {
-  if (p.admin || p.grants.some((g: Obj) => g.scope === 'all')) return { where: '1', args: [] };
-  const args: any[] = [];
-  const terms = p.grants.filter((g: Obj) => ['task','project'].includes(g.scope)).map((g: Obj) => {
-    args.push(g.target); return `${g.scope === 'task' ? 'id' : 'project'}=?`;
-  });
-  return { where: '(' + (terms.join(' OR ') || '0') + ')', args };
-}
-
 /** All/project totals come from tiny write-maintained counters. Task-only
  * grants use exact primary-key lookups, excluding overlapping project grants. */
 export function intakeExportCounts(sql: SqlStorage, p: Obj, project: string | null): Obj[] {
   const all = p.admin || p.grants.some((g: Obj) => g.scope === 'all');
+  if (all && project === null) return sql.exec('SELECT status,archived,n FROM intake_export_totals').toArray() as Obj[];
   const projects: string[] = all ? [] : [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'project').map((g: Obj) => g.target))];
   const tasks: string[] = all ? [] : [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'task').map((g: Obj) => g.target))];
   const terms: string[] = []; const args: any[] = [];
@@ -62,7 +65,7 @@ export function intakeExportCounts(sql: SqlStorage, p: Obj, project: string | nu
     const taskTerms = [`id IN (${tasks.map(() => '?').join(',')})`]; const taskArgs: any[] = [...tasks];
     if (project !== null) { taskTerms.push('project=?'); taskArgs.push(project); }
     if (projects.length) { taskTerms.push(`project NOT IN (${projects.map(() => '?').join(',')})`); taskArgs.push(...projects); }
-    rows.push(...sql.exec(`SELECT status,archived,COUNT(*) AS n FROM intake_export WHERE ${taskTerms.join(' AND ')} GROUP BY status,archived`, ...taskArgs).toArray() as Obj[]);
+    rows.push(...sql.exec(`SELECT status,archived,COUNT(*) AS n FROM intake_export INDEXED BY sqlite_autoindex_intake_export_1 WHERE ${taskTerms.join(' AND ')} GROUP BY status,archived`, ...taskArgs).toArray() as Obj[]);
   }
   return rows;
 }
@@ -71,19 +74,58 @@ export function intakeExportCounts(sql: SqlStorage, p: Obj, project: string | nu
  * bounded by grant count, even for sparse authorization on a large ledger. */
 export function intakeExportRecent(sql: SqlStorage, p: Obj, project: string | null): Obj[] {
   const all = p.admin || p.grants.some((g: Obj) => g.scope === 'all');
-  if (all) return sql.exec(`SELECT data FROM intake_export${project === null ? '' : ' WHERE project=?'} ORDER BY updated_at DESC,id LIMIT 5`,
+  if (all) return sql.exec(`SELECT data FROM intake_export INDEXED BY ${project === null ? 'intake_export_recent' : 'intake_export_project_recent'}${project === null ? '' : ' WHERE project=?'} ORDER BY updated_at DESC,id LIMIT 5`,
     ...(project === null ? [] : [project])).toArray() as Obj[];
   const projects = [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'project' && (project === null || g.target === project)).map((g: Obj) => g.target))];
   const tasks = [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'task').map((g: Obj) => g.target))];
   const parts: string[] = []; const args: any[] = [];
   for (const target of projects) {
-    parts.push('SELECT id,updated_at,data FROM (SELECT id,updated_at,data FROM intake_export WHERE project=? ORDER BY updated_at DESC,id LIMIT 5)'); args.push(target);
+    parts.push('SELECT id,updated_at,data FROM (SELECT id,updated_at,data FROM intake_export INDEXED BY intake_export_project_recent WHERE project=? ORDER BY updated_at DESC,id LIMIT 5)'); args.push(target);
   }
   if (tasks.length) {
     const terms = [`id IN (${tasks.map(() => '?').join(',')})`]; args.push(...tasks);
     if (project !== null) { terms.push('project=?'); args.push(project); }
     if (projects.length) { terms.push(`project NOT IN (${projects.map(() => '?').join(',')})`); args.push(...projects); }
-    parts.push(`SELECT id,updated_at,data FROM (SELECT id,updated_at,data FROM intake_export WHERE ${terms.join(' AND ')} ORDER BY updated_at DESC,id LIMIT 5)`);
+    parts.push(`SELECT id,updated_at,data FROM (SELECT id,updated_at,data FROM intake_export INDEXED BY sqlite_autoindex_intake_export_1 WHERE ${terms.join(' AND ')} ORDER BY updated_at DESC,id LIMIT 5)`);
   }
   return parts.length ? sql.exec(`SELECT data FROM (${parts.join(' UNION ALL ')}) ORDER BY updated_at DESC,id LIMIT 5`, ...args).toArray() as Obj[] : [];
+}
+
+export type IntakeExportFilter = { project: string | null; statuses: string[] | null; archived: number | null };
+export function intakeExportMatches(row: Obj, filter: IntakeExportFilter): boolean {
+  return (filter.statuses === null || filter.statuses.includes(row.status)) &&
+    (filter.archived === null || Number(row.archived) === filter.archived);
+}
+/** Every source is an equality-prefix + primary-key range with its own LIMIT.
+ * The merge sorts at most (grants * fixed status count * limit) ids; it never
+ * scans unrelated projects looking for authorized matches. */
+export function intakeExportPageIds(sql: SqlStorage, p: Obj, filter: IntakeExportFilter, after: string | null, limit: number): string[] {
+  const all = p.admin || p.grants.some((g: Obj) => g.scope === 'all');
+  const projects: (string | null)[] = all ? [filter.project] : [...new Set<string>(p.grants
+    .filter((g: Obj) => g.scope === 'project' && (filter.project === null || g.target === filter.project)).map((g: Obj) => g.target))];
+  const ids = new Set<string>();
+  for (const project of projects) for (const status of filter.statuses ?? [null]) {
+    const terms: string[] = []; const args: any[] = [];
+    if (project !== null) { terms.push('project=?'); args.push(project); }
+    if (status !== null) { terms.push('status=?'); args.push(status); }
+    if (filter.archived !== null) { terms.push('archived=?'); args.push(filter.archived); }
+    if (after) { terms.push('id>?'); args.push(after); }
+    let index: string;
+    if (project !== null) index = status !== null ? (filter.archived !== null ? 'project_status_archive' : 'project_status') : (filter.archived !== null ? 'project_archive' : 'project');
+    else index = status !== null ? (filter.archived !== null ? 'status' : 'status_id') : (filter.archived !== null ? 'archive' : '');
+    const name = index ? 'intake_export_' + index : 'sqlite_autoindex_intake_export_1';
+    for (const row of sql.exec(`SELECT id FROM intake_export INDEXED BY ${name}${terms.length ? ' WHERE ' + terms.join(' AND ') : ''} ORDER BY id LIMIT ?`, ...args, limit).toArray() as Obj[]) ids.add(row.id);
+  }
+  if (!all) {
+    const tasks = [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'task').map((g: Obj) => g.target))];
+    if (tasks.length) {
+      const terms = [`id IN (${tasks.map(() => '?').join(',')})`]; const args: any[] = [...tasks];
+      if (filter.project !== null) { terms.push('project=?'); args.push(filter.project); }
+      if (filter.statuses !== null) { terms.push(`status IN (${filter.statuses.map(() => '?').join(',')})`); args.push(...filter.statuses); }
+      if (filter.archived !== null) { terms.push('archived=?'); args.push(filter.archived); }
+      if (after) { terms.push('id>?'); args.push(after); }
+      for (const row of sql.exec(`SELECT id FROM intake_export INDEXED BY sqlite_autoindex_intake_export_1 WHERE ${terms.join(' AND ')} ORDER BY id LIMIT ?`, ...args, limit).toArray() as Obj[]) ids.add(row.id);
+    }
+  }
+  return [...ids].sort().slice(0, limit);
 }

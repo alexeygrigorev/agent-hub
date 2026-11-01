@@ -77,8 +77,12 @@ describe('private durable intake HTTP/SQLite', () => {
           archived_at: i % 2 ? 1 : null, history: [{ id: 'note', kind: 'note', text: 'x'.repeat(8192), captured_at: i }] }));
       }
       // Guard actual SQL, not a wall-clock assertion affected by shared-host load.
-      const queries: string[] = [];
-      const sql = { exec: (query: string, ...args: any[]) => { queries.push(query); return h.sql.exec(query, ...args); } };
+      const queries: string[] = []; const plans: any[] = [];
+      const sql = { exec: (query: string, ...args: any[]) => {
+        queries.push(query);
+        if (/^SELECT id FROM intake_export /.test(query)) plans.push(...h.sql.exec('EXPLAIN QUERY PLAN ' + query, ...args).toArray());
+        return h.sql.exec(query, ...args);
+      } };
       const service = new IntakeService(sql as any);
       const p = { admin: true };
       const summary = (service as any).read(new URL('https://hub.test/api/intake/summary'), p);
@@ -92,6 +96,16 @@ describe('private durable intake HTTP/SQLite', () => {
       expect(page.items[0].payload_data.history[0].text).toHaveLength(8192);
       expect(queries.filter(q => /SELECT data FROM intake_tasks/.test(q))).toHaveLength(25);
       expect(queries.some(q => /SELECT data FROM intake_tasks ORDER/.test(q))).toBe(false);
+      expect(page.intake_open_warning).toMatchObject({ open_count: 542, items_total: 542, item_limit: 128, items_truncated: true });
+      expect(page.intake_open_warning.items).toHaveLength(128);
+      expect(queries.some(q => /COUNT\(\*\).*FROM intake_export(?:\s|$)|SELECT DISTINCT.*FROM intake_export(?:\s|$)/.test(q))).toBe(false);
+      expect(JSON.stringify(plans)).not.toMatch(/MULTI-INDEX OR|TEMP B-TREE/);
+      const mixed = { admin: false, grants: [{ scope: 'project', target: 'export-fixture' }, { scope: 'task', target: 'export-1082' }] };
+      plans.length = 0;
+      const mixedPage = (service as any).read(new URL('https://hub.test/api/intake/tasks?all=true&limit=25'), mixed);
+      expect(mixedPage.total).toBe(1083); expect(mixedPage.items.map((t: any) => t.id)).toEqual(page.items.map((t: any) => t.id));
+      expect(JSON.stringify(plans)).not.toMatch(/MULTI-INDEX OR|TEMP B-TREE/);
+
       const plan = h.sql.exec('EXPLAIN QUERY PLAN SELECT data FROM intake_export ORDER BY updated_at DESC,id LIMIT 5').toArray();
       expect(JSON.stringify(plan)).toContain('intake_export_recent');
       // Rollback updates both metadata and counters; session state is read live.

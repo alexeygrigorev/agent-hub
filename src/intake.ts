@@ -9,7 +9,7 @@ type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
 import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, initSessionLinks, initLinkRefs, triageTargets, workerAccessContext, workerCreatedTargets, workerLinkedTargets } from './worker-access';
-import { initIntakeExport, intakeExportScope, intakeExportCounts, intakeExportRecent } from './intake-export';
+import { initIntakeExport, intakeExportCounts, intakeExportRecent, intakeExportPageIds, intakeExportMatches, type IntakeExportFilter } from './intake-export';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
@@ -506,11 +506,14 @@ export class IntakeService {
   }
   /** Operator-visible soft warning when open intake is high. Null when under threshold. */
   intakeOpenWarning(principal?: Obj, summaries?: Obj[]): Obj | null {
-    if (!summaries && this.openNonTerminalCount(principal) <= OPEN_INTAKE_WARN_THRESHOLD) return null;
-    const rows = summaries ?? this.sql.exec("SELECT data FROM intake_export WHERE archived=0 AND status IN ('open','in_progress','blocked','pending_approval')").toArray().map((r: any) => JSON.parse(r.data));
-    const open = rows.filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t)));
-    const open_count = open.length;
+    const p = principal ?? { admin: true };
+    const supplied = summaries?.filter(t => !t.archived_at && OPEN.includes(t.status) && this.allowed(p, t));
+    const open_count = supplied?.length ?? this.openNonTerminalCount(p);
     if (open_count <= OPEN_INTAKE_WARN_THRESHOLD) return null;
+    const itemLimit = 128;
+    const open = supplied ? supplied.slice(0, itemLimit) : intakeExportPageIds(this.sql, p,
+      { project: null, statuses: OPEN, archived: 0 }, null, itemLimit).map(id =>
+        JSON.parse((this.sql.exec('SELECT data FROM intake_export WHERE id=?', id).toArray()[0] as any).data));
     return {
       code: 'intake_open_high',
       severity: 'warn',
@@ -518,6 +521,7 @@ export class IntakeService {
       threshold: OPEN_INTAKE_WARN_THRESHOLD,
       message: 'Open intake is high. Closing requires a DONE note containing a commit SHA or deploy run URL AND a live check (command/URL plus result). Review evidence for each intake before closing.',
       action: 'review_done_evidence',
+      items_total: open_count, item_limit: itemLimit, items_truncated: open_count > open.length,
       items: open
         .map(t => ({ id: t.id, title: t.title, age_ms: Math.max(0, Date.now() - (t.created_at ?? Date.now())) })),
     };
@@ -781,23 +785,20 @@ export class IntakeService {
     if (url.searchParams.has('authorization_valid_until') && Number(url.searchParams.get('authorization_valid_until')) !== (p.valid_until ?? null)) fail('stale_snapshot', 409);
     if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');
     const page = this.page(url, [], revision); // shared limit/cursor/revision validation
-    const scope = intakeExportScope(p); const terms = [scope.where]; const args = [...scope.args];
-    if (url.searchParams.has('project')) { terms.push('project=?'); args.push(url.searchParams.get('project')); }
     const status = url.searchParams.get('status'); const archived = url.searchParams.get('archived'); const all = url.searchParams.get('all');
     if (archived && archived !== 'true') fail('invalid_archived');
     if (all && all !== 'true') fail('invalid_all');
     if (status && status !== 'all' && !STATUSES.includes(status)) fail('invalid_status');
-    if (archived === 'true') terms.push('archived=1');
-    else if (all !== 'true' && status !== 'all' && !['done','cancelled'].includes(status ?? '')) terms.push("archived=0 AND status IN ('open','in_progress','blocked','pending_approval')");
-    if (status && status !== 'all') { terms.push('status=?'); args.push(status); }
-    const where = terms.join(' AND ');
-    const total = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM intake_export WHERE ${where}`, ...args).toArray()[0] as any).n);
-    const after = url.searchParams.get('after');
-    const candidates = this.sql.exec(`SELECT id FROM intake_export WHERE ${where}${after ? ' AND id>?' : ''} ORDER BY id LIMIT ?`,
-      ...args, ...(after ? [after] : []), page.effective_limit + 1).toArray() as Obj[];
-    const items = candidates.slice(0, page.effective_limit).map(r => this.taskView(this.get('tasks', r.id)!, p));
-    const projects = this.sql.exec(`SELECT DISTINCT project FROM intake_export WHERE ${where}`, ...args).toArray();
-    const rules = this.rules(projects as Obj[]);
+    const defaultOpen = archived !== 'true' && all !== 'true' && status !== 'all' && !['done','cancelled'].includes(status ?? '');
+    const filter: IntakeExportFilter = { project: url.searchParams.get('project'),
+      statuses: status && status !== 'all' ? [status] : defaultOpen ? OPEN : null,
+      archived: archived === 'true' ? 1 : defaultOpen ? 0 : null };
+    const total = intakeExportCounts(this.sql, p, filter.project).filter(r => intakeExportMatches(r, filter)).reduce((n, r) => n + Number(r.n), 0);
+    const candidates = intakeExportPageIds(this.sql, p, filter, url.searchParams.get('after'), page.effective_limit + 1);
+    const items = candidates.slice(0, page.effective_limit).map(id => this.taskView(this.get('tasks', id)!, p));
+    // Rules are capped at 128; check only their exact project counter keys.
+    const rules = this.rows('rules').filter(rule => rule.project === null ||
+      (typeof rule.project === 'string' && (filter.project === null || rule.project === filter.project) && intakeExportCounts(this.sql, p, rule.project).some(r => intakeExportMatches(r, filter))));
     const warn = this.intakeOpenWarning(p);
     return { ...page, total, items, next: candidates.length > page.effective_limit ? items[items.length-1].id : null,
       authorization_valid_until: p.valid_until ?? null, operator_rules: rules, data_notice: DATA_NOTICE,
