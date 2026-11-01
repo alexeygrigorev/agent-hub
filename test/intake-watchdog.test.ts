@@ -27,6 +27,45 @@ function session(h: any, id: string, t: any, state: string, extra: any = {}) {
     new Date(NOW - 3600000).toISOString(), new Date(NOW - 1800000).toISOString(), extra.machine || null, extra.binding ? JSON.stringify(extra.binding) : null);
 }
 describe('forgotten intake watchdog', () => {
+  it('examines overdue restarts outside the cursor with a bounded indexed lane', async () => fixture(h => {
+    const normal=Array.from({length:64},(_,i)=>task('a-'+String(i).padStart(3,'0')));
+    const overdue=Array.from({length:12},(_,i)=>task('z-'+String(i).padStart(3,'0')));
+    const all=[...normal,...overdue];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>all} as any,(f:any)=>f(),{},()=>NOW);w.init();
+    h.sql.exec("UPDATE intake_queue_cursor SET after_id='' WHERE id=1");
+    for(const t of overdue)h.sql.exec("INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at) VALUES(?,'queued','watchdog_global_capacity',?,?,?)",t.id,NOW-60000,NOW-60000,NOW);
+    const page=(w as any).batch(NOW);
+    expect(page.tasks).toHaveLength(72);
+    expect(page.tasks.slice(64).map((t:any)=>t.id)).toEqual(overdue.slice(0,8).map(t=>t.id));
+    expect(h.sql.exec('SELECT after_id FROM intake_queue_cursor WHERE id=1').one().after_id).toBe('a-063');
+    const plan=h.sql.exec("EXPLAIN QUERY PLAN SELECT task_id FROM intake_restart_queue WHERE state='queued' AND next_at<=? ORDER BY next_at,task_id LIMIT 8",NOW).toArray();
+    expect(JSON.stringify(plan)).toContain('intake_queue_due');
+  }));
+  it('dispatches a queued restart before fresh pickup without raising admission caps', async () => fixture(async h => {
+    const fresh=Array.from({length:9},(_,i)=>task('fresh-'+i)), overdue=task('queued-restart');
+    const all=[...fresh,overdue],started:string[]=[];
+    for(const t of all)session(h,'failed-'+t.id,t,'failed');
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>all} as any,(f:any)=>f(),{
+      start:async input=>{started.push(input.intake_task_id);return {status:202,body:{id:'new-'+input.intake_task_id,state:'queued'}}}
+    },()=>NOW);w.init();
+    h.sql.exec("UPDATE intake_queue_cursor SET after_id='' WHERE id=1");
+    h.sql.exec("INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at) VALUES(?,'queued','watchdog_global_capacity',?,?,?)",overdue.id,NOW-60000,NOW-60000,NOW);
+    await w.tick();
+    expect(started[0]).toBe(overdue.id);
+    expect(started).toHaveLength(2); // Canonical pre-admission reservations retain the default cap.
+    expect(h.sql.exec("SELECT reason FROM intake_restart_queue WHERE task_id=?",fresh[1].id).one().reason).toBe('watchdog_global_capacity');
+  }));
+  it('does not renew the hold deadline when admission gates alternate', async () => fixture(async h => {
+    const t=task('alternating-gates');let now=NOW;
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{},()=>now);w.init();
+    (w as any).hold(t,'watchdog_global_capacity',now,WATCHDOG_INTERVAL);
+    now+=QUEUE_HOLD_TTL_MS-WATCHDOG_INTERVAL;
+    (w as any).hold(t,'workspace_configuration_required',now,WATCHDOG_INTERVAL);
+    expect(h.sql.exec('SELECT held_since FROM intake_restart_queue WHERE task_id=?',t.id).one().held_since).toBe(NOW);
+    now+=WATCHDOG_INTERVAL;await w.tick();
+    expect(w.queue([t])[0]).toMatchObject({state:'escalated',reason:'hold_ttl_workspace_configuration_required'});
+  }));
+
   it('uses >2h no-session age, ignores note updates, omits terminal archives', async () => fixture(h => {
     const w = new IntakeWatchdog(h.sql, h.intakeService, (f: any) => f(), {}, () => NOW); w.init();
     const rows = w.project([task(), task('boundary',7200000), {...task('closed'),status:'done',archived_at:NOW}]);

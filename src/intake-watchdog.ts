@@ -105,6 +105,7 @@ export class IntakeWatchdog {
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_human_alerts(task_id TEXT NOT NULL, reason TEXT NOT NULL, alerted_at INTEGER NOT NULL, PRIMARY KEY(task_id, reason))');
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_movement(seq INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL,state TEXT NOT NULL,reason TEXT NOT NULL,at INTEGER NOT NULL)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS intake_queue_movement_task ON intake_queue_movement(task_id,seq)');
+    this.sql.exec("CREATE INDEX IF NOT EXISTS intake_queue_due ON intake_restart_queue(next_at,task_id) WHERE state='queued'");
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_cursor(id INTEGER PRIMARY KEY CHECK(id=1),after_id TEXT NOT NULL,forgotten_seen INTEGER NOT NULL DEFAULT 0)');
     this.sql.exec("INSERT OR IGNORE INTO intake_queue_cursor(id,after_id) VALUES(1,'')");
     const cursorCols = (this.sql.exec('PRAGMA table_info(intake_queue_cursor)').toArray() as any[]).map(c => c.name);
@@ -404,22 +405,31 @@ export class IntakeWatchdog {
     if(typeof this.intake.statusTaskById==='function')return this.intake.statusTaskById({admin:true},id);
     return this.intake.statusAuthorizedTasks({admin:true}).find(t=>t.id===id);
   }
-  private batch(): {tasks:Obj[];wrapped:boolean} {
+  private batch(now: number): {tasks:Obj[];wrapped:boolean} {
     const after=this.rows('SELECT after_id FROM intake_queue_cursor WHERE id=1')[0].after_id;
     let tasks:Obj[];
     if(typeof this.intake.watchdogTasks==='function')tasks=this.intake.watchdogTasks(after,QUEUE_BATCH_SIZE);
     else tasks=this.intake.statusAuthorizedTasks({admin:true}).filter(t=>OPEN.has(t.status)&&!t.archived_at&&t.id>after).sort((a,b)=>a.id.localeCompare(b.id)).slice(0,QUEUE_BATCH_SIZE);
     const wrapped=tasks.length<QUEUE_BATCH_SIZE;
     this.sql.exec('UPDATE intake_queue_cursor SET after_id=? WHERE id=1',wrapped?'':tasks[tasks.length-1].id);
+    // Give overdue restarts a bounded lane independent of the intake cursor.
+    // The partial index avoids scanning quiet/submitted queue history per tick.
+    const ids = new Set(tasks.map(t => t.id));
+    const due = this.rows("SELECT task_id FROM intake_restart_queue WHERE state='queued' AND next_at<=? ORDER BY next_at,task_id LIMIT 8", now);
+    for (const row of due) {
+      if (ids.has(row.task_id)) continue;
+      const t = this.task(row.task_id);
+      if (t && OPEN.has(t.status) && !t.archived_at) { tasks.push(t); ids.add(t.id); }
+    }
     return {tasks,wrapped};
   }
   private hold(t: Obj, reason: string, now: number, delay = QUEUE_RETRY_BASE_MS) {
     const old = this.rows('SELECT * FROM intake_restart_queue WHERE task_id=?', t.id)[0];
-    // A re-hold of the same queued reason extends the episode; anything else
-    // starts a fresh hold for the TTL clock.
+    // Changing admission gates must not reset the deadline of a queued episode.
+    // Keep the current reason visible while retaining its original hold age.
     this.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at) VALUES(?, 'queued', ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET state='queued',reason=excluded.reason,next_at=excluded.next_at,updated_at=excluded.updated_at,
-      held_since=CASE WHEN intake_restart_queue.state='queued' AND intake_restart_queue.reason=excluded.reason
+      held_since=CASE WHEN intake_restart_queue.state='queued' AND intake_restart_queue.reason NOT IN ('watchdog_disabled','watchdog_configuration_invalid','watchdog_project_not_enabled','reported_completion_requires_operator_review','done_evidence_requires_operator_review')
         THEN intake_restart_queue.held_since ELSE excluded.held_since END`,
       t.id, reason, now, now + delay, now);
     if (!old || old.reason !== reason || old.state !== 'queued') { this.movement(t,'queued',reason,now);this.audit(t,'restart_queued',reason,now); }
@@ -717,7 +727,7 @@ export class IntakeWatchdog {
       this.sql.exec('UPDATE intake_watchdog_meta SET last_tick=?,last_source=? WHERE id=1',now,source);return true;
     });
     if(!acquired)return {state:'already_checked'};
-    const {tasks,wrapped}=this.batch();
+    const {tasks,wrapped}=this.batch(now);
     const context=this.snapshot(tasks,now);
     if(context.overflow)await this.reportObservationLimit(tasks,now);
     const items=this.project(tasks,now,context),forgotten=items.filter(i=>i.forgotten);
@@ -769,11 +779,15 @@ export class IntakeWatchdog {
     }
     await this.reconcile(tasks,now,context);
     await this.sweepQueue(tasks,now,context);
+    const dispatchRows=new Map(tasks.map(t=>[t.id,this.queueRow(t.id)]));
     const ordered=items.filter(i=>{
-      const q=this.queueRow(i.id);
+      const q=dispatchRows.get(i.id);
       const task=tasks.find(t=>t.id===i.id);
       return task && !this.automationHold(task) && i.ready && q?.state!=='escalated' && (!q || q.next_at<=now);
-    }).sort((a,b)=>(context.queue.get(a.id)?.updated_at??0)-(context.queue.get(b.id)?.updated_at??0)||a.id.localeCompare(b.id));
+    }).sort((a,b)=>{
+      const aq=dispatchRows.get(a.id),bq=dispatchRows.get(b.id);
+      return Number(!aq)-Number(!bq) || (aq?.next_at??0)-(bq?.next_at??0) || a.id.localeCompare(b.id);
+    });
     for(const item of ordered.slice(0,8))await this.restart(tasks.find(t=>t.id===item.id)!,now);
     const human_hold_alerts=await this.alertHumanHolds(tasks,now);
     let asks:Obj|undefined;
@@ -782,7 +796,7 @@ export class IntakeWatchdog {
       catch(e:any) { asks={state:'error',error:String(e?.message||e).slice(0,200)}; }
     }
     const result={state:'checked',checked_at:now,forgotten_count:forgotten.length,open_count:items.length,human_hold_alerts,...(asks?{asks}:{}),
-      observation_scope:'cursor_batch',batch_limit:QUEUE_BATCH_SIZE,observed_sessions:context.sessions.length,observed_native:context.native.length,observation_limited:context.overflow,elapsed_ms:performance.now()-began};
+      observation_scope:'cursor_batch',batch_limit:QUEUE_BATCH_SIZE,restart_priority_limit:8,observed_sessions:context.sessions.length,observed_native:context.native.length,observation_limited:context.overflow,elapsed_ms:performance.now()-began};
     this.sql.exec('UPDATE intake_watchdog_meta SET last_result=? WHERE id=1',JSON.stringify(result));return result;
   }
 }
