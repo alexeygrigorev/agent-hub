@@ -188,7 +188,8 @@ def test_probe_started_before_new_failure_cannot_clear_the_new_hold(tmp_path):
     started, release = threading.Event(), threading.Event()
     def probe():
         started.set()
-        return release.wait(timeout=10)
+        release.wait(timeout=10)
+        return True
     h = ZcodexHealth(lambda m, path, body=None: calls.append(body), tmp_path / 'generation.json',
                      now=lambda: clock[0], probe=probe, threaded=True)
     try:
