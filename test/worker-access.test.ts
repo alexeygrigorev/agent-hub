@@ -256,7 +256,7 @@ describe('scoped durable worker access',()=>{
  },'interactive'));
  it('restricts chained sessions to policy routed headless children on the same intake/workspace',()=>setup(async({stub,session,task,other,worker,call}:any)=>{
   const start=(body:any)=>call('/api/sessions',{key:uuid(),workspace:'/repo',intake_task_id:task,brief:'small real followup',...body},worker.access_token);
-  for(const bad of [{workspace:'/else'},{intake_task_id:other},{mode:'interactive'},{parent_id:uuid()},{engine:'opencode',engine_override_reason:'no'},{machine:'worker-host'}]) expect([400,403]).toContain((await start(bad)).status);
+  for(const bad of [{workspace:'/else'},{intake_task_id:other},{mode:'interactive'},{parent_id:uuid()},{mode:'interactive',engine:'opencode',engine_override_reason:'x'}]) expect([400,403]).toContain((await start(bad)).status);
   const res=await start({}); const data:any=await res.json();
   // No route is advertised by this fixture, so normal routing should hold the
   // legitimate child, after recording its real lineage, rather than bypass it.
@@ -265,6 +265,26 @@ describe('scoped durable worker access',()=>{
    const child=h.sql.exec('SELECT parent_id,request_json FROM session_control_sessions WHERE id!=?',session).toArray()[0];
    expect(child.parent_id).toBe(session);expect(JSON.parse(child.request_json).intake_task_id).toBe(task);
   });
+ }));
+ it('lets a worker start engine/machine child sessions for its own intake, audited and limited (dfe494fe)',()=>setup(async({stub,session,task,other,worker,call}:any)=>{
+  const start=(body:any)=>call('/api/sessions',{key:uuid(),workspace:'/repo',intake_task_id:task,brief:'smoke cell',engine:'opencode',engine_override_reason:'matrix smoke',machine:'worker-host',...body},worker.access_token);
+  const detail=async(r:Response)=>{expect(r.status).toBe(403);const b:any=await r.json();expect(b.error).toBe('worker_scope_forbidden');return b.detail;};
+  expect(await detail(await start({intake_task_id:other}))).toBe('intake_mismatch');
+  expect(await detail(await start({workspace:'/else'}))).toBe('workspace_mismatch');
+  expect(await detail(await start({mode:'interactive',brief:undefined}))).toBe('mode_not_headless');
+  expect(await detail(await start({parent_id:uuid()}))).toBe('parent_mismatch');
+  const res=await start({});expect([201,202,409]).toContain(res.status);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   const child=h.sql.exec('SELECT id,parent_id,request_json FROM session_control_sessions WHERE id!=?',session).toArray()[0];
+   expect(child.parent_id).toBe(session);
+   const req=JSON.parse(child.request_json);expect(req).toMatchObject({engine:'opencode',machine:'worker-host',intake_task_id:task});
+   const hist=JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',task).toArray()[0].data).history;
+   expect(hist.some((e:any)=>e.kind==='note'&&e.text.includes('parent='+session)&&e.text.includes('child='+child.id)&&e.text.includes('engine=opencode')&&e.text.includes('machine=worker-host'))).toBe(true);
+   // Fill to the concurrent cap directly, then the next start is refused with a named limit.
+   for(let i=0;i<4;i++) h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,parent_id,created_at,updated_at) VALUES(?,'t',?,'{}','headless','running',?,?,?)`,uuid(),uuid(),session,new Date().toISOString(),new Date().toISOString());
+  });
+  const over=await start({});expect(over.status).toBe(429);
+  expect(await over.json()).toMatchObject({error:'worker_scope_forbidden',detail:'child_limit',limit:'concurrent'});
  }));
  it('files follow-up intakes with provenance, reads/notes only its own creations, and names cross-intake denials (34d0271b)',()=>setup(async({stub,id,session,task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);

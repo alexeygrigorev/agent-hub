@@ -272,6 +272,24 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   return true;
 }
 
+/** Audit note on the intake for a child session a worker started (dfe494fe):
+ * parent session, engine, machine and child id. Call inside the start transaction. */
+export function recordWorkerChildStart(sql: SqlStorage, session: Obj, parentSessionId: string, now: number): void {
+  const request = JSON.parse(session.request_json);
+  const rows: any[] = sql.exec('SELECT data FROM intake_tasks WHERE id=?', request.intake_task_id).toArray();
+  if (rows.length !== 1) return;
+  const task = JSON.parse(rows[0].data);
+  prepareIntakeHistory(task, 1);
+  if (task.history.length >= INTAKE_LIMITS.events) return; // audit is best effort at capacity; the session row carries parent_id
+  task.history.push({ id: crypto.randomUUID(), kind: 'note', actor: 'hub:service:worker-child-start', authority: 'operator_record',
+    text: `child session start: parent=${parentSessionId} child=${session.id} engine=${request.engine ?? 'auto'} machine=${request.machine ?? 'auto'}`,
+    captured_at: now, intake_key: 'child-start-' + session.id });
+  task.version++; task.updated_at = now;
+  flushIntakeHistory(sql, task);
+  sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(task), task.id);
+  sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
+}
+
 /** Extra done-close gates beside DONE evidence and the worktree gate (e.g. the
  * ask ledger, 55c10deb AC5). Synchronous: they run inside the close transaction. */
 export type IntakeCloseGate = (task: Obj, unverified: boolean) => { code: string; detail?: Obj } | null;

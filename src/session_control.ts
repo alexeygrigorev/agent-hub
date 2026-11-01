@@ -32,7 +32,11 @@ import { abandonedLaunch, expireSilentStartRows } from './silent-start';
  * are reported as `recorded` / `transported` / `uncertain`, never as processed.
  * See docs/SESSION-CONTROL.md.
  */
-import { recordIntakeSessionLink, IntakeSessionLinkError, IntakeService } from './intake';
+import { recordIntakeSessionLink, recordWorkerChildStart, IntakeSessionLinkError, IntakeService } from './intake';
+
+/** Child/smoke session limits per worker parent (dfe494fe). */
+export const WORKER_CHILD_CONCURRENT = 4;
+export const WORKER_CHILD_PER_HOUR = 12;
 import { ResourceManagement } from './resource-management';
 import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold } from './session_stall';
 import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, stopHostOnline, visibleSessionPrefixMatches } from './session_stop';
@@ -2175,11 +2179,13 @@ export class SessionControlService {
       const worker = workerAccessContext(this.sql, caller.tokenId);
       if (worker) {
         const intake = input.intake_task_id;
-        if (typeof intake !== 'string' || !(intake === worker.task_id || (intake.length >= 8 && worker.task_id.startsWith(intake))) ||
-            ![worker.workspace,worker.native_workspace].includes(input.workspace) || mode !== 'headless' || input.engine !== undefined || input.machine !== undefined ||
-            (input.parent_id !== undefined && input.parent_id !== worker.session_id)) {
-          return response({ error: 'worker_scope_forbidden' }, 403);
-        }
+        // A worker session may start child/smoke sessions for its OWN intake,
+        // with engine/machine overrides (dfe494fe). The failing check is named.
+        const denied = typeof intake !== 'string' || !(intake === worker.task_id || (intake.length >= 8 && worker.task_id.startsWith(intake))) ? 'intake_mismatch'
+          : ![worker.workspace, worker.native_workspace].includes(input.workspace) ? 'workspace_mismatch'
+          : mode !== 'headless' ? 'mode_not_headless'
+          : (input.parent_id !== undefined && input.parent_id !== worker.session_id) ? 'parent_mismatch' : null;
+        if (denied) return response({ error: 'worker_scope_forbidden', detail: denied }, 403);
         input.intake_task_id = worker.task_id;
         input.parent_id = worker.session_id;
       }
@@ -2187,6 +2193,7 @@ export class SessionControlService {
       try { return this.transaction(() => {
         const finish = (row: any, extra: any = {}, status = 200) => {
           recordIntakeSessionLink(this.sql, row, this.now(), extra.hold);
+          if (worker && !extra.replay) recordWorkerChildStart(this.sql, row, worker.session_id, this.now());
           return response({ ...this.view(row), ...extra }, status);
         };
         let parentId: string | null = null;
@@ -2253,6 +2260,12 @@ export class SessionControlService {
           if (live.fleet_launch_id || live.state === 'cancelled') return finish(live, { replay: true });
           // A held intent may be placed once capacity/admission recovers; the fleet
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
+        }
+        if (!prior && worker) {
+          const live: any = this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id = ? AND state NOT IN ('exited','stopped','failed','cancelled','dead','forgotten','pruned')`, worker.session_id).toArray()[0];
+          if (live.n >= WORKER_CHILD_CONCURRENT) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'concurrent', max: WORKER_CHILD_CONCURRENT }, 429);
+          const hourly: any = this.sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id = ? AND created_at > ?', worker.session_id, new Date(this.now() - 3600000).toISOString()).toArray()[0];
+          if (hourly.n >= WORKER_CHILD_PER_HOUR) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'per_hour', max: WORKER_CHILD_PER_HOUR }, 429);
         }
         // No casual engine picker: fresh starts with an explicit engine must
         // carry a non-empty explanation. Replays under an existing key skip
