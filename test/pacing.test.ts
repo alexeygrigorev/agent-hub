@@ -249,9 +249,10 @@ describe('banked EDF arbiter', () => {
 });
 
 describe('routing score factors', () => {
-  it('free pool 1.3x, codex 0.9x, others 1.0; grok demoted once by 0.2x', () => {
+  it('preferred providers 1.3x, codex 0.9x, others 1.0; grok demoted once by 0.2x', () => {
     expect(providerPreference('zai')).toBe(1.3); expect(providerPreference('go')).toBe(1.3);
-    expect(providerPreference('codex')).toBe(0.9); expect(providerPreference('gemini')).toBe(1);
+    expect(providerPreference('codex')).toBe(0.9); expect(providerPreference('gemini')).toBe(1.3);
+    expect(providerPreference('claude')).toBe(1);
     expect(providerPreference('grok')).toBe(1); expect(grokDemotion('grok')).toBe(0.2); expect(grokDemotion('zai')).toBe(1);
   });
   it('task fit allows down-tiering deep->daily at 0.5 and forbids up-tiering', () => {

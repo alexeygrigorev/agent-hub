@@ -96,6 +96,8 @@
       "sonnet",
       "glm-flash",
       "glm-flash-zcodex",
+      "argon",
+      "argon-gemini",
       "muse",
       "deepseek-flash",
       "beam-free",

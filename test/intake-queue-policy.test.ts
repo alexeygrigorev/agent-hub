@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { liveQueuePolicy } from '../src/intake-queue-policy';
 import { providerPreference } from '../src/pacing';
+import { modelCandidates, policy as routingPolicy } from '../src/model-routing';
 import { IntakeWatchdog, queuePolicyFrom } from '../src/intake-watchdog';
 
 const NOW = Date.parse('2026-11-01T10:00:00Z');
@@ -25,6 +26,15 @@ describe('live autonomous queue policy', () => {
   it('prefers admitted Z.ai and Gemini routes over Claude at equal scoring inputs', () => {
     expect(providerPreference('zai')).toBeGreaterThan(providerPreference('claude'));
     expect(providerPreference('gemini')).toBeGreaterThan(providerPreference('claude'));
+  });
+  it('routes default automatic goals to advertised Gemini models with fresh quota', () => {
+    const model = routingPolicy.models.find(m => m.id === 'argon')!;
+    const route = { provider:'gemini',engine:model.engine,profile:model.profile,account:'shared-gemini' };
+    const quota = {status:'ok',observed_at:new Date(NOW).toISOString(),details:{limit_reached:false},
+      windows:{'5h':{present:true,percent_remaining:81,reset_at:new Date(NOW+3600000).toISOString()}}};
+    const ad = [{...model,account:route.account}];
+    expect(modelCandidates({},route,ad,quota,NOW).map(m=>m.id)).toContain('argon');
+    expect(modelCandidates({},route,ad,{...quota,details:{limit_reached:true}},NOW)).toEqual([]);
   });
   it('enables real projects with a capacity budget above the proof-only 2/1 limits', () => fixture((h, fleet) => {
     expect(liveQueuePolicy(settings, h.sql, fleet, NOW)).toMatchObject({ enabled: true, valid: true,
