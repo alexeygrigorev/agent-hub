@@ -70,8 +70,52 @@ def set_hold(state_dir, hours, reason, now=None):
     hold = {'set_at': stamp(now), 'until': stamp(now + seconds), 'reason': reason}
     path = Path(state_dir) / HOLD_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(hold), encoding='utf-8')
+    import os
+    import uuid
+    tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        tmp.write_text(json.dumps(hold), encoding='utf-8')
+        os.replace(tmp, path)  # atomic within the directory
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     return hold
+
+
+# Exit code the task preflight uses to tell the update task "held: skip the installer".
+PREFLIGHT_HELD = 75
+
+
+def preflight(state_dir, now=None):
+    """Installer-task preflight: PREFLIGHT_HELD while a valid hold is active, else 0."""
+    hold = active_hold(state_dir, now)
+    print(json.dumps({'event': 'package_update_preflight', 'hold': hold}), flush=True)
+    return PREFLIGHT_HELD if hold is not None else 0
+
+
+def disable_pending_task(run=None):
+    """Disable this user's pending AgentHubUpdate task; never touch a running one.
+
+    Reversible: the next scheduling re-registers it enabled (Register-ScheduledTask
+    -Force). Returns absent | running | disabled | disabled_now | unsupported | error.
+    """
+    if sys.platform != 'win32' and run is None:
+        return 'unsupported'
+    import subprocess
+    run = run or subprocess.run
+    ps = (" $id=[Security.Principal.WindowsIdentity]::GetCurrent();"
+          " $name='AgentHubUpdate-'+$id.User.Value;"
+          " $t=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue;"
+          " if (-not $t) { 'absent' } elseif ($t.State -eq 'Running') { 'running' }"
+          " elseif ($t.State -eq 'Disabled') { 'disabled' }"
+          " else { Disable-ScheduledTask -TaskName $name | Out-Null; 'disabled_now' }")
+    try:
+        res = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "$ErrorActionPreference='Stop';" + ps],
+                  capture_output=True, text=True, timeout=60)
+    except Exception:
+        return 'error'
+    state = (res.stdout or '').strip().splitlines()[-1:] or ['']
+    return state[0] if res.returncode == 0 and state[0] in ('absent', 'running', 'disabled', 'disabled_now') else 'error'
 
 
 def clear_hold(state_dir):
@@ -123,22 +167,35 @@ def served_archive_sha(base_url, fetch=None):
     return sha if SHA.fullmatch(sha) else None
 
 
-def task_script(base_url, log):
-    """The one-shot task body: the public installer, nothing else."""
+def task_script(base_url, log, preflight_python=None, package_dir=None):
+    """The one-shot task body: an optional hold preflight, then the public installer.
+
+    With preflight_python/package_dir the task first runs
+    `python -m agent_hub_host.package_update preflight` and exits without
+    running the installer when it reports a valid hold (exit PREFLIGHT_HELD), so
+    a task scheduled before a hold was set cannot reinstall (intake e3e6bade).
+    """
     base = base_url.rstrip('/')
     if not re.fullmatch(r'https://[A-Za-z0-9.-]+(:[0-9]{1,5})?', base):
         raise ValueError('Package update needs an https Hub origin')
-    log = "'" + str(log).replace("'", "''") + "'"
-    return ("$ErrorActionPreference = 'Continue'\n"
-            "$env:HUB_BASE_URL = '" + base + "'\n"
-            "& { irm '" + base + "/host/install.ps1' | iex } *>> " + log + "\n")
+    quote = lambda v: "'" + str(v).replace("'", "''") + "'"
+    log = quote(log)
+    script = ("$ErrorActionPreference = 'Continue'\n"
+              "$env:HUB_BASE_URL = '" + base + "'\n")
+    if preflight_python and package_dir:
+        script += ("$env:PYTHONPATH = " + quote(package_dir) + "\n"
+                   "& " + quote(preflight_python) + " -m agent_hub_host.package_update preflight *>> " + log + "\n"
+                   "if ($LASTEXITCODE -eq " + str(PREFLIGHT_HELD) + ") { exit 0 }\n")
+    return script + "& { irm '" + base + "/host/install.ps1' | iex } *>> " + log + "\n"
 
 
 def register_task(base_url, state_dir, run=None):
     import subprocess
     run = run or subprocess.run
     script = Path(state_dir) / 'package-update.ps1'
-    script.write_text(task_script(base_url, Path(state_dir) / 'package-update.log'), encoding='utf-8')
+    script.write_text(task_script(base_url, Path(state_dir) / 'package-update.log',
+                                  preflight_python=sys.executable,
+                                  package_dir=Path(__file__).resolve().parents[1]), encoding='utf-8')
     quote = lambda v: "'" + str(v).replace("'", "''") + "'"
     # Per-user task like the controller's: no password, RunAs or UAC.
     ps = (" $id=[Security.Principal.WindowsIdentity]::GetCurrent();"
@@ -226,10 +283,13 @@ def main(argv=None):
     hold.add_argument('reason')
     sub.add_parser('release')
     sub.add_parser('show')
+    sub.add_parser('preflight')
     args = parser.parse_args(argv)
     state_dir = bootstrap.user_install_root()
+    if args.cmd == 'preflight':
+        return preflight(state_dir)
     if args.cmd == 'hold':
-        result = {'hold': set_hold(state_dir, args.hours, args.reason)}
+        result = {'hold': set_hold(state_dir, args.hours, args.reason), 'pending_task': disable_pending_task()}
     elif args.cmd == 'release':
         result = {'released': clear_hold(state_dir)}
     else:

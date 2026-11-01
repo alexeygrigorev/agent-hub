@@ -97,3 +97,76 @@ def test_cli_hold_show_release(tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)['hold']['reason'] == 'canary-red'
     assert u.main(['release']) == 0
     assert json.loads(capsys.readouterr().out) == {'released': True}
+
+
+# --- e3e v4 review: pending task, task preflight, atomic write -------------
+
+def test_task_script_preflight_skips_installer_when_held():
+    script = u.task_script('https://hub.example', r'C:\l\package-update.log',
+                           preflight_python=r'C:\r\venv\Scripts\python.exe', package_dir=r'C:\r\package\host')
+    lines = script.splitlines()
+    pre = next(i for i, l in enumerate(lines) if 'agent_hub_host.package_update preflight' in l)
+    gate = lines.index('if ($LASTEXITCODE -eq %d) { exit 0 }' % u.PREFLIGHT_HELD)
+    inst = next(i for i, l in enumerate(lines) if '/host/install.ps1' in l)
+    assert pre < gate < inst  # the hold is checked before the installer can run
+    assert r"$env:PYTHONPATH = 'C:\r\package\host'" in lines
+    assert r"& 'C:\r\venv\Scripts\python.exe' -m agent_hub_host.package_update preflight" in lines[pre]
+
+
+def test_registered_task_carries_the_preflight(tmp_path):
+    class R:
+        returncode = 0
+    u.register_task('https://hub.example', tmp_path, run=lambda *a, **k: R())
+    body = (tmp_path / 'package-update.ps1').read_text(encoding='utf-8')
+    assert body.index('package_update preflight') < body.index('/host/install.ps1')
+
+
+def test_preflight_exit_codes(tmp_path, capsys):
+    now = time.time()
+    assert u.preflight(tmp_path, now) == 0
+    u.set_hold(tmp_path, 2, 'canary-red', now=now)
+    assert u.preflight(tmp_path, now + 1) == u.PREFLIGHT_HELD
+    assert '"package_update_preflight"' in capsys.readouterr().out
+
+
+def _ps(stdout, returncode=0, seen=None):
+    def run(argv, **kw):
+        if seen is not None:
+            seen.append(argv[-1])
+        return type('R', (), {'returncode': returncode, 'stdout': stdout})()
+    return run
+
+
+def test_disable_pending_task_never_touches_a_running_task():
+    seen = []
+    assert u.disable_pending_task(run=_ps('disabled_now\n', seen=seen)) == 'disabled_now'
+    assert u.disable_pending_task(run=_ps('running\n')) == 'running'
+    assert u.disable_pending_task(run=_ps('absent\n')) == 'absent'
+    assert u.disable_pending_task(run=_ps('garbage\n')) == 'error'
+    assert u.disable_pending_task(run=_ps('disabled_now\n', returncode=1)) == 'error'
+    assert u.disable_pending_task(run=lambda *a, **k: (_ for _ in ()).throw(OSError('no ps'))) == 'error'
+    script = seen[0]
+    assert "elseif ($t.State -eq 'Running') { 'running' }" in script
+    assert 'Disable-ScheduledTask' in script
+    assert 'Stop-ScheduledTask' not in script and 'Unregister-ScheduledTask' not in script
+
+
+def test_hold_cli_reports_pending_task_state(tmp_path, monkeypatch, capsys):
+    from agent_hub_host import bootstrap
+    monkeypatch.setattr(bootstrap, 'user_install_root', lambda: tmp_path)
+    monkeypatch.setattr(u, 'disable_pending_task', lambda: 'disabled_now')
+    assert u.main(['hold', '6', 'canary-red']) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out['pending_task'] == 'disabled_now' and out['hold']['reason'] == 'canary-red'
+    assert u.main(['preflight']) == u.PREFLIGHT_HELD
+
+
+def test_hold_write_is_atomic_and_leaves_no_temp(tmp_path, monkeypatch):
+    import os
+    replaced = []
+    real = os.replace
+    monkeypatch.setattr(os, 'replace', lambda a, b: replaced.append((str(a), str(b))) or real(a, b))
+    u.set_hold(tmp_path, 1, 'x')
+    [(src, dst)] = replaced
+    assert dst.endswith(u.HOLD_FILE) and src.endswith('.tmp')
+    assert not list(tmp_path.glob(u.HOLD_FILE + '.*.tmp'))

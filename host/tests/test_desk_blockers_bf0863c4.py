@@ -407,7 +407,11 @@ def test_package_update_task_runs_only_the_public_installer(tmp_path):
     class R:
         returncode = 0
     u.register_task('https://hub.dtcdev.click', tmp_path, run=lambda argv, **kw: calls.append(argv) or R())
-    assert (tmp_path / 'package-update.ps1').read_text() == u.task_script('https://hub.dtcdev.click', tmp_path / 'package-update.log')
+    import sys
+    from pathlib import Path as _P
+    assert (tmp_path / 'package-update.ps1').read_text() == u.task_script(
+        'https://hub.dtcdev.click', tmp_path / 'package-update.log', preflight_python=sys.executable,
+        package_dir=_P(u.__file__).resolve().parents[1])
     script = calls[0][-1]
     assert 'AgentHubUpdate-' in script and '-RunLevel Limited' in script and 'Highest' not in script
 
