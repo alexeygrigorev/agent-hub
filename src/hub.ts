@@ -1,7 +1,8 @@
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
-import { IntakeWatchdog, queuePolicyFrom } from './intake-watchdog';
+import { IntakeWatchdog } from './intake-watchdog';
+import { liveQueuePolicy } from './intake-queue-policy';
 import { OpsLiveness } from './ops-liveness';
 import { IntakeTriage } from './intake-triage';
 import { IntakeVerifier } from './intake-verifier';
@@ -337,7 +338,7 @@ export class Hub extends DurableObject {
     this.intakeService.addCloseGate((task, unverified) => this.askLedger.closeGate(task, unverified));
     this.statusService.setAskSummary(() => this.askLedger.counts());
     this.intakeWatchdog = new IntakeWatchdog(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
-      policy: () => queuePolicyFrom(env as unknown as Record<string, unknown>),
+      policy: () => liveQueuePolicy(env as unknown as Record<string, unknown>, this.sql, this.fleetService),
       asks: now => this.askLedger.tick(now),
       asksDigest: () => this.askLedger.summaryLine(),
       start: async input => {
@@ -384,6 +385,7 @@ export class Hub extends DurableObject {
     // ops session, dead host watchdog or dead host is still detected and work restarts.
     this.opsLiveness = new OpsLiveness(this.sql, {
       enabled: () => this.env.HUB_OPS_LIVENESS !== 'false',
+      queuePolicy: () => liveQueuePolicy(env as unknown as Record<string, unknown>, this.sql, this.fleetService),
       kick: async () => this.env.HUB_BACKLOG_IDLE_KICK === 'false' ? { task_id: null, reason: 'idle_kick_disabled' } : this.intakeWatchdog.idleKick(),
       holdReasons: () => Object.fromEntries((this.sql.exec("SELECT reason, COUNT(*) AS n FROM intake_restart_queue GROUP BY reason ORDER BY n DESC LIMIT 12").toArray() as any[]).map(r => [r.reason, r.n])),
       alert: async (subject, detail) => {

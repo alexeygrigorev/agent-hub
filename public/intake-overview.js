@@ -90,6 +90,23 @@
       }
     } catch { if (generation === queueGeneration) queue.textContent = 'Queue unavailable — sign in or retry'; }
   }
+  const throughput = document.getElementById('intake-throughput');
+  async function updateThroughput() {
+    if (!throughput) return;
+    try {
+      const response = await fetch('/api/ops/liveness', { credentials: 'same-origin', cache: 'no-store' });
+      if (!response.ok) throw new Error('unavailable');
+      const data = (await response.json()).throughput;
+      if (!data || data.error) throw new Error('unavailable');
+      const capacity = data.active_vs_capacity;
+      const holds = Object.entries(data.holds_by_reason || {}).map(([reason, n]) => `${reason}: ${n}`).join(' · ') || 'none';
+      throughput.textContent = `24h: started ${data.started_24h} (${data.automatic_started_24h} automatic) · closed ${data.closed_24h} · created ${data.created_24h}` +
+        ` · automatic active/capacity ${capacity.active_sessions ?? '?'}/${capacity.effective_capacity ?? '?'} · holds: ${holds}` +
+        (data.alert ? ` · ⚠ ${data.alert}` : '');
+    } catch { throughput.textContent = '24h throughput: unavailable — sign in or retry'; }
+  }
+  updateThroughput();
+  setInterval(updateThroughput, 60000);
   updateQueue();
   setInterval(updateQueue, 60000);
   update();

@@ -41,6 +41,7 @@ export interface Env {
   HUB_OPS_LIVENESS?: string;
   HUB_BACKLOG_IDLE_KICK?: string;
   HUB_INTAKE_QUEUE_PROJECTS?: string;
+  /** "auto" derives a bounded queue budget from fresh host/account capacity. */
   HUB_INTAKE_QUEUE_MAX_INFLIGHT?: string;
   HUB_INTAKE_QUEUE_MAX_PER_PROJECT?: string;
 }

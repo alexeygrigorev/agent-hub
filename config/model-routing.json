@@ -453,6 +453,7 @@
     ],
     "preferred_providers": [
       "zai",
+      "gemini",
       "go"
     ],
     "provider_preference": 1.3,

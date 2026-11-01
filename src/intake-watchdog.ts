@@ -32,17 +32,22 @@ const CONTEXT_LIMIT = 512;
 const requestIntake = "json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id')";
 const OWNED = "actor='hub:service:intake-watchdog' AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.with_goal')=1";
 export type QueuePolicy = { enabled: boolean; valid: boolean; max_inflight: number; max_per_project: number; projects: string[] | null };
-export function queuePolicyFrom(env: Record<string, unknown> = {}): QueuePolicy {
+export function queuePolicyFrom(env: Record<string, unknown> = {}, capacity = 0): QueuePolicy {
   const enabled = env.HUB_INTAKE_QUEUE_ENABLED ?? 'false';
-  const global = Number(env.HUB_INTAKE_QUEUE_MAX_INFLIGHT ?? 2);
-  const project = Number(env.HUB_INTAKE_QUEUE_MAX_PER_PROJECT ?? 1);
+  // Automatic limits may be zero: absent capacity evidence must not create slots.
+  const automatic = env.HUB_INTAKE_QUEUE_MAX_INFLIGHT === 'auto';
+  const measured = Number.isInteger(capacity) && capacity >= 0 ? Math.min(32, capacity) : 0;
+  const global = automatic ? measured : Number(env.HUB_INTAKE_QUEUE_MAX_INFLIGHT ?? 2);
+  const autoProject = env.HUB_INTAKE_QUEUE_MAX_PER_PROJECT === 'auto' ||
+    (automatic && env.HUB_INTAKE_QUEUE_MAX_PER_PROJECT === undefined);
+  const project = autoProject ? global : Number(env.HUB_INTAKE_QUEUE_MAX_PER_PROJECT ?? 1);
   const scope = env.HUB_INTAKE_QUEUE_PROJECTS;
   const projects = typeof scope === 'string' && scope.length <= 64 * 129 ? scope.split(',').map(p => p.trim()) : [];
   const all = projects.length === 1 && projects[0] === '*';
   const scoped = projects.length > 0 && projects.length <= 64 && new Set(projects).size === projects.length &&
     projects.every(p => /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(p));
-  const valid = ['true', 'false'].includes(String(enabled)) && Number.isInteger(global) && global >= 1 && global <= 32 &&
-    Number.isInteger(project) && project >= 1 && project <= global &&
+  const valid = ['true', 'false'].includes(String(enabled)) && Number.isInteger(global) && global >= (automatic ? 0 : 1) && global <= 32 &&
+    Number.isInteger(project) && project >= (autoProject ? 0 : 1) && project <= global &&
     (scope === undefined || all || scoped) && (String(enabled) !== 'true' || all || scoped);
   return { enabled: valid && String(enabled) === 'true', valid, max_inflight: valid ? global : 2,
     max_per_project: valid ? project : 1, projects: valid && all ? null : valid && scoped ? projects : [] };

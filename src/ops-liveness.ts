@@ -37,6 +37,8 @@ export type OpsLivenessHooks = {
   /** Why queued intakes wait, for the idle record. */
   holdReasons?: () => Obj;
   enabled?: () => boolean;
+  /** The same live queue budget used by automatic admission. */
+  queuePolicy?: () => any;
 };
 
 const iso = (ms: number | null | undefined) => typeof ms === 'number' && ms > 0 ? new Date(ms).toISOString() : null;
@@ -56,6 +58,10 @@ export class OpsLiveness {
     this.sql.exec('INSERT OR IGNORE INTO ops_liveness_meta(id,last_eval,expected_since) VALUES(1,NULL,?)', this.now());
     const cols = (this.sql.exec('PRAGMA table_info(ops_liveness)').toArray() as any[]).map(c => c.name);
     if (!cols.includes('first_seen_at')) this.sql.exec('ALTER TABLE ops_liveness ADD COLUMN first_seen_at INTEGER');
+    this.sql.exec("CREATE INDEX IF NOT EXISTS ops_intake_created ON intake_task_projection(json_extract(data,'$.created_at'))");
+    this.sql.exec('CREATE INDEX IF NOT EXISTS ops_intake_audit_time ON intake_audit(captured_at,kind,task_id)');
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_intake_native_started ON session_control_sessions(
+      json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_created_at_ms'))`);
   }
 
   /** One report from the orchestrator tick (kind=tick) or the host watchdog (kind=watchdog). */
@@ -156,6 +162,37 @@ export class OpsLiveness {
     return { open_with_ac: open, active_sessions: active, last_work_at: lastWork };
   }
 
+  /** Rolling [now-24h, now) counts. A native binding proves a start; queue creation
+   * is not execution. Verified closes and cancellations come from immutable audit,
+   * excluding archive duplicates and operator-unverified DONE transitions. */
+  throughput(now = this.now()): Obj {
+    try {
+      const since = now - 86400000;
+      const nativeAt = "json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_created_at_ms')";
+      const starts = this.rows(`SELECT COUNT(DISTINCT ${requestIntake}) AS total,
+        COUNT(DISTINCT CASE WHEN actor='hub:service:intake-watchdog' THEN ${requestIntake} END) AS automatic
+        FROM session_control_sessions WHERE ${nativeAt}>=? AND ${nativeAt}<?
+        AND json_extract(binding_json,'$.native_id') IS NOT NULL`, since, now)[0];
+      const created = this.rows(`SELECT COUNT(*) AS n FROM intake_task_projection
+        WHERE json_extract(data,'$.created_at')>=? AND json_extract(data,'$.created_at')<?`, since, now)[0].n;
+      const closed = this.rows(`SELECT COUNT(DISTINCT task_id) AS n FROM intake_audit
+        WHERE captured_at>=? AND captured_at<? AND kind IN ('close','cancel')`, since, now)[0].n;
+      const policy = this.hooks.queuePolicy?.();
+      const capacity = policy?.capacity;
+      const slots = capacity && policy.enabled && policy.valid
+        ? Math.max(0, Math.min(capacity.available_slots, policy.max_inflight - capacity.active)) : null;
+      const active = capacity?.active ?? null;
+      const alert = slots !== null && slots > 0 && created > closed
+        ? `intake backlog grew over 24h (created ${created} > closed ${closed}) with ${slots} automatic queue slot(s) available.` : null;
+      return { window_start: iso(since), window_end: iso(now), window_s: 86400,
+        started_24h: starts.total, automatic_started_24h: starts.automatic,
+        created_24h: created, closed_24h: closed, net_24h: created - closed,
+        active_vs_capacity: { active_sessions: active, effective_capacity: policy?.max_inflight ?? null,
+          idle_capacity: slots, source: capacity?.source ?? 'unknown' },
+        holds_by_reason: this.safeHolds(), alert };
+    } catch { return { error: 'throughput_unavailable' }; }
+  }
+
   status(now = this.now()): Obj {
     const roles: Obj = {};
     const byRole = new Map(this.rows('SELECT * FROM ops_liveness').map(r => [r.role, r]));
@@ -165,7 +202,7 @@ export class OpsLiveness {
     let backlog: Obj = {};
     try { backlog = this.backlog(now); } catch { backlog = { error: 'backlog_unavailable' }; }
     const meta = this.rows('SELECT last_eval FROM ops_liveness_meta WHERE id=1')[0];
-    return { evaluated_at: iso(meta?.last_eval), window_s: OPS_WINDOW_MS / 1000, roles, backlog,
+    return { evaluated_at: iso(meta?.last_eval), window_s: OPS_WINDOW_MS / 1000, roles, backlog, throughput: this.throughput(now),
       idle: open ? this.episode(open, now) : null, recent_idle: recent };
   }
 
@@ -191,6 +228,8 @@ export class OpsLiveness {
       out.roles[role] = s.state;
       if (s.state !== 'never_reported') await this.hooks.alert?.('ops-' + role, s.alert);
     }
+    out.throughput = this.throughput(now);
+    if (!out.throughput.error) await this.hooks.alert?.('ops-backlog-throughput', out.throughput.alert);
     out.idle = await this.idleTick(now, byRole);
     return out;
   }
