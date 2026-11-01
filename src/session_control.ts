@@ -1068,6 +1068,11 @@ export class SessionControlService {
     let modelReason: string | null = null;
     let memoryRejected: any[] = [];
     let holdReason: string | null = null;
+    // Intake dcac7cd4 AC1: top-level needs-hold diagnosis from the stored
+    // hold payload (why no routed host matches, which hosts advertise the
+    // needs), surfaced alongside the per-route rejected[] entries.
+    let needsHoldReason: string | null = null;
+    let needsMachines: any[] | null = null;
     // Offered route (account/profile labels only, never credentials or paths).
     let offeredRoute: { machine: string | null; engine: string | null; account: string | null; profile: string | null } | null = null;
     let workerStatus: string | null = null;
@@ -1125,6 +1130,8 @@ export class SessionControlService {
       const holdInfo = this.readHoldInfo(row, request);
       if (holdInfo.rejected.length > 0) memoryRejected = holdInfo.rejected;
       if (holdInfo.reason && (row.state === 'refused' || row.state === 'held' || row.state === 'cancelled')) holdReason = holdInfo.reason;
+      needsHoldReason = holdInfo.needs_reason;
+      needsMachines = holdInfo.needs_machines;
     }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     // Scheduled wake: a pending future wake suspends stall/idle classification.
@@ -1169,6 +1176,7 @@ export class SessionControlService {
       ...(modelReason ? { reason: modelReason } : {}),
       ...(memoryRejected.length ? { reason: holdReason ?? memoryRejected[0]?.reason ?? 'placement_unknown', rejected: memoryRejected } : holdReason ? { reason: holdReason } : {}),
       ...(['refused', 'held'].includes(row.state) ? { reason: holdReason || memoryRejected[0]?.reason || 'placement_unknown', rejected: memoryRejected } : {}),
+      ...(needsHoldReason ? { hold_reason: needsHoldReason, ...(needsMachines ? { needs_machines: needsMachines } : {}) } : {}),
       ...(offeredRoute ? { offered_route: offeredRoute } : {}),
       ...(launchError ? { reason: launchError.reason, message: launchError.message,
         launch_error: launchError.stage === 'dispatch_route' && offeredRoute ? { ...launchError, route: offeredRoute } : launchError } : {}),
@@ -1264,7 +1272,7 @@ export class SessionControlService {
    * even if no client observed offered. Native running/terminal transitions
    * stay with the binding/result flows, which carry the incarnation evidence
    * this sync must never invent. */
-  private readHoldInfo(row: any, request?: any): { reason: string | null; rejected: any[]; hold: any } {
+  private readHoldInfo(row: any, request?: any): { reason: string | null; rejected: any[]; hold: any; needs_reason: string | null; needs_machines: any[] | null } {
     const req = request ?? parsed(row?.request_json, {});
     let holdObj: any = row?.hold_json ? parsed(row.hold_json, null) : null;
     if (!holdObj && typeof req?.intake_task_id === 'string' && req.intake_task_id) {
@@ -1286,7 +1294,12 @@ export class SessionControlService {
     const reason = (typeof holdObj?.reason === 'string' ? holdObj.reason : null)
       ?? rejected[0]?.reason
       ?? (typeof holdObj === 'string' ? holdObj : typeof holdObj?.error === 'string' ? holdObj.error : null);
-    return { reason, rejected, hold: holdObj };
+    // Intake dcac7cd4 AC1: the fleet reserve attaches the needs-hold
+    // diagnosis (no routed host matches + satisfying machines) to the hold
+    // payload; preserve it for the view without touching the legacy fields.
+    const needs_reason = typeof holdObj?.hold_reason === 'string' ? holdObj.hold_reason : null;
+    const needs_machines = Array.isArray(holdObj?.needs_machines) ? holdObj.needs_machines : null;
+    return { reason, rejected, hold: holdObj, needs_reason, needs_machines };
   }
 
   /** Re-evaluate unplaced held sessions whose hold was caused by transient

@@ -981,7 +981,7 @@ export class FleetService {
 
   private planWithinMaintenance(input: any):
     { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
-    { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any> } {
+    { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any>; hold_reason?: string; needs_machines?: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] } {
     if (input && (modelDisabledByPolicy(input.engine) || modelDisabledByPolicy(input.model) ||
         policy.models.some(m => [m.id, m.model].includes(input.engine) && modelDisabledByPolicy(m)))) return { error: 'model_disabled_by_policy' };
     if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project', 'needs']) ||
@@ -1299,6 +1299,49 @@ export class FleetService {
       const fallback: any = this.plan({ ...input, engine: undefined, tier: input.tier ?? taskTier({ model: overrideModels[0]?.id }) });
       if (!fallback.error) return { ...fallback, request: { ...fallback.request, engine: request.engine }, rejected: [...rejected, ...fallback.rejected], fallback_from: input.engine };
     }
+    // Intake dcac7cd4 AC1: rejected[] names only machines that have routes,
+    // so a needs-carrying start held while no host advertising those needs is
+    // online AND routed (the Windows request whose Windows host has no route
+    // advertisement) reads as a broken auto-restart. When the hold is really
+    // a missing routed host, say so at the top level and name every enrolled
+    // machine whose labels satisfy the needs with its online/route state.
+    // Bounded to 64 machines; never changes placement math.
+    if (needs.length && !candidates.length) {
+      try {
+        const machines = this.sql.exec('SELECT id, hostname, os, arch, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL ORDER BY id LIMIT 256').toArray() as any[];
+        const satisfying: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] = [];
+        for (const m of machines) {
+          const labels = new Set<string>();
+          try {
+            const rn: any = this.sql.exec('SELECT needs_json, observed_at FROM routing_machines WHERE machine_id = ?', m.id).toArray()[0];
+            if (rn && fresh(rn.observed_at, this.now(), 180000)) {
+              const advertised = JSON.parse(rn.needs_json);
+              if (Array.isArray(advertised)) for (const n of advertised) if (typeof n === 'string') labels.add(n);
+            }
+          } catch { /* operator routing needs are optional */ }
+          if (typeof m.os === 'string' && m.os.trim()) labels.add('os:' + m.os.trim().toLowerCase());
+          const archRaw = typeof m.arch === 'string' ? m.arch.trim().toLowerCase() : '';
+          if (archRaw) labels.add('arch:' + archRaw);
+          if (!needs.every(n => labels.has(n))) continue;
+          const routes = this.sql.exec('SELECT engine, account, profile FROM fleet_routes WHERE machine_id = ? ORDER BY engine, account LIMIT 64', m.id).toArray() as any[];
+          satisfying.push({
+            machine: m.id,
+            hostname: typeof m.hostname === 'string' ? m.hostname : null,
+            online: !m.drained && fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000),
+            routed: routes.length > 0,
+            routes: routes.slice(0, 8).map(r => ({ engine: r.engine, account: r.account, ...(r.profile ? { profile: r.profile } : {}) })),
+            last_checkin_at: typeof m.last_checkin_at === 'string' ? m.last_checkin_at : null,
+          });
+          if (satisfying.length >= 64) break;
+        }
+        // Only when no satisfying host is online AND routed: otherwise the
+        // per-route rejected[] entries already name the real blocker.
+        if (!satisfying.some(m => m.online && m.routed)) {
+          return { request, selected: candidates[0] || null, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine),
+            hold_reason: 'no_routed_host_matches_needs', needs_machines: satisfying };
+        }
+      } catch { /* diagnosis is best-effort: never break placement */ }
+    }
     return { request, selected: candidates[0] || null, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine) };
     });
   }
@@ -1538,7 +1581,11 @@ export class FleetService {
           return result({ id, state: 'queued', queued: true, queue_position: this.queuePosition(id), rejected: plan.rejected, access: admitted.access.mode }, 202);
         }
         try { this.recordPlacementRejection(actor, plan.rejected); } catch { /* alerting never breaks placement */ }
-        return result({ error: 'no_eligible_route', rejected: plan.rejected, access: parsed.access.mode }, 409);
+        // Intake dcac7cd4 AC1: a needs hold with no routed matching host
+        // carries the top-level reason plus the satisfying-machine states.
+        return result({ error: 'no_eligible_route', rejected: plan.rejected,
+          ...(plan.hold_reason ? { hold_reason: plan.hold_reason, needs_machines: plan.needs_machines } : {}),
+          access: parsed.access.mode }, 409);
       }
       const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
       this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
