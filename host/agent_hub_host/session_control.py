@@ -678,6 +678,7 @@ def match_session_state(entry: dict, wanted: str) -> bool:
 
 def wait_until_bound(session_id, interval, timeout=BIND_WAIT_TIMEOUT):
     """Poll a pending session until it is running (bound); False when the budget runs out."""
+    from urllib.parse import quote
     end = time.monotonic() + timeout
     while True:
         row = request('GET', '/api/sessions/' + quote(session_id, safe=''))
