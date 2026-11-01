@@ -23,6 +23,63 @@ RETRY_S = 6 * 3600
 MIN_INTERVAL_S = 12 * 3600
 DISK_FLOOR_GB = 50
 SHA = re.compile(r'[a-f0-9]{64}')
+# Bounded, reversible operator hold (intake e3e6bade): while a valid hold is
+# active no update task is scheduled. A hold is never permanent: it must name
+# its reason and expire within MAX_HOLD_S of being set; malformed, future-set,
+# over-long or expired holds are ignored. Deleting the file releases it.
+HOLD_FILE = 'package-update-hold.json'
+MAX_HOLD_S = 72 * 3600
+REASON = re.compile(r'[a-z0-9][a-z0-9_.-]{0,63}')
+
+
+def _iso(value):
+    import datetime as dt
+    if not isinstance(value, str) or not value.endswith('Z'):
+        return None
+    try:
+        return dt.datetime.fromisoformat(value[:-1] + '+00:00').timestamp()
+    except ValueError:
+        return None
+
+
+def active_hold(state_dir, now=None):
+    """The active hold {until, reason} or None. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        hold = json.loads((Path(state_dir) / HOLD_FILE).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(hold, dict) or not isinstance(hold.get('reason'), str) or not REASON.fullmatch(hold['reason']):
+        return None
+    set_at, until = _iso(hold.get('set_at')), _iso(hold.get('until'))
+    if set_at is None or until is None or set_at > now + 60 or until <= now or until - set_at > MAX_HOLD_S:
+        return None
+    return {'until': hold['until'], 'reason': hold['reason']}
+
+
+def set_hold(state_dir, hours, reason, now=None):
+    """Write a bounded hold (at most MAX_HOLD_S) and return it."""
+    import datetime as dt
+    now = time.time() if now is None else now
+    if not REASON.fullmatch(reason or ''):
+        raise ValueError('hold reason must be a short lowercase slug')
+    seconds = float(hours) * 3600
+    if not 0 < seconds <= MAX_HOLD_S:
+        raise ValueError('hold must be positive and at most 72 hours')
+    stamp = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    hold = {'set_at': stamp(now), 'until': stamp(now + seconds), 'reason': reason}
+    path = Path(state_dir) / HOLD_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(hold), encoding='utf-8')
+    return hold
+
+
+def clear_hold(state_dir):
+    try:
+        (Path(state_dir) / HOLD_FILE).unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def running_release():
@@ -110,6 +167,8 @@ def step_once(base_url, state_dir, *, now=None, fetch=None, register=None, relea
         return 'served_unknown'
     if served == current:
         return 'current'
+    if active_hold(state_dir, now) is not None:
+        return 'held'
     marker = Path(state_dir) / 'package-update.json'
     try:
         last = json.loads(marker.read_text(encoding='utf-8'))
@@ -147,6 +206,37 @@ def maybe_update(clock=time.monotonic, _last=[None]):
     base_url = config.load_host_config().get('base_url')
     if not base_url:
         return None
-    state = step_once(base_url, bootstrap.user_install_root())
-    print(json.dumps({'event': 'package_update', 'state': state}), flush=True)
+    state_dir = bootstrap.user_install_root()
+    state = step_once(base_url, state_dir)
+    event = {'event': 'package_update', 'state': state}
+    if state == 'held':
+        event['hold'] = active_hold(state_dir)
+    print(json.dumps(event), flush=True)
     return state
+
+
+def main(argv=None):
+    """Operator CLI: python -m agent_hub_host.package_update hold HOURS REASON | release | show"""
+    import argparse
+    from . import bootstrap
+    parser = argparse.ArgumentParser(prog='package_update')
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    hold = sub.add_parser('hold')
+    hold.add_argument('hours', type=float)
+    hold.add_argument('reason')
+    sub.add_parser('release')
+    sub.add_parser('show')
+    args = parser.parse_args(argv)
+    state_dir = bootstrap.user_install_root()
+    if args.cmd == 'hold':
+        result = {'hold': set_hold(state_dir, args.hours, args.reason)}
+    elif args.cmd == 'release':
+        result = {'released': clear_hold(state_dir)}
+    else:
+        result = {'hold': active_hold(state_dir)}
+    print(json.dumps(result))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
