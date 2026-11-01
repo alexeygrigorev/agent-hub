@@ -302,10 +302,11 @@ describe('phantom account reservations', () => {
     expect((await report('hetzner', [{ native_id: 'live-native', tag: 'task', engine: 'claude', phase: 'running', agent_state: 'idle', workspace: 'demo', profile: null, account: 'shared-claude' }])).status).toBe(200);
     expect((await report('win35', [])).status).toBe(200);
     const oldNativeAt = now - 30 * 86400000;
+    sql.exec('UPDATE fleet_launches SET created_at = ? WHERE id = ?', iso(-30 * 86400000), launch.id);
     sql.exec('UPDATE fleet_sessions SET created_at_ms = ? WHERE native_id = ?', oldNativeAt, 'live-native');
     const control = new SessionControlService(sql, cb => cb(), () => now); control.init();
     sql.exec("INSERT INTO session_control_sessions (id,actor,request_key,request_json,state,mode,machine_id,engine,fleet_launch_id,binding_json,created_at,updated_at) VALUES ('control','test-admin','test','{}','stopped','headless','hetzner','claude',?,?,?,?)",
-      launch.id, JSON.stringify({ native_id: 'live-native', native_created_at_ms: oldNativeAt }), iso(-30 * 86400000), iso(-30 * 86400000));
+      launch.id, JSON.stringify({ native_id: 'live-native', tag: 'task', workspace: 'demo', native_created_at_ms: oldNativeAt }), iso(-30 * 86400000), iso(-30 * 86400000));
 
     const fleet = async () => await (await f.handle(new Request('https://hub.test/api/fleet'), admin)).json();
     const snapshot: any = await fleet();
@@ -319,7 +320,9 @@ describe('phantom account reservations', () => {
     expect(sql.exec("SELECT phase FROM fleet_sessions WHERE native_id = 'live-native'").one().phase).toBe('running');
     expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'control'").one().state).toBe('stopped');
     sql.exec("UPDATE fleet_sessions SET phase = 'exited' WHERE native_id = 'live-native'");
-    expect(reconcileAccountCapacity(sql, now)).toHaveLength(1);
+    expect(reconcileAccountCapacity(sql, now)).toEqual([{ id: launch.id, before: 'running', after: 'exited', reason: 'native_terminal' }]);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('exited');
+    expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'control'").one().state).toBe('stopped');
   }));
 
   it('holds terminal control reservations until exact native proof, including missing catalogs', () => fixture(async (f, sql) => {
