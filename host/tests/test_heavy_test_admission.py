@@ -43,8 +43,8 @@ class AdmissionTests(unittest.TestCase):
             child.wait()
         self.temp.cleanup()
 
-    def until(self, condition):
-        deadline = time.monotonic() + 30
+    def until(self, condition, timeout=30):
+        deadline = time.monotonic() + timeout
         while not condition():
             if time.monotonic() > deadline:
                 self.fail('timed out waiting for test event')
@@ -197,8 +197,13 @@ class AdmissionTests(unittest.TestCase):
     def test_term_forwards_to_group_and_holds_slot_until_group_exits(self):
         self.holder.close()
         marker = self.root / 'started'
+        term_marker = self.root / 'child-term'
         child_pid = self.root / 'child.pid'
-        child_code = "import signal,sys,time; signal.signal(signal.SIGTERM, lambda *_: (time.sleep(.4),sys.exit(0))); time.sleep(30)"
+        child_code = (
+            'import signal,sys,time; from pathlib import Path; '
+            f"signal.signal(signal.SIGTERM, lambda *_: (Path({str(term_marker)!r}).touch(), "
+            'time.sleep(1),sys.exit(0))); time.sleep(300)'
+        )
         code = f'''import signal,subprocess,sys,time
 from pathlib import Path
 child=subprocess.Popen([sys.executable, '-c', {child_code!r}], pass_fds=(9,))
@@ -213,17 +218,55 @@ time.sleep(30)
         holder = self.start('holder', code=code)
         self.until(lambda: marker.exists() and child_pid.exists())
         descendant = int(child_pid.read_text())
+        signal_started = time.monotonic()
         holder.terminate()
         waiter = self.start('next')
-        time.sleep(.2)
+        self.until(lambda: term_marker.exists(), timeout=5)
+        self.assertLess(time.monotonic() - signal_started, 5)
+        self.assertTrue(Path(f'/proc/{descendant}/stat').exists(),
+                        'descendant exited before its SIGTERM handler completed')
         # The waiter cannot pass admission while the holder's process group
-        # still owns the inherited slot descriptor.
+        # still owns the inherited slot descriptor, including while the child
+        # is deliberately delayed in its SIGTERM handler.
         self.assertFalse((self.root / 'order').exists())
         self.assertEqual(holder.wait(timeout=40), 143)
         self.assertEqual(waiter.wait(timeout=40), 0)
         self.assertEqual(self.order(), ['next'])
-        self.until(lambda: not Path(f'/proc/{descendant}/stat').exists()
-                   or Path(f'/proc/{descendant}/stat').read_text().split()[2] == 'Z')
+        self.until(lambda: self.process_state(descendant) in (None, 'Z'))
+
+    @staticmethod
+    def process_state(pid):
+        try:
+            stat = Path(f'/proc/{pid}/stat').read_text()
+        except FileNotFoundError:
+            return None
+        close = stat.rfind(')')
+        return stat[close + 1:].split()[0] if close >= 0 else None
+
+    def test_nested_admission_after_unsetting_held_flag_fails_fast(self):
+        self.holder.close()
+        helper = WRAPPER.with_name('heavy-test-admission.py')
+        nested = (
+            f"unset AGENT_HUB_HEAVY_TEST_HELD; exec {sys.executable} {str(helper)!r} "
+            "--slots 1 --wait 30 -- python -c 'pass'"
+        )
+        started = time.monotonic()
+        outer = subprocess.Popen(
+            [sys.executable, str(helper), '--slots', '1', '--wait', '30', '--',
+             'bash', '-c', nested], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        self.children.append(outer)
+        try:
+            stdout, stderr = outer.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(outer.pid, signal.SIGKILL)
+            outer.wait()
+            self.fail('nested admission waited for another heavy-test slot')
+        self.assertEqual(outer.returncode, 2,
+                         (stdout.decode(errors='replace'), stderr.decode(errors='replace')))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn(b'nested heavy-test admission detected', stderr)
+        self.assertIn(b'already owns a slot', stderr)
 
 
 class RefusalTests(unittest.TestCase):

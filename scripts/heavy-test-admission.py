@@ -18,6 +18,7 @@ NORMAL_AGE_S = 300
 # path, a refusal before the command starts writes it; the command never sees
 # the variable, so its own exit 3 leaves no marker.
 REFUSAL_FILE_ENV = 'AGENT_HUB_HEAVY_TEST_REFUSAL_FILE'
+HOLDER_TOKEN_ENV = 'AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN'
 COMMAND_STARTED = False
 DEFAULT_RUN_TIMEOUT_S = 1800
 FINAL_RUN_TIMEOUT_S = 7200
@@ -120,13 +121,65 @@ def signal_group(pgid, number):
         pass
 
 
+def process_start_time(pid):
+    """Return Linux process start ticks, parsing comm fields with parentheses safely."""
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+    except (OSError, ValueError):
+        return None
+    close = stat.rfind(')')
+    if close < 0:
+        return None
+    fields = stat[close + 1:].split()
+    # The tail starts at field 3 (state); starttime is field 22.
+    try:
+        return fields[19]
+    except IndexError:
+        return None
+
+
+def nested_holder_ancestor():
+    """Find a live ancestor that owns this command's inherited slot token."""
+    token = os.environ.get(HOLDER_TOKEN_ENV, '')
+    try:
+        holder_pid_text, holder_start = token.split(':', 1)
+        holder_pid = int(holder_pid_text)
+        if holder_pid < 2 or not holder_start.isdecimal():
+            return None
+    except (ValueError, TypeError):
+        return None
+    if process_start_time(holder_pid) != holder_start:
+        return None
+
+    parent = os.getppid()
+    visited = set()
+    while parent > 1 and parent not in visited:
+        if parent == holder_pid:
+            return holder_pid
+        visited.add(parent)
+        try:
+            stat = Path(f'/proc/{parent}/stat').read_text()
+            close = stat.rfind(')')
+            if close < 0:
+                return None
+            fields = stat[close + 1:].split()
+            parent = int(fields[1])  # tail fields: state, ppid, ...
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
 def run_command(command, slot, interrupted, run_timeout):
     global COMMAND_STARTED
     # Reserve/inherit the historical FD9. Parent retains its own descriptor
     # even when the command closes FD9. Descendants retaining it also keep
     # the slot after an uncatchable wrapper-only crash.
     os.dup2(slot.fileno(), 9)
+    holder_pid = os.getpid()
+    holder_start = process_start_time(holder_pid)
     env = dict(os.environ, AGENT_HUB_HEAVY_TEST_HELD='1')
+    if holder_start is not None:
+        env[HOLDER_TOKEN_ENV] = f'{holder_pid}:{holder_start}'
     env.pop(REFUSAL_FILE_ENV, None)
     COMMAND_STARTED = True
     try:
@@ -209,6 +262,12 @@ def main():
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('no command given')
+    ancestor_holder = nested_holder_ancestor()
+    if ancestor_holder is not None:
+        print('capped-test-run: nested heavy-test admission detected; '
+              f'ancestor holder PID {ancestor_holder} already owns a slot',
+              file=sys.stderr, flush=True)
+        return 2
     root = Path(os.environ.get('AGENT_HUB_HEAVY_TEST_DIR', f'/run/user/{os.getuid()}/agent-hub/heavy-test'))
     root.mkdir(parents=True, exist_ok=True)
     queue = Queue(root)
