@@ -197,6 +197,20 @@ OFFERS_FETCH_ATTEMPTS = 3
 OFFERS_FETCH_BACKOFF_S = 1.0
 
 
+def _emit_stage_timing(offer_id, stages) -> None:
+    """One bounded event per claimed offer: seconds spent in each pre-claim stage.
+
+    Intake e1ed7abe: offered->running latency was unattributable without it.
+    Fixed stage names and numbers only; no paths, argv or credentials.
+    """
+    try:
+        out = {name: round(at - stages[i][1], 3) for i, (name, at) in enumerate(stages[1:])}
+        print(json.dumps({'event': 'offer_dispatch_stages', 'offer_id': offer_id,
+                          'total_s': round(stages[-1][1] - stages[0][1], 3), 'stages_s': out}), flush=True)
+    except Exception:
+        pass
+
+
 def dispatch_concurrency(settings) -> int:
     try:
         value = int((settings or {}).get("dispatch_concurrency", DISPATCH_CONCURRENCY))
@@ -2898,6 +2912,7 @@ class Dispatcher:
         # load average is checked here: above factor x cores the launch is
         # held (queued, retried next cycle). Nothing running is touched.
         from .host_load import check_live_load
+        stages = [('start', time.monotonic())]
         check_live_load(self.settings)
         sub = self._route(offer)
         device_auth = self.settings.get('opencode_auth') if sub.get('launcher_provider') == 'opencode' else None
@@ -2922,6 +2937,7 @@ class Dispatcher:
         # a relabel (_route already pinned canonical identity above).
         admission_payload["account"] = sub["account_label"]
         at = self._preclaim_check(offer_id, self._dispatch_admission, sub, admission_payload, selection, offer)
+        stages.append(('admission', time.monotonic()))
         mode = offer.get("mode")
         # The offer workspace is a configured identifier — a legacy label or
         # an explicitly allowed absolute path — never a free-form path: it is
@@ -2937,6 +2953,7 @@ class Dispatcher:
             workspace = resolve_workspace_path(self.settings, offer["workspace"])
         offer_workspace = workspace
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"), self.settings)
+        stages.append(('workspace', time.monotonic()))
         native = self.settings.get("aplexer_bin", "aplexer")
         if mode == "interactive":
             if selection:
@@ -3021,6 +3038,7 @@ class Dispatcher:
             # Refuse before creating a maintained-launcher task or acquiring
             # execution authority: a foreign lock must leave no reservation.
             self._lock_session_worktree(offer, target_cwd)
+            stages.append(('worktree', time.monotonic()))
             task_id = "hub-" + offer_id
             goal = wt_note + compose_prompt(offer["prompt"]) + "\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers."
             curr = workspace
@@ -3105,6 +3123,7 @@ class Dispatcher:
             submit_argv = prefix + ["submit", "--id", task_id, "--key", task_id, "--paths", str(result_path), "--payload", json.dumps(payload), "--json"]
             self._preclaim_check(offer_id, self._submit_launcher_task, prefix, launcher, task_id, submit_argv)
             plan = self._preclaim_check(offer_id, self.runner, prefix + ["plan", "--id", task_id], cwd=launcher["root"])
+            stages.append(('submit_plan', time.monotonic()))
             eligible = plan.get("eligible", [])
             # Real maintained-plan contract (verified live against the
             # maintained CLI dry-run): entries carry provider/model/task_fit
@@ -3179,6 +3198,8 @@ class Dispatcher:
         check_live_load(self.settings)
         claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
         self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, offer_workspace)
+        stages.append(('claim', time.monotonic()))
+        _emit_stage_timing(offer_id, stages)
         from .launch_diagnostics import capture_log_offsets
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()

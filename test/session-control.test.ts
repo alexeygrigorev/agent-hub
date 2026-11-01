@@ -300,6 +300,29 @@ describe('hub session control durable queue', () => {
     }, fake.hook);
   });
 
+  it('answers capture/send before the native binding with a clear pending state (intake e1ed7abe)', async () => {
+    const fake = fakeReserve();
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, {}, admin, 'pending-1');
+      for (const [sub, body] of [['capture', { key: 'p-cap' }], ['send', { key: 'p-send', body: 'hi' }]] as const) {
+        const res = await s.handle(request(`/api/sessions/${session.id}/${sub}`, body), admin);
+        expect(res.status).toBe(409);
+        const out: any = await res.json();
+        expect(out.error).toBe('session_not_bound');
+        expect(out.pending).toBe(true);
+        expect(['queued', 'held', 'offered', 'starting']).toContain(out.state);
+        expect(out.retry_after_s).toBeGreaterThan(0);
+        expect(out.message).toContain('no native binding yet');
+      }
+      // A finished session is not pending: no retry hint, so clients stop waiting.
+      sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", session.id);
+      const gone: any = await (await s.handle(request(`/api/sessions/${session.id}/capture`, { key: 'p-gone' }), admin)).json();
+      expect(gone.error).toBe('session_not_bound');
+      expect(gone.pending).toBe(false);
+      expect(gone.retry_after_s).toBeUndefined();
+    }, fake.hook);
+  });
+
   it('enqueues send with idempotent keys and rejects conflicts', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {

@@ -116,6 +116,25 @@ const ACK_OUTCOMES = new Set(['delivered', 'transported', 'refused', 'uncertain'
 const RECENT_STATE_MS = 5 * 60 * 1000;
 const HEADERS = { 'Cache-Control': 'private, no-store' };
 const BOUND_STATES = new Set(['running']);
+/** States that are still on their way to a native binding: a capture/send now is early, not wrong. */
+const BINDING_PENDING_STATES = new Set(['queued', 'held', 'offered', 'starting', 'uncertain']);
+/** Seconds a client should wait before retrying a pending capture/send (offered->bound target is < 60 s). */
+const BINDING_RETRY_AFTER_S = 5;
+/** Intake e1ed7abe: a capture/send before the native binding exists answers a clear, retryable pending
+ * state instead of a bare 409, so clients wait for the bind rather than treating the session as broken. */
+function notBoundResponse(live: any): Response {
+  const state = String(live?.state ?? '');
+  const pending = BINDING_PENDING_STATES.has(state);
+  return response({
+    error: 'session_not_bound',
+    state,
+    pending,
+    ...(pending ? { retry_after_s: BINDING_RETRY_AFTER_S } : {}),
+    message: pending
+      ? `session is ${state}: no native binding yet; retry in ${BINDING_RETRY_AFTER_S}s (it binds within about a minute of the offer)`
+      : `session is ${state}: it has no live native binding`
+  }, 409);
+}
 /** worktree-guards bounds (intake 4d05302a): every request reads a capped, indexed row set. */
 const GUARD_MAX_IDS = 50;
 const GUARD_PAGE_DEFAULT = 100;
@@ -3439,7 +3458,7 @@ export class SessionControlService {
           return this.transaction(() => {
             const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
             if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
-            if (!allowed.has(live.state)) return response({ error: err }, 409);
+            if (!allowed.has(live.state)) return err === 'session_not_bound' ? notBoundResponse(live) : response({ error: err }, 409);
             return this.enqueue(live, kind, actorName(caller), caller, input.key, payload, warning);
           });
         };
@@ -3451,7 +3470,7 @@ export class SessionControlService {
           return this.transaction(() => {
             const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
             if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
-            if (!BOUND_STATES.has(live.state)) return response({ error: 'session_not_bound' }, 409);
+            if (!BOUND_STATES.has(live.state)) return notBoundResponse(live);
             const binding = live.binding_json ? parsed(live.binding_json, null) : null;
             const reported: any = (live.machine_id && binding?.native_id) ? this.sql.exec(
               'SELECT agent_state, observed_at, phase FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',

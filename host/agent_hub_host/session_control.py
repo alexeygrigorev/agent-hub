@@ -31,6 +31,10 @@ WAIT_DEFAULT_TIMEOUT = 300.0
 WAIT_MAX_TIMEOUT = 600.0
 WAIT_MIN_INTERVAL = 1.0
 CAPTURE_TIMEOUT = 30.0
+# A capture sent while the session is still offered/starting waits this long for its native
+# binding (Hub target: offered -> bound under 60 s) before it is enqueued; the ack wait
+# then gets its own full --timeout.
+BIND_WAIT_TIMEOUT = 90.0
 _request_deadline = contextvars.ContextVar('session_request_deadline', default=None)
 # Terminal command states: only these confirm an outcome. `transported` alone
 # is fetch/PTY bytes, never processing proof; waiting never treats it as done.
@@ -44,9 +48,13 @@ MAX_ERROR_RESPONSE = 10 * 1024 * 1024
 
 
 class SessionHTTPError(ValueError):
-    def __init__(self, status, code='request_failed', message=None):
+    def __init__(self, status, code='request_failed', message=None, pending=False, state=None):
         self.status = status
         self.code = code
+        # Hub answers a capture/send on a session that has no native binding yet
+        # with pending=true (intake e1ed7abe): early, retryable, not a failure.
+        self.pending = pending
+        self.state = state
         super().__init__(message or f'Session HTTP request failed with status {status} ({code})')
 
 
@@ -118,6 +126,8 @@ def http_error(exc, key=None):
     field = None
     detail = None
     reason = None
+    pending = False
+    pending_state = None
     routes = ''
     held_info = ''
     provider_guidance = ''
@@ -171,6 +181,11 @@ def http_error(exc, key=None):
             r = data.get('reason')
             if isinstance(r, str) and SAFE_ERROR.match(r):
                 reason = r
+            if code == 'session_not_bound' and data.get('pending') is True:
+                pending = True
+                st = data.get('state')
+                if isinstance(st, str) and SAFE_ERROR.match(st):
+                    pending_state = st
     except Exception:
         name = ''
 
@@ -183,6 +198,8 @@ def http_error(exc, key=None):
         parts.append(concurrency_guidance)
     if held_info:
         parts.append(held_info)
+    if pending:
+        parts.append(f'; session is {pending_state or "starting"} and not yet bound; retry shortly')
     if reason:
         parts.append(f'; reason: {reason}')
     if field:
@@ -192,7 +209,7 @@ def http_error(exc, key=None):
     full_message = ''.join(parts)
     if key and f'reconcile with --key {key}' not in full_message:
         full_message += f' (reconcile with --key {key} via show/commands)'
-    return SessionHTTPError(exc.code, code=code, message=full_message)
+    return SessionHTTPError(exc.code, code=code, message=full_message, pending=pending, state=pending_state)
 
 
 def request(method, path, payload=None):
@@ -659,6 +676,23 @@ def match_session_state(entry: dict, wanted: str) -> bool:
     return entry_state == wanted
 
 
+def wait_until_bound(session_id, interval, timeout=BIND_WAIT_TIMEOUT):
+    """Poll a pending session until it is running (bound); False when the budget runs out."""
+    end = time.monotonic() + timeout
+    while True:
+        row = request('GET', '/api/sessions/' + quote(session_id, safe=''))
+        if isinstance(row, dict):
+            state = row.get('state')
+            if state == 'running':
+                return True
+            if state not in ('queued', 'held', 'offered', 'starting', 'uncertain'):
+                return False  # terminal or unknown: no bind is coming
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(interval, remaining))
+
+
 def execute(args):
     # Capture's budget covers enqueue, every paginated HTTP request and sleep.
     # A context-local deadline cannot affect concurrent host receiver requests.
@@ -949,7 +983,27 @@ def _execute(args):
         else:
             payload = {'key': key}
         try:
-            enqueue = lambda: request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
+            def enqueue():
+                try:
+                    return request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
+                except SessionHTTPError as exc:
+                    if cmd != 'capture' or not exc.pending or timeout is None:
+                        raise
+                    # Early capture: wait for the native binding instead of failing with
+                    # a bare 409, then give the acknowledgement its full budget.
+                    print(f'Session {args.id} is {exc.state or "starting"}: waiting up to {BIND_WAIT_TIMEOUT:g}s for its native binding',
+                          file=sys.stderr, flush=True)
+                    outer = _request_deadline.get()
+                    bind_token = _request_deadline.set(time.monotonic() + BIND_WAIT_TIMEOUT + 10)
+                    try:
+                        bound = wait_until_bound(args.id, min(interval, 2.0))
+                    finally:
+                        _request_deadline.reset(bind_token)
+                    if not bound:
+                        raise SessionInputError(f'session_not_bound; session {args.id} did not reach running within {BIND_WAIT_TIMEOUT:g}s; retry later') from None
+                    if outer is not None:
+                        _request_deadline.set(time.monotonic() + timeout)
+                    return request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
             # Capture is diagnostic and stays single-shot; keyed mutations
             # replay, never past the caller's wait budget.
             queued = (api.replay_keyed(enqueue, hub_unavailable, delays=replay_delays(), notify=replay_notice)

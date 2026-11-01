@@ -616,6 +616,34 @@ def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
             sampler.join(timeout=1)
 
 
+def offers_loop(dispatcher, stop, polling=None, *, clock=time.monotonic, poll_s=None):
+    """Claim offers on their own cadence, never behind the main loop body.
+
+    The main loop also runs host-receive, credential provisioning and other
+    steps whose combined iteration can take tens of seconds on a loaded
+    host. Polling offers from that loop made a fresh launch wait one full
+    iteration before its claim (intake e1ed7abe, offered->bound 40-180 s).
+    Each poll is bounded and spawns its own launch workers, so this loop only
+    fetches and hands off; ``polling`` is set for the duration of a poll so
+    the settings reload never swaps configuration mid-fetch.
+    """
+    interval = fleet.OFFERS_POLL_S if poll_s is None else poll_s
+    while not stop.is_set():
+        started = clock()
+        if polling is not None:
+            polling.set()
+        try:
+            offers_step_once(dispatcher)
+        except Exception as error:
+            # offers_step_once reports its own errors; this keeps an unexpected one from
+            # ending claim polling for the controller's lifetime.
+            print(json.dumps({'event': 'offers_loop_error', 'type': type(error).__name__}), flush=True)
+        finally:
+            if polling is not None:
+                polling.clear()
+        stop.wait(max(0.0, interval - (clock() - started)))
+
+
 def maybe_start_named_thread(current, target, args, name):
     if current is not None and current.is_alive():
         return current
@@ -832,8 +860,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         telemetry_thread = None
         next_checkin = 0
         checkin_thread = None
-        next_offers = 0
         offers_thread = None
+        offers_polling = threading.Event()
         bindings_thread = None
         terminal_thread = None
         next_terminal = 0
@@ -851,6 +879,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         try:
             bindings_thread = maybe_start_named_thread(
                 None, bindings_loop, (dispatcher, stop), 'fleet-bindings')
+            offers_thread = maybe_start_named_thread(
+                None, offers_loop, (dispatcher, stop, offers_polling), 'fleet-offers')
             # Intake a3227276: Hub-pinned host release for checkout installs
             # (Windows hosts without ssh). An applied update sets ``stop``;
             # the supervisor restarts the controller on the new code.
@@ -867,7 +897,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 reloaded = None
                 from .offer_claims import has_inflight
                 if ((maintenance_thread is None or not maintenance_thread.is_alive())
-                        and (offers_thread is None or not offers_thread.is_alive())
+                        and not offers_polling.is_set()
                         and not has_inflight(dispatcher)):
                     reloaded, settings_mtime = maybe_reload_fleet_settings(settings_path, settings_mtime)
                 if reloaded is not None:
@@ -898,10 +928,6 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                         worktree_thread, worktree_step_once,
                         (dispatcher, cfg['machine_id'], str(journal)), 'worktree-observer')
                     next_worktree = time.monotonic() + 60
-                if time.monotonic() >= next_offers:
-                    offers_thread = maybe_start_named_thread(
-                        offers_thread, offers_step_once, (dispatcher,), 'fleet-offers')
-                    next_offers = time.monotonic() + fleet.OFFERS_POLL_S
                 from .terminal_reports import POLL_SECONDS
                 if time.monotonic() >= next_terminal:
                     terminal_thread = maybe_start_named_thread(
@@ -964,6 +990,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 pass
             if bindings_thread is not None:
                 bindings_thread.join(timeout=1)
+            if offers_thread is not None:
+                offers_thread.join(timeout=1)
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 
