@@ -45,7 +45,7 @@ export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_catalog_census (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, complete INTEGER NOT NULL CHECK (complete IN (0, 1)));
 CREATE TABLE IF NOT EXISTS fleet_queue_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), after_rowid INTEGER NOT NULL, high_water INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT, evidence_json TEXT);
+CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT, evidence_json TEXT, host_load_machine TEXT, host_load_factor REAL);
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
 CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
@@ -136,7 +136,8 @@ function disabledEngines(): Set<string> {
 // fallback to older or registry-only evidence).
 // route_advertisement_stale: the host's last complete list aged out (it
 // stopped posting /api/host/routes); every route holds.
-const CAPACITY_REASONS = new Set(['route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+const CAPACITY_REASONS = new Set(['route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high']);
+const HOST_LOAD_FACTOR = 1.5;
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -146,7 +147,7 @@ import { MEMORY_FLOOR_MB, NEXT_SLOT_MB, ResourceManagement, memoryVerdict } from
 export { MEMORY_FLOOR_MB, NEXT_SLOT_MB };
 /** Placement-pressure reasons that degrade host health and raise operator
  * alerts: any launch rejected or held for memory/capacity. */
-export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high']);
 /** Incidental per-route reasons that may accompany capacity but never queue alone
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
@@ -159,6 +160,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   memory_pressure: 'Host memory full pressure exceeds the safety cap.',
   host_oom: 'A recent host OOM kill requires a placement cooldown.',
   host_runtime_choking: 'Recent session or service failures require a placement cooldown.',
+  host_load_high: 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
   "workspace_unavailable": "The requested workspace is not available on this host.",
   "mode_unavailable": "This host does not advertise the requested session mode (e.g. headless without a maintained launcher).",
   "dispatch_route_unconfigured": "The offered account, engine and profile do not match a local route.",
@@ -184,8 +186,8 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "codex_quota_gate_stale_window_evidence": "The managed Codex quota evidence is stale.",
   "codex_quota_gate_quota_check_failed": "The managed Codex quota check failed."
 };
-const CLAIM_HTTP_SLUGS = new Set<string>(["account_capacity", "account_concurrency", "account_unavailable", "already_claimed", "claim_actor_ambiguous", "claim_authority_changed", "claim_authority_unsupported", "claim_conflict", "claim_holder_mismatch", "claim_inactive", "claim_project_mismatch", "claim_required", "claim_scope_mismatch", "claim_workspace_unconfigured", "cooldown_active", "cpu_headroom", "cpu_pressure", "cpu_usage_unknown", "forbidden", "fresh_admission_required", "future_observation", "grok_entitlement", "host_oom", "host_runtime_choking", "invalid_claim", "invalid_observed_at", "limit_reached", "machine_capacity", "malformed", "memory_pressure", "model_unsupported", "no_available_window", "no_quota_evidence", "not_found", "provider_disabled", "quota_exhausted", "quota_stale", "quota_unavailable", "quota_unknown", "reserve", "reserve_required", "reset_passed_since_observation", "route_not_ok", "route_stale", "stale_observation", "stale_window_evidence", "unauthorized", "window_unavailable", "worker_scope_forbidden"]);
-const RETRYABLE_CLAIM_ERRORS = new Set<string>(["account_capacity", "account_concurrency", "cpu_headroom", "cpu_pressure", "fresh_admission_required", "host_oom", "host_runtime_choking", "machine_capacity", "memory_pressure"]);
+const CLAIM_HTTP_SLUGS = new Set<string>(["account_capacity", "account_concurrency", "account_unavailable", "already_claimed", "claim_actor_ambiguous", "claim_authority_changed", "claim_authority_unsupported", "claim_conflict", "claim_holder_mismatch", "claim_inactive", "claim_project_mismatch", "claim_required", "claim_scope_mismatch", "claim_workspace_unconfigured", "cooldown_active", "cpu_headroom", "cpu_pressure", "cpu_usage_unknown", "forbidden", "fresh_admission_required", "future_observation", "grok_entitlement", "host_oom", "host_runtime_choking", "host_load_high", "invalid_claim", "invalid_observed_at", "limit_reached", "machine_capacity", "malformed", "memory_pressure", "model_unsupported", "no_available_window", "no_quota_evidence", "not_found", "provider_disabled", "quota_exhausted", "quota_stale", "quota_unavailable", "quota_unknown", "reserve", "reserve_required", "reset_passed_since_observation", "route_not_ok", "route_stale", "stale_observation", "stale_window_evidence", "unauthorized", "window_unavailable", "worker_scope_forbidden"]);
+const RETRYABLE_CLAIM_ERRORS = new Set<string>(["account_capacity", "account_concurrency", "cpu_headroom", "cpu_pressure", "fresh_admission_required", "host_oom", "host_runtime_choking", "host_load_high", "machine_capacity", "memory_pressure"]);
 function claimFieldsValid(d: any): boolean {
   const fields = ['http_status', 'hub_error', 'hub_reason', 'retryable'];
   if (d.reason !== 'dispatch_claim_refused') return fields.every(k => d[k] === undefined);
@@ -608,6 +610,8 @@ export class FleetService {
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const holdColumns = this.sql.exec('PRAGMA table_info(fleet_memory_holds)').toArray().map((c: any) => c.name);
     if (!holdColumns.includes('evidence_json')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN evidence_json TEXT');
+    if (!holdColumns.includes('host_load_machine')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN host_load_machine TEXT');
+    if (!holdColumns.includes('host_load_factor')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN host_load_factor REAL');
     initResourceRequestProjection(this.sql, 'fleet_launches');
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
     for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key', 'runtime_json', 'worker_status']) {
@@ -1014,11 +1018,11 @@ export class FleetService {
     } catch { /* alerting never breaks placement */ }
   }
 
-  plan(input: any) {
-    return this.withMaintenance(() => this.planWithinMaintenance(input));
+  plan(input: any, loadRefusal?: { machine: string; factor: number }) {
+    return this.withMaintenance(() => this.planWithinMaintenance(input, loadRefusal));
   }
 
-  private planWithinMaintenance(input: any):
+  private planWithinMaintenance(input: any, loadRefusal?: { machine: string; factor: number }):
     { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
     { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any>; hold_reason?: string; needs_machines?: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] } {
     if (input && (modelDisabledByPolicy(input.engine) || modelDisabledByPolicy(input.model) ||
@@ -1252,12 +1256,14 @@ export class FleetService {
           : !engineMissing && !modeMissing && workspaceMissing ? 'workspace_unavailable'
           : !engineMissing && modeMissing && !workspaceMissing ? 'mode_unavailable' : 'capability_unavailable';
       }
-      // Intake 4398ce2a (Alexey t1523u): the aggregate host gate and launcher
-      // telemetry are projections, not refusals. Missing, stale, failed or
-      // timed-out projections fail OPEN; per-route quota-gate refusals
-      // (fleet_route_rejections above) and real MemAvailable/PSI/OOM/disk
-      // signals below still hold. The host re-runs its real admission gate
-      // before every claim, and the claim requires a <30 s observation.
+      // Load remains advisory for fresh placement. A fenced host overload
+      // refusal supplies an internal, durable retry context; only that retry
+      // waits for this host's load to clear. Other eligible hosts may win.
+      else if (
+        loadRefusal !== undefined && loadRefusal.machine === route.machine_id &&
+        Number.isFinite(hb?.load?.[0]) && Number.isFinite(caps?.cpu_count) &&
+        caps.cpu_count > 0 && hb.load[0] > loadRefusal.factor * caps.cpu_count
+      ) reason = 'host_load_high';
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         memory().reserved_mb,
         memory().requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
@@ -1271,7 +1277,22 @@ export class FleetService {
       else if (!account || account.status === 'blocked') reason = 'account_' + (account?.status || 'unmapped');
       else if (!routeQuota.ok) reason = 'quota_' + routeQuota.reason;
       else if (account.available_slots < 1) reason = 'account_concurrency';
-      if (reason) { evidence(); rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason.startsWith('route_') ? { account: route.account, profile: route.profile ?? null } : {}), ...(reason === 'route_advertisement_overflow' ? { advertised_routes: hb.fleet_routes_overflow } : {}), ...(reason === 'route_advertisement_stale' ? { advertised_at: effectiveRoutesAt(route.machine_id, hb.fleet_routes_at) } : {}), ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
+      if (reason) {
+        evidence();
+        rejected.push({
+          machine: route.machine_id, engine: route.engine, reason,
+          ...(reason.startsWith('route_') ? { account: route.account, profile: route.profile ?? null } : {}),
+          ...(reason === 'route_advertisement_overflow' ? { advertised_routes: hb.fleet_routes_overflow } : {}),
+          ...(reason === 'route_advertisement_stale' ? { advertised_at: effectiveRoutesAt(route.machine_id, hb.fleet_routes_at) } : {}),
+          ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}),
+          ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}),
+          ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}),
+          ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}),
+          ...(reason === 'host_load_high' ? { load1: hb.load[0], cpu_count: caps.cpu_count, load_limit: loadRefusal!.factor * caps.cpu_count } : {}),
+          ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}),
+        });
+        continue;
+      }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
@@ -1479,8 +1500,15 @@ export class FleetService {
         for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project', 'needs']) {
           if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
         }
+        // These columns survive updates to the currently displayed hold reason.
+        // A primary-key lookup keeps each host-polled drain slice bounded.
+        const memoryHold: any = this.sql.exec('SELECT since, refused, host_load_machine, host_load_factor FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
+        const loadRefusal = memoryHold?.host_load_machine ? {
+          machine: String(memoryHold.host_load_machine),
+          factor: Number.isFinite(memoryHold.host_load_factor) && memoryHold.host_load_factor >= 0.5 && memoryHold.host_load_factor <= 8 ? memoryHold.host_load_factor : HOST_LOAD_FACTOR,
+        } : undefined;
         let plan: any;
-        try { plan = this.plan(input); } catch { continue; }
+        try { plan = this.plan(input, loadRefusal); } catch { continue; }
         if (!plan || (plan as any).error) continue;
         if (!plan.selected) {
           const rejected = plan.rejected || [];
@@ -1493,7 +1521,6 @@ export class FleetService {
           }
           continue;
         }
-        const memoryHold: any = this.sql.exec('SELECT since, refused FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
         // Keep known disk evidence sticky if a later plan reports another
         // temporary hold. A generic heartbeat cannot clear that refusal.
         const diskHeld = parsed(row.launch_error_json)?.reason === 'launcher_disk_reserve';
@@ -2369,7 +2396,9 @@ export class FleetService {
         // excludes this (machine, account) until a newer generation exists (I5).
         if (row.account && (data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected')) recordCredentialRejection(this.sql, row.machine_id, row.account, data.reason, this.now());
         if (match[2] === 'reject') {
-          if (!object(data, ['reason', 'diagnostic']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
+          if (!object(data, ['reason', 'diagnostic', 'host_load_factor']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
+          if (data.host_load_factor !== undefined && (data.reason !== 'host_load_high' || typeof data.host_load_factor !== 'number' || !Number.isFinite(data.host_load_factor) || data.host_load_factor < 0.5 || data.host_load_factor > 8)) return response({ error: 'invalid_rejection' }, 400);
+          const loadFactor = data.host_load_factor ?? HOST_LOAD_FACTOR;
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
           if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable', 'gate_reason', 'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s']) || !claimFieldsValid(diagnostic) || !gateReasonValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
               diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
@@ -2386,7 +2415,7 @@ export class FleetService {
             // Retain the same intent; next offer repeats every admission/authority gate.
             return response({ id: row.id, state: 'held', reason: data.reason, diagnostic, retryable: true });
           }
-          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || data.reason === 'not_logged_in' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
+          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || data.reason === 'not_logged_in' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking','host_load_high'].includes(data.reason)) {
             if (data.reason === 'not_logged_in') {
               this.sql.exec('INSERT OR REPLACE INTO fleet_login_holds (machine_id, engine, account, profile, held_at_ms) VALUES (?, ?, ?, ?, ?)', row.machine_id, row.engine, row.account, row.profile ?? '', this.now());
             }
@@ -2396,10 +2425,15 @@ export class FleetService {
             // The fenced pre-claim refusal proves no native start. Retain the
             // failed attempt as route evidence and use a new launcher identity.
             const id = crypto.randomUUID();
-            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason, ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason) ? {cpu:this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id)} : {}) }];
+            const loadMachine: any = data.reason === 'host_load_high' ? this.sql.exec('SELECT last_heartbeat, capabilities FROM machines WHERE id = ?', row.machine_id).toArray()[0] : null;
+            const loadHeartbeat = parsed(loadMachine?.last_heartbeat) || {};
+            const loadCores = parsed(loadMachine?.capabilities)?.cpu_count;
+            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason,
+              ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason) ? {cpu:this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id)} : {}),
+              ...(data.reason === 'host_load_high' ? { load1: loadHeartbeat.load?.[0] ?? null, cpu_count: loadCores ?? null, load_limit: Number.isFinite(loadCores) ? loadFactor * loadCores : null } : {}) }];
             this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ?", 'model-retry-' + row.id, data.reason, at, at, row.id);
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
-            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json) VALUES (?, ?, ?)', id, at, JSON.stringify(rejected));
+            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, host_load_machine, host_load_factor) VALUES (?, ?, ?, ?, ?)', id, at, JSON.stringify(rejected), data.reason === 'host_load_high' ? row.machine_id : null, data.reason === 'host_load_high' ? loadFactor : null);
             if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
               this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, state = 'queued', updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held')", id, at, row.id);
             }

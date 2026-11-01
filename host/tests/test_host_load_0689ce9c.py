@@ -94,6 +94,12 @@ class DispatchDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diagnostic["message"], MESSAGES["host_overload"])
         self.assertEqual(diagnostic["stage"], "dispatch_route")
 
+    def test_hub_load_rejection_has_a_fixed_protocol_message(self):
+        self.assertIn("stay queued", MESSAGES["host_load_high"])
+        diagnostic = classify(ValueError("host_load_high: retry after heartbeat"))
+        self.assertEqual(diagnostic["reason"], "host_load_high")
+        self.assertEqual(diagnostic["message"], MESSAGES["host_load_high"])
+
 
 class DispatchHoldsUnderLoadTests(unittest.TestCase):
     def offer(self):
@@ -140,20 +146,101 @@ class DispatchHoldsUnderLoadTests(unittest.TestCase):
                     dispatcher.dispatch(self.offer())
             self.assertFalse(str(ctx.exception).startswith("host_overload"))
 
-    def test_overload_is_held_queued_never_rejected(self):
+    def test_overload_refreshes_heartbeat_then_rejects_unclaimed_offer(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             dispatcher, _ = self.dispatcher(tmp)
             results = []
-            with patch.object(dispatcher, '_persist_launch_record') as persist, patch("agent_hub_host.host_load.live_load_status",
+            calls = []
+            retry_id = "22345678-1234-1234-1234-123456789abc"
+
+            def request(method, path, payload=None):
+                calls.append((method, path, payload))
+                return {"id": retry_id, "state": "queued", "queued": True,
+                        "rejected": [{"reason": "host_load_high"}]}
+
+            with patch.object(dispatcher, '_persist_launch_record') as persist, \
+                    patch.object(dispatcher, '_refresh_checkin', side_effect=lambda hb: calls.append(("heartbeat", None, None)) or True), \
+                    patch.object(dispatcher, 'request', side_effect=request), \
+                    patch("agent_hub_host.host_load.live_load_status",
                        return_value={"load1": 40.0, "cores": 12, "factor": 1.5,
                                      "overloaded": True, "unknown": False}):
                 dispatcher._dispatch_one(self.offer(), results)
             self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["state"], "queued")
+            self.assertNotEqual(results[0]["id"], self.offer()["id"])
+            self.assertEqual(results[0]["rejected"][0]["reason"], "host_load_high")
+            self.assertEqual(calls[0][0], "heartbeat")
+            self.assertEqual(calls[1][0:2], ("POST", "/api/fleet/launches/12345678-1234-1234-1234-123456789abc/reject"))
+            self.assertEqual(calls[1][2]["diagnostic"], {
+                "reason": "host_load_high",
+                "message": MESSAGES["host_load_high"],
+                "stage": "dispatch_route",
+                "error_type": "ValueError",
+            })
+            self.assertEqual(calls[1][2]["host_load_factor"], 1.5)
+            self.assertEqual(persist.call_args_list[-1][0][0]["settled"], True)
+
+    def test_overload_reports_validated_local_factor(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dispatcher, _ = self.dispatcher(tmp)
+            dispatcher.settings["host_load_factor"] = 2.0
+            receipt = {"id": "22345678-1234-1234-1234-123456789abc",
+                       "state": "queued", "queued": True, "rejected": []}
+            with patch.object(dispatcher, "_refresh_checkin", return_value=True), \
+                    patch.object(dispatcher, "request", return_value=receipt) as request, \
+                    patch("agent_hub_host.host_load.live_load_status", return_value={
+                        "load1": 40.0, "cores": 12, "factor": 2.0,
+                        "overloaded": True, "unknown": False}):
+                dispatcher._dispatch_one(self.offer(), [])
+            self.assertEqual(request.call_args.args[2]["host_load_factor"], 2.0)
+
+    def test_overload_stays_offered_when_heartbeat_refresh_fails(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dispatcher, _ = self.dispatcher(tmp)
+            results = []
+            with patch.object(dispatcher, "_pending_claim_key", return_value=None), \
+                    patch.object(dispatcher, "_refresh_checkin", return_value=False), \
+                    patch.object(dispatcher, "request") as request, \
+                    patch("agent_hub_host.host_load.live_load_status",
+                          return_value={"load1": 40.0, "cores": 12, "factor": 1.5,
+                                        "overloaded": True, "unknown": False}):
+                dispatcher._dispatch_one(self.offer(), results)
             self.assertEqual(results[0]["state"], "held")
-            self.assertEqual(results[0]["reason"], "host_overload")
-            self.assertEqual(results[0]["diagnostic"]["reason"], "host_overload")
-            persist.assert_not_called()  # An ambiguous earlier claim keeps its key.
+            self.assertEqual(results[0]["stage"], "heartbeat_refresh")
+            request.assert_not_called()
+
+    def test_overload_does_not_reject_pending_claim_or_routed_task(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dispatcher, _ = self.dispatcher(tmp)
+            with patch("agent_hub_host.host_load.live_load_status",
+                       return_value={"load1": 40.0, "cores": 12, "factor": 1.5,
+                                     "overloaded": True, "unknown": False}), \
+                    patch.object(dispatcher, "_pending_claim_key", return_value="a" * 32), \
+                    patch.object(dispatcher, "_refresh_checkin") as refresh, \
+                    patch.object(dispatcher, "request") as request:
+                results = []
+                dispatcher._dispatch_one(self.offer(), results)
+            self.assertEqual(results[0]["state"], "held")
+            request.assert_not_called()
+            refresh.assert_not_called()
+
+            routed = self.offer()
+            routed["task_id"] = "task-1"
+            with patch("agent_hub_host.host_load.live_load_status",
+                       return_value={"load1": 40.0, "cores": 12, "factor": 1.5,
+                                     "overloaded": True, "unknown": False}), \
+                    patch.object(dispatcher, "_pending_claim_key", return_value=None), \
+                    patch.object(dispatcher, "_refresh_checkin") as refresh, \
+                    patch.object(dispatcher, "request") as request:
+                results = []
+                dispatcher._dispatch_one(routed, results)
+            self.assertEqual(results[0]["state"], "held")
+            request.assert_not_called()
+            refresh.assert_not_called()
 
 
 # Reuse the real dispatch-path fixtures: no native command or Hub write escapes
@@ -176,22 +263,40 @@ class DispatchLoadRecoveryTests(unittest.TestCase):
     clear = {"load1": 1.0, "cores": 12, "factor": 1.5, "overloaded": False, "unknown": False}
     busy = {"load1": 40.0, "cores": 12, "factor": 1.5, "overloaded": True, "unknown": False}
 
-    def test_load_rising_during_preparation_holds_then_recovers_once(self):
+    def test_load_rising_during_preparation_requeues_then_retry_recovers_once(self):
         launch = helpers._valid_uuid4()
         hub = helpers.FakeHub(); hub.offer(launch)
         calls = []
-        dispatcher = fleet.Dispatcher(self._settings(), hub.request, self._runner(calls, launch), journal_dir=self.tmp.name)
+        retry_ids = []
+
+        def request(method, path, payload=None):
+            if path.endswith('/reject'):
+                retry_id = helpers._valid_uuid4()
+                hub.state[launch] = 'failed'
+                hub.offer(retry_id)
+                retry_ids.append(retry_id)
+                hub.calls.append((method, path))
+                return {'id': retry_id, 'state': 'queued', 'queued': True,
+                        'rejected': [{'reason': 'host_load_high'}]}
+            return hub.request(method, path, payload)
+
+        dispatcher = fleet.Dispatcher(self._settings(), request, self._runner(calls, launch), journal_dir=self.tmp.name)
         held = []
         with patch("agent_hub_host.host_load.live_load_status", side_effect=[self.clear, self.busy]):
             dispatcher._dispatch_one(self._offer(launch), held)
-        self.assertEqual(held[0]["reason"], "host_overload")
-        self.assertEqual(hub.state[launch], "offered")
+        self.assertEqual(held[0]["state"], "queued")
+        self.assertEqual(held[0]["rejected"][0]["reason"], "host_load_high")
+        self.assertEqual(hub.state[launch], "failed")
+        self.assertEqual(len(retry_ids), 1)
         self.assertEqual(hub.claim_calls, [])
         self.assertFalse(any("run" in argv for argv in calls))
-        self.assertFalse(any(path.endswith("/reject") for _, path in hub.calls))
+        self.assertTrue(any(path.endswith("/reject") for _, path in hub.calls))
         recovered = []
+        retry_dispatcher = fleet.Dispatcher(self._settings(), request,
+                                            self._runner(calls, retry_ids[0]),
+                                            journal_dir=self.tmp.name)
         with patch("agent_hub_host.host_load.live_load_status", return_value=self.clear):
-            dispatcher._dispatch_one(self._offer(launch), recovered)
+            retry_dispatcher._dispatch_one(self._offer(retry_ids[0]), recovered)
         self.assertEqual(recovered[0]["state"], "running")
         self.assertEqual(len(hub.claim_calls), 1)
         self.assertEqual(sum("run" in argv for argv in calls), 1)

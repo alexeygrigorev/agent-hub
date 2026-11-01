@@ -36,15 +36,20 @@ process if the holder reaches its cap, so the suite cannot continue after its
 slot is released.
 
 Host dispatch samples the live one-minute load before admission preparation
-and again immediately before claim. Above 1.5 times the core count, offers are
-held for retry without rejecting them or touching running sessions. This counts
-load from subprocesses that start inside already admitted sessions, including
-Vitest workerd pools and Chromium. Existing launcher memory, quota and pressure
-gates still apply. Unreadable load inputs report unknown and preserve existing
-admission behavior. The optional local `host_load_factor` setting overrides the
-default within 0.5–8. Heartbeat gates publish overload as `host_overload`; server
-placement still treats the aggregate gate as advisory, so dispatch enforces the
-live check on every execution path.
+and again immediately before claim. Above 1.5 times the core count, the host
+does not start new work or touch running sessions. For an unclaimed, non-task
+offer, it refreshes the heartbeat and refuses that attempt as `host_load_high`;
+Hub records the attempt as not started and durably retains the refusing host
+and its validated load factor on the retry hold. Only that retry waits for the
+host's fresh load sample to clear; another eligible host may take it. Fresh
+placement keeps its existing advisory-load policy. This counts load from subprocesses
+that start inside already admitted sessions, including Vitest workerd pools
+and Chromium. Existing launcher memory, quota and pressure gates still apply.
+Unreadable load inputs report unknown and preserve existing admission behavior.
+The optional local `host_load_factor` setting overrides the default within
+0.5–8. Heartbeat gates publish overload as `host_overload`; the aggregate gate
+remains advisory; retry placement checks the refusing host's live load sample.
+The host rechecks load before every claim as the final admission boundary.
 
 The fleet-host oneshot template uses `TimeoutStartSec=600`. It performs sequential
 provisioning, quota, catalog, reconciliation and dispatch work, whose combined

@@ -2956,12 +2956,13 @@ class Dispatcher:
     def dispatch(self, offer):
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
             raise ValueError('Goal work is interactive only')
-        # Intake 0689ce9c AC2: live host load gates every new launch before
-        # any admission subprocess, claim or native start. Test processes
-        # spawned INSIDE sessions are invisible to launcher admission and
-        # server placement (both deliberately choking-only), so the 1-minute
-        # load average is checked here: above factor x cores the launch is
-        # held (queued, retried next cycle). Nothing running is touched.
+        # Intake 0689ce9c: live host load gates every new launch before any
+        # admission subprocess, claim or native start. Test processes spawned
+        # INSIDE sessions are invisible to launcher admission; this 1-minute
+        # load check refuses new starts above factor x cores. For an unclaimed
+        # non-task offer, _dispatch_one refreshes the heartbeat before sending
+        # host_load_high so Hub keeps its retry queued until load clears.
+        # Nothing already running is touched.
         from .host_load import check_live_load
         stages = [('start', time.monotonic())]
         check_live_load(self.settings)
@@ -3964,7 +3965,7 @@ class Dispatcher:
                     stale=(not alive) or held_s > self._cycle_lock_stale_s())
         return info
 
-    def _refresh_checkin(self, hb) -> None:
+    def _refresh_checkin(self, hb) -> bool:
         """Best-effort checkin refresh between serial dispatches.
 
         A multi-offer batch dispatches serially and each dispatch can take a
@@ -3979,6 +3980,7 @@ class Dispatcher:
         # Intake 4398ce2a: never re-post an old cycle snapshot — it overwrote
         # fresher telemetry (cpu_usage/observed_at) from the fast telemetry
         # tick. Sample a fresh base heartbeat and keep the latest projections.
+        sample_fresh = True
         try:
             from . import api
             fresh_hb = api.get_heartbeat_payload()
@@ -3988,11 +3990,13 @@ class Dispatcher:
                     fresh_hb[key] = latest[key]
         except Exception:
             fresh_hb = hb
+            sample_fresh = False
         try:
             self.post_route_advertisement()
             self.request('POST', '/api/host/poll', fresh_hb)
+            return sample_fresh
         except Exception:
-            pass
+            return False
 
     def _dispatch_one(self, offer, results) -> None:
         """Dispatch a single fleet offer, appending exactly one outcome row.
@@ -4072,16 +4076,70 @@ class Dispatcher:
             diagnostic = classify(exc, workspace_available=workspace_available)
             reason = diagnostic['reason']
             if reason == 'host_overload':
-                # Intake 0689ce9c AC2: an overloaded host holds the offer
-                # (stays queued, retried next cycle). A /reject POST would
-                # terminally fail non-task offers, and nothing running may
-                # be touched, so the launch is only parked locally.
+                # Intake 0689ce9c: only an unclaimed non-task offer can be
+                # rejected. A pending claim may already own a native start,
+                # and routed task offers require their task-report path.
                 print(json.dumps({'event': 'dispatch_host_overload',
                                   'offer_id': offer.get('id'),
                                   'diagnostic': diagnostic}), flush=True)
-                # Load holds preserve any earlier ambiguous claim and its retry key.
+                pending_key = self._pending_claim_key(offer.get('id'))
+                if pending_key is not None or offer.get('task_id'):
+                    # Never reject an ambiguous claim or a routed task offer.
+                    if pending_key is not None:
+                        self._persist_launch_record({'offer_id': offer.get('id'),
+                            'state': 'claim_pending', 'claim_key': pending_key,
+                            'reason': reason, 'diagnostic': diagnostic, 'settled': False})
+                    results.append({'id': offer.get('id'), 'state': 'held',
+                                    'reason': reason, 'diagnostic': diagnostic})
+                    return
+
+                # Publish the same fresh load sample the local 1.5x-core
+                # guard used before rejecting. Hub drains the retry inside
+                # /reject, so it must see this heartbeat before choosing a
+                # host or the new queued intent could be immediately re-offered.
+                if not self._refresh_checkin(getattr(self, '_last_hb', None)):
+                    results.append({'id': offer.get('id'), 'state': 'held',
+                                    'reason': reason, 'diagnostic': diagnostic,
+                                    'stage': 'heartbeat_refresh'})
+                    return
+
+                from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
+                hub_reason = 'host_load_high'
+                hub_diagnostic = {
+                    'reason': hub_reason,
+                    'message': _DISPATCH_MESSAGES[hub_reason],
+                    'stage': 'dispatch_route',
+                    'error_type': 'ValueError',
+                }
+                record = {'offer_id': offer.get('id'), 'state': 'dispatch_refused',
+                          'reason': hub_reason, 'diagnostic': hub_diagnostic,
+                          'settled': False}
+                self._persist_launch_record(record)
+                try:
+                    from .host_load import load_factor
+                    rejected = self.request(
+                        'POST', '/api/fleet/launches/' + offer['id'] + '/reject',
+                        {'reason': hub_reason, 'diagnostic': hub_diagnostic,
+                         'host_load_factor': load_factor(self.settings)})
+                    if (not isinstance(rejected, dict) or
+                            not isinstance(rejected.get('id'), str) or
+                            rejected['id'] == offer.get('id') or
+                            rejected.get('state') not in {'queued', 'offered'} or
+                            not isinstance(rejected.get('queued'), bool) or
+                            rejected.get('queued') != (rejected['state'] == 'queued') or
+                            not isinstance(rejected.get('rejected'), list)):
+                        raise ValueError('invalid_host_load_requeue_receipt')
+                    record['settled'] = True
+                    self._persist_launch_record(record)
+                    results.append(rejected)
+                    return
+                except Exception as reject_exc:
+                    # No valid retry receipt means the old offer is not proven
+                    # settled. A racing claim or transport failure stays visible.
+                    err = (type(reject_exc).__name__ or 'Error')[:64]
                 results.append({'id': offer.get('id'), 'state': 'held',
-                                'reason': reason, 'diagnostic': diagnostic})
+                                'reason': reason, 'stage': 'dispatch_route',
+                                'error': err, 'diagnostic': diagnostic})
                 return
             if reason == 'dispatch_claim_refused':
                 print(json.dumps({'event': 'dispatch_claim_refused', 'offer_id': offer.get('id'),

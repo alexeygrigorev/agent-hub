@@ -2,7 +2,7 @@ import policy from '../config/model-routing.json';
 import {freshCpu} from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { FleetService, isCapacityOnlyHold } from '../src/fleet';
+import { FleetService, isCapacityOnlyHold, PLACEMENT_PRESSURE_REASONS } from '../src/fleet';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { SESSION_CONTROL_SCHEMA, SessionControlService } from '../src/session_control';
@@ -768,6 +768,73 @@ describe('generic accounts and launch placement', () => {
     await s.handle(request('/launches/' + claimed.id + '/claim', { gate_allowed: true, model: 'gpt-6-luna', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', claimed.id).one().state).toBe('starting');
+  }));
+  it('keeps fresh placement load advisory after upgrading legacy hold rows', async () => fixture(async (s, sql) => {
+    sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_machine');
+    sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_factor');
+    sql.exec("INSERT INTO fleet_memory_holds (launch_id, since, rejected_json) VALUES ('legacy-hold', ?, '[]')", iso());
+    s.init();
+    expect(sql.exec("SELECT rejected_json, host_load_machine, host_load_factor FROM fleet_memory_holds WHERE launch_id='legacy-hold'").one()).toMatchObject({rejected_json:'[]',host_load_machine:null,host_load_factor:null});
+    await configure(s);
+    const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
+    heartbeat.load = [100, 100, 100];
+    sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    expect(s.plan(intent({ machine: 'hetzner' })).selected?.machine).toBe('hetzner');
+    expect(isCapacityOnlyHold([{reason:'host_load_high'}])).toBe(true);
+    expect(PLACEMENT_PRESSURE_REASONS.has('host_load_high')).toBe(true);
+  }));
+  it.each([
+    {factor:1.5,pinned:true,sendFactor:false},
+    {factor:2,pinned:true,sendFactor:true},
+    {factor:1.5,pinned:false,sendFactor:true},
+  ])('requeues only a load-refused retry: factor=$factor pinned=$pinned', async ({factor,pinned,sendFactor}) => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const launch: any = await (await s.handle(request('/launches', intent(pinned ? { machine: 'hetzner' } : {})), admin)).json();
+    expect(launch.machine).toBe('hetzner');
+    const sessionId = crypto.randomUUID();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES (?, 'test-admin', ?, '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", sessionId, sessionId, launch.id, iso(), iso());
+    const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
+    const beat = (load: number, memory=32000) => {
+      heartbeat.load = [load, 5, 2]; heartbeat.mem_avail_mb = memory; heartbeat.at = iso();
+      sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    };
+    const diagnostic = {
+      reason: 'host_load_high',
+      message: 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
+      stage: 'dispatch_route', error_type: 'ValueError',
+    };
+    beat(8 * factor + 1);
+    for (const bad of [null, true, 0.1, 9, '2']) {
+      expect((await s.handle(request('/launches/' + launch.id + '/reject', {reason:'host_load_high',diagnostic,host_load_factor:bad}), host('hetzner'))).status).toBe(400);
+    }
+    const retry: any = await (await s.handle(request('/launches/' + launch.id + '/reject', {
+      reason: 'host_load_high', diagnostic, ...(sendFactor ? {host_load_factor:factor} : {}),
+    }), host('hetzner'))).json();
+    expect(retry.id).not.toBe(launch.id);
+    expect(sql.exec('SELECT state, verification_status, exit_reason FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({state:'failed',verification_status:'not_started',exit_reason:'host_load_high'});
+    expect(sql.exec('SELECT fleet_launch_id FROM session_control_sessions WHERE id = ?', sessionId).one().fleet_launch_id).toBe(retry.id);
+    if (!pinned) {
+      expect(retry).toMatchObject({state:'offered',queued:false});
+      expect(sql.exec('SELECT machine_id FROM fleet_launches WHERE id = ?', retry.id).one().machine_id).toBe('win35');
+      return;
+    }
+    expect(retry).toMatchObject({state:'queued',queued:true});
+    expect(sql.exec('SELECT state, machine_id FROM session_control_sessions WHERE id = ?', sessionId).one()).toMatchObject({state:'queued',machine_id:null});
+    expect(sql.exec('SELECT host_load_machine, host_load_factor FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one()).toMatchObject({host_load_machine:'hetzner',host_load_factor:factor});
+    // An intervening memory hold must not erase the host's refusal context.
+    beat(8 * factor, 1);
+    s.drainCapacityQueue();
+    expect(JSON.parse(String(sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one().rejected_json))).toContainEqual(expect.objectContaining({reason:'launcher_memory_reserve'}));
+    const restarted = new FleetService(sql, cb => cb(), () => now);
+    restarted.init();
+    beat(8 * factor + 1);
+    restarted.drainCapacityQueue();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('queued');
+    expect(JSON.parse(String(sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one().rejected_json))).toContainEqual(expect.objectContaining({reason:'host_load_high',load_limit:8*factor}));
+    beat(8 * factor);
+    expect(restarted.drainCapacityQueue().promoted).toBeGreaterThan(0);
+    expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({state:'offered',machine_id:'hetzner'});
   }));
   it('round-trips a full host diagnostic and surfaces it on the session', async () => fixture(async (s, sql) => {
     await configure(s);

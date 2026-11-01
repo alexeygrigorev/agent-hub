@@ -11,9 +11,10 @@ admission kept launching.
 This module is the host-side counterweight: a live, fail-open load check
 that runs in ``Dispatcher.dispatch`` BEFORE any admission subprocess,
 claim or native start, and is ANDed into the heartbeat gate. Above
-``factor`` (default 1.5x) times the core count, new launches are HELD
-(offers stay queued, retried next cycle). Nothing running is ever touched:
-no kills, no rejections that fail the launch, no server changes.
+``factor`` (default 1.5x) times the core count, a new launch is refused
+before claim. For an unclaimed non-task offer, the fleet adapter refreshes
+the heartbeat and reports ``host_load_high`` so Hub can keep the retry
+queued until a fresh sample admits it. Nothing running is ever touched.
 
 Readings come from ``os.getloadavg`` (1-minute average) and
 ``os.cpu_count``. Anything unreadable fails OPEN (no admission), matching
