@@ -205,3 +205,34 @@ class ServerQuotaTests(unittest.TestCase):
                         'managed_state_file': str(state)}
             with self.assertRaises(ValueError):
                 quota_server.collect_accounts(settings, runner=lambda *a, **k: {})
+
+    def test_managed_antigravity_reports_on_gemini_route(self):
+        """Intake e0af55f3: a managed antigravity account aborted every run."""
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps([{'label': 'hub-antigravity', 'provider': 'antigravity', 'revision': 'rev-a'}]))
+            def runner(argv, **kwargs):
+                if isinstance(argv, str):
+                    return {}
+                return {'accounts': [{'account': 'hub-antigravity', 'provider': 'antigravity', 'quota': {
+                    'status': 'ok', 'details': {'limit_reached': False},
+                    'windows': {'5h': {'percent_remaining': 60.0, 'reset_at': '2030-01-01T05:00:00Z'}}}}]}
+            settings = {'accounts': [{'provider': 'go', 'account': 'go'}], 'managed_state_file': str(state)}
+            row = quota_server.collect_accounts(settings, runner=runner)['accounts'][1]
+            self.assertEqual((row['account'], row['provider'], row['quota']['status']), ('hub-antigravity', 'gemini', 'ok'))
+
+    def test_failure_log_names_class_and_account_without_secrets(self):
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps([{'label': 'odd-one', 'provider': 'mystery', 'revision': 'r'}]))
+            cfg = Path(directory) / 'cfg.json'
+            cfg.write_text(json.dumps({'accounts': [{'provider': 'go', 'account': 'go'}], 'managed_state_file': str(state),
+                                       'quse': ['true']}))
+            out = io.StringIO()
+            from unittest import mock
+            with contextlib.redirect_stdout(out), mock.patch.object(quota_server.quota_snapshot, 'execute_quse', return_value={}):
+                code = quota_server.main(['--config', str(cfg)])
+            self.assertEqual(code, 1)
+            self.assertIn('CollectionError', out.getvalue())
+            self.assertIn('odd-one', out.getvalue())

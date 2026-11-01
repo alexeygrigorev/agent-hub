@@ -19,6 +19,17 @@ import urllib.request
 from . import config, quota_snapshot
 
 
+# Managed harness providers that report on a policy family's quota route.
+# Antigravity is a harness on the Gemini family; the Worker only accepts the
+# family name on ingest (intake e0af55f3: the catalog gained hub-antigravity and
+# the whole collection aborted on the unknown provider).
+WIRE_PROVIDER = {'antigravity': 'gemini'}
+
+
+class CollectionError(ValueError):
+    """Failure that names its stage and (non-secret) account label."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -111,11 +122,14 @@ def collect_accounts(settings, *, runner=None):
             if not isinstance(entry, dict):
                 raise ValueError('Invalid managed account catalog')
             label, provider = entry.get('label'), entry.get('provider')
-            if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', label) or provider not in quota_snapshot.ALLOWED_PROVIDERS:
-                raise ValueError('Invalid managed account catalog')
+            if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', label):
+                raise CollectionError('managed catalog: invalid account label')
+            wire = WIRE_PROVIDER.get(provider, provider)
+            if wire not in quota_snapshot.ALLOWED_PROVIDERS:
+                raise CollectionError('managed catalog: account %s has unsupported provider' % label)
             key = _canonical_account(label)
             if key in managed_seen:
-                raise ValueError('Invalid managed account catalog')
+                raise CollectionError('managed catalog: duplicate account %s' % label)
             managed_seen.add(key)
             row = next((r for r in managed if isinstance(r, dict) and r.get('account') == label and r.get('provider') == provider), None)
             if row is None:
@@ -137,15 +151,15 @@ def collect_accounts(settings, *, runner=None):
                 # staleness) without this host inventing evidence.
                 unobserved_managed.add(key)
                 continue
-            quota = quota_snapshot.sanitize_provider(provider, row.get('quota'), now)
+            quota = quota_snapshot.sanitize_provider(wire, row.get('quota'), now)
             if key in by_account:
-                results[by_account[key]] = {'account': label, 'provider': provider, 'quota': quota}
+                results[by_account[key]] = {'account': label, 'provider': wire, 'quota': quota}
                 continue
             if len(results) >= 32:
                 raise ValueError('Too many account observations')
             seen.add(label)
             by_account[key] = len(results)
-            results.append({'account': label, 'provider': provider, 'quota': quota})
+            results.append({'account': label, 'provider': wire, 'quota': quota})
         if unobserved_managed:
             results = [r for r in results if _canonical_account(r.get('account', '')) not in unobserved_managed]
     return {'captured_at': quota_snapshot.format_iso_utc(datetime.datetime.now(datetime.timezone.utc)), 'accounts': results}
@@ -207,9 +221,15 @@ def main(argv=None):
         publish(settings, payload)
         print('Hub server quota: stored %d account observations.' % len(payload['accounts']))
         return 0
-    except Exception:
-        # Provider errors/HTTP bodies/config paths may contain private material.
-        print('Hub server quota collection failed; inspect configuration and provider authentication.')
+    except Exception as error:
+        # Provider errors/HTTP bodies/config paths may contain private material:
+        # report only the error class and, for CollectionError, its curated
+        # message (stage + account label), never str() of an arbitrary error.
+        detail = str(error) if isinstance(error, CollectionError) else ''
+        if isinstance(error, urllib.error.HTTPError):
+            detail = 'http %d' % error.code
+        print('Hub server quota collection failed: %s%s; inspect configuration and provider authentication.'
+              % (type(error).__name__, ' (%s)' % detail if detail else ''))
         return 1
 
 
