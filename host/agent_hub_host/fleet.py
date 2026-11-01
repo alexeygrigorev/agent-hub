@@ -3998,6 +3998,45 @@ class Dispatcher:
         except Exception:
             return False
 
+    def _reject_pending_reserve_claim(self, offer, diagnostic):
+        """Abandon only this host's durable, pre-native pending attempt.
+
+        Dispatch holds the per-offer cross-process lock. The journal guard
+        additionally fences terminal delivery and rechecks the durable state;
+        a native-start fence or an absent journal can never release a claim.
+        """
+        if (offer.get('task_id') or
+                diagnostic.get('reason') != 'codex_quota_gate_codex_reserve_required'):
+            return None
+        from .terminal_reports import launch_guard, read_record
+        try:
+            with launch_guard(self, offer.get('id')):
+                record = read_record(self, offer.get('id'))
+                key = self._pending_claim_key(offer.get('id'))
+                if (not record or record.get('state') != 'claim_pending' or
+                        record.get('settled') is True or key is None or
+                        any(record.get(k) for k in ('native_id', 'native_session_id',
+                                                    'task_id', 'incarnation', 'tag'))):
+                    return None
+                receipt = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject',
+                                       {'reason': diagnostic['reason'],
+                                        'diagnostic': diagnostic, 'claim_key': key})
+                if (not isinstance(receipt, dict) or not isinstance(receipt.get('id'), str) or
+                        receipt['id'] == offer['id'] or
+                        receipt.get('state') not in {'queued', 'offered'} or
+                        not isinstance(receipt.get('queued'), bool) or
+                        receipt['queued'] != (receipt['state'] == 'queued') or
+                        not isinstance(receipt.get('rejected'), list)):
+                    return None
+                record.update(state='dispatch_refused', settled=True,
+                              reason=diagnostic['reason'], diagnostic=diagnostic)
+                self._persist_launch_record(record)
+                return receipt
+        except Exception:
+            # A transport error, old Hub or racing state change is not proof
+            # of release. Retain the exact pending key for another cycle.
+            return None
+
     def _dispatch_one(self, offer, results) -> None:
         """Dispatch a single fleet offer, appending exactly one outcome row.
 
@@ -4016,6 +4055,20 @@ class Dispatcher:
             if server_key is not None:
                 pending = self._pending_claim_key(offer.get('id'))
                 if not (isinstance(server_key, str) and CLAIM_KEY_RE.fullmatch(server_key) and pending == server_key):
+                    if (pending is not None and offer.get('state') == 'starting' and
+                            isinstance(server_key, str) and CLAIM_KEY_RE.fullmatch(server_key)):
+                        from .terminal_reports import launch_guard, read_record
+                        try:
+                            with launch_guard(self, offer.get('id')):
+                                record = read_record(self, offer.get('id'))
+                                if (record and record.get('state') == 'claim_pending' and
+                                        record.get('claim_key') == pending and record.get('settled') is not True and
+                                        not any(record.get(k) for k in ('native_id', 'native_session_id', 'task_id', 'incarnation', 'tag'))):
+                                    record.update(state='superseded', settled=True,
+                                                  reason='claim_superseded', superseded_by_hub_claim=True)
+                                    self._persist_launch_record(record)
+                        except Exception:
+                            pass  # Preserve uncertain ownership if evidence cannot be persisted.
                     results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'already_claimed'})
                     return
             outcome = self.dispatch(offer)
@@ -4146,6 +4199,10 @@ class Dispatcher:
                                   'diagnostic': diagnostic}), flush=True)
             pending_key = self._pending_claim_key(offer.get('id'))
             if pending_key is not None:
+                receipt = self._reject_pending_reserve_claim(offer, diagnostic)
+                if receipt is not None:
+                    results.append(receipt)
+                    return
                 # This is an already-ambiguous claim attempt, not an
                 # unclaimed offer. Admission can recover on a later cycle;
                 # retain its key and capacity, never attempt an unclaimed

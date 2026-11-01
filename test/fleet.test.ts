@@ -1410,3 +1410,56 @@ describe('imported session lifecycle and non-resurrection in fleet catalog', () 
     expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_ID_1).toArray()[0].state).toBe('stopped');
   }));
 });
+
+// Host-owned abandonment of a durable pre-native claim, intake 4a9304c5.
+describe('pending claim reserve refusal', () => {
+  it('requires exact owning claim, preserves effects and requeues with a new identity', async () => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const launch: any = await (await s.handle(request('/launches', intent({machine:'hetzner'})), admin)).json();
+    const key = 'a'.repeat(32);
+    const sessionId = crypto.randomUUID();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES (?, 'test-admin', ?, '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", sessionId, sessionId, launch.id, iso(), iso());
+    const payload = {reason:'codex_quota_gate_codex_reserve_required', claim_key:key};
+    const snapshot = () => ({
+      launches:sql.exec('SELECT * FROM fleet_launches ORDER BY id').toArray(),
+      sessions:sql.exec('SELECT * FROM session_control_sessions ORDER BY id').toArray(),
+      holds:sql.exec('SELECT * FROM fleet_memory_holds ORDER BY launch_id').toArray(),
+    });
+    // Keyed release is never the ordinary offered-state rejection protocol,
+    // even if an offered row happens to retain that exact key.
+    for (const storedKey of [null, key]) {
+      sql.exec('UPDATE fleet_launches SET claim_key=? WHERE id=?', storedKey, launch.id);
+      const before = snapshot();
+      const refused = await s.handle(request('/launches/'+launch.id+'/reject', payload), host('hetzner'));
+      expect(refused.status).toBe(409); expect(await refused.json()).toEqual({error:'claim_key_mismatch'});
+      expect(snapshot()).toEqual(before);
+    }
+    sql.exec("UPDATE fleet_launches SET state='starting', claim_key=? WHERE id=?", key, launch.id);
+    sql.exec("UPDATE session_control_sessions SET state='starting' WHERE id=?", sessionId);
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', payload), host('win35'))).status).toBe(404);
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', {reason:payload.reason}), host('hetzner'))).status).toBe(409);
+    const beforeWrong = snapshot();
+    const wrong = await s.handle(request('/launches/'+launch.id+'/reject', {...payload,claim_key:'b'.repeat(32)}), host('hetzner'));
+    expect(wrong.status).toBe(409); expect(await wrong.json()).toEqual({error:'claim_key_mismatch'});
+    expect(snapshot()).toEqual(beforeWrong);
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', {...payload,claim_key:''}), host('hetzner'))).status).toBe(400);
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', {...payload,reason:'dispatch_refused'}), host('hetzner'))).status).toBe(400);
+    for (const column of ['native_id','launcher_task_id']) {
+      sql.exec(`UPDATE fleet_launches SET ${column}=? WHERE id=?`, 'existing-effect', launch.id);
+      expect((await s.handle(request('/launches/'+launch.id+'/reject', payload), host('hetzner'))).status).toBe(409);
+      expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('starting');
+      sql.exec(`UPDATE fleet_launches SET ${column}=NULL WHERE id=?`, launch.id);
+    }
+    // A real quota hold keeps the retry queued; no quota/admission gate is bypassed.
+    sql.exec("UPDATE host_quota_snapshots SET routes_json=? WHERE host_id='hetzner'", JSON.stringify({codex:{status:'ok',observed_at:iso(),details:{limit_reached:true},windows:{weekly:{present:true,percent_remaining:5,reset_at:iso(86400000)}}}}));
+    const result = await s.handle(request('/launches/'+launch.id+'/reject', payload), host('hetzner'));
+    expect(result.status).toBe(200);
+    const retry:any = await result.json();
+    expect(retry.id).not.toBe(launch.id); expect(retry.state).toBe('queued'); expect(retry.queued).toBe(true);
+    expect(sql.exec('SELECT state,verification_status,exit_reason FROM fleet_launches WHERE id=?', launch.id).one()).toMatchObject({state:'failed',verification_status:'not_started',exit_reason:payload.reason});
+    expect(sql.exec('SELECT fleet_launch_id,state,binding_json FROM session_control_sessions WHERE id=?', sessionId).one()).toMatchObject({fleet_launch_id:retry.id,state:'queued',binding_json:null});
+    // Replaying an obsolete release can never release the replacement's claim.
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', payload), host('hetzner'))).status).toBe(409);
+  }));
+});

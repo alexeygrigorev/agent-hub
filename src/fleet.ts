@@ -2396,7 +2396,9 @@ export class FleetService {
         // excludes this (machine, account) until a newer generation exists (I5).
         if (row.account && (data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected')) recordCredentialRejection(this.sql, row.machine_id, row.account, data.reason, this.now());
         if (match[2] === 'reject') {
-          if (!object(data, ['reason', 'diagnostic', 'host_load_factor']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
+          if (!object(data, ['reason', 'diagnostic', 'host_load_factor', 'claim_key']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
+          const claimRefusal = data.claim_key !== undefined;
+          if (claimRefusal && (typeof data.claim_key !== 'string' || !CLAIM_KEY.test(data.claim_key) || data.reason !== 'codex_quota_gate_codex_reserve_required')) return response({ error: 'invalid_rejection' }, 400);
           if (data.host_load_factor !== undefined && (data.reason !== 'host_load_high' || typeof data.host_load_factor !== 'number' || !Number.isFinite(data.host_load_factor) || data.host_load_factor < 0.5 || data.host_load_factor > 8)) return response({ error: 'invalid_rejection' }, 400);
           const loadFactor = data.host_load_factor ?? HOST_LOAD_FACTOR;
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
@@ -2404,9 +2406,12 @@ export class FleetService {
               diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
               typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
               !sanitizeCommandFields(diagnostic)) return response({ error: 'invalid_rejection' }, 400);
-          // Only an unclaimed offer proves that no start was authorized. The
-          // transaction fences a racing claim; never reject possibly-live work.
-          if (row.state !== 'offered' || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);
+          // The owning host may abandon its exact effect-free pending claim.
+          // It fences native start in its journal before invoking an engine;
+          // uncertain/native-start records must never use this protocol.
+          const ownedPending = claimRefusal && row.state === 'starting' && row.claim_key === data.claim_key;
+          if (claimRefusal && !ownedPending) return response({ error: 'claim_key_mismatch' }, 409);
+          if ((!claimRefusal && row.state !== 'offered') || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);
           if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
           this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), row.id);
           const at = new Date(this.now()).toISOString();
@@ -2415,7 +2420,7 @@ export class FleetService {
             // Retain the same intent; next offer repeats every admission/authority gate.
             return response({ id: row.id, state: 'held', reason: data.reason, diagnostic, retryable: true });
           }
-          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || data.reason === 'not_logged_in' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking','host_load_high'].includes(data.reason)) {
+          if (claimRefusal || data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || data.reason === 'not_logged_in' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking','host_load_high'].includes(data.reason)) {
             if (data.reason === 'not_logged_in') {
               this.sql.exec('INSERT OR REPLACE INTO fleet_login_holds (machine_id, engine, account, profile, held_at_ms) VALUES (?, ?, ?, ?, ?)', row.machine_id, row.engine, row.account, row.profile ?? '', this.now());
             }
@@ -2435,7 +2440,7 @@ export class FleetService {
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
             this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, host_load_machine, host_load_factor) VALUES (?, ?, ?, ?, ?)', id, at, JSON.stringify(rejected), data.reason === 'host_load_high' ? row.machine_id : null, data.reason === 'host_load_high' ? loadFactor : null);
             if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
-              this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, state = 'queued', updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held')", id, at, row.id);
+              this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, state = 'queued', updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held','starting')", id, at, row.id);
             }
             this.drainCapacityQueue();
             const next: any = this.sql.exec('SELECT state FROM fleet_launches WHERE id = ?', id).one();

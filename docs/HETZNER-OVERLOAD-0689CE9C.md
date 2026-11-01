@@ -51,6 +51,18 @@ The optional local `host_load_factor` setting overrides the default within
 remains advisory; retry placement checks the refusing host's live load sample.
 The host rechecks load before every claim as the final admission boundary.
 
+A reserve refusal can also arrive while a prior claim response is still pending.
+For `codex_quota_gate_codex_reserve_required` only, the host may abandon its
+own persisted `claim_pending` attempt under the per-offer and journal locks.
+It sends the existing attempt key; Hub matches the owning machine and key,
+requires no native/task binding, retains the original as not started, and
+creates a retry through ordinary quota/admission placement. A valid retry
+receipt settles the local record. A different key in Hub's effect-free
+starting offer supersedes only the old local pending record; it does not
+mutate Hub's claim. Missing keys, native-start fences, uncertain records and
+routed tasks never use this release path. Transport failures retain ownership
+until an authenticated receipt is obtained. No claim keys appear in reports.
+
 The fleet-host oneshot template uses `TimeoutStartSec=600`. It performs sequential
 provisioning, quota, catalog, reconciliation and dispatch work, whose combined
 latency can exceed the previous 240-second budget under load. Install the timeout

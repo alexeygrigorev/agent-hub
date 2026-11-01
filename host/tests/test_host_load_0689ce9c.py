@@ -317,5 +317,81 @@ class DispatchLoadRecoveryTests(unittest.TestCase):
         self.assertFalse(any(path.endswith("/reject") for _, path in hub.calls))
 
 
+class PendingReserveClaimTests(unittest.TestCase):
+    setUp = DispatchLoadRecoveryTests.setUp
+    _settings = DispatchLoadRecoveryTests._settings
+    _offer = DispatchLoadRecoveryTests._offer
+    _runner = DispatchLoadRecoveryTests._runner
+
+    def prepare(self, state="claim_pending", key="a" * 32, **extra):
+        launch = helpers._valid_uuid4()
+        self.sent = []
+        self.receipt = {"id": helpers._valid_uuid4(), "state": "queued", "queued": True, "rejected": []}
+        def request(method, path, payload):
+            self.sent.append((method, path, payload))
+            if isinstance(self.receipt, Exception):
+                raise self.receipt
+            return self.receipt
+        dispatcher = fleet.Dispatcher(self._settings(), request, self._runner([], launch), journal_dir=self.tmp.name)
+        dispatcher._persist_launch_record({"offer_id": launch, "state": state, "claim_key": key,
+                                          "settled": False, **extra})
+        return dispatcher, self._offer(launch)
+
+    def diagnostic(self):
+        reason = "codex_quota_gate_codex_reserve_required"
+        return {"reason": reason, "message": MESSAGES[reason], "stage": "dispatch_route", "error_type": "ValueError"}
+
+    def test_owned_pending_reserve_refusal_requeues_and_settles_after_receipt(self):
+        from agent_hub_host.terminal_reports import read_record
+        dispatcher, offer = self.prepare()
+        with patch.object(dispatcher, "dispatch", side_effect=ValueError("reserve refused")), \
+                patch("agent_hub_host.dispatch_diagnostics.classify", return_value=self.diagnostic()):
+            results = []
+            dispatcher._dispatch_one(offer, results)
+        self.assertEqual(results, [self.receipt])
+        self.assertEqual(self.sent[0][2]["claim_key"], "a" * 32)
+        self.assertEqual(self.sent[0][2]["reason"], self.diagnostic()["reason"])
+        self.assertTrue(read_record(dispatcher, offer["id"])["settled"])
+        self.assertIsNone(dispatcher._pending_claim_key(offer["id"]))
+
+    def test_no_receipt_never_settles_pending_claim(self):
+        from agent_hub_host.terminal_reports import read_record
+        for receipt in (TimeoutError("lost response"), {}, {"id": "same", "state": "queued"}):
+            with self.subTest(receipt=type(receipt).__name__):
+                dispatcher, offer = self.prepare()
+                self.receipt = receipt
+                self.assertIsNone(dispatcher._reject_pending_reserve_claim(offer, self.diagnostic()))
+                self.assertFalse(read_record(dispatcher, offer["id"])["settled"])
+                self.assertEqual(dispatcher._pending_claim_key(offer["id"]), "a" * 32)
+
+    def test_native_fence_missing_key_routed_task_and_missing_journal_never_reject(self):
+        for state, key, extra in (("uncertain", "a" * 32, {}), ("claim_pending", None, {}),
+                                  ("claim_pending", "a" * 32, {"native_id": "native"}),
+                                  ("claim_pending", "a" * 32, {"task_id": "hub-task"})):
+            with self.subTest(state=state, extra=extra):
+                dispatcher, offer = self.prepare(state, key, **extra)
+                self.assertIsNone(dispatcher._reject_pending_reserve_claim(offer, self.diagnostic()))
+                self.assertEqual(self.sent, [])
+        dispatcher, offer = self.prepare()
+        offer["task_id"] = "routed-task"
+        self.assertIsNone(dispatcher._reject_pending_reserve_claim(offer, self.diagnostic()))
+        offer.pop("task_id"); offer["id"] = helpers._valid_uuid4()
+        self.assertIsNone(dispatcher._reject_pending_reserve_claim(offer, self.diagnostic()))
+        self.assertEqual(self.sent, [])
+
+    def test_foreign_hub_claim_supersedes_only_pending_journal_without_dispatch(self):
+        from agent_hub_host.terminal_reports import read_record
+        for state in ("claim_pending", "uncertain"):
+            dispatcher, offer = self.prepare(state)
+            offer.update(state="starting", claim_key="b" * 32)
+            with patch.object(dispatcher, "dispatch") as dispatch:
+                dispatcher._dispatch_one(offer, [])
+            dispatch.assert_not_called()
+            self.assertEqual(self.sent, [])
+            record = read_record(dispatcher, offer["id"])
+            self.assertEqual(record["settled"], state == "claim_pending")
+            self.assertEqual(record["state"], "superseded" if state == "claim_pending" else "uncertain")
+
+
 if __name__ == "__main__":
     unittest.main()
