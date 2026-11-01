@@ -91,6 +91,7 @@
       "argon-gemini"
     ],
     "daily": [
+      "luna",
       "sol",
       "sonnet",
       "glm-flash",
@@ -154,12 +155,20 @@
       "effort": "high"
     },
     {
+      "id": "luna",
+      "model": "gpt-6-luna",
+      "provider": "codex",
+      "engine": "codex",
+      "profile": null,
+      "effort": "max"
+    },
+    {
       "id": "sol",
       "model": "gpt-6.1-sol",
       "provider": "codex",
       "engine": "codex",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "sonnet",
@@ -208,14 +217,6 @@
       "engine": "claude",
       "profile": null,
       "effort": null
-    },
-    {
-      "id": "luna",
-      "model": "gpt-6-luna",
-      "provider": "codex",
-      "engine": "codex",
-      "profile": null,
-      "effort": "max"
     },
     {
       "id": "glm-flash-zcodex",

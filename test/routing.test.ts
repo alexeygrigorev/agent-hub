@@ -99,7 +99,7 @@ describe('configured model tiers and ranking', () => {
   it('keeps aliases and never substitutes tiers', () => { expect(taskTier({tier:'smart'})).toBe('deep'); expect(taskTier({difficulty:'concrete'})).toBe('quick'); });
   it('blocks Grok, requires explicit Codex, and excludes full GLM and GLM in OpenCode', () => {
     const route = { provider: 'codex', engine: 'codex', profile: null, account: 'a' };
-    const ads = [{ engine:'codex',profile:null,account:'a',model:'gpt-6.1-sol',effort:'high' }];
+    const ads = [{ engine:'codex',profile:null,account:'a',model:'gpt-6.1-sol',effort:'medium' }];
     expect(modelCandidates({}, route, ads, quota, now)).toHaveLength(0);
     expect(modelCandidates({preferred_runner:'codex'}, route, ads, quota, now)).toHaveLength(1);
     expect(modelCandidates({}, {provider:'grok',engine:'grok',profile:null,account:'a'}, [{engine:'grok',profile:null,account:'a',model:'grok',effort:null}], quota, now)).toHaveLength(0);

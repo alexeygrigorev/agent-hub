@@ -56,14 +56,14 @@ class RoutedResultsTests(unittest.TestCase):
         settings = dict(self.settings, capabilities=[], workspaces={'demo': str(self.ws)}, subscriptions=[{
             'service': 'codex', 'account_label': 'shared-codex', 'engine': 'codex', 'profile': None,
             'admission_argv': ['maintained-gate'], 'launcher_provider': 'codex',
-            'launcher_model': 'gpt-6.1-sol', 'launcher_effort': 'high'}])
+            'launcher_model': 'gpt-6.1-sol', 'launcher_effort': 'medium'}])
 
         def runner(argv, **kwargs):
             if argv[0] == 'maintained-gate':
                 from agent_hub_host.fleet import utcnow
                 return {'launch_allowed': True, 'profile_supported': True,
                         'account_label': 'shared-codex', 'observed_at': utcnow(),
-                        'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'high'}
+                        'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'medium'}
             if 'plan' in argv:
                 return {'eligible': [{'provider': 'codex', 'model': 'gpt-6.1-sol', 'task_fit': 1.0}]}
             if 'run' in argv:
@@ -76,7 +76,7 @@ class RoutedResultsTests(unittest.TestCase):
         d = Dispatcher(settings, Mock(return_value={}), runner, journal_dir=str(self.journal))
         result = d.dispatch({'id': offer, 'engine': 'codex', 'account': 'shared-codex', 'profile': None,
                              'workspace': 'demo', 'prompt': 'Read committed source.', 'mode': 'headless',
-                             'task_id': JOB, 'needs': [], 'selection': {'id': 'sol', 'model': 'gpt-6.1-sol', 'effort': 'high'}})
+                             'task_id': JOB, 'needs': [], 'selection': {'id': 'sol', 'model': 'gpt-6.1-sol', 'effort': 'medium'}})
         self.assertEqual(result['state'], 'running')
         self.assertEqual(d._active_launches[offer]['routing_task_id'], JOB)
         self.assertEqual(self.dispatcher()._active_launches[offer]['routing_task_id'], JOB)

@@ -85,7 +85,8 @@ def test_managed_execute_prepares_workspace_before_isolated_launch(monkeypatch, 
         p.execute()
     assert calls[0][0] == 'trust'
     assert calls[0][1][0] == str(p.Path.cwd().resolve())
-    assert calls[1][1] == ['/test/codex', '--no-daemon', '--dangerously-bypass-approvals-and-sandbox', '/goal verify workspace']
+    assert calls[1][1] == ['/test/codex', '--no-daemon', '-c', 'model_reasoning_effort="medium"',
+                           '--dangerously-bypass-approvals-and-sandbox', '/goal verify workspace']
 
 
 def test_exact_workspace_trust_upgrades_existing_table_and_preserves_siblings(tmp_path):

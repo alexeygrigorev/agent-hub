@@ -75,7 +75,7 @@ async function startNative(ctx: Ctx, key: string) {
   expect(res.status, JSON.stringify(created)).toBe(201);
   expect(created.state).toBe('offered');
   const launchId = created.fleet_launch_id as string;
-  const claim = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: new Date(clock.now).toISOString(), account: 'shared-codex', profile_supported: true };
+  const claim = { gate_allowed: true, model: 'gpt-6-luna', observed_at: new Date(clock.now).toISOString(), account: 'shared-codex', profile_supported: true };
   const claimed = await f.handle(fleetReq('/launches/' + launchId + '/claim', claim), host);
   expect(claimed.status, JSON.stringify(await claimed.clone().json())).toBe(200);
   const state = () => sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', created.id).one().state;
@@ -132,7 +132,7 @@ describe('offered rows with a native receipt (intake 1c8d915e)', () => {
     const operator = { caller: { isAdmin: true, actor: 'human:admin-token:fixture', kind: 'human' }, scopes: ['admin'] };
     const res = await s.handle(sessReq('/api/sessions', { key: 'claimed-no-native', workspace: 'demo', machine: 'stale-1c8d', mode: 'headless', brief: 'offered-stale probe' }), operator);
     const created: any = await res.json();
-    const claim = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: new Date(clock.now).toISOString(), account: 'shared-codex', profile_supported: true };
+    const claim = { gate_allowed: true, model: 'gpt-6-luna', observed_at: new Date(clock.now).toISOString(), account: 'shared-codex', profile_supported: true };
     expect((await f.handle(fleetReq('/launches/' + created.fleet_launch_id + '/claim', claim), host)).status).toBe(200);
     await s.handle(new Request('https://hub.test/api/sessions', { method: 'GET' }), admin);
     await s.handle(sessReq('/api/sessions/host-bindings', undefined, 'GET'), host);

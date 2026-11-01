@@ -63,7 +63,7 @@ async function startClaimed(ctx: Ctx, key: string, receipt: boolean) {
   const created: any = await res.json();
   expect(res.status, JSON.stringify(created)).toBe(201);
   const launchId = created.fleet_launch_id as string;
-  const claim = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: new Date(clock.now).toISOString(), account: 'shared-codex', profile_supported: true };
+  const claim = { gate_allowed: true, model: 'gpt-6-luna', observed_at: new Date(clock.now).toISOString(), account: 'shared-codex', profile_supported: true };
   expect((await f.handle(fleetReq('/launches/' + launchId + '/claim', claim), host)).status).toBe(200);
   if (receipt) expect((await f.handle(fleetReq('/launches/' + launchId + '/result', { state: 'running', native_id: NATIVE_ID, launcher_task_id: 'hub-' + launchId }), host)).status).toBe(200);
   return { id: created.id as string, launchId, sql };

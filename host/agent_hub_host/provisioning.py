@@ -1871,7 +1871,7 @@ def launcher_metadata(provider, bundle=None):
         return {
             'launcher_provider': 'codex',
             'launcher_model': model or 'gpt-6.1-sol',
-            'launcher_effort': effort or 'high',
+            'launcher_effort': effort or 'medium',
         }
     elif provider == 'claude':
         return {
@@ -2097,6 +2097,39 @@ def refresh_launch_credential(label, b, home, dest, request=None):
         return {'status': 'hub_unreachable'}
 
 
+def managed_codex_effort_args(bundle, extra_argv):
+    """Enforce policy defaults at the native boundary, below explicit argv."""
+    if bundle['provider'] != 'codex':
+        return []
+    args = bundle['args'] + extra_argv
+    if args in (["--version"], ["-v"], ["--help"], ["-h"]):
+        return []
+    # Caller and bundle overrides are authoritative. Config files are not:
+    # older managed homes may still contain high/xhigh for the same model.
+    for i, arg in enumerate(args):
+        if arg == '--':
+            break
+        value = None
+        if arg in ('-c', '--config') and i + 1 < len(args):
+            value = args[i + 1]
+        elif arg.startswith('--config='):
+            value = arg[len('--config='):]
+        elif arg.startswith('-c') and arg != '-c':
+            value = arg[2:]
+        if value and value.partition('=')[0].strip() == 'model_reasoning_effort':
+            return []
+        if arg == '--effort' or arg.startswith('--effort='):
+            return []
+    from .model_contract import native_model, policy_models
+    model = native_model(extra_argv) or native_model(bundle['args']) or launcher_metadata('codex', bundle)['launcher_model']
+    efforts = {m['effort'] for m in policy_models()
+               if m['provider'] == 'codex' and m['model'] == model}
+    if len(efforts) != 1:
+        return []
+    effort = efforts.pop()
+    return ['-c', 'model_reasoning_effort=' + json.dumps(effort)] if effort else []
+
+
 def execute():
     label = sys.argv[1]
     if not LABEL.fullmatch(label):
@@ -2176,7 +2209,8 @@ def execute():
                     if '--dangerously-skip-permissions' not in extra_argv and '--dangerously-skip-permissions' not in b.get('args', []):
                         bypass_flags = ['--dangerously-skip-permissions']
             from .codex_interactive import isolated_argv
-            argv = command + isolated_argv(b['provider'], b['args'] + bypass_flags + extra_argv)
+            effort_args = managed_codex_effort_args(b, extra_argv)
+            argv = command + isolated_argv(b['provider'], effort_args + b['args'] + bypass_flags + extra_argv)
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
         if not is_diagnostic:
             allowed, reason = hub_launch_gate(label)

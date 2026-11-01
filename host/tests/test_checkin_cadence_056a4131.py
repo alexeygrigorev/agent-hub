@@ -38,7 +38,7 @@ def test_checkin_tick_posts_poll_and_capabilities_while_slow_cycle_holds_lock():
         cfg['capabilities'] = ['cap:demo']
         cfg['max_agents'] = 2
         cfg['subscriptions'][0]['launcher_model'] = 'gpt-6.1-sol'
-        cfg['subscriptions'][0]['launcher_effort'] = 'high'
+        cfg['subscriptions'][0]['launcher_effort'] = 'medium'
         posts = []
 
         def request(method, path, body=None):
@@ -61,7 +61,7 @@ def test_checkin_tick_posts_poll_and_capabilities_while_slow_cycle_holds_lock():
         # The advertisement matches the slow cycle's payload shape.
         assert caps[0] == {'needs': ['cap:demo'], 'max_agents': 2, 'runners': [
             {'engine': 'codex', 'profile': None, 'account': 'shared-codex',
-             'model': 'gpt-6.1-sol', 'effort': 'high'}]}
+             'model': 'gpt-6.1-sol', 'effort': 'medium'}]}
         # The check-in never takes over telemetry projection ownership.
         assert dispatcher._last_hb is None
 

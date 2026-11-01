@@ -64,7 +64,7 @@ async function claimed(ctx: Ctx, key: string) {
   const created: any = await res.json();
   expect(res.status, JSON.stringify(created)).toBe(201);
   const launchId = created.fleet_launch_id as string;
-  const claim = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: new Date(clock.now).toISOString(), account: 'shared-codex', profile_supported: true };
+  const claim = { gate_allowed: true, model: 'gpt-6-luna', observed_at: new Date(clock.now).toISOString(), account: 'shared-codex', profile_supported: true };
   expect((await f.handle(fleetReq('/launches/' + launchId + '/claim', claim), host)).status).toBe(200);
   sql.exec('UPDATE fleet_launches SET launcher_task_id = ? WHERE id = ?', 'hub-' + launchId, launchId);
   expect(sessionState(sql, created.id)).toBe('offered');

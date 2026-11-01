@@ -55,7 +55,7 @@ describe('headless disk admission and failure evidence',()=>{
  }));
  it('enriches only an owning host legacy fenced terminal failure without retry',()=>fixture(async(f,sql)=>{
   const launch=f.reserve(req(),admin).value;
-  expect((await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6.1-sol',observed_at:iso(),account:'test-codex',profile_supported:true}),host)).status).toBe(200);
+  expect((await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6-luna',observed_at:iso(),account:'test-codex',profile_supported:true}),host)).status).toBe(200);
   const base={state:'failed',confirmed_exit:true,reason:'launcher_command_failed',launcher_task_id:'hub-'+launch.id,diagnostic:{reason:'launcher_command_failed',message:'The launcher command failed; unrecognized output was withheld.',error_type:'ValueError',stage:'dispatch_headless',exit_code:1}};
   expect((await f.handle(http('/launches/'+launch.id+'/result',base),host)).status).toBe(200);
   const diagnostic={...base.diagnostic,reason:'launcher_disk_reserve',message:'Host disk headroom after launcher reservations is below the maintained disk floor.'};
@@ -69,7 +69,7 @@ describe('headless disk admission and failure evidence',()=>{
   const launch=f.reserve(req(),admin).value;
   const sid=crypto.randomUUID();
   sql.exec("INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,mode,state,created_at,updated_at) VALUES(?,?,?,?,?,NULL,'headless','queued',?,?)",sid,'admin',sid,'{}',launch.id,iso(),iso());
-  expect((await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6.1-sol',observed_at:iso(),account:'test-codex',profile_supported:true}),host)).status).toBe(200);
+  expect((await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6-luna',observed_at:iso(),account:'test-codex',profile_supported:true}),host)).status).toBe(200);
   const diagnostic={reason:'launcher_disk_reserve',message:'Host disk headroom after launcher reservations is below the maintained disk floor.',error_type:'ValueError',exit_code:1,stage:'dispatch_headless'};
   const receipt={state:'failed',confirmed_exit:true,reason:diagnostic.reason,diagnostic,launcher_task_id:'hub-'+launch.id};
   beat(0,{disk_free_gb:35,launcher_resources:ledger()});
@@ -93,7 +93,7 @@ describe('headless disk admission and failure evidence',()=>{
  }));
  it('requires newer real disk evidence after a proven no-start disk refusal',()=>fixture(async(f,sql,beat,advance)=>{
   beat(0,{disk_free_gb:80,launcher_resources:ledger({active_disk_mb:0})});const launch=f.reserve(req(),admin).value;
-  await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6.1-sol',observed_at:iso(),account:'test-codex',profile_supported:true}),host);
+  await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6-luna',observed_at:iso(),account:'test-codex',profile_supported:true}),host);
   const diagnostic={reason:'launcher_disk_reserve',message:'Host disk headroom after launcher reservations is below the maintained disk floor.',error_type:'ValueError',exit_code:1,stage:'dispatch_headless'};
   const q:any=await(await f.handle(http('/launches/'+launch.id+'/result',{state:'failed',confirmed_exit:true,reason:diagnostic.reason,diagnostic,launcher_task_id:'hub-'+launch.id}),host)).json();
   beat(8,{cpu_usage:{...freshCpu(iso(),8,8),psi_full_avg10:6}});expect(f.drainCapacityQueue().promoted).toBe(0);

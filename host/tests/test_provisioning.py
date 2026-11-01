@@ -550,7 +550,7 @@ def test_launcher_metadata_mapping():
     assert p.launcher_metadata('codex') == {
         'launcher_provider': 'codex',
         'launcher_model': 'gpt-6.1-sol',
-        'launcher_effort': 'high',
+        'launcher_effort': 'medium',
     }
     # With bundle override
     bundle_override = {'args': ['--model', 'gpt-6-astra', '--effort', 'max']}
@@ -582,7 +582,7 @@ def test_admission_payload_matching(tmp_path, monkeypatch):
     payload_valid = json.dumps({
         'profile': 'hub-test-account',
         'account': 'test-account',
-        'selection': {'model': 'gpt-6.1-sol', 'effort': 'high'},
+        'selection': {'model': 'gpt-6.1-sol', 'effort': 'medium'},
     })
     import io, sys
     monkeypatch.setattr(sys, 'stdin', io.StringIO(payload_valid))
@@ -1539,3 +1539,33 @@ def test_install_fetches_windows_zcodex_release_exe(tmp_path, monkeypatch):
     assert (dest / 'engine' / 'bin' / 'zcodex.exe').read_bytes() == payload
     wrapper = (dest / 'engine' / 'bin' / 'zcodex.cmd').read_text()
     assert 'zcodex.exe' in wrapper
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX execve command capture')
+@pytest.mark.parametrize('label', ['shared-codex', 'codex-orin'])
+@pytest.mark.parametrize('model,explicit,expected', [
+    ('gpt-6.1-sol', None, 'medium'),
+    ('gpt-6-luna', None, 'max'),
+    ('gpt-6.1-sol', 'high', 'high'),
+])
+def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, explicit, expected):
+    managed = tmp_path / 'managed'
+    managed.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: managed)
+    monkeypatch.delenv('CODEX_LAUNCH_WRAPPER', raising=False)
+    b = bundle()
+    b.update(provider='codex', label=label, args=[])
+    b['files']['.codex/config.toml'] = 'model_reasoning_effort = "xhigh"\n'
+    dest = managed / (label + '-' + b['revision'])
+    dest.mkdir(mode=0o700)
+    p.write_json(dest / 'bundle.json', b)
+    p.write_json(managed / 'state.json', [{'label': label, 'revision': b['revision'], 'provider': 'codex'}])
+    calls = []
+    monkeypatch.setattr(p.os, 'execve', lambda cmd, argv, env: calls.append(argv))
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda *a: (True, 'ok'))
+    args = ['execute', label, 'exec', '--model', model]
+    if explicit:
+        args += ['-c', 'model_reasoning_effort="' + explicit + '"']
+    monkeypatch.setattr(sys, 'argv', args + ['task'])
+    p.execute()
+    overrides = [arg for arg in calls[0] if arg.startswith('model_reasoning_effort=')]
+    assert overrides == ['model_reasoning_effort="' + expected + '"']

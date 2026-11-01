@@ -851,13 +851,13 @@ class FleetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = settings(Path(tmp)); cfg['capabilities'] = []
             cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
-            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6.1-sol', launcher_effort='high')
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6.1-sol', launcher_effort='medium')
             calls, requests = [], []
             def runner(argv, **kw):
                 calls.append(argv)
                 if argv[0] == 'maintained-gate':
                     return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow(),
-                            'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'high'}
+                            'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'medium'}
                 if 'plan' in argv:
                     return {'eligible': [{'provider': 'codex', 'model': 'gpt-6.1-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
                 if 'run' in argv:
@@ -905,14 +905,14 @@ class FleetTests(unittest.TestCase):
             calls.clear()
             requests.clear()
             legacy_offer = offer(mode='headless', task_id='task-intake-999', prompt='Legacy review task',
-                                 needs=[], selection={'id': 'sol', 'model': 'gpt-6.1-sol', 'effort': 'high'})
+                                 needs=[], selection={'id': 'sol', 'model': 'gpt-6.1-sol', 'effort': 'medium'})
             legacy_result_file = Path(tmp) / '.local' / 'hub-results' / (legacy_offer['id'] + '.json')
 
             def legacy_runner(argv, **kw):
                 calls.append(argv)
                 if argv[0] == 'maintained-gate':
                     return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow(),
-                            'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'high'}
+                            'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'medium'}
                 if 'plan' in argv:
                     return {'eligible': [{'provider': 'codex', 'model': 'gpt-6.1-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
                 if 'run' in argv:
@@ -1045,10 +1045,10 @@ class FleetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = settings(Path(tmp)); cfg['capabilities'] = []
             cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
-            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6.1-sol', launcher_effort='high')
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6.1-sol', launcher_effort='medium')
 
             assigned_offer = offer(mode='headless', task_id='task-intake-abc', prompt='Do task',
-                                   needs=[], selection={'id': 'sol', 'model': 'gpt-6.1-sol', 'effort': 'high'})
+                                   needs=[], selection={'id': 'sol', 'model': 'gpt-6.1-sol', 'effort': 'medium'})
             result_file = Path(tmp) / '.local' / 'hub-results' / (assigned_offer['id'] + '.json')
 
             for case_name, file_content, process_exit_code, expected_status, is_symlink in [
@@ -1068,7 +1068,7 @@ class FleetTests(unittest.TestCase):
                     def runner(argv, **kw):
                         if argv[0] == 'maintained-gate':
                             return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow(),
-                                    'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'high'}
+                                    'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'medium'}
                         if 'plan' in argv:
                             return {'eligible': [{'provider': 'codex', 'model': 'gpt-6.1-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
                         if 'run' in argv:
