@@ -28,6 +28,8 @@ def test_claude_launch_trusts_session_cwd_and_git_root(tmp_path, monkeypatch):
     projects = _claude_json(home)['projects']
     assert projects[work]['hasTrustDialogAccepted'] is True
     assert projects[work + '/sub']['hasTrustDialogAccepted'] is True
+    # A freshly created managed config must not open the first-run onboarding.
+    assert _claude_json(home)['hasCompletedOnboarding'] is True
 
 
 def test_windows_paths_get_the_forward_slash_key_too():
@@ -45,6 +47,7 @@ def test_existing_claude_state_is_preserved(tmp_path):
     p.ensure_claude_trusted_projects(path, ['/w', '/w2'])
     data = json.loads(path.read_text(encoding='utf-8'))
     assert data['oauthAccount'] == {'emailAddress': 'fixture'} and data['numStartups'] == 7
+    assert data['hasCompletedOnboarding'] is True
     assert data['projects']['/w'] == {'allowedTools': ['Bash'], 'hasTrustDialogAccepted': True}
     assert data['projects']['/w2'] == {'hasTrustDialogAccepted': True}
 
@@ -52,7 +55,8 @@ def test_existing_claude_state_is_preserved(tmp_path):
 def test_already_trusted_config_is_not_rewritten(tmp_path, monkeypatch):
     home = _home(tmp_path)
     path = home / '.claude' / '.claude.json'
-    path.write_text(json.dumps({'projects': {'/w': {'hasTrustDialogAccepted': True}}}), encoding='utf-8')
+    path.write_text(json.dumps({'hasCompletedOnboarding': True,
+                                'projects': {'/w': {'hasTrustDialogAccepted': True}}}), encoding='utf-8')
     writes = []
     monkeypatch.setattr(p, '_write_engine_config', lambda *a: writes.append(a))
     p.ensure_claude_trusted_projects(path, ['/w'])

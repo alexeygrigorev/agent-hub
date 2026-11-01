@@ -631,6 +631,11 @@ def ensure_claude_trusted_projects(config_path, paths):
     if not isinstance(projects, dict):
         return
     changed = False
+    # A managed home is never used by a person: a fresh or re-created config
+    # must not open Claude at the first-run theme/onboarding screen either.
+    if config.get('hasCompletedOnboarding') is not True:
+        config['hasCompletedOnboarding'] = True
+        changed = True
     for path in paths:
         for key in claude_project_keys(path):
             entry = projects.setdefault(key, {})
