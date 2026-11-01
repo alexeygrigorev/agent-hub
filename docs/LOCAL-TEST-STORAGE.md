@@ -75,6 +75,14 @@ are preserved; other Node options are kept. These defaults apply only to the
 Vitest command. Console timing reports remain visible for passing tests too.
 No file is excluded, no sample is retried and the 100 ms threshold is unchanged.
 
+When `scripts/test-affected-local.sh` prints a capacity HOLD, retry its
+self-admitting lane directly with
+`scripts/capped-test-retry.sh -- scripts/test-affected-local.sh`. This uses one
+slot per attempt and inherits `AGENT_HUB_HEAVY_TEST_PRIORITY` when set. Never
+nest the affected runner in `capped-test-run.sh` or `heavy-test-admission.py`,
+and never clear `AGENT_HUB_HEAVY_TEST_HELD` in a child shell to bypass its
+nested-admission guard.
+
 For bounded verification on a shared Linux host:
 
 ```sh

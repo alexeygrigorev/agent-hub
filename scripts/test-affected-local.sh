@@ -95,7 +95,11 @@ if [ "${RC}" -eq 3 ] && [ -f "${MARKER}" ]; then
   if [ -n "${AGENT_HUB_HEAVY_TEST_REFUSAL_FILE:-}" ]; then
     printf '%s\n' "$(cat "${MARKER}")" > "${AGENT_HUB_HEAVY_TEST_REFUSAL_FILE}"
   fi
-  echo "HOLD: $(cat "${MARKER}"); retry later"; exit 3
+  RETRY_COMMAND="scripts/capped-test-retry.sh -- scripts/test-affected-local.sh"
+  if [ -n "${AGENT_HUB_HEAVY_TEST_PRIORITY:-}" ]; then
+    RETRY_COMMAND="AGENT_HUB_HEAVY_TEST_PRIORITY=${AGENT_HUB_HEAVY_TEST_PRIORITY} ${RETRY_COMMAND}"
+  fi
+  echo "HOLD: $(cat "${MARKER}"); retry with: ${RETRY_COMMAND}"; exit 3
 fi
 [ "${RC}" -ne 0 ] && FAILURES=$((FAILURES + 1))
 if [ "${FAILURES}" -eq 0 ]; then echo "PASS: affected tests passed (full suite runs post-push in CI)"; exit 0; fi

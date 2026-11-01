@@ -55,6 +55,10 @@ Defaults are `/run/user/<uid>/agent-hub/heavy-test`, two slots, and a 1800-secon
 wall-clock cap per admitted command (`--run-timeout` or
 `AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S` overrides the run cap). Never unlink
 live lock files or kill holders. See [heavy test admission](docs/HETZNER-OVERLOAD-0689CE9C.md).
+If the affected lane prints a capacity HOLD, retry it directly with
+`scripts/capped-test-retry.sh -- scripts/test-affected-local.sh`; it inherits
+`AGENT_HUB_HEAVY_TEST_PRIORITY` when set. Never nest the lane in another
+admission wrapper or clear `AGENT_HUB_HEAVY_TEST_HELD` in a child shell.
 
 Before installing dependencies in a fresh checkout, run
 `python3 scripts/local-dependencies.py` to reuse a validated matching canonical

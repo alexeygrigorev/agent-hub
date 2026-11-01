@@ -135,6 +135,7 @@ exiting:
 ```bash
 scripts/capped-test-retry.sh -- ./my-heavy-step.sh
 scripts/capped-test-retry.sh --attempts 8 --base-delay 60 --max-delay 600 -- scripts/test-full-local.sh --priority final
+scripts/capped-test-retry.sh -- scripts/test-affected-local.sh
 ```
 
 Exit 3 alone is ambiguous: the admitted command can exit 3 itself (pytest
@@ -149,6 +150,12 @@ refused phase as `HOLD` and a command's own exit 3 as `FAIL`. It exits 3 and
 writes the caller's marker only when every failure was a hold; any real
 failure makes it exit 1. The retry wrapper runs the full runner directly,
 without an outer slot, because the runner takes a slot per heavy phase.
+The affected lane takes one slot for its heavy block and prints the direct retry
+command shown above on a capacity HOLD. Run it directly through
+`capped-test-retry.sh`; never nest `test-affected-local.sh` inside
+`capped-test-run.sh` or `heavy-test-admission.py`, or clear
+`AGENT_HUB_HEAVY_TEST_HELD` in a child shell to bypass the nested-admission
+guard. The retry command inherits `AGENT_HUB_HEAVY_TEST_PRIORITY` when set.
 `--priority final` and the AGENTS.md push gates are unchanged. Direct
 `npx vitest` / `pytest` runs that hit the in-process hooks (`heavy-test slot
 not acquired`) must be rerun under `capped-test-retry.sh`, not abandoned.
