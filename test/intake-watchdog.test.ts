@@ -17,7 +17,7 @@ function task(id = 'synthetic-task', age = 3 * 3600000): any {
 }
 async function fixture(fn: (h: any) => any) {
   return inDO(stub(), async (h: any) => {
-    for (const table of ['intake_queue_admissions', 'intake_queue_movement', 'intake_restart_queue', 'intake_watchdog_meta', 'session_control_sessions', 'fleet_sessions', 'claims', 'fleet_catalog_seen']) h.sql.exec('DELETE FROM ' + table);
+    for (const table of ['intake_queue_due_cursor', 'intake_queue_admissions', 'intake_queue_movement', 'intake_restart_queue', 'intake_watchdog_meta', 'session_control_sessions', 'fleet_sessions', 'claims', 'fleet_catalog_seen']) h.sql.exec('DELETE FROM ' + table);
     return fn(h);
   });
 }
@@ -52,8 +52,8 @@ describe('forgotten intake watchdog', () => {
     h.sql.exec("INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at) VALUES(?,'queued','watchdog_global_capacity',?,?,?)",overdue.id,NOW-60000,NOW-60000,NOW);
     await w.tick();
     expect(started[0]).toBe(overdue.id);
-    expect(started).toHaveLength(2); // Canonical pre-admission reservations retain the default cap.
-    expect(h.sql.exec("SELECT reason FROM intake_restart_queue WHERE task_id=?",fresh[1].id).one().reason).toBe('watchdog_global_capacity');
+    expect(started).toEqual([overdue.id]); // The default per-project cap remains one.
+    expect(h.sql.exec("SELECT reason FROM intake_restart_queue WHERE task_id=?",fresh[0].id).one().reason).toBe('watchdog_project_capacity');
   }));
   it('advances the indexed due lane past exempt holds outside the normal cursor', async () => fixture(h => {
     const normal=Array.from({length:192},(_,i)=>task('a-'+String(i).padStart(3,'0')));
