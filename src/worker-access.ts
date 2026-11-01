@@ -238,6 +238,7 @@ export class WorkerAccess {
       } else claim = this.sql.exec('SELECT * FROM claims WHERE id=?', target).toArray()[0];
       const binding = worker.native_binding;
       const ownNative = claim?.claim_source === 'native' && binding?.native_id && binding?.tag &&
+        claim.native_session_id === binding.native_id &&
         binding.workspace === worker.workspace && claim.worktree === worker.workspace &&
         claim.holder === formatNativeActor(worker.machine_id, binding.tag, binding.native_id);
       if (!claim || claim.project !== worker.task_project || (claim.holder !== worker.actor && !ownNative)) return deny();

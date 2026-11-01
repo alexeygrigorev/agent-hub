@@ -53,7 +53,8 @@ describe('scoped durable worker access',()=>{
  },mode));
 
  it('releases only claims held by the worker actor or its exact attested native workspace',()=>setup(async({stub,id,session,worker,call}:any)=>{
-  const native=uuid(), tag='hub-own-claim', own=uuid(), bridged=uuid(), byScope=uuid(), peer=uuid(), old=uuid(), wrongWorkspace=uuid(), wrongProject=uuid(), wrongHost=uuid();
+  const native='12345678-1111-4111-8111-111111111111', collision='12345678-2222-4222-8222-222222222222', tag='hub-own-claim';
+  const own=uuid(), bridged=uuid(), byScope=uuid(), peer=uuid(), old=uuid(), wrongWorkspace=uuid(), wrongProject=uuid(), wrongHost=uuid(), samePrefix=uuid(), legacy=uuid();
   const actor='hub-workers:worker-'+id;
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify({native_id:native,tag,workspace:'/repo'}),session);
@@ -61,13 +62,17 @@ describe('scoped durable worker access',()=>{
     [own,actor,'agent-hub','/repo','hub'],[byScope,actor,'agent-hub','/repo','hub'],[bridged,formatNativeActor('worker-host',tag,native),'agent-hub','/repo','native'],
     [peer,'someone-else','agent-hub','/repo','hub'],[old,formatNativeActor('worker-host',tag,uuid()),'agent-hub','/repo','native'],
     [wrongWorkspace,formatNativeActor('worker-host',tag,native),'agent-hub','/other','native'],[wrongProject,actor,'other-project','/repo','hub'],
-    [wrongHost,formatNativeActor('another-host',tag,native),'agent-hub','/repo','native']])
+    [wrongHost,formatNativeActor('another-host',tag,native),'agent-hub','/repo','native'],
+    [samePrefix,formatNativeActor('worker-host',tag,collision),'agent-hub','/repo','native'],
+    [legacy,formatNativeActor('worker-host',tag,native),'agent-hub','/repo','native']])
     h.sql.exec('INSERT INTO claims(id,project,scope,holder,created_at,expires_at,worktree,claim_source) VALUES(?,?,?,?,?,?,?,?)',id,project,'src/'+id,holder,Date.now(),Date.now()+60000,worktree,source);
+   for(const id of [bridged,old,wrongWorkspace,wrongHost]) h.sql.exec('UPDATE claims SET native_session_id=? WHERE id=?',native,id);
+   h.sql.exec('UPDATE claims SET native_session_id=? WHERE id=?',collision,samePrefix);
   });
   const release=(target:string)=>call('/api/bus/claims/'+encodeURIComponent(target)+'/release',{},worker.access_token);
   for(const id of [own,bridged]) {expect((await release(id)).status).toBe(200);expect((await release(id)).status).toBe(200);}
   expect((await release('agent-hub:src/'+byScope)).status).toBe(200);
-  for(const id of [peer,old,wrongWorkspace,wrongProject,wrongHost,uuid()]) {
+  for(const id of [peer,old,wrongWorkspace,wrongProject,wrongHost,samePrefix,legacy,uuid()]) {
    const res=await release(id);expect(res.status).toBe(403);expect(await res.json()).toEqual({error:'worker_claim_forbidden'});
   }
   expect((await release('agent-hub:src/'+peer)).status).toBe(403);
@@ -75,7 +80,7 @@ describe('scoped durable worker access',()=>{
   expect((await call('/api/bus/claims',{project:'agent-hub',scope:'x',holder:actor},worker.access_token)).status).toBe(403);
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    for(const id of [own,bridged,byScope]) expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?',id).toArray()[0].released_at).toBeTruthy();
-   for(const id of [peer,old,wrongWorkspace,wrongProject,wrongHost]) expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?',id).toArray()[0].released_at).toBeNull();
+   for(const id of [peer,old,wrongWorkspace,wrongProject,wrongHost,samePrefix,legacy]) expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?',id).toArray()[0].released_at).toBeNull();
    h.sql.exec('UPDATE worker_access SET expires_at=?',Date.now()-1);
   });
   expect((await release(own)).status).toBe(403);

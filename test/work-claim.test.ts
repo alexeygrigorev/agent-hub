@@ -201,7 +201,7 @@ describe('POST /api/bus/native-sync (host-attested bridge)', () => {
       }
       try { instance.sql.exec('DELETE FROM fleet_claim_policy'); } catch (e) {}
       try {
-        for (const col of ['work_key', 'claim_mode', 'claim_source', 'worktree', 'session_state', 'native_claim_id']) {
+        for (const col of ['work_key', 'claim_mode', 'claim_source', 'worktree', 'session_state', 'native_claim_id', 'native_session_id']) {
           const has = (instance.sql.exec('PRAGMA table_info(claims)').toArray() as any[]).some((c) => c.name === col);
           if (!has) instance.sql.exec(`ALTER TABLE claims ADD COLUMN ${col} TEXT`);
         }
@@ -249,6 +249,16 @@ describe('POST /api/bus/native-sync (host-attested bridge)', () => {
       native_claim_id: 'clm_01K8AN7D4XE9P0T2V5WYH6JM',
     });
     expect(activity.notice).toContain('someone may already be on this');
+    await runInDurableObject(stub, async (instance: Hub) => {
+      expect(instance.sql.exec('SELECT native_session_id FROM claims WHERE native_claim_id=?', claimData().claim_id).one().native_session_id).toBe('sess-1');
+      // Existing rows, including legacy rows, gain full attested identity on refresh.
+      instance.sql.exec('UPDATE claims SET native_session_id=NULL');
+    });
+    const refreshed = await http('POST', '/api/bus/native-sync', 'tok_host_a', { claims: [{ data: claimData() }], messages: [] });
+    expect(refreshed.status).toBe(200);
+    await runInDurableObject(stub, async (instance: Hub) => {
+      expect(instance.sql.exec('SELECT native_session_id FROM claims WHERE native_claim_id=?', claimData().claim_id).one().native_session_id).toBe('sess-1');
+    });
   });
 
   it('makes Hub claims conflict with synced native edit scopes', async () => {

@@ -710,7 +710,10 @@ export class Hub extends DurableObject {
       claim_source: 'TEXT',
       worktree: 'TEXT',
       session_state: 'TEXT',
-      native_claim_id: 'TEXT'
+      native_claim_id: 'TEXT',
+      // Full host-attested identity for worker releases; holder is a display
+      // address containing only an eight-hex native id prefix.
+      native_session_id: 'TEXT'
     });
 
     // If audit was upgraded from SPEC §6 where ts existed instead of at:
@@ -3299,17 +3302,17 @@ export class Hub extends DurableObject {
           const existingId = liveByScope.get(scope);
           if (existingId) {
             this.sql.exec(
-              'UPDATE claims SET project = ?, holder = ?, expires_at = ?, work_key = ?, claim_mode = ?, worktree = ?, session_state = ? WHERE id = ?',
+              'UPDATE claims SET project = ?, holder = ?, expires_at = ?, work_key = ?, claim_mode = ?, worktree = ?, session_state = ?, native_session_id = ? WHERE id = ?',
               clean.project, actor, expiresAt, clean.work_key, clean.mode,
-              typeof clean.worktree === 'string' ? clean.worktree : null, stateValue, existingId,
+              typeof clean.worktree === 'string' ? clean.worktree : null, stateValue, clean.holder.session_id, existingId,
             );
           } else {
             this.sql.exec(
-              "INSERT INTO claims (id, project, scope, holder, created_at, expires_at, released_at, work_key, claim_mode, claim_source, worktree, session_state, native_claim_id) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 'native', ?, ?, ?)",
+              "INSERT INTO claims (id, project, scope, holder, created_at, expires_at, released_at, work_key, claim_mode, claim_source, worktree, session_state, native_claim_id, native_session_id) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 'native', ?, ?, ?, ?)",
               generateUlid(now), clean.project, redactedScope, actor, now, expiresAt,
               clean.work_key, clean.mode,
               typeof clean.worktree === 'string' ? String(redactForBus(clean.worktree)) : null,
-              stateValue, clean.claim_id,
+              stateValue, clean.claim_id, clean.holder.session_id,
             );
           }
           syncedClaims++;
