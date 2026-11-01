@@ -1022,6 +1022,13 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 drain_inflight_dispatch(dispatcher)
             except Exception:
                 pass
+            # Observers that wake on ``stop`` exit promptly; bounded joins keep
+            # them from outliving run() in the normal case (they were joined
+            # before the output fence landed and callers rely on it).
+            if bindings_thread is not None:
+                bindings_thread.join(timeout=1)
+            if offers_thread is not None:
+                offers_thread.join(timeout=2)
             # The release poller wakes on ``release_stop``; give it a moment to
             # exit so its own error line is not written after the fence closes
             # (bounded: it may be inside a network call).

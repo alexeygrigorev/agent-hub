@@ -132,7 +132,7 @@ class SelfUpdateTest(unittest.TestCase):
         calls = {'n': 0}
         original = self_update.step_once
 
-        def step(request, root=None):
+        def step(request, root=None, log=print):
             calls['n'] += 1
             return True
         self_update.step_once = step

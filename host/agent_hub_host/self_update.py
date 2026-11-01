@@ -201,7 +201,7 @@ def loop(request, stop, *, root=None, interval=POLL_S, clock=time.monotonic, lau
     while not stop.is_set():
         started = clock()
         try:
-            if step_once(request, root=root):
+            if step_once(request, root=root, log=log):
                 stop.set()
                 return
         except Exception as exc:

@@ -263,7 +263,14 @@ class SessionHostTests(unittest.TestCase):
                  patch.object(session_host, 'qualify_sender_binding', return_value=SimpleNamespace(session_id='test-native', workspace=str(pathlib.Path.cwd()))), \
                  patch.object(session_host.fleet, 'Dispatcher') as dispatcher, \
                  patch.object(session_host, 'RoleConsumer'), \
+                 patch.object(session_host, 'offers_loop', lambda *a, **k: None), \
+                 patch.object(session_host, 'maybe_start_maintenance_thread', return_value=None), \
+                 patch.object(session_host, 'maybe_start_token_thread', return_value=None), \
                  patch.object(session_host.session_control, 'execute'):
+                # The real offers loop raises offers_polling while it polls
+                # (which, by design, defers the swap) and background steps
+                # may consume the second load_settings value; keep them out
+                # so the swap is deterministic.
                 session_host.run(settings_file, directory, cycles=1)
                 instance = dispatcher.return_value
                 self.assertEqual(instance.settings, v2)
