@@ -552,6 +552,7 @@ async function runSuite(page) {
     assert.ok(await page.locator('.msg__body >> text=draft that must survive').count(), 'draft restored from localStorage');
     state.failNextSends = 0;
     await page.click('button[aria-label="Retry sending this message"]');
+    await until(() => sendLog.length === 2);
     await page.waitForFunction(() => !document.querySelector('.dk-badge--danger'), null, { timeout: 5000 });
     assert.equal(sendLog[1].payload.idempotency_key, firstKey, 'persisted draft retries with the original key');
     assert.deepEqual(sendLog[1].payload, firstPayload, 'same actor reload retains the exact key and payload');
