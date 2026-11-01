@@ -1,7 +1,7 @@
 /** Forgotten-work projection and durable restart queue. Canonical session/Fleet admission
  * remains the only launcher; notes never count as liveness or restart authority. */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import { intakeCompletionHoldReason, intakeHasDoneEvidence, type IntakeService } from './intake';
+import { currentHistory, intakeCompletionHoldReason, intakeHasDoneEvidence, type IntakeService } from './intake';
 import { freshCatalogs } from './catalog-freshness';
 import { decodeRepoWorkspace, resolveLabelUnderRoots } from './fleet';
 import { parseNativeActor } from './work_claim';
@@ -195,6 +195,8 @@ export class IntakeWatchdog {
   private automationHold(t: Obj, policy = this.policy()): string | null {
     if (!policy.valid) return 'watchdog_configuration_invalid';
     if (!policy.enabled) return 'watchdog_disabled';
+    const triage = latestTriageVerdict({ history: currentHistory(t) });
+    if (triage && triage !== 'ACTUAL') return 'watchdog_triage_' + triage.toLowerCase();
     if (this.idleOverride === t.id) return null;
     return policy.projects !== null && !policy.projects.includes(t.project) ? 'watchdog_project_not_enabled' : null;
   }

@@ -10,7 +10,7 @@ const settings = { HUB_INTAKE_QUEUE_ENABLED: 'true', HUB_INTAKE_QUEUE_PROJECTS: 
 async function fixture(fn: (h: any, fleet: any, account: any) => void | Promise<void>) {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('queue-capacity-policy'));
   await (runInDurableObject as any)(stub, async (h: any) => {
-    for (const table of ['machines', 'routing_machines', 'fleet_accounts', 'session_control_sessions', 'fleet_sessions', 'fleet_launches']) h.sql.exec('DELETE FROM ' + table);
+    for (const table of ['intake_queue_admissions', 'intake_restart_queue', 'intake_watchdog_meta', 'intake_queue_movement', 'machines', 'routing_machines', 'fleet_accounts', 'session_control_sessions', 'fleet_sessions', 'fleet_launches']) h.sql.exec('DELETE FROM ' + table);
     h.sql.exec("INSERT INTO fleet_accounts(label,provider,max_concurrency,reserve_percent,enabled) VALUES('zai-main','zai',26,15,1)");
     h.sql.exec(`INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained)
       VALUES('online','online','online',?,?,?,0)`, new Date(NOW).toISOString(), new Date(NOW).toISOString(), JSON.stringify({disk_free_gb: 100}));
@@ -55,6 +55,29 @@ describe('live autonomous queue policy', () => {
     policyReads = 0;
     expect(w.queue(tasks).find(t=>t.id==='real-3')).toMatchObject({reason:'watchdog_global_capacity'});
     expect(policyReads).toBe(1);
+  }));
+  it.each(['OBSOLETE','DUPLICATE','DONE'])('holds current TRIAGE %s claims but invalidates old verdicts after AC updates', verdict => fixture(async (h, fleet) => {
+    const negative = {id:'negative',project:'real-project',title:'Old work',status:'open',created_at:NOW,
+      acceptance_criteria:'Verify outcome',history:[{kind:'note',text:'TRIAGE ' + verdict + ' — reviewed'}]};
+    const changed = {...negative,id:'changed',history:[...negative.history,
+      {kind:'update',changes:{acceptance_criteria:'New authorized requirement'}}]};
+    const tasks = [negative,changed];
+    h.sql.exec('UPDATE machines SET capabilities=?', JSON.stringify({workspaces:['real-project']}));
+    const started:string[] = [];
+    const w = new IntakeWatchdog(h.sql, {statusAuthorizedTasks:()=>tasks} as any, (fn:any)=>fn(), {
+      policy: () => liveQueuePolicy(settings,h.sql,fleet,NOW),
+      start: async input => { started.push(input.intake_task_id); return {status:409,body:{error:'test_refusal'}}; }
+    }, () => NOW);
+    w.init(); await w.tick();
+    expect(started).toEqual(['changed']);
+    expect(w.queue(tasks).find(t=>t.id==='negative')).toMatchObject({reason:'watchdog_triage_' + verdict.toLowerCase()});
+  }));
+  it('skips disabled and explicit-only accounts before expensive status maintenance', () => fixture((h, fleet) => {
+    h.sql.exec("UPDATE fleet_accounts SET provider='codex'");
+    let reads = 0;
+    fleet.accountStatus = () => { reads++; throw new Error('must not probe explicit-only account'); };
+    expect(liveQueuePolicy(settings,h.sql,fleet,NOW).max_inflight).toBe(0);
+    expect(reads).toBe(0);
   }));
   it('honors the existing machine ceiling without raising it', () => fixture((h, fleet) => {
     h.sql.exec("INSERT OR REPLACE INTO routing_machines(machine_id,needs_json,max_agents,observed_at) VALUES('online','[]',1,?)", new Date(NOW).toISOString());

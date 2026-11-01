@@ -1,6 +1,6 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { FleetService } from './fleet';
-import { dedupeAccountsByCanonical } from './quota';
+import { canonicalQuotaProvider, dedupeAccountsByCanonical } from './quota';
 import { queuePolicyFrom } from './intake-watchdog';
 import routingPolicy from '../config/model-routing.json';
 
@@ -24,6 +24,8 @@ export function liveQueuePolicy(env: Record<string, unknown>, sql: SqlStorage,
     const definitions = sql.exec('SELECT * FROM fleet_accounts LIMIT 129').toArray() as any[];
     if (definitions.length > 128) throw new Error('capacity_observation_limited');
     const accounts = fleet.withMaintenance(() => dedupeAccountsByCanonical(definitions)
+      .filter(a => a.enabled && !routingPolicy.rules.disabled_providers.includes(canonicalQuotaProvider(a.provider)) &&
+        !routingPolicy.rules.explicit_only_providers.includes(canonicalQuotaProvider(a.provider)))
       .map(a => fleet.accountStatus(a))).filter(a => a.enabled && a.supports_goal && a.status === 'ok' &&
         !routingPolicy.rules.disabled_providers.includes(a.provider) &&
         !routingPolicy.rules.explicit_only_providers.includes(a.provider));
