@@ -19,6 +19,8 @@ NORMAL_AGE_S = 300
 # the variable, so its own exit 3 leaves no marker.
 REFUSAL_FILE_ENV = 'AGENT_HUB_HEAVY_TEST_REFUSAL_FILE'
 COMMAND_STARTED = False
+DEFAULT_RUN_TIMEOUT_S = 1800
+TERMINATE_GRACE_S = 10
 
 
 def refuse(reason):
@@ -94,17 +96,30 @@ class Queue:
                     del state['active'][name]
 
     @staticmethod
-    def head(state, now):
+    def order(row, now):
         # An aged normal joins the final class with its original sequence.
         # Later final arrivals cannot indefinitely overtake that normal.
-        def order(item):
-            row = item[1]
-            preferred = row['priority'] == 'final' or now - row['created'] >= NORMAL_AGE_S
-            return (not preferred, row['sequence'])
-        return min(state['active'].items(), key=order)[0]
+        preferred = row['priority'] == 'final' or now - row['created'] >= NORMAL_AGE_S
+        return (not preferred, row['sequence'])
+
+    @classmethod
+    def head(cls, state, now):
+        return min(state['active'].items(), key=lambda item: cls.order(item[1], now))[0]
+
+    @classmethod
+    def position(cls, state, name, now):
+        ordered = sorted(state['active'].items(), key=lambda item: cls.order(item[1], now))
+        return next(index for index, item in enumerate(ordered, 1) if item[0] == name), len(ordered)
 
 
-def run_command(command, slot, interrupted):
+def signal_group(pgid, number):
+    try:
+        os.killpg(pgid, number)
+    except ProcessLookupError:
+        pass
+
+
+def run_command(command, slot, interrupted, run_timeout):
     global COMMAND_STARTED
     # Reserve/inherit the historical FD9. Parent retains its own descriptor
     # even when the command closes FD9. Descendants retaining it also keep
@@ -115,11 +130,43 @@ def run_command(command, slot, interrupted):
     COMMAND_STARTED = True
     try:
         try:
-            child = subprocess.Popen(command, pass_fds=(9,), env=env)
+            # A dedicated process group lets a timeout clean up the test runner
+            # and its ordinary descendants before releasing the shared slot.
+            child = subprocess.Popen(command, pass_fds=(9,), env=env,
+                                     start_new_session=True)
         except OSError as error:
             print(f'capped-test-run: {error}', file=sys.stderr)
             return 127 if isinstance(error, FileNotFoundError) else 126
-        result = child.wait()
+        deadline = time.monotonic() + run_timeout
+        stopping_at = None
+        timed_out = False
+        while True:
+            signal_status = interrupted()
+            now = time.monotonic()
+            if stopping_at is None and signal_status:
+                stopping_at = now
+                signal_group(child.pid, signal.SIGTERM)
+            elif stopping_at is None and now >= deadline:
+                timed_out = True
+                stopping_at = now
+                print(f'capped-test-run: command exceeded {run_timeout}s; terminating process group',
+                      file=sys.stderr, flush=True)
+                signal_group(child.pid, signal.SIGTERM)
+            elif stopping_at is not None and now - stopping_at >= TERMINATE_GRACE_S:
+                signal_group(child.pid, signal.SIGKILL)
+                result = child.wait()
+                break
+            try:
+                result = child.wait(timeout=0.1)
+                if stopping_at is not None:
+                    # The direct command may exit on TERM while a descendant
+                    # still holds the inherited slot descriptor.
+                    signal_group(child.pid, signal.SIGKILL)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if timed_out:
+            return 124
         return interrupted() or (128 - result if result < 0 else result)
     finally:
         os.close(9)
@@ -129,6 +176,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--slots', default=os.environ.get('AGENT_HUB_HEAVY_TEST_SLOTS', '2'))
     parser.add_argument('--wait', default=os.environ.get('AGENT_HUB_HEAVY_TEST_WAIT_S', '1800'))
+    parser.add_argument('--run-timeout', default=os.environ.get(
+        'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S', str(DEFAULT_RUN_TIMEOUT_S)))
     parser.add_argument('--priority', default=os.environ.get('AGENT_HUB_HEAVY_TEST_PRIORITY', 'normal'), choices=['normal', 'final'])
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -136,6 +185,9 @@ def main():
         parser.error('invalid slot count')
     if not args.wait.isascii() or not args.wait.isdecimal():
         parser.error('invalid wait seconds')
+    if (not args.run_timeout.isascii() or not args.run_timeout.isdecimal()
+            or not 1 <= int(args.run_timeout) <= 86400):
+        parser.error('invalid command run timeout seconds (expected 1..86400)')
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('no command given')
@@ -218,13 +270,15 @@ def main():
                         print(f'capped-test-run: no heavy-test slot free after {args.wait}s ({args.slots} slots)', file=sys.stderr)
                         return refuse(f'no heavy-test slot free after {args.wait}s')
                     if not announced:
-                        print(f'capped-test-run: all {args.slots} heavy-test slots busy; waiting up to {args.wait}s ({args.priority} ticket {sequence})', file=sys.stderr, flush=True)
+                        position, waiting = queue.position(state, name, time.monotonic())
+                        print(f'capped-test-run: all {args.slots} heavy-test slots busy; waiting up to {args.wait}s ({args.priority} ticket {sequence}), queue position {position}/{waiting}', file=sys.stderr, flush=True)
                         announced = True
                     time.sleep(min(random.uniform(1, 2), remaining))
             with slot:
                 running = True
                 print(f'capped-test-run: admitted {args.priority} ticket {sequence}', file=sys.stderr, flush=True)
-                return run_command(command, slot, lambda: interrupted)
+                print(f'capped-test-run: run timeout {args.run_timeout}s', file=sys.stderr, flush=True)
+                return run_command(command, slot, lambda: interrupted, int(args.run_timeout))
 
 
 if __name__ == '__main__':

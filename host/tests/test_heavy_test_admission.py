@@ -50,7 +50,7 @@ class AdmissionTests(unittest.TestCase):
                 self.fail('timed out waiting for test event')
             time.sleep(.02)
 
-    def start(self, name, priority='normal', code=None, wait='40'):
+    def start(self, name, priority='normal', code=None, wait='40', run_timeout=None):
         count = self.state()['next']
         code = code or f"from pathlib import Path; p=Path({str(self.root / 'order')!r}); f=p.open('a'); f.write({name!r}+'\\n'); f.close()"
         command = [str(WRAPPER)]
@@ -65,7 +65,10 @@ class AdmissionTests(unittest.TestCase):
                 'runpy.run_path(sys.argv[0],run_name="__main__")'
             )
             command = [sys.executable, '-c', bootstrap]
-        child = subprocess.Popen(command + ['--priority', priority, '--wait', wait,
+        args = command + ['--priority', priority, '--wait', wait]
+        if run_timeout is not None:
+            args += ['--run-timeout', str(run_timeout)]
+        child = subprocess.Popen(args + [
                                   '--', sys.executable, '-c', code], env=self.env,
                                  start_new_session=True)
         self.children.append(child)
@@ -148,6 +151,41 @@ class AdmissionTests(unittest.TestCase):
         holder.wait()
         self.assertEqual(waiter.wait(timeout=40), 0)
         self.assertEqual(self.order(), ['next'])
+
+    def test_run_timeout_terminates_command_and_releases_slot(self):
+        self.holder.close()
+        marker = self.root / 'started'
+        code = f"from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(30)"
+        timed = self.start('timed', code=code, run_timeout=1)
+        self.until(marker.exists)
+        self.assertEqual(timed.wait(timeout=5), 124)
+        next_run = self.start('next')
+        self.assertEqual(next_run.wait(timeout=5), 0)
+        self.assertEqual(self.order(), ['next'])
+
+    def test_expired_direct_pytest_holder_stops_the_test_process(self):
+        hook_root = self.root / 'hook-root'
+        hook_root.mkdir()
+        conftest = WRAPPER.parent.parent / 'host/tests/conftest.py'
+        code = (
+            'import importlib.util,time; '
+            f'spec=importlib.util.spec_from_file_location("hub_test_conftest",{str(conftest)!r}); '
+            'module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); '
+            'from types import SimpleNamespace; module.pytest_configure(SimpleNamespace()); '
+            'time.sleep(30)'
+        )
+        env = dict(self.env, AGENT_HUB_HEAVY_TEST_DIR=str(hook_root),
+                   AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S='1')
+        env.pop('AGENT_HUB_HEAVY_TEST_HELD', None)
+        env.pop('CI', None)
+        child = subprocess.Popen([sys.executable, '-c', code], env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True)
+        self.children.append(child)
+        stdout, stderr = child.communicate(timeout=5)
+        self.assertEqual(child.returncode, -signal.SIGTERM,
+                         (stdout.decode(errors='replace'), stderr.decode(errors='replace')))
+        self.assertIn(b'stopping this test process', stderr)
 
     def test_timeout_and_exit_status(self):
         timed = self.start('timeout', wait='0')
@@ -353,6 +391,7 @@ class QueueCostTests(unittest.TestCase):
                      mock.patch.object(self.module.random, 'uniform', return_value=1.5):
                     self.assertEqual(self.module.main(), 3)
                 self.assertIn('(normal ticket 1000001)', diagnostics.getvalue())
+                self.assertIn('queue position 41/41', diagnostics.getvalue())
                 self.assertNotIn('admitted', diagnostics.getvalue())
                 # Registration probes 40 active leases once; four retries plus
                 # the deadline probe touch just the head, not all 40 tickets.

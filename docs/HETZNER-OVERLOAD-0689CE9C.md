@@ -24,6 +24,17 @@ Python to a disposable HOME and removing live credential selectors.
 Use the same slot count and directory across participating sessions; a private
 lock directory is appropriate only for isolated wrapper tests.
 
+Each admitted command has a 1800-second wall-clock limit by default. Configure
+it with `--run-timeout SECONDS` or `AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S` (1 to
+86400 seconds). On expiry the wrapper sends TERM to the command's process group,
+waits 10 seconds, then sends KILL; the slot stays held through that cleanup.
+Timeout exits 124 and is a test failure, not a capacity HOLD. The run cap does
+not change the shared slot count. Queue wait and command runtime are separate
+budgets (`--wait` and `--run-timeout`).
+Direct Vitest/pytest hooks watch their holder process and terminate the test
+process if the holder reaches its cap, so the suite cannot continue after its
+slot is released.
+
 Host dispatch samples the live one-minute load before admission preparation
 and again immediately before claim. Above 1.5 times the core count, offers are
 held for retry without rejecting them or touching running sessions. This counts
@@ -86,6 +97,9 @@ priority for every phase; the existing priority environment variable also works.
 exact-source pre-push verification, not routine development runs. The shared
 host user can set this environment variable: it is scheduling policy, not an
 authorization boundary. Admissions log the requested class and ticket number.
+Waiting diagnostics include the current queue position and waiter count (for
+example, `queue position 3/8`); this snapshot can change as normal tickets age
+into the final class.
 After 300 seconds a normal waiter joins the final class with its original
 sequence, preventing later final arrivals from overtaking it indefinitely.
 Priority and aging never preempt a running suite or increase the slot cap.
@@ -99,8 +113,9 @@ other sessions to migrate them. Prototype tickets left by an earlier local
 candidate are not read or deleted by the indexed scheduler.
 
 TERM/INT sent only to the wrapper retain the running command's slot until it
-exits. To stop an owned test run, signal its owning process group/session using
-its normal lifecycle controls. An uncatchable wrapper-only crash releases its
+exits; the wrapper forwards shutdown to the command group and escalates after
+the 10-second grace period. The bounded command run timeout applies the same
+cleanup to hung commands and ordinary descendants. An uncatchable wrapper-only crash releases its
 descriptors, so commands that close inherited descriptors must also remain
 inside their owning session's lifecycle containment. Supported Vitest/pytest
 hooks use `AGENT_HUB_HEAVY_TEST_HELD=1` to avoid requesting a second slot.

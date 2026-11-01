@@ -51,7 +51,9 @@ Heavy suites share a host-wide cap of two runs per user. The full runner acquire
 automatically. `scripts/test-affected-local.sh` is the pre-push lane and takes its own slot. Wrap ad-hoc Vitest/workerd (including `npm test`), Playwright and
 full pytest commands with `scripts/capped-test-run.sh -- <command>`; use the
 same `AGENT_HUB_HEAVY_TEST_DIR` and `AGENT_HUB_HEAVY_TEST_SLOTS` across sessions.
-Defaults are `/run/user/<uid>/agent-hub/heavy-test` and two slots. Never unlink
+Defaults are `/run/user/<uid>/agent-hub/heavy-test`, two slots, and a 1800-second
+wall-clock cap per admitted command (`--run-timeout` or
+`AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S` overrides the run cap). Never unlink
 live lock files or kill holders. See [heavy test admission](docs/HETZNER-OVERLOAD-0689CE9C.md).
 
 Before installing dependencies in a fresh checkout, run
