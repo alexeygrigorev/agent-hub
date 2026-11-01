@@ -82,6 +82,37 @@ class TestIntakeCli(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
+    def test_oversized_page_reduces_limit_preserving_snapshot_cursor_and_records(self):
+        from urllib.parse import parse_qs, urlparse
+        first = {'items': [{'id': 'a', 'history': ['complete-a']}], 'next': 'a', 'snapshot_version': 7,
+                 'authorization_valid_until': 12345, 'total': 2, 'effective_limit': 100}
+        last = dict(first, items=[{'id': 'b', 'history': ['complete-b']}], next=None, effective_limit=50)
+        too_large = intake.IntakeResponseTooLarge('Intake response error: Response too large')
+        with patch.object(intake, 'request', side_effect=[first, too_large, last]) as transport:
+            result = intake.list_all({'limit': 100, 'all': 'true'})
+        self.assertEqual([t['history'] for t in result['items']], [['complete-a'], ['complete-b']])
+        self.assertEqual(result['effective_limit'], 50)
+        self.assertTrue(result['page_size_reduced'])
+        retry = parse_qs(urlparse(transport.call_args_list[2].args[1]).query)
+        self.assertEqual(retry, {'limit': ['50'], 'all': ['true'], 'after': ['a'], 'revision': ['7'],
+                                 'authorization_valid_until': ['12345']})
+        with patch.object(intake, 'request', side_effect=[too_large, dict(last, items=[{'id': 'a'}, {'id': 'b'}])]) as transport:
+            self.assertEqual(intake.list_all({'limit': 100})['total'], 2)
+            self.assertIn('limit=50', transport.call_args.args[1])
+        for limit, failure in [(1, too_large), (100, intake.IntakeTransportError('connection interrupted')),
+                               (100, intake.StaleSnapshot('Snapshot changed'))]:
+            with patch.object(intake, 'request', side_effect=failure) as transport:
+                with self.assertRaises(type(failure)):
+                    intake.list_all({'limit': limit})
+                self.assertEqual(transport.call_count, 1)
+
+    def test_response_cap_failure_is_typed_without_increasing_transport_cap(self):
+        with patch.object(intake.config, 'load_config', return_value={'base_url': 'https://fixture.invalid'}), \
+             patch.dict(os.environ, {'HUB_URL': 'https://fixture.invalid', 'HUB_TOKEN': 'fixture'}), \
+             patch.object(intake.api, 'safe_http_json', side_effect=RuntimeError('Response too large')):
+            with self.assertRaises(intake.IntakeResponseTooLarge):
+                intake.request('GET', '/api/intake/tasks?limit=100')
+
     def test_forgotten(self):
         with patch.object(intake, 'request', return_value={'items': [], 'forgotten_count': 0}) as transport:
             code, out, error = self.run_cli('intake', 'forgotten', '--project', 'demo')

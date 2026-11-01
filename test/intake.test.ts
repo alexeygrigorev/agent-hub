@@ -80,7 +80,8 @@ describe('private durable intake HTTP/SQLite', () => {
       const queries: string[] = []; const plans: any[] = [];
       const sql = { exec: (query: string, ...args: any[]) => {
         queries.push(query);
-        if (/^SELECT id FROM intake_export /.test(query)) plans.push(...h.sql.exec('EXPLAIN QUERY PLAN ' + query, ...args).toArray());
+        if (args.length > 100) throw new Error('SQL binding limit exceeded');
+        if (/^SELECT .* FROM intake_export(?:_counts|_totals)?(?: WHERE| INDEXED|$)/.test(query)) plans.push(...h.sql.exec('EXPLAIN QUERY PLAN ' + query, ...args).toArray());
         return h.sql.exec(query, ...args);
       } };
       const service = new IntakeService(sql as any);
@@ -114,6 +115,19 @@ describe('private durable intake HTTP/SQLite', () => {
         const selected = (service as any).read(new URL('https://hub.test/api/intake/tasks?limit=25&' + query), principal);
         expect(selected.total).toBe(expectedTotal);
         expect(selected.items).toHaveLength(Math.min(25, expectedTotal));
+        expect(JSON.stringify(plans)).not.toMatch(/MULTI-INDEX OR|TEMP B-TREE/);
+      }
+      const taskGrants = Array.from({ length: 100 }, (_, i) => ({ scope: 'task', target: 'export-' + String(i).padStart(4, '0') }));
+      const projectGrants = Array.from({ length: 101 }, (_, i) => ({ scope: 'project', target: i === 0 ? 'export-fixture' : 'absent-' + i }));
+      for (const grants of [taskGrants, projectGrants, [...taskGrants, ...projectGrants]]) {
+        plans.length = 0;
+        const principal = { admin: false, grants };
+        const result = (service as any).read(new URL('https://hub.test/api/intake/summary'), principal);
+        expect(result.total).toBe(grants === taskGrants ? 100 : 1083);
+        expect(result.recent).toHaveLength(5);
+        const selected = (service as any).read(new URL('https://hub.test/api/intake/tasks?all=true&limit=25'), principal);
+        expect(selected.total).toBe(result.total); expect(selected.items).toHaveLength(25);
+        expect(new Set(selected.items.map((t: any) => t.id)).size).toBe(25);
         expect(JSON.stringify(plans)).not.toMatch(/MULTI-INDEX OR|TEMP B-TREE/);
       }
       const plan = h.sql.exec('EXPLAIN QUERY PLAN SELECT data FROM intake_export ORDER BY updated_at DESC,id LIMIT 5').toArray();
