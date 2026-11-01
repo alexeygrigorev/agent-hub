@@ -942,6 +942,8 @@ def test_managed_home_rebootstrap_reapplies_state_hooks(tmp_path, monkeypatch):
 
 
 def test_set_toml_top_level_keys():
+    import tomllib
+
     # 1. Empty content
     res1 = p.set_toml_top_level_keys("", {"approval_policy": "never", "sandbox_mode": "danger-full-access"})
     assert 'approval_policy = "never"' in res1
@@ -966,6 +968,70 @@ def test_set_toml_top_level_keys():
     assert 'approval_policy = "on-request"' not in res3
     assert 'sandbox_mode = "workspace-write"' not in res3
     assert 'model = "gpt-5"' in res3
+
+    typed = p.set_toml_top_level_keys('approval_policy = "never"\n', {
+        'check_for_update_on_startup': False,
+    })
+    parsed = tomllib.loads(typed)
+    assert parsed['check_for_update_on_startup'] is False
+    assert parsed['approval_policy'] == 'never'
+
+    array_tables = ('[[profiles]]\nname = "one"\n\n[[profiles]]\nname = "two"\n')
+    array_update = p.set_toml_top_level_keys(array_tables, {'check_for_update_on_startup': False})
+    assert tomllib.loads(array_update) == {
+        'check_for_update_on_startup': False,
+        'profiles': [{'name': 'one'}, {'name': 'two'}],
+    }
+
+    windows_path = p.set_toml_top_level_keys('model = "gpt-5"\n', {
+        'model': r'C:\Users\test',
+    })
+    assert tomllib.loads(windows_path)['model'] == r'C:\Users\test'
+
+
+@pytest.mark.parametrize(('provider', 'config_path'), [
+    ('codex', '.codex/config.toml'),
+    ('zai', '.zcodex/config.toml'),
+])
+def test_managed_codex_config_keeps_update_check_boolean_type(tmp_path, provider, config_path):
+    import tomllib
+
+    home = tmp_path / 'home'
+    config = home / config_path
+    config.parent.mkdir(parents=True, mode=0o700)
+    home.chmod(0o700)
+    # Reconcile a previously string-valued setting and keep the disable flag
+    # boolean on subsequent syncs.
+    config.write_text('check_for_update_on_startup = "true"\n')
+
+    for _ in range(2):
+        p.install_managed_engine_permissions({'provider': provider}, home)
+        parsed = tomllib.loads(config.read_text())
+        assert parsed['check_for_update_on_startup'] is False
+        assert parsed['approval_policy'] == 'never'
+        assert parsed['sandbox_mode'] == 'danger-full-access'
+
+
+@pytest.mark.parametrize(('provider', 'config_path'), [
+    ('codex', '.codex/config.toml'),
+    ('zai', '.zcodex/config.toml'),
+])
+def test_rollout_self_update_disable_writes_and_verifies_toml_boolean(tmp_path, provider, config_path):
+    import tomllib
+    from agent_hub_host import engine_rollout
+
+    home = tmp_path / 'home'
+    home.mkdir(mode=0o700)
+    config = home / config_path
+    config.parent.mkdir(mode=0o700)
+    config.write_text('check_for_update_on_startup = "false"\n')
+    config.chmod(0o600)
+
+    assert not engine_rollout.self_update_disabled_ok(home, provider)
+    engine_rollout.ensure_self_update_disabled(home, provider)
+    parsed = tomllib.loads(config.read_text())
+    assert parsed['check_for_update_on_startup'] is False
+    assert engine_rollout.self_update_disabled_ok(home, provider)
 
 
 def test_provision_managed_home_permissions_for_all_engines(tmp_path, monkeypatch):
@@ -1307,3 +1373,75 @@ def test_failed_reinstall_keeps_offered_bundle_dir_and_logs_type_only_6cbb862a(t
         desired[:] = [orin]  # Hub withdrew the account: only then is the dir removed
         assert p.sync(request)['profiles'] == ['hub-codex-orin']
     assert not shared_dir.exists()
+
+
+def test_codex_config_merge_is_idempotent_across_crlf_and_quoting(tmp_path):
+    import tomllib
+
+    hooks = tmp_path / 'hooks.json'
+    paths = ['/a/b', '/c']
+    # Codex rewrote the file: CRLF endings and a literal-quoted table.
+    base = ('approval_policy = "never"\r\n\r\n[projects."/a/b"]\r\ntrust_level = "untrusted"\r\n'
+            '\r\n[projects.\'/c\']\r\ntrust_level = "trusted"\r\n')
+
+    def run(text):
+        out = p.ensure_toml_trusted_projects(text, paths)
+        return p.ensure_toml_trusted_hooks(out, hooks)
+
+    once = run(base)
+    assert run(once) == once
+    data = tomllib.loads(once)
+    assert data['projects'][str(Path('/a/b').resolve())]['trust_level'] == 'trusted'
+    assert len(data['hooks']['state']) == len(p.KNOWN_HOOK_HASHES)
+
+
+def test_repair_toml_duplicate_tables_fixes_already_broken_config():
+    import tomllib
+
+    broken = ('[projects."C:\\\\x"]\ntrust_level = "trusted"\n\n[hooks.state]\n\n[tui]\na = 1\n\n'
+              '[projects."C:\\\\x"]\ntrust_level = "trusted"\n\n[hooks.state]\n')
+    with pytest.raises(tomllib.TOMLDecodeError):
+        tomllib.loads(broken)
+    fixed = p.repair_toml_duplicate_tables(broken.replace('\n', '\r\n'))
+    assert '\r' not in fixed
+    assert tomllib.loads(fixed) == {
+        'projects': {'C:\\x': {'trust_level': 'trusted'}},
+        'hooks': {'state': {}},
+        'tui': {'a': 1},
+    }
+
+
+@pytest.mark.parametrize('multiline', [
+    'description = """\n[tui]\nmodel = "inside string"\ncheck_for_update_on_startup = "false"\nnot_a_table = true\n"""\n',
+    "description = '''\n[tui]\nmodel = \"inside string\"\ncheck_for_update_on_startup = \"false\"\nnot_a_table = true\n'''\n",
+])
+def test_repair_toml_duplicate_tables_ignores_headers_inside_multiline_strings(multiline):
+    import tomllib
+
+    content = multiline + 'model = "gpt-5"\n\n[tui]\nshow_tooltips = false\n'
+    repaired = p.repair_toml_duplicate_tables(content)
+    parsed = tomllib.loads(repaired)
+    expected_description = '[tui]\nmodel = "inside string"\ncheck_for_update_on_startup = "false"\nnot_a_table = true\n'
+    assert parsed['description'] == expected_description
+    assert parsed['model'] == 'gpt-5'
+    assert parsed['tui'] == {'show_tooltips': False}
+
+    updated = p.set_toml_top_level_keys(content, {
+        'model': r'C:\Users\test',
+        'check_for_update_on_startup': False,
+    })
+    updated_parsed = tomllib.loads(updated)
+    assert updated_parsed['description'] == parsed['description']
+    assert updated_parsed['model'] == r'C:\Users\test'
+    assert updated_parsed['tui'] == parsed['tui']
+
+
+def test_set_toml_top_level_keys_replaces_multiline_value():
+    import tomllib
+
+    source = 'check_for_update_on_startup = """false\nlegacy detail\n"""\nmodel = "gpt-5"\n'
+    updated = p.set_toml_top_level_keys(source, {'check_for_update_on_startup': False})
+    assert tomllib.loads(updated) == {
+        'check_for_update_on_startup': False,
+        'model': 'gpt-5',
+    }

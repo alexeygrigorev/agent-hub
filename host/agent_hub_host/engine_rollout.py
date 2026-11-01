@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 
 ENGINE_ORDER = ('codex', 'claude', 'opencode', 'agy', 'zcodex')
@@ -208,7 +209,7 @@ def ensure_self_update_disabled(home=None, provider: str | None = None) -> list[
         except Exception:
             return
         text = '' if current is None else current.decode('utf-8', 'replace')
-        updated = provisioning.set_toml_top_level_keys(text, {'check_for_update_on_startup': 'false'})
+        updated = provisioning.set_toml_top_level_keys(text, {'check_for_update_on_startup': False})
         if current is None or updated.encode() != current:
             provisioning.private_fs.atomic_write(path, updated.encode('utf-8'), 131072, engine_owned=True)
             changed.append(str(path))
@@ -253,11 +254,11 @@ def self_update_disabled_ok(home, provider: str) -> bool:
     home = Path(home)
     try:
         if provider == 'codex':
-            raw = open(home / '.codex' / 'config.toml', 'rb').read().decode('utf-8', 'replace')
-            return 'check_for_update_on_startup' in raw and '"false"' in raw.replace("'", '"').lower() or 'false' in raw.lower()
+            config = tomllib.loads((home / '.codex' / 'config.toml').read_text(encoding='utf-8'))
+            return config.get('check_for_update_on_startup') is False
         if provider == 'zai':
-            raw = open(home / '.zcodex' / 'config.toml', 'rb').read().decode('utf-8', 'replace')
-            return 'check_for_update_on_startup' in raw
+            config = tomllib.loads((home / '.zcodex' / 'config.toml').read_text(encoding='utf-8'))
+            return config.get('check_for_update_on_startup') is False
         if provider == 'claude':
             raw = open(home / '.claude' / 'settings.json', 'rb').read().decode('utf-8', 'replace')
             return '"autoUpdates"' in raw and 'false' in raw.lower()

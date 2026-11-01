@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import zipfile
 
 from . import bus, config, hook_command, private_fs
@@ -309,25 +310,24 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                 pass
 
 
-def set_toml_top_level_keys(content: str, keys: dict[str, str]) -> str:
-    """Ensure top-level string keys are set in a TOML string without disrupting existing tables."""
-    lines = content.splitlines(keepends=True)
-    split_idx = len(lines)
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith('[') and not stripped.startswith('#'):
-            split_idx = i
-            break
-
-    header = ''.join(lines[:split_idx])
-    rest = ''.join(lines[split_idx:])
+def set_toml_top_level_keys(content: str, keys: dict[str, str | bool]) -> str:
+    """Set top-level TOML strings and booleans without disrupting existing tables."""
+    content = repair_toml_duplicate_tables(content)
+    sections = _toml_sections(content)
+    header = sections[0][1]
+    rest = ''.join(section for _, section in sections[1:])
 
     for key, val in keys.items():
         pattern = re.compile(r'^[ \t]*' + re.escape(key) + r'[ \t]*=.*$', re.M)
-        new_entry = f'{key} = "{val}"'
-        if pattern.search(header):
-            header = pattern.sub(new_entry, header)
+        if isinstance(val, bool):
+            toml_value = 'true' if val else 'false'
+        elif isinstance(val, str):
+            toml_value = json.dumps(val, ensure_ascii=False)
         else:
+            raise TypeError(f'unsupported TOML top-level value for {key}: {type(val).__name__}')
+        new_entry = f'{key} = {toml_value}'
+        header, replaced = _replace_toml_header_key(header, pattern, new_entry)
+        if not replaced:
             if header and not header.endswith('\n'):
                 header += '\n'
             header = header + new_entry + '\n'
@@ -338,43 +338,163 @@ def set_toml_top_level_keys(content: str, keys: dict[str, str]) -> str:
     return header.rstrip('\n') + '\n'
 
 
-def collapse_duplicate_toml_tables(content: str, prefix: str) -> str:
-    """Drop later duplicates of a ``<prefix>...]`` table header and normalize CRLF.
+def _toml_header_path(line: str):
+    """Dotted key path of a ``[table]`` header in any TOML quoting style, else None."""
+    stripped = line.strip()
+    if not stripped.startswith('[') or stripped.startswith('[['):
+        return None
+    try:
+        node = tomllib.loads(stripped + '\n')
+    except tomllib.TOMLDecodeError:
+        return None
+    path = []
+    while isinstance(node, dict) and len(node) == 1:
+        (key, node), = node.items()
+        path.append(key)
+    return tuple(path) if not node else None
 
-    The engine CLI replaces its config.toml on launch and writes CRLF on
-    Windows; the line-anchored ``[ \\t]*$`` matches below do not match a
-    trailing ``\\r``, so an earlier run re-appended tables that were already
-    present. TOML forbids duplicate table headers and the engine then
-    refuses the whole file (codex: ``duplicate key`` at startup, exit 1
-    with stderr only — intake 61bba72f). Keeping the first occurrence heals
-    files that already carry duplicates, and the CRLF normalization keeps
-    the recurring rewrite from creating new ones.
+
+def _toml_array_table_header(line: str) -> bool:
+    """Whether a line is a valid ``[[array-of-tables]]`` header."""
+    stripped = line.strip()
+    if not stripped.startswith('[['):
+        return False
+    try:
+        node = tomllib.loads(stripped + '\n')
+    except tomllib.TOMLDecodeError:
+        return False
+    while isinstance(node, dict) and len(node) == 1:
+        (key, node), = node.items()
+    return isinstance(node, list) and len(node) == 1 and isinstance(node[0], dict)
+
+
+def _toml_sections(content: str):
+    """Split content at table headers, ignoring header-like multiline-string text."""
+    sections = [[None, '']]
+    multiline: str | None = None
+    for line in content.splitlines(keepends=True):
+        path = _toml_header_path(line) if multiline is None else None
+        array_header = path is None and multiline is None and _toml_array_table_header(line)
+        if path is not None or array_header:
+            sections.append([path, line])
+        else:
+            sections[-1][1] += line
+        multiline = _toml_multiline_state(line, multiline)
+    return sections
+
+
+def _toml_multiline_state(line: str, state: str | None) -> str | None:
+    """Track TOML multiline strings so their contents cannot look like headers."""
+    i = 0
+    while i < len(line):
+        if state == 'basic':
+            if line[i] == '\\':
+                # Escaped quotes cannot close a multiline basic string.
+                i += 2
+            elif line.startswith('"""', i):
+                state = None
+                i += 3
+            else:
+                i += 1
+            continue
+        if state == 'literal':
+            if line.startswith("'''", i):
+                state = None
+                i += 3
+            else:
+                i += 1
+            continue
+
+        char = line[i]
+        if char == '#':
+            break
+        if char == '"':
+            if line.startswith('"""', i):
+                state = 'basic'
+                i += 3
+            else:
+                # Skip a single-line basic string, honoring escapes so quote
+                # characters inside it cannot start a multiline string.
+                i += 1
+                while i < len(line):
+                    if line[i] == '\\':
+                        i += 2
+                    elif line[i] == '"':
+                        i += 1
+                        break
+                    else:
+                        i += 1
+            continue
+        if char == "'":
+            if line.startswith("'''", i):
+                state = 'literal'
+                i += 3
+            else:
+                i += 1
+                while i < len(line) and line[i] != "'":
+                    i += 1
+                i += 1
+            continue
+        i += 1
+    return state
+
+
+def _replace_toml_header_key(header: str, pattern: re.Pattern, new_entry: str) -> tuple[str, bool]:
+    """Replace matching top-level assignments outside multiline strings."""
+    lines = header.splitlines(keepends=True)
+    state: str | None = None
+    matches: list[int] = []
+    for index, line in enumerate(lines):
+        if state is None and pattern.match(line):
+            matches.append(index)
+        state = _toml_multiline_state(line, state)
+
+    # Apply from the end so removing a replaced multiline value's continuation
+    # lines cannot shift any earlier match.
+    for index in reversed(matches):
+        original = lines[index]
+        state = _toml_multiline_state(original, None)
+        end = index + 1
+        while state is not None and end < len(lines):
+            state = _toml_multiline_state(lines[end], state)
+            end += 1
+        if end > index + 1:
+            del lines[index + 1:end]
+        newline = '\n' if original.endswith('\n') else ''
+        lines[index] = new_entry + newline
+    return ''.join(lines), bool(matches)
+
+
+def repair_toml_duplicate_tables(content: str, prefix: str | None = None) -> str:
+    """Normalize EOLs and drop repeated TOML tables, keeping the first of each.
+
+    Codex rewrites config.toml with CRLF and its own key quoting. Parsing each
+    header makes duplicate detection independent of EOLs and quote style. If
+    prefix is supplied, only matching table headers are collapsed.
     """
     content = content.replace('\r\n', '\n')
-    header = re.compile(r'^[ \t]*' + re.escape(prefix) + r'.*?\][ \t]*$', re.M)
-    seen: set[str] = set()
-    spans: list[tuple[int, int]] = []
-    for match in header.finditer(content):
-        if match.group().strip() in seen:
-            nxt = re.search(r'^[ \t]*\[', content[match.end():], re.M)
-            end = match.end() + nxt.start() if nxt else len(content)
-            spans.append((match.start(), end))
-        else:
-            seen.add(match.group().strip())
-    if not spans:
-        return content
+    seen: set[tuple] = set()
     out: list[str] = []
-    pos = 0
-    for start, end in spans:
-        out.append(content[pos:start])
-        pos = end
-    out.append(content[pos:])
+    for path, section in _toml_sections(content):
+        header = section.splitlines()[0].strip() if section else ''
+        if path is None or (prefix is not None and not header.startswith(prefix)):
+            out.append(section)
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(section)
     return ''.join(out)
+
+
+def collapse_duplicate_toml_tables(content: str, prefix: str) -> str:
+    """Compatibility wrapper for the TOML-aware table repair helper."""
+    return repair_toml_duplicate_tables(content, prefix=prefix)
 
 
 def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
     """Ensure paths have [projects."<path>"] trust_level = "trusted" in TOML content."""
-    res = collapse_duplicate_toml_tables(content, '[projects.')
+    res = repair_toml_duplicate_tables(content)
     for p in paths:
         if not p:
             continue
@@ -382,21 +502,20 @@ def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
             p_str = str(Path(p).resolve())
         except Exception:
             p_str = str(p)
-        pattern = re.compile(r'^[ \t]*\[projects\.' + re.escape(json.dumps(p_str)) + r'\][ \t]*$', re.M)
-        alt_pattern = re.compile(r'^[ \t]*\[projects\."' + re.escape(p_str) + r'"\][ \t]*$', re.M)
-        existing = pattern.search(res) or alt_pattern.search(res)
-        if existing:
+        want = ('projects', p_str)
+        sections = _toml_sections(res)
+        idx = next((i for i, (path, _) in enumerate(sections) if path == want), None)
+        if idx is not None:
             # An existing table may explicitly be untrusted or lack the key.
             # Upgrade only this authorized path, retaining sibling settings.
-            next_table = re.search(r'^[ \t]*\[', res[existing.end():], re.M)
-            end = existing.end() + next_table.start() if next_table else len(res)
-            section = res[existing.end():end]
+            header, _, section = sections[idx][1].partition('\n')
             trust = re.compile(r'^[ \t]*trust_level[ \t]*=.*$', re.M)
             if trust.search(section):
                 section = trust.sub('trust_level = "trusted"', section, count=1)
             else:
-                section = '\ntrust_level = "trusted"\n' + section.lstrip('\n')
-            res = res[:existing.end()] + section + res[end:]
+                section = 'trust_level = "trusted"\n' + section
+            sections[idx][1] = header + '\n' + section
+            res = ''.join(t for _, t in sections)
             continue
         if res and not res.endswith('\n'):
             res += '\n'
@@ -416,18 +535,15 @@ KNOWN_HOOK_HASHES = {
 
 def ensure_toml_trusted_hooks(content: str, hooks_file: Path) -> str:
     """Ensure installed hooks in hooks_file are trusted in TOML content to prevent hook review prompts."""
-    res = collapse_duplicate_toml_tables(content, '[hooks.state.')
+    res = repair_toml_duplicate_tables(content)
     try:
         h_str = str(hooks_file.resolve())
     except Exception:
         h_str = str(hooks_file)
+    present = {path for path, _ in _toml_sections(res) if path}
     for suffix, hash_val in KNOWN_HOOK_HASHES.items():
         key = f'{h_str}:{suffix}'
-        pattern = re.compile(r'^[ \t]*\[hooks\.state\.' + re.escape(json.dumps(key)) + r'\][ \t]*$', re.M)
-        if pattern.search(res):
-            continue
-        alt_pattern = re.compile(r'^[ \t]*\[hooks\.state\."' + re.escape(key) + r'"\][ \t]*$', re.M)
-        if alt_pattern.search(res):
+        if ('hooks', 'state', key) in present:
             continue
         if res and not res.endswith('\n'):
             res += '\n'
@@ -532,7 +648,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
 
     Reconciles on every bootstrap/re-bootstrap and execution to match operator config:
     - codex / zai: approval_policy = "never", sandbox_mode = "danger-full-access",
-      check_for_update_on_startup = "false" in .codex/.zcodex config.toml
+      check_for_update_on_startup = false in .codex/.zcodex config.toml
       plus [projects."<path>"] trust_level = "trusted" for workspaces and operator roots,
       and [hooks.state."..."] trusted_hash to bypass hook review prompts.
     - claude: skipDangerousModePermissionPrompt = True, autoUpdates = False
@@ -568,7 +684,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
-                'check_for_update_on_startup': 'false',
+                'check_for_update_on_startup': False,
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, hooks_file)
@@ -582,7 +698,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
-                'check_for_update_on_startup': 'false',
+                'check_for_update_on_startup': False,
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, zhooks_file)
