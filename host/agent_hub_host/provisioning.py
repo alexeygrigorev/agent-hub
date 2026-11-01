@@ -959,15 +959,45 @@ def profile_path():
 
 
 def module_command(handler, label, managed_dir=None):
-    prefix = ''
+    # Profiles run outside the launcher environment, whose .cmd is what puts
+    # <release>/package/host on PYTHONPATH (intake 608a2f9a): without an
+    # embedded path the -c import dies with ModuleNotFoundError on Windows.
+    prefix = 'import sys; sys.path.insert(0, ' + repr(str(Path(__file__).resolve().parents[1])) + '); '
     if Path(sys.argv[0]).is_file() and zipfile.is_zipfile(sys.argv[0]):
-        prefix = 'import sys; sys.path.insert(0, ' + repr(str(Path(sys.argv[0]).resolve())) + '); '
+        # The frozen zipapp stays ahead of the checkout copy on sys.path.
+        prefix += 'sys.path.insert(0, ' + repr(str(Path(sys.argv[0]).resolve())) + '); '
     m_dir = str(managed_dir or root())
     prefix += 'import os; os.environ["AGENT_HUB_MANAGED_DIR"] = ' + repr(m_dir) + '; '
     return [sys.executable, '-c', prefix + 'from agent_hub_host.provisioning import ' + handler + '; ' + handler + '()', label]
 
 
-def profiles(bundles, path=None):
+def _opencode_engine_pin(bundles, is_windows=None):
+    """argv pin for aplexer's [engines.opencode], or None to leave it alone.
+
+    On Windows aplexer's built-in bare `opencode` resolves to the npm shim,
+    which CreateProcess cannot exec (a task run --engine opencode exits 127,
+    intake 608a2f9a); the managed 'go' install ships the real opencode.exe.
+    The pin is recomputed on every sync because the revision dir changes per
+    release. Linux engines resolve natively, so they are left untouched.
+    """
+    if is_windows is None:
+        is_windows = (os.name == 'nt')
+    if not is_windows:
+        return None
+    for b in bundles:
+        if b.get('provider') != 'go':
+            continue
+        dest = root() / (b['label'] + '-' + b['revision'])
+        try:
+            executable = executable_path(b, dest, is_windows=True)
+        except Exception:
+            continue
+        if executable.is_file():
+            return [str(executable)]
+    return None
+
+
+def profiles(bundles, path=None, is_windows=None):
     """Replace only our marked block; refuse a collision with operator profiles."""
     path = Path(path) if path else profile_path()
     # aplexer's ordinary TOML may originally be 0644. Tighten only this owned file
@@ -1016,6 +1046,13 @@ def profiles(bundles, path=None):
         # Only public label and paths go into native registry command metadata.
         command = module_command('execute', b['label'])
         block += '\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
+    # After our block is stripped, any [engines.opencode] left in the file is
+    # operator-owned and wins over the managed pin (duplicate tables would not
+    # even parse for aplexer).
+    if not re.search(r'(?m)^\s*\[engines\.opencode\]\s*$', text):
+        pin = _opencode_engine_pin(bundles, is_windows=is_windows)
+        if pin:
+            block += '\n[engines.opencode]\ncommand = ' + json.dumps(pin) + '\n'
     private_fs.atomic_write(path, (text.rstrip() + '\n\n' + block + END).encode(), 262144)
 
 
@@ -1262,6 +1299,49 @@ def engine_argv(bundle, dest, is_windows=None):
     return [str(executable)]
 
 
+def _is_windows():
+    # Seam for tests: pathlib.Path switches flavor with os.name on 3.12, so
+    # tests patch this predicate instead of the os module.
+    return os.name == 'nt'
+
+
+def _fetch_checksummed_zcodex_asset(tag, asset, cache_dir, tmp_download):
+    """Download one codex-zcode release asset (cache first) and return the
+    verified local path. Any checksum or download failure becomes a generic
+    install failure; details never reach output."""
+    url = f'https://github.com/alexeygrigorev/codex-zcode/releases/download/{tag}/{asset}'
+    sums_url = f'https://github.com/alexeygrigorev/codex-zcode/releases/download/{tag}/SHA256SUMS'
+    cache_file = cache_dir / asset
+    try:
+        tmp_download.mkdir(parents=True, exist_ok=True)
+        target = cache_file if cache_file.is_file() else tmp_download / asset
+        sums_file = tmp_download / 'SHA256SUMS'
+        subprocess.run(['curl', '-fSL', sums_url, '-o', str(sums_file)],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
+        expected_sha = None
+        for line in sums_file.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].strip().lstrip('*') == asset:
+                expected_sha = parts[0].strip()
+                break
+            elif asset in line and len(parts) >= 1:
+                expected_sha = parts[0].strip()
+                break
+        if not expected_sha or len(expected_sha) != 64 or not all(c in '0123456789abcdefABCDEF' for c in expected_sha):
+            raise ValueError(f'Missing or malformed SHA256 checksum for {asset}')
+        if not target.is_file():
+            subprocess.run(['curl', '-fSL', url, '-o', str(target)],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+        import hashlib
+        with open(target, 'rb') as f:
+            actual_sha = hashlib.sha256(f.read()).hexdigest()
+        if actual_sha.lower() != expected_sha.lower():
+            raise ValueError(f'Checksum mismatch for {asset}')
+        return target
+    except (subprocess.SubprocessError, OSError, ValueError):
+        raise ValueError('Managed engine installation failed') from None
+
+
 def install(bundle, request=None):
     from . import credentials
     validate(bundle)
@@ -1291,7 +1371,7 @@ def install(bundle, request=None):
         npm_config_cache=str(root() / 'npm-cache'),
     )
     if bundle['provider'] == 'zai':
-        bin_name = 'engine/bin/zcodex.cmd' if os.name == 'nt' else 'engine/bin/zcodex'
+        bin_name = 'engine/bin/zcodex.cmd' if _is_windows() else 'engine/bin/zcodex'
         wrapper = dest / bin_name
         with private_fs.parent(wrapper, create=True):
             pass
@@ -1310,50 +1390,40 @@ def install(bundle, request=None):
         else:
             system = sys.platform
             cpu = platform.machine().lower()
-            if system != 'linux' or cpu not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
+            if system != 'linux' and not _is_windows():
                 raise ValueError('Native zcodex platform unsupported')
-            arch = 'amd64' if cpu in ('x86_64', 'amd64') else 'arm64'
-            asset = f'zcodex-linux-{arch}.tar.zst'
+            if _is_windows() and cpu not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
+                raise ValueError('Native zcodex platform unsupported')
+            if system == 'linux' and cpu not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
+                raise ValueError('Native zcodex platform unsupported')
             version = bundle['version']
             tag = f'zcode-3.14.5-codex-{version}' if not version.startswith('zcode-') else version
-            url = f'https://github.com/alexeygrigorev/codex-zcode/releases/download/{tag}/{asset}'
-            cache_file = root() / 'zcodex-cache' / asset
             tmp_download = dest / 'engine/tmp-zcodex'
             try:
-                tmp_download.mkdir(parents=True, exist_ok=True)
-                target_tar = cache_file if cache_file.is_file() else tmp_download / asset
-                sums_url = f'https://github.com/alexeygrigorev/codex-zcode/releases/download/{tag}/SHA256SUMS'
-                sums_file = tmp_download / 'SHA256SUMS'
-                subprocess.run(['curl', '-fSL', sums_url, '-o', str(sums_file)],
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
-                expected_sha = None
-                for line in sums_file.read_text().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1].strip().lstrip('*') == asset:
-                        expected_sha = parts[0].strip()
-                        break
-                    elif asset in line and len(parts) >= 1:
-                        expected_sha = parts[0].strip()
-                        break
-                if not expected_sha or len(expected_sha) != 64 or not all(c in '0123456789abcdefABCDEF' for c in expected_sha):
-                    raise ValueError(f'Missing or malformed SHA256 checksum for {asset}')
-                if not target_tar.is_file():
-                    subprocess.run(['curl', '-fSL', url, '-o', str(target_tar)],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
-                import hashlib
-                with open(target_tar, 'rb') as f:
-                    actual_sha = hashlib.sha256(f.read()).hexdigest()
-                if actual_sha.lower() != expected_sha.lower():
-                    raise ValueError(f'Checksum mismatch for {asset}')
-                subprocess.run(['tar', '--zstd', '-xf', str(target_tar), '-C', str(tmp_download)],
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
-                extracted = tmp_download / f'zcodex-linux-{arch}'
-                if not extracted.is_file():
-                    extracted = tmp_download / 'zcodex'
-                if not extracted.is_file():
-                    raise ValueError('Release asset does not contain zcodex binary')
-                shutil.move(str(extracted), str(wrapper))
-                os.chmod(wrapper, 0o700)
+                if _is_windows():
+                    # No npm/shell fallback: the checksummed release exe lands
+                    # beside the wrapper (intake 608a2f9a, mirrors agy.exe).
+                    arch = 'arm64' if cpu in ('aarch64', 'arm64') else 'amd64'
+                    asset = f'zcodex-windows-{arch}.exe'
+                    verified = _fetch_checksummed_zcodex_asset(tag, asset, root() / 'zcodex-cache', tmp_download)
+                    binary = dest / 'engine' / 'bin' / 'zcodex.exe'
+                    shutil.copyfile(verified, binary)
+                    script = f'@echo off\r\n"{binary}" %*\r\n'
+                    private_fs.atomic_write(wrapper, script.encode(), 4096)
+                    os.chmod(wrapper, 0o700)
+                else:
+                    arch = 'amd64' if cpu in ('x86_64', 'amd64') else 'arm64'
+                    asset = f'zcodex-linux-{arch}.tar.zst'
+                    verified = _fetch_checksummed_zcodex_asset(tag, asset, root() / 'zcodex-cache', tmp_download)
+                    subprocess.run(['tar', '--zstd', '-xf', str(verified), '-C', str(tmp_download)],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
+                    extracted = tmp_download / f'zcodex-linux-{arch}'
+                    if not extracted.is_file():
+                        extracted = tmp_download / 'zcodex'
+                    if not extracted.is_file():
+                        raise ValueError('Release asset does not contain zcodex binary')
+                    shutil.move(str(extracted), str(wrapper))
+                    os.chmod(wrapper, 0o700)
             except (subprocess.SubprocessError, OSError, ValueError):
                 raise ValueError('Managed engine installation failed') from None
             finally:
@@ -2145,6 +2215,7 @@ def add_commands(sub):
     add.add_argument('--token-file', help='Private Claude setup-token output (subscription token, not API billing)')
     add.add_argument('--auth-file', help='Private native auth file; contents never printed')
     add.add_argument('--config-file', help='Optional private native config file')
+    add.add_argument('--adopt', action='store_true', help='Attach the import to an existing unmanaged quota pool with this label (limits are preserved, never reset)')
     add.add_argument('--version', help='Exact pinned engine version (defaults to tested version)')
     list_cmd = commands.add_parser('list')
     list_cmd.add_argument('--view', choices=['worker'], default=None, help='Sanitized read-only verification view (worker sessions): engine, account, host, health, quota state')
@@ -2532,7 +2603,7 @@ def command(args):
         raise ValueError('OpenCode uses host-local device login; credential bundles are unsupported')
     if not args.file and (args.provider == 'go' or (args.provider == 'gemini' and not args.auth_file)):
         bundle['auth_method'] = 'machine-login'
-    return bus._do_request('PUT', '/api/engines/' + bundle['label'], bundle)
+    return bus._do_request('PUT', '/api/engines/' + bundle['label'] + ('?adopt=true' if getattr(args, 'adopt', False) else ''), bundle)
 
 
 if __name__ == '__main__':

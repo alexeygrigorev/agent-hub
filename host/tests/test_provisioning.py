@@ -1445,3 +1445,91 @@ def test_set_toml_top_level_keys_replaces_multiline_value():
         'check_for_update_on_startup': False,
         'model': 'gpt-5',
     }
+def test_profile_command_imports_package_without_launcher_pythonpath(tmp_path, monkeypatch):
+    # Intake 608a2f9a (A): hub-* profiles run outside the launcher .cmd, so the
+    # -c command must carry the package parent itself instead of relying on
+    # PYTHONPATH=<release>/package/host.
+    managed = tmp_path / 'managed'
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR', str(managed))
+    argv = p.module_command('execute', 'test-account', managed_dir=managed)
+    assert argv[0] == sys.executable and argv[1] == '-c' and argv[3] == 'test-account'
+    assert str(Path(p.__file__).resolve().parents[1]) in argv[2]
+    setup = argv[2].split('; from agent_hub_host', 1)[0]
+    env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+    env['PYTHONDONTWRITEBYTECODE'] = '1'
+    probe = subprocess.run([sys.executable, '-c', setup + '; import agent_hub_host.provisioning'],
+                           env=env, capture_output=True, text=True, timeout=60)
+    assert probe.returncode == 0, probe.stderr
+
+
+def _fake_windows_go_install(revision='33333333-3333-4333-8333-333333333333'):
+    dest = p.root() / ('go-account-' + revision)
+    package = dest / 'engine' / 'node_modules' / 'opencode-windows-x64'
+    (package / 'bin').mkdir(parents=True)
+    (package / 'package.json').write_text(json.dumps({'version': '1.0.0'}))
+    executable = package / 'bin' / 'opencode.exe'
+    executable.write_bytes(b'MZ')
+    return dict(label='go-account', provider='go', version='1.0.0', revision=revision,
+                files={}, env={}, args=['--model', 'opencode-go/muse-spark-1.3-contributor']), executable
+
+
+def test_windows_go_bundle_pins_managed_opencode_engine(monkeypatch):
+    # Intake 608a2f9a (B): aplexer's bare `opencode` resolves to the npm shim
+    # on Windows (exit 127); the managed block pins the native binary and the
+    # pin follows each installed revision.
+    bundle, executable = _fake_windows_go_install()
+    p.profiles([bundle], is_windows=True)
+    text = p.profile_path().read_text()
+    assert text.count('[engines.opencode]') == 1
+    assert json.dumps([str(executable)]) in text
+    assert '# BEGIN HUB MANAGED ENGINES' in text
+    p.profiles([])  # bundle withdrawn: the pin goes with the managed block
+    assert '[engines.opencode]' not in p.profile_path().read_text()
+
+
+def test_opencode_engine_pin_absent_off_windows_and_for_operator_tables(monkeypatch):
+    bundle, executable = _fake_windows_go_install()
+    p.profiles([bundle], is_windows=False)  # POSIX engines resolve natively, no pin
+    assert '[engines.opencode]' not in p.profile_path().read_text()
+    path = p.profile_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('version = 1\n[engines.opencode]\ncommand = ["C:\\\\ops\\\\opencode.exe"]\n')
+    p.profiles([bundle], is_windows=True)  # operator table outside our block wins
+    text = path.read_text()
+    assert text.count('[engines.opencode]') == 1
+    assert 'C:\\\\ops\\\\opencode.exe' in text and str(executable) not in text
+
+
+def test_install_fetches_windows_zcodex_release_exe(tmp_path, monkeypatch):
+    # Intake 608a2f9a (C): with no native zcodex on a Windows host, the managed
+    # install fetches the checksummed release exe instead of failing closed.
+    import hashlib
+    b = {'label': 'zai-win', 'provider': 'zai', 'version': '0.155.1',
+         'revision': '88888888-8888-4888-8888-888888888888',
+         'files': {}, 'env': {'ZAI_API_KEY': 'tok'}, 'args': ['--model', 'glm-5.3-flash']}
+    monkeypatch.setattr(p, 'locate_native_zcodex', lambda bundle=None, is_windows=None: None)
+    monkeypatch.setattr(p, 'root', lambda: tmp_path / 'managed-engines')
+    monkeypatch.setattr(p, '_is_windows', lambda: True)
+    monkeypatch.setattr(p, 'locate_zcode_runtime', lambda dest=None: None)
+    payload = b'fake-zcodex-exe'
+    sha = hashlib.sha256(payload).hexdigest()
+
+    def fake_run(cmd, *args, **kwargs):
+        cmd_str = ' '.join(str(c) for c in cmd)
+        for i, arg in enumerate(cmd):
+            if arg == '-o':
+                out = Path(cmd[i + 1])
+                if 'SHA256SUMS' in cmd_str:
+                    out.write_text(f'{sha}  zcodex-windows-amd64.exe\n')
+                elif any(str(c).startswith('https://github.com') and str(c).endswith('.exe') for c in cmd):
+                    out.write_bytes(payload)
+                return subprocess.CompletedProcess(cmd, 0)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    with pytest.raises(ValueError, match='ZCode runtime missing'):
+        p.install(b)
+    dest = tmp_path / 'managed-engines' / 'zai-win-88888888-8888-4888-8888-888888888888'
+    assert (dest / 'engine' / 'bin' / 'zcodex.exe').read_bytes() == payload
+    wrapper = (dest / 'engine' / 'bin' / 'zcodex.cmd').read_text()
+    assert 'zcodex.exe' in wrapper
