@@ -42,6 +42,10 @@ class IntakeTransportError(ValueError):
     pass
 
 
+class IntakeResponseTooLarge(IntakeTransportError):
+    """A bounded response was refused before returning any page items."""
+
+
 class IntakeInputError(ValueError):
     """A client diagnostic containing only fixed labels and limits."""
 
@@ -185,7 +189,8 @@ def request(method, path, payload=None):
             reason = ('Intake response error: invalid JSON or UTF-8 response'
                       if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)) else diagnostic(exc))
             recovery = '; mutation outcome unknown; inspect before retrying with the same key and payload' if method != 'GET' else ''
-            raise IntakeTransportError(reason + recovery) from None
+            error_type = IntakeResponseTooLarge if isinstance(exc, RuntimeError) and str(exc) == 'Response too large' else IntakeTransportError
+            raise error_type(reason + recovery) from None
 
     try:
         return send(token)
@@ -399,8 +404,22 @@ def list_all(params):
         raise IntakeInputError('--all cannot be combined with --after')
     items, seen, cursors = [], set(), set()
     first = None
+    reduced = False
     for _ in range(10001):
-        page = request('GET', BASE + '/tasks?' + urlencode(params))
+        while True:
+            try:
+                page = request('GET', BASE + '/tasks?' + urlencode(params))
+                break
+            except IntakeResponseTooLarge:
+                # Retry only an oversized GET, with the same cursor/revision.
+                # The limit strictly decreases, so there are at most 7 such
+                # reductions across the entire export; transport/auth/stale
+                # failures keep their existing fail-closed behavior.
+                current = min(params.get('limit', 25), 100)
+                if current <= 1:
+                    raise
+                params['limit'] = max(1, current // 2)
+                reduced = True
         if first is None:
             first = page
         elif (page['snapshot_version'] != first['snapshot_version'] or
@@ -416,7 +435,10 @@ def list_all(params):
         if not after:
             if len(items) != first['total']:
                 raise IntakeInputError('Incomplete snapshot; retry the command')
-            return dict(first, items=items, next=None, total=len(items))
+            result = dict(first, items=items, next=None, total=len(items))
+            if reduced:
+                result.update(effective_limit=page.get('effective_limit', min(params.get('limit', 25), 100)), page_size_reduced=True)
+            return result
         if after in cursors or not page['items']:
             raise IntakeInputError('Invalid snapshot cursor; retry the command')
         cursors.add(after)

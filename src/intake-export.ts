@@ -50,45 +50,37 @@ export function initIntakeExport(sql: SqlStorage) {
     ${op !== 'DELETE' ? 'INSERT INTO intake_export_totals VALUES(NEW.status,NEW.archived,1) ON CONFLICT(status,archived) DO UPDATE SET n=n+1;' : ''}
     END`);
 }
-/** All/project totals come from tiny write-maintained counters. Task-only
- * grants use exact primary-key lookups, excluding overlapping project grants. */
+/** Exact project buckets and task primary keys keep both work and binding
+ * count bounded. Callers combine bucket parts in memory; no SQL GROUP sort. */
 export function intakeExportCounts(sql: SqlStorage, p: Obj, project: string | null): Obj[] {
   const all = p.admin || p.grants.some((g: Obj) => g.scope === 'all');
   if (all && project === null) return sql.exec('SELECT status,archived,n FROM intake_export_totals').toArray() as Obj[];
-  const projects: string[] = all ? [] : [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'project').map((g: Obj) => g.target))];
-  const tasks: string[] = all ? [] : [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'task').map((g: Obj) => g.target))];
-  const terms: string[] = []; const args: any[] = [];
-  if (project !== null) { terms.push('project=?'); args.push(project); }
-  if (!all) { terms.push(projects.length ? `project IN (${projects.map(() => '?').join(',')})` : '0'); args.push(...projects); }
-  const rows = sql.exec(`SELECT status,archived,SUM(n) AS n FROM intake_export_counts${terms.length ? ' WHERE ' + terms.join(' AND ') : ''} GROUP BY status,archived`, ...args).toArray() as Obj[];
-  if (tasks.length) {
-    const taskTerms = [`id IN (${tasks.map(() => '?').join(',')})`]; const taskArgs: any[] = [...tasks];
-    if (project !== null) { taskTerms.push('project=?'); taskArgs.push(project); }
-    if (projects.length) { taskTerms.push(`project NOT IN (${projects.map(() => '?').join(',')})`); taskArgs.push(...projects); }
-    rows.push(...sql.exec(`SELECT status,archived,COUNT(*) AS n FROM intake_export INDEXED BY sqlite_autoindex_intake_export_1 WHERE ${taskTerms.join(' AND ')} GROUP BY status,archived`, ...taskArgs).toArray() as Obj[]);
+  const projects: string[] = all ? [project!] : [...new Set<string>(p.grants.filter((g: Obj) =>
+    g.scope === 'project' && (project === null || g.target === project)).map((g: Obj) => g.target))];
+  const rows: Obj[] = [];
+  for (const target of projects) rows.push(...sql.exec('SELECT status,archived,n FROM intake_export_counts WHERE project=?', target).toArray() as Obj[]);
+  if (!all) for (const id of new Set<string>(p.grants.filter((g: Obj) => g.scope === 'task').map((g: Obj) => g.target))) {
+    const row = sql.exec('SELECT project,status,archived FROM intake_export WHERE id=?', id).toArray()[0] as Obj | undefined;
+    if (row && (project === null || row.project === project) && !projects.includes(row.project)) rows.push({ status: row.status, archived: row.archived, n: 1 });
   }
   return rows;
 }
 
-/** Each grant contributes at most five indexed candidates. The final sort is
- * bounded by grant count, even for sparse authorization on a large ledger. */
+/** Each project contributes only five indexed rows; each task is one primary
+ * key lookup. Merge at most grants*5 candidates without large IN/UNION binds. */
 export function intakeExportRecent(sql: SqlStorage, p: Obj, project: string | null): Obj[] {
   const all = p.admin || p.grants.some((g: Obj) => g.scope === 'all');
   if (all) return sql.exec(`SELECT data FROM intake_export INDEXED BY ${project === null ? 'intake_export_recent' : 'intake_export_project_recent'}${project === null ? '' : ' WHERE project=?'} ORDER BY updated_at DESC,id LIMIT 5`,
     ...(project === null ? [] : [project])).toArray() as Obj[];
-  const projects = [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'project' && (project === null || g.target === project)).map((g: Obj) => g.target))];
-  const tasks = [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'task').map((g: Obj) => g.target))];
-  const parts: string[] = []; const args: any[] = [];
-  for (const target of projects) {
-    parts.push('SELECT id,updated_at,data FROM (SELECT id,updated_at,data FROM intake_export INDEXED BY intake_export_project_recent WHERE project=? ORDER BY updated_at DESC,id LIMIT 5)'); args.push(target);
+  const rows = new Map<string, Obj>();
+  for (const target of new Set<string>(p.grants.filter((g: Obj) => g.scope === 'project' && (project === null || g.target === project)).map((g: Obj) => g.target))) {
+    for (const row of sql.exec('SELECT id,updated_at,data FROM intake_export INDEXED BY intake_export_project_recent WHERE project=? ORDER BY updated_at DESC,id LIMIT 5', target).toArray() as Obj[]) rows.set(row.id, row);
   }
-  if (tasks.length) {
-    const terms = [`id IN (${tasks.map(() => '?').join(',')})`]; args.push(...tasks);
-    if (project !== null) { terms.push('project=?'); args.push(project); }
-    if (projects.length) { terms.push(`project NOT IN (${projects.map(() => '?').join(',')})`); args.push(...projects); }
-    parts.push(`SELECT id,updated_at,data FROM (SELECT id,updated_at,data FROM intake_export INDEXED BY sqlite_autoindex_intake_export_1 WHERE ${terms.join(' AND ')} ORDER BY updated_at DESC,id LIMIT 5)`);
+  for (const id of new Set<string>(p.grants.filter((g: Obj) => g.scope === 'task').map((g: Obj) => g.target))) {
+    const row = sql.exec('SELECT id,project,updated_at,data FROM intake_export WHERE id=?', id).toArray()[0] as Obj | undefined;
+    if (row && (project === null || row.project === project)) rows.set(row.id, row);
   }
-  return parts.length ? sql.exec(`SELECT data FROM (${parts.join(' UNION ALL ')}) ORDER BY updated_at DESC,id LIMIT 5`, ...args).toArray() as Obj[] : [];
+  return [...rows.values()].sort((a, b) => Number(b.updated_at) - Number(a.updated_at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).slice(0, 5);
 }
 
 export type IntakeExportFilter = { project: string | null; statuses: string[] | null; archived: number | null };
@@ -116,16 +108,9 @@ export function intakeExportPageIds(sql: SqlStorage, p: Obj, filter: IntakeExpor
     const name = index ? 'intake_export_' + index : 'sqlite_autoindex_intake_export_1';
     for (const row of sql.exec(`SELECT id FROM intake_export INDEXED BY ${name}${terms.length ? ' WHERE ' + terms.join(' AND ') : ''} ORDER BY id LIMIT ?`, ...args, limit).toArray() as Obj[]) ids.add(row.id);
   }
-  if (!all) {
-    const tasks = [...new Set<string>(p.grants.filter((g: Obj) => g.scope === 'task').map((g: Obj) => g.target))];
-    if (tasks.length) {
-      const terms = [`id IN (${tasks.map(() => '?').join(',')})`]; const args: any[] = [...tasks];
-      if (filter.project !== null) { terms.push('project=?'); args.push(filter.project); }
-      if (filter.statuses !== null) { terms.push(`status IN (${filter.statuses.map(() => '?').join(',')})`); args.push(...filter.statuses); }
-      if (filter.archived !== null) { terms.push('archived=?'); args.push(filter.archived); }
-      if (after) { terms.push('id>?'); args.push(after); }
-      for (const row of sql.exec(`SELECT id FROM intake_export INDEXED BY sqlite_autoindex_intake_export_1 WHERE ${terms.join(' AND ')} ORDER BY id LIMIT ?`, ...args, limit).toArray() as Obj[]) ids.add(row.id);
-    }
+  if (!all) for (const id of new Set<string>(p.grants.filter((g: Obj) => g.scope === 'task').map((g: Obj) => g.target))) {
+    const row = sql.exec('SELECT id,project,status,archived FROM intake_export WHERE id=?', id).toArray()[0] as Obj | undefined;
+    if (row && (!after || row.id > after) && (filter.project === null || row.project === filter.project) && intakeExportMatches(row, filter)) ids.add(row.id);
   }
   return [...ids].sort().slice(0, limit);
 }
