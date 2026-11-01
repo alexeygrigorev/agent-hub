@@ -1,28 +1,44 @@
 param(
   [Parameter(Mandatory=$true)][string]$Runner,
-  [string]$TaskName
+  [string]$TaskName,
+  # Test seam: print the task name this invocation would install and exit.
+  [switch]$ResolveTaskNameOnly
 )
 $ErrorActionPreference = 'Stop'
 $runnerPath = (Resolve-Path -LiteralPath $Runner).Path
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $user = $identity.Name
-if ([string]::IsNullOrWhiteSpace($TaskName)) {
-  # A legacy boot task may have an administrator-owned ACL; create this user's
-  # task instead of modifying or stopping that existing task. When the legacy
-  # task is already this user's, upgrade it in place so the machine keeps ONE
-  # supervisor loop (two loops would fight over the host journal lock).
-  $legacy = Get-ScheduledTask -TaskName 'AgentHubSessionHost' -ErrorAction SilentlyContinue
-  if ($legacy -and ($legacy.Principal.UserId -eq $user -or $legacy.Principal.UserId -eq $identity.User.Value)) {
-    $TaskName = 'AgentHubSessionHost'
-  } else {
-    $TaskName = "AgentHubSessionHost-User-$($identity.User.Value)"
-  }
+# Task Scheduler stores local accounts without the machine prefix
+# (Tabo\alexe registers as alexe), so ownership comparisons must accept
+# both forms plus the SID (intake c964dbd6 follow-up).
+$account = $user.Split('\')[-1]
+$ownedByMe = {
+  param($PrincipalUserId)
+  $PrincipalUserId -and ($user, $account, $identity.User.Value) -ccontains $PrincipalUserId
 }
+function Resolve-TaskName {
+  if (-not [string]::IsNullOrWhiteSpace($TaskName)) { return $TaskName }
+  # A legacy boot task may have an administrator-owned ACL; create this
+  # user's task instead of modifying or stopping that existing task. When
+  # the legacy task is already this user's, upgrade it in place so the
+  # machine keeps ONE supervisor loop (two loops would fight over the host
+  # journal lock).
+  $legacy = Get-ScheduledTask -TaskName 'AgentHubSessionHost' -ErrorAction SilentlyContinue
+  if ($legacy -and (& $ownedByMe $legacy.Principal.UserId)) {
+    return 'AgentHubSessionHost'
+  }
+  return "AgentHubSessionHost-User-$($identity.User.Value)"
+}
+if ($ResolveTaskNameOnly) {
+  Write-Output (Resolve-TaskName)
+  exit 0
+}
+$TaskName = Resolve-TaskName
 if ($TaskName.Length -gt 238 -or $TaskName -notmatch '^AgentHubSessionHost(?:-[A-Za-z0-9_-]+)?$') {
   throw 'Invalid Hub task name'
 }
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existing -and $existing.Principal.UserId -ne $user -and $existing.Principal.UserId -ne $identity.User.Value) {
+if ($existing -and -not (& $ownedByMe $existing.Principal.UserId)) {
   throw 'Existing task belongs to another user'
 }
 $psExe = (Get-Command powershell.exe).Source

@@ -64,6 +64,36 @@ class RealAutostartRegistrationTests(unittest.TestCase):
         record = pathlib.Path(self.directory.name) / 'autostart-task-name.txt'
         self.assertEqual(record.read_text(encoding='ascii').strip(), self.TASK)
 
+    def test_task_name_pick_upgrades_a_user_owned_legacy_task(self):
+        """The pick must compare Task Scheduler's bare account form
+        (alexe) against the prefixed identity name (Tabo\\alexe): without
+        normalization a user-owned legacy task is not upgraded in place and
+        a second per-user task fights the running supervisor for the host
+        journal lock (intake c964dbd6 follow-up)."""
+        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive',
+                                 '-ExecutionPolicy', 'Bypass', '-File', str(SCRIPT),
+                                 '-Runner', str(self.runner), '-ResolveTaskNameOnly'],
+                                capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        picked = result.stdout.strip()
+        identity = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                                   '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value'],
+                                  capture_output=True, text=True, timeout=120).stdout.strip()
+        legacy = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                                 '$t = Get-ScheduledTask -TaskName "AgentHubSessionHost" '
+                                 '-ErrorAction SilentlyContinue; '
+                                 'if ($t) { "$($t.Principal.UserId)|$([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)" }'],
+                                capture_output=True, text=True, timeout=120).stdout.strip()
+        owns_legacy = False
+        if legacy:
+            legacy_user, identity_name = legacy.split('|')
+            account = identity_name.split('\\')[-1]
+            owns_legacy = legacy_user in (identity_name, account, identity)
+        if owns_legacy:
+            self.assertEqual(picked, 'AgentHubSessionHost')
+        else:
+            self.assertEqual(picked, f'AgentHubSessionHost-User-{identity}')
+
 
 if __name__ == '__main__':
     unittest.main()
