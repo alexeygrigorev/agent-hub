@@ -22,7 +22,7 @@ import { SILENT_START_MS, SILENT_START_REASON, ABANDONED_RECOVERY_MS, abandonedL
 import { reconcileAccountCapacity } from './account_capacity';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
-import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
+import { freshCatalogs } from './catalog-freshness';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency } from './pacing';
@@ -42,7 +42,6 @@ export { SILENT_START_MS, SILENT_START_REASON };
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS fleet_catalog_census (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, complete INTEGER NOT NULL CHECK (complete IN (0, 1)));
 CREATE TABLE IF NOT EXISTS fleet_queue_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), after_rowid INTEGER NOT NULL, high_water INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT, evidence_json TEXT);
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
@@ -797,58 +796,20 @@ export class FleetService {
     const liveList = [...liveIds];
     const staleCutoff = new Date(this.now() - 48 * 3600000).toISOString();
     const idleCutoff = this.now() - this.resources.config().idle_minutes * 60000;
-    const completeCatalogs = freshCompleteCatalogs(this.sql, this.now());
-    const isIdle = (row: any) => row.phase === 'running' && completeCatalogs.has(String(row.machine_id))
+    const catalogs = freshCatalogs(this.sql, this.now());
+    const isIdle = (row: any) => row.phase === 'running' && catalogs.has(String(row.machine_id))
       && typeof row.last_activity_at === 'string' && Number.isFinite(Date.parse(row.last_activity_at))
       && Date.parse(row.last_activity_at) <= idleCutoff;
-    // A fresh complete census that no longer contains the exact native proves
-    // it does not consume physical concurrency. If an uncertain launch lost its
-    // launch native_id after binding, the exact session-control binding can
-    // still locate that historical native row. Keep launch/lifecycle rows
-    // unchanged: unobserved is not positive terminal proof.
-    let boundNativeId = 'NULL';
-    let boundNativeCreatedAt = 'NULL';
-    try {
-      const hasControlStore = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
-      if (hasControlStore) {
-        const bindingWhere = `c.machine_id = l.machine_id AND c.fleet_launch_id = l.id AND c.engine = l.engine
-          AND c.state IN ('running','uncertain') AND c.binding_json IS NOT NULL`;
-        boundNativeId = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(
-          CASE WHEN json_valid(c.binding_json) THEN
-            CASE WHEN json_type(c.binding_json, '$.native_id') = 'text' AND json_type(c.binding_json, '$.native_created_at_ms') = 'integer'
-              THEN json_extract(c.binding_json, '$.native_id') END
-          END) END
-        FROM session_control_sessions c
-        WHERE ${bindingWhere})`;
-        boundNativeCreatedAt = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(
-            CASE WHEN json_valid(c.binding_json) THEN
-              CASE WHEN json_type(c.binding_json, '$.native_created_at_ms') = 'integer'
-                THEN json_extract(c.binding_json, '$.native_created_at_ms') END
-            END) END
-          FROM session_control_sessions c WHERE ${bindingWhere})`;
-      }
-    } catch { /* Fleet-only stores have no session-control binding to join. */ }
-    const isUnobserved = (row: any) => ['running', 'uncertain'].includes(row.state) && row.phase === 'unobserved'
-      && completeCatalogs.has(String(row.machine_id))
-      // Uncertain launches may shed a reservation only through the exact
-      // session-control fallback above. Their direct native_id branch has no
-      // incarnation proof and must not release on a mismatched native row.
-      && (row.state !== 'uncertain' || row.native_id == null || row.native_id === '');
     // Native activity, rather than a launch receipt's update timestamp,
     // determines whether a bound running session still occupies admission.
     // Stale catalogs, unknown native state/activity and in-flight starts
     // retain their reservations, even while independent heartbeats are fresh.
     const reserved = liveList.length
-      ? (this.sql.exec(`SELECT l.state, l.native_id, l.machine_id, s.phase, s.last_activity_at FROM fleet_launches l
-          LEFT JOIN fleet_sessions s ON s.machine_id=l.machine_id
-            AND s.native_id=COALESCE(NULLIF(l.native_id, ''), ${boundNativeId})
-            AND (NULLIF(l.native_id, '') IS NOT NULL OR
-              (s.engine=l.engine AND s.account=l.account AND s.created_at_ms=${boundNativeCreatedAt}))
+      ? (this.sql.exec(`SELECT l.state, l.machine_id, s.phase, s.last_activity_at FROM fleet_launches l
+          LEFT JOIN fleet_sessions s ON s.machine_id=l.machine_id AND s.native_id=l.native_id
           WHERE l.account = ? AND l.state IN ${ACTIVE} AND l.machine_id IN (${liveList.map(() => '?').join(',')})
           AND (l.state = 'running' OR l.updated_at > ?)`, account.label, ...liveList, staleCutoff).toArray() as any[])
-          .filter(row => row.state === 'running'
-            ? (!isIdle(row) && !isUnobserved(row))
-            : row.state === 'uncertain' ? !isUnobserved(row) : true).length
+          .filter(row => row.state !== 'running' || !isIdle(row)).length
       : 0;
     const observedSessions = (() => {
       if (!liveList.length) return 0;
@@ -866,7 +827,7 @@ export class FleetService {
     // capacity fixer owns the counting; this only projects it.
     let nativeLive: number | null = null;
     try {
-      const seen = freshCompleteCatalogs(this.sql, this.now());
+      const seen = freshCatalogs(this.sql, this.now());
       if (liveList.length && liveList.every(id => seen.has(id))) nativeLive = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase = 'running' AND s.machine_id IN (${liveList.map(() => '?').join(',')})`, account.label, ...liveList).one().n);
     } catch { nativeLive = null; }
     const availableSlots = Math.max(0, Number(account.max_concurrency) - active);
@@ -2066,14 +2027,7 @@ export class FleetService {
       // mutation limit even with fewer than 100 sessions. Preserve the 500
       // row and field limits below; allow their maximum serialized footprint.
       const data = await body(request, 3 * 1024 * 1024);
-      if (!object(data, ['sessions', 'census_complete']) || !Array.isArray(data.sessions) || data.sessions.length > 500 ||
-          (data.census_complete !== undefined && typeof data.census_complete !== 'boolean')) return response({ error: 'invalid_sessions' }, 400);
-      // Older hosts do not send the completeness bit. A sub-cap legacy report
-      // is known to be untruncated; a report at the cap fails closed because
-      // it may have omitted live native rows.
-      const censusComplete = data.census_complete === undefined
-        ? data.sessions.length < 500
-        : data.census_complete;
+      if (!object(data, ['sessions']) || !Array.isArray(data.sessions) || data.sessions.length > 500) return response({ error: 'invalid_sessions' }, 400);
       const ids = new Set();
       for (const s of data.sessions) {
         if (!object(s, ['native_id', 'tag', 'engine', 'model', 'parent_id', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit', 'progress', 'tokens']) ||
@@ -2095,15 +2049,6 @@ export class FleetService {
         ids.add(s.native_id);
       }
       return this.transaction(() => {
-        // Record the newest completeness verdict before reconciliation or
-        // queue draining can inspect capacity. A change of verdict is applied
-        // immediately; unchanged reports retain the existing 60 s write cap.
-        const censusNow = this.now();
-        const censusObservedAt = new Date(censusNow).toISOString();
-        this.sql.exec(`INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES (?, ?, ?)
-          ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at, complete=excluded.complete
-          WHERE fleet_catalog_census.complete != excluded.complete OR fleet_catalog_census.observed_at <= ?`,
-          caller.machineId!, censusObservedAt, censusComplete ? 1 : 0, new Date(censusNow - 60000).toISOString());
         // Write only rows that changed: hosts report every minute and Durable Object row writes
         // are metered. observed_at therefore means "last changed"; host freshness comes from heartbeats.
         const fields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'progress_json'];
@@ -2161,9 +2106,7 @@ export class FleetService {
         // Preserve historical observations. A missing catalog row is not exit
         // proof, but an orphan no longer observed is not a live workload.
         // A reported row skipped as already-stopped is not "seen" and falls through here, as before.
-        const gone = censusComplete
-          ? [...liveUnreported, ...reportedIds.filter(id => existing.has(id) && !seen.has(id))]
-          : [];
+        const gone = [...liveUnreported, ...reportedIds.filter(id => existing.has(id) && !seen.has(id))];
         for (const id of gone) {
           this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!, id); written++;
         }
