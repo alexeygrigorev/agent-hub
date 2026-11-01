@@ -1039,6 +1039,24 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/tasks/' + task.id + '/history?archived=1&limit=101')).status).toBe(400);
   });
 
+  it('archives superseded link and worktree events when ordinary notes are exhausted at the event cap', async () => {
+    const { task } = await create();
+    const latestLinkId = crypto.randomUUID();
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      data.history.push({ id: crypto.randomUUID(), kind: 'worktree', action: 'registered', worktree_id: crypto.randomUUID(), machine: 'm1', path: '/tmp/wt', branch: 'b1' });
+      while (data.history.length < INTAKE_LIMITS.events - 1) {
+        data.history.push({ id: crypto.randomUUID(), kind: 'link', hub_session_id: crypto.randomUUID(), authority: 'hub_launch_verified', provenance: source });
+      }
+      data.history.push({ id: latestLinkId, kind: 'link', hub_session_id: crypto.randomUUID(), authority: 'hub_launch_verified', provenance: source });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+    });
+    const res = await append(task.id, task.version, { kind: 'note', text: 'overseer matrix update after 128 link/worktree events', source });
+    expect(res.task.history_archive.count).toBeGreaterThan(0);
+    expect(res.task.payload_data.history.some((e: any) => e.id === latestLinkId)).toBe(true);
+    expect(res.task.payload_data.history.at(-1).text).toBe('overseer matrix update after 128 link/worktree events');
+  });
+
   it('bounds archive pages by bytes and preserves every event across cursors', async () => {
     const { task } = await create();
     const original = await inDO(stub(), (h: any) => {

@@ -121,8 +121,13 @@ function prepareIntakeHistory(task: Obj, reserveEvents = 0) {
   const targetBytes = Math.floor(INTAKE_LIMITS.taskBytes * 0.75);
   const targetEvents = Math.floor(INTAKE_LIMITS.events * 0.75);
   while (encoded(task) > targetBytes || history.length + reserveEvents > targetEvents) {
-    // Completion claims and every structured event retain their live semantics.
-    const index = history.findIndex((e, i) => i > 0 && e.kind === 'note' && !/^\s*(?:DONE\b|START(?:ED)?\b|ORIGINAL FINAL STATE\b|TRIAGE (?:ACTUAL|DONE|OBSOLETE|DUPLICATE)\b|VERIFICATION (?:FAILED|SKIPPED)\b)/im.test(e.text ?? ''));
+    // Completion claims and every structured event retain their live semantics;
+    // when ordinary notes are exhausted and event count overflows, archive
+    // worktree or superseded link events while keeping the latest link inline.
+    let index = history.findIndex((e, i) => i > 0 && e.kind === 'note' && !/^\s*(?:DONE\b|START(?:ED)?\b|ORIGINAL FINAL STATE\b|TRIAGE (?:ACTUAL|DONE|OBSOLETE|DUPLICATE)\b|VERIFICATION (?:FAILED|SKIPPED)\b)/im.test(e.text ?? ''));
+    if (index < 0 && history.length + reserveEvents > INTAKE_LIMITS.events) {
+      index = history.findIndex((e, i) => i > 0 && (e.kind === 'worktree' || (e.kind === 'link' && history.slice(i + 1).some(later => later.kind === 'link'))));
+    }
     if (index < 0) break;
     const event = history[index];
     const data = JSON.stringify(event);
