@@ -149,9 +149,13 @@ def render_text(data):
             len(account_coverage.get("fresh") or []), len(account_coverage.get("stale") or []),
             len(account_coverage.get("unavailable") or []), account_coverage.get("total")))
     if isinstance(coverage, dict) and coverage.get("machines_total") is not None:
-        lines.append("coverage: %s fresh, %s stale, %s missing of %s machines" % (
+        line = "coverage: %s fresh, %s stale, %s missing of %s machines" % (
             len(coverage.get("fresh") or []), len(coverage.get("stale") or []),
-            len(coverage.get("missing") or []), coverage.get("machines_total")))
+            len(coverage.get("missing") or []), coverage.get("machines_total"))
+        not_fleet = coverage.get("not_fleet")
+        if isinstance(not_fleet, list) and not_fleet:
+            line += " (+%s not in fleet: drained or never checked in)" % len(not_fleet)
+        lines.append(line)
     if not lines:
         return "No quota pools reported."
     return "\n".join(lines)
