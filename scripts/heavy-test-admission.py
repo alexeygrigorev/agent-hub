@@ -138,13 +138,21 @@ def process_start_time(pid):
         return None
 
 
-def nested_holder_ancestor():
-    """Find a live ancestor that owns this command's inherited slot token."""
+def pool_identity(root):
+    """Return a stable identity for the admission pool directory."""
+    info = root.stat()
+    return info.st_dev, info.st_ino
+
+
+def nested_holder_ancestor(identity):
+    """Find an ancestor holding a slot in this command's admission pool."""
     token = os.environ.get(HOLDER_TOKEN_ENV, '')
     try:
-        holder_pid_text, holder_start = token.split(':', 1)
+        holder_pid_text, holder_start, holder_device, holder_inode = token.split(':', 3)
         holder_pid = int(holder_pid_text)
-        if holder_pid < 2 or not holder_start.isdecimal():
+        if (holder_pid < 2 or not holder_start.isdecimal()
+                or not holder_device.isdecimal() or not holder_inode.isdecimal()
+                or (int(holder_device), int(holder_inode)) != identity):
             return None
     except (ValueError, TypeError):
         return None
@@ -169,7 +177,7 @@ def nested_holder_ancestor():
     return None
 
 
-def run_command(command, slot, interrupted, run_timeout):
+def run_command(command, slot, interrupted, run_timeout, identity):
     global COMMAND_STARTED
     # Reserve/inherit the historical FD9. Parent retains its own descriptor
     # even when the command closes FD9. Descendants retaining it also keep
@@ -179,7 +187,8 @@ def run_command(command, slot, interrupted, run_timeout):
     holder_start = process_start_time(holder_pid)
     env = dict(os.environ, AGENT_HUB_HEAVY_TEST_HELD='1')
     if holder_start is not None:
-        env[HOLDER_TOKEN_ENV] = f'{holder_pid}:{holder_start}'
+        device, inode = identity
+        env[HOLDER_TOKEN_ENV] = f'{holder_pid}:{holder_start}:{device}:{inode}'
     env.pop(REFUSAL_FILE_ENV, None)
     COMMAND_STARTED = True
     try:
@@ -262,14 +271,15 @@ def main():
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('no command given')
-    ancestor_holder = nested_holder_ancestor()
+    root = Path(os.environ.get('AGENT_HUB_HEAVY_TEST_DIR', f'/run/user/{os.getuid()}/agent-hub/heavy-test'))
+    root.mkdir(parents=True, exist_ok=True)
+    identity = pool_identity(root)
+    ancestor_holder = nested_holder_ancestor(identity)
     if ancestor_holder is not None:
         print('capped-test-run: nested heavy-test admission detected; '
               f'ancestor holder PID {ancestor_holder} already owns a slot',
               file=sys.stderr, flush=True)
         return 2
-    root = Path(os.environ.get('AGENT_HUB_HEAVY_TEST_DIR', f'/run/user/{os.getuid()}/agent-hub/heavy-test'))
-    root.mkdir(parents=True, exist_ok=True)
     queue = Queue(root)
     deadline = time.monotonic() + int(args.wait)
     interrupted = 0
@@ -355,7 +365,7 @@ def main():
                 running = True
                 print(f'capped-test-run: admitted {args.priority} ticket {sequence}', file=sys.stderr, flush=True)
                 print(f'capped-test-run: run timeout {run_timeout}s', file=sys.stderr, flush=True)
-                return run_command(command, slot, lambda: interrupted, run_timeout)
+                return run_command(command, slot, lambda: interrupted, run_timeout, identity)
 
 
 if __name__ == '__main__':

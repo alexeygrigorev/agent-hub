@@ -269,6 +269,30 @@ time.sleep(30)
         self.assertIn(b'nested heavy-test admission detected', stderr)
         self.assertIn(b'already owns a slot', stderr)
 
+    def test_nested_admission_with_different_pool_is_allowed(self):
+        self.holder.close()
+        helper = WRAPPER.with_name('heavy-test-admission.py')
+        other_pool = self.root / 'other-pool'
+        other_pool.mkdir()
+        nested = (
+            f"AGENT_HUB_HEAVY_TEST_DIR={str(other_pool)!r} {sys.executable} {str(helper)!r} "
+            "--slots 1 --wait 0 -- python -c 'print(\"different-pool-ran\")'"
+        )
+        outer = subprocess.Popen(
+            [sys.executable, str(helper), '--slots', '1', '--wait', '30', '--',
+             'bash', '-c', nested], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        self.children.append(outer)
+        try:
+            stdout, stderr = outer.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(outer.pid, signal.SIGKILL)
+            outer.wait()
+            self.fail('nested admission against a different pool did not finish')
+        self.assertEqual(outer.returncode, 0,
+                         (stdout.decode(errors='replace'), stderr.decode(errors='replace')))
+        self.assertIn(b'different-pool-ran', stdout)
+
 
 class RefusalTests(unittest.TestCase):
     def setUp(self):
