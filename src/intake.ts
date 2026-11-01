@@ -9,7 +9,6 @@ type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
 import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, initSessionLinks, initLinkRefs, triageTargets, workerAccessContext, workerCreatedTargets, workerLinkedTargets } from './worker-access';
-import { initIntakeExport, intakeExportCounts, intakeExportRecent, intakeExportPageIds, intakeExportMatches, type IntakeExportFilter } from './intake-export';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
@@ -350,7 +349,6 @@ export class IntakeService {
       for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
         this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_${table} (id TEXT PRIMARY KEY, data TEXT NOT NULL)`);
       }
-      initIntakeExport(this.sql);
       const projectionExists = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_task_projection'").toArray().length > 0;
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_task_projection(id TEXT PRIMARY KEY, data TEXT NOT NULL, links TEXT NOT NULL)');
       // Only events consumed by status/continuation enter this projection.
@@ -500,20 +498,15 @@ export class IntakeService {
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
   /** Non-terminal task count used for soft open-intake warnings (never blocks create). */
   openNonTerminalCount(principal?: Obj, summaries?: Obj[]): number {
-    if (!summaries) return intakeExportCounts(this.sql, principal ?? { admin: true }, null).filter(r => !r.archived && OPEN.includes(r.status)).reduce((n, r) => n + Number(r.n), 0);
-    const rows = summaries;
+    const rows = summaries ?? this.sql.exec('SELECT data FROM intake_task_projection').toArray().map((r: any) => JSON.parse(r.data));
     return rows.filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t))).length;
   }
   /** Operator-visible soft warning when open intake is high. Null when under threshold. */
   intakeOpenWarning(principal?: Obj, summaries?: Obj[]): Obj | null {
-    const p = principal ?? { admin: true };
-    const supplied = summaries?.filter(t => !t.archived_at && OPEN.includes(t.status) && this.allowed(p, t));
-    const open_count = supplied?.length ?? this.openNonTerminalCount(p);
+    const rows = summaries ?? this.sql.exec('SELECT data FROM intake_task_projection').toArray().map((r: any) => JSON.parse(r.data));
+    const open = rows.filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t)));
+    const open_count = open.length;
     if (open_count <= OPEN_INTAKE_WARN_THRESHOLD) return null;
-    const itemLimit = 128;
-    const open = supplied ? supplied.slice(0, itemLimit) : intakeExportPageIds(this.sql, p,
-      { project: null, statuses: OPEN, archived: 0 }, null, itemLimit).map(id =>
-        JSON.parse((this.sql.exec('SELECT data FROM intake_export WHERE id=?', id).toArray()[0] as any).data));
     return {
       code: 'intake_open_high',
       severity: 'warn',
@@ -521,7 +514,6 @@ export class IntakeService {
       threshold: OPEN_INTAKE_WARN_THRESHOLD,
       message: 'Open intake is high. Closing requires a DONE note containing a commit SHA or deploy run URL AND a live check (command/URL plus result). Review evidence for each intake before closing.',
       action: 'review_done_evidence',
-      items_total: open_count, item_limit: itemLimit, items_truncated: open_count > open.length,
       items: open
         .map(t => ({ id: t.id, title: t.title, age_ms: Math.max(0, Date.now() - (t.created_at ?? Date.now())) })),
     };
@@ -780,49 +772,6 @@ export class IntakeService {
     const page = remaining.slice(0, limit);
     return { snapshot_version: revision, effective_limit: limit, items: page, next: remaining.length > limit ? page[page.length - 1].id : null, total: items.length };
   }
-  /** Full records are hydrated only after bounded metadata page selection. */
-  private exportPage(url: URL, p: Obj, revision: number): Obj {
-    if (url.searchParams.has('authorization_valid_until') && Number(url.searchParams.get('authorization_valid_until')) !== (p.valid_until ?? null)) fail('stale_snapshot', 409);
-    if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');
-    const page = this.page(url, [], revision); // shared limit/cursor/revision validation
-    const status = url.searchParams.get('status'); const archived = url.searchParams.get('archived'); const all = url.searchParams.get('all');
-    if (archived && archived !== 'true') fail('invalid_archived');
-    if (all && all !== 'true') fail('invalid_all');
-    if (status && status !== 'all' && !STATUSES.includes(status)) fail('invalid_status');
-    const defaultOpen = archived !== 'true' && all !== 'true' && status !== 'all' && !['done','cancelled'].includes(status ?? '');
-    const filter: IntakeExportFilter = { project: url.searchParams.get('project'),
-      statuses: status && status !== 'all' ? [status] : defaultOpen ? OPEN : null,
-      archived: archived === 'true' ? 1 : defaultOpen ? 0 : null };
-    const total = intakeExportCounts(this.sql, p, filter.project).filter(r => intakeExportMatches(r, filter)).reduce((n, r) => n + Number(r.n), 0);
-    const candidates = intakeExportPageIds(this.sql, p, filter, url.searchParams.get('after'), page.effective_limit + 1);
-    const items = candidates.slice(0, page.effective_limit).map(id => this.taskView(this.get('tasks', id)!, p));
-    // Rules are capped at 128; check only their exact project counter keys.
-    const rules = this.rows('rules').filter(rule => rule.project === null ||
-      (typeof rule.project === 'string' && (filter.project === null || rule.project === filter.project) && intakeExportCounts(this.sql, p, rule.project).some(r => intakeExportMatches(r, filter))));
-    const warn = this.intakeOpenWarning(p);
-    return { ...page, total, items, next: candidates.length > page.effective_limit ? items[items.length-1].id : null,
-      authorization_valid_until: p.valid_until ?? null, operator_rules: rules, data_notice: DATA_NOTICE,
-      authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
-      completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.',
-      ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
-      open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
-      ...(warn ? { intake_open_warning: warn } : {}) };
-  }
-  private exportSummary(url: URL, p: Obj, revision: number): Obj {
-    // Counts include every authorized task, including retained terminal/archive rows.
-    const counts: Obj = Object.fromEntries(STATUSES.map(s => [s, 0])); let total = 0; let archived = 0; let open = 0;
-    for (const row of intakeExportCounts(this.sql, p, url.searchParams.get('project'))) {
-      counts[row.status] = (counts[row.status] ?? 0) + Number(row.n); total += Number(row.n);
-      if (row.archived) archived += Number(row.n); else if (OPEN.includes(row.status)) open += Number(row.n);
-    }
-    const recent = intakeExportRecent(this.sql, p, url.searchParams.get('project'))
-      .map(r => { const task = JSON.parse(r.data); const session = task.last_session_id ? this.sessionRow(task.last_session_id) : null;
-        return { ...task, session: session ? (p.admin || session.actor === p.actor ? { id: session.id, state: session.state, updated_at: session.updated_at } : { id: session.id, linkage: 'not_visible' }) : null }; });
-    return { snapshot_version: revision, as_of: Date.now(), freshness: 'transactional_current_read',
-      authorization_valid_until: p.valid_until ?? null, authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
-      total, counts, archived_count: archived, open_non_terminal_count: open, recent,
-      status_authority: 'hub_ledger; session.state is canonical session control, not an acceptance claim', data_notice: DATA_NOTICE };
-  }
   private read(url: URL, p: Obj): Obj {
     const path = url.pathname.slice('/api/intake'.length); const revision = this.revision();
     if (path === '/storage') {
@@ -945,8 +894,6 @@ export class IntakeService {
       // seq padded for the common revision-pinned cursor implementation.
       return this.page(url, visible.map(e => ({ ...e, id: String(Number.MAX_SAFE_INTEGER - e.seq).padStart(20, '0') })).sort((a, b) => a.id.localeCompare(b.id)), revision);
     }
-    if (path === '/summary') return this.exportSummary(url, p, revision);
-    if (path === '/tasks' && url.searchParams.get('status') !== 'open') return this.exportPage(url, p, revision);
     if (path === '/tasks' || path === '/handoff') {
       if (url.searchParams.has('authorization_valid_until') && Number(url.searchParams.get('authorization_valid_until')) !== (p.valid_until ?? null)) fail('stale_snapshot', 409);
       if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');

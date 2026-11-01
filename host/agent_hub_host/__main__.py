@@ -1,15 +1,5 @@
-"""Public module entry point with a small latency-sensitive summary path."""
-import sys
-
-
-def main():
-    if sys.argv[1:3] == ['intake', 'summary']:
-        from .intake import summary_main
-        summary_main()
-    else:
-        from .cli import main as cli_main
-        cli_main()
-
+"""Run the existing public hub CLI through python -m agent_hub_host."""
+from .cli import main
 
 if __name__ == '__main__':
     main()

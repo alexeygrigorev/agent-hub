@@ -42,10 +42,6 @@ class IntakeTransportError(ValueError):
     pass
 
 
-class IntakeResponseTooLarge(IntakeTransportError):
-    """A bounded response was refused before returning any page items."""
-
-
 class IntakeInputError(ValueError):
     """A client diagnostic containing only fixed labels and limits."""
 
@@ -189,8 +185,7 @@ def request(method, path, payload=None):
             reason = ('Intake response error: invalid JSON or UTF-8 response'
                       if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)) else diagnostic(exc))
             recovery = '; mutation outcome unknown; inspect before retrying with the same key and payload' if method != 'GET' else ''
-            error_type = IntakeResponseTooLarge if isinstance(exc, RuntimeError) and str(exc) == 'Response too large' else IntakeTransportError
-            raise error_type(reason + recovery) from None
+            raise IntakeTransportError(reason + recovery) from None
 
     try:
         return send(token)
@@ -247,11 +242,9 @@ def add_commands(sub):
     listing.add_argument('--after')
     listing.add_argument('--revision', type=int)
     listing.add_argument('--authorization-valid-until', type=int)
-    listing.add_argument('--limit', type=int, default=None, help='Positive integer; default 25 (100 with --all), server clamps above max 100')
+    listing.add_argument('--limit', type=int, default=25, help='Positive integer; default 25, server clamps above max 100')
     listing.add_argument('--all', action='store_true', help='Follow all pages with a pinned snapshot; restart if it changes')
     listing.add_argument('--archived', action='store_true', help='List archived intakes')
-    summary = commands.add_parser('summary', help='Current authorized task counts and five recent tasks; no histories')
-    summary.add_argument('--project')
     audit = commands.add_parser('audit', help='Durable lifecycle events for one intake, or recent events')
     audit.add_argument('id', nargs='?')
     audit.add_argument('--limit', type=int, default=25)
@@ -404,22 +397,8 @@ def list_all(params):
         raise IntakeInputError('--all cannot be combined with --after')
     items, seen, cursors = [], set(), set()
     first = None
-    reduced = False
     for _ in range(10001):
-        while True:
-            try:
-                page = request('GET', BASE + '/tasks?' + urlencode(params))
-                break
-            except IntakeResponseTooLarge:
-                # Retry only an oversized GET, with the same cursor/revision.
-                # The limit strictly decreases, so there are at most 7 such
-                # reductions across the entire export; transport/auth/stale
-                # failures keep their existing fail-closed behavior.
-                current = min(params.get('limit', 25), 100)
-                if current <= 1:
-                    raise
-                params['limit'] = max(1, current // 2)
-                reduced = True
+        page = request('GET', BASE + '/tasks?' + urlencode(params))
         if first is None:
             first = page
         elif (page['snapshot_version'] != first['snapshot_version'] or
@@ -435,10 +414,7 @@ def list_all(params):
         if not after:
             if len(items) != first['total']:
                 raise IntakeInputError('Incomplete snapshot; retry the command')
-            result = dict(first, items=items, next=None, total=len(items))
-            if reduced:
-                result.update(effective_limit=page.get('effective_limit', min(params.get('limit', 25), 100)), page_size_reduced=True)
-            return result
+            return dict(first, items=items, next=None, total=len(items))
         if after in cursors or not page['items']:
             raise IntakeInputError('Invalid snapshot cursor; retry the command')
         cursors.add(after)
@@ -479,11 +455,8 @@ def execute(args):
         if getattr(args, 'verification', None) is not None:
             body['verification'] = args.verification
         return request('POST', BASE + '/tasks', body)
-    if command == 'summary':
-        params = {'project': args.project} if args.project is not None else {}
-        return request('GET', BASE + '/summary?' + urlencode(params))
     if command == 'list':
-        params = {'limit': args.limit if args.limit is not None else (100 if args.all else 25)}
+        params = {'limit': args.limit}
         if args.status is not None:
             params['status'] = args.status
         if args.archived:
@@ -638,17 +611,3 @@ def cas_update(path, payload, automatic, key):
             version_info = f'; attempted version: {attempted}' if attempted is not None else ''
             raise IntakeTransportError(f'{diagnostic(exc)}; Intake update outcome unknown; inspect the task before retrying. Retry key: {key}{version_info}') from None
     raise IntakeInputError('Intake update did not complete')
-
-
-def summary_main():
-    """Small shared entry point; skip unrelated CLI imports/registration."""
-    import argparse
-    parser = argparse.ArgumentParser(prog='hub intake summary', description='Current task counts and five recent tasks; no histories')
-    parser.add_argument('--project')
-    args = parser.parse_args(sys.argv[3:])
-    args.cmd, args.intake_cmd = 'intake', 'summary'
-    try:
-        print(json.dumps(execute(args), ensure_ascii=True))
-    except Exception as exc:
-        print(diagnostic(exc), file=sys.stderr)
-        sys.exit(1)

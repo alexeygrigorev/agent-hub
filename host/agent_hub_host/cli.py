@@ -381,12 +381,6 @@ def add_bridge_resume_command(sub):
 
 
 def main():
-    # Summary is a latency-sensitive single read. Avoid importing/registering
-    # every unrelated command (and computing version metadata) on this path.
-    if sys.argv[1:3] == ['intake', 'summary']:
-        from . import intake
-        intake.summary_main()
-        return
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     parser.add_argument("--version", action="version", version=f"%(prog)s {format_version()}")
     parser.add_argument("--profile", default=None, help="Named agent profile for messaging commands (e.g. developer; see hub msg --help)")
