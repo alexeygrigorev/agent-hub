@@ -31,25 +31,40 @@ class SessionHostTests(unittest.TestCase):
             self.assertEqual(args.machine_id,'test-machine')
             self.assertEqual(args.sessions_cmd,'host-receive')
 
-    def test_run_waits_for_inflight_observer_so_its_cycle_line_cannot_leak(self):
-        # A mid-step observer daemon prints its *_cycle line when it ends; if
-        # run() returned first, the line landed in a later test's captured
-        # stdout (Host canary flake, intake 26fc40d3).
+    def test_blocked_daemon_cannot_log_into_later_stdout(self):
+        import contextlib
+        import io
         import threading
-        import time
-        finished = threading.Event()
+        release, entered = threading.Event(), threading.Event()
+        threads = []
 
         def slow_observer(current, collector):
             def step():
-                time.sleep(0.3)
-                finished.set()
-            thread = threading.Thread(target=step, daemon=True)
+                session_host._log('observer_started')
+                entered.set()
+                release.wait(5)
+                session_host._log('disk_cycle')
+            thread = session_host._background_thread(target=step, daemon=True)
+            threads.append(thread)
             thread.start()
+            self.assertTrue(entered.wait(1))
             return thread
 
-        with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',return_value=SimpleNamespace(session_id='test-native',workspace=str(pathlib.Path.cwd()))), patch.object(session_host.fleet,'Dispatcher'), patch.object(session_host.session_control,'execute'), patch.object(session_host,'maybe_start_disk_thread',side_effect=slow_observer):
-            session_host.run('synthetic-settings',directory,cycles=1)
-        self.assertTrue(finished.is_set())
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',return_value=SimpleNamespace(session_id='test-native',workspace=str(pathlib.Path.cwd()))), patch.object(session_host.fleet,'Dispatcher'), patch.object(session_host.session_control,'execute'), patch.object(session_host,'maybe_start_disk_thread',side_effect=slow_observer), contextlib.redirect_stdout(io.StringIO()) as controller_stdout:
+                session_host.run('synthetic-settings',directory,cycles=1)
+                self.assertIn('observer_started', controller_stdout.getvalue())
+                self.assertFalse(release.is_set())
+                self.assertTrue(threads[0].is_alive())
+            with contextlib.redirect_stdout(io.StringIO()) as later_stdout:
+                release.set()
+                threads[0].join(2)
+            self.assertFalse(threads[0].is_alive())
+            self.assertEqual(later_stdout.getvalue(), '')
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(2)
 
     def test_unbound_controller_has_no_fleet_or_command_effects(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',side_effect=ValueError('unbound')), patch.object(session_host.fleet,'Dispatcher') as dispatcher, patch.object(session_host.session_control,'execute') as execute:
