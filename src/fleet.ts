@@ -800,6 +800,11 @@ export class FleetService {
     const isIdle = (row: any) => row.phase === 'running' && catalogs.has(String(row.machine_id))
       && typeof row.last_activity_at === 'string' && Number.isFinite(Date.parse(row.last_activity_at))
       && Date.parse(row.last_activity_at) <= idleCutoff;
+    // A fresh complete census that no longer contains the exact native proves
+    // it does not consume physical concurrency. Keep the launch/lifecycle rows
+    // unchanged: unobserved is not positive terminal proof.
+    const isUnobserved = (row: any) => row.state === 'running' && row.phase === 'unobserved'
+      && catalogs.has(String(row.machine_id));
     // Native activity, rather than a launch receipt's update timestamp,
     // determines whether a bound running session still occupies admission.
     // Stale catalogs, unknown native state/activity and in-flight starts
@@ -809,7 +814,7 @@ export class FleetService {
           LEFT JOIN fleet_sessions s ON s.machine_id=l.machine_id AND s.native_id=l.native_id
           WHERE l.account = ? AND l.state IN ${ACTIVE} AND l.machine_id IN (${liveList.map(() => '?').join(',')})
           AND (l.state = 'running' OR l.updated_at > ?)`, account.label, ...liveList, staleCutoff).toArray() as any[])
-          .filter(row => row.state !== 'running' || !isIdle(row)).length
+          .filter(row => row.state !== 'running' || (!isIdle(row) && !isUnobserved(row))).length
       : 0;
     const observedSessions = (() => {
       if (!liveList.length) return 0;
