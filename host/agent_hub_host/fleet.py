@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import closing
 import json
 import math
 import os
@@ -2667,7 +2668,7 @@ class Dispatcher:
         if not db.is_file() or db.is_symlink():
             return
         try:
-            with sqlite3.connect(str(db), timeout=5) as conn:
+            with closing(sqlite3.connect(str(db), timeout=5)) as conn, conn:
                 row = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
                 if not row or row[0] != "queued":
                     return

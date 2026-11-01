@@ -1,5 +1,6 @@
 import contextlib
 import datetime
+import io
 import json
 import os
 import pathlib
@@ -24,6 +25,41 @@ class TestJobsClient(unittest.TestCase):
     def setUp(self):
         self.client = JobsClient()
         self.base_url = "https://hub.example.com"
+
+    def test_consumed_http_errors_close_their_response_streams(self):
+        for status, body in ((409, b'{"error":"conflict"}'), (409, b'bad json'),
+                             (500, b'{"error":"unavailable"}'), (500, b'bad json'),
+                             (401, b'{"error":"unauthorized"}')):
+            with self.subTest(status=status, body=body):
+                error = urllib.error.HTTPError(self.base_url, status, 'fixture', {}, io.BytesIO(body))
+                self.addCleanup(error.close)
+                with patch.object(api, 'safe_http_json', side_effect=error):
+                    result = self.client._request('GET', self.base_url, token='fixture', is_job_token=True)
+                self.assertEqual(result['status_code'], status)
+                self.assertTrue(error.closed)
+
+    def test_refresh_failure_closes_both_http_error_responses(self):
+        first = urllib.error.HTTPError(self.base_url, 401, 'fixture', {}, io.BytesIO())
+        retry = urllib.error.HTTPError(self.base_url, 403, 'fixture', {}, io.BytesIO())
+        self.addCleanup(first.close)
+        self.addCleanup(retry.close)
+        with patch.object(api, 'safe_http_json', side_effect=[first, retry]), \
+             patch('agent_hub_host.jobs.auth.refresh_token', return_value='refreshed'):
+            result = self.client._request('GET', self.base_url, token='fixture')
+        self.assertEqual(result, {'error': 'unauthorized', 'status_code': 401})
+        self.assertTrue(first.closed)
+        self.assertTrue(retry.closed)
+
+    def test_error_body_read_failure_still_closes_response(self):
+        class BrokenBody(io.BytesIO):
+            def read(self, *args):
+                raise OSError('fixture read failure')
+        error = urllib.error.HTTPError(self.base_url, 500, 'fixture', {}, BrokenBody())
+        self.addCleanup(error.close)
+        with patch.object(api, 'safe_http_json', side_effect=error):
+            result = self.client._request('GET', self.base_url, token='fixture')
+        self.assertEqual(result, {'error': 'HTTP 500', 'status_code': 500})
+        self.assertTrue(error.closed)
 
     @patch("agent_hub_host.api.safe_http_json")
     def test_claim_job_success(self, mock_http):
