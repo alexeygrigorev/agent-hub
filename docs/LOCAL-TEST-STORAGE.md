@@ -27,6 +27,17 @@ only the current run's new temporary directory on normal exit, failure, INT or
 TERM. Other runs and pre-existing scratch remain untouched. SIGKILL or host
 failure can leave temporary files; inspect those separately before cleanup.
 
+The heavy-test admission wrapper bounds an ordinary holder to 30 minutes and a
+`--priority final` holder to two hours. Final full-gate runs can therefore
+progress through the documented 75–90 minute suite without losing their slot;
+both holder kinds remain bounded, and `--run-timeout` or
+`AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S` can set an explicit 1–86400 second limit.
+On wrapper SIGINT/SIGTERM or timeout, the wrapper signals only the dedicated
+child process group and keeps the group leader unreaped until escalation is
+complete, preventing a reused process-group ID from being signalled. The slot
+remains locked by the wrapper or inherited child descriptors until that group
+has exited.
+
 The uv cache uses the original HOME/XDG cache location, or explicit
 `UV_CACHE_DIR`, even while tests use a disposable HOME. This avoids downloading
 a new cache into each disposable home. Vitest uses `npx --no-install` so a

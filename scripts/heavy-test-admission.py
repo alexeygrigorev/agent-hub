@@ -20,6 +20,7 @@ NORMAL_AGE_S = 300
 REFUSAL_FILE_ENV = 'AGENT_HUB_HEAVY_TEST_REFUSAL_FILE'
 COMMAND_STARTED = False
 DEFAULT_RUN_TIMEOUT_S = 1800
+FINAL_RUN_TIMEOUT_S = 7200
 TERMINATE_GRACE_S = 10
 
 
@@ -137,6 +138,10 @@ def run_command(command, slot, interrupted, run_timeout):
         except OSError as error:
             print(f'capped-test-run: {error}', file=sys.stderr)
             return 127 if isinstance(error, FileNotFoundError) else 126
+        # The session leader's PID is the PGID because start_new_session is
+        # true. Keep it unreaped until cleanup signals are finished so that
+        # this numeric PGID cannot be reused for an unrelated process group.
+        child_pgid = child.pid
         deadline = time.monotonic() + run_timeout
         stopping_at = None
         timed_out = False
@@ -145,23 +150,33 @@ def run_command(command, slot, interrupted, run_timeout):
             now = time.monotonic()
             if stopping_at is None and signal_status:
                 stopping_at = now
-                signal_group(child.pid, signal.SIGTERM)
+                signal_group(child_pgid, signal.SIGTERM)
             elif stopping_at is None and now >= deadline:
                 timed_out = True
                 stopping_at = now
                 print(f'capped-test-run: command exceeded {run_timeout}s; terminating process group',
                       file=sys.stderr, flush=True)
-                signal_group(child.pid, signal.SIGTERM)
+                signal_group(child_pgid, signal.SIGTERM)
             elif stopping_at is not None and now - stopping_at >= TERMINATE_GRACE_S:
-                signal_group(child.pid, signal.SIGKILL)
+                signal_group(child_pgid, signal.SIGKILL)
                 result = child.wait()
                 break
+            if stopping_at is not None:
+                # Observe leader exit without reaping it. If it exits on TERM,
+                # kill any descendants in its group before releasing the PID.
+                try:
+                    exited = os.waitid(os.P_PID, child.pid,
+                                       os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                except ChildProcessError:
+                    exited = None
+                if exited is not None and exited.si_pid:
+                    signal_group(child_pgid, signal.SIGKILL)
+                    result = child.wait()
+                    break
+                time.sleep(0.1)
+                continue
             try:
                 result = child.wait(timeout=0.1)
-                if stopping_at is not None:
-                    # The direct command may exit on TERM while a descendant
-                    # still holds the inherited slot descriptor.
-                    signal_group(child.pid, signal.SIGKILL)
                 break
             except subprocess.TimeoutExpired:
                 continue
@@ -177,7 +192,7 @@ def main():
     parser.add_argument('--slots', default=os.environ.get('AGENT_HUB_HEAVY_TEST_SLOTS', '2'))
     parser.add_argument('--wait', default=os.environ.get('AGENT_HUB_HEAVY_TEST_WAIT_S', '1800'))
     parser.add_argument('--run-timeout', default=os.environ.get(
-        'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S', str(DEFAULT_RUN_TIMEOUT_S)))
+        'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S'))
     parser.add_argument('--priority', default=os.environ.get('AGENT_HUB_HEAVY_TEST_PRIORITY', 'normal'), choices=['normal', 'final'])
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -185,9 +200,12 @@ def main():
         parser.error('invalid slot count')
     if not args.wait.isascii() or not args.wait.isdecimal():
         parser.error('invalid wait seconds')
-    if (not args.run_timeout.isascii() or not args.run_timeout.isdecimal()
-            or not 1 <= int(args.run_timeout) <= 86400):
+    if (args.run_timeout is not None and
+            (not args.run_timeout.isascii() or not args.run_timeout.isdecimal()
+             or not 1 <= int(args.run_timeout) <= 86400)):
         parser.error('invalid command run timeout seconds (expected 1..86400)')
+    run_timeout = int(args.run_timeout) if args.run_timeout is not None else (
+        FINAL_RUN_TIMEOUT_S if args.priority == 'final' else DEFAULT_RUN_TIMEOUT_S)
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('no command given')
@@ -277,8 +295,8 @@ def main():
             with slot:
                 running = True
                 print(f'capped-test-run: admitted {args.priority} ticket {sequence}', file=sys.stderr, flush=True)
-                print(f'capped-test-run: run timeout {args.run_timeout}s', file=sys.stderr, flush=True)
-                return run_command(command, slot, lambda: interrupted, int(args.run_timeout))
+                print(f'capped-test-run: run timeout {run_timeout}s', file=sys.stderr, flush=True)
+                return run_command(command, slot, lambda: interrupted, run_timeout)
 
 
 if __name__ == '__main__':

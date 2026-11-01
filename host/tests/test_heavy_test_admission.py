@@ -194,20 +194,36 @@ class AdmissionTests(unittest.TestCase):
         child = self.start('exit', code='raise SystemExit(17)')
         self.assertEqual(child.wait(timeout=40), 17)
 
-    def test_term_retains_slot_until_command_finishes(self):
+    def test_term_forwards_to_group_and_holds_slot_until_group_exits(self):
         self.holder.close()
         marker = self.root / 'started'
-        release = self.root / 'release'
-        code = f"from pathlib import Path; import time; Path({str(marker)!r}).touch()\nwhile not Path({str(release)!r}).exists(): time.sleep(.02)"
+        child_pid = self.root / 'child.pid'
+        child_code = "import signal,sys,time; signal.signal(signal.SIGTERM, lambda *_: (time.sleep(.4),sys.exit(0))); time.sleep(30)"
+        code = f'''import signal,subprocess,sys,time
+from pathlib import Path
+child=subprocess.Popen([sys.executable, '-c', {child_code!r}], pass_fds=(9,))
+def stop(*_):
+    child.wait()
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+Path({str(child_pid)!r}).write_text(str(child.pid))
+Path({str(marker)!r}).touch()
+time.sleep(30)
+'''
         holder = self.start('holder', code=code)
-        self.until(marker.exists)
+        self.until(lambda: marker.exists() and child_pid.exists())
+        descendant = int(child_pid.read_text())
         holder.terminate()
         waiter = self.start('next')
         time.sleep(.2)
+        # The waiter cannot pass admission while the holder's process group
+        # still owns the inherited slot descriptor.
         self.assertFalse((self.root / 'order').exists())
-        release.touch()
         self.assertEqual(holder.wait(timeout=40), 143)
         self.assertEqual(waiter.wait(timeout=40), 0)
+        self.assertEqual(self.order(), ['next'])
+        self.until(lambda: not Path(f'/proc/{descendant}/stat').exists()
+                   or Path(f'/proc/{descendant}/stat').read_text().split()[2] == 'Z')
 
 
 class RefusalTests(unittest.TestCase):
