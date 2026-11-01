@@ -277,6 +277,28 @@ def test_package_update_schedules_once_per_served_archive(tmp_path):
     assert len(registered) == 2
 
 
+def test_package_update_served_check_identifies_the_client(monkeypatch):
+    # Cloudflare 403s urllib's default User-Agent: the check raised on every
+    # Windows package host, so none ever self-updated (laptop, intake 8d006dc3).
+    from agent_hub_host import api, package_update as u
+    seen = []
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(req, timeout=None):
+        seen.append(req)
+        return Resp(('e' * 64 + '  hub.pyz\n').encode())
+    monkeypatch.setattr(u.urllib.request, 'urlopen', urlopen)
+    assert u.served_archive_sha('https://hub.example/') == 'e' * 64
+    assert seen[0].full_url == 'https://hub.example/cli/hub.pyz.sha256'
+    assert seen[0].get_header('User-agent') == api.USER_AGENT
+
+
 def test_package_update_needs_disk_room(tmp_path):
     from agent_hub_host import package_update as u
     release = make_release(tmp_path, 'd' * 64)

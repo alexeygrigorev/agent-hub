@@ -55,7 +55,11 @@ def served_archive_sha(base_url, fetch=None):
     url = base_url.rstrip('/') + '/cli/hub.pyz.sha256'
     if fetch is None:
         def fetch(u):
-            with urllib.request.urlopen(u, timeout=30) as r:
+            # Cloudflare answers urllib's default "Python-urllib/x.y" with 403, which
+            # kept every Windows package host on its install-day release.
+            from .api import USER_AGENT
+            req = urllib.request.Request(u, headers={'User-Agent': USER_AGENT})
+            with urllib.request.urlopen(req, timeout=30) as r:
                 return r.read(256).decode('ascii', 'replace')
     text = fetch(url).strip().split()
     sha = text[0].lower() if text else ''
