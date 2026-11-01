@@ -3,6 +3,7 @@ import type { FleetService } from './fleet';
 import { canonicalQuotaProvider, dedupeAccountsByCanonical } from './quota';
 import { queuePolicyFrom } from './intake-watchdog';
 import routingPolicy from '../config/model-routing.json';
+import { unobservedReservationReleased } from './fleet-capacity-snapshot';
 
 const OWNED_ACTIVE = `actor='hub:service:intake-watchdog'
   AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.with_goal')=1
@@ -45,7 +46,8 @@ export function liveQueuePolicy(env: Record<string, unknown>, sql: SqlStorage,
         // and unbound launch reservations occupy distinct slots.
         if (Number.isInteger(m.max_agents) && m.max_agents > 0) {
           const occupied = snapshot.natives.filter(n => n.machine_id === m.id && n.phase === 'running').length +
-            snapshot.launches.filter(l => l.machine_id === m.id && l.native_id === null).length;
+            snapshot.launches.filter(l => l.machine_id === m.id && (l.native_id == null || l.native_id === '') &&
+              !unobservedReservationReleased(l, snapshot.completeCatalogs)).length;
           slots = Math.min(slots, Math.max(0, m.max_agents - occupied));
         }
         if (!slots) continue;

@@ -22,7 +22,10 @@ export const capacityFamilyKey = (machine: string, provider: string) => JSON.str
 export function reservationNativeJoinSql(sql: SqlStorage): string {
   let boundNativeId = 'NULL';
   let boundNativeCreatedAt = 'NULL';
-  const hasControlStore = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
+  let hasControlStore = false;
+  try {
+    hasControlStore = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
+  } catch { /* No usable control store: keep the physical reservation. */ }
   if (hasControlStore) {
     const bindings = `SELECT c.binding_json FROM session_control_sessions c
       WHERE c.machine_id=l.machine_id AND c.fleet_launch_id=l.id AND c.engine=l.engine

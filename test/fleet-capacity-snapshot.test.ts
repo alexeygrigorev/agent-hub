@@ -25,6 +25,7 @@ async function fixture(fn: (s: FleetService, sql: any, queries: {query:string,ar
       VALUES('online','1.0',?,?,?,?,'ok',?)`,iso(),now,iso(),now,JSON.stringify({zai:{status:'ok',observed_at:iso(),
       details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:iso(86400000)}}}}));
     sql.exec("INSERT INTO fleet_catalog_seen VALUES('online',?)",iso());
+    sql.exec("INSERT INTO fleet_catalog_census(machine_id,observed_at,complete) VALUES('online',?,1)",iso());
     queries.length=0; fn(s,sql,queries);
   });
 }
@@ -40,6 +41,17 @@ function launch(sql:any,id:string,state='offered',native:string|null=null) {
 function native(sql:any,id:string,activity=iso()) {
   sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,account,last_activity_at)
     VALUES('online',?,?,'zcodex','running',?,'real-project','zai-main',?)`,id,'external-'+id,iso(),activity);
+}
+function absentBoundLaunch(sql:any,state='uncertain',nativeId:string|null=null) {
+  launch(sql,'absent-launch',state,nativeId);
+  native(sql,'absent-native');
+  sql.exec("UPDATE fleet_sessions SET phase='unobserved',created_at_ms=? WHERE native_id='absent-native'",now);
+  controlBinding(sql,'exact-binding');
+}
+function controlBinding(sql:any,id:string) {
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    VALUES(?,'fixture',?,'{}','absent-launch','online','zcodex','headless','uncertain',?,?,?)`,
+    id,id,JSON.stringify({native_id:'absent-native',native_created_at_ms:now}),iso(),iso());
 }
 describe('bounded real Fleet autonomous capacity snapshot',()=>{
   it('uses real quota/account/resource admission without global maintenance or writes',()=>fixture((s,sql,queries)=>{
@@ -59,8 +71,67 @@ describe('bounded real Fleet autonomous capacity snapshot',()=>{
     const normal=s.accountStatus(a);
     expect(bounded).toMatchObject({active:3,reserved:2,observed_sessions:1,native_live:3});
     expect(bounded).toEqual(normal);
-    sql.exec('DELETE FROM fleet_catalog_seen');
+    // A fresh legacy receipt alone is not complete-census evidence.
+    sql.exec('DELETE FROM fleet_catalog_census');
     expect(s.accountStatus(a,s.queueCapacitySnapshot(now))).toMatchObject({active:4,observed_sessions:2,native_live:null});
+  }));
+  it.each(['missing','incomplete','stale','future'])('keeps idle reservations without a usable complete census: %s',kind=>fixture((s,sql)=>{
+    launch(sql,'idle-bound','running','idle-native'); native(sql,'idle-native',iso(-3600000));
+    native(sql,'idle-orphan',iso(-3600000));
+    if(kind==='missing') sql.exec('DELETE FROM fleet_catalog_census');
+    if(kind==='incomplete') sql.exec('UPDATE fleet_catalog_census SET complete=0');
+    if(kind==='stale') sql.exec('UPDATE fleet_catalog_census SET observed_at=?',iso(-180001));
+    if(kind==='future') sql.exec('UPDATE fleet_catalog_census SET observed_at=?',iso(60001));
+    const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
+    const bounded=s.accountStatus(a,s.queueCapacitySnapshot(now));
+    expect(bounded).toMatchObject({active:2,reserved:1,observed_sessions:1,native_live:null});
+    expect(bounded).toEqual(s.accountStatus(a));
+  }));
+  it.each(['running','uncertain'])('releases only physical absence with complete census for %s launches',state=>fixture((s,sql)=>{
+    absentBoundLaunch(sql,state,state==='running'?'absent-native':null);
+    const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
+    const bounded=s.accountStatus(a,s.queueCapacitySnapshot(now));
+    expect(bounded).toMatchObject({active:0,reserved:0,observed_sessions:0,native_live:0});
+    expect(bounded).toEqual(s.accountStatus(a));
+    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='absent-launch'").one().state).toBe(state);
+  }));
+  it.each(['incomplete','ambiguous','missing','engine','account','incarnation','malformed','direct-uncertain'])('retains uncertain reservations when absence proof is %s',kind=>fixture((s,sql)=>{
+    absentBoundLaunch(sql);
+    if(kind==='incomplete') sql.exec('UPDATE fleet_catalog_census SET complete=0');
+    if(kind==='ambiguous') controlBinding(sql,'duplicate-binding');
+    if(kind==='missing') sql.exec('DELETE FROM session_control_sessions');
+    if(kind==='engine') sql.exec("UPDATE fleet_sessions SET engine='claude' WHERE native_id='absent-native'");
+    if(kind==='account') sql.exec("UPDATE fleet_sessions SET account='foreign' WHERE native_id='absent-native'");
+    if(kind==='incarnation') sql.exec("UPDATE fleet_sessions SET created_at_ms=? WHERE native_id='absent-native'",now-1);
+    if(kind==='malformed') sql.exec("UPDATE session_control_sessions SET binding_json='invalid'");
+    if(kind==='direct-uncertain') sql.exec("UPDATE fleet_launches SET native_id='absent-native' WHERE id='absent-launch'");
+    const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
+    const bounded=s.accountStatus(a,s.queueCapacitySnapshot(now));
+    expect(bounded).toMatchObject({active:1,reserved:1,observed_sessions:0});
+    expect(bounded).toEqual(s.accountStatus(a));
+    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='absent-launch'").one().state).toBe('uncertain');
+  }));
+  it.each([null,''])('preserves a one-agent machine ceiling while releasing a proven absent binding with native_id=%s',nativeId=>fixture((s,sql)=>{
+    absentBoundLaunch(sql,'uncertain',nativeId);
+    sql.exec("INSERT INTO routing_machines(machine_id,needs_json,max_agents,observed_at) VALUES('online','[]',1,?)",iso());
+    expect(liveQueuePolicy(settings,sql,s,now)).toMatchObject({max_inflight:1,capacity:{machine_slots:1,available_slots:1}});
+    sql.exec('UPDATE fleet_catalog_census SET complete=0');
+    expect(liveQueuePolicy(settings,sql,s,now)).toMatchObject({max_inflight:0,capacity:{machine_slots:0,available_slots:0}});
+    expect(sql.exec("SELECT max_agents FROM routing_machines WHERE machine_id='online'").one().max_agents).toBe(1);
+  }));
+  it('bounds duplicate control-binding reads while holding the ambiguous reservation',()=>fixture((s,sql)=>{
+    absentBoundLaunch(sql);
+    for(let i=0;i<199;i++) controlBinding(sql,'duplicate-'+i);
+    const measured:any[]=[]; const exec=sql.exec.bind(sql);
+    sql.exec=(query:string,...args:any[])=>{
+      const cursor=exec(query,...args);
+      if(query.includes('FROM fleet_launches l') && query.includes('FROM session_control_sessions c')) measured.push(cursor);
+      return cursor;
+    };
+    const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
+    expect(s.accountStatus(a,s.queueCapacitySnapshot(now))).toMatchObject({active:1,reserved:1});
+    expect(measured).toHaveLength(1);
+    expect(Number(measured[0].rowsRead)).toBeLessThan(40);
   }));
   it('fails closed on 99 live hosts before account status and keeps every binding batch below 100',()=>fixture((s,sql,queries)=>{
     for(let i=0;i<98;i++) machine(sql,'live-'+i);
