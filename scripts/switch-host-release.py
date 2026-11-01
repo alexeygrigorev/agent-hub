@@ -12,8 +12,8 @@ and environment are preserved and only the release path changes.
 Usage:
   switch-host-release.py --release <dir> --template <conf> --dropin <conf> [--restart]
 
---dropin should sort after every other drop-in for the unit (systemd applies
-the last ExecStart=). --restart reloads user units and restarts the service,
+--dropin must be the shared zz~~hub-desired-release.conf managed override.
+--restart reloads user units and restarts the service,
 then waits for it to report active.
 """
 import argparse
@@ -24,6 +24,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 VERIFY = REPO / "scripts" / "verify-host-release.py"
+DROPIN = 'zz~~hub-desired-release.conf'
+MARKER = '# Managed by Agent Hub desired host release.\n'
 # Full old release directory path: any non-space run ending in a 40-hex
 # release segment, followed by /, whitespace, quote or end of line. Matching
 # the full path (not just the sha segment) keeps the substitution exact.
@@ -61,12 +63,20 @@ def main():
     parser.add_argument("--service", default="agent-hub-session-host.service")
     parser.add_argument("--restart", action="store_true")
     args = parser.parse_args()
+    dropin = Path(args.dropin)
+    if dropin.name != DROPIN:
+        raise SystemExit('switch-host-release: REFUSED: use managed ' + DROPIN)
+    if dropin.is_symlink() or (dropin.exists() and
+            (not dropin.is_file() or not dropin.read_text(encoding='utf-8').startswith(MARKER))):
+        raise SystemExit('switch-host-release: REFUSED: unmanaged destination')
     release = Path(args.release).resolve()
     rc = subprocess.run([sys.executable, str(VERIFY), str(release)]).returncode
     if rc != 0:
         raise SystemExit("switch-host-release: REFUSED: release failed verification")
     template_text = Path(args.template).read_text(encoding="utf-8")
     new_text = substitute_release(template_text, str(release))
+    if not new_text.startswith(MARKER):
+        new_text = MARKER + new_text
     if "PYTHONDONTWRITEBYTECODE" not in new_text:
         # Keep the release tree verifiable at runtime: no bytecode caches
         # are ever written next to the hashed sources (startup cost only).
@@ -74,7 +84,6 @@ def main():
         insert_at = next((i for i, line in enumerate(lines) if line.startswith("ExecStart=")), len(lines))
         lines.insert(insert_at, "Environment=PYTHONDONTWRITEBYTECODE=1\n")
         new_text = "".join(lines)
-    dropin = Path(args.dropin)
     dropin.parent.mkdir(parents=True, exist_ok=True)
     dropin.write_text(new_text, encoding="utf-8")
     print("switch-host-release: wrote " + str(dropin))

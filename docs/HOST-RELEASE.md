@@ -91,6 +91,31 @@ hashed in the release manifest. The managed final drop-in is
 Status retains the running SHA during `updating`/`updated` and changes to the
 new SHA only when the new release reports `current`.
 
+### Operator switches and legacy overrides
+
+Use `scripts/switch-host-release.py --release <verified-release-dir>
+--template <active-drop-in> --dropin <unit-drop-in-dir>/zz~~hub-desired-release.conf`
+for manual switches. The switcher writes the same ownership marker as the
+desired-state updater and refuses other destination names or an unmarked
+existing destination. Do not add more tildes to override precedence.
+
+The updater recognizes legacy `zz~<7-to-40-hex-sha>-switch-release.conf`
+names (including repeated tildes) only for regular, user-owned files in the
+unit's user drop-in directory, referencing a single manifested release whose
+SHA matches the filename. After a successful verified switch it renames these
+to `.conf.disabled`, preserving their contents. Before each rename it fsyncs
+a source/backup record to the old release's
+`.local/host-release-switch-journal.jsonl`. Existing backups cause refusal;
+foreign later overrides remain `release_dropin_precedence` errors.
+
+For rollback, inspect that private journal and the preserved overrides, restore
+the recorded backup to its source name only when the source is absent, then
+reload user units and restart during an approved maintenance window. No file
+is deleted. Older running releases need one operator bootstrap onto this kit
+before they can perform the migration. After release, verify the next Hub pin
+reaches `host_release.state=current` and the unit's ExecStart references that
+same SHA; a successful build alone does not prove live acceptance.
+
 Hosts that run the session host straight from a git checkout and have no
 inbound channel (Tabo: Windows, no ssh) take releases from the Hub instead
 of from an operator at the keyboard (intake a3227276):

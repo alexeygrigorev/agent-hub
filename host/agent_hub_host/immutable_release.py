@@ -6,6 +6,7 @@ The normal supervisor restart marker loads the new unit after the report lands.
 """
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ from .self_update import SHA, UpdateRefused, _git, _run
 SERVICE = 'agent-hub-session-host.service'
 MARKER = '# Managed by Agent Hub desired host release.\n'
 DROPIN = 'zz~~hub-desired-release.conf'
+LEGACY_DROPIN = re.compile(r'zz~+[0-9a-f]{7,40}-switch-release\.conf')
 ORIGINS = {'https://github.com/alexeygrigorev/agent-hub.git',
            'https://github.com/alexeygrigorev/agent-hub',
            'git@github.com:alexeygrigorev/agent-hub.git'}
@@ -35,6 +37,43 @@ def manifest_sha(root):
 def _require(ok, reason):
     if not ok:
         raise UpdateRefused(reason)
+
+
+def legacy_switches(dropins, unit_dir, root):
+    """Recognize only local, owned operator switches to a manifested release."""
+    legacy = []
+    for path in dropins:
+        if path.name <= DROPIN:
+            continue
+        _require(path.parent.resolve() == unit_dir and not path.is_symlink()
+                 and path.is_file() and path.stat().st_uid == os.getuid()
+                 and LEGACY_DROPIN.fullmatch(path.name), 'release_dropin_precedence')
+        text = path.read_text(encoding='utf-8')
+        refs = set(re.findall(r'/[^\s\"\']+/([0-9a-f]{40})(?=[/\s\"\']|$)', text))
+        _require(len(refs) == 1, 'release_dropin_precedence')
+        sha = next(iter(refs))
+        _require(str(root.parent / sha) in text and
+                 manifest_sha(root.parent / sha) == sha and
+                 sha.startswith(path.name.split('-switch-release')[0].lstrip('z~')),
+                 'release_dropin_precedence')
+        backup = path.with_suffix('.conf.disabled')
+        _require(not backup.exists() and not backup.is_symlink(), 'release_dropin_backup_conflict')
+        legacy.append((path, backup))
+    return legacy
+
+
+def retire_switches(legacy, journal):
+    """Write ahead before each reversible rename; never delete an override."""
+    if not legacy:
+        return
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    with journal.open('a', encoding='utf-8') as handle:
+        for path, backup in legacy:
+            handle.write(json.dumps({'action': 'disable_operator_switch',
+                                     'source': str(path), 'backup': str(backup)}) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+            path.rename(backup)
 
 
 def apply(target, before, request, *, root, source=None, run=subprocess.run,
@@ -89,7 +128,7 @@ def _apply(target, before, request, *, root, source, run, python, disk_usage):
             candidates.append(path)
     _require(bool(candidates), 'release_service_template_missing')
     destination = unit_dir / DROPIN
-    _require(all(p.name <= DROPIN for p in dropins), 'release_dropin_precedence')
+    legacy = legacy_switches(dropins, unit_dir, root)
     if destination.exists() or destination.is_symlink():
         _require(not destination.is_symlink() and destination.is_file() and
                  destination.stat().st_uid == os.getuid() and
@@ -128,6 +167,11 @@ def _apply(target, before, request, *, root, source, run, python, disk_usage):
         path.unlink()
     if code:
         return 'failed', 'release_switch_failed', before
+    retire_switches(legacy, root / '.local' / 'host-release-switch-journal.jsonl')
+    if legacy:
+        code, _ = _run(run, ['systemctl', '--user', 'daemon-reload'], root, 30)
+        if code:
+            return 'failed', 'release_reload_failed', before
     # The currently running module is still the old release until the normal
     # restart marker drains the controller and the supervisor restarts the unit.
     return 'updated', None, before

@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import subprocess
 import tempfile
@@ -113,3 +114,60 @@ class ImmutableReleaseTest(unittest.TestCase):
         destination.write_text('another owner\n')
         self.assertEqual(self.apply(), ('refused', 'release_dropin_conflict', self.before))
         self.assertEqual(destination.read_text(), 'another owner\n')
+
+    def test_legacy_switch_is_preserved_and_next_release_becomes_current(self):
+        self.template = self.unit_dir / ('zz~~~~' + self.before[:8] + '-switch-release.conf')
+        self.template.write_text(self.text)
+        original = self.template
+        self.assertEqual(self.apply(), ('updated', None, self.before))
+        self.assertFalse(original.exists())
+        self.assertEqual(original.with_suffix('.conf.disabled').read_text(), self.text)
+        journal = self.root / '.local' / 'host-release-switch-journal.jsonl'
+        self.assertEqual(json.loads(journal.read_text())['source'], str(original))
+        self.before = self.target
+        self.root = self.root.parent / self.target
+        self.assertEqual(self.apply(), ('current', None, self.target))
+
+    def test_later_foreign_override_is_refused_without_changes(self):
+        self.template = self.unit_dir / 'zz~~~~foreign.conf'
+        self.template.write_text(self.text)
+        self.assertEqual(self.apply(), ('refused', 'release_dropin_precedence', self.before))
+        self.assertEqual(self.template.read_text(), self.text)
+        self.assertFalse(any('build-host-release.py' in str(c) for c in self.calls))
+
+    def test_legacy_backup_collision_refuses_without_build(self):
+        self.template = self.unit_dir / ('zz~~~~' + self.before[:8] + '-switch-release.conf')
+        self.template.write_text(self.text)
+        self.template.with_suffix('.conf.disabled').write_text('preserve')
+        self.assertEqual(self.apply(), ('refused', 'release_dropin_backup_conflict', self.before))
+
+    def test_failed_build_keeps_legacy_override_active(self):
+        self.template = self.unit_dir / ('zz~~~~' + self.before[:8] + '-switch-release.conf')
+        self.template.write_text(self.text)
+        self.fail_build = True
+        self.assertEqual(self.apply(), ('failed', 'release_build_failed', self.before))
+        self.assertEqual(self.template.read_text(), self.text)
+        self.assertFalse(self.template.with_suffix('.conf.disabled').exists())
+
+    def test_legacy_name_with_foreign_content_is_not_adopted(self):
+        self.template = self.unit_dir / ('zz~~~~' + self.target[:8] + '-switch-release.conf')
+        self.template.write_text(self.text)
+        self.assertEqual(self.apply(), ('refused', 'release_dropin_precedence', self.before))
+        self.assertEqual(self.template.read_text(), self.text)
+
+    def test_manual_switch_uses_managed_marker_and_rejects_legacy_destination(self):
+        spec = importlib.util.spec_from_file_location('switch_release',
+            Path(__file__).resolve().parents[2] / 'scripts' / 'switch-host-release.py')
+        switch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(switch)
+        destination = self.unit_dir / update.DROPIN
+        argv = ['switch', '--release', str(self.root.parent / self.target),
+                '--template', str(self.template), '--dropin', str(destination)]
+        with patch('sys.argv', argv), patch.object(switch.subprocess, 'run',
+                return_value=subprocess.CompletedProcess([], 0, '', '')):
+            self.assertEqual(switch.main(), 0)
+        self.assertTrue(destination.read_text().startswith(update.MARKER))
+        self.assertIn(str(self.root.parent / self.target), destination.read_text())
+        with patch('sys.argv', argv[:-1] + [str(self.unit_dir / 'zz~~~~legacy.conf')]):
+            with self.assertRaisesRegex(SystemExit, 'use managed'):
+                switch.main()
