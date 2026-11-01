@@ -493,6 +493,31 @@ hub sessions host-receive --once --machine-id hetzner [--actor machine:hetzner]
     [--credential-family host:hetzner] [--journal-dir ABS] [--aplexer-bin aplexer] [--limit 20]
 ```
 
+### Capture or send before the session is bound (intake e1ed7abe)
+
+A session has no native binding while it is `queued`, `held`, `offered` or
+`starting` (target: offered -> bound under 60 s). `capture` and `send` in that
+window answer `409` with a retryable pending state instead of a bare error:
+
+```json
+{"error":"session_not_bound","state":"offered","pending":true,"retry_after_s":5,
+ "message":"session is offered: no native binding yet; retry in 5s (...)"}
+```
+
+Once the session is `stopped`, `failed` or `cancelled` the same `409` carries
+`pending:false` and no `retry_after_s`: nothing is coming. `hub sessions capture`
+(with its default wait) polls the session for up to 90 s until it is `running`,
+then enqueues the capture and waits for the acknowledgement with the full
+`--timeout` (so the bind wait is separate from, and not bounded by, `--timeout`);
+`--no-wait` returns the pending error immediately. `send` does not wait: it fails
+fast with the same pending 409 and its `retry_after_s`. Webhook delivery already
+retries `session_not_bound`.
+
+The host claims offers on a dedicated thread (`offers_loop`, every
+`OFFERS_POLL_S` = 2 s), independent of the main loop, and logs one
+`offer_dispatch_stages` event per claimed offer with the seconds spent in the
+admission, workspace, worktree, submit/plan and claim stages.
+
 ### Scheduled wakes (waiting on an external event = register a Hub wake)
 
 Waiting on an external event means registering a Hub wake; a passive timer

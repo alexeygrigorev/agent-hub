@@ -991,7 +991,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             if bindings_thread is not None:
                 bindings_thread.join(timeout=1)
             if offers_thread is not None:
-                offers_thread.join(timeout=1)
+                offers_thread.join(timeout=2)
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 

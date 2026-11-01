@@ -94,11 +94,12 @@ class PendingCapture(unittest.TestCase):
 
     def test_capture_waits_for_the_bind_then_enqueues(self):
         states = iter(['offered', 'starting', 'running'])
-        posts = []
+        posts, keys = [], []
 
         def fake(method, path, payload=None):
             if method == 'POST':
                 posts.append(path)
+                keys.append(payload['key'])
                 if len(posts) == 1:
                     raise sc.http_error(pending_error())
                 return {'command_id': 'c1'}
@@ -109,6 +110,8 @@ class PendingCapture(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as err:
             result = sc.execute(self.args())
         self.assertEqual(len(posts), 2)
+        # The retry after the bind wait replays the same idempotency key: no duplicate capture.
+        self.assertEqual(keys, ['stable', 'stable'])
         self.assertEqual(result['command_wait'], ack)
         self.assertIn('waiting up to', err.getvalue())
 
