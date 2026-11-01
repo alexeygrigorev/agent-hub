@@ -29,6 +29,7 @@ class AdmissionTests(unittest.TestCase):
         self.env = dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=str(self.root),
                         AGENT_HUB_HEAVY_TEST_SLOTS='1', AGENT_HUB_HEAVY_TEST_WAIT_S='40',
                         AGENT_HUB_HEAVY_TEST_PRIORITY='normal')
+        self.env.pop('AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN', None)
         self.holder = (self.root / 'slot-0.lock').open('a+')
         fcntl.flock(self.holder, fcntl.LOCK_EX)
 
@@ -278,7 +279,8 @@ class RefusalTests(unittest.TestCase):
         self.state_path = self.root / 'fifo-state.json'
         self.env = dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=str(self.root),
                         AGENT_HUB_HEAVY_TEST_SLOTS='1', AGENT_HUB_HEAVY_TEST_WAIT_S='0')
-        for name in ('CI', 'AGENT_HUB_HEAVY_TEST_HELD', 'AGENT_HUB_HEAVY_TEST_AUTO'):
+        for name in ('CI', 'AGENT_HUB_HEAVY_TEST_HELD', 'AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN',
+                     'AGENT_HUB_HEAVY_TEST_AUTO'):
             self.env.pop(name, None)
         self.bad_states = ['{invalid', json.dumps({'version': 99, 'next': 1, 'active': {}})]
 

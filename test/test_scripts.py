@@ -206,6 +206,7 @@ class TestCappedTestRun(unittest.TestCase):
 
     def run_capped(self, *args, env_extra=None):
         env = dict(os.environ)
+        env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
         if env_extra:
             env.update(env_extra)
         return subprocess.run([self.capped, *args], capture_output=True,
@@ -263,6 +264,7 @@ class TestCappedTestRun(unittest.TestCase):
         import time
         with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
             env = {**os.environ, "AGENT_HUB_HEAVY_TEST_DIR": os.path.join(tmpdir, "heavy")}
+            env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
             child_pid = os.path.join(tmpdir, "child")
             parent = subprocess.Popen(
                 [self.capped, "--slots", "1", "--", "bash", "-c",
@@ -283,6 +285,7 @@ class TestCappedTestRun(unittest.TestCase):
     def test_two_slots_allow_two_holders_and_hold_third(self):
         with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
             env = {**os.environ, "AGENT_HUB_HEAVY_TEST_DIR": os.path.join(tmpdir, "heavy")}
+            env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
             holders = [subprocess.Popen([self.capped, "--slots", "2", "--", "bash", "-c",
                          'echo ready; read -r line'], env=env, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -362,6 +365,7 @@ class TestCappedTestRun(unittest.TestCase):
         import time
         with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
             env = dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=os.path.join(tmpdir, "heavy"))
+            env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
             ready = os.path.join(tmpdir, "ready")
             release = os.path.join(tmpdir, "release")
             program = ("from pathlib import Path; import os,sys,time; os.close(9); "

@@ -65,6 +65,7 @@ class HeavyEnv:
                    AGENT_HUB_HEAVY_TEST_SLOTS="1", AGENT_HUB_HEAVY_TEST_WAIT_S="0",
                    CAPPED_TEST_RETRY_SLEEP=str(self.fake_sleep), TMPDIR=str(self.root))
         env.pop(MARKER_ENV, None)
+        env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
         env.update(extra)
         return env
 

@@ -33,10 +33,10 @@ with record.open("a") as out:
                           "priority": os.environ.get("AGENT_HUB_HEAVY_TEST_PRIORITY"),
                           "selectors": sorted(k for k in os.environ if (k.startswith(("APLEXER_", "HUB_", "AGENT_HUB_"))
                             or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR"))
-                            and k != "AGENT_HUB_HEAVY_TEST_HELD"),
+                            and k not in ("AGENT_HUB_HEAVY_TEST_HELD", "AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN")),
                           "profile": str(profile),
                           "hub_env": sorted(k for k in os.environ if k.startswith(("HUB_", "AGENT_HUB_"))
-                                            and k != "AGENT_HUB_HEAVY_TEST_HELD")}) + "\n")
+                                            and k not in ("AGENT_HUB_HEAVY_TEST_HELD", "AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN"))}) + "\n")
 if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_PROFILE_ISOLATION"):
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text("written by isolated Python fixture")
@@ -127,7 +127,7 @@ class FullLocalStorageTests(unittest.TestCase):
         for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "VITEST_EXIT", "FAIL_TYPECHECK",
                     "AGENT_HUB_HEAVY_TEST_REFUSAL_FILE", "CAPPED_TEST_RETRY_SLEEP", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
                     "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS",
-                    "AGENT_HUB_HEAVY_TEST_HELD"):
+                    "AGENT_HUB_HEAVY_TEST_HELD", "AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN"):
             env.pop(key, None)
         env.update(AGENT_HUB_HEAVY_TEST_PRIORITY="normal")
         env.update(overrides)
