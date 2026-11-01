@@ -58,6 +58,30 @@ class TestIntakeCli(unittest.TestCase):
             self.assertEqual(code, 0, error)
             self.assertIn('limit=' + str(limit), transport.call_args.args[1])
 
+    def test_zip_bytecode_is_deterministic_and_other_versions_fall_back_to_source(self):
+        import importlib.util
+        import marshal
+        import zipfile
+        spec = importlib.util.spec_from_file_location('hub_cli_builder_fixture', ROOT / 'scripts/build-hub-cli.py')
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        cached_source = b"VALUE = 'cached'\n"
+        cached = builder.zip_bytecode(cached_source, 'fixture.py')
+        self.assertEqual(cached, builder.zip_bytecode(cached_source, 'fixture.py'))
+        self.assertEqual(marshal.loads(cached[16:]).co_filename, 'fixture.py')
+        scratch = ROOT / '.local/tmp'
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            for magic, expected in [(cached[:4], 'cached'), (b'bad!', 'source')]:
+                archive = Path(directory) / 'fixture.pyz'
+                with zipfile.ZipFile(archive, 'w') as output:
+                    output.writestr('__main__.py', 'import fixture; print(fixture.VALUE)')
+                    output.writestr('fixture.py', "VALUE = 'source'\n")
+                    output.writestr('fixture.pyc', magic + cached[4:])
+                result = subprocess.run([sys.executable, str(archive)], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
     def test_forgotten(self):
         with patch.object(intake, 'request', return_value={'items': [], 'forgotten_count': 0}) as transport:
             code, out, error = self.run_cli('intake', 'forgotten', '--project', 'demo')
