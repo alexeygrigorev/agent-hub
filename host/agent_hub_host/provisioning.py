@@ -1881,7 +1881,7 @@ def sync_status(listing):
     """Compact per-host view of the sanitized `GET /api/engines` sync_status."""
     hosts = []
     for h in listing.get('sync_status', []):
-        hosts.append({'machine': h.get('machine') or h['machine_id'], 'online': h['online'], 'host_state': h['host_state'],
+        hosts.append({'machine': h.get('machine') or h['machine_id'], 'machine_id': h['machine_id'], 'online': h['online'], 'host_state': h['host_state'],
                       'last_sync_at': h['last_sync_at'], 'accounts': {a['label']: a['state'] + (':' + a['error'] if a.get('error') else '') for a in h['accounts']}})
     return {'hosts': hosts}
 

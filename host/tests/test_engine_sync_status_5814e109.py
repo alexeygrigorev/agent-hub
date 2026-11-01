@@ -82,7 +82,7 @@ class SyncReportTest(unittest.TestCase):
         listing = {'sync_status': [{'machine_id': 'm1', 'machine': 'RMTHZ', 'online': True, 'host_state': 'synced',
                                     'last_sync_at': 5, 'accounts': [{'label': 'a', 'state': 'synced'},
                                                                     {'label': 'b', 'state': 'failed', 'error': 'OSError'}]}]}
-        self.assertEqual(p.sync_status(listing), {'hosts': [{'machine': 'RMTHZ', 'online': True, 'host_state': 'synced',
+        self.assertEqual(p.sync_status(listing), {'hosts': [{'machine': 'RMTHZ', 'machine_id': 'm1', 'online': True, 'host_state': 'synced',
                                                              'last_sync_at': 5, 'accounts': {'a': 'synced', 'b': 'failed:OSError'}}]})
 
 
