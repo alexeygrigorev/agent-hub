@@ -116,7 +116,7 @@ def build(out_dir: Path, version: str):
             encoding="utf-8",
         )
         (staging / "__main__.py").write_text(
-            "from agent_hub_host.cli import main\nif __name__ == '__main__':\n    main()\n",
+            "from agent_hub_host.__main__ import main\nif __name__ == '__main__':\n    main()\n",
             encoding="utf-8",
         )
         pyz_tmp = staging / "hub.pyz.tmp"
