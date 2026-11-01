@@ -15,6 +15,9 @@ Outputs (exact filenames for the server allowlist):
 """
 import argparse
 import hashlib
+import importlib.util
+import marshal
+import struct
 import json
 import os
 import shutil
@@ -72,6 +75,18 @@ def collect_files():
     return files
 
 
+def zip_bytecode(source: bytes, archive_name: str) -> bytes:
+    """Deterministic optional cache; retain .py for other Python versions.
+
+    zipimport recognizes adjacent module.pyc (not __pycache__). PEP 552's
+    unchecked hash header avoids filesystem timestamps. The immutable zipapp
+    remains protected by its existing SHA256; caches never load private files.
+    """
+    code = compile(source, archive_name, 'exec', dont_inherit=True, optimize=0)
+    return (importlib.util.MAGIC_NUMBER + struct.pack('<I', 1) +
+            importlib.util.source_hash(source) + marshal.dumps(code))
+
+
 def build(out_dir: Path, version: str):
     if sys.version_info < (3, 9):
         raise SystemExit("Python >=3.9 required to build hub.pyz")
@@ -119,13 +134,21 @@ def build(out_dir: Path, version: str):
                     arc = full.relative_to(staging).as_posix()
                     entries.append((arc, full))
             entries.sort(key=lambda t: t[0])
-            for arc, full in entries:
+            def write_entry(arc, data):
                 info = zipfile.ZipInfo(arc, date_time=FIXED_DATE)
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.create_system = 3
                 # Regular file 644; __main__ still runnable via python3 hub.pyz.
                 info.external_attr = (0o644 << 16)
-                zf.writestr(info, full.read_bytes())
+                zf.writestr(info, data)
+
+            for arc, full in entries:
+                data = full.read_bytes()
+                write_entry(arc, data)
+                if arc.endswith('.py') and sys.implementation.name == 'cpython':
+                    # Avoid compiling the entire CLI on every cold zipapp read.
+                    # Mismatched interpreter magic falls back to included source.
+                    write_entry(arc[:-3] + '.pyc', zip_bytecode(data, arc))
         # Prepend shebang for direct execution.
         raw = pyz_tmp.read_bytes()
         blob = b"#!/usr/bin/env python3\n" + raw[raw.index(b"PK\x03\x04"):]
