@@ -14,7 +14,7 @@ Hub stores one row per intake in `intake_merge_state`: tracked worktree
 - every worktree recorded for the intake (starts tracking, `state=tracking`),
 - every host worktree status result (head, unmerged count),
 - `hub intake merge-check <intake> [--repo DIR] [--sha SHA] [--dry-run]`, which
-  runs `git fetch origin main`, ancestry (`merge-base --is-ancestor`) for the
+  runs `git fetch origin main` in a private clone of the project repo (`--repo DIR` overrides and also checks that checkout's HEAD; the caller's cwd is never used), takes commits only from `report`/`commit` events or DONE-note hex tokens verified with `git cat-file -e` (uuids and intake/session ids are ignored), ancestry (`merge-base --is-ancestor`) for the
   DONE-note commits plus HEAD, and `gh run list --workflow deploy.yml` for the
   exact commits (a later green Deploy that contains the commit counts; `[skip ci]`
   commits are `skipped`; `gh` failure is `unknown`, never green). It posts

@@ -280,7 +280,7 @@ def add_commands(sub):
                        help='Operator only: close without DONE evidence, recorded as closed_unverified with --reason (never counted as verified)')
     merge_check = commands.add_parser('merge-check', help='Collect git ancestry + Deploy evidence for this intake and record it in Hub (merge gate)')
     merge_check.add_argument('id')
-    merge_check.add_argument('--repo', default='.', help='Git checkout holding the work (default: current directory)')
+    merge_check.add_argument('--repo', default=None, help='Git checkout holding the work, also checked for its HEAD (default: a private clone of the project repo, independent of the current directory)')
     merge_check.add_argument('--sha', action='append', default=[], help='Extra commit to verify (the DONE note commits and HEAD are always checked)')
     merge_check.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     merge_check.add_argument('--dry-run', action='store_true', help='Print the evidence without recording it')
@@ -487,10 +487,16 @@ def execute(args):
         from . import merge_evidence
         shown = request('GET', BASE + '/tasks/' + safe_id(args.id))
         history = ((shown.get('task') or {}).get('payload_data') or {}).get('history') or []
+        task = shown.get('task') or {}
         text = '\n'.join(e.get('text', '') for e in history if isinstance(e, dict) and e.get('kind') == 'note' and str(e.get('text', '')).lstrip().startswith('DONE'))
-        wanted = merge_evidence.shas_from_text(text) + [x for x in args.sha if isinstance(x, str)]
+        explicit = [str(e.get('reference') or '').strip() for e in history
+                    if isinstance(e, dict) and e.get('kind') in ('report', 'commit') and merge_evidence.SHA.match(str(e.get('reference') or '').strip())]
         try:
-            evidence = merge_evidence.collect(str(Path(args.repo).resolve()), wanted)
+            repo = str(Path(args.repo).resolve()) if args.repo else merge_evidence.own_clone()
+            candidates = merge_evidence.shas_from_text(text, exclude=(task.get('id'),) + tuple(e.get('hub_session_id') or e.get('id') for e in history if isinstance(e, dict)))
+            merge_evidence.fetch_origin(repo)
+            wanted = explicit + merge_evidence.existing_commits(repo, candidates) + [x for x in args.sha if isinstance(x, str)]
+            evidence = merge_evidence.collect(str(Path(repo).resolve()), wanted, fetch=False, include_head=args.repo is not None)
         except RuntimeError as exc:
             raise IntakeInputError(str(exc)) from None
         if args.dry_run:

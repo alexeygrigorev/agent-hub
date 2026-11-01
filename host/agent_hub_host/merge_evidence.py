@@ -8,8 +8,10 @@ missing deploy run never reads as green.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 SHA = re.compile(r'^[0-9a-f]{7,40}$', re.I)
@@ -27,13 +29,40 @@ def _run(runner: Callable, argv: list, cwd: str, timeout: int = GIT_TIMEOUT):
         return None
 
 
-def shas_from_text(text: str) -> list:
-    """Commit-looking tokens (7-40 hex with at least one letter and one digit)."""
+UUID = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.I)
+DEFAULT_REMOTE = 'git@github.com:alexeygrigorev/agent-hub.git'
+
+
+def shas_from_text(text: str, exclude: tuple = ()) -> list:
+    """Commit-*candidate* tokens (7-40 hex with a letter and a digit). Only candidates:
+    callers must verify them with ``existing_commits``. Uuids (and fragments of ids in
+    ``exclude``) are intake/session ids, never commits."""
+    text = UUID.sub(' ', text or '')
+    skip = {frag.lower() for ident in exclude for frag in re.split(r'[-\s]+', str(ident or '')) if frag}
     found = []
-    for token in re.findall(r'\b[0-9a-f]{7,40}\b', text or '', re.I):
-        if re.search(r'[a-f]', token, re.I) and re.search(r'\d', token) and token.lower() not in found:
-            found.append(token.lower())
+    for token in re.findall(r'\b[0-9a-f]{7,40}\b', text, re.I):
+        low = token.lower()
+        if re.search(r'[a-f]', low) and re.search(r'\d', low) and low not in found and low not in skip:
+            found.append(low)
     return found[:MAX_COMMITS]
+
+
+def existing_commits(repo: str, candidates: list, runner: Callable = subprocess.run) -> list:
+    """Candidates that are real commits in ``repo`` (git cat-file -e <sha>^{commit})."""
+    return [c for c in candidates
+            if (p := _run(runner, ['git', 'cat-file', '-e', c + '^{commit}'], repo)) is not None and p.returncode == 0]
+
+
+def own_clone(runner: Callable = subprocess.run, remote: Optional[str] = None) -> str:
+    """Private checkout of the project repo (never the caller's cwd)."""
+    remote = remote or os.environ.get('AGENT_HUB_MERGE_CHECK_REMOTE') or DEFAULT_REMOTE
+    base = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'agent-hub' / 'merge-check-repo'
+    if not (base / '.git').exists() and not (base / 'HEAD').exists():
+        base.parent.mkdir(parents=True, exist_ok=True)
+        proc = _run(runner, ['git', 'clone', '--quiet', '--no-checkout', remote, str(base)], str(base.parent), 300)
+        if proc is None or proc.returncode != 0:
+            raise RuntimeError('could not clone the project repository for merge-check; pass --repo DIR')
+    return str(base)
 
 
 def _is_ancestor(runner, repo, sha, ref):
@@ -74,22 +103,26 @@ def deploy_state(repo: str, sha: str, runner: Callable = subprocess.run) -> dict
     return {'state': 'missing', 'sha': sha}
 
 
+def fetch_origin(repo: str, runner: Callable = subprocess.run) -> None:
+    proc = _run(runner, ['git', 'fetch', '--quiet', 'origin', 'main'], repo, FETCH_TIMEOUT)
+    if proc is None or proc.returncode != 0:
+        raise RuntimeError('git fetch origin main failed; merge state cannot be verified')
+
+
 def collect(repo: str, shas: Optional[list] = None, runner: Callable = subprocess.run, fetch: bool = True,
-            deploy: bool = True) -> dict:
+            deploy: bool = True, include_head: bool = True) -> dict:
     """Evidence body for POST /api/intake/tasks/<id>/merge-evidence."""
     out: dict[str, Any] = {}
     if fetch:
-        proc = _run(runner, ['git', 'fetch', '--quiet', 'origin', 'main'], repo, FETCH_TIMEOUT)
-        if proc is None or proc.returncode != 0:
-            raise RuntimeError('git fetch origin main failed; merge state cannot be verified')
-    head = _run(runner, ['git', 'rev-parse', 'HEAD'], repo)
+        fetch_origin(repo, runner)
+    head = _run(runner, ['git', 'rev-parse', 'HEAD'], repo) if include_head else None
     head_sha = (head.stdout or '').strip() if head is not None and head.returncode == 0 else ''
     if SHA.match(head_sha):
         out['head'] = head_sha
-    branch = _run(runner, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], repo)
+    branch = _run(runner, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], repo) if include_head else None
     if branch is not None and branch.returncode == 0 and (branch.stdout or '').strip() not in ('', 'HEAD'):
         out['branch'] = branch.stdout.strip()[:255]
-    cherry = _run(runner, ['git', 'cherry', 'origin/main', 'HEAD'], repo)
+    cherry = _run(runner, ['git', 'cherry', 'origin/main', 'HEAD'], repo) if include_head else None
     if cherry is not None and cherry.returncode == 0:
         out['unmerged'] = sum(1 for line in (cherry.stdout or '').splitlines() if line.startswith('+'))
     wanted = []

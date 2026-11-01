@@ -81,5 +81,62 @@ class MergeEvidenceTests(unittest.TestCase):
         self.assertEqual(me.shas_from_text('no commits 12345678'), [])
 
 
+class CommitExtractionTests(unittest.TestCase):
+    def test_uuid_and_known_id_fragments_are_not_candidates(self):
+        text = ('DONE afab8367 intake 5e2cc166-0b5c-4a7d-9f11-34a66405e0e7 session c30f1f98 commit 89f55bd7 '
+                'and 0c934b64e1 task a5821c84')
+        got = me.shas_from_text(text, exclude=('afab8367-0000-4000-8000-000000000000', 'c30f1f98'))
+        self.assertNotIn('afab8367', got)
+        self.assertNotIn('c30f1f98', got)
+        self.assertNotIn('34a66405e0e7', got)
+        self.assertNotIn('5e2cc166', got)
+        self.assertIn('89f55bd7', got)
+
+    def test_unknown_hex_tokens_are_dropped_by_cat_file(self):
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0 if argv[-1].startswith('89f55bd7') else 128, stdout='', stderr='')
+        self.assertEqual(me.existing_commits('/r', ['a5821c84', '89f55bd7'], runner), ['89f55bd7'])
+        self.assertEqual(calls[0][:3], ['git', 'cat-file', '-e'])
+
+    def test_collect_include_head_false_skips_head_and_cherry(self):
+        runner = FakeRunner(in_main=[B], cherry='', runs=[{'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'u'}])
+        out = me.collect('/r', [B], runner, fetch=False, include_head=False)
+        self.assertNotIn('head', out)
+        self.assertEqual([c['sha'] for c in out['commits']], [B])
+        self.assertEqual(out['deploy']['state'], 'success')
+        self.assertFalse(any(c[:2] == ['git', 'cherry'] for c in runner.calls))
+
+
+class OwnCloneTests(unittest.TestCase):
+    def test_clone_made_outside_caller_cwd_and_fetch_failure_is_reported(self):
+        import os, tempfile
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append((argv, kw.get('cwd')))
+            return subprocess.CompletedProcess(argv, 0, stdout='', stderr='')
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get('XDG_CACHE_HOME')
+            os.environ['XDG_CACHE_HOME'] = tmp
+            try:
+                repo = me.own_clone(runner, remote='file:///nonexistent')
+            finally:
+                if old is None:
+                    os.environ.pop('XDG_CACHE_HOME')
+                else:
+                    os.environ['XDG_CACHE_HOME'] = old
+            self.assertTrue(repo.startswith(tmp))
+            self.assertEqual(calls[0][0][:3], ['git', 'clone', '--quiet'])
+            self.assertTrue(calls[0][1].startswith(tmp))
+
+        def bad(argv, **kw):
+            return subprocess.CompletedProcess(argv, 128, stdout='', stderr='')
+        with self.assertRaises(RuntimeError):
+            me.fetch_origin('/tmp', bad)
+
+
 if __name__ == '__main__':
     unittest.main()
