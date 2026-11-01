@@ -31,6 +31,26 @@ class SessionHostTests(unittest.TestCase):
             self.assertEqual(args.machine_id,'test-machine')
             self.assertEqual(args.sessions_cmd,'host-receive')
 
+    def test_run_waits_for_inflight_observer_so_its_cycle_line_cannot_leak(self):
+        # A mid-step observer daemon prints its *_cycle line when it ends; if
+        # run() returned first, the line landed in a later test's captured
+        # stdout (Host canary flake, intake 26fc40d3).
+        import threading
+        import time
+        finished = threading.Event()
+
+        def slow_observer(current, collector):
+            def step():
+                time.sleep(0.3)
+                finished.set()
+            thread = threading.Thread(target=step, daemon=True)
+            thread.start()
+            return thread
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',return_value=SimpleNamespace(session_id='test-native',workspace=str(pathlib.Path.cwd()))), patch.object(session_host.fleet,'Dispatcher'), patch.object(session_host.session_control,'execute'), patch.object(session_host,'maybe_start_disk_thread',side_effect=slow_observer):
+            session_host.run('synthetic-settings',directory,cycles=1)
+        self.assertTrue(finished.is_set())
+
     def test_unbound_controller_has_no_fleet_or_command_effects(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',side_effect=ValueError('unbound')), patch.object(session_host.fleet,'Dispatcher') as dispatcher, patch.object(session_host.session_control,'execute') as execute:
             with self.assertRaises(ValueError):session_host.run('synthetic-settings',directory,cycles=1)

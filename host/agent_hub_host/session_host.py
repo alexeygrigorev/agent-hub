@@ -992,6 +992,16 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 bindings_thread.join(timeout=1)
             if offers_thread is not None:
                 offers_thread.join(timeout=2)
+            # Single-inflight observer daemons print their cycle line when a
+            # step ends. Returning while one is mid-step lets that line land in
+            # whatever owns stdout next (a later test's captured output made the
+            # Host canary flaky). Bounded shared wait; still daemons, so a hung
+            # step cannot hold the service stop.
+            observer_deadline = time.monotonic() + 5
+            for observer in (status_thread, metrics_thread, disk_thread, host_health_thread,
+                             role_consumer_thread, token_thread):
+                if observer is not None:
+                    observer.join(timeout=max(0.0, observer_deadline - time.monotonic()))
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 
