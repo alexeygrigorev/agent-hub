@@ -89,6 +89,12 @@ if [ "$AFFECTED_BUILD" = 1 ]; then echo "=== worker dry-run build ==="; npm run 
 exit $rc'
 RC=$?
 if [ "${RC}" -eq 3 ] && [ -f "${MARKER}" ]; then
+  # capped-test-retry.sh runs this self-admitting script directly so it does
+  # not hold a second outer slot. Propagate its private refusal marker to the
+  # retry wrapper's marker, preserving the distinction from a command exit 3.
+  if [ -n "${AGENT_HUB_HEAVY_TEST_REFUSAL_FILE:-}" ]; then
+    printf '%s\n' "$(cat "${MARKER}")" > "${AGENT_HUB_HEAVY_TEST_REFUSAL_FILE}"
+  fi
   echo "HOLD: $(cat "${MARKER}"); retry later"; exit 3
 fi
 [ "${RC}" -ne 0 ] && FAILURES=$((FAILURES + 1))

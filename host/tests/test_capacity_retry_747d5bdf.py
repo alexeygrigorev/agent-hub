@@ -245,6 +245,34 @@ class RetryWrapperTests(unittest.TestCase):
                              ["--priority final|", "--priority final|"])
             self.assertEqual(heavy.recorded_sleeps(), [5])
 
+    def test_affected_runner_is_run_directly_and_its_hold_retries(self):
+        with scratch() as temp:
+            heavy = HeavyEnv(Path(temp))
+            tree = Path(temp) / "repo" / "scripts"
+            tree.mkdir(parents=True)
+            for name in ("capped-test-retry.sh", "heavy-phase-status.sh"):
+                shutil.copyfile(SCRIPTS / name, tree / name)
+            outer = Path(temp) / "outer-wrapper-called"
+            write_exec(tree / "capped-test-run.sh", f"#!/usr/bin/env bash\ntouch {outer}\nexit 99\n")
+            runs = Path(temp) / "runs"
+            write_exec(tree / "test-affected-local.sh",
+                       "#!/usr/bin/env bash\n"
+                       f"echo \"$*|${{AGENT_HUB_HEAVY_TEST_HELD:-}}\" >> {runs}\n"
+                       f"if [ \"$(wc -l < {runs})\" -eq 1 ]; then\n"
+                       f"  echo 'no heavy-test slot free' > \"${{{MARKER_ENV}}}\"; exit 3\n"
+                       "fi\nexit 0\n")
+            env = heavy.env()
+            env.pop("AGENT_HUB_HEAVY_TEST_HELD", None)
+            result = run(["bash", "scripts/capped-test-retry.sh", "--base-delay", "5", "--",
+                          "scripts/test-affected-local.sh"], env=env, cwd=tree.parent)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(outer.exists())
+            self.assertEqual(runs.read_text().splitlines(), ["|", "|"])
+            self.assertEqual(heavy.recorded_sleeps(), [5])
+        affected = (SCRIPTS / "test-affected-local.sh").read_text()
+        self.assertIn("AGENT_HUB_HEAVY_TEST_REFUSAL_FILE}", affected)
+        self.assertIn("HOLD:", affected)
+
 
 GIT_ENV = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t",
                GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
