@@ -319,6 +319,28 @@ describe('phantom account reservations', () => {
     expect(reconcileAccountCapacity(sql, now)[0].reason).toBe('native_terminal');
   }));
 
+  it('frees physical capacity for an unobserved native only with a fresh catalog, preserving launch history', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running', native_id = 'gone' WHERE id = ?", launch.id);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','gone','task','codex','unobserved',?,'/repo','shared-codex',?)", iso(), now);
+
+    const active = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).active;
+    expect(active()).toBe(1); // Missing or stale catalog evidence keeps the reservation.
+
+    sql.exec('INSERT INTO fleet_catalog_seen VALUES (\'hetzner\', ?)', iso());
+    expect(active()).toBe(0); // Fresh census confirms this exact native is no longer observed.
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
+
+    sql.exec('UPDATE fleet_catalog_seen SET observed_at = ? WHERE machine_id = \'hetzner\'', iso(-180001));
+    expect(active()).toBe(1); // Stale census cannot release the slot.
+
+    sql.exec('UPDATE fleet_catalog_seen SET observed_at = ? WHERE machine_id = \'hetzner\'', iso());
+    sql.exec("UPDATE fleet_sessions SET phase = 'unknown' WHERE machine_id = 'hetzner' AND native_id = 'gone'");
+    expect(active()).toBe(1); // Fresh but unknown native state remains fail-closed.
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
+  }));
+
   it('ignores stale progress on orphan workloads while preserving unknown activity holds', () => fixture(async (f, sql) => {
     await configure(f);
     sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso());

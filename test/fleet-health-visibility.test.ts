@@ -65,10 +65,12 @@ describe('fleet health visibility + machine aliasing', () => {
     expect(status()).toMatchObject({active: 5, reserved: 4, observed_sessions: 1});
     sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(0));
     sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(-11 * 60000));
-    for (const phase of ['unknown', 'uncertain', 'unobserved', 'starting', 'broken']) {
+    for (const phase of ['unknown', 'uncertain', 'starting', 'broken']) {
       sql.exec("UPDATE fleet_sessions SET phase=? WHERE native_id='idle-bound'", phase);
       expect(status().reserved).toBe(4);
     }
+    sql.exec("UPDATE fleet_sessions SET phase='unobserved' WHERE native_id='idle-bound'");
+    expect(status().reserved).toBe(3); // A fresh complete census releases only this physical reservation.
     sql.exec("UPDATE fleet_sessions SET phase='running' WHERE native_id='idle-bound'");
     expect(status().reserved).toBe(3);
 
