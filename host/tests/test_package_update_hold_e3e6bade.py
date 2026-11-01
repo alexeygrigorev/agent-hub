@@ -7,7 +7,10 @@ build, and moving that marker would fake a timestamp. A hold file now pauses
 scheduling for a stated reason, at most 72 h, and is released by deleting it.
 """
 import json
+import os
 import time
+
+import pytest
 
 from agent_hub_host import package_update as u
 
@@ -101,16 +104,53 @@ def test_cli_hold_show_release(tmp_path, monkeypatch, capsys):
 
 # --- e3e v4 review: pending task, task preflight, atomic write -------------
 
-def test_task_script_preflight_skips_installer_when_held():
+def test_task_script_proceeds_only_on_preflight_exit_zero():
     script = u.task_script('https://hub.example', r'C:\l\package-update.log',
                            preflight_python=r'C:\r\venv\Scripts\python.exe', package_dir=r'C:\r\package\host')
     lines = script.splitlines()
+    guard = lines.index(r"if (Test-Path -LiteralPath 'C:\r\venv\Scripts\python.exe' -PathType Leaf) {")
     pre = next(i for i, l in enumerate(lines) if 'agent_hub_host.package_update preflight' in l)
-    gate = lines.index('if ($LASTEXITCODE -eq %d) { exit 0 }' % u.PREFLIGHT_HELD)
+    gate = lines.index('if ($preflight -ne 0) {')
     inst = next(i for i, l in enumerate(lines) if '/host/install.ps1' in l)
-    assert pre < gate < inst  # the hold is checked before the installer can run
+    assert lines.index('$preflight = 1') < guard < pre < gate < inst
+    assert '  $global:LASTEXITCODE = 1' in lines  # no stale exit code can read as success
     assert r"$env:PYTHONPATH = 'C:\r\package\host'" in lines
-    assert r"& 'C:\r\venv\Scripts\python.exe' -m agent_hub_host.package_update preflight" in lines[pre]
+    assert 'package_update_preflight_skip' in script
+
+
+def _run_task(tmp_path, preflight_python):
+    """Execute the real task body in Windows PowerShell; report whether the installer line ran."""
+    import subprocess
+    log = tmp_path / 'package-update.log'
+    # The installer origin is unroutable, so reaching it only leaves an irm error in the log.
+    body = u.task_script('https://127.0.0.1:9', log, preflight_python=preflight_python, package_dir=tmp_path)
+    marker = tmp_path / 'installer-reached'
+    marker.unlink(missing_ok=True)
+    body = body.replace("& { irm 'https://127.0.0.1:9/host/install.ps1' | iex }",
+                        "& { Set-Content -LiteralPath '" + str(marker).replace("'", "''") + "' -Value 'reached' }")
+    script = tmp_path / 'task.ps1'
+    script.write_text(body, encoding='utf-8')
+    subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script)],
+                   capture_output=True, text=True, timeout=60)
+    text = log.read_bytes().decode('utf-8', 'replace').replace('\x00', '') if log.exists() else ''
+    return marker.exists(), text
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='executes the real Windows PowerShell task body')
+def test_real_task_body_gates_installer_on_preflight_result(tmp_path):
+    def fake(code):
+        cmd = tmp_path / f'pre{code}.cmd'
+        cmd.write_text(f'@exit /b {code}\r\n', encoding='ascii')
+        return str(cmd)
+    reached, _ = _run_task(tmp_path, fake(0))
+    assert reached, 'exit 0 must proceed to the installer'
+    for code in (u.PREFLIGHT_HELD, 1, 3):
+        (tmp_path / 'package-update.log').unlink(missing_ok=True)
+        reached, text = _run_task(tmp_path, fake(code))
+        assert not reached and '"code":%d' % code in text, (code, text)
+    (tmp_path / 'package-update.log').unlink(missing_ok=True)
+    reached, text = _run_task(tmp_path, str(tmp_path / 'missing' / 'python.exe'))
+    assert not reached and '"code":1' in text  # missing interpreter: skipped, not installed
 
 
 def test_registered_task_carries_the_preflight(tmp_path):

@@ -183,9 +183,22 @@ def task_script(base_url, log, preflight_python=None, package_dir=None):
     script = ("$ErrorActionPreference = 'Continue'\n"
               "$env:HUB_BASE_URL = '" + base + "'\n")
     if preflight_python and package_dir:
+        # Proceed ONLY on an explicit preflight exit 0. Held (75), a missing
+        # interpreter, an import crash or any other failure skips the installer
+        # (a valid hold could not be checked); the per-archive retry throttle
+        # bounds the next attempt.
+        python = quote(preflight_python)
         script += ("$env:PYTHONPATH = " + quote(package_dir) + "\n"
-                   "& " + quote(preflight_python) + " -m agent_hub_host.package_update preflight *>> " + log + "\n"
-                   "if ($LASTEXITCODE -eq " + str(PREFLIGHT_HELD) + ") { exit 0 }\n")
+                   "$preflight = 1\n"
+                   "if (Test-Path -LiteralPath " + python + " -PathType Leaf) {\n"
+                   "  $global:LASTEXITCODE = 1\n"
+                   "  & " + python + " -m agent_hub_host.package_update preflight *>> " + log + "\n"
+                   "  $preflight = $LASTEXITCODE\n"
+                   "}\n"
+                   "if ($preflight -ne 0) {\n"
+                   "  Add-Content -LiteralPath " + log + " -Value ('{\"event\":\"package_update_preflight_skip\",\"code\":' + [int]$preflight + '}')\n"
+                   "  exit 0\n"
+                   "}\n")
     return script + "& { irm '" + base + "/host/install.ps1' | iex } *>> " + log + "\n"
 
 
