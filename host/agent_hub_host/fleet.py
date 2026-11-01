@@ -736,11 +736,14 @@ def load_settings(path=None):
     return data
 
 
-def run_json(argv, *, payload=None, cwd=None, timeout=30):
-    """No shell; typed failures carry bounded redacted evidence, never argv."""
+def run_json(argv, *, payload=None, cwd=None, timeout=30, env=None):
+    """No shell; typed failures carry bounded redacted evidence, never argv.
+
+    env: an explicit child environment (launcher subprocesses only, see
+    launcher_env); None inherits the host environment as before."""
     from .launch_diagnostics import LocalCommandError
     from .aplexer_client import client_call
-    native = client_call(argv[0], argv[1:]) if payload is None else None
+    native = client_call(argv[0], argv[1:]) if payload is None and env is None else None
     if native is not None:
         if native.returncode:
             raise LocalCommandError(native.stdout + '\n' + native.stderr,
@@ -751,7 +754,7 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
             raise RuntimeError("Native client response exceeds bound; reconcile effects")
         return json.loads(native.stdout)
     import threading
-    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env)
     overflow = threading.Event()
     stdout = bytearray()
     stderr = bytearray()
@@ -1963,7 +1966,7 @@ class Dispatcher:
             task_id = record["task_id"]
             reconcile_argv = prefix + ["reconcile", "--id", task_id, "--json"]
             try:
-                reconcile_out = self.runner(reconcile_argv, cwd=launcher["root"])
+                reconcile_out = self._launcher_run(reconcile_argv, cwd=launcher["root"])
             except Exception:
                 continue
 
@@ -2658,14 +2661,26 @@ class Dispatcher:
         except Exception:
             return
 
+    def _launcher_run(self, argv, **kwargs):
+        """Run a launcher command with AGENT_HUB_HOST_PATH in its own env only.
+
+        The production runner receives an explicit environment copy carrying
+        this host's validated package path (Hub intake 86254a30 AC6); an
+        injected runner that declares accepts_env gets it too. Other injected
+        runners are called exactly as before."""
+        if self.runner is run_json or getattr(self.runner, "accepts_env", False) is True:
+            from .launcher_env import launcher_environment
+            return self.runner(argv, env=launcher_environment(), **kwargs)
+        return self.runner(argv, **kwargs)
+
     def _submit_launcher_task(self, prefix, launcher, task_id, submit_argv):
         try:
-            return self.runner(submit_argv, cwd=launcher["root"])
+            return self._launcher_run(submit_argv, cwd=launcher["root"])
         except (TimeoutError, subprocess.TimeoutExpired):
             raise  # Submission may have landed; retry its original key next cycle.
         except RuntimeError:
             self._drop_queued_launcher_task(launcher, task_id)
-            return self.runner(submit_argv, cwd=launcher["root"])
+            return self._launcher_run(submit_argv, cwd=launcher["root"])
 
     def _admission_gate(self, sub, admission_payload):
         """Single-flight, briefly shared admission gate run per route.
@@ -3140,7 +3155,7 @@ class Dispatcher:
                 payload["managed_dir"] = str(provisioning.root())
             submit_argv = prefix + ["submit", "--id", task_id, "--key", task_id, "--paths", str(result_path), "--payload", json.dumps(payload), "--json"]
             self._preclaim_check(offer_id, self._submit_launcher_task, prefix, launcher, task_id, submit_argv)
-            plan = self._preclaim_check(offer_id, self.runner, prefix + ["plan", "--id", task_id], cwd=launcher["root"])
+            plan = self._preclaim_check(offer_id, self._launcher_run, prefix + ["plan", "--id", task_id], cwd=launcher["root"])
             stages.append(('submit_plan', time.monotonic()))
             eligible = plan.get("eligible", [])
             # Real maintained-plan contract (verified live against the
@@ -3269,7 +3284,10 @@ class Dispatcher:
                 if mode == 'headless':
                     fence['task_id'] = task_id
                 self._persist_launch_record(fence)
-            receipt = self.runner(argv, cwd=cwd, timeout=120)
+            # Headless starts are launcher `run` commands; interactive starts are
+            # native aplexer and never receive the launcher-only host path.
+            receipt = (self._launcher_run(argv, cwd=cwd, timeout=120) if mode == "headless"
+                       else self.runner(argv, cwd=cwd, timeout=120))
             if mode == "interactive":
                 native_id = receipt.get("id")
                 if selection:
