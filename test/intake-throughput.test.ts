@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { OpsLiveness } from '../src/ops-liveness';
+import { OpsLiveness, THROUGHPUT_OBSERVATION_LIMIT, THROUGHPUT_QUERIES } from '../src/ops-liveness';
 
 const NOW = Date.parse('2026-11-01T10:00:00Z'), DAY = 86400000;
 async function fixture(fn: (h: any, ops: OpsLiveness, alerts: any[]) => Promise<void> | void) {
@@ -50,4 +50,51 @@ describe('intake throughput evidence', () => {
     const ops = new OpsLiveness(h.sql, {}, () => NOW);
     expect(ops.throughput()).toMatchObject({ active_vs_capacity: {active_sessions:null,idle_capacity:null}, alert:null });
   }));
+  it('keeps close and cancellation evidence distinct within a half-open window',()=>fixture((h,ops)=>{
+    for(const [id,kind,at] of [['edge','close',NOW-DAY],['edge','cancel',NOW-DAY],['old','cancel',NOW-DAY-1],['future','close',NOW]] as const)
+      h.sql.exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES(?,'demo',?,'operator',?,'test')",id,kind,at);
+    expect(ops.throughput()).toMatchObject({complete:true,closed_24h:1});
+  }));
+  it.each(['starts','created','closed'])('reports unknown on overflowing %s observations without fabricated growth alerts', kind => fixture(async (h,ops,alerts) => {
+    for(let i=0;i<=THROUGHPUT_OBSERVATION_LIMIT;i++) {
+      if(kind==='starts') session(h,'start-'+i,'same-intake',NOW-1000);
+      if(kind==='created') task(h,'created-'+i,NOW-1000);
+      if(kind==='closed') h.sql.exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('same-intake','demo','close','operator',?,'test')",NOW-1000);
+    }
+    const result=ops.throughput();
+    expect(result.complete).toBe(false);
+    expect(result.observation_limit).toBe(THROUGHPUT_OBSERVATION_LIMIT);
+    if(kind==='starts') expect(result).toMatchObject({started_24h:null,automatic_started_24h:null,created_24h:0,closed_24h:0});
+    if(kind==='created') expect(result).toMatchObject({created_24h:null,closed_24h:0,net_24h:null,alert:null,alert_evaluable:false});
+    if(kind==='closed') expect(result).toMatchObject({created_24h:0,closed_24h:null,net_24h:null,alert:null,alert_evaluable:false});
+    expect(result.incomplete_metrics).toContain(kind==='starts'?'started_24h':kind+'_24h');
+    if(kind!=='starts') {
+      await ops.tick();
+      // Unknown evidence must not resolve a previously open growth alert.
+      expect(alerts.some(a=>a.subject==='ops-backlog-throughput')).toBe(false);
+    }
+  }));
+  it('keeps exact distinct counts at the budget boundary and excludes unrelated retained audit history',()=>fixture((h,ops)=>{
+    for(let i=0;i<THROUGHPUT_OBSERVATION_LIMIT;i++) {
+      session(h,'retry-'+i,'same-intake',NOW-1000,i%2===0);
+      task(h,'created-'+i,NOW-1000);
+      h.sql.exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('same-intake','demo',?,'operator',?,'test')",i%2?'close':'cancel',NOW-1000);
+    }
+    for(let i=0;i<THROUGHPUT_OBSERVATION_LIMIT+1;i++)
+      h.sql.exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('unrelated','demo','note','operator',?,'test')",NOW-1000);
+    expect(ops.throughput()).toMatchObject({complete:true,incomplete_metrics:[],started_24h:1,automatic_started_24h:1,
+      created_24h:THROUGHPUT_OBSERVATION_LIMIT,closed_24h:1,net_24h:THROUGHPUT_OBSERVATION_LIMIT-1});
+  }));
+  it('uses bounded range-index reads with no DISTINCT or temporary B-tree on every throughput path',()=>fixture((h)=>{
+    const expected={starts:'ops_intake_native_started',created:'ops_intake_created',closed:'ops_intake_closed_time'};
+    for(const [name,query] of Object.entries(THROUGHPUT_QUERIES)) {
+      const detail=h.sql.exec('EXPLAIN QUERY PLAN '+query,NOW-DAY,NOW).toArray().map((r:any)=>r.detail).join('\n');
+      expect(detail).toMatch(new RegExp('USING (?:COVERING )?INDEX '+expected[name as keyof typeof expected]));
+      expect(detail).toMatch(/SEARCH/);
+      expect(detail).not.toMatch(/TEMP B-TREE|SCAN /);
+      expect(query).not.toMatch(/COUNT|DISTINCT|GROUP BY/i);
+      expect(query).toContain('LIMIT '+(THROUGHPUT_OBSERVATION_LIMIT+1));
+    }
+  }));
+
 });

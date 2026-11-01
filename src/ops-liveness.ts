@@ -27,6 +27,21 @@ const ACTIVE_STATES = "('starting','offered','running')";
 const NATIVE_STALE_MS = 10 * 60000;
 const requestIntake = "json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id')";
 
+/** Per metric, read one overflow sentinel beyond this budget. Never publish
+ * a prefix as an exact daily count or use unknown counts to clear an alert. */
+export const THROUGHPUT_OBSERVATION_LIMIT = 2048;
+const nativeStartedAt = "json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_created_at_ms')";
+export const THROUGHPUT_QUERIES = {
+  starts: `SELECT ${requestIntake} AS intake_id,actor,
+    json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id') AS native_id
+    FROM session_control_sessions INDEXED BY ops_intake_native_started
+    WHERE ${nativeStartedAt}>=? AND ${nativeStartedAt}<? LIMIT ${THROUGHPUT_OBSERVATION_LIMIT + 1}`,
+  created: `SELECT id FROM intake_task_projection INDEXED BY ops_intake_created
+    WHERE json_extract(data,'$.created_at')>=? AND json_extract(data,'$.created_at')<? LIMIT ${THROUGHPUT_OBSERVATION_LIMIT + 1}`,
+  closed: `SELECT task_id FROM intake_audit INDEXED BY ops_intake_closed_time
+    WHERE captured_at>=? AND captured_at<? AND kind IN ('close','cancel') LIMIT ${THROUGHPUT_OBSERVATION_LIMIT + 1}`,
+};
+
 type Obj = Record<string, any>;
 export type KickResult = { task_id: string | null; reason: string };
 export type OpsLivenessHooks = {
@@ -59,7 +74,7 @@ export class OpsLiveness {
     const cols = (this.sql.exec('PRAGMA table_info(ops_liveness)').toArray() as any[]).map(c => c.name);
     if (!cols.includes('first_seen_at')) this.sql.exec('ALTER TABLE ops_liveness ADD COLUMN first_seen_at INTEGER');
     this.sql.exec("CREATE INDEX IF NOT EXISTS ops_intake_created ON intake_task_projection(json_extract(data,'$.created_at'))");
-    this.sql.exec('CREATE INDEX IF NOT EXISTS ops_intake_audit_time ON intake_audit(captured_at,kind,task_id)');
+    this.sql.exec("CREATE INDEX IF NOT EXISTS ops_intake_closed_time ON intake_audit(captured_at,task_id) WHERE kind IN ('close','cancel')");
     this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_intake_native_started ON session_control_sessions(
       json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_created_at_ms'))`);
   }
@@ -168,25 +183,34 @@ export class OpsLiveness {
   throughput(now = this.now()): Obj {
     try {
       const since = now - 86400000;
-      const nativeAt = "json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_created_at_ms')";
-      const starts = this.rows(`SELECT COUNT(DISTINCT ${requestIntake}) AS total,
-        COUNT(DISTINCT CASE WHEN actor='hub:service:intake-watchdog' THEN ${requestIntake} END) AS automatic
-        FROM session_control_sessions WHERE ${nativeAt}>=? AND ${nativeAt}<?
-        AND json_extract(binding_json,'$.native_id') IS NOT NULL`, since, now)[0];
-      const created = this.rows(`SELECT COUNT(*) AS n FROM intake_task_projection
-        WHERE json_extract(data,'$.created_at')>=? AND json_extract(data,'$.created_at')<?`, since, now)[0].n;
-      const closed = this.rows(`SELECT COUNT(DISTINCT task_id) AS n FROM intake_audit
-        WHERE captured_at>=? AND captured_at<? AND kind IN ('close','cancel')`, since, now)[0].n;
+      const starts = this.rows(THROUGHPUT_QUERIES.starts, since, now);
+      const creations = this.rows(THROUGHPUT_QUERIES.created, since, now);
+      const closes = this.rows(THROUGHPUT_QUERIES.closed, since, now);
+      const startsComplete = starts.length <= THROUGHPUT_OBSERVATION_LIMIT;
+      const created = creations.length <= THROUGHPUT_OBSERVATION_LIMIT ? creations.length : null;
+      const closed = closes.length <= THROUGHPUT_OBSERVATION_LIMIT ? new Set(closes.map(r => r.task_id)).size : null;
+      const started = new Set(), automatic = new Set();
+      if (startsComplete) for (const row of starts) {
+        if (row.native_id == null || row.intake_id == null) continue;
+        started.add(row.intake_id);
+        if (row.actor === 'hub:service:intake-watchdog') automatic.add(row.intake_id);
+      }
+      const incomplete = [!startsComplete && 'started_24h', !startsComplete && 'automatic_started_24h',
+        created === null && 'created_24h', closed === null && 'closed_24h',
+        (created === null || closed === null) && 'net_24h'].filter(Boolean);
       const policy = this.hooks.queuePolicy?.();
       const capacity = policy?.capacity;
       const slots = capacity && policy.enabled && policy.valid
         ? Math.max(0, Math.min(capacity.available_slots, policy.max_inflight - capacity.active)) : null;
       const active = capacity?.active ?? null;
-      const alert = slots !== null && slots > 0 && created > closed
+      const alertEvaluable = slots !== null && created !== null && closed !== null;
+      const alert = alertEvaluable && slots > 0 && created > closed
         ? `intake backlog grew over 24h (created ${created} > closed ${closed}) with ${slots} automatic queue slot(s) available.` : null;
       return { window_start: iso(since), window_end: iso(now), window_s: 86400,
-        started_24h: starts.total, automatic_started_24h: starts.automatic,
-        created_24h: created, closed_24h: closed, net_24h: created - closed,
+        started_24h: startsComplete ? started.size : null, automatic_started_24h: startsComplete ? automatic.size : null,
+        created_24h: created, closed_24h: closed, net_24h: created !== null && closed !== null ? created - closed : null,
+        complete: incomplete.length === 0, incomplete_metrics: incomplete, observation_limit: THROUGHPUT_OBSERVATION_LIMIT,
+        alert_evaluable: alertEvaluable,
         active_vs_capacity: { active_sessions: active, effective_capacity: policy?.max_inflight ?? null,
           idle_capacity: slots, source: capacity?.source ?? 'unknown' },
         holds_by_reason: this.safeHolds(), alert };
@@ -229,7 +253,7 @@ export class OpsLiveness {
       if (s.state !== 'never_reported') await this.hooks.alert?.('ops-' + role, s.alert);
     }
     out.throughput = this.throughput(now);
-    if (!out.throughput.error) await this.hooks.alert?.('ops-backlog-throughput', out.throughput.alert);
+    if (out.throughput.alert_evaluable) await this.hooks.alert?.('ops-backlog-throughput', out.throughput.alert);
     out.idle = await this.idleTick(now, byRole);
     return out;
   }

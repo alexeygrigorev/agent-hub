@@ -100,8 +100,9 @@
       if (!data || data.error) throw new Error('unavailable');
       const capacity = data.active_vs_capacity;
       const holds = Object.entries(data.holds_by_reason || {}).map(([reason, n]) => `${reason}: ${n}`).join(' · ') || 'none';
-      throughput.textContent = `24h: started ${data.started_24h} (${data.automatic_started_24h} automatic) · closed ${data.closed_24h} · created ${data.created_24h}` +
+      throughput.textContent = `24h: started ${data.started_24h ?? '?'} (${data.automatic_started_24h ?? '?'} automatic) · closed ${data.closed_24h ?? '?'} · created ${data.created_24h ?? '?'}` +
         ` · automatic active/capacity ${capacity.active_sessions ?? '?'}/${capacity.effective_capacity ?? '?'} · holds: ${holds}` +
+        (data.complete === false ? ' · partial metrics: observation limit reached' : '') +
         (data.alert ? ` · ⚠ ${data.alert}` : '');
     } catch { throughput.textContent = '24h throughput: unavailable — sign in or retry'; }
   }
