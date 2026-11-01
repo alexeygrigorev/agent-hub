@@ -68,9 +68,13 @@ GATE_REASONS = frozenset({
 
 class AdmissionRefusedError(ValueError):
     """admission_refused with a fixed gate_reason slug."""
-    def __init__(self, message, gate_reason):
+    def __init__(self, message, gate_reason, *, timing=None):
         super().__init__(message)
         self.gate_reason = gate_reason if gate_reason in GATE_REASONS else 'gate_refused'
+        import math
+        self.timing = {k: round(v, 3) for k, v in (timing or {}).items()
+                       if k in {'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s'}
+                       and type(v) in (int, float) and math.isfinite(v) and abs(v) <= 86400}
 
 
 def classify(exc, *, workspace_available=True):
@@ -98,6 +102,7 @@ def classify(exc, *, workspace_available=True):
             'error_type': type(exc).__name__ if type(exc).__name__.isalpha() and len(type(exc).__name__) <= 64 else 'Error'}
     if isinstance(exc, AdmissionRefusedError) and reason == 'admission_refused':
         value['gate_reason'] = exc.gate_reason
+        value.update(exc.timing)
     from .launch_diagnostics import LocalCommandError
     if isinstance(exc, LocalCommandError):
         value.update(exc.command_diagnostic)

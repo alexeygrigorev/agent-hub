@@ -63,3 +63,18 @@ describe('bounded local command diagnostics (488b)', () => {
     expect(JSON.stringify(stored)).not.toContain('fixture-secret');
   }));
 });
+
+it('persists only bounded numeric admission timing evidence', async () => fixture(async (fleet, _sessions, sql, id) => {
+  const diagnostic = { reason: 'admission_refused',
+    message: 'Fresh admission refused this account or could not verify its timestamp and model.',
+    stage: 'dispatch_route', error_type: 'AdmissionRefusedError', gate_reason: 'admission_timestamp_stale',
+    gate_duration_s: 2.3, gate_post_stamp_s: 0.4, host_minus_hub_s: -1.7, admission_age_s: -6 };
+  const send = (value: any) => fleet.handle(new Request('https://hub.test/api/fleet/launches/' + id + '/reject', {
+    method: 'POST', body: JSON.stringify({ reason: 'admission_refused', diagnostic: value }) }), host);
+  for (const change of [{ gate_duration_s: -1 }, { host_minus_hub_s: 'private' },
+    { admission_age_s: 86401 }, { admission_age_s: null }, { secret: 'private' }]) {
+    expect((await send({ ...diagnostic, ...change })).status).toBe(400);
+  }
+  expect((await send(diagnostic)).status).toBe(200);
+  expect(JSON.parse(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id=?', id).one().launch_error_json)).toEqual(diagnostic);
+}));

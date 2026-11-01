@@ -2147,6 +2147,14 @@ def admission():
     except Exception:
         result = {'launch_allowed': False, 'profile_supported': False, 'account_label': label, 'reason': 'hub_unreachable'}
 
+    stamp_received = time.monotonic()
+    try:
+        server_at = dt.datetime.fromisoformat(result['server_observed_at'].replace('Z', '+00:00'))
+        # Includes response transit; never forward server text or exception data.
+        result['host_minus_hub_s'] = round((dt.datetime.now(dt.timezone.utc) - server_at).total_seconds(), 3)
+    except (KeyError, TypeError, ValueError):
+        pass
+
     # Login probe (intake 06d2a0ac AC2): a managed Codex profile without a
     # credential opens at the "Sign in with ChatGPT" screen and never runs a
     # turn. Refuse it as not_logged_in so Hub re-places on another route.
@@ -2201,6 +2209,8 @@ def admission():
     if result.get('reason') == 'quota_exhausted' and isinstance(bundle, dict) and bundle.get('provider') == 'codex':
         result['reason'] = 'codex_quota_gate_codex_reserve_required'
 
+    # Lower bound on work after the Hub stamp: response transit is excluded.
+    result['gate_post_stamp_s'] = round(time.monotonic() - stamp_received, 3)
     print(json.dumps(result))
 
 

@@ -198,6 +198,10 @@ const GATE_REASONS = new Set(['local_bundle_missing', 'local_lock_unavailable', 
   'account_unmapped', 'credential_invalid', 'credential_rejected', 'quota_exhausted', 'profile_unsupported',
   'account_label_mismatch', 'admission_timestamp_stale', 'model_unverified', 'gate_refused', 'not_logged_in']);
 function gateReasonValid(d: any): boolean {
+  const timing = ['gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s'];
+  if (timing.some(k => d[k] !== undefined && (d.reason !== 'admission_refused' ||
+      typeof d[k] !== 'number' || !Number.isFinite(d[k]) || Math.abs(d[k]) > 86400 ||
+      ((k === 'gate_duration_s' || k === 'gate_post_stamp_s') && d[k] < 0)))) return false;
   return d.gate_reason === undefined || (d.reason === 'admission_refused' && GATE_REASONS.has(d.gate_reason));
 }
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
@@ -2314,7 +2318,7 @@ export class FleetService {
         if (match[2] === 'reject') {
           if (!object(data, ['reason', 'diagnostic']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
-          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable', 'gate_reason']) || !claimFieldsValid(diagnostic) || !gateReasonValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
+          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable', 'gate_reason', 'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s']) || !claimFieldsValid(diagnostic) || !gateReasonValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
               diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
               typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
               !sanitizeCommandFields(diagnostic)) return response({ error: 'invalid_rejection' }, 400);

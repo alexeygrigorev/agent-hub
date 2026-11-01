@@ -228,7 +228,10 @@ export class ProvisioningService {
       return reply({ launch_allowed: !reason, profile_supported: !!installed || (native && !!a), ...(reason ? { reason } : {}),
         ...(quotaStatus === 'unknown' ? { quota_warning: 'quota_probe_unavailable' } : {}),
         ...(cred ? { credential_generation: cred.generation } : {}),
-        account_label: data.label, observed_at: new Date().toISOString() });
+        // Compatibility with installed hosts whose clocks lag Hub slightly. Backdating
+        // consumes freshness budget; it never extends the 30-second stale cutoff.
+        account_label: data.label, observed_at: new Date(Date.now() - 5_000).toISOString(),
+        server_observed_at: new Date().toISOString() });
     }
     if (path === '/api/engines/logins' && request.method === 'POST') {
       if (!admin) return reply({error:'forbidden'},403);

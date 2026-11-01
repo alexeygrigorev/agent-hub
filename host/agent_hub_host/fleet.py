@@ -2698,7 +2698,9 @@ class Dispatcher:
         """Run the local admission gate; return its fresh observed_at."""
         from .model_contract import canonical_account_label
         from .dispatch_diagnostics import AdmissionRefusedError
+        gate_started = time.monotonic()
         gate = self._admission_gate(sub, admission_payload)
+        gate_duration_s = time.monotonic() - gate_started
         if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or canonical_account_label(gate.get("account_label")) != canonical_account_label(sub["account_label"]):
             gate_reason = gate.get("reason") if isinstance(gate.get("reason"), str) else ""
             # Preserve host-side gate slugs (intake 59a6f44a AC3/AC4): a managed
@@ -2716,13 +2718,25 @@ class Dispatcher:
         if (offer.get('task_id') or (selection and sub.get("account_label") in self._managed_labels)) and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
             raise AdmissionRefusedError('Selected model/effort requires verified admission', 'model_unverified')
         at = gate.get("observed_at")
+        timing = {"gate_duration_s": round(gate_duration_s, 3)}
+        try:
+            server_at = dt.datetime.fromisoformat(gate["server_observed_at"].replace("Z", "+00:00"))
+            # This is an end-of-gate offset sample, including response transit
+            # and post-stamp work, not an exact synchronized-clock measurement.
+            timing["host_minus_hub_s"] = round((dt.datetime.now(dt.timezone.utc) - server_at).total_seconds(), 3)
+        except (KeyError, TypeError, ValueError):
+            pass
+        for key in ("host_minus_hub_s", "gate_post_stamp_s"):
+            if type(gate.get(key)) in (int, float):
+                timing[key] = gate[key]
         try:
             observed = dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
             age = (dt.datetime.now(dt.timezone.utc) - observed).total_seconds()
-            if not 0 <= age <= 30:
+            timing["admission_age_s"] = round(age, 3)
+            if not -5 <= age <= 30 or gate_duration_s > 30:
                 raise ValueError()
         except Exception:
-            raise AdmissionRefusedError("Fresh admission timestamp required", "admission_timestamp_stale") from None
+            raise AdmissionRefusedError("Fresh admission timestamp required", "admission_timestamp_stale", timing=timing) from None
         return at
 
     def _pending_claim_key(self, offer_id):

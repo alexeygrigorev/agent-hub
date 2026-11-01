@@ -17,6 +17,23 @@ async function fixture(fn: (s: ProvisioningService, sql: any, allow: (v: boolean
   });
 }
 describe('central engine provisioning', () => {
+  it('backdates admission conservatively for installed hosts with small negative skew', async () => fixture(async (s, sql) => {
+    sql.exec("INSERT INTO fleet_accounts VALUES ('test-account','codex',4,15,1)");
+    const before = Date.now();
+    const result: any = await (await s.handle(req('/admission', 'POST', { label: 'test-account', native: true }), host)).json();
+    const after = Date.now();
+    const stamp = Date.parse(result.observed_at);
+    expect(stamp).toBeGreaterThanOrEqual(before - 5000);
+    expect(stamp).toBeLessThanOrEqual(after - 5000);
+    expect(Date.parse(result.server_observed_at)).toBeGreaterThanOrEqual(before);
+    // Old installed hosts still require 0..30 seconds, now including a lagging laptop.
+    for (const skew of [-1700, 0]) {
+      const age = (after + skew - stamp) / 1000;
+      expect(age).toBeGreaterThanOrEqual(0);
+      expect(age).toBeLessThanOrEqual(30);
+    }
+    expect((after + 31000 - stamp) / 1000).toBeGreaterThan(30);
+  }));
   it('adopts the Codex Orin quota alias without merging accounts or changing its quota identity', async () => fixture(async (s, sql) => {
     sql.exec("INSERT INTO fleet_accounts VALUES ('test-account','codex-orin',4,15,1)");
     expect((await s.handle(req('/test-account?adopt=true', 'PUT', bundle), admin)).status).toBe(200);
