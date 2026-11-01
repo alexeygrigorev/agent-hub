@@ -34,6 +34,7 @@
   "conversations send",
   "device-pending",
   "engines add",
+  "engines cancel",
   "engines list",
   "engines login",
   "engines maintain",
