@@ -1,3 +1,4 @@
+import { engineEpoch } from './engine-epoch';
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { GOAL_ENGINES, GOAL_PROVIDERS } from './goal-engines';
 import { observationModel } from './session-observation';
@@ -1958,7 +1959,7 @@ export class FleetService {
               ...(row.state !== 'offered' ? { state: row.state, claim_key: row.claim_key ?? null } : {}) };
           });
         });
-        return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!) });
+        return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!), engine_epoch: engineEpoch(this.sql) });
       }),1);
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {

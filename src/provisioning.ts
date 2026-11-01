@@ -7,6 +7,7 @@ import { GOAL_PROVIDERS } from './goal-engines';
 import { canonicalQuotaProvider, canonicalAccountLabel, validateQuotaSnapshotPayload } from './quota';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { effectiveCheckin } from './registry';
+import { bumpEngineEpoch } from './engine-epoch';
 import { CLAUDE_OAUTH, CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claudeAuthorization, claudeExchange, credentialFreshness, credentialSubset,
   fetchQuota, needsRefresh, refreshCredential, refreshable, structurallyValid, validCredentialFiles, type CredentialFiles, type FetchLike } from './credentials';
 
@@ -74,6 +75,8 @@ export class ProvisioningService {
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_sync_status (machine_id TEXT NOT NULL, label TEXT NOT NULL, revision TEXT NOT NULL, state TEXT NOT NULL, error TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(machine_id,label))');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_sync_hosts (machine_id TEXT PRIMARY KEY, state TEXT NOT NULL, last_sync_at INTEGER NOT NULL)');
     for (const ddl of CREDENTIAL_SCHEMA) this.sql.exec(ddl);
+    // A7: the credential generation each host acknowledged installing, per account.
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_credential_acks (machine_id TEXT NOT NULL, label TEXT NOT NULL, generation INTEGER NOT NULL, acked_at INTEGER NOT NULL, PRIMARY KEY(machine_id,label))');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL, detail TEXT NOT NULL)');
     this.migrateImplicitMaxConcurrency();
   }
@@ -106,6 +109,8 @@ export class ProvisioningService {
     const hosts = new Map((this.sql.exec('SELECT * FROM engine_sync_hosts').toArray() as any[]).map(h => [h.machine_id, h]));
     const installed = new Set((this.sql.exec('SELECT machine_id,label,revision FROM engine_installations').toArray() as any[]).map(i => i.machine_id + '|' + i.label + '|' + i.revision));
     const status = new Map((this.sql.exec('SELECT * FROM engine_sync_status').toArray() as any[]).map(r => [r.machine_id + '|' + r.label, r]));
+    const acks = new Map((this.sql.exec('SELECT machine_id,label,generation,acked_at FROM engine_credential_acks').toArray() as any[]).map(r => [r.machine_id + '|' + r.label, r]));
+    const current = new Map((this.sql.exec('SELECT label,generation FROM engine_credentials').toArray() as any[]).map(r => [r.label, r.generation]));
     return machines.map(m => {
       const h: any = hosts.get(m.id);
       // Liveness comes from the machine check-in, so sync reports need only be sent on change.
@@ -115,7 +120,9 @@ export class ProvisioningService {
         accounts: engines.map(e => {
           const r: any = status.get(m.id + '|' + e.label);
           const state = installed.has(m.id + '|' + e.label + '|' + e.revision) ? 'synced' : r?.revision === e.revision && r.state === 'failed' ? 'failed' : 'pending';
-          return { label: e.label, provider: e.provider, state, ...(state === 'failed' && r.error ? { error: r.error } : {}) };
+          const ack: any = acks.get(m.id + '|' + e.label);
+          return { label: e.label, provider: e.provider, state, ...(state === 'failed' && r.error ? { error: r.error } : {}),
+            ...(current.has(e.label) ? { credential_generation: current.get(e.label), acked_generation: ack?.generation ?? null, acked_at: ack?.acked_at ?? null } : {}) };
         }) };
     });
   }
@@ -132,6 +139,7 @@ export class ProvisioningService {
       credentialFreshness(provider, files), accessExpiry(provider, files), 'ok', null, by, this.now(), null,
       this.credentialRow(label)?.quota_attempt_at ?? null);
     this.sql.exec('DELETE FROM engine_credential_rejections WHERE label=? AND generation<?', label, generation);
+    bumpEngineEpoch(this.sql, this.now());
   }
   /** Non-secret credential metadata for operators. */
   credentialStatus() {
@@ -265,6 +273,10 @@ export class ProvisioningService {
           // on change: Free-plan Durable Object row writes are a daily budget.
           const prior: any = this.sql.exec('SELECT revision,state,error FROM engine_sync_status WHERE machine_id=? AND label=?', machine, it.label).toArray()[0];
           if (it.state === 'installed') {
+            if (Number.isInteger(it.credential_generation) && it.credential_generation >= 0) {
+              const ack: any = this.sql.exec('SELECT generation FROM engine_credential_acks WHERE machine_id=? AND label=?', machine, it.label).toArray()[0];
+              if (!ack || ack.generation !== it.credential_generation) this.sql.exec('INSERT OR REPLACE INTO engine_credential_acks VALUES (?,?,?,?)', machine, it.label, it.credential_generation, now);
+            }
             if (prior) this.sql.exec('DELETE FROM engine_sync_status WHERE machine_id=? AND label=?', machine, it.label);
             continue;
           }
@@ -307,6 +319,7 @@ export class ProvisioningService {
       this.sql.exec('DELETE FROM engine_installations WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_sync_status WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_bundles WHERE label=?', label);
+      bumpEngineEpoch(this.sql, this.now());
       this.sql.exec('DELETE FROM engine_credentials WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_credential_rejections WHERE label=?', label);
       this.sql.exec('DELETE FROM fleet_accounts WHERE label=?', label);
@@ -353,6 +366,7 @@ export class ProvisioningService {
       }
       if (!managed && rows().length >= 32) return reply({ error: 'bundle_capacity' }, 409);
       this.sql.exec('INSERT OR REPLACE INTO engine_bundles VALUES (?,?,?,?,?)', label, bundle.provider, bundle.version, revision, ciphertext);
+      bumpEngineEpoch(this.sql, this.now());
       this.sql.exec('DELETE FROM engine_installations WHERE label=?', label);
       this.sql.exec('DELETE FROM fleet_routes WHERE account=?', label);
       this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', label);

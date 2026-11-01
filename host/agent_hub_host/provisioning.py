@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 
@@ -1248,7 +1249,11 @@ _last_sync_report = {'body': None, 'at': 0.0}
 def report_sync(request, state, installed=(), failed=(), errors=None, clock=time.monotonic):
     """Best-effort per-host sync status for Hub (exception type only, never messages)."""
     errors = errors or {}
-    items = [{'label': b['label'], 'revision': b['revision'], 'state': 'installed'} for b in installed]
+    items = [{'label': b['label'], 'revision': b['revision'], 'state': 'installed',
+              # A7: acknowledge the Hub credential generation this host materialized.
+              **({'credential_generation': b['credential_generation']}
+                 if isinstance(b.get('credential_generation'), int) and not isinstance(b.get('credential_generation'), bool) else {})}
+             for b in installed]
     items += [{'label': b['label'], 'revision': b['revision'], 'state': 'failed',
                'error': type(errors[b['label']]).__name__ if b['label'] in errors else 'InstallFailed'} for b in failed]
     body = {'state': state, 'items': items}
@@ -1260,6 +1265,52 @@ def report_sync(request, state, installed=(), failed=(), errors=None, clock=time
     except Exception:
         return False
     _last_sync_report.update(body=body, at=now)
+    return True
+
+
+# A7: Hub pushes credential changes by bumping an epoch that rides on the 2 s
+# offers poll. A host that sees an epoch it has not applied syncs at once (the
+# same install path as the heartbeat pull, which stays as the fallback) and acks
+# the generations it installed through report_sync.
+EPOCH_RETRY_S = 30.0
+_epoch = {'applied': None, 'thread': None, 'failed_at': -1e9, 'seen': None}
+_epoch_lock = threading.Lock()
+
+
+def _apply_epoch(epoch, tick_fn):
+    try:
+        result = tick_fn()
+        ok = isinstance(result, dict) and result.get('status') == 'synced'
+    except Exception:
+        ok = False
+    with _epoch_lock:
+        if ok:
+            _epoch['applied'] = epoch
+        else:
+            _epoch['failed_at'] = time.monotonic()
+        _epoch['thread'] = None
+
+
+def note_epoch(epoch, tick_fn=None, clock=time.monotonic, spawn=True):
+    """Start one background sync when Hub announces an epoch not yet applied.
+
+    Returns True when a sync was started. Failed syncs retry after
+    EPOCH_RETRY_S, never in a tight loop.
+    """
+    if not isinstance(epoch, str) or not 1 <= len(epoch) <= 32:
+        return False
+    with _epoch_lock:
+        _epoch['seen'] = epoch
+        if _epoch['applied'] == epoch or (_epoch['thread'] is not None and _epoch['thread'].is_alive()):
+            return False
+        if clock() - _epoch['failed_at'] < EPOCH_RETRY_S:
+            return False
+        worker = threading.Thread(target=_apply_epoch, args=(epoch, tick_fn or tick), name='engine-epoch-sync', daemon=True)
+        _epoch['thread'] = worker
+    if spawn:
+        worker.start()
+    else:
+        worker.run()
     return True
 
 
@@ -1883,6 +1934,11 @@ def sync_status(listing):
     for h in listing.get('sync_status', []):
         hosts.append({'machine': h.get('machine') or h['machine_id'], 'machine_id': h['machine_id'], 'online': h['online'], 'host_state': h['host_state'],
                       'last_sync_at': h['last_sync_at'], 'accounts': {a['label']: a['state'] + (':' + a['error'] if a.get('error') else '') for a in h['accounts']}})
+        # A7: credential generation Hub holds vs the one this host acknowledged.
+        creds = {a['label']: {'current': a['credential_generation'], 'acked': a.get('acked_generation')}
+                 for a in h['accounts'] if 'credential_generation' in a}
+        if creds:
+            hosts[-1]['credentials'] = creds
     return {'hosts': hosts}
 
 

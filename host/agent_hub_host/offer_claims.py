@@ -73,7 +73,14 @@ def poll(dispatcher):
     if lock is False:
         return out
     try:
-        offers = dispatcher._fetch_offers().get('offers', [])
+        fetched = dispatcher._fetch_offers()
+        offers = fetched.get('offers', [])
+        # A7: Hub pushes credential changes as an epoch on this poll.
+        try:
+            from . import provisioning
+            provisioning.note_epoch(fetched.get('engine_epoch'))
+        except Exception:
+            pass
     finally:
         if lock is not None:
             lock.close()
