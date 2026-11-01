@@ -23,6 +23,7 @@ import { reconcileAccountCapacity } from './account_capacity';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
+import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency } from './pacing';
@@ -92,10 +93,10 @@ const NATIVE_IN_FLIGHT = `(
       THEN json_extract(l.request_json, '$.cwd')
       ELSE rtrim(l.workspace, '/') || '/' || json_extract(l.request_json, '$.cwd') END
     END = s.workspace AND
-  (SELECT COUNT(*) FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
+  (SELECT COUNT(*) FROM (SELECT 1 FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
    AND spawned.tag = s.tag AND spawned.engine = s.engine AND spawned.account = s.account
    AND spawned.profile IS s.profile AND spawned.workspace = s.workspace
-   AND spawned.phase IN ('starting','running','broken','unknown','uncertain')) = 1 AND
+   AND spawned.phase IN ('starting','running','broken','unknown','uncertain') LIMIT 2)) = 1 AND
   ((l.mode = 'headless' AND s.tag = 'task-hub-' || l.id) OR
    (l.mode = 'interactive' AND s.tag = 'hub-' || l.id)))`;
 // Separate exact native identity from the in-flight predicate so SQLite can
@@ -511,8 +512,10 @@ export class FleetService {
   /** Run `query(placeholders)` over `ids` in bounded chunks: reads only matching rows. */
   private byChunks(ids: string[], query: (marks: string) => string, ...lead: any[]): any[] {
     const out: any[] = [];
-    for (let i = 0; i < ids.length; i += 50) {
-      const chunk = ids.slice(i, i + 50);
+    const size = Math.min(50, 100 - lead.length);
+    if (size < 1) throw new Error('sql_binding_budget');
+    for (let i = 0; i < ids.length; i += size) {
+      const chunk = ids.slice(i, i + size);
       out.push(...this.sql.exec(query(chunk.map(() => '?').join(',')), ...lead, ...chunk).toArray());
     }
     return out;
@@ -626,6 +629,8 @@ export class FleetService {
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_inflight_identity ON fleet_launches(machine_id,engine,account,profile) WHERE native_id IS NULL AND state IN ('starting','uncertain')");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_incarnation ON fleet_sessions(machine_id,tag,engine,account,profile,workspace,phase)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_route_account ON fleet_routes(account)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_queue_live_machines ON machines(last_checkin_at,id) WHERE drained=0 AND revoked_at IS NULL');
+    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_queue_runtime_exit ON fleet_launches(machine_id,updated_at DESC) WHERE state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')");
     this.sql.exec('CREATE INDEX IF NOT EXISTS routing_launch ON routing_jobs(launch_id)');
     const columns = this.sql.exec('PRAGMA table_info(fleet_sessions)').toArray().map((c: any) => c.name);
     if (!columns.includes('last_activity_at')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN last_activity_at TEXT');
@@ -634,34 +639,36 @@ export class FleetService {
     if (!columns.includes('progress_json')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN progress_json TEXT');
   }
 
-  public observationProvenance(account: any, route: any): { quota: any; subscriptionObservedAt: string | null } | null {
+  public observationProvenance(account: any, route: any, snapshot?: FleetCapacitySnapshot): { quota: any; subscriptionObservedAt: string | null } | null {
+    const now = snapshot?.now ?? this.now();
     const provider = canonicalQuotaProvider(account.provider);
     const label = canonicalAccountLabel(account.label);
     const legacyLabel = Object.entries(LEGACY_ACCOUNT_LABELS).find(([, c]) => c === label)?.[0] ?? label;
     const central: any = this.sql.exec('SELECT * FROM server_quota_snapshots WHERE (account = ? OR account = ?) AND (provider = ? OR provider = ?)', label, legacyLabel, provider, legacyRouteKeyFor(provider) ?? provider).toArray()[0];
-    if (central && fresh(central.captured_at, this.now(), QUOTA_STALE_MS - 1)) {
+    if (central && fresh(central.captured_at, now, QUOTA_STALE_MS - 1)) {
       const quota = parsed(central.quota_json);
-      if (!quota.observed_at || fresh(quota.observed_at, this.now(), QUOTA_STALE_MS - 1)) {
+      if (!quota.observed_at || fresh(quota.observed_at, now, QUOTA_STALE_MS - 1)) {
         return { quota, subscriptionObservedAt: central.captured_at };
       }
     }
     const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
     if (subscription) {
-      if (canonicalQuotaProvider(subscription.service) !== provider || !fresh(subscription.observed_at, this.now(), 1200000)) return null;
+      if (canonicalQuotaProvider(subscription.service) !== provider || !fresh(subscription.observed_at, now, 1200000)) return null;
       const quota = parsed(subscription.quota_json);
       const quotaObs = quota?.observed_at || subscription.observed_at;
-      return fresh(quotaObs, this.now(), 1200000) ? { quota: quota?.observed_at ? quota : { ...quota, observed_at: quotaObs }, subscriptionObservedAt: subscription.observed_at } : null;
+      return fresh(quotaObs, now, 1200000) ? { quota: quota?.observed_at ? quota : { ...quota, observed_at: quotaObs }, subscriptionObservedAt: subscription.observed_at } : null;
     }
     // A default CLI reading cannot describe a named profile or two accounts on one service.
     if (route.profile !== null && route.profile !== provider) return null;
-    const count = Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)', route.machine_id, provider, legacyRouteKeyFor(provider) ?? provider).one().n);
-    const snapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
-    if (count !== 1 || !snapshot || !fresh(snapshot.captured_at, this.now(), 1200000)) return null;
-    const quota = snapshotRouteForAccount(account.label, provider, parsed(snapshot.routes_json));
-    const obsTs = quota?.observed_at || snapshot.captured_at;
-    if (!quota || !fresh(obsTs, this.now(), 1200000)) return null;
+    const count = snapshot ? (snapshot.familyAccounts.get(capacityFamilyKey(route.machine_id, provider))?.size ?? 0)
+      : Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)', route.machine_id, provider, legacyRouteKeyFor(provider) ?? provider).one().n);
+    const hostSnapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
+    if (count !== 1 || !hostSnapshot || !fresh(hostSnapshot.captured_at, now, 1200000)) return null;
+    const quota = snapshotRouteForAccount(account.label, provider, parsed(hostSnapshot.routes_json));
+    const obsTs = quota?.observed_at || hostSnapshot.captured_at;
+    if (!quota || !fresh(obsTs, now, 1200000)) return null;
     const quotaWithTs = quota.observed_at ? quota : { ...quota, observed_at: obsTs };
-    return { quota: snapshot.status === 'ok' ? quotaWithTs : { ...quotaWithTs, status: 'unknown' }, subscriptionObservedAt: snapshot.captured_at };
+    return { quota: hostSnapshot.status === 'ok' ? quotaWithTs : { ...quotaWithTs, status: 'unknown' }, subscriptionObservedAt: hostSnapshot.captured_at };
   }
 
   private observation(account: any, route: any) {
@@ -741,24 +748,34 @@ export class FleetService {
     return out;
   }
 
-  accountStatus(account: any) {
+  /** Bounded read-only observations for autonomous queue budgets. */
+  queueCapacitySnapshot(now = this.now()): FleetCapacitySnapshot {
+    return readFleetCapacitySnapshot(this.sql, now, NATIVE_UNRESERVED);
+  }
+
+  accountStatus(account: any, snapshot?: FleetCapacitySnapshot) {
+    if (snapshot) return this.accountStatusWithinMaintenance(account, snapshot);
     return this.withMaintenance(() => this.accountStatusWithinMaintenance(account));
   }
 
-  private accountStatusWithinMaintenance(account: any) {
-    this.reconcileCapacity();
+  private accountStatusWithinMaintenance(account: any, snapshot?: FleetCapacitySnapshot) {
+    // Budget reads must never trigger global expiry/reconciliation scans.
+    // Canonical placement continues to own its normal maintenance path.
+    if (!snapshot) this.reconcileCapacity();
+    const now = snapshot?.now ?? this.now();
     // Canonical provider model: `codex-orin` is an account under provider
     // `codex`, never a separate provider. Stored rows keyed by old names
     // canonicalize here so grouping by provider shows both Codex accounts.
     const provider = canonicalQuotaProvider(account.provider);
-    const routes = this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
+    const routes = snapshot ? snapshot.routes.filter(r => r.account === account.label)
+      : this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
     let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled; let healthy = false;
     const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
     for (const route of routes) {
-      const prov = this.observationProvenance(account, route);
+      const prov = this.observationProvenance(account, route, snapshot);
       if (!prov) continue;
       observed++;
-      const adm = evaluateLaunchQuota({ provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: this.now(), reserves });
+      const adm = evaluateLaunchQuota({ provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: now, reserves });
       if (!adm.ok) {
         if (['limit_reached', 'cooldown_active'].includes(adm.reason)) blocked = true;
         else if (adm.reason === 'reserve') {
@@ -782,9 +799,9 @@ export class FleetService {
     const liveIds = new Set<string>();
     const liveEnginesByMachine = new Map<string, Set<string>>();
     try {
-      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines WHERE revoked_at IS NULL').toArray() as any[]) {
+      for (const m of (snapshot?.machines ?? this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines WHERE revoked_at IS NULL').toArray()) as any[]) {
         if (m.drained) continue;
-        if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000)) continue;
+        if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), now, 180000)) continue;
         liveIds.add(String(m.id));
         // Same advertised-engine rule as plan(): a route stays placeable only
         // while its machine's fresh capabilities still list the engine. A host
@@ -795,9 +812,9 @@ export class FleetService {
       }
     } catch { /* fail closed below when the live set is empty */ }
     const liveList = [...liveIds];
-    const staleCutoff = new Date(this.now() - 48 * 3600000).toISOString();
-    const idleCutoff = this.now() - this.resources.config().idle_minutes * 60000;
-    const completeCatalogs = freshCompleteCatalogs(this.sql, this.now());
+    const staleCutoff = new Date(now - 48 * 3600000).toISOString();
+    const idleCutoff = now - this.resources.config().idle_minutes * 60000;
+    const completeCatalogs = snapshot?.completeCatalogs ?? freshCompleteCatalogs(this.sql, now);
     const isIdle = (row: any) => row.phase === 'running' && completeCatalogs.has(String(row.machine_id))
       && typeof row.last_activity_at === 'string' && Number.isFinite(Date.parse(row.last_activity_at))
       && Date.parse(row.last_activity_at) <= idleCutoff;
@@ -806,59 +823,25 @@ export class FleetService {
     // launch native_id after binding, the exact session-control binding can
     // still locate that historical native row. Keep launch/lifecycle rows
     // unchanged: unobserved is not positive terminal proof.
-    let boundNativeId = 'NULL';
-    let boundNativeCreatedAt = 'NULL';
-    try {
-      const hasControlStore = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
-      if (hasControlStore) {
-        const bindingWhere = `c.machine_id = l.machine_id AND c.fleet_launch_id = l.id AND c.engine = l.engine
-          AND c.state IN ('running','uncertain') AND c.binding_json IS NOT NULL`;
-        boundNativeId = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(
-          CASE WHEN json_valid(c.binding_json) THEN
-            CASE WHEN json_type(c.binding_json, '$.native_id') = 'text' AND json_type(c.binding_json, '$.native_created_at_ms') = 'integer'
-              THEN json_extract(c.binding_json, '$.native_id') END
-          END) END
-        FROM session_control_sessions c
-        WHERE ${bindingWhere})`;
-        boundNativeCreatedAt = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(
-            CASE WHEN json_valid(c.binding_json) THEN
-              CASE WHEN json_type(c.binding_json, '$.native_created_at_ms') = 'integer'
-                THEN json_extract(c.binding_json, '$.native_created_at_ms') END
-            END) END
-          FROM session_control_sessions c WHERE ${bindingWhere})`;
-      }
-    } catch { /* Fleet-only stores have no session-control binding to join. */ }
-    const isUnobserved = (row: any) => ['running', 'uncertain'].includes(row.state) && row.phase === 'unobserved'
-      && completeCatalogs.has(String(row.machine_id))
-      // Uncertain launches may shed a reservation only through the exact
-      // session-control fallback above. Their direct native_id branch has no
-      // incarnation proof and must not release on a mismatched native row.
-      && (row.state !== 'uncertain' || row.native_id == null || row.native_id === '');
+    const isUnobserved = (row: any) => unobservedReservationReleased(row, completeCatalogs);
     // Native activity, rather than a launch receipt's update timestamp,
     // determines whether a bound running session still occupies admission.
     // Stale catalogs, unknown native state/activity and in-flight starts
     // retain their reservations, even while independent heartbeats are fresh.
-    const reserved = liveList.length
-      ? (this.sql.exec(`SELECT l.state, l.native_id, l.machine_id, s.phase, s.last_activity_at FROM fleet_launches l
-          LEFT JOIN fleet_sessions s ON s.machine_id=l.machine_id
-            AND s.native_id=COALESCE(NULLIF(l.native_id, ''), ${boundNativeId})
-            AND (NULLIF(l.native_id, '') IS NOT NULL OR
-              (s.engine=l.engine AND s.account=l.account AND s.created_at_ms=${boundNativeCreatedAt}))
-          WHERE l.account = ? AND l.state IN ${ACTIVE} AND l.machine_id IN (${liveList.map(() => '?').join(',')})
-          AND (l.state = 'running' OR l.updated_at > ?)`, account.label, ...liveList, staleCutoff).toArray() as any[])
-          .filter(row => row.state === 'running'
-            ? (!isIdle(row) && !isUnobserved(row))
-            : row.state === 'uncertain' ? !isUnobserved(row) : true).length
-      : 0;
-    const observedSessions = (() => {
-      if (!liveList.length) return 0;
-      const orphans = this.sql.exec(`SELECT s.machine_id, s.phase, s.last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND ${NATIVE_UNRESERVED}`, account.label, ...liveList).toArray() as any[];
-      let counted = 0;
-      for (const row of orphans) {
-        if (!isIdle(row)) counted++;
-      }
-      return counted;
-    })();
+    const reservations = snapshot ? snapshot.launches.filter(l => l.account === account.label &&
+      l.state !== 'queued' && (l.state === 'running' || l.updated_at > staleCutoff))
+      : this.byChunks(liveList, marks => `SELECT l.state,l.native_id,l.machine_id,s.phase,s.last_activity_at FROM fleet_launches l
+          ${reservationNativeJoinSql(this.sql)}
+          WHERE l.account=? AND (l.state='running' OR l.updated_at>?)
+          AND l.state IN ${ACTIVE} AND l.machine_id IN (${marks})`, account.label, staleCutoff);
+    const reserved = reservations.filter(row => row.state === 'running'
+      ? (!isIdle(row) && !isUnobserved(row))
+      : row.state === 'uncertain' ? !isUnobserved(row) : true).length;
+    const orphans = snapshot ? snapshot.natives.filter(n => n.account === account.label && n.unreserved)
+      : this.byChunks(liveList, marks => `SELECT s.machine_id,s.phase,s.last_activity_at FROM fleet_sessions s
+          WHERE s.account=? AND s.phase IN ('starting','running','broken','unknown','uncertain')
+          AND s.machine_id IN (${marks}) AND ${NATIVE_UNRESERVED}`, account.label);
+    const observedSessions = orphans.filter(row => !isIdle(row)).length;
     const active = reserved + observedSessions;
     // Visibility breakdown (no accounting change): counted slots split into
     // launch reservations vs orphan observed sessions, alongside live native
@@ -866,8 +849,12 @@ export class FleetService {
     // capacity fixer owns the counting; this only projects it.
     let nativeLive: number | null = null;
     try {
-      const seen = freshCompleteCatalogs(this.sql, this.now());
-      if (liveList.length && liveList.every(id => seen.has(id))) nativeLive = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase = 'running' AND s.machine_id IN (${liveList.map(() => '?').join(',')})`, account.label, ...liveList).one().n);
+      const seen = completeCatalogs;
+      if (liveList.length && liveList.every(id => seen.has(id))) nativeLive = snapshot
+        ? snapshot.natives.filter(n => n.account === account.label && n.phase === 'running').length
+        : this.byChunks(liveList, marks => `SELECT COUNT(*) AS n FROM fleet_sessions s
+            WHERE s.account=? AND s.phase='running' AND s.machine_id IN (${marks})`, account.label)
+            .reduce((total, row) => total + Number(row.n), 0);
     } catch { nativeLive = null; }
     const availableSlots = Math.max(0, Number(account.max_concurrency) - active);
     const placeableMachines = new Set<string>();

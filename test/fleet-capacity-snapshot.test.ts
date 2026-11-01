@@ -1,0 +1,117 @@
+import { describe, expect, it } from 'vitest';
+import { env, runInDurableObject } from 'cloudflare:test';
+import { FleetService } from '../src/fleet';
+import { CAPACITY_MACHINES_SQL } from '../src/fleet-capacity-snapshot';
+import { liveQueuePolicy } from '../src/intake-queue-policy';
+import { freshCpu } from './cpu-fixture';
+
+const now = Date.parse('2026-11-01T10:00:00Z');
+const iso = (delta = 0) => new Date(now + delta).toISOString();
+const settings = { HUB_INTAKE_QUEUE_ENABLED:'true', HUB_INTAKE_QUEUE_PROJECTS:'*',
+  HUB_INTAKE_QUEUE_MAX_INFLIGHT:'auto', HUB_INTAKE_QUEUE_MAX_PER_PROJECT:'auto' };
+async function fixture(fn: (s: FleetService, sql: any, queries: {query:string,args:any[]}[]) => void) {
+  const stub = (env as any).HUB.get((env as any).HUB.idFromName('bounded-capacity-' + crypto.randomUUID()));
+  await (runInDurableObject as any)(stub, (h: any) => {
+    const queries: {query:string,args:any[]}[] = [];
+    const sql = {exec(query:string,...args:any[]) {
+      expect(args.length).toBeLessThanOrEqual(100);
+      queries.push({query,args}); return h.sql.exec(query,...args);
+    }};
+    const s = new FleetService(sql as any, fn=>fn(), ()=>now); s.init();
+    sql.exec("INSERT INTO fleet_accounts(label,provider,max_concurrency,reserve_percent,enabled) VALUES('zai-main','zai',10,15,1)");
+    machine(sql,'online');
+    sql.exec("INSERT INTO fleet_routes(machine_id,engine,account,profile) VALUES('online','zcodex','zai-main',NULL)");
+    sql.exec(`INSERT INTO host_quota_snapshots(host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,routes_json)
+      VALUES('online','1.0',?,?,?,?,'ok',?)`,iso(),now,iso(),now,JSON.stringify({zai:{status:'ok',observed_at:iso(),
+      details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:iso(86400000)}}}}));
+    sql.exec("INSERT INTO fleet_catalog_seen VALUES('online',?)",iso());
+    queries.length=0; fn(s,sql,queries);
+  });
+}
+function machine(sql:any,id:string,drained=0) {
+  sql.exec(`INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities)
+    VALUES(?,?,?,?,?,?,?,?)`,id,id,id,iso(),iso(),JSON.stringify({mem_avail_mb:32000,disk_free_gb:80,cpu_usage:freshCpu(iso())}),drained,
+    JSON.stringify({engines:['zcodex'],cpu_count:8,workspaces:['real-project']}));
+}
+function launch(sql:any,id:string,state='offered',native:string|null=null) {
+  sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at,native_id)
+    VALUES(?,'test','human','test',?,'{}','online','zcodex','zai-main','headless','real-project','',?,?,?,?)`,id,id,state,iso(),iso(),native);
+}
+function native(sql:any,id:string,activity=iso()) {
+  sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,account,last_activity_at)
+    VALUES('online',?,?,'zcodex','running',?,'real-project','zai-main',?)`,id,'external-'+id,iso(),activity);
+}
+describe('bounded real Fleet autonomous capacity snapshot',()=>{
+  it('uses real quota/account/resource admission without global maintenance or writes',()=>fixture((s,sql,queries)=>{
+    (s as any).reconcileCapacity=()=>{throw new Error('global maintenance forbidden');};
+    const result=liveQueuePolicy(settings,sql,s,now);
+    expect(result.max_inflight).toBe(10);
+    expect((result as any).capacity).toMatchObject({account_slots:10,available_slots:10});
+    expect(queries.every(q=>/^\s*(SELECT|WITH)/i.test(q.query))).toBe(true);
+    expect(queries.some(q=>q.query.includes('FROM machines WHERE revoked_at'))).toBe(false);
+    expect(queries.some(q=>q.query.includes('session_cpu_usage'))).toBe(false);
+  }));
+  it('preserves exact native reservation deduplication and idle catalog accounting',()=>fixture((s,sql)=>{
+    launch(sql,'bound','running','native'); native(sql,'native');
+    native(sql,'orphan'); native(sql,'idle',iso(-3600000)); launch(sql,'pending');
+    const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
+    const bounded=s.accountStatus(a,s.queueCapacitySnapshot(now));
+    const normal=s.accountStatus(a);
+    expect(bounded).toMatchObject({active:3,reserved:2,observed_sessions:1,native_live:3});
+    expect(bounded).toEqual(normal);
+    sql.exec('DELETE FROM fleet_catalog_seen');
+    expect(s.accountStatus(a,s.queueCapacitySnapshot(now))).toMatchObject({active:4,observed_sessions:2,native_live:null});
+  }));
+  it('fails closed on 99 live hosts before account status and keeps every binding batch below 100',()=>fixture((s,sql,queries)=>{
+    for(let i=0;i<98;i++) machine(sql,'live-'+i);
+    const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
+    // Ordinary Fleet status also needs safe binding chunks with 99 live hosts.
+    expect(s.accountStatus(a).active).toBe(0);
+    let calls=0; s.accountStatus=()=>{calls++;throw new Error('must not reach accounts');};
+    queries.length=0;
+    expect(liveQueuePolicy(settings,sql,s,now)).toMatchObject({max_inflight:0,capacity:{available_slots:0,observation_limited:true}});
+    expect(calls).toBe(0);
+    expect(queries.filter(q=>q.query.includes('fleet_accounts'))).toHaveLength(0);
+  }));
+  it.each(['routes','launches','natives'])('fails closed before account projection on overflowing %s',kind=>fixture((s,sql)=>{
+    for(let i=0;i<257;i++) {
+      if(kind==='routes') sql.exec("INSERT INTO fleet_routes(machine_id,engine,account,profile) VALUES(?,'zcodex','zai-main',NULL)",'historical-'+i);
+      if(kind==='launches') launch(sql,'launch-'+i);
+      if(kind==='natives') native(sql,'native-'+i);
+    }
+    let calls=0; s.accountStatus=()=>{calls++;throw new Error('must not reach accounts');};
+    expect(liveQueuePolicy(settings,sql,s,now).max_inflight).toBe(0); expect(calls).toBe(0);
+  }));
+  it.each(['accounts','engines'])('rejects overflowing %s before account projection',kind=>fixture((s,sql)=>{
+    if(kind==='accounts') for(let i=0;i<128;i++) sql.exec("INSERT INTO fleet_accounts(label,provider,max_concurrency,reserve_percent,enabled) VALUES(?,'zai',1,15,1)",'account-'+i);
+    if(kind==='engines') for(let i=0;i<17;i++) {launch(sql,'engine-'+i);sql.exec('UPDATE fleet_launches SET engine=? WHERE id=?','engine-'+i,'engine-'+i);}
+    let calls=0; s.accountStatus=()=>{calls++;throw new Error('must not reach accounts');};
+    expect(liveQueuePolicy(settings,sql,s,now)).toMatchObject({max_inflight:0,capacity:{observation_limited:true}});
+    expect(calls).toBe(0);
+  }));
+  it('uses range/index probes despite retained drained machines and terminal history',()=>fixture((s,sql,queries)=>{
+    for(let i=0;i<300;i++) { machine(sql,'drained-'+i,1); launch(sql,'old-'+i,'exited'); }
+    const plan=sql.exec('EXPLAIN QUERY PLAN '+CAPACITY_MACHINES_SQL,iso(-360000),iso(60000)).toArray();
+    const detail=plan.map((r:any)=>r.detail).join('\n');
+    expect(detail).toMatch(/SEARCH m USING INDEX fleet_queue_live_machines/);
+    expect(detail).not.toMatch(/SCAN m/);
+    queries.length=0;
+    expect(liveQueuePolicy(settings,sql,s,now).max_inflight).toBe(10);
+    for(const q of queries.filter(q=>q.query.includes('FROM fleet_launches l LEFT JOIN fleet_sessions'))) {
+      const p=sql.exec('EXPLAIN QUERY PLAN '+q.query,...q.args).toArray().map((r:any)=>r.detail).join('\n');
+      expect(p).toMatch(/SEARCH l USING INDEX fleet_launch_machine_state/);
+    }
+  }));
+  it('retains hard PSI/OOM admission while ordinary busy CPU remains advisory',()=>fixture((s,sql)=>{
+    const update=(cpu:any)=>sql.exec("UPDATE machines SET last_heartbeat=? WHERE id='online'",JSON.stringify({mem_avail_mb:32000,disk_free_gb:80,cpu_usage:cpu}));
+    update(freshCpu(iso(),8,8));
+    expect(s.resources.capacityCpuAdmitted('online')).toBe(s.resources.cpuHeadroom('online').admitted);
+    expect(liveQueuePolicy(settings,sql,s,now).max_inflight).toBe(10);
+    update({...freshCpu(iso()),psi_full_avg10:100});
+    expect(s.resources.capacityCpuAdmitted('online')).toBe(false);
+    expect(liveQueuePolicy(settings,sql,s,now).max_inflight).toBe(0);
+    update({...freshCpu(iso()),host_oom_kills_delta:1});
+    expect(s.resources.capacityCpuAdmitted('online')).toBe(false);
+    expect(liveQueuePolicy(settings,sql,s,now).max_inflight).toBe(0);
+  }));
+});

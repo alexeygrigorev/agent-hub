@@ -16,8 +16,8 @@ async function fixture(fn: (h: any, fleet: any, account: any) => void | Promise<
     h.sql.exec(`INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained)
       VALUES('online','online','online',?,?,?,0)`, new Date(NOW).toISOString(), new Date(NOW).toISOString(), JSON.stringify({disk_free_gb: 100}));
     const account = { provider: 'zai', enabled: true, supports_goal: true, status: 'ok', placeable_machines: ['online'], placeable_slots: 26 };
-    const fleet = { withMaintenance: (fn: any) => fn(), accountStatus: () => account, resources: {
-      config: () => ({ disk_floor_gb: 15 }), cpuHeadroom: () => ({ admitted: true }),
+    const fleet = { queueCapacitySnapshot: (now: number) => h.fleetService.queueCapacitySnapshot(now), withMaintenance: (fn: any) => fn(), accountStatus: () => account, resources: {
+      withReadSnapshot: (fn: any) => fn(), config: () => ({ disk_floor_gb: 15 }), capacityCpuAdmitted: () => true,
       headroom: () => ({ mem_available_mb: 20480, reserved_mb: 1024, floor_mb: 10240, requested_mb: 512 }) } };
     await fn(h, fleet, account);
   });
@@ -106,7 +106,7 @@ describe('live autonomous queue policy', () => {
     if (reason === 'revoked') h.sql.exec('UPDATE machines SET revoked_at=?', new Date(NOW).toISOString());
     if (reason === 'disk') h.sql.exec('UPDATE machines SET last_heartbeat=?', JSON.stringify({ disk_free_gb: 14 }));
     if (reason === 'memory') fleet.resources.headroom = () => ({ mem_available_mb: null });
-    if (reason === 'cpu') fleet.resources.cpuHeadroom = () => ({ admitted: false });
+    if (reason === 'cpu') fleet.resources.capacityCpuAdmitted = () => false;
     if (reason === 'quota') account.status = 'blocked';
     if (reason === 'unknown_quota') account.status = 'unknown';
     if (reason === 'explicit_only') account.provider = 'codex';

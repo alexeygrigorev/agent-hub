@@ -26,6 +26,7 @@ const TERMINAL = new Set(['exited', 'finished', 'failed', 'stopped', 'dead', 're
 export const RESOURCE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS resource_resident_samples (launch_id TEXT PRIMARY KEY, resident_mb REAL NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_choking_events (machine_id TEXT NOT NULL, reason TEXT NOT NULL, observed_at TEXT NOT NULL, PRIMARY KEY(machine_id,reason));
+CREATE INDEX IF NOT EXISTS resource_queue_choking_recent ON resource_choking_events(machine_id,observed_at DESC) WHERE reason!='host_runtime_choking';
 CREATE TABLE IF NOT EXISTS resource_cpu_samples (launch_id TEXT PRIMARY KEY, current_cpu_cores REAL NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_cpu_starts (launch_id TEXT PRIMARY KEY, expected_cpu_cores REAL NOT NULL, expected_cpu_source TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_usage (session_id TEXT PRIMARY KEY, p95_cpu_cores REAL, observed_at TEXT NOT NULL);
@@ -257,6 +258,15 @@ export class ResourceManagement {
     const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,now);
     const choking=this.chokingState(machine,now,config,verdict.reason);
     return {...verdict,...choking,admitted:choking.reason===null,expected_cpu_source:estimate.expected_cpu_source};
+  }
+  /** Queue budgets need the real choking verdict, not advisory CPU estimates.
+   * This shares the exact live PSI/OOM/runtime guards with cpuHeadroom while
+   * avoiding its unrelated global CPU estimation history/pending scans. */
+  capacityCpuAdmitted(machine: string): boolean {
+    const now = this.snapshotNow ?? this.now(), config = this.config();
+    const m: any = this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?', machine)[0];
+    const verdict = cpuVerdict(parse(m?.last_heartbeat).cpu_usage, parse(m?.capabilities).cpu_count, 0, 0, config, now);
+    return this.chokingState(machine, now, config, verdict.reason).reason === null;
   }
   resourceChoking(machine: string) {
     // Watchdog needs current failure evidence, not a hypothetical launch's
