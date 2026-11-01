@@ -94,6 +94,10 @@ WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 # Windows hosts (Tabo) must NOT receive Linux cgroup flags: aplexer on
 # Windows contains workloads with Job Objects and reports containment_empty.
 WORKER_MEMORY = "1500M"
+# zcodex = Rust TUI (~200 MB) + Node zcode core (300-460 MB, re-spawned on every
+# stream retry) + the agent's own toolchain; 1500M OOM-killed the core
+# mid-turn (intake de6f2139). Other engines keep the default cap.
+ENGINE_WORKER_MEMORY = {"zcodex": "4096M"}
 WORKER_PIDS = "256"
 WORKER_CPU_QUOTA_US = "100000"
 WORKER_CPU_PERIOD_US = "100000"
@@ -113,11 +117,11 @@ def is_windows_host() -> bool:
         return False
 
 
-def worker_resource_argv() -> list[str]:
+def worker_resource_argv(engine: str | None = None) -> list[str]:
     """Linux cgroup flags for `aplexer start`, empty on Windows (Job Objects)."""
     if is_windows_host():
         return []
-    return ["--memory", WORKER_MEMORY, "--pids", WORKER_PIDS,
+    return ["--memory", ENGINE_WORKER_MEMORY.get(engine, WORKER_MEMORY), "--pids", WORKER_PIDS,
             "--cpu-quota-us", WORKER_CPU_QUOTA_US, "--cpu-period-us", WORKER_CPU_PERIOD_US]
 
 # Advertisement-only cache for qualified role profiles (intake eff9a5ce AC1:
@@ -2978,7 +2982,7 @@ class Dispatcher:
             from .intake_worktree import launch_cwd
             target_cwd, wt_note, intake_wt = launch_cwd(self.request, offer, workspace, target_cwd)
             self._lock_session_worktree(offer, target_cwd)
-            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"]] + worker_resource_argv() + ["--json"]
+            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"]] + worker_resource_argv(offer["engine"]) + ["--json"]
             if offer.get("profile"):
                 argv += ["--profile", offer["profile"]]
             if target_cwd != workspace:
@@ -3720,6 +3724,14 @@ class Dispatcher:
                             persist_observation(self, record)
         catalog = bounded_catalog(rows)
         progress = self._session_progress.sample(catalog, active_launches)
+        try:
+            if not hasattr(self, '_zcodex_health'):
+                from .zcodex_health import ZcodexHealth
+                self._zcodex_health = ZcodexHealth(
+                    self.request, Path(self.journal_dir) / 'zcodex-health.json' if self.journal_dir else None)
+            self._zcodex_health.observe(catalog, progress)
+        except Exception:
+            pass  # health projection never blocks the catalog report
         enriched = session_metadata(catalog, self.settings, progress)
         with self._catalog_report_lock:
             # Enrichment is never authoritative for identity or lifecycle.

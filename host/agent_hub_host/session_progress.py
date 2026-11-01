@@ -152,9 +152,18 @@ class SessionProgress:
                                  'seen_alive': previous.get('seen_alive', False) or (headless and alive is True),
                                  'attempted': previous.get('attempted', False), 'cleanup': cleanup,
                                  'orphaned': orphan or previous.get('orphaned', False)}
+            terminal = None
+            # zcodex exits non-zero on reconnect exhaustion or loses its core
+            # to the cgroup OOM killer; surviving children keep the scope
+            # non-empty, which Hub otherwise shows as idle for hours.
+            if (row.get('engine') == 'zcodex' and not headless and alive is False
+                    and row.get('containment_empty') is False):
+                terminal = 'zcodex_agent_exited'
             result[sid] = {'last_progress_at': dt.datetime.fromtimestamp(min(last, now) / 1000, dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
                            'headless': headless, 'agent_alive': alive if headless else None,
                            'orphaned': self.samples[key]['orphaned'], 'cleanup': cleanup}
+            if terminal:
+                result[sid]['terminal_error'] = terminal
             if output is not None:
                 result[sid]['sampled_at'] = dt.datetime.fromtimestamp(now / 1000, dt.timezone.utc).isoformat().replace('+00:00', 'Z')
         if hasattr(self.output, 'goal_status'):

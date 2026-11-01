@@ -63,3 +63,37 @@ it('reports a dead Codex TUI as failed while retaining lifecycle and capacity un
     expect(watchdog.project([task])[0]).toMatchObject({ forgotten: false, state: 'unknown' });
   });
 });
+
+it('fails a dead zcodex session (phase exiting) fast, holds the engine route, and releases only on probe pass', async () => {
+  const bindings = env as unknown as Env;
+  const stub = bindings.HUB.get(bindings.HUB.idFromName('zcodex-dead-' + crypto.randomUUID()));
+  await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    const now = Date.parse('2026-11-01T03:00:00Z'), at = new Date(now).toISOString();
+    const tx = <T>(cb: () => T) => state.storage.transactionSync(cb);
+    const service = new SessionControlService(hub.sql, tx, () => now); service.init();
+    const fleet = new FleetService(hub.sql, tx, () => now); fleet.init();
+    const id = '22222222-2222-4222-8222-222222222222';
+    hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at) VALUES ('test-host', 'test-host', 'test-host', ?, ?)", at, at);
+    hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+      VALUES (?, 'test-admin', 'test', '{}', 'test-host', 'zcodex', 'interactive', 'running', ?, ?, ?)`, id,
+      JSON.stringify({ native_id: id, tag: 'hub-test', workspace: '/test', native_created_at_ms: now - 120000 }), at, at);
+    const row = { native_id: id, tag: 'hub-test', workspace: '/test', engine: 'zcodex', phase: 'exiting', agent_state: null, profile: null, account: null,
+      created_at_ms: now - 120000, last_activity_at: at,
+      progress: { last_progress_at: new Date(now - 120000).toISOString(), headless: false, agent_alive: false, orphaned: false, cleanup: 'none', terminal_error: 'zcodex_agent_exited' } };
+    const host = { caller: { machineId: 'test-host', kind: 'host', actor: 'machine:test-host' }, scopes: ['host'] };
+    const report = (data: any) => fleet.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions: [data] }) }), host);
+    // The error is accepted only for engine zcodex.
+    expect((await report({ ...row, engine: 'codex' })).status).toBe(400);
+    expect((await report(row)).status).toBe(200);
+    const view = await (await service.handle(new Request('https://hub.test/api/sessions/' + id),
+      { caller: { isAdmin: true, kind: 'human', actor: 'test-admin' }, scopes: ['admin'] })).json();
+    expect(view).toMatchObject({ state: 'failed', stalled: false, failure_reason: 'zcodex_agent_exited' });
+    // Route hold is set by the host and released only by the zcodex probe-pass reason.
+    const probe = (body: any) => fleet.handle(new Request('https://hub.test/api/fleet/probe', { method: 'POST', body: JSON.stringify(body) }), host);
+    expect((await probe({ engine: 'zcodex', status: 'unavailable', reason: 'zcodex_session_failed' })).status).toBe(200);
+    expect((await probe({ engine: 'zcodex', status: 'ok', reason: 'admission_configured' })).status).toBe(200);
+    expect(hub.sql.exec("SELECT status FROM fleet_engine_health WHERE engine='zcodex'").one().status).toBe('unavailable');
+    expect((await probe({ engine: 'zcodex', status: 'ok', reason: 'zcodex_probe_passed' })).status).toBe(200);
+    expect(hub.sql.exec("SELECT status FROM fleet_engine_health WHERE engine='zcodex'").one().status).toBe('ok');
+  });
+});
