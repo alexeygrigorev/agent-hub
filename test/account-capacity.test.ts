@@ -329,21 +329,196 @@ describe('phantom account reservations', () => {
     expect(active()).toBe(1); // Missing or stale catalog evidence keeps the reservation.
 
     sql.exec('INSERT INTO fleet_catalog_seen VALUES (\'hetzner\', ?)', iso());
+    sql.exec('INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES (\'hetzner\', ?, 1)', iso());
     expect(active()).toBe(0); // Fresh census confirms this exact native is no longer observed.
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
 
     sql.exec('UPDATE fleet_catalog_seen SET observed_at = ? WHERE machine_id = \'hetzner\'', iso(-180001));
+    sql.exec('UPDATE fleet_catalog_census SET observed_at = ? WHERE machine_id = \'hetzner\'', iso(-180001));
     expect(active()).toBe(1); // Stale census cannot release the slot.
 
     sql.exec('UPDATE fleet_catalog_seen SET observed_at = ? WHERE machine_id = \'hetzner\'', iso());
+    sql.exec('UPDATE fleet_catalog_census SET observed_at = ? WHERE machine_id = \'hetzner\'', iso());
     sql.exec("UPDATE fleet_sessions SET phase = 'unknown' WHERE machine_id = 'hetzner' AND native_id = 'gone'");
     expect(active()).toBe(1); // Fresh but unknown native state remains fail-closed.
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
+  }));
+
+  it('projects an uncertain launch as physically absent only through its exact binding and fresh complete census', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state='uncertain', native_id=NULL WHERE id=?", launch.id);
+    const control = new SessionControlService(sql, cb => cb(), () => now); control.init();
+    const nativeId = 'bound-native-gone';
+    sql.exec("INSERT INTO session_control_sessions (id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+      'control-' + launch.id, 'test-admin', 'control-' + launch.id, '{}', launch.id, 'hetzner', 'codex', 'headless', 'uncertain',
+      JSON.stringify({ native_id: nativeId, native_created_at_ms: now }), iso(), iso());
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner',?,'task-hub-' || ?, 'codex','unobserved',?,'demo','shared-codex',?)",
+      nativeId, launch.id, iso(), now);
+    const active = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active;
+
+    expect(active()).toBe(1); // Missing census is fail-closed.
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id,observed_at,complete) VALUES ('hetzner',?,1)", iso(-180001));
+    expect(active()).toBe(1); // Stale complete census is insufficient.
+    sql.exec("UPDATE fleet_catalog_census SET observed_at=?,complete=0 WHERE machine_id='hetzner'", iso());
+    expect(active()).toBe(1); // Fresh incomplete census is insufficient.
+    sql.exec("UPDATE fleet_catalog_census SET observed_at=?,complete=1 WHERE machine_id='hetzner'", iso());
+    expect(active()).toBe(0); // Exact bound native plus fresh complete absence releases only physical capacity.
+    expect(sql.exec('SELECT state,native_id FROM fleet_launches WHERE id=?', launch.id).one()).toMatchObject({ state: 'uncertain', native_id: null });
+    expect(sql.exec('SELECT state,binding_json FROM session_control_sessions WHERE id=?', 'control-' + launch.id).one()).toMatchObject({
+      state: 'uncertain', binding_json: JSON.stringify({ native_id: nativeId, native_created_at_ms: now }),
+    });
+
+    sql.exec("UPDATE fleet_sessions SET phase='unknown' WHERE machine_id='hetzner' AND native_id=?", nativeId);
+    expect(active()).toBe(1); // Unknown phase remains reserved despite the complete census.
+    sql.exec("UPDATE fleet_sessions SET phase='unobserved' WHERE machine_id='hetzner' AND native_id=?", nativeId);
+    sql.exec("UPDATE fleet_sessions SET created_at_ms=? WHERE machine_id='hetzner' AND native_id=?", now + 1, nativeId);
+    expect(active()).toBe(1); // A mismatched native incarnation cannot release this launch.
+    sql.exec("UPDATE fleet_sessions SET created_at_ms=? WHERE machine_id='hetzner' AND native_id=?", now, nativeId);
+    sql.exec("UPDATE fleet_sessions SET engine='claude' WHERE machine_id='hetzner' AND native_id=?", nativeId);
+    expect(active()).toBe(1); // A mismatched engine cannot release this launch.
+    sql.exec("UPDATE fleet_sessions SET engine='codex',account='desktop-codex' WHERE machine_id='hetzner' AND native_id=?", nativeId);
+    expect(active()).toBe(1); // A mismatched account cannot release this launch.
+    sql.exec("UPDATE fleet_sessions SET account='shared-codex' WHERE machine_id='hetzner' AND native_id=?", nativeId);
+    sql.exec("UPDATE session_control_sessions SET machine_id='win35' WHERE id=?", 'control-' + launch.id);
+    expect(active()).toBe(1); // A binding on another machine cannot release this launch.
+    sql.exec("UPDATE session_control_sessions SET machine_id='hetzner',engine='claude' WHERE id=?", 'control-' + launch.id);
+    expect(active()).toBe(1); // A mismatched control binding engine cannot release this launch.
+    sql.exec("UPDATE session_control_sessions SET engine='codex',binding_json=? WHERE id=?", JSON.stringify({ native_id: nativeId, native_created_at_ms: now + 1 }), 'control-' + launch.id);
+    expect(active()).toBe(1); // A mismatched bound creation time cannot release this launch.
+    sql.exec("UPDATE session_control_sessions SET binding_json=? WHERE id=?", JSON.stringify({ native_id: 'different-native', native_created_at_ms: now }), 'control-' + launch.id);
+    expect(active()).toBe(1); // A different bound native cannot release this launch.
+    sql.exec("UPDATE session_control_sessions SET binding_json=NULL WHERE id=?", 'control-' + launch.id);
+    expect(active()).toBe(1); // An unbound uncertain launch remains reserved.
+    sql.exec("UPDATE session_control_sessions SET binding_json=?,state='uncertain' WHERE id=?", JSON.stringify({ native_id: nativeId, native_created_at_ms: now }), 'control-' + launch.id);
+    sql.exec("UPDATE fleet_launches SET state='starting' WHERE id=?", launch.id);
+    expect(active()).toBe(1); // An in-flight start remains reserved even with stale absence history.
+  }));
+
+  it('keeps uncertain direct-native reservations when the unobserved row has a different engine or account', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state='uncertain', native_id='direct-native' WHERE id=?", launch.id);
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id,observed_at,complete) VALUES ('hetzner',?,1)", iso());
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','direct-native',?,'claude','unobserved',?,'demo','shared-codex',?)",
+      'task-hub-' + launch.id, iso(), now);
+    const active = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active;
+
+    expect(active()).toBe(1); // Direct uncertain native IDs lack an incarnation-checked binding.
+    sql.exec("UPDATE fleet_sessions SET engine='codex', account='desktop-codex' WHERE native_id='direct-native'");
+    expect(active()).toBe(1); // Account mismatch cannot release the uncertain reservation either.
+  }));
+
+  it('keeps an uncertain reservation when more than one exact control binding matches', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state='uncertain', native_id=NULL WHERE id=?", launch.id);
+    const service = new SessionControlService(sql, cb => cb(), () => now); service.init();
+    const nativeId = 'ambiguous-bound-native';
+    const binding = JSON.stringify({ native_id: nativeId, native_created_at_ms: now });
+    for (const id of ['control-first', 'control-second']) {
+      sql.exec("INSERT INTO session_control_sessions (id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        id + '-' + launch.id, 'test-admin', id + '-' + launch.id, '{}', launch.id, 'hetzner', 'codex', 'headless', 'uncertain', binding, iso(), iso());
+    }
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner',?,'task-hub-' || ?, 'codex','unobserved',?,'demo','shared-codex',?)",
+      nativeId, launch.id, iso(), now);
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id,observed_at,complete) VALUES ('hetzner',?,1)", iso());
+
+    expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active).toBe(1);
+  }));
+
+  it.each([
+    ['legacy census at the row cap', undefined, 500],
+    ['explicitly incomplete census below the row cap', false, 0],
+  ])('does not free an unobserved reservation after an %s', (label, censusComplete, rowCount) => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running', native_id = 'gone' WHERE id = ?", launch.id);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','gone','task','codex','unobserved',?,'/repo','shared-codex',?)", iso(), now);
+    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso());
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1)", iso());
+    const active = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).active;
+    expect(active()).toBe(0);
+
+    const sessions = Array.from({ length: rowCount }, (_, i) => ({
+      native_id: `history-${i}`, tag: `history-${i}`, engine: 'codex', phase: 'failed',
+      agent_state: null, workspace: '/repo', profile: null, account: null,
+    }));
+    const body: any = { sessions };
+    if (censusComplete !== undefined) body.census_complete = censusComplete;
+    expect((await f.handle(request('/sessions', body, 'PUT'), host('hetzner'))).status).toBe(200);
+
+    expect(sql.exec("SELECT phase FROM fleet_sessions WHERE machine_id='hetzner' AND native_id='gone'").one().phase).toBe('unobserved');
+    expect(sql.exec("SELECT complete FROM fleet_catalog_census WHERE machine_id='hetzner'").one().complete).toBe(0);
+    expect(active()).toBe(1); // Incomplete freshness invalidates the older complete marker.
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
+  }));
+
+  it('does not mark an absent native unobserved when the host labels its census incomplete', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running', native_id = 'still-live' WHERE id = ?", launch.id);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','still-live','task','codex','running',?,'/repo','shared-codex',?)", iso(), now);
+    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso());
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1)", iso());
+
+    const body = { sessions: [], census_complete: false };
+    expect((await f.handle(request('/sessions', body, 'PUT'), host('hetzner'))).status).toBe(200);
+
+    expect(sql.exec("SELECT phase FROM fleet_sessions WHERE machine_id='hetzner' AND native_id='still-live'").one().phase).toBe('running');
+    expect(sql.exec("SELECT complete FROM fleet_catalog_census WHERE machine_id='hetzner'").one().complete).toBe(0);
+    expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active).toBe(1);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
+  }));
+
+  it('records an incomplete census before draining capacity waiters', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running', native_id = 'still-live' WHERE id = ?", launch.id);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','still-live','task','codex','unobserved',?,'/repo','shared-codex',?)", iso(), now);
+
+    const waiting: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    expect(waiting.state).toBe('queued');
+    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso());
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1)", iso());
+
+    const report = await f.handle(request('/sessions', { sessions: [], census_complete: false }, 'PUT'), host('hetzner'));
+    expect(report.status).toBe(200);
+    expect(sql.exec("SELECT phase FROM fleet_sessions WHERE machine_id='hetzner' AND native_id='still-live'").one().phase).toBe('unobserved');
+    expect(sql.exec("SELECT complete FROM fleet_catalog_census WHERE machine_id='hetzner'").one().complete).toBe(0);
+    expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active).toBe(1);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', waiting.id).one().state).toBe('queued');
+  }));
+
+  it('keeps legacy sub-cap reports complete and accepts an explicit complete terminal-history truncation', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running', native_id = 'gone' WHERE id = ?", launch.id);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','gone','task','codex','running',?,'/repo','shared-codex',?)", iso(), now);
+
+    expect((await f.handle(request('/sessions', { sessions: [] }, 'PUT'), host('hetzner'))).status).toBe(200);
+    expect(sql.exec("SELECT phase FROM fleet_sessions WHERE native_id='gone'").one().phase).toBe('unobserved');
+    expect(sql.exec("SELECT complete FROM fleet_catalog_census WHERE machine_id='hetzner'").one().complete).toBe(1);
+    expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active).toBe(0);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
+
+    sql.exec("UPDATE fleet_sessions SET phase='running' WHERE native_id='gone'");
+    const terminalHistory = Array.from({ length: 500 }, (_, i) => ({
+      native_id: `history-${i}`, tag: `history-${i}`, engine: 'codex', phase: 'failed',
+      agent_state: null, workspace: '/repo', profile: null, account: null,
+    }));
+    expect((await f.handle(request('/sessions', { sessions: terminalHistory, census_complete: true }, 'PUT'), host('hetzner'))).status).toBe(200);
+    expect(sql.exec("SELECT phase FROM fleet_sessions WHERE native_id='gone'").one().phase).toBe('unobserved');
+    expect(sql.exec("SELECT complete FROM fleet_catalog_census WHERE machine_id='hetzner'").one().complete).toBe(1);
+    expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active).toBe(0);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
   }));
 
   it('ignores stale progress on orphan workloads while preserving unknown activity holds', () => fixture(async (f, sql) => {
     await configure(f);
     sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso());
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1)", iso());
     sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,last_activity_at,workspace,account) VALUES ('hetzner','orphan','orphan','codex','running',?,?,'/repo','shared-codex')", iso(), iso(-7 * 3600000));
     const account = sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one();
     expect(f.accountStatus(account).active).toBe(0);

@@ -2,15 +2,22 @@
 from .bus import HttpRequestError
 
 
-def report_catalog(request, rows):
+def report_catalog(request, rows, *, census_complete=None):
     """Retry one schema refusal without the two newer advisory progress keys.
 
     Identity, lifecycle and the complete row set are unchanged. Never retry
     authorization, network or server failures, and never remove other fields
-    to make a malformed census pass validation.
+    to make a malformed census pass validation. When supplied, census
+    completeness is preserved across both the current schema and its legacy
+    progress-field retry.
     """
+    if census_complete is not None and type(census_complete) is not bool:
+        raise TypeError('census_complete must be a boolean when provided')
+    payload = {'sessions': rows}
+    if census_complete is not None:
+        payload['census_complete'] = census_complete
     try:
-        return request('PUT', '/api/fleet/sessions', {'sessions': rows})
+        return request('PUT', '/api/fleet/sessions', payload)
     except HttpRequestError as exc:
         if (exc.http_status != 400 or
                 str(exc) != 'HTTP request failed with status 400: invalid_session'):
@@ -26,4 +33,5 @@ def report_catalog(request, rows):
             legacy.append(row)
         if not changed:
             raise
-    return request('PUT', '/api/fleet/sessions', {'sessions': legacy})
+    legacy_payload = {**payload, 'sessions': legacy}
+    return request('PUT', '/api/fleet/sessions', legacy_payload)

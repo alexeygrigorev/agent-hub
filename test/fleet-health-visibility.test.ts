@@ -44,6 +44,7 @@ describe('fleet health visibility + machine aliasing', () => {
     machine(sql, 'idle-host', 'idle-host', now);
     sql.exec("INSERT INTO resource_settings VALUES (1, ?)", JSON.stringify({idle_minutes: 10}));
     sql.exec("INSERT INTO fleet_catalog_seen VALUES ('idle-host', ?)", iso(0));
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('idle-host', ?, 1)", iso(0));
     sql.exec("INSERT INTO fleet_accounts VALUES ('idle-account', 'codex', 8, 15, 1)");
     const add = (id: string, state: string, activity: string | null, bound = true) => {
       sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES ('idle-host',?,?, 'codex','running','idle',?,'demo','idle-account',?)", id, id, iso(0), activity);
@@ -56,14 +57,22 @@ describe('fleet health visibility + machine aliasing', () => {
     add('starting', 'starting', iso(-11 * 60000));
     const status = () => fleet.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='idle-account'").one());
     expect(status()).toMatchObject({active: 3, reserved: 3, observed_sessions: 0});
+    // A fresh incomplete report cannot turn retained old activity into proof
+    // that either a bound launch or an orphan stopped consuming capacity.
+    sql.exec("UPDATE fleet_catalog_census SET complete=0 WHERE machine_id='idle-host'");
+    expect(status()).toMatchObject({active: 5, reserved: 4, observed_sessions: 1});
+    sql.exec("UPDATE fleet_catalog_census SET complete=1 WHERE machine_id='idle-host'");
+    expect(status()).toMatchObject({active: 3, reserved: 3, observed_sessions: 0});
     // Productive activity immediately restores the bound admission slot.
     sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(0));
     expect(status().active).toBe(4);
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_sessions').one().n).toBe(5);
     // Independent host heartbeats do not prove the native catalog is current.
     sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
+    sql.exec("UPDATE fleet_catalog_census SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
     expect(status()).toMatchObject({active: 5, reserved: 4, observed_sessions: 1});
     sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(0));
+    sql.exec("UPDATE fleet_catalog_census SET observed_at=? WHERE machine_id='idle-host'", iso(0));
     sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(-11 * 60000));
     for (const phase of ['unknown', 'uncertain', 'starting', 'broken']) {
       sql.exec("UPDATE fleet_sessions SET phase=? WHERE native_id='idle-bound'", phase);
@@ -162,6 +171,7 @@ describe('fleet health visibility + machine aliasing', () => {
       iso(0), iso(0),
     );
     sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso(0));
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1)", iso(0));
     const status: any = fleet.accountStatus({ label: 'shared-codex', provider: 'codex', max_concurrency: 8, reserve_percent: 15, enabled: 1 });
     expect(status.active).toBe(status.reserved + status.observed_sessions);
     expect(status.reserved).toBe(1);
@@ -328,15 +338,27 @@ describe('fleet health visibility + machine aliasing', () => {
    let tick=now; const fleet=new FleetService(sql, fn=>fn(), ()=>tick);
    machine(sql,'census-host','census-host',now);
    const caller={caller:{machineId:'census-host',kind:'host',actor:'machine:census-host'},scopes:['host']};
-   const payload={sessions:[{native_id:'n1',tag:'worker',engine:'codex',phase:'running',agent_state:null,workspace:'demo',profile:null,account:null}]};
-   const send=()=>fleet.handle(new Request('https://hub/api/fleet/sessions',{method:'PUT',body:JSON.stringify(payload)}),caller);
+   const payload: {sessions: any[]; census_complete?: boolean}={sessions:[{native_id:'n1',tag:'worker',engine:'codex',phase:'running',agent_state:null,workspace:'demo',profile:null,account:null}],census_complete:true};
+   const send=(body: typeof payload = payload)=>fleet.handle(new Request('https://hub/api/fleet/sessions',{method:'PUT',body:JSON.stringify(body)}),caller);
    expect((await send()).status).toBe(200);
    const first=sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at;
+   expect(sql.exec("SELECT complete FROM fleet_catalog_census WHERE machine_id='census-host'").one().complete).toBe(1);
    tick+=30000; expect((await (await send()).json() as any).written).toBe(0);
    expect(sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(first);
+   expect(sql.exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(first);
    tick+=60000; expect((await (await send()).json() as any).written).toBe(0);
    expect(sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(iso(90000));
    expect(sql.exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(first);
+   expect(sql.exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(iso(90000));
+   const malformed=await send({...payload,census_complete:1 as any});
+   expect(malformed.status).toBe(400);
+   expect(sql.exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:1});
+   const flipsImmediately=await send({...payload,census_complete:false});
+   expect(flipsImmediately.status).toBe(200);
+   expect(sql.exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:0});
+   tick+=30000;
+   expect((await send({...payload,census_complete:false})).status).toBe(200);
+   expect(sql.exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:0});
  }));
 
  it('keeps absent native observations unknown rather than asserting exit', () => fixture(async ({live,sql}) => {
