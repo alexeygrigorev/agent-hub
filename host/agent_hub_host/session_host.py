@@ -999,7 +999,9 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             # step cannot hold the service stop.
             observer_deadline = time.monotonic() + 5
             for observer in (status_thread, metrics_thread, disk_thread, host_health_thread,
-                             role_consumer_thread, token_thread):
+                             role_consumer_thread, token_thread, maintenance_thread,
+                             telemetry_thread, checkin_thread, terminal_thread, worktree_thread,
+                             bindings_thread, offers_thread):
                 if observer is not None:
                     observer.join(timeout=max(0.0, observer_deadline - time.monotonic()))
             for sig, handler in previous.items():
