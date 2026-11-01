@@ -1370,18 +1370,39 @@ export class QuotaStore {
     // own — coverage counts canonical machines only, so a superseded
     // registration can never show as a missing machine.
     let aliasOf = new Map<string, string>();
+    // Fleet-membership evidence per machine row. Registration alone is not a
+    // check-in (machine registry spec): a record with no check-in never
+    // joined the fleet, and drain is an operator's deliberate removal.
+    // Neither may fail fleet coverage forever — status already treats a
+    // drained machine as never-missing and a never-seen registration is a
+    // pending enrollment, not an outage. Both stay out of the fleet-wide
+    // coverage (listed under not_fleet with the reason); an explicit --host
+    // filter still shows exactly what is known about that machine.
+    const membership = new Map<string, { drained: boolean; joined: boolean }>();
     try {
       const aliasRows = this.sql.exec("SELECT id, hostname, drained, last_checkin_at FROM machines WHERE revoked_at IS NULL").toArray() as any[];
       aliasOf = resolveMachineAliases(aliasRows.map((m: any) => {
         const seen = typeof m.last_checkin_at === 'string' ? Date.parse(m.last_checkin_at) : NaN;
+        membership.set(String(m.id), { drained: m.drained === 1 || m.drained === true, joined: Number.isFinite(seen) });
         return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(seen) ? seen : null };
       })).aliasOf;
     } catch { aliasOf = new Map(); }
     // A filter naming an alias reads the canonical machine it resolves to.
     const effectiveHostId = filters.host_id && aliasOf.has(filters.host_id) ? aliasOf.get(filters.host_id)! : filters.host_id;
+    const notFleet = new Map<string, string>();
+    const inFleet = (id: string): boolean => {
+      const m = membership.get(id);
+      // Degrade open: without membership evidence (failed registry read)
+      // every machine counts, as before.
+      if (!m) return true;
+      if (m.drained) { notFleet.set(id, "drained"); return false; }
+      if (!m.joined) { notFleet.set(id, "never_checked_in"); return false; }
+      return true;
+    };
     const machines = (this.sql.exec("SELECT id FROM machines WHERE revoked_at IS NULL ORDER BY id").toArray() as any[])
       .map((m: any) => m.id)
-      .filter((id: string) => !aliasOf.has(id) && (!effectiveHostId || id === effectiveHostId));
+      .filter((id: string) => !aliasOf.has(id) && (!effectiveHostId || id === effectiveHostId))
+      .filter((id: string) => effectiveHostId !== null && effectiveHostId !== undefined ? true : inFleet(id));
 
     for (const machineId of machines) {
       const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", machineId).toArray()[0];
@@ -1439,11 +1460,24 @@ export class QuotaStore {
           }
           const quotaObs = quota?.observed_at || sub.observed_at;
           if (quota && isFreshTs(sub.observed_at, nowMs, QUOTA_STALE_MS) && isFreshTs(quotaObs, nowMs, QUOTA_STALE_MS)) {
-            freshObs.push({ machine: route.machine_id, quota: quota.observed_at ? quota : { ...quota, observed_at: quotaObs }, kind: "subscription" });
+            // A fresh but empty/unknown managed-account probe is not quota
+            // evidence. Let the host-wide collector snapshot fill the gap
+            // below; this is especially important for device-login providers
+            // whose account probe can fail while the normal host collector
+            // still has a valid reading. Preserve positive exhaustion and
+            // cooldown evidence from the account probe.
+            const hasActiveCooldown = typeof quota.details?.cooldown_until === "string" &&
+              Date.parse(quota.details.cooldown_until) > nowMs;
+            const hasExhaustedWindow = windowMinPercent(quota) === 0;
+            if (!observationUnavailable(quota) || quota.details?.limit_reached === true || hasActiveCooldown || hasExhaustedWindow) {
+              freshObs.push({ machine: route.machine_id, quota: quota.observed_at ? quota : { ...quota, observed_at: quotaObs }, kind: "subscription" });
+              continue;
+            }
+            hasStale = true;
           } else {
             hasStale = true;
+            continue;
           }
-          continue;
         }
         // Single-account host snapshot fallback: same canonical rule as fleet observation().
         // A named profile that is not the provider itself cannot be read from
@@ -1619,7 +1653,12 @@ export class QuotaStore {
     const coverage = { machines_total: machines.length, fresh: [] as string[], stale: [] as string[], missing: [] as string[],
       // Machines counted fresh through their own per-account route reports
       // (no fresh host-wide quse snapshot); see routeReportCoverage below.
-      route_reports: [] as string[] };
+      route_reports: [] as string[],
+      // Registered records outside the operating fleet (drained, or
+      // registered without ever checking in), with the reason each is not
+      // counted. Empty on any membership-evidence failure.
+      not_fleet: [...notFleet.entries()].sort(([a], [b]) => a.localeCompare(b))
+        .map(([machine_id, reason]) => ({ machine_id, reason })) };
     const coverageAccounts = new Set(accounts.map((a: any) => a.label));
     const accountFiltered = Boolean(filters.provider || filters.account);
     // A machine's own fleet subscription reports (one per routed account,

@@ -104,6 +104,43 @@ describe('quota probe failure placement (b3749cbb)', () => {
       expect(service.accountStatus(sql.exec("SELECT * FROM fleet_accounts LIMIT 1").one()).remaining_percent).toBeNull();
     });
   });
+  it('keeps an installed OpenCode Go route placeable when quota is unknown', async () => {
+    await fixture([], (service, sql) => {
+      sql.exec('DELETE FROM fleet_subscriptions');
+      sql.exec("INSERT INTO fleet_accounts VALUES ('shared-go','go',10,5,1)");
+      sql.exec("INSERT INTO fleet_routes VALUES ('host','opencode','shared-go',NULL)");
+      const caps = JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id='host'").one().capabilities);
+      sql.exec("UPDATE machines SET capabilities=? WHERE id='host'", JSON.stringify({ ...caps, engines: ['codex', 'opencode'] }));
+
+      const plan = service.plan({ workspace: 'demo', mode: 'interactive', engine: 'opencode', tier: 'daily', prompt: 'test' });
+      expect(plan.selected?.engine).toBe('opencode');
+      expect(plan.selected?.account).toBe('shared-go');
+      expect(plan.selected?.selection.id).toBe('muse');
+      expect(plan.selected?.quota_warning).toBe('quota_probe_unavailable');
+      expect(service.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-go'").one()).remaining_percent).toBeNull();
+    });
+  });
+  it('uses a healthy host snapshot when the fresh managed-account probe is unknown', async () => {
+    await fixture([], (_service, sql) => {
+      sql.exec("INSERT INTO fleet_accounts VALUES ('shared-go','go',10,5,1)");
+      sql.exec("INSERT INTO fleet_routes VALUES ('host','opencode','shared-go','hub-shared-go')");
+      sql.exec("INSERT INTO fleet_subscriptions VALUES ('host','shared-go','go',NULL,?,?)",
+        iso(), JSON.stringify({ status: 'unknown', observed_at: iso(), details: { limit_reached: null }, windows: {} }));
+      const hostQuota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: {
+        weekly: { present: true, percent_remaining: 17, reset_at: iso(86400000) },
+      } };
+      sql.exec(`INSERT INTO host_quota_snapshots
+        (host_id,schema_version,collector_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json)
+        VALUES ('host','1.1','quota_snapshot/1.1',?,?,?,?,'ok',NULL,?)`,
+        iso(), now, iso(), now, JSON.stringify({ go: hostQuota }));
+
+      const view = new QuotaStore(sql, undefined, undefined, () => now)
+        .getFleetView({ host_id: null, provider: 'go', engine: null, account: null }, now);
+      expect(view.body.pools.find((pool: any) => pool.account === 'shared-go')).toMatchObject({
+        state: 'fresh', source: 'machine-fallback', remaining_percent: 17,
+      });
+    });
+  });
   it('holds an explicit Codex start when every Codex account is rejected', async () => {
     await fixture([], (service, sql) => {
       sql.exec("UPDATE fleet_subscriptions SET quota_json = ?", JSON.stringify({status: 'ok', observed_at: iso(), details: {limit_reached: true}, windows: {}}));

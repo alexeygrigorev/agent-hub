@@ -250,6 +250,22 @@ class QuotaCliTests(unittest.TestCase):
         self.assertIn('codex/codex/shared-codex', text)
         self.assertIn('opencode/go/shared-go', text)
 
+    def test_render_text_reports_not_in_fleet_machines_without_counting_them(self):
+        text = quota_cli.render_text({
+            'pools': [],
+            'coverage': {'machines_total': 2, 'fresh': ['m1', 'm2'], 'stale': [], 'missing': [],
+                         'not_fleet': [{'machine_id': 'pending', 'reason': 'never_checked_in'},
+                                       {'machine_id': 'retired', 'reason': 'drained'}]}})
+        self.assertIn('coverage: 2 fresh, 0 stale, 0 missing of 2 machines', text)
+        self.assertIn('(+2 not in fleet: drained or never checked in)', text)
+
+    def test_render_text_omits_not_in_fleet_when_absent_or_empty(self):
+        text = quota_cli.render_text({
+            'pools': [],
+            'coverage': {'machines_total': 1, 'fresh': ['m1'], 'stale': [], 'missing': []}})
+        self.assertIn('coverage: 1 fresh, 0 stale, 0 missing of 1 machines', text)
+        self.assertNotIn('not in fleet', text)
+
 
 if __name__ == '__main__':
     unittest.main()
