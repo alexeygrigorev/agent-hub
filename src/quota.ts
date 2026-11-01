@@ -309,6 +309,9 @@ const OPTIONAL_DETAILS_KEYS = new Set<string>([
   "profile",
   "cooldown_until",
   "banked_resets",
+  // Reset-credits sub-probe failure marker (intake 7bf6f6ee): explicit
+  // unknown that must survive to banked consumers, never a silent empty list.
+  "banked_resets_error",
 ]);
 
 const FORBIDDEN_PROTO_KEYS = new Set<string>([
@@ -350,6 +353,8 @@ export interface QuotaRouteDetailsDTO {
   /** Known provider backoff deadline (UTC ISO). Active holds block admission even when quota looks fine. */
   cooldown_until?: string | null;
   banked_resets?: { expires_at: string; available: boolean; label: string }[];
+  /** Reset-credits sub-probe failure: banked list is unknown, not empty. Opaque short reason, never provider output. */
+  banked_resets_error?: string | null;
 }
 
 export interface QuotaRouteDTO {
@@ -886,6 +891,13 @@ export function validateQuotaSnapshotPayload(
           if (!expiry) return { ok: false, status: 400, error: 'invalid_banked_resets' };
           sanitizedDetails.banked_resets.push({ expires_at: expiry.iso, available: grant.available, label: grant.label });
         }
+      }
+      if (detailsVal.banked_resets_error !== undefined && detailsVal.banked_resets_error !== null) {
+        if (typeof detailsVal.banked_resets_error !== 'string' || detailsVal.banked_resets_error.length === 0 ||
+            detailsVal.banked_resets_error.length > 256) {
+          return { ok: false, status: 400, error: 'invalid_banked_resets_error' };
+        }
+        sanitizedDetails.banked_resets_error = detailsVal.banked_resets_error;
       }
     }
 

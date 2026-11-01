@@ -271,6 +271,44 @@ def test_direct_provider_quota_probe(home):
     assert c.probe_quota('codex', h / 'missing', opener=opener) == {}
 
 
+def test_codex_probe_carries_banked_grants_and_marks_credits_failure(home):
+    """Intake 7bf6f6ee AC2/AC3: the managed probe reads reset credits too.
+
+    A redeemed/available grant is reported with its deadline; a credits
+    failure is explicit unknown (empty list plus error), never 0 banked.
+    """
+    dest, h = home
+    (h / PATH).write_text(auth('a'))
+    usage = {'rate_limit': {'limit_reached': False, 'primary_window': {'used_percent': 30, 'limit_window_seconds': 604800, 'reset_at': 1893456000}}}
+    credits = {'credits': [{'status': 'available', 'title': 'Full reset', 'expires_at': '2026-11-30T20:11:54Z'},
+                            {'status': 'redeemed', 'title': 'Full reset', 'expires_at': '2026-10-26T00:00:00Z'}]}
+
+    class TwoStep(Opener):
+        def open(self, req, timeout=None):
+            self.requests.append(req)
+            if req.full_url.endswith('rate-limit-reset-credits'):
+                if self.status != 200:
+                    raise urllib.error.HTTPError(req.full_url, self.status, 'x', {}, io.BytesIO(b'{}'))
+                return FakeResponse(json.dumps(self.body).encode())
+            return FakeResponse(json.dumps(usage).encode())
+
+    raw = c.probe_quota('codex', h, opener=TwoStep(body=credits))
+    details = raw['codex']['details']
+    assert details['banked_resets'] == [
+        {'expires_at': '2026-11-30T20:11:54Z', 'available': True, 'label': 'Full reset'},
+        {'expires_at': '2026-10-26T00:00:00Z', 'available': False, 'label': 'Full reset'},
+    ]
+    assert 'banked_resets_error' not in details
+
+    raw = c.probe_quota('codex', h, opener=TwoStep(status=500, body=credits))
+    details = raw['codex']['details']
+    assert details['banked_resets'] == []
+    assert details['banked_resets_error'] == 'quota_http_500'
+
+    grants, error = c.codex_banked(TwoStep(status=401, body=credits), {'Authorization': 'Bearer x'})
+    assert grants == [] and error == 'quota_blocked'
+
+
 def test_server_collector_quotas_skip_accounts_without_a_reading(home, monkeypatch):
     _no_quse(monkeypatch)
     dest, h = home

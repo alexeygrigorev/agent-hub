@@ -163,6 +163,7 @@ def report_rejection(label, generation, reason, request):
 # ---------- Direct provider quota (replaces quse for managed accounts) ----------
 
 CODEX_USAGE = 'https://chatgpt.com/backend-api/wham/usage'
+CODEX_RESET_CREDITS = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
 CLAUDE_USAGE = 'https://api.anthropic.com/api/oauth/usage'
 
 
@@ -206,7 +207,7 @@ def _span(seconds, fallback):
     return '%ds' % seconds
 
 
-def codex_quota(body, now=None):
+def codex_quota(body, banked=None, banked_error=None, now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
     rl = body.get('rate_limit') if isinstance(body, dict) and isinstance(body.get('rate_limit'), dict) else {}
     present = [w for w in (rl.get('primary_window'), rl.get('secondary_window')) if isinstance(w, dict)]
@@ -217,7 +218,50 @@ def codex_quota(body, now=None):
         windows[name] = {'percent_remaining': _remaining(w.get('used_percent')), 'reset_at': _iso(w.get('reset_at')), 'present': True}
     weekly = windows['7d']
     limit = rl.get('limit_reached') is True or (weekly['present'] and weekly['percent_remaining'] == 0)
-    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limit}, 'windows': windows}
+    details = {'limit_reached': limit}
+    # A credits failure is explicit unknown (intake 7bf6f6ee): an empty grant
+    # list with this error must never read as "no banked resets".
+    if banked is not None or banked_error is not None:
+        details['banked_resets'] = banked if banked is not None else []
+        if banked_error is not None:
+            details['banked_resets_error'] = banked_error
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': details, 'windows': windows}
+
+
+def codex_banked(opener, headers, timeout=15):
+    """Read-only reset-credit probe: (grants, error).
+
+    Failures are explicit unknown, never an empty grant list mistaken for "no
+    resets". Only fixed reason codes travel; no provider output is retained.
+    """
+    try:
+        with opener.open(urllib.request.Request(CODEX_RESET_CREDITS, headers=headers, method='GET'), timeout=timeout) as response:
+            body = json.loads(response.read(131072))
+        if not isinstance(body, dict) or not isinstance(body.get('credits'), list):
+            return [], 'quota_invalid_response'
+        grants = []
+        for item in body['credits'][:32]:
+            if not isinstance(item, dict):
+                continue
+            expires = _iso(item.get('expires_at'))
+            if expires is None:
+                continue
+            label = item.get('title')
+            if not isinstance(label, str) or not label or not re.fullmatch(r'[A-Za-z0-9 ._-]{0,80}', label):
+                label = 'Full reset'
+            grants.append({'expires_at': expires, 'available': item.get('status') == 'available', 'label': label})
+        return grants, None
+    except urllib.error.HTTPError as error:
+        try:
+            error.close()
+        except Exception:
+            pass
+        if error.code in (401, 403, 429):
+            return [], 'quota_blocked'
+        return [], 'quota_http_%d' % error.code
+    except Exception:
+        # Exceptions may carry provider bodies or credential paths; report nothing.
+        return [], 'quota_unreachable'
 
 
 def claude_quota(body, now=None):
@@ -248,7 +292,12 @@ def probe_quota(provider, home, opener=None, timeout=15):
                        'User-Agent': 'codex_cli_rs/0.162.1', 'originator': 'codex_cli_rs'}
             if isinstance(tokens.get('account_id'), str):
                 headers['ChatGPT-Account-Id'] = tokens['account_id']
-            url, parse = CODEX_USAGE, codex_quota
+            with opener.open(urllib.request.Request(CODEX_USAGE, headers=headers, method='GET'), timeout=timeout) as response:
+                body = json.loads(response.read(131072))
+            if not isinstance(body, dict):
+                return {}
+            banked, banked_error = codex_banked(opener, headers, timeout=timeout)
+            return {provider: codex_quota(body, banked=banked, banked_error=banked_error)}
         elif provider == 'claude':
             creds = json.loads(private_fs.read_bytes(home / '.claude' / '.credentials.json', MAX_FILE * 2, private=False))
             headers = {'Authorization': 'Bearer ' + creds['claudeAiOauth']['accessToken'], 'Accept': 'application/json',

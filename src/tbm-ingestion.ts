@@ -82,6 +82,10 @@ export function syncWindowsIntoTbm(sql: SqlStorage, windows: WindowIngest[], at:
 
 /** A banked full-reset grant has a real deadline but does not report a token quantity. */
 function syncBanked(sql: SqlStorage, provider: string, account: string, quota: any, at: number): number {
+  // A reset-credits sub-probe failure is explicit unknown: an ok-status
+  // route with an empty grant list must never mark live tranches exhausted
+  // (intake 7bf6f6ee), nor invent grants. Omission already means unknown.
+  if (quota?.details?.banked_resets_error) return 0;
   const grants = quota?.details?.banked_resets;
   if (!Array.isArray(grants)) return 0;
   const pools: any[] = sql.exec('SELECT pool_id FROM tbm_quota_pools WHERE provider=? AND account=? ORDER BY cycle_ms DESC,pool_id', provider,account).toArray();

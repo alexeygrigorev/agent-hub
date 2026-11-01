@@ -352,6 +352,11 @@ function sanitizedQuota(raw: any): any {
         !object(g, ['expires_at', 'available', 'label']) || typeof g.available !== 'boolean' ||
         typeof g.expires_at !== 'string' || !UTC_ISO.test(g.expires_at) || !Number.isFinite(Date.parse(g.expires_at)) ||
         typeof g.label !== 'string' || !/^[A-Za-z0-9 ._-]{0,80}$/.test(g.label))) return null;
+    } else if (key === 'banked_resets_error') {
+      // Reset-credits sub-probe failure marker (intake 7bf6f6ee): an opaque
+      // short reason that keeps an ok-status empty grant list from reading
+      // as "no banked resets". Null/omitted means no known probe failure.
+      if (value !== null && (typeof value !== 'string' || value.length === 0 || value.length > 256)) return null;
     } else return null;
     details[key] = value;
   }

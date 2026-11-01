@@ -7,7 +7,7 @@ import { FleetService } from '../src/fleet';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { ProvisioningService } from '../src/provisioning';
-import { codexQuotaFrom, claudeQuotaFrom, credentialFreshness, needsRefresh, jwtExpiryMs, CODEX_OAUTH, CLAUDE_OAUTH } from '../src/credentials';
+import { codexQuotaFrom, claudeQuotaFrom, codexResetCreditsFrom, fetchQuota, credentialFreshness, needsRefresh, jwtExpiryMs, CODEX_OAUTH, CLAUDE_OAUTH } from '../src/credentials';
 import { freshCpu } from './cpu-fixture';
 
 const DAY = 86400000;
@@ -82,6 +82,42 @@ describe('Hub-owned credentials: pure provider logic', () => {
     const claude = claudeQuotaFrom({ five_hour: { utilization: 7, resets_at: iso(3600000) }, seven_day: { utilization: 100, resets_at: iso(DAY) } }, now);
     expect(claude.windows['5h'].percent_remaining).toBe(93);
     expect(claude.details.limit_reached).toBe(true);
+  });
+  it('maps reset-credit bodies to banked grants, never inventing deadlines', () => {
+    const mapped = codexResetCreditsFrom({ credits: [
+      { status: 'available', title: 'Full reset', expires_at: iso(30 * DAY) },
+      { status: 'redeemed', title: 'Full reset', expires_at: iso(20 * DAY) },
+      { status: 'available', title: '<script>', expires_at: iso(10 * DAY) },
+      { status: 'available', title: 'No deadline' },
+    ] });
+    expect(mapped.banked_resets_error).toBeNull();
+    expect(mapped.banked_resets).toHaveLength(3);
+    expect(mapped.banked_resets[0]).toMatchObject({ available: true, label: 'Full reset' });
+    expect(mapped.banked_resets[1]).toMatchObject({ available: false, label: 'Full reset' });
+    expect(mapped.banked_resets[2].label).toBe('Full reset');
+    expect(codexResetCreditsFrom({ credits: 'nope' })).toMatchObject({ banked_resets: [], banked_resets_error: 'quota_invalid_response' });
+  });
+  it('attaches banked grants to central codex quota, marking credits failures explicitly unknown', async () => {
+    const files = { '.codex/auth.json': codexAuth('a', iso(-DAY), now + 9 * DAY) };
+    const usage = { rate_limit: { limit_reached: false, primary_window: { used_percent: 10, limit_window_seconds: 604800, reset_at: Math.floor((now + DAY) / 1000) } } };
+    const credits = { credits: [{ status: 'available', title: 'Full reset', expires_at: iso(30 * DAY) }] };
+    const okProvider = fakeProvider({ [CODEX_OAUTH.usage]: () => ({ status: 200, json: usage }), [CODEX_OAUTH.resetCredits]: () => ({ status: 200, json: credits }) });
+    const ok = await fetchQuota('codex', files, okProvider.fn as any, now);
+    expect(ok.ok).toBe(true);
+    if (ok.ok) {
+      expect(ok.quota.details.banked_resets).toHaveLength(1);
+      expect(ok.quota.details.banked_resets_error ?? null).toBeNull();
+      expect(okProvider.calls.map(c => c.url).sort()).toEqual([CODEX_OAUTH.resetCredits, CODEX_OAUTH.usage].sort());
+    }
+    const blockedProvider = fakeProvider({ [CODEX_OAUTH.usage]: () => ({ status: 200, json: usage }), [CODEX_OAUTH.resetCredits]: () => ({ status: 429, json: {} }) });
+    const blocked = await fetchQuota('codex', files, blockedProvider.fn as any, now);
+    expect(blocked.ok).toBe(true);
+    if (blocked.ok) {
+      // Intake 7bf6f6ee AC3: an empty grant list with this error is explicit
+      // unknown, never "no banked resets".
+      expect(blocked.quota.details.banked_resets).toEqual([]);
+      expect(blocked.quota.details.banked_resets_error).toBe('quota_blocked');
+    }
   });
 });
 

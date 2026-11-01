@@ -306,6 +306,13 @@ def sanitize_provider(
             grants.append({"expires_at": format_iso_utc(expiry), "available": grant["available"], "label": label})
         if grants or not raw_details["banked_resets"]:
             sanitized_details["banked_resets"] = grants
+    # A reset-credits sub-probe failure is explicit unknown, never proof that
+    # banked grants disappeared (intake 7bf6f6ee: an ok-status route with an
+    # empty grant list and a dropped error marked live tranches exhausted).
+    # Opaque short reason only; never provider output.
+    raw_banked_error = raw_details.get("banked_resets_error")
+    if isinstance(raw_banked_error, str) and 1 <= len(raw_banked_error) <= 256:
+        sanitized_details["banked_resets_error"] = raw_banked_error
     for native_key, native_val in extract_native_fields(raw_details).items():
         if native_val is not None:
             sanitized_details[native_key] = native_val

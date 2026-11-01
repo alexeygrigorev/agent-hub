@@ -88,6 +88,21 @@ describe('generic accounts and launch placement', () => {
     expect(low.selected?.account).toBe('shared-codex');
     expect(low.candidates?.some((r: any) => r.account === 'desktop-codex')).toBe(false);
   }));
+
+  it('accepts the banked probe-failure marker on subscriptions instead of reading 0 banked', async () => fixture(async (service, sql) => {
+    // Intake 7bf6f6ee AC3: ok + [] + banked_resets_error is explicit unknown.
+    // The subscription is accepted and the marker is preserved verbatim.
+    await configure(service);
+    const res = await service.handle(request('/subscriptions', { subscriptions: [{
+      service: 'codex', account: 'shared-codex', plan: 'pro',
+      quota: { status: 'ok', observed_at: iso(-1000),
+        details: { limit_reached: false, banked_resets: [], banked_resets_error: 'quota_unreachable' },
+        windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000), rolling: false } } },
+    }] }, 'PUT'), host('hetzner'));
+    expect(res.status).toBe(200);
+    const stored: any = sql.exec("SELECT quota_json FROM fleet_subscriptions WHERE machine_id='hetzner' AND account='shared-codex'").toArray()[0];
+    expect(JSON.parse(stored.quota_json).details.banked_resets_error).toBe('quota_unreachable');
+  }));
   it('keeps configured Claude, native ZAI and Grok visible and routes policy models under allowed absolute workspace roots', async () => fixture(async (s, sql) => {
     const entries = [['shared-claude', 'claude', 'claude'], ['shared-zai', 'zai', 'zcodex'], ['shared-grok', 'grok', 'grok']];
     const config = {
