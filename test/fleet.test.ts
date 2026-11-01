@@ -964,12 +964,10 @@ describe('generic accounts and launch placement', () => {
     expect(s.plan(intent()).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
     expect(s.plan(intent({ mode: 'interactive', prompt: '' })).selected?.machine).toBe('hetzner');
   }));
-  it('places a default daily start past claude-headless advertisement and antigravity tier gap (intake 4f6cf562)', async () => fixture(async (s, sql) => {
-    // RMTHZ 2026-10-28 shape: one machine advertises claude, antigravity and
-    // zcodex; the host refuses claude headless without a managed profile
-    // (advertised fleet_route_rejections) and argon, the only antigravity
-    // model, is deep/review-only. A default start (no engine, no tier) must
-    // still place on the remaining daily route instead of 409ing.
+  it('places default daily work on eligible Gemini and falls back to Z.ai when Gemini is depleted (intakes 4f6cf562/85318207)', async () => fixture(async (s, sql) => {
+    // One host advertises Claude, Gemini and Z.ai, but refuses Claude headless.
+    // Gemini is now eligible for daily work; known quota exhaustion must still
+    // route the same default goal through the remaining admitted Z.ai model.
     const entries = [['shared-claude', 'claude', 'claude', 90], ['shared-gemini', 'gemini', 'antigravity', 50], ['shared-zai', 'zai', 'zcodex', 20]];
     const config = {
       accounts: entries.map(([label, provider]) => ({ label, provider, max_concurrency: 8, reserve_percent: 0, enabled: true })),
@@ -982,25 +980,29 @@ describe('generic accounts and launch placement', () => {
       fleet_route_rejections: [{ engine: 'claude', account: 'shared-claude', profile: null, mode: 'headless', reason: 'model_unsupported' }] };
     sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'hetzner');
     const headless = s.plan(intent({ mode: 'headless' }));
-    expect(headless.selected?.engine, JSON.stringify(headless.rejected)).toBe('zcodex');
-    expect(headless.selected?.account).toBe('shared-zai');
-    // The native zai/zcodex route resolves through either daily alias; policy
-    // order picks glm-flash (same glm-5.3-flash native model, zcodex profile).
-    expect(headless.selected?.selection).toMatchObject({ id: 'glm-flash', model: 'glm-5.3-flash' });
+    expect(headless.selected?.engine, JSON.stringify(headless.rejected)).toBe('antigravity');
+    expect(headless.selected?.account).toBe('shared-gemini');
+    expect(headless.selected?.selection).toMatchObject({ id: 'argon' });
     expect(headless.rejected).toContainEqual({ machine: 'hetzner', engine: 'claude', reason: 'model_unsupported' });
-    expect(headless.rejected).toContainEqual({ machine: 'hetzner', engine: 'antigravity', reason: 'model_unsupported' });
-    // The headless refusal is mode-scoped: a default interactive start still
-    // lands on claude (its healthier quota wins here).
+    expect(headless.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
+    // The headless refusal remains mode-scoped, and actual quota headroom
+    // still lets the healthier Claude account win this interactive request.
     const interactive = s.plan(intent({ mode: 'interactive', prompt: '' }));
     expect(interactive.selected?.engine, JSON.stringify(interactive.rejected)).toBe('claude');
     expect(interactive.selected?.selection).toMatchObject({ id: 'sonnet' });
-    expect(interactive.rejected).toContainEqual({ machine: 'hetzner', engine: 'antigravity', reason: 'model_unsupported' });
+    expect(interactive.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
     expect(interactive.rejected).not.toContainEqual(expect.objectContaining({ engine: 'claude' }));
-    // The antigravity gap is daily-specific: a deep-tier default places there (argon).
     const deep = s.plan(intent({ mode: 'headless', tier: 'deep' }));
     expect(deep.selected?.engine, JSON.stringify(deep.rejected)).toBe('antigravity');
     expect(deep.selected?.selection).toMatchObject({ id: 'argon' });
     expect(deep.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
+    expect((await s.handle(request('/subscriptions', { subscriptions: [{account:'shared-gemini',service:'gemini',plan:'pro',quota:quota(0)}] }, 'PUT'), host('hetzner'))).status).toBe(200);
+    const fallback = s.plan(intent({ mode: 'headless' }));
+    expect(fallback.selected?.engine, JSON.stringify(fallback.rejected)).toBe('zcodex');
+    expect(fallback.selected?.account).toBe('shared-zai');
+    expect(fallback.selected?.selection).toMatchObject({ id: 'glm-flash', model: 'glm-5.3-flash' });
+    expect(fallback.rejected).toContainEqual({ machine:'hetzner',engine:'antigravity',reason:'account_blocked' });
+    expect(fallback.rejected).toContainEqual({ machine:'hetzner',engine:'claude',reason:'model_unsupported' });
   }));
   it('accepts host model and parent metadata in census reports and rejects malformed values atomically', async () => fixture(async (s, sql) => {
     const native={native_id:crypto.randomUUID(),tag:'native-observation',engine:'codex',model:'openai/gpt-6-luna',
