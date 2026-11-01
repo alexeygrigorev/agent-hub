@@ -1964,6 +1964,13 @@ class Dispatcher:
                         break
             if not is_retired:
                 continue
+            # Qualified native exit evidence survives catalog auto-retirement.
+            # Publish route health before launcher backoff/batch limits delay settlement.
+            try:
+                from .zcodex_health import observe_verified_terminal
+                observe_verified_terminal(self, record, target, tombstone or {})
+            except Exception:
+                pass  # health publication must not block terminal settlement
             if time.time() < self._reconcile_backoff.get(offer_id, 0) or launcher_runs >= RECONCILE_LAUNCHER_BATCH:
                 continue
             launcher_runs += 1
@@ -3781,11 +3788,8 @@ class Dispatcher:
         catalog = bounded_catalog(rows)
         progress = self._session_progress.sample(catalog, active_launches)
         try:
-            if not hasattr(self, '_zcodex_health'):
-                from .zcodex_health import ZcodexHealth
-                self._zcodex_health = ZcodexHealth(
-                    self.request, Path(self.journal_dir) / 'zcodex-health.json' if self.journal_dir else None)
-            self._zcodex_health.observe(catalog, progress)
+            from .zcodex_health import monitor_for
+            monitor_for(self).observe(catalog, progress)
         except Exception:
             pass  # health projection never blocks the catalog report
         enriched = session_metadata(catalog, self.settings, progress)

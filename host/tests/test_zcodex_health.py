@@ -27,9 +27,9 @@ def test_hold_on_new_failure_and_release_only_by_probe_pass(tmp_path):
     h = ZcodexHealth(lambda m, path, body=None: calls.append(body), tmp_path / 's.json',
                      probe=lambda: probes[0], now=lambda: clock[0], threaded=False)
     bad = {'z1': {'terminal_error': 'zcodex_agent_exited'}}
-    assert not h.observe([row()], bad)  # pre-existing corpse: baseline only
+    assert not h.observe([row(exit={'code': 75})], bad)  # pre-existing corpse: baseline only
     assert calls == []
-    assert h.observe([row(), row('z2')], {**bad, 'z2': {'terminal_error': 'zcodex_agent_exited'}})
+    assert h.observe([row(exit={'code': 75}), row('z2', exit={'code': 75})], {**bad, 'z2': {'terminal_error': 'zcodex_agent_exited'}})
     assert calls == [{'engine': 'zcodex', 'status': 'unavailable', 'reason': 'zcodex_session_failed'}]
     clock[0] += 400
     assert h.observe([row('z2')], bad)  # probe fails: hold stays
@@ -85,3 +85,73 @@ def test_quiet_live_successful_stopped_and_unconfirmed_sessions_do_not_hold(tmp_
     ]
     assert not h.observe(rows, {r['id']: {'headless': True, 'agent_alive': True} for r in rows})
     assert calls == []
+
+
+def test_actual_sampler_markers_do_not_hold_normal_stopped_or_unknown_exits(tmp_path):
+    calls = []
+    h = ZcodexHealth(lambda *args: calls.append(args), tmp_path / 'producer.json', threaded=False)
+    assert not h.observe([], {})
+    rows = [row('normal', exit={'code': 0}),
+            row('stopped', exit={'code': None, 'signal': 15, 'oom_killed': False}),
+            row('unknown')]
+    sampler = p.SessionProgress(now_ms=lambda: 120000, output=lambda r: None, proc_root=tmp_path)
+    progress = sampler.sample(rows)
+    assert all(progress[r['id']]['terminal_error'] == 'zcodex_agent_exited' for r in rows)
+    assert not h.observe(rows, progress)
+    assert not calls
+
+
+def test_native_failed_phase_requires_explicit_failure_evidence(tmp_path):
+    calls = []
+    h = ZcodexHealth(lambda *args: calls.append(args), tmp_path / 'failed.json', threaded=False)
+    assert not h.observe([], {})
+    unknown = row('unknown', phase='failed', command=['zcodex', 'exec', 'task'],
+                  containment_empty=True, exit={'code': None, 'signal': 9, 'oom_killed': False})
+    assert not h.observe([unknown], {})
+    assert h.observe([dict(unknown, id='oom', exit={'code': None, 'signal': 9, 'oom_killed': True})], {})
+    assert len(calls) == 1
+
+
+def test_vanished_native_qualified_retirement_holds_once_and_recovers_only_by_probe(tmp_path):
+    import json
+    from types import SimpleNamespace
+    from agent_hub_host.native_sessions import NativeTarget
+    from agent_hub_host.retired_native import verify_native_retirement
+    from agent_hub_host.zcodex_health import observe_verified_terminal
+
+    sid = 'ab7ac540-f991-4543-8580-5cce7136da1b'
+    work = tmp_path / 'work'
+    work.mkdir()
+    target = NativeTarget(sid, 'task-hub-proof', str(work), 1000, 'zcodex').validated()
+    record = {'native_id': sid, 'tag': target.tag, 'workspace': str(work),
+              'incarnation': 1000, 'engine': 'zcodex'}
+    calls, healthy, clock = [], [False], [1000.0]
+    h = ZcodexHealth(lambda m, path, body=None: calls.append(body), tmp_path / 'retired-health.json',
+                     probe=lambda: healthy[0], now=lambda: clock[0], threaded=False)
+    owner = SimpleNamespace(_zcodex_health=h)
+    assert not h.observe([row(sid, workspace=str(work), tag=target.tag, phase='running')], {})
+    assert not h.observe([], {})  # disappearance alone proves nothing
+    ok, evidence, _ = verify_native_retirement('unused', target, state_dir=str(tmp_path), sessions=[])
+    assert not ok and evidence is None
+    tomb = tmp_path / 'retired-sessions' / sid / 'tombstone.json'
+    tomb.parent.mkdir(parents=True)
+    tomb.write_text(json.dumps({'id': sid, 'tag': target.tag, 'workspace': str(work),
+        'cause': 'finished', 'finished_at_ms': 5000,
+        'exit': {'code': 75, 'signal': None, 'oom_killed': False, 'exited_at_ms': 5000}}))
+    ok, evidence, _ = verify_native_retirement('unused', target, state_dir=str(tmp_path), sessions=[])
+    assert ok
+    assert not observe_verified_terminal(owner, dict(record, incarnation=2000), target, evidence)
+    assert not calls
+    assert observe_verified_terminal(owner, record, target, evidence)
+    assert [c['status'] for c in calls] == ['unavailable']
+    clock[0] += 400
+    assert h.observe([], {})  # failing real probe cannot release
+    healthy[0] = True
+    clock[0] += 400
+    assert not h.observe([], {})
+    assert [c['status'] for c in calls] == ['unavailable', 'ok']
+    assert not observe_verified_terminal(owner, record, target, evidence)
+    assert [c['status'] for c in calls] == ['unavailable', 'ok']
+    again = ZcodexHealth(lambda *args: calls.append(args), tmp_path / 'retired-health.json', threaded=False)
+    assert not observe_verified_terminal(SimpleNamespace(_zcodex_health=again), record, target, evidence)
+    assert len(calls) == 2
