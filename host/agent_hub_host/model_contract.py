@@ -94,9 +94,12 @@ def configured_selection(selection, engine, provider):
               # name still resolve to the canonical `codex` family.
               'codex-orin': 'codex'}.get(provider, provider)
     # Native ZCode uses engine=zcodex; managed ZAI uses codex/profile=zcodex.
-    policy_engine = 'codex' if family == 'zai' and engine == 'zcodex' else engine
+    # The policy lists both shapes (glm-flash: codex, glm-flash-zcodex: zcodex);
+    # mapping zcodex only to codex made the native entry unmatchable, so Hub's
+    # native shared-zai route was refused as admission_refused (intake 8d006dc3).
+    policy_engines = {engine, 'codex'} if family == 'zai' and engine == 'zcodex' else {engine}
     matches = [m for m in policy_models() if m['id'] == selection.get('id') and
-               m['model'] == selection.get('model') and m['engine'] == policy_engine and
+               m['model'] == selection.get('model') and m['engine'] in policy_engines and
                m['provider'] == family and m['effort'] == selection.get('effort')]
     if not matches:
         raise ValueError('model_unsupported: model is not configured for this route')
