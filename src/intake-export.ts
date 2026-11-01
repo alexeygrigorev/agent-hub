@@ -32,7 +32,7 @@ export function initIntakeExport(sql: SqlStorage) {
     PRIMARY KEY(project,status,archived))`);
   if (!countsExist) sql.exec('INSERT INTO intake_export_counts SELECT project,status,archived,COUNT(*) FROM intake_export GROUP BY project,status,archived');
   for (const op of ['INSERT','UPDATE','DELETE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_export_count_${op.toLowerCase()} AFTER ${op} ON intake_export BEGIN
-    ${op !== 'INSERT' ? 'UPDATE intake_export_counts SET n=n-1 WHERE project=OLD.project AND status=OLD.status AND archived=OLD.archived; DELETE FROM intake_export_counts WHERE n=0;' : ''}
+    ${op !== 'INSERT' ? 'UPDATE intake_export_counts SET n=n-1 WHERE project=OLD.project AND status=OLD.status AND archived=OLD.archived; DELETE FROM intake_export_counts WHERE project=OLD.project AND status=OLD.status AND archived=OLD.archived AND n=0;' : ''}
     ${op !== 'DELETE' ? 'INSERT INTO intake_export_counts VALUES(NEW.project,NEW.status,NEW.archived,1) ON CONFLICT(project,status,archived) DO UPDATE SET n=n+1;' : ''}
     END`);
 
