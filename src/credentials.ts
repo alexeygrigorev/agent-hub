@@ -25,7 +25,9 @@ export const CREDENTIAL_PATHS: Record<string, string[]> = {
   zai: ['.zcode/v2/credentials.json'],
   gemini: ['.gemini/oauth_creds.json'],
   antigravity: ['.gemini/antigravity-cli/antigravity-oauth-token'],
-  go: [],
+  // OpenCode device login: the `opencode auth export opencode` JSON, held
+  // centrally and imported into each host's Hub-owned device store (5814e109).
+  go: ['.local/share/opencode-hub/device-auth.json'],
 };
 
 export const CODEX_OAUTH = {

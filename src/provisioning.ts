@@ -49,7 +49,8 @@ export function validBundle(v: any): boolean {
     ? Object.keys(v.files || {}).some(k => /oauth|credential|token/i.test(k))
     : v.auth_method !== undefined || typeof v.files?.['.gemini/oauth_creds.json'] !== 'string'))) return false;
   if (!object(v.files) || Object.keys(v.files).length > 24 || !object(v.env) || Object.keys(v.env).length > 12) return false;
-  if (v.provider === 'go' && (Object.keys(v.files).length || Object.keys(v.env).length)) return false;
+  // OpenCode: no env secrets; the only file is the Hub-held device-login export.
+  if (v.provider === 'go' && (Object.keys(v.env).length || (Object.keys(v.files).length && JSON.stringify(Object.keys(v.files)) !== JSON.stringify(CREDENTIAL_PATHS.go)))) return false;
   // Antigravity: exactly the Hub-held OAuth token file, no env secrets.
   if (v.provider === 'antigravity' && (Object.keys(v.env).length || v.auth_method !== undefined ||
     JSON.stringify(Object.keys(v.files)) !== JSON.stringify(CREDENTIAL_PATHS.antigravity))) return false;

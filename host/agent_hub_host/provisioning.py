@@ -32,6 +32,7 @@ PACKAGES = {
     'antigravity': ('antigravity-cli', 'agy', 'antigravity'),
 }
 ANTIGRAVITY_TOKEN = '.gemini/antigravity-cli/antigravity-oauth-token'
+OPENCODE_DEVICE_EXPORT = '.local/share/opencode-hub/device-auth.json'
 ENV = {'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
        'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENCODE_API_KEY',
        'ZAI_API_KEY', 'ZAI_BASE_URL', 'ZAI_TOKEN'}
@@ -106,6 +107,64 @@ def sync_native_antigravity(bundle):
         status = 'installed'
     if last != digest:
         write_json(marker, {'sha256': digest})
+    return status
+
+
+def _opencode_device_export(text):
+    """Accept only a native device-login export; legacy auth.json and API keys stay refused."""
+    try:
+        rows = json.loads(text)
+    except ValueError:
+        rows = None
+    active = [r for r in rows if isinstance(r, dict) and r.get('active') is True and r.get('integrationID') == 'opencode'] if isinstance(rows, list) else []
+    value = active[0].get('value') if len(active) == 1 and isinstance(active[0].get('value'), dict) else {}
+    if not (value.get('type') == 'oauth' and value.get('methodID') == 'device' and value.get('access') and value.get('refresh')):
+        raise ValueError('OpenCode imports only a native device login export (opencode auth export opencode); not API keys or legacy auth.json')
+    return text
+
+
+def opencode_device_default_path():
+    return root() / 'opencode-device-default.json'
+
+
+def sync_opencode_device(bundle, native=None):
+    """Install the store's OpenCode device login into a Hub-owned per-account store.
+
+    The stored `opencode auth export` JSON is imported with the native CLI into
+    a Hub-owned source store (never edited by hand, never copied host to host);
+    the default `opencode_auth` configuration pointing at it is recorded for
+    `fleet.load_settings`, which uses it only where subscriptions.json sets no
+    explicit one (intake 5814e109 AC3). Returns a non-secret status string.
+    """
+    if bundle.get('provider') != 'go':
+        return 'not_go'
+    export = (bundle.get('files') or {}).get(OPENCODE_DEVICE_EXPORT)
+    if not isinstance(export, str) or not export:
+        return 'no_store_credential'
+    import hashlib
+    from . import opencode_auth
+    base = root() / ('opencode-device-' + bundle['label'])
+    dest = root() / (bundle['label'] + '-' + bundle['revision'])
+    cfg = {'binary': engine_argv(bundle, dest)[0], 'source_data': str(base / 'source'),
+           'source_config': str(base / 'source-config'), 'target_data': str(base / 'runtime')}
+    opencode_auth.validate(cfg)
+    for directory in (base, *(Path(cfg[k]) for k in ('source_data', 'source_config', 'target_data'))):
+        directory.mkdir(parents=True, exist_ok=True)
+        if os.name != 'nt':
+            os.chmod(directory, 0o700)
+    digest = hashlib.sha256(export.encode('utf-8')).hexdigest()
+    receipt = base / 'store-receipt.json'
+    if (read_json(receipt, {}) or {}).get('sha256') == digest and (Path(cfg['source_data']) / 'opencode' / 'opencode.db').is_file():
+        status = 'current'
+    else:
+        rows = json.loads(export)
+        if not isinstance(rows, list):
+            raise ValueError('Invalid OpenCode device export')
+        (native or opencode_auth._native)(cfg, ['auth', 'import'], opencode_auth.environment(cfg, source=True),
+                                          json.dumps(rows).encode('utf-8'))
+        write_json(receipt, {'sha256': digest})
+        status = 'imported'
+    write_json(opencode_device_default_path(), cfg)
     return status
 
 
@@ -807,6 +866,70 @@ def preserve_managed_file(target):
         return False
 
 
+ZCODE_CLI_CONFIG = '.zcode/cli/config.json'
+ZCODE_PROVIDER_CONFIG = '.zcode/v2/provider_config.json'
+ZCODE_PROVIDER_ID = 'zai-coding-plan'
+ZCODE_MODEL_ID = 'GLM-5.3-Flash'
+ZCODE_CONTEXT_WINDOW = 1000000  # read from the working native home on the desktop (benign field)
+
+
+def _zcode_goz(bundle):
+    try:
+        goz = json.loads((bundle.get('files') or {}).get('.config/goz/config.json') or '')
+    except (TypeError, ValueError, AttributeError):
+        return {}
+    return goz if isinstance(goz, dict) else {}
+
+
+def zcode_token(bundle):
+    if not isinstance(bundle, dict) or bundle.get('provider') != 'zai':
+        return None
+    token = (bundle.get('env') or {}).get('ZAI_API_KEY') or _zcode_goz(bundle).get('zai_token')
+    return token if isinstance(token, str) and token else None
+
+
+def zcode_base_url(bundle):
+    base = _zcode_goz(bundle).get('zai_base_url')
+    return base if isinstance(base, str) and base else 'https://api.z.ai/api/anthropic'
+
+
+def zcode_managed_configs(bundle):
+    """ZCode's model selection files, generated from the key the store delivers.
+
+    A managed home without them answers "Select a model before continuing"
+    (CONFIGURATION_ERROR; intake 5814e109, desktop zai-central). The shapes
+    mirror the working native home (schema only, never its values); the key is
+    the bundle's own (ZAI_API_KEY env or .config/goz/config.json). Returns
+    {relative_path: json_text}, or {} when the bundle holds no usable key.
+    """
+    token, base = zcode_token(bundle), zcode_base_url(bundle)
+    if not token:
+        return {}
+    cli = {
+        'model': 'zai/glm-5.3-flash',
+        'provider': {
+            ZCODE_PROVIDER_ID: {
+                'name': 'Z.AI Coding Plan', 'kind': 'anthropic', 'source': 'custom',
+                'options': {'apiKey': token, 'baseURL': base, 'apiKeyRequired': True},
+                'models': {ZCODE_MODEL_ID: {'limit': {'context': ZCODE_CONTEXT_WINDOW},
+                                            'modalities': {'input': ['text'], 'output': ['text']}}}},
+            'zai': {'models': {'glm-5.3-flash': {'name': 'glm-5.3-flash'}}}}}
+    provider = {
+        'schemaVersion': 1,
+        'config': {
+            'providerConfigRules': {'providerRules': [{
+                'providerId': ZCODE_PROVIDER_ID, 'providerName': 'Z.AI Coding Plan',
+                'config': {'group': 'standard-personal', 'access': {'type': 'api-key', 'apiKey': token},
+                           'api': {'type': 'anthropic-messages', 'baseUrl': base},
+                           'personalModelIds': [ZCODE_MODEL_ID], 'modelOrder': [ZCODE_MODEL_ID]}}]},
+            'modelConfigRules': {'providerModelRules': [{
+                'modelId': ZCODE_MODEL_ID, 'providerId': ZCODE_PROVIDER_ID,
+                'config': {'properties': {'contextWindow': ZCODE_CONTEXT_WINDOW}}}],
+                'manualProviderModelRules': []},
+            'defaultModelSelection': {'providerId': ZCODE_PROVIDER_ID, 'modelId': ZCODE_MODEL_ID}}}
+    return {ZCODE_CLI_CONFIG: json.dumps(cli, indent=1), ZCODE_PROVIDER_CONFIG: json.dumps(provider, indent=1)}
+
+
 def provision_managed_home(bundle=None, home=None, dest=None):
     """Shared provisioning hook point for managed engine homes.
 
@@ -856,6 +979,24 @@ def provision_managed_home(bundle=None, home=None, dest=None):
                     os.chmod(target, 0o600)
                 except OSError:
                     pass
+
+    # 2b. ZCode's model selection, generated from the delivered key (never copied from a native home).
+    # An existing file already carrying that key is the engine's own state: kept as is.
+    for relative, text in zcode_managed_configs(bundle).items():
+        target = home / relative
+        token = zcode_token(bundle)
+        try:
+            current = target.read_text(encoding='utf-8')
+        except OSError:
+            current = None
+        if current is not None and token in current:
+            continue
+        private_fs.atomic_write(target, text.encode(), 32768, engine_owned=True)
+        if os.name != 'nt':
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
 
     # 3. Provision aplexer state hooks
     install_aplexer_state_hooks(bundle, home)
@@ -923,8 +1064,8 @@ def validate(bundle):
             if bundle.get('auth_method') == 'machine-login' else
             bundle.get('auth_method') is not None or not isinstance(bundle.get('files', {}).get('.gemini/oauth_creds.json'), str))):
         raise ValueError('Gemini needs machine login or a Hub-held OAuth credential')
-    if bundle['provider'] == 'go' and (bundle.get('files') or bundle.get('env')):
-        raise ValueError('OpenCode uses native device login; credential bundles are unsupported')
+    if bundle['provider'] == 'go' and (bundle.get('env') or list(bundle.get('files') or {}) not in ([], [OPENCODE_DEVICE_EXPORT])):
+        raise ValueError('OpenCode bundles carry no env and at most the Hub-held device-login export')
     if bundle['provider'] == 'antigravity' and (bundle.get('env') or 'auth_method' in bundle or
                                                 list(bundle.get('files') or {}) != [ANTIGRAVITY_TOKEN]):
         raise ValueError('Antigravity needs exactly its Hub-held OAuth token')
@@ -1591,6 +1732,10 @@ def sync(request=None):
                 sync_native_antigravity(b)
             except Exception as e:
                 print(json.dumps({'native_antigravity_sync_failed': type(e).__name__}), file=sys.stderr)
+            try:
+                sync_opencode_device(b)
+            except Exception as e:
+                print(json.dumps({'opencode_device_sync_failed': type(e).__name__}), file=sys.stderr)
             authenticated = b['provider'] != 'gemini' or (root() / (b['label'] + '-' + b['revision']) / 'home/.gemini/oauth_creds.json').is_file()
             request('POST', '/api/engines/' + b['label'], {'revision': b['revision'], 'authenticated': authenticated})
         from . import engine_login
@@ -2531,9 +2676,11 @@ def command(args):
         auth_path, config_path, version = paths[args.provider]
         env = {}
         if args.provider == 'go':
-            if args.auth_file or getattr(args, 'token_file', None) or args.config_file:
-                raise ValueError('OpenCode uses host-local device login; do not import API keys or credential files')
-            files = {}
+            if getattr(args, 'token_file', None) or args.config_file:
+                raise ValueError('OpenCode imports only its `opencode auth export opencode` file (--auth-file)')
+            # The device-login export (private file, never printed) goes to the
+            # central store; hosts import it into their own Hub-owned device store.
+            files = {OPENCODE_DEVICE_EXPORT: _opencode_device_export(private_fs.read_bytes(Path(args.auth_file).expanduser().absolute(), 16000).decode())} if args.auth_file else {}
         elif args.provider == 'gemini':
             if getattr(args, 'token_file', None):
                 raise ValueError('Gemini imports its private OAuth cache with --auth-file')
@@ -2609,9 +2756,9 @@ def command(args):
                   'env': env, 'args': default_args}
     if not isinstance(bundle, dict) or not LABEL.fullmatch(bundle.get('label', '')):
         raise ValueError('Invalid managed bundle')
-    if bundle.get('provider') == 'go' and (bundle.get('files') or bundle.get('env')):
-        raise ValueError('OpenCode uses host-local device login; credential bundles are unsupported')
-    if not args.file and (args.provider == 'go' or (args.provider == 'gemini' and not args.auth_file)):
+    if bundle.get('provider') == 'go' and (bundle.get('env') or list(bundle.get('files') or {}) not in ([], [OPENCODE_DEVICE_EXPORT])):
+        raise ValueError('OpenCode bundles carry no env and at most the Hub-held device-login export')
+    if not args.file and ((args.provider == 'go' and not args.auth_file) or (args.provider == 'gemini' and not args.auth_file)):
         bundle['auth_method'] = 'machine-login'
     return bus._do_request('PUT', '/api/engines/' + bundle['label'] + ('?adopt=true' if getattr(args, 'adopt', False) else ''), bundle)
 

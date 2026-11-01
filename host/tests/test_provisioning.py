@@ -301,6 +301,12 @@ def test_go_import_refuses_legacy_credentials_and_uses_machine_login(tmp_path):
         with pytest.raises(ValueError, match='device login'):
             p.command(args)
         request.assert_not_called()
+        export = d/'export.json'
+        export.write_text(json.dumps([{'id':'c1','active':True,'integrationID':'opencode','value':{'type':'oauth','methodID':'device','access':'A','refresh':'R'}}]));export.chmod(0o600)
+        args.auth_file = str(export)
+        p.command(args)
+        stored = request.call_args.args[2]
+        assert list(stored['files']) == [p.OPENCODE_DEVICE_EXPORT] and 'auth_method' not in stored
         args.auth_file = None
         p.command(args)
     payload=request.call_args.args[2]

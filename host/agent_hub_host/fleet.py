@@ -610,6 +610,16 @@ def load_settings(path=None):
     if 'opencode_auth' in data:
         from .opencode_auth import validate
         validate(data['opencode_auth'])
+    elif default_path:
+        # Hub-provisioned default (central store device login); an explicit
+        # opencode_auth above always wins (intake 5814e109 AC3).
+        try:
+            from . import provisioning
+            from .opencode_auth import validate
+            default_cfg = json.loads(provisioning.opencode_device_default_path().read_text(encoding='utf-8'))
+            data['opencode_auth'] = validate(default_cfg)
+        except (OSError, ValueError, TypeError, ImportError):
+            pass
     git_conf = data.get("git") if "git" in data else data.get("git_identity")
     if git_conf is not None:
         validate_git_identity_config(git_conf)
