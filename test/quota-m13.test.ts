@@ -332,6 +332,11 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
 
     // Verify auto-discovery of codex-orin and snapshot fallback in fleet view
     const snapOrin = snap11(hostA.machineId, isoNow(-1000));
+    // Fleet quota coverage includes checked-in machines only. Pairing creates
+    // the registry row but does not itself constitute a host check-in.
+    await runInDurableObject((defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub')), (instance: Hub) => {
+      instance.sql.exec('UPDATE machines SET last_checkin_at = ? WHERE id = ?', isoNow(), hostA.machineId);
+    });
     (snapOrin.routes as any)['codex-orin'] = {
       status: 'ok',
       error: null,
