@@ -206,9 +206,63 @@ describe('singleton Hub driver', () => {
       expect(hub.sql.exec("SELECT id FROM session_deliveries WHERE source='driver'").toArray()).toHaveLength(0);
       expect(hub.sql.exec('SELECT id FROM session_schedules').toArray()).toHaveLength(0);
 
+      const stopped = await actual.handle(req('/api/driver/stop', { key: 'driver-stop-refused' }), admin);
+      expect(stopped.status).toBe(200);
+      expect(await stopped.json()).toMatchObject({ stopped: true, driver: { phase: 'rejected' } });
       const replay = await start(actual, 'driver-real-refusal', { engine: 'codex' });
       expect(replay.status).toBe(409);
       expect(await replay.json()).toMatchObject({ error: 'driver_start_rejected', replay: true });
+    });
+  });
+
+  it('stops an uncertain start without issuing another session create', async () => {
+    await withDriver(async ({ hub, scheduler }) => {
+      let creates = 0;
+      const sessions = async (request: Request) => {
+        if (request.method === 'POST' && new URL(request.url).pathname === '/api/sessions') {
+          creates++;
+          return Response.json({ error: 'temporary' }, { status: 503 });
+        }
+        return Response.json({ error: 'not_found' }, { status: 404 });
+      };
+      const actual = new DriverService(hub.sql, sessions, scheduler);
+      actual.init();
+
+      expect((await start(actual, 'driver-stop-uncertain')).status).toBe(503);
+      expect(hub.sql.exec('SELECT phase,session_id FROM hub_drivers').toArray()[0]).toMatchObject({ phase: 'starting', session_id: null });
+      const stopped = await actual.handle(req('/api/driver/stop', { key: 'driver-stop-uncertain-command' }), admin);
+      expect(stopped.status).toBe(200);
+      expect(await stopped.json()).toMatchObject({ stopped: true, driver: { phase: 'stopped' } });
+      expect(creates).toBe(1);
+    });
+  });
+
+  it('recovers and pauses a schedule committed before a lost create response when stopping', async () => {
+    await withDriver(async ({ hub, starts, sessionHandler }) => {
+      let lose = true;
+      const scheduler = async (request: Request, auth: any) => {
+        const path = new URL(request.url).pathname;
+        const response = await hub.sessionSchedules.handle(request, auth);
+        if (lose && request.method === 'POST' && path === '/api/session-schedules') {
+          lose = false;
+          throw new Error('response lost after schedule commit');
+        }
+        return response;
+      };
+      const actual = new DriverService(hub.sql, sessionHandler, scheduler);
+      actual.init();
+
+      expect((await start(actual, 'driver-stop-lost-schedule')).status).toBe(503);
+      const before: any = hub.sql.exec('SELECT phase,session_id,schedule_id FROM hub_drivers').toArray()[0];
+      expect(before).toMatchObject({ phase: 'starting', schedule_id: null });
+      const created: any = hub.sql.exec('SELECT id,enabled FROM session_schedules').toArray()[0];
+      expect(created.enabled).toBe(1);
+
+      const stopped = await actual.handle(req('/api/driver/stop', { key: 'driver-stop-lost-schedule-command' }), admin);
+      expect(stopped.status).toBe(200);
+      expect(await stopped.json()).toMatchObject({ stopped: true, driver: { phase: 'stopped', schedule_id: created.id } });
+      expect(hub.sql.exec('SELECT enabled FROM session_schedules WHERE id=?', created.id).toArray()[0].enabled).toBe(0);
+      expect(starts).toHaveLength(1); // stop recovers by lookup and never replays start
     });
   });
 
@@ -230,6 +284,27 @@ describe('singleton Hub driver', () => {
       expect(body.schedule).toMatchObject({ enabled: true, target_label: body.session.id });
       expect(hub.sql.exec("SELECT status FROM session_deliveries WHERE source='driver' AND delivery_key='startup'").toArray()[0].status).toBe('pending');
       expect(hub.sql.exec('SELECT id FROM session_schedules').toArray()).toHaveLength(1);
+    });
+  });
+
+  it('stops a held driver without retrying placement', async () => {
+    await withDriver(async ({ hub, state }) => {
+      let placementCalls = 0;
+      const control = new SessionControlService(hub.sql, fn => state.storage.transactionSync(fn), Date.now,
+        { reserve: () => { placementCalls++; return { value: { error: 'no_eligible_route', rejected: [] }, status: 409 }; } });
+      control.init();
+      const actual = new DriverService(hub.sql,
+        (request, auth) => control.handle(request, auth),
+        (request, auth) => hub.sessionSchedules.handle(request, auth));
+      actual.init();
+
+      const created: any = await (await start(actual, 'driver-held-stop', { engine: 'codex' })).json();
+      expect(created.session.state).toBe('held');
+      hub.sql.exec("UPDATE hub_drivers SET phase='starting' WHERE id=?", created.driver.id);
+      const stopped = await actual.handle(req('/api/driver/stop', { key: 'driver-held-stop-command' }), admin);
+      expect(stopped.status).toBe(200);
+      expect(await stopped.json()).toMatchObject({ stopped: true, session: { state: 'cancelled' } });
+      expect(placementCalls).toBe(1);
     });
   });
 

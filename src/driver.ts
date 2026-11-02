@@ -85,23 +85,31 @@ export class DriverService {
   }
   private async stop(row: Row, auth: Auth) {
     auth = this.rowAuth(auth, row);
-    if (['rejected', 'stopped'].includes(row.phase) && !row.session_id) {
-      this.sql.exec("UPDATE hub_drivers SET phase='stopped' WHERE id=?", row.id);
+    const rejected = row.phase === 'rejected';
+    if ((rejected || row.phase === 'stopped') && !row.session_id) {
       return reply({ ...(await this.view(this.get(row.id), auth)), stopped: true });
     }
-    // Recover an interrupted start first so neither its session nor its schedule
-    // can become orphaned. Stable keys recover downstream effects after a crash.
-    if (row.phase === 'starting') {
-      const started = await this.start(row, auth);
+    // A stop must never resume POST /api/sessions: that could create or promote
+    // work while the operator is trying to stop it. The deterministic
+    // SessionControl key lets us recover a create whose response was lost.
+    if (row.phase === 'starting' && !row.session_id) {
+      const recovered = this.recoverSession(row);
+      if (recovered.error) return reply({ error: 'driver_session_recovery_failed', retry_key: row.request_key }, 503);
+      if (!recovered.id) {
+        this.sql.exec("UPDATE hub_drivers SET phase='stopped' WHERE id=?", row.id);
+        return reply({ ...(await this.view(this.get(row.id), auth)), stopped: true });
+      }
       row = this.get(row.id)!;
-      if (started.status >= 400 && !row.session_id) {
-        // A terminal refusal with no session can be stopped locally. An
-        // uncertain create must keep its generation live for a later retry.
-        if (row.phase === 'rejected') {
-          this.sql.exec("UPDATE hub_drivers SET phase='stopped' WHERE id=?", row.id);
-          return reply({ ...(await this.view(this.get(row.id), auth)), stopped: true });
-        }
-        return reply({ error: 'driver_start_uncertain', retry_key: row.request_key }, 503);
+    }
+    // A schedule create may have committed before a lost response or an object
+    // eviction. Look it up by this generation's unique name and validate its
+    // identity before pausing it; never create a schedule as part of stop.
+    if (row.session_id && !row.schedule_id) {
+      const existing = await this.existingSchedule(row, auth);
+      if (existing.error) return existing.error;
+      if (existing.schedule) {
+        row.schedule_id = existing.schedule.body.id;
+        this.sql.exec('UPDATE hub_drivers SET schedule_id=? WHERE id=?', row.schedule_id, row.id);
       }
     }
     if (row.schedule_id) {
@@ -109,12 +117,14 @@ export class DriverService {
       if (paused.status >= 300) return reply({ error: 'driver_schedule_pause_failed', detail: paused.body }, paused.status);
     }
     this.sql.exec("UPDATE session_deliveries SET status='failed',last_error='driver_stopped',next_attempt_at=NULL WHERE source_id=? AND status='pending'", row.id);
-    this.sql.exec("UPDATE hub_drivers SET phase='stopping' WHERE id=?", row.id);
+    // Keep a deterministic refusal visible to its original idempotency key,
+    // even when its already-terminal SessionControl row is cleaned up here.
+    if (!rejected) this.sql.exec("UPDATE hub_drivers SET phase='stopping' WHERE id=?", row.id);
     if (!row.session_id) return reply({ error: 'driver_session_unknown' }, 409);
     const observed = await this.call(this.sessions, '/api/sessions/' + row.session_id, auth);
     if (observed.status !== 200) return reply({ error: 'driver_session_unknown', detail: observed.body }, 409);
     if (terminal.has(observed.body.state)) {
-      this.sql.exec("UPDATE hub_drivers SET phase='stopped' WHERE id=?", row.id);
+      if (!rejected) this.sql.exec("UPDATE hub_drivers SET phase='stopped' WHERE id=?", row.id);
       return reply({ ...(await this.view(this.get(row.id), auth)), stopped: true });
     }
     // The canonical operator stop atomically cancels provably unstarted intents
@@ -127,10 +137,33 @@ export class DriverService {
     if (stopped.status >= 300) return reply({ error: 'driver_stop_pending', state: 'pending_stop', pending_stop: true, detail: stopped.body }, 202);
     const after = await this.call(this.sessions, '/api/sessions/' + row.session_id, auth);
     if (after.status === 200 && terminal.has(after.body.state)) {
-      this.sql.exec("UPDATE hub_drivers SET phase='stopped' WHERE id=?", row.id);
+      if (!rejected) this.sql.exec("UPDATE hub_drivers SET phase='stopped' WHERE id=?", row.id);
       return reply({ ...(await this.view(this.get(row.id), auth)), stopped: true });
     }
     return reply({ ...(await this.view(this.get(row.id), auth)), state: 'pending_stop', pending_stop: true, command: stopped.body }, 202);
+  }
+  private recoverSession(row: Row): { id: string | null; error: boolean } {
+    try {
+      const prior: any = this.sql.exec('SELECT id FROM session_control_sessions WHERE actor=? AND request_key=? LIMIT 1',
+        row.actor, 'driver-' + row.id).toArray()[0];
+      if (!prior) return { id: null, error: false };
+      if (typeof prior.id !== 'string' || !prior.id) return { id: null, error: true };
+      this.sql.exec('UPDATE hub_drivers SET session_id=? WHERE id=?', prior.id, row.id);
+      return { id: prior.id, error: false };
+    } catch { return { id: null, error: true }; }
+  }
+  private async existingSchedule(row: Row, auth: Auth): Promise<{ schedule: any | null; error: Response | null }> {
+    const name = 'hub-driver-' + row.id;
+    const existing = await this.call(this.schedules, '/api/session-schedules/' + encodeURIComponent(name), auth);
+    if (existing.status === 404) return { schedule: null, error: null };
+    if (existing.status !== 200) return { schedule: null,
+      error: reply({ error: 'driver_schedule_lookup_failed', detail: existing.body }, existing.status >= 500 ? 503 : existing.status) };
+    const expected = { name, target_label: row.session_id, cron: '*/15 * * * *', tz: 'UTC',
+      prompt_id: null, prompt_bytes: DRIVER_PING.length, created_by: row.actor };
+    const matches = typeof existing.body?.id === 'string' && typeof existing.body?.enabled === 'boolean' &&
+      Object.entries(expected).every(([key, value]) => existing.body[key] === value);
+    return matches ? { schedule: existing, error: null } : { schedule: null,
+      error: reply({ error: 'driver_schedule_identity_mismatch' }, 409) };
   }
   private async start(row: Row, auth: Auth): Promise<Response> {
     auth = this.rowAuth(auth, row);

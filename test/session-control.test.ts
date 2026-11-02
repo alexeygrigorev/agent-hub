@@ -1702,9 +1702,10 @@ describe('held cancellation current human bearer authority', () => {
   });
   it('rechecks a human operator bearer before stopping another owner held intent', async () => {
     const bindings = {...env, HUB_ADMINS: 'admin@fake.local'} as unknown as Env;
+    const reserve = fakeReserve({status:409,error:'no_eligible_route',rejected:[]});
     await fixture(async (s, sql) => {
       await seed(sql);
-      const held = await (await s.handle(request('/api/sessions', {key:'operator-start',workspace:'demo',mode:'interactive'}), auth)).json() as any;
+      const held = await (await s.handle(request('/api/sessions', {key:'operator-start',workspace:'demo',mode:'interactive'}), agent())).json() as any;
       let controller!: ReadableStreamDefaultController<Uint8Array>;
       const stream = new ReadableStream<Uint8Array>({start(value) {controller=value;}});
       const pending = s.handle(new Request('https://hub.test/api/sessions/'+held.id+'/stop', {method:'POST',body:stream}), auth);
@@ -1713,7 +1714,7 @@ describe('held cancellation current human bearer authority', () => {
       controller.enqueue(new TextEncoder().encode('{"key":"operator-stop"}'));controller.close();
       expect((await pending).status).toBe(404);
       expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?', held.id).toArray()[0].state).toBe('held');
-    }, undefined, {env:bindings});
+    }, reserve.hook, {env:bindings});
   });
 });
 
