@@ -398,8 +398,8 @@ describe('Persisted PID controller, reset ledger, rewards, rollups & routing fee
         details: { limit_reached: false },
         windows: { '5h': { present: true, percent_remaining: 80, reset_at: new Date(NOW + 5 * HOUR).toISOString() } },
       };
-      const adsFast = [{ engine: 'codex', profile: null, model: 'gpt-6-astra', effort: 'high', account: 'acct-fast' }];
-      const adsSlow = [{ engine: 'codex', profile: null, model: 'gpt-6-astra', effort: 'high', account: 'acct-slow' }];
+      const adsFast = [{ engine: 'codex', profile: null, model: 'gpt-6-astra', effort: 'medium', account: 'acct-fast' }];
+      const adsSlow = [{ engine: 'codex', profile: null, model: 'gpt-6-astra', effort: 'medium', account: 'acct-slow' }];
       const [candFast] = modelCandidates({ tier: 'deep', preferred_runner: 'codex' }, { provider: 'codex', engine: 'codex', profile: null, account: 'acct-fast' }, adsFast, quota, NOW + 10_000, pacingMap);
       const [candSlow] = modelCandidates({ tier: 'deep', preferred_runner: 'codex' }, { provider: 'codex', engine: 'codex', profile: null, account: 'acct-slow' }, adsSlow, quota, NOW + 10_000, pacingMap);
       expect(candFast.weight).toBeGreaterThan(candSlow.weight);
