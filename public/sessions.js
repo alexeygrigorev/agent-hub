@@ -129,6 +129,7 @@ function attentionKind(s) {
 function renderAttention(sessions, statusData = null) {
   const list = byId('sessions-attention-list'), count = byId('sessions-attention-count');
   if (!list) return;
+  const taskTitles = new Map((Array.isArray(statusData?.tasks) ? statusData.tasks : []).map(task => [task.id, task.title]).filter(([id, title]) => id && title));
   const byIdMap = new Map(sessions.map(s => [s.id, s]));
   const authoritative = Array.isArray(statusData?.needs_attention)
     ? statusData.needs_attention.filter(row => row.source === 'session_idle' || row.source === 'session_ping' || row.source === 'session_stalled' || row.source === 'session_uncertain' || row.kind === 'session')
@@ -137,7 +138,8 @@ function renderAttention(sessions, statusData = null) {
   for (const row of authoritative) {
     const id = row.session_id || row.id;
     if (!id) continue;
-    const session = byIdMap.get(id) || { id, state: row.state, updated_at: row.updated_at, intake_id: row.intake_id };
+    const session = { ...(byIdMap.get(id) || { id, state: row.state, updated_at: row.updated_at, intake_id: row.intake_id }) };
+    if (session.intake_id && !session.intake_title) session.intake_title = taskTitles.get(session.intake_id);
     let kind = attentionKind({ ...session, ...row });
     if (!kind) kind = row.source === 'session_ping' || row.source === 'session_uncertain' ? 'Stale observation' : row.source === 'session_stalled' ? 'Blocked' : 'Idle with unfinished work';
     rows.set(id, { session, kind });
@@ -961,6 +963,10 @@ async function loadData() {
     updateMoreButton();
     cachedTree = treeData || { tree: [] };
     attentionRows = Array.isArray(statusData?.needs_attention) ? statusData.needs_attention : [];
+    if (Array.isArray(statusData?.tasks)) {
+      const titles = new Map(statusData.tasks.map(task => [task.id, task.title]).filter(([id, title]) => id && title));
+      cachedSessions = cachedSessions.map(session => session.intake_id && titles.has(session.intake_id) ? { ...session, intake_title: titles.get(session.intake_id) } : session);
+    }
     renderAttention(cachedSessions, statusData);
     renderAudit(auditData);
     updateView();
