@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 import urllib.error
 import zipfile
@@ -245,12 +246,20 @@ def run(argv, *, env=None, capture=False, timeout=900):
     return result.stdout.strip() if capture else None
 
 
+DOWNLOAD_SLEEP = time.sleep
+
+
 def download(url, target):
     if not url.startswith('https://'):
         raise ValueError('Runtime downloads require HTTPS')
+    from .installer_hygiene import retry_transient
     req = urllib.request.Request(url, headers={'User-Agent': 'agent-hub-installer/1'})
-    with urllib.request.urlopen(req, timeout=120) as source, Path(target).open('wb') as out:
-        shutil.copyfileobj(source, out)
+
+    def fetch():
+        with urllib.request.urlopen(req, timeout=120) as source, Path(target).open('wb') as out:
+            shutil.copyfileobj(source, out)
+    # DNS hiccups (www.7-zip.org) killed whole installs: back off 1, 2, 4 s before giving up.
+    retry_transient(fetch, attempts=4, base_delay=1.0, sleep=DOWNLOAD_SLEEP)
 
 
 def verify(path, sums, name):
@@ -381,12 +390,41 @@ def install_engines(install_root, node, npm):
     return env
 
 
+def reuse_git_runtime(install_root, target):
+    """Copy an existing verified PortableGit (install root or a previous release) instead of downloading it."""
+    name = Path(target).name
+    base = Path(install_root).parent.parent if Path(install_root).parent.name == 'releases' else Path(install_root)
+    candidates = [base / 'runtimes' / name]
+    releases = base / 'releases'
+    if releases.is_dir():
+        found = [r / 'runtimes' / name for r in releases.iterdir() if r != Path(install_root)]
+        candidates += sorted(found, key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    for source in candidates:
+        try:
+            if source.is_symlink() or not (source / 'cmd/git.exe').is_file() or not (source / 'usr/bin/bash.exe').is_file():
+                continue
+            if GIT_VERSION.rsplit('.', 1)[0] not in run([source / 'cmd/git.exe', '--version'], capture=True, timeout=30):
+                continue
+            staging = Path(install_root) / 'tmp' / ('git-reuse-' + uuid.uuid4().hex[:8])
+            shutil.copytree(source, staging, symlinks=False)
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(staging, target, dirs_exist_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+            print('Reusing existing Portable Git from ' + str(source), flush=True)
+            return source
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
 def ensure_windows_git(install_root):
     """Extract PortableGit; never execute its installer or request elevation."""
     if sys.platform != 'win32':
         return None
     target = install_root / 'runtimes' / ('git-' + GIT_VERSION + '-' + architecture())
     git, bash = target / 'cmd/git.exe', target / 'usr/bin/bash.exe'
+    if not git.is_file() or not bash.is_file():
+        reuse_git_runtime(install_root, target)
     if not git.is_file() or not bash.is_file():
         cpu = '64-bit' if architecture() == 'x64' else 'arm64'
         name = 'PortableGit-' + GIT_VERSION + '-' + cpu + '.7z.exe'
@@ -759,7 +797,7 @@ def install_service(install_root, command):
         # makes it and the runner loop exit 76 so the task stops (88ff6766).
         request_replace(control)
         try:
-            handover(control)
+            handover(control, journal=state_root(install_root) / 'journal')
         except BaseException:
             clear_replace(control)
             raise

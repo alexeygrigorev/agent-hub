@@ -134,13 +134,43 @@ def _attention(directory, generation=None):
     raise NeedsAttention('Previous controller exit is unproven; inspect needs-attention.json and restore native status access before retrying')
 
 
-def stop_orphan_receipt(receipt):
+def stop_orphan_receipt(receipt, signal='TERM', grace_ms=30000):
     """Ask aplexer to stop the exact orphaned controller; the reply is only a hint, the caller re-observes."""
-    result = subprocess.run(['aplexer', 'kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '30000'],
+    result = subprocess.run(['aplexer', 'kill', receipt['id'], '--signal', signal, '--grace-ms', str(grace_ms)],
                             capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
     if result.returncode or len(result.stdout) > 131072:
         return None
     return json.loads(result.stdout)
+
+
+def journal_lock_held(journal):
+    """True when another process holds the controller's exclusive journal lock (host.lock)."""
+    path = Path(journal) / 'host.lock'
+    if not path.exists():
+        return False
+    try:
+        with path.open('a') as lock:
+            if os.name == 'nt':
+                import msvcrt
+                if os.fstat(lock.fileno()).st_size == 0:
+                    return False
+                os.lseek(lock.fileno(), 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    return True
+                os.lseek(lock.fileno(), 0, os.SEEK_SET)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                return False
+            import fcntl
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
 
 
 def recover_stale_owner(directory, current_boot, observe, absent=None, tag_absent=None, stop=None):
@@ -228,6 +258,49 @@ def _stop_live_orphan(receipt, observe, absent, stop):
     return None
 
 
+def _force_stop_unresponsive(directory, owner, stop, boot_probe, observe, absent, tag_absent, force_wait, sleep):
+    """Cooperative stop timed out on a busy host: kill the exact receipt, then prove exit as the supervisor does.
+
+    TERM first, then KILL; the old owner must release owner.lock (bounded) and the usual receipt proof
+    (record removed / containment empty / absent from catalog) must hold before the lease is cleared.
+    """
+    receipt = owner.get('receipt') if isinstance(owner, dict) else None
+    if not isinstance(receipt, dict) or not all(k in receipt for k in IDENTITY_KEYS):
+        return False
+    end = time.monotonic() + force_wait
+    for signal in ('TERM', 'KILL'):
+        try:
+            stop(receipt, signal=signal) if _accepts_signal(stop) else stop(receipt)
+        except Exception:
+            pass
+        step_end = min(end, time.monotonic() + max(force_wait / 2, 0))
+        while True:
+            stack = ExitStack()
+            try:
+                stack.enter_context(private_fs.exclusive_lock(directory / 'owner.lock'))
+            except OSError:
+                stack.close()
+            else:
+                with stack:
+                    try:
+                        recover_stale_owner(directory, boot_probe(), observe, absent, tag_absent, stop)
+                    except NeedsAttention:
+                        return False
+                return True
+            if time.monotonic() >= step_end:
+                break
+            sleep(0.5)
+    return False
+
+
+def _accepts_signal(fn):
+    import inspect
+    try:
+        return 'signal' in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _fresh_request(request, generation):
     if not isinstance(request, dict) or request.get('generation') != generation:
         return False
@@ -287,7 +360,8 @@ class ControllerLease:
         (self.directory / 'owner.json').unlink()
 
 
-def handover(directory, *, timeout=90, boot_probe=None, observe=None, stop=None):
+def handover(directory, *, timeout=90, boot_probe=None, observe=None, stop=None, journal=None, force_wait=60,
+             lock_held=None, sleep=time.sleep):
     absent = receipt_absent if observe is None else None
     tag_absent = pending_tag_absent if observe is None else None
     if stop is None and observe is None:
@@ -297,10 +371,21 @@ def handover(directory, *, timeout=90, boot_probe=None, observe=None, stop=None)
         raise ValueError('Invalid controller handover timeout')
     # Serializes request publication/cancellation; never unlink kernel locks.
     with private_fs.exclusive_lock(directory / 'request.lock'):
-        _handover(directory, timeout, boot_probe or boot_identity, observe or observe_receipt, absent, tag_absent, stop)
+        _handover(directory, timeout, boot_probe or boot_identity, observe or observe_receipt, absent, tag_absent, stop,
+                  force_wait, sleep)
+    if journal is not None:
+        # The new controller dies on a held host.lock (desktop: ~10.5 min of PermissionError);
+        # wait for it bounded instead of starting into it.
+        held = lock_held or journal_lock_held
+        end = time.monotonic() + force_wait
+        while held(journal):
+            if time.monotonic() >= end:
+                raise NeedsAttention('Old controller still holds the journal lock host.lock; retry the install')
+            sleep(0.5)
 
 
-def _handover(directory, timeout, boot_probe, observe, absent=None, tag_absent=None, stop=None):
+def _handover(directory, timeout, boot_probe, observe, absent=None, tag_absent=None, stop=None, force_wait=60,
+              sleep=time.sleep):
     stack = ExitStack()
     try:
         stack.enter_context(private_fs.exclusive_lock(directory / 'owner.lock'))
@@ -336,7 +421,10 @@ def _handover(directory, timeout, boot_probe, observe, absent=None, tag_absent=N
                             return
                 except OSError:
                     pass
-            time.sleep(0.25)
+            sleep(0.25)
+        if stop is not None and _force_stop_unresponsive(directory, owner, stop, boot_probe, observe, absent,
+                                                         tag_absent, force_wait, sleep):
+            return
         raise RuntimeError('Controller handover unconfirmed; existing controller and evidence preserved')
     finally:
         # A timed-out, cancelled, or crashed installer cannot leave a deferred
