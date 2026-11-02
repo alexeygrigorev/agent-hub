@@ -3,6 +3,8 @@
  * delivery rows carry ids/statuses, never prompt bodies. */
 const byId = id => document.getElementById(id);
 let csrf = null;
+let selectedSchedule = null;
+let listScroll = 0;
 
 async function api(path, method = 'GET', data) {
   const headers = {};
@@ -23,6 +25,12 @@ async function api(path, method = 'GET', data) {
 }
 
 const setStatus = text => { byId('ps-status').textContent = text || ''; };
+
+
+function cadenceLabel(cron, timezone) {
+  const readable = cron === '0 9 * * *' ? 'Daily at 09:00' : cron === '0 * * * *' ? 'Every hour' : `Cron: ${cron}`;
+  return `${readable} · ${timezone || 'timezone unknown'}`;
+}
 
 function cell(row, text, mono = false) {
   const td = document.createElement('td');
@@ -55,13 +63,15 @@ async function loadPrompts() {
   body.textContent = '';
   for (const p of data.prompts) {
     const tr = document.createElement('tr');
-    cell(tr, p.slug, true); cell(tr, p.title); cell(tr, 'v' + p.current_version); cell(tr, p.updated_at);
+    cell(tr, p.title); cell(tr, p.slug, true); cell(tr, 'v' + p.current_version); cell(tr, p.updated_at);
     const actions = document.createElement('td');
     actions.appendChild(button('View', async () => {
-      const detail = await api('/api/prompts/' + encodeURIComponent(p.slug));
       const pre = byId('ps-prompt-body');
-      pre.textContent = detail.body;
-      pre.hidden = false;
+      pre.hidden = false; pre.textContent = 'Loading prompt…';
+      try {
+        const detail = await api('/api/prompts/' + encodeURIComponent(p.slug));
+        pre.textContent = detail.body;
+      } catch (err) { pre.textContent = 'Prompt unavailable: ' + err.message; }
     }));
     tr.appendChild(actions);
     body.appendChild(tr);
@@ -75,39 +85,64 @@ async function act(label, fn) {
 async function loadSchedules() {
   const body = byId('ps-schedules-body');
   const data = await api('/api/session-schedules');
-  if (!data.schedules.length) return empty(body, 8, 'No session schedules yet (hub schedules create)');
+  if (!data.schedules.length) return empty(body, 6, 'No send-prompt schedules yet.');
   body.textContent = '';
   for (const s of data.schedules) {
     const tr = document.createElement('tr');
-    cell(tr, s.name, true); cell(tr, s.target_label); cell(tr, `${s.cron} (${s.tz})`, true);
-    cell(tr, s.prompt_id ? 'library: ' + s.prompt_id : `inline (${s.prompt_bytes} bytes)`);
-    cell(tr, s.enabled ? 'yes' : 'paused'); cell(tr, s.next_due_at); cell(tr, s.last_fire_at);
+    cell(tr, s.name); cell(tr, s.target_label); cell(tr, cadenceLabel(s.cron, s.tz));
+    cell(tr, s.next_due_at || 'Unknown'); cell(tr, s.enabled ? 'Enabled' : 'Paused');
     const actions = document.createElement('td');
     const ref = encodeURIComponent(s.name);
+    actions.appendChild(button('Open', () => loadDeliveries(s)));
     actions.appendChild(button(s.enabled ? 'Pause' : 'Resume', () => act(s.enabled ? 'Pause' : 'Resume',
       () => api(`/api/session-schedules/${ref}/${s.enabled ? 'pause' : 'resume'}`, 'POST', {}))));
-    actions.appendChild(button('Fire now', () => act('Fire', () => api(`/api/session-schedules/${ref}/fire`, 'POST', {}))));
+    actions.appendChild(button('Send now', () => { if (confirm('Send this prompt to the existing target session now?')) act('Send', () => api(`/api/session-schedules/${ref}/fire`, 'POST', {})); }));
     tr.appendChild(actions);
     body.appendChild(tr);
   }
 }
 
-async function loadDeliveries() {
+async function loadDeliveries(schedule) {
+  listScroll = window.scrollY;
+  document.querySelector('main').dataset.view = 'detail';
+  selectedSchedule = schedule.name;
   const body = byId('ps-deliveries-body');
-  const data = await api('/api/session-schedules/deliveries');
-  body.textContent = '';
-  if (!data.deliveries.length) return empty(body, 8, 'No schedule deliveries yet');
-  for (const d of data.deliveries) {
-    const tr = document.createElement('tr');
-    cell(tr, d.id, true); cell(tr, d.schedule); cell(tr, d.target_label); cell(tr, d.status);
-    cell(tr, d.attempts); cell(tr, d.last_error); cell(tr, d.created_at); cell(tr, d.delivered_at);
-    body.appendChild(tr);
+  byId('ps-schedule-detail').hidden = false;
+  if (matchMedia('(max-width:700px)').matches) byId('ps-schedule-detail').scrollIntoView({ block: 'start' });
+  byId('ps-detail-summary').textContent = `${schedule.name} → ${schedule.target_label} · Loading history…`;
+  empty(body, 8, 'Loading deliveries…');
+  try {
+    const data = await api('/api/session-schedules/' + encodeURIComponent(schedule.name) + '/deliveries');
+    if (selectedSchedule !== schedule.name) return;
+    byId('ps-detail-summary').textContent = `${schedule.name} → ${schedule.target_label} · ${schedule.cron} · ${schedule.tz}`;
+    if (!data.deliveries.length) return empty(body, 8, 'No deliveries for this schedule yet.');
+    body.textContent = '';
+    for (const d of data.deliveries) {
+      const tr = document.createElement('tr');
+      cell(tr, d.id, true); cell(tr, schedule.name); cell(tr, d.target_label); cell(tr, d.status);
+      cell(tr, d.attempts); cell(tr, d.last_error); cell(tr, d.created_at); cell(tr, d.delivered_at);
+      body.appendChild(tr);
+    }
+  } catch (err) {
+    if (selectedSchedule !== schedule.name) return;
+    empty(body, 8, 'Delivery history unavailable: ' + err.message);
   }
 }
 
 async function loadAll() {
-  try { await Promise.all([loadPrompts(), loadSchedules(), loadDeliveries()]); }
-  catch (err) { setStatus('Load failed: ' + err.message); }
+  const requests = [[loadPrompts, 'ps-prompts-body', 5], [loadSchedules, 'ps-schedules-body', 6]];
+  await Promise.all(requests.map(async ([load, id, columns]) => {
+    try { await load(); } catch (err) { empty(byId(id), columns, 'Load failed: ' + err.message); setStatus('Load failed: ' + err.message); }
+  }));
+}
+
+function promptRoute() {
+  const library = location.hash === '#library';
+  byId('library').hidden = !library;
+  byId('ps-schedules-panel').hidden = library;
+  byId('ps-schedule-detail').hidden = true;
+  selectedSchedule = null;
+  document.querySelector('main').dataset.view = 'list';
 }
 
 async function init() {
@@ -117,7 +152,22 @@ async function init() {
     await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual', headers: { 'X-CSRF-Token': csrf } });
     location.assign('/');
   });
+  byId('ps-close-detail').addEventListener('click', () => { selectedSchedule = null; byId('ps-schedule-detail').hidden = true; document.querySelector('main').dataset.view = 'list'; window.scrollTo(0, listScroll); });
+  addEventListener('hashchange', promptRoute);
+  promptRoute();
   await loadAll();
 }
 
 init();
+
+// Preserve column context when tables become one-column cards on phones.
+function labelSecondaryTables() {
+  document.querySelectorAll('main table').forEach(table => {
+    const labels = [...table.querySelectorAll('thead th')].map(th => th.textContent);
+    table.querySelectorAll('tbody tr').forEach(row => [...row.children].forEach((cell, index) => {
+      if (cell.colSpan === 1) cell.dataset.label = labels[index] || '';
+    }));
+  });
+}
+new MutationObserver(labelSecondaryTables).observe(document.querySelector('main'), { childList: true, subtree: true });
+labelSecondaryTables();

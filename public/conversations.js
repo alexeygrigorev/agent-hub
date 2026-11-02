@@ -483,9 +483,13 @@
   function renderConversations() {
     var list = byId('conv-list');
     var stateBox = byId('conv-list-state');
+    var scroll = byId('conv-list-scroll').scrollTop;
     stateBox.replaceChildren();
     list.replaceChildren();
-    for (var conversation of state.conversations) list.append(conversationRow(conversation, conversation.id === state.currentId));
+    var ordered = state.conversations.slice();
+    if (!byId('conv-order') || byId('conv-order').value === 'unread') ordered.sort(function (a, b) { return Number(b.unreadCount > 0) - Number(a.unreadCount > 0); });
+    for (var conversation of ordered) list.append(conversationRow(conversation, conversation.id === state.currentId));
+    byId('conv-list-scroll').scrollTop = scroll;
     byId('conv-count').textContent = state.conversations.length ? String(state.conversations.length) : '';
     var unread = state.conversations.reduce(function (sum, c) { return sum + (c.unreadCount || 0); }, 0);
     if (globalThis.dakitShell) globalThis.dakitShell.setCount(byId('unread-total'), unread);
@@ -847,7 +851,7 @@
           return (m.actor === state.selfActor ? 'You' : displayLabel(m.actor)) + ' (' + m.kind + ')';
         })
       : [];
-    head.append(el('p', 'conv-detail-head__meta', members.length ? 'Members: ' + members.join(', ') : 'Members are not available yet.'));
+    head.append(el('p', 'conv-detail-head__meta', members.length ? 'Participants: ' + members.join(', ') : 'Members are not available yet.'));
     return head;
   }
 
@@ -1058,7 +1062,9 @@
         return f.state === 'known' ? 'Delivered' : 'Pending';
       }));
 
-      card.append(grid);
+      var evidence = el('details', 'conv-ft-evidence');
+      evidence.append(el('summary', null, 'Status & authority evidence'), grid);
+      card.append(evidence);
     }
 
     return card;
@@ -1519,6 +1525,7 @@
   /* ---- wiring and bootstrap ---- */
 
   function wireListClicks() {
+    if (byId('conv-order')) byId('conv-order').addEventListener('change', renderConversations);
     byId('conv-list').addEventListener('click', function (event) {
       var row = event.target.closest('.dk-split__item');
       if (!row) return;

@@ -4,6 +4,7 @@
 const byId = id => document.getElementById(id);
 let csrf = null;
 let selectedRoute = null;
+let listScroll = 0;
 
 async function api(path, method = 'GET', data) {
   const headers = {};
@@ -57,7 +58,7 @@ async function loadRoutes() {
     body.textContent = '';
     if (!data.webhooks.length) {
       const tr = document.createElement('tr');
-      cell(tr, 'No webhook routes yet', false).colSpan = 7;
+      cell(tr, 'No webhook routes yet', false).colSpan = 4;
       body.appendChild(tr);
       return;
     }
@@ -65,9 +66,6 @@ async function loadRoutes() {
       const tr = document.createElement('tr');
       cell(tr, route.name);
       cell(tr, route.target_label, true);
-      cell(tr, route.auth_mode);
-      cell(tr, route.rate_limit_per_min);
-      cell(tr, route.max_body_bytes);
       cell(tr, route.enabled ? 'yes' : 'no');
       const actions = document.createElement('td');
       const open = document.createElement('button');
@@ -89,18 +87,29 @@ async function loadRoutes() {
   } catch (err) {
     body.textContent = '';
     const tr = document.createElement('tr');
-    cell(tr, `Load failed: ${err.message}`).colSpan = 7;
+    cell(tr, `Load failed: ${err.message}`).colSpan = 4;
     body.appendChild(tr);
   }
 }
 
 async function openRoute(name) {
+  if (document.querySelector('main').dataset.view !== 'detail') listScroll = window.scrollY;
+  document.querySelector('main').dataset.view = 'detail';
   selectedRoute = name;
   byId('wh-detail').hidden = false;
+  if (matchMedia('(max-width:700px)').matches) byId('wh-detail').scrollIntoView({ block: 'start' });
   byId('wh-detail-name').textContent = name;
   setStatus('Loading deliveries…');
+  byId('wh-detail-summary').textContent = 'Loading destination and delivery history…';
+  byId('wh-ingest-url').textContent = '';
+  byId('wh-detail-transport').textContent = '';
+  byId('wh-deliveries-body').replaceChildren();
+  byId('wh-audit-list').replaceChildren();
   try {
     const detail = await api(`/api/webhooks/${encodeURIComponent(name)}`);
+    if (selectedRoute !== name) return;
+    byId('wh-detail-summary').textContent = `Target: ${detail.target_label || 'unknown'} · ${detail.enabled ? 'Enabled' : 'Paused'} · Latest result: ${detail.deliveries?.[0]?.status || 'No deliveries yet'}`;
+    byId('wh-detail-transport').textContent = `Authentication: ${detail.auth_mode || 'unknown'} · ${detail.rate_limit_per_min ?? 'unknown'} requests/min · Body limit: ${detail.max_body_bytes ?? 'unknown'} bytes`;
     byId('wh-ingest-url').textContent = `${location.origin}${detail.url_path}`;
     const body = byId('wh-deliveries-body');
     body.textContent = '';
@@ -135,6 +144,8 @@ async function openRoute(name) {
     }
     setStatus('');
   } catch (err) {
+    if (selectedRoute !== name) return;
+    byId('wh-detail-summary').textContent = `Detail failed: ${err.message}`;
     setStatus(`Detail failed: ${err.message}`);
   }
 }
@@ -192,6 +203,7 @@ async function createRoute(event) {
 
 async function sendTest() {
   if (!selectedRoute) return;
+  if (!confirm('Send a test event to this session?')) return;
   try {
     if (!csrf) csrf = (await api('/auth/me')).csrf_token || null;
     const result = await api(`/api/webhooks/${encodeURIComponent(selectedRoute)}/test`, 'POST', {});
@@ -209,9 +221,25 @@ async function init() {
     await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual', headers: { 'X-CSRF-Token': csrf } });
     location.assign('/');
   });
+  byId('wh-close-detail').addEventListener('click', () => { selectedRoute = null; byId('wh-detail').hidden = true; document.querySelector('main').dataset.view = 'list'; window.scrollTo(0, listScroll); });
+  byId('wh-create-panel').addEventListener('toggle', () => {
+    if (!byId('wh-create-panel').open) { byId('wh-created').textContent = ''; byId('wh-created').hidden = true; }
+  });
   byId('wh-create-form').addEventListener('submit', createRoute);
   byId('wh-test').addEventListener('click', sendTest);
   await loadRoutes();
 }
 
 init();
+
+// Preserve column context when tables become one-column cards on phones.
+function labelSecondaryTables() {
+  document.querySelectorAll('main table').forEach(table => {
+    const labels = [...table.querySelectorAll('thead th')].map(th => th.textContent);
+    table.querySelectorAll('tbody tr').forEach(row => [...row.children].forEach((cell, index) => {
+      if (cell.colSpan === 1) cell.dataset.label = labels[index] || '';
+    }));
+  });
+}
+new MutationObserver(labelSecondaryTables).observe(document.querySelector('main'), { childList: true, subtree: true });
+labelSecondaryTables();
