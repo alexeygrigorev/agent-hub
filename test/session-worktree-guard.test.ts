@@ -273,13 +273,18 @@ describe('worktree guard (intake a0f01448)', () => {
   it('provides fresh host-scoped terminal and intake protection facts', async () => fixture(async (s, sql) => {
     const created = await startAgentSession(s, 'guard-host-facts');
     await bindAgentSession(s, sql, created.id, 'launch-1');
+    const lastActivity = '2026-11-01T00:00:00.000Z';
+    sql.exec('UPDATE fleet_sessions SET last_activity_at=? WHERE machine_id=? AND native_id=?',
+      lastActivity, 'hetzner', NATIVE_ID);
     const facts = async () => {
       const res = await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), host('hetzner'));
       expect(res.status).toBe(200);
       return (await res.json() as any).sessions;
     };
     expect((await facts())[0]).toMatchObject({ session_id: created.id, native_id: NATIVE_ID,
-      native_created_at_ms: NATIVE_CREATED, terminal: false, linked_intake_open: true, human_owned: false });
+      session_state: 'running',
+      native_created_at_ms: NATIVE_CREATED, native_last_activity_at: lastActivity,
+      terminal: false, linked_intake_open: true, human_owned: false });
     sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", created.id);
     sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
     closeFixtureIntake(sql);

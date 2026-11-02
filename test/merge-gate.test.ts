@@ -167,4 +167,17 @@ describe('AC2/AC3 watcher and requeue', () => {
     expect(v).toMatchObject({ head: SHA, unmerged: 2 });
     expect(v.problems.join(' ')).toContain('2 commit(s)');
   }));
+  it('retains deploy run id, conclusion, and the deployed SHA containing the merged head', async () => fixture(async c => {
+    const t = await createTask(c); await track(c, t.id);
+    const deployedSha = 'b'.repeat(40);
+    const submitted = await evidence(c, t.id, {
+      commits: [{ sha: SHA, in_main: true }],
+      deploy: { state: 'success', sha: SHA, run: 'https://github.com/example/repo/actions/runs/41479858903',
+        run_id: '41479858903', conclusion: 'success', deployed_sha: deployedSha },
+    });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    expect((await intake(c, '/tasks/' + t.id)).body.task.merge_state.deploy).toMatchObject({
+      state: 'success', sha: SHA, run_id: '41479858903', conclusion: 'success', deployed_sha: deployedSha,
+    });
+  }));
 });

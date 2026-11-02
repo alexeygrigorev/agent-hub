@@ -444,6 +444,29 @@ export function isDesktopCodexExcluded(
   return hosts.includes(hostname) || hosts.includes(name);
 }
 
+/** Model ids that are fallbacks (rules.fallback_models, config-driven; no engine is named in code). */
+export function fallbackModelIds(): Set<string> {
+  return new Set<string>(((policy.rules as any).fallback_models as string[] | undefined) ?? []);
+}
+/** Multiplier for a fallback model while a healthy non-fallback route exists; 1 otherwise. Never removes a candidate. */
+export function fallbackFactor(isFallback: boolean, healthyAlternative: boolean): number {
+  if (!isFallback || !healthyAlternative) return 1;
+  const f = Number((policy.rules as any).fallback_factor);
+  return Number.isFinite(f) && f > 0 && f <= 1 ? f : 0.6;
+}
+/**
+ * A non-fallback decision counts as a healthy alternative when it is not exhausted, not
+ * depleted-and-behind-schedule (burn_status 'depleted'), and has at least
+ * rules.fallback_headroom_percent left (default: rules.low_headroom_percent).
+ */
+export function isHealthyAlternative(decision: { factors?: { remaining_pct?: number; burn_status?: string } } | null | undefined): boolean {
+  const f = decision?.factors;
+  if (!f || !Number.isFinite(f.remaining_pct)) return false;
+  const cfg = Number((policy.rules as any).fallback_headroom_percent);
+  const floor = Number.isFinite(cfg) ? cfg : (typeof (policy.rules as any).low_headroom_percent === 'number' ? (policy.rules as any).low_headroom_percent : LOW_HEADROOM_PERCENT);
+  return f.burn_status !== 'exhausted' && f.burn_status !== 'depleted' && (f.remaining_pct as number) >= floor;
+}
+
 export interface EngineDecisionInput {
   machine: string;
   engine: string;
@@ -471,6 +494,8 @@ export interface EngineDecisionInput {
   reservePercent?: number;
   /** false for interactive sessions: no expiry boost (they are not burnable backlog). */
   expiryForecast?: boolean;
+  /** True when a healthy non-fallback candidate exists (computed by the planner over all candidates). */
+  healthyAlternative?: boolean;
 }
 
 export interface EngineDecisionResult {
@@ -485,6 +510,7 @@ export interface EngineDecisionResult {
     hours_to_reset: number | null;
     burn_ratio: number | null;
     burn_factor: number;
+    fallback_factor: number;
     pace_factor: number;
     expiry_factor: number;
     projected_unused_percent: number | null;
@@ -526,7 +552,8 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
   const failureFactor = 1 / (1 + 0.5 * failures + (input.degraded ? 0.5 : 0));
   const hostFactor = 1 / (1 + Math.max(0, input.cpuLoad) + Math.max(0, input.pendingLaunches));
   const tbm = Number.isFinite(input.tbmWeight) && input.tbmWeight > 0 ? input.tbmWeight : 1;
-  const rawScore = headroomFactor * burn.factor * pref * tierFit * loadFactor * failureFactor * hostFactor * tbm;
+  const fbFactor = fallbackFactor(fallbackModelIds().has(String(input.model?.id)), input.healthyAlternative === true);
+  const rawScore = headroomFactor * burn.factor * pref * tierFit * loadFactor * failureFactor * hostFactor * tbm * fbFactor;
   const score = Math.round(rawScore * 1e6) / 1e6;
   const mode: 'auto' | 'pinned' = input.pinnedEngine ? 'pinned' : 'auto';
   const modelLabel = input.model?.id ? `${input.model.id}` : input.engine;
@@ -537,7 +564,7 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
   const overridePart = input.pinnedEngine && input.overrideReason
     ? ` override_reason=${JSON.stringify(input.overrideReason)}`
     : '';
-  const reason = `${mode}: ${input.engine}/${input.account ?? 'default'} (${modelLabel}) on ${input.machine} score=${score.toFixed(4)} [rem=${Math.round(remainingPct)}% ${winPart} ${ratioPart} status=${burn.burn_status} burn=${burn.factor.toFixed(2)}x${burn.expiry_factor > 1 ? `(pace ${burn.pace_factor.toFixed(2)}x expiry ${burn.expiry_factor.toFixed(2)}x unused ${burn.forecast?.projected_unused_percent ?? 0}%)` : ""} pref=${pref.toFixed(2)}x tier=${input.tier}(${tierFit.toFixed(2)}x) load=acct:${acctActive}/${maxConc},fam:${famActive} fail=${failures}${overridePart}]`;
+  const reason = `${mode}: ${input.engine}/${input.account ?? 'default'} (${modelLabel}) on ${input.machine} score=${score.toFixed(4)} [rem=${Math.round(remainingPct)}% ${winPart} ${ratioPart} status=${burn.burn_status} burn=${burn.factor.toFixed(2)}x${burn.expiry_factor > 1 ? `(pace ${burn.pace_factor.toFixed(2)}x expiry ${burn.expiry_factor.toFixed(2)}x unused ${burn.forecast?.projected_unused_percent ?? 0}%)` : ""} pref=${pref.toFixed(2)}x${fbFactor < 1 ? ` fallback=${fbFactor.toFixed(2)}x` : ''} tier=${input.tier}(${tierFit.toFixed(2)}x) load=acct:${acctActive}/${maxConc},fam:${famActive} fail=${failures}${overridePart}]`;
   return {
     mode,
     score,
@@ -550,6 +577,7 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
       hours_to_reset: burn.hours_to_reset,
       burn_ratio: burn.ratio !== null ? Math.round(burn.ratio * 1000) / 1000 : null,
       burn_factor: Math.round(burn.factor * 1000) / 1000,
+      fallback_factor: Math.round(fbFactor * 1000) / 1000,
       pace_factor: Math.round(burn.pace_factor * 1000) / 1000,
       expiry_factor: Math.round(burn.expiry_factor * 1000) / 1000,
       projected_unused_percent: burn.forecast ? burn.forecast.projected_unused_percent : null,

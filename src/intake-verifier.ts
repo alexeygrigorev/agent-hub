@@ -22,6 +22,10 @@ const parse = (raw: any): Obj => { try { return JSON.parse(raw || '{}'); } catch
 const ms = (v: any): number => typeof v === 'number' ? v : (Date.parse(v) || 0);
 export const VERIFIED_NOTE = /^DONE\b[^\n]*\bVERIFIED by Hub verifier\b/;
 export const FAILED_NOTE = /^VERIFICATION FAILED\b/;
+/** A registry workspace label ("agent-hub"), as opposed to a host path ("/home/x/git/y", "C:\work\y"). */
+export const isWorkspaceLabel = (w: unknown): w is string => typeof w === 'string' && w.length > 0 && !/[\\/:~]/.test(w);
+/** Host-side start failures that say nothing about the intake: one fresh launch before a human is alerted. */
+const TRANSIENT_START = new Set(['workspace_unavailable', 'launcher_memory_reserve', 'launcher_command_failed']);
 const TRIAGE_NOTE = /backlog triage/i;
 
 /** Auto policy (Developer decision, t1937u). REQUIRED wins over SKIP; with no
@@ -100,8 +104,10 @@ export class IntakeVerifier {
   }
   private workspace(task: Obj): string {
     const prior = this.rows('SELECT request_json FROM session_control_sessions ORDER BY created_at DESC')
-      // Never an intake worktree path: the verifier runs detached from it (79458f2d).
-      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace && !namesWorktree(r.workspace));
+      // Never an intake worktree path: the verifier runs detached from it (79458f2d). Never a concrete host
+      // path either: a prior session's per-host checkout (drain-*, rr-*) is gone or lives on another machine,
+      // and pinning it made auto placement fail (workspace_unavailable, launcher errors). Registry labels only.
+      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace && !namesWorktree(r.workspace) && isWorkspaceLabel(r.workspace));
     if (prior) return prior.workspace;
     const configured = this.rows('SELECT capabilities FROM machines').some(m => {
       const roots = parse(m.capabilities).workspaces;
@@ -245,6 +251,10 @@ export class IntakeVerifier {
         }
         // A start that failed before running (any launch_error) is surfaced once, never retried silently.
         const failure = sessionLaunchFailure(this.sql, row.session_id);
+        if (failure && TRANSIENT_START.has(failure) && row.attempts < VERIFIER_MAX_ATTEMPTS) {
+          if (budget > 0) { budget--; if (await this.launch(task, claim, row)) counts.launched++; } else counts.waiting++;
+          continue;
+        }
         if (failure) { await this.escalate(task, claim, `verifier session ${row.session_id} failed to start: ${failure}`); counts.escalated++; continue; }
         if (row.attempts >= VERIFIER_MAX_ATTEMPTS) { await this.escalate(task, claim, `verifier ended ${row.attempts}x without a verdict`); counts.escalated++; }
         else if (budget > 0) { budget--; if (await this.launch(task, claim, row)) counts.launched++; }

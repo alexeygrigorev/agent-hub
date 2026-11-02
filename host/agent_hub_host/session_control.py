@@ -544,7 +544,8 @@ def add_commands(sub):
     listing = commands.add_parser('list', help='List sessions visible to this credential')
     listing.add_argument('--threshold', help='Long-running threshold (default 3h; HUB_SESSION_WARNING_THRESHOLD)')
     listing.add_argument('--state')
-    listing.add_argument('--limit', type=int, default=50)
+    listing.add_argument('--limit', type=int, help='Maximum total sessions to return (default: all pages)')
+    listing.add_argument('--all', action='store_true', help='Include historical finished sessions')
     listing.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     listing.add_argument('--tree', action='store_true', help='Display session lineage tree')
     count = commands.add_parser('count', help='Count live sessions (running/queued/stalled) grouped by host, engine and/or account')
@@ -876,35 +877,46 @@ def _execute(args):
         return request('GET', '/api/sessions/tree')
     if cmd == 'list':
         wanted = getattr(args, 'state', None)
-        limit = int(getattr(args, 'limit', None) or 50)
-        if not wanted:
-            params = ''
-            if getattr(args, 'limit', None):
-                params = '?limit=%d' % limit
-            return request('GET', threshold_path(args, '/api/sessions' + params))
-        # State-filtered listing follows next_cursor (bounded, id-deduped) so
-        # filtering is complete instead of first-page-only.
+        total_limit = getattr(args, 'limit', None)
+        if total_limit is not None and total_limit < 1:
+            raise ValueError('Session list limit must be at least 1')
+        # The API intentionally caps each indexed page at 100. Walk its cursor
+        # until exhausted so the default list (including --json) cannot hide
+        # older live sessions behind that page boundary.
         from urllib.parse import quote
         seen: list = []
         known: set = set()
         cursor = None
-        for _ in range(10):
-            path = '/api/sessions?limit=%d' % limit
+        cursors: set = set()
+        first_page = None
+        page_size = min(100, total_limit) if total_limit is not None else 100
+        live_only = (total_limit is None and not getattr(args, 'all', False)
+                     and wanted not in ('stopped', 'failed', 'cancelled', 'refused', 'done'))
+        while True:
+            path = '/api/sessions?%slimit=%d' % ('live=1&' if live_only else '', page_size)
             if cursor:
                 path += '&cursor=' + quote(cursor, safe='')
             page = request('GET', threshold_path(args, path))
+            if first_page is None:
+                first_page = page
             for entry in page.get('sessions', []):
                 if entry.get('id') in known:
                     continue
                 known.add(entry.get('id'))
-                if match_session_state(entry, wanted):
+                if not wanted or match_session_state(entry, wanted):
                     seen.append(entry)
-                    if len(seen) >= limit:
-                        return {'sessions': seen[:limit], 'next_cursor': None}
+                    if total_limit is not None and len(seen) >= total_limit:
+                        break
             cursor = page.get('next_cursor')
-            if not cursor:
+            if (total_limit is not None and len(seen) >= total_limit) or not cursor:
                 break
-        return {'sessions': seen[:limit], 'next_cursor': None}
+            if cursor in cursors:
+                raise ValueError('Session list pagination repeated a cursor; retry the listing')
+            cursors.add(cursor)
+        result = dict(first_page or {})
+        result['sessions'] = seen
+        result['next_cursor'] = None
+        return result
     if cmd == 'show':
         return request('GET', threshold_path(args, '/api/sessions/' + args.id))
     if cmd == 'events':

@@ -97,9 +97,9 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(fetch.call_count, 2)
 
     def test_list_show_commands_paths(self):
-        with patch.object(session_control, 'request', return_value={'sessions': []}) as transport:
+        with patch.object(session_control, 'request', return_value={'sessions': [], 'next_cursor': None}) as transport:
             result = session_control.execute(self.parse('list', '--limit', '10'))
-        self.assertEqual(result, {'sessions': []})
+        self.assertEqual(result, {'sessions': [], 'next_cursor': None})
         self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions?limit=10'))
         with patch.object(session_control, 'request', return_value={'id': 's'}) as transport:
             session_control.execute(self.parse('show', 's'))
@@ -288,6 +288,30 @@ class TestSessionControlCli(unittest.TestCase):
         with patch.object(session_control, 'request', return_value=payload):
             result = session_control.execute(args)
         self.assertEqual([s['id'] for s in result['sessions']], ['a'])
+
+    def test_default_list_and_json_follow_all_api_pages(self):
+        args = self.parse('list', '--json')
+        first = {'sessions': [{'id': str(i), 'state': 'running'} for i in range(100)],
+                 'next_cursor': 'cursor-1', 'active_count': 125, 'active_count_capped': False}
+        second = {'sessions': [{'id': str(i), 'state': 'running'} for i in range(100, 125)],
+                  'next_cursor': None, 'active_count': 125, 'active_count_capped': False}
+        with patch.object(session_control, 'request', side_effect=[first, second]) as transport:
+            result = session_control.execute(args)
+        self.assertEqual(len(result['sessions']), 125)
+        self.assertEqual(result['sessions'][-1]['id'], '124')
+        self.assertEqual(result['active_count'], 125)
+        self.assertIsNone(result['next_cursor'])
+        self.assertEqual(transport.call_args_list[0].args[:2], ('GET', '/api/sessions?live=1&limit=100'))
+        self.assertEqual(transport.call_args_list[1].args[:2], ('GET', '/api/sessions?live=1&limit=100&cursor=cursor-1'))
+
+    def test_state_filter_walks_pages_until_all_matches_are_found(self):
+        args = self.parse('list', '--state', 'running')
+        first = {'sessions': [{'id': 'a', 'state': 'offered'}], 'next_cursor': 'page-two'}
+        second = {'sessions': [{'id': 'b', 'state': 'running'}], 'next_cursor': None}
+        with patch.object(session_control, 'request', side_effect=[first, second]) as transport:
+            result = session_control.execute(args)
+        self.assertEqual([s['id'] for s in result['sessions']], ['b'])
+        self.assertEqual(transport.call_count, 2)
 
     def test_start_prompt_inline_with_brief_boundaries(self):
         with patch.object(session_control, 'request', return_value={}) as transport:

@@ -37,6 +37,8 @@ def test_compose_prompt_keeps_rules_in_front_of_brief():
     assert CPU_LOAD_RULE in composed
     # The existing AWS rule stays part of the preamble.
     assert "main-temp AWS profile" in composed
+    assert "commit-msg hook" in SESSION_PREAMBLE
+    assert "Scope: gray <intake-UUID>" in SESSION_PREAMBLE
 
 
 def test_oversized_goal_uses_private_full_brief_file(tmp_path):

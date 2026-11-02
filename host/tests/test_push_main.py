@@ -41,6 +41,8 @@ class PushMainTests(unittest.TestCase):
         (self.repo / 'host/tests/__init__.py').write_text('')
         shutil.copy(ROOT / 'scripts/push-main.sh', self.repo / 'scripts/push-main.sh')
         shutil.copy(ROOT / 'host/agent_hub_host/prepush.py', self.repo / 'host/agent_hub_host/prepush.py')
+        shutil.copy(ROOT / 'host/agent_hub_host/scope_commit_hook.py',
+                    self.repo / 'host/agent_hub_host/scope_commit_hook.py')
         shutil.copy(ROOT / 'scripts/ci/affected_tests.py', self.repo / 'scripts/ci/affected_tests.py')
         self.write('scripts/capped-test-retry.sh', '#!/bin/bash\nset -eu\n[ "$1" = -- ]; shift\nexec "$@"\n')
         # Lightweight fixture lane uses the production affected-test selector,
@@ -88,6 +90,7 @@ sys.exit(subprocess.call(['python3', '-m', 'unittest', 'discover', '-s', 'host/t
 
     def write(self, name, body):
         path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
         if name.startswith('scripts/'):
             path.chmod(0o755)
@@ -269,6 +272,34 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.git('rev-parse', 'worker', cwd=self.remote), failing)
         self.assertFalse((self.state / 'tested-base').exists())
 
+    def test_scope_hook_adds_trailer_to_normal_sensitive_commit(self):
+        self.install_for_launch()
+        self.write('public/scope-fixture.js', 'capture();\n')
+        commit = self.commit('normal session commit without footer')
+        message = self.git('show', '-s', '--format=%B', commit)
+        self.assertRegex(message, r'(?m)^Scope: in$')
+
+    def test_scope_hook_preserves_gray_intake_trailer(self):
+        self.install_for_launch()
+        self.write('public/gray-fixture.js', 'capture();\n')
+        scope = 'Scope: gray d0e54a43-debd-492f-a1fc-af2eccc685b9'
+        commit = self.commit('gray session commit\n\n' + scope)
+        message = self.git('show', '-s', '--format=%B', commit)
+        self.assertTrue(message.rstrip().endswith(scope), message)
+        self.assertEqual(message.count(scope), 1)
+
+    def test_scope_hook_adds_trailer_to_merge_commit(self):
+        self.install_for_launch()
+        self.git('checkout', '-qb', 'scope-feature')
+        self.write('public/feature.js', 'captureFeature();\n')
+        self.commit('feature without footer')
+        self.git('checkout', '-q', 'worker')
+        self.write('public/main.js', 'captureMain();\n')
+        self.commit('main without footer')
+        self.git('merge', '--no-ff', '-m', 'merge feature without footer', 'scope-feature')
+        message = self.git('show', '-s', '--format=%B', 'HEAD')
+        self.assertRegex(message, r'(?m)^Scope: in$')
+
     def test_hook_broad_failure_refuses_raw_push(self):
         self.install_for_launch()
         self.candidate()
@@ -309,6 +340,10 @@ class Fixture(unittest.TestCase):
         original = '#!/bin/sh\nexit 17\n'
         prior = custom / 'pre-push'
         prior.write_text(original); prior.chmod(0o755)
+        commit_message_marker = self.root / 'commit-msg-ran'
+        commit_message_hook = custom / 'commit-msg'
+        commit_message_hook.write_text('#!/bin/sh\ntouch "' + str(commit_message_marker) + '"\n')
+        commit_message_hook.chmod(0o755)
         marker = self.root / 'post-commit-ran'
         post = custom / 'post-commit'
         post.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\n'); post.chmod(0o755)
@@ -317,16 +352,20 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.git('config', '--get', 'core.hooksPath', cwd=self.primary), str(custom))
         self.passing_candidate()
         self.assertTrue(marker.exists(), 'inherited post-commit hook must still run')
+        self.assertTrue(commit_message_marker.exists(), 'inherited commit-msg hook must still run')
         self.assert_refused(self.raw_push())
         self.assertEqual(prior.read_text(), original)
         prior.write_text('#!/bin/sh\nexit 0\n')
         result = self.raw_push()
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_main_checkout_and_other_projects_are_not_automatically_hooked(self):
+    def test_main_checkout_gets_scope_hook_without_pre_push_gate(self):
         from agent_hub_host.worktree_guard import protect_bound_worktree
         self.assertTrue(protect_bound_worktree('git', str(self.primary), None, None))
         self.assertFalse((self.primary / '.git/hooks/pre-push').exists())
+        hooks_path = Path(self.git('config', '--get', 'core.hooksPath', cwd=self.primary))
+        self.assertTrue((hooks_path / 'commit-msg').is_file())
+        self.assertFalse((hooks_path / 'pre-push').exists())
         explicit = subprocess.run(['python3', 'host/agent_hub_host/prepush.py', 'install'],
                                   cwd=self.primary, env=self.env, capture_output=True)
         self.assertNotEqual(explicit.returncode, 0)
@@ -334,7 +373,7 @@ class Fixture(unittest.TestCase):
         self.assertFalse((self.primary / '.git/hooks/pre-push').exists())
         check = subprocess.run(['git', 'config', '--get', 'core.hooksPath'], cwd=self.primary,
                                env=self.env, capture_output=True)
-        self.assertEqual(check.returncode, 1)
+        self.assertEqual(check.returncode, 0)
 
         other = self.root / 'other-project'
         self.git('init', '-q', str(other))

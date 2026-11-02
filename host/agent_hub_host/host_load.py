@@ -13,7 +13,7 @@ start, and is ANDed into the heartbeat gate. Nothing running is ever touched.
 A host is busy only on a MEASURED signal (Alexey t2358u-t2363u):
 
 * CPU busy >= 98% averaged over >= 10s (``/proc/stat`` deltas, iowait excluded);
-* MemAvailable below 6 GiB (capped at 25% of RAM on small hosts);
+* MemAvailable below 3% of RAM (at least 512 MiB, capped at 2 GiB);
 * a runaway 1-minute load average above ``factor`` (default 6) x cores. Load
   counts IO-wait and runnable threads, so 1.5x cores is routine on a healthy
   host (RMTHZ at load 24-37 on 12 cores was 35-70% CPU with 30 GiB free).
@@ -37,8 +37,11 @@ HOST_LOAD_FACTOR_MAX = 8.0
 #: CPU is full only when measured busy CPU averages >= this over >= window.
 CPU_SATURATED_PCT = 98.0
 CPU_WINDOW_S = 10.0
-#: Hold new launches below this much MemAvailable.
-MEM_FLOOR_BYTES = 6 * 1024 ** 3
+#: Hold new launches below 3% of RAM (at least 512 MiB, capped at 2 GiB),
+#: matching server placement's effectiveFloorMb (intake 189f6cd6).
+MEM_FLOOR_BYTES = 2 * 1024 ** 3
+MEM_FLOOR_MIN_BYTES = 512 * 1024 ** 2
+MEM_FLOOR_PCT = 3
 #: Fixed refusal slug prefix; the suffix carries bounded numbers only.
 HOST_OVERLOAD_PREFIX = "host_overload"
 _STATE_KEEP_S = 300.0
@@ -177,7 +180,14 @@ def live_load_status(settings: Optional[dict] = None, *,
     except Exception:
         pass
 
-    mem_floor = min(MEM_FLOOR_BYTES, mem_total // 4) if mem_total else None
+    mem_floor = None
+    if mem_total and mem_total > 0:
+        total_mb = mem_total / (1024 ** 2)
+        floor_mb = min(
+            MEM_FLOOR_BYTES // (1024 ** 2),
+            max(MEM_FLOOR_MIN_BYTES // (1024 ** 2), round(total_mb * MEM_FLOOR_PCT / 100)),
+        )
+        mem_floor = int(floor_mb) * (1024 ** 2)
     trigger = None
     if runaway:
         trigger = "load_runaway"

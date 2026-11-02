@@ -68,6 +68,15 @@ AUTH_EXPIRED_PATTERNS = [
 ]
 
 
+def launch_diagnostics_lock_owner(candidate):
+    """Parse only the strict owner-id/state refusal grammar (intake 40316358)."""
+    try:
+        from .worktree_guard import parse_lock_owner_error
+        return parse_lock_owner_error(candidate)
+    except Exception:
+        return None
+
+
 def check_auth_expired_text(text: str) -> bool:
     """Return True if text contains genuine provider authentication failure in an error context."""
     if not text:
@@ -601,6 +610,11 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         if re.fullmatch(r'(?:cwd|tmpdir) filesystem free < (?:(?:20|50)GiB|disk) floor \+ required disk \([0-9]{1,16} B\)', candidate):
             reason, message = REFUSALS['launcher_disk_reserve']
             surfaced_tail = error_type + ': ' + candidate
+            refusal_found = True
+            break
+        if launch_diagnostics_lock_owner(candidate) is not None:
+            reason, message = REFUSALS['worktree_lock_failed: checkout could not be protected']
+            surfaced_tail = candidate
             refusal_found = True
             break
         if candidate in REFUSALS:

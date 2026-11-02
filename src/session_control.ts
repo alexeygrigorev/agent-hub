@@ -95,6 +95,8 @@ CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_eve
 CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL, generation INTEGER NOT NULL, intake_id TEXT NOT NULL, PRIMARY KEY(subject, generation, intake_id));
 CREATE TABLE IF NOT EXISTS session_worktree_episodes (subject TEXT PRIMARY KEY, active INTEGER NOT NULL, generation INTEGER NOT NULL, completed INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_stale_reconciliations (session_id TEXT PRIMARY KEY, previous_state TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL);
 `;
 
 type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string; tokenHash?: string };
@@ -157,8 +159,12 @@ function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
   return {
     sql: `(state IN ('queued','held','offered') OR (state IN ('starting','running','uncertain') AND EXISTS (
       SELECT 1 FROM fleet_sessions f WHERE f.machine_id = session_control_sessions.machine_id
-      AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id') AND f.observed_at >= ?)))`,
-    params: [cutoff],
+      AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id')
+      AND f.phase NOT IN ('exited','dead','pruned','forgotten','unobserved')
+      AND (f.observed_at >= ? OR EXISTS (
+        SELECT 1 FROM fleet_catalog_seen c WHERE c.machine_id = f.machine_id AND c.observed_at >= ?
+      )))))`,
+    params: [cutoff, cutoff],
   };
 }
 /** Literal must match the partial indexes session_control_live_created / _live_actor_created. */
@@ -2182,7 +2188,8 @@ export class SessionControlService {
         const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
           this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
             binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
-        return { session_id: row.id, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+        return { session_id: row.id, session_state: row.state, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+          native_last_activity_at: native?.last_activity_at ?? null,
           lock_release_permitted: !protectedSession || (adoptedLock && !row.guard_explicit_protection),
           engine: row.engine, adoption_intent_id: binding?.adoption_intent_id ?? null,
           tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),
@@ -4678,12 +4685,14 @@ export function adoptObservedNativeSessions(
       }
 
       // Update existing adopted session if state or phase changed
+      const staleReconciled = existing.state === 'stopped' && !verifiedTerminal && (s.phase === 'starting' || s.phase === 'running') &&
+        sql.exec("SELECT 1 FROM session_stale_reconciliations WHERE session_id = ? AND reason = 'stale_no_heartbeat' LIMIT 1", nativeId).toArray().length > 0;
       let shouldUpdate = false;
       let nextState = existing.state;
       if (verifiedTerminal && existing.state !== 'stopped') {
         nextState = 'stopped';
         shouldUpdate = true;
-      } else if (!verifiedTerminal && existing.state !== 'stopped' && existing.state !== state) {
+      } else if (!verifiedTerminal && (existing.state !== 'stopped' || staleReconciled) && existing.state !== state) {
         nextState = state;
         shouldUpdate = true;
       }
@@ -4694,6 +4703,9 @@ export function adoptObservedNativeSessions(
           isoNow,
           nativeId,
         );
+        if (staleReconciled) {
+          sql.exec('DELETE FROM session_stale_reconciliations WHERE session_id = ?', nativeId);
+        }
         updated++;
       }
       if (parentId && !existing.parent_id) {

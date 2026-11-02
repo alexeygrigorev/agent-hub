@@ -68,5 +68,9 @@ export function refreshObservedHostFamily(sql: SqlStorage, machineId: string, ex
 
 export function visibleSessionPrefixMatches(sql: SqlStorage, prefix: string, owns: (row:any)=>boolean): any[] {
   if (!/^[a-f0-9][a-f0-9-]{7,34}$/i.test(prefix)) return [];
-  return (sql.exec('SELECT * FROM session_control_sessions WHERE id LIKE ? ORDER BY id', prefix.toLowerCase()+'%').toArray() as any[]).filter(owns);
+  const pat = prefix.toLowerCase() + '%';
+  return (sql.exec(
+    `SELECT * FROM session_control_sessions WHERE id LIKE ? OR fleet_launch_id LIKE ? OR (CASE WHEN json_valid(binding_json) THEN json_extract(binding_json, '$.native_id') END) LIKE ? ORDER BY id`,
+    pat, pat, pat,
+  ).toArray() as any[]).filter(owns);
 }
