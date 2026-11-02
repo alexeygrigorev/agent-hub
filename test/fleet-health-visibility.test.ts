@@ -56,13 +56,13 @@ describe('fleet health visibility + machine aliasing', () => {
     add('unknown-bound', 'running', null);
     add('starting', 'starting', iso(-11 * 60000));
     const status = () => fleet.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='idle-account'").one());
-    expect(status()).toMatchObject({active: 3, reserved: 3, observed_sessions: 0});
+    expect(status()).toMatchObject({active: 3, reserved: 0, observed_sessions: 3});
     // A fresh incomplete report cannot turn retained old activity into proof
     // that either a bound launch or an orphan stopped consuming capacity.
     sql.exec("UPDATE fleet_catalog_census SET complete=0 WHERE machine_id='idle-host'");
-    expect(status()).toMatchObject({active: 5, reserved: 4, observed_sessions: 1});
+    expect(status()).toMatchObject({active: 5, reserved: 0, observed_sessions: 5});
     sql.exec("UPDATE fleet_catalog_census SET complete=1 WHERE machine_id='idle-host'");
-    expect(status()).toMatchObject({active: 3, reserved: 3, observed_sessions: 0});
+    expect(status()).toMatchObject({active: 3, reserved: 0, observed_sessions: 3});
     // Productive activity immediately restores the bound admission slot.
     sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(0));
     expect(status().active).toBe(4);
@@ -70,18 +70,18 @@ describe('fleet health visibility + machine aliasing', () => {
     // Independent host heartbeats do not prove the native catalog is current.
     sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
     sql.exec("UPDATE fleet_catalog_census SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
-    expect(status()).toMatchObject({active: 5, reserved: 4, observed_sessions: 1});
+    expect(status()).toMatchObject({active: 5, reserved: 0, observed_sessions: 5});
     sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(0));
     sql.exec("UPDATE fleet_catalog_census SET observed_at=? WHERE machine_id='idle-host'", iso(0));
     sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(-11 * 60000));
     for (const phase of ['unknown', 'uncertain', 'starting', 'broken']) {
       sql.exec("UPDATE fleet_sessions SET phase=? WHERE native_id='idle-bound'", phase);
-      expect(status().reserved).toBe(4);
+      expect(status()).toMatchObject({active: 4, reserved: 0, observed_sessions: 4});
     }
     sql.exec("UPDATE fleet_sessions SET phase='unobserved' WHERE native_id='idle-bound'");
-    expect(status().reserved).toBe(3); // A fresh complete census releases only this physical reservation.
+    expect(status()).toMatchObject({active: 3, reserved: 0, observed_sessions: 3}); // A fresh complete census releases only this physical reservation.
     sql.exec("UPDATE fleet_sessions SET phase='running' WHERE native_id='idle-bound'");
-    expect(status().reserved).toBe(3);
+    expect(status()).toMatchObject({active: 3, reserved: 0, observed_sessions: 3});
 
   }));
 
@@ -170,14 +170,24 @@ describe('fleet health visibility + machine aliasing', () => {
       "INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at) VALUES ('hetzner', 'n-orphan', 'parked', 'codex', 'running', 'idle', ?, 'demo', NULL, 'shared-codex', ?)",
       iso(0), iso(0),
     );
+    // One fresh in-flight reservation without an observed native session (counts in reserved),
+    // and one expired reservation past the 15m TTL (does not count).
+    sql.exec(
+      "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('a0000000-0000-4000-8000-000000000002', 'admin', 'human', NULL, 't2', 'k2', '{}', 'hetzner', 'codex', 'shared-codex', NULL, 'headless', 'demo', 'goal', 'starting', NULL, ?, ?)",
+      iso(-60000), iso(-1000),
+    );
+    sql.exec(
+      "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('a0000000-0000-4000-8000-000000000003', 'admin', 'human', NULL, 't3', 'k3', '{}', 'hetzner', 'codex', 'shared-codex', NULL, 'headless', 'demo', 'goal', 'starting', NULL, ?, ?)",
+      iso(-20 * 60000), iso(-16 * 60000),
+    );
     sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso(0));
     sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1)", iso(0));
     const status: any = fleet.accountStatus({ label: 'shared-codex', provider: 'codex', max_concurrency: 8, reserve_percent: 15, enabled: 1 });
     expect(status.active).toBe(status.reserved + status.observed_sessions);
     expect(status.reserved).toBe(1);
-    expect(status.observed_sessions).toBe(1);
+    expect(status.observed_sessions).toBe(2);
     expect(status.native_live).toBe(2);
-    expect(status.available_slots).toBe(6);
+    expect(status.available_slots).toBe(5);
   }));
 
   it('raises a stuck alert subject for launches held queued over 5 minutes without current numbers', () => fixture(async ({ live, sql }) => {
