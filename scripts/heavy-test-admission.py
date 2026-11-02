@@ -17,6 +17,12 @@ import time
 # moderately aged normal tickets (was 300s, which made every queued ticket
 # final-equivalent and the priority meaningless; position 33/35 observed).
 NORMAL_AGE_S = 1500
+try:  # test hook / host tuning; invalid values keep the default
+    _age = os.environ.get('AGENT_HUB_HEAVY_TEST_NORMAL_AGE_S', '')
+    if _age.isascii() and _age.isdecimal() and 1 <= int(_age) <= 86400:
+        NORMAL_AGE_S = int(_age)
+except Exception:
+    pass
 # Slot sizing (intake 167c6178 follow-up, 2026-11-02): RMTHZ (12 cores, 64G)
 # was capped at 2 slots with 40 sessions queued while ~65% CPU / 30G free.
 # The default is 6; a host may override it live, without restarting sessions,

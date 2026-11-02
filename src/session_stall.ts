@@ -92,7 +92,7 @@ export function sessionTerminalError(row: any, native: any): string | null {
  * leader's last CPU advance — separates a genuinely hung call (no output and
  * no CPU) from a long-running one that only lacks transcript writes. */
 export function activeToolCall(native: any, progress: any): boolean {
-  return native?.agent_state === 'working' ||
+  return (native?.agent_state === 'working' && native?.engine !== 'shell') ||
     (progress?.headless === true && progress?.agent_alive === true);
 }
 

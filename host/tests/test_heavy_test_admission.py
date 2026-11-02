@@ -19,6 +19,13 @@ from types import SimpleNamespace
 WRAPPER = Path(__file__).resolve().parents[2] / 'scripts/capped-test-run.sh'
 
 
+def _admission_module():
+    spec = importlib.util.spec_from_file_location('heavy_admission', WRAPPER.with_name('heavy-test-admission.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class AdmissionTests(unittest.TestCase):
     def setUp(self):
         parent = WRAPPER.parent.parent / '.local/tmp'
@@ -27,7 +34,7 @@ class AdmissionTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.children = []
         self.env = dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=str(self.root),
-                        AGENT_HUB_HEAVY_TEST_SLOTS='1', AGENT_HUB_HEAVY_TEST_WAIT_S='40',
+                        AGENT_HUB_HEAVY_TEST_SLOTS='1', AGENT_HUB_HEAVY_TEST_NORMAL_AGE_S='300', AGENT_HUB_HEAVY_TEST_WAIT_S='40',
                         AGENT_HUB_HEAVY_TEST_PRIORITY='normal')
         self.env.pop('AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN', None)
         self.holder = (self.root / 'slot-0.lock').open('a+')
@@ -104,7 +111,7 @@ class AdmissionTests(unittest.TestCase):
         normal = self.start('normal')
         first_final = self.start('final1', 'final')
         # Advance only this fixture's normal registration age, under the same
-        # mutex used by the real scheduler, rather than waiting five minutes.
+        # mutex used by the real scheduler, rather than waiting for the aging window.
         with (self.root / 'admission.lock').open('a+') as mutex:
             fcntl.flock(mutex, fcntl.LOCK_EX)
             state = self.state()
@@ -392,8 +399,8 @@ class QueueCostTests(unittest.TestCase):
         state = {'active': {'0': {'sequence': 1, 'priority': 'normal', 'created': 0}}}
         for i in range(2, 1002):
             state['active'][str(i)] = {'sequence': i, 'priority': 'final', 'created': i / 10}
-        self.assertNotEqual(self.module.Queue.head(state, 299), '0')
-        self.assertEqual(self.module.Queue.head(state, 300), '0')
+        self.assertNotEqual(self.module.Queue.head(state, self.module.NORMAL_AGE_S - 1), '0')
+        self.assertEqual(self.module.Queue.head(state, self.module.NORMAL_AGE_S), '0')
 
     def test_repeated_runs_reuse_lease_inode_and_keep_counter(self):
         # Thousands of admissions with real flock/atomic state writes but no
