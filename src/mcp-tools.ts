@@ -129,6 +129,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'engines maintain': 'Operator trigger for Hub credential refresh and direct provider quota; the cron already runs it.',
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',
   'engines remove': 'Operator credential withdrawal stays in the explicit credential-management CLI/UI workflow.',
+  'engines recommend': 'Read-only placement recommendation preview for CLI/backup callers; MCP callers use plan_agent or sessions_start (intake 83d27f69).',
   'engines status': 'Operator read of per-host engine sync status; deliberate CLI step, not an agent tool.',
   'engines cancel': 'Admin cancel of a pending engine rollout that restores the prior bundle version (intake 8cc9e31a, rollout 0de287c8); an operator incident action, never an agent tool.',
   'engines update': 'Operator rollout of Hub-managed engine versions to hosts (intake 8cc9e31a); a fleet-wide change, never an agent tool.',

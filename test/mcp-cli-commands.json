@@ -39,6 +39,7 @@
   "engines login",
   "engines maintain",
   "engines quota",
+  "engines recommend",
   "engines remove",
   "engines status",
   "engines sync",
