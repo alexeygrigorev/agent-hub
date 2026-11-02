@@ -1,0 +1,9 @@
+/* Webhooks page (intake 19ec91c2) — layout only, dakit provides the theme. */
+.wh-form { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; align-items: end; }
+.wh-form label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.85rem; }
+.wh-form input, .wh-form select { min-width: 10rem; }
+.wh-created { margin-top: 0.75rem; padding: 0.75rem; border: 1px solid var(--dk-border, #ccc); border-radius: 8px; }
+.wh-created code { display: inline-block; margin-top: 0.25rem; word-break: break-all; }
+.wh-hint { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.wh-audit { font-size: 0.8rem; max-height: 12rem; overflow: auto; margin: 0.25rem 0 0; padding-left: 1.25rem; }
+.wh-status { min-height: 1.5rem; color: var(--dk-muted, #666); }

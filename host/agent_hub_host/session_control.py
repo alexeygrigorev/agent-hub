@@ -600,9 +600,11 @@ def add_commands(sub):
     send = commands.add_parser('send', help='Enqueue one prompt delivery on a bound session')
     send.add_argument('id')
     body_src = send.add_mutually_exclusive_group(required=True)
+    body_src.add_argument('--prompt-id', help='Library prompt id, slug or slug@version (rendered by Hub; see --var)')
     body_src.add_argument('--body-file', help='UTF-8 prompt file, or - for stdin (max 16 KiB)')
     body_src.add_argument('--prompt', default=None,
                           help='Inline UTF-8 prompt text (max 16 KiB; same boundaries as --body-file)')
+    send.add_argument('--var', action='append', metavar='KEY=VALUE', help='Variable for {{var.KEY}} in a --prompt-id prompt (repeatable)')
     send.add_argument('--require-ready', dest='require_ready', action='store_true',
                       help='Refuse send immediately if target session has no recent reported state')
     send.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
@@ -1041,7 +1043,14 @@ def _execute(args):
         if cmd == 'send':
             if getattr(args, 'prompt', None) is not None and getattr(args, 'body_file', None):
                 raise SessionInputError('Cannot specify both --body-file and --prompt')
-            if getattr(args, 'prompt', None) is not None:
+            if getattr(args, 'prompt_id', None):
+                from .prompt_schedules import parse_vars
+                rendered = request('POST', '/api/prompts/' + __import__("urllib.parse").parse.quote(args.prompt_id, safe='@') + '/render',
+                                   {'vars': parse_vars(getattr(args, 'var', None)) or {}})
+                body = rendered.get('text') or ''
+                if not body.strip():
+                    raise SessionInputError('Prompt rendered empty')
+            elif getattr(args, 'prompt', None) is not None:
                 body = read_prompt_text(args.prompt, limit=MAX_BODY, field='Prompt')
             elif getattr(args, 'body_file', None):
                 body = read_file(args.body_file, limit=MAX_BODY, field='Body file')

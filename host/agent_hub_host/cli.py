@@ -457,6 +457,8 @@ def main():
     webhooks_cli.add_parser(sub)
     from . import schedules as schedules_cli
     schedules_cli.add_parser(sub)
+    from . import prompt_schedules as prompt_schedules_cli
+    prompt_schedules_cli.add_parser(sub)
     from . import ops_liveness
     ops_liveness.add_parser(sub)
     from . import limits_cli
@@ -706,6 +708,16 @@ def main():
                 print(json.dumps(rendered, indent=2, ensure_ascii=True))
         except Exception as exc:
             print(webhooks_cli.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd in ('prompts', 'schedules'):
+        from . import prompt_schedules as ps_cli
+        try:
+            result = ps_cli.execute_prompts(args) if args.cmd == 'prompts' else ps_cli.execute_schedules(args)
+            rendered = ps_cli.render_output(args, result)
+            print(rendered if isinstance(rendered, str) else json.dumps(rendered, indent=2, ensure_ascii=True))
+        except Exception as exc:
+            print(ps_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'schedule':

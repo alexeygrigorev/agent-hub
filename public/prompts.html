@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Prompts &amp; schedules · Agent Hub</title>
+  <link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css">
+  <link rel="stylesheet" href="/sessions.css">
+  <link rel="stylesheet" href="/prompts.css">
+  <script src="/auth.js"></script>
+  <script src="/prompts.js" defer></script>
+</head>
+<body>
+<div class="dk-shell" data-app="agent-hub" data-sidebar="expanded">
+  <a class="dk-skip-link" href="#main-content">Skip to content</a>
+
+  <header class="dk-topbar">
+    <button class="dk-icon-button" type="button" data-dk-drawer-toggle aria-controls="dk-sidebar" aria-expanded="false" aria-label="Open navigation">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <a class="dk-topbar__title" href="/">Agent Hub</a>
+    <div class="dk-topbar__end">
+      <nav class="hub-topbar-links" aria-label="Quick links">
+        <a class="hub-topbar-link" href="/sessions.html">Sessions</a>
+        <a class="hub-topbar-link" href="/webhooks.html">Webhooks</a>
+        <a class="hub-topbar-link" href="/prompts.html" aria-current="page">Prompts</a>
+        <a class="hub-topbar-link" href="/fleet.html#quota">Usage</a>
+      </nav>
+    </div>
+  </header>
+
+  <aside class="dk-sidebar" id="dk-sidebar" aria-label="Workspace">
+    <div class="dk-menu__identity">
+      <span class="dk-menu__name" id="menu-name">Signed out</span>
+      <span class="dk-menu__email" id="menu-email"></span>
+    </div>
+    <button class="dk-menu__item" type="button" role="switch" aria-checked="false" data-dk-theme-toggle>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      Dark mode<span class="dk-switch" aria-hidden="true"></span>
+    </button>
+    <div class="dk-menu__sep" role="separator"></div>
+    <button class="dk-menu__item dk-menu__item--danger" type="button" id="sign-out">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>
+      Sign out
+    </button>
+  </aside>
+
+  <main class="dk-main" id="main-content">
+    <div class="dk-page-head">
+      <h1 class="dk-page-head__title">Prompts &amp; schedules</h1>
+      <p class="dk-page-head__lede">Versioned prompt library and cron prompt schedules delivered into interactive sessions through the durable delivery queue (same queue as webhooks).</p>
+    </div>
+
+    <section class="dk-card" aria-labelledby="ps-prompts-title">
+      <h2 class="dk-card__title" id="ps-prompts-title">Prompt library</h2>
+      <div class="dk-table-wrap"><table class="dk-table">
+        <thead><tr><th>Slug</th><th>Title</th><th>Version</th><th>Updated</th><th>Actions</th></tr></thead>
+        <tbody id="ps-prompts-body"><tr><td colspan="5" class="dk-muted">Loading…</td></tr></tbody>
+      </table></div>
+      <pre class="dk-mono" id="ps-prompt-body" hidden></pre>
+    </section>
+
+    <section class="dk-card" aria-labelledby="ps-schedules-title">
+      <h2 class="dk-card__title" id="ps-schedules-title">Session schedules</h2>
+      <div class="dk-table-wrap"><table class="dk-table">
+        <thead><tr><th>Name</th><th>Target</th><th>Cron</th><th>Prompt</th><th>Enabled</th><th>Next</th><th>Last fire</th><th>Actions</th></tr></thead>
+        <tbody id="ps-schedules-body"><tr><td colspan="8" class="dk-muted">Loading…</td></tr></tbody>
+      </table></div>
+    </section>
+
+    <section class="dk-card" aria-labelledby="ps-deliveries-title">
+      <h2 class="dk-card__title" id="ps-deliveries-title">Recent schedule deliveries</h2>
+      <div class="dk-table-wrap"><table class="dk-table">
+        <thead><tr><th>Delivery</th><th>Schedule</th><th>Target</th><th>Status</th><th>Attempts</th><th>Error</th><th>Created</th><th>Delivered</th></tr></thead>
+        <tbody id="ps-deliveries-body"></tbody>
+      </table></div>
+    </section>
+
+    <p class="wh-status" id="ps-status" role="status"></p>
+  </main>
+
+  <div id="dk-live" class="dk-visually-hidden" aria-live="polite"></div>
+</div>
+<script src="/vendor/dakit/shell.js"></script>
+</body>
+</html>

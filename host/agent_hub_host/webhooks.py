@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import api, config, session_control
+from . import api, config, prompt_schedules, session_control
 
 TEST_INTERVAL = 3.0
 
@@ -85,6 +85,11 @@ def execute(args: argparse.Namespace):
             payload['template'] = session_control.read_file(args.template_file, max_chars=4096, field='Template')
         elif args.template:
             payload['template'] = session_control.read_prompt_text(args.template, max_chars=4096, field='Template')
+        if args.prompt_id:
+            payload['prompt_id'] = args.prompt_id
+            variables = prompt_schedules.parse_vars(args.var)
+            if variables:
+                payload['prompt_vars'] = variables
         if args.auth != 'token':
             payload['auth_mode'] = args.auth
         if args.rate_limit is not None:
@@ -205,6 +210,8 @@ def add_parser(sub) -> None:
     template_src = create.add_mutually_exclusive_group()
     template_src.add_argument('--template-file', help='UTF-8 template file (max 4096 chars)')
     template_src.add_argument('--template', help='Inline template ({{payload}}, {{payload_json}}, {{payload.field}})')
+    template_src.add_argument('--prompt-id', help='Library prompt id, slug or slug@version used as the template')
+    prompt_schedules.add_vars_argument(create)
     create.add_argument('--auth', choices=['token', 'hmac'], default='token',
                         help='token: X-Webhook-Token bearer; hmac: X-Webhook-Signature sha256 HMAC over "<ts>.<body>"')
     create.add_argument('--rate-limit', type=int, default=None, help='Requests per minute (default 30)')

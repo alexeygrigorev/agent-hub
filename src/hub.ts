@@ -55,6 +55,7 @@ import { MetricsStore, handleMetricsRoutes } from './metrics';
 import { MonitoringService } from './monitoring';
 import { BackupService } from './backup';
 import { WebhookService } from './webhooks';
+import { PromptLibraryService, SessionSchedulesService } from './scheduled_prompts';
 import { LaunchSchedulesService } from './launch_schedules';
 import { isValidMachineId } from './machine-id';
 import { HostHistoryService } from './host-history';
@@ -153,6 +154,8 @@ export class Hub extends DurableObject {
   public backupService: BackupService;
   public hostHistoryService: HostHistoryService;
   public webhookService: WebhookService;
+  public promptLibrary: PromptLibraryService;
+  public sessionSchedules: SessionSchedulesService;
   public launchSchedules: LaunchSchedulesService;
 
   private idleWork: IdleWorkService;
@@ -244,6 +247,14 @@ export class Hub extends DurableObject {
       () => this.sessionControlService,
       validSessionSecret(this.env) ? this.env.SESSION_SECRET : null);
     this.webhookService.init();
+    // Prompt library + session schedules (intake 19ec91c2 AC8-AC10): schedules
+    // enqueue into the webhook delivery queue (same durable redelivery).
+    const txn = <T>(fn: () => T): T => this.ctx.storage.transactionSync(fn);
+    this.promptLibrary = new PromptLibraryService(this.sql, txn, Date.now);
+    this.promptLibrary.init();
+    this.webhookService.setPromptResolver(ref => this.promptLibrary.resolve(ref));
+    this.sessionSchedules = new SessionSchedulesService(this.sql, txn, Date.now, this.promptLibrary,
+      (source, sourceId, key, target, body) => this.webhookService.enqueueDelivery(source, sourceId, key, target, body));
     // Cron launch schedules (intake a839dfb6): each due tick creates a Hub
     // intake (source schedule) and starts the linked headless session through
     // the canonical admission path below; placement/capacity gates are never
@@ -1142,6 +1153,12 @@ export class Hub extends DurableObject {
       }
       if (path === '/webhooks' || path.startsWith('/webhooks/')) {
         return this.webhookService.handleIngest(request, path);
+      }
+      if (path === '/api/prompts' || path.startsWith('/api/prompts/')) {
+        return this.promptLibrary.handle(request, await this.sessionControlAuth(request));
+      }
+      if (path === '/api/session-schedules' || path.startsWith('/api/session-schedules/')) {
+        return this.sessionSchedules.handle(request, await this.sessionControlAuth(request));
       }
       // Cron launch schedules (intake a839dfb6). Admin management under
       // /api/schedules with the same operator/cookie authority as webhooks;
@@ -2315,6 +2332,8 @@ export class Hub extends DurableObject {
     // enqueue sessions through the canonical admission path. Runs on both
     // crons (every 5 minutes); a manual single-check run never fires them.
     if (!only) {
+      try { await m('session_schedules', () => this.sessionSchedules.tick()); }
+      catch { console.warn('session_schedule_tick_failed'); }
       try { await m('launch_schedules', () => this.launchSchedules.tick('cron')); }
       catch { console.warn('launch_schedule_tick_failed'); }
     }
