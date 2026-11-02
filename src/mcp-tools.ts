@@ -163,6 +163,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'schedule resume': 'Operator cron lifecycle control stays an explicit operator action in the CLI.',
   'schedule runs': 'Run history inspection is operator-only product scope; operators use the CLI or dashboard.',
   'schedule tick': 'A manual tick fires sessions outside their cron; stays an explicit operator action in the CLI.',
+  'worktree repair-locks': 'Host-local repair of git worktree locks left by terminal Hub sessions (intake f49b4d69); runs on the owning host against its own checkouts, dry-run by default - never an agent tool.',
   'ops heartbeat': 'Host ops-watchdog and orchestrator tick reports for Hub-side liveness (intake 500fd60b); a model tool must not fake liveness for the session it runs in.',
   'ops status': 'Operator view of orchestrator/watchdog liveness and backlog idle episodes; alerts reach operators through the existing alert path.',
 };
