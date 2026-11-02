@@ -914,6 +914,14 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         next_terminal = 0
         worktree_thread = None
         next_worktree = 0
+        # Intake 8cc2848c AC2: the intake-worktree commands poll has its own
+        # cadence and thread. It previously shared next_worktree and
+        # worktree_thread with the worktree-observer step, whose check reset
+        # next_worktree to +60s before the commands check ran, so the commands
+        # step never fired, refresh requests stayed queued forever and the Hub
+        # worktree close gate kept reporting 'status unknown'.
+        worktree_commands_thread = None
+        next_worktree_commands = 0
         count = 0
         # Operator fleet settings (workspaces map, workspace_roots,
         # subscriptions, launcher) are re-read when the file changes, so a
@@ -1011,11 +1019,12 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     _log(json.dumps({'event': 'session_intake_credentials_error', 'type': type(error).__name__}), flush=True)
                 # Intake 4b161918: intake-worktree status/remove commands run in
                 # one single-inflight daemon thread (git fetch can take a minute),
-                # polled every WORKTREE_POLL_S to bound Hub requests.
-                if time.monotonic() >= next_worktree:
-                    worktree_thread = maybe_start_named_thread(
-                        worktree_thread, worktree_commands_step_once, (dispatcher,), 'intake-worktree-commands')
-                    next_worktree = time.monotonic() + WORKTREE_POLL_S
+                # polled every WORKTREE_POLL_S to bound Hub requests. Independent
+                # cadence/thread from the worktree-observer step (8cc2848c AC2).
+                if time.monotonic() >= next_worktree_commands:
+                    worktree_commands_thread = maybe_start_named_thread(
+                        worktree_commands_thread, worktree_commands_step_once, (dispatcher,), 'intake-worktree-commands')
+                    next_worktree_commands = time.monotonic() + WORKTREE_POLL_S
                 # Status observation never blocks commands/quota: one bounded
                 # single-inflight daemon thread, skipped while alive.
                 status_thread = maybe_start_status_thread(status_thread, status_collector)
