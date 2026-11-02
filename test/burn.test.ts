@@ -137,7 +137,7 @@ describe('burn-aware model candidates', () => {
     expect(modelCandidates({ tier: 'daily' }, r, a, stale, NOW)).toEqual([]);
   });
 
-  it.each([['gemini', 'gemini', 'gemini-2.5-pro', 'deep', 'medium'], ['go', 'opencode', 'opencode-go/muse-spark-1.3-contributor', 'daily', null]])(
+  it.each([['gemini', 'gemini', 'gemini-4-argon-medium', 'deep', 'medium'], ['go', 'opencode', 'opencode-go/muse-spark-1.3-contributor', 'daily', null]])(
     'scores expiring quota for %s', (provider, engine, model, tier, effort) => {
       const [candidate] = modelCandidates({ tier }, route(provider, engine), ad(engine, model, effort, provider + '-acct'), q(weekly(95, 28)), NOW);
       expect(candidate.factors.burn).toBeGreaterThan(3);

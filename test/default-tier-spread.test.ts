@@ -1,10 +1,9 @@
 // Intake 3d1f8702: unspecified starts must spread by quota headroom across engines
-// (Claude sonnet, Z.ai, OpenCode muse, Antigravity, Codex luna) instead of always
+// (Claude sonnet, Z.ai, OpenCode muse, Codex luna) instead of always
 // landing on Codex luna, and unmetered engines (no host quota API) must stay placeable.
 // Intake 9647e6d5: fully unpinned auto-starts draw weighted by headroom with no
 // fixed order; the deterministic top pick stays for pins, previews and callers
-// without a random source; default routing never resolves high-effort models
-// (Antigravity is gemini-4-argon-medium, never gemini-4-argon-high).
+// without a random source; Argon aliases remain medium-effort deep choices.
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -44,15 +43,19 @@ describe('default tier policy', () => {
     expect(byId.get('sonnet')).toMatchObject({ effort: 'medium' });
   });
 
-  it('never defaults to high effort: antigravity is medium and argon-high is gone', () => {
+  it('keeps medium-effort Argon aliases out of the daily tier', () => {
     const byId = new Map((policy.models as any[]).map(m => [m.id, m]));
-    // Intake 9647e6d5: an unpinned auto-start must never resolve Antigravity
-    // to gemini-4-argon-high. Both Antigravity-family legs run at medium.
+    // Intake 9647e6d5: Argon aliases keep a medium model and effort, while
+    // remaining explicit/deep-tier choices rather than daily defaults.
     expect(byId.get('argon')).toMatchObject({ model: 'gemini-4-argon-medium', effort: 'medium' });
-    expect(byId.get('argon-gemini')).toMatchObject({ model: 'gemini-2.5-pro', effort: 'medium' });
+    expect(byId.get('argon-gemini')).toMatchObject({ model: 'gemini-4-argon-medium', effort: 'medium' });
     const daily = policy.tiers.daily as string[];
+    for (const id of policy.tiers.deep as string[]) expect(daily).not.toContain(id);
+    expect(daily).not.toContain('argon');
+    expect(daily).not.toContain('argon-gemini');
     expect(daily).not.toContain('haiku');
     expect(daily).not.toContain('astra');
+    expect(daily).not.toContain('opus');
     for (const id of daily) {
       const m = byId.get(id);
       expect(m.model, id).not.toBe('gemini-4-argon-high');
@@ -62,7 +65,7 @@ describe('default tier policy', () => {
 });
 
 describe('default tier placement', () => {
-  it('spreads three unspecified starts over at least two engines including unmetered ones', async () => {
+  it('spreads unspecified starts across quota-ready and unmetered preferred engines', async () => {
     const now = Date.now();
     const iso = (d = 0) => new Date(now + d).toISOString();
     const bindings = env as unknown as Env;
@@ -74,19 +77,21 @@ describe('default tier placement', () => {
       hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
         machine, machine, machine, iso(), iso(), JSON.stringify({
           mem_avail_mb: 32000, disk_free_gb: 80, cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() },
-        }), JSON.stringify({ engines: ['codex', 'claude', 'antigravity', 'opencode'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
+        }), JSON.stringify({ engines: ['codex', 'claude', 'antigravity', 'zcodex', 'opencode'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
       const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] } as any;
       const put = await fleet.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify({
         accounts: [
           { label: 'shared-codex', provider: 'codex', max_concurrency: 4, reserve_percent: 0, enabled: true },
           { label: 'shared-claude', provider: 'claude', max_concurrency: 4, reserve_percent: 0, enabled: true },
           { label: 'hub-antigravity', provider: 'gemini', max_concurrency: 4, reserve_percent: 0, enabled: true },
+          { label: 'shared-zai', provider: 'zai', max_concurrency: 4, reserve_percent: 0, enabled: true },
           { label: 'shared-go', provider: 'go', max_concurrency: 4, reserve_percent: 0, enabled: true },
         ],
         routes: [
           { machine_id: machine, engine: 'codex', account: 'shared-codex', profile: null },
           { machine_id: machine, engine: 'claude', account: 'shared-claude', profile: null },
           { machine_id: machine, engine: 'antigravity', account: 'hub-antigravity', profile: 'hub-hub-antigravity' },
+          { machine_id: machine, engine: 'zcodex', account: 'shared-zai', profile: null },
           { machine_id: machine, engine: 'opencode', account: 'shared-go', profile: null },
         ] }) }), admin);
       expect(put.status, await put.clone().text()).toBe(200);
@@ -94,8 +99,9 @@ describe('default tier placement', () => {
         'INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)', machine, account, service, null, iso(), quota);
       sub('shared-codex', 'codex', metered(iso(), 60, now));
       sub('shared-claude', 'claude', metered(iso(), 27, now));
-      // The probes for the unmetered engines fail on the host, as observed live.
       sub('hub-antigravity', 'gemini', broken(iso()));
+      sub('shared-zai', 'zai', metered(iso(), 60, now));
+      // The probes for the unmetered engines fail on the host, as observed live.
       sub('shared-go', 'go', broken(iso()));
 
       expect(fleet.accountStatus(hub.sql.exec("SELECT * FROM fleet_accounts WHERE label='hub-antigravity'").one())).toMatchObject({ status: 'ok' });
@@ -115,6 +121,7 @@ describe('default tier placement', () => {
       expect(engines.slice(0, 3).every(e => e === 'codex'), engines.join(',')).toBe(false);
       expect(engines).toContain('antigravity');
       expect(engines).toContain('opencode');
+      expect(engines).toContain('zcodex');
     });
   });
 
@@ -218,20 +225,18 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
       hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
         machine, machine, machine, iso(), iso(), JSON.stringify({
           mem_avail_mb: 32000, disk_free_gb: 80, cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() },
-        }), JSON.stringify({ engines: ['codex', 'claude', 'antigravity', 'zcodex', 'opencode'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
+        }), JSON.stringify({ engines: ['codex', 'claude', 'zcodex', 'opencode'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
       const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] } as any;
       const put = await fleet.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify({
         accounts: [
           { label: 'shared-codex', provider: 'codex', max_concurrency: 4, reserve_percent: 0, enabled: true },
           { label: 'shared-claude', provider: 'claude', max_concurrency: 4, reserve_percent: 0, enabled: true },
-          { label: 'hub-antigravity', provider: 'gemini', max_concurrency: 4, reserve_percent: 0, enabled: true },
           { label: 'zai-central', provider: 'zai', max_concurrency: 4, reserve_percent: 0, enabled: true },
           { label: 'shared-go', provider: 'go', max_concurrency: 4, reserve_percent: 0, enabled: true },
         ],
         routes: [
           { machine_id: machine, engine: 'codex', account: 'shared-codex', profile: null },
           { machine_id: machine, engine: 'claude', account: 'shared-claude', profile: null },
-          { machine_id: machine, engine: 'antigravity', account: 'hub-antigravity', profile: 'hub-hub-antigravity' },
           { machine_id: machine, engine: 'zcodex', account: 'zai-central', profile: null },
           { machine_id: machine, engine: 'opencode', account: 'shared-go', profile: null },
         ] }) }), admin);
@@ -241,16 +246,15 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
       sub('shared-codex', 'codex', metered(iso(), 60, now));
       sub('shared-claude', 'claude', metered(iso(), 27, now));
       // Keep each preferred provider below the Luna fallback floor so this
-      // fixture exercises a draw across all five configured candidates.
+      // fixture exercises a draw across all four daily-eligible candidates.
       sub('zai-central', 'zai', metered(iso(), 29, now));
       // The probes for the unmetered engines fail on the host, as observed live.
-      sub('hub-antigravity', 'gemini', broken(iso()));
       sub('shared-go', 'go', broken(iso()));
 
       // Without a random source the fully unpinned start stays deterministic.
       const top = fleet.plan({ mode: 'headless', workspace: 'demo', prompt: 'deterministic' });
       expect(top.selected, JSON.stringify(top.rejected)).toBeTruthy();
-      expect(top.candidates!.length).toBe(5);
+      expect(top.candidates!.length).toBe(4);
       expect(top.selected).toBe(top.candidates![0]);
       // A pinned engine keeps the top pick even with a random source.
       const pinned = fleet.plan({ mode: 'headless', workspace: 'demo', prompt: 'pinned', engine: 'codex' }, undefined, mulberry32(9647));
@@ -275,15 +279,14 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
       const counts = new Map<string, number>();
       for (const e of seqA) counts.set(e, (counts.get(e) ?? 0) + 1);
       // Every engine with headroom gets starts; nothing stacks on one winner.
-      expect([...counts.keys()].sort()).toEqual(['antigravity', 'claude', 'codex', 'opencode', 'zcodex']);
+      expect([...counts.keys()].sort()).toEqual(['claude', 'codex', 'opencode', 'zcodex']);
       for (const [, n] of counts) expect(n).toBeGreaterThanOrEqual(20);
       // Weighting follows quota headroom: 60% codex outdraws 27% claude.
       expect(counts.get('codex')!).toBeGreaterThan(counts.get('claude')!);
       // Luna never takes every start (the t2555u complaint).
       expect(counts.get('codex')).toBeLessThan(400);
 
-      // The drawn legs are the wanted default models, never high-effort
-      // Antigravity-high, haiku or astra.
+      // The drawn legs stay in the daily tier and never resolve to deep models.
       const seen = new Map<string, any>();
       {
         const rand = mulberry32(9647);
@@ -291,6 +294,7 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
           const planned: any = fleet.plan({ mode: 'headless', workspace: 'demo', prompt: 'legs ' + i }, undefined, rand);
           const sel = planned.selected.selection;
           if (!seen.has(planned.selected.engine)) seen.set(planned.selected.engine, sel);
+          expect(['argon', 'argon-gemini', 'astra', 'opus']).not.toContain(sel.id);
           expect(sel.model, planned.selected.engine).not.toBe('gemini-4-argon-high');
           expect(String(sel.id).toLowerCase()).not.toContain('haiku');
           expect(String(sel.id).toLowerCase()).not.toContain('astra');
@@ -298,7 +302,6 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
         }
       }
       expect(seen.get('claude')).toMatchObject({ id: 'sonnet', effort: 'medium' });
-      expect(seen.get('antigravity')).toMatchObject({ id: 'argon', model: 'gemini-4-argon-medium', effort: 'medium' });
       expect(seen.get('opencode')).toMatchObject({ id: 'muse' });
       expect(seen.get('codex')).toMatchObject({ id: 'luna', effort: 'max' });
       expect(seen.get('zcodex')).toMatchObject({ model: 'glm-5.3-flash' });

@@ -235,10 +235,9 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE fleet_accounts SET provider='gemini' WHERE label='shared-codex'");
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
     // Duplicate model ids are forbidden: each engine alternative has its own
-    // policy id (argon for antigravity, argon-gemini for gemini). Default
-    // routing never uses high effort (intake 9647e6d5): antigravity resolves
-    // to gemini-4-argon-medium, the gemini engine to gemini-2.5-pro.
-    const expectedModel = { antigravity: 'gemini-4-argon-medium', gemini: 'gemini-2.5-pro' } as const;
+    // policy id (argon for antigravity, argon-gemini for gemini). Both Argon
+    // alternatives use the verified medium model and remain deep-tier only.
+    const expectedModel = { antigravity: 'gemini-4-argon-medium', gemini: 'gemini-4-argon-medium' } as const;
     for (const [engine, modelId] of [['antigravity', 'argon'], ['gemini', 'argon-gemini']] as const) {
       sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
       sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
@@ -1095,10 +1094,10 @@ describe('generic accounts and launch placement', () => {
     expect(s.plan(intent()).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
     expect(s.plan(intent({ mode: 'interactive', prompt: '' })).selected?.machine).toBe('hetzner');
   }));
-  it('places default daily work on eligible Gemini and falls back to Z.ai when Gemini is depleted (intakes 4f6cf562/85318207)', async () => fixture(async (s, sql) => {
+  it('keeps deep Argon out of daily work and uses Z.ai when Claude is unavailable (intakes 4f6cf562/85318207)', async () => fixture(async (s, sql) => {
     // One host advertises Claude, Gemini and Z.ai, but refuses Claude headless.
-    // Gemini is now eligible for daily work; known quota exhaustion must still
-    // route the same default goal through the remaining admitted Z.ai model.
+    // Argon remains deep-tier only, so the daily goal uses the admitted Z.ai
+    // model while the deep request can still use Gemini Argon.
     const entries = [['shared-claude', 'claude', 'claude', 90], ['shared-gemini', 'gemini', 'antigravity', 50], ['shared-zai', 'zai', 'zcodex', 20]];
     const config = {
       accounts: entries.map(([label, provider]) => ({ label, provider, max_concurrency: 8, reserve_percent: 0, enabled: true })),
@@ -1111,17 +1110,16 @@ describe('generic accounts and launch placement', () => {
       fleet_route_rejections: [{ engine: 'claude', account: 'shared-claude', profile: null, mode: 'headless', reason: 'model_unsupported' }] };
     sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'hetzner');
     const headless = s.plan(intent({ mode: 'headless' }));
-    expect(headless.selected?.engine, JSON.stringify(headless.rejected)).toBe('antigravity');
-    expect(headless.selected?.account).toBe('shared-gemini');
-    expect(headless.selected?.selection).toMatchObject({ id: 'argon' });
+    expect(headless.selected?.engine, JSON.stringify(headless.rejected)).toBe('zcodex');
+    expect(headless.selected?.account).toBe('shared-zai');
+    expect(headless.selected?.selection).toMatchObject({ id: 'glm-flash', model: 'glm-5.3-flash' });
+    expect(headless.candidates?.some((c: any) => ['argon', 'argon-gemini', 'astra', 'opus'].includes(c.selection?.id)) ?? false).toBe(false);
     expect(headless.rejected).toContainEqual({ machine: 'hetzner', engine: 'claude', reason: 'model_unsupported' });
-    expect(headless.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
     // The headless refusal remains mode-scoped, and actual quota headroom
     // still lets the healthier Claude account win this interactive request.
     const interactive = s.plan(intent({ mode: 'interactive', prompt: '' }));
     expect(interactive.selected?.engine, JSON.stringify(interactive.rejected)).toBe('claude');
     expect(interactive.selected?.selection).toMatchObject({ id: 'sonnet' });
-    expect(interactive.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
     expect(interactive.rejected).not.toContainEqual(expect.objectContaining({ engine: 'claude' }));
     const deep = s.plan(intent({ mode: 'headless', tier: 'deep' }));
     expect(deep.selected?.engine, JSON.stringify(deep.rejected)).toBe('antigravity');
@@ -1136,7 +1134,6 @@ describe('generic accounts and launch placement', () => {
     expect(fallback.selected?.engine, JSON.stringify(fallback.rejected)).toBe('zcodex');
     expect(fallback.selected?.account).toBe('shared-zai');
     expect(fallback.selected?.selection).toMatchObject({ id: 'glm-flash', model: 'glm-5.3-flash' });
-    expect(fallback.rejected).toContainEqual({ machine:'hetzner',engine:'antigravity',reason:'account_blocked' });
     expect(fallback.rejected).toContainEqual({ machine:'hetzner',engine:'claude',reason:'model_unsupported' });
   }));
   it('accepts host model and parent metadata in census reports and rejects malformed values atomically', async () => fixture(async (s, sql) => {

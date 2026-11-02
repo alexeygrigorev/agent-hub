@@ -111,7 +111,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(claudeCand.selection).toMatchObject({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
       expect(plan.candidates.filter((c: any) => c.engine === 'claude').every((c: any) =>
         c.selection?.id === 'sonnet' && c.selection?.effort === 'medium')).toBe(true);
-      expect(plan.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(false);
+      expect(plan.candidates.some((c: any) => ['argon', 'argon-gemini', 'astra', 'opus'].includes(c.selection?.id))).toBe(false);
       expect(plan.candidates.some((c: any) => /haiku/i.test(c.selection?.model ?? ''))).toBe(false);
 
       // Astra requires an explicit deep/review tier; even another tier that
@@ -132,8 +132,9 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       updateSub('zai-central', 'zai', 40);
       updateSub('shared-codex', 'codex', 95);
       const withHealthy: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'ordinary start' });
-      for (const id of ['argon', 'muse', 'sonnet', 'luna'])
+      for (const id of ['muse', 'sonnet', 'luna'])
         expect(withHealthy.candidates.some((c: any) => c.selection?.id === id), id).toBe(true);
+      expect(withHealthy.candidates.some((c: any) => ['argon', 'argon-gemini', 'astra', 'opus'].includes(c.selection?.id))).toBe(false);
       expect(withHealthy.candidates.some((c: any) =>
         c.engine === 'zcodex' && c.account === 'zai-central' && c.selection?.provider === 'zai')).toBe(true);
       const lunaHealthy = withHealthy.candidates.find((c: any) => c.selection?.id === 'luna');
