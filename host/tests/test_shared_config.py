@@ -283,6 +283,9 @@ def test_packaged_bundle_build_refuses_session_credentials(tmp_path, monkeypatch
     (pkg / '__init__.py').write_text('')
     (repo / 'config').mkdir()
     (repo / 'config/model-routing.json').write_text('{}')
+    # The build copies the maintained supervisor before the bundle embed.
+    (repo / 'scripts').mkdir()
+    (repo / 'scripts/session-host-supervisor.py').write_text('#')
     (repo / 'shared-config/aws').mkdir(parents=True)
     (repo / 'shared-config/manifest.json').write_text(json.dumps({'version': 1, 'files': ['aws/config']}))
     (repo / 'shared-config/aws/config').write_text('[default]\n' + material + '\n')

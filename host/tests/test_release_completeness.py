@@ -151,6 +151,7 @@ class ReleaseCompletenessTests(unittest.TestCase):
             files = {
                 "config/model-routing.json": "{}",
                 "scripts/session-host-supervisor.py": "#",
+                "scripts/build-host-release.py": "#",
                 "scripts/metrics-dashboard-export.py": "#",
                 "pyproject.toml": "",
                 "uv.lock": "",
