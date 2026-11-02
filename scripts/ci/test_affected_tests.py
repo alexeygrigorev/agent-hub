@@ -16,6 +16,10 @@ class SelectTests(unittest.TestCase):
         for rel, text in {
             'src/quota.ts': '', 'host/agent_hub_host/jobs.py': '',
             'test/quota.test.ts': "import '../src/quota'", 'test/other.test.ts': 'nothing',
+            'test/mcp.test.ts': 'MCP integration test',
+            'src/mcp-tools.ts': '', 'src/mcp.ts': '', 'src/mcp-usage.ts': '',
+            'src/mcp-oauth.ts': '', 'src/conversation-hub.ts': '', 'src/worker.ts': '',
+            'src/ui-pages.ts': '',
             'host/tests/test_jobs.py': 'from agent_hub_host import jobs',
             'host/tests/test_misc.py': 'import agent_hub_host.jobs as j',
             'host/tests/test_unrelated.py': 'import os',
@@ -37,6 +41,11 @@ class SelectTests(unittest.TestCase):
     def test_shared_infrastructure_is_broad(self):
         self.assertEqual(m.select(['package-lock.json', 'host/tests/conftest.py'], self.root)['broad'],
                          ['package-lock.json', 'host/tests/conftest.py'])
+
+    def test_mcp_surface_changes_always_select_mcp_integration_test(self):
+        for path in sorted(m.MCP_FILES):
+            with self.subTest(path=path):
+                self.assertEqual(m.select([path], self.root)['vitest'], ['test/mcp.test.ts'])
 
 
 if __name__ == '__main__':
