@@ -487,8 +487,11 @@ class SessionRulesTests(unittest.TestCase):
         from agent_hub_host.session_rules import (
             CAPACITY_RETRY_RULE, CLEAN_EXIT_RULE, SESSION_PREAMBLE,
             compose_prompt)
-        self.assertIn("scripts/capped-test-retry.sh -- scripts/test-full-local.sh --priority final",
-                      CAPACITY_RETRY_RULE)
+        self.assertIn("scripts/capped-test-retry.sh -- <command>", CAPACITY_RETRY_RULE)
+        self.assertNotIn("test-full-local.sh", CAPACITY_RETRY_RULE)
+        from agent_hub_host.session_rules import CI_ONLY_TESTS_RULE
+        self.assertIn("gh pr merge --auto --rebase", CI_ONLY_TESTS_RULE)
+        self.assertIn(CI_ONLY_TESTS_RULE, SESSION_PREAMBLE)
         self.assertIn("exit 3", CAPACITY_RETRY_RULE)
         self.assertIn("HOLD", CAPACITY_RETRY_RULE)
         self.assertIn("never retried", CAPACITY_RETRY_RULE)
