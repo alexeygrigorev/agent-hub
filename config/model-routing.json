@@ -144,11 +144,11 @@
     },
     {
       "id": "argon",
-      "model": "gemini-4-argon-high",
+      "model": "gemini-4-argon-medium",
       "provider": "gemini",
       "engine": "antigravity",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "luna",
@@ -216,11 +216,11 @@
     },
     {
       "id": "argon-gemini",
-      "model": "gemini-4-argon-high",
+      "model": "gemini-2.5-pro",
       "provider": "gemini",
       "engine": "gemini",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "beam-free",
