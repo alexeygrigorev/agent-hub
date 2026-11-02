@@ -544,6 +544,7 @@ async function closeIntake(force) {
 }
 
 function renderDetail(task) {
+  window.intakeStats?.detail(task.stats);
   const titleEl = byId('intake-detail-title');
   const badgesEl = byId('intake-detail-badges');
   const metaEl = byId('intake-detail-meta');
@@ -702,7 +703,7 @@ async function refreshTaskDetail(taskId) {
   if (!taskId || selectedTaskId !== taskId) return;
   const actionStatus = byId('intake-action-status');
   try {
-    const data = await api(`/api/intake/tasks/${encodeURIComponent(taskId)}`);
+    const data = await api(`/api/intake/tasks/${encodeURIComponent(taskId)}?include_stats=true`);
     if (selectedTaskId !== taskId || !data || !data.task) return;
     cachedDetail = data.task;
     renderDetail(data.task);
@@ -724,6 +725,7 @@ function openTaskDetail(taskId, pushHistory = true) {
   const listSec = byId('intake-list-section');
   const detailSec = byId('intake-detail-section');
   if (listSec) listSec.hidden = true;
+  if (byId('intake-stats-section')) byId('intake-stats-section').hidden = true;
   if (detailSec) detailSec.hidden = false;
   if (pushHistory) history.pushState({ taskId }, '', taskPath(taskId));
   const cached = cachedTasks.find(t => t.id === taskId);
@@ -745,6 +747,7 @@ function closeTaskDetail(pushHistory = true) {
   const detailSec = byId('intake-detail-section');
   if (detailSec) detailSec.hidden = true;
   if (listSec) listSec.hidden = false;
+  if (byId('intake-stats-section')) byId('intake-stats-section').hidden = false;
   if (pushHistory) history.pushState({}, '', '/intake');
   renderList(cachedTasks, byId('intake-filter')?.value || '');
 }

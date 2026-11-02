@@ -212,7 +212,17 @@ describe('M5 public Worker authority, retained unread and bridge contract', () =
   });
   it('scans only explicit per-CID grants and fails closed above fifty', async () => {
     const { owner, cid } = await setup(); expect((await evaluate()).status).toBe('fail');
-    for (let n = 0; n < 50; n++) { const next = await group(owner); await grant(next, owner); }
+    // Keep the HTTP authentication and grant issuance paths, but avoid 100
+    // Worker/DO RPC round trips just to populate this scan-boundary fixture.
+    await inside(async h => {
+      const local = (path: string, method: string, body: unknown) => h.fetch(new Request('https://hub.test' + path, {
+        method, headers: { Cookie: owner, 'X-CSRF-Token': csrf, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      }));
+      for (let n = 0; n < 50; n++) {
+        const next = (await ok(await local('/api/conversations', 'POST', { kind: 'group', title: 'Local ping contract', members: [actor], idempotency_key: crypto.randomUUID() }), 201)).id;
+        await ok(await local(`/api/conversations/${next}/automation`, 'PUT', { check: 'followup', target_actor: actor, body: template, on: 'fail', expires_at: Date.now() + 600000 }));
+      }
+    });
     await inside(h => expect(() => h.conversationsService.evaluateScheduledBacklog({ actor, checkName: 'followup', maxAgeS: 3600 })).toThrow());
     expect((await evaluate(cid)).status).toBe('fail');
     const unauthorized = await group(owner); await send(unauthorized, owner); await age(unauthorized);

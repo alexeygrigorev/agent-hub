@@ -60,6 +60,8 @@ tool('jobs_list', 'GET', '/api/fleet/tasks', 'Recent routed tasks.', ['jobs']);
 tool('jobs_show', 'GET', '/api/fleet/tasks/{id}', 'Task state, report and artifacts.', ['job']);
 tool('task_result', 'POST', '/api/fleet/tasks/{id}/result', 'Assigned host only: status/report/artifacts/confirmed_exit.', ['task-result']);
 tool('artifact', 'GET', '/api/fleet/tasks/{id}/artifacts/{name}', 'Fetch a sanitized PNG as the API base64 DTO.', ['artifact']);
+tool('stats', 'GET', '/api/intake/stats', 'Authorized intake timing table and DONE aggregates. Query window=24h|7d|30d|all, project, sort, order=asc|desc. Unknown values include reasons.', ['stats']);
+tool('intake_stats', 'GET', '/api/intake/tasks/{id}/stats', 'Intake creation, first native start, DONE, lead/cycle/wall/active durations, attempts, engines/accounts and blockers, with unknown reasons.', ['intake stats']);
 tool('asks_read', 'GET', '/api/asks/{view}', 'Ask ledger view list (query state, agent_id, intake), messages (agent_id, role, since) or summary.', ['asks list', 'asks tail', 'asks search', 'asks summary']);
 tool('asks_write', 'POST', '/api/asks/{op}', "Ask ledger op ingest: Alexey's message verbatim, idempotent on agent+msg_id, {source:'bot', agents:[{agent_id, agent_name, messages:[{msg_id:'tNNNNu', role:'user', ts, text, intake_id?}]}]}; map/dismiss/verify: ask_id + intake_id, ac_line? / reason / evidence; check; settings.", ['asks record', 'asks map', 'asks dismiss', 'asks verify', 'asks check', 'asks settings']);
 tool('intake_create', 'POST', '/api/intake/tasks', 'File verbatim task: payload key, project, title, text, transcription, source {type,reference,timestamp}, optional acceptance_criteria (nullable bounded text; required non-empty before assign/start).', ['intake create']);

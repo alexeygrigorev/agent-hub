@@ -65,7 +65,8 @@ describe('Hub MCP protocol and parity', () => {
     // ledger (intake 55c10deb) adds asks_read and asks_write (1044 bytes; the
     // view/op slot covers ten CLI commands), moving it 45000 -> 46000. Session pings (intake b8d239f3) add
     // sessions_ping, sessions_ping_clear and sessions_pings: 46000 -> 47500.
-    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(47500);
+    // Intake stats (intake 2e1b4f95) adds one read tool (917 bytes): 47500 -> 48500.
+    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(48500);
     for (const route of MCP_ROUTES) {
       const tool = tools.find(tool => tool.name === route.name)!;
       const readOnly = route.method === 'GET' || route.name === 'sessions_capture';
