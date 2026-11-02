@@ -215,7 +215,7 @@ describe('generic accounts and launch placement', () => {
     sessions.init();
     sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at) VALUES ('quick-test', 'owner', 'quick-key', '{}', ?, 'hetzner', 'codex', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
     const view = (sessions as any).view(sql.exec("SELECT * FROM session_control_sessions WHERE id='quick-test'").one());
-    expect(view).toMatchObject({ engine: 'codex', model_id: 'luna', model: 'gpt-6-luna' });
+    expect(view).toMatchObject({ engine: 'codex', model_id: 'luna', model: 'gpt-6-luna', effort: 'max' });
   }));
   it('carries hub_session_id and intake_task_id on offers for the host worktree lock (AC1)', async () => fixture(async (s, sql) => {
     await configure(s);

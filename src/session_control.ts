@@ -1278,7 +1278,7 @@ export class SessionControlService {
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
       ...sessionAccount(launchAccount, observed?.account),
-      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? request.model ?? null,
+      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? request.model ?? null, effort: modelSelection?.effort ?? null,
       expected_cpu_cores:expectedCpu?.expected_cpu_cores ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_cores ?? null,
       expected_cpu_source:expectedCpu?.expected_cpu_source ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_source ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',

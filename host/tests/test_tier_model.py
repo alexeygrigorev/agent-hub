@@ -15,7 +15,7 @@ from agent_hub_host.session_control import render_table
     ('antigravity', 'antigravity', 'argon'), ('codex', 'codex', 'astra'),
     ('codex', 'zai', 'glm-flash'),
     ('codex', 'codex', 'sol'), ('codex', 'codex', 'luna'),
-    ('claude', 'claude', 'opus'), ('claude', 'claude', 'haiku'),
+    ('claude', 'claude', 'opus'), ('claude', 'claude', 'sonnet'),
 ])
 @pytest.mark.parametrize('mode', ['headless', 'interactive'])
 def test_model_survives_default_subscription(engine, provider, model_id, mode):
@@ -124,3 +124,19 @@ def test_interactive_unsupported_adapter_refused_before_claim(tmp_path):
                                      profile=None, workspace='main', prompt='', selection=selected))
     assert not requests
     assert len(calls) == 2
+
+
+def test_claude_routes_are_sonnet_medium_never_haiku():
+    config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
+    assert 'haiku' not in json.dumps(config).lower()
+    claude = [m for m in config['models'] if m['engine'] == 'claude' and m['id'] != 'opus']
+    assert [(m['model'], m['effort']) for m in claude] == [('sonnet', 'medium')]
+    for ids in config['tiers'].values():
+        assert not [i for i in ids if 'haiku' in i]
+
+
+def test_sessions_table_shows_model_and_effort():
+    out = render_table([{'id': 's1', 'engine': 'claude', 'model_id': 'sonnet', 'effort': 'medium', 'state': 'running'}])
+    header = out.splitlines()[0].split()
+    row = out.splitlines()[2].split()
+    assert 'EFFORT' in header and 'sonnet' in row and 'medium' in row

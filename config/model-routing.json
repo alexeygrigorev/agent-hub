@@ -81,8 +81,7 @@
     ],
     "ask": [
       "opus",
-      "sonnet",
-      "haiku"
+      "sonnet"
     ],
     "review": [
       "opus",
@@ -101,7 +100,6 @@
       "muse",
       "deepseek-flash",
       "beam-free",
-      "claude-haiku-5-5",
       "deepseek-v4-pro",
       "gemini-4-argon-contributor",
       "glm-5-2",
@@ -127,7 +125,6 @@
       "step-5-preview"
     ],
     "quick": [
-      "haiku",
       "luna"
     ]
   },
@@ -178,7 +175,7 @@
       "provider": "claude",
       "engine": "claude",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "glm-flash",
@@ -213,14 +210,6 @@
       "effort": "high"
     },
     {
-      "id": "haiku",
-      "model": "haiku",
-      "provider": "claude",
-      "engine": "claude",
-      "profile": null,
-      "effort": null
-    },
-    {
       "id": "glm-flash-zcodex",
       "model": "glm-5.3-flash",
       "provider": "zai",
@@ -239,14 +228,6 @@
     {
       "id": "beam-free",
       "model": "opencode-go/beam-free",
-      "provider": "go",
-      "engine": "opencode",
-      "profile": null,
-      "effort": null
-    },
-    {
-      "id": "claude-haiku-5-5",
-      "model": "opencode-go/claude-haiku-5-5",
       "provider": "go",
       "engine": "opencode",
       "profile": null,

@@ -1229,11 +1229,11 @@ def render_breakdown(result):
 
 def render_table(sessions):
     """Render a compact table for `hub sessions list` with columns:
-    TYPE, NAME, HOST, ENGINE, ACCOUNT, MODEL, STATE, WORKSPACE, UPDATED and runtime warnings.
+    TYPE, NAME, HOST, ENGINE, ACCOUNT, MODEL, EFFORT, STATE, WORKSPACE, UPDATED and runtime warnings.
     """
     if not sessions:
         return 'No sessions found.'
-    headers = ['TYPE', 'NAME', 'HOST', 'ENGINE', 'ACCOUNT', 'MODEL', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
+    headers = ['TYPE', 'NAME', 'HOST', 'ENGINE', 'ACCOUNT', 'MODEL', 'EFFORT', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
     rows = []
     for s in sessions:
         stype = s.get('session_type') or ('aplexer' if s.get('mode') == 'interactive' else 'headless')
@@ -1250,7 +1250,7 @@ def render_table(sessions):
         upd = (s.get('updated_at') or '')[:19].replace('T', ' ')
         host = s.get('machine') or '-'
         account = s.get('account') or '-'
-        rows.append([stype, name, host, engine, account, s.get('model_id') or s.get('model') or '-', state, ws, upd, str(s.get('long_running', False)).lower(),
+        rows.append([stype, name, host, engine, account, s.get('model_id') or s.get('model') or '-', s.get('effort') or '-', state, ws, upd, str(s.get('long_running', False)).lower(),
                      format_duration(s.get('runtime')), format_duration(s.get('idle_for')), s.get('activity_state', '-')])
 
     widths = [len(h) for h in headers]
