@@ -567,6 +567,7 @@ def add_commands(sub):
     start.add_argument('--repo', default=None, help='Repository owner/name; the placed host (any OS) clones its own fresh work tree from origin/main, so no host path is needed')
     start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
     start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier for policy routing')
+    start.add_argument('--effort', choices=['low', 'medium', 'high', 'max'], help='Per-session model reasoning effort')
     start.add_argument('--cwd')
     start.add_argument('--intake-worktree', dest='intake_worktree', choices=['detached', 'successor'], default=None,
                        help='detached: keep the intake link but never resume, create or lock its worktree (79458f2d). '
@@ -983,6 +984,8 @@ def _execute(args):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        if getattr(args, 'effort', None) is not None:
+            payload['effort'] = args.effort
         if getattr(args, 'intake_worktree', None):
             if payload.get('cwd'):
                 raise ValueError('--intake-worktree successor keeps Hub in charge of the cwd; drop --cwd (a detached start never names one either)')

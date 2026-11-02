@@ -176,6 +176,7 @@ describe('hub session control durable queue', () => {
       { key: 'k4', workspace: 'demo', cwd: '/absolute' },
       { key: 'k5', workspace: 'demo', mode: 'interactive', brief: 'inject' },
       { key: 'k6', workspace: 'demo', brief: '' },
+      { key: 'k7', workspace: 'demo', effort: 'xhigh' },
     ]) {
       expect((await s.handle(request('/api/sessions', payload), admin)).status, JSON.stringify(payload)).toBe(400);
     }
@@ -203,6 +204,20 @@ describe('hub session control durable queue', () => {
       expect(ok.status).toBe(201);
       expect(fake.calls.length).toBe(1);
       expect(fake.calls[0].tier).toBe('daily');
+    }, fake.hook);
+  });
+
+  it('validates and forwards per-session effort into model placement and idempotency', async () => {
+    const fake = fakeReserve();
+    await fixture(async (s) => {
+      const started = await s.handle(request('/api/sessions', { key: 'effort-1', workspace: 'demo', effort: 'medium' }), admin);
+      expect(started.status).toBe(201);
+      expect((await started.json() as any).effort).toBe('medium');
+      expect(fake.calls[0].effort).toBe('medium');
+      const replay = await s.handle(request('/api/sessions', { key: 'effort-1', workspace: 'demo', effort: 'medium' }), admin);
+      expect(replay.status).toBe(200);
+      const conflict = await s.handle(request('/api/sessions', { key: 'effort-1', workspace: 'demo', effort: 'high' }), admin);
+      expect(conflict.status).toBe(409);
     }, fake.hook);
   });
 

@@ -3107,7 +3107,7 @@ class Dispatcher:
         if offer.get('task_id'):
             if not isinstance(offer.get('needs'), list) or not set(offer['needs']).issubset(self.settings.get('capabilities', [])):
                 raise ValueError('Required capabilities are no longer available locally')
-            if not isinstance(selection, dict) or selection.get('model') != sub.get('launcher_model') or selection.get('effort') != sub.get('launcher_effort'):
+            if not isinstance(selection, dict) or selection.get('model') != sub.get('launcher_model') or selection.get('effort') not in ('low', 'medium', 'high', 'max'):
                 raise ValueError('Selected model/effort is not configured locally')
         offer_id = offer.get("id")
         if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
@@ -3195,6 +3195,12 @@ class Dispatcher:
                 if selection:
                     from .model_contract import replace_model_args
                     launch = replace_model_args(launch, selection["model"])
+                    if sub.get('launcher_provider') == 'codex':
+                        if sub.get('account_label') in self._managed_labels:
+                            launch += ['--hub-session-effort=' + selection['effort']]
+                        else:
+                            native_effort = 'xhigh' if selection['effort'] == 'max' else selection['effort']
+                            launch += ['-c', 'model_reasoning_effort=' + json.dumps(native_effort)]
                 argv += ["--"] + launch + (['/goal ' + wt_note + compose_prompt(offer['prompt']) + '\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers.'] if with_goal else [])
             prefix = sub.get("native_start_argv") or self.settings.get("native_start_argv")
             if prefix is not None:
