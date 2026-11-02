@@ -464,18 +464,21 @@ def protect_bound_worktree(git_bin: str, path: str, session_id: Any, intake_id: 
     if not roots:
         return True
     root = max(roots, key=lambda e: len(e["path"]))["path"]
-    # Scope this gate to Agent Hub worker worktrees. The main checkout and
-    # other projects retain their own hook/test policy.
+    # Install the Scope trailer hook for every Agent Hub session checkout,
+    # including the primary checkout. The heavier pre-push gate and lock remain
+    # scoped to linked worker worktrees; other projects retain their own policy.
     worker = Path(root)
-    if not (worker / '.git').is_file():
-        return True
+    linked = (worker / '.git').is_file()
     try:
-        from .prepush import PrepushHookInstallError, install, required
+        from .prepush import PrepushHookInstallError, install, install_scope, required
         if required(root, git_bin):
-            install(root, git_bin)
+            if linked:
+                install(root, git_bin)
+            else:
+                install_scope(root, git_bin)
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         raise PrepushHookInstallError() from exc
-    if os.path.isfile(os.path.join(root, ".git")):
+    if linked and os.path.isfile(os.path.join(root, ".git")):
         if not ensure_locked(git_bin, root, session_id, intake_id, runner, owner_terminal=owner_terminal):
             return False
     return True

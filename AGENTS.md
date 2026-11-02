@@ -22,6 +22,17 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 5. Batch related commits into one finished feature. Nondeploy/docs/checkpoint commits must use `[skip ci]`. Exactly ONE deploy push for the finished feature, only after required CI test suites pass on the exact final source. Normal fast-forward integration, no force pushes, no PRs. Keep Agent Branches and GitHub main in sync after every integration.
 6. Post each milestone's accepted result on the tracking issue (see the issue labelled `tracking`).
 
+## Commit scope trailers
+
+Agent Hub installs a `commit-msg` hook before Hub-launched sessions start. It
+adds `Scope: in` when absent, preserves a valid `Scope: gray <intake-UUID>`,
+and runs for merge commits on Linux and Windows. A direct aplexer workspace
+that did not go through Hub bootstrap must run
+`python3 host/agent_hub_host/prepush.py install-scope` (Linux) or
+`python host/agent_hub_host/prepush.py install-scope` (Windows) before
+committing. Never bypass the hook with `--no-verify`; CI still rejects
+sensitive commits that reach it without a valid final trailer.
+
 ## Gates and limits
 
 - Quota gates: fresh `quse` before every launch; Codex launches go through `~/git/cloudflare-agent-git/scripts/launch-codex.sh` (runs `scripts/quota-gate.py`, 15% reserve, fails closed). Never pick paid options or "usage credits" in agent menus.

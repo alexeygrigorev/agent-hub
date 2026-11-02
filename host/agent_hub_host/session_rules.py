@@ -55,6 +55,17 @@ PREPUSH_TEST_RULE = (
 )
 SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + PREPUSH_TEST_RULE
 
+SCOPE_TRAILER_RULE = (
+    "Scope boundary: every commit that changes session control, registry, auth, or public files "
+    "must end with `Scope: in` or `Scope: gray <intake-UUID>`. Hub installs a commit-msg hook "
+    "in Agent Hub session worktrees and the primary checkout; it adds `Scope: in` when absent, "
+    "preserves a valid gray intake trailer, and also runs for merge commits. Never use `--no-verify`. "
+    "If an Agent Hub aplexer workspace was started outside Hub host bootstrap, install it before "
+    "committing with the host's Python, for example `python3 host/agent_hub_host/prepush.py install-scope` "
+    "on Linux or `python host/agent_hub_host/prepush.py install-scope` on Windows."
+)
+SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + SCOPE_TRAILER_RULE
+
 # Incident 504d662b (2026-10-31): a reviewer session ran
 #   TMPDIR=$(mktemp -d) && HOME=$(mktemp -d) ... python3 -m pytest ...; rm -rf "$TMPDIR" "$HOME"
 # `HOME=... cmd` sets HOME only for that one command, so the shell's $HOME was

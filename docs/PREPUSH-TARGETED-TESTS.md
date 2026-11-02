@@ -20,14 +20,16 @@ It receives Git's advertised remote main SHA and runs
 with final priority. BROAD (exit 4) runs the full local gate. Tests run once per
 push, with no cached pass, environment skip flag or helper-only exception.
 
-Hub installs the hook from `host/agent_hub_host/prepush.py` in
-`worktree_guard.protect_bound_worktree`, before launching/adopting an Agent Hub
-worker in a created, resumed or existing linked worktree. Each worker gets a
-private durable gate under its Git metadata directory and a per-worktree
-`core.hooksPath` (`extensions.worktreeConfig` enables this Git capability).
-The main checkout and other projects keep their hook settings. A repository
-policy marker preserves enforcement if a candidate removes the affected lane.
-Canonical Agent Hub origins are also recognized when the lane is missing.
+Hub installs the hooks from `host/agent_hub_host/prepush.py` in
+`worktree_guard.protect_bound_worktree` before launching/adopting an Agent Hub
+session checkout. The primary checkout gets the Scope `commit-msg` hook; linked
+worker worktrees get that hook plus the private durable pre-push gate under the
+worktree's Git metadata directory. Each installed path uses a per-worktree
+`core.hooksPath` (`extensions.worktreeConfig` enables this Git capability), so
+the primary checkout's pre-push behavior and other projects' hook settings stay
+unchanged. A repository policy marker preserves enforcement if a candidate
+removes the affected lane. Canonical Agent Hub origins are also recognized when
+the lane is missing.
 
 Inherited hooks remain effective: the previous pre-push hook receives the same
 ref input and must pass; other executable hooks are forwarded to their original
@@ -60,17 +62,20 @@ verification through push; this helper does not grant it.
 
 The runner requires the `capped-test-retry.sh` direct routing for self-admitting
 lanes (introduced in d8740aac); older checkouts must update before using it.
-The trusted worker preamble requires the hook and forbids disabling it or using
-`--no-verify`. Local hooks enforce ordinary pushes; intentional Git hook-disable
-options remain outside this local control. Post-push CI remains required.
+The trusted worker preamble requires the Scope commit hook and the pre-push gate,
+and forbids disabling them or using `--no-verify`. Local hooks enforce ordinary
+pushes; intentional Git hook-disable options remain outside this local control.
+Post-push CI remains required.
 
 Regression coverage: `host/tests/test_push_main.py` uses disposable bare origins,
 real commits, affected-test selection, test execution and pushes. It covers both
 helper and plain pushes, a failing commit leaving origin/main unchanged, a
-repaired commit pushing, separately protected worker worktrees, main/other-project
-exclusion, inherited-hook preservation, missing lanes, refspecs, source mutation
-and BROAD failures. Fix-forward and revert commits use the same gate: test the
-repaired/reverted tree and push when green.
+repaired commit pushing, automatic Scope trailers on normal and merge commits,
+gray trailer preservation, the primary checkout's Scope-only hook, and linked
+worker pre-push protection, other-project exclusion, inherited-hook preservation,
+missing lanes, refspecs, source mutation and BROAD failures. Fix-forward and
+revert commits use the same gate: test the repaired/reverted tree and push when
+green.
 
 - Before a push: `scripts/test-affected-local.sh` (optionally `--base REF`,
   `--dry-run` to print the selection). It runs scope guard, workflow validation
