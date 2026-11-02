@@ -1234,6 +1234,27 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/tasks/' + task.id + '/history?archived=1&limit=101')).status).toBe(400);
   });
 
+  it('reports an appended note archived at inline capacity and makes it readable from archive history', async () => {
+    const { task } = await create();
+    const noteText = 'This note was archived during append ' + 'x'.repeat(7000);
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      while (new TextEncoder().encode(JSON.stringify(data)).length < INTAKE_LIMITS.taskBytes - 1024) data.history.push({
+        id: crypto.randomUUID(), kind: 'decision', text: '界'.repeat(2700), source });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+    });
+
+    const result = await append(task.id, task.version, { kind: 'note', text: noteText, source }, undefined, 'archived-on-append');
+    expect(result.appended_event).toMatchObject({ archived: true, sequence: expect.any(Number) });
+    const sequence = result.appended_event.sequence;
+    const shown = await ok('/tasks/' + task.id);
+    expect(shown.task.history_archive.count).toBeGreaterThan(0);
+    expect(shown.task.history_archive.latest_sequence).toBe(sequence);
+    expect(shown.task.payload_data.history.some((event: any) => event.text === noteText)).toBe(false);
+    const history = await ok('/tasks/' + task.id + '/history?archived=1&after=' + (sequence - 1) + '&limit=1');
+    expect(history.items).toEqual([{ sequence, event: expect.objectContaining({ kind: 'note', text: noteText }) }]);
+  });
+
   it('archives superseded link and worktree events when ordinary notes are exhausted at the event cap', async () => {
     const { task } = await create();
     const latestLinkId = crypto.randomUUID();

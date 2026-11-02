@@ -787,10 +787,17 @@ export class IntakeService {
     };
   }
   private taskView(task: Obj, p: Obj): Obj {
-    const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, _history_order, _history_next_seq, ...identity } = task;
+    const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, history_archive,
+      _history_order, _history_next_seq, ...identity } = task;
+    const latestArchivedSequence = history_archive?.count
+      ? this.sql.exec('SELECT MAX(seq) AS latest_sequence FROM intake_note_archive WHERE task_id=?', task.id).toArray()[0]?.latest_sequence
+      : undefined;
+    const archiveView = history_archive ? { ...history_archive,
+      ...(Number.isSafeInteger(latestArchivedSequence) ? { latest_sequence: latestArchivedSequence } : {}) } : undefined;
     const capacityWarning = taskCapacityWarning(task);
     return { ...identity, control: { version: task.version, status: task.status, continuation_state: this.continuation(task),
       authority: 'hub_ledger_cas', execution_evidence: 'not_verified_by_intake' },
+      ...(archiveView ? { history_archive: archiveView } : {}),
       ...(capacityWarning ? { capacity_warning: capacityWarning } : {}),
       scope_flag: task.scope?.flag ?? null, scope: this.scopeView(task),
       payload_data: { title, current_state, next_step, owner, uncertainty, acceptance_criteria: acceptance_criteria ?? null, history }, unresolved: this.unresolved(task),
@@ -1496,6 +1503,7 @@ export class IntakeService {
     this.expected(b, task.version);
     prepareIntakeHistory(task, 2);
     if (task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
+    let appendedEventId: string | undefined;
     if (match[2] === '/continue') {
       keys(b, ['key', 'expected_version']);
       if (this.continuation(task) !== 'ready') fail('continuation_not_ready', 409);
@@ -1508,7 +1516,9 @@ export class IntakeService {
       // Also accept note as a UTF-8 string and top-level text as note text so
       // common agent payloads do not flake as opaque invalid_object.
       const event = appendEvent(b);
-      task.history.push(this.event(event, task, p, now));
+      const appendedEvent = this.event(event, task, p, now);
+      task.history.push(appendedEvent);
+      appendedEventId = appendedEvent.id;
       // F2: new intake text changes the decision basis -> re-hint. Other
       // event kinds (notes, scope decisions themselves) never change the flag.
       if (task.scope && typeof task.scope === 'object' && task.history[task.history.length - 1]?.kind === 'intake') {
@@ -1563,7 +1573,12 @@ export class IntakeService {
     task.version++; task.updated_at = now;
     const capacityError = taskCapacityError(task);
     if (capacityError) fail(capacityError, 507);
-    this.put('tasks', task); return { task: this.view(task, p) };
+    const archivedAppend = appendedEventId && pendingNoteArchives.get(task)?.find(row => row.id === task.id + ':' + appendedEventId);
+    this.put('tasks', task);
+    return { task: this.view(task, p), ...(appendedEventId ? { appended_event: {
+      archived: !!archivedAppend,
+      ...(archivedAppend ? { sequence: archivedAppend.seq } : { location: 'inline' }),
+    } } : {}) };
   }
   /** M12b assignment: create the task's Hub session through the canonical
    * session-control service with the caller's own auth (existing Fleet
