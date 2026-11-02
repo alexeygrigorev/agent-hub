@@ -139,6 +139,14 @@ class AdmissionTests(unittest.TestCase):
         stdout, stderr = child.communicate(timeout=40)
         self.assertEqual(child.returncode, 0, stderr.decode(errors='replace'))
         self.assertIn('admitted release ticket', stderr.decode(errors='replace'))
+        event_line = next(line for line in stderr.decode(errors='replace').splitlines()
+                          if 'admission-event ' in line)
+        event = json.loads(event_line.split('admission-event ', 1)[1])
+        self.assertEqual(event['event'], 'heavy_test_admitted')
+        self.assertEqual(event['protocol'], 1)
+        self.assertEqual(event['priority'], 'release')
+        self.assertGreaterEqual(event['queue_wait_s'], 0)
+        self.assertTrue(event['admitted_at_utc'].endswith('Z'))
         self.assertEqual((self.root / 'order').read_text(), 'rel')
 
     def test_slots_file_is_authoritative_over_env(self):
@@ -554,6 +562,29 @@ class SharedReleaseDelegationTests(unittest.TestCase):
         self.assertTrue(self.marker.exists())
         self.assertIn('no heavy-test slot free', result.stderr)
 
+    def test_orchestrator_release_root_is_selected_without_env_override(self):
+        home = self.root / 'home'
+        releases = home / '.local/share/agent-hub/host-releases-orch'
+        releases.mkdir(parents=True)
+        self.release.rename(releases / self.release.name)
+        self.release = releases / self.release.name
+        executable = self.release / '.venv/bin/python'
+        self.env['HOME'] = str(home)
+        self.env.pop('AGENT_HUB_HOST_RELEASES_DIR', None)
+        systemctl = self.fake_bin / 'systemctl'
+        systemctl.write_text(
+            '#!/bin/sh\nprintf " { path=%s ; argv[]=%s }\\n" '
+            f'"{executable}" "{executable} -m agent_hub_host.session_host"\n',
+            encoding='utf-8')
+        systemctl.chmod(0o755)
+        self.install_module()
+        result = subprocess.run([str(WRAPPER), '--wait', '0', '--', sys.executable,
+                                 '-c', 'raise SystemExit(0)'], env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertTrue(self.marker.exists())
+        self.assertIn('no heavy-test slot free', result.stderr)
+
     def test_unavailable_or_older_release_uses_worktree_fallback(self):
         # A verified release before the fixed admission revision must not be
         # selected even when it advertises the same protocol integer.
@@ -681,6 +712,31 @@ class NestedHoldReaperTests(unittest.TestCase):
         with mock.patch.object(shared_admission, '_lock_is_held', return_value=True):
             found = shared_admission.nested_hold_candidates(self.pool, current, previous, 20.0)
         self.assertEqual(found, [])
+
+    def test_never_reaps_a_nested_admission_that_already_acquired_a_slot(self):
+        second_slot = self.pool / 'slot-1.lock'
+        second_slot.touch()
+        current, previous = self.snapshots()
+        current['processes'][101]['fds'].add(str(second_slot.resolve()))
+        previous['processes'][101]['fds'].add(str(second_slot.resolve()))
+        with mock.patch.object(shared_admission, '_lock_is_held', return_value=True):
+            found = shared_admission.nested_hold_candidates(self.pool, current, previous, 20.0)
+        self.assertEqual(found, [])
+
+    def test_shared_module_uses_current_release_priority_queue_protocol(self):
+        queue = shared_admission.Queue(self.pool)
+        state = {'version': 1, 'next': 4, 'active': {
+            '1': {'sequence': 1, 'priority': 'normal', 'created': 1.0},
+            '2': {'sequence': 2, 'priority': 'final', 'created': 2.0},
+            '3': {'sequence': 3, 'priority': 'release', 'created': 3.0},
+        }, 'runs': {}}
+        self.assertEqual(queue.head(state, 4.0), '3')
+        with mock.patch.dict(os.environ, {shared_admission.RUN_ID_ENV: 'same-run'}):
+            state['runs']['same-run'] = {'sequence': 7, 'created': 1.0, 'seen': 19.0}
+            state['next'] = 8
+            sequence, ticket = queue.new_ticket(state, 'normal', 20.0)
+        self.assertEqual(sequence, 7)
+        self.assertEqual(ticket['created'], 1.0)
 
     def test_reaper_signals_only_nested_command_group_and_posts_note(self):
         current, previous = self.snapshots()

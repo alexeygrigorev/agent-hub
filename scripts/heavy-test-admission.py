@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 # Priority classes, lowest privilege first (intake 1293b560 AC3).
 # 'final' is a pre-push verification lane: it jumps queued normal tickets
@@ -90,11 +91,19 @@ REAP_INTERVAL_S = 60
 ADMISSION_PROTOCOL_VERSION = 1
 
 
+def active_release_roots():
+    roots = {
+        Path.home() / '.local/share/agent-hub/host-releases',
+        Path.home() / '.local/share/agent-hub/host-releases-orch',
+    }
+    configured = os.environ.get('AGENT_HUB_HOST_RELEASES_DIR')
+    if configured:
+        roots.add(Path(configured).expanduser())
+    return {root.resolve() for root in roots}
+
+
 def active_release_module():
     """Return the verified admission module in the active host release, if supported."""
-    release_root = Path(os.environ.get(
-        'AGENT_HUB_HOST_RELEASES_DIR',
-        str(Path.home() / '.local/share/agent-hub/host-releases'))).resolve()
     module_rel = Path('host/agent_hub_host/heavy_test_admission.py')
     try:
         result = subprocess.run(
@@ -109,8 +118,8 @@ def active_release_module():
         executable = Path(os.path.abspath(match.group(1).strip().strip('"')))
         if executable.parent.name != 'bin' or executable.parent.parent.name != '.venv':
             return None
-        release = executable.parent.parent.parent
-        if (release.parent != release_root or release.resolve().parent != release_root
+        release = executable.parent.parent.parent.resolve()
+        if (release.parent not in active_release_roots()
                 or not executable.is_file()
                 or not re.fullmatch(r'[0-9a-f]{40}', release.name)):
             return None
@@ -122,11 +131,14 @@ def active_release_module():
             capture_output=True, text=True, timeout=60, check=False)
         if verified.returncode != 0:
             raise RuntimeError('active host release verification failed')
+        manifest_path = release / 'release-manifest.json'
+        if manifest_path.is_symlink():
+            raise RuntimeError('active host release manifest is a symlink')
         try:
-            manifest = json.loads((release / 'release-manifest.json').read_text(encoding='utf-8'))
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         except (OSError, ValueError) as error:
             raise RuntimeError('active host release manifest is unreadable') from error
-        if manifest.get('release_rev') != release.name:
+        if not isinstance(manifest, dict) or manifest.get('release_rev') != release.name:
             raise RuntimeError('active host release revision mismatch')
         repository = Path(__file__).resolve().parents[1]
         ancestor = subprocess.run(
@@ -141,7 +153,10 @@ def active_release_module():
         module = release / module_rel
         if not module.is_file() or module.is_symlink():
             return None
-        expected_hash = manifest.get('files_sha256', {}).get(module_rel.as_posix())
+        hashes = manifest.get('files_sha256')
+        if not isinstance(hashes, dict):
+            raise RuntimeError('active host release manifest has no file hashes')
+        expected_hash = hashes.get(module_rel.as_posix())
         if not isinstance(expected_hash, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_hash):
             return None
         data = module.read_bytes()
@@ -644,8 +659,13 @@ def main():
             if not lock_available(ticket):
                 ticket.close()
                 raise ValueError('unindexed heavy-test lease is locked')
-            sequence, state['active'][name] = queue.new_ticket(
-                state, args.priority, time.monotonic())
+            ticket_created_at = time.monotonic()
+            sequence, ticket_row = queue.new_ticket(
+                state, args.priority, ticket_created_at)
+            state['active'][name] = ticket_row
+            # Retry affinity preserves the original ticket age. Report total
+            # queue age for the run, matching the shared pool's FIFO state.
+            queue_wait_started = ticket_row['created']
             queue.save(state)
         finally:
             fcntl.flock(mutex, fcntl.LOCK_UN)
@@ -712,7 +732,22 @@ def main():
                     time.sleep(min(random.uniform(1, 2), remaining))
             with slot:
                 running = True
-                print(f'capped-test-run: admitted {args.priority} ticket {sequence}', file=sys.stderr, flush=True)
+                admission_event = {
+                    'event': 'heavy_test_admitted',
+                    'protocol': ADMISSION_PROTOCOL_VERSION,
+                    'ticket_sequence': sequence,
+                    'priority': args.priority,
+                    'queue_wait_s': round(max(0.0, time.monotonic() - queue_wait_started), 3),
+                    'admitted_at_utc': datetime.now(timezone.utc).isoformat(
+                        timespec='milliseconds').replace('+00:00', 'Z'),
+                }
+                # Keep the established human-readable line for older test
+                # tooling, then emit the structured measurement record.
+                print(f'capped-test-run: admitted {args.priority} ticket {sequence}',
+                      file=sys.stderr, flush=True)
+                print('capped-test-run: admission-event ' +
+                      json.dumps(admission_event, sort_keys=True),
+                      file=sys.stderr, flush=True)
                 print(f'capped-test-run: run timeout {run_timeout}s', file=sys.stderr, flush=True)
                 return run_command(command, slot, lambda: interrupted, run_timeout, identity)
 
