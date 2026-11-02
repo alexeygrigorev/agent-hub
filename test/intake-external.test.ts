@@ -77,7 +77,7 @@ describe('verified external intake assignments', () => {
       h.sql.exec("DELETE FROM fleet_catalog_seen WHERE machine_id='external-fixture'");
       const stale = await (await call('/tasks/'+id)).json();
       expect(stale.task.assigned_sessions[0]).toMatchObject({liveness:'unknown',state:'unknown'});
-      expect((await append('stale-native',2,event)).status).toBe(409);
+      expect((await append('stale-native',2,event)).status).toBe(503);
       expect((await append('bad-native',2,{...event,verify_live:'yes'})).status).toBe(400);
       h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('external-fixture',?)",new Date().toISOString());
       h.sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE native_id=?",native);
