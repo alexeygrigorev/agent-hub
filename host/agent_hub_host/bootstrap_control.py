@@ -134,8 +134,23 @@ def _attention(directory, generation=None):
     raise NeedsAttention('Previous controller exit is unproven; inspect needs-attention.json and restore native status access before retrying')
 
 
-def recover_stale_owner(directory, current_boot, observe, absent=None, tag_absent=None):
-    """Caller must hold owner.lock: an absent owner process alone is no proof."""
+def stop_orphan_receipt(receipt):
+    """Ask aplexer to stop the exact orphaned controller; the reply is only a hint, the caller re-observes."""
+    result = subprocess.run(['aplexer', 'kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '30000'],
+                            capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+    if result.returncode or len(result.stdout) > 131072:
+        return None
+    return json.loads(result.stdout)
+
+
+def recover_stale_owner(directory, current_boot, observe, absent=None, tag_absent=None, stop=None):
+    """Caller must hold owner.lock: an absent owner process alone is no proof.
+
+    stop (installer replace only): when the lock is free but the exact receipt
+    is still a LIVE orphan (its supervisor died, 2026-11-02 11:23), stop that
+    exact receipt through aplexer, as the supervisor's own confirm_owned_exit
+    does, then prove exit only from a fresh observation or catalog absence.
+    """
     try:
         owner = _read(directory / 'owner.json')
     except FileNotFoundError:
@@ -168,6 +183,10 @@ def recover_stale_owner(directory, current_boot, observe, absent=None, tag_absen
                 if (isinstance(row, dict) and all(row.get(k) == receipt[k] for k in MATCH_KEYS)
                         and row.get('containment_empty') is True):
                     proof = 'exact_receipt_containment_empty'
+                elif (stop is not None and isinstance(row, dict)
+                        and all(row.get(k) == receipt[k] for k in MATCH_KEYS)
+                        and row.get('containment_empty') is not True):
+                    proof = _stop_live_orphan(receipt, observe, absent, stop)
                 elif row is None and absent is not None and absent(receipt):
                     # Rerun recovery: caller holds owner.lock (no live owner) and a
                     # full catalog listing no longer contains the exact receipt id.
@@ -187,6 +206,26 @@ def recover_stale_owner(directory, current_boot, observe, absent=None, tag_absen
         (directory / 'needs-attention.json').unlink()
     except FileNotFoundError:
         pass
+
+
+def _stop_live_orphan(receipt, observe, absent, stop):
+    try:
+        reply = stop(receipt)
+    except Exception:
+        reply = None
+    if isinstance(reply, dict) and reply.get('id') == receipt['id'] and reply.get('record_removed') is True:
+        return 'orphan_stopped_record_removed'
+    try:
+        row = observe(receipt)
+    except Exception:
+        return None
+    if isinstance(row, dict):
+        if all(row.get(k) == receipt[k] for k in MATCH_KEYS) and row.get('containment_empty') is True:
+            return 'orphan_stopped_containment_empty'
+        return None
+    if row is None and absent is not None and absent(receipt):
+        return 'orphan_stopped_receipt_absent'
+    return None
 
 
 def _fresh_request(request, generation):
@@ -248,18 +287,20 @@ class ControllerLease:
         (self.directory / 'owner.json').unlink()
 
 
-def handover(directory, *, timeout=90, boot_probe=None, observe=None):
+def handover(directory, *, timeout=90, boot_probe=None, observe=None, stop=None):
     absent = receipt_absent if observe is None else None
     tag_absent = pending_tag_absent if observe is None else None
+    if stop is None and observe is None:
+        stop = stop_orphan_receipt
     directory = Path(directory)
     if not 0 <= timeout <= MAX_HANDOVER_SECONDS:
         raise ValueError('Invalid controller handover timeout')
     # Serializes request publication/cancellation; never unlink kernel locks.
     with private_fs.exclusive_lock(directory / 'request.lock'):
-        _handover(directory, timeout, boot_probe or boot_identity, observe or observe_receipt, absent, tag_absent)
+        _handover(directory, timeout, boot_probe or boot_identity, observe or observe_receipt, absent, tag_absent, stop)
 
 
-def _handover(directory, timeout, boot_probe, observe, absent=None, tag_absent=None):
+def _handover(directory, timeout, boot_probe, observe, absent=None, tag_absent=None, stop=None):
     stack = ExitStack()
     try:
         stack.enter_context(private_fs.exclusive_lock(directory / 'owner.lock'))
@@ -267,7 +308,7 @@ def _handover(directory, timeout, boot_probe, observe, absent=None, tag_absent=N
         stack.close()
     else:
         with stack:
-            recover_stale_owner(directory, boot_probe(), observe, absent, tag_absent)
+            recover_stale_owner(directory, boot_probe(), observe, absent, tag_absent, stop)
         return
     try:
         owner = _read(directory / 'owner.json')
