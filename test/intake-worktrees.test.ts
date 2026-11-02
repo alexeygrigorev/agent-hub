@@ -253,6 +253,41 @@ describe('resume plan + observe (host channel)', () => {
     expect((await host(c, OTHER, '/plan', { launch_id: second.launchId })).status).toBe(404);
   }));
 
+  it('accepts a host-created fallback after a resume plan while retaining the old session worktree', async () => fixture(async c => {
+    const t = await createTask(c);
+    const first = seedLaunch(c, t.id);
+    const old = await host(c, HOST, '/observe', {
+      launch_id: first.launchId, action: 'created', path: WT, branch: 'demo-wt-aaaa1111',
+    });
+    expect(old.body.recorded).toBe(true);
+    endSession(c, first.sessionId);
+    const second = seedLaunch(c, t.id);
+    expect((await host(c, HOST, '/plan', { launch_id: second.launchId })).body.plan)
+      .toMatchObject({ mode: 'resume', path: WT, worktree_id: old.body.worktree.id });
+
+    // The host preserves the prior session's lock and uses its per-launch path.
+    const branch = 'demo-wt-' + second.launchId;
+    const path = '/home/alexey/git/' + branch;
+    const created = await host(c, HOST, '/observe', {
+      launch_id: second.launchId, action: 'created', path, branch,
+    });
+    expect(created.body).toMatchObject({ recorded: true, worktree: {
+      path, branch, state: 'active', origin: 'hub_created', session_ids: [second.sessionId],
+    } });
+    expect(created.body.worktree.id).not.toBe(old.body.worktree.id);
+    await host(c, HOST, '/observe', { launch_id: second.launchId, action: 'reused', path, branch });
+    const registry = (await intake(c, '/tasks/' + t.id + '/worktrees')).body;
+    expect(registry.worktrees).toHaveLength(2);
+    expect(registry.worktrees.find((w: any) => w.path === WT)).toMatchObject({
+      id: old.body.worktree.id, state: 'active', session_ids: [first.sessionId],
+    });
+    expect(registry.worktrees.find((w: any) => w.path === path)).toMatchObject({
+      id: created.body.worktree.id, state: 'active', session_ids: [second.sessionId],
+    });
+    expect(registry.close_gate.ok).toBe(false);
+    expect(registry.close_gate.blocking).toHaveLength(2);
+  }));
+
   it('records an explicit worktree cwd/workspace and leaves unlinked or relative-cwd launches alone', async () => fixture(async c => {
     const t = await createTask(c); const other = await createTask(c);
     const explicit = seedLaunch(c, t.id, HOST, { cwd: WT });
