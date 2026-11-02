@@ -35,7 +35,7 @@ def git_process(repo, *argv, timeout=GIT_TIMEOUT):
 
 def git(repo, *argv, timeout=GIT_TIMEOUT):
     proc = git_process(repo, *argv, timeout=timeout)
-    return None if proc is None else proc.stdout.strip() if proc.returncode == 0 else ''
+    return proc.stdout.strip() if proc is not None and proc.returncode == 0 else None
 
 
 def default_root(script_path=None, home=None):
