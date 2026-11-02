@@ -78,6 +78,6 @@ export function suppressOpenAlertBackfill(sql: SqlStorage, now = Date.now()): nu
 export function pruneAlertRouting(sql: SqlStorage, now = Date.now()) {
   sql.exec('DELETE FROM bus_reader_activity WHERE last_read_at < ?', now - READER_FRESH_MS);
   sql.exec('DELETE FROM alert_delivery_receipts WHERE sent_at < ?', now - ALERT_SUBJECT_COOLDOWN_MS);
-  sql.exec(`DELETE FROM alert_backfill_suppressed s WHERE NOT EXISTS (
-    SELECT 1 FROM liveness_alerts a WHERE a.id=s.alert_id AND a.resolved_at IS NULL)`);
+  sql.exec(`DELETE FROM alert_backfill_suppressed WHERE NOT EXISTS (
+    SELECT 1 FROM liveness_alerts a WHERE a.id=alert_backfill_suppressed.alert_id AND a.resolved_at IS NULL)`);
 }

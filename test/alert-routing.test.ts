@@ -10,7 +10,10 @@ import type { Env } from '../src/env';
 async function fixture(fn: (hub: any) => Promise<void>) {
   const e = env as unknown as Env;
   const stub = e.HUB.get(e.HUB.idFromName('alert-routing-' + crypto.randomUUID()));
-  await runInDurableObject(stub, fn);
+  await runInDurableObject(stub, async h => {
+    h.env = { ...h.env, HUB_ALERT_WEBHOOK: '' };
+    await fn(h);
+  });
 }
 async function reader(h: any, actor = 'watched', token = 'test-reader-token') {
   const now = new Date().toISOString();
