@@ -100,7 +100,7 @@ describe('burn-aware model candidates', () => {
 
   it('routes Claude opus for deep and review work when it is expiring', () => {
     for (const tier of ['deep', 'review']) {
-      const [opus] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'opus', 'high', 'claude-acct'), claude, NOW);
+      const [opus] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'opus', 'medium', 'claude-acct'), claude, NOW);
       expect(opus?.id).toBe('opus');
       expect(opus.factors.burn).toBeGreaterThan(3);
     }
@@ -108,7 +108,7 @@ describe('burn-aware model candidates', () => {
 
   it('releases explicit-only Codex for daily/deep only while its weekly quota would expire unused', () => {
     const sol = ad('codex', 'gpt-6.1-sol', 'medium', 'codex-acct');
-    const astra = ad('codex', 'gpt-6-astra', 'high', 'codex-acct');
+    const astra = ad('codex', 'gpt-6-astra', 'medium', 'codex-acct');
     const idle = q(weekly(90, 30)); // 10% used in 138h -> ~88% would expire
     expect(burnReleasesExplicitOnly(burnForecast(idle, NOW))).toBe(true);
     expect(modelCandidates({ tier: 'daily' }, route('codex', 'codex'), sol, idle, NOW)).toHaveLength(1);
@@ -139,7 +139,7 @@ describe('burn-aware model candidates', () => {
 
   it.each([['gemini', 'gemini', 'gemini-4-argon-high', 'deep'], ['go', 'opencode', 'opencode-go/muse-spark-1.3-contributor', 'daily']])(
     'scores expiring quota for %s', (provider, engine, model, tier) => {
-      const [candidate] = modelCandidates({ tier }, route(provider, engine), ad(engine, model, engine === 'opencode' ? null : 'high', provider + '-acct'), q(weekly(95, 28)), NOW);
+      const [candidate] = modelCandidates({ tier }, route(provider, engine), ad(engine, model, engine === 'opencode' ? null : 'medium', provider + '-acct'), q(weekly(95, 28)), NOW);
       expect(candidate.factors.burn).toBeGreaterThan(3);
     });
 });

@@ -63,7 +63,12 @@ export function validBundle(v: any): boolean {
     // OpenCode is exclusively the subscribed Muse route; GLM belongs to zcodex.
     (v.provider !== 'go' || [JSON.stringify(['--model', 'opencode-go/muse-spark-1.3-contributor']), JSON.stringify(['--model', 'opencode-go/muse-spark-1.3-contributor', '--version'])].includes(JSON.stringify(v.args))) &&
     // Z.ai routes through native zcodex and never routes OpenCode Muse models.
-    (v.provider !== 'zai' || !v.args.some((a: string) => a.includes('opencode-go') || a.includes('muse')));
+    (v.provider !== 'zai' || !v.args.some((a: string) => a.includes('opencode-go') || a.includes('muse'))) &&
+    // Codex effort comes from the Hub session/policy at launch, never from the
+    // bundle: a hardcoded model_reasoning_effort/--effort would pin every
+    // session on that account (intake 8852ba59, e.g. codex-orin high).
+    (v.provider !== 'codex' || !v.args.some((a: string) =>
+      a.includes('model_reasoning_effort') || a === '--effort' || a.startsWith('--effort=')));
 }
 
 export class ProvisioningService {
