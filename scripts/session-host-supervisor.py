@@ -12,6 +12,16 @@ import uuid
 from contextlib import ExitStack
 
 
+def _bypass_proxy_for_hub():
+    """Dead engine proxy env must not silence the supervisor or its children (2026-11-02)."""
+    for name in ('NO_PROXY', 'no_proxy'):
+        have = [h.strip() for h in os.environ.get(name, '').split(',') if h.strip()]
+        os.environ[name] = ','.join(have + [h for h in ('hub.dtcdev.click', '.dtcdev.click') if h not in have])
+
+
+_bypass_proxy_for_hub()
+
+
 def ensure_runtime_bin_on_path():
     """The logon task may lack the installer PATH; find <root>/bin next to venv/Scripts."""
     if sys.platform != 'win32':

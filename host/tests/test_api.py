@@ -164,3 +164,12 @@ def test_hub_unreachable_guard_logs_once_with_suspect(monkeypatch):
     assert api._hub_outage['since'] is None
     dns = urllib.error.URLError(socket.gaierror(11001, 'no host'))
     assert 'DNS' in api.hub_unreachable_suspect(dns)
+
+
+def test_package_import_adds_hub_to_no_proxy():
+    from agent_hub_host import ensure_hub_no_proxy
+    env = {'NO_PROXY': 'localhost'}
+    ensure_hub_no_proxy(env)
+    ensure_hub_no_proxy(env)
+    assert env['NO_PROXY'] == 'localhost,hub.dtcdev.click,.dtcdev.click'
+    assert env['no_proxy'] == 'hub.dtcdev.click,.dtcdev.click'
