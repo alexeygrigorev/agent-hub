@@ -412,6 +412,8 @@ def main():
     repos.add_commands(sub)
     from . import session_control
     session_control.add_commands(sub)
+    from . import driver as driver_cli
+    driver_cli.add_parser(sub)
     from . import quota as quota_cmd
     quota_cmd.add_commands(sub)
     from . import metrics as metrics_cmd
@@ -696,6 +698,14 @@ def main():
                 print(json.dumps(rendered, indent=2, ensure_ascii=True))
         except Exception as exc:
             print(session_control.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'driver':
+        from . import driver as driver_cli
+        try:
+            print(json.dumps(driver_cli.execute(args), indent=2, ensure_ascii=True))
+        except Exception as exc:
+            print(driver_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'ops':

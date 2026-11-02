@@ -3,6 +3,7 @@ import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { GOAL_ENGINES, GOAL_PROVIDERS } from './goal-engines';
 import { observationModel } from './session-observation';
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
+import { driverLaunchRegistered } from './driver-access';
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 import { sanitizeCommandFields } from './command-diagnostics';
 import {sanitizeCpuAdmission,sanitizeCpuUsage,CPU_SATURATED_PCT} from './cpu-headroom';
@@ -2433,7 +2434,7 @@ export class FleetService {
           return valid.map(row => {
             const request = parsed(row.request_json);
             const link = hubLinks.get(String(row.id));
-            return { ...(scopedWorkers.has(String(row.id)) ? { worker_credential_required: true } : {}),
+            return { ...(scopedWorkers.has(String(row.id)) || driverLaunchRegistered(this.sql, String(row.id)) ? { worker_credential_required: true } : {}),
               // AC1 lock identity (additive; unknown keys are ignored by hosts).
               ...(link ? { hub_session_id: link.hub_session_id, ...(link.intake_task_id ? { intake_task_id: link.intake_task_id } : {}) } : {}),
               ...this.resources.cpuStart(String(row.id)), resource_choking: choking, resource_management: this.resources.configFor(caller.machineId!),
