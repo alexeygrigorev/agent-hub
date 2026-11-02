@@ -399,8 +399,10 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
                     status_failures += 1
                     if status_failures < STATUS_FAILURES_BEFORE_KILL:
                         continue
-                    recover_wedged_controller(receipt, last_pids)
-                    wedge_recovered = True
+                    _killed, forgotten = recover_wedged_controller(receipt, last_pids)
+                    # Exit is proven only when the record was actually forgotten; otherwise the normal
+                    # cleanup path decides (and marks the lease unproven so the loop retries).
+                    wedge_recovered = forgotten
                     raise RuntimeError('Controller wedged: status failed %d times; killed and forgotten' % status_failures)
                 status_failures = 0
                 if not same_controller(row, receipt):
