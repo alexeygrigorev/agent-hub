@@ -46,11 +46,15 @@ export function reservationNativeJoinSql(sql: SqlStorage): string {
 }
 
 /** Absence releases physical capacity only with a fresh complete census.
- * An uncertain launch's direct native_id lacks incarnation proof: only its
- * exact control-binding fallback above can release that reservation. */
+ * A running launch is releasable only when its direct native_id has no row;
+ * an uncertain launch's direct native_id lacks incarnation proof and requires
+ * its exact control-binding fallback above. */
 export function unobservedReservationReleased(row: Row, completeCatalogs: Map<string, number>): boolean {
-  return ['running','uncertain'].includes(row.state) && row.phase==='unobserved'
-    && completeCatalogs.has(String(row.machine_id))
+  const censusAt = completeCatalogs.get(String(row.machine_id));
+  const exactNativeMissing = row.state === 'running' && row.phase == null
+    && typeof row.native_id === 'string' && row.native_id.length > 0;
+  return ['running','uncertain'].includes(row.state) && (row.phase==='unobserved' || exactNativeMissing)
+    && censusAt !== undefined
     && (row.state!=='uncertain' || row.native_id==null || row.native_id==='');
 }
 
