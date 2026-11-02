@@ -530,6 +530,11 @@ describe('scope lifecycle adoption boundaries', () => {
 
 describe('compatible retries and offer scanning', () => {
   it('bounds each reconciliation sweep and wraps without retiring authorized starts', () => fleetFixture(async (f, sql, bus) => {
+    // Intake 9647e6d5: an unpinned launch draws weighted by headroom. This
+    // sweep test claims on a fixed host, so it pins the draw to the top
+    // candidate (the pre-draw behavior) without touching the scenario.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
     const claim = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000);
     const first: any = await (await f.handle(req('/api/fleet/launches', intent({ access: editAccess(claim.id) })), holder)).json();
     expect((await f.handle(req('/api/fleet/launches/' + first.id + '/claim', nativeStart), host())).status).toBe(200);
@@ -543,6 +548,7 @@ describe('compatible retries and offer scanning', () => {
     f.admission.reconcileOffers();
     expect(sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE verification_status = 'not_started'").one().n).toBe(101);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', first.id).one().state).toBe('starting');
+    } finally { random.mockRestore(); }
   }));
 
   it('replays a pre-adoption unspecified launch without labeling it read-only', () => fleetFixture(async (f, sql) => {
