@@ -215,11 +215,17 @@ export class HostCredentialService {
     const status: any = this.sql.exec('SELECT resync_requested_at FROM host_credential_status WHERE machine_id=?', machine).toArray()[0];
     const force = status?.resync_requested_at != null;
     const generations: Record<string, number> = {};
-    const credentials: Record<string, { generation: number; payload: Payload }> = {};
+    const credentials: Record<string, { generation: number; payload: Payload; registered?: boolean }> = {};
     try {
       for (const r of this.sql.exec('SELECT * FROM host_credentials ORDER BY kind').toArray() as any[]) {
         generations[r.kind] = r.generation;
-        if (force || have[r.kind] !== r.generation) credentials[r.kind] = { generation: r.generation, payload: await this.open(r) };
+        if (force || have[r.kind] !== r.generation) {
+          // GitHub does not accept the shared key until register-key succeeds;
+          // hosts must not install it before that (it would override their
+          // working github.com identity with a key GitHub refuses).
+          const registered = r.kind === 'git_ssh_key' ? JSON.parse(r.meta).registered === true : undefined;
+          credentials[r.kind] = { generation: r.generation, payload: await this.open(r), ...(registered === undefined ? {} : { registered }) };
+        }
       }
     } catch { return reply({ error: 'bundle_decryption_unavailable' }, 503); }
     if (force) this.sql.exec('UPDATE host_credential_status SET resync_requested_at=NULL WHERE machine_id=?', machine);
@@ -230,8 +236,10 @@ export class HostCredentialService {
   private async handleStatus(request: Request, machine: string): Promise<Response> {
     const report = sanitizeStatus(await request.json().catch(() => null));
     if (!report) return reply({ error: 'invalid_report' }, 400);
+    const keyRow = this.row('git_ssh_key');
+    const keyUsable = !!keyRow && JSON.parse(keyRow.meta).registered === true;
     const ghMissing = !report.gh.logged_in && !!this.row('gh_token');
-    const sshMissing = !report.ssh.authenticated && !!this.row('git_ssh_key');
+    const sshMissing = !report.ssh.authenticated && keyUsable;
     const body = JSON.stringify(report);
     const prior: any = this.sql.exec('SELECT report, resync_requested_at FROM host_credential_status WHERE machine_id=?', machine).toArray()[0];
     const resync = ghMissing || sshMissing;
@@ -263,6 +271,9 @@ export class HostCredentialService {
     if (outcome === 'registered') {
       const meta = { ...JSON.parse(keyRow.meta), registered: true, registered_at: this.now() };
       this.sql.exec('UPDATE host_credentials SET meta=? WHERE kind=?', JSON.stringify(meta), 'git_ssh_key');
+      // Hosts already hold this generation, so a plain poll would not deliver
+      // it; force one sync so they install the now-accepted key.
+      this.sql.exec('UPDATE host_credential_status SET resync_requested_at=?', this.now());
     }
     return reply({ status: outcome, fingerprint: JSON.parse(keyRow.meta).fingerprint ?? null }, outcome === 'registered' ? 200 : 502);
   }

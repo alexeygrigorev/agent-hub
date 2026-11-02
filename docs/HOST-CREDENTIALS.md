@@ -40,6 +40,13 @@ lacks `admin:public_key`/`write:public_key`; Hub reports `missing_scope_admin_pu
 a token needs a browser login, which agents must not start, so the token Hub holds must be minted with that
 scope. An already-registered key (422 "already in use") counts as registered.
 
+Until GitHub accepts the key, hosts hold it back: a sync payload for `git_ssh_key` carries
+`registered: false`, the host skips installing it and records the generation as
+`awaiting_github_registration`, so an unregistered key never overrides a working `github.com` ssh
+identity. A ssh failure report does not schedule re-sync churn while the key is unregistered (nothing
+would change). The moment `register-key` succeeds, Hub flags every machine for one forced sync, which
+delivers the now-accepted key despite the unchanged generation.
+
 ## Rotation and revocation
 
 `generate-ssh-key --rotate` stores generation N+1; every host overwrites the same key file

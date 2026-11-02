@@ -73,7 +73,8 @@ class HostCredentialsTest(unittest.TestCase):
             calls.append((method, path, body))
             if path.startswith('/api/host-credentials/sync'):
                 return {'generations': gens or {k: 1 for k in payloads}, 'forced': False,
-                        'credentials': {k: {'generation': 1, 'payload': v} for k, v in payloads.items()}}
+                        'credentials': {k: {'generation': 1, 'payload': v, **({'registered': True} if k == 'git_ssh_key' else {})}
+                                        for k, v in payloads.items()}}
             return {'status': 'recorded', 'resync': resync}
         return request, calls
 
@@ -168,6 +169,35 @@ class HostCredentialsTest(unittest.TestCase):
         state = hc._load_state()
         self.assertEqual(state['generations'], {})
         self.assertEqual(calls[0][1], '/api/host-credentials/sync')
+
+    def test_unregistered_key_is_held_until_github_accepts_it(self):
+        runner = FakeRunner(logged_in=False)
+        payloads = {'git_ssh_key': {'private_key': PRIV, 'public_key': PUB}, 'gh_token': {'token': TOKEN}}
+
+        def request(method, path, body=None):
+            if path.startswith('/api/host-credentials/sync'):
+                return {'generations': {k: 1 for k in payloads}, 'forced': False,
+                        'credentials': {k: {'generation': 1, 'payload': v, **({'registered': False} if k == 'git_ssh_key' else {})}
+                                        for k, v in payloads.items()}}
+            return {'status': 'recorded', 'resync': True}
+
+        result = hc.sync(request, runner)
+        # The gh login is applied; the shared key is NOT installed and its
+        # generation is remembered so Hub does not re-send it every poll.
+        self.assertEqual(result['applied'], ['gh_token'])
+        self.assertEqual(result['errors'], {'git_ssh_key': 'awaiting_github_registration'})
+        self.assertFalse((self.ssh / hc.KEY_NAME).exists())
+        # The held key must not masquerade as an applied ssh credential: its
+        # generation is remembered so Hub does not re-send it every poll.
+        self.assertEqual(hc._load_state()['generations'].get('git_ssh_key'), 1)
+
+    def test_registered_key_installs_and_authenticates(self):
+        runner = FakeRunner(logged_in=True)
+        request, _ = self.hub({'git_ssh_key': {'private_key': PRIV, 'public_key': PUB}})
+        result = hc.sync(request, runner)
+        self.assertEqual(result['applied'], ['git_ssh_key'])
+        self.assertTrue((self.ssh / hc.KEY_NAME).exists())
+        self.assertEqual(result.get('errors'), None)
 
     def test_hub_resync_after_logged_out_report_fetches_again_once(self):
         runner = FakeRunner(logged_in=False)
