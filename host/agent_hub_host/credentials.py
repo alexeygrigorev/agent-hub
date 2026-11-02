@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from . import private_fs
@@ -167,6 +168,12 @@ CODEX_RESET_CREDITS = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-cre
 CLAUDE_USAGE = 'https://api.anthropic.com/api/oauth/usage'
 GO_USAGE = 'https://opencode.ai/zen/go/v1/usage'
 GO_DEVICE_AUTH = Path('.local/share/opencode-hub/device-auth.json')
+ZAI_USAGE = 'https://api.z.ai/api/monitor/usage/quota/limit'
+ZAI_CONFIG = Path('.config/goz/config.json')
+AGY_TOKEN = Path('.gemini/antigravity-cli/antigravity-oauth-token')
+AGY_QUOTA = 'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary'
+GOOGLE_TOKEN = 'https://oauth2.googleapis.com/token'
+AGY_CLIENT_PREFIX = b'1071006060591-'
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -306,6 +313,114 @@ def _go_access_token(home):
     return token if isinstance(token, str) and token else None
 
 
+def zai_quota(body, now=None):
+    """Map a Z.AI ``monitor/usage/quota/limit`` body (used percent) to the quota route shape."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    data = body.get('data') if isinstance(body, dict) and isinstance(body.get('data'), dict) else body
+    limits = data.get('limits') if isinstance(data, dict) and isinstance(data.get('limits'), list) else None
+    if limits is None:
+        return None
+    windows = {'5h': {'percent_remaining': None, 'reset_at': None, 'present': False},
+               '7d': {'percent_remaining': None, 'reset_at': None, 'present': False}}
+    for item in limits:
+        if not isinstance(item, dict) or item.get('type') != 'TOKENS_LIMIT':
+            continue
+        name = {3: '5h', 6: '7d'}.get(item.get('unit'))
+        if name is None or windows[name]['present']:
+            continue
+        windows[name] = {'percent_remaining': _remaining(item.get('percentage', 0)),
+                         'reset_at': _iso(item.get('nextResetTime')), 'present': True}
+    if not any(w['present'] for w in windows.values()):
+        return None
+    limited = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values())
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limited}, 'windows': windows}
+
+
+def antigravity_quota(body, now=None):
+    """Map Antigravity ``retrieveUserQuotaSummary`` groups to the 5h/7d windows (tightest group wins)."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    groups = body.get('groups') if isinstance(body, dict) and isinstance(body.get('groups'), list) else None
+    if not groups:
+        return None
+    windows = {'5h': {'percent_remaining': None, 'reset_at': None, 'present': False},
+               '7d': {'percent_remaining': None, 'reset_at': None, 'present': False}}
+    for group in groups[:16]:
+        buckets = group.get('buckets') if isinstance(group, dict) and isinstance(group.get('buckets'), list) else []
+        for bucket in buckets[:16]:
+            if not isinstance(bucket, dict):
+                continue
+            name = {'5h': '5h', 'weekly': '7d'}.get(bucket.get('window'))
+            fraction = bucket.get('remainingFraction')
+            if name is None or isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+                continue
+            percent = max(0.0, min(100.0, float(fraction) * 100))
+            current = windows[name]
+            if not current['present'] or percent < current['percent_remaining']:
+                windows[name] = {'percent_remaining': percent, 'reset_at': _iso(bucket.get('resetTime')), 'present': True}
+    if not any(w['present'] for w in windows.values()):
+        return None
+    limited = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values())
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limited}, 'windows': windows}
+
+
+def _zai_token(home):
+    """Plaintext Z.AI coding-plan key from the managed home; the ZCode app's encrypted store is not usable."""
+    config = json.loads(private_fs.read_bytes(Path(home) / ZAI_CONFIG, MAX_FILE * 2, private=False))
+    token = config.get('zai_token') if isinstance(config, dict) else None
+    if not isinstance(token, str) or not token or token.startswith('enc:') or any(c.isspace() for c in token):
+        return None
+    return token
+
+
+def _agy_client(agy_binary):
+    """The Antigravity desktop OAuth application values embedded in the installed vendor binary.
+
+    Public application configuration, read at runtime and never stored or logged.
+    """
+    import mmap
+    with open(agy_binary, 'rb') as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        match = re.search(re.escape(AGY_CLIENT_PREFIX) + rb'[a-z0-9]{20,40}\.apps\.googleusercontent\.com', data)
+        if not match:
+            return None, []
+        secrets = [m.group().decode() for m in re.finditer(rb'GOCSPX-[A-Za-z0-9_-]{20,}', data)][:8]
+        return match.group().decode(), secrets
+
+
+def _agy_access_token(home, opener, timeout, now):
+    """Antigravity access token from the managed home; refreshed in memory only when expired."""
+    stored = json.loads(private_fs.read_bytes(Path(home) / AGY_TOKEN, MAX_FILE * 2, private=False))
+    token = stored.get('token') if isinstance(stored, dict) else None
+    if not isinstance(token, dict) or not isinstance(token.get('access_token'), str):
+        return None
+    expiry = None
+    if isinstance(token.get('expiry'), str):
+        try:
+            expiry = dt.datetime.fromisoformat(re.sub(r'(\.\d{6})\d+', r'\1', token['expiry'].replace('Z', '+00:00')))
+        except ValueError:
+            expiry = None
+    if expiry is not None and expiry.tzinfo is not None and expiry > now + dt.timedelta(seconds=60):
+        return token['access_token']
+    refresh = token.get('refresh_token')
+    binaries = sorted((Path(home).parent / 'engine' / 'bin').glob('agy*'))
+    if not isinstance(refresh, str) or not refresh or not binaries:
+        return token['access_token'] if expiry is None else None
+    client_id, secrets = _agy_client(binaries[0])
+    for secret in secrets:
+        form = urllib.parse.urlencode({'grant_type': 'refresh_token', 'refresh_token': refresh,
+                                       'client_id': client_id, 'client_secret': secret}).encode()
+        request = urllib.request.Request(GOOGLE_TOKEN, data=form, method='POST',
+                                         headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                value = json.loads(response.read(65536))
+        except urllib.error.HTTPError as error:
+            error.close()
+            continue
+        if isinstance(value, dict) and isinstance(value.get('access_token'), str):
+            return value['access_token']
+    return None
+
+
 def probe_quota(provider, home, opener=None, timeout=15):
     """Read quota straight from the provider with the materialized Hub credential.
 
@@ -341,6 +456,25 @@ def probe_quota(provider, home, opener=None, timeout=15):
                 return {}
             headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json', 'User-Agent': 'opencode/1.19'}
             url, parse = GO_USAGE, go_quota
+        elif provider == 'zai':
+            # Plaintext coding-plan key only: the ZCode app's encrypted store
+            # ("enc:...") cannot authenticate the monitor API.
+            token = _zai_token(home)
+            if token is None:
+                return {}
+            headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json', 'Content-Type': 'application/json',
+                       'User-Agent': 'agent-hub-quota/1'}
+            url, parse = ZAI_USAGE, zai_quota
+        elif provider == 'antigravity':
+            token = _agy_access_token(home, opener, timeout, dt.datetime.now(dt.timezone.utc))
+            if token is None:
+                return {}
+            request = urllib.request.Request(AGY_QUOTA, data=b'{}', method='POST', headers={
+                'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'User-Agent': 'antigravity'})
+            with opener.open(request, timeout=timeout) as response:
+                body = json.loads(response.read(131072))
+            route = antigravity_quota(body) if isinstance(body, dict) else None
+            return {provider: route} if route else {}
         else:
             return {}
         with opener.open(urllib.request.Request(url, headers=headers, method='GET'), timeout=timeout) as response:
