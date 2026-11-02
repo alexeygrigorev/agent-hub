@@ -1,3 +1,5 @@
+import { reservationNativeJoinSql, unobservedReservationReleased } from './fleet-capacity-snapshot';
+
 export const ACTIVE_LAUNCH_STATES_SQL = "('offered','starting','running','uncertain')";
 
 export type ReservedLaunchContext = {
@@ -5,9 +7,11 @@ export type ReservedLaunchContext = {
   stale_cutoff: string;
   idle_cutoff_ms: number;
   complete_catalogs: Map<string, number>;
-  bound_native_id_sql: string;
-  bound_native_created_at_sql: string;
 };
+
+/** Cutoffs and catalogs without the live-machine set: the pure eligibility
+ * part shared by accountStatus (snapshot branch) and the bounded page. */
+export type ReservedLaunchEligibility = Pick<ReservedLaunchContext, 'stale_cutoff' | 'idle_cutoff_ms' | 'complete_catalogs'>;
 
 export type ReservedLaunchCursor = { state: string; id: string } | null;
 
@@ -26,18 +30,23 @@ export function encodeReservedLaunchCursor(cursor: ReservedLaunchCursor): string
   return cursor ? `${cursor.state}:${cursor.id}` : null;
 }
 
-function isIdle(row: any, context: ReservedLaunchContext): boolean {
-  return row.phase === 'running' && context.complete_catalogs.has(String(row.machine_id))
+function isIdle(row: any, eligibility: ReservedLaunchEligibility): boolean {
+  return row.phase === 'running' && eligibility.complete_catalogs.has(String(row.machine_id))
     && typeof row.last_activity_at === 'string' && Number.isFinite(Date.parse(row.last_activity_at))
-    && Date.parse(row.last_activity_at) <= context.idle_cutoff_ms;
+    && Date.parse(row.last_activity_at) <= eligibility.idle_cutoff_ms;
 }
 
-function isUnobserved(row: any, context: ReservedLaunchContext): boolean {
-  return ['running', 'uncertain'].includes(row.state) && row.phase === 'unobserved'
-    && context.complete_catalogs.has(String(row.machine_id))
-    // Uncertain launches may shed a reservation only through an exact
-    // session-control binding; a mismatched native row is not terminal proof.
-    && (row.state !== 'uncertain' || row.native_id == null || row.native_id === '');
+/** The single reserved-eligibility predicate: state freshness plus the
+ * catalog-backed idle/unobserved releases. accountStatus (both the snapshot
+ * and the query branch via reservedLaunchPage) counts reservations with it. */
+export function isEligibleReservedLaunch(row: any, eligibility: ReservedLaunchEligibility): boolean {
+  if (!['offered', 'starting', 'running', 'uncertain'].includes(row.state)) return false;
+  if (row.state !== 'running' && !(row.updated_at > eligibility.stale_cutoff)) return false;
+  if (row.state === 'running') {
+    return !isIdle(row, eligibility) && !unobservedReservationReleased(row, eligibility.complete_catalogs);
+  }
+  if (row.state === 'uncertain') return !unobservedReservationReleased(row, eligibility.complete_catalogs);
+  return true;
 }
 
 /**
@@ -72,18 +81,13 @@ export function reservedLaunchPage(
   const rawRows = sql.exec(`SELECT l.id, l.machine_id, l.state, l.native_id, l.created_at, l.updated_at,
       ${hubSessionIdSql} AS hub_session_id, s.phase, s.last_activity_at, s.created_at_ms
     FROM fleet_launches l${launchIndexHint}
-    LEFT JOIN fleet_sessions s ON s.machine_id=l.machine_id
-      AND s.native_id=COALESCE(NULLIF(l.native_id, ''), ${context.bound_native_id_sql})
-      AND (NULLIF(l.native_id, '') IS NOT NULL OR
-        (s.engine=l.engine AND s.account=l.account AND s.created_at_ms=${context.bound_native_created_at_sql}))
+    ${reservationNativeJoinSql(sql)}
     WHERE l.account = ? AND l.state IN ${ACTIVE_LAUNCH_STATES_SQL}
       AND EXISTS (SELECT 1 FROM json_each(?) live WHERE live.value=l.machine_id)
       AND (l.state = 'running' OR l.updated_at > ?) ${whereCursor}
     ORDER BY l.state, l.id LIMIT ?`, account, JSON.stringify(context.live_ids), context.stale_cutoff,
     ...cursorBindings, limit).toArray() as any[];
-  const rows = rawRows.filter(row => row.state === 'running'
-    ? (!isIdle(row, context) && !isUnobserved(row, context))
-    : row.state === 'uncertain' ? !isUnobserved(row, context) : true)
+  const rows = rawRows.filter(row => isEligibleReservedLaunch(row, context))
     .map(row => ({
       id: String(row.id),
       machine: String(row.machine_id),

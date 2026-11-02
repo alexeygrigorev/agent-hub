@@ -822,35 +822,14 @@ export class FleetService {
   }
 
   private reservedLaunchContext(liveIds: string[], nowMs = this.now(), catalogs?: Map<string, number>): ReservedLaunchContext {
-    const completeCatalogs = catalogs ?? freshCompleteCatalogs(this.sql, nowMs);
-    let boundNativeIdSql = 'NULL';
-    let boundNativeCreatedAtSql = 'NULL';
-    try {
-      const hasControlStore = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
-      if (hasControlStore) {
-        const bindingWhere = `c.machine_id = l.machine_id AND c.fleet_launch_id = l.id AND c.engine = l.engine
-          AND c.state IN ('running','uncertain') AND c.binding_json IS NOT NULL`;
-        boundNativeIdSql = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(
-          CASE WHEN json_valid(c.binding_json) THEN
-            CASE WHEN json_type(c.binding_json, '$.native_id') = 'text' AND json_type(c.binding_json, '$.native_created_at_ms') = 'integer'
-              THEN json_extract(c.binding_json, '$.native_id') END
-          END) END
-        FROM session_control_sessions c WHERE ${bindingWhere})`;
-        boundNativeCreatedAtSql = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(
-            CASE WHEN json_valid(c.binding_json) THEN
-              CASE WHEN json_type(c.binding_json, '$.native_created_at_ms') = 'integer'
-                THEN json_extract(c.binding_json, '$.native_created_at_ms') END
-            END) END
-          FROM session_control_sessions c WHERE ${bindingWhere})`;
-      }
-    } catch { /* Fleet-only stores have no session-control binding to join. */ }
+    // The launch↔session native join (with its bounded LIMIT 2 uniqueness
+    // probe) lives only in reservationNativeJoinSql; every reserved-accounting
+    // read reuses it instead of carrying SQL fragments through this context.
     return {
       live_ids: liveIds,
       stale_cutoff: new Date(nowMs - 48 * 3600000).toISOString(),
       idle_cutoff_ms: nowMs - this.resources.config().idle_minutes * 60000,
-      complete_catalogs: completeCatalogs,
-      bound_native_id_sql: boundNativeIdSql,
-      bound_native_created_at_sql: boundNativeCreatedAtSql,
+      complete_catalogs: catalogs ?? freshCompleteCatalogs(this.sql, nowMs),
     };
   }
 
