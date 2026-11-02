@@ -264,7 +264,7 @@ export const FREE_POOL_PROVIDERS = policy.rules.preferred_providers;
 export const ROUTING_DEFAULTS = { codexPreference: 0.9, grokDemotion: 0.2, urgencyGamma: 1.5 };
 
 /** S(m) factors; the score is their product. */
-export interface RouteScoreFactors { fit: number; health: number; preference: number; headroom: number; urgency: number; pacing: number; grok: number; banked: number }
+export interface RouteScoreFactors { fit: number; health: number; preference: number; headroom: number; urgency: number; pacing: number; grok: number; banked: number; burn?: number }
 
 /** F_fit: exact tier 1.0, deep model on daily task 0.5, anything else (up-tiering) 0. */
 export function taskFit(modelTier: string, taskTier: string): number {
@@ -323,7 +323,8 @@ export function scheduleBurnFactor(quota: any, nowMs: number): { factor: number;
   if (remaining !== null && remaining < LOW_HEADROOM_PERCENT && ratio < 1) factor *= Math.pow(Math.max(0.1, remaining / LOW_HEADROOM_PERCENT), 2);
   return { factor, ratio, remaining };
 }
-export const routeScore = (f: RouteScoreFactors) => f.fit * f.health * f.preference * f.headroom * f.urgency * f.pacing * f.grok * f.banked;
+/** `burn` (src/burn.ts) is the use-it-or-lose-it multiplier; absent stays neutral. */
+export const routeScore = (f: RouteScoreFactors) => f.fit * f.health * f.preference * f.headroom * f.urgency * f.pacing * f.grok * f.banked * (f.burn ?? 1);
 
 /** Per-provider / per-account pacing context for routing, derived from tbm_* rows. */
 export interface ProviderPacing {
