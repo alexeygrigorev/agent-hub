@@ -720,7 +720,20 @@ def configure_default_engine():
     if not isinstance(data, dict):
         raise ValueError('Invalid Claude settings; existing file preserved')
     data.setdefault('model', 'opus')
-    write_private(settings, json.dumps(data, indent=2) + '\n')
+    write_claude_settings(settings, json.dumps(data, indent=2) + '\n')
+
+
+def write_claude_settings(settings, text, *, sleep=None):
+    """A running Claude can lock settings.json (access denied): back off and retry, never abort the install."""
+    from .installer_hygiene import retry_transient
+    kwargs = {'sleep': sleep} if sleep else {}
+    try:
+        retry_transient(lambda: write_private(settings, text), **kwargs)
+    except OSError as error:
+        print('Claude default model not written (' + type(error).__name__ + '); the file is locked, continuing. '
+              'Rerun the installer to apply it.', flush=True)
+        return False
+    return True
 
 
 def install_service(install_root, command):
