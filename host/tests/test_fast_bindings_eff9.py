@@ -137,6 +137,11 @@ class FastBindingsTests(unittest.TestCase):
 
 class CensusIsolationTests(unittest.TestCase):
     def setUp(self):
+        # Dispatcher fixtures share the same fake executable name. Do not let
+        # a process-wide native census from an earlier test replace this
+        # fixture's mocked runner result.
+        from agent_hub_host import native_list_cache
+        native_list_cache.invalidate("list")
         # This census ordering fixture has virtual paths. Filesystem guard
         # behavior is tested with real Git trees in test_worktree_guard.
         guard = patch('agent_hub_host.worktree_guard.protect_adoption', return_value=True)
