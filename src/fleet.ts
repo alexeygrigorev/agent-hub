@@ -1324,7 +1324,11 @@ export class FleetService {
       // for the same measured trigger to clear. Other eligible hosts may win.
       else if (loadRefusal !== undefined && loadRefusal.machine === route.machine_id && (() => {
         const trigger = loadRefusal.trigger || 'legacy';
-        if (trigger === 'mem_available') return Number.isFinite(hb.mem_avail_mb) && Number.isFinite(loadRefusal.limit) && hb.mem_avail_mb < loadRefusal.limit;
+        if (trigger === 'mem_available') {
+          const memFloor = loadRefusal.limit;
+          return Number.isFinite(hb.mem_avail_mb) && typeof memFloor === 'number'
+            && Number.isFinite(memFloor) && hb.mem_avail_mb < memFloor;
+        }
         if (trigger === 'cpu_busy') {
           const usage = sanitizeCpuUsage(hb.cpu_usage);
           const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;
