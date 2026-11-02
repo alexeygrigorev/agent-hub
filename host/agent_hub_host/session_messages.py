@@ -193,7 +193,10 @@ def relay_replies(*, journal_dir: str, executable: str, request: Callable,
     relayed: list[dict[str, Any]] = []
     for mailbox, records in by_mailbox.items():
         try:
-            log = fetch_message_log(executable, mailbox)
+            # Replies are authored by sessions outside this process. Read a
+            # fresh mailbox snapshot so a just-arrived reply is not hidden by
+            # the short shared message-log cache.
+            log = fetch_message_log(executable, mailbox, fresh=True)
         except (SessionControlError, SessionUncertain):
             continue
         for path, record in records[-MAX_RELAY_JOURNALS:]:

@@ -846,6 +846,8 @@ def fetch_message_log(
     executable: str,
     workspace: str,
     limit: int = MAX_LOG_ROWS,
+    *,
+    fresh: bool = False,
 ) -> list[dict[str, Any]]:
     """Retrieve the actual native message log for the exact workspace (bounded, read-only).
 
@@ -870,7 +872,7 @@ def fetch_message_log(
             raise SessionUncertain("Native message log is not an array; reconciliation deferred")
         return rows
 
-    rows = native_list_cache.message_log(executable, canonical, fetch)
+    rows = native_list_cache.message_log(executable, canonical, fetch, force=fresh)
     return [r for r in rows if isinstance(r, dict)][-limit:]
 
 
@@ -918,7 +920,10 @@ def verify_ack_via_reply(
     except SessionControlError as exc:
         return AckResult(state="unknown", reason=f"target requalification failed: {exc}")
     try:
-        log = fetch_message_log(executable, sender.workspace)
+        # ACK proof depends on the latest recipient reply. A cached log could
+        # miss a reply that arrived after the last poll, so always read a fresh
+        # native snapshot for this decision.
+        log = fetch_message_log(executable, sender.workspace, fresh=True)
     except SessionUncertain as exc:
         return AckResult(state="unknown", reason=f"proof transport unqualified: {exc}")
     except SessionControlError as exc:
