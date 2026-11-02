@@ -131,8 +131,10 @@ describe('per-step rows-read budgets', () => {
     expect(rows['tick:session_audit'] ?? 0).toBeLessThan(SESSIONS * 40);
     expect(rows['tick:bus_retention'] ?? 0).toBeLessThanOrEqual(40);
     const total = Object.values(rows).reduce((a, b) => a + b, 0);
-    // Linear in running sessions only (~70 rows each today); never in table sizes.
-    expect(total).toBeLessThan(SESSIONS * 80);
+    // Linear in running sessions only (about 82 rows each with the bounded
+    // in-flight launch correlation); never in table sizes.
+    expect(rows['tick:intake_watchdog'] ?? 0).toBeLessThan(SESSIONS * 27);
+    expect(total).toBeLessThan(SESSIONS * 85);
   }));
 });
 
