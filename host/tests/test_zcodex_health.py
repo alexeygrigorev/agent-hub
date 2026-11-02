@@ -9,7 +9,7 @@ def row(sid='z1', **kw):
 
 
 def test_zcodex_cap_is_engine_specific():
-    assert fleet.worker_resource_argv('zcodex')[1] == '4096M'
+    assert fleet.worker_resource_argv('zcodex')[1] == '6144M'
     assert fleet.worker_resource_argv('codex')[1] == '6144M'
     assert fleet.worker_resource_argv()[1] == '6144M'
 
