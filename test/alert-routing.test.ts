@@ -1,7 +1,7 @@
 import { mintSessionCredential } from '../src/session-messaging';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { alertDestinations, inboxReaderStatus, READER_FRESH_MS, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting } from '../src/alert-routing';
+import { alertDestinations, DEFAULT_HUB_ALERT_WEBHOOK, inboxReaderStatus, READER_FRESH_MS, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting } from '../src/alert-routing';
 import { sha256 } from '../src/auth/crypto';
 import { LivenessService } from '../src/liveness';
 import { validateCheck } from '../src/checks';
@@ -32,12 +32,14 @@ async function expiredSession(h:any) {
 const incident = (h: any, kind = 'session', subject = 'host/shell') => h.livenessService.setAlert(kind, subject, { state: 'stalled', detail: 'no_native_progress' });
 
 describe('alert routing acceptance', () => {
-  it('has no dead default and rejects insecure or credential-bearing webhooks', () => {
-    expect(alertDestinations({})).toEqual({ actors: [], webhook: null, invalidWebhook: false, invalidActors: false });
+  it('defaults to the existing Developer mailbox pipeline and rejects insecure webhooks', () => {
+    expect(alertDestinations({})).toEqual({ actors: [], webhook: DEFAULT_HUB_ALERT_WEBHOOK, invalidWebhook: false, invalidActors: false, webhookAuthRequired: true });
+    expect(alertDestinations({ HUB_ALERT_WEBHOOK: '' })).toMatchObject({ webhook: null, webhookAuthRequired: false });
     for (const url of ['http://example.test', 'https://u:p@example.test', 'invalid']) expect(alertDestinations({ HUB_ALERT_WEBHOOK: url }).invalidWebhook).toBe(true);
   });
 
   it('refuses unset and no-reader targets without adding backlog', () => fixture(async h => {
+    h.env = { ...h.env, HUB_ALERT_WEBHOOK: '' };
     delete h.env.HUB_ALERT_TO;
     const a = incident(h);
     await h.notifyAlert(a);
@@ -51,6 +53,25 @@ describe('alert routing acceptance', () => {
     expect(h.livenessService.alerts().some((a: any) => a.subject_kind === 'alert_routing' && a.state === 'fail')).toBe(true);
     const status = await h.statusService.handle(new Request('https://hub.test/api/status'), async () => ({ caller: { isAdmin: true, actor: 'test', kind: 'human' }, scopes: ['admin'] }));
     expect((await status.json()).needs_attention.some((a: any) => a.subject === 'alert_routing:destination')).toBe(true);
+  }));
+
+  it('posts default alerts to the watched Dapier dev-mailbox webhook with its bearer secret', () => fixture(async h => {
+    h.env = { ...h.env, HUB_ALERT_TO: '', HUB_ALERT_WEBHOOK_TOKEN: 'fixture-dapier-token' };
+    delete h.env.HUB_ALERT_WEBHOOK;
+    const original = globalThis.fetch; const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: any, init: RequestInit) => { calls.push({ url: String(url), init }); return new Response('accepted'); }) as any;
+    try {
+      const a = incident(h);
+      await h.notifyAlert(a);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe(DEFAULT_HUB_ALERT_WEBHOOK);
+      expect((calls[0].init.headers as any).Authorization).toBe('Bearer fixture-dapier-token');
+      const payload = JSON.parse(String(calls[0].init.body));
+      expect(payload).toMatchObject({ from: 'Agent Hub <alerts@dtcdev.click>', to: 'dev@dtcdev.click', message_id: `hub-alert-${a.id}` });
+      expect(payload.alert.subject).toBe('host/shell');
+      expect(h.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE to_actor='grok-bot'").one().n).toBe(0);
+      expect(h.livenessService.alerts()[0].notify_error).toBeNull();
+    } finally { globalThis.fetch = original; }
   }));
 
   it('routes to a reader once per open stall, including stale-row retries and restarts', () => fixture(async h => {
@@ -89,18 +110,36 @@ describe('alert routing acceptance', () => {
     } finally { globalThis.fetch = original; }
   }));
 
-  it('reroutes an already-open incident when configuration changes without repeating successful targets', () => fixture(async h => {
-    await h.runChecks('liveness');
-    const a = incident(h, 'check', 'existing-slo');
-    h.livenessService.markNotified(a.id, null, ['inbox:retired']);
-    h.sql.exec('UPDATE liveness_alerts SET opened_at=? WHERE id=?', new Date(Date.now()-3600000).toISOString(), a.id);
-    const caller = await reader(h);
-    h.busService.inbox(caller, 'watched');
-    h.env = { ...h.env, HUB_ALERT_TO: 'watched' };
-    await h.runChecks('liveness');
-    expect(h.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE to_actor='watched'").one().n).toBe(1);
-    await h.runChecks('liveness');
-    expect(h.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE to_actor='watched'").one().n).toBe(1);
+  it('summarizes a pre-existing alert backlog once when the destination changes', () => fixture(async h => {
+    h.env = { ...h.env, HUB_ALERT_TO: '', HUB_ALERT_WEBHOOK: 'https://example.test/cutover' };
+    const original = globalThis.fetch; const calls: { url: string; payload: any }[] = [];
+    globalThis.fetch = (async (url: any, init: RequestInit) => { calls.push({ url: String(url), payload: JSON.parse(String(init.body)) }); return new Response('ok'); }) as any;
+    try {
+      for (let i = 0; i < 25; i++) {
+        const old = h.livenessService.setAlert('check', `old-${i}`, { state: 'fail', detail: 'old destination could not be read' });
+        h.livenessService.markNotified(old.id, 'alert destinations changed');
+        h.sql.exec('UPDATE liveness_alerts SET notified_at=? WHERE id=?', new Date(Date.now() - 3600000).toISOString(), old.id);
+      }
+      await h.runChecks('liveness');
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe('https://example.test/cutover');
+      expect(calls[0].payload.alert.subject).toBe('cutover_backlog');
+      expect(calls[0].payload.text).toContain('25 pre-existing open alert(s)');
+      expect(h.sql.exec('SELECT COUNT(*) AS n FROM alert_backfill_suppressed').one().n).toBe(25);
+      expect(h.livenessService.undelivered(900)).toEqual([]);
+      await h.runChecks('liveness');
+      expect(calls).toHaveLength(1);
+    } finally { globalThis.fetch = original; }
+  }));
+
+  it('does not send the Dapier bearer secret to a different configured webhook', () => fixture(async h => {
+    h.env = { ...h.env, HUB_ALERT_TO: '', HUB_ALERT_WEBHOOK: 'https://example.test/private-hook', HUB_ALERT_WEBHOOK_TOKEN: 'must-not-leak' };
+    const original = globalThis.fetch; let headers: any;
+    globalThis.fetch = (async (_url: any, init: RequestInit) => { headers = init.headers; return new Response('ok'); }) as any;
+    try {
+      await h.notifyAlert(incident(h));
+      expect(headers.Authorization).toBeUndefined();
+    } finally { globalThis.fetch = original; }
   }));
 
   it('requires fresh actual inbox reads; admin inspection, token use and revoked/expired readers cannot pass', () => fixture(async h => {
@@ -212,6 +251,27 @@ describe('alert routing acceptance', () => {
     const response=await h.fetch(new Request('https://hub.test/api/token/refresh',{method:'POST',body:JSON.stringify({grant_type:'refresh_token',refresh_token:c.refresh})}));
     expect(response.status).toBe(200);
     expect(h.sql.exec("SELECT resolved_at FROM liveness_alerts WHERE id=?",a.id).one().resolved_at).not.toBeNull();
+  }));
+
+  it('routes a known consumer bus-read 401 through the default Dapier alert pipeline', () => fixture(async h => {
+    h.env = { ...h.env, HUB_ALERT_TO: '', HUB_ALERT_WEBHOOK_TOKEN: 'fixture-dapier-token' };
+    delete h.env.HUB_ALERT_WEBHOOK;
+    await reader(h, 'broken-default', 'expired-default-token');
+    h.sql.exec("UPDATE credentials SET expires_at=? WHERE id='broken-default'", new Date(Date.now() - 1).toISOString());
+    const original = globalThis.fetch; const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: any, init: RequestInit) => { calls.push({ url: String(url), init }); return new Response('accepted'); }) as any;
+    try {
+      const response = await h.fetch(new Request('https://hub.test/api/bus/inbox?actor=spoofed', { headers: { Authorization: 'Bearer expired-default-token' } }));
+      expect(response.status).toBe(401);
+      const alert = h.sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind='bus_auth' AND subject='broken-default'").one();
+      await h.notifyAlert(alert);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe(DEFAULT_HUB_ALERT_WEBHOOK);
+      expect((calls[0].init.headers as any).Authorization).toBe('Bearer fixture-dapier-token');
+      const payload = JSON.parse(String(calls[0].init.body));
+      expect(payload.alert.subject).toBe('broken-default');
+      expect(JSON.stringify(payload)).not.toContain('expired-default-token');
+    } finally { globalThis.fetch = original; }
   }));
 
   it('notifies distinct outages and state changes while bounding reopened native stalls', () => fixture(async h => {

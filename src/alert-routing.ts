@@ -12,6 +12,7 @@ export function readerActor(sql: SqlStorage, actor: string): string {
 export const READER_FRESH_MS = 15 * 60 * 1000;
 export const BUS_REFRESH_GRACE_MS = 2 * 60 * 1000;
 export const ALERT_SUBJECT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_HUB_ALERT_WEBHOOK = 'https://dapier.dtcdev.click/hooks/webhook/dev';
 export const ALERT_ROUTING_SCHEMA = `
 CREATE TABLE IF NOT EXISTS bus_auth_pending (subject TEXT PRIMARY KEY, credential_id TEXT NOT NULL, first_failed_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS bus_auth_pending_due ON bus_auth_pending(first_failed_at);
@@ -50,17 +51,33 @@ export function alertDestinations(env: { HUB_ALERT_TO?: string; HUB_ALERT_WEBHOO
   const invalidActors = actors.length !== targets.length;
   let webhook: string | null = null;
   let invalidWebhook = false;
-  if (env.HUB_ALERT_WEBHOOK) {
+  const webhookValue = env.HUB_ALERT_WEBHOOK === undefined ? DEFAULT_HUB_ALERT_WEBHOOK : env.HUB_ALERT_WEBHOOK;
+  let webhookAuthRequired = false;
+  if (webhookValue) {
     try {
-      const url = new URL(env.HUB_ALERT_WEBHOOK);
+      const url = new URL(webhookValue);
       if (url.protocol !== 'https:' || url.username || url.password || url.hash) invalidWebhook = true;
-      else webhook = url.toString();
+      else {
+        webhook = url.toString();
+        webhookAuthRequired = url.hostname === 'dapier.dtcdev.click' && url.pathname === '/hooks/webhook/dev';
+      }
     } catch { invalidWebhook = true; }
   }
-  return { actors, webhook, invalidWebhook, invalidActors };
+  return { actors, webhook, invalidWebhook, invalidActors, webhookAuthRequired };
+}
+
+/** Prevent a destination cutover from replaying an unbounded old alert queue. */
+export function suppressOpenAlertBackfill(sql: SqlStorage, now = Date.now()): number {
+  const count = Number(sql.exec(`SELECT COUNT(*) AS n FROM liveness_alerts a
+    WHERE a.resolved_at IS NULL AND NOT EXISTS (SELECT 1 FROM alert_backfill_suppressed s WHERE s.alert_id=a.id)`).one().n);
+  if (count) sql.exec(`INSERT OR IGNORE INTO alert_backfill_suppressed(alert_id, suppressed_at)
+    SELECT id, ? FROM liveness_alerts WHERE resolved_at IS NULL`, now);
+  return count;
 }
 
 export function pruneAlertRouting(sql: SqlStorage, now = Date.now()) {
   sql.exec('DELETE FROM bus_reader_activity WHERE last_read_at < ?', now - READER_FRESH_MS);
   sql.exec('DELETE FROM alert_delivery_receipts WHERE sent_at < ?', now - ALERT_SUBJECT_COOLDOWN_MS);
+  sql.exec(`DELETE FROM alert_backfill_suppressed s WHERE NOT EXISTS (
+    SELECT 1 FROM liveness_alerts a WHERE a.id=s.alert_id AND a.resolved_at IS NULL)`);
 }
