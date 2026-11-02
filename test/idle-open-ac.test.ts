@@ -104,7 +104,7 @@ describe('idle with open acceptance criteria', () => {
     adoptObservedNativeSessions(counted as any,'idle-host',natives,at+1000);
     expect(reads.some(q=>q.includes('FROM intake_tasks'))).toBe(false);
   }));
-  it('links the ca6092b2 note-aplexer START evidence in the first observation cycle', async () => fixture(async ({sql,task}: any) => {
+  it('links ca6092b2 from a note-aplexer key despite operational status text', async () => fixture(async ({sql,task}: any) => {
     const native={native_id:'ca6092b2-d6ce-4bde-9bd9-4b3d027c6a1e',tag:'fix-6ce3c560',
       workspace:'/test/agent-hub-wt-6ce3c560',engine:'codex',created_at_ms:at-1000,phase:'running'};
     task.history.push({id:crypto.randomUUID(),kind:'note',intake_key:'note-aplexer-ca6092b2',
