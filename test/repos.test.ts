@@ -117,8 +117,11 @@ describe('private repo registry', () => {
     expect(r.prepareLaunch({ workspace: 'dtc-websit', prompt: 'x' }).error.matches[0]).toBe('dtc-website');
     expect(r.prepareLaunch({ workspace: 'dtc-website', prompt: '', mode: 'interactive' }).input.prompt).toBe('');
   }));
-  it('routes PORTABLE repos as repo identities instead of pinning the registry machine (178ec5bb)', () => fixture(async r => {
-    await seed(r, [repo({ flags: ['PORTABLE'] })]);
+  it('routes portable repos as repo identities instead of pinning the registry machine (178ec5bb)', () => fixture(async r => {
+    await seed(r);
+    expect((await r.handle(req('/dtc-website', 'PATCH', { portable: 'yes' }), admin)).status).toBe(400);
+    expect((await r.handle(req('/dtc-website', 'PATCH', { portable: true }), agent)).status).toBe(403);
+    expect((await r.handle(req('/dtc-website', 'PATCH', { portable: true }), admin)).status).toBe(200);
     const result = r.prepareLaunch({ workspace: 'dtc-website', prompt: 'x', mode: 'headless', intake_task_id: '178ec5bb-99c4-41da-80d5-8c8d7e367422' }).input;
     expect(result.machine).toBeUndefined();
     expect(result.workspace).toMatch(/^repo-178ec5bb-/);
