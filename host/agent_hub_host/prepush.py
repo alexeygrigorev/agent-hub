@@ -173,7 +173,7 @@ def verify(root, candidate, base):
     print(f'push-main: verified {candidate} against advertised main {base}', flush=True)
 
 
-def hook(root, lines):
+def hook(root, lines, remote_url='origin'):
     updates = []
     for line in lines:
         fields = line.split()
@@ -186,10 +186,18 @@ def hook(root, lines):
     if len(updates) != 1:
         raise RuntimeError('multiple main updates refused')
     _, candidate, _, base = updates[0]
-    # Git sends the remote's advertised old SHA and atomically compares it when
-    # updating the ref. An intervening remote push is refused by Git itself.
+    # Verification may wait for admission or run arbitrary tests. Never hold
+    # the repository release lock during it (including BROAD fallback).
+    verify(root, candidate, base)
+    # Keep only the final remote/source comparison serialized. The hook exits
+    # before its parent Git updates main; Git's remote ref transaction provides
+    # the atomic old-SHA compare and lock for that update, including raw pushes.
     with release_lock(root):
-        verify(root, candidate, base)
+        git(root, 'fetch', '--no-tags', remote_url, 'refs/heads/main')
+        if git(root, 'rev-parse', 'FETCH_HEAD') != base:
+            raise RuntimeError('remote main changed during verification; integrate and retry')
+        if git(root, 'rev-parse', 'HEAD') != candidate or not clean(root):
+            raise RuntimeError('source changed before push; nothing pushed')
 
 
 def main():
@@ -210,7 +218,7 @@ def main():
                                             input=''.join(lines), text=True)
                     if result.returncode:
                         raise RuntimeError('inherited pre-push hook refused push')
-            hook(root, lines)
+            hook(root, lines, sys.argv[3])
         elif mode == 'push' and len(sys.argv) == 2:
             if not clean(root):
                 raise RuntimeError('commit working-tree changes before releasing')
