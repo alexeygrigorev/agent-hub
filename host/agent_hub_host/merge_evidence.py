@@ -70,7 +70,7 @@ def active_report_references(history: list) -> list:
         if isinstance(event, dict) and event.get('kind') == 'report' and isinstance(event.get('id'), str):
             reports[event['id'].lower()] = (index, event)
 
-    superseded = set()
+    supersession_claims = []
     events = history if isinstance(history, list) else []
     for index, event in enumerate(events):
         if not isinstance(event, dict) or event.get('kind') != 'report':
@@ -92,7 +92,17 @@ def active_report_references(history: list) -> list:
                 valid = False
                 break
         if valid:
-            superseded.update(normalized)
+            supersession_claims.append(normalized)
+
+    claim_counts = {}
+    for targets in supersession_claims:
+        for target in targets:
+            claim_counts[target] = claim_counts.get(target, 0) + 1
+    # Ambiguous history must keep the old reference required. The worker API
+    # rejects duplicate targets, but this parser also fails closed on malformed
+    # or legacy history containing competing supersession events.
+    superseded = {target for targets in supersession_claims
+                  for target in targets if claim_counts[target] == 1}
 
     refs = []
     for event in events:
