@@ -1241,6 +1241,20 @@ def profiles(bundles, path=None, is_windows=None):
     private_fs.atomic_write(path, (text.rstrip() + '\n\n' + block + END).encode(), 262144)
 
 
+def _ensure_builtin_provider(res_dir):
+    """ZCode reads glm/provider/zcode-builtin.json ('Built-in Provider Config').
+
+    The Linux deb ships that file only as config/provider/zcode-builtin.json (the
+    Windows app has both), so a runtime taken from the deb failed with 'ZCode cannot
+    locate its Built-in Provider Config' (Windows laptop)."""
+    res_dir = Path(res_dir)
+    target = res_dir / 'glm' / 'provider' / 'zcode-builtin.json'
+    source = res_dir / 'config' / 'provider' / 'zcode-builtin.json'
+    if (res_dir / 'glm').is_dir() and not target.is_file() and source.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+
 def _copy_runtime_resources(src_res_dir, dst_res_dir):
     dst_res_dir.mkdir(parents=True, exist_ok=True)
     for name in ('glm', 'tools', 'model-providers', 'config'):
@@ -1250,6 +1264,7 @@ def _copy_runtime_resources(src_res_dir, dst_res_dir):
             if dst_entry.is_dir():
                 shutil.rmtree(dst_entry)
             shutil.copytree(src_entry, dst_entry)
+    _ensure_builtin_provider(dst_res_dir)
 
 
 def parse_deb_manifest(manifest_text):
@@ -1320,7 +1335,7 @@ def _extract_deb_resources(deb_path, target):
     with tarfile.open(fileobj=buf, mode='r:*') as tar:
         for member in tar:
             rel = member.name[2:] if member.name.startswith('./') else member.name
-            if not rel.startswith(prefix) or not (member.isfile() or member.isdir()):
+            if not rel.startswith(prefix) or not (member.isfile() or member.isdir() or member.islnk() or member.issym()):
                 continue
             out = (root_dir / rel).resolve()
             if not out.is_relative_to(root_dir / prefix):
@@ -1330,6 +1345,8 @@ def _extract_deb_resources(deb_path, target):
                 continue
             out.parent.mkdir(parents=True, exist_ok=True)
             src = tar.extractfile(member)
+            if src is None:
+                continue
             with open(out, 'wb') as dst:
                 shutil.copyfileobj(src, dst)
 
@@ -1337,6 +1354,11 @@ def _extract_deb_resources(deb_path, target):
 def ensure_zcode_runtime(dest=None):
     runtime = locate_zcode_runtime(dest)
     if runtime:
+        for candidate in {runtime.parent.parent, runtime.parent}:
+            try:
+                _ensure_builtin_provider(candidate)
+            except OSError:
+                pass
         if dest and not runtime.resolve().is_relative_to(dest.resolve()):
             src_res = runtime.parent.parent if runtime.parent.name == 'glm' else runtime.parent
             if src_res.is_dir():

@@ -149,5 +149,18 @@ class WindowsLaunchArgv(unittest.TestCase):
         self.assertEqual(out.stdout.split(), [cfg['target_data'], 'False'])
 
 
+class ProxyEnvironment(unittest.TestCase):
+    def test_user_proxy_never_reaches_the_opencode_store(self):
+        from agent_hub_host import opencode_auth
+        base = Path(tempfile.mkdtemp())
+        cfg = {'binary': str(base / 'oc'), 'source_data': str(base / 's'),
+               'source_config': str(base / 'sc'), 'target_data': str(base / 't')}
+        dirty = {'HTTP_PROXY': 'http://127.0.0.1:8899', 'https_proxy': 'http://127.0.0.1:8899', 'NO_PROXY': 'x', 'PATH': os.environ.get('PATH', '')}
+        for source in (False, True):
+            env = opencode_auth.environment(cfg, source=source, base=dirty)
+            self.assertFalse({k for k in env if k.lower().endswith('_proxy')})
+            self.assertEqual(env['PATH'], dirty['PATH'])
+
+
 if __name__ == "__main__":
     unittest.main()

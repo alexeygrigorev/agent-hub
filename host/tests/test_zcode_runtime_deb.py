@@ -43,6 +43,18 @@ class ExtractDebResources(unittest.TestCase):
         self.assertFalse((out / 'opt/ZCode/ZCode').exists())
         self.assertFalse((out / 'usr').exists())
 
+    def test_builtin_provider_config_is_provided_where_zcode_looks_for_it(self):
+        res = self.tmp / 'res'
+        (res / 'glm').mkdir(parents=True)
+        (res / 'glm' / 'zcode.cjs').write_bytes(b'x')
+        (res / 'config' / 'provider').mkdir(parents=True)
+        (res / 'config' / 'provider' / 'zcode-builtin.json').write_text('{"providers": []}')
+        p._ensure_builtin_provider(res)
+        self.assertEqual((res / 'glm' / 'provider' / 'zcode-builtin.json').read_text(), '{"providers": []}')
+        (res / 'glm' / 'provider' / 'zcode-builtin.json').write_text('own')
+        p._ensure_builtin_provider(res)  # never overwrites an existing file
+        self.assertEqual((res / 'glm' / 'provider' / 'zcode-builtin.json').read_text(), 'own')
+
     def test_refuses_traversal_and_zstd(self):
         deb = self.tmp / 'bad.deb'
         deb.write_bytes(_deb({'opt/ZCode/resources/../../../evil': b'x'}))
