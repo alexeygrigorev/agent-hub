@@ -31,6 +31,10 @@ export interface Env {
   HUB_MACHINE_STALE_S?: string;
   HUB_MACHINE_OFFLINE_S?: string;
   HUB_AGENT_STALL_S?: string;
+  /** Intake b527e905: operator opt-in to put Claude first in the intake
+   * recovery engine order. Unset keeps the standing no-new-Claude policy
+   * (codex, opencode, zcodex, antigravity). */
+  HUB_RECOVERY_CLAUDE_ENABLED?: string;
   /** Intake 167c6178: longer bound for an active tool call (Working state or live
    * headless child) before it is classified as a hung tool call. Default 7200. */
   HUB_AGENT_TOOLCALL_STALL_S?: string;

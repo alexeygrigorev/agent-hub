@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom, WATCHDOG_INTERVAL, QUEUE_RETRY_BASE_MS, QUEUE_HOLD_TTL_MS } from '../src/intake-watchdog';
+import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom, WATCHDOG_INTERVAL, QUEUE_RETRY_BASE_MS, QUEUE_HOLD_TTL_MS, INTAKE_IDLE_GRACE } from '../src/intake-watchdog';
+import { SessionControlService } from '../src/session_control';
 // Forgotten-work dispatch cases opt in explicitly; the queue suite checks the disabled default.
 class IntakeWatchdog extends BaseIntakeWatchdog {
   constructor(...args: ConstructorParameters<typeof BaseIntakeWatchdog>) {
@@ -83,9 +84,9 @@ describe('forgotten intake watchdog', () => {
     expect(w.queue([t])[0]).toMatchObject({state:'escalated',reason:'hold_ttl_workspace_configuration_required'});
   }));
 
-  it('uses >2h no-session age, ignores note updates, omits terminal archives', async () => fixture(h => {
+  it('uses 25-minute no-session age, ignores note updates, omits terminal archives', async () => fixture(h => {
     const w = new IntakeWatchdog(h.sql, h.intakeService, (f: any) => f(), {}, () => NOW); w.init();
-    const rows = w.project([task(), task('boundary',7200000), {...task('closed'),status:'done',archived_at:NOW}]);
+    const rows = w.project([task(), task('boundary',INTAKE_IDLE_GRACE-1), {...task('closed'),status:'done',archived_at:NOW}]);
     expect(rows).toHaveLength(2); expect(rows[0].forgotten).toBe(true); expect(rows[1].forgotten).toBe(false);
   }));
   it('flags only failed sessions immediately; pending intents suppress duplicates', async () => fixture(h => {
@@ -206,14 +207,16 @@ describe('forgotten intake watchdog', () => {
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:200,body:{}}}},()=>NOW);w.init();await w.tick();
     expect(starts).toBe(0);expect(w.project([t])[0].restart.reason).toBe('unattributed_live_workspace_session');
   }));
-  it('retries a lost admission reply with the same canonical key and never starts without goal', async () => fixture(async h => {
+  it('retries a lost admission reply with the same canonical key before considering fallback', async () => fixture(async h => {
     const t=task();session(h,'old-failure',t,'failed');let now=NOW;const inputs:any[]=[];
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async input=>{
       inputs.push(input);if(inputs.length===1)throw new Error('lost response');
       return {status:202,body:{id:'new-session',state:'queued'}};
     }},()=>now);w.init();await w.tick();now+=QUEUE_RETRY_BASE_MS;await w.tick();
-    expect(inputs).toHaveLength(2);expect(inputs[1]).toEqual(inputs[0]);expect(inputs[0]).not.toHaveProperty('engine');
-    expect(inputs[0]).toMatchObject({mode:'interactive',with_goal:true,intake_task_id:t.id,workspace:'fixture'});
+    expect(inputs).toHaveLength(2);expect(inputs[1]).toEqual(inputs[0]);
+    // The failed codex attempt is recorded, so the recovery order continues
+    // after it; a headless engine cannot require an interactive goal flag.
+    expect(inputs[0]).toMatchObject({engine:'opencode',mode:'headless',intake_task_id:t.id,workspace:'fixture'});
     expect(w.project([t])[0].restart).toMatchObject({state:'submitted',session_id:'new-session'});
   }));
   it('canonical held session suppresses later duplicate restarts and preserves the queue reason', async () => fixture(async h => {
@@ -278,10 +281,12 @@ describe('forgotten intake watchdog', () => {
     expect(input).toMatchObject({intake_task_id:t.id,workspace:'subrepo',with_goal:true});
     expect(h.sql.exec('SELECT reason FROM intake_restart_queue').one().reason).toBe('canonical_queued');
   }));
-  it('sends one daily digest and alerts only after sustained >24h; resets when count reaches zero', async () => fixture(async h => {
+  it('sends one daily digest and alerts on actual >30 minute idle; resets when count reaches zero', async () => fixture(async h => {
     let now=NOW,tasks=[task()];const notices:any[]=[];
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>tasks} as any,(f:any)=>f(),{notify:async(...args)=>{notices.push(args)}},()=>now);w.init();
-    await w.tick();expect(notices.filter(n=>n[0]==='intake_digest')).toHaveLength(1);expect(notices[0][2]).toBe(null);
+    await w.tick();expect(notices.filter(n=>n[0]==='intake_digest')).toHaveLength(1);
+    // A 3h-old open intake with no session is a real >30 minute violation.
+    expect(notices.some(n=>n[0]==='intake_watchdog'&&n[2]?.includes('>30 min'))).toBe(true);
     now+=WATCHDOG_INTERVAL;await w.tick();expect(notices.filter(n=>n[0]==='intake_digest')).toHaveLength(1);
     now+=86400001;await w.tick();expect(notices.some(n=>n[0]==='intake_watchdog' && n[2]?.includes('>24h'))).toBe(true);
     tasks=[];now+=WATCHDOG_INTERVAL;await w.tick();expect(h.sql.exec('SELECT nonzero_since FROM intake_watchdog_meta').one().nonzero_since).toBe(null);
@@ -303,6 +308,215 @@ describe('forgotten intake watchdog', () => {
     await h.notifyAlert(failed);
     const pending=h.sql.exec('SELECT * FROM liveness_alerts WHERE id=?',failed.id).one();
     expect(pending.resolved_at).toBeNull();expect(pending.notify_error).toBeTruthy();
+  }));
+  it('stops stalled but alive native work through canonical control before replacement', async () => fixture(async h => {
+    const t=task();const binding={native_id:'native',tag:'worker',workspace:'fixture',native_created_at_ms:NOW-3600000};
+    session(h,'stalled',t,'running',{machine:'fixture',binding});
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,progress_json) VALUES('fixture','native','worker','running',?,'fixture',?,?)",
+      new Date(NOW).toISOString(),binding.native_created_at_ms,JSON.stringify({last_progress_at:new Date(NOW-3600000).toISOString()}));
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    let now=NOW;const stops:any[]=[],starts:any[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      claudeRecoveryEnabled:true,
+      stop:async(...args)=>{stops.push(args)},start:async input=>{starts.push(input);return {status:202,body:{id:'replacement',state:'queued'}}}
+    },()=>now);w.init();await w.tick();expect(stops).toEqual([['stalled','iw-stall-stalled']]);expect(starts).toHaveLength(0);
+    expect(w.project([t])[0]).toMatchObject({state:'recovering',reason:'stalled_native_exit_pending',forgotten:false});
+    h.sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id='stalled'");
+    h.sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE native_id='native'");
+    now+=WATCHDOG_INTERVAL;await w.tick();expect(starts).toHaveLength(1);expect(starts[0].engine).toBe('claude');
+  }));
+  it('quarantines three proven pre-launch failures on their host until an explicit successful probe', async () => fixture(async h => {
+    for(let i=0;i<3;i++)h.sql.exec(`INSERT INTO fleet_launches(id,actor,request_key,requester_kind,summary,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at,verification_status,exit_reason)
+      VALUES(?,'fixture',?,'human','test','{}','fixture','antigravity','fixture','headless','fixture','test','failed',?,?,'not_started','launcher_command_failed')`,
+      'quarantine-'+i,'quarantine-'+i,new Date(NOW-60000+i).toISOString(),new Date(NOW-60000+i).toISOString());
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[]} as any,(f:any)=>f(),{},()=>NOW);w.init();await w.tick();
+    expect(h.sql.exec("SELECT status,reason FROM fleet_engine_health WHERE machine_id='fixture' AND engine='antigravity'").one()).toMatchObject({status:'unavailable',reason:'launch_failures_quarantined'});
+    h.sql.exec("UPDATE fleet_engine_health SET status='ok',updated_at=? WHERE machine_id='fixture' AND engine='antigravity'",new Date(NOW).toISOString());
+    const next=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[]} as any,(f:any)=>f(),{},()=>NOW+WATCHDOG_INTERVAL);next.init();await next.tick();
+    expect(h.sql.exec("SELECT status FROM fleet_engine_health WHERE machine_id='fixture' AND engine='antigravity'").one().status).toBe('ok');
+  }));
+  it.each(['model_unsupported', 'goal_unsupported', 'account_unavailable','tier_unavailable','launcher_memory_reserve']
+    .flatMap(reason=>[[reason,true],[reason,false]] as [string,boolean][]))('cancels a %s held intent with recorded engine=%s and selects another engine', async (reason,recordedEngine) => fixture(async h => {
+    const t=task(),sessionId=crypto.randomUUID();session(h,sessionId,t,'held');
+    h.sql.exec("UPDATE session_control_sessions SET hold_json=?,engine=?,mode='interactive',request_json=? WHERE id=?",JSON.stringify({reason}),recordedEngine?'codex':null,
+      JSON.stringify({intake_task_id:t.id,workspace:'fixture',engine:'codex',mode:'interactive',with_goal:true}),sessionId);
+    const starts:any[]=[],stopResults:any[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      stop:async(id,key)=>{
+        const r=await h.sessionControlService.handle(new Request('https://hub.internal/api/sessions/'+id+'/stop',{method:'POST',body:JSON.stringify({key})}),
+          {caller:{isAdmin:true,actor:'hub:service:intake-watchdog',kind:'human'},scopes:['admin']});
+        stopResults.push({status:r.status,body:await r.json()});
+      },start:async input=>{starts.push(input);return {status:202,body:{id:'fallback',state:'queued'}}}
+    },()=>NOW);w.init();await w.tick();
+    expect(stopResults).toMatchObject([{status:200}]);
+    expect(h.sql.exec("SELECT state FROM session_control_sessions WHERE id=?",sessionId).one().state).toBe('cancelled');
+    expect(starts).toHaveLength(1);expect(starts[0].engine).toBe('opencode');
+  }));
+  it('advances engine and request key after a definitive admission refusal without a session', async () => fixture(async h => {
+    const t=task();session(h,'prior-codex',t,'failed');let now=NOW;const inputs:any[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async input=>{
+      inputs.push(input);return {status:400,body:{error:'model_unsupported'}};
+    }},()=>now);w.init();await w.tick();now+=QUEUE_RETRY_BASE_MS;await w.tick();
+    expect(inputs.map(i=>i.engine)).toEqual(['opencode','zcodex']);expect(inputs[0].key).not.toBe(inputs[1].key);
+  }));
+  it.each(['future-wake','different-incarnation'])('preserves %s instead of stopping it', async scenario => fixture(async h => {
+    const t=task();const binding={native_id:'native',tag:'worker',workspace:'fixture',native_created_at_ms:NOW-3600000};
+    session(h,'protected-native',t,'running',{machine:'fixture',binding});
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,progress_json) VALUES('fixture','native','worker','running',?,'fixture',?,?)",
+      new Date(NOW).toISOString(),binding.native_created_at_ms+(scenario==='different-incarnation'?1:0),JSON.stringify({last_progress_at:new Date(NOW-3600000).toISOString()}));
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    if(scenario==='future-wake')h.sql.exec(`INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at)
+      VALUES('protected-wake','protected-native','fixture','protected',?,?,'continue','pending',?,?)`,NOW+60000,new Date(NOW+60000).toISOString(),new Date(NOW).toISOString(),new Date(NOW).toISOString());
+    let stops=0,starts=0;
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      stop:async()=>{stops++},start:async()=>{starts++;return {status:202,body:{}}}
+    },()=>NOW);w.init();await w.tick();expect(stops).toBe(0);expect(starts).toBe(0);expect(w.project([t])[0].state).toBe('active');
+  }));
+  it('alerts when a stalled native remains unconfirmed beyond the recovery deadline', async () => fixture(async h => {
+    const t=task(),binding={native_id:'native',tag:'worker',workspace:'fixture',native_created_at_ms:NOW-7200000};
+    session(h,'stalled-deadline',t,'running',{machine:'fixture',binding});
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,progress_json) VALUES('fixture','native','worker','running',?,'fixture',?,?)",
+      new Date(NOW).toISOString(),binding.native_created_at_ms,JSON.stringify({last_progress_at:new Date(NOW-7200000).toISOString()}));
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    const notices:any[]=[];let starts=0;
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      stop:async()=>{},start:async()=>{starts++;return {status:202,body:{}}},notify:async(...args)=>{notices.push(args)}
+    },()=>NOW);w.init();await w.tick();expect(starts).toBe(0);
+    expect(notices.some(n=>n[0]==='intake_watchdog' && n[2]?.includes('>30 min') && n[2]?.includes(t.id) && n[2]?.includes('stalled_native_exit_pending'))).toBe(true);
+  }));
+  it('waits for native exit after a projected Codex reconnect failure', async () => fixture(async h => {
+    const t=task(),binding={native_id:'native',tag:'worker',workspace:'fixture',native_created_at_ms:NOW-60000};
+    session(h,'reconnect-old',t,'running',{machine:'fixture',binding});
+    h.sql.exec("UPDATE session_control_sessions SET mode='interactive' WHERE id='reconnect-old'");
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,engine,observed_at,workspace,created_at_ms,progress_json) VALUES('fixture','native','worker','running','codex',?,'fixture',?,?)",
+      new Date(NOW).toISOString(),binding.native_created_at_ms,JSON.stringify({last_progress_at:new Date(NOW).toISOString(),headless:false,terminal_error:'codex_reconnect_failed'}));
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    let stops=0,starts=0;
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      stop:async()=>{stops++},start:async()=>{starts++;return {status:202,body:{id:'replacement'}}}
+    },()=>NOW);w.init();await w.tick();expect(stops).toBe(1);expect(starts).toBe(0);
+    expect(w.project([t])[0]).toMatchObject({state:'recovering',forgotten:false});
+  }));
+  it('restarts from a fresh exact terminal census even before the canonical row catches up', async () => fixture(async h => {
+    const t=task(),binding={native_id:'native',tag:'worker',workspace:'fixture',native_created_at_ms:NOW-60000};
+    session(h,'lagging-old',t,'running',{machine:'fixture',binding});
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,engine,observed_at,workspace,created_at_ms) VALUES('fixture','native','worker','exited','codex',?,'fixture',?)",new Date(NOW).toISOString(),binding.native_created_at_ms);
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    const starts:any[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      start:async input=>{starts.push(input);return {status:202,body:{id:'replacement'}}}
+    },()=>NOW);w.init();await w.tick();expect(starts).toHaveLength(1);expect(starts[0].engine).toBe('opencode');
+  }));
+  it('does not use a terminal row from a different native incarnation as exit proof', async () => fixture(h => {
+    const t=task(),binding={native_id:'native',tag:'worker',workspace:'fixture',native_created_at_ms:NOW-60000};
+    session(h,'old-incarnation',t,'running',{machine:'fixture',binding});
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,engine,observed_at,workspace,created_at_ms) VALUES('fixture','native','worker','exited','codex',?,'fixture',?)",new Date(NOW-3600000).toISOString(),binding.native_created_at_ms+1);
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();
+    expect(w.project([t])[0]).toMatchObject({state:'unknown',forgotten:false});
+  }));
+  it('keeps a future registered wake as pending intent after native stop and restarts only when due', async () => fixture(async h => {
+    const t=task();session(h,'future-stopped',t,'stopped');let now=NOW,starts=0;
+    h.sql.exec(`INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at)
+      VALUES('future-stopped-wake','future-stopped','fixture','future-stopped',?,?,'continue','pending',?,?)`,NOW+3600000,new Date(NOW+3600000).toISOString(),new Date(NOW).toISOString(),new Date(NOW).toISOString());
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      start:async()=>{starts++;return {status:202,body:{id:'replacement'}}}
+    },()=>now);w.init();await w.tick();expect(starts).toBe(0);
+    expect(w.project([t])[0]).toMatchObject({state:'active',idle_ms:null,forgotten:false});
+    // A due wake settles to missed through the canonical wake reconciler; the
+    // recovery path then requeues the spent episode within its normal cadence.
+    h.sql.exec("UPDATE session_control_wakes SET state='missed' WHERE id='future-stopped-wake'");
+    now=NOW+3600001;await w.tick();expect(starts).toBe(1);
+  }));
+  it.each(['running','held'])('rechecks a future wake added during automatic %s stop admission', async state => fixture(async h => {
+    const t=task(),id=crypto.randomUUID(),binding={native_id:crypto.randomUUID(),tag:'worker',workspace:'fixture',native_created_at_ms:NOW-7200000};
+    session(h,id,t,state,state==='running'?{machine:'fixture',binding}:{});
+    if(state==='held')h.sql.exec('UPDATE session_control_sessions SET hold_json=? WHERE id=?',JSON.stringify({reason:'model_unsupported'}),id);
+    else{
+      h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,engine,observed_at,workspace,created_at_ms,progress_json) VALUES('fixture',?,'worker','running','codex',?,'fixture',?,?)",binding.native_id,new Date(NOW).toISOString(),binding.native_created_at_ms,JSON.stringify({last_progress_at:new Date(NOW-7200000).toISOString()}));
+      h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    }
+    const service=new SessionControlService(h.sql,(f:any)=>f(),()=>NOW);service.init();
+    const results:any[]=[];let starts=0;
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      stop:async(sessionId,key)=>{
+        h.sql.exec(`INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at)
+          VALUES(?,?,'fixture',?, ?,?,'continue','pending',?,?)`,crypto.randomUUID(),id,id,NOW+60000,new Date(NOW+60000).toISOString(),new Date(NOW).toISOString(),new Date(NOW).toISOString());
+        const r=await service.handle(new Request('https://hub.internal/api/sessions/'+sessionId+'/stop',{method:'POST',body:JSON.stringify({key})}),
+          {caller:{isAdmin:true,actor:'hub:service:intake-watchdog',kind:'human'},scopes:['admin']});
+        results.push({status:r.status,body:await r.json()});
+      },start:async()=>{starts++;return {status:202,body:{}}}
+    },()=>NOW);w.init();await w.tick();
+    expect(results).toMatchObject([{status:409,body:{error:'session_waiting_until'}}]);expect(starts).toBe(0);
+    expect(h.sql.exec('SELECT state FROM session_control_sessions WHERE id=?',id).one().state).toBe(state);
+    expect(h.sql.exec('SELECT id FROM session_control_commands WHERE session_id=?',id).toArray()).toHaveLength(0);
+  }));
+  it('does not let repeated recoverable admission holds reset the thirty-minute idle deadline', async () => fixture(async h => {
+    const t=task('hold-loop',60000);let now=NOW;const notices:any[]=[];
+    const first=crypto.randomUUID();session(h,first,t,'held');
+    h.sql.exec('UPDATE session_control_sessions SET hold_json=? WHERE id=?',JSON.stringify({reason:'model_unsupported'}),first);
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      stop:async id=>{h.sql.exec("UPDATE session_control_sessions SET state='cancelled',updated_at=? WHERE id=?",new Date(now).toISOString(),id)},
+      start:async input=>{
+        const id=crypto.randomUUID();session(h,id,t,'held');
+        h.sql.exec('UPDATE session_control_sessions SET engine=?,hold_json=?,created_at=?,updated_at=? WHERE id=?',input.engine,JSON.stringify({reason:'model_unsupported'}),new Date(now).toISOString(),new Date(now).toISOString(),id);
+        return {status:409,body:{id,state:'held',reason:'model_unsupported'}};
+      },notify:async(...args)=>{notices.push(args)}
+    },()=>now);w.init();await w.tick();
+    expect(notices.filter(n=>n[0]==='intake_watchdog'&&n[2]!==null)).toHaveLength(0);
+    for(let i=0;i<34;i++){now+=WATCHDOG_INTERVAL;await w.tick();}
+    expect(notices.some(n=>n[0]==='intake_watchdog'&&n[2]?.includes('>30 min')&&n[2]?.includes('model_unsupported'))).toBe(true);
+    // The bounded retry cap names the stuck cycle instead of looping forever;
+    // the idle deadline itself is never reset by the repeating holds.
+    expect(w.project([t])[0]).toMatchObject({state:'escalated',reason:'only_failed_sessions'});
+    expect(w.project([t])[0].idle_ms).toBeGreaterThan(1800000);
+  }));
+  it('replays an already-recorded automatic stop after a future wake is added', async () => fixture(async h => {
+    const t=task(),id=crypto.randomUUID(),binding={native_id:crypto.randomUUID(),tag:'worker',workspace:'fixture',native_created_at_ms:NOW-60000};
+    session(h,id,t,'running',{machine:'fixture',binding});
+    const service=new SessionControlService(h.sql,(f:any)=>f(),()=>NOW);service.init();
+    const send=()=>service.handle(new Request('https://hub.internal/api/sessions/'+id+'/stop',{method:'POST',body:JSON.stringify({key:'replay-stop'})}),
+      {caller:{isAdmin:true,actor:'hub:service:intake-watchdog',kind:'human'},scopes:['admin']});
+    const first=await send();expect(first.status).toBe(201);const original:any=await first.json();
+    h.sql.exec(`INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at)
+      VALUES(?,?,'fixture',?, ?,?,'continue','pending',?,?)`,crypto.randomUUID(),id,id,NOW+60000,new Date(NOW+60000).toISOString(),new Date(NOW).toISOString(),new Date(NOW).toISOString());
+    const replay=await send();expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({command_id:original.command_id,replay:true});
+    expect(h.sql.exec('SELECT id FROM session_control_commands WHERE session_id=?',id).toArray()).toHaveLength(1);
+  }));
+  it.each(['offered','starting','uncertain'])('requests canonical stop for a bound stalled %s session without starting a duplicate', async state => fixture(async h => {
+    const t=task(),id=crypto.randomUUID(),binding={native_id:crypto.randomUUID(),tag:'worker',workspace:'fixture',native_created_at_ms:NOW-7200000,generation:1};
+    session(h,id,t,state,{machine:'fixture',binding});
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,engine,observed_at,workspace,created_at_ms,progress_json) VALUES('fixture',?,'worker','running','codex',?,'fixture',?,?)",
+      binding.native_id,new Date(NOW).toISOString(),binding.native_created_at_ms,JSON.stringify({last_progress_at:new Date(NOW-7200000).toISOString()}));
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    const service=new SessionControlService(h.sql,(fn:any)=>fn(),()=>NOW);service.init();let starts=0;const stops:number[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(fn:any)=>fn(),{
+      stop:async(sessionId,key)=>{const r=await service.handle(new Request('https://hub.internal/api/sessions/'+sessionId+'/stop',{method:'POST',body:JSON.stringify({key})}),
+        {caller:{isAdmin:true,actor:'hub:service:intake-watchdog',kind:'human'},scopes:['admin']});stops.push(r.status);},
+      start:async()=>{starts++;return {status:202,body:{}};}
+    },()=>NOW);w.init();expect(w.project([t])[0].state).toBe('recovering');await w.tick();
+    expect(stops).toEqual([201]);expect(starts).toBe(0);
+    expect(h.sql.exec('SELECT state FROM session_control_sessions WHERE id=?',id).one().state).toBe(state);
+    expect(h.sql.exec("SELECT kind,state FROM session_control_commands WHERE session_id=?",id).one()).toMatchObject({kind:'stop',state:'recorded'});
+  }));
+  it.each(['codex','opencode','zcodex','antigravity'])('advances beyond %s when all engines have historical failures', async previous => fixture(async h => {
+    const t=task(),order=['codex','opencode','zcodex','antigravity'];
+    const history=[...order.filter(engine=>engine!==previous),previous];
+    history.forEach((engine,i)=>{
+      const id='cycle-'+i;session(h,id,t,'failed');
+      const at=new Date(NOW-10000+i*1000).toISOString();
+      h.sql.exec('UPDATE session_control_sessions SET engine=?,created_at=?,updated_at=? WHERE id=?',engine,at,at,id);
+    });
+    const inputs:any[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(fn:any)=>fn(),{
+      start:async input=>{inputs.push(input);return {status:202,body:{id:'next-cycle',state:'queued'}};}
+    },()=>NOW);w.init();
+    // Engine choice must not select any recorded failed attempt.
+    h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,request_key,request_json,session_id,attempts,next_at,updated_at)
+      VALUES(?,'submitted','canonical_failed','old-key',?,'cycle-3',0,?,?)`,t.id,JSON.stringify({engine:previous,key:'old-key'}),NOW-1000,NOW-1000);
+    await w.tick();expect(inputs).toHaveLength(1);
+    expect(inputs[0].engine).toBe(order[(order.indexOf(previous)+1)%order.length]);
   }));
   it('REST refuses unauthenticated readers', async () => {
     const res=await SELF.fetch('https://hub.test/api/intake/forgotten');expect([401,403]).toContain(res.status);

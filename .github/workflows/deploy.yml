@@ -133,11 +133,14 @@ jobs:
       group: agent-hub-production
       cancel-in-progress: false
     needs: test
+    # Pushes run the full test job. Keep production deployment an explicit
+    # workflow_dispatch action because this repository has no protected
+    # production environment configured to gate push-triggered deployment.
     if: |
       always() &&
       (needs.test.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.skip_tests == true)) &&
       github.ref == 'refs/heads/main' &&
-      github.event_name != 'pull_request'
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

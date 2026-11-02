@@ -677,7 +677,7 @@ describe('private durable intake HTTP/SQLite', () => {
     });
     const data=await ok('/forgotten?project=demo');
     expect(data.items.some((t:any)=>t.id===task.id)).toBe(true);
-    expect(data.items.find((t:any)=>t.id===task.id)).toMatchObject({reason:'no_live_session_over_two_hours',last_session:null});
+    expect(data.items.find((t:any)=>t.id===task.id)).toMatchObject({reason:'no_live_session_over_25_minutes',last_session:null});
     expect(data.watchdog).toHaveProperty('last_checked_at');
     expect(data.watchdog).not.toHaveProperty('result');
     expect(data.watchdog).not.toHaveProperty('forgotten_count');

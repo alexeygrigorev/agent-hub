@@ -270,6 +270,38 @@ describe('host-enrollment authority prerequisite (R3, session/registry surfaces)
     });
   });
 
+  it('accepts catalog-heavy registration above the legacy limit and bounds capabilities at 16 KiB', async () => {
+    const { stub, bindings } = await freshHub('register-capability-size');
+    await runInDurableObject(stub, async (hub: Hub) => {
+      seedFixtureIntake(hub.sql);
+      const headers = await adminCookieHeader(bindings as unknown as Env);
+      const at = new Date().toISOString();
+      hub.sql.exec(`INSERT INTO machines (id, name, hostname, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', ?)`, at);
+      const codes = await issueHostPairing(hub, headers, 'register-size', 'hetzner');
+      const exchange = await exchangeCode(hub, codes.device_code);
+      expect(exchange.status).toBe(200);
+      const token: any = await exchange.json();
+      const auth = { Authorization: 'Bearer ' + token.access_token };
+
+      const catalogCapabilities = { workspaces: ['/srv/' + 'x'.repeat(4_600)] };
+      const catalogSize = JSON.stringify(catalogCapabilities).length;
+      expect(catalogSize).toBeGreaterThan(4_096);
+      expect(catalogSize).toBeLessThanOrEqual(16_384);
+      const accepted = await hub.fetch(hubRequest('/api/machines/register', {
+        ...registerBody, capabilities: catalogCapabilities,
+      }, 'POST', auth));
+      expect(accepted.status).toBe(200);
+
+      const oversizedCapabilities = { workspaces: ['x'.repeat(16_385)] };
+      expect(JSON.stringify(oversizedCapabilities).length).toBeGreaterThan(16_384);
+      const rejected = await hub.fetch(hubRequest('/api/machines/register', {
+        ...registerBody, capabilities: oversizedCapabilities,
+      }, 'POST', auth));
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toEqual({ error: 'payload_too_large' });
+    });
+  });
+
   it('H5 after C exchange, old B is denied and C owns the machine', async () => {
     const { stub, bindings } = await freshHub('takeover');
     await runInDurableObject(stub, async (hub: Hub) => {

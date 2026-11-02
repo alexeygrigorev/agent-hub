@@ -40,6 +40,7 @@ export const WORKER_CHILD_PER_HOUR = 12;
 export const WORKER_CHILD_PER_INTAKE = 8;
 import { ResourceManagement } from './resource-management';
 import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold, toolCallStallThreshold } from './session_stall';
+import { recoveryProtected, recoveryWakePending } from './intake-recovery';
 import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, stopHostOnline, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
@@ -513,11 +514,31 @@ export class SessionControlService {
     } catch { return {}; }
   }
 
+  /** An automatic stop must recheck protection/admission/waiting after its
+   * body. Existing receipts still replay; explicit operator stops remain
+   * available (intake b527e905, reviewer B1). */
+  private recoveryStopHold(session: any, key: string, caller: Caller): string | null {
+    if (caller.isAdmin !== true || caller.kind !== 'human' || caller.actor !== 'hub:service:intake-watchdog') return null;
+    if (recoveryProtected(this.sql, session)) return 'session_protected';
+    if (!session.binding_json && session.fleet_launch_id) {
+      const launch: any = this.sql.exec('SELECT state,native_id,launcher_task_id FROM fleet_launches WHERE id=?',session.fleet_launch_id).toArray()[0];
+      // The host may have promoted a queued resource retry while the body
+      // streamed. Preserve that admission; only explicit operators cancel it.
+      if (launch && (['offered','starting','running','uncertain'].includes(launch.state) || launch.native_id || launch.launcher_task_id)) return 'session_admission_in_progress';
+    }
+    if (this.sql.exec("SELECT id FROM session_control_commands WHERE session_id=? AND actor=? AND request_key=? AND kind='stop' LIMIT 1",
+      session.id,actorName(caller),key).toArray().length) return null;
+    return recoveryWakePending(this.sql,session,this.now()) ? 'session_waiting_until' : null;
+  }
+
   private cancelOwnerLive(row: any, caller: Caller, operatorStop = false): boolean {
     // Explicit human operators already may stop any bound session. Apply the
     // same authority to a provably unstarted intent, without broadening the
     // owner-only /cancel endpoint or trusting a collapsed browser actor.
     if (operatorStop && caller.isAdmin === true && caller.kind === 'human') {
+      // The internal recovery service uses the same canonical stop/cancellation
+      // transaction as operators. HTTP authentication never issues this actor.
+      if (caller.actor === 'hub:service:intake-watchdog') return true;
       if (typeof caller.actor === 'string' && caller.actor.startsWith('human:admin-token:')) return true;
       if (caller.tokenId) {
         const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
@@ -3550,6 +3571,8 @@ export class SessionControlService {
           if (!writer || !live || !this.cancelOwnerLive(live, caller, sub === 'stop')) {
             return response({ error: 'not_found' }, 404);
           }
+          const recoveryHold = sub === 'stop' ? this.recoveryStopHold(live, input.key, caller) : null;
+          if (recoveryHold) return response({ error: recoveryHold }, 409);
           const prior: any = this.sql.exec('SELECT * FROM session_control_cancellations WHERE session_id = ?', live.id).toArray()[0];
           if (prior) {
             if (prior.actor !== actorName(caller) || prior.request_key !== input.key) return response({ error: 'idempotency_conflict' }, 409);
@@ -3744,6 +3767,8 @@ export class SessionControlService {
           const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
           if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
           if (!new Set([...STOPPABLE, 'stopped']).has(live.state)) return response({ error: 'session_not_stoppable' }, 409);
+          const recoveryHold = this.recoveryStopHold(live, input.key, caller);
+          if (recoveryHold) return response({ error: recoveryHold }, 409);
           const actor = actorName(caller);
           const resp = this.enqueue(live, kind, actor, caller, input.key, {});
           if (resp.status >= 400) return resp;
