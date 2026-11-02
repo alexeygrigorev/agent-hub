@@ -3,9 +3,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("local-dependencies.py")
 SPEC = importlib.util.spec_from_file_location("local_dependencies", SCRIPT)
@@ -106,6 +108,67 @@ class LocalDependenciesTests(unittest.TestCase):
         subprocess.run(["git", "worktree", "add", "--detach", "-q", str(linked)],
                        cwd=self.source, check=True)
         self.assertEqual(DEPS.canonical_checkout(linked), self.source)
+
+    def make_playwright_install(self, home, *, version=DEPS.PLAYWRIGHT_VERSION, chromium=True):
+        donor = home / DEPS.OWNED_PLAYWRIGHT_REL
+        modules = donor / "node_modules"
+        (modules / "playwright").mkdir(parents=True)
+        (modules / "playwright-core").mkdir()
+        (donor / "package.json").write_text(json.dumps({"dependencies": {"playwright": DEPS.PLAYWRIGHT_VERSION}}))
+        (modules / "playwright" / "package.json").write_text(json.dumps({"version": version}))
+        (modules / "playwright-core" / "package.json").write_text(json.dumps({"version": version}))
+        browsers = {
+            "browsers": [
+                {"name": "chromium", "revision": DEPS.CHROMIUM_REVISION, "installByDefault": True},
+                {"name": "chromium-headless-shell", "revision": DEPS.CHROMIUM_REVISION, "installByDefault": True},
+            ]
+        }
+        (modules / "playwright-core" / "browsers.json").write_text(json.dumps(browsers))
+        cache = home / DEPS.OWNED_BROWSERS_REL
+        for folder, relative in (
+            (f"chromium-{DEPS.CHROMIUM_REVISION}", "chrome-linux64/chrome"),
+            (f"chromium_headless_shell-{DEPS.CHROMIUM_REVISION}",
+             "chrome-headless-shell-linux64/chrome-headless-shell"),
+        ):
+            if not chromium and folder.startswith("chromium-"):
+                continue
+            binary = cache / folder / relative
+            binary.parent.mkdir(parents=True)
+            binary.write_text("fixture executable")
+            binary.chmod(0o755)
+            (binary.parent.parent / "INSTALLATION_COMPLETE").write_text("")
+
+    def test_playwright_preflight_uses_account_home_not_managed_home_or_donor_override(self):
+        account_home = self.root / "account-home"
+        managed_home = self.root / "managed-home"
+        managed_home.mkdir()
+        self.make_playwright_install(account_home)
+        with patch.dict(os.environ, {
+            "HOME": str(managed_home),
+            "PLAYWRIGHT_PACKAGE": str(self.root / "unowned" / "package.json"),
+            "PLAYWRIGHT_BROWSERS_PATH": str(managed_home / "browser-cache"),
+        }), patch.object(DEPS, "current_user_home", return_value=account_home):
+            result = DEPS.validate_playwright(self.repo)
+        self.assertIn("Validated Playwright 1.64.1 from owned user donor", result)
+        self.assertIn(str(account_home / DEPS.OWNED_PLAYWRIGHT_REL), result)
+        self.assertIn(str(account_home / DEPS.OWNED_BROWSERS_REL), result)
+        self.assertNotIn(str(managed_home), result)
+
+    def test_playwright_preflight_fails_before_accepting_a_missing_chromium(self):
+        account_home = self.root / "account-home"
+        self.make_playwright_install(account_home, chromium=False)
+        chromium = account_home / DEPS.OWNED_BROWSERS_REL / f"chromium-{DEPS.CHROMIUM_REVISION}"
+        with patch.object(DEPS, "current_user_home", return_value=account_home):
+            with self.assertRaisesRegex(DEPS.DependencyError, "Chromium chromium-1248 is unavailable") as raised:
+                DEPS.validate_playwright(self.repo)
+        self.assertIn("playwright install chromium", str(raised.exception))
+
+    def test_playwright_preflight_rejects_an_unpinned_donor(self):
+        account_home = self.root / "account-home"
+        self.make_playwright_install(account_home, version="1.65.0")
+        with patch.object(DEPS, "current_user_home", return_value=account_home):
+            with self.assertRaisesRegex(DEPS.DependencyError, "does not match pinned 1.64.1"):
+                DEPS.validate_playwright(self.repo)
 
 
 if __name__ == "__main__":

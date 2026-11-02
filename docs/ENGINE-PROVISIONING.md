@@ -365,8 +365,8 @@ history, then:
 hub engines add --provider claude --label my-claude --token-file /private/token-file
 ```
 
-Browser consent relay check (requires Playwright available through
-`PLAYWRIGHT_PACKAGE`, defaulting to the existing local tooling):
+Browser consent relay check (uses the repo-local pinned Playwright package in CI
+or the owned user-local installation documented in [TEST-COVERAGE.md](TEST-COVERAGE.md)):
 
 ```bash
 node test/provisioning-ui.browser.mjs

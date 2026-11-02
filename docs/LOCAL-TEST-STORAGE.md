@@ -57,8 +57,13 @@ GitHub config overrides. A disposable
 HOME alone cannot isolate the per-launch worker profile selected by a native
 session tag. The parent session keeps its identity and credentials.
 
-With a managed HOME, point `PLAYWRIGHT_BROWSERS_PATH` at an existing matching
-browser installation before running the suite. The runner does not download one.
+Full browser checks use the pinned Playwright `1.64.1` installation under the
+real user's `~/.local/share/agent-hub/playwright` directory and its matching
+Chromium revision `1248` in `~/.cache/ms-playwright`. The resolver reads the
+system account home, so it works when a managed session has a different `HOME`.
+`scripts/test-full-local.sh` validates both Chromium and headless-shell
+executables before Vitest and does not download or install during the run. For
+the single supported setup command, see [TEST-COVERAGE.md](TEST-COVERAGE.md).
 
 The retained-history performance test takes one fixed population of 100 samples
 per case, including every sample and keeping concurrent cohorts at four requests.

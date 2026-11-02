@@ -11,12 +11,34 @@ fails the run if any suite fails. Each process group has a three-minute
 deadline and descendant cleanup. Native-session modes remain explicit manual
 checks; automated runs use local fixture identities and loopback Workers.
 
-Browser dependencies come from the local `playwright` package or an existing
-installation selected with `PLAYWRIGHT_PACKAGE=/path/to/package.json`.
-Chromium uses Playwright's installed browser by default; `CHROMIUM_PATH` and
-`PLAYWRIGHT_BROWSERS_PATH` support an existing shared browser installation.
-The harness contains no developer-specific dependency or browser paths.
-CI installs Playwright and Chromium before running the same dispatcher.
+Browser checks use Playwright `1.64.1` with Chromium and headless-shell revision
+`1248`. In CI, the workflow installs that exact version in its job-local
+`node_modules`. On Hetzner, `test/playwright.mjs` resolves the stable owned
+installation at `~/.local/share/agent-hub/playwright` and its matching browser
+cache at `~/.cache/ms-playwright`. It resolves the real account home from the
+system account database, so managed sessions work when `HOME` points at an
+engine-specific directory.
+
+Prepare the user-local installation once on a host that does not have it. These
+commands pin the package and place both Chromium executables in the supported
+cache without a global install:
+
+```sh
+REAL_HOME="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
+PLAYWRIGHT_DIR="${REAL_HOME}/.local/share/agent-hub/playwright"
+PLAYWRIGHT_CACHE="${REAL_HOME}/.cache/ms-playwright"
+mkdir -p "${PLAYWRIGHT_DIR}" "${PLAYWRIGHT_CACHE}"
+npm --prefix "${PLAYWRIGHT_DIR}" install --save-exact playwright@1.64.1
+PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_CACHE}" \
+  "${PLAYWRIGHT_DIR}/node_modules/.bin/playwright" install chromium
+```
+
+`scripts/test-full-local.sh` runs the Playwright and Chromium preflight before
+dependency preparation, temporary-directory creation and Vitest. It exits
+immediately with the setup command if the pinned package or either matching
+Chromium executable is missing. The browser harness does not accept
+`PLAYWRIGHT_PACKAGE`, `CHROMIUM_PATH` or `PLAYWRIGHT_BROWSERS_PATH` overrides;
+use the owned installation above instead of ad-hoc package donors or caches.
 
 | Audit item | Maintained verification |
 | --- | --- |

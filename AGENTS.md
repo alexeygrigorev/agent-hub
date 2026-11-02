@@ -67,11 +67,22 @@ admission wrapper or clear `AGENT_HUB_HEAVY_TEST_HELD` in a child shell.
 
 Before installing dependencies in a fresh checkout, run
 `python3 scripts/local-dependencies.py` to reuse a validated matching canonical
-installation. `scripts/test-full-local.sh` runs this check automatically. Do not
-run `npm ci` in each worktree when matching dependencies already exist; each copy
-can add hundreds of megabytes. When manifests change, choose a matching donor
-with `--source` or deliberately prepare one installation for that lockfile.
-Never replace or remove another checkout's dependencies.
+installation. `scripts/test-full-local.sh` first runs
+`python3 scripts/local-dependencies.py --check-playwright` before dependency
+prep, temp creation or Vitest. Full browser checks use Playwright `1.64.1` and
+Chromium revision `1248` from the stable owned installation under the real
+account home: `~/.local/share/agent-hub/playwright` and
+`~/.cache/ms-playwright`. The resolver uses the system account home even when a
+managed session sets `HOME` to its engine directory. On a host without the
+installation, prepare it once with the documented setup in
+`docs/TEST-COVERAGE.md`; this is user-local and requires no global install.
+Do not set `PLAYWRIGHT_PACKAGE`, `CHROMIUM_PATH` or
+`PLAYWRIGHT_BROWSERS_PATH` to ad-hoc donors. CI installs the same pinned package
+in its job-local `node_modules`. Do not run `npm ci` in each worktree when
+matching dependencies already exist; each copy can add hundreds of megabytes.
+When manifests change, choose a matching donor with `--source` or deliberately
+prepare one installation for that lockfile. Never replace or remove another
+checkout's dependencies.
 
 The full runner gives each run a unique temporary directory and zero pytest
 temporary-file retention, removing only that run's new temps on exit. Existing

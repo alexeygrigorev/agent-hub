@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
+import { PINNED_PLAYWRIGHT_VERSION, ownedPlaywrightPackage, resolvePlaywrightPackage } from '../test/playwright.mjs';
 
 test('discovery runs every suite, aggregates failures and isolates live identity', async () => {
   const parent = resolve(import.meta.dirname, '../.local/tmp');
@@ -37,5 +39,42 @@ test('discovery runs every suite, aggregates failures and isolates live identity
       ['added.browser.mjs', 'style.checks.mjs', 'machine-pairing.mjs', 'conversation-platform.mjs'].sort());
     assert.match(result.stdout + result.stderr, /FAIL added.browser.mjs: 7/);
     assert.match(result.stdout, /4 standalone suites; 1 failed/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('resolvePlaywrightPackage uses the owned donor despite managed HOME and ignores ad-hoc donor overrides', async () => {
+  const parent = resolve(import.meta.dirname, '../.local/tmp');
+  await mkdir(parent, { recursive: true });
+  const root = await mkdtemp(resolve(parent, 'playwright-resolve-'));
+  try {
+    const repo = resolve(root, 'repo');
+    const repoPkg = resolve(repo, 'package.json');
+    await mkdir(repo, { recursive: true });
+    await writeFile(repoPkg, '{"name":"fixture-repo"}\n');
+
+    const accountHome = resolve(root, 'account-home');
+    const managedHome = resolve(root, 'empty-managed-home');
+    const ownedPkg = ownedPlaywrightPackage(accountHome);
+    await mkdir(resolve(ownedPkg, '..'), { recursive: true });
+    await writeFile(ownedPkg, JSON.stringify({ name: 'playwright', version: PINNED_PLAYWRIGHT_VERSION }));
+
+    const oldHome = process.env.HOME;
+    const oldPackage = process.env.PLAYWRIGHT_PACKAGE;
+    process.env.HOME = managedHome;
+    process.env.PLAYWRIGHT_PACKAGE = resolve(root, 'unowned/package.json');
+    try {
+      assert.equal(ownedPlaywrightPackage(), ownedPlaywrightPackage(userInfo().homedir));
+      assert.equal(resolvePlaywrightPackage(repoPkg, accountHome), ownedPkg);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+      if (oldPackage === undefined) delete process.env.PLAYWRIGHT_PACKAGE;
+      else process.env.PLAYWRIGHT_PACKAGE = oldPackage;
+    }
+
+    await mkdir(resolve(repo, 'node_modules/playwright'), { recursive: true });
+    const localPackage = resolve(repo, 'node_modules/playwright/package.json');
+    await writeFile(localPackage, JSON.stringify({ name: 'playwright', version: PINNED_PLAYWRIGHT_VERSION }));
+    assert.equal(resolvePlaywrightPackage(repoPkg, accountHome), localPackage);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

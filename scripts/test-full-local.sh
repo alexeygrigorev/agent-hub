@@ -34,7 +34,11 @@ cd "${REPO_ROOT}" || exit 1
 # hub-worker-auth/<session>.json files clobbered with pytest fixture data).
 # The suite must never touch a real profile.
 unset APLEXER_TAG APLEXER_WORKSPACE HUB_WORKER_CONFIG_FILE HUB_CONFIG_FILE
+# Browser suites use the pinned package and cache resolved by the maintained
+# helper. Ignore historical per-session donor and browser-path overrides.
+unset PLAYWRIGHT_PACKAGE CHROMIUM_PATH PLAYWRIGHT_BROWSERS_PATH
 
+python3 scripts/local-dependencies.py --check-playwright || exit 1
 python3 scripts/local-dependencies.py || exit 1
 
 # Capture the shared cache before the Python suite switches to a disposable HOME.

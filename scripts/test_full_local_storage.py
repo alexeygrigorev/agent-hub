@@ -37,6 +37,9 @@ with record.open("a") as out:
                           "profile": str(profile),
                           "hub_env": sorted(k for k in os.environ if k.startswith(("HUB_", "AGENT_HUB_"))
                                             and k not in ("AGENT_HUB_HEAVY_TEST_HELD", "AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN"))}) + "\n")
+if name == "python3" and args[:2] == ["scripts/local-dependencies.py", "--check-playwright"] and os.environ.get("FAIL_PLAYWRIGHT"):
+    print("local-dependencies: pinned Playwright Chromium is unavailable")
+    sys.exit(1)
 if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_PROFILE_ISOLATION"):
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text("written by isolated Python fixture")
@@ -80,7 +83,9 @@ class FullLocalStorageTests(unittest.TestCase):
     def setUp(self):
         base = Path(os.environ.get("TMPDIR", RUNNER.parent.parent / ".local/tmp")).resolve()
         base.mkdir(parents=True, exist_ok=True)
-        self.root = Path(tempfile.mkdtemp(prefix="runner-storage-", dir=base))
+        # Keep the fixture path long enough to exercise Linux's 108-byte
+        # Unix-socket limit regardless of the checkout's own path length.
+        self.root = Path(tempfile.mkdtemp(prefix="runner-storage-long-checkout-path-", dir=base))
         self.repo = self.root / "repo"
         scripts = self.repo / "scripts"
         scripts.mkdir(parents=True)
@@ -124,7 +129,7 @@ class FullLocalStorageTests(unittest.TestCase):
                    # shell-storage fixtures out of the real host semaphore.
                    AGENT_HUB_HEAVY_TEST_DIR=str(self.root / "fixture-heavy-slots"),
                    AGENT_HUB_HEAVY_TEST_SLOTS="2")
-        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "VITEST_EXIT", "FAIL_TYPECHECK",
+        for key in ("SKIP_PHONE_UI", "FAIL_PLAYWRIGHT", "FAIL_SYNC", "FAIL_VITEST", "VITEST_EXIT", "FAIL_TYPECHECK",
                     "AGENT_HUB_HEAVY_TEST_REFUSAL_FILE", "CAPPED_TEST_RETRY_SLEEP", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
                     "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS",
                     "AGENT_HUB_HEAVY_TEST_HELD", "AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN"):
@@ -183,6 +188,17 @@ class FullLocalStorageTests(unittest.TestCase):
         vitest = next(row for row in self.records(record) if row["tool"] == "npx")
         self.assertEqual(vitest["priority"], "final")
         self.assert_preserved()
+
+    def test_playwright_preflight_fails_before_dependency_prep_temp_creation_or_vitest(self):
+        child, record = self.start("playwright-preflight-fail", FAIL_PLAYWRIGHT="1")
+        code, output = self.finish(child)
+        self.assertEqual(code, 1, output)
+        self.assertIn("pinned Playwright Chromium is unavailable", output)
+        rows = self.records(record)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tool"], "python3")
+        self.assertEqual(rows[0]["args"], ["scripts/local-dependencies.py", "--check-playwright"])
+        self.assertEqual(list(self.temp.iterdir()), [self.sentinel])
 
     def occupy_fixture_slot(self):
         """Hold the fixture's only slot; with wait 0 every heavy phase is refused."""
