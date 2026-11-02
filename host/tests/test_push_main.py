@@ -35,6 +35,10 @@ class PushMainTests(unittest.TestCase):
         (self.repo / 'scripts/ci').mkdir(parents=True)
         (self.repo / 'host/tests').mkdir(parents=True)
         (self.repo / 'host/agent_hub_host').mkdir()
+        # Regular packages: unittest resolves host.tests.* from this fixture even when another regular `host`
+        # package (the real repo on sys.path/.pth in CI) exists; a bare namespace dir would lose to it.
+        (self.repo / 'host/__init__.py').write_text('')
+        (self.repo / 'host/tests/__init__.py').write_text('')
         shutil.copy(ROOT / 'scripts/push-main.sh', self.repo / 'scripts/push-main.sh')
         shutil.copy(ROOT / 'host/agent_hub_host/prepush.py', self.repo / 'host/agent_hub_host/prepush.py')
         shutil.copy(ROOT / 'scripts/ci/affected_tests.py', self.repo / 'scripts/ci/affected_tests.py')
