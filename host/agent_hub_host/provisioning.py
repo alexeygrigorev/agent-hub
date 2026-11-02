@@ -1663,7 +1663,9 @@ def install(bundle, request=None):
                 if _is_windows():
                     # No npm/shell fallback: the checksummed release exe lands
                     # beside the wrapper (intake 608a2f9a, mirrors agy.exe).
-                    arch = 'arm64' if cpu in ('aarch64', 'arm64') else 'amd64'
+                    # The codex-zcode release publishes only zcodex-windows-amd64.exe; Windows on ARM (Tabo)
+                    # runs it under x64 emulation, so every Windows CPU takes the amd64 asset.
+                    arch = 'amd64'
                     asset = f'zcodex-windows-{arch}.exe'
                     verified = _fetch_checksummed_zcodex_asset(tag, asset, root() / 'zcodex-cache', tmp_download)
                     binary = dest / 'engine' / 'bin' / 'zcodex.exe'
