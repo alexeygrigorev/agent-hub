@@ -2754,6 +2754,23 @@ class Dispatcher:
                 return row.get("cwd") == str(target_cwd)
         return False
 
+    def _seed_interactive_readiness(self, native, native_id, workspace):
+        """Report 'waiting' for a fresh empty interactive prompt (intake 2fdcaef5).
+
+        Engines like zcodex fire state hooks only on prompt events, so a
+        never-prompted session has no reported state at all and aplexer's
+        message-deliver readiness gate refuses every queued envelope (the
+        session preamble and cross-device hub messages alike) until a human
+        types first. An empty prompt is truthfully 'waiting'; the first
+        genuine harness event overwrites this report. Best effort: a failed
+        seed only leaves the message queued, never affects the launch.
+        """
+        try:
+            self.runner([native, "state-report", "waiting"], cwd=str(workspace),
+                        env=dict(os.environ, APLEXER_SESSION_ID=native_id))
+        except Exception:
+            pass
+
     def _drop_queued_launcher_task(self, launcher, task_id):
         """Best-effort clear of a still-queued launcher row for offer retry.
 
@@ -3431,6 +3448,8 @@ class Dispatcher:
                     raise ValueError("Native receipt mismatch")
                 if target_cwd != workspace and not self._verify_native_cwd(native, native_id, target_cwd, receipt):
                     raise ValueError("Native cwd mismatch")
+                if not offer.get("with_goal"):
+                    self._seed_interactive_readiness(native, native_id, workspace)
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})

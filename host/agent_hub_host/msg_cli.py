@@ -298,6 +298,9 @@ def execute(args):
             original = _request('GET', '/api/bus/messages/' + quote(args.id, safe=''))
             to = original['from_actor'] if original.get('to_actor') == sender else original['to_actor']
             args.to = to
+            # /api/bus/reply requires reply_to; the server derives the thread
+            # from it when --thread is not given (§11).
+            args.reply_to = args.id
             result = _request('POST', '/api/bus/reply', _send_payload(args, sender), retries=True)
         return {**result, 'from': sender, 'idempotency_key': key}
     if args.msg_cmd == 'inbox':

@@ -77,7 +77,9 @@ class MsgCliTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.run_cli(["msg", "send", "--to", "x", "--body", "hi", "--from", "agent:developer"])
             reply = self.run_cli(["msg", "reply", "m1", "--body", "pong"])
+            self.assertEqual(self.calls[-1][0:2], ("POST", "/api/bus/reply"))
             self.assertEqual(self.calls[-1][2]["to_actor"], "agent:developer")
+            self.assertEqual(self.calls[-1][2]["reply_to"], "m1")
             self.assertEqual(reply["from"], "session:" + HUB_SESSION)
         # Without APLEXER_WORKSPACE the session file is not discovered.
         del os.environ["APLEXER_WORKSPACE"]
@@ -202,6 +204,25 @@ class MsgCliM5Test(unittest.TestCase):
         self.assertEqual(path, "/api/bus/send")
         self.assertEqual(payload["delivery"], "tui")
         self.assertEqual(payload["thread_id"], "t1")
+        self.assertEqual(payload["deliver_by_s"], 86400)
+        self.assertEqual(payload["ref"], {"kind": "url", "value": "https://x"})
+        self.assertEqual(payload["from_actor"], "agent:developer")
+
+    def test_reply_carries_reply_to_and_flags_map_to_the_api_payload(self):
+        # Regression: `hub msg reply` must send reply_to — the server rejects
+        # /api/bus/reply without it (400 missing_reply_to), live-found 2026-10-30.
+        self.write_profile()
+        with mock.patch("agent_hub_host.bus._do_request", side_effect=self.fake_request):
+            argv = parse(["msg", "reply", "m1", "--body", "pong", "--tui", "--ref", '{"kind":"url","value":"https://x"}',
+                          "--deliver-by", "24h", "--key", "k1"])
+            argv.profile = "developer"
+            msg_cli.execute(argv)
+        method, path, payload = self.calls[-1]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/api/bus/reply")
+        self.assertEqual(payload["reply_to"], "m1")
+        self.assertEqual(payload["to_actor"], "session:x")  # resolved from the replied-to message
+        self.assertEqual(payload["delivery"], "tui")
         self.assertEqual(payload["deliver_by_s"], 86400)
         self.assertEqual(payload["ref"], {"kind": "url", "value": "https://x"})
         self.assertEqual(payload["from_actor"], "agent:developer")
