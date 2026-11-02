@@ -64,6 +64,7 @@ import { HISTORY_RETENTION_MS } from './host-history';
 import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validateTokenPayload } from './token-history';
 import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
+import { sampleAccountCapacityHistory } from './account-capacity-history';
 
 const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
 const METER_FLUSH_INTERVAL_MS = 5 * 60_000;
@@ -2559,6 +2560,14 @@ export class Hub extends DurableObject {
     // for a root slot. Durable episode/command keys fence duplicate delivery.
     try { await m('idle_work', () => this.idleWorkTick()); } catch { console.warn('idle_work_tick_failed'); }
     try { await m('host_history', () => this.hostHistoryService.sample()); } catch { console.warn('resource_history_sampling_failed'); }
+    try {
+      await m('fleet_account_capacity_history', () => sampleAccountCapacityHistory(
+        this.sql,
+        now.getTime(),
+        () => dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[])
+          .map(account => this.fleetService.accountStatus(account)),
+      ));
+    } catch { console.warn('fleet_account_capacity_history_sample_failed'); }
     const cleanup = await m('bus_retention', () => this.busService.retentionCleanup(now.getTime(), 100));
     let nextAlarm = await m('jobs_alarms', () => this.jobsService.processAlarms());
     // Webhook delivery pump (intake 19ec91c2): pending redeliveries pull the

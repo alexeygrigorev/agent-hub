@@ -443,6 +443,16 @@ def main():
     p_fleet.add_argument('--fleet', default=None, help='Fleet snapshot file for doctor (default: live Hub fleet)')
     p_fleet.add_argument('--write', action='store_true', help='sync-host-config writes files atomically (default is a dry run)')
     p_fleet.add_argument('--skip-quse', action='store_true', help='doctor skips live quota probes')
+    reservations = sub.add_parser('fleet-reservations', help='Admin-only account launch reservations with session evidence')
+    reservations.add_argument('account', help='Exact fleet account label')
+    reservations.add_argument('--limit', type=int, default=100, help='Page size (1..100)')
+    reservations.add_argument('--cursor', help='Opaque next-page cursor')
+    capacity_history = sub.add_parser('fleet-capacity-history', help='Admin-only account capacity observations')
+    capacity_history.add_argument('account', help='Exact fleet account label')
+    capacity_history.add_argument('--from', dest='from_at', required=True, help='Inclusive UTC ISO-8601 lower bound')
+    capacity_history.add_argument('--to', dest='to_at', required=True, help='Exclusive UTC ISO-8601 upper bound')
+    capacity_history.add_argument('--limit', type=int, default=100, help='Maximum observations (1..100)')
+    capacity_history.add_argument('--cursor', type=int, help='Observed-at millisecond cursor from the previous page')
     heartbeat = sub.add_parser('heartbeat', help='Report that this agent is alive (agent credential with health:report)')
     heartbeat.add_argument('--status', default='working', help='Short state word, for example working, idle or waiting')
     heartbeat.add_argument('--summary', help='Non-secret one-line summary shown on the dashboard (max 240 chars)')
@@ -770,7 +780,7 @@ def main():
             print('Heartbeat failed; check the agent credential has the health:report scope.', file=sys.stderr)
             sys.exit(1)
         return
-    if args.cmd in ('start-agent', 'start-session', 'plan-agent', 'fleet', 'subscriptions', 'fleet-host'):
+    if args.cmd in ('start-agent', 'start-session', 'plan-agent', 'fleet', 'subscriptions', 'fleet-host', 'fleet-reservations', 'fleet-capacity-history'):
         from . import fleet, bus
         from pathlib import Path
         import uuid
@@ -802,6 +812,26 @@ def main():
                     return
                 else:
                     result = session_control.request('GET', '/api/fleet')
+            elif args.cmd in ('fleet-reservations', 'fleet-capacity-history'):
+                from urllib.parse import quote, urlencode
+                if args.cmd == 'fleet-reservations':
+                    if not 1 <= args.limit <= 100:
+                        print('fleet-reservations --limit must be between 1 and 100', file=sys.stderr)
+                        sys.exit(2)
+                    query = {'limit': args.limit}
+                    if args.cursor:
+                        query['cursor'] = args.cursor
+                    suffix = 'reserved-launches'
+                else:
+                    if not 1 <= args.limit <= 100:
+                        print('fleet-capacity-history --limit must be between 1 and 100', file=sys.stderr)
+                        sys.exit(2)
+                    query = {'from': args.from_at, 'to': args.to_at, 'limit': args.limit}
+                    if args.cursor is not None:
+                        query['cursor'] = args.cursor
+                    suffix = 'capacity-history'
+                account = quote(args.account, safe='')
+                result = session_control.request('GET', f'/api/fleet/accounts/{account}/{suffix}?{urlencode(query)}')
             elif args.cmd in ('subscriptions', 'fleet-host'):
                 if args.cmd == 'subscriptions' and getattr(args, 'subscriptions_cmd', None):
                     result = fleet.set_machine_route_disabled(

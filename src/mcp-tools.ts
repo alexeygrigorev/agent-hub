@@ -105,6 +105,8 @@ tool('limits', 'GET', '/api/fleet/limits', 'Operator-only per-engine and per-acc
 tool('limits_set', 'PATCH', '/api/fleet/limits', 'Operator-only live, persisted concurrency cap set: payload target (engine or account), max_concurrency 1..100, allow_lower. Raise-only unless allow_lower.', ['limits set']);
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
+  'fleet-reservations': 'Admin-only reserved fleet launch rows include native and Hub session identities; inspect with the operator CLI, never agent MCP tools.',
+  'fleet-capacity-history': 'Admin-only account capacity observations are operator diagnostics, never agent MCP tools.',
   'intake merge-check': 'Host-local: runs git and gh in a checkout, then records merge evidence; deliberate CLI step. The close gate itself is enforced for MCP intake_update (intake 2e00e01f).',
   'intake merge-state': 'Read of the merge gate; shown on intake_show (merge_state) and GET /api/intake/merge-state.',
   'machines remove': 'Operator-only machine retirement; deliberate CLI step, not an agent tool.',
