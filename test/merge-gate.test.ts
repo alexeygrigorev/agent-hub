@@ -115,7 +115,7 @@ describe('AC4 reviewer-auth fallback', () => {
     expect(brief).toContain('immediately request one retry through canonical routing with a new request key');
     expect(brief).toContain('verify the retry uses a different provider engine/account');
     expect(brief).toContain('hub sessions show');
-    expect(brief).toContain('never reuse the failed provider/account');
+    expect(brief).toContain('Never reuse the failed provider/account');
     expect(brief).toContain('hub intake show intake-1');
     expect(brief).toContain('hub intake append intake-1 --version <current-version>');
     expect(brief).toContain('"kind":"blocker"');
