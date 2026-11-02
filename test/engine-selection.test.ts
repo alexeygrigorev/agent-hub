@@ -86,6 +86,9 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       const sub = (account: string, service: string, q: any) =>
         hub.sql.exec('INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)',
           machine, account, service, null, iso(), JSON.stringify(q));
+      const updateSub = (account: string, service: string, pct: number) =>
+        hub.sql.exec('UPDATE fleet_subscriptions SET observed_at = ?, quota_json = ? WHERE machine_id = ? AND account = ? AND service = ?',
+          iso(), JSON.stringify(makeQuota(now, { pct7d: pct, hours7d: 100.8 })), machine, account, service);
       sub('hub-claude', 'claude', makeQuota(now, { pct7d: 15, hours7d: 100.8 }));
       sub('shared-claude', 'claude', makeQuota(now, { pct7d: 15, hours7d: 100.8 }));
       sub('hub-antigravity', 'gemini', makeQuota(now, { pct7d: 60, hours7d: 100.8 }));
@@ -105,6 +108,48 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(claudeCand).toBeTruthy();
       expect(agyCand.score).toBeGreaterThan(claudeCand.score * 10);
       expect(claudeCand.decision.factors.depleted).toBe(true);
+      expect(claudeCand.selection).toMatchObject({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
+      expect(plan.candidates.filter((c: any) => c.engine === 'claude').every((c: any) =>
+        c.selection?.id === 'sonnet' && c.selection?.effort === 'medium')).toBe(true);
+      expect(plan.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(false);
+      expect(plan.candidates.some((c: any) => /haiku/i.test(c.selection?.model ?? ''))).toBe(false);
+
+      // Astra requires an explicit deep/review tier; even another tier that
+      // contains it in policy must not turn routine placement into Astra.
+      const ordinaryAsk: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'routine ask', tier: 'ask' });
+      expect(ordinaryAsk.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(false);
+      const explicitDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'deep review', tier: 'deep' });
+      expect(explicitDeep.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(true);
+
+      // Codex Luna is a fallback. Even with 95% left, it must not outrank a
+      // preferred provider that still has usable Hub quota headroom.
+      updateSub('hub-claude', 'claude', 80);
+      updateSub('shared-claude', 'claude', 80);
+      updateSub('hub-antigravity', 'gemini', 50);
+      updateSub('shared-go', 'go', 45);
+      updateSub('zai-central', 'zai', 40);
+      updateSub('shared-codex', 'codex', 95);
+      const withPreferredHeadroom: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'ordinary start' });
+      expect(withPreferredHeadroom.selected?.selection).toMatchObject({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
+      expect(withPreferredHeadroom.candidates.some((c: any) => c.selection?.id === 'argon')).toBe(true);
+      expect(withPreferredHeadroom.candidates.some((c: any) => c.selection?.id === 'glm-flash-zcodex')).toBe(true);
+      expect(withPreferredHeadroom.candidates.some((c: any) => c.selection?.id === 'muse')).toBe(true);
+      expect(withPreferredHeadroom.candidates.some((c: any) => c.selection?.id === 'luna')).toBe(false);
+
+      // When every available preferred route is below the configured
+      // low-headroom floor, plain starts may fall back to Luna at max effort.
+      updateSub('hub-claude', 'claude', 15);
+      updateSub('shared-claude', 'claude', 15);
+      updateSub('hub-antigravity', 'gemini', 15);
+      updateSub('shared-go', 'go', 15);
+      updateSub('zai-central', 'zai', 15);
+      const withNoPreferredHeadroom: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'ordinary start fallback' });
+      expect(withNoPreferredHeadroom.selected?.selection).toMatchObject({ id: 'luna', model: 'gpt-6-luna', effort: 'max' });
+
+      // A model pin can cross tier membership, so luna + deep stays on Luna.
+      const lunaDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'pinned Luna', engine: 'luna', tier: 'deep' });
+      expect(lunaDeep.selected?.selection).toMatchObject({ id: 'luna', model: 'gpt-6-luna', effort: 'max' });
+      expect(lunaDeep.rejected.some((r: any) => r.reason === 'tier_unavailable')).toBe(false);
     });
   });
 

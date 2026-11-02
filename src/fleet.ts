@@ -1099,15 +1099,16 @@ export class FleetService {
     // Tier resolves through the EXISTING model-routing table (aliases +
     // tier membership), never new ranking: candidates are filtered to routes
     // whose (engine, profile) pair is a configured member of the tier, while
-    // the existing score order still decides placement. An explicit engine
-    // outside the tier simply matches nothing (honest no_eligible_route).
+    // the existing score order still decides placement. An explicit model
+    // selector may resolve its exact model across tier membership.
     const pacing = loadProviderPacing(this.sql, this.now());
     const pools = loadPools(this.sql);
     let tierModels: typeof policy.models | null = null;
+    const explicitTier = input.tier != null ? taskTier({ tier: input.tier }) : null;
+    const allowAstra = input.tier != null && (explicitTier === 'deep' || explicitTier === 'review');
     if (input.tier != null) {
-      const tier = taskTier({ tier: input.tier });
-      if (!tier) return { error: 'invalid_launch_request' };
-      const members: string[] = (policy.tiers as any)[tier] || [];
+      if (!explicitTier) return { error: 'invalid_launch_request' };
+      const members: string[] = (policy.tiers as any)[explicitTier] || [];
       tierModels = policy.models.filter(m => members.includes(m.id) && !modelDisabledByPolicy(m));
     }
     // Model ids are policy selectors, not native executable names. Keep the
@@ -1191,7 +1192,9 @@ export class FleetService {
         // Named profiles share policy membership with their registered provider,
         // never merely with an executable (Z.ai also uses the Codex engine).
         const family = canonicalQuotaProvider(provider as string);
-        if (!tierModels.some(m => (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family))) {
+        const tierMatch = tierModels.some(m => (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
+        const explicitModelMatch = overrideModels.some(m => matchesModelRoute(m, route, family));
+        if (!tierMatch && !(overrideModels.length && explicitModelMatch)) {
           rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'tier_unavailable' });
           continue;
         }
@@ -1380,10 +1383,13 @@ export class FleetService {
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
-      const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) && (anyTier || members.includes(m.id)) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
-      // An engine named without a tier (e.g. antigravity, whose models sit in deep/review only)
-      // falls back to that engine's models in any tier instead of the default tier alone.
-      const model = pick(false) ?? (input.tier == null && request.engine && !overrideModels.length ? pick(true) : undefined);
+      const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) && (m.id !== 'astra' || allowAstra) &&
+        (anyTier || members.includes(m.id)) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
+      // A native engine named without a tier (e.g. antigravity, whose models sit
+      // in deep/review only) falls back to that engine's models in any tier.
+      // An explicit model selector similarly resolves that exact model across tiers.
+      const explicitModelFallback = overrideModels.length ? pick(true) : undefined;
+      const model = pick(false) ?? explicitModelFallback ?? (input.tier == null && request.engine && !overrideModels.length ? pick(true) : undefined);
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       // Host adapter refusals are scoped to the exact route, mode and model
       // within the engine health retry window so transient historical launch
@@ -1467,6 +1473,24 @@ export class FleetService {
         if (accounts.get(candidates[i].account)?.status !== 'unknown') continue;
         rejected.push({ machine: candidates[i].machine, engine: candidates[i].engine, reason: 'account_unknown' });
         candidates.splice(i, 1);
+      }
+    }
+    // Plain starts prefer routes with usable quota headroom from Claude
+    // Sonnet, Antigravity, Z.ai, and OpenCode Muse. Codex Luna is a fallback
+    // only when none of those eligible routes reaches the configured floor.
+    const preferredModelIds = new Set(policy.models.filter(m =>
+      m.id === 'sonnet' || m.provider === 'gemini' || m.provider === 'zai' || (m.id === 'muse' && m.engine === 'opencode'))
+      .map(m => m.id));
+    const configuredHeadroomFloor = (policy.rules as any).low_headroom_percent;
+    const headroomFloor = Number.isFinite(configuredHeadroomFloor) ? configuredHeadroomFloor : 30;
+    const plainAutomaticStart = input.engine == null && input.tier == null && input.account == null;
+    const preferredHeadroomAvailable = plainAutomaticStart && candidates.some(candidate => {
+      const remaining = candidate.decision?.factors?.remaining_pct;
+      return preferredModelIds.has(candidate.selection?.id) && Number.isFinite(remaining) && remaining >= headroomFloor;
+    });
+    if (preferredHeadroomAvailable) {
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        if (candidates[i].selection?.id === 'luna') candidates.splice(i, 1);
       }
     }
     candidates.sort((a, b) =>
