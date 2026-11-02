@@ -821,7 +821,7 @@ export class FleetService {
     return this.withMaintenance(() => this.accountStatusWithinMaintenance(account));
   }
 
-  private reservedLaunchContext(liveIds: string[], nowMs = this.now(), catalogs?: Set<string>): ReservedLaunchContext {
+  private reservedLaunchContext(liveIds: string[], nowMs = this.now(), catalogs?: Map<string, number>): ReservedLaunchContext {
     const completeCatalogs = catalogs ?? freshCompleteCatalogs(this.sql, nowMs);
     let boundNativeIdSql = 'NULL';
     let boundNativeCreatedAtSql = 'NULL';
