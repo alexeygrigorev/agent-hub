@@ -3000,9 +3000,9 @@ class Dispatcher:
         # Intake 0689ce9c: live host load gates every new launch before any
         # admission subprocess, claim or native start. Test processes spawned
         # INSIDE sessions are invisible to launcher admission; this 1-minute
-        # load check refuses new starts above factor x cores. For an unclaimed
-        # non-task offer, _dispatch_one refreshes the heartbeat before sending
-        # host_load_high so Hub keeps its retry queued until load clears.
+        # load check refuses starts only for its measured trigger. For an
+        # unclaimed non-task offer, _dispatch_one refreshes the heartbeat
+        # before sending the matching Hub refusal so its retry stays held.
         # Nothing already running is touched.
         from .host_load import check_live_load
         stages = [('start', time.monotonic())]
@@ -4179,21 +4179,42 @@ class Dispatcher:
             diagnostic = classify(exc, workspace_available=workspace_available)
             reason = diagnostic['reason']
             if reason == 'host_overload':
+                load_status = getattr(exc, 'host_load_status', None)
+                hub_reason = 'host_load_high'
+                hub_diagnostic = {
+                    'reason': hub_reason,
+                    'message': diagnostic['message'],
+                    'stage': 'dispatch_route',
+                    'error_type': 'ValueError',
+                }
+                if (isinstance(load_status, dict) and
+                        load_status.get('trigger') in {'mem_available', 'cpu_busy', 'load_runaway'}):
+                    from .host_load import hub_refusal
+                    hub_reason, host_load = hub_refusal(load_status)
+                    from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
+                    hub_diagnostic = {
+                        'reason': hub_reason,
+                        'message': _DISPATCH_MESSAGES[hub_reason],
+                        'stage': 'dispatch_route',
+                        'error_type': 'ValueError',
+                        'host_load': host_load,
+                    }
+                    reason = hub_reason
                 # Intake 0689ce9c: only an unclaimed non-task offer can be
                 # rejected. A pending claim may already own a native start,
                 # and routed task offers require their task-report path.
                 print(json.dumps({'event': 'dispatch_host_overload',
                                   'offer_id': offer.get('id'),
-                                  'diagnostic': diagnostic}), flush=True)
+                                  'diagnostic': hub_diagnostic}), flush=True)
                 pending_key = self._pending_claim_key(offer.get('id'))
                 if pending_key is not None or offer.get('task_id'):
                     # Never reject an ambiguous claim or a routed task offer.
                     if pending_key is not None:
                         self._persist_launch_record({'offer_id': offer.get('id'),
                             'state': 'claim_pending', 'claim_key': pending_key,
-                            'reason': reason, 'diagnostic': diagnostic, 'settled': False})
+                            'reason': reason, 'diagnostic': hub_diagnostic, 'settled': False})
                     results.append({'id': offer.get('id'), 'state': 'held',
-                                    'reason': reason, 'diagnostic': diagnostic})
+                                    'reason': reason, 'diagnostic': hub_diagnostic})
                     return
 
                 # Publish the same fresh load sample the local 1.5x-core
@@ -4206,24 +4227,20 @@ class Dispatcher:
                                     'stage': 'heartbeat_refresh'})
                     return
 
-                from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
-                hub_reason = 'host_load_high'
-                hub_diagnostic = {
-                    'reason': hub_reason,
-                    'message': _DISPATCH_MESSAGES[hub_reason],
-                    'stage': 'dispatch_route',
-                    'error_type': 'ValueError',
-                }
                 record = {'offer_id': offer.get('id'), 'state': 'dispatch_refused',
                           'reason': hub_reason, 'diagnostic': hub_diagnostic,
                           'settled': False}
                 self._persist_launch_record(record)
                 try:
-                    from .host_load import load_factor
+                    payload = {'reason': hub_reason, 'diagnostic': hub_diagnostic}
+                    if hub_reason == 'host_load_high':
+                        from .host_load import load_factor
+                        payload['host_load_factor'] = (load_status.get('factor')
+                                                       if isinstance(load_status, dict)
+                                                       else load_factor(self.settings))
                     rejected = self.request(
                         'POST', '/api/fleet/launches/' + offer['id'] + '/reject',
-                        {'reason': hub_reason, 'diagnostic': hub_diagnostic,
-                         'host_load_factor': load_factor(self.settings)})
+                        payload)
                     if (not isinstance(rejected, dict) or
                             not isinstance(rejected.get('id'), str) or
                             rejected['id'] == offer.get('id') or
