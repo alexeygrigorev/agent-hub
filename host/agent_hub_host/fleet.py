@@ -646,7 +646,12 @@ def resolve_max_agents(value):
 def load_settings(path=None):
     """Explicit non-secret machine configuration, including several accounts per service."""
     default_path = path is None
-    path = Path(path) if path else subscriptions_path()
+    sub_path = subscriptions_path()
+    path = Path(path) if path else sub_path
+    try:
+        is_default_subscriptions = default_path or path.resolve() == sub_path.resolve()
+    except OSError:
+        is_default_subscriptions = default_path or path == sub_path
     if default_path and not path.exists():
         data = {'version': 1, 'subscriptions': [], 'workspaces': {'home': str(Path.home())}}
     else:
@@ -665,7 +670,7 @@ def load_settings(path=None):
     if 'opencode_auth' in data:
         from .opencode_auth import validate
         validate(data['opencode_auth'])
-    elif default_path:
+    elif is_default_subscriptions:
         # Hub-provisioned default (central store device login); an explicit
         # opencode_auth above always wins (intake 5814e109 AC3).
         try:
@@ -3065,6 +3070,15 @@ class Dispatcher:
         check_live_load(self.settings)
         sub = self._route(offer)
         device_auth = self.settings.get('opencode_auth') if sub.get('launcher_provider') == 'opencode' else None
+        if not device_auth and sub.get('launcher_provider') == 'opencode' and sub.get('account_label') in getattr(self, '_managed_labels', ()):
+            try:
+                from . import provisioning
+                from .opencode_auth import validate as _validate_opencode_auth
+                device_auth = _validate_opencode_auth(
+                    json.loads(provisioning.opencode_device_default_path().read_text(encoding='utf-8'))
+                )
+            except (OSError, ValueError, TypeError, ImportError):
+                device_auth = None
         if device_auth:
             self._prepare_device_auth(device_auth)  # Before quota, submission and claim.
         selection = offer.get('selection')
@@ -4416,6 +4430,14 @@ class Dispatcher:
         self.settings['subscriptions'] = [s for s in self.settings['subscriptions'] if s['account_label'] not in self._managed_labels] + managed
         self._managed_labels = {s['account_label'] for s in managed}
         self._merge_native_subscriptions()
+        if 'opencode_auth' not in self.settings and self._managed_labels:
+            try:
+                from .opencode_auth import validate as _validate_opencode_auth
+                self.settings['opencode_auth'] = _validate_opencode_auth(
+                    json.loads(provisioning.opencode_device_default_path().read_text(encoding='utf-8'))
+                )
+            except (OSError, ValueError, TypeError, ImportError):
+                pass
         _mark('provisioning')
         # AC2: exactly one of the 60s timer loop and the 20s session-host
         # loop owns offers per cycle. The loser skips with a receipt instead
