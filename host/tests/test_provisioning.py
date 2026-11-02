@@ -1583,3 +1583,24 @@ def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, exp
     p.execute()
     overrides = [arg for arg in calls[0] if arg.startswith('model_reasoning_effort=')]
     assert overrides == ['model_reasoning_effort="' + expected + '"']
+
+
+def test_antigravity_home_is_seeded_past_theme_and_data_sharing_prompts(tmp_path, monkeypatch):
+    # Desktop agy sessions stopped at the theme picker and the data-sharing consent.
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    tmp_path = root_dir
+    home = tmp_path / 'home'
+    b = {'label': 'agy', 'provider': 'antigravity', 'revision': '55555555-5555-4555-8555-555555555555',
+         'version': '1.4.12', 'files': {}, 'env': {}, 'args': []}
+    p.provision_managed_home(b, home, tmp_path)
+    marker = home / p.ANTIGRAVITY_ONBOARDING
+    data = json.loads(marker.read_text())
+    assert data['onboardingComplete'] is True and data['consumerOnboardingComplete'] is True
+    marker.write_text('{"onboardingComplete": true, "kept": 1}')
+    p.provision_managed_home(b, home, tmp_path)  # idempotent, never overwrites engine state
+    assert json.loads(marker.read_text())['kept'] == 1
+    other = tmp_path / 'other'
+    p.provision_managed_home(dict(b, provider='codex'), other, tmp_path)
+    assert not (other / p.ANTIGRAVITY_ONBOARDING).exists()

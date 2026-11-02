@@ -34,6 +34,10 @@ PACKAGES = {
     'antigravity': ('antigravity-cli', 'agy', 'antigravity'),
 }
 GO_CLI_VERSION = '2.0.32'  # exact pin of @opencode/cli; the bundle version of a go account is ignored
+ANTIGRAVITY_ONBOARDING = '.gemini/antigravity-cli/cache/onboarding.json'
+ANTIGRAVITY_ONBOARDING_JSON = json.dumps({'consumerOnboardingComplete': True,
+                                          'enterpriseOnboardingComplete': False,
+                                          'onboardingComplete': True}, indent=2) + '\n'
 ANTIGRAVITY_TOKEN = '.gemini/antigravity-cli/antigravity-oauth-token'
 OPENCODE_DEVICE_EXPORT = '.local/share/opencode-hub/device-auth.json'
 ENV = {'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
@@ -1029,6 +1033,18 @@ def provision_managed_home(bundle=None, home=None, dest=None):
 
     # 4. Provision engine permissions (approvals disabled, full access)
     install_managed_engine_permissions(bundle, home)
+
+    # 5. Antigravity first-run: the colour-scheme picker and the data-sharing
+    # consent otherwise block every interactive agy start on a fresh home. The
+    # marker below is what the CLI itself writes after the theme choice
+    # (default 'terminal') and the Terms screen with the improve-the-product
+    # data-sharing box left UNCHECKED; no consent is recorded or granted here.
+    if isinstance(bundle, dict) and bundle.get('provider') == 'antigravity':
+        marker = home / ANTIGRAVITY_ONBOARDING
+        try:
+            marker.read_bytes()
+        except OSError:
+            private_fs.atomic_write(marker, ANTIGRAVITY_ONBOARDING_JSON.encode(), 4096, engine_owned=True)
 
     return home
 
