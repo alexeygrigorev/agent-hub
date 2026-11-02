@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
-import { MERGE_IDLE_MS, MERGE_MAX_REQUEUES, MergeGate, mergeGateTick } from '../src/merge-gate';
+import { finishBrief, MERGE_IDLE_MS, MERGE_MAX_REQUEUES, MergeGate, mergeGateTick } from '../src/merge-gate';
 
 // Intake 2e00e01f: close gate, unmerged watcher, requeue. Synthetic Hub DOs only; never prod.
 const admin = { caller: { isAdmin: true, actor: 'human:operator', kind: 'human' }, scopes: ['admin'] } as any;
@@ -105,6 +105,24 @@ function hooks(c: Ctx, over: any = {}) {
 const age = (c: Ctx, id: string, ms: number) => {
   c.hub.sql.exec('UPDATE intake_merge_state SET activity_at = activity_at - ?, due_at = due_at - ?, evidence_at = evidence_at - ? WHERE task_id = ?', ms, ms, ms, id);
 };
+
+describe('AC4 reviewer-auth fallback', () => {
+  it('requires canonical independent review, a distinct-provider retry, and a durable blocker on repeated auth failure', () => {
+    const brief = finishBrief({ id: 'intake-1', title: 'Example' }, { path: WT, branch: 'demo-wt-bbbb2222', machine: 'hetzner' }, ['deploy pending']);
+    expect(brief).toContain('hub sessions start --task-kind review --tier deep --headless');
+    expect(brief).toContain('--intake-task-id intake-1 --intake-worktree detached');
+    expect(brief).toContain('do not pin an engine or machine');
+    expect(brief).toContain('immediately request one retry through canonical routing with a new request key');
+    expect(brief).toContain('verify the retry uses a different provider engine/account');
+    expect(brief).toContain('hub sessions show');
+    expect(brief).toContain('never reuse the failed provider/account');
+    expect(brief).toContain('hub intake show intake-1');
+    expect(brief).toContain('hub intake append intake-1 --version <current-version>');
+    expect(brief).toContain('"kind":"blocker"');
+    expect(brief).toContain('after three unsuccessful finish-merge requeues the watcher creates a prerequisite and alert');
+    expect(brief).not.toContain('hub intake blocker');
+  });
+});
 
 describe('AC2/AC3 watcher and requeue', () => {
   it('flags an idle unmerged intake once, requeues a finish-merge session, escalates to a blocker after the limit', async () => fixture(async c => {
