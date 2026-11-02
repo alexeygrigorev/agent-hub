@@ -2582,8 +2582,44 @@ def refresh_launch_credential(label, b, home, dest, request=None):
         return {'status': 'hub_unreachable'}
 
 
+def strip_codex_effort_args(args):
+    """Remove profile effort defaults so the routed model policy can win."""
+    result = []
+    has_override = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '--':
+            result.extend(args[i:])
+            break
+        value = None
+        consumed = 1
+        if arg in ('-c', '--config') and i + 1 < len(args):
+            value = args[i + 1]
+            consumed = 2
+        elif arg.startswith('--config='):
+            value = arg[len('--config='):]
+        elif arg.startswith('-c') and arg != '-c':
+            value = arg[2:]
+        if value and value.partition('=')[0].strip() == 'model_reasoning_effort':
+            has_override = True
+            i += consumed
+            continue
+        if arg == '--effort':
+            has_override = True
+            i += 2 if i + 1 < len(args) else 1
+            continue
+        if arg.startswith('--effort='):
+            has_override = True
+            i += 1
+            continue
+        result.append(arg)
+        i += 1
+    return result, has_override
+
+
 def managed_codex_effort_args(bundle, extra_argv):
-    """Apply the Hub effort after bundle defaults and before explicit caller argv."""
+    """Apply the routed/session effort below caller overrides and above profile defaults."""
     if bundle['provider'] != 'codex':
         return []
     marker = '--hub-session-effort='
@@ -2593,21 +2629,10 @@ def managed_codex_effort_args(bundle, extra_argv):
     args = [arg for arg in extra_argv if not arg.startswith(marker)]
     if args in (["--version"], ["-v"], ["--help"], ["-h"]):
         return []
-    # Explicit caller config is last in the final argv and must remain authoritative.
-    for i, arg in enumerate(args):
-        if arg == '--':
-            break
-        value = None
-        if arg in ('-c', '--config') and i + 1 < len(args):
-            value = args[i + 1]
-        elif arg.startswith('--config='):
-            value = arg[len('--config='):]
-        elif arg.startswith('-c') and arg != '-c':
-            value = arg[2:]
-        if value and value.partition('=')[0].strip() == 'model_reasoning_effort':
-            return []
-        if arg == '--effort' or arg.startswith('--effort='):
-            return []
+    # Explicit caller args stay last and authoritative. Profile args are defaults.
+    _, caller_override = strip_codex_effort_args(args)
+    if caller_override:
+        return []
     if session_efforts:
         effort = session_efforts[0]
     else:
@@ -2773,9 +2798,11 @@ def execute():
                 effort_args = managed_codex_effort_args(b, extra_argv)
                 # This adapter-only marker is consumed above and must never reach Codex.
                 extra_argv = [arg for arg in extra_argv if not arg.startswith('--hub-session-effort=')]
-                # Bundle args carry startup defaults. Place Hub policy/session effort
-                # after them, with explicit caller argv last so it can override policy.
-                argv = command + isolated_argv(b['provider'], b['args'] + bypass_flags + effort_args + extra_argv)
+                bundle_args = b['args']
+                if b['provider'] == 'codex' and not is_diagnostic:
+                    bundle_args, _ = strip_codex_effort_args(bundle_args)
+                # Keep explicit caller argv last so it can override routed/session policy.
+                argv = command + isolated_argv(b['provider'], bundle_args + bypass_flags + effort_args + extra_argv)
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
         if not is_diagnostic:
             allowed, reason = hub_launch_gate(label)
