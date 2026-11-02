@@ -95,7 +95,7 @@ def ensure_repo_workspace(settings, label, *, home: Optional[str] = None,
             raise ValueError("workspace path exists and is not a git checkout")
     path.parent.mkdir(parents=True, exist_ok=True)
     slug = f"{owner}/{name}"
-    gh = gh_bin if gh_bin is not None else shutil.which("gh")
+    gh = gh_bin if gh_bin is not None else git_noninteractive.find_gh()
     proc = None
     if gh:
         proc = run([gh, "repo", "clone", slug, str(path)], None, CLONE_TIMEOUT)

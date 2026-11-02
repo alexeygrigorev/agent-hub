@@ -35,10 +35,24 @@ _AUTH_MARKERS = (
 )
 
 
+def find_gh() -> Optional[str]:
+    """gh executable: PATH first, then the standard Windows install locations."""
+    found = shutil.which("gh")
+    if found:
+        return found
+    for var, tail in (("ProgramFiles", "GitHub CLI"), ("LOCALAPPDATA", "Programs/GitHub CLI")):
+        base = os.environ.get(var)
+        if base:
+            candidate = os.path.join(base, tail, "gh.exe")
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
 def credential_helpers(gh_bin: Optional[str] = None) -> list[str]:
     """Ordered ``credential.helper`` values: reset first, then the gh helper."""
     helpers = [""]
-    gh = gh_bin if gh_bin is not None else shutil.which("gh")
+    gh = gh_bin if gh_bin is not None else find_gh()
     if gh:
         helpers.append('!"' + gh.replace("\\", "/") + '" auth git-credential')
     return helpers
