@@ -68,6 +68,9 @@ import {
 export const SESSION_CONTROL_WAKE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_control_wakes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, wake_at_ms INTEGER NOT NULL, wake_at TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, command_id TEXT, intake_task_id TEXT, owner_token_id TEXT, owner_family TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, delivered_at TEXT, acked_at TEXT, UNIQUE(session_id, actor, request_key));
 CREATE INDEX IF NOT EXISTS session_control_wakes_due ON session_control_wakes(state, wake_at_ms);
+CREATE INDEX IF NOT EXISTS session_control_wakes_due_order ON session_control_wakes(state, wake_at_ms, created_at, id);
+CREATE INDEX IF NOT EXISTS session_control_wakes_delivery_order ON session_control_wakes(state, delivered_at, id);
+CREATE INDEX IF NOT EXISTS session_control_wakes_resolution_order ON session_control_wakes(state, updated_at);
 CREATE INDEX IF NOT EXISTS session_control_wakes_session ON session_control_wakes(session_id, state);
 CREATE TABLE IF NOT EXISTS session_control_wake_alerts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, wake_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, intake_task_id TEXT, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_control_wake_alerts_session ON session_control_wake_alerts(session_id, created_at);
@@ -820,10 +823,14 @@ export class SessionControlService {
   }
 
   public nextWakeTime(): number | null {
+    // Seek the earliest row of each indexed queue; never aggregate retained
+    // outstanding history or apply julianday to every delivery. Keep the
+    // active-ping deadline in the same alarm calculation.
     const row: any = this.sql.exec(`SELECT MIN(deadline) AS deadline FROM (
-      SELECT wake_at_ms AS deadline FROM session_control_wakes WHERE state='pending'
-      UNION ALL SELECT CAST((julianday(delivered_at)-2440587.5)*86400000 AS INTEGER)+600000
-      FROM session_control_wakes WHERE state='delivered'
+      SELECT (SELECT wake_at_ms FROM session_control_wakes WHERE state='pending'
+        ORDER BY wake_at_ms, created_at, id LIMIT 1) AS deadline
+      UNION ALL SELECT CAST((julianday((SELECT delivered_at FROM session_control_wakes
+        WHERE state='delivered' AND delivered_at IS NOT NULL ORDER BY delivered_at, id LIMIT 1))-2440587.5)*86400000 AS INTEGER)+600000
       UNION ALL SELECT next_at_ms AS deadline FROM session_control_pings WHERE state='active')`).toArray()[0];
     return typeof row?.deadline === 'number' ? row.deadline : null;
   }
