@@ -165,6 +165,8 @@ def report_rejection(label, generation, reason, request):
 CODEX_USAGE = 'https://chatgpt.com/backend-api/wham/usage'
 CODEX_RESET_CREDITS = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
 CLAUDE_USAGE = 'https://api.anthropic.com/api/oauth/usage'
+GO_USAGE = 'https://opencode.ai/zen/go/v1/usage'
+GO_DEVICE_AUTH = Path('.local/share/opencode-hub/device-auth.json')
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -276,6 +278,34 @@ def claude_quota(body, now=None):
     return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limit}, 'windows': windows}
 
 
+def go_quota(body, now=None):
+    """Map an OpenCode Go ``zen/go/v1/usage`` body (used percent) to the quota route shape."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    usage = body.get('usage') if isinstance(body, dict) and isinstance(body.get('usage'), dict) else None
+    if usage is None:
+        return None
+
+    def win(w, rolling=False):
+        if not isinstance(w, dict):
+            return {'percent_remaining': None, 'reset_at': None, 'present': False, 'rolling': rolling}
+        used = w.get('percent', w.get('usagePercent'))
+        return {'percent_remaining': _remaining(used), 'reset_at': _iso(w.get('resetsAt')), 'present': True, 'rolling': rolling}
+    windows = {'5h': win(usage.get('rolling'), True), '7d': win(usage.get('weekly')), 'monthly': win(usage.get('monthly'))}
+    limited = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values()) or any(
+        isinstance(usage.get(k), dict) and str(usage[k].get('status', '')).lower().replace('_', '-') in ('exhausted', 'limited', 'rate-limited')
+        for k in ('rolling', 'weekly', 'monthly'))
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limited}, 'windows': windows}
+
+
+def _go_access_token(home):
+    """Active OpenCode device-login access token from the Hub-materialized export."""
+    entries = json.loads(private_fs.read_bytes(Path(home) / GO_DEVICE_AUTH, MAX_FILE * 2, private=False))
+    active = [e for e in entries if isinstance(e, dict) and e.get('active') is True] if isinstance(entries, list) else []
+    value = active[0].get('value') if active else None
+    token = value.get('access') if isinstance(value, dict) else None
+    return token if isinstance(token, str) and token else None
+
+
 def probe_quota(provider, home, opener=None, timeout=15):
     """Read quota straight from the provider with the materialized Hub credential.
 
@@ -303,11 +333,20 @@ def probe_quota(provider, home, opener=None, timeout=15):
             headers = {'Authorization': 'Bearer ' + creds['claudeAiOauth']['accessToken'], 'Accept': 'application/json',
                        'anthropic-beta': 'oauth-2025-04-20', 'User-Agent': 'Claude-Code/2.1.198'}
             url, parse = CLAUDE_USAGE, claude_quota
+        elif provider == 'go':
+            # OpenCode Go reads usage with the device-login access token. The
+            # endpoint rejects the default urllib agent (Cloudflare 1010).
+            token = _go_access_token(home)
+            if token is None:
+                return {}
+            headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json', 'User-Agent': 'opencode/1.19'}
+            url, parse = GO_USAGE, go_quota
         else:
             return {}
         with opener.open(urllib.request.Request(url, headers=headers, method='GET'), timeout=timeout) as response:
             body = json.loads(response.read(131072))
-        return {provider: parse(body)} if isinstance(body, dict) else {}
+        route = parse(body) if isinstance(body, dict) else None
+        return {provider: route} if route else {}
     except urllib.error.HTTPError as error:
         error.close()
         return {'unauthorized': True} if error.code == 401 else {}
