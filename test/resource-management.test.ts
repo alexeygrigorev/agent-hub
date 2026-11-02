@@ -282,6 +282,14 @@ describe('resource management',()=>{
   expect(()=>resourceConfig({memory_floor_mb:-1})).toThrow();expect(()=>resourceConfig({cpu_load_factor:Infinity})).toThrow();
   expect(percentile([100,200,300,400,500,600,700,800,900,1000],90)).toBe(900);
  });
+ it('migrates the persisted legacy floor default once while preserving later explicit settings',async()=>fixture(async(r,sql)=>{
+  const legacy={...resourceConfig(),memory_floor_mb:1024,memory_floor_pct:3};
+  sql.exec('INSERT INTO resource_settings VALUES(1,?)',JSON.stringify(legacy));
+  expect(r.config()).toMatchObject({memory_floor_mb:1024,memory_floor_pct:1.5});
+  expect(JSON.parse(sql.exec('SELECT data FROM resource_settings WHERE id=1').one().data)).toMatchObject({memory_floor_pct:1.5});
+  r.configure({...r.config(),memory_floor_pct:3});
+  expect(r.config().memory_floor_pct).toBe(3);
+ }));
  it('does not subtract resident caps but reserves unstarted ramps, crediting measured resident usage',async()=>fixture(async(r,sql)=>{
   expect(r.headroom('host')).toMatchObject({reserved_mb:0,requested_mb:512});
   sql.exec("UPDATE fleet_launches SET state='starting' WHERE id='launch'");
