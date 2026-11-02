@@ -40,8 +40,9 @@ describe('hourly intake backlog triage (d8d509d2 AC5)', () => {
     expect(r).toMatchObject({ state: 'reviewer_started', session_id: 'sess-1', candidates: TRIAGE_BATCH + 3 });
     expect(r.requested).toEqual(tasks.slice(0, TRIAGE_BATCH).map(x => x.id));
     expect(inputs).toHaveLength(1);
-    expect(inputs[0]).toMatchObject({ engine: 'claude', tier: 'review', task_kind: 'review', mode: 'headless', workspace: 'agent-hub' });
-    expect(inputs[0].engine_override_reason).toMatch(/Opus/);
+    expect(inputs[0]).toMatchObject({ tier: 'review', task_kind: 'review', mode: 'headless', workspace: 'agent-hub' });
+    expect(inputs[0]).not.toHaveProperty('engine'); // burn-aware routing places it, no Claude pin
+    expect(inputs[0]).not.toHaveProperty('engine_override_reason');
     expect(inputs[0].intake_task_id).toBe(TRIAGE_INTAKE_ID); // headless starts link the triage intake, never a triaged one
     expect(inputs[0].intake_worktree).toBe('detached'); // 79458f2d: never the triage intake's worktree
     expect(inputs[0].cwd).toBeUndefined();

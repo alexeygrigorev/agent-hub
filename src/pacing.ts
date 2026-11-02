@@ -10,6 +10,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import policy from '../config/model-routing.json';
 import {
   TBM_FLEET_POOL_ID,
+  WINDOW_NOMINAL_CYCLE_MS,
   evaluateTbmAdmission,
   isPercentOnlyTbmPool,
   normalizeProviderFamily,
@@ -295,6 +296,32 @@ export function pacingAlignment(actualTpm: number, targetTpm: number): number {
   if (actualTpm < 0.85 * targetTpm) return 1 + Math.min(1.5, (targetTpm - actualTpm) / targetTpm);
   if (actualTpm > 1.15 * targetTpm) return Math.max(0.2, targetTpm / actualTpm);
   return 1;
+}
+/** Fraction of quota left below which a route is treated as low-headroom. */
+export const LOW_HEADROOM_PERCENT = 30;
+/**
+ * Burn-rate factor (Alexey 2026-11-02: spread usage so every account depletes at a similar relative pace).
+ * ratio = (fraction of quota left) / (fraction of the window left), min over the timed windows: above 1 the
+ * account is behind schedule (burn it), below 1 it is ahead (spare it). A route under LOW_HEADROOM_PERCENT
+ * that is also ahead of schedule is further squared down so it loses to any engine with room. Windows without
+ * a known cycle or reset (unmetered engines) are neutral (factor 1).
+ */
+export function scheduleBurnFactor(quota: any, nowMs: number): { factor: number; ratio: number | null; remaining: number | null } {
+  let ratio: number | null = null; let remaining: number | null = null;
+  for (const [name, w] of Object.entries(quota?.windows || {}) as [string, any][]) {
+    if (w?.present === false || typeof w?.percent_remaining !== 'number' || !Number.isFinite(w.percent_remaining)) continue;
+    remaining = remaining === null ? w.percent_remaining : Math.min(remaining, w.percent_remaining);
+    const cycle = (WINDOW_NOMINAL_CYCLE_MS as Record<string, number>)[String(name).toLowerCase()];
+    const reset = typeof w.reset_at === 'string' ? Date.parse(w.reset_at) : NaN;
+    if (!cycle || !Number.isFinite(reset)) continue;
+    const frac = Math.max(0.02, Math.min(1, (reset - nowMs) / cycle));
+    const r = (w.percent_remaining / 100) / frac;
+    ratio = ratio === null ? r : Math.min(ratio, r);
+  }
+  if (ratio === null) return { factor: 1, ratio: null, remaining };
+  let factor = Math.max(0.05, Math.min(3, ratio));
+  if (remaining !== null && remaining < LOW_HEADROOM_PERCENT && ratio < 1) factor *= Math.pow(Math.max(0.1, remaining / LOW_HEADROOM_PERCENT), 2);
+  return { factor, ratio, remaining };
 }
 export const routeScore = (f: RouteScoreFactors) => f.fit * f.health * f.preference * f.headroom * f.urgency * f.pacing * f.grok * f.banked;
 

@@ -103,8 +103,10 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await note(h, t.id, DONE_EVIDENCE);
     clock.now = Date.now();
     expect(await tick(v, clock)).toMatchObject({ state: 'checked', launched: 1 });
-    expect(starts[0]).toMatchObject({ engine: 'claude', tier: 'review', task_kind: 'review', mode: 'headless', intake_task_id: t.id,
+    expect(starts[0]).toMatchObject({ tier: 'review', task_kind: 'review', mode: 'headless', intake_task_id: t.id,
       intake_worktree: 'detached' }); // 79458f2d: never the intake's (possibly locked) worktree
+    expect(starts[0]).not.toHaveProperty('engine'); // no pin: burn-aware routing places the review tier
+    expect(starts[0]).not.toHaveProperty('engine_override_reason');
     expect(starts[0].brief).toMatch(/verification ONLY/);
     running(h, 'verifier-1', t.id);
     expect(await tick(v, clock)).toMatchObject({ launched: 0, waiting: 1 }); // one verifier per claim while it runs
@@ -139,7 +141,7 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await note(h, t.id, DONE_EVIDENCE);
     clock.now = Date.now();
     await tick(v, clock);
-    expect(starts[0]).toMatchObject({ engine: 'claude', workspace: 'demo' });
+    expect(starts[0]).toMatchObject({ workspace: 'demo' }); expect(starts[0].engine).toBeUndefined();
   }));
   it('ignores history link engines for verifier routing', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
@@ -151,7 +153,7 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await note(h, t.id, DONE_EVIDENCE);
     clock.now = Date.now();
     await tick(v, clock);
-    expect(starts[0]).toMatchObject({ engine: 'claude' });
+    expect(starts[0].engine).toBeUndefined();
   }));
   it('ignores another actor forging a PASS or FAIL and requires evidence in the verifier PASS itself', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];

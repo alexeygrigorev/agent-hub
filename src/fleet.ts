@@ -26,7 +26,7 @@ import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
 import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
-import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency } from './pacing';
+import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
 import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
 import { WORKER_SCOPE, workerAccessContext } from './worker-access';
 import { GOAL_STATUSES } from './intake-session';
@@ -1358,7 +1358,7 @@ export class FleetService {
       // the single highest-percentage family.
       const headroomPercent = routeQuota.remaining ?? (isUnmeteredProvider(family) ? (policy.rules as any).unmetered_headroom_percent : 5);
       const familyLoad = [...accounts.values()].filter(a => a.provider === family).reduce((n, a) => n + a.active, 0);
-      const score = (headroomPercent / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) / (1 + familyLoad) * tbm_weight;
+      const score = (headroomPercent / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) / (1 + familyLoad) * tbm_weight * scheduleBurnFactor(routeProv?.quota, this.now()).factor;
       // Windows hosts are overflow for work that does not ask for Windows:
       // agent tooling assumes Linux, so they win only when every Linux route
       // is held (loaded, capped or quota-limited). Pinned and os:windows
