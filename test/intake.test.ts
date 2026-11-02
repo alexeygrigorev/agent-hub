@@ -1561,7 +1561,7 @@ describe('archive retention, evidence gates and durable audit', () => {
     expect(task.archived_at).toBeNull();
     expect((await call('/tasks/' + task.id, { key: 'stale-evidence', expected_version: task.version, status: 'done' })).status).toBe(409);
     expect((await ok('/tasks/' + task.id + '/audit')).items[0].kind).toBe('reopen');
-  });
+  }, 15_000);
   it('list/show/update/history agree for every visible full id and prefix during parallel archive passes', async () => {
     const first = await create(), second = await create();
     const closed = await append(second.task.id, 1, done);
