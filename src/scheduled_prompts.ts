@@ -215,6 +215,7 @@ export class PromptLibraryService {
     if (!hasBody && input.title === undefined) return json({ error: 'nothing_to_update' }, 400);
     return this.txn(() => {
       const at = this.at();
+      prompt = this.sql.exec('SELECT * FROM hub_prompts WHERE id = ?', prompt.id).toArray()[0] || prompt;
       let version = Number(prompt.current_version);
       if (hasBody) {
         version += 1;
@@ -233,7 +234,9 @@ type Enqueue = (source: string, sourceId: string, deliveryKey: string, target: s
 
 export class SessionSchedulesService {
   constructor(private sql: SqlStorage, private txn: (fn: () => any) => any, private now: () => number,
-              private prompts: PromptLibraryService, private enqueue: Enqueue) {}
+              private prompts: PromptLibraryService, private enqueue: Enqueue,
+              private insert: (source: string, sourceId: string, key: string, target: string, body: string) => { id: string; replayed: boolean },
+              private pump: () => Promise<void>) {}
 
   private at(): string { return new Date(this.now()).toISOString(); }
 
@@ -275,31 +278,46 @@ export class SessionSchedulesService {
     let fired = 0;
     for (const row of due) {
       const next = this.nextDue(row, nowMs);
-      const advanced = this.txn(() => {
+      const text = this.renderText(row);
+      // Advance the schedule and enqueue the occurrence in ONE transaction so
+      // a crash between the two can never drop an occurrence.
+      const outcome = this.txn(() => {
         const fresh: any = this.sql.exec('SELECT next_due_ms FROM session_schedules WHERE id = ? AND enabled = 1', row.id).toArray()[0];
-        if (!fresh || Number(fresh.next_due_ms) !== Number(row.next_due_ms)) return false;
+        if (!fresh || Number(fresh.next_due_ms) !== Number(row.next_due_ms)) return 'skipped';
         this.sql.exec('UPDATE session_schedules SET next_due_ms = ?, last_fire_ms = ?, last_fire_at = ?, updated_at = ? WHERE id = ?',
           next, row.next_due_ms, this.at(), this.at(), row.id);
-        return true;
+        if (!text) return 'failed';
+        // Coalesce: an earlier occurrence still waiting for a busy/down target
+        // is enough; do not stack identical prompts.
+        const open = this.sql.exec("SELECT 1 FROM session_deliveries WHERE source = 'schedule' AND source_id = ? AND status IN ('pending','queued') LIMIT 1", row.id).toArray();
+        if (open.length) return 'coalesced';
+        const key = 'fire-' + new Date(Number(row.next_due_ms)).toISOString();
+        const result = this.insert('schedule', row.id, key, row.target_label, text);
+        this.audit('schedule.fire', 'hub:schedules', row.name, { schedule_id: row.id, delivery_id: result.id, key, replayed: result.replayed });
+        return 'fired';
       });
-      if (!advanced) continue;
-      await this.fire(row, Number(row.next_due_ms), 'schedule');
-      fired += 1;
+      if (outcome === 'skipped') continue;
+      if (outcome === 'failed') this.audit('schedule.fire_failed', 'hub:schedules', row.name, { schedule_id: row.id, error: 'prompt_unavailable_or_empty' });
+      if (outcome === 'coalesced') this.audit('schedule.fire_coalesced', 'hub:schedules', row.name, { schedule_id: row.id });
+      if (outcome === 'fired') fired += 1;
     }
+    if (fired) await this.pump();
     return fired;
   }
 
-  private async fire(row: any, occurrenceMs: number, source: string, keyOverride?: string) {
-    let text: string | null = null;
-    let error: string | null = null;
+  private renderText(row: any): string | null {
     if (row.prompt_id) {
       const rendered = this.prompts.render(row.prompt_id, parsed(row.prompt_vars, {}));
-      if (rendered) text = rendered.text; else error = 'prompt_unavailable';
-    } else {
-      text = renderTemplate(row.prompt_text, '', parsed(row.prompt_vars, {})).text;
+      return rendered && rendered.text.trim() ? rendered.text : null;
     }
-    if (error || !text) {
-      this.audit('schedule.fire_failed', 'hub:schedules', row.name, { schedule_id: row.id, error: error || 'empty_prompt' });
+    const text = renderTemplate(row.prompt_text, '', parsed(row.prompt_vars, {})).text;
+    return text.trim() ? text : null;
+  }
+
+  private async fire(row: any, occurrenceMs: number, source: string, keyOverride?: string) {
+    const text = this.renderText(row);
+    if (!text) {
+      this.audit('schedule.fire_failed', 'hub:schedules', row.name, { schedule_id: row.id, error: 'prompt_unavailable_or_empty' });
       return null;
     }
     const key = keyOverride ?? 'fire-' + new Date(occurrenceMs).toISOString();
@@ -368,7 +386,7 @@ export class SessionSchedulesService {
   private create(input: any, actor: string): Response {
     if (!input || typeof input !== 'object') return json({ error: 'invalid_request' }, 400);
     const name = typeof input.name === 'string' ? input.name : '';
-    if (!SLUG_RE.test(name)) return json({ error: 'invalid_name', detail: 'lowercase slug, 2-64 chars' }, 400);
+    if (!SLUG_RE.test(name) || name === 'deliveries') return json({ error: 'invalid_name', detail: 'lowercase slug, 2-64 chars (not "deliveries")' }, 400);
     const target = typeof input.target_label === 'string' ? input.target_label.trim() : '';
     if (!target || target.length > 200) return json({ error: 'invalid_target_label' }, 400);
     const cronExpr = typeof input.cron === 'string' ? input.cron.trim() : '';

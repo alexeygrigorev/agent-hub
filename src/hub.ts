@@ -254,7 +254,9 @@ export class Hub extends DurableObject {
     this.promptLibrary.init();
     this.webhookService.setPromptResolver(ref => this.promptLibrary.resolve(ref));
     this.sessionSchedules = new SessionSchedulesService(this.sql, txn, Date.now, this.promptLibrary,
-      (source, sourceId, key, target, body) => this.webhookService.enqueueDelivery(source, sourceId, key, target, body));
+      (source, sourceId, key, target, body) => this.webhookService.enqueueDelivery(source, sourceId, key, target, body),
+      (source, sourceId, key, target, body) => this.webhookService.insertDelivery(source, sourceId, key, target, body),
+      () => this.webhookService.pumpQueue());
     // Cron launch schedules (intake a839dfb6): each due tick creates a Hub
     // intake (source schedule) and starts the linked headless session through
     // the canonical admission path below; placement/capacity gates are never

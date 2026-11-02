@@ -68,6 +68,7 @@ describe('prompt library and session schedules', () => {
     expect((await admin('POST', '/api/session-schedules', { name: 'a-b', target_label: 't', cron: '* * * * *' })).status).toBe(400);
     expect((await admin('POST', '/api/session-schedules', { name: 'a-b', target_label: 't', cron: '* * * * *', prompt: 'x', prompt_id: 'y' })).status).toBe(400);
     expect((await admin('POST', '/api/session-schedules', { name: 'a-b', target_label: 't', cron: '* * * * *', prompt_id: 'missing' })).status).toBe(400);
+    expect((await admin('POST', '/api/session-schedules', { name: 'deliveries', target_label: 't', cron: '* * * * *', prompt: 'x' })).status).toBe(400);
     const made: any = await (await admin('POST', '/api/session-schedules', { name: 'hourly', target_label: 'orchestrator-main', cron: '0 * * * *', prompt: 'check things' })).json();
     expect(made.next_due_at).toBeTruthy();
     expect(JSON.stringify(made)).not.toContain('check things');
@@ -98,6 +99,10 @@ describe('prompt library and session schedules', () => {
       expect(await instance.sessionSchedules.tick()).toBe(0);
       const rows = instance.sql.exec("SELECT * FROM session_deliveries WHERE source = 'schedule'").toArray();
       expect(rows).toHaveLength(1);
+      // Target still down: the next occurrence coalesces instead of stacking.
+      instance.sql.exec('UPDATE session_schedules SET next_due_ms = ?', Date.now() - 1000);
+      expect(await instance.sessionSchedules.tick()).toBe(0);
+      expect(instance.sql.exec("SELECT * FROM session_deliveries WHERE source = 'schedule'").toArray()).toHaveLength(1);
       const audit: any[] = instance.sql.exec("SELECT detail FROM audit WHERE action = 'schedule.fire'").toArray();
       expect(audit.length).toBeGreaterThan(0);
       expect(JSON.stringify(audit)).not.toContain('sweep');
