@@ -24,7 +24,12 @@ SKIP_CI = re.compile(r'\[(?:skip ci|ci skip|no ci)\]', re.I)
 
 def _run(runner: Callable, argv: list, cwd: str, timeout: int = GIT_TIMEOUT):
     try:
-        return runner(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+        extra = {}
+        if runner is subprocess.run:
+            from .git_noninteractive import noninteractive_env
+            extra['env'] = noninteractive_env()
+            extra['stdin'] = subprocess.DEVNULL
+        return runner(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False, **extra)
     except (OSError, subprocess.SubprocessError):
         return None
 

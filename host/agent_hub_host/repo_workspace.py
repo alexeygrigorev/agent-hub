@@ -19,6 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import git_noninteractive
+
 REPO_WORKSPACE = re.compile(r"repo-([0-9a-f]{8})-([A-Za-z0-9][A-Za-z0-9-]{0,38})__([A-Za-z0-9_-]{1,60})\Z")
 REPO_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
 CLONE_TIMEOUT = 900.0
@@ -54,7 +56,7 @@ def repo_path(settings, label, home: Optional[str] = None) -> Path:
 
 
 def _run(argv: list[str], cwd: Optional[str], timeout: float) -> subprocess.CompletedProcess:
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="true", LC_ALL="C")
+    env = git_noninteractive.noninteractive_env()
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False,
                           cwd=cwd, env=env, stdin=subprocess.DEVNULL)
 
@@ -97,10 +99,15 @@ def ensure_repo_workspace(settings, label, *, home: Optional[str] = None,
     if proc is None or proc.returncode != 0:
         proc = run([git_bin, "clone", "--quiet", f"https://github.com/{slug}.git", str(path)], None, CLONE_TIMEOUT)
     if proc.returncode != 0:
+        detail = (proc.stderr or "") + (proc.stdout or "")
+        if git_noninteractive.is_auth_failure(detail):
+            raise ValueError(git_noninteractive.AUTH_FAILED + ": " + slug + ": " + _short(proc))
         raise ValueError("repo clone failed: " + _short(proc))
     for argv in ([git_bin, "fetch", "--quiet", "origin", "main"],
                  [git_bin, "checkout", "--quiet", "-B", "wt-" + id8, "origin/main"]):
         proc = run(argv, str(path), GIT_TIMEOUT)
         if proc.returncode != 0:
+            if git_noninteractive.is_auth_failure((proc.stderr or "") + (proc.stdout or "")):
+                raise ValueError(git_noninteractive.AUTH_FAILED + f": git {argv[1]}: " + _short(proc))
             raise ValueError(f"git {argv[1]} failed: " + _short(proc))
     return path.resolve()

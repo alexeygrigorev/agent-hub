@@ -3045,6 +3045,9 @@ class Dispatcher:
                 argv += ["--env", f"GIT_AUTHOR_NAME={git_name}", "--env", f"GIT_COMMITTER_NAME={git_name}"]
             if git_email:
                 argv += ["--env", f"GIT_AUTHOR_EMAIL={git_email}", "--env", f"GIT_COMMITTER_EMAIL={git_email}"]
+            from . import git_noninteractive
+            for _k, _v in git_noninteractive.session_env_pairs():
+                argv += ["--env", f"{_k}={_v}"]
             if selection and not sub.get("startup_argv") and sub.get("account_label") not in self._managed_labels:
                 argv += ["--model", selection["model"]]
             if with_goal or sub.get("startup_argv") or (selection and sub.get("account_label") in self._managed_labels):

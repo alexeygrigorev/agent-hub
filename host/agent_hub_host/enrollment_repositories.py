@@ -49,7 +49,7 @@ def sync(install_root, *, request=None, runner=None):
         raise ValueError('Linked repository root refused')
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-    env.update(GIT_TERMINAL_PROMPT='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+    env.update(GIT_TERMINAL_PROMPT='0', GCM_INTERACTIVE='never', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
                GIT_CONFIG_COUNT='3', GIT_CONFIG_KEY_0='credential.helper', GIT_CONFIG_VALUE_0='',
                GIT_CONFIG_KEY_1='http.followRedirects', GIT_CONFIG_VALUE_1='false',
                GIT_CONFIG_KEY_2='core.hooksPath', GIT_CONFIG_VALUE_2=os.devnull)

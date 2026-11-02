@@ -59,7 +59,7 @@ class EnsureTests(unittest.TestCase):
 
     def test_clone_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as home:
-            run = lambda argv, cwd, timeout: subprocess.CompletedProcess(argv, 128, '', 'fatal: repository not found')
+            run = lambda argv, cwd, timeout: subprocess.CompletedProcess(argv, 128, '', 'fatal: unable to access: Could not resolve host')
             with self.assertRaisesRegex(ValueError, 'repo clone failed'):
                 repo_workspace.ensure_repo_workspace({}, LABEL, home=home, runner=run, gh_bin='')
 
