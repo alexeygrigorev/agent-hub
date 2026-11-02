@@ -445,7 +445,7 @@ def prompt_line(task_id: Any, path: str, branch: Optional[str]) -> str:
 def prepare_launch_worktree(request: Callable, launch_id: str, workspace: Any, *,
                             git_bin: str = "git", runner: Optional[Callable] = None,
                             home: Optional[str] = None, make_tmp: bool = False,
-                            log: Callable = print) -> Optional[dict[str, Any]]:
+                            log: Callable = print, session_id: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Fleet launch hook. Returns the ensured worktree (plus ``prompt_line``) or None.
 
     Fail-open: an old Hub (404), a network error or a git failure returns None
@@ -479,6 +479,26 @@ def prepare_launch_worktree(request: Callable, launch_id: str, workspace: Any, *
         plan = plan["plan"]  # Hub replies {"plan": {...}}
     if not isinstance(plan, dict) or plan.get("mode") not in ("resume", "create"):
         return None
+    # A previous session's lock remains valid while its intake is open, even
+    # after that session exits. Never steal it when resuming the intake. Give
+    # this launch a separate checkout, preserving all previous work in place.
+    previous_path = None
+    if plan.get("mode") == "resume" and session_id:
+        from . import worktree_guard as guard
+        try:
+            expected = guard.lock_reason(session_id, plan.get("task_id"))
+            path = path_guard(plan.get("path"), home)
+            entry = guard.find_entry(guard.list_entries(git_bin, path, runner), path)
+            if entry and entry.get("locked") and entry.get("reason") != expected:
+                if not COMMAND_ID.fullmatch(launch_id):
+                    raise WorktreeGuardError("invalid launch identity")
+                previous_path = path
+                plan = {"mode": "create", "task_id": plan.get("task_id"),
+                        "suffix": "wt-" + launch_id}
+        except Exception:
+            # The existing lock guard still refuses an unknown/foreign lock.
+            # Failure to inspect it never authorizes unlocking or replacing it.
+            previous_path = None
     try:
         result = ensure_intake_worktree(workspace, plan, git_bin, runner, home=home)
     except Exception as exc:  # noqa: BLE001
@@ -499,7 +519,11 @@ def prepare_launch_worktree(request: Callable, launch_id: str, workspace: Any, *
     if result["action"] == "failed":
         log_event("intake_worktree_failed", str(result.get("error")))
         return None
-    return dict(result, prompt_line=prompt_line(plan.get("task_id"), result["path"], result["branch"]))
+    note = prompt_line(plan.get("task_id"), result["path"], result["branch"])
+    if previous_path:
+        note += (f" Previous work remains at {previous_path}, protected by another session's lock."
+                 " Inspect that work read-only and adopt relevant finished changes; preserve that checkout and its lock.")
+    return dict(result, prompt_line=note)
 
 
 def launch_cwd(request: Callable, offer: dict, workspace: Any, target_cwd: Any, *,
@@ -513,7 +537,8 @@ def launch_cwd(request: Callable, offer: dict, workspace: Any, target_cwd: Any, 
     try:
         # An explicit cwd is still reported so Hub records (and refuses sharing
         # of) a session-named worktree; Hub plans mode "none" for it.
-        wt = prepare_launch_worktree(request, offer.get("id"), workspace, make_tmp=make_tmp)
+        wt = prepare_launch_worktree(request, offer.get("id"), workspace, make_tmp=make_tmp,
+                                    session_id=None if explicit else offer.get("hub_session_id"))
     except Exception:  # noqa: BLE001 - never lose a launch to this feature
         wt = None
     if wt is None or explicit:
