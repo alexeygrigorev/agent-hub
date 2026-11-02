@@ -13,7 +13,7 @@ class ConfigureDefaultEngineUtf8(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             (home / '.claude').mkdir()
-            (home / '.claude/settings.json').write_bytes(json.dumps({'note': 'café “✅'}, ensure_ascii=False).encode('utf-8'))
+            (home / '.claude/settings.json').write_bytes(json.dumps({'note': 'caf' + chr(0xe9) + chr(0x201d)}, ensure_ascii=False).encode('utf-8'))
             env = {'APPDATA': str(home / 'appdata'), 'XDG_CONFIG_HOME': str(home / 'cfg')}
             real_read = Path.read_text
 
