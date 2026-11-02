@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 
 TOKEN_PATH = Path('.gemini/antigravity-cli/antigravity-oauth-token')
@@ -96,6 +97,59 @@ def _credential_present(home):
         return False
 
 
+CREATE_NO_WINDOW = 0x08000000
+_CLI_NAMES = {'agy', 'agy.exe', 'agy.cmd', 'agy.bat'}
+
+
+def valid_cli(binary):
+    """True only for the ``agy`` CLI. The Antigravity desktop app (Antigravity.exe,
+    or the ``antigravity`` editor launcher) never returns from ``-p`` and leaks."""
+    if not binary:
+        return False
+    text = str(binary).replace(chr(92), '/')
+    parts = [p.lower() for p in text.split('/') if p]
+    if not parts or parts[-1] not in _CLI_NAMES:
+        return False
+    return 'antigravity' not in parts[:-1]
+
+
+def kill_tree(proc):
+    """Kill proc and every descendant (taskkill /T /F on Windows, process group on POSIX)."""
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                           creationflags=CREATE_NO_WINDOW, check=False)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def run_bounded(argv, *, env, timeout):
+    """Run argv with a hard timeout; the whole process tree is always reaped."""
+    kwargs = {'creationflags': CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, env=env, **kwargs)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        if proc.returncode != 0 or len(out) > MAX_OUTPUT:
+            return None
+        return json.loads(out.decode('utf-8'))
+    finally:
+        # Also covers success: reap any child the CLI left in its group/tree.
+        if proc.poll() is None or os.name != 'nt':
+            kill_tree(proc)
+
+
 def probe(binary, home, *, runner=None, now=None):
     """Probe via Antigravity's own no-model ``/usage`` command, pinned to HOME."""
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -103,19 +157,16 @@ def probe(binary, home, *, runner=None, now=None):
                         'details': {'source': 'native_antigravity_usage', 'observed_at': now.isoformat()},
                         'windows': {}}}
     home = Path(home)
-    if not home.is_absolute() or not _credential_present(home):
+    if not valid_cli(binary) or not home.is_absolute() or not _credential_present(home):
         return empty
     try:
         argv = [str(binary), '-p', '/usage', '--output-format', 'json']
         env = {'HOME': str(home), 'PATH': os.environ.get('PATH', ''), 'LANG': 'C.UTF-8',
                'TERM': 'dumb', 'CI': '1', 'NO_COLOR': '1'}
         if runner is None:
-            result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, timeout=MAX_SECONDS,
-                                    env=env, check=False)
-            if result.returncode != 0 or len(result.stdout) > MAX_OUTPUT:
+            payload = run_bounded(argv, env=env, timeout=MAX_SECONDS)
+            if payload is None:
                 return empty
-            payload = json.loads(result.stdout.decode('utf-8'))
         else:
             payload = runner(argv, env=env, timeout=MAX_SECONDS)
         return parse_usage(payload, now=now)

@@ -1,6 +1,7 @@
 import contextlib
 import datetime as dt
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -90,7 +91,66 @@ def test_managed_quota_uses_antigravity_probe_for_its_bundle(tmp_path, monkeypat
                             'status': 'ok', 'error': None, 'details': {'limit_reached': False},
                             'windows': {'5h': {'percent_remaining': 64, 'reset_at': '2030-01-02T17:00:00Z'}}}}))
     result = provisioning.quotas()
-    assert called == [(bundle_dir / 'engine/bin/agy', bundle_dir / 'home')]
+    assert called == [(bundle_dir / 'engine/bin' / ('agy.exe' if os.name == 'nt' else 'agy'), bundle_dir / 'home')]
     assert result['accounts'][0]['account'] == 'hub-antigravity'
     assert result['accounts'][0]['quota']['status'] == 'ok'
     assert result['accounts'][0]['quota']['windows']['5h']['percent_remaining'] == 64
+
+
+def _alive(pid):
+    import os
+    import subprocess
+    if os.name == 'nt':
+        out = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'], capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:  # a zombie is dead for our purposes
+        return ') Z' not in open(f'/proc/{pid}/stat').read()
+    except OSError:
+        return True
+
+
+@pytest.mark.parametrize('binary', [
+    None, '', r'C:\Users\x\AppData\Local\Programs\Antigravity\Antigravity.exe',
+    r'C:\Users\x\AppData\Local\Programs\Antigravity\bin\antigravity.cmd',
+    '/usr/bin/antigravity', r'C:\Users\x\AppData\Local\Programs\Antigravity\bin\agy.exe',
+])
+def test_probe_rejects_desktop_app_and_launcher_without_spawning(tmp_path, binary):
+    home = tmp_path / 'h'
+    token = home / quota.TOKEN_PATH
+    token.parent.mkdir(parents=True)
+    token.write_text(json.dumps({'token': {'access_token': 'a', 'refresh_token': 'r'}}))
+    assert not quota.valid_cli(binary)
+    result = quota.probe(binary, home, runner=lambda *a, **k: pytest.fail('must not spawn'))
+    assert result['gemini']['status'] == 'unknown'
+
+
+def test_valid_cli_accepts_agy_names():
+    assert quota.valid_cli('/home/u/.local/bin/agy')
+    assert quota.valid_cli(r'C:\Users\x\AppData\Local\Programs\agy\agy.exe')
+
+
+def test_hanging_probe_is_killed_with_its_children(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import time
+    pidfile = tmp_path / 'pids'
+    script = tmp_path / 'hang.py'
+    script.write_text(
+        'import subprocess, sys, time\n'
+        'c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])\n'
+        f'open({str(pidfile)!r}, "w").write(str(c.pid))\n'
+        'time.sleep(300)\n')
+    started = time.time()
+    with pytest.raises(subprocess.TimeoutExpired):
+        quota.run_bounded([sys.executable, str(script)], env=dict(os.environ), timeout=2)
+    assert time.time() - started < 30
+    child = int(pidfile.read_text())
+    deadline = time.time() + 10
+    while time.time() < deadline and _alive(child):
+        time.sleep(0.2)
+    assert not _alive(child)

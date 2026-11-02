@@ -970,8 +970,9 @@ def collect_subscriptions(settings, runner=run_json, antigravity_probe=None):
             try:
                 if antigravity_probe is None:
                     from . import account_registry, native_antigravity_quota
-                    binary = account_registry._find_binary(account_registry.NATIVE_BINARIES["antigravity"])
-                    raw = native_antigravity_quota.probe(binary, Path.home())
+                    # CLI only: never the Antigravity desktop app / editor launcher.
+                    binary = account_registry._find_binary(("agy",))
+                    raw = native_antigravity_quota.probe(binary, Path.home()) if binary else {}
                 else:
                     raw = antigravity_probe()
             except Exception:
