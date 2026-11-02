@@ -58,6 +58,7 @@ describe('repo-identity workspace (intake 8028bb06)', () => {
       const seen: any[] = [];
       const service = new SessionControlService(hub.sql, cb => state.storage.transactionSync(cb), Date.now, {
         reserve: input => { seen.push(input); return { status: 400, value: { error: 'no_eligible_route', rejected: [] } }; },
+        resolveRepo: repo => typeof repo === 'string' ? { repo } : { error: { error: 'repo_not_found' } },
       });
       service.init();
       seedFixtureIntake(hub.sql);
