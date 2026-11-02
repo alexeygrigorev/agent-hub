@@ -2417,29 +2417,55 @@ def refresh_launch_credential(label, b, home, dest, request=None):
         return {'status': 'hub_unreachable'}
 
 
-def managed_codex_effort_args(bundle, extra_argv):
-    """Enforce policy defaults at the native boundary, below explicit argv."""
-    if bundle['provider'] != 'codex':
-        return []
-    args = bundle['args'] + extra_argv
-    if args in (["--version"], ["-v"], ["--help"], ["-h"]):
-        return []
-    # Caller and bundle overrides are authoritative. Config files are not:
-    # older managed homes may still contain high/xhigh for the same model.
-    for i, arg in enumerate(args):
+def strip_codex_effort_args(args):
+    """Remove profile defaults for effort so the routed model policy can win."""
+    result = []
+    has_override = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
         if arg == '--':
+            result.extend(args[i:])
             break
         value = None
+        consumed = 1
         if arg in ('-c', '--config') and i + 1 < len(args):
             value = args[i + 1]
+            consumed = 2
         elif arg.startswith('--config='):
             value = arg[len('--config='):]
         elif arg.startswith('-c') and arg != '-c':
             value = arg[2:]
         if value and value.partition('=')[0].strip() == 'model_reasoning_effort':
-            return []
-        if arg == '--effort' or arg.startswith('--effort='):
-            return []
+            has_override = True
+            i += consumed
+            continue
+        if arg == '--effort':
+            has_override = True
+            i += 2 if i + 1 < len(args) else 1
+            continue
+        if arg.startswith('--effort='):
+            has_override = True
+            i += 1
+            continue
+        result.append(arg)
+        i += 1
+    return result, has_override
+
+
+def managed_codex_effort_args(bundle, extra_argv):
+    """Enforce routed model effort below the caller's explicit argv."""
+    if bundle['provider'] != 'codex':
+        return []
+    args = bundle['args'] + extra_argv
+    if args in (["--version"], ["-v"], ["--help"], ["-h"]):
+        return []
+    # CLI arguments supplied by this caller are explicit and remain
+    # authoritative. Profile args are defaults; in particular, old managed
+    # bundles may pin high even when this launch routes gpt-6-luna/max.
+    _, caller_override = strip_codex_effort_args(extra_argv)
+    if caller_override:
+        return []
     from .model_contract import native_model, policy_models
     model = native_model(extra_argv) or native_model(bundle['args']) or launcher_metadata('codex', bundle)['launcher_model']
     efforts = {m['effort'] for m in policy_models()
@@ -2547,7 +2573,10 @@ def execute():
                         bypass_flags = ['--dangerously-skip-permissions']
             from .codex_interactive import isolated_argv
             effort_args = managed_codex_effort_args(b, extra_argv)
-            argv = command + isolated_argv(b['provider'], effort_args + b['args'] + bypass_flags + extra_argv)
+            bundle_args = b['args']
+            if b['provider'] == 'codex' and not is_diagnostic:
+                bundle_args, _ = strip_codex_effort_args(bundle_args)
+            argv = command + isolated_argv(b['provider'], bundle_args + effort_args + bypass_flags + extra_argv)
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
         if not is_diagnostic:
             allowed, reason = hub_launch_gate(label)
