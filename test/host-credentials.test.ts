@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
+import { sha256 } from '../src/auth/crypto';
 import { HostCredentialService, sanitizeStatus, sshFingerprint, validPayload } from '../src/host-credentials';
 
 const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] };
@@ -24,17 +25,17 @@ function github(script: Record<string, { status: number; json?: any; headers?: R
   return { fn, calls };
 }
 
-async function fixture(fetchFn: Fetch, fn: (svc: HostCredentialService, sql: any) => Promise<void>) {
+async function fixture(fetchFn: Fetch, fn: (svc: HostCredentialService, sql: any, hub: Hub) => Promise<void>, opts: { hostAllowed?: boolean } = {}) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('host-credentials-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    const svc = new HostCredentialService(hub.sql, cb => state.storage.transactionSync(cb), bindings, () => true, fetchFn);
+    const svc = new HostCredentialService(hub.sql, cb => state.storage.transactionSync(cb), bindings, () => opts.hostAllowed !== false, fetchFn);
     svc.init();
     for (const id of ['rmthz', 'tabo']) {
       hub.sql.exec('INSERT OR REPLACE INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         id, id, id, new Date().toISOString(), new Date().toISOString(), '{}', 0, '{}');
     }
-    await fn(svc, hub.sql);
+    await fn(svc, hub.sql, hub);
   });
 }
 const req = (path: string, method = 'GET', body?: unknown) => new Request('https://hub.test' + path, { method, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -73,7 +74,8 @@ describe('host credential store', () => {
       const body: any = await res.json();
       expect(body).toMatchObject({ status: 'stored', generation: 1, account: 'alexeygrigorev', scopes: ['repo', 'read:org'] });
       expect(JSON.stringify(body)).not.toContain(TOKEN);
-      expect(((await put(svc, 'gh_token', { token: TOKEN.replace('A1b2', 'Z9y8') })).json() as Promise<any>)).resolves.toMatchObject({ generation: 2 });
+      const second = await put(svc, 'gh_token', { token: TOKEN.replace('A1b2', 'Z9y8') });
+      await expect(second.json()).resolves.toMatchObject({ generation: 2 });
       const raw = JSON.stringify(sql.exec('SELECT * FROM host_credentials').toArray());
       expect(raw).not.toContain('ghp_');
       const overview = JSON.stringify(await (await svc.handle(req('/api/host-credentials'), admin)).json());
@@ -119,6 +121,76 @@ describe('host credential store', () => {
       const tabo = overview.machines.find((m: any) => m.machine_id === 'tabo');
       expect(tabo.gh).toMatchObject({ logged_in: true, account: 'alexeygrigorev' });
       expect(overview.machines.find((m: any) => m.machine_id === 'rmthz').stale).toBe(true);
+    });
+  });
+});
+
+describe('authorization boundaries (review findings)', () => {
+  it('a worker bearer is refused on every host-credential route through the real Hub route path', async () => {
+    const gh = github(okUser);
+    await fixture(gh.fn, async (svc, sql, hub) => {
+      await put(svc, 'gh_token', { token: TOKEN });
+      const token = 'hubt_worker_bearer_' + crypto.randomUUID().replaceAll('-', '');
+      sql.exec(`INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, machine_id, created_by_sub, created_at, expires_at, revoked_at)
+                VALUES (?, 'worker', ?, ?, ?, ?, ?, NULL, 'system', ?, ?, NULL)`,
+        'wc_test_1', await sha256(token), 'wc_test_1-fam', 'worker:test', 'worker:test', JSON.stringify(['worker']),
+        new Date().toISOString(), new Date(Date.now() + 86400000).toISOString());
+      const bearer = (path: string, method = 'GET', body?: unknown) => new Request('https://hub.test' + path, {
+        method, body: body === undefined ? undefined : JSON.stringify(body), headers: { Authorization: 'Bearer ' + token } });
+      expect((await hub.fetch(bearer('/api/host-credentials'))).status).toBe(403);
+      expect((await hub.fetch(bearer('/api/host-credentials/sync?have=gh_token:0'))).status).toBe(403);
+      expect((await hub.fetch(bearer('/api/host-credentials/status', 'POST', { gh: { logged_in: true }, ssh: { authenticated: true } }))).status).toBe(403);
+      expect((await hub.fetch(bearer('/api/host-credentials/gh_token', 'PUT', { payload: { token: TOKEN } }))).status).toBe(403);
+    });
+  });
+  it('worker/agent/job callers get 403 on sync and status; a host token gets 403 on the admin list', async () => {
+    const gh = github(okUser);
+    await fixture(gh.fn, async svc => {
+      await put(svc, 'gh_token', { token: TOKEN });
+      for (const kind of ['worker', 'agent', 'job']) {
+        const auth = { caller: { kind, tokenId: 't1' }, scopes: [kind === 'worker' ? 'worker' : 'bus:read'] };
+        expect((await svc.handle(req('/api/host-credentials/sync?have=gh_token:0'), auth)).status).toBe(403);
+        expect((await svc.handle(req('/api/host-credentials/status', 'POST', { gh: { logged_in: true }, ssh: { authenticated: true } }), auth)).status).toBe(403);
+        expect((await svc.handle(req('/api/host-credentials'), auth)).status).toBe(403);
+      }
+      // Host token: sync/status are fine, the admin overview is not.
+      expect((await svc.handle(req('/api/host-credentials'), hostAuth('rmthz'))).status).toBe(403);
+      expect((await svc.handle(req('/api/host-credentials/sync'), hostAuth('rmthz'))).status).toBe(200);
+    });
+  });
+  it('a host whose credential family was revoked/changed (hostAllowed=false) gets 403 on sync and status', async () => {
+    const gh = github(okUser);
+    await fixture(gh.fn, async svc => {
+      await put(svc, 'gh_token', { token: TOKEN });
+      expect((await svc.handle(req('/api/host-credentials/sync'), hostAuth('tabo'))).status).toBe(403);
+      expect((await svc.handle(req('/api/host-credentials/status', 'POST', { gh: { logged_in: true }, ssh: { authenticated: true } }), hostAuth('tabo'))).status).toBe(403);
+    }, { hostAllowed: false });
+  });
+  it('after a sync and a status report, status/list output never carries plaintext or ciphertext', async () => {
+    const gh = github(okUser);
+    await fixture(gh.fn, async (svc, sql) => {
+      await put(svc, 'gh_token', { token: TOKEN });
+      await put(svc, 'git_ssh_key', { private_key: PRIV, public_key: PUB });
+      const got = await sync(svc, 'rmthz', '');
+      expect(got.credentials.gh_token.payload.token).toBe(TOKEN); // the host itself receives plaintext over the authenticated channel
+      await svc.handle(req('/api/host-credentials/status', 'POST', { gh: { logged_in: true, account: 'alexeygrigorev', scopes: ['repo'] }, ssh: { authenticated: true }, generations: { gh_token: 1, git_ssh_key: 1 } }), hostAuth('rmthz'));
+      const statusRow = JSON.stringify(sql.exec('SELECT * FROM host_credential_status').toArray());
+      expect(statusRow).not.toContain(TOKEN);
+      expect(statusRow).not.toContain('b3BlbnNzaC1rZXktdjE');
+      const overviewRes = await svc.handle(req('/api/host-credentials'), admin);
+      const overview = JSON.stringify(await overviewRes.json());
+      for (const banned of [TOKEN, PRIV, 'b3BlbnNzaC1rZXktdjE', 'ciphertext', '"iv"', '"data":"']) {
+        expect(overview).not.toContain(banned);
+      }
+      expect(overview).toContain('alexeygrigorev');
+    });
+  });
+  it('records who wrote a credential in updated_by (review nit)', async () => {
+    const gh = github(okUser);
+    await fixture(gh.fn, async svc => {
+      await put(svc, 'gh_token', { token: TOKEN });
+      const overview: any = await (await svc.handle(req('/api/host-credentials'), admin)).json();
+      expect(overview.kinds.find((k: any) => k.kind === 'gh_token').updated_by).toBe('test-admin');
     });
   });
 });
