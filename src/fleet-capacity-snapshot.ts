@@ -140,12 +140,13 @@ export function readFleetCapacitySnapshot(sql: SqlStorage, now: number, unreserv
   const natives = keyed(ids, CAPACITY_LIMITS.natives, (marks, n) => `SELECT machine_id,native_id,account,phase,last_activity_at
     FROM fleet_sessions WHERE machine_id IN (${marks}) AND phase IN ('starting','running','broken','unknown','uncertain') LIMIT ${n}`);
   // Only after BOTH observation budgets succeeded may incarnation correlation
-  // run. Native and managed-tag probes use their existing identity indexes.
-  for (const native of natives) {
-    const corr = sql.exec(`SELECT ${unreservedPredicate} AS unreserved, ${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id
-      FROM fleet_sessions s WHERE s.machine_id=? AND s.native_id=?`, native.machine_id, native.native_id).one();
-    native.unreserved = Number(corr.unreserved) === 1;
-    native.inflight_launch_id = corr.inflight_launch_id;
+  // run, and only when an unbound starting/uncertain launch exists to correlate.
+  const hasInFlight = launches.some(l => !l.native_id && (l.state === 'starting' || l.state === 'uncertain'));
+  if (hasInFlight) {
+    for (const native of natives) {
+      native.inflight_launch_id = sql.exec(`SELECT ${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id
+        FROM fleet_sessions s WHERE s.machine_id=? AND s.native_id=?`, native.machine_id, native.native_id).one().inflight_launch_id;
+    }
   }
   const seen = keyed(ids, CAPACITY_LIMITS.hosts, (marks, n) => `SELECT machine_id,observed_at FROM fleet_catalog_census
     WHERE complete=1 AND observed_at>=? AND observed_at<=? AND machine_id IN (${marks}) LIMIT ${n}`,
