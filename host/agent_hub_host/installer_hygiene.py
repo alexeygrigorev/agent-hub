@@ -54,11 +54,15 @@ _BS = re.escape(chr(92))
 _SEP = '[/' + _BS + ']'
 _RELEASE = re.compile('(?:^|' + _SEP + ')agent-hub' + _SEP + 'releases' + _SEP + '([^/' + _BS + ']+)(?:' + _SEP + '|$)', re.IGNORECASE)
 
+_STANDALONE_APLEXER = re.compile('(?:^|' + _SEP + ')Programs' + _SEP + 'aplexer(?:' + _SEP + '|$)', re.IGNORECASE)
+
 
 def prune_stale_release_paths(entries, current_release):
     """Drop PATH entries inside agent-hub/releases/<other>; keep the current release and unrelated entries."""
     keep = []
     for entry in entries:
+        if _STANDALONE_APLEXER.search(entry or ''):
+            continue  # old standalone aplexer (a 0.1.10) shadows the release's own `a`
         match = _RELEASE.search(entry or '')
         if match and match.group(1).lower() != str(current_release).lower():
             continue

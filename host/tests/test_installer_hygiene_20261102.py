@@ -73,6 +73,16 @@ class StaleReleasePath(unittest.TestCase):
         self.assertEqual(h.prune_stale_release_paths(entries, 'cur-bbb'),
                          [base + r'\cur-bbb\venv\Scripts', r'C:\Windows\System32', r'C:\Program Files\nodejs'])
 
+    def test_standalone_aplexer_entry_is_dropped_and_release_bin_stays_first(self):
+        old = 'C:' + chr(92) + 'Users' + chr(92) + 'a' + chr(92) + 'AppData' + chr(92) + 'Local' + chr(92) + 'Programs' + chr(92) + 'aplexer' + chr(92) + 'bin'
+        self.assertEqual(h.prune_stale_release_paths([old, '/x/other'], 'cur'), ['/x/other'])
+        with patch.object(b.sys, 'platform', 'win32'), patch.object(b, 'architecture', return_value='x64'),                 patch.object(b, 'run') as run, patch.dict(os.environ, {'PATH': old + os.pathsep + 'Q'}):
+            b.publish_user_path(Path('C:/x/agent-hub/releases/cur'))
+            parts = os.environ['PATH'].split(os.pathsep)
+        self.assertNotIn(old, parts)
+        self.assertEqual(parts[0], str(Path('C:/x/agent-hub/releases/cur') / 'bin'))
+        self.assertIn('aplexer', run.call_args[0][0][-1])
+
     def test_engine_env_uses_release_node_and_drops_stale_entries(self):
         root = Path('/r/agent-hub/releases/cur-bbb')
         node = root / 'runtimes/node/node.exe'

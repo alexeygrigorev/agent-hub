@@ -675,6 +675,7 @@ def publish_user_path(install_root):
               '$add=@(' + ','.join(quote(p) for p in directories) + ');'
               '$cur=' + quote(install_root.name) + ';'
               '$parts=@($add)+@($old -split ";" | Where-Object { $_ -and $_ -notin $add -and '
+              '-not ($_ -match "(?i)[/\\x5c]Programs[/\\x5c]aplexer([/\\x5c]|$)") -and '
               '-not ($_ -match "(?i)[/\\x5c]agent-hub[/\\x5c]releases[/\\x5c]([^/\\x5c]+)" -and $Matches[1] -ne $cur) });'
               '[Environment]::SetEnvironmentVariable("Path",($parts -join ";"),"User");'
               '[Environment]::SetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH",' +
