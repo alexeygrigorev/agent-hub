@@ -2167,6 +2167,12 @@ def engine_environment(bundle, home, dest=None):
         # The managed agy binary only moves with the reviewed pin.
         env['ANTIGRAVITY_DISABLE_AUTO_UPDATE'] = '1'
         env['AGY_DISABLE_AUTO_UPDATE'] = '1'
+        # A user-level HTTP(S)_PROXY (desktop: 127.0.0.1:8899) breaks agy's Google OAuth
+        # refresh: a valid Hub token then answers 'Authentication required' (same account,
+        # identical token, OK without the proxy env on the same host).
+        for key in list(env):
+            if key.lower() in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'):
+                env.pop(key)
     return env
 
 

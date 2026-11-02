@@ -1592,6 +1592,22 @@ def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, exp
     assert overrides == ['model_reasoning_effort="' + expected + '"']
 
 
+def test_antigravity_environment_drops_user_proxy_variables(tmp_path, monkeypatch):
+    # Desktop: HTTPS_PROXY=127.0.0.1:8899 made agy's OAuth refresh fail ('Authentication required')
+    # with a valid, Hub-identical token; the same home answered OK without the proxy env.
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY'):
+        monkeypatch.setenv(key, 'http://127.0.0.1:8899')
+    b = {'label': 'agy', 'provider': 'antigravity', 'revision': '66666666-6666-4666-8666-666666666666',
+         'version': '1.4.12', 'files': {}, 'env': {}, 'args': []}
+    env = p.engine_environment(b, root_dir / 'agy-x' / 'home', root_dir / 'agy-x')
+    assert not [k for k in env if k.lower().endswith('_proxy')]
+    codex = p.engine_environment(dict(b, provider='codex'), root_dir / 'c' / 'home', root_dir / 'c')
+    assert codex.get('HTTPS_PROXY') == 'http://127.0.0.1:8899' or codex.get('https_proxy')  # other engines untouched
+
+
 def test_antigravity_home_is_seeded_past_theme_and_data_sharing_prompts(tmp_path, monkeypatch):
     # Desktop agy sessions stopped at the theme picker and the data-sharing consent.
     root_dir = tmp_path / 'managed'
