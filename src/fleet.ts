@@ -885,8 +885,10 @@ export class FleetService {
           ${reservationNativeJoinSql(this.sql)}
           WHERE l.account=? AND l.updated_at>?
           AND l.state IN ${ACTIVE} AND l.machine_id IN (${marks})`, account.label, reservationCutoff);
+    const hasInFlight = reservations.some(r => !r.native_id && (r.state === 'starting' || r.state === 'uncertain'));
+    const inflightExpr = hasInFlight ? INFLIGHT_LAUNCH_ID_SQL : 'NULL';
     const natives = snapshot ? snapshot.natives.filter(n => n.account === account.label)
-      : this.byChunks(liveList, marks => `SELECT s.machine_id,s.native_id,s.phase,s.last_activity_at,${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id
+      : this.byChunks(liveList, marks => `SELECT s.machine_id,s.native_id,s.phase,s.last_activity_at,${inflightExpr} AS inflight_launch_id
           FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain')
           AND s.machine_id IN (${marks})`, account.label);
     const startingNativeIds = new Set(reservations.filter(r => r.state === 'starting' && r.native_id).map(r => `${r.machine_id}\0${r.native_id}`));
