@@ -75,6 +75,16 @@ def test_model_fail_closed_before_any_native_effect():
     assert native_model(['native', '--model', 'astra', '--model', 'sol']) is None
 
 
+def test_configured_model_accepts_per_session_effort_override():
+    from agent_hub_host.model_contract import configured_selection
+    selection = dict(id='astra', model='gpt-6-astra', effort='low')
+    assert configured_selection(selection, 'codex', 'codex')['effort'] == 'low'
+    with pytest.raises(ValueError, match='model_unsupported'):
+        configured_selection(dict(selection, effort='xhigh'), 'codex', 'codex')
+    with pytest.raises(ValueError, match='model_unsupported'):
+        configured_selection(dict(selection, effort='high'), 'codex', 'codex')
+
+
 def test_model_visible_in_list():
     assert 'astra' in render_table([dict(id='test', engine='codex', model_id='astra')])
 
@@ -133,6 +143,14 @@ def test_claude_routes_are_sonnet_medium_never_haiku():
     assert [(m['model'], m['effort']) for m in claude] == [('sonnet', 'medium')]
     for ids in config['tiers'].values():
         assert not [i for i in ids if 'haiku' in i]
+
+
+def test_heavy_model_defaults_are_medium():
+    config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
+    defaults = {m['id']: m['effort'] for m in config['models']}
+    assert {name: defaults[name] for name in ('astra', 'argon', 'argon-gemini', 'opus', 'sol')} == {
+        'astra': 'medium', 'argon': 'medium', 'argon-gemini': 'medium', 'opus': 'medium', 'sol': 'medium'
+    }
 
 
 def test_sessions_table_shows_model_and_effort():

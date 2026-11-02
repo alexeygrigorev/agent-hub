@@ -389,6 +389,15 @@ class TestCliUpdate(unittest.TestCase):
         self.assertIn('reason: kill_switch_active', output)
         self.assertNotIn('Session operation failed; check authentication', output)
 
+    def test_sessions_start_effort_is_sent_to_hub(self):
+        from agent_hub_host import cli, session_control
+        from unittest.mock import patch
+        with patch.object(sys, 'argv', ['hub', 'sessions', 'start', '--workspace', '/test', '--prompt', 'do something', '--effort', 'low', '--key', 'effort-key']), \
+             patch.object(session_control, 'request', return_value={'id': 'session-1'}) as request:
+            cli.main()
+        payload = request.call_args.args[2]
+        self.assertEqual(payload['effort'], 'low')
+
 
 
 class TestHeartbeatCommand(unittest.TestCase):
