@@ -244,6 +244,97 @@ class SyncOnceTests(unittest.TestCase):
             self.assertEqual(len(claims), 1)
             self.assertEqual(claims[0]["data"]["holder"]["machine_id"], "m")
 
+    def test_sync_prefers_credential_bound_machine_id(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = __import__("pathlib").Path(tmp)
+            entry = root / "sessions" / "sess-1"
+            entry.mkdir(parents=True)
+            (entry / "session.json").write_text(json.dumps({"id": "sess-1", "tag": "fixer"}))
+            (entry / "coordination.json").write_text(json.dumps({"session_id": "sess-1", "declarations": [{
+                "workspace": "/repo", "mode": "edit", "scopes": ["src"],
+                "task": "task:7142fe0b-d45c-4a3a-b92b-726ecc10575a | Fix", "updated_at_ms": int(time.time() * 1000),
+            }]}))
+            posted = {}
+
+            def fake_request(method, path, payload=None):
+                posted["payload"] = payload
+                return {"status": "ok", "synced_claims": 1, "synced_messages": 0}
+
+            # No explicit arg, no settings machine_id: the bridge must attest
+            # with the host credential's machine id, never the hostname — the
+            # server rejects host calls whose rows name another machine.
+            settings = {"workspaces": {"repo": "/repo"},
+                        "journal_dir": os.path.join(tmp, "journal")}
+            with patch("agent_hub_host.config.load_host_config",
+                       return_value={"machine_id": "mach-hostcfg"}):
+                summary = wc.sync_once(fake_request, settings=settings,
+                                       runner=lambda argv: {"sessions": [{"id": "sess-1", "phase": "Running"}]},
+                                       state_dir=str(root))
+            self.assertTrue(summary["ok"])
+            claims = posted["payload"]["claims"]
+            self.assertEqual(claims[0]["data"]["holder"]["machine_id"], "mach-hostcfg")
+
+    def test_sync_summary_surfaces_server_errors(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = __import__("pathlib").Path(tmp)
+            entry = root / "sessions" / "sess-1"
+            entry.mkdir(parents=True)
+            (entry / "session.json").write_text(json.dumps({"id": "sess-1", "tag": "fixer"}))
+            (entry / "coordination.json").write_text(json.dumps({"session_id": "sess-1", "declarations": [{
+                "workspace": "/repo", "mode": "edit", "scopes": ["src"],
+                "task": "task:7142fe0b-d45c-4a3a-b92b-726ecc10575a | Fix", "updated_at_ms": int(time.time() * 1000),
+            }]}))
+
+            def fake_request(method, path, payload=None):
+                return {"status": "ok", "synced_claims": 0, "released_claims": 0,
+                        "synced_messages": 0, "deduped_messages": 0,
+                        "errors": [{"index": 0, "kind": "claim", "reason": "invalid_holder_machine"},
+                                   {"index": 1, "kind": "claim", "reason": "invalid_project"},
+                                   {"index": 2, "kind": "claim", "reason": "x"},
+                                   {"index": 3, "kind": "claim", "reason": "dropped"}]}
+
+            settings = {"workspaces": {"repo": "/repo"}, "machine_id": "m"}
+            summary = wc.sync_once(fake_request, settings=settings,
+                                   runner=lambda argv: {"sessions": [{"id": "sess-1", "phase": "Running"}]},
+                                   state_dir=str(root))
+            self.assertTrue(summary["ok"])
+            self.assertEqual(summary["posted"]["synced_claims"], 0)
+            self.assertEqual(summary["errors"], ["invalid_holder_machine", "invalid_project", "x"])
+
+    def test_sync_batches_claims_past_server_cap(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = __import__("pathlib").Path(tmp)
+            now = int(time.time() * 1000)
+            for i in range(wc.MAX_ITEMS_PER_SYNC + 6):
+                entry = root / "sessions" / f"sess-{i:03d}"
+                entry.mkdir(parents=True)
+                (entry / "session.json").write_text(json.dumps({"id": f"sess-{i:03d}", "tag": f"t{i}"}))
+                (entry / "coordination.json").write_text(json.dumps({"session_id": f"sess-{i:03d}", "declarations": [{
+                    "workspace": "/repo", "mode": "read", "scopes": ["docs"],
+                    "task": f"task:7142fe0b-d45c-4a3a-b92b-726ecc10575{i % 10} | Fix {i}",
+                    "updated_at_ms": now,
+                }]}))
+            calls = []
+
+            def fake_request(method, path, payload=None):
+                calls.append(payload)
+                return {"status": "ok", "synced_claims": len(payload["claims"]),
+                        "released_claims": 0, "synced_messages": 0, "deduped_messages": 0}
+
+            settings = {"workspaces": {"repo": "/repo"}, "machine_id": "m"}
+            summary = wc.sync_once(fake_request, settings=settings,
+                                   runner=lambda argv: {"sessions": []},
+                                   state_dir=str(root))
+            self.assertTrue(summary["ok"])
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([len(c["claims"]) for c in calls], [wc.MAX_ITEMS_PER_SYNC, 6])
+            self.assertEqual(len(calls[1]["messages"]), 0)
+            self.assertEqual(summary["posted"]["synced_claims"], wc.MAX_ITEMS_PER_SYNC + 6)
+            self.assertEqual(summary["claims"], wc.MAX_ITEMS_PER_SYNC + 6)
+
     def test_sync_failure_returns_error_summary(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
