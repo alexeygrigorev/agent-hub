@@ -5,6 +5,7 @@ import { SessionControlService } from '../src/session_control';
 import { QuotaStore } from '../src/quota';
 import { modelCandidates } from '../src/model-routing';
 import { analyzeQuotaBurn, computeEngineDecision, isDesktopCodexExcluded, scheduleBurnFactor } from '../src/pacing';
+import routingPolicy from '../config/model-routing.json';
 import { freshCpu } from './cpu-fixture';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
@@ -379,5 +380,35 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
     const sorted2 = [...list].reverse().sort(comparator);
     expect(sorted1.map(x => x.engine)).toEqual(['antigravity', 'opencode']);
     expect(sorted2.map(x => x.engine)).toEqual(['antigravity', 'opencode']);
+  });
+});
+
+describe('desktop codex guard is config-driven (intake 83d27f69 review)', () => {
+  const desktop = { id: '0sJC0fDcz0bzhG4XQp5EeQ', name: 'desktop', hostname: 'DESKTOP-FP4OP26' };
+  const guard = (routingPolicy as any).rules.desktop_codex_guard;
+
+  it('excludes OpenAI codex on the desktop by id or hostname, nothing else', () => {
+    expect(isDesktopCodexExcluded(desktop, { engine: 'codex', provider: 'codex' })).toBe(true);
+    expect(isDesktopCodexExcluded({ id: 'other', hostname: 'DESKTOP-FP4OP26' }, { engine: 'codex', provider: 'codex' }, 'codex')).toBe(true);
+    // a host that merely has the generic name desktop is not the guarded machine
+    expect(isDesktopCodexExcluded({ id: 'x', name: 'desktop', hostname: 'desktop' }, { engine: 'codex', provider: 'codex' }, 'codex')).toBe(false);
+    expect(isDesktopCodexExcluded({ id: 'hetzner', hostname: 'RMTHZ' }, { engine: 'codex', provider: 'codex' }, 'codex')).toBe(false);
+  });
+
+  it('keeps zai (codex harness profile and zcodex), muse and antigravity eligible on the desktop', () => {
+    expect(isDesktopCodexExcluded(desktop, { engine: 'codex', provider: 'codex', profile: 'hub-zai-central' }, 'zai')).toBe(false);
+    expect(isDesktopCodexExcluded(desktop, { engine: 'zcodex', provider: 'zai' }, 'zai')).toBe(false);
+    expect(isDesktopCodexExcluded(desktop, { engine: 'opencode', provider: 'go' }, 'go')).toBe(false);
+    expect(isDesktopCodexExcluded(desktop, { engine: 'antigravity', provider: 'gemini' }, 'gemini')).toBe(false);
+  });
+
+  it('can be lifted with enabled=false', () => {
+    guard.enabled = false;
+    try {
+      expect(isDesktopCodexExcluded(desktop, { engine: 'codex', provider: 'codex' }, 'codex')).toBe(false);
+    } finally {
+      guard.enabled = true;
+    }
+    expect(isDesktopCodexExcluded(desktop, { engine: 'codex', provider: 'codex' }, 'codex')).toBe(true);
   });
 });
