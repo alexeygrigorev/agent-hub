@@ -1156,6 +1156,25 @@ def profile_path():
     return base / 'aplexer' / 'config.toml'
 
 
+def _posix_engine_launcher(command, label):
+    """Command whose first element tolerates the engine subcommand aplexer injects after it.
+
+    `a task run --engine opencode --profile X` builds [command[0], 'run', *command[1:], ...]; with
+    command[0] = python that is `python run -c ...` ("can't open file 'run'"). A tiny sh launcher takes
+    that argument order and hands it to the same python -c; execute() puts `run` back after the label."""
+    import shlex
+    path = root() / 'engine-launch' / (label + '.sh')
+    body = '#!/bin/sh' + chr(10) + 'exec ' + shlex.quote(command[0]) + ' -c ' + shlex.quote(command[2]) + ' "$@"' + chr(10)
+    try:
+        with private_fs.parent(path, create=True):
+            pass
+        private_fs.atomic_write(path, body.encode('utf-8'), 65536)
+        os.chmod(path, 0o700)
+    except (OSError, ValueError):
+        return command
+    return [str(path), label]
+
+
 def module_command(handler, label, managed_dir=None):
     # Profiles run outside the launcher environment, whose .cmd is what puts
     # <release>/package/host on PYTHONPATH (intake 608a2f9a): without an
@@ -1243,7 +1262,9 @@ def profiles(bundles, path=None, is_windows=None):
             raise ValueError('Operator profile collision')
         # Only public label and paths go into native registry command metadata.
         command = module_command('execute', b['label'])
-        block += '\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
+        if b.get('provider') == 'go' and (os.name != 'nt' if is_windows is None else not is_windows):
+            command = _posix_engine_launcher(command, b['label'])
+        block +='\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
     # After our block is stripped, any [engines.opencode] left in the file is
     # operator-owned and wins over the managed pin (duplicate tables would not
     # even parse for aplexer).
@@ -2300,7 +2321,17 @@ def managed_codex_effort_args(bundle, extra_argv):
     return ['-c', 'model_reasoning_effort=' + json.dumps(effort)] if effort else []
 
 
+def normalize_engine_argv(argv):
+    """`prog run <label> ...` (engine subcommand injected before the label) -> `prog <label> run ...`."""
+    argv = list(argv)
+    if len(argv) > 2 and argv[1] == 'run' and LABEL.fullmatch(argv[2]):
+        argv[1], argv[2] = argv[2], 'run'
+    return argv
+
+
 def execute():
+    # `a task run --engine opencode --profile X` hands over `run <label> ...` (see _posix_engine_launcher).
+    sys.argv[:] = normalize_engine_argv(sys.argv)
     label = sys.argv[1]
     if not LABEL.fullmatch(label):
         raise ValueError('Invalid managed label')
@@ -2363,6 +2394,11 @@ def execute():
                     continue
                 run_cmd.append(extra_argv[i])
                 i += 1
+            # OpenCode 2.x `run` otherwise attaches to / starts the shared per-user background service
+            # (fixed port), which is another store's server: 'port already in use' or
+            # 'Database is not empty and has no session table'. A private server per store is isolated.
+            if '--standalone' not in run_cmd:
+                run_cmd.insert(1, '--standalone')
             argv = command + run_cmd
         else:
             is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
