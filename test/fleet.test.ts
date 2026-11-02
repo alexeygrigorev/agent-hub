@@ -784,9 +784,9 @@ describe('generic accounts and launch placement', () => {
     expect(PLACEMENT_PRESSURE_REASONS.has('host_load_high')).toBe(true);
   }));
   it.each([
-    {factor:1.5,pinned:true,sendFactor:false},
-    {factor:2,pinned:true,sendFactor:true},
-    {factor:1.5,pinned:false,sendFactor:true},
+    {factor:6,pinned:true,sendFactor:false},
+    {factor:7,pinned:true,sendFactor:true},
+    {factor:6,pinned:false,sendFactor:true},
   ])('requeues only a load-refused retry: factor=$factor pinned=$pinned', async ({factor,pinned,sendFactor}) => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
@@ -801,7 +801,7 @@ describe('generic accounts and launch placement', () => {
     };
     const diagnostic = {
       reason: 'host_load_high',
-      message: 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
+      message: 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
       stage: 'dispatch_route', error_type: 'ValueError',
     };
     beat(8 * factor + 1);
@@ -832,7 +832,15 @@ describe('generic accounts and launch placement', () => {
     restarted.drainCapacityQueue();
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('queued');
     expect(JSON.parse(String(sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one().rejected_json))).toContainEqual(expect.objectContaining({reason:'host_load_high',load_limit:8*factor}));
-    beat(8 * factor);
+    // Load average below the runaway cap never holds, but measured CPU >= 98% over >= 10s does.
+    const usage = (window: number) => ({ cores: 8, busy_percent: window, busy_cores: window * 8 / 100, busy_percent_window: window, window_s: 10, interval_s: 1, observed_at: iso() });
+    heartbeat.cpu_usage = usage(99);
+    beat(8 * 3);
+    restarted.drainCapacityQueue();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('queued');
+    expect(JSON.parse(String(sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one().rejected_json))).toContainEqual(expect.objectContaining({reason:'host_load_high',cpu_busy_window:99}));
+    heartbeat.cpu_usage = usage(60);
+    beat(8 * 3);
     expect(restarted.drainCapacityQueue().promoted).toBeGreaterThan(0);
     expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({state:'offered',machine_id:'hetzner'});
   }));

@@ -5,7 +5,7 @@ import { observationModel } from './session-observation';
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 import { sanitizeCommandFields } from './command-diagnostics';
-import {sanitizeCpuAdmission,sanitizeCpuUsage} from './cpu-headroom';
+import {sanitizeCpuAdmission,sanitizeCpuUsage,CPU_SATURATED_PCT} from './cpu-headroom';
 import { launcherDiskHeadroom } from './launcher-disk';
 /** Generic account registry and placement. Provider credentials never enter this service. */
 import type { SqlStorage } from '@cloudflare/workers-types';
@@ -137,7 +137,9 @@ function disabledEngines(): Set<string> {
 // route_advertisement_stale: the host's last complete list aged out (it
 // stopped posting /api/host/routes); every route holds.
 const CAPACITY_REASONS = new Set(['route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high']);
-const HOST_LOAD_FACTOR = 1.5;
+/** Runaway-load cap (multiple of cores). Load average counts IO-wait and runnable threads, so it only
+ * guards the 2026-10-28 incident (load 275-295 on 12 cores); real busyness is measured CPU/memory. */
+const HOST_LOAD_FACTOR = 6;
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -160,7 +162,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   memory_pressure: 'Host memory full pressure exceeds the safety cap.',
   host_oom: 'A recent host OOM kill requires a placement cooldown.',
   host_runtime_choking: 'Recent session or service failures require a placement cooldown.',
-  host_load_high: 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
+  host_load_high: 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
   "workspace_unavailable": "The requested workspace is not available on this host.",
   "mode_unavailable": "This host does not advertise the requested session mode (e.g. headless without a maintained launcher).",
   "dispatch_route_unconfigured": "The offered account, engine and profile do not match a local route.",
@@ -1262,7 +1264,15 @@ export class FleetService {
       else if (
         loadRefusal !== undefined && loadRefusal.machine === route.machine_id &&
         Number.isFinite(hb?.load?.[0]) && Number.isFinite(caps?.cpu_count) &&
-        caps.cpu_count > 0 && hb.load[0] > loadRefusal.factor * caps.cpu_count
+        caps.cpu_count > 0 && (
+          // Stored factors below the runaway default are legacy (1.5x) holds: never gate on them.
+          hb.load[0] > Math.max(loadRefusal.factor, HOST_LOAD_FACTOR) * caps.cpu_count
+          // Busy means measured CPU >= 98% averaged over >= 10s on a fresh sample, never load average.
+          || (() => {
+            const usage = sanitizeCpuUsage(hb.cpu_usage);
+            const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;
+            return usage?.busy_percent_window != null && age <= 180000 && age >= -30000 && usage.busy_percent_window >= CPU_SATURATED_PCT;
+          })())
       ) reason = 'host_load_high';
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         memory().reserved_mb,
@@ -1288,7 +1298,7 @@ export class FleetService {
           ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}),
           ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}),
           ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}),
-          ...(reason === 'host_load_high' ? { load1: hb.load[0], cpu_count: caps.cpu_count, load_limit: loadRefusal!.factor * caps.cpu_count } : {}),
+          ...(reason === 'host_load_high' ? { load1: hb.load[0], cpu_count: caps.cpu_count, load_limit: Math.max(loadRefusal!.factor, HOST_LOAD_FACTOR) * caps.cpu_count, cpu_busy_window: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window ?? null } : {}),
           ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}),
         });
         continue;
@@ -2432,7 +2442,7 @@ export class FleetService {
             const loadCores = parsed(loadMachine?.capabilities)?.cpu_count;
             const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason,
               ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason) ? {cpu:this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id)} : {}),
-              ...(data.reason === 'host_load_high' ? { load1: loadHeartbeat.load?.[0] ?? null, cpu_count: loadCores ?? null, load_limit: Number.isFinite(loadCores) ? loadFactor * loadCores : null } : {}) }];
+              ...(data.reason === 'host_load_high' ? { load1: loadHeartbeat.load?.[0] ?? null, cpu_count: loadCores ?? null, load_limit: Number.isFinite(loadCores) ? Math.max(loadFactor, HOST_LOAD_FACTOR) * loadCores : null } : {}) }];
             this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ?", 'model-retry-' + row.id, data.reason, at, at, row.id);
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
             this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, host_load_machine, host_load_factor) VALUES (?, ?, ?, ?, ?)', id, at, JSON.stringify(rejected), data.reason === 'host_load_high' ? row.machine_id : null, data.reason === 'host_load_high' ? loadFactor : null);

@@ -1,7 +1,7 @@
 """Fixed pre-start reasons plus bounded, redacted typed command evidence."""
 MESSAGES = {
-    'host_overload': 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
-    'host_load_high': 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
+    'host_overload': 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
+    'host_load_high': 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
     'dispatch_worktree_refused': 'The worktree could not be protected before native start.',
     'cpu_headroom': 'Host CPU usage plus expected session demand exceeds the CPU target.',
     'cpu_pressure': 'Host CPU pressure exceeds the safety cap.',
