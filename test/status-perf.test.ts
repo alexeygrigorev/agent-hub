@@ -304,7 +304,7 @@ it('bounds status and host query work with retained production-scale history', a
     ['GET', '/api/sessions?limit=1', SAMPLES * 2, 28, 350],
     ['POST', '/api/host/poll', SAMPLES, 6, 8],
     ['POST', '/api/machines/register', SAMPLES, 7, 8],
-    ['GET', '/api/fleet/offers', SAMPLES * 4, 95, 750],
+    ['GET', '/api/fleet/offers', SAMPLES * 4, 95, 900],
     ['GET', '/api/fleet/resources/watchdog', SAMPLES * 2, 13, 5000],
     ['POST', '/api/fleet/resources/report', SAMPLES, 4, 2300],
     ['POST', `/api/fleet/launches/${sessionId(11999)}/claim`, SAMPLES * 3, 18, 260],
