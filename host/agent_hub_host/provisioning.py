@@ -2707,6 +2707,16 @@ def add_commands(sub):
     versions.add_argument('--json', dest='json', action='store_true', help='Machine-readable output (default)')
     versions.add_argument('--fleet', action='store_true', help='Fleet-wide per-host versions from Hub version reports instead of this host')
     versions.add_argument('--machine', default=None, help='With --fleet: only this registered host')
+    recommend = commands.add_parser('recommend', help='Recommend engine/account/model/host using Hub burn-rate decision logic without reserving')
+    recommend.add_argument('--tier', default=None, help='Task tier (daily, deep, quick, review, ask)')
+    recommend.add_argument('--workspace', default=None, help='Workspace name or path')
+    recommend.add_argument('--machine', default=None, help='Preferred machine id')
+    recommend.add_argument('--project', default=None, help='Project name')
+    recommend.add_argument('--needs', default=None, help='Comma-separated capability/OS labels')
+    recommend.add_argument('--mode', choices=['headless', 'interactive'], default='headless')
+    recommend.add_argument('--engine', default=None, help='Optional pinned engine (requires --reason)')
+    recommend.add_argument('--reason', default=None, help='Required explanation when --engine is pinned')
+    recommend.add_argument('--json', action='store_true', default=True, help='JSON output (default)')
 
 
 def central_login(args, prompt=None):
@@ -2930,6 +2940,17 @@ def engine_update_command(args):
 
 
 def command(args):
+    if args.engines_cmd == 'recommend':
+        import urllib.parse
+        if getattr(args, 'engine', None) and not (getattr(args, 'reason', None) and str(args.reason).strip()):
+            raise ValueError('engine_reason_required: --engine requires --reason')
+        q = {}
+        for k in ('tier', 'workspace', 'machine', 'project', 'needs', 'mode', 'engine', 'reason'):
+            v = getattr(args, k, None)
+            if v is not None and str(v).strip():
+                q[k] = str(v).strip()
+        qs = ('?' + urllib.parse.urlencode(q)) if q else ''
+        return bus._do_request('GET', '/api/fleet/recommend' + qs)
     if args.engines_cmd == 'quota':
         return quotas()
     if args.engines_cmd == 'login':

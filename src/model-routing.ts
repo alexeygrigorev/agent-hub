@@ -22,6 +22,15 @@ export function taskTier(input: any): string | null {
  * weight = fit * health * preference * headroom * urgency * pacing * grok * banked.
  * `pacing` comes from tbm_* rows; omitted or empty keeps those factors neutral.
  */
+function profileMatchesModel(modelProfile: string | null, actualProfile: string | null, account: string | null): boolean {
+  if (modelProfile === actualProfile) return true;
+  if (modelProfile === null && typeof actualProfile === 'string' && typeof account === 'string') {
+    const canon = canonicalAccountLabel(account);
+    return actualProfile === `hub-${account}` || actualProfile === `hub-${canon}`;
+  }
+  return false;
+}
+
 export function modelCandidates(input: any, route: any, advertisement: any, quota: any, now: number, pacing?: Map<string, ProviderPacing>, unavailableEngines?: Set<string>) {
   // Paid routing is unsupported. Reject an incompatible policy rather than
   // advertising subscription-only behavior while silently accepting paid mode.
@@ -34,8 +43,8 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
     if (unavailableEngines && unavailableEngines.has(m.engine)) return false;
     if (policy.rules.explicit_only_providers.includes(m.provider) && input.preferred_runner !== m.engine && ![m.id, m.model].includes(input.model)) return false;
     const routeFam = route.provider === 'codex-orin' ? 'codex' : route.provider;
-    return m.provider === routeFam && m.engine === route.engine && m.profile === route.profile &&
-      advertisement.some((a: any) => a.engine === m.engine && a.profile === m.profile && a.model === m.model && a.effort === m.effort &&
+    return m.provider === routeFam && m.engine === route.engine && profileMatchesModel(m.profile, route.profile ?? null, route.account ?? null) &&
+      advertisement.some((a: any) => a.engine === m.engine && profileMatchesModel(m.profile, a.profile ?? null, a.account ?? route.account ?? null) && a.model === m.model && a.effort === m.effort &&
         typeof a.account === 'string' && typeof route.account === 'string' && canonicalAccountLabel(a.account) === canonicalAccountLabel(route.account));
   }).map(m => {
     // Canonical fail-closed admission shared with dispatch/accountStatus/claim.

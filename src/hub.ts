@@ -1007,6 +1007,9 @@ export class Hub extends DurableObject {
           hostRepositoryAuthorizer(this.sql, auth.caller,
             (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller)))(request);
       }
+      if (path === '/api/engines/recommend') {
+        return this.fleetService.handle(request, await this.sessionControlAuth(request));
+      }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
         const url = new URL(request.url);
         if (path === '/api/engines' && url.searchParams.getAll('view').length === 1 && url.searchParams.get('view') === 'worker') {

@@ -323,6 +323,226 @@ export function scheduleBurnFactor(quota: any, nowMs: number): { factor: number;
   if (remaining !== null && remaining < LOW_HEADROOM_PERCENT && ratio < 1) factor *= Math.pow(Math.max(0.1, remaining / LOW_HEADROOM_PERCENT), 2);
   return { factor, ratio, remaining };
 }
+
+export type QuotaBurnStatus =
+  | 'behind_schedule'
+  | 'on_pace'
+  | 'ahead_of_schedule'
+  | 'depleted'
+  | 'exhausted'
+  | 'unmetered';
+
+export interface QuotaBurnAnalysis {
+  factor: number;
+  ratio: number | null;
+  remaining: number | null;
+  window_type: string | null;
+  hours_to_reset: number | null;
+  depleted: boolean;
+  burn_status: QuotaBurnStatus;
+  windows_summary: string;
+}
+
+export function analyzeQuotaBurn(quota: any, nowMs: number, unmetered = false): QuotaBurnAnalysis {
+  const base = scheduleBurnFactor(quota, nowMs);
+  let bottleneckWindow: string | null = null;
+  let bottleneckHours: number | null = null;
+  let minRatio: number | null = null;
+  const parts: string[] = [];
+  for (const [name, w] of Object.entries(quota?.windows || {}) as [string, any][]) {
+    if (w?.present === false || typeof w?.percent_remaining !== 'number' || !Number.isFinite(w.percent_remaining)) continue;
+    const cycle = (WINDOW_NOMINAL_CYCLE_MS as Record<string, number>)[String(name).toLowerCase()];
+    const reset = typeof w.reset_at === 'string' ? Date.parse(w.reset_at) : NaN;
+    if (cycle && Number.isFinite(reset)) {
+      const hours = Math.max(0, (reset - nowMs) / HOUR);
+      const frac = Math.max(0.02, Math.min(1, (reset - nowMs) / cycle));
+      const r = (w.percent_remaining / 100) / frac;
+      parts.push(`${name}:${Math.round(w.percent_remaining)}%@${hours.toFixed(1)}h`);
+      if (minRatio === null || r < minRatio) {
+        minRatio = r;
+        bottleneckWindow = name;
+        bottleneckHours = Math.round(hours * 10) / 10;
+      }
+    } else {
+      parts.push(`${name}:${Math.round(w.percent_remaining)}%`);
+    }
+  }
+  const lowFloor = typeof (policy.rules as any).low_headroom_percent === 'number'
+    ? (policy.rules as any).low_headroom_percent
+    : LOW_HEADROOM_PERCENT;
+  const depleted = base.remaining !== null && base.remaining < lowFloor;
+  const limitReached = quota?.details?.limit_reached === true || (base.remaining !== null && base.remaining <= 0);
+  let burnStatus: QuotaBurnStatus;
+  if (limitReached) {
+    burnStatus = 'exhausted';
+  } else if (base.ratio === null) {
+    burnStatus = unmetered && base.remaining === null ? 'unmetered' : (depleted ? 'depleted' : 'on_pace');
+  } else if (depleted && base.ratio < 1) {
+    burnStatus = 'depleted';
+  } else if (base.ratio > 1.05) {
+    burnStatus = 'behind_schedule';
+  } else if (base.ratio < 0.90) {
+    burnStatus = 'ahead_of_schedule';
+  } else {
+    burnStatus = 'on_pace';
+  }
+  return {
+    ...base,
+    window_type: bottleneckWindow,
+    hours_to_reset: bottleneckHours,
+    depleted,
+    burn_status: burnStatus,
+    windows_summary: parts.length > 0 ? parts.join(',') : (unmetered ? 'unmetered' : 'none'),
+  };
+}
+
+export function providerWeight(provider: string, project?: string | null): number {
+  const weights = (policy.rules as any).provider_weights as Record<string, number> | undefined;
+  const base = typeof weights?.[provider] === 'number' ? weights[provider] : providerPreference(provider);
+  const projWeights = project ? ((policy.rules as any).project_preferences?.[project] as Record<string, number> | undefined) : undefined;
+  const projMult = typeof projWeights?.[provider] === 'number' ? projWeights[provider] : 1;
+  return base * projMult;
+}
+
+export function isDesktopCodexExcluded(
+  machine: { id?: string | null; name?: string | null; hostname?: string | null } | null | undefined,
+  route: { engine?: string | null; provider?: string | null; profile?: string | null } | null | undefined,
+  family?: string | null,
+): boolean {
+  if (!machine || !route) return false;
+  // Z.ai via zcodex talks to Z.ai API, not OpenAI Codex VPN.
+  if (route.profile === 'zcodex' || route.engine === 'zcodex' || route.provider === 'zai' || family === 'zai') {
+    return false;
+  }
+  const effProvider = String(family || route.provider || route.engine || '').toLowerCase();
+  const excludedProviders = (((policy.rules as any).desktop_excluded_providers as string[] | undefined) ?? ['codex']).map(p => p.toLowerCase());
+  if (!excludedProviders.includes(effProvider)) return false;
+  const id = String(machine.id ?? '');
+  // Tabo's canonical machine ID is Linux even when synthetic tests name its hostname 'desktop'.
+  if (id === 'cBynxGDoKVPoGpGWxvCTvg') return false;
+  const desktopIds = ((policy.rules as any).desktop_machine_ids as string[] | undefined) ?? ['0sJC0fDcz0bzhG4XQp5EeQ'];
+  if (desktopIds.includes(id)) return true;
+  const desktopHosts = (((policy.rules as any).desktop_hostnames as string[] | undefined) ?? ['DESKTOP-FP4OP26', 'desktop']).map(h => h.toUpperCase());
+  const hostname = String(machine.hostname ?? '').toUpperCase();
+  const name = String(machine.name ?? '').toUpperCase();
+  return desktopHosts.includes(hostname) || desktopHosts.includes(name) || desktopHosts.includes(id.toUpperCase());
+}
+
+export interface EngineDecisionInput {
+  machine: string;
+  engine: string;
+  account: string | null;
+  profile: string | null;
+  provider: string;
+  model: { id: string; model: string; provider?: string; engine?: string; effort?: string | null } | null;
+  tier: string;
+  needs?: string[];
+  project?: string | null;
+  quota: any;
+  headroomPercent: number;
+  nowMs: number;
+  cpuLoad: number;
+  pendingLaunches: number;
+  familyLoad: number;
+  accountActive: number;
+  accountMaxConcurrency: number;
+  recentAccountFailures: number;
+  degraded: boolean;
+  tbmWeight: number;
+  pinnedEngine?: string | null;
+  overrideReason?: string | null;
+}
+
+export interface EngineDecisionResult {
+  mode: 'auto' | 'pinned';
+  score: number;
+  reason: string;
+  override_reason: string | null;
+  factors: {
+    remaining_pct: number;
+    headroom_factor: number;
+    window_type: string | null;
+    hours_to_reset: number | null;
+    burn_ratio: number | null;
+    burn_factor: number;
+    burn_status: QuotaBurnStatus;
+    depleted: boolean;
+    provider_weight: number;
+    tier_fit: number;
+    load_factor: number;
+    failure_factor: number;
+    host_factor: number;
+    tbm_weight: number;
+    active_account: number;
+    active_family: number;
+    available_slots: number;
+    max_concurrency: number;
+    recent_failures: number;
+  };
+}
+
+export function computeEngineDecision(input: EngineDecisionInput): EngineDecisionResult {
+  const unmeteredProviders = ((policy.rules as any).unmetered_providers as string[] | undefined) ?? [];
+  const burn = analyzeQuotaBurn(input.quota, input.nowMs, unmeteredProviders.includes(input.provider));
+  const remainingPct = burn.remaining !== null ? burn.remaining : input.headroomPercent;
+  const headroomFactor = Math.max(0.01, input.headroomPercent / 100);
+  const pref = providerWeight(input.provider, input.project);
+  const caps = (policy.rules as any).engine_capabilities?.[input.engine]
+    ?? (policy.rules as any).engine_capabilities?.[input.provider]
+    ?? {};
+  let tierFit = 1.0;
+  if (input.needs?.includes('long_context') && (caps.context_tokens ?? 0) >= 500_000) tierFit *= 1.15;
+  if ((input.needs?.includes('fast') || input.tier === 'quick') && caps.speed === 'fast') tierFit *= 1.10;
+  const maxConc = Math.max(1, input.accountMaxConcurrency || 1);
+  const acctActive = Math.max(0, input.accountActive || 0);
+  const famActive = Math.max(0, input.familyLoad || 0);
+  const availSlots = Math.max(0, maxConc - acctActive);
+  const slotHeadroom = 0.7 + 0.3 * (availSlots / maxConc);
+  const loadFactor = slotHeadroom / ((1 + famActive) * (1 + 0.25 * acctActive));
+  const failures = Math.max(0, input.recentAccountFailures || 0);
+  const failureFactor = 1 / (1 + 0.5 * failures + (input.degraded ? 0.5 : 0));
+  const hostFactor = 1 / (1 + Math.max(0, input.cpuLoad) + Math.max(0, input.pendingLaunches));
+  const tbm = Number.isFinite(input.tbmWeight) && input.tbmWeight > 0 ? input.tbmWeight : 1;
+  const rawScore = headroomFactor * burn.factor * pref * tierFit * loadFactor * failureFactor * hostFactor * tbm;
+  const score = Math.round(rawScore * 1e6) / 1e6;
+  const mode: 'auto' | 'pinned' = input.pinnedEngine ? 'pinned' : 'auto';
+  const modelLabel = input.model?.id ? `${input.model.id}` : input.engine;
+  const winPart = burn.window_type && burn.hours_to_reset !== null
+    ? `win=${burn.window_type}@${burn.hours_to_reset.toFixed(1)}h`
+    : `win=${burn.windows_summary}`;
+  const ratioPart = burn.ratio !== null ? `ratio=${burn.ratio.toFixed(2)}` : 'ratio=unmetered';
+  const overridePart = input.pinnedEngine && input.overrideReason
+    ? ` override_reason=${JSON.stringify(input.overrideReason)}`
+    : '';
+  const reason = `${mode}: ${input.engine}/${input.account ?? 'default'} (${modelLabel}) on ${input.machine} score=${score.toFixed(4)} [rem=${Math.round(remainingPct)}% ${winPart} ${ratioPart} status=${burn.burn_status} burn=${burn.factor.toFixed(2)}x pref=${pref.toFixed(2)}x tier=${input.tier}(${tierFit.toFixed(2)}x) load=acct:${acctActive}/${maxConc},fam:${famActive} fail=${failures}${overridePart}]`;
+  return {
+    mode,
+    score,
+    reason,
+    override_reason: input.overrideReason ?? null,
+    factors: {
+      remaining_pct: Math.round(remainingPct * 10) / 10,
+      headroom_factor: Math.round(headroomFactor * 1000) / 1000,
+      window_type: burn.window_type,
+      hours_to_reset: burn.hours_to_reset,
+      burn_ratio: burn.ratio !== null ? Math.round(burn.ratio * 1000) / 1000 : null,
+      burn_factor: Math.round(burn.factor * 1000) / 1000,
+      burn_status: burn.burn_status,
+      depleted: burn.depleted,
+      provider_weight: Math.round(pref * 1000) / 1000,
+      tier_fit: Math.round(tierFit * 1000) / 1000,
+      load_factor: Math.round(loadFactor * 1000) / 1000,
+      failure_factor: Math.round(failureFactor * 1000) / 1000,
+      host_factor: Math.round(hostFactor * 1000) / 1000,
+      tbm_weight: Math.round(tbm * 1000) / 1000,
+      active_account: acctActive,
+      active_family: famActive,
+      available_slots: availSlots,
+      max_concurrency: maxConc,
+      recent_failures: failures,
+    },
+  };
+}
 export const routeScore = (f: RouteScoreFactors) => f.fit * f.health * f.preference * f.headroom * f.urgency * f.pacing * f.grok * f.banked;
 
 /** Per-provider / per-account pacing context for routing, derived from tbm_* rows. */

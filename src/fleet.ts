@@ -26,7 +26,7 @@ import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
 import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
-import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
+import { computeEngineDecision, isDesktopCodexExcluded, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
 import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
 import { WORKER_SCOPE, workerAccessContext } from './worker-access';
 import { GOAL_STATUSES } from './intake-session';
@@ -186,7 +186,8 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "codex_quota_gate_quota_unavailable": "The managed Codex account quota gate refused launch before execution.",
   "codex_quota_gate_codex_reserve_required": "The managed Codex account is below the configured weekly reserve.",
   "codex_quota_gate_stale_window_evidence": "The managed Codex quota evidence is stale.",
-  "codex_quota_gate_quota_check_failed": "The managed Codex quota check failed."
+  "codex_quota_gate_quota_check_failed": "The managed Codex quota check failed.",
+  "desktop_codex_excluded": "Codex does not run on the Windows desktop (codex-vpn guard)."
 };
 const CLAIM_HTTP_SLUGS = new Set<string>(["account_capacity", "account_concurrency", "account_unavailable", "already_claimed", "claim_actor_ambiguous", "claim_authority_changed", "claim_authority_unsupported", "claim_conflict", "claim_holder_mismatch", "claim_inactive", "claim_project_mismatch", "claim_required", "claim_scope_mismatch", "claim_workspace_unconfigured", "cooldown_active", "cpu_headroom", "cpu_pressure", "cpu_usage_unknown", "forbidden", "fresh_admission_required", "future_observation", "grok_entitlement", "host_oom", "host_runtime_choking", "host_load_high", "invalid_claim", "invalid_observed_at", "limit_reached", "machine_capacity", "malformed", "memory_pressure", "model_unsupported", "no_available_window", "no_quota_evidence", "not_found", "provider_disabled", "quota_exhausted", "quota_stale", "quota_unavailable", "quota_unknown", "reserve", "reserve_required", "reset_passed_since_observation", "route_not_ok", "route_stale", "stale_observation", "stale_window_evidence", "unauthorized", "window_unavailable", "worker_scope_forbidden"]);
 const RETRYABLE_CLAIM_ERRORS = new Set<string>(["account_capacity", "account_concurrency", "cpu_headroom", "cpu_pressure", "fresh_admission_required", "host_oom", "host_runtime_choking", "host_load_high", "machine_capacity", "memory_pressure"]);
@@ -213,7 +214,7 @@ function gateReasonValid(d: any): boolean {
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
 // tier exclusion or a recorded route refusal); it never frees up, so it must not
 // turn a capacity wait into a hard 409.
-const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'not_logged_in']);
+const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'not_logged_in', 'desktop_codex_excluded']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
@@ -627,6 +628,7 @@ export class FleetService {
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_account_phase ON fleet_sessions(account,phase)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_machine_phase ON fleet_sessions(machine_id,phase)');
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_recent ON fleet_launches(machine_id,finished_at) WHERE state = 'failed' AND mode = 'headless' AND verification_status = 'unverified'");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_account_failed_recent ON fleet_launches(account,updated_at DESC) WHERE state = 'failed'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native_state ON fleet_launches(machine_id,native_id,state)');
     // Intake e8a22f4c: plan() and the choking watchdog look for these rare exit reasons on every poll;
     // partial indexes keep both lookups independent of the machine's retained launch history.
@@ -1138,6 +1140,18 @@ export class FleetService {
       }
       return runnersByMachine.get(machineId);
     };
+    const recentFailuresByAccount = new Map<string, number>();
+    const countRecentAccountFailures = (acct: string): number => {
+      if (!recentFailuresByAccount.has(acct)) {
+        let n = 0;
+        try {
+          const sinceIso = new Date(this.now() - 3600_000).toISOString();
+          n = this.sql.exec("SELECT 1 FROM fleet_launches WHERE account = ? AND state = 'failed' AND updated_at > ? LIMIT 8", acct, sinceIso).toArray().length;
+        } catch { n = 0; }
+        recentFailuresByAccount.set(acct, n);
+      }
+      return recentFailuresByAccount.get(acct)!;
+    };
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
       if (overrideModels.length) {
@@ -1258,6 +1272,7 @@ export class FleetService {
       };
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
+      else if (isDesktopCodexExcluded(machine, route, canonicalQuotaProvider(definitions.get(route.account)?.provider as string))) reason = 'desktop_codex_excluded';
       else if (hb.fleet_routes_overflow !== undefined) reason = 'route_advertisement_overflow';
       else if (Array.isArray(hb.fleet_routes) && !fresh(effectiveRoutesAt(route.machine_id, hb.fleet_routes_at), this.now(), 180000)) reason = 'route_advertisement_stale';
       else if (!routeAdvertised(advertisedRoutes(Array.isArray(hb.fleet_routes) ? { ...hb, fleet_routes_at: effectiveRoutesAt(route.machine_id, hb.fleet_routes_at) } : hb,
@@ -1358,7 +1373,34 @@ export class FleetService {
       // the single highest-percentage family.
       const headroomPercent = routeQuota.remaining ?? (isUnmeteredProvider(family) ? (policy.rules as any).unmetered_headroom_percent : 5);
       const familyLoad = [...accounts.values()].filter(a => a.provider === family).reduce((n, a) => n + a.active, 0);
-      const score = (headroomPercent / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) / (1 + familyLoad) * tbm_weight * scheduleBurnFactor(routeProv?.quota, this.now()).factor;
+      const cpuLoad = (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / Math.max(1, caps.cpu_count || 1);
+      const isDegraded = Boolean(gateProjection && !gateRefusal);
+      const decision = computeEngineDecision({
+        machine: route.machine_id,
+        engine: route.engine,
+        account: route.account,
+        profile: route.profile ?? null,
+        provider: family,
+        model,
+        tier: tier || policy.default_tier,
+        needs,
+        project: request.project ?? null,
+        quota: routeProv?.quota ?? null,
+        headroomPercent,
+        nowMs: this.now(),
+        cpuLoad,
+        pendingLaunches: pending,
+        familyLoad,
+        accountActive: account?.active ?? 0,
+        accountMaxConcurrency: account?.max_concurrency ?? 1,
+        recentAccountFailures: countRecentAccountFailures(route.account),
+        degraded: isDegraded,
+        tbmWeight: tbm_weight,
+        pinnedEngine: request.engine ?? null,
+        overrideReason: typeof input.engine_override_reason === 'string' && input.engine_override_reason.trim() ? input.engine_override_reason.trim() : null,
+      });
+      const score = decision.score;
+      const selectionWithDecision = { ...model, decision_score: score, decision_reason: decision.reason, decision };
       // Windows hosts are overflow for work that does not ask for Windows:
       // agent tooling assumes Linux, so they win only when every Linux route
       // is held (loaded, capped or quota-limited). Pinned and os:windows
@@ -1366,9 +1408,9 @@ export class FleetService {
       const overflow = overflowMachine(machine, needs);
       // A failed probe has no credential verdict. Prefer an admitted sibling,
       // while retaining hard refusals for rejected or stale credentials.
-      if (gateProjection && !gateRefusal) gateDegraded.add(candidates.length);
+      if (isDegraded) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: model, score, ...(routeQuota.reason !== 'eligible' || (gateProjection && !gateRefusal) ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, decision_score: score, decision_reason: decision.reason, decision, ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
     }
     // Intake 06d2a0ac AC1: an account with no quota verdict at all (status
     // unknown: never observed, or only "unknown"/unavailable reports) is
@@ -1385,7 +1427,17 @@ export class FleetService {
         candidates.splice(i, 1);
       }
     }
-    candidates.sort((a, b) => Number(!!a.overflow) - Number(!!b.overflow) || Number(degraded.has(a)) - Number(degraded.has(b)) || b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
+    candidates.sort((a, b) =>
+      Number(!!a.overflow) - Number(!!b.overflow)
+      || Number(degraded.has(a)) - Number(degraded.has(b))
+      || b.score - a.score
+      || (b.decision?.factors?.burn_ratio ?? 0) - (a.decision?.factors?.burn_ratio ?? 0)
+      || (b.decision?.factors?.remaining_pct ?? 0) - (a.decision?.factors?.remaining_pct ?? 0)
+      || (a.decision?.factors?.active_account ?? 0) - (b.decision?.factors?.active_account ?? 0)
+      || a.machine.localeCompare(b.machine)
+      || a.engine.localeCompare(b.engine)
+      || String(a.account ?? '').localeCompare(String(b.account ?? ''))
+    );
     // The stored intent carries the winner's normalized workspace: a bare
     // label that resolved under the selected host's root is persisted and
     // offered as the absolute path the host accepts. Labels that were
@@ -1694,7 +1746,7 @@ export class FleetService {
       this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
       this.resources.freezeCpuStart(id,selected);
       this.sql.exec('UPDATE fleet_launches SET model_selection_json = ? WHERE id = ?', JSON.stringify(selected.selection), id);
-      return result({ id, selection: selected.selection, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode, access: admitted.access.mode }, 201);
+      return result({ id, selection: selected.selection, decision_score: selected.decision_score ?? selected.score ?? null, decision_reason: selected.decision_reason ?? null, decision: selected.decision ?? null, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode, access: admitted.access.mode }, 201);
     });
   }
 
@@ -1706,6 +1758,69 @@ export class FleetService {
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
+    if ((path === '/api/fleet/recommend' || path === '/api/engines/recommend') && (request.method === 'GET' || request.method === 'POST')) {
+      if (!writer && !host) return response({ error: 'forbidden' }, 403);
+      let params: Record<string, any> = Object.fromEntries(new URL(request.url).searchParams);
+      if (request.method === 'POST') {
+        const b = await body(request);
+        if (b && typeof b === 'object') params = { ...params, ...b };
+      }
+      if (params.engine && (!params.engine_override_reason || !String(params.engine_override_reason).trim()) && (!params.reason || !String(params.reason).trim())) {
+        return response({ error: 'engine_reason_required', detail: 'Pinning an engine requires --reason (engine_override_reason).' }, 400);
+      }
+      let workspace = typeof params.workspace === 'string' && params.workspace.trim() ? params.workspace.trim() : '';
+      if (!workspace) {
+        try {
+          for (const m of this.sql.exec('SELECT capabilities FROM machines WHERE revoked_at IS NULL AND drained = 0 ORDER BY last_checkin_at DESC LIMIT 8').toArray() as any[]) {
+            const ws = parsed(m.capabilities)?.workspaces;
+            if (Array.isArray(ws) && typeof ws[0] === 'string') { workspace = ws[0]; break; }
+            if (ws && typeof ws === 'object') {
+              const firstKey = Object.keys(ws)[0];
+              if (firstKey) { workspace = firstKey; break; }
+            }
+          }
+        } catch { /* fallback below */ }
+      }
+      if (!workspace) workspace = 'agent-hub';
+      const needs = Array.isArray(params.needs)
+        ? params.needs
+        : (typeof params.needs === 'string' && params.needs.trim() ? params.needs.split(',').map((s: string) => s.trim()).filter(Boolean) : undefined);
+      const mode = params.mode === 'interactive' ? 'interactive' : 'headless';
+      const planInput: any = {
+        mode,
+        workspace,
+        prompt: mode === 'headless' ? (typeof params.prompt === 'string' && params.prompt.trim() ? params.prompt : 'recommend preview') : '',
+        ...(params.tier ? { tier: String(params.tier) } : {}),
+        ...(params.machine ? { machine: String(params.machine) } : {}),
+        ...(params.engine ? { engine: String(params.engine) } : {}),
+        ...(params.account ? { account: String(params.account) } : {}),
+        ...(params.project ? { project: String(params.project) } : {}),
+        ...(needs?.length ? { needs } : {}),
+        ...(params.engine_override_reason || params.reason ? { engine_override_reason: String(params.engine_override_reason || params.reason) } : {}),
+      };
+      const planned: any = this.plan(planInput);
+      if ('error' in planned) return response(planned, 400);
+      const formatCandidate = (c: any) => ({
+        machine: c.machine,
+        engine: c.engine,
+        account: c.account,
+        profile: c.profile ?? null,
+        model_id: c.selection?.id ?? null,
+        model: c.selection?.model ?? null,
+        effort: c.selection?.effort ?? null,
+        decision_score: c.decision_score ?? c.score ?? null,
+        decision_reason: c.decision_reason ?? c.selection?.decision_reason ?? null,
+        decision: c.decision ?? c.selection?.decision ?? null,
+      });
+      return response({
+        tier: taskTier({ tier: params.tier }) || policy.default_tier,
+        selected: planned.selected ? formatCandidate(planned.selected) : null,
+        decision_score: planned.selected ? (planned.selected.decision_score ?? planned.selected.score ?? null) : null,
+        decision_reason: planned.selected ? (planned.selected.decision_reason ?? null) : null,
+        candidates: Array.isArray(planned.candidates) ? planned.candidates.map(formatCandidate) : [],
+        rejected: planned.rejected || [],
+      });
+    }
     if (path === '/api/fleet/resources' || path.startsWith('/api/fleet/resources/')) {
       const suffix = path.slice('/api/fleet/resources'.length);
       if (request.method === 'GET') {
@@ -1807,7 +1922,7 @@ export class FleetService {
         placement: this.placementOverview(),
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
           harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() })),
-        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
+        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, decision_score: selection?.decision_score ?? null, decision_reason: selection?.decision_reason ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
     }
     const revokeMatch = /^\/api\/fleet\/machines\/([A-Za-z0-9_-]{1,64})\/revoke$/.exec(path);
     if (revokeMatch && request.method === 'POST') {

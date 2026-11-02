@@ -263,3 +263,25 @@ class ExhaustedWindowDisplayTests(unittest.TestCase):
             "windows": {"7d": {"percent_remaining": 17}}, "harness": ["codex"]}]})
         self.assertIn("codex/codex/codex-orin: exhausted", text)
         self.assertIn("unknown; windows 7d=17%", text)
+
+    def test_render_text_includes_decision_reason_and_engines_recommend(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from agent_hub_host import provisioning
+        from agent_hub_host.quota import render_text
+        text = render_text({"pools": [{
+            "provider": "go", "account": "shared-go", "state": "fresh",
+            "remaining_percent": 47.0, "observed_at": "2026-11-02T17:15:00Z",
+            "observed_by_hosts": ["hetzner"], "harness": ["opencode"],
+            "decision_reason": "go/shared-go score=0.6640 [rem=47% status=behind_schedule]",
+        }]})
+        self.assertIn("go/shared-go score=0.6640 [rem=47% status=behind_schedule]", text)
+        with self.assertRaises(ValueError):
+            provisioning.command(SimpleNamespace(engines_cmd="recommend", engine="claude", reason=None))
+        with mock.patch("agent_hub_host.bus._do_request", return_value={"selected": {"engine": "opencode"}}) as req:
+            res = provisioning.command(SimpleNamespace(
+                engines_cmd="recommend", tier="daily", workspace="agent-hub",
+                machine=None, project=None, needs=None, mode="headless", engine=None, reason=None
+            ))
+            self.assertEqual(res["selected"]["engine"], "opencode")
+            req.assert_called_once_with("GET", "/api/fleet/recommend?tier=daily&workspace=agent-hub&mode=headless")
