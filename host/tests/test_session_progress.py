@@ -27,6 +27,50 @@ class SessionProgressTests(unittest.TestCase):
         self.assertEqual(event_ms(self.row), 4000)
 
     @patch('agent_hub_host.session_progress.process', return_value={'pid': 123, 'start': 1, 'cpu': 0})
+    def test_claude_goal_rejection_is_detected_on_first_progress_sample(self, proc):
+        self.clock = 100_000
+        self.row.update(engine='claude', created_at_ms=99_000, command=['claude', '/goal long brief'],
+                        reported_state_event_ms=99_000, phase='running')
+        screens = []
+        sampler = self.sampler(screen=lambda row: screens.append(row['id']) or
+                               'Goal condition is limited to 4000 characters (got 4936)')
+
+        progress = sampler.sample([self.row])['native']
+
+        self.assertEqual(screens, ['native'])
+        self.assertEqual(progress['terminal_error'], 'goal_rejected')
+
+    @patch('agent_hub_host.session_progress.process', return_value={'pid': 123, 'start': 1, 'cpu': 0})
+    def test_claude_limit_discussion_without_rejection_is_not_terminal(self, proc):
+        self.clock = 100_000
+        self.row.update(engine='claude', created_at_ms=99_000, command=['claude', '/goal long brief'],
+                        reported_state_event_ms=99_000, phase='running')
+        sampler = self.sampler(screen=lambda row: 'The goal limit is 4000 characters.')
+
+        progress = sampler.sample([self.row])['native']
+
+        self.assertNotIn('terminal_error', progress)
+
+    @patch('agent_hub_host.session_progress.process', return_value={'pid': 123, 'start': 1, 'cpu': 0})
+    def test_claude_goal_rejection_survives_progress_monitor_restart(self, proc):
+        import json
+        self.clock = 100_000
+        self.row.update(engine='claude', created_at_ms=99_000, command=['claude', '/goal long brief'],
+                        reported_state_event_ms=99_000, phase='running')
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / 'private' / 'progress.json'
+            sampler = self.sampler(state_path=state, screen=lambda row:
+                                   'Goal condition is limited to 4000 characters (got 4936)')
+            sampler.sample([self.row])
+
+            persisted = json.loads(state.read_text())
+            self.assertEqual(persisted[0]['terminal_error'], 'goal_rejected')
+
+            restarted = self.sampler(state_path=state)
+            progress = restarted.sample([self.row])['native']
+            self.assertEqual(progress['terminal_error'], 'goal_rejected')
+
+    @patch('agent_hub_host.session_progress.process', return_value={'pid': 123, 'start': 1, 'cpu': 0})
     def test_polling_is_not_progress_and_unknown_does_not_prove_death(self, proc):
         sampler = self.sampler()
         first = sampler.sample([self.row])['native']

@@ -4,8 +4,13 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 import pytest
-from agent_hub_host import fleet, session_control
-from agent_hub_host.session_rules import AWS_MAIN_TEMP_RULE, compose_prompt
+from agent_hub_host import fleet, session_control, session_rules
+from agent_hub_host.session_rules import (
+    AWS_MAIN_TEMP_RULE,
+    CONTAINER_HYGIENE_RULE,
+    GOAL_CHAR_LIMIT,
+    compose_prompt,
+)
 from test_fleet import settings, offer
 
 
@@ -226,3 +231,47 @@ def test_claude_goal_route_advertised_and_started_with_goal(tmp_path):
     assert result['state'] == 'running'
     assert calls[-1][-4:-1] == ['--', 'trusted-claude', '--dangerously-skip-permissions']
     assert calls[-1][-1].startswith('/goal ' + compose_prompt('Ship the fix') + '\n')
+
+
+def test_oversized_claude_start_and_replacement_goals_use_full_private_brief(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    cfg['subscriptions'].append(dict(service='claude', engine='claude', account_label='shared-claude',
+                                     profile=None, admission_argv=['claude-gate'],
+                                     startup_argv=['trusted-claude', '--dangerously-skip-permissions']))
+    calls = []
+    monkeypatch.setattr(session_rules, 'goal_brief_dir', lambda: tmp_path / 'private-goals')
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        if argv[0] == 'claude-gate':
+            return {'launch_allowed': True, 'profile_supported': True,
+                    'account_label': 'shared-claude', 'observed_at': fleet.utcnow()}
+        offer_id = next(part[4:] for part in argv if isinstance(part, str) and part.startswith('hub-'))
+        return {'id': 'native-' + offer_id, 'workspace': str(tmp_path), 'tag': 'hub-' + offer_id,
+                'engine': 'claude', 'profile': None, 'phase': 'running'}
+
+    d = fleet.Dispatcher(cfg, lambda *a: {}, runner)
+    d._lock_session_worktree = lambda *a: True
+    with patch('agent_hub_host.intake_worktree.launch_cwd',
+               side_effect=lambda request, offer, workspace, target_cwd: (target_cwd, '', None)):
+        cases = [
+            offer(id='initial-goal', engine='claude', account='shared-claude', with_goal=True,
+                  prompt='Initial brief. ' + 'A' * 5000),
+            offer(id='replacement-goal', engine='claude', account='shared-claude', with_goal=True,
+                  prompt='Replacement brief. ' + 'B' * 5000, parent_id='stalled-session',
+                  intake_task_id='7970260d-0158-4a53-accd-445666555317', intake_worktree='successor'),
+        ]
+        for item in cases:
+            result = d.dispatch(item)
+            assert result['state'] == 'running'
+            goal = calls[-1][-1]
+            assert goal.startswith('/goal ')
+            assert len(goal) <= GOAL_CHAR_LIMIT
+            assert 'Hub session rules and the full brief are in ' in goal
+            path_start = goal.index('Hub session rules and the full brief are in ') + len(
+                'Hub session rules and the full brief are in ')
+            path_end = goal.index('. Read that file completely', path_start)
+            stored = Path(goal[path_start:path_end])
+            assert stored.read_text() == compose_prompt(item['prompt']) + '\n' + CONTAINER_HYGIENE_RULE
+
+    assert len([c for c in calls if c[0] == 'aplexer']) == 2
