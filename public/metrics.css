@@ -71,8 +71,7 @@
 .metrics-toolbar { justify-content: space-between; margin-bottom: 1rem; }
 .metrics-range-label { display: flex; align-items: center; gap: .5rem; }
 .metrics-range-label select { width: auto; }
-#host-history label:has([aria-label="Resource history range"]) { display: none; }
-#metrics-routing-notice { padding: .75rem; border: 1px solid var(--dk-warning-text); border-radius: .5rem; overflow-wrap: anywhere; }
+#metrics-routing-notice { padding: .75rem; border: 1px solid var(--dk-border-default); border-radius: .5rem; overflow-wrap: anywhere; background: var(--dk-warning-bg); color: var(--dk-warning-text); }
 #metrics-analysis > [data-metrics-panel] > :is(section, details) { margin-bottom: 1rem; }
 #metrics-coverage-summary { font-size: var(--dk-text-sm); }
 #coverage-panel { margin-top: 1rem; }

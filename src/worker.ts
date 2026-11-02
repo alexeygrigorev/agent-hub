@@ -145,7 +145,7 @@ export default {
       '/conversations', '/conversations.html', '/conversations.js', '/conversations.css',
       '/metrics', '/metrics.html', '/metrics.js', '/metrics-charts.js', '/metrics.css', '/host-health-charts.js', '/tbm.js', '/tbm.css', '/usage-history.js',
       '/usage', '/usage.html',
-      '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
+      '/sessions', '/sessions.html', '/sessions.js', '/sessions.css', '/session-launch.js',
       '/schedules', '/schedules.html', '/schedules.js', '/schedules.css',
       '/intake', '/intake.html', '/intake.js', '/intake.css', '/intake-overview.js', '/intake-stats.js', '/resource-management.js', '/idle-attention.js',
       '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',

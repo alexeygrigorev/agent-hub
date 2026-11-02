@@ -190,7 +190,7 @@ try {
 
   // Conversations page: composer (send) present at phone width, no accepted-delivery badge.
   await page.goto(base + '/conversations.html');
-  await page.locator('h1', { hasText: 'Conversations' }).waitFor();
+  await page.locator('h1', { hasText: 'Messages' }).waitFor();
   const convBody = await page.locator('#main-content').textContent();
   assert.ok(!/accepted/i.test(convBody.replace(/Accepted Outcome|accepted_outcome/gi, '')), 'conversations never show delivery as accepted');
   await capture('phone-conversations-390-dark');
