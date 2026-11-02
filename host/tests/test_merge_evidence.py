@@ -129,6 +129,31 @@ class MergeEvidenceTests(unittest.TestCase):
 
 
 class CommitExtractionTests(unittest.TestCase):
+    def test_active_report_references_excludes_only_explicit_prior_reports(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        other_id = '33333333-3333-4333-8333-333333333333'
+        old_sha = 'a1' * 20
+        new_sha = 'b2' * 20
+        other_sha = 'c3' * 20
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': old_sha},
+            {'id': other_id, 'kind': 'report', 'reference': other_sha},
+            {'id': new_id, 'kind': 'report', 'reference': new_sha, 'supersedes': [old_id]},
+            {'id': '44444444-4444-4444-8444-444444444444', 'kind': 'commit', 'reference': old_sha},
+        ]
+        self.assertEqual(me.active_report_references(history), [other_sha, new_sha, old_sha])
+
+    def test_malformed_or_dangling_supersession_fails_closed(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        old_sha = 'a1' * 20
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': old_sha},
+            {'id': new_id, 'kind': 'report', 'reference': 'b2' * 20, 'supersedes': ['missing-id']},
+        ]
+        self.assertEqual(me.active_report_references(history), [old_sha, 'b2' * 20])
+
     def test_uuid_and_known_id_fragments_are_not_candidates(self):
         text = ('DONE afab8367 intake 5e2cc166-0b5c-4a7d-9f11-34a66405e0e7 session c30f1f98 commit 89f55bd7 '
                 'and 0c934b64e1 task a5821c84')

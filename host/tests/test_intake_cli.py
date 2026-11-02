@@ -2,6 +2,7 @@
 import io
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from agent_hub_host import cli, intake
 
@@ -89,3 +90,26 @@ class TestQueuePriorityCli(unittest.TestCase):
             cli.main()
         request.assert_called_once_with('GET', '/api/intake/queue?project=demo&limit=10')
         self.assertEqual(json.loads(output.getvalue())['items'][0]['id'], 'q-1')
+
+
+class TestMergeCheckCli(unittest.TestCase):
+    def test_merge_check_omits_only_explicitly_superseded_report(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        other_id = '33333333-3333-4333-8333-333333333333'
+        old_sha, new_sha, other_sha = 'a1' * 20, 'b2' * 20, 'c3' * 20
+        shown = {'task': {'id': 'fixture-task', 'payload_data': {'history': [
+            {'id': old_id, 'kind': 'report', 'reference': old_sha},
+            {'id': other_id, 'kind': 'report', 'reference': other_sha},
+            {'id': new_id, 'kind': 'report', 'reference': new_sha, 'supersedes': [old_id]},
+        ]}}}
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'merge-check', 'fixture-task', '--repo', '/repo', '--dry-run']), \
+                patch('sys.stdout', output), \
+                patch.object(intake, 'request', return_value=shown) as request, \
+                patch('agent_hub_host.merge_evidence.fetch_origin'), \
+                patch('agent_hub_host.merge_evidence.collect', return_value={'commits': []}) as collect:
+            cli.main()
+        request.assert_called_once_with('GET', '/api/intake/tasks/fixture-task')
+        collect.assert_called_once_with(str(Path('/repo').resolve()), [other_sha, new_sha], fetch=False, include_head=True)
+        self.assertTrue(json.loads(output.getvalue())['dry_run'])

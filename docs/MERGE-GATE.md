@@ -21,6 +21,14 @@ Hub stores one row per intake in `intake_merge_state`: tracked worktree
   `POST /api/intake/tasks/ID/merge-evidence` (CLI/REST only: it runs git and gh locally, and the MCP
   tool surface is at its compact-schema budget).
 
+When a report commit is rebased, append a new `report` event for the replacement
+SHA with `supersedes: ["<prior-report-event-id>"]`. The target must identify an
+earlier report event on the same intake with a commit SHA reference and may be
+superseded only once. Merge-check excludes only those explicitly superseded
+report events; commit events and malformed or dangling supersession data remain
+required evidence, so missing commits still fail closed. Supersession does not
+alter historical event content.
+
 Deploy states: `success`, `skipped`, `not_required` are green; `failure`,
 `pending`, `missing`, `unknown` block.
 

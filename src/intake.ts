@@ -1402,7 +1402,26 @@ export class IntakeService {
         const row = this.sessionRow(hub_session_id);
         if (!row || (!p.admin && row.actor !== p.actor)) fail('not_found', 404);
       }
-    } else if (kind === 'report' || kind === 'commit') {
+    } else if (kind === 'report') {
+      keys(raw, ['kind', 'reference', 'source', 'supersedes']);
+      const reference = str(raw.reference, 2048);
+      const supersedes: string[] = [];
+      if (raw.supersedes !== undefined) {
+        if (!Array.isArray(raw.supersedes) || raw.supersedes.length < 1 || raw.supersedes.length > 32) fail('invalid_supersedes');
+        if (!/^[0-9a-f]{7,40}$/i.test(reference)) fail('invalid_superseding_report');
+        for (const rawId of raw.supersedes) {
+          if (typeof rawId !== 'string' || !SESSION_UUID.test(rawId)) fail('invalid_supersedes');
+          const id = rawId.toLowerCase();
+          if (supersedes.includes(id)) fail('invalid_supersedes');
+          const prior = task.history.find((e: Obj) => typeof e.id === 'string' && e.id.toLowerCase() === id && e.kind === 'report');
+          if (!prior || typeof prior.reference !== 'string' || !/^[0-9a-f]{7,40}$/i.test(prior.reference)) fail('unknown_superseded_report');
+          const alreadySuperseded = task.history.some((e: Obj) => e.kind === 'report' && Array.isArray(e.supersedes) && e.supersedes.some((v: any) => typeof v === 'string' && v.toLowerCase() === id));
+          if (alreadySuperseded) fail('report_already_superseded');
+          supersedes.push(id);
+        }
+      }
+      fields = { reference, source: source(raw.source), ...(supersedes.length ? { supersedes } : {}), evidence: 'external_unverified' };
+    } else if (kind === 'commit') {
       keys(raw, ['kind', 'reference', 'source']); fields = { reference: str(raw.reference, 2048), source: source(raw.source), evidence: 'external_unverified' };
     } else if (kind === 'rule_reference') {
       keys(raw, ['kind', 'rule_id', 'version', 'source']); const rule = this.get('rules', identifier(raw.rule_id));

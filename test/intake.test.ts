@@ -850,6 +850,25 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(briefing.total).toBe(0);
     expect((await ok('/tasks/' + task.id + '/links')).task.payload_data.history).toHaveLength(10);
   });
+  it('allows a report to supersede one existing report event by id, and rejects unknown targets', async () => {
+    let { task } = await create();
+    task = (await append(task.id, task.version, { kind: 'report', reference: 'a'.repeat(40), source })).task;
+    const previous = task.payload_data.history.at(-1);
+    task = (await append(task.id, task.version, { kind: 'report', reference: 'b'.repeat(40), supersedes: [previous.id], source })).task;
+    expect(task.payload_data.history.at(-1)).toMatchObject({ reference: 'b'.repeat(40), supersedes: [previous.id.toLowerCase()] });
+    const duplicate = await call('/tasks/' + task.id + '/events', {
+      key: 'duplicate-superseded-report-test', expected_version: task.version,
+      event: { kind: 'report', reference: 'c'.repeat(40), supersedes: [previous.id], source },
+    });
+    expect(duplicate.status).toBe(400);
+    expect((await duplicate.json() as any).error).toBe('report_already_superseded');
+    const invalid = await call('/tasks/' + task.id + '/events', {
+      key: 'unknown-superseded-report-test', expected_version: task.version,
+      event: { kind: 'report', reference: 'c'.repeat(40), supersedes: ['99999999-9999-4999-8999-999999999999'], source },
+    });
+    expect(invalid.status).toBe(400);
+    expect((await invalid.json() as any).error).toBe('unknown_superseded_report');
+  });
   it('requires current session CSRF and supports current token-admin cookie and human admin bearer', async () => {
     expect((await SELF.fetch('https://hub.test/api/intake/tasks')).status).toBe(401);
     expect((await call('/tasks', { key: 'x' }, undefined, { 'x-csrf-token': '' })).status).toBe(403);

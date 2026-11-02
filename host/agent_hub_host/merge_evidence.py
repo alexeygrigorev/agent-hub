@@ -58,36 +58,58 @@ def existing_commits(repo: str, candidates: list, runner: Callable = subprocess.
             if (p := _run(runner, ['git', 'cat-file', '-e', c + '^{commit}'], repo)) is not None and p.returncode == 0]
 
 
-def explicit_commit_refs(history: list) -> list:
-    """Return the latest report head plus every explicit commit event SHA.
+def active_report_references(history: list) -> list:
+    """Return report/commit refs, excluding only explicitly superseded reports.
 
-    A ``report`` reference records a branch-head checkpoint. Rebase replaces
-    that checkpoint, so older report references are audit history, not commits
-    that must also become reachable from main. A ``commit`` event is an
-    immutable deliverable reference and remains required cumulatively. Note
-    text, intake/session/launch ids and uuid fragments never count here;
-    free-text candidates go through ``shas_from_text`` + ``existing_commits``.
+    Supersession points to a prior report event id, never to a SHA by itself.
+    Malformed or dangling supersession data is ignored so the original report
+    remains required and missing commits continue to fail closed.
     """
-    active: list[tuple[int, str]] = []
-    latest_report: tuple[int, str] | None = None
-    for index, entry in enumerate(history if isinstance(history, list) else []):
-        if not isinstance(entry, dict) or entry.get('kind') not in ('report', 'commit'):
-            continue
-        ref = str(entry.get('reference') or '').strip()
-        if not SHA.fullmatch(ref):
-            continue
-        normalized = ref.lower()
-        if entry.get('kind') == 'report':
-            latest_report = (index, normalized)
-        else:
-            active.append((index, normalized))
+    reports = {}
+    for index, event in enumerate(history if isinstance(history, list) else []):
+        if isinstance(event, dict) and event.get('kind') == 'report' and isinstance(event.get('id'), str):
+            reports[event['id'].lower()] = (index, event)
 
-    if latest_report is not None:
-        active.append(latest_report)
+    superseded = set()
+    events = history if isinstance(history, list) else []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or event.get('kind') != 'report':
+            continue
+        targets = event.get('supersedes')
+        if not isinstance(targets, list) or not targets or len(targets) > 32:
+            continue
+        normalized = [target.lower() for target in targets if isinstance(target, str)]
+        if len(normalized) != len(targets) or len(set(normalized)) != len(normalized):
+            continue
+        valid = True
+        for target in normalized:
+            prior = reports.get(target)
+            reference = prior[1].get('reference') if prior else None
+            if prior is None or prior[0] >= index or not isinstance(reference, str) or not SHA.fullmatch(reference):
+                valid = False
+                break
+        if valid:
+            superseded.update(normalized)
+
     refs = []
-    for _, ref in sorted(active):
-        if ref not in refs:
-            refs.append(ref)
+    for event in events:
+        if not isinstance(event, dict) or event.get('kind') not in ('report', 'commit'):
+            continue
+        if event.get('kind') == 'report' and isinstance(event.get('id'), str) and event['id'].lower() in superseded:
+            continue
+        reference = event.get('reference')
+        if isinstance(reference, str) and SHA.fullmatch(reference.strip()):
+            refs.append(reference.strip())
+    return refs
+
+
+def explicit_commit_refs(history: list) -> list:
+    """Return normalized, unique explicit commit refs after report supersession."""
+    refs = []
+    for ref in active_report_references(history):
+        normalized = ref.strip().lower()
+        if SHA.fullmatch(normalized) and normalized not in refs:
+            refs.append(normalized)
     return refs
 
 
