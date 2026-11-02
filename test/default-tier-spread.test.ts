@@ -9,9 +9,14 @@ import { freshCpu } from './cpu-fixture';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
-const metered = (at: string, resetAt: string, pct: number) => JSON.stringify({
+// Windows are half elapsed (on schedule for scheduleBurnFactor), so this test exercises the load/headroom spread
+// and not the burn-rate boost a nearly-expired window gives the fullest account.
+const metered = (at: string, pct: number, now: number) => JSON.stringify({
   status: 'ok', error: null, observed_at: at, details: { limit_reached: false },
-  windows: { '5h': { present: true, percent_remaining: pct, reset_at: resetAt, error: null }, '7d': { present: true, percent_remaining: pct, reset_at: resetAt, error: null } },
+  windows: {
+    '5h': { present: true, percent_remaining: pct, reset_at: new Date(now + 2.5 * 3600000).toISOString(), error: null },
+    '7d': { present: true, percent_remaining: pct, reset_at: new Date(now + 3.5 * 86400000).toISOString(), error: null },
+  },
 });
 const broken = (at: string) => JSON.stringify({ status: 'unknown', error: 'unavailable', observed_at: at, details: { limit_reached: null }, windows: {} });
 
@@ -65,8 +70,8 @@ describe('default tier placement', () => {
       expect(put.status, await put.clone().text()).toBe(200);
       const sub = (account: string, service: string, quota: string) => hub.sql.exec(
         'INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)', machine, account, service, null, iso(), quota);
-      sub('shared-codex', 'codex', metered(iso(), iso(3600000), 60));
-      sub('shared-claude', 'claude', metered(iso(), iso(3600000), 27));
+      sub('shared-codex', 'codex', metered(iso(), 60, now));
+      sub('shared-claude', 'claude', metered(iso(), 27, now));
       // The probes for the unmetered engines fail on the host, as observed live.
       sub('hub-antigravity', 'gemini', broken(iso()));
       sub('shared-go', 'go', broken(iso()));
