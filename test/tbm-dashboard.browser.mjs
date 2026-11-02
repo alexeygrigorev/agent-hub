@@ -41,6 +41,17 @@ let banked = () => ({
     { tranche_id: 't-late', pool_id: 'codex:main', provider: 'codex', label: 'bonus', allocated_tokens: 20000, remaining_tokens: 20000, granted_at_ms: NOW - 3600000, expires_at_ms: NOW + 50 * 3600000, status: 'active', banked_burn_rate_tpm: 0, target_banked_burn_rate_tpm: 5, expired_unused_tokens: 0, updated_at_ms: NOW },
   ],
 });
+const metrics = () => ({
+  as_of: new Date(NOW).toISOString(),
+  windows: Object.fromEntries(['24h', '7d'].map((window) => [window, { pools: [{
+    pool_id: 'codex:main', provider: 'codex', account: 'main',
+    metrics: {
+      useful_work_per_tokens: { value: 12.5, unit: 'VU/MTok' },
+      engine_mix: { value: { free: 1, paid: 0, grok: 0 }, unit: 'fraction' },
+      burn_rate_vs_pacing_target: { value: null, unit: 'ratio', reason: 'No historical pacing samples.' },
+    },
+  }] }])),
+});
 let killState = { active: false, reason: '' };
 let authStatus = 200;
 let mode = 'normal';
@@ -87,6 +98,11 @@ try {
         assert.equal(request.headers()['x-csrf-token'], 'fixture');
         if (mode === 'error') return route.fulfill({ status: 503, body: '' });
         return route.fulfill({ json: banked() });
+      }
+      if (u.pathname === '/api/quota/metrics') {
+        assert.equal(request.headers()['x-csrf-token'], 'fixture');
+        if (mode === 'error') return route.fulfill({ status: 503, body: '' });
+        return route.fulfill({ json: metrics() });
       }
       if (u.pathname === '/api/quota/kill-switch') {
         if (request.method() === 'POST') {
@@ -137,6 +153,11 @@ try {
     assert.match(await page.locator('#tbm-pacing').innerText(), /quota-percent projection/i);
     assert.match(await page.locator('#tbm-pacing').innerText(), /real token/i);
     assert.match(await page.locator('#tbm-pacing').innerText(), /window 7d/);
+    assert.match(await page.locator('#tbm-metrics').innerText(), /24h/);
+    assert.match(await page.locator('#tbm-metrics').innerText(), /7d/);
+    assert.match(await page.locator('#tbm-metrics').innerText(), /Useful work per tokens/);
+    assert.match(await page.locator('#tbm-metrics').innerText(), /12\.5 VU\/MTok/);
+    assert.match(await page.locator('#tbm-metrics').innerText(), /Unknown — No historical pacing samples/);
     assert.match(await page.locator('#tbm').innerText(), /routing factors/i);
     // Banked deadlines sorted earliest first.
     const firstRow = await page.locator('#tbm-banked tbody tr').first().innerText();
