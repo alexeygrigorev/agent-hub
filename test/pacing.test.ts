@@ -7,7 +7,7 @@ import { modelCandidates, policy } from '../src/model-routing';
 import {
   bankedUrgencyMultiplier, baseTargetTpm, edfOrder, grokDemotion, hardFloorTokens, loadProviderPacing, netHeadroom,
   newPidState, pacingAlignment, pacingStep, providerPacing, providerPreference, refreshPacing, resetUrgency, routeScore,
-  selectBurnSource, softReserveTokens, taskFit, trancheUrgencyTpm, type PidState, type TbmPoolRow, type TbmTrancheRow,
+  scheduleBurnFactor, selectBurnSource, softReserveTokens, taskFit, trancheUrgencyTpm, type PidState, type TbmPoolRow, type TbmTrancheRow,
 } from '../src/pacing';
 
 const H = 3600000; const MIN = 60000; const NOW = Date.UTC(2026, 9, 22, 12);
@@ -19,6 +19,25 @@ const pool = (o: Partial<TbmPoolRow> = {}): TbmPoolRow => ({
 const tranche = (id: string, hours: number, remaining = 1_000_000, o: Partial<TbmTrancheRow> = {}): TbmTrancheRow => ({
   tranche_id: id, pool_id: 'zai:default', provider: 'zai', remaining_tokens: remaining, expires_at_ms: NOW + hours * H,
   status: 'active', banked_burn_rate_tpm: 0, target_banked_burn_rate_tpm: 0, expired_unused_tokens: 0, ...o,
+});
+
+describe('scheduleBurnFactor (burn-rate spread)', () => {
+  const win = (pct: number, hoursLeft: number) => ({ windows: { '7d': { present: true, percent_remaining: pct, reset_at: new Date(NOW + hoursLeft * H).toISOString() } } });
+  it('ranks the account most behind schedule highest', () => {
+    const behind = scheduleBurnFactor(win(48, 24), NOW); const onPace = scheduleBurnFactor(win(50, 84), NOW);
+    expect(behind.ratio).toBeCloseTo(0.48 / (24 / 168)); expect(behind.factor).toBeGreaterThan(onPace.factor);
+  });
+  it('makes a low-headroom account that is ahead of schedule lose to one with room', () => {
+    const claude = scheduleBurnFactor(win(15, 84), NOW); const other = scheduleBurnFactor(win(31, 84), NOW);
+    expect(claude.factor).toBeLessThan(0.1); expect(other.factor).toBeGreaterThan(5 * claude.factor);
+  });
+  it('does not penalise a low-headroom account that is behind schedule near its reset', () => {
+    expect(scheduleBurnFactor(win(15, 4), NOW).factor).toBe(3);
+  });
+  it('is neutral for unmetered windows', () => {
+    expect(scheduleBurnFactor({ windows: {} }, NOW).factor).toBe(1);
+    expect(scheduleBurnFactor(null, NOW).factor).toBe(1);
+  });
 });
 
 describe('safety floors', () => {
