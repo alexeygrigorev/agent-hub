@@ -135,7 +135,18 @@ export class MergeGate {
     if (b.deploy !== undefined) {
       if (!b.deploy || typeof b.deploy !== 'object' || !DEPLOY_STATES.includes(b.deploy.state)) fail('invalid_deploy');
       deployState = b.deploy.state;
-      deployJson = { ...(clip(b.deploy.sha, 64) ? { sha: clip(b.deploy.sha, 64) } : {}), ...(clip(b.deploy.run, 300) ? { run: clip(b.deploy.run, 300) } : {}) };
+      const deployedSha = clip(b.deploy.deployed_sha, 64);
+      if (deployedSha && !SHA.test(deployedSha)) fail('invalid_deploy');
+      const runId = typeof b.deploy.run_id === 'number' && Number.isSafeInteger(b.deploy.run_id) && b.deploy.run_id >= 0
+        ? String(b.deploy.run_id) : clip(b.deploy.run_id, 32);
+      if (runId && !/^\d{1,32}$/.test(runId)) fail('invalid_deploy');
+      deployJson = {
+        ...(clip(b.deploy.sha, 64) ? { sha: clip(b.deploy.sha, 64) } : {}),
+        ...(clip(b.deploy.run, 300) ? { run: clip(b.deploy.run, 300) } : {}),
+        ...(runId ? { run_id: runId } : {}),
+        ...(clip(b.deploy.conclusion, 32) ? { conclusion: clip(b.deploy.conclusion, 32) } : {}),
+        ...(deployedSha ? { deployed_sha: deployedSha.toLowerCase() } : {}),
+      };
     }
     if (b.unmerged !== undefined && !(Number.isInteger(b.unmerged) && b.unmerged >= 0 && b.unmerged < 1e6)) fail('invalid_unmerged');
     if (b.head !== undefined && !(typeof b.head === 'string' && SHA.test(b.head))) fail('invalid_head');
