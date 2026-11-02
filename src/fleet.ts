@@ -46,7 +46,7 @@ export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_catalog_census (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, complete INTEGER NOT NULL CHECK (complete IN (0, 1)));
 CREATE TABLE IF NOT EXISTS fleet_queue_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), after_rowid INTEGER NOT NULL, high_water INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT, evidence_json TEXT, host_load_machine TEXT, host_load_factor REAL);
+CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT, evidence_json TEXT, host_load_machine TEXT, host_load_factor REAL, host_load_trigger TEXT, host_load_limit REAL);
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
 CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
@@ -333,6 +333,21 @@ function offerCwdOk(value: unknown): value is string {
 function object(value: any, keys: string[]): boolean {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => keys.includes(k));
 }
+function validHostLoad(reason: string, value: any): boolean {
+  if (!object(value, ['trigger', 'mem_avail_mb', 'mem_floor_mb', 'cpu_busy_pct', 'cpu_window_s', 'load1', 'cores', 'factor'])) return false;
+  if (value.trigger === 'mem_available') return reason === 'memory_pressure' &&
+    Object.keys(value).length === 3 && Number.isFinite(value.mem_avail_mb) && value.mem_avail_mb >= 0 && value.mem_avail_mb <= 1e9 &&
+    Number.isFinite(value.mem_floor_mb) && value.mem_floor_mb > 0 && value.mem_floor_mb <= 6144 && value.mem_avail_mb < value.mem_floor_mb;
+  if (value.trigger === 'cpu_busy') return reason === 'cpu_pressure' &&
+    Object.keys(value).length === 3 && Number.isFinite(value.cpu_busy_pct) && value.cpu_busy_pct >= CPU_SATURATED_PCT && value.cpu_busy_pct <= 100 &&
+    Number.isFinite(value.cpu_window_s) && value.cpu_window_s >= 10 && value.cpu_window_s <= 3600;
+  if (value.trigger === 'load_runaway') return reason === 'host_load_high' &&
+    Object.keys(value).length === 4 && Number.isFinite(value.load1) && value.load1 >= 0 && value.load1 <= 1e9 &&
+    Number.isInteger(value.cores) && value.cores >= 1 && value.cores <= 4096 &&
+    Number.isFinite(value.factor) && value.factor >= 0.5 && value.factor <= 8 &&
+    value.load1 > value.factor * value.cores;
+  return false;
+}
 function parsed(value: any, fallback: any = {}) { try { return JSON.parse(value || '{}'); } catch { return fallback; } }
 const NATIVE_AMOUNTS: Record<string, number> = { credits_remaining: 1e12, spend_used: 1e15, spend_limit: 1e15 };
 const NATIVE_UNITS = new Set(['percent', 'credits', 'usd_cents', 'requests', 'tokens']);
@@ -616,6 +631,8 @@ export class FleetService {
     if (!holdColumns.includes('evidence_json')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN evidence_json TEXT');
     if (!holdColumns.includes('host_load_machine')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN host_load_machine TEXT');
     if (!holdColumns.includes('host_load_factor')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN host_load_factor REAL');
+    if (!holdColumns.includes('host_load_trigger')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN host_load_trigger TEXT');
+    if (!holdColumns.includes('host_load_limit')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN host_load_limit REAL');
     initResourceRequestProjection(this.sql, 'fleet_launches');
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
     for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key', 'runtime_json', 'worker_status']) {
@@ -1048,11 +1065,11 @@ export class FleetService {
     } catch { /* alerting never breaks placement */ }
   }
 
-  plan(input: any, loadRefusal?: { machine: string; factor: number }) {
+  plan(input: any, loadRefusal?: { machine: string; factor: number; trigger?: string; limit?: number }) {
     return this.withMaintenance(() => this.planWithinMaintenance(input, loadRefusal));
   }
 
-  private planWithinMaintenance(input: any, loadRefusal?: { machine: string; factor: number }):
+  private planWithinMaintenance(input: any, loadRefusal?: { machine: string; factor: number; trigger?: string; limit?: number }):
     { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
     { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any>; hold_reason?: string; needs_machines?: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] } {
     if (input && (modelDisabledByPolicy(input.engine) || modelDisabledByPolicy(input.model) ||
@@ -1299,22 +1316,27 @@ export class FleetService {
           : !engineMissing && !modeMissing && workspaceMissing ? 'workspace_unavailable'
           : !engineMissing && modeMissing && !workspaceMissing ? 'mode_unavailable' : 'capability_unavailable';
       }
-      // Load remains advisory for fresh placement. A fenced host overload
-      // refusal supplies an internal, durable retry context; only that retry
-      // waits for this host's load to clear. Other eligible hosts may win.
-      else if (
-        loadRefusal !== undefined && loadRefusal.machine === route.machine_id &&
-        Number.isFinite(hb?.load?.[0]) && Number.isFinite(caps?.cpu_count) &&
-        caps.cpu_count > 0 && (
-          // Stored factors below the runaway default are legacy (1.5x) holds: never gate on them.
-          hb.load[0] > Math.max(loadRefusal.factor, HOST_LOAD_FACTOR) * caps.cpu_count
-          // Busy means measured CPU >= 98% averaged over >= 10s on a fresh sample, never load average.
-          || (() => {
-            const usage = sanitizeCpuUsage(hb.cpu_usage);
-            const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;
-            return usage?.busy_percent_window != null && age <= 180000 && age >= -30000 && usage.busy_percent_window >= CPU_SATURATED_PCT;
-          })())
-      ) reason = 'host_load_high';
+      // Load remains advisory for fresh placement. A fenced host refusal
+      // supplies an internal, durable retry context; only that retry waits
+      // for the same measured trigger to clear. Other eligible hosts may win.
+      else if (loadRefusal !== undefined && loadRefusal.machine === route.machine_id && (() => {
+        const trigger = loadRefusal.trigger || 'legacy';
+        if (trigger === 'mem_available') return Number.isFinite(hb.mem_avail_mb) && Number.isFinite(loadRefusal.limit) && hb.mem_avail_mb < loadRefusal.limit;
+        if (trigger === 'cpu_busy') {
+          const usage = sanitizeCpuUsage(hb.cpu_usage);
+          const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;
+          return usage?.busy_percent_window != null && age <= 180000 && age >= -30000 && usage.busy_percent_window >= (loadRefusal.limit ?? CPU_SATURATED_PCT);
+        }
+        const runaway = Number.isFinite(hb?.load?.[0]) && Number.isFinite(caps?.cpu_count) && caps.cpu_count > 0 &&
+          hb.load[0] > (trigger === 'load_runaway' ? loadRefusal.factor : Math.max(loadRefusal.factor, HOST_LOAD_FACTOR)) * caps.cpu_count;
+        if (trigger === 'load_runaway') return runaway;
+        // Holds written before trigger-specific diagnostics retained the old
+        // combined load/CPU behavior. New refusals gate only on their trigger.
+        const usage = sanitizeCpuUsage(hb.cpu_usage);
+        const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;
+        return runaway || (usage?.busy_percent_window != null && age <= 180000 && age >= -30000 && usage.busy_percent_window >= CPU_SATURATED_PCT);
+      })()) reason = loadRefusal.trigger === 'mem_available' ? 'memory_pressure'
+        : loadRefusal.trigger === 'cpu_busy' ? 'cpu_pressure' : 'host_load_high';
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         memory().reserved_mb,
         memory().requested_mb, this.resources.config(), hb.mem_total_mb)) reason = 'launcher_memory_reserve';
@@ -1339,8 +1361,10 @@ export class FleetService {
           ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}),
           ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}),
           ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}),
-          ...(reason === 'host_load_high' ? { load1: hb.load[0], cpu_count: caps.cpu_count, load_limit: Math.max(loadRefusal!.factor, HOST_LOAD_FACTOR) * caps.cpu_count, cpu_busy_window: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window ?? null } : {}),
-          ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}),
+          ...(reason === 'host_load_high' ? { ...(Number.isFinite(hb?.load?.[0]) ? { load1: hb.load[0] } : {}), cpu_count: caps.cpu_count, load_limit: (loadRefusal!.trigger === 'load_runaway' ? loadRefusal!.factor : Math.max(loadRefusal!.factor, HOST_LOAD_FACTOR)) * caps.cpu_count, cpu_busy_window: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window ?? null } : {}),
+          ...(reason === 'memory_pressure' && loadRefusal?.trigger === 'mem_available' ? { host_load: { trigger: 'mem_available', mem_avail_mb: hb.mem_avail_mb, mem_floor_mb: loadRefusal.limit } } : {}),
+          ...(reason === 'cpu_pressure' && loadRefusal?.trigger === 'cpu_busy' ? { host_load: { trigger: 'cpu_busy', cpu_busy_pct: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window, cpu_window_s: sanitizeCpuUsage(hb.cpu_usage)?.window_s } } : {}),
+          ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) && !((reason === 'memory_pressure' && loadRefusal?.trigger === 'mem_available') || (reason === 'cpu_pressure' && loadRefusal?.trigger === 'cpu_busy')) ? {cpu:cpu()} : {}),
         });
         continue;
       }
@@ -1597,10 +1621,12 @@ export class FleetService {
         }
         // These columns survive updates to the currently displayed hold reason.
         // A primary-key lookup keeps each host-polled drain slice bounded.
-        const memoryHold: any = this.sql.exec('SELECT since, refused, host_load_machine, host_load_factor FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
+        const memoryHold: any = this.sql.exec('SELECT since, refused, host_load_machine, host_load_factor, host_load_trigger, host_load_limit FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
         const loadRefusal = memoryHold?.host_load_machine ? {
           machine: String(memoryHold.host_load_machine),
           factor: Number.isFinite(memoryHold.host_load_factor) && memoryHold.host_load_factor >= 0.5 && memoryHold.host_load_factor <= 8 ? memoryHold.host_load_factor : HOST_LOAD_FACTOR,
+          trigger: ['mem_available', 'cpu_busy', 'load_runaway'].includes(memoryHold.host_load_trigger) ? String(memoryHold.host_load_trigger) : 'legacy',
+          limit: Number.isFinite(memoryHold.host_load_limit) ? memoryHold.host_load_limit : undefined,
         } : undefined;
         let plan: any;
         try { plan = this.plan(input, loadRefusal); } catch { continue; }
@@ -2634,10 +2660,11 @@ export class FleetService {
           if (data.host_load_factor !== undefined && (data.reason !== 'host_load_high' || typeof data.host_load_factor !== 'number' || !Number.isFinite(data.host_load_factor) || data.host_load_factor < 0.5 || data.host_load_factor > 8)) return response({ error: 'invalid_rejection' }, 400);
           const loadFactor = data.host_load_factor ?? HOST_LOAD_FACTOR;
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
-          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable', 'gate_reason', 'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s']) || !claimFieldsValid(diagnostic) || !gateReasonValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
+          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable', 'gate_reason', 'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s', 'host_load']) || !claimFieldsValid(diagnostic) || !gateReasonValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
               diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
               typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
-              !sanitizeCommandFields(diagnostic)) return response({ error: 'invalid_rejection' }, 400);
+              !sanitizeCommandFields(diagnostic) || (diagnostic.host_load !== undefined && !validHostLoad(data.reason, diagnostic.host_load)) ||
+              (diagnostic.host_load?.trigger === 'load_runaway' && data.host_load_factor !== diagnostic.host_load.factor)) return response({ error: 'invalid_rejection' }, 400);
           // The owning host may abandon its exact effect-free pending claim.
           // It fences native start in its journal before invoking an engine;
           // uncertain/native-start records must never use this protocol.
@@ -2662,15 +2689,24 @@ export class FleetService {
             // The fenced pre-claim refusal proves no native start. Retain the
             // failed attempt as route evidence and use a new launcher identity.
             const id = crypto.randomUUID();
-            const loadMachine: any = data.reason === 'host_load_high' ? this.sql.exec('SELECT last_heartbeat, capabilities FROM machines WHERE id = ?', row.machine_id).toArray()[0] : null;
+            const reportedHostLoad = diagnostic.host_load;
+            const hasHostLoad = reportedHostLoad !== undefined;
+            const loadMachine: any = (data.reason === 'host_load_high' || hasHostLoad) ? this.sql.exec('SELECT last_heartbeat, capabilities FROM machines WHERE id = ?', row.machine_id).toArray()[0] : null;
             const loadHeartbeat = parsed(loadMachine?.last_heartbeat) || {};
             const loadCores = parsed(loadMachine?.capabilities)?.cpu_count;
             const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason,
-              ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason) ? {cpu:this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id)} : {}),
-              ...(data.reason === 'host_load_high' ? { load1: loadHeartbeat.load?.[0] ?? null, cpu_count: loadCores ?? null, load_limit: Number.isFinite(loadCores) ? Math.max(loadFactor, HOST_LOAD_FACTOR) * loadCores : null } : {}) }];
+              ...(hasHostLoad ? { host_load: reportedHostLoad } : {}),
+              ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason) && !hasHostLoad ? {cpu:this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id)} : {}),
+              ...(data.reason === 'host_load_high' && !hasHostLoad ? { load1: Number.isFinite(loadHeartbeat.load?.[0]) ? loadHeartbeat.load[0] : null, cpu_count: loadCores ?? null, load_limit: Number.isFinite(loadCores) ? Math.max(loadFactor, HOST_LOAD_FACTOR) * loadCores : null } : {}),
+              ...(data.reason === 'host_load_high' && reportedHostLoad?.trigger === 'load_runaway' ? { load1: reportedHostLoad.load1, cpu_count: reportedHostLoad.cores, load_limit: reportedHostLoad.factor * reportedHostLoad.cores } : {}) }];
             this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ?", 'model-retry-' + row.id, data.reason, at, at, row.id);
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
-            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, host_load_machine, host_load_factor) VALUES (?, ?, ?, ?, ?)', id, at, JSON.stringify(rejected), data.reason === 'host_load_high' ? row.machine_id : null, data.reason === 'host_load_high' ? loadFactor : null);
+            const hostLoadTrigger = hasHostLoad ? String(reportedHostLoad.trigger) : null;
+            const hostLoadLimit = reportedHostLoad?.trigger === 'mem_available' ? reportedHostLoad.mem_floor_mb
+              : reportedHostLoad?.trigger === 'cpu_busy' ? reportedHostLoad.cpu_busy_pct : null;
+            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, host_load_machine, host_load_factor, host_load_trigger, host_load_limit) VALUES (?, ?, ?, ?, ?, ?, ?)',
+              id, at, JSON.stringify(rejected), (hasHostLoad || data.reason === 'host_load_high') ? row.machine_id : null,
+              data.reason === 'host_load_high' ? loadFactor : null, hostLoadTrigger, hostLoadLimit);
             if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
               this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, state = 'queued', updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held','starting')", id, at, row.id);
             }
