@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Crash-safe, non-preemptive heavy-test admission; never unlink shared locks."""
+import ast
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -83,6 +86,92 @@ try:  # test hook; invalid values keep the default
 except Exception:
     pass
 REAP_INTERVAL_S = 60
+
+ADMISSION_PROTOCOL_VERSION = 1
+
+
+def active_release_module():
+    """Return the verified admission module in the active host release, if supported."""
+    release_root = Path(os.environ.get(
+        'AGENT_HUB_HOST_RELEASES_DIR',
+        str(Path.home() / '.local/share/agent-hub/host-releases'))).resolve()
+    module_rel = Path('host/agent_hub_host/heavy_test_admission.py')
+    try:
+        result = subprocess.run(
+            ['systemctl', '--user', 'show', 'agent-hub-session-host.service',
+             '--property=ExecStart', '--value'],
+            capture_output=True, text=True, timeout=5, check=False)
+        if result.returncode != 0:
+            return None
+        match = re.search(r'(?:^|[ {])path=([^;]+)', result.stdout.strip())
+        if not match:
+            return None
+        executable = Path(os.path.abspath(match.group(1).strip().strip('"')))
+        if executable.parent.name != 'bin' or executable.parent.parent.name != '.venv':
+            return None
+        release = executable.parent.parent.parent
+        if (release.parent != release_root or release.resolve().parent != release_root
+                or not executable.is_file()
+                or not re.fullmatch(r'[0-9a-f]{40}', release.name)):
+            return None
+        verifier = release / 'scripts' / 'verify-host-release.py'
+        if not verifier.is_file() or verifier.is_symlink():
+            raise RuntimeError('active host release verifier is missing')
+        verified = subprocess.run(
+            [str(executable), str(verifier), str(release)],
+            capture_output=True, text=True, timeout=60, check=False)
+        if verified.returncode != 0:
+            raise RuntimeError('active host release verification failed')
+        try:
+            manifest = json.loads((release / 'release-manifest.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError) as error:
+            raise RuntimeError('active host release manifest is unreadable') from error
+        if manifest.get('release_rev') != release.name:
+            raise RuntimeError('active host release revision mismatch')
+        repository = Path(__file__).resolve().parents[1]
+        ancestor = subprocess.run(
+            ['git', '-C', str(repository), 'merge-base', '--is-ancestor',
+             'd8740aaca3944a295680177a40148bb00accea78', release.name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10, check=False)
+        if ancestor.returncode == 1:
+            return None
+        if ancestor.returncode != 0:
+            raise RuntimeError('cannot verify active host release revision')
+        module = release / module_rel
+        if not module.is_file() or module.is_symlink():
+            return None
+        expected_hash = manifest.get('files_sha256', {}).get(module_rel.as_posix())
+        if not isinstance(expected_hash, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_hash):
+            return None
+        data = module.read_bytes()
+        if hashlib.sha256(data).hexdigest() != expected_hash:
+            raise RuntimeError('active host release admission module hash mismatch')
+        tree = ast.parse(data, filename=str(module))
+        protocol = next((node.value.value for node in tree.body
+                         if isinstance(node, ast.Assign)
+                         and any(isinstance(target, ast.Name)
+                                 and target.id == 'ADMISSION_PROTOCOL_VERSION'
+                                 for target in node.targets)
+                         and isinstance(node.value, ast.Constant)
+                         and type(node.value.value) is int), None)
+        if protocol != ADMISSION_PROTOCOL_VERSION:
+            return None
+        return module
+    except RuntimeError:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError, TypeError):
+        return None
+
+
+def dispatch_to_active_release():
+    try:
+        module = active_release_module()
+    except RuntimeError as error:
+        print(f'capped-test-run: REFUSED: {error}', file=sys.stderr)
+        raise SystemExit(126)
+    if module is not None:
+        os.execv(sys.executable, [sys.executable, str(module), *sys.argv[1:]])
 
 
 def refuse(reason):
@@ -629,6 +718,7 @@ def main():
 
 
 if __name__ == '__main__':
+    dispatch_to_active_release()
     try:
         sys.exit(main())
     except (OSError, ValueError, OverflowError, RecursionError) as error:

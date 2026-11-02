@@ -146,6 +146,8 @@ class ReleaseCompletenessTests(unittest.TestCase):
             (target / "host" / "agent_hub_host").mkdir(parents=True)
             init = target / "host" / "agent_hub_host" / "__init__.py"
             init.write_text("# pristine")
+            admission = target / "host" / "agent_hub_host" / "heavy_test_admission.py"
+            admission.write_text("ADMISSION_PROTOCOL_VERSION = 1\n")
             files = {}
             for name, body in [
                 ("config/model-routing.json", "{}"),
@@ -161,6 +163,8 @@ class ReleaseCompletenessTests(unittest.TestCase):
                 dest.write_text(body)
                 files[name] = hashlib.sha256(body.encode()).hexdigest()
             files["host/agent_hub_host/__init__.py"] = hashlib.sha256(b"# pristine").hexdigest()
+            files["host/agent_hub_host/heavy_test_admission.py"] = hashlib.sha256(
+                b"ADMISSION_PROTOCOL_VERSION = 1\n").hexdigest()
             (target / "release-manifest.json").write_text(json.dumps({
                 "manifest_version": json.loads(MANIFEST.read_text())["version"],
                 "release_rev": "0" * 40,

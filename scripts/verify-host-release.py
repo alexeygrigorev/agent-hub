@@ -24,17 +24,21 @@ MANIFEST_TEMPLATE = REPO / "scripts" / "host-release-manifest.json"
 
 SMOKE = (
     "import sys;"
-    "from agent_hub_host import model_contract as mc, native_admission as na;"
+    "from agent_hub_host import model_contract as mc, native_admission as na, heavy_test_admission as hta;"
     "models = mc.policy_models(); rules = na.routing_rules(); aliases = mc.account_aliases();"
     "assert isinstance(models, list) and models, 'no policy models';"
     "assert isinstance(rules, dict) and rules, 'no routing rules';"
     "assert isinstance(aliases, dict), 'aliases malformed';"
+    "assert hta.ADMISSION_PROTOCOL_VERSION == 1, 'heavy admission protocol unsupported';"
     "import os;"
     "host_root = os.path.realpath(os.path.join(os.environ.get('RELEASE_DIR', ''), 'host'));"
     "assert os.path.realpath(mc.__file__).startswith(host_root), 'model_contract not from release';"
     "assert os.path.realpath(na.__file__).startswith(host_root), 'native_admission not from release';"
+    "assert os.path.realpath(hta.__file__).startswith(host_root), 'heavy_test_admission not from release';"
     "print('smoke ok: models=' + str(len(models)) + ' rules=' + str(len(rules)) + ' aliases=' + str(len(aliases)))"
 )
+
+REQUIRED_ADMISSION_MODULE = "host/agent_hub_host/heavy_test_admission.py"
 
 
 def fail(message):
@@ -115,9 +119,13 @@ def main(argv):
                 return fail("package file changed after build: " + name)
         if "host/agent_hub_host/__init__.py" not in actual:
             return fail("host package entry is missing")
+    if REQUIRED_ADMISSION_MODULE not in hashes:
+        return fail("heavy-test admission module is missing from the manifest")
     venv_python = release / ".venv" / "bin" / "python"
     if not venv_python.is_file():
         return fail("release interpreter is missing (.venv/bin/python)")
+    if not (release / "scripts" / "verify-host-release.py").is_file():
+        return fail("release verifier is missing")
     if not (release / ".local" / "tmp").is_dir():
         return fail("release tmp dir is missing (.local/tmp)")
     env = {"PYTHONPATH": str(release / "host"), "PATH": "/usr/bin:/bin",

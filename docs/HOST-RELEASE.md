@@ -19,6 +19,9 @@ after the switch.
 - `scripts/metrics-dashboard-export.py` — read by `metrics_producer.py`.
 - `pyproject.toml`, `uv.lock` — build provenance.
 - `host/` — the `agent_hub_host` package.
+- `host/agent_hub_host/heavy_test_admission.py` — versioned shared heavy-test
+  admission implementation, selected by worktree wrappers only after matching
+  the active service release manifest and module hash.
 - `release-manifest.json` — written by the build with the git rev and sha256
   of every required file, plus `.venv/` with a release-local interpreter.
 
@@ -28,9 +31,32 @@ reads (`parents[2] / ...`) and fails if any is missing from the manifest.
 ## Install-time smoke gate
 
 `scripts/verify-host-release.py <release-dir>` checks every manifest file
-(presence + sha256) and smoke-loads the release's own routing config by
-importing `model_contract` and `native_admission` from the release and
-loading policy models, routing rules and account aliases.
+(presence + sha256), requires the shared heavy-test module, and smoke-loads the
+release's own routing config by importing `model_contract`, `native_admission`,
+and the supported heavy-test admission protocol from the release.
+
+`scripts/capped-test-run.sh` asks the active user service for its `ExecStart`,
+runs the release's own verifier, requires `release_rev` to contain d8740aac,
+checks the packaged module hash, then executes that module directly (no wrapper
+recursion). If the active release predates d8740aac, the worktree script is the
+fallback. `scripts/test-affected-local.sh` holds with a rebase instruction
+before taking a slot when its worktree predates that revision; rebasing is
+voluntary.
+
+The host session loop also watches its shared admission pool. After a 10-second
+zero-CPU sample confirms a queued admission is nested under a slot holder, and
+only when no test runner is present in that process tree, it sends SIGTERM to
+the queued command's process group and appends a sanitized note to the linked
+intake. It never unlinks lock files or signals an admitted test process.
+
+Existing worktrees are never rewritten by the host release switch. Until each
+worktree rebases, old one-off test commands that bypass
+`scripts/test-affected-local.sh` still use their local legacy gate. The host
+reaper covers visible Linux process trees that hold a shared-pool ticket; a
+process hidden from the host's `/proc`, a nonstandard admission command name,
+or a test runner not recognized by the conservative active-runner list may
+remain outside that protection. Rollout should prompt owners to rebase and
+skip dirty, unpushed, locked or live worktrees rather than forcing updates.
 
 `scripts/switch-host-release.py` refuses to write any drop-in unless the
 release verifies: it clones `--template` (normally the active drop-in),

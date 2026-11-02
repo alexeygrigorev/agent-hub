@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "files": [
     "config/model-routing.json",
     "scripts/session-host-supervisor.py",
@@ -8,7 +8,8 @@
     "scripts/verify-host-release.py",
     "scripts/switch-host-release.py",
     "pyproject.toml",
-    "uv.lock"
+    "uv.lock",
+    "host/agent_hub_host/heavy_test_admission.py"
   ],
   "hashed_trees": [
     "host"

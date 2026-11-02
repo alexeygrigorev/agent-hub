@@ -24,6 +24,12 @@ while [ "$#" -gt 0 ]; do
 done
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}" || exit 1
+ADMISSION_BASE="d8740aaca3944a295680177a40148bb00accea78"
+if ! git cat-file -e "${ADMISSION_BASE}^{commit}" 2>/dev/null || \
+   ! git merge-base --is-ancestor "${ADMISSION_BASE}" HEAD; then
+  echo "HOLD: this worktree predates the fixed heavy-test admission in d8740aac; rebase it onto current origin/main, then rerun this gate." >&2
+  exit 2
+fi
 unset APLEXER_TAG APLEXER_WORKSPACE HUB_WORKER_CONFIG_FILE HUB_CONFIG_FILE
 
 PLAN="$(python3 scripts/ci/affected_tests.py "${BASE}")" || exit 1
