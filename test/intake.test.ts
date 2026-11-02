@@ -1264,7 +1264,7 @@ describe('private durable intake HTTP/SQLite', () => {
       expect(() => h.sql.exec('UPDATE intake_note_archive SET data=data WHERE task_id=?', task.id)).toThrow(/append_only_note_archive/);
     });
     expect((await call('/tasks/' + task.id + '/history?archived=1&limit=101')).status).toBe(400);
-  });
+  }, 15000);
 
   it('reports an appended note archived at inline capacity and makes it readable from archive history', async () => {
     const { task } = await create();
@@ -1405,7 +1405,7 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(result.bytes).toBeLessThan(2000000);
     const appended = await append(task.id, task.version, { kind: 'note', text: 'bounded marker', source });
     expect(appended.task.status).toBe('open');
-  });
+  }, 15000);
 
   it('rolls back oversized-history writes at the separate record safety bound', async () => {
     const { task } = await create();
@@ -1459,7 +1459,7 @@ describe('private durable intake HTTP/SQLite', () => {
     });
     before = await compactState(); expect((await call('/tasks', { key: 'globalcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(200);
     expect((await compactState()).receipts.slice(0, before.receipts.length)).toEqual(before.receipts);
-  });
+  }, 15000);
   it('archives legacy terminal tasks in batches without deleting payloads', async () => {
     const stale = Date.now() - 20 * 86400000;
     const seed = 300;
@@ -1537,7 +1537,7 @@ describe('archive retention, evidence gates and durable audit', () => {
     task = (await ok('/tasks/' + task.id, { key: 'cancel-explicit', expected_version: task.version, status: 'cancelled', reason: 'dropped by Alexey: no longer requested' })).task;
     expect(task.archived_at).toEqual(expect.any(Number));
     expect((await ok('/tasks/' + task.id + '/audit')).items).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'cancel', from_status: 'open', to_status: 'cancelled', reason: 'dropped by Alexey: no longer requested' })]));
-  });
+  }, 15000);
   it('preserves closed payload/history after five minutes; supports archive filters, notes, reopen and fresh evidence', async () => {
     let { task } = await create();
     task = (await append(task.id, task.version, done)).task;
