@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import uuid
 import math
 import os
 import platform
@@ -1044,9 +1045,21 @@ def provision_managed_home(bundle=None, home=None, dest=None):
     if isinstance(bundle, dict) and bundle.get('provider') == 'antigravity':
         marker = home / ANTIGRAVITY_ONBOARDING
         try:
-            marker.read_bytes()
-        except OSError:
-            private_fs.atomic_write(marker, ANTIGRAVITY_ONBOARDING_JSON.encode(), 4096, engine_owned=True)
+            current = json.loads(marker.read_bytes())
+        except (OSError, ValueError):
+            current = None
+        # The CLI itself writes onboardingComplete:false on a first headless start, and
+        # then fails with 'plan model not specified' (desktop). Only a completed marker
+        # is left alone.
+        if not (isinstance(current, dict) and current.get('onboardingComplete') is True):
+            merged = dict(current) if isinstance(current, dict) else {}
+            merged.update(json.loads(ANTIGRAVITY_ONBOARDING_JSON))
+            # Plain write: the CLI creates cache/ itself with inherited (non-private) ACEs on Windows,
+            # which private_fs refuses; this marker is non-secret engine state.
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            staged = marker.with_name(marker.name + '.' + uuid.uuid4().hex + '.tmp')
+            staged.write_text(json.dumps(merged, indent=2) + chr(10), encoding='utf-8')
+            os.replace(staged, marker)
 
     return home
 

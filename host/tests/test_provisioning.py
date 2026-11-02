@@ -1608,6 +1608,11 @@ def test_antigravity_home_is_seeded_past_theme_and_data_sharing_prompts(tmp_path
     marker.write_text('{"onboardingComplete": true, "kept": 1}')
     p.provision_managed_home(b, home, tmp_path)  # idempotent, never overwrites engine state
     assert json.loads(marker.read_text())['kept'] == 1
+    # The CLI's own incomplete marker (written on a first headless start) is completed, keeping other keys.
+    marker.write_text('{"onboardingComplete": false, "enterpriseOnboardingComplete": false, "kept": 2}')
+    p.provision_managed_home(b, home, tmp_path)
+    fixed = json.loads(marker.read_text())
+    assert fixed['onboardingComplete'] is True and fixed['kept'] == 2
     other = tmp_path / 'other'
     p.provision_managed_home(dict(b, provider='codex'), other, tmp_path)
     assert not (other / p.ANTIGRAVITY_ONBOARDING).exists()
