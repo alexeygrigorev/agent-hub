@@ -1,7 +1,7 @@
 ﻿"""Windows rollout defects of 2026-11-02: live orphan controller, dead proxy, stale PATH, locked settings."""
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -77,10 +77,10 @@ class StaleReleasePath(unittest.TestCase):
         old = 'C:' + chr(92) + 'Users' + chr(92) + 'a' + chr(92) + 'AppData' + chr(92) + 'Local' + chr(92) + 'Programs' + chr(92) + 'aplexer' + chr(92) + 'bin'
         self.assertEqual(h.prune_stale_release_paths([old, '/x/other'], 'cur'), ['/x/other'])
         with patch.object(b.sys, 'platform', 'win32'), patch.object(b, 'architecture', return_value='x64'),                 patch.object(b, 'run') as run, patch.dict(os.environ, {'PATH': old + os.pathsep + 'Q'}):
-            b.publish_user_path(Path('C:/x/agent-hub/releases/cur'))
-            parts = os.environ['PATH'].split(os.pathsep)
-        self.assertNotIn(old, parts)
-        self.assertEqual(parts[0], str(Path('C:/x/agent-hub/releases/cur') / 'bin'))
+            b.publish_user_path(PureWindowsPath('C:/x/agent-hub/releases/cur'))
+            value = os.environ['PATH']
+        self.assertNotIn(old, value)
+        self.assertTrue(value.startswith(str(PureWindowsPath('C:/x/agent-hub/releases/cur') / 'bin')))
         self.assertIn('aplexer', run.call_args[0][0][-1])
 
     def test_engine_env_uses_release_node_and_drops_stale_entries(self):
@@ -97,7 +97,7 @@ class StaleReleasePath(unittest.TestCase):
     def test_user_path_script_prunes_stale_releases(self):
         with patch.object(b.sys, 'platform', 'win32'), patch.object(b, 'architecture', return_value='x64'), \
                 patch.object(b, 'run') as run, patch.dict(os.environ, {'PATH': ''}):
-            b.publish_user_path(Path(r'C:\x\agent-hub\releases\cur-bbb'))
+            b.publish_user_path(PureWindowsPath('C:/x/agent-hub/releases/cur-bbb'))
         script = run.call_args[0][0][-1]
         self.assertIn("$cur='cur-bbb'", script)
         self.assertIn('agent-hub', script)
