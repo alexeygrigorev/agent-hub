@@ -545,7 +545,17 @@ def execute(args):
             if after is not None:
                 params['after'] = after
             return request('GET', path + '/history?' + urlencode(params))
-        return request('GET', path + ('' if command == 'show' else '/' + command))
+        result = request('GET', path + ('' if command == 'show' else '/' + command))
+        if command == 'show' and isinstance(result, dict):
+            task = result.get('task')
+            archive = task.get('history_archive') if isinstance(task, dict) else None
+            if isinstance(archive, dict) and isinstance(archive.get('count'), int) and archive['count'] > 0:
+                latest = archive.get('latest_sequence')
+                if type(latest) is int and latest > 0:
+                    archive['read_command'] = f'hub intake history {safe_id(args.id)} --archived --after {latest - 1} --limit 1'
+                else:
+                    archive['read_command'] = f'hub intake history {safe_id(args.id)} --archived'
+        return result
     if command == 'revoke':
         return request('POST', BASE + '/grants/' + safe_id(args.id) + '/revoke', json_file(args.payload_file))
     key = args.key or (command + '-' + uuid.uuid4().hex if command in ('update', 'close') else None)
