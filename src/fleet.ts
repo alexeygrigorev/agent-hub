@@ -2770,7 +2770,12 @@ export class FleetService {
           if (data.host_load_factor !== undefined && (data.reason !== 'host_load_high' || typeof data.host_load_factor !== 'number' || !Number.isFinite(data.host_load_factor) || data.host_load_factor < 0.5 || data.host_load_factor > 8)) return response({ error: 'invalid_rejection' }, 400);
           const loadFactor = data.host_load_factor ?? HOST_LOAD_FACTOR;
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
-          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable', 'gate_reason', 'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s', 'host_load']) || !claimFieldsValid(diagnostic) || !gateReasonValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
+          const hasLockOwner = ['lock_owner', 'lock_owner_state', 'recovery'].some(key => Object.hasOwn(diagnostic, key));
+          const lockOwnerValid = !hasLockOwner || (data.reason === 'dispatch_worktree_refused' &&
+            typeof diagnostic.lock_owner === 'string' && /^[0-9a-fA-F-]{8,64}$/.test(diagnostic.lock_owner) &&
+            ['queued', 'held', 'offered', 'starting', 'running', 'uncertain', 'stopped', 'finished', 'failed', 'refused', 'cancelled', 'terminal', 'native-terminal', 'non-terminal', 'unknown'].includes(diagnostic.lock_owner_state) &&
+            diagnostic.recovery === 'hub sessions stop ' + diagnostic.lock_owner);
+          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable', 'gate_reason', 'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s', 'host_load', 'lock_owner', 'lock_owner_state', 'recovery']) || !claimFieldsValid(diagnostic) || !gateReasonValid(diagnostic) || !lockOwnerValid || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
               diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
               typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
               !sanitizeCommandFields(diagnostic) || (diagnostic.host_load !== undefined && !validHostLoad(data.reason, diagnostic.host_load)) ||

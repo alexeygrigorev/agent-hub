@@ -101,6 +101,7 @@ def classify(exc, *, workspace_available=True):
     if isinstance(exc, ClaimRefusedError):
         return dict(exc.diagnostic)
     reason = 'dispatch_internal_error'
+    lock_owner = None
     if isinstance(exc, ValueError):
         value = str(exc)
         prefix = value.split(':', 1)[0]
@@ -114,6 +115,11 @@ def classify(exc, *, workspace_available=True):
             reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
             if reason == 'dispatch_internal_error':
                 reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
+            if reason == 'dispatch_internal_error':
+                from .worktree_guard import parse_lock_owner_error
+                lock_owner = parse_lock_owner_error(value)
+                if lock_owner:
+                    reason = 'dispatch_worktree_refused'
         if value.startswith('HTTP request failed with status '):
             reason = 'dispatch_claim_refused'
     elif isinstance(exc, (RuntimeError, OSError)):
@@ -122,6 +128,9 @@ def classify(exc, *, workspace_available=True):
         reason = 'workspace_unavailable'
     value = {'reason': reason, 'message': MESSAGES[reason], 'stage': 'dispatch_route',
             'error_type': type(exc).__name__ if type(exc).__name__.isalpha() and len(type(exc).__name__) <= 64 else 'Error'}
+    if reason == 'dispatch_worktree_refused' and lock_owner:
+        value.update(lock_owner=lock_owner[0], lock_owner_state=lock_owner[1],
+                     recovery='hub sessions stop ' + lock_owner[0])
     if isinstance(exc, AdmissionRefusedError) and reason == 'admission_refused':
         value['gate_reason'] = exc.gate_reason
         value.update(exc.timing)

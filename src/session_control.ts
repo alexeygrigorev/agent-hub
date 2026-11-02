@@ -2182,7 +2182,8 @@ export class SessionControlService {
         const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
           this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
             binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
-        return { session_id: row.id, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+        return { session_id: row.id, session_state: row.state, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+          native_last_activity_at: native?.last_activity_at ?? null,
           lock_release_permitted: !protectedSession || (adoptedLock && !row.guard_explicit_protection),
           engine: row.engine, adoption_intent_id: binding?.adoption_intent_id ?? null,
           tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),

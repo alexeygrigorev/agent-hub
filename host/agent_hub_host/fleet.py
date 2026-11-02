@@ -105,6 +105,8 @@ ENGINE_WORKER_MEMORY = {"zcodex": "6144M"}
 WORKER_PIDS = "256"
 WORKER_CPU_QUOTA_US = "100000"
 WORKER_CPU_PERIOD_US = "100000"
+WORKTREE_STALE_OWNER_HOURS = 24
+WORKTREE_STALE_OWNER_MAX_HOURS = 24 * 30
 
 
 def is_windows_host() -> bool:
@@ -2311,8 +2313,142 @@ class Dispatcher:
                 if not guard.protect_successor_worktree(
                         self.request, "git", str(target_path),
                         offer.get("hub_session_id"), offer.get("intake_task_id")):
-                    raise ValueError("worktree_lock_failed: checkout could not be protected")
+                    error = self._stale_owner_takeover_or_refusal(offer, str(target_path))
+                    if error is not None:
+                        raise ValueError(error)
         return True
+
+    def _stale_owner_hours(self) -> Optional[int]:
+        """Return the configured stale-owner bound; invalid values disable takeover."""
+        raw = self.settings.get('worktree_stale_owner_hours', WORKTREE_STALE_OWNER_HOURS)
+        if type(raw) is not int or not 1 <= raw <= WORKTREE_STALE_OWNER_MAX_HOURS:
+            return None
+        return raw
+
+    @staticmethod
+    def _activity_timestamp_ms(value: Any) -> Optional[int]:
+        if type(value) is int and value > 0:
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    return None
+                stamp = int(parsed.timestamp() * 1000)
+                return stamp if stamp > 0 else None
+            except (ValueError, OverflowError, OSError):
+                return None
+        return None
+
+    def _stale_owner_activity_ms(self, fact: dict) -> Optional[int]:
+        """Get last activity only when a fresh local catalog proves the native stale.
+
+        A non-terminal native must be explicitly idle; a working or unknown
+        native stays protected. A missing native is usable only when the full
+        bounded catalog was returned and the Hub has a last-activity timestamp.
+        """
+        from . import native_list_cache
+        from .native_sessions import TERMINAL_PHASES, list_sessions
+        native_id = fact.get('native_id')
+        if not isinstance(native_id, str) or not native_id:
+            return None
+        try:
+            native_list_cache.invalidate('list')
+            rows = list_sessions(self.settings.get('aplexer_bin', 'aplexer'),
+                                 include_exited=True, fresh=True)
+        except Exception:
+            return None
+        matches = [row for row in rows if row.session_id == native_id]
+        if len(matches) > 1 or (not matches and len(rows) >= 500 and fact.get('native_terminal') is not True):
+            return None
+
+        local_activity = None
+        if matches:
+            row = matches[0]
+            if row.phase not in TERMINAL_PHASES and row.agent_state != 'idle':
+                return None
+            local_activity = row.last_activity_ms
+        hub_activity = self._activity_timestamp_ms(fact.get('native_last_activity_at'))
+        activity = [value for value in (local_activity, hub_activity)
+                    if type(value) is int and value > 0]
+        return max(activity) if activity else None
+
+    @staticmethod
+    def _worktree_owner_state(fact: Any, owner_id: str) -> str:
+        if not isinstance(fact, dict) or fact.get('session_id') != owner_id:
+            return 'unknown'
+        session_state = fact.get('session_state')
+        from .worktree_guard import SESSION_OWNER_STATES
+        if isinstance(session_state, str) and session_state in SESSION_OWNER_STATES:
+            return session_state
+        if fact.get('terminal') is True:
+            return 'terminal'
+        if fact.get('native_terminal') is True:
+            return 'native-terminal'
+        if fact.get('terminal') is False:
+            return 'non-terminal'
+        return 'unknown'
+
+    def _stale_owner_takeover_or_refusal(self, offer, target_path) -> Optional[str]:
+        """Transfer a stale same-intake lock or return a named bounded refusal.
+
+        Root cause: the native headless session can disappear without an ack,
+        while its Hub lifecycle row stays non-terminal and its Git worktree
+        lock remains. The old generic refusal discarded the owner identity.
+        """
+        from . import worktree_guard as guard
+        base = 'worktree_lock_failed: checkout could not be protected'
+        owner = None
+        state = 'unknown'
+        try:
+            root = guard.bound_worktree_root(target_path)
+            entry = guard.find_entry(guard.list_entries('git', root), root) if root else None
+            owner = guard.parse_lock_reason(entry.get('reason')) if entry else None
+            if not owner:
+                return base  # Manual or foreign lock: no Hub owner to name.
+
+            try:
+                facts = guard.guard_facts(self.request, session_id=owner[0])
+            except Exception:
+                facts = []
+            matches = [fact for fact in facts if isinstance(fact, dict)
+                       and fact.get('session_id') == owner[0]]
+            fact = matches[0] if len(matches) == 1 else None
+            state = self._worktree_owner_state(fact, owner[0])
+            intake = offer.get('intake_task_id')
+            hours = self._stale_owner_hours()
+            if (hours is not None and owner[0] != offer.get('hub_session_id')
+                    and owner[1] is not None and owner[1] == intake
+                    and isinstance(fact, dict) and fact.get('terminal') is False
+                    and fact.get('intake_task_id') == intake):
+                activity_ms = self._stale_owner_activity_ms(fact)
+                if activity_ms is not None and guard.stale_owner_takeover(
+                        self.request, 'git', target_path, offer.get('hub_session_id'), intake,
+                        last_activity_ms=activity_ms, stale_after_ms=hours * 3600 * 1000,
+                        now_ms=int(time.time() * 1000)):
+                    return None
+
+            # A concurrent operator may have changed the lock while Hub facts
+            # were read. Name only the owner still recorded in Git now.
+            current = guard.find_entry(guard.list_entries('git', root), root) if root else None
+            current_owner = guard.parse_lock_reason(current.get('reason')) if current else None
+            if current_owner != owner:
+                if not current_owner:
+                    return base
+                owner = current_owner
+                try:
+                    current_facts = guard.guard_facts(self.request, session_id=owner[0])
+                    current_matches = [item for item in current_facts if isinstance(item, dict)
+                                       and item.get('session_id') == owner[0]]
+                    fact = current_matches[0] if len(current_matches) == 1 else None
+                except Exception:
+                    fact = None
+                state = self._worktree_owner_state(fact, owner[0])
+            return guard.lock_owner_error(owner[0], state)
+        except Exception:
+            if owner:
+                return guard.lock_owner_error(owner[0], state)
+            return base
 
     def _maybe_cleanup_worktree(self, workspace: Path, native_id: Optional[str] = None):
         """Attempt safe auto-cleanup of finished headless worktree if configured in cleanup_roots.

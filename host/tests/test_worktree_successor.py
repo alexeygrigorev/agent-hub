@@ -110,8 +110,9 @@ class WorktreeSuccessorTests(unittest.TestCase):
         self.fact['native_terminal'] = True
         self.assertTrue(dispatcher._lock_session_worktree(offer, self.tree))
         # Two fresh guards lookups per attempt: the canonical stopped-lock
-        # reuse check first, then the same-intake successor transfer.
+        # reuse check first, then the same-intake successor transfer. The
+        # failed first attempt adds the stale-owner naming/takeover probe.
         self.assertEqual([(r[0], r[1].split('?')[0]) for r in requests if r[1].startswith('/api/sessions/worktree-guards')],
-                         [('GET', '/api/sessions/worktree-guards')] * 4)
+                         [('GET', '/api/sessions/worktree-guards')] * 5)
         entry = guard.find_entry(guard.list_entries('git', self.tree), self.tree)
         self.assertEqual(entry['reason'], guard.lock_reason(self.new, 'intake-test'))
