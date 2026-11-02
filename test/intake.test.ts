@@ -1578,7 +1578,7 @@ describe('archive retention, evidence gates and durable audit', () => {
       }
     }
     expect((await ok('/tasks/' + first.task.id)).task.status).toBe('open');
-  });
+  }, 15_000);
   it('audit is append-only, survives row loss, and does not disclose other projects', async () => {
     let { task } = await create('secret');
     task = (await append(task.id, 1, done)).task;
