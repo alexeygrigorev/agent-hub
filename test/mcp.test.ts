@@ -67,7 +67,7 @@ describe('Hub MCP protocol and parity', () => {
     // sessions_ping, sessions_ping_clear and sessions_pings: 46000 -> 47500.
     // Intake stats (intake 2e1b4f95) adds one read tool (917 bytes): 47500 -> 48500.
     // The managed driver lifecycle (intake 1035ad06) adds four small routes
-    // (driver start/stop/restart/status, 1685 bytes): 48500 -> 50500.
+    // (driver start/stop/restart/status, 1789 bytes): 48500 -> 50500.
     expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(50500);
     for (const route of MCP_ROUTES) {
       const tool = tools.find(tool => tool.name === route.name)!;
