@@ -136,3 +136,12 @@ class TestGetAvailableMachinesAuth(unittest.TestCase):
             api.get_available_machines("https://hub.invalid")
         self.assertIn("500", str(ctx.exception))
         mock_refresh.assert_not_called()
+
+
+def test_hub_opener_ignores_environment_proxy(monkeypatch):
+    import urllib.request
+    monkeypatch.setenv('HTTPS_PROXY', 'http://127.0.0.1:1')
+    monkeypatch.setenv('HTTP_PROXY', 'http://127.0.0.1:1')
+    from agent_hub_host import api
+    handlers = [h for h in api._get_opener().handlers if isinstance(h, urllib.request.ProxyHandler)]
+    assert all(not h.proxies for h in handlers)  # empty ProxyHandler registers no *_open methods

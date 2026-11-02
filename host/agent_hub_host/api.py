@@ -20,7 +20,10 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 USER_AGENT = "agent-hub-host/1"
 
 def _get_opener():
-    opener = urllib.request.build_opener(NoRedirectHandler())
+    # Never route Hub traffic through HTTP(S)_PROXY from the user environment: a
+    # dead engine proxy (codex-vpn on 127.0.0.1:8899) made every check-in fail with
+    # WinError 10061 and Hub showed the host offline for 70+ minutes (2026-11-02).
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirectHandler())
     opener.addheaders = [("User-Agent", USER_AGENT)]
     return opener
 
