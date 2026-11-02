@@ -18,7 +18,7 @@ import time
 import tomllib
 import zipfile
 
-from . import bus, config, hook_command, private_fs, state_hook_commands
+from . import bus, config, hook_command, hook_trust, private_fs, state_hook_commands
 
 LABEL = re.compile(r'[a-z][a-z0-9_-]{0,47}\Z')
 REV = re.compile(r'[a-f0-9-]{36}\Z')
@@ -380,6 +380,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
     with private_fs.parent(codex_hooks, create=True):
         pass
     private_fs.atomic_write(codex_hooks, content_bytes, 65536)
+    hook_trust.refresh(codex_home / "config.toml", codex_hooks, template_hooks)
     if os.name != 'nt':
         try:
             os.chmod(codex_hooks, 0o600)
@@ -392,6 +393,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
         with private_fs.parent(zcodex_hooks, create=True):
             pass
         private_fs.atomic_write(zcodex_hooks, content_bytes, 65536)
+        hook_trust.refresh(zcodex_home / "config.toml", zcodex_hooks, template_hooks)
         if os.name != 'nt':
             try:
                 os.chmod(zcodex_hooks, 0o600)
