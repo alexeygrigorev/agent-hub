@@ -18,8 +18,8 @@ beforeEach(async () => {
     isAdmin: true, csrfToken: 'tbm-csrf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
   await inDO(stub(), (h: any) => {
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
-    h.sql.exec('DELETE FROM tbm_quota_pools');
     h.sql.exec('DELETE FROM tbm_banked_tranches');
+    h.sql.exec('DELETE FROM tbm_quota_pools');
   });
 });
 
@@ -51,7 +51,7 @@ describe('TBM public REST composition', () => {
         (tranche_id, pool_id, provider, allocated_tokens, remaining_tokens, granted_at_ms,
          expires_at_ms, status, banked_burn_rate_tpm, target_banked_burn_rate_tpm,
          expired_unused_tokens, updated_at_ms, quantity_known)
-        VALUES ('tranche-one', 'go:metrics:5h', 'go', 500, 300, ?, ?, 'active', 0, 0, 0, ?, 1)`, now - 1000, now + 7200000, now);
+        VALUES ('tranche-one', 'go:metrics:5h', 'go', 500, 300, ?, ?, 'active', 50, 0, 0, ?, 1)`, now - 1000, now + 7200000, now);
     });
     const response = await call('metrics');
     expect(response.status).toBe(200);
@@ -62,6 +62,7 @@ describe('TBM public REST composition', () => {
       expect(pool.metrics.useful_work_per_tokens.value).toBe(20);
       expect(pool.metrics.engine_mix.value).toEqual({ free: 1, paid: 0, grok: 0 });
       expect(pool.metrics.banked_remaining.value).toBe(300);
+      expect(pool.metrics.banked_burn_rate.value).toBe(50);
       expect(pool.metrics.time_to_expiry.value).toBeGreaterThan(0);
       expect(pool.metrics.burn_rate_vs_pacing_target.value).toBeNull();
       expect(pool.metrics.burn_rate_vs_pacing_target.reason).toContain('No historical pacing samples');

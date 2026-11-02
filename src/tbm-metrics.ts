@@ -106,7 +106,8 @@ function metricsForPool(sql: SqlStorage, pool: any, now: number, since: number, 
 
   try {
     const tranches = rows(sql,
-      `SELECT remaining_tokens, quantity_known, expires_at_ms, status, expired_unused_tokens, updated_at_ms
+      `SELECT remaining_tokens, quantity_known, expires_at_ms, status, expired_unused_tokens,
+              banked_burn_rate_tpm, updated_at_ms
        FROM tbm_banked_tranches WHERE pool_id = ?`, pid);
     const active = tranches.filter(t => t.status === 'active' && Number(t.expires_at_ms) > now);
     const unknownActive = active.some(t => Number(t.quantity_known) === 0 || safeNumber(t.remaining_tokens) === null);
