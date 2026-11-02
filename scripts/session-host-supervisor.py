@@ -39,7 +39,12 @@ def native(*argv):
     command.insert(command.index('--') if '--' in command else len(command), '--json')
     result = subprocess.run(command, capture_output=True, text=True, timeout=35)
     if result.returncode:
-        raise RuntimeError('Native controller operation failed')
+        error = RuntimeError('Native controller operation failed')
+        # The reason (e.g. "a: no matching session") used to be discarded, which hid
+        # why 238 controller restarts failed (2026-11-02); failure_reason logs it.
+        error.exit_code = result.returncode
+        error.stderr = (result.stderr or '').strip()[-300:]
+        raise error
     if len(result.stdout) > 131072:
         raise RuntimeError('Native response exceeded capacity')
     return json.loads(result.stdout)
@@ -195,7 +200,11 @@ def log_event(event, **fields):
 def failure_reason(error):
     """Bounded, credential-free reason for controller.log (type + short message)."""
     text = redact(str(error))[:240]
-    return {'type': type(error).__name__, 'detail': text}
+    reason = {'type': type(error).__name__, 'detail': text}
+    if getattr(error, 'exit_code', None) is not None:
+        reason['exit_code'] = error.exit_code
+        reason['stderr'] = redact(str(getattr(error, 'stderr', '')))[:200]
+    return reason
 
 
 _SECRETISH = None

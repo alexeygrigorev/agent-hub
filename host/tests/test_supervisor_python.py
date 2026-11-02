@@ -107,3 +107,16 @@ def test_no_second_controller_while_journal_lock_is_held(tmp_path):
         except RuntimeError as error:
             assert 'lock held' in str(error)
     native.assert_not_called()
+
+
+def test_native_failure_logs_aplexer_stderr_without_changing_type():
+    supervisor = _load_supervisor()
+    done = Mock(returncode=1, stdout='', stderr='a: no matching session\n')
+    with patch.object(supervisor.subprocess, 'run', return_value=done):
+        try:
+            supervisor.native('status', 'x')
+            raise AssertionError('must raise')
+        except RuntimeError as error:
+            reason = supervisor.failure_reason(error)
+    assert reason['type'] == 'RuntimeError' and reason['detail'] == 'Native controller operation failed'
+    assert reason['exit_code'] == 1 and reason['stderr'] == 'a: no matching session'
