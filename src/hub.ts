@@ -1,4 +1,4 @@
-import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting } from './alert-routing';
+import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
 import { handleNamedAgentRequest } from './named-agents';
 import { IdleWorkService } from './idle-work';
@@ -2502,10 +2502,12 @@ export class Hub extends DurableObject {
     {
       const text = alertText(alert); const errors: string[] = [];
       const delivered = new Set(this.livenessService.deliveredTo(alert));
-      const { actors: configuredActors, webhook, invalidWebhook, invalidActors } = alertDestinations(this.env);
+      const { actors: configuredActors, webhook, invalidWebhook, invalidActors, webhookAuthRequired } = alertDestinations(this.env);
       const actors = [...new Set(configuredActors.map(to => this.busService.canonicalActor(to)))];
       if (invalidActors) errors.push('invalid alert inbox configuration');
       if (invalidWebhook) errors.push('invalid alert webhook configuration (HTTPS required)');
+      const webhookToken = typeof this.env.HUB_ALERT_WEBHOOK_TOKEN === 'string' ? this.env.HUB_ALERT_WEBHOOK_TOKEN.trim() : '';
+      if (webhookAuthRequired && !webhookToken) errors.push('webhook: missing bearer token');
       if (!actors.length && !webhook) errors.push('no alert target configured');
       // Audit summaries group distinct actionable batches under one display subject.
       // Keep their payloads independent while identical batches remain idempotent.
@@ -2543,14 +2545,27 @@ export class Hub extends DurableObject {
       }
       // Keep a destination fingerprint, never the webhook URL, in receipts.
       const webhookTarget = webhook ? 'webhook:' + (await sha256(webhook)).slice(0, 24) : null;
-      if (webhook && webhookTarget && !delivered.has(webhookTarget) && allowed(webhookTarget)) {
+      if (webhook && webhookTarget && !(webhookAuthRequired && !webhookToken) && !delivered.has(webhookTarget) && allowed(webhookTarget)) {
         try {
-          const r = await fetch(webhook, { method: 'POST', redirect: 'error', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `hub-alert-${alert.id}` }, body: JSON.stringify({ text, alert: { id: alert.id, subject_kind: alert.subject_kind, subject: alert.subject, state: alert.state, detail: alert.detail, opened_at: alert.opened_at } }), signal: AbortSignal.timeout(10000) });
+          const fields = {
+            from: 'Agent Hub <alerts@dtcdev.click>',
+            to: 'dev@dtcdev.click',
+            subject: `[agent-hub] ${alert.subject_kind}: ${alert.subject} (${alert.state})`,
+            snippet: text.replace(/\s+/g, ' ').slice(0, 200),
+            text,
+            date: new Date().toISOString(),
+            message_id: `hub-alert-${alert.id}`,
+            attachments: [],
+            alert: { id: alert.id, subject_kind: alert.subject_kind, subject: alert.subject, state: alert.state, detail: alert.detail, opened_at: alert.opened_at },
+          };
+          const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Idempotency-Key': `hub-alert-${alert.id}` };
+          if (webhookAuthRequired) headers.Authorization = `Bearer ${webhookToken}`;
+          const r = await fetch(webhook, { method: 'POST', redirect: 'error', headers, body: JSON.stringify(fields), signal: AbortSignal.timeout(10000) });
           if (r.ok) success(webhookTarget); else errors.push(`webhook: HTTP ${r.status}`);
         } catch { errors.push('webhook: unreachable'); }
       }
       this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : null, [...delivered]);
-      if (alert.subject_kind === 'intake_digest' && !errors.length) this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
+      if ((alert.subject_kind === 'intake_digest' || (alert.subject_kind === 'alert_routing' && alert.subject === 'cutover_backlog')) && !errors.length) this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
       return { delivered: [...delivered], errors };
     }
   }
@@ -2573,6 +2588,22 @@ export class Hub extends DurableObject {
 
   private async runChecksMetered(only?: string) {
     const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('checks:' + step, fn);
+    const destinations = alertDestinations(this.env);
+    const destinationHash = await sha256(JSON.stringify(destinations));
+    const previousDestinations = this.sql.exec("SELECT value FROM hub_meta WHERE key='alert_destination_hash'").toArray()[0]?.value;
+    if (previousDestinations !== destinationHash) {
+      // Do not replay every legacy open row to the newly watched mailbox.
+      // Suppress individual retries and send one bounded cutover summary instead.
+      const suppressed = suppressOpenAlertBackfill(this.sql);
+      if (suppressed) {
+        const notice = this.livenessService.setAlert('alert_routing', 'cutover_backlog', {
+          state: 'attention',
+          detail: `${suppressed} pre-existing open alert(s) were not replayed individually after the destination change. Review the Hub alerts and delivery SLO for the preserved backlog.`,
+        });
+        if (notice) await m('alert_backfill_notice', () => this.notifyAlert(notice));
+      }
+      this.sql.exec("INSERT INTO hub_meta(key,value) VALUES ('alert_destination_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", destinationHash);
+    }
     // Cron launch schedules (intake a839dfb6): due ticks create intakes and
     // enqueue sessions through the canonical admission path. Runs on both
     // crons (every 5 minutes); a manual single-check run never fires them.
@@ -2602,18 +2633,10 @@ export class Hub extends DurableObject {
     await m('liveness_prune', () => this.livenessService.prune());
     pruneAlertRouting(this.sql);
     this.checkBusAuthFailures();
-    const destinations = alertDestinations(this.env);
-    const destinationHash = await sha256(JSON.stringify(destinations));
-    const previousDestinations = this.sql.exec("SELECT value FROM hub_meta WHERE key='alert_destination_hash'").toArray()[0]?.value;
-    if (previousDestinations !== destinationHash) {
-      // Previously delivered alerts may have gone to an unread destination.
-      // Retry only after the target changes; receipts prevent duplicate sends.
-      this.sql.exec("UPDATE liveness_alerts SET notify_error='alert destinations changed', notified_at=NULL WHERE resolved_at IS NULL");
-      this.sql.exec("INSERT INTO hub_meta(key,value) VALUES ('alert_destination_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", destinationHash);
-    }
     const routingErrors = destinations.actors.filter(to => !inboxReaderStatus(this.sql, this.busService.canonicalActor(to)).active_reader).map(to => `${to}: no_active_credential_read_loop`);
     if (destinations.invalidWebhook) routingErrors.push('invalid alert webhook configuration');
     if (destinations.invalidActors) routingErrors.push('invalid alert inbox configuration');
+    if (destinations.webhookAuthRequired && !this.env.HUB_ALERT_WEBHOOK_TOKEN?.trim()) routingErrors.push('alert webhook bearer secret missing');
     if (!destinations.actors.length && !destinations.webhook) routingErrors.push('no alert target configured');
     const routingAlert = this.livenessService.setAlert('alert_routing', 'destination', routingErrors.length ? { state: 'fail', detail: routingErrors.join('; ') } : null);
     if (routingAlert) await m('alert_routing', () => this.notifyAlert(routingAlert));

@@ -26,11 +26,12 @@ async function fixture(fn: (live: LivenessService, sql: any) => Promise<void> | 
 }
 
 describe('hub-ops liveness reproducer', () => {
-  it('hubops-default-inbox refuses an unset alert destination', async () => {
+  it('hubops-default-inbox refuses delivery when both destinations are disabled', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('hubops-default-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub) => {
       delete (hub.env as any).HUB_ALERT_TO;
+      (hub.env as any).HUB_ALERT_WEBHOOK = '';
       hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
       hub.sql.exec(
         "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)",

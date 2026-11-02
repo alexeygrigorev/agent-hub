@@ -154,6 +154,23 @@ describe('stale alerts', () => {
     expect(live.undelivered(900)).toEqual([]);
   }));
 
+  it('suppresses cutover replay but re-enables delivery when an incident changes state', () => fixture((live, sql, clock) => {
+    machine(sql, 'hetzner', iso(300));
+    const [alert] = live.reconcileAlerts(live.evaluate().subjects);
+    live.markNotified(alert.id, 'old destination unavailable');
+    clock.t += 901000;
+    sql.exec('INSERT INTO alert_backfill_suppressed(alert_id,suppressed_at) VALUES (?,?)', alert.id, clock.t);
+    expect(live.undelivered(900)).toEqual([]);
+
+    const changed = live.setAlert('machine', 'hetzner', { state: 'offline', detail: 'host is now offline' });
+    expect(changed).toMatchObject({ id: alert.id, state: 'offline', notify_error: null, delivered_to: '[]' });
+    expect(live.undelivered(900).map((a: any) => a.id)).toEqual([alert.id]);
+
+    sql.exec('INSERT INTO alert_backfill_suppressed(alert_id,suppressed_at) VALUES (?,?)', alert.id, clock.t);
+    live.setAlert('machine', 'hetzner', null);
+    expect(sql.exec('SELECT COUNT(*) AS n FROM alert_backfill_suppressed').one().n).toBe(0);
+  }));
+
   it('retries an alert whose notification was never attempted', () => fixture((live, sql, clock) => {
     machine(sql, 'hetzner', iso(300));
     const [alert] = live.reconcileAlerts(live.evaluate().subjects);
@@ -184,11 +201,12 @@ describe('stale alerts', () => {
     });
   });
 
-  it('refuses the unwatched default when HUB_ALERT_TO is unset', async () => {
+  it('refuses delivery only when both configured routes are explicitly disabled', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('notify-default-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub) => {
       delete (hub.env as any).HUB_ALERT_TO;
+      (hub.env as any).HUB_ALERT_WEBHOOK = '';
       hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
       hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)", new Date().toISOString(), new Date(Date.now() - 3600000).toISOString());
       await hub.runChecks('liveness');

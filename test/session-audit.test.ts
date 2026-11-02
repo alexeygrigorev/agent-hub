@@ -565,7 +565,7 @@ describe('production notification adapter (real hub liveness + delivery receipt)
       seedAlertReader(hub);
       for (let i = 0; i < 10; i++) seedNative(hub, i);
       const savedTo = hub.env.HUB_ALERT_TO, savedHook = hub.env.HUB_ALERT_WEBHOOK;
-      delete hub.env.HUB_ALERT_WEBHOOK;
+      hub.env.HUB_ALERT_WEBHOOK = '';
       hub.env.HUB_ALERT_TO = '';
       try {
         const r1 = await hub.sessionAudit.tick('manual');
