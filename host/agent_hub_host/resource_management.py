@@ -408,12 +408,18 @@ def sample_session_tree(
         roots = [p for p in (worker_pid, workload_pid) if type(p) is int and p > 0]
         cg = _cgroup_path(cgroup, roots or None)
         current_mb: Optional[float] = None
+        oom_kills: Optional[int] = None
         if cg is not None:
             mem_stat = _read_text(os.path.join(cg, "memory.stat"))
             if mem_stat is not None:
                 anon_bytes = _parse_kv_int(mem_stat, "anon")
                 if anon_bytes is not None and anon_bytes > 0:
                     rss_mb = anon_bytes / (1024 * 1024)
+            events_raw = _read_text(os.path.join(cg, "memory.events"))
+            if events_raw is not None:
+                oom_n = _parse_kv_int(events_raw, "oom_kill")
+                if oom_n is not None and oom_n >= 0:
+                    oom_kills = oom_n
             current_raw = _read_text(os.path.join(cg, "memory.current"))
             if current_raw is not None:
                 try:
@@ -528,6 +534,7 @@ def sample_session_tree(
             "runtime_s": float(runtime_s) if runtime_s is not None else None,
             "avg_cpu_cores": float(avg_cpu) if avg_cpu is not None else None,
             "current_mb": float(current_mb) if current_mb is not None else None,
+            "oom_kills": oom_kills,
             "cpu_identity": cpu_identity,
             "cgroup_path": cg,
         }
@@ -753,6 +760,7 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
         "runtime_s": prior.get("runtime_s") if cpu_frozen else _latest("runtime_s"),
         "avg_cpu_cores": prior.get("avg_cpu_cores") if cpu_frozen else _latest("avg_cpu_cores"),
         "current_mb": _latest("current_mb"),
+        "oom_kills": _peak_max("oom_kills", "oom_kills"),
         "observed_at": observed_at,
         **rss_state,
         **distribution,
@@ -1087,7 +1095,7 @@ def _sample_row(sid: str, nid: str, peak: Any, observed_at: str) -> dict[str, An
     """Server report row: unknown fields are omitted (null), never zeroed."""
     row: dict[str, Any] = {"session_id": sid, "native_id": nid, "observed_at": observed_at}
     if isinstance(peak, dict):
-        for field in ("peak_rss_mb", "peak_pss_mb", "p50_rss_mb", "cpu_seconds", "runtime_s", "avg_cpu_cores", "p95_cpu_cores"):
+        for field in ("peak_rss_mb", "peak_pss_mb", "p50_rss_mb", "cpu_seconds", "runtime_s", "avg_cpu_cores", "p95_cpu_cores", "oom_kills"):
             if _finite_number(peak.get(field)) is not None:
                 row[field] = peak[field]
     return row

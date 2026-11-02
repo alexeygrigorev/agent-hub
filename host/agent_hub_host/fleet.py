@@ -94,11 +94,13 @@ WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 # subprocess for flags outside its allowlist).
 # Windows hosts (Tabo) must NOT receive Linux cgroup flags: aplexer on
 # Windows contains workloads with Job Objects and reports containment_empty.
-WORKER_MEMORY = "1500M"
+# MemoryMax is a crash-containment CEILING, not the admission estimate (placement uses ledger p50/p90 and host_sizing.WORKER_MB).
+# 1500M OOM-killed codex and workerd (vitest/playwright in the session scope) on RMTHZ with 31 GiB free.
+WORKER_MEMORY = "6144M"
 # zcodex = Rust TUI (~200 MB) + Node zcode core (300-460 MB, re-spawned on every
 # stream retry) + the agent's own toolchain; 1500M OOM-killed the core
 # mid-turn (intake de6f2139). Other engines keep the default cap.
-ENGINE_WORKER_MEMORY = {"zcodex": "4096M"}
+ENGINE_WORKER_MEMORY = {"zcodex": "6144M"}
 WORKER_PIDS = "256"
 WORKER_CPU_QUOTA_US = "100000"
 WORKER_CPU_PERIOD_US = "100000"

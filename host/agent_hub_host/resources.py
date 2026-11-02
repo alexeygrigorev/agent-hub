@@ -189,12 +189,12 @@ def render_ledger(rows) -> str:
         if not isinstance(row, dict):
             continue
         lines.append("task=%s project=%s engine=%s model=%s machine=%s state=%s runtime=%s "
-                     "rss_peak=%s rss_p50=%s cpu_avg=%s cpu_p95=%s session=%s" % (
+                     "rss_peak=%s rss_p50=%s cpu_avg=%s cpu_p95=%s oom=%s session=%s" % (
                          str(row.get("intake_id") or "-")[:8], row.get("project_label") or row.get("project") or "?",
                          row.get("engine", "?"), row.get("model") or "?", row.get("machine_id", "?"),
                          row.get("state", "?"), _fmt_runtime(row.get("runtime_s")),
                          _fmt_mb(row.get("peak_rss_mb")), _fmt_mb(row.get("p50_rss_mb")),
-                         _fmt_avg(row.get("avg_cpu_cores")), _fmt_avg(row.get("p95_cpu_cores")),
+                         _fmt_avg(row.get("avg_cpu_cores")), _fmt_avg(row.get("p95_cpu_cores")), row.get("oom_kills") if row.get("oom_kills") is not None else "-",
                          row.get("session_id", "?")))
     return "\n".join(lines) if lines else "No sessions reported."
 

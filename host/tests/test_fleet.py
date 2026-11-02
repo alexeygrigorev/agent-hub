@@ -230,7 +230,7 @@ class FleetTests(unittest.TestCase):
             # Intake 4b161918: the worktree plan query precedes the claim.
             self.assertTrue([a for a in http if not a[1].startswith('/api/worktree-host/')][0][1].endswith('/claim'))
             start_argv = calls[-1][0]
-            self.assertEqual(start_argv[start_argv.index('--memory') + 1], '1500M')
+            self.assertEqual(start_argv[start_argv.index('--memory') + 1], '6144M')
             self.assertEqual(start_argv[start_argv.index('--pids') + 1], '256')
             self.assertEqual(start_argv[start_argv.index('--cpu-quota-us') + 1], '100000')
             self.assertEqual(start_argv[start_argv.index('--cpu-period-us') + 1], '100000')

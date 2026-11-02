@@ -85,7 +85,7 @@ Placement is gated on live data, not on a fixed sum of per-session reservations.
   explanatory measurements, never independent holds (Alexey t1511u).
 - Tune if it crashes: if the OOM killer fires or MemAvailable stays below the
   floor, raise the floor or the estimate multiplier one step and record that here.
-- The cgroup `MemoryMax` per worker (1500M, or 4096M for managed Codex) is a
+- The cgroup `MemoryMax` per worker (6144M ceiling; was 1500M, which OOM-killed test-heavy sessions at 1.5 GiB while 31 GiB was free) is a
   per-session safety cap. It is separate from the placement estimate.
 
 ### 4. Watchdog (memory reaper)

@@ -506,6 +506,12 @@ describe('resource management',()=>{
   expect(r.overview().stats.find((g:any)=>g.project==='agent-hub')).toMatchObject({samples:1,p50_rss_mb:300});
  }));
 
+ it('counts OOM kills per session in the ledger and never lowers the count',async()=>fixture(async(r)=>{
+  r.report('host',{samples:[sample({peak_rss_mb:300,oom_kills:3})],reaps:[]});
+  r.report('host',{samples:[sample({peak_rss_mb:300,oom_kills:1})],reaps:[]});
+  expect(r.usage().find((u:any)=>u.native_id==='native')!.oom_kills).toBe(3);
+ }));
+
  it('estimates memory and CPU from project+engine+model history before coarser cohorts',async()=>fixture(async(r,sql)=>{
   const add=(id:string,project:string,engine:string,model:string,rss:number,cpu:number)=>{
    sql.exec('INSERT INTO session_resource_usage VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id,'host','n-'+id,null,null,project,engine,model,'daily','goal',iso(-9000),iso(-1000),'exited',rss,rss,10,100,0.1,iso(-500));

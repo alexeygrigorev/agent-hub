@@ -31,6 +31,20 @@ class RssMedianTests(unittest.TestCase):
         self.assertEqual(row["peak_rss_mb"], 200.0)
 
 
+class OomCounterTests(unittest.TestCase):
+    def test_oom_kills_are_monotonic_and_reported(self):
+        state = {"peaks": {}}
+        update_peaks(state, "s", "n", {"rss_mb": 200.0, "oom_kills": 3}, "2026-11-02T10:00:00.000Z")
+        peak = update_peaks(state, "s", "n", {"rss_mb": 100.0, "oom_kills": None}, "2026-11-02T10:01:00.000Z")
+        self.assertEqual(peak["oom_kills"], 3)
+        row = _sample_row("s", "n", peak, "2026-11-02T10:01:00.000Z")
+        self.assertEqual(row["oom_kills"], 3)
+
+    def test_ledger_line_shows_oom_count(self):
+        text = resources.render_text({"sessions": [{"session_id": "s", "oom_kills": 4}]}, "ledger")
+        self.assertIn("oom=4", text)
+
+
 class LedgerRenderTests(unittest.TestCase):
     def test_ledger_has_one_line_per_task_with_all_fields(self):
         text = resources.render_text({"sessions": [{

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS resource_cpu_samples (launch_id TEXT PRIMARY KEY, cur
 CREATE TABLE IF NOT EXISTS resource_cpu_starts (launch_id TEXT PRIMARY KEY, expected_cpu_cores REAL NOT NULL, expected_cpu_source TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_usage (session_id TEXT PRIMARY KEY, p95_cpu_cores REAL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_rss_median (session_id TEXT PRIMARY KEY, p50_rss_mb REAL, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_oom_kills (session_id TEXT PRIMARY KEY, oom_kills INTEGER NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_finalized (session_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_metadata (session_id TEXT PRIMARY KEY, workspace TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_ramps (launch_id TEXT PRIMARY KEY, started_at TEXT NOT NULL);
@@ -639,7 +640,7 @@ export class ResourceManagement {
     for (const sample of value.samples) {
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
-      for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
+      for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores','oom_kills']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
       const at=Date.parse(sample.observed_at);
       if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
       const old:any=this.sql.exec('SELECT * FROM session_resource_usage WHERE machine_id=? AND native_id=?',machine,session.native_id).toArray()[0];
@@ -656,6 +657,7 @@ export class ResourceManagement {
           if (TERMINAL.has(session.state)) this.sql.exec('INSERT OR IGNORE INTO session_cpu_finalized VALUES(?,?)',ledgerId,sample.observed_at);
         }
       }
+      if (finite(sample.oom_kills) && Number.isInteger(sample.oom_kills) && sample.oom_kills>=0) this.sql.exec('INSERT INTO session_oom_kills VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET oom_kills=MAX(session_oom_kills.oom_kills,excluded.oom_kills),observed_at=excluded.observed_at',ledgerId,sample.oom_kills,sample.observed_at);
       if (finite(sample.p50_rss_mb)) this.sql.exec('INSERT INTO session_rss_median VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p50_rss_mb=excluded.p50_rss_mb,observed_at=excluded.observed_at WHERE excluded.observed_at>=session_rss_median.observed_at',ledgerId,sample.p50_rss_mb,sample.observed_at);
       if (session.fleet_launch_id && finite(sample.current_rss_mb)) this.sql.exec('INSERT INTO resource_resident_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET resident_mb=excluded.resident_mb,observed_at=excluded.observed_at WHERE excluded.observed_at>=resource_resident_samples.observed_at',session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
       const max = (k:string) => finite(sample[k]) ? Math.max(old?.[k] ?? 0,sample[k]) : old?.[k] ?? null;
@@ -727,7 +729,7 @@ export class ResourceManagement {
       const key=r.machine_id+':'+r.native_id;
       if (!latestThrottle.has(key)) latestThrottle.set(key,r.action);
     }
-    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,p50_rss_mb:this.sql.exec('SELECT p50_rss_mb FROM session_rss_median WHERE session_id=?',r.session_id).toArray()[0]?.p50_rss_mb ?? null,project_label:projectLabel(r.project),rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)==='throttled'}));
+    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,p50_rss_mb:this.sql.exec('SELECT p50_rss_mb FROM session_rss_median WHERE session_id=?',r.session_id).toArray()[0]?.p50_rss_mb ?? null,oom_kills:this.sql.exec('SELECT oom_kills FROM session_oom_kills WHERE session_id=?',r.session_id).toArray()[0]?.oom_kills ?? null,project_label:projectLabel(r.project),rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)==='throttled'}));
   }
   reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
   throttles() {
