@@ -10,7 +10,7 @@ scripts/capped-test-run.sh -- uv run --with pytest python -m pytest
 scripts/capped-test-run.sh -- node scripts/test-browser-local.mjs
 ```
 
-All checkouts under the same host user share six slots by default (override live with the integer in <heavy-test-dir>/slots or AGENT_HUB_HEAVY_TEST_SLOTS; hard ceiling 8; was 2 until 2026-11-02). Use --priority final to jump the queue ahead of normal tickets younger than 25 minutes. The Linux
+All checkouts under the same host user share one host-level slot count (intake 1293b560 AC2): the integer in the live <heavy-test-dir>/slots file, re-read by every admission (default 6, hard ceiling 8; was 2 until 2026-11-02). An explicit --slots flag still wins for tests/emergencies; AGENT_HUB_HEAVY_TEST_SLOTS is only a fallback for private pools and tests when the file is absent -- do not export it per-process, it no longer overrides the live host setting, so old and new checkouts stay on the same count. Sizing formula (measured 2026-11-02, RMTHZ 12 cores / 62 GiB): slots = clamp(1, 8, min(floor((1.5*cores - base_load_5min)/cpu_per_lane), floor((MemAvailable_GiB - 6)/mem_per_lane_GiB))) with per-lane worst case vitest ~0.71 cores / ~0.9 GiB and pytest ~0.27 cores / ~0.64 GiB (typical base 5-min load 10-15 gives 4-8 slots; memory is not binding). Use --priority final to jump the queue ahead of normal tickets younger than 25 minutes; --priority release (orchestrator-main release/integration gates only) is admitted ahead of both final and normal, so main is never blocked behind worker test lanes. A capacity-refused waiter parks its place: a retry with the same AGENT_HUB_HEAVY_TEST_RUN_ID (set automatically by scripts/capped-test-retry.sh and the affected/full runners) reclaims the original sequence and age instead of re-queueing at the back. The Linux
 `flock` locks live under `/run/user/<uid>/agent-hub/heavy-test`. The supervising
 wrapper retains its lock until the command finishes, even if a runtime closes
 inherited descriptors. Kernel locks release automatically when holders exit.
@@ -20,8 +20,9 @@ pass through. The full runner captures the shared directory before switching
 Python to a disposable HOME and removing live credential selectors.
 
 `AGENT_HUB_HEAVY_TEST_SLOTS`, `AGENT_HUB_HEAVY_TEST_WAIT_S`, and
-`AGENT_HUB_HEAVY_TEST_DIR` configure slots, wait budget, and lock location.
-Use the same slot count and directory across participating sessions; a private
+`AGENT_HUB_HEAVY_TEST_DIR` configure the slot-count fallback (used only when
+the live `<dir>/slots` file is absent), wait budget, and lock location.
+Use the same directory across participating sessions; a private
 lock directory is appropriate only for isolated wrapper tests.
 
 Each admitted command has a 1800-second wall-clock limit by default. Configure
@@ -120,11 +121,13 @@ Run the full runner directly: it acquires and releases a slot for each heavy
 phase. Never put `test-full-local.sh` inside `capped-test-run.sh`: an outer
 wrapper would hold a slot while its phases queue again. The full runner refuses
 an inherited `AGENT_HUB_HEAVY_TEST_HELD=1` with exit 2 before starting any phase
-and prints the direct invocation above. `--priority normal|final` sets the
+and prints the direct invocation above. `--priority normal|final|release` sets the
 priority for every phase; the existing priority environment variable also works.
 
 `normal` is the default. `final` precedes normal waiters; reserve it for the last
-exact-source pre-push verification, not routine development runs. The shared
+exact-source pre-push verification, not routine development runs. `release` precedes
+both final and normal; reserve it for orchestrator-main release/integration gates
+(intake 1293b560 AC3), never for routine lanes. The shared
 host user can set this environment variable: it is scheduling policy, not an
 authorization boundary. Admissions log the requested class and ticket number.
 Waiting diagnostics include the current queue position and waiter count (for

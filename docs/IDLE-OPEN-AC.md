@@ -2,8 +2,10 @@
 
 Hub links adopted native sessions using explicit intake links, an unambiguous
 `START:`/`STARTED` note containing the exact native ID or qualified tag, or a
-`note-aplexer-<native-id-prefix>` note containing that exact identity. An
-operator can link manually with `hub sessions link SESSION --intake-task-id INTAKE --key KEY`; a worker credential scoped to that intake,
+`note-aplexer-<native-id-prefix>` key on a note containing that exact identity.
+Keyed notes may start with operational status text; they do not need to begin
+with `START`. An operator can link manually with `hub sessions link SESSION
+--intake-task-id INTAKE --key KEY`; a worker credential scoped to that intake,
 machine and workspace can link an observed native session in the same scope.
 The REST route is `POST /api/sessions/SESSION/link` and the MCP tool is
 `sessions_link`. Linking never grants native-control authority.

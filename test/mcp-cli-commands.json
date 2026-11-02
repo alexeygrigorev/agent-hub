@@ -168,6 +168,8 @@
   "status",
   "submit",
   "subscriptions",
+  "subscriptions disable",
+  "subscriptions enable",
   "task-artifact",
   "task-result",
   "update",

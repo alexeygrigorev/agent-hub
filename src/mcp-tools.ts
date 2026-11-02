@@ -144,6 +144,8 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'run': 'Local foreground host daemon; remote MCP must not install or start another host executor.',
   'fleet-host': 'Local host dispatcher; existing enrolled hosts own execution.',
   'subscriptions': 'Local subscription collection/reporting requires host files and host identity; safe reported subscriptions are in fleet.',
+  'subscriptions disable': 'Local-only host subscription change; MCP cannot edit host subscription files.',
+  'subscriptions enable': 'Local-only host subscription change; MCP cannot edit host subscription files.',
   'bridge': 'Local native mailbox bridge; existing hosts own it.',
   'bridge-resume': 'Local journal acknowledgement, no server API.',
   'workclaim-sync': 'Local native work-claim bridge; existing hosts own it.',

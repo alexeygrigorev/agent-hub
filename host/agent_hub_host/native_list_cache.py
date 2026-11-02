@@ -36,7 +36,7 @@ def _entry(key: Any) -> dict[str, Any]:
         return _entries.setdefault(key, {"lock": threading.Lock(), "at": None, "value": None, "gen": 0})
 
 
-def cached(key: Any, fetch: Callable[[], Any], max_age: float) -> Any:
+def cached(key: Any, fetch: Callable[[], Any], max_age: float, *, force: bool = False) -> Any:
     """Return the snapshot for ``key`` no older than ``max_age`` s, fetching once if needed.
 
     Concurrent callers serialize on the entry lock; the first refreshes and the
@@ -46,7 +46,7 @@ def cached(key: Any, fetch: Callable[[], Any], max_age: float) -> Any:
     wanted_at = _clock()
     with entry["lock"]:
         at = entry["at"]
-        if at is not None and (wanted_at - at <= max_age or at >= wanted_at):
+        if not force and at is not None and (wanted_at - at <= max_age or at >= wanted_at):
             return entry["value"]
         started, gen = _clock(), entry["gen"]
         value = fetch()
@@ -69,5 +69,8 @@ def list_raw(executable: str, fetch: Callable[[], Any], max_age: float | None = 
     return cached(("list", executable), fetch, ttl_s() if max_age is None else min(max_age, ttl_s()))
 
 
-def message_log(executable: str, workspace: str, fetch: Callable[[], Any], max_age: float | None = None) -> Any:
-    return cached(("log", executable, workspace), fetch, LOG_TTL_S if max_age is None else max_age)
+def message_log(executable: str, workspace: str, fetch: Callable[[], Any], max_age: float | None = None,
+                *, force: bool = False) -> Any:
+    """Read a bounded-age log snapshot, or force a fresh native log fetch."""
+    return cached(("log", executable, workspace), fetch, LOG_TTL_S if max_age is None else max_age,
+                  force=force)

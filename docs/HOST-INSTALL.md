@@ -26,7 +26,7 @@ We install Python, Node and Git in your account, then add aplexer to manage sess
 
 Your engine commands include Claude Code, Codex and OpenCode. We also install Gemini CLI, Grok and Antigravity. On Windows we supply Git Bash so Claude can run without another install.
 
-On Windows the host keeps itself current: when Hub serves a new `hub.pyz`, the host schedules a one-off task for your account that reruns the same install command (no admin, at most one attempt per release every six hours). Each update builds a new release beside the old one; older releases stay until you remove them.
+On Windows the host keeps itself current: when Hub serves a new `hub.pyz`, the host schedules a one-off task for your account that reruns the same install command (no admin, at most one attempt per release every six hours). Each update builds a new release beside the old one; older releases stay until you remove them. `hub host-release` pins do not apply to these immutable package installs (they report `unsupported immutable_platform_unsupported`); see [HOST-RELEASE.md](HOST-RELEASE.md#windows-package-installs-immutable-release-trees-supported-update-path) for the exact supported path.
 
 We also install the pinned Agent Quota Launcher in `launcher-releases/<commit>`, so the host accepts headless (`--prompt`) sessions as well as interactive ones. A launcher you configured yourself is never replaced. Over an ssh logon the user PATH can't always be saved; installation still completes, and the services carry their own PATH.
 

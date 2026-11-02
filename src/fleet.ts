@@ -23,7 +23,7 @@ import { reconcileAccountCapacity } from './account_capacity';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
-import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
+import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, reservationHoldsCapacity, RESERVATION_TTL_MS, INFLIGHT_LAUNCH_ID_SQL, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { computeEngineDecision, isDesktopCodexExcluded, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
@@ -873,36 +873,38 @@ export class FleetService {
       }
     } catch { /* fail closed below when the live set is empty */ }
     const liveList = [...liveIds];
-    const staleCutoff = new Date(now - 48 * 3600000).toISOString();
+    const reservationCutoff = new Date(now - RESERVATION_TTL_MS).toISOString();
     const idleCutoff = now - this.resources.config().idle_minutes * 60000;
     const completeCatalogs = snapshot?.completeCatalogs ?? freshCompleteCatalogs(this.sql, now);
-    const isIdle = (row: any) => row.phase === 'running' && completeCatalogs.has(String(row.machine_id))
-      && typeof row.last_activity_at === 'string' && Number.isFinite(Date.parse(row.last_activity_at))
-      && Date.parse(row.last_activity_at) <= idleCutoff;
-    // A fresh complete census that no longer contains the exact native proves
-    // it does not consume physical concurrency. If an uncertain launch lost its
-    // launch native_id after binding, the exact session-control binding can
-    // still locate that historical native row. Keep launch/lifecycle rows
-    // unchanged: unobserved is not positive terminal proof.
-    const isUnobserved = (row: any) => unobservedReservationReleased(row, completeCatalogs);
-    // Native activity, rather than a launch receipt's update timestamp,
-    // determines whether a bound running session still occupies admission.
-    // Stale catalogs, unknown native state/activity and in-flight starts
-    // retain their reservations, even while independent heartbeats are fresh.
+    // Active concurrency is derived from observed live native sessions; launch
+    // reservations without a matching observed live native hold capacity only
+    // within RESERVATION_TTL_MS and release early on a fresh complete census.
     const reservations = snapshot ? snapshot.launches.filter(l => l.account === account.label &&
-      l.state !== 'queued' && (l.state === 'running' || l.updated_at > staleCutoff))
-      : this.byChunks(liveList, marks => `SELECT l.state,l.native_id,l.machine_id,s.phase,s.last_activity_at FROM fleet_launches l
+      l.state !== 'queued' && l.updated_at > reservationCutoff)
+      : this.byChunks(liveList, marks => `SELECT l.id,l.account,l.state,l.native_id,l.machine_id,l.updated_at,s.phase,s.last_activity_at,s.account AS native_account FROM fleet_launches l
           ${reservationNativeJoinSql(this.sql)}
-          WHERE l.account=? AND (l.state='running' OR l.updated_at>?)
-          AND l.state IN ${ACTIVE} AND l.machine_id IN (${marks})`, account.label, staleCutoff);
-    const reserved = reservations.filter(row => row.state === 'running'
-      ? (!isIdle(row) && !isUnobserved(row))
-      : row.state === 'uncertain' ? !isUnobserved(row) : true).length;
-    const orphans = snapshot ? snapshot.natives.filter(n => n.account === account.label && n.unreserved)
-      : this.byChunks(liveList, marks => `SELECT s.machine_id,s.phase,s.last_activity_at
+          WHERE l.account=? AND l.updated_at>?
+          AND l.state IN ${ACTIVE} AND l.machine_id IN (${marks})`, account.label, reservationCutoff);
+    const hasInFlight = reservations.some(r => !r.native_id && (r.state === 'starting' || r.state === 'uncertain'));
+    const inflightExpr = hasInFlight ? INFLIGHT_LAUNCH_ID_SQL : 'NULL';
+    const natives = snapshot ? snapshot.natives.filter(n => n.account === account.label)
+      : this.byChunks(liveList, marks => `SELECT s.machine_id,s.native_id,s.phase,s.last_activity_at,${inflightExpr} AS inflight_launch_id
           FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain')
-          AND s.machine_id IN (${marks}) AND ${NATIVE_UNRESERVED}`, account.label);
-    const observedSessions = orphans.filter(row => !isIdle(row)).length;
+          AND s.machine_id IN (${marks})`, account.label);
+    const startingNativeIds = new Set(reservations.filter(r => r.state === 'starting' && r.native_id).map(r => `${r.machine_id}\0${r.native_id}`));
+    const startingLaunchIds = new Set(reservations.filter(r => r.state === 'starting' && r.id).map(r => String(r.id)));
+    const isIdle = (row: any) => {
+      if (startingNativeIds.has(`${row.machine_id}\0${row.native_id}`)) return false;
+      if (row.inflight_launch_id && startingLaunchIds.has(String(row.inflight_launch_id))) return false;
+      return row.phase === 'running' && completeCatalogs.has(String(row.machine_id))
+        && typeof row.last_activity_at === 'string' && Number.isFinite(Date.parse(row.last_activity_at))
+        && Date.parse(row.last_activity_at) <= idleCutoff;
+    };
+    const inFlightMatchedIds = new Set(
+      natives.map(n => n.inflight_launch_id).filter((id): id is string => typeof id === 'string' && id.length > 0),
+    );
+    const reserved = reservations.filter(row => reservationHoldsCapacity(row, completeCatalogs, reservationCutoff, inFlightMatchedIds)).length;
+    const observedSessions = natives.filter(row => !isIdle(row)).length;
     const active = reserved + observedSessions;
     // Visibility breakdown (no accounting change): counted slots split into
     // launch reservations vs orphan observed sessions, alongside live native
@@ -1324,7 +1326,11 @@ export class FleetService {
       // for the same measured trigger to clear. Other eligible hosts may win.
       else if (loadRefusal !== undefined && loadRefusal.machine === route.machine_id && (() => {
         const trigger = loadRefusal.trigger || 'legacy';
-        if (trigger === 'mem_available') return Number.isFinite(hb.mem_avail_mb) && Number.isFinite(loadRefusal.limit) && hb.mem_avail_mb < loadRefusal.limit;
+        if (trigger === 'mem_available') {
+          const memFloor = loadRefusal.limit;
+          return Number.isFinite(hb.mem_avail_mb) && typeof memFloor === 'number'
+            && Number.isFinite(memFloor) && hb.mem_avail_mb < memFloor;
+        }
         if (trigger === 'cpu_busy') {
           const usage = sanitizeCpuUsage(hb.cpu_usage);
           const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;

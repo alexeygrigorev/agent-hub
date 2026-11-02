@@ -56,8 +56,16 @@ describe('repo-identity workspace (intake 8028bb06)', () => {
     const stub = bindings.HUB.get(bindings.HUB.idFromName('repo-start-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
       const seen: any[] = [];
+      const seeded = await hub.repoRegistry.handle(new Request('https://hub.test/api/repos/seed', {
+        method: 'POST', body: JSON.stringify({ repos: [{
+          name: 'agent-hub', machine, dir: '/srv/git/agent-hub', origin: 'alexeygrigorev/agent-hub',
+          org: 'alexeygrigorev', default_branch: 'main', status: 'active', aliases: [],
+        }] }),
+      }), admin);
+      expect(seeded.status).toBe(200);
       const service = new SessionControlService(hub.sql, cb => state.storage.transactionSync(cb), Date.now, {
         reserve: input => { seen.push(input); return { status: 400, value: { error: 'no_eligible_route', rejected: [] } }; },
+        resolveRepo: repo => hub.repoRegistry.resolveOrigin(repo),
       });
       service.init();
       seedFixtureIntake(hub.sql);

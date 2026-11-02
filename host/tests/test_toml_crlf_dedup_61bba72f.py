@@ -13,6 +13,7 @@ the expectations hold on every platform.
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_hub_host import provisioning as p
 
@@ -56,8 +57,10 @@ class CollapseDuplicateTomlTablesTests(unittest.TestCase):
 
     def test_duplicate_hook_tables_collapse(self):
         hook, header = hook_table('probe-hooks.json')
-        out = p.ensure_toml_trusted_hooks(hook + '\n' + hook,
-                                          Path('probe-hooks.json'))
+        hooks = {'hooks': {'Stop': [{'hooks': [{'command': 'echo probe'}]}]}}
+        with patch.object(p, 'read_engine_file', return_value=json.dumps(hooks).encode('utf-8')):
+            out = p.ensure_toml_trusted_hooks(hook + '\n' + hook,
+                                              Path('probe-hooks.json'))
         self.assertEqual(out.count(header), 1)
 
     def test_missing_trust_is_still_added_after_collapse(self):

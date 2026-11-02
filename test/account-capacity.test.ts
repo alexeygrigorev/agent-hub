@@ -311,7 +311,7 @@ describe('phantom account reservations', () => {
     const fleet = async () => await (await f.handle(new Request('https://hub.test/api/fleet'), admin)).json();
     const snapshot: any = await fleet();
     const account = snapshot.accounts.find((row: any) => row.label === 'shared-claude');
-    expect(account).toMatchObject({ active: 1, reserved: 1, observed_sessions: 0, native_live: 1 }); // One reservation, no orphan double count.
+    expect(account).toMatchObject({ active: 1, reserved: 0, observed_sessions: 1, native_live: 1 }); // Derived from observed live session, no reservation double count.
     expect(snapshot.accounts.find((row: any) => row.label === 'shared-codex').active).toBe(0);
     expect(snapshot.sessions.find((row: any) => row.native_id === 'live-native')).toMatchObject({ phase: 'running', account: 'shared-claude' });
     expect(snapshot.launches.find((row: any) => row.id === launch.id)).toMatchObject({ state: 'running', hub_session_id: 'control' });
@@ -548,6 +548,47 @@ describe('phantom account reservations', () => {
     expect(f.accountStatus(account).active).toBe(0);
     sql.exec("UPDATE fleet_sessions SET last_activity_at = NULL WHERE native_id = 'orphan'");
     expect(f.accountStatus(account).active).toBe(1);
+  }));
+
+  it('derives active concurrency from observed live sessions, expires unmatched reservations after TTL, and refuses genuinely full capacity', () => fixture(async (f, sql) => {
+    await configure(f);
+    sql.exec("UPDATE fleet_accounts SET max_concurrency = 2 WHERE label = 'shared-codex'");
+    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?), ('win35', ?)", iso(), iso());
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1), ('win35', ?, 1)", iso(), iso());
+    const status = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one());
+
+    // 1. Reservations without a matching observed native session hold a slot within TTL (15m) and expire past TTL.
+    sql.exec(`INSERT INTO fleet_launches (id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+      VALUES ('unmatched-offered','admin','human','offered','k-off','{}','hetzner','codex','shared-codex','headless','demo','goal','offered',NULL,?,?)`, iso(-20 * 60000), iso(-5 * 60000));
+    sql.exec(`INSERT INTO fleet_launches (id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+      VALUES ('unmatched-running','admin','human','running-no-native','k-run','{}','hetzner','codex','shared-codex','headless','demo','goal','running',NULL,?,?)`, iso(-20 * 60000), iso(-5 * 60000));
+    expect(status()).toMatchObject({ active: 2, reserved: 2, observed_sessions: 0, available_slots: 0 });
+
+    // Once updated_at ages past the 15-minute reservation TTL without a live native session, both expire.
+    sql.exec("UPDATE fleet_launches SET updated_at = ? WHERE id IN ('unmatched-offered', 'unmatched-running')", iso(-16 * 60000));
+    expect(status()).toMatchObject({ active: 0, reserved: 0, observed_sessions: 0, available_slots: 2 });
+
+    // 2. Bound running launch with a live observed native session counts in observed_sessions (not reserved), even when launch.updated_at is old.
+    sql.exec(`INSERT INTO fleet_launches (id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+      VALUES ('bound-live','admin','human','bound','k-bound','{}','hetzner','codex','shared-codex','headless','demo','goal','running','native-1',?,?)`, iso(-2 * 3600000), iso(-2 * 3600000));
+    sql.exec(`INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,agent_state,observed_at,last_activity_at,workspace,account)
+      VALUES ('hetzner','native-1','task-hub-bound-live','codex','running','working',?,?,'demo','shared-codex')`, iso(), iso());
+    expect(status()).toMatchObject({ active: 1, reserved: 0, observed_sessions: 1, native_live: 1, available_slots: 1 });
+
+    // 3. Adding a second observed live session fills max_concurrency = 2 -> genuinely full capacity refuses placement with account_concurrency.
+    sql.exec(`INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,agent_state,observed_at,last_activity_at,workspace,account)
+      VALUES ('hetzner','native-2','manual-worker','codex','running','working',?,?,'demo','shared-codex')`, iso(), iso());
+    expect(status()).toMatchObject({ active: 2, reserved: 0, observed_sessions: 2, native_live: 2, available_slots: 0 });
+    expect(status().placement_reasons).toContain('account_concurrency');
+
+    const planned: any = f.plan(intent({ machine: 'hetzner', account: 'shared-codex' }));
+    expect(planned.selected).toBeNull();
+    expect(planned.rejected).toEqual(expect.arrayContaining([
+      expect.objectContaining({ machine: 'hetzner', reason: 'account_concurrency', account: 'shared-codex', concurrency: { active: 2, limit: 2, available: 0 } }),
+    ]));
+    const held: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner', account: 'shared-codex' })), admin)).json();
+    expect(held.state).toBe('queued');
+    expect(held.rejected).toEqual(expect.arrayContaining([expect.objectContaining({ machine: 'hetzner', reason: 'account_concurrency' })]));
   }));
 });
 
