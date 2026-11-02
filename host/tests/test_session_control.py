@@ -301,8 +301,8 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(result['sessions'][-1]['id'], '124')
         self.assertEqual(result['active_count'], 125)
         self.assertIsNone(result['next_cursor'])
-        self.assertEqual(transport.call_args_list[0].args[:2], ('GET', '/api/sessions?limit=100'))
-        self.assertEqual(transport.call_args_list[1].args[:2], ('GET', '/api/sessions?limit=100&cursor=cursor-1'))
+        self.assertEqual(transport.call_args_list[0].args[:2], ('GET', '/api/sessions?live=1&limit=100'))
+        self.assertEqual(transport.call_args_list[1].args[:2], ('GET', '/api/sessions?live=1&limit=100&cursor=cursor-1'))
 
     def test_state_filter_walks_pages_until_all_matches_are_found(self):
         args = self.parse('list', '--state', 'running')

@@ -545,6 +545,7 @@ def add_commands(sub):
     listing.add_argument('--threshold', help='Long-running threshold (default 3h; HUB_SESSION_WARNING_THRESHOLD)')
     listing.add_argument('--state')
     listing.add_argument('--limit', type=int, help='Maximum total sessions to return (default: all pages)')
+    listing.add_argument('--all', action='store_true', help='Include historical finished sessions')
     listing.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     listing.add_argument('--tree', action='store_true', help='Display session lineage tree')
     count = commands.add_parser('count', help='Count live sessions (running/queued/stalled) grouped by host, engine and/or account')
@@ -889,8 +890,10 @@ def _execute(args):
         cursors: set = set()
         first_page = None
         page_size = min(100, total_limit) if total_limit is not None else 100
+        live_only = (total_limit is None and not getattr(args, 'all', False)
+                     and wanted not in ('stopped', 'failed', 'cancelled', 'refused', 'done'))
         while True:
-            path = '/api/sessions?limit=%d' % page_size
+            path = '/api/sessions?%slimit=%d' % ('live=1&' if live_only else '', page_size)
             if cursor:
                 path += '&cursor=' + quote(cursor, safe='')
             page = request('GET', threshold_path(args, path))

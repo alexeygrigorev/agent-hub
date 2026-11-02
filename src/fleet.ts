@@ -2510,17 +2510,23 @@ export class FleetService {
         // Stopped same-incarnation native sessions cannot resurrect from late live-catalog snapshots:
         // do not insert or resurrect in fleet_sessions or adoptObservedNativeSessions if already canonically stopped for the same incarnation.
         const stoppedSessions = new Map<string, number | null>();
+        const staleReconciledStopped = new Set<string>();
         try {
           // Primary-key lookups only: with machine_id/state in the WHERE the planner prefers the
           // (machine_id,state) index and reads the machine's whole stopped history per chunk.
+          const stoppedIds: string[] = [];
           for (const r of this.byChunks(reportedIds, (marks) => `SELECT id, machine_id, state, binding_json FROM session_control_sessions WHERE id IN (${marks})`)) {
             if (r.machine_id !== caller.machineId || r.state !== 'stopped') continue;
+            stoppedIds.push(String(r.id));
             try {
               const b = JSON.parse(r.binding_json || '{}');
               stoppedSessions.set(r.id, b.native_created_at_ms ?? null);
             } catch {
               stoppedSessions.set(r.id, null);
             }
+          }
+          for (const r of this.byChunks(stoppedIds, (marks) => `SELECT session_id FROM session_stale_reconciliations WHERE session_id IN (${marks}) AND reason = 'stale_no_heartbeat'`)) {
+            staleReconciledStopped.add(String(r.session_id));
           }
         } catch {}
 
@@ -2531,7 +2537,8 @@ export class FleetService {
         for (const s of data.sessions) {
           if (s.tokens) recordSessionTokens(this.sql, { session_id: `${caller.machineId}:${s.native_id}`,
             native_id: s.native_id, tag: s.tag, engine: s.engine, account: s.account, ...s.tokens }, this.now());
-          if (stoppedSessions.has(s.native_id)) {
+          const staleRecoverable = staleReconciledStopped.has(s.native_id) && (s.phase === 'starting' || s.phase === 'running');
+          if (stoppedSessions.has(s.native_id) && !staleRecoverable) {
             const stoppedCreated = stoppedSessions.get(s.native_id);
             if (stoppedCreated === null || stoppedCreated === undefined || s.created_at_ms === null || s.created_at_ms === undefined || s.created_at_ms <= stoppedCreated) {
               continue;
@@ -2544,7 +2551,7 @@ export class FleetService {
           cleanSessions.push(s);
           const prior = existing.get(s.native_id); seen.add(s.native_id);
           const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null, progress_json: s.progress ? JSON.stringify(s.progress) : null };
-          if (prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
+          if (!staleRecoverable && prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
           changedSessions.push(s);
           this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms, progress_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, row.cwd, s.profile, s.account, row.last_activity_at, row.created_at_ms, row.progress_json);
           written++;
