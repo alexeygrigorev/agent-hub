@@ -5,6 +5,54 @@ const inDO: any = runInDurableObject;
 const native = '3261084c-1f4f-4d9d-b88c-1eb74aa1810a';
 
 describe('verified external intake assignments', () => {
+  it('does not poison an append key when verify_live fails before the native appears', async () => {
+    const stub = (env as any).HUB.get((env as any).HUB.idFromName('hub'));
+    await inDO(stub, async (h: any) => {
+      const auth = async () => ({caller:{kind:'human',isAdmin:true,actor:'human:fixture'},scopes:['admin']});
+      const call = (path: string, payload?: any) => h.intakeService.handle(new Request('https://hub.test/api/intake'+path,
+        {method:payload?'POST':'GET',...(payload?{body:JSON.stringify(payload)}:{})}),auth);
+      const created = await (await call('/tasks',{key:'retry-create-absent',project:'demo',title:'Retry external assignment',text:'Synthetic task',source:{type:'unknown'}})).json();
+      const id = created.task.id;
+      const nativeId = '23f7091c-b64d-4c43-8bc4-55282b1a5e8b';
+      const payload = {key:'retry-absent-native',expected_version:1,event:{kind:'session',native_id:nativeId,host:'retry-host',verify_live:true}};
+      const append = () => call('/tasks/'+id+'/events',payload);
+      expect((await append()).status).toBe(409);
+      h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('retry-host',?,'worker','running',?,'retry-workspace')",nativeId,new Date().toISOString());
+      h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('retry-host',?)",new Date().toISOString());
+      const retried = await append();
+      expect(retried.status,await retried.clone().text()).toBe(200);
+      const replayed = await append();
+      expect(replayed.status).toBe(200);
+      expect((await replayed.json()).task.payload_data.history.at(-1)).toMatchObject({native_id:nativeId,evidence:'external_live_verified'});
+    });
+  });
+
+  it('returns retryable census staleness and allows the same append key after a fresh census', async () => {
+    const stub = (env as any).HUB.get((env as any).HUB.idFromName('hub'));
+    await inDO(stub, async (h: any) => {
+      const auth = async () => ({caller:{kind:'human',isAdmin:true,actor:'human:fixture'},scopes:['admin']});
+      const call = (path: string, payload?: any) => h.intakeService.handle(new Request('https://hub.test/api/intake'+path,
+        {method:payload?'POST':'GET',...(payload?{body:JSON.stringify(payload)}:{})}),auth);
+      const created = await (await call('/tasks',{key:'retry-create-stale',project:'demo',title:'Stale census assignment',text:'Synthetic task',source:{type:'unknown'}})).json();
+      const id = created.task.id;
+      const nativeId = '32c2da53-ef1d-4d2a-8f20-9235ed4ce212';
+      const old = new Date(Date.now()-181000).toISOString();
+      h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('stale-host',?,'worker','running',?,'stale-workspace')",nativeId,old);
+      h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('stale-host',?)",old);
+      const payload = {key:'retry-stale-census',expected_version:1,event:{kind:'session',native_id:nativeId,host:'stale-host',verify_live:true}};
+      const append = () => call('/tasks/'+id+'/events',payload);
+      const stale = await append();
+      expect(stale.status).toBe(503);
+      expect(stale.headers.get('Retry-After')).toBe('5');
+      expect(await stale.json()).toMatchObject({error:'external_session_not_live',retryable:true,retry_after:5,message:expect.stringContaining('census is stale')});
+      h.sql.exec("UPDATE fleet_sessions SET observed_at=? WHERE machine_id='stale-host' AND native_id=?",new Date().toISOString(),nativeId);
+      h.sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='stale-host'",new Date().toISOString());
+      const retried = await append();
+      expect(retried.status,await retried.clone().text()).toBe(200);
+      expect((await retried.json()).task.payload_data.history.at(-1)).toMatchObject({native_id:nativeId,evidence:'external_live_verified'});
+    });
+  });
+
   it('registers through the append route shared by CLI/MCP and expires live evidence with the host census', async () => {
     const stub = (env as any).HUB.get((env as any).HUB.idFromName('hub'));
     await inDO(stub, async (h: any) => {

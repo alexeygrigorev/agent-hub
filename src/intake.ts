@@ -1094,7 +1094,11 @@ export class IntakeService {
       if (raw.verify_live === true) {
         this.operator(p);
         const n = externalSession(this.sql, fields, now);
-        if (!n?.live) fail('external_session_not_live', 409);
+        if (!n?.live) {
+          if (n?.retryable) throw new IntakeError('external_session_not_live', 503, undefined, undefined,
+            { retryable: true, retry_after: 5, message: 'The host census is stale for this session; retry after the host reports again.' });
+          fail('external_session_not_live', 409);
+        }
         fields.host = n.machine_id;
         fields.engine = n.engine ?? fields.engine;
         fields.evidence = 'external_live_verified';
@@ -1921,7 +1925,9 @@ export class IntakeService {
     }
   }
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+    const json = (data: Obj, status = 200, extraHeaders: Record<string, string> = {}) => Response.json(data, { status, headers: {
+      'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', ...extraHeaders,
+    } });
     try {
       const initial = await authenticate();
       const crossOrigin = request.method === 'POST' && request.headers.has('Origin') && request.headers.get('Origin') !== new URL(request.url).origin;
@@ -1986,7 +1992,7 @@ export class IntakeService {
         ...(e.field === 'limit' ? { min: 1, max: INTAKE_LIMITS.page } : {}),
         ...(e.code === 'invalid_event_kind' ? { valid_kinds: INTAKE_EVENT_KINDS } : {}),
         ...(e.detail ?? {}),
-      }, e.status);
+      }, e.status, e.detail?.retry_after ? { 'Retry-After': String(e.detail.retry_after) } : {});
     }
   }
 }
