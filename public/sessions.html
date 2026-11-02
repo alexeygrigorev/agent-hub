@@ -3,10 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Sessions &amp; Lineage · Agent Hub</title>
+  <title>Sessions · Agent Hub</title>
   <link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css">
   <link rel="stylesheet" href="/sessions.css">
   <script src="/auth.js"></script>
+  <script src="/session-launch.js" defer></script>
   <script src="/sessions.js" defer></script>
 </head>
 <body>
@@ -80,32 +81,51 @@
     <div class="dk-main__inner">
       <header class="dk-page-header">
         <div class="dk-page-header__main">
-          <h1 class="dk-page-header__title">Sessions &amp; Lineage</h1>
-          <p class="dk-page-header__subtitle">All host native and headless sessions, unified lineage, and control</p>
+          <h1 class="dk-page-header__title">Sessions</h1>
+          <p class="dk-page-header__subtitle">Running work and the sessions that need your attention.</p>
+        </div>
+        <div class="dk-page-header__actions">
+          <button class="dk-button dk-button--primary" type="button" data-hub-new-session>New session</button>
         </div>
       </header>
 
-      <div class="dk-cluster sessions-controls">
-        <div class="dk-tabs" role="tablist" aria-label="Session View">
-          <button class="dk-tab" id="view-list-btn" type="button" role="tab" aria-selected="true" aria-controls="list-section">List View</button>
-          <button class="dk-tab" id="view-tree-btn" type="button" role="tab" aria-selected="false" aria-controls="tree-section">Lineage Tree</button>
+      <section class="sessions-attention dk-card" aria-labelledby="sessions-attention-title">
+        <div class="sessions-attention__head">
+          <div><h2 id="sessions-attention-title">Needs attention</h2><p class="dk-muted">Blocked, waiting for you, idle with unfinished work, or no recent observation.</p></div>
+          <span id="sessions-attention-count" class="dk-chip" aria-live="polite">Checking…</span>
         </div>
+        <div id="sessions-attention-list" class="sessions-attention__list" aria-live="polite">Loading attention status…</div>
+      </section>
+
+      <div class="dk-cluster sessions-controls">
+        <details class="sessions-advanced-view">
+          <summary>Lineage view</summary>
+          <div class="dk-tabs" role="tablist" aria-label="Session detail views">
+            <button class="dk-tab" id="view-list-btn" type="button" role="tab" aria-selected="true" aria-controls="list-section">Sessions</button>
+            <button class="dk-tab" id="view-tree-btn" type="button" role="tab" aria-selected="false" aria-controls="tree-section">Lineage tree</button>
+          </div>
+        </details>
+        <nav class="sessions-view-filter" aria-label="Session status">
+          <a class="sessions-view-filter__item" href="/sessions.html?view=running" data-sessions-view="running">Running</a>
+          <a class="sessions-view-filter__item" href="/sessions.html?view=attention" data-sessions-view="attention">Needs attention</a>
+          <a class="sessions-view-filter__item" href="/sessions.html?scope=all" data-sessions-view="finished">Finished</a>
+        </nav>
         <div class="sessions-filter-wrap">
-          <input type="search" id="sessions-filter" class="dk-input" placeholder="Filter by name, alias, engine, state…" aria-label="Filter sessions">
+          <input type="search" id="sessions-filter" class="dk-input" placeholder="Filter loaded sessions…" aria-label="Filter loaded sessions">
         </div>
         <button class="dk-button dk-button--secondary" type="button" id="sessions-refresh">Refresh</button>
-        <button class="dk-button dk-button--secondary" type="button" id="sessions-show-all">Show finished</button>
         <span id="status" role="status" class="dk-muted">Loading sessions…</span>
       </div>
 
       <section class="dk-card dk-stack sessions-card" id="list-section">
-        <h2 class="sessions-section-title">Sessions</h2>
+        <h2 class="sessions-section-title" id="sessions-list-title">Running sessions</h2>
+        <p id="sessions-scope-note" class="dk-muted">Showing the first page of running sessions. Load more to browse older records.</p>
         <div id="sessions-table-container"></div>
         <button class="dk-button dk-button--secondary" type="button" id="sessions-more" hidden>Load more</button>
       </section>
 
       <section class="dk-card dk-stack sessions-card" id="tree-section" hidden>
-        <h2 class="sessions-section-title">Session Lineage Tree</h2>
+        <h2 class="sessions-section-title">Session lineage</h2>
         <p class="dk-muted">Parent-child hierarchy (Developer &gt; Coordinator &gt; Workers). Sessions started outside the hub show external origin.</p>
         <div id="sessions-tree-container"></div>
       </section>

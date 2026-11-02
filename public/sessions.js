@@ -3,16 +3,19 @@ const byId = id => document.getElementById(id);
 let activeTab = 'list';
 let cachedSessions = [];
 let cachedTree = { tree: [] };
-// Live-only by default; "Show finished" and "Load more" are explicit (hub-1101-outage-20261031).
-let showAll = false;
+// Session scope and status stay in the URL so detail/back preserves the view.
+const initialParams = new URLSearchParams(location.search);
+let viewFilter = initialParams.get('view') === 'attention' ? 'attention' : initialParams.get('view') === 'finished' || initialParams.get('scope') === 'all' ? 'finished' : 'running';
+let showAll = viewFilter === 'finished';
 let nextCursor = null;
 let activeCount = null;
+let attentionRows = [];
+let savedListScroll = 0;
 
 function updateMoreButton() {
   const more = byId('sessions-more');
   if (more) more.hidden = !nextCursor;
-  const toggle = byId('sessions-show-all');
-  if (toggle) toggle.textContent = showAll ? 'Live only' : 'Show finished';
+  if (more) more.textContent = 'Load more sessions';
 }
 
 async function loadMore() {
@@ -51,7 +54,6 @@ async function loadSessionPages() {
 }
 let selectedSessionId = null;
 let detailPollTimer = null;
-const autoCapturedSessions = new Set();
 let csrf = null;
 let loading = false;
 
@@ -104,10 +106,63 @@ function typeBadge(type) {
 // A cleanly stopped session whose worker reported done is a completion,
 // not a failure (intake 17e774f8); every other stop keeps its own badge.
 function sessionDisplayState(s) {
-  if (s.waiting_confirmation || s.agent_state === 'waiting') return 'waiting-confirmation';
+  if (s.waiting_confirmation || s.agent_state === 'waiting' || ['waiting_confirmation', 'waiting_for_human'].includes(s.state)) return 'waiting-confirmation';
   if (s.agent_state === 'idle' && s.state === 'running') return 'idle';
   if (s.state === 'stopped' && s.worker_status === 'done') return 'done';
   return s.state;
+}
+
+function sessionTaskLabel(s) {
+  return s.summary || s.task_summary || s.task || s.name || s.intake_title || (s.intake_id ? `Task ${s.intake_id}` : '') || s.qualified_alias || `Session ${s.id || ''}`;
+}
+
+function attentionKind(s) {
+  if (s.waiting_confirmation || s.agent_state === 'waiting' || ['waiting_confirmation', 'waiting_for_human', 'needs_human'].includes(s.state)) return 'Waiting for you';
+  if (['stalled', 'blocked'].includes(s.state) || s.agent_state === 'stalled') return 'Blocked';
+  if (s.state === 'uncertain') return 'Stale observation';
+  if (['idle_with_open_ac', 'idle'].includes(s.state) || s.agent_state === 'idle' && s.state === 'running') return 'Idle with unfinished work';
+  const updated = Date.parse(s.updated_at || '');
+  if (Number.isFinite(updated) && Date.now() - updated > 15 * 60 * 1000 && !['stopped', 'done', 'failed', 'cancelled'].includes(s.state)) return 'Stale observation';
+  return '';
+}
+
+function renderAttention(sessions, statusData = null) {
+  const list = byId('sessions-attention-list'), count = byId('sessions-attention-count');
+  if (!list) return;
+  const byIdMap = new Map(sessions.map(s => [s.id, s]));
+  const authoritative = Array.isArray(statusData?.needs_attention)
+    ? statusData.needs_attention.filter(row => row.source === 'session_idle' || row.source === 'session_ping' || row.source === 'session_stalled' || row.source === 'session_uncertain' || row.kind === 'session')
+    : [];
+  const rows = new Map();
+  for (const row of authoritative) {
+    const id = row.session_id || row.id;
+    if (!id) continue;
+    const session = byIdMap.get(id) || { id, state: row.state, updated_at: row.updated_at, intake_id: row.intake_id };
+    let kind = attentionKind({ ...session, ...row });
+    if (!kind) kind = row.source === 'session_ping' || row.source === 'session_uncertain' ? 'Stale observation' : row.source === 'session_stalled' ? 'Blocked' : 'Idle with unfinished work';
+    rows.set(id, { session, kind });
+  }
+  for (const session of sessions) {
+    const kind = attentionKind(session);
+    if (kind && !rows.has(session.id)) rows.set(session.id, { session, kind });
+  }
+  const values = [...rows.values()];
+  list.replaceChildren();
+  count.textContent = `${values.length} ${values.length === 1 ? 'session' : 'sessions'}`;
+  if (!values.length) {
+    const empty = document.createElement('p'); empty.className = 'dk-muted';
+    empty.textContent = Array.isArray(statusData?.needs_attention) ? 'No sessions need attention.' : 'Attention status is unavailable. Refresh to try again.';
+    list.append(empty); return;
+  }
+  for (const { session, kind } of values) {
+    const item = document.createElement('article'); item.className = 'sessions-attention-item';
+    const title = document.createElement('button'); title.type = 'button'; title.className = 'sessions-attention-item__title';
+    title.textContent = sessionTaskLabel(session); title.addEventListener('click', () => openSessionDetail(session.id));
+    const label = document.createElement('span'); label.className = 'dk-badge dk-badge--warning'; label.textContent = kind;
+    const context = document.createElement('span'); context.className = 'dk-muted';
+    context.textContent = session.intake_id ? `Linked task ${session.intake_id}` : `Session ${session.id}`;
+    item.append(title, label, context); list.append(item);
+  }
 }
 
 function stateBadge(state) {
@@ -115,7 +170,7 @@ function stateBadge(state) {
   const s = state || 'unknown';
   let color = 'dk-badge--neutral';
   if (['running', 'active', 'working', 'acked', 'delivered', 'done'].includes(s)) color = 'dk-badge--success';
-  else if (['stale', 'stalled', 'uncertain', 'offered', 'starting', 'recorded', 'transported', 'claimed', 'held', 'waiting', 'waiting-confirmation', 'waiting_confirmation', 'waiting-idle', 'waiting_until', 'idle'].includes(s)) color = 'dk-badge--warning';
+  else if (['stale', 'stalled', 'uncertain', 'offered', 'starting', 'recorded', 'transported', 'claimed', 'held', 'waiting', 'waiting-confirmation', 'waiting_confirmation', 'waiting-idle', 'waiting_until', 'idle', 'blocked', 'waiting for you', 'idle with unfinished work', 'stale observation'].includes(s)) color = 'dk-badge--warning';
   else if (['failed', 'refused', 'stopped', 'offline', 'error', 'cancelled'].includes(s)) color = 'dk-badge--danger';
   span.className = `dk-badge ${color}`;
   span.textContent = s;
@@ -180,7 +235,7 @@ function renderSessionCards(filtered, emptyMessage) {
   for (const s of filtered) {
     const card = document.createElement('article');
     card.className = 'dk-card dk-stack sessions-card-item';
-    const nameText = s.qualified_alias || s.name || s.id || '-';
+    const nameText = sessionTaskLabel(s);
     bindSessionTap(card, s.id, nameText);
 
     const head = document.createElement('div');
@@ -199,7 +254,7 @@ function renderSessionCards(filtered, emptyMessage) {
     chev.setAttribute('aria-hidden', 'true');
     chev.textContent = '›';
     const displayState = sessionDisplayState(s);
-    badges.append(stateBadge(displayState), typeBadge(s.session_type), chev);
+    badges.append(stateBadge(attentionKind(s) || displayState), typeBadge(s.session_type), chev);
     head.append(badges);
     card.append(head);
 
@@ -236,7 +291,7 @@ function renderTable(sessions, filter = '') {
   const query = filter.toLowerCase().trim();
   const filtered = sessions.filter(s => {
     if (!query) return true;
-    const name = (s.qualified_alias || s.name || s.id || '').toLowerCase();
+    const name = sessionTaskLabel(s).toLowerCase();
     const engine = (s.engine || '').toLowerCase();
     const rawState = (s.state || '').toLowerCase();
     const isWait = Boolean(s.waiting_confirmation || s.agent_state === 'waiting');
@@ -250,7 +305,7 @@ function renderTable(sessions, filter = '') {
   const emptyMessage = sessions.length === 0 ? 'No sessions reported.' : 'No sessions match filter.';
   container.append(renderSessionCards(filtered, emptyMessage));
 
-  const columns = ['Type', 'Name / Alias', 'Engine', 'State', 'Workspace', 'Parent', 'Updated'];
+  const columns = ['Task / Session', 'Status', 'Type', 'Engine', 'Workspace', 'Parent', 'Updated'];
   const wrapper = document.createElement('div');
   wrapper.className = 'scroll sessions-table-wrap';
   const table = document.createElement('table');
@@ -271,16 +326,11 @@ function renderTable(sessions, filter = '') {
   for (const s of filtered) {
     const tr = document.createElement('tr');
     tr.className = 'sessions-row';
-    const nameText = s.qualified_alias || s.name || s.id;
+    const nameText = sessionTaskLabel(s);
     bindSessionTap(tr, s.id, nameText);
 
-    const tdType = document.createElement('td');
-    tdType.dataset.label = 'Type';
-    tdType.append(typeBadge(s.session_type));
-    tr.append(tdType);
-
     const tdName = document.createElement('td');
-    tdName.dataset.label = 'Name / Alias';
+    tdName.dataset.label = 'Task / Session';
     const nameSpan = document.createElement('span');
     nameSpan.className = 'code-pill sessions-truncate';
     nameSpan.textContent = nameText;
@@ -288,16 +338,21 @@ function renderTable(sessions, filter = '') {
     tdName.append(nameSpan);
     tr.append(tdName);
 
+    const tdState = document.createElement('td');
+    tdState.dataset.label = 'Status';
+    const status = attentionKind(s);
+    tdState.append(stateBadge(status || sessionDisplayState(s)));
+    tr.append(tdState);
+
+    const tdType = document.createElement('td');
+    tdType.dataset.label = 'Type';
+    tdType.append(typeBadge(s.session_type));
+    tr.append(tdType);
+
     const tdEngine = document.createElement('td');
     tdEngine.dataset.label = 'Engine';
     tdEngine.textContent = s.engine || '-';
     tr.append(tdEngine);
-
-    const tdState = document.createElement('td');
-    tdState.dataset.label = 'State';
-    const displayState = sessionDisplayState(s);
-    tdState.append(stateBadge(displayState));
-    tr.append(tdState);
 
     const tdWs = document.createElement('td');
     tdWs.dataset.label = 'Workspace';
@@ -494,7 +549,7 @@ function renderSessionDetail(session, commands = []) {
   const sendBtn = byId('session-send-btn');
   const sendInput = byId('session-send-input');
 
-  const displayTitle = session.qualified_alias || session.name || session.id || 'Session';
+  const displayTitle = sessionTaskLabel(session);
   if (titleEl) titleEl.textContent = displayTitle;
   if (badgesEl) {
     badgesEl.replaceChildren(stateBadge(session.state === 'stopped' && session.worker_status === 'done' ? 'done' : session.state), typeBadge(session.session_type));
@@ -512,6 +567,12 @@ function renderSessionDetail(session, commands = []) {
     metaEl.replaceChildren();
     addMetaItem(metaEl, 'Session ID', session.id);
     addMetaItem(metaEl, 'Alias / Name', session.qualified_alias || session.name || '-');
+    if (session.intake_id) {
+      const item = document.createElement('div'); item.className = 'session-meta-item';
+      const label = document.createElement('span'); label.className = 'session-meta-item__label'; label.textContent = 'Linked task';
+      const link = document.createElement('a'); link.className = 'session-meta-link'; link.href = `/intake/${encodeURIComponent(session.intake_id)}`; link.textContent = session.intake_title || session.intake_id;
+      item.append(label, link); metaEl.append(item);
+    }
     addMetaItem(metaEl, 'Engine / Mode', `${session.engine || '-'} · ${session.mode || session.session_type || '-'}`);
     addMetaItem(metaEl, 'Machine', session.machine || '-');
     addMetaItem(metaEl, 'Workspace', session.workspace || '-');
@@ -729,9 +790,6 @@ async function refreshSessionDetail(sessionId) {
     }
     if (hasPending) {
       detailPollTimer = setTimeout(() => refreshSessionDetail(sessionId), 2000);
-    } else if (sessionData.state === 'running' && csrf && !cmds.some(c => c.kind === 'capture') && !autoCapturedSessions.has(sessionData.id)) {
-      autoCapturedSessions.add(sessionData.id);
-      requestCapture('tail', true);
     }
   } catch (err) {
     if (actionStatus) actionStatus.textContent = `Could not load session details: ${err.message || 'error'}`;
@@ -740,6 +798,7 @@ async function refreshSessionDetail(sessionId) {
 
 function openSessionDetail(sessionId, pushHistory = true) {
   if (!sessionId) return;
+  savedListScroll = window.scrollY;
   selectedSessionId = sessionId;
   if (detailPollTimer) {
     clearTimeout(detailPollTimer);
@@ -792,6 +851,7 @@ function closeSessionDetail(pushHistory = true) {
     history.pushState({}, '', url.pathname + url.search);
   }
   updateView();
+  window.requestAnimationFrame(() => window.scrollTo({ top: savedListScroll, behavior: 'instant' }));
 }
 
 async function requestCapture(mode = 'tail', silent = false) {
@@ -888,23 +948,26 @@ async function loadData() {
     } catch (e) {
       if (e && e.message === 'Sign-in required') return;
     }
-    const [sessionsData, treeData, auditData] = await Promise.all([
+    const [sessionsData, treeData, auditData, statusData] = await Promise.all([
       loadSessionPages(),
       api(`/api/sessions/tree?limit=200${showAll ? '&include=all' : ''}`),
       // Admin-only; a 403 just means the panel stays hidden.
-      api('/api/sessions/audit?last=5').catch(() => null)
+      api('/api/sessions/audit?last=5').catch(() => null),
+      api('/api/status').catch(() => null)
     ]);
     cachedSessions = sessionsData.sessions || [];
     nextCursor = sessionsData.next_cursor || null;
     activeCount = sessionsData.active_count;
     updateMoreButton();
     cachedTree = treeData || { tree: [] };
+    attentionRows = Array.isArray(statusData?.needs_attention) ? statusData.needs_attention : [];
+    renderAttention(cachedSessions, statusData);
     renderAudit(auditData);
     updateView();
     if (selectedSessionId) {
       await refreshSessionDetail(selectedSessionId);
     }
-    status.textContent = `Authenticated · ${activeCount ?? cachedSessions.length} active`;
+    status.textContent = `Authenticated · ${activeCount ?? cachedSessions.length} active · ${cachedSessions.length} loaded`;
   } catch (err) {
     status.textContent = 'Sessions could not be refreshed.';
     updateView();
@@ -915,9 +978,24 @@ async function loadData() {
 }
 
 function updateView() {
-  const filter = byId('sessions-filter')?.value || '';
+  const filterInput = byId('sessions-filter');
+  const filter = filterInput?.value || '';
   if (activeTab === 'list') {
-    renderTable(cachedSessions, filter);
+    const attentionIds = new Set(attentionRows.map(row => row.session_id || row.id).filter(Boolean));
+    const viewSessions = viewFilter === 'attention'
+      ? cachedSessions.filter(s => attentionIds.has(s.id) || attentionKind(s))
+      : viewFilter === 'finished'
+        ? cachedSessions.filter(s => ['stopped', 'done', 'failed', 'cancelled', 'exited'].includes(s.state))
+        : cachedSessions.filter(s => !['stopped', 'done', 'failed', 'cancelled', 'exited'].includes(s.state));
+    const title = byId('sessions-list-title');
+    if (title) title.textContent = viewFilter === 'attention' ? 'Sessions needing attention' : viewFilter === 'finished' ? 'Finished sessions' : 'Running sessions';
+    const note = byId('sessions-scope-note');
+    if (note) note.textContent = `${viewSessions.length} shown from ${cachedSessions.length} loaded · ${nextCursor ? 'more pages available' : 'no more pages reported'}`;
+    document.querySelectorAll('[data-sessions-view]').forEach(link => {
+      const active = link.dataset.sessionsView === viewFilter;
+      link.setAttribute('aria-current', active ? 'page' : 'false');
+    });
+    renderTable(viewSessions, filter);
   } else {
     renderTree(cachedTree, filter);
   }
@@ -1020,13 +1098,15 @@ function setupEvents() {
 
   filterInput?.addEventListener('input', () => {
     if (selectedSessionId) closeSessionDetail();
-    else updateView();
+    const url = new URL(location.href);
+    if (filterInput.value) url.searchParams.set('q', filterInput.value); else url.searchParams.delete('q');
+    history.replaceState(history.state, '', url.pathname + url.search);
+    if (!selectedSessionId) updateView();
   });
 
   refreshBtn?.addEventListener('click', () => {
     loadData();
   });
-  byId('sessions-show-all')?.addEventListener('click', () => { showAll = !showAll; updateMoreButton(); loadData(); });
   byId('sessions-more')?.addEventListener('click', () => { loadMore().catch(() => {}); });
 
   byId('session-detail-back')?.addEventListener('click', () => {
@@ -1092,6 +1172,8 @@ function setupEvents() {
 
 document.addEventListener('DOMContentLoaded', () => {
   setupEvents();
+  const query = initialParams.get('q');
+  if (query && byId('sessions-filter')) byId('sessions-filter').value = query;
   const initialSession = new URLSearchParams(location.search).get('session');
   if (initialSession) {
     openSessionDetail(initialSession, false);
