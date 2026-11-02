@@ -526,6 +526,7 @@ def execute(args):
             candidates = merge_evidence.shas_from_text(text, exclude=(task.get('id'),) + tuple(e.get('hub_session_id') or e.get('id') for e in history if isinstance(e, dict)))
             merge_evidence.fetch_origin(repo)
             wanted = explicit + merge_evidence.existing_commits(repo, candidates) + [x for x in args.sha if isinstance(x, str)]
+            wanted += merge_evidence.hub_recorded_shas(task.get('merge_state'))
             evidence = merge_evidence.collect(str(Path(repo).resolve()), wanted, fetch=False, include_head=args.repo is not None)
         except RuntimeError as exc:
             raise IntakeInputError(str(exc)) from None

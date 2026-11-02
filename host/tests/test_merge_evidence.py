@@ -38,6 +38,14 @@ class FakeRunner:
 
 
 class MergeEvidenceTests(unittest.TestCase):
+    def test_hub_recorded_head_yields_deploy_evidence(self):
+        self.assertEqual(me.hub_recorded_shas({'head': A.upper(), 'commits': [{'sha': B}, {'sha': 'zz'}, 'x']}), [A, B])
+        self.assertEqual(me.hub_recorded_shas(None), [])
+        runner_ok = FakeRunner(in_main=[A], runs=[{'headSha': A, 'conclusion': 'success', 'status': 'completed', 'url': 'u'}])
+        out = me.collect('/r', me.hub_recorded_shas({'head': A}), runner_ok, fetch=False, include_head=False)
+        self.assertEqual(out['deploy']['state'], 'success')
+        self.assertEqual(out['deploy']['run'], 'u')
+
     def test_unmerged_commit_is_not_in_main_and_deploy_missing(self):
         out = me.collect('/r', [], FakeRunner())
         self.assertEqual(out['head'], A)

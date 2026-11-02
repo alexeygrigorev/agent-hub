@@ -74,6 +74,20 @@ def explicit_commit_refs(history: list) -> list:
     return refs
 
 
+def hub_recorded_shas(merge_state: Any) -> list:
+    """Commit SHAs Hub already tracks for the worktree (branch head from host status plus
+    earlier evidence). Without these a merged worktree whose intake carries no report/DONE
+    sha yields no commits, hence no deploy evidence (intake 3f2011c2)."""
+    state = merge_state if isinstance(merge_state, dict) else {}
+    refs = [state.get('head')] + [c.get('sha') for c in state.get('commits') or [] if isinstance(c, dict)]
+    out = []
+    for ref in refs:
+        ref = str(ref or '').strip().lower()
+        if SHA.match(ref) and ref not in out:
+            out.append(ref)
+    return out
+
+
 def own_clone(runner: Callable = subprocess.run, remote: Optional[str] = None) -> str:
     """Private checkout of the project repo (never the caller's cwd)."""
     remote = remote or os.environ.get('AGENT_HUB_MERGE_CHECK_REMOTE') or DEFAULT_REMOTE
