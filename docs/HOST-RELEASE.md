@@ -38,16 +38,20 @@ and the supported heavy-test admission protocol from the release.
 `scripts/capped-test-run.sh` asks the active user service for its `ExecStart`,
 runs the release's own verifier, requires `release_rev` to contain d8740aac,
 checks the packaged module hash, then executes that module directly (no wrapper
-recursion). If the active release predates d8740aac, the worktree script is the
-fallback. `scripts/test-affected-local.sh` holds with a rebase instruction
+recursion). It recognizes both the standard `host-releases` root and the
+orchestrator's `host-releases-orch` root under
+`~/.local/share/agent-hub/`; `AGENT_HUB_HOST_RELEASES_DIR` may add an explicit
+managed root. If the active release predates d8740aac, the worktree script is
+the fallback. `scripts/test-affected-local.sh` holds with a rebase instruction
 before taking a slot when its worktree predates that revision; rebasing is
 voluntary.
 
 The host session loop also watches its shared admission pool. After a 10-second
 zero-CPU sample confirms a queued admission is nested under a slot holder, and
-only when no test runner is present in that process tree, it sends SIGTERM to
-the queued command's process group and appends a sanitized note to the linked
-intake. It never unlinks lock files or signals an admitted test process.
+only when no test runner is present in that process tree and the nested command
+does not hold a second slot, it sends SIGTERM to the queued command's process
+group and appends a sanitized note to the linked intake. It never unlinks lock
+files or signals an admitted test process.
 
 Existing worktrees are never rewritten by the host release switch. Until each
 worktree rebases, old one-off test commands that bypass
@@ -57,6 +61,9 @@ process hidden from the host's `/proc`, a nonstandard admission command name,
 or a test runner not recognized by the conservative active-runner list may
 remain outside that protection. Rollout should prompt owners to rebase and
 skip dirty, unpushed, locked or live worktrees rather than forcing updates.
+New Hub session prompts check for d8740aac before gating, honor the HOLD, and
+require a clean checkpoint plus head-coordinated non-forced rebase for an
+older worktree. No automatic or mass worktree rewrite is part of the release.
 
 `scripts/switch-host-release.py` refuses to write any drop-in unless the
 release verifies: it clones `--template` (normally the active drop-in),

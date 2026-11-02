@@ -29,3 +29,14 @@ def test_compose_prompt_keeps_rules_in_front_of_brief():
     assert "main-temp AWS profile" in composed
     assert "commit-msg hook" in SESSION_PREAMBLE
     assert "Scope: gray <intake-UUID>" in SESSION_PREAMBLE
+
+
+def test_preamble_guides_safe_admission_upgrade_for_older_worktrees():
+    from agent_hub_host.session_rules import HEAVY_TEST_ADMISSION_UPGRADE_RULE
+
+    assert "d8740aaca3944a295680177a40148bb00accea78" in HEAVY_TEST_ADMISSION_UPGRADE_RULE
+    assert "honor the HOLD" in HEAVY_TEST_ADMISSION_UPGRADE_RULE
+    assert "opt-in and dry-run first" in HEAVY_TEST_ADMISSION_UPGRADE_RULE
+    assert "dirty, unpushed, locked, or live worktrees" in HEAVY_TEST_ADMISSION_UPGRADE_RULE
+    assert "normal, non-forced rebase" in HEAVY_TEST_ADMISSION_UPGRADE_RULE
+    assert "another session's worktree" in HEAVY_TEST_ADMISSION_UPGRADE_RULE

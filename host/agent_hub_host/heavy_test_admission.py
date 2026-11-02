@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""Versioned host-release implementation of heavy-test admission.
-
-The small worktree wrapper selects this file from the active verified host
-release when available. Keep the CLI and shared queue protocol compatible
-with the script fallback shipped in worktrees.
-"""
+"""Versioned host-release implementation of heavy-test admission."""
 import argparse
-from datetime import datetime, timezone
 import fcntl
 import json
 import math
@@ -18,9 +12,50 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
-NORMAL_AGE_S = 300
-ADMISSION_PROTOCOL_VERSION = 1
+# Priority classes, lowest privilege first (intake 1293b560 AC3).
+# 'final' is a pre-push verification lane: it jumps queued normal tickets
+# younger than NORMAL_AGE_S. 'release' is the orchestrator-main
+# release/integration gate lane: it is admitted ahead of both normal and
+# final tickets, so main is never blocked behind worker test lanes. Only an
+# explicit --priority release / AGENT_HUB_HEAVY_TEST_PRIORITY=release takes
+# the release class; aging promotes a normal ticket to the final class only,
+# never to release. Older readers (before release existed) coerce an unknown
+# priority to 'normal' with a warning instead of failing the queue (see
+# Queue.load), so a release row degrades to normal instead of poisoning them.
+PRIORITIES = ('normal', 'final', 'release')
+NORMAL_AGE_S = 1500
+try:  # test hook / host tuning; invalid values keep the default
+    _age = os.environ.get('AGENT_HUB_HEAVY_TEST_NORMAL_AGE_S', '')
+    if _age.isascii() and _age.isdecimal() and 1 <= int(_age) <= 86400:
+        NORMAL_AGE_S = int(_age)
+except Exception:
+    pass
+# Slot sizing (intake 1293b560 AC2, supersedes the 167c6178 follow-up note).
+# The slot count is ONE host-level setting: the integer in the live
+# <heavy-test-dir>/slots file, re-read by every admission. An explicit
+# --slots flag still wins (operator/tests); AGENT_HUB_HEAVY_TEST_SLOTS is
+# only a fallback for private pools and tests when the file is absent, never
+# a per-process override of the live host setting. Old worktrees already read
+# the same file when the env var is unset, so unsetting the env (see
+# docs/HETZNER-OVERLOAD-0689CE9C.md and AGENTS.md) keeps old and new
+# checkouts on the same count with no code change on their side.
+#
+# Sizing formula (measured 2026-11-02, RMTHZ: 12 cores, 62 GiB):
+#   load_budget = 1.5 * cores            (host 5-min load budget for tests)
+#   cpu_slots   = floor((load_budget - base_load_5min) / cpu_per_lane)
+#   mem_slots   = floor((MemAvailable_GiB - mem_reserve_GiB) / mem_per_lane_GiB)
+#   slots       = clamp(1, MAX_SLOTS, min(cpu_slots, mem_slots))
+# Measured per-lane cost: vitest lane ~0.71 cores / ~0.9 GiB, pytest lane
+# ~0.27 cores / ~0.64 GiB (two existing lanes, 2026-11-02). mem_reserve is
+# 6 GiB (at most 25% of RAM on small hosts, matching the host-dispatch
+# floor). Example: budget 18, base 5-min load 10-15 -> headroom 3-8 ->
+# cpu_slots 4-11 with the worst-case 0.71 lane; mem (33-6)/0.9 ~= 30, not
+# binding; MAX_SLOTS clamps to 8. The default below is the formula's
+# mid-range outcome; the live file carries the tuned value.
+DEFAULT_SLOTS = 6
+MAX_SLOTS = 8
 # Refusal channel (intake 9432731e): exit 3 alone is ambiguous because the
 # admitted command may itself exit 3 (pytest INTERNALERROR). When this names a
 # path, a refusal before the command starts writes it; the command never sees
@@ -31,8 +66,27 @@ COMMAND_STARTED = False
 DEFAULT_RUN_TIMEOUT_S = 1800
 FINAL_RUN_TIMEOUT_S = 7200
 TERMINATE_GRACE_S = 10
-NESTED_WAIT_QUIET_S = 10.0
-_REAPER_SNAPSHOT = None
+# Run affinity (intake cb5c362e, 2026-11-02: 33 queued tickets, pushes blocked).
+# A full gate takes one ticket per heavy phase and a capacity retry takes a new
+# ticket per attempt; each used to rejoin the back of the queue, so one run paid
+# the whole queue wait four or five times. Tickets that carry the same
+# AGENT_HUB_HEAVY_TEST_RUN_ID reuse the run's first sequence number (and age) for
+# RUN_AFFINITY_S, so a started run finishes ahead of newer arrivals.
+RUN_ID_ENV = 'AGENT_HUB_HEAVY_TEST_RUN_ID'
+RUN_AFFINITY_S = 7200
+# Holders of an unbounded wrapper (written before the run timeout existed) never
+# release. A waiter reclaims a slot whose holder wrapper is older than this
+# (longest run + longest wait + slack) by stopping the holder's test group.
+OVERDUE_HOLDER_S = FINAL_RUN_TIMEOUT_S + 1800 + 600
+try:  # test hook; invalid values keep the default
+    _overdue = os.environ.get('AGENT_HUB_HEAVY_TEST_OVERDUE_S', '')
+    if _overdue.isascii() and _overdue.isdecimal() and 1 <= int(_overdue) <= 86400:
+        OVERDUE_HOLDER_S = int(_overdue)
+except Exception:
+    pass
+REAP_INTERVAL_S = 60
+
+ADMISSION_PROTOCOL_VERSION = 1
 
 
 def refuse(reason):
@@ -82,11 +136,26 @@ class Queue:
                     or type(row.get('sequence')) is not int
                     or not 0 < row['sequence'] < state['next']
                     or row['sequence'] in sequences
-                    or row.get('priority') not in ('normal', 'final')
                     or type(row.get('created')) not in (float, int)
                     or not math.isfinite(row['created']) or row['created'] < 0):
                 raise ValueError('invalid heavy-test queue entry')
+            if row.get('priority') not in PRIORITIES:
+                # Self-heal (2026-11-02 incident: one 'intake' row refused every
+                # admission): an unknown priority is just a normal ticket.
+                print(f"capped-test-run: warning: queue ticket {lease} had invalid priority {row.get('priority')!r}; treating as normal", file=sys.stderr, flush=True)
+                row['priority'] = 'normal'
             sequences.add(row['sequence'])
+        runs = state.get('runs')
+        if not isinstance(runs, dict):
+            runs = {}
+        # Affinity is an optimisation: a malformed run record is dropped, never fatal.
+        state['runs'] = {
+            run: record for run, record in runs.items()
+            if isinstance(record, dict) and type(record.get('sequence')) is int
+            and 0 < record['sequence'] < state['next']
+            and type(record.get('created')) in (float, int)
+            and math.isfinite(record['created']) and type(record.get('seen')) in (float, int)
+            and math.isfinite(record['seen'])}
         return state
 
     def save(self, state):
@@ -107,12 +176,67 @@ class Queue:
                 if lock_available(lease):
                     del state['active'][name]
 
+    def park_refused(self, state, name, now):
+        """Release a capacity-refused waiter's queue row but keep its place.
+
+        Intake 1293b560 AC1: a waiter refused after the full wait budget used
+        to leave its row behind with no run record refresh, so a retry with
+        the same AGENT_HUB_HEAVY_TEST_RUN_ID found its old sequence taken and
+        re-queued at the back. Parking deletes our own active row (our lease
+        unlocks on return anyway, so the row is dead) while refreshing the
+        run record with the original sequence and creation time. The retry
+        then reclaims the same sequence and age -- it keeps its queue
+        position (and any aging) instead of joining the tail. Callers without
+        a run id just drop the dead row so the shared state stays small.
+        """
+        row = state['active'].pop(name, None)
+        if row is None:
+            return
+        run = self.run_id()
+        if run is None:
+            return
+        record = {'sequence': row['sequence'], 'created': row['created'],
+                  'seen': now}
+        state.setdefault('runs', {})[run] = record
+
+    @staticmethod
+    def run_id():
+        run = os.environ.get(RUN_ID_ENV, '')
+        if run and len(run) <= 64 and run.isascii() and all(c.isalnum() or c in '_.-' for c in run):
+            return run
+        return None
+
+    def new_ticket(self, state, priority, now):
+        """Allocate a ticket row; a known run reuses its original sequence."""
+        runs = state.setdefault('runs', {})
+        for run in [r for r, v in runs.items() if now - v['seen'] > RUN_AFFINITY_S]:
+            del runs[run]
+        taken = {row['sequence'] for row in state['active'].values()}
+        run = self.run_id()
+        record = runs.get(run) if run else None
+        if record is not None and record['sequence'] not in taken:
+            sequence, created = record['sequence'], record['created']
+        else:
+            sequence, created = state['next'], now
+            state['next'] += 1
+        if run:
+            runs[run] = {'sequence': sequence, 'created': created, 'seen': now}
+        return sequence, {'sequence': sequence, 'priority': priority, 'created': created}
+
     @staticmethod
     def order(row, now):
-        # An aged normal joins the final class with its original sequence.
-        # Later final arrivals cannot indefinitely overtake that normal.
-        preferred = row['priority'] == 'final' or now - row['created'] >= NORMAL_AGE_S
-        return (not preferred, row['sequence'])
+        # Release outranks everything; an aged normal joins the final class
+        # with its original sequence, but never the release class. Later
+        # final arrivals cannot indefinitely overtake that aged normal, and
+        # later arrivals of any lower class cannot overtake a release ticket.
+        priority = row['priority']
+        if priority == 'release':
+            rank = 0
+        elif priority == 'final' or now - row['created'] >= NORMAL_AGE_S:
+            rank = 1
+        else:
+            rank = 2
+        return (rank, row['sequence'])
 
     @classmethod
     def head(cls, state, now):
@@ -152,6 +276,9 @@ def pool_identity(root):
     """Return a stable identity for the admission pool directory."""
     info = root.stat()
     return info.st_dev, info.st_ino
+
+
+NESTED_WAIT_QUIET_S = 10.0
 
 
 def proc_snapshot(proc_root='/proc'):
@@ -251,7 +378,7 @@ def nested_hold_candidates(pool, current, previous, now, *, quiet_s=NESTED_WAIT_
         return []
     processes = current.get('processes', {})
     old = previous.get('processes', {})
-    lock_owners = {}
+    slot_owners = {}
     for path in slots:
         if not _lock_is_held(path):
             continue
@@ -261,8 +388,8 @@ def nested_hold_candidates(pool, current, previous, now, *, quiet_s=NESTED_WAIT_
             continue
         for pid, row in processes.items():
             if target in row['fds']:
-                lock_owners[pid] = True
-    if not lock_owners:
+                slot_owners.setdefault(pid, set()).add(target)
+    if not slot_owners:
         return []
 
     lease_pids = {}
@@ -279,22 +406,38 @@ def nested_hold_candidates(pool, current, previous, now, *, quiet_s=NESTED_WAIT_
                     and before.get('cpu') == row['cpu']):
                 lease_pids[pid] = (name, ticket)
 
-    active_tests = {'pytest', 'py.test', 'vitest', 'vitest.mjs', 'unittest', 'nosetests', 'node'}
+    active_tests = {
+        'pytest', 'py.test', 'vitest', 'vitest.mjs', 'unittest', 'nosetests', 'node',
+        'host_canary_check.py', 'test-browser-local.test.mjs',
+    }
+
+    def has_test_runner(process):
+        tokens = process['tokens']
+        return bool(tokens & active_tests) or any(
+            (token.startswith('test_') and token.endswith('.py')) or '.tests.' in token
+            for token in tokens)
+
     output, seen = [], set()
-    for holder_pid in lock_owners:
+    for holder_pid, holder_slots in slot_owners.items():
         descendants = _descendants(processes, holder_pid)
-        if any(processes[pid]['tokens'] & active_tests for pid in descendants if pid in processes):
+        if any(has_test_runner(processes[pid]) for pid in descendants if pid in processes):
             continue
         for waiter_pid in descendants:
             waiter = processes.get(waiter_pid)
             if waiter_pid not in lease_pids or waiter is None or waiter['pgid'] <= 1:
+                continue
+            waiter_tree = {waiter_pid} | _descendants(processes, waiter_pid)
+            if any(target not in holder_slots for pid in waiter_tree
+                   for target in slot_owners.get(pid, ())):
+                # The nested admission already acquired a distinct slot; it is
+                # no longer queued and must never be reaped.
                 continue
             before = old.get(waiter_pid)
             if (before is None or before.get('start') != waiter['start']
                     or before.get('cpu') != waiter['cpu']):
                 continue
             _, ticket = lease_pids[waiter_pid]
-            key = (holder_pid, waiter['pgid'], waiter_pid, waiter['start'], ticket['sequence'])
+            key = (waiter['pgid'], waiter_pid, waiter['start'], ticket['sequence'])
             if key in seen:
                 continue
             seen.add(key)
@@ -375,6 +518,90 @@ def nested_holder_ancestor(identity):
     return None
 
 
+def proc_ppid_pgid(pid):
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        fields = stat[stat.rfind(')') + 1:].split()
+        return int(fields[1]), int(fields[2])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def lock_holders(path):
+    """PIDs of this user's processes with the lock file open (fuser-like /proc scan)."""
+    try:
+        target = path.stat()
+    except OSError:
+        return []
+    found = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdecimal():
+            continue
+        try:
+            for fd in os.listdir(f'/proc/{entry}/fd'):
+                try:
+                    info = os.stat(f'/proc/{entry}/fd/{fd}')
+                except OSError:
+                    continue
+                if (info.st_ino, info.st_dev) == (target.st_ino, target.st_dev):
+                    found.append(int(entry))
+                    break
+        except OSError:
+            continue
+    return found
+
+
+def process_age_s(pid):
+    start = process_start_time(pid)
+    if start is None:
+        return None
+    try:
+        uptime = float(Path('/proc/uptime').read_text().split()[0])
+        return uptime - int(start) / os.sysconf('SC_CLK_TCK')
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def stop_group(pgid):
+    signal_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + TERMINATE_GRACE_S
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    signal_group(pgid, signal.SIGKILL)
+
+
+def reap_overdue_holders(root, slots):
+    """Stop the test group of any slot holder older than OVERDUE_HOLDER_S.
+
+    Only an admission wrapper that declared no bound of its own (no
+    --run-timeout / run-timeout env) is touched, and only its command's
+    process group; the wrapper then exits normally and releases the slot.
+    """
+    for index in range(slots):
+        for pid in lock_holders(root / f'slot-{index}.lock'):
+            try:
+                argv = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+                bounded = (b'--run-timeout' in argv or b'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S='
+                           in Path(f'/proc/{pid}/environ').read_bytes())
+            except OSError:
+                continue
+            if not any(a.endswith(b'heavy-test-admission.py') for a in argv[:3]) or bounded:
+                continue
+            age = process_age_s(pid)
+            if age is None or age < OVERDUE_HOLDER_S:
+                continue
+            for child in os.listdir('/proc'):
+                if child.isdecimal() and proc_ppid_pgid(int(child)) == (pid, int(child)):
+                    print(f'capped-test-run: reclaiming slot-{index}: holder wrapper PID {pid} is {int(age)}s old '
+                          f'(> {OVERDUE_HOLDER_S}s, no run bound); stopping its command group {child}',
+                          file=sys.stderr, flush=True)
+                    stop_group(int(child))
+
+
 def run_command(command, slot, interrupted, run_timeout, identity):
     global COMMAND_STARTED
     # Reserve/inherit the historical FD9. Parent retains its own descriptor
@@ -449,15 +676,47 @@ def run_command(command, slot, interrupted, run_timeout, identity):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--slots', default=os.environ.get('AGENT_HUB_HEAVY_TEST_SLOTS', '2'))
+    parser.add_argument('--slots', default=None)
     parser.add_argument('--wait', default=os.environ.get('AGENT_HUB_HEAVY_TEST_WAIT_S', '1800'))
     parser.add_argument('--run-timeout', default=os.environ.get(
         'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S'))
-    parser.add_argument('--priority', default=os.environ.get('AGENT_HUB_HEAVY_TEST_PRIORITY', 'normal'), choices=['normal', 'final'])
+    env_priority = os.environ.get('AGENT_HUB_HEAVY_TEST_PRIORITY', 'normal')
+    if env_priority not in PRIORITIES:
+        # argparse does not validate a default against choices; a bad env value
+        # used to be written into the shared queue and poison every contender.
+        print(f'capped-test-run: warning: ignoring invalid AGENT_HUB_HEAVY_TEST_PRIORITY={env_priority!r}; using normal', file=sys.stderr, flush=True)
+        env_priority = 'normal'
+    parser.add_argument('--priority', default=env_priority, choices=list(PRIORITIES))
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    root = Path(os.environ.get('AGENT_HUB_HEAVY_TEST_DIR', f'/run/user/{os.getuid()}/agent-hub/heavy-test'))
+    root.mkdir(parents=True, exist_ok=True)
+    # Precedence (intake 1293b560 AC2): explicit --slots, then the live
+    # host-level <dir>/slots file, then AGENT_HUB_HEAVY_TEST_SLOTS (fallback
+    # for private pools/tests when the file is absent), then DEFAULT_SLOTS.
+    # The file is authoritative: a per-process env value never overrides the
+    # live host setting, so old and new checkouts share one count.
+    if args.slots is None:
+        try:
+            args.slots = (root / 'slots').read_text().strip()
+            slots_source = 'file'
+        except OSError:
+            args.slots = None
+            slots_source = None
+    else:
+        slots_source = 'flag'
+    if args.slots is None:
+        args.slots = os.environ.get('AGENT_HUB_HEAVY_TEST_SLOTS')
+        slots_source = 'env' if args.slots is not None else None
+    if args.slots is None:
+        args.slots = str(DEFAULT_SLOTS)
+        slots_source = 'default'
     if not args.slots.isascii() or not args.slots.isdecimal() or int(args.slots) < 1:
-        parser.error('invalid slot count')
+        if slots_source == 'file':
+            args.slots = str(DEFAULT_SLOTS)
+        else:
+            parser.error('invalid slot count')
+    args.slots = str(min(int(args.slots), MAX_SLOTS))
     if not args.wait.isascii() or not args.wait.isdecimal():
         parser.error('invalid wait seconds')
     if (args.run_timeout is not None and
@@ -465,12 +724,10 @@ def main():
              or not 1 <= int(args.run_timeout) <= 86400)):
         parser.error('invalid command run timeout seconds (expected 1..86400)')
     run_timeout = int(args.run_timeout) if args.run_timeout is not None else (
-        FINAL_RUN_TIMEOUT_S if args.priority == 'final' else DEFAULT_RUN_TIMEOUT_S)
+        FINAL_RUN_TIMEOUT_S if args.priority in ('final', 'release') else DEFAULT_RUN_TIMEOUT_S)
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('no command given')
-    root = Path(os.environ.get('AGENT_HUB_HEAVY_TEST_DIR', f'/run/user/{os.getuid()}/agent-hub/heavy-test'))
-    root.mkdir(parents=True, exist_ok=True)
     identity = pool_identity(root)
     ancestor_holder = nested_holder_ancestor(identity)
     if ancestor_holder is not None:
@@ -509,17 +766,20 @@ def main():
             if not lock_available(ticket):
                 ticket.close()
                 raise ValueError('unindexed heavy-test lease is locked')
-            sequence = state['next']
-            state['next'] += 1
-            state['active'][name] = {'sequence': sequence, 'priority': args.priority,
-                                     'created': time.monotonic()}
-            ticket_created = state['active'][name]['created']
+            ticket_created_at = time.monotonic()
+            sequence, ticket_row = queue.new_ticket(
+                state, args.priority, ticket_created_at)
+            state['active'][name] = ticket_row
+            # Retry affinity preserves the original ticket age. Report total
+            # queue age for the run, matching the shared pool's FIFO state.
+            queue_wait_started = ticket_row['created']
             queue.save(state)
         finally:
             fcntl.flock(mutex, fcntl.LOCK_UN)
         with ticket:
             announced = False
             slot = None
+            next_reap = time.monotonic() + REAP_INTERVAL_S
             while slot is None:
                 fcntl.flock(mutex, fcntl.LOCK_EX)
                 try:
@@ -553,24 +813,47 @@ def main():
                 if slot is None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        # Park our place before refusing (intake 1293b560
+                        # AC1): delete our own dead row but keep the run
+                        # record, so a retry with the same
+                        # AGENT_HUB_HEAVY_TEST_RUN_ID reclaims the original
+                        # sequence and age instead of re-queueing at the back.
+                        fcntl.flock(mutex, fcntl.LOCK_EX)
+                        try:
+                            state = queue.load()
+                            queue.park_refused(state, name, time.monotonic())
+                            queue.save(state)
+                        finally:
+                            fcntl.flock(mutex, fcntl.LOCK_UN)
                         print(f'capped-test-run: no heavy-test slot free after {args.wait}s ({args.slots} slots)', file=sys.stderr)
                         return refuse(f'no heavy-test slot free after {args.wait}s')
                     if not announced:
                         position, waiting = queue.position(state, name, time.monotonic())
                         print(f'capped-test-run: all {args.slots} heavy-test slots busy; waiting up to {args.wait}s ({args.priority} ticket {sequence}), queue position {position}/{waiting}', file=sys.stderr, flush=True)
+                        if waiting > 2 * int(args.slots):
+                            print('capped-test-run: queue is deep; prefer targeted verification (scripts/test-affected-local.sh, see docs/PREPUSH-TARGETED-TESTS.md) over the full suite', file=sys.stderr, flush=True)
                         announced = True
+                    if time.monotonic() >= next_reap:
+                        next_reap = time.monotonic() + REAP_INTERVAL_S
+                        reap_overdue_holders(root, int(args.slots))
                     time.sleep(min(random.uniform(1, 2), remaining))
             with slot:
                 running = True
-                event = {
+                admission_event = {
                     'event': 'heavy_test_admitted',
                     'protocol': ADMISSION_PROTOCOL_VERSION,
                     'ticket_sequence': sequence,
                     'priority': args.priority,
-                    'queue_wait_s': round(max(0.0, time.monotonic() - ticket_created), 3),
-                    'admitted_at_utc': datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                    'queue_wait_s': round(max(0.0, time.monotonic() - queue_wait_started), 3),
+                    'admitted_at_utc': datetime.now(timezone.utc).isoformat(
+                        timespec='milliseconds').replace('+00:00', 'Z'),
                 }
-                print('capped-test-run: admitted ' + json.dumps(event, sort_keys=True),
+                # Keep the established human-readable line for older test
+                # tooling, then emit the structured measurement record.
+                print(f'capped-test-run: admitted {args.priority} ticket {sequence}',
+                      file=sys.stderr, flush=True)
+                print('capped-test-run: admission-event ' +
+                      json.dumps(admission_event, sort_keys=True),
                       file=sys.stderr, flush=True)
                 print(f'capped-test-run: run timeout {run_timeout}s', file=sys.stderr, flush=True)
                 return run_command(command, slot, lambda: interrupted, run_timeout, identity)

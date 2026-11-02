@@ -66,6 +66,21 @@ SCOPE_TRAILER_RULE = (
 )
 SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + SCOPE_TRAILER_RULE
 
+HEAVY_TEST_ADMISSION_UPGRADE_RULE = (
+    "Before a heavy-test gate, check whether the worktree contains the fixed "
+    "admission revision with `git merge-base --is-ancestor "
+    "d8740aaca3944a295680177a40148bb00accea78 HEAD`. If the check fails, "
+    "honor the HOLD from `scripts/test-affected-local.sh`; do not bypass it by "
+    "using an older wrapper or nesting another admission. Any fleet-wide "
+    "worktree rollout is opt-in and dry-run first, and skips dirty, unpushed, "
+    "locked, or live worktrees. For your own older worktree, preserve your "
+    "changes and ask the Hub head to coordinate a normal, non-forced rebase "
+    "after a clean checkpoint; never reset, force-rebase, or edit another "
+    "session's worktree. Recheck the revision before gating, or report a HOLD "
+    "and continue with non-heavy work."
+)
+SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + HEAVY_TEST_ADMISSION_UPGRADE_RULE
+
 # Incident 504d662b (2026-10-31): a reviewer session ran
 #   TMPDIR=$(mktemp -d) && HOME=$(mktemp -d) ... python3 -m pytest ...; rm -rf "$TMPDIR" "$HOME"
 # `HOME=... cmd` sets HOME only for that one command, so the shell's $HOME was
