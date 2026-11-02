@@ -225,13 +225,18 @@ class SessionProgress:
             claude_goal = (row.get('engine') == 'claude' and isinstance(command, list)
                            and any(isinstance(arg, str) and arg.startswith('/goal ')
                                    for arg in command))
+            checked, cached = self.screen_checks.get(key, (0, None))
+            if progress and cached and (not self.screen or now - checked < 60000):
+                if cached == 'goal_stalled':
+                    progress['goal_status'] = 'stalled'
+                else:
+                    progress['terminal_error'] = cached
             if (not self.screen or not progress or row.get('engine') not in ('codex', 'claude') or progress['headless']
                     or (row.get('engine') == 'claude' and not claude_goal)
                     or (row.get('state') or row.get('phase')) in ('exited', 'dead', 'pruned', 'forgotten', 'stopped', 'unobserved', 'unknown')
                     or (now - self.samples[key]['last'] < 60000
                         and not (claude_goal and key not in self.screen_checks))):
                 continue
-            checked, cached = self.screen_checks.get(key, (0, None))
             if now - checked >= 60000:
                 if time.monotonic() >= budget:
                     continue

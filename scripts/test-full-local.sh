@@ -165,8 +165,22 @@ PHONE_MARKER="${RUN_TMP_ABSOLUTE}/refused-phone"
 if [ -n "${SKIP_PHONE_UI:-}" ]; then
   echo "SKIP: SKIP_PHONE_UI is set; phone browser UI not executed."
 else
-  AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${PHONE_MARKER}" \
-  "${REPO_ROOT}/scripts/capped-test-run.sh" -- bash -c 'node --test scripts/test-browser-local.test.mjs && node scripts/test-browser-local.mjs' || PHONE_RC=$?
+  # CI installs Playwright outside the project manifest. Keep the local copy
+  # and browser cache inside this run's disposable storage, away from shared
+  # canonical node_modules and user caches.
+  BROWSER_DEPS="${RUN_TMP_ABSOLUTE}/browser-deps"
+  PLAYWRIGHT_BROWSERS_PATH="${RUN_TMP_ABSOLUTE}/playwright-browsers"
+  mkdir -p "${BROWSER_DEPS}"
+  if npm install --prefix "${BROWSER_DEPS}" --no-save --no-audit --no-fund playwright \
+      && "${BROWSER_DEPS}/node_modules/.bin/playwright" install chromium; then
+    export NODE_PATH="${BROWSER_DEPS}/node_modules${NODE_PATH:+:${NODE_PATH}}"
+    export PLAYWRIGHT_BROWSERS_PATH
+    AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${PHONE_MARKER}" \
+    "${REPO_ROOT}/scripts/capped-test-run.sh" -- bash -c 'node --test scripts/test-browser-local.test.mjs && node scripts/test-browser-local.mjs' || PHONE_RC=$?
+  else
+    echo "FAIL: could not prepare Playwright Chromium for standalone browser checks" >&2
+    PHONE_RC=1
+  fi
   hold_or_fail "${PHONE_RC}" "Standalone browser and static checks" "${PHONE_MARKER}" "needs Playwright Chromium; see docs/TEST-COVERAGE.md"
 fi
 
