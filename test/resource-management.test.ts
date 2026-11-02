@@ -219,7 +219,7 @@ describe('resource management',()=>{
     expect(r.headroom('host').reserved_mb).toBe(412);
   });
   sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id='launch'");
-  r.configure({memory_floor_mb:4096});
+  r.configure({memory_floor_mb:4096,memory_floor_pct:20});
   sql.exec('INSERT INTO resource_choking_events(machine_id,reason,observed_at) VALUES(?,?,?)','host','host_oom',iso());
   r.withReadSnapshot(()=>{
     expect(r.cpuHeadroom('host')).toMatchObject({ramping_cpu_cores:0,reason:'host_oom',admitted:false});
@@ -229,6 +229,7 @@ describe('resource management',()=>{
  it('invalidates measured-history caches on writes, configuration changes and rolled-back generations',async()=>fixture(async(r,sql,f)=>{
   r.report('host',{samples:[sample()],reaps:[]});
   sql.exec("UPDATE session_resource_usage SET finished_at=?,peak_rss_mb=200 WHERE session_id='session'",iso());
+  r.configure({estimate_cap_mb:65536});
   expect(r.estimate('demo','opencode','goal')).toBe(250);
   sql.exec("UPDATE session_resource_usage SET peak_rss_mb=400 WHERE session_id='session'");
   expect(r.estimate('demo','opencode','goal')).toBe(500);
@@ -241,7 +242,7 @@ describe('resource management',()=>{
   // would incorrectly keep the estimate computed in the aborted transaction.
   sql.exec("UPDATE session_resource_usage SET peak_rss_mb=900 WHERE session_id='session'");
   expect(r.estimate('demo','opencode','goal')).toBe(1125);
-  r.configure({estimate_multiplier:2});
+  r.configure({estimate_multiplier:2,estimate_cap_mb:65536});
   expect(r.estimate('demo','opencode','goal')).toBe(1800);
   sql.exec("INSERT INTO session_cpu_usage VALUES('session',1,?)",iso());
   expect(r.cpuEstimate('demo','goal').expected_cpu_cores).toBe(r.config().cpu_estimate_multiplier);
@@ -456,7 +457,7 @@ describe('resource management',()=>{
   expect((await f.handle(req('/report','POST',{samples:[],reaps:[]}),{caller:{kind:'agent',actor:'agent'},scopes:['fleet:launch']})).status).toBe(403);
   expect((await f.handle(req('/watchdog'),{caller:{kind:'host',machineId:'host'},scopes:['host']})).status).toBe(200);
   const admin={caller:{isAdmin:true,actor:'admin',kind:'human'},scopes:['admin']};
-  expect((await f.handle(req('/config','PUT',{memory_floor_mb:4096}),admin)).status).toBe(200);
+  expect((await f.handle(req('/config','PUT',{memory_floor_mb:4096,memory_floor_pct:20}),admin)).status).toBe(200);
   expect(r.headroom('host').floor_mb).toBe(4096);
  }));
  it('refuses watchdog evidence while the linked intake is open and resumes after DONE (AC2)',async()=>fixture(async(r,sql)=>{

@@ -73,7 +73,7 @@ export function percentile(values: number[], p: number): number | null {
 export function resourceConfig(value: any = {}): ResourceConfig {
   const result = { ...defaults };
   const bounds: Record<string, number[]> = {
-    memory_floor_mb: [128, 1048576], disk_floor_gb: [1, 1048576], ramp_reserve_default_mb: [64, 65536], estimate_percentile: [50,100],
+    memory_floor_mb: [128, 1048576], disk_floor_gb: [1, 1048576], ramp_reserve_default_mb: [64, 65536], estimate_percentile: [50,100], estimate_cap_mb: [64,65536], memory_floor_pct: [.5,20],
     estimate_multiplier: [1,4], ramp_seconds: [30,900], cpu_load_factor: [.5,4],
     watchdog_interval_s: [300,600], idle_minutes: [10,10080], rss_flag_gb: [.125,1024],
     cpu_target_utilization:[.1,1],cpu_default_cores:[.05,128],cpu_estimate_multiplier:[1,4],cpu_psi_hard_cap_pct:[1,100],cpu_psi_full_hard_cap_pct:[.1,100],memory_psi_full_hard_cap_pct:[.1,100],choking_cooldown_seconds:[30,3600],
@@ -82,13 +82,19 @@ export function resourceConfig(value: any = {}): ResourceConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_resource_config');
   for (const [k,v] of Object.entries(value)) {
     if (!bounds[k] || !finite(v) || (v as number) < bounds[k][0] || (v as number) > bounds[k][1]) throw new Error('invalid_resource_config');
-    if (!['disk_floor_gb','cpu_load_factor','estimate_multiplier','rss_flag_gb','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct','cpu_psi_full_hard_cap_pct','memory_psi_full_hard_cap_pct','cpu_throttle_cores'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
+    if (!['disk_floor_gb','cpu_load_factor','estimate_multiplier','rss_flag_gb','memory_floor_pct','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct','cpu_psi_full_hard_cap_pct','memory_psi_full_hard_cap_pct','cpu_throttle_cores'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
     (result as any)[k] = v;
   }
   return result;
 }
-export function memoryVerdict(available: number, ramp: number, estimate: number, config: ResourceConfig) {
-  return finite(available) && finite(ramp) && finite(estimate) && available - ramp - estimate >= config.memory_floor_mb;
+/** Floor scaled to the host: memory_floor_pct of total RAM, never above the configured ceiling and never below 512 MiB.
+ * Unknown total keeps the configured value. A 32 GiB laptop gets ~960 MiB, a 16 GiB tablet 512 MiB, a 64 GiB server 1920 MiB. */
+export function effectiveFloorMb(config: ResourceConfig, totalMb: unknown): number {
+  if (!finite(totalMb) || (totalMb as number) <= 0) return config.memory_floor_mb;
+  return Math.min(config.memory_floor_mb, Math.max(512, Math.round((totalMb as number) * config.memory_floor_pct / 100)));
+}
+export function memoryVerdict(available: number, ramp: number, estimate: number, config: ResourceConfig, totalMb?: unknown) {
+  return finite(available) && finite(ramp) && finite(estimate) && available - ramp - estimate >= effectiveFloorMb(config, totalMb);
 }
 // Idle-reap authority reads only request.intake_task_id; skip copying and
 // re-parsing whole retained prompts per session. Invalid JSON passes through
@@ -182,6 +188,12 @@ export class ResourceManagement {
     this.readSnapshot?.set(key,rows);
     return rows;
   }
+  /** Config as forwarded to one host: memory floor scaled to that host's RAM. */
+  configFor(machine: string): ResourceConfig {
+    const config = this.config();
+    const m: any = this.readRows('SELECT last_heartbeat FROM machines WHERE id=?', machine)[0];
+    return { ...config, memory_floor_mb: effectiveFloorMb(config, parse(m?.last_heartbeat).mem_total_mb) };
+  }
   config(): ResourceConfig { return resourceConfig(parse(this.readRows('SELECT data FROM resource_settings WHERE id=1')[0]?.data)); }
   configure(value: any) {
     const config = resourceConfig(value);
@@ -197,7 +209,9 @@ export class ResourceManagement {
     // Only actual measurements, never a cgroup cap or fabricated zero. Bounded recent history.
     let rows = this.memoryHistory.get(engine);
     if (!rows) {
-      rows = this.sql.exec('SELECT project,kind,model,peak_rss_mb FROM session_resource_usage WHERE engine IS ? AND finished_at IS NOT NULL AND peak_rss_mb > 0 ORDER BY observed_at DESC LIMIT 500', engine).toArray() as any[];
+      // Typical resident size (p50 of the session's own samples) when recorded, else its peak. A multi-day goal session's
+      // test-run peak is not what a new launch needs.
+      rows = this.sql.exec('SELECT u.project,u.kind,u.model,COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.engine IS ? AND u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500', engine).toArray() as any[];
       if (this.memoryHistory.size >= 64) this.memoryHistory.clear();
       this.memoryHistory.set(engine, rows);
     }
@@ -208,7 +222,7 @@ export class ResourceManagement {
     const specific = sameProject.filter(r => r.kind === kind);
     const cohort = byModel.length ? byModel : specific.length ? specific : rows;
     const measured = percentile(cohort.map(r => Number(r.peak_rss_mb)), config.estimate_percentile);
-    const result = Math.ceil(Math.max(64, measured === null ? config.ramp_reserve_default_mb : measured * config.estimate_multiplier));
+    const result = Math.ceil(Math.min(config.estimate_cap_mb, Math.max(64, measured === null ? config.ramp_reserve_default_mb : measured * config.estimate_multiplier)));
     if (this.memoryEstimates.size >= 2048) this.memoryEstimates.clear();
     this.memoryEstimates.set(key, result);
     return result;
@@ -341,7 +355,7 @@ export class ResourceManagement {
       reserved += Math.max(0, estimate - (finite(row.resident_mb) ? row.resident_mb : 0));
     }
     return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
-      reserved_mb: reserved, floor_mb: config.memory_floor_mb,
+      reserved_mb: reserved, floor_mb: effectiveFloorMb(config, hb.mem_total_mb),
       requested_mb: this.estimate(input.project || input.workspace || null, engine, input.task_kind || input.kind || 'goal', input.model ?? null),
       observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null };
   }
@@ -738,9 +752,9 @@ export class ResourceManagement {
     if (cpu.cpu_saturated === true) reasons.push('cpu_busy_over_'+CPU_SATURATED_PCT+'pct_10s');
     if (memAvail !== null && memAvail < MEMORY_FULL_MB) reasons.push('mem_available_below_'+MEMORY_FULL_MB+'mb');
     const perTaskCpu = this.cpuEstimate(null, null).expected_cpu_cores;
-    const rows = this.sql.exec('SELECT peak_rss_mb FROM session_resource_usage WHERE finished_at IS NOT NULL AND peak_rss_mb > 0 ORDER BY observed_at DESC LIMIT 500').toArray() as any[];
+    const rows = this.sql.exec('SELECT COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500').toArray() as any[];
     const p90 = percentile(rows.map(r => Number(r.peak_rss_mb)), this.config().estimate_percentile);
-    const perTaskMem = Math.ceil(Math.max(64, p90 === null ? this.config().ramp_reserve_default_mb : p90 * this.config().estimate_multiplier));
+    const perTaskMem = Math.ceil(Math.min(this.config().estimate_cap_mb, Math.max(64, p90 === null ? this.config().ramp_reserve_default_mb : p90 * this.config().estimate_multiplier)));
     const freeCores = cores !== null && busy !== null ? Math.max(0, cores - busy) : null;
     const byCpu = freeCores !== null && perTaskCpu > 0 ? Math.floor(freeCores / perTaskCpu) : null;
     const byMem = memAvail !== null ? Math.max(0, Math.floor((memAvail - MEMORY_FULL_MB) / perTaskMem)) : null;

@@ -3159,7 +3159,7 @@ class Dispatcher:
                 if isinstance(policy, dict) and policy:
                     bounded = {k: policy[k] for k in (
                         "memory_floor_mb", "ramp_reserve_default_mb", "estimate_percentile",
-                        "estimate_multiplier", "ramp_seconds", "cpu_load_factor",
+                        "estimate_multiplier", "estimate_cap_mb", "memory_floor_pct", "ramp_seconds", "cpu_load_factor",
                         "cpu_target_utilization", "cpu_default_cores", "cpu_estimate_multiplier", "cpu_psi_hard_cap_pct", "cpu_psi_full_hard_cap_pct", "memory_psi_full_hard_cap_pct", "choking_cooldown_seconds",
                         "watchdog_interval_s", "idle_minutes", "rss_flag_gb") if k in policy}
                     if bounded:

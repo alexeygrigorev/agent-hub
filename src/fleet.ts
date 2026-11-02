@@ -1266,7 +1266,7 @@ export class FleetService {
       ) reason = 'host_load_high';
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         memory().reserved_mb,
-        memory().requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
+        memory().requested_mb, this.resources.config(), hb.mem_total_mb)) reason = 'launcher_memory_reserve';
       // Missing mem/disk telemetry is not a choking signal: fail OPEN (intake
       // 4398ce2a, Alexey t1523u). Only a present, real reading below a floor holds.
       // Root-disk floor is configurable (resource_settings.disk_floor_gb, default
@@ -2072,7 +2072,7 @@ export class FleetService {
             return { ...(scopedWorkers.has(String(row.id)) ? { worker_credential_required: true } : {}),
               // AC1 lock identity (additive; unknown keys are ignored by hosts).
               ...(link ? { hub_session_id: link.hub_session_id, ...(link.intake_task_id ? { intake_task_id: link.intake_task_id } : {}) } : {}),
-              ...this.resources.cpuStart(String(row.id)), resource_choking: choking, resource_management: this.resources.config(),
+              ...this.resources.cpuStart(String(row.id)), resource_choking: choking, resource_management: this.resources.configFor(caller.machineId!),
               memory_estimate_mb: this.resources.estimate(request.project || String(row.workspace), String(row.engine), request.task_kind || 'goal'),
               selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile,
               mode: row.mode, workspace: row.workspace, cwd: request.cwd ?? null, prompt: row.prompt,
