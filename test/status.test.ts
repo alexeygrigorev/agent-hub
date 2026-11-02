@@ -402,9 +402,9 @@ describe('M14a authorized one-call status projection', () => {
       await inDO(stub(), (h: any) => { h.statusService.now = Date.now; });
     }
     expect(data.coverage.missing_hosts).toContain('host-old');
-    // The window is wall-clock bounded; after it closes win35 is an ordinary
-    // missing host (expiry itself is pinned by the test below).
-    if (Date.now() <= Date.parse('2026-10-31T15:23:00Z')) {
+    // This request's Hub clock is pinned before the cutoff, independent of
+    // the machine's current wall clock (which may be long after the window).
+    if (Date.parse(data.snapshot_at) <= Date.parse('2026-10-31T15:23:00Z')) {
       expect(data.coverage.missing_hosts).not.toContain('win35');
       expect(data.coverage.expected_offline).toContain('win35');
       expect(data.coverage.expected_offline_until).toBe('2026-10-31T15:23:00Z');
