@@ -941,7 +941,7 @@ def _is_quota_cli(argv):
     return name in ("quse", "quse.exe") or any(str(a) in ("quse", "quse.cli") for a in argv[1:3])
 
 
-def collect_subscriptions(settings, runner=run_json):
+def collect_subscriptions(settings, runner=run_json, antigravity_probe=None):
     """Probe default accounts once per service. Alternate accounts require explicit wrappers."""
     subscriptions = settings["subscriptions"]
     counts = {service: sum(s["service"] == service for s in subscriptions) for service in SERVICES}
@@ -950,10 +950,21 @@ def collect_subscriptions(settings, runner=run_json):
         service = sub["service"]
         raw = {}
         profile = sub.get("profile")
-        # Quota is Hub's (intake 5814e109 I4): the host runs no quota CLI. An
-        # explicitly configured non-quse adapter argv is still honoured.
+        # Hub-managed quota is read centrally. Host-home Antigravity accounts
+        # use its official, read-only /usage command after account_registry has
+        # verified the account-specific credential; no login flow is started.
         command = sub.get("quota_argv")
-        if command and not _is_quota_cli(command):
+        if service == "gemini" and sub.get("engine") == "antigravity":
+            try:
+                if antigravity_probe is None:
+                    from . import account_registry, native_antigravity_quota
+                    binary = account_registry._find_binary(account_registry.NATIVE_BINARIES["antigravity"])
+                    raw = native_antigravity_quota.probe(binary, Path.home())
+                else:
+                    raw = antigravity_probe()
+            except Exception:
+                pass
+        elif command and not _is_quota_cli(command):
             try:
                 raw = runner(command)
             except Exception:
@@ -4251,7 +4262,19 @@ class Dispatcher:
         previous = getattr(self, '_native_labels', set())
         base = [s for s in self.settings['subscriptions'] if s['account_label'] not in previous]
         try:
-            from .account_registry import native_subscriptions
+            from .account_registry import native_credential_present, native_subscriptions, policy_accounts
+            from .model_contract import canonical_account_label
+            catalog = {account['account']: account for account in policy_accounts()}
+            # shared-gemini is the Antigravity host-home account. Remove a
+            # catalog-derived route when this host has no Antigravity token;
+            # Gemini CLI's separate oauth_creds.json is not that credential.
+            base = [sub for sub in base if not (
+                (account := catalog.get(canonical_account_label(sub.get('account_label'))))
+                and account.get('provider') == 'gemini'
+                and account.get('harness') == 'antigravity'
+                and account.get('credential', {}).get('mode') == 'host-home'
+                and not native_credential_present(account)
+            )]
             native = native_subscriptions({'subscriptions': base})
         except Exception as exc:
             print(json.dumps({'event': 'native_subscriptions_skipped', 'error': type(exc).__name__}), flush=True)

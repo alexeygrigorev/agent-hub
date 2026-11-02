@@ -43,7 +43,8 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
     const admission = evaluateLaunchQuota({ provider: m.provider, quota, subscriptionObservedAt: null, nowMs: now, reserves: ((policy.rules as any).reserve_percent || {}) as Record<string, number> });
     if (!admission.ok) return null;
     const windows: any[] = Object.values(quota?.windows || {}).filter((w: any) => w.present !== false && Number.isFinite(w.percent_remaining));
-    const remaining = (admission.remaining ?? policy.rules.headroom_floor * 100) / 100;
+    const unmetered = quota?.details?.unmetered === true ? (policy.rules as any).unmetered_headroom_percent : null;
+    const remaining = (admission.remaining ?? unmetered ?? policy.rules.headroom_floor * 100) / 100;
     if (!Number.isFinite(remaining) || remaining <= 0 || remaining * 100 <= ((policy.rules.reserve_percent as any)[m.provider] ?? 0)) return null;
     const hours = windows.length ? Math.min(...windows.map(w => (Date.parse(w.reset_at) - now) / 3600000)) : Infinity;
     const paced = pacingFor(pacing, m.provider, route.account, route.provider);

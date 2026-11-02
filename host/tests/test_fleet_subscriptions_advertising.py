@@ -26,7 +26,7 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
             self.assertEqual(loaded['subscriptions'], native + managed)
             self.assertEqual(len({s['account_label'] for s in loaded['subscriptions']}), 4)
 
-    def _advertise_and_report(self, disabled_providers):
+    def _advertise_and_report(self, disabled_providers, antigravity_credential=True):
         """One dispatcher cycle under an EXPLICIT routing policy (intake 611d57e0).
 
         Returns (registered_engines, reported_accounts). Only disabled_providers
@@ -89,7 +89,10 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
             with patch("agent_hub_host.system.get_system_info", return_value={"capabilities": {}, "hostname": "hetzner", "os": "linux", "network": "home", "roles": []}), \
                  patch("agent_hub_host.api.get_heartbeat_payload", return_value={"type": "heartbeat"}), \
                  patch("agent_hub_host.native_admission.routing_rules",
-                       return_value=dict(real_rules, disabled_providers=list(disabled_providers))):
+                       return_value=dict(real_rules, disabled_providers=list(disabled_providers))), \
+                 patch("agent_hub_host.account_registry.native_credential_present",
+                       return_value=antigravity_credential), \
+                 patch("agent_hub_host.native_antigravity_quota.probe", return_value={}):
                 dispatcher = fleet.Dispatcher(cfg, request, runner)
                 dispatcher.once()
 
@@ -124,6 +127,16 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
         self.assertNotIn("shared-grok", reported_accounts)
         self.assertEqual(sorted(reported_accounts),
                          ["shared-claude", "shared-codex", "shared-gemini", "shared-go", "shared-zai"])
+
+    def test_antigravity_without_credential_is_dropped_only_then(self):
+        # Decision for intake 3d1f8702: antigravity/shared-gemini stay advertised
+        # whenever the host has a real Antigravity login (engine passes a real
+        # run); they are dropped only when that credential is truly missing.
+        registered_engines, reported_accounts = self._advertise_and_report(
+            disabled_providers=[], antigravity_credential=False)
+        self.assertNotIn("shared-gemini", reported_accounts)
+        self.assertIn("shared-go", reported_accounts)
+        self.assertIn("shared-claude", reported_accounts)
 
     def test_monitor_only_account_does_not_disable_runnable_account_on_same_engine(self):
         from unittest.mock import Mock

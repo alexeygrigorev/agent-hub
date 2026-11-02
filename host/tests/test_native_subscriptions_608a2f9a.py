@@ -43,9 +43,10 @@ class NativeSubscriptionsTest(unittest.TestCase):
     def test_renders_installed_logged_in_accounts(self):
         self.bins = {"zcodex": "/bin/zcodex", "agy": "/bin/agy", "opencode": "/bin/opencode",
                      "grok": "/bin/grok", "claude": "/bin/claude"}
-        for path in (".zcode/v2/credentials.json", ".gemini/oauth_creds.json", ".grok/auth.json",
+        for path in (".zcode/v2/credentials.json", ".gemini/antigravity-cli/antigravity-oauth-token", ".grok/auth.json",
                      ".claude/.credentials.json", ".local/share/opencode/auth.json"):
-            self.login(*path.split("/"))
+            self.login(*path.split("/"), content='{"token":{"access_token":"access","refresh_token":"refresh"}}'
+                       if "antigravity-oauth-token" in path else '{"token":"x"}')
         subs = {s["account_label"]: s for s in self.render()}
         self.assertEqual(sorted(subs), ["shared-gemini", "shared-go", "shared-zai"])
         zai = subs["shared-zai"]
@@ -81,7 +82,8 @@ class NativeSubscriptionsTest(unittest.TestCase):
         self.assertEqual(self.render([{"account_label": "shared-zai", "service": "zai"}]), [])
 
     def test_windows_user_install_dirs(self):
-        self.login(".gemini", "oauth_creds.json")
+        self.login(".gemini", "antigravity-cli", "antigravity-oauth-token",
+                   content='{"token":{"access_token":"access","refresh_token":"refresh"}}')
         appdata = Path(self.home, "AppData", "Local")
         agy = appdata / "Programs" / "agy" / "agy.exe"
         agy.parent.mkdir(parents=True)
@@ -91,6 +93,30 @@ class NativeSubscriptionsTest(unittest.TestCase):
                 patch.dict(os.environ, {"LOCALAPPDATA": str(appdata)}):
             subs = self.render()
         self.assertEqual([(s["account_label"], s["engine"]) for s in subs], [("shared-gemini", "antigravity")])
+
+    def test_gemini_cli_credentials_do_not_advertise_antigravity(self):
+        self.bins = {"agy": "/bin/agy"}
+        # Gemini CLI's oauth_creds.json is not Antigravity's separate token.
+        self.login(".gemini", "oauth_creds.json")
+        self.assertEqual(self.render(), [])
+
+    def test_invalid_antigravity_token_is_not_advertised(self):
+        self.bins = {"agy": "/bin/agy"}
+        self.login(".gemini", "antigravity-cli", "antigravity-oauth-token", content='{"token":{}}')
+        self.assertEqual(self.render(), [])
+
+    def test_native_antigravity_subscription_collects_parsed_usage(self):
+        subscription = {"service": "gemini", "account_label": "shared-gemini",
+                        "engine": "antigravity", "profile": None}
+        raw = {"gemini": {"status": "ok", "error": None,
+                           "details": {"limit_reached": False},
+                           "windows": {"5h": {"percent_remaining": 82,
+                                               "reset_at": "2030-01-02T17:00:00Z"}}}}
+        reports = fleet.collect_subscriptions({"subscriptions": [subscription]},
+                                              antigravity_probe=lambda: raw)
+        self.assertEqual(reports[0]["account"], "shared-gemini")
+        self.assertEqual(reports[0]["quota"]["status"], "ok")
+        self.assertEqual(reports[0]["quota"]["windows"]["5h"]["percent_remaining"], 82)
 
     def test_local_bin_fallback(self):
         self.login(".zcode", "v2", "credentials.json")
@@ -137,6 +163,15 @@ class DispatcherMergeTest(unittest.TestCase):
         # The previous native entry is not treated as an operator entry.
         self.assertEqual(render.call_args[0][0], {"subscriptions": [operator]})
         self.assertEqual(d.settings["subscriptions"], [operator])
+
+    def test_merge_removes_shared_gemini_when_antigravity_credential_is_absent(self):
+        d = self.dispatcher([{"account_label": "shared-gemini", "service": "gemini",
+                              "engine": "antigravity", "profile": None}])
+        with patch.object(account_registry, "policy_accounts", return_value=ACCOUNTS), \
+                patch.object(account_registry, "native_credential_present", return_value=False), \
+                patch.object(account_registry, "native_subscriptions", return_value=[]):
+            d._merge_native_subscriptions()
+        self.assertEqual(d.settings["subscriptions"], [])
 
     def test_render_failure_keeps_last_native_set(self):
         native = {"account_label": "shared-zai", "service": "zai", "engine": "zcodex"}

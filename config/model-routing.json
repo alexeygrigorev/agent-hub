@@ -90,21 +90,15 @@
       "argon-gemini"
     ],
     "daily": [
-      "luna",
-      "sol",
       "sonnet",
       "glm-flash",
       "glm-flash-zcodex",
-      "argon",
-      "argon-gemini",
       "muse",
+      "argon",
       "deepseek-flash",
       "beam-free",
       "deepseek-v4-pro",
       "gemini-4-argon-contributor",
-      "glm-5-2",
-      "glm-5-3",
-      "glm-5-3-flash",
       "gpt-5-6-luna",
       "gpt-6-luna",
       "hy3",
@@ -122,7 +116,9 @@
       "qwen3-7-plus",
       "qwen3-8-flash",
       "qwen3-8-max",
-      "step-5-preview"
+      "step-5-preview",
+      "luna",
+      "sol"
     ],
     "quick": [
       "luna"
@@ -457,6 +453,8 @@
         "soft": 0
       }
     },
+    "unmetered_providers": ["gemini", "go"],
+    "unmetered_headroom_percent": 50,
     "allow_paid": false,
     "difficulty_tiers": {
       "hard": "deep",

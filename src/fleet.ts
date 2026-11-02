@@ -13,7 +13,7 @@ import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin, effectiveRoutesAt } from './registry';
 import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
-import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
+import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
@@ -654,7 +654,23 @@ export class FleetService {
     if (!columns.includes('progress_json')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN progress_json TEXT');
   }
 
+  /**
+   * Unmetered engines (Antigravity/OpenCode Go expose no host quota API): a
+   * missing or failed reading is not an outage. Substitute a neutral
+   * run-verified observation unless the reading positively blocks the account
+   * (limit/cooldown). Engine health, credential and login holds still gate
+   * placement independently in plan()/claim.
+   */
   public observationProvenance(account: any, route: any, snapshot?: FleetCapacitySnapshot): { quota: any; subscriptionObservedAt: string | null } | null {
+    const found = this.observationProvenanceRaw(account, route, snapshot);
+    if (!isUnmeteredProvider(account.provider)) return found;
+    const now = snapshot?.now ?? this.now();
+    if (found && (found.quota?.status === 'ok' || quotaPositivelyBlocked(found.quota, now))) return found;
+    const at = new Date(now).toISOString();
+    return { quota: unmeteredObservation(at), subscriptionObservedAt: at };
+  }
+
+  private observationProvenanceRaw(account: any, route: any, snapshot?: FleetCapacitySnapshot): { quota: any; subscriptionObservedAt: string | null } | null {
     const now = snapshot?.now ?? this.now();
     const provider = canonicalQuotaProvider(account.provider);
     const label = canonicalAccountLabel(account.label);
@@ -784,7 +800,7 @@ export class FleetService {
     const provider = canonicalQuotaProvider(account.provider);
     const routes = snapshot ? snapshot.routes.filter(r => r.account === account.label)
       : this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
-    let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled; let healthy = false;
+    let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled; let healthy = false; let unmeteredOk = false;
     const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
     for (const route of routes) {
       const prov = this.observationProvenance(account, route, snapshot);
@@ -801,7 +817,8 @@ export class FleetService {
       if (adm.remaining !== null) {
         remaining = remaining === null ? adm.remaining : Math.min(remaining, adm.remaining);
         healthy = true;
-      } else unknown = true;
+      } else if (prov.quota?.details?.unmetered === true) { unmeteredOk = true; healthy = true; }
+      else unknown = true;
     }
     if (remaining !== null && remaining <= account.reserve_percent) blocked = true;
     // Capacity counts only live machines (Hetzner urgent live, legacy stale):
@@ -885,7 +902,7 @@ export class FleetService {
       } else placementReasons.add(liveIds.has(String(route.machine_id)) ? 'engine_unavailable' : 'machine_unavailable');
     }
     return { label: canonicalAccountLabel(account.label), provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: GOAL_PROVIDERS.has(provider),
-      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || remaining === null || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
+      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || (remaining === null && !unmeteredOk) || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
       // Counted vs live: active splits into launch reservations + orphan
       // observed sessions; native_live is the host-catalog verified live
       // process count for this account (includes launch-linked sessions).
@@ -1331,7 +1348,13 @@ export class FleetService {
       const urgency = ownPools.length ? Math.max(...ownPools.map(p => resetUrgency(netHeadroom(p.headroom_percentage, p.hard_floor_percent),
         (p.reset_at_ms - this.now()) / 3600000))) : 1;
       const tbm_weight = request.mode === 'interactive' ? 1 : tbm.pacing * tbm.banked * (tbm.efficiency ?? 1) * urgency;
-      const score = ((routeQuota.remaining ?? 5) / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) * tbm_weight;
+      // Unmetered engines carry no percentage; rank them at the policy's neutral
+      // headroom. Load already placed on the same provider family divides the
+      // score so unspecified starts spread by headroom instead of stacking on
+      // the single highest-percentage family.
+      const headroomPercent = routeQuota.remaining ?? (isUnmeteredProvider(family) ? (policy.rules as any).unmetered_headroom_percent : 5);
+      const familyLoad = [...accounts.values()].filter(a => a.provider === family).reduce((n, a) => n + a.active, 0);
+      const score = (headroomPercent / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) / (1 + familyLoad) * tbm_weight;
       // Windows hosts are overflow for work that does not ask for Windows:
       // agent tooling assumes Linux, so they win only when every Linux route
       // is held (loaded, capped or quota-limited). Pinned and os:windows

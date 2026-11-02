@@ -5,6 +5,32 @@ import { getSession, allowedCallbackUrls, verifyCsrf } from "./auth/session";
 import { syncTbmFromHostSnapshot, syncTbmFromServerAccounts } from "./tbm-ingestion";
 import { resolveMachineAliases } from "./machine-alias";
 import { isPlainObject, parseUtcIso, readBoundedJsonBody } from "./strict-json";
+import routingPolicy from "../config/model-routing.json";
+
+/**
+ * Providers whose engines expose no usable quota API on the host (Antigravity
+ * /Gemini and OpenCode Go). A probe failure there is the absence of a meter,
+ * never evidence the engine is down: the real-run health holds, credential
+ * holds and positive exhaustion (limit_reached/cooldown) remain the only
+ * reasons to withhold placement (intake 3d1f8702).
+ */
+export function isUnmeteredProvider(provider: unknown): boolean {
+  const list: string[] = (routingPolicy.rules as any).unmetered_providers ?? [];
+  return typeof provider === "string" && list.includes(canonicalQuotaProvider(provider));
+}
+
+/** Observation Hub synthesizes for an unmetered provider; carries no percentage. */
+export function unmeteredObservation(observedAt: string): Record<string, any> {
+  return { status: "ok", error: null, observed_at: observedAt,
+    details: { limit_reached: false, unmetered: true, source: "hub-unmetered-engine" }, windows: {} };
+}
+
+/** True when a reading carries positive exhaustion/backoff evidence. */
+export function quotaPositivelyBlocked(quota: any, nowMs: number): boolean {
+  if (quota?.details?.limit_reached === true) return true;
+  const until = Date.parse(quota?.details?.cooldown_until);
+  return Number.isFinite(until) && until > nowMs;
+}
 
 export const QUOTA_MAX_BODY_BYTES = 32_768;
 export const QUOTA_STALE_MS = 1_200_000; // 1200 seconds (20 minutes) conservative boundary
@@ -1514,6 +1540,25 @@ export class QuotaStore {
         if (typeof cv === "string") collectorVersion = cv;
       } else if (hasStale) {
         state = "stale";
+      }
+      // Unmetered engines (no quota API): a failed/absent probe is not an outage.
+      // Fresh when a routed machine is live and its engine has no health hold;
+      // percentage stays unknown. Positive exhaustion keeps its own state.
+      if (["unavailable", "unknown", "stale"].includes(state) && Number(account.enabled) !== 0 && isUnmeteredProvider(account.provider) &&
+          !freshObs.some((o) => quotaPositivelyBlocked(o.quota, nowMs))) {
+        const liveRoute = routes.find((r) => {
+          const m: any = this.sql.exec("SELECT last_checkin_at, drained FROM machines WHERE id = ? AND revoked_at IS NULL", r.machine_id).toArray()[0];
+          if (!m || m.drained || !isFreshTs(m.last_checkin_at, nowMs, 180_000)) return false;
+          const held = this.sql.exec("SELECT 1 FROM fleet_engine_health WHERE engine = ? AND status = 'unavailable' AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL) LIMIT 1", r.engine, r.machine_id).toArray().length;
+          return !held;
+        });
+        if (liveRoute) {
+          state = "fresh";
+          remaining = null;
+          observedAt = new Date(nowMs).toISOString();
+          source = "unmetered-engine";
+          freshObs.splice(0, freshObs.length, { machine: liveRoute.machine_id, quota: unmeteredObservation(observedAt), kind: "unmetered" });
+        }
       }
       const routeEngines = routes.length ? [...new Set(routes.map((r) => r.engine))].sort() : [canonicalQuotaProvider(account.provider)];
       // Display the first healthy observation when one exists so a broken

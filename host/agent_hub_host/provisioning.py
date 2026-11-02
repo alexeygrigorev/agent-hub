@@ -2045,9 +2045,10 @@ def probe_native_claude_quota(bundle, dest, model=None):
 def quotas():
     """For the dedicated server collector: dynamic isolated accounts, sanitized only.
 
-    Reads each provider directly with the Hub-materialized credential; no
-    quota CLI is invoked (intake 5814e109 I4). Hub itself also reads these
-    accounts centrally; this is the backend fallback path.
+    Reads each provider with the Hub-materialized credential. Antigravity's
+    read-only `/usage` command is used because its quota service is distinct
+    from Gemini CLI's native Google Code Assist API. Hub itself also reads
+    these accounts centrally; this is the backend fallback path.
     """
     from .fleet import quota_metadata
     from . import credentials
@@ -2063,6 +2064,10 @@ def quotas():
                 if b.get('provider') == 'gemini':
                     from . import native_google_quota
                     raw = native_google_quota.probe(b, dest)
+                elif b.get('provider') == 'antigravity':
+                    from . import native_antigravity_quota
+                    binary = dest / 'engine/bin' / ('agy.exe' if os.name == 'nt' else 'agy')
+                    raw = native_antigravity_quota.probe(binary, dest / 'home')
                 elif b.get('provider') == 'claude' and not credentials.managed_paths(b):
                     from . import native_claude_quota
                     raw = native_claude_quota.probe(b, dest)
@@ -2075,7 +2080,8 @@ def quotas():
                 # No direct reading: report nothing rather than an error row
                 # that would mask Hub's own fresh observation.
                 continue
-            accounts.append({'account': entry['label'], 'provider': entry['provider'], 'quota': quota_metadata(raw, entry['provider'])})
+            quota_provider = 'gemini' if entry['provider'] == 'antigravity' else entry['provider']
+            accounts.append({'account': entry['label'], 'provider': entry['provider'], 'quota': quota_metadata(raw, quota_provider)})
     return {'accounts': accounts}
 
 

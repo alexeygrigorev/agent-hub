@@ -153,7 +153,13 @@ NATIVE_LAUNCHER = {"zai": "zai", "gemini": "antigravity", "go": "opencode"}
 # The login file inside the credential home (same paths provisioning imports).
 # The CLIs create the home directories themselves, so a directory alone is not
 # a login (intake 06d2a0ac: never advertise logged-out accounts).
-NATIVE_CREDENTIAL_MARKERS = {"zai": "v2/credentials.json", "gemini": "oauth_creds.json", "go": "auth.json"}
+NATIVE_CREDENTIAL_MARKERS = {
+    "zai": "v2/credentials.json",
+    # The catalog's Gemini-family native harness is Antigravity. Its login is
+    # separate from Gemini CLI's oauth_creds.json (intake 3d1f8702).
+    "gemini": "antigravity-cli/antigravity-oauth-token",
+    "go": "auth.json",
+}
 
 
 def _default_launcher_model(provider, harness):
@@ -181,6 +187,35 @@ def _find_binary(names, which=shutil.which, home=None):
     return None
 
 
+def native_credential_present(account, home=None):
+    """Check the exact host-home credential expected by a native catalog route."""
+    provider, harness = account.get("provider"), account.get("harness")
+    credential = account.get("credential")
+    if not isinstance(credential, dict) or credential.get("mode") != "host-home":
+        return False
+    marker_name = NATIVE_CREDENTIAL_MARKERS.get(provider)
+    if not marker_name:
+        return False
+    home_path = Path(home) if home is not None else Path.home()
+    marker = Path(expand_home(credential.get("path", ""), home)) / marker_name
+    try:
+        current = marker
+        while current != home_path and home_path in current.parents:
+            if current.is_symlink():
+                return False
+            current = current.parent
+        if current.is_symlink() or marker.is_symlink() or not marker.is_file() or marker.stat().st_size <= 2:
+            return False
+        if provider == "gemini" and harness == "antigravity":
+            token = json.loads(marker.read_text(encoding="utf-8")).get("token")
+            return (isinstance(token, dict)
+                    and isinstance(token.get("access_token"), str) and bool(token["access_token"])
+                    and isinstance(token.get("refresh_token"), str) and bool(token["refresh_token"]))
+        return True
+    except (OSError, UnicodeError, ValueError, AttributeError):
+        return False
+
+
 def native_subscriptions(settings, accounts=None, which=shutil.which, home=None, python=None):
     """Subscription entries for catalog host-home accounts usable on this host.
 
@@ -202,13 +237,7 @@ def native_subscriptions(settings, accounts=None, which=shutil.which, home=None,
                 or provider in disabled or account["account"] in configured):
             continue
         binary = _find_binary(NATIVE_BINARIES.get(harness, (harness,)), which=which, home=home)
-        credential = Path(expand_home(account["credential"]["path"], home))
-        marker = credential / NATIVE_CREDENTIAL_MARKERS[provider]
-        try:
-            logged_in = marker.is_file() and marker.stat().st_size > 2
-        except OSError:
-            logged_in = False
-        if not binary or not logged_in:
+        if not binary or not native_credential_present(account, home=home):
             continue
         sub = {
             "service": provider,

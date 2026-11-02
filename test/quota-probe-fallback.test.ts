@@ -123,7 +123,25 @@ describe('quota probe failure placement (b3749cbb)', () => {
       // Deep tier cannot silently degrade to a daily model.
       const deep = service.plan({workspace: 'demo', mode: 'interactive', engine: 'astra', tier: 'deep', prompt: 'test'});
       expect(deep.selected).toBeNull();
-      expect(deep.rejected).toContainEqual(expect.objectContaining({engine: 'opencode', reason: 'tier_unavailable'}));
+      expect(deep.candidates?.some((route: any) => route.engine !== 'codex')).toBe(false);
+      expect(deep.rejected).toContainEqual(expect.objectContaining({engine: 'codex', reason: 'account_blocked'}));
+      expect((deep.rejected ?? []).some((r: any) => r.engine === 'opencode')).toBe(false);
+    });
+  });
+  it('holds an explicit --engine codex instead of silently landing on claude (f147094b)', async () => {
+    await fixture([], (service, sql) => {
+      sql.exec("UPDATE fleet_subscriptions SET quota_json=?", JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:true},windows:{}}));
+      sql.exec("INSERT INTO fleet_accounts VALUES ('shared-claude','claude',10,0,1)");
+      sql.exec("INSERT INTO fleet_routes VALUES ('host','claude','shared-claude',NULL)");
+      sql.exec("INSERT INTO fleet_subscriptions VALUES ('host','shared-claude','claude',NULL,?,?)", iso(), JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:iso(86400000)}}}));
+      const caps=JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id='host'").one().capabilities);
+      sql.exec("UPDATE machines SET capabilities=?", JSON.stringify({...caps,engines:['codex','claude']}));
+      const plan=service.plan({workspace:'demo',mode:'headless',engine:'codex',tier:'daily',prompt:'work'});
+      expect(plan.selected).toBeNull();
+      expect(plan.candidates?.some((route: any) => route.engine !== 'codex')).toBe(false);
+      expect(plan.request?.engine).toBe('codex');
+      expect((plan as any).fallback_from).toBeUndefined();
+      expect(plan.rejected).toContainEqual(expect.objectContaining({engine: 'codex', reason: 'account_blocked'}));
     });
   });
   it('holds an explicit Codex goal when only a zcodex goal route remains', async () => {
