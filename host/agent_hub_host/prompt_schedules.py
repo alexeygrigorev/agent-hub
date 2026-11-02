@@ -139,7 +139,9 @@ def render_output(args, result):
 
 def diagnostic(exc):
     if isinstance(exc, session_control.SessionHTTPError):
-        return f'operation failed: HTTP {exc.status}: {exc.message or exc.code}'
+        status = exc.status if isinstance(exc.status, int) and 100 <= exc.status <= 599 else 'unknown'
+        code = exc.code if isinstance(exc.code, str) and session_control.SAFE_ERROR.fullmatch(exc.code) else 'request_failed'
+        return f'operation failed: HTTP {status} ({code})'
     if isinstance(exc, (session_control.SessionInputError, session_control.SessionTransportError)):
         return f'operation failed: {exc}'
     return 'operation failed; check authentication and inputs (details withheld)'
