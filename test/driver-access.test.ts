@@ -10,7 +10,7 @@ describe('Hub driver access bounds', () => {
     expect(DRIVER_SCOPES).not.toContain('worker:own-intake');
   });
 
-  it('allows repair notes, acceptance criteria and linked assignments but denies terminal and operator decisions', () => {
+  it('allows repair notes, task creation criteria and linked assignments but denies AC edits and operator decisions', () => {
     expect(driverIntakeMutationAllowed('/tasks', {
       key: 'repair', project: 'agent-hub', title: 'Repair', text: 'Fix a breakage', acceptance_criteria: 'Evidence is recorded',
     })).toBe(true);
@@ -20,9 +20,28 @@ describe('Hub driver access bounds', () => {
     expect(driverIntakeMutationAllowed('/tasks/item/events', {
       key: 'note', expected_version: 2, event: { kind: 'note', text: 'DONE with proof' },
     })).toBe(true);
-    expect(driverIntakeMutationAllowed('/tasks/item/assign', {
-      key: 'link-session', expected_version: 2, session: { hub_session_id: 'session-id' },
+    expect(driverIntakeMutationAllowed('/tasks/item/events', {
+      key: 'mcp-note', expected_version: 2, note: { text: 'DONE with proof', source: 'agent' },
     })).toBe(true);
+    expect(driverIntakeMutationAllowed('/tasks/item/events', {
+      key: 'cli-note', expected_version: 2, note: 'DONE with proof',
+    })).toBe(true);
+    expect(driverIntakeMutationAllowed('/tasks/item/events', {
+      key: 'text-note', expected_version: 2, text: 'DONE with proof',
+    })).toBe(true);
+    expect(driverIntakeMutationAllowed('/tasks/item/events', {
+      key: 'conflicting-note', expected_version: 2, note: 'note', text: 'different note',
+    })).toBe(false);
+    expect(driverIntakeMutationAllowed('/tasks/item/assign', {
+      key: 'link-session', expected_version: 2,
+      session: { workspace: 'agent-hub', mode: 'interactive' }, provenance: 'unknown',
+    })).toBe(true);
+    expect(driverIntakeMutationAllowed('/tasks/item', {
+      key: 'clear-ac', expected_version: 2, acceptance_criteria: null,
+    })).toBe(false);
+    expect(driverIntakeMutationAllowed('/tasks/item', {
+      key: 'replace-ac', expected_version: 2, acceptance_criteria: 'replaced criteria',
+    })).toBe(false);
     expect(driverIntakeMutationAllowed('/tasks/item/events', {
       key: 'scope', expected_version: 2, event: { kind: 'scope_decision', verdict: 'in_scope' },
     })).toBe(false);

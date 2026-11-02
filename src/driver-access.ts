@@ -142,14 +142,21 @@ export function driverIntakeMutationAllowed(path: string, payload: any): boolean
     typeof payload.acceptance_criteria === 'string' && payload.acceptance_criteria.trim().length > 0 &&
     payload.acceptance_criteria.length <= 8000;
   if (/^\/tasks\/[A-Za-z0-9._:-]+\/events$/.test(path)) {
-    return only(['key', 'expected_version', 'event']) &&
-      ['note', 'report', 'blocker', 'work_action', 'first_action', 'session', 'link'].includes(payload.event?.kind);
+    if (!only(['key', 'expected_version', 'event', 'note', 'text'])) return false;
+    const forms = ['event', 'note', 'text'].filter(key => key in payload);
+    if (forms.length !== 1) return false;
+    if ('event' in payload) return ['note', 'report', 'blocker', 'work_action', 'first_action', 'session', 'link']
+      .includes(payload.event?.kind);
+    if ('text' in payload) return typeof payload.text === 'string';
+    if (typeof payload.note === 'string') return true;
+    return !!payload.note && typeof payload.note === 'object' && !Array.isArray(payload.note) &&
+      Object.keys(payload.note).every(key => ['text', 'source'].includes(key)) && typeof payload.note.text === 'string';
   }
   if (/^\/tasks\/[A-Za-z0-9._:-]+\/assign$/.test(path)) {
     return only(['key', 'expected_version', 'session', 'provenance', 'current_state', 'next_step', 'owner']);
   }
   if (/^\/tasks\/[A-Za-z0-9._:-]+$/.test(path)) {
-    return only(['key', 'expected_version', 'title', 'acceptance_criteria', 'current_state', 'next_step', 'owner', 'uncertainty']);
+    return only(['key', 'expected_version', 'title', 'current_state', 'next_step', 'owner', 'uncertainty']);
   }
   return false;
 }

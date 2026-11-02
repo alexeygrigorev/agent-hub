@@ -3,7 +3,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import { DRIVER_PROMPT, DRIVER_PING, DRIVER_PROMPT_VERSION } from './driver-prompt';
 import { boundedText } from './mcp';
 
-type Auth = { caller?: { isAdmin?: boolean; actor?: string }; error?: Response };
+type Auth = { caller?: { isAdmin?: boolean; actor?: string; kind?: string; tokenId?: string; machineId?: string }; scopes?: string[]; error?: Response };
 type Handler = (request: Request, auth: any) => Promise<Response>;
 type Row = { id: string; actor: string; request_key: string; config: string;
   session_id: string | null; schedule_id: string | null; phase: string; created_at: string };
@@ -37,6 +37,13 @@ export class DriverService {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     }), auth);
     return { status: res.status, body: await res.json() as any };
+  }
+  /** Driver effects belong to the operator who created the generation. A
+   * different admin may recover it, but must not rebind its session or schedule
+   * to their own actor. This internal caller is only made after route admin auth. */
+  private rowAuth(auth: Auth, row: Row): Auth {
+    return { ...auth, caller: { ...(auth.caller ?? {}), actor: row.actor,
+      isAdmin: true, kind: 'human', tokenId: undefined, machineId: undefined }, scopes: ['admin'] };
   }
   private async view(row: Row | undefined, auth: Auth) {
     if (!row) return { driver: null, session: null, schedule: null };
@@ -77,6 +84,7 @@ export class DriverService {
     catch { return reply({ error: 'driver_operation_uncertain', retry_key: input.key }, 503); }
   }
   private async stop(row: Row, auth: Auth) {
+    auth = this.rowAuth(auth, row);
     if (['rejected', 'stopped'].includes(row.phase) && !row.session_id) {
       this.sql.exec("UPDATE hub_drivers SET phase='stopped' WHERE id=?", row.id);
       return reply({ ...(await this.view(this.get(row.id), auth)), stopped: true });
@@ -117,6 +125,7 @@ export class DriverService {
     return reply({ ...(await this.view(this.get(row.id), auth)), state: 'pending_stop', pending_stop: true, command: stopped.body }, 202);
   }
   private async start(row: Row, auth: Auth): Promise<Response> {
+    auth = this.rowAuth(auth, row);
     const config = JSON.parse(row.config);
     const started = await this.call(this.sessions, '/api/sessions', auth, {
       key: 'driver-' + row.id, workspace: config.workspace, mode: 'interactive',
@@ -128,8 +137,12 @@ export class DriverService {
       row.session_id = started.body.id;
       this.sql.exec('UPDATE hub_drivers SET session_id=? WHERE id=?', row.session_id, row.id);
     }
+    if (started.status >= 400 || terminal.has(String(started.body.state ?? ''))) {
+      this.sql.exec("UPDATE hub_drivers SET phase='rejected' WHERE id=?", row.id);
+      return reply({ error: 'driver_start_failed', detail: started.body, retry_key: row.request_key },
+        started.status >= 400 ? started.status : 503);
+    }
     if (!row.session_id) {
-      if (started.status >= 400 && started.status < 500) this.sql.exec("UPDATE hub_drivers SET phase='rejected' WHERE id=?", row.id);
       return reply({ error: 'driver_start_failed', detail: started.body, retry_key: row.request_key }, started.status >= 300 ? started.status : 503);
     }
     // Every engine starts at its normal empty interactive prompt. Deliver the
@@ -140,8 +153,8 @@ export class DriverService {
       (id,source,source_id,delivery_key,target_label,body,status,attempts,next_attempt_at,created_at,updated_at)
       VALUES (?,'driver',?,'startup',?,?,'pending',0,?,?,?)`,
       crypto.randomUUID(), row.id, row.session_id, DRIVER_PROMPT, at, at, at);
-    // A held/queued session still owns the singleton and needs its schedule for
-    // future activation. Delivery waits for a verified running native binding.
+    // A capacity-queued session still owns the singleton and needs its schedule
+    // for future activation. Delivery waits for a verified running native binding.
     const schedule = await this.ensureSchedule(row, auth);
     if (!schedule) return reply({ error: 'driver_schedule_failed',
       session: started.body, retry_key: row.request_key }, 503);
@@ -179,7 +192,7 @@ export class DriverService {
     if (action === 'stop') return current ? this.stop(current, auth) : reply({ driver: null, stopped: true });
     if (op.result_id) {
       const prior = this.get(op.result_id)!;
-      if (prior.phase === 'starting') return this.start(prior, auth);
+      if (prior.phase === 'starting') return this.start(prior, this.rowAuth(auth, prior));
       return reply({ ...(await this.view(prior, auth)), replay: true });
     }
     let inherited: any = {};
@@ -188,6 +201,13 @@ export class DriverService {
       const observed = current.session_id ? await this.call(this.sessions, '/api/sessions/' + current.session_id, auth) : null;
       const live = !['rejected', 'stopped'].includes(current.phase) && (!observed || observed.status !== 200 || !terminal.has(observed.body.state));
       if (live && action === 'start' && !input.force) {
+        if (current.phase === 'stopping') return reply({ error: 'driver_stopping', ...(await this.view(current, auth)) }, 409);
+        if (current.phase === 'starting') {
+          const recovered = await this.start(current, this.rowAuth(auth, current));
+          if (recovered.status >= 300) return recovered;
+          this.sql.exec('UPDATE hub_driver_operations SET result_id=? WHERE actor=? AND request_key=?', current.id, actor, input.key);
+          return reply({ ...(await this.view(this.get(current.id), auth)), reused: true }, recovered.status);
+        }
         this.sql.exec('UPDATE hub_driver_operations SET result_id=? WHERE actor=? AND request_key=?', current.id, actor, input.key);
         return reply({ ...(await this.view(current, auth)), reused: true });
       }

@@ -545,19 +545,10 @@ export class SessionControlService {
   }
 
   private cancelOwnerLive(row: any, caller: Caller, operatorStop = false): boolean {
-    // Explicit human operators already may stop any bound session. Apply the
-    // same authority to a provably unstarted intent, without broadening the
-    // owner-only /cancel endpoint or trusting a collapsed browser actor.
-    if (operatorStop && caller.isAdmin === true && caller.kind === 'human') {
-      // The internal recovery service uses the same canonical stop/cancellation
-      // transaction as operators. HTTP authentication never issues this actor.
-      if (caller.actor === 'hub:service:intake-watchdog') return true;
-      if (typeof caller.actor === 'string' && caller.actor.startsWith('human:admin-token:')) return true;
-      if (caller.tokenId) {
-        const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
-        if (validateHumanCredentialRecord(this.sql, this.options.env, cred, this.now())?.actor === caller.actor) return true;
-      }
-    }
+    // Explicit admin stop has already passed the writer/admin route gate. Keep
+    // that operator authority for an unstarted intent even when cookie auth has
+    // no tokenId. /cancel passes operatorStop=false and remains owner-only.
+    if (operatorStop && caller.isAdmin === true) return true;
     if (row.actor !== actorName(caller) || !this.ownerOk(row, caller)) return false;
     // Legacy admin bearers have a stable actor but no credentials-table row.
     // Exact ownership still applies; browser's shared actor=admin cannot cancel.
