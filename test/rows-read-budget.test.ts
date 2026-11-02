@@ -130,9 +130,13 @@ describe('per-step rows-read budgets', () => {
     console.log('tick rows by scope', JSON.stringify(rows));
     expect(rows['tick:session_audit'] ?? 0).toBeLessThan(SESSIONS * 40);
     expect(rows['tick:bus_retention'] ?? 0).toBeLessThanOrEqual(40);
+    // Watchdog capacity observation grew with the in-flight launch matching
+    // of eca41f28 (+450 rows at 150 sessions, all inside this step); pin it
+    // per session so future growth is caught here, not in the total.
+    expect(rows['tick:intake_watchdog'] ?? 0).toBeLessThan(SESSIONS * 30);
     const total = Object.values(rows).reduce((a, b) => a + b, 0);
-    // Linear in running sessions only (~70 rows each today); never in table sizes.
-    expect(total).toBeLessThan(SESSIONS * 80);
+    // Linear in running sessions only (~82 rows each today); never in table sizes.
+    expect(total).toBeLessThan(SESSIONS * 85);
   }));
 });
 
