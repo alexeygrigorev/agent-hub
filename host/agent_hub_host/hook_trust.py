@@ -51,34 +51,42 @@ def entries(hooks_path, hooks_doc):
     return found
 
 
-def refresh(config_path, hooks_path, hooks_doc):
-    """Rewrite the [hooks.state] tables of hooks_path in config_path; keep everything else."""
+def render(current, hooks_path, hooks_doc):
+    """Replace trust tables for one generated hooks file in a TOML document."""
     trusted = entries(str(hooks_path), hooks_doc)
-    if not trusted:
-        return False
-    config_path = Path(config_path)
-    try:
-        current = config_path.read_text(encoding='utf-8')
-    except OSError:
-        current = ''
     prefix = str(hooks_path) + ':'
     kept = []
     skipping = False
+    removed = False
     for line in current.splitlines():
         header = _HEADER.match(line.strip())
         if header:
             try:
                 skipping = json.loads(header.group(1)).startswith(prefix)
+                removed = removed or skipping
             except ValueError:
                 skipping = False
         elif line.lstrip().startswith('['):
             skipping = False
         if not skipping:
             kept.append(line)
+    if not trusted and not removed:
+        return current
     text = '\n'.join(kept).rstrip('\n')
     for key, value in sorted(trusted.items()):
         text += '\n\n[hooks.state.%s]\ntrusted_hash = %s' % (json.dumps(key), json.dumps(value))
-    text = text.lstrip('\n') + '\n'
+    text = text.lstrip('\n')
+    return text + '\n' if text else ''
+
+
+def refresh(config_path, hooks_path, hooks_doc):
+    """Rewrite the [hooks.state] tables of hooks_path in config.toml."""
+    config_path = Path(config_path)
+    try:
+        current = config_path.read_text(encoding='utf-8')
+    except OSError:
+        current = ''
+    text = render(current, hooks_path, hooks_doc)
     if text == current:
         return False
     with private_fs.parent(config_path, create=True):

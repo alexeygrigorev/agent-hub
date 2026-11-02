@@ -29,25 +29,31 @@ def test_claude_launch_trusts_session_cwd_and_git_root(tmp_path, monkeypatch):
     assert projects[work]['hasTrustDialogAccepted'] is True
     assert projects[work + '/sub']['hasTrustDialogAccepted'] is True
     # A freshly created managed config must not open the first-run onboarding.
-    assert _claude_json(home)['hasCompletedOnboarding'] is True
+    data = _claude_json(home)
+    assert data['hasCompletedOnboarding'] is True
+    assert data['theme'] == 'dark'
+    settings = json.loads((home / '.claude' / 'settings.json').read_text(encoding='utf-8'))
+    assert settings['skipDangerousModePermissionPrompt'] is True
+    assert settings['permissions']['defaultMode'] == 'bypassPermissions'
 
 
 def test_windows_paths_get_the_forward_slash_key_too():
     assert p.claude_project_keys('C:\\Users\\alexe\\work\\bf0863c4\\agent-hub') == [
         'C:\\Users\\alexe\\work\\bf0863c4\\agent-hub', 'C:/Users/alexe/work/bf0863c4/agent-hub']
     assert p.claude_project_keys('/home/u/work/x') == ['/home/u/work/x']
+    assert p.claude_project_keys('/Users/alexey/work/x') == ['/Users/alexey/work/x']
 
 
 def test_existing_claude_state_is_preserved(tmp_path):
     home = _home(tmp_path)
     path = home / '.claude' / '.claude.json'
-    path.write_text(json.dumps({'oauthAccount': {'emailAddress': 'fixture'}, 'numStartups': 7,
-                                'projects': {'/w': {'allowedTools': ['Bash'], 'hasTrustDialogAccepted': False}}}),
-                    encoding='utf-8')
+    p.private_fs.atomic_write(path, json.dumps({'oauthAccount': {'emailAddress': 'fixture'}, 'numStartups': 7,
+                                'projects': {'/w': {'allowedTools': ['Bash'], 'hasTrustDialogAccepted': False}}}).encode('utf-8'), 131072)
     p.ensure_claude_trusted_projects(path, ['/w', '/w2'])
     data = json.loads(path.read_text(encoding='utf-8'))
     assert data['oauthAccount'] == {'emailAddress': 'fixture'} and data['numStartups'] == 7
     assert data['hasCompletedOnboarding'] is True
+    assert data['theme'] == 'dark'
     assert data['projects']['/w'] == {'allowedTools': ['Bash'], 'hasTrustDialogAccepted': True}
     assert data['projects']['/w2'] == {'hasTrustDialogAccepted': True}
 
@@ -55,8 +61,8 @@ def test_existing_claude_state_is_preserved(tmp_path):
 def test_already_trusted_config_is_not_rewritten(tmp_path, monkeypatch):
     home = _home(tmp_path)
     path = home / '.claude' / '.claude.json'
-    path.write_text(json.dumps({'hasCompletedOnboarding': True,
-                                'projects': {'/w': {'hasTrustDialogAccepted': True}}}), encoding='utf-8')
+    p.private_fs.atomic_write(path, json.dumps({'hasCompletedOnboarding': True, 'theme': 'dark',
+                                'projects': {'/w': {'hasTrustDialogAccepted': True}}}).encode('utf-8'), 131072)
     writes = []
     monkeypatch.setattr(p, '_write_engine_config', lambda *a: writes.append(a))
     p.ensure_claude_trusted_projects(path, ['/w'])
@@ -67,7 +73,7 @@ def test_unparsable_or_non_object_config_is_never_replaced(tmp_path):
     home = _home(tmp_path)
     path = home / '.claude' / '.claude.json'
     for content in ('{not json', '[1, 2]', '{"projects": []}'):
-        path.write_text(content, encoding='utf-8')
+        p.private_fs.atomic_write(path, content.encode('utf-8'), 131072)
         p.ensure_claude_trusted_projects(path, ['/w'])
         assert path.read_text(encoding='utf-8') == content
 

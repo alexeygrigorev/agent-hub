@@ -617,32 +617,17 @@ def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
     return res
 
 
-KNOWN_HOOK_HASHES = {
-    'session_start:0:0': 'sha256:ac5079da741baea9d7cb457e131ce58f3b563b443cd750940bfa2e54be63a0ec',
-    'session_start:1:0': 'sha256:b8d459bbdbea59e7ff5bd6064a65ced7d9ea57686bb163d1c9fb40eef8ffd4f6',
-    'user_prompt_submit:0:0': 'sha256:db2f3aaa4d73a3c4ce637c104399b654efb2990cd46f72a7f3646cf9c783feac',
-    'user_prompt_submit:1:0': 'sha256:9110ecd5d2975cef72b5596811be8115687e1d437311d7b11f87caf911a24c9b',
-    'stop:0:0': 'sha256:6d270f46d79288e0768c5124346fd2289e3c1b694f38041892633190beb161f8',
-    'post_tool_use:0:0': 'sha256:9e4b66a5438f7470eba7321ae25b62a3ce845c416418da8d85cda2b3c41cca37',
-}
-
-
 def ensure_toml_trusted_hooks(content: str, hooks_file: Path) -> str:
-    """Ensure installed hooks in hooks_file are trusted in TOML content to prevent hook review prompts."""
-    res = repair_toml_duplicate_tables(content)
+    """Trust only handlers present in the actual generated hooks file."""
     try:
-        h_str = str(hooks_file.resolve())
+        hooks_file = Path(hooks_file).resolve()
+        raw = read_engine_file(hooks_file)
+        if raw is None:
+            return content
+        hooks_doc = json.loads(raw.decode('utf-8'))
     except Exception:
-        h_str = str(hooks_file)
-    present = {path for path, _ in _toml_sections(res) if path}
-    for suffix, hash_val in KNOWN_HOOK_HASHES.items():
-        key = f'{h_str}:{suffix}'
-        if ('hooks', 'state', key) in present:
-            continue
-        if res and not res.endswith('\n'):
-            res += '\n'
-        res += f'\n[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{hash_val}"\n'
-    return res
+        return content
+    return hook_trust.render(repair_toml_duplicate_tables(content), str(hooks_file), hooks_doc)
 
 
 def read_engine_file(target, limit=131072):
@@ -730,6 +715,9 @@ def ensure_claude_trusted_projects(config_path, paths):
     if config.get('hasCompletedOnboarding') is not True:
         config['hasCompletedOnboarding'] = True
         changed = True
+    if config.get('theme') != 'dark':
+        config['theme'] = 'dark'
+        changed = True
     for path in paths:
         for key in claude_project_keys(path):
             entry = projects.setdefault(key, {})
@@ -816,6 +804,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         settings['autoUpdates'] = False
         perms = settings.setdefault('permissions', {})
         if isinstance(perms, dict):
+            perms['defaultMode'] = 'bypassPermissions'
             perms.setdefault('deny', ['AskUserQuestion'])
         # Interactive claude sessions report semantic state through the same
         # hook contract as .codex/hooks.json: UserPromptSubmit/SessionStart ->

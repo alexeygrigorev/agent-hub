@@ -451,15 +451,18 @@ def list_sessions(
     workspace: Optional[str] = None,
     include_exited: bool = False,
     fresh: bool = False,
+    timeout: float = QUICK_TIMEOUT,
 ) -> list[NativeSession]:
     """List native sessions, optionally filtered to one canonical workspace (read-only).
 
     Served from the shared host snapshot (see ``native_list_cache``): at most one
     ``aplexer list --all --json`` per TTL. ``fresh=True`` (claim re-qualify, stop,
     reap confirmation) accepts a snapshot at most ``FRESH_MAX_AGE_S`` old.
+    Every native call stays within ``timeout`` so startup health and stop
+    paths keep their bounded ceilings (intake 4038d834).
     """
     def fetch() -> list[Any]:
-        proc = run_native(executable, ["list", "--json", "--all"])
+        proc = run_native(executable, ["list", "--json", "--all"], timeout=timeout)
         if proc.returncode != 0:
             raise SessionControlError("Native list failed")
         rows = _parse_json_output(proc, "list")
@@ -482,6 +485,7 @@ def qualify_target(
     executable: str,
     target: NativeTarget,
     live_only: bool = True,
+    timeout: float = QUICK_TIMEOUT,
 ) -> NativeSession:
     """Re-qualify tag -> (UUID, workspace, generation) immediately before an effect.
 
@@ -493,7 +497,7 @@ def qualify_target(
     """
     target = target.validated()
     native_list_cache.invalidate("list")  # stop/claim qualification needs a fresh catalog
-    sessions = [s for s in list_sessions(executable, include_exited=True)
+    sessions = [s for s in list_sessions(executable, include_exited=True, timeout=timeout)
                 if _stop_workspace_matches(s.workspace, target.workspace)]
     same_tag = [s for s in sessions if s.tag == target.tag]
     if len(same_tag) != 1:
@@ -999,6 +1003,7 @@ def capture_output(
     target: NativeTarget,
     limit_bytes: int = MAX_CAPTURE_BYTES,
     mode: str = "tail",
+    timeout: float = QUICK_TIMEOUT,
 ) -> CaptureResult:
     """Bounded capture: ``capture --bytes N`` tail or ``--screen --plain`` snapshot."""
     target = target.validated()
@@ -1006,14 +1011,14 @@ def capture_output(
         raise SessionControlError(f"Capture bound must be 1..{MAX_CAPTURE_LIMIT}")
     if mode not in ("tail", "screen"):
         raise SessionControlError("Capture mode must be tail|screen")
-    qualify_target(executable, target, live_only=False)
+    qualify_target(executable, target, live_only=False, timeout=timeout)
     if mode == "screen":
         args = ["capture", "--workspace", target.workspace, "--tag", target.tag,
                 "--screen", "--plain"]
     else:
         args = ["capture", "--workspace", target.workspace, "--tag", target.tag,
                 "--bytes", str(limit_bytes)]
-    proc = run_native(executable, args, timeout=QUICK_TIMEOUT)
+    proc = run_native(executable, args, timeout=timeout)
     if proc.returncode != 0:
         raise SessionControlError("Native capture failed")
     text = proc.stdout
@@ -1357,7 +1362,7 @@ def stop_session(
         executable,
         ["kill", target.session_id, "--workspace", before[0].workspace, "--tag", target.tag,
          "--signal", signal, "--grace-ms", str(grace_ms), "--keep-record", "--json"],
-        timeout=QUICK_TIMEOUT + grace_ms / 1000.0 + 10,
+        timeout=QUICK_TIMEOUT,
     )
     if proc.returncode != 0:
         # No exit proof: the session may be gone because it was forgotten/pruned

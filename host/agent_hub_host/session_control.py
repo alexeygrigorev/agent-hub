@@ -621,7 +621,7 @@ def add_commands(sub):
     stop = commands.add_parser('stop', help='Enqueue stop; the hub releases capacity only on confirmed native exit')
     stop.add_argument('id')
     stop.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
-    add_wait(stop, timeout=10.0, interval=1.0)
+    add_wait(stop, timeout=30.0, interval=1.0)
     stop.set_defaults(wait=True)
     stop.add_argument('--no-wait', dest='wait', action='store_false', help='Record the stop intent without waiting for verified exit')
     cancel = commands.add_parser('cancel', help='Cancel an owned held, queued or unclaimed offered intent before native start')
