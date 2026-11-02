@@ -1356,12 +1356,9 @@ export class FleetService {
     if (candidates[0] && typeof candidates[0].workspace === 'string' && candidates[0].workspace !== request.workspace) {
       request.workspace = candidates[0].workspace;
     }
-    const codexSelector = input.engine === 'codex' || overrideModels.some(m => m.provider === 'codex');
-    if (!candidates.length && codexSelector && !input.account && rejected.some(r =>
-      r.reason.startsWith('codex_quota_gate_') || ['account_blocked', 'account_unknown', 'engine_auth_expired', 'credential_invalid', 'credential_rejected'].includes(r.reason))) {
-      const fallback: any = this.plan({ ...input, engine: undefined, tier: input.tier ?? taskTier({ model: overrideModels[0]?.id }) });
-      if (!fallback.error) return { ...fallback, request: { ...fallback.request, engine: request.engine }, rejected: [...rejected, ...fallback.rejected], fallback_from: input.engine };
-    }
+    // Every matching account and machine for an explicit engine has already
+    // been considered above. Replanning without `engine` here could silently
+    // offer a different engine while persisting the original requested engine.
     // Intake dcac7cd4 AC1: rejected[] names only machines that have routes,
     // so a needs-carrying start held while no host advertising those needs is
     // online AND routed (the Windows request whose Windows host has no route
