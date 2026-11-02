@@ -36,12 +36,13 @@ class WorkerCredentialFailureTests(unittest.TestCase):
 
         out = io.StringIO()
         with contextlib.redirect_stdout(out), self.assertRaisesRegex(
-                ValueError, '^Worker Hub credential could not be prepared$'):
+                ValueError, '^Worker Hub credential unavailable \('):
             dispatcher._provision_worker_credential(provision, '/workspace', LAUNCH)
 
         self.assertEqual(calls, [('/workspace', LAUNCH)])
         failure = self._failure_event(out)
         self.assertEqual(failure['status'], 409)
+        self.assertEqual(failure['category'], 'unknown')
         self.assertEqual(failure['code'], 'worker_session_required')
         self.assertEqual(failure['error_type'], 'HttpRequestError')
         self.assertNotIn('hubt_never-log-this', out.getvalue())
@@ -61,7 +62,7 @@ class WorkerCredentialFailureTests(unittest.TestCase):
 
         out = io.StringIO()
         with contextlib.redirect_stdout(out), self.assertRaisesRegex(
-                ValueError, '^Worker Hub credential could not be prepared$'):
+                ValueError, '^Worker Hub credential unavailable \('):
             dispatcher._provision_worker_credential(provision, '/workspace', LAUNCH)
 
         self.assertEqual(calls, [('/workspace', LAUNCH)])
@@ -69,6 +70,7 @@ class WorkerCredentialFailureTests(unittest.TestCase):
         self.assertIsNone(failure['status'])
         self.assertIsNone(failure['code'])
         self.assertEqual(failure['error_type'], 'TimeoutError')
+        self.assertEqual(failure['category'], 'unknown')
         self.assertEqual(failure['offer_id'], LAUNCH)
 
     def test_local_validation_failure_keeps_fixed_diagnostic(self):
@@ -82,13 +84,14 @@ class WorkerCredentialFailureTests(unittest.TestCase):
 
         out = io.StringIO()
         with contextlib.redirect_stdout(out), self.assertRaisesRegex(
-                ValueError, '^Worker Hub credential could not be prepared$'):
+                ValueError, '^Worker Hub credential unavailable \('):
             dispatcher._provision_worker_credential(provision, '/workspace', LAUNCH)
 
         failure = self._failure_event(out)
         self.assertIsNone(failure['status'])
         self.assertIsNone(failure['code'])
         self.assertEqual(failure['error_type'], 'ValueError')
+        self.assertEqual(failure['category'], 'unknown')
         self.assertNotIn('hubt_leaked-value', out.getvalue())
 
     def test_malformed_error_code_is_dropped(self):
@@ -103,11 +106,12 @@ class WorkerCredentialFailureTests(unittest.TestCase):
 
         out = io.StringIO()
         with contextlib.redirect_stdout(out), self.assertRaisesRegex(
-                ValueError, '^Worker Hub credential could not be prepared$'):
+                ValueError, '^Worker Hub credential unavailable \('):
             dispatcher._provision_worker_credential(provision, '/workspace', LAUNCH)
 
         failure = self._failure_event(out)
         self.assertEqual(failure['status'], 500)
+        self.assertEqual(failure['category'], 'unknown')
         self.assertIsNone(failure['code'])
         self.assertNotIn('Boom', out.getvalue())
 
