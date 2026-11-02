@@ -12,7 +12,19 @@ import subprocess
 import sys
 import time
 
-NORMAL_AGE_S = 300
+# A normal ticket only joins the final class after 25 minutes (inside the 30 minute
+# wait budget), so --priority final really jumps a long queue of fresh and
+# moderately aged normal tickets (was 300s, which made every queued ticket
+# final-equivalent and the priority meaningless; position 33/35 observed).
+NORMAL_AGE_S = 1500
+# Slot sizing (intake 167c6178 follow-up, 2026-11-02): RMTHZ (12 cores, 64G)
+# was capped at 2 slots with 40 sessions queued while ~65% CPU / 30G free.
+# The default is 6; a host may override it live, without restarting sessions,
+# by writing an integer to <heavy-test-dir>/slots (re-read on every start).
+# MAX_SLOTS is a hard ceiling that prevents the 2026-10-28 overload (46 vitest,
+# 21 workerd, 25 playwright at once); it also clamps AGENT_HUB_HEAVY_TEST_SLOTS.
+DEFAULT_SLOTS = 6
+MAX_SLOTS = 8
 # Refusal channel (intake 9432731e): exit 3 alone is ambiguous because the
 # admitted command may itself exit 3 (pytest INTERNALERROR). When this names a
 # path, a refusal before the command starts writes it; the command never sees
@@ -251,15 +263,25 @@ def run_command(command, slot, interrupted, run_timeout, identity):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--slots', default=os.environ.get('AGENT_HUB_HEAVY_TEST_SLOTS', '2'))
+    parser.add_argument('--slots', default=os.environ.get('AGENT_HUB_HEAVY_TEST_SLOTS'))
     parser.add_argument('--wait', default=os.environ.get('AGENT_HUB_HEAVY_TEST_WAIT_S', '1800'))
     parser.add_argument('--run-timeout', default=os.environ.get(
         'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S'))
     parser.add_argument('--priority', default=os.environ.get('AGENT_HUB_HEAVY_TEST_PRIORITY', 'normal'), choices=['normal', 'final'])
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    root = Path(os.environ.get('AGENT_HUB_HEAVY_TEST_DIR', f'/run/user/{os.getuid()}/agent-hub/heavy-test'))
+    root.mkdir(parents=True, exist_ok=True)
+    if args.slots is None:
+        try:
+            args.slots = (root / 'slots').read_text().strip()
+        except OSError:
+            args.slots = str(DEFAULT_SLOTS)
+        if not args.slots.isascii() or not args.slots.isdecimal() or int(args.slots) < 1:
+            args.slots = str(DEFAULT_SLOTS)
     if not args.slots.isascii() or not args.slots.isdecimal() or int(args.slots) < 1:
         parser.error('invalid slot count')
+    args.slots = str(min(int(args.slots), MAX_SLOTS))
     if not args.wait.isascii() or not args.wait.isdecimal():
         parser.error('invalid wait seconds')
     if (args.run_timeout is not None and
@@ -271,8 +293,6 @@ def main():
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('no command given')
-    root = Path(os.environ.get('AGENT_HUB_HEAVY_TEST_DIR', f'/run/user/{os.getuid()}/agent-hub/heavy-test'))
-    root.mkdir(parents=True, exist_ok=True)
     identity = pool_identity(root)
     ancestor_holder = nested_holder_ancestor(identity)
     if ancestor_holder is not None:

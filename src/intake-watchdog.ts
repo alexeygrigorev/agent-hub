@@ -623,7 +623,7 @@ export class IntakeWatchdog {
       if (observed?.waiting_until || observed?.stall_reason === 'waiting_until') continue;
       const stalled = owned && (['running','starting','offered','uncertain'].includes(s.state) || FAILED.has(s.state)) && matches && catalogs.has(s.machine_id) &&
         !['unknown','unobserved','exited','stopped','failed'].includes(n.phase) &&
-        (terminal || observed?.stall_reason==='agent_exited_children_running' || (idleCandidate && observed?.stall_reason === 'no_native_progress' && (observed.stalled === true || s.state !== 'running')));
+        (terminal || observed?.stall_reason==='agent_exited_children_running' || (idleCandidate && ["no_native_progress", "hung_tool_call"].includes(observed?.stall_reason as string) && (observed?.stalled === true || s.state !== 'running')));
       const held = owned && s.state === 'held' && !binding.native_id;
       // An unproven launch is observed with backoff, never stopped on age.
       // Missing receipts cannot authorize replacing a possibly live worker.

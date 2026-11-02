@@ -10,7 +10,7 @@ scripts/capped-test-run.sh -- uv run --with pytest python -m pytest
 scripts/capped-test-run.sh -- node scripts/test-browser-local.mjs
 ```
 
-All checkouts under the same host user share two slots by default. The Linux
+All checkouts under the same host user share six slots by default (override live with the integer in <heavy-test-dir>/slots or AGENT_HUB_HEAVY_TEST_SLOTS; hard ceiling 8; was 2 until 2026-11-02). Use --priority final to jump the queue ahead of normal tickets younger than 25 minutes. The Linux
 `flock` locks live under `/run/user/<uid>/agent-hub/heavy-test`. The supervising
 wrapper retains its lock until the command finishes, even if a runtime closes
 inherited descriptors. Kernel locks release automatically when holders exit.

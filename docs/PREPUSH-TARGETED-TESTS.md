@@ -23,7 +23,7 @@ commit reached main in 40 minutes.
 - BROAD (exit 4): `package.json`, lockfiles, `vitest.config.ts`, `wrangler.jsonc`,
   `tsconfig*`, `pyproject.toml`, `uv.lock`, `host/tests/conftest.py`, the heavy-test
   gate/scripts. Run `scripts/test-full-local.sh --priority final` for those.
-- The cap is unchanged: same two slots, same `AGENT_HUB_HEAVY_TEST_DIR`, FIFO.
+- The cap is unchanged: same six slots, same `AGENT_HUB_HEAVY_TEST_DIR`, FIFO.
   Only the work per push shrank. A targeted run holds a slot ~40 s instead of 10+ min.
 
 ## Measurement (Hetzner, 2026-10-31, load average 13-18)

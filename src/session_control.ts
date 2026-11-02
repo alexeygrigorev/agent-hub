@@ -39,7 +39,7 @@ export const WORKER_CHILD_CONCURRENT = 4;
 export const WORKER_CHILD_PER_HOUR = 12;
 export const WORKER_CHILD_PER_INTAKE = 8;
 import { ResourceManagement } from './resource-management';
-import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold } from './session_stall';
+import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold, toolCallStallThreshold } from './session_stall';
 import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, stopHostOnline, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
@@ -1158,7 +1158,7 @@ export class SessionControlService {
     } : null;
     const hostFresh = nativeObservationFresh(this.sql, native, this.now());
     const terminalError = hostFresh ? sessionTerminalError(row, observed) : null;
-    const stall = classifySessionStall(this.sql, native, this.now(), stallThreshold(this.options.env), hostFresh);
+    const stall = classifySessionStall(this.sql, native, this.now(), stallThreshold(this.options.env), hostFresh, toolCallStallThreshold(this.options.env));
     const intake = linkedIntake(this.sql, row);
     const goalStatus = nativeGoalStatus(native);
     const wake = sessionWakeState(this.sql, row.id, this.now());
@@ -1274,7 +1274,7 @@ export class SessionControlService {
       stalled: waitingActive ? false : (row.state === 'running' && !terminalError && stall.stalled),
       stall_reason: waitingActive ? 'waiting_until' : (terminalError ?? (orphanFailure(native) ? 'agent_exited_children_running' : stall.reason)), stalled_since: waitingActive ? null : stall.since,
       ...(terminalError ? { failure_reason: terminalError, cleanup_pending: true } : {}),
-      stall_threshold: stallThreshold(this.options.env), lifecycle_state: row.state,
+      stall_threshold: stallThreshold(this.options.env), tool_call_stall_threshold: toolCallStallThreshold(this.options.env), lifecycle_state: row.state,
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
       ...sessionAccount(launchAccount, observed?.account),

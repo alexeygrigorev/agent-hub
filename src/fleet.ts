@@ -2111,11 +2111,12 @@ export class FleetService {
             (s.parent_id !== undefined && s.parent_id !== null && (typeof s.parent_id !== 'string' || !/^[a-zA-Z0-9-]{1,160}$/.test(s.parent_id))) ||
             (s.tokens !== undefined && (!object(s.tokens, ['input_tokens', 'output_tokens']) ||
               !['input_tokens', 'output_tokens'].every(k => Number.isInteger(s.tokens[k]) && s.tokens[k] >= 0 && s.tokens[k] <= 1e12))) ||
-            (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup', 'terminal_error', 'goal_status', 'sampled_at']) ||
+            (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup', 'terminal_error', 'goal_status', 'sampled_at', 'last_cpu_at']) ||
               (s.progress.sampled_at !== undefined && (typeof s.progress.sampled_at !== 'string' || !fresh(s.progress.sampled_at, this.now() + 60000, 366 * 86400000))) ||
               (s.progress.goal_status !== undefined && !GOAL_STATUSES.includes(s.progress.goal_status)) ||
               (s.progress.terminal_error !== undefined && (!((s.progress.terminal_error === 'codex_reconnect_failed' && s.engine === 'codex') || (['zcodex_agent_exited', 'zcodex_reconnect_failed'].includes(s.progress.terminal_error) && s.engine === 'zcodex')) || s.progress.headless !== false)) ||
               typeof s.progress.last_progress_at !== 'string' || !fresh(s.progress.last_progress_at, this.now() + 60000, 366 * 86400000) ||
+              (s.progress.last_cpu_at !== undefined && (typeof s.progress.last_cpu_at !== 'string' || !fresh(s.progress.last_cpu_at, this.now() + 60000, 366 * 86400000))) ||
               typeof s.progress.headless !== 'boolean' || ![true, false, null].includes(s.progress.agent_alive) ||
               typeof s.progress.orphaned !== 'boolean' || !['none', 'reaped', 'uncertain'].includes(s.progress.cleanup))) ||
             (s.last_activity_at !== undefined && s.last_activity_at !== null && (typeof s.last_activity_at !== 'string' || !fresh(s.last_activity_at, this.now() + 60000, 366 * 86400000))) ||

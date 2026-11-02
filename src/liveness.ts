@@ -8,7 +8,7 @@ import { effectiveCheckin } from './registry';
 import { accountCapacityAlerts } from './account_capacity';
 import { resolveMachineAliases, aliasDetail, projectAliasSessions } from './machine-alias';
 import { freshCatalogs } from './catalog-freshness';
-import { classifySessionStall, initSessionStalls, orphanFailure } from './session_stall';
+import { classifySessionStall, initSessionStalls, orphanFailure, toolCallStallThreshold } from './session_stall';
 
 export const LIVENESS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_heartbeats (actor TEXT PRIMARY KEY, machine_id TEXT, status TEXT NOT NULL, summary TEXT, at TEXT NOT NULL);
@@ -18,8 +18,8 @@ CREATE INDEX IF NOT EXISTS liveness_alerts_open_kind ON liveness_alerts (subject
 CREATE INDEX IF NOT EXISTS liveness_alerts_resolved ON liveness_alerts (resolved_at) WHERE resolved_at IS NOT NULL;
 `;
 
-export type Thresholds = { machineStaleS: number; machineOfflineS: number; agentStallS: number; heartbeatStaleS: number; launchStuckS: number };
-export const DEFAULT_THRESHOLDS: Thresholds = { machineStaleS: 180, machineOfflineS: 900, agentStallS: 1800, heartbeatStaleS: 900, launchStuckS: 600 };
+export type Thresholds = { machineStaleS: number; machineOfflineS: number; agentStallS: number; agentToolCallStallS: number; heartbeatStaleS: number; launchStuckS: number };
+export const DEFAULT_THRESHOLDS: Thresholds = { machineStaleS: 180, machineOfflineS: 900, agentStallS: 1800, agentToolCallStallS: 7200, heartbeatStaleS: 900, launchStuckS: 600 };
 
 /** Read thresholds from Worker vars, ignoring anything that is not a positive number of seconds. */
 export function thresholdsFrom(env: any): Thresholds {
@@ -31,6 +31,7 @@ export function thresholdsFrom(env: any): Thresholds {
     machineStaleS: pick('HUB_MACHINE_STALE_S', DEFAULT_THRESHOLDS.machineStaleS),
     machineOfflineS: pick('HUB_MACHINE_OFFLINE_S', DEFAULT_THRESHOLDS.machineOfflineS),
     agentStallS: pick('HUB_AGENT_STALL_S', DEFAULT_THRESHOLDS.agentStallS),
+    agentToolCallStallS: toolCallStallThreshold(env),
     heartbeatStaleS: pick('HUB_HEARTBEAT_STALE_S', DEFAULT_THRESHOLDS.heartbeatStaleS),
     launchStuckS: pick('HUB_LAUNCH_STUCK_S', DEFAULT_THRESHOLDS.launchStuckS),
   };
@@ -127,7 +128,7 @@ export class LivenessService {
       const activity = ageSeconds(s.last_activity_at, now);
       const resolved = canonical(s.machine_id);
       const alias = aliasOf.get(String(s.machine_id)) ?? null;
-      const stall = classifySessionStall(this.sql, s, now, t.agentStallS, hostKnown(s.machine_id));
+      const stall = classifySessionStall(this.sql, s, now, t.agentStallS, hostKnown(s.machine_id), t.agentToolCallStallS);
       let state: string; let detail: string;
       if (!hostKnown(s.machine_id)) { state = 'unknown'; detail = `machine ${label(resolved)} is not reporting`; }
       else if (s.alias_observation === 'no_current_native_observation') { state = 'unknown'; detail = 'no current native observation on canonical host'; }
