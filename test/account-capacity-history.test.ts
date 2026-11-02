@@ -3,9 +3,11 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { readAccountCapacityHistory, sampleAccountCapacityHistory } from '../src/account-capacity-history';
 import { FleetService } from '../src/fleet';
 
+const inDO: any = runInDurableObject;
+
 it('records bounded rolling account-capacity observations and reads a half-open time window', async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName(crypto.randomUUID()));
-  await runInDurableObject(stub, (hub: any) => {
+  await inDO(stub, (hub: any) => {
     const sql = hub.sql;
     const account = { label: 'history-account', active: 7, reserved: 5, native_live: 4, max_concurrency: 13 };
     const start = Date.UTC(2026, 10, 1, 4, 20);
@@ -31,9 +33,9 @@ it('records bounded rolling account-capacity observations and reads a half-open 
 
 it('serves capacity history through the bounded admin-only account API', async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName(crypto.randomUUID()));
-  await runInDurableObject(stub, async (hub: any, state: DurableObjectState) => {
+  await inDO(stub, async (hub: any, state: any) => {
     const start = Date.UTC(2026, 10, 1, 4, 20);
-    const service = new FleetService(hub.sql, (fn: () => unknown) => state.storage.transactionSync(fn), () => start);
+    const service = new FleetService(hub.sql, (_fn: any) => _fn(), () => start);
     service.init();
     hub.sql.exec("INSERT INTO fleet_accounts(label,provider,max_concurrency,reserve_percent,enabled) VALUES('history-account','claude',13,0,1)");
     sampleAccountCapacityHistory(hub.sql, start, () => [
