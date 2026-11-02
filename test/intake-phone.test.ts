@@ -7,6 +7,8 @@ import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import intakeHtml from '../public/intake.html?raw';
 import intakeJs from '../public/intake.js?raw';
+import asksHtml from '../public/asks.html?raw';
+import asksJs from '../public/asks.js?raw';
 import enginesHtml from '../public/engines.html?raw';
 import sessionsJs from '../public/sessions.js?raw';
 import conversationsJs from '../public/conversations.js?raw';
@@ -56,6 +58,26 @@ function sessionRowCount(): Promise<number> {
 }
 
 describe('F7 phone routes and intake pages', () => {
+  it('labels page-scoped intake search, preserves list state, and prioritizes open decisions', () => {
+    expect(intakeHtml).toContain('Search this page by title, project or ID');
+    expect(intakeHtml).toContain('All states · includes finished');
+    expect(intakeHtml).toContain('intake-page-previous');
+    expect(intakeHtml).toContain('intake-page-next');
+    expect(intakeHtml).toContain('intake-detail-obligations');
+    expect(intakeJs).toContain('Search is page-scoped');
+    expect(intakeJs).toContain('params.set(\'after\', listCursor)');
+    expect(intakeJs).toContain('returnScrollY');
+    expect(intakeJs).toContain('taskTitle(t)} ${(t.project || \'\')} ${t.id');
+  });
+
+  it('defaults Ask audit to unresolved mapping and keeps ask evidence verbatim', () => {
+    expect(asksHtml).toContain('<option value="unresolved">Unresolved mapping work</option>');
+    expect(asksJs).toContain("queryFor('pending'), queryFor('unmapped')");
+    expect(asksJs).toContain('const fullText = String(a.text ?? \'\')');
+    expect(asksJs).toContain("node('p', fullText)");
+    expect(asksJs).toContain('this endpoint has no cursor yet');
+  });
+
   it('gates clean phone URLs (not 404) and keeps unknown paths denied', async () => {
     for (const path of ['/intake', '/fleet', '/conversations', '/engines', '/sessions', '/metrics', '/']) {
       const anon = await SELF.fetch('https://hub.test' + path, { redirect: 'manual' });
@@ -82,6 +104,21 @@ describe('F7 phone routes and intake pages', () => {
       expect(t.payload_data.title).toBeTruthy();
       expect(t.control.status).toBeTruthy();
     }
+  });
+
+  it('paginates a selected task scope with a pinned snapshot and explicit total', async () => {
+    const a = await createTask('paged', 'paged-a');
+    await createTask('paged', 'paged-b');
+    await createTask('paged', 'paged-c');
+    const first = await ok('/tasks?project=paged&status=open&limit=1');
+    expect(first.total).toBe(3);
+    expect(first.items).toHaveLength(1);
+    expect(first.next).toBeTruthy();
+    const second = await ok(`/tasks?project=paged&status=open&limit=1&after=${first.next}&revision=${first.snapshot_version}`);
+    expect(second.snapshot_version).toBe(first.snapshot_version);
+    expect(second.items).toHaveLength(1);
+    expect(second.items[0].id).not.toBe(first.items[0].id);
+    expect(new Set([a.task.id, first.items[0].id, second.items[0].id]).size).toBeGreaterThanOrEqual(2);
   });
 
   it('exposes title, status, AC, history and linked sessions on the detail view', async () => {

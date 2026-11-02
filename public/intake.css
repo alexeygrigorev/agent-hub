@@ -55,6 +55,10 @@
 .intake-controls { align-items: end; gap: var(--dk-gap-control); }
 .intake-filter-wrap { flex: 1; min-width: 200px; max-width: 420px; }
 .intake-status-wrap { display: flex; flex-direction: column; gap: var(--dk-space-1); font-size: var(--dk-text-sm); color: var(--dk-text-muted); min-width: 160px; }
+.intake-pagebar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--dk-space-2); }
+.intake-pagebar p { margin: 0; font-size: var(--dk-text-xs); }
+.intake-pagebar__actions { display: flex; align-items: center; gap: var(--dk-space-2); }
+.intake-pagebar__actions .dk-muted { font-size: var(--dk-text-xs); }
 
 .intake-list { display: grid; gap: var(--dk-space-2); }
 .intake-item {
@@ -86,7 +90,13 @@
   max-width: 100%;
 }
 .intake-item__sub { color: var(--dk-text-muted); font-size: var(--dk-text-xs); font-family: var(--dk-font-mono); overflow-wrap: anywhere; }
+.intake-item__next { color: var(--dk-text-primary); font-size: var(--dk-text-sm); overflow-wrap: anywhere; }
 .intake-item__badges { display: flex; flex-wrap: wrap; align-items: center; gap: var(--dk-space-1); flex-shrink: 0; }
+.intake-obligations { padding: var(--dk-space-3); border: 1px solid var(--dk-border-strong); border-radius: var(--dk-radius-md); background: var(--dk-bg-muted); }
+.intake-obligations > h3 { margin: 0; }
+.intake-obligation { display: flex; flex-direction: column; align-items: flex-start; gap: var(--dk-space-1); padding: var(--dk-space-2) 0; border-top: 1px solid var(--dk-border-default); }
+.intake-obligation__title { margin: 0; font-size: var(--dk-text-sm); font-weight: var(--dk-weight-semibold); color: var(--dk-text-heading); }
+.intake-obligation__text, .intake-obligation__evidence { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 
 .intake-detail__bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--dk-space-2); }
 .intake-detail__head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--dk-space-2); min-width: 0; }
@@ -160,6 +170,8 @@
   .intake-filter-wrap { max-width: 100%; }
   .intake-status-wrap { min-width: 0; }
   .intake-status-wrap .dk-select { width: 100%; }
+  .intake-pagebar { align-items: flex-start; flex-direction: column; }
+  .intake-pagebar__actions { width: 100%; justify-content: space-between; }
   .intake-item__title { white-space: normal; }
   .sessions-truncate { max-width: 100%; }
   .intake-detail__meta { grid-template-columns: 1fr; }

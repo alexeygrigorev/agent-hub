@@ -12,6 +12,15 @@ let pendingApprovalRef = null;
 let csrf = null;
 let loading = false;
 let cachedDetail = null;
+let listCursor = null;
+let listRevision = null;
+let listAuthorizationValidUntil = null;
+let listNextCursor = null;
+let listTotal = 0;
+let listPage = 1;
+let listCursorStack = [];
+let listScrollY = 0;
+let detailHasListEntry = false;
 
 async function api(path, method = 'GET', data) {
   const headers = {};
@@ -78,6 +87,55 @@ function taskTitle(t) {
   return (t.payload_data && t.payload_data.title) || t.id;
 }
 
+function taskNextAction(t) {
+  const unresolved = Array.isArray(t.unresolved) ? t.unresolved : [];
+  const urgent = unresolved.find(e => e && ['pending_approval', 'blocker', 'followup'].includes(e.kind));
+  if (urgent) {
+    const label = urgent.kind === 'pending_approval' ? 'Approval needed' : urgent.kind === 'blocker' ? 'Blocked' : 'Follow-up open';
+    const detail = typeof urgent.text === 'string' ? urgent.text.trim() : '';
+    return detail ? `${label} · ${detail.slice(0, 180)}` : label;
+  }
+  const payload = t.payload_data || {};
+  return payload.next_step || payload.current_state || 'No next action recorded';
+}
+
+function listParams() {
+  const params = new URLSearchParams();
+  const status = byId('intake-status-filter')?.value || 'open';
+  const query = byId('intake-filter')?.value.trim() || '';
+  if (status !== 'open') params.set('status', status);
+  if (query) params.set('q', query);
+  if (listCursor) params.set('after', listCursor);
+  if (listRevision !== null) params.set('revision', String(listRevision));
+  if (listAuthorizationValidUntil !== null) params.set('authorization_valid_until', String(listAuthorizationValidUntil));
+  if (listPage > 1) params.set('page', String(listPage));
+  return params;
+}
+
+function syncListUrl(replace = true) {
+  const query = listParams().toString();
+  const target = `/intake${query ? `?${query}` : ''}`;
+  const state = { ...(history.state || {}), taskId: null, listPage, listCursorStack: [...listCursorStack] };
+  if (replace) history.replaceState(state, '', target);
+  else history.pushState(state, '', target);
+}
+
+function restoreListControls() {
+  const params = new URLSearchParams(location.search);
+  const status = params.get('status') || 'open';
+  const statusSelect = byId('intake-status-filter');
+  if (statusSelect && [...statusSelect.options].some(o => o.value === status)) statusSelect.value = status;
+  const query = byId('intake-filter');
+  if (query) query.value = params.get('q') || '';
+  listCursor = params.get('after') || null;
+  listRevision = params.has('revision') ? Number(params.get('revision')) : null;
+  listAuthorizationValidUntil = params.has('authorization_valid_until') ? Number(params.get('authorization_valid_until')) : null;
+  if (!Number.isSafeInteger(listRevision)) listRevision = null;
+  if (!Number.isSafeInteger(listAuthorizationValidUntil)) listAuthorizationValidUntil = null;
+  listCursorStack = Array.isArray(history.state?.listCursorStack) ? [...history.state.listCursorStack] : [];
+  listPage = Math.max(1, Number(params.get('page')) || (listCursor ? 2 : 1));
+}
+
 function bindTaskTap(el, taskId, labelText) {
   if (!taskId) return;
   el.tabIndex = 0;
@@ -102,15 +160,29 @@ function renderList(tasks, filterText) {
   container.replaceChildren();
   const q = (filterText || '').trim().toLowerCase();
   const filtered = !q ? tasks : tasks.filter(t => {
-    const hay = `${taskTitle(t)} ${(t.project || '')} ${((t.control && t.control.status) || '')}`.toLowerCase();
+    const hay = `${taskTitle(t)} ${(t.project || '')} ${t.id || ''} ${((t.control && t.control.status) || '')} ${(t.payload_data && t.payload_data.owner) || ''} ${taskNextAction(t)}`.toLowerCase();
     return hay.includes(q);
   });
   const statusEl = byId('intake-status');
-  if (statusEl) statusEl.textContent = `Authenticated · ${filtered.length} task${filtered.length === 1 ? '' : 's'}`;
+  const first = listTotal ? (listPage - 1) * 50 + 1 : 0;
+  const last = Math.min(listTotal, (listPage - 1) * 50 + tasks.length);
+  const selectedScope = byId('intake-status-filter');
+  const visibleCount = q ? `${filtered.length} search result${filtered.length === 1 ? '' : 's'} on this page` : `showing ${first}–${last}`;
+  if (statusEl) statusEl.textContent = `Authenticated · ${listTotal} task${listTotal === 1 ? '' : 's'} in scope · ${selectedScope?.selectedOptions[0]?.textContent || 'Open'} · ${visibleCount}`;
+  const scope = byId('intake-page-scope');
+  if (scope) scope.textContent = `Current page · ${listTotal} matching task${listTotal === 1 ? '' : 's'} in this scope · search checks the 50 loaded rows on this page`;
+  const pageLabel = byId('intake-page-label');
+  if (pageLabel) pageLabel.textContent = `Page ${listPage}`;
+  const previous = byId('intake-page-previous');
+  if (previous) previous.disabled = listPage <= 1 || (listPage > 2 && listCursorStack.length === 0);
+  const next = byId('intake-page-next');
+  if (next) next.disabled = !listNextCursor;
   if (!filtered.length) {
     const p = document.createElement('p');
     p.className = 'dk-muted';
-    p.textContent = 'No tasks match this filter.';
+    p.textContent = q
+      ? (tasks.length ? 'No matches on this page. Search is page-scoped; move through the pages to check the full selected scope.' : 'No tasks on this page match the selected state. The page total and navigation show whether more results exist.')
+      : 'No tasks on this page. The selected scope is empty here; use the page controls when more pages are available.';
     container.append(p);
     return;
   }
@@ -127,10 +199,14 @@ function renderList(tasks, filterText) {
     title.title = taskTitle(t);
     const sub = document.createElement('span');
     sub.className = 'intake-item__sub';
-    const cont = t.control && t.control.continuation_state ? ` · ${t.control.continuation_state}` : '';
-    sub.textContent = `${t.project || '-'} · ${t.id}${cont}`;
+    const owner = t.payload_data && t.payload_data.owner ? t.payload_data.owner : 'Owner not set';
+    sub.textContent = `${t.project || 'No project'} · ${owner} · ID ${t.id}`;
     sub.title = sub.textContent;
+    const next = document.createElement('span');
+    next.className = 'intake-item__next';
+    next.textContent = `Next: ${taskNextAction(t)}`;
     main.append(title, sub);
+    main.append(next);
     const badges = document.createElement('div');
     badges.className = 'intake-item__badges';
     badges.append(statusBadge(t.control && t.control.status));
@@ -140,6 +216,12 @@ function renderList(tasks, filterText) {
       s.className = 'dk-badge dk-badge--info dk-mono';
       s.textContent = `${sessions} session${sessions === 1 ? '' : 's'}`;
       badges.append(s);
+    }
+    if (t.control && t.control.continuation_state) {
+      const continuation = document.createElement('span');
+      continuation.className = 'dk-badge dk-badge--neutral';
+      continuation.textContent = t.control.continuation_state;
+      badges.append(continuation);
     }
     item.append(main, badges);
     bindTaskTap(item, t.id, taskTitle(t));
@@ -177,6 +259,35 @@ function historyText(e) {
   if (typeof e.outcome_ref === 'string' && e.outcome_ref) return e.outcome_ref;
   if (e.changes && typeof e.changes === 'object') return Object.keys(e.changes).join(', ');
   return '';
+}
+
+function renderObligations(task) {
+  const wrap = byId('intake-obligations-wrap');
+  const list = byId('intake-detail-obligations');
+  if (!wrap || !list) return;
+  list.replaceChildren();
+  const unresolved = Array.isArray(task.unresolved) ? task.unresolved : [];
+  const visible = unresolved.filter(e => e && e.kind !== 'pending_approval');
+  for (const event of visible) {
+    const card = document.createElement('article');
+    card.className = `intake-obligation intake-obligation--${event.kind || 'open'}`;
+    const kind = document.createElement('span');
+    kind.className = 'dk-badge dk-badge--warning';
+    kind.textContent = event.kind || 'Open item';
+    const text = document.createElement('p');
+    text.className = 'intake-obligation__text';
+    text.textContent = event.text || event.reference || event.outcome_ref || 'No evidence text recorded.';
+    card.append(kind, text);
+    if (event.reference || event.outcome_ref) {
+      const evidence = document.createElement('p');
+      evidence.className = 'dk-muted intake-obligation__evidence';
+      evidence.textContent = `Evidence: ${event.reference || event.outcome_ref}`;
+      card.append(evidence);
+    }
+    list.append(card);
+  }
+  const pending = unresolved.some(e => e && e.kind === 'pending_approval');
+  wrap.hidden = visible.length === 0 && !pending;
 }
 
 /* Worktrees (intake 4b161918). Host status is shown exactly as reported:
@@ -580,6 +691,7 @@ function renderDetail(task) {
     }
     if (payload.owner) addMetaItem(metaEl, 'Owner', payload.owner);
   }
+  renderObligations(task);
   if (acEl) {
     const ac = payload.acceptance_criteria;
     acEl.textContent = typeof ac === 'string' && ac ? ac : 'No acceptance criteria recorded.';
@@ -684,6 +796,8 @@ function renderDetail(task) {
   } else if (approveWrap) {
     approveWrap.hidden = true;
   }
+  const obligationsWrap = byId('intake-obligations-wrap');
+  if (obligationsWrap && pending) obligationsWrap.hidden = false;
   const closeWrap = byId('intake-close-wrap');
   if (closeWrap) closeWrap.hidden = control.status === 'done';
   const statusSelect = byId('intake-status-select');
@@ -691,11 +805,40 @@ function renderDetail(task) {
   if (actionStatus && actionStatus.dataset.sticky !== '1') actionStatus.textContent = '';
 }
 
-async function loadList() {
+async function loadList(options = {}) {
+  const { reset = false } = options;
+  if (reset) {
+    listCursor = null;
+    listRevision = null;
+    listAuthorizationValidUntil = null;
+    listNextCursor = null;
+    listTotal = 0;
+    listPage = 1;
+    listCursorStack = [];
+  }
   const filter = byId('intake-status-filter')?.value || 'open';
-  const data = await api(`/api/intake/tasks?status=${encodeURIComponent(filter)}&limit=50`);
-  cachedTasks = (data && Array.isArray(data.items)) ? data.items : [];
-  renderList(cachedTasks, byId('intake-filter')?.value || '');
+  const params = new URLSearchParams({ status: filter, limit: '50' });
+  if (listCursor) params.set('after', listCursor);
+  if (listRevision !== null) params.set('revision', String(listRevision));
+  if (listAuthorizationValidUntil !== null) params.set('authorization_valid_until', String(listAuthorizationValidUntil));
+  try {
+    const data = await api(`/api/intake/tasks?${params}`);
+    cachedTasks = (data && Array.isArray(data.items)) ? data.items : [];
+    listRevision = data?.snapshot_version ?? listRevision;
+    listAuthorizationValidUntil = data?.authorization_valid_until ?? listAuthorizationValidUntil;
+    listNextCursor = data?.next || null;
+    listTotal = Number(data?.total) || 0;
+    renderList(cachedTasks, byId('intake-filter')?.value || '');
+    if (!taskIdFromPath()) syncListUrl(true);
+  } catch (err) {
+    if (err.status === 409 && !reset) {
+      await loadList({ reset: true });
+      const statusEl = byId('intake-status');
+      if (statusEl) statusEl.textContent = 'Task list changed; restarted at page 1 of the current scope.';
+      return;
+    }
+    throw err;
+  }
 }
 
 /* Read-only open: exactly one GET, never a session start. */
@@ -727,7 +870,12 @@ function openTaskDetail(taskId, pushHistory = true) {
   if (listSec) listSec.hidden = true;
   if (byId('intake-stats-section')) byId('intake-stats-section').hidden = true;
   if (detailSec) detailSec.hidden = false;
-  if (pushHistory) history.pushState({ taskId }, '', taskPath(taskId));
+  if (pushHistory) {
+    listScrollY = window.scrollY;
+    detailHasListEntry = true;
+    const query = listParams().toString();
+    history.pushState({ taskId, returnScrollY: listScrollY }, '', `${taskPath(taskId)}${query ? `?${query}` : ''}`);
+  } else detailHasListEntry = false;
   const cached = cachedTasks.find(t => t.id === taskId);
   if (cached) {
     renderDetail({ ...cached, payload_data: cached.payload_data || {}, control: cached.control || {}, unresolved: cached.unresolved || [], assigned_sessions: cached.assigned_sessions || [] });
@@ -748,8 +896,10 @@ function closeTaskDetail(pushHistory = true) {
   if (detailSec) detailSec.hidden = true;
   if (listSec) listSec.hidden = false;
   if (byId('intake-stats-section')) byId('intake-stats-section').hidden = false;
-  if (pushHistory) history.pushState({}, '', '/intake');
+  if (pushHistory) syncListUrl(false);
   renderList(cachedTasks, byId('intake-filter')?.value || '');
+  detailHasListEntry = false;
+  requestAnimationFrame(() => window.scrollTo({ top: listScrollY, behavior: 'instant' }));
 }
 
 async function ensureCsrf() {
@@ -874,9 +1024,10 @@ async function loadData() {
 function setupEvents() {
   byId('intake-filter')?.addEventListener('input', () => {
     renderList(cachedTasks, byId('intake-filter')?.value || '');
+    syncListUrl(true);
   });
   byId('intake-status-filter')?.addEventListener('change', () => {
-    loadList().catch(() => {
+    loadList({ reset: true }).catch(() => {
       const statusEl = byId('intake-status');
       if (statusEl) statusEl.textContent = 'Intake could not be refreshed.';
     });
@@ -885,7 +1036,37 @@ function setupEvents() {
     loadData();
   });
   byId('intake-detail-back')?.addEventListener('click', () => {
-    closeTaskDetail();
+    if (detailHasListEntry) history.back();
+    else closeTaskDetail();
+  });
+  byId('intake-page-next')?.addEventListener('click', async () => {
+    if (!listNextCursor) return;
+    const currentCursor = listCursor;
+    listCursorStack.push(listCursor);
+    listCursor = listNextCursor;
+    listPage += 1;
+    try { await loadList(); } catch {
+      listCursor = currentCursor;
+      listCursorStack.pop();
+      listPage = Math.max(1, listPage - 1);
+      renderList(cachedTasks, byId('intake-filter')?.value || '');
+      const el = byId('intake-status'); if (el) el.textContent = 'Could not load the next page. Your current page is still available.';
+    }
+  });
+  byId('intake-page-previous')?.addEventListener('click', async () => {
+    if (listPage <= 1) return;
+    const currentCursor = listCursor;
+    const previousCursor = listCursorStack.pop() ?? null;
+    const currentPage = listPage;
+    listCursor = previousCursor;
+    listPage = Math.max(1, listPage - 1);
+    try { await loadList(); } catch {
+      listCursor = currentCursor;
+      listCursorStack.push(previousCursor);
+      listPage = currentPage;
+      renderList(cachedTasks, byId('intake-filter')?.value || '');
+      const el = byId('intake-status'); if (el) el.textContent = 'Could not load the previous page. Your current page is still available.';
+    }
   });
   byId('intake-detail-refresh')?.addEventListener('click', () => {
     if (selectedTaskId) refreshTaskDetail(selectedTaskId);
@@ -910,12 +1091,19 @@ function setupEvents() {
   window.addEventListener('popstate', () => {
     const tid = taskIdFromPath();
     if (tid) openTaskDetail(tid, false);
-    else if (selectedTaskId) closeTaskDetail(false);
+    else {
+      restoreListControls();
+      if (selectedTaskId) closeTaskDetail(false);
+      loadList().catch(() => { const el = byId('intake-status'); if (el) el.textContent = 'Could not restore this task list page.'; });
+      const returnY = history.state && Number.isFinite(history.state.returnScrollY) ? history.state.returnScrollY : listScrollY;
+      requestAnimationFrame(() => window.scrollTo({ top: returnY, behavior: 'instant' }));
+    }
   });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   setupEvents();
+  restoreListControls();
   const tid = taskIdFromPath();
   loadData().then(() => {
     if (tid) openTaskDetail(tid, false);
