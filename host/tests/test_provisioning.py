@@ -1568,7 +1568,7 @@ def test_install_fetches_windows_zcodex_release_exe(tmp_path, monkeypatch):
 @pytest.mark.parametrize('label', ['shared-codex', 'codex-orin'])
 @pytest.mark.parametrize('model,explicit,expected', [
     ('gpt-6.1-sol', None, 'medium'),
-    ('gpt-6-luna', None, 'max'),
+    ('gpt-6-luna', None, 'xhigh'),
     ('gpt-6.1-sol', 'high', 'high'),
 ])
 def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, explicit, expected):
@@ -1577,7 +1577,7 @@ def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, exp
     monkeypatch.setattr(p, 'root', lambda: managed)
     monkeypatch.delenv('CODEX_LAUNCH_WRAPPER', raising=False)
     b = bundle()
-    b.update(provider='codex', label=label, args=[])
+    b.update(provider='codex', label=label, args=['-c', 'model_reasoning_effort="high"'])
     b['files']['.codex/config.toml'] = 'model_reasoning_effort = "xhigh"\n'
     dest = managed / (label + '-' + b['revision'])
     dest.mkdir(mode=0o700)
@@ -1592,7 +1592,9 @@ def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, exp
     monkeypatch.setattr(sys, 'argv', args + ['task'])
     p.execute()
     overrides = [arg for arg in calls[0] if arg.startswith('model_reasoning_effort=')]
-    assert overrides == ['model_reasoning_effort="' + expected + '"']
+    assert overrides[-1] == 'model_reasoning_effort="' + expected + '"'
+    if not explicit:
+        assert overrides[0] == 'model_reasoning_effort="high"'
 
 
 def test_antigravity_environment_drops_user_proxy_variables(tmp_path, monkeypatch):
