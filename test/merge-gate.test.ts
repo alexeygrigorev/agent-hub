@@ -122,7 +122,7 @@ describe('AC4 reviewer-auth fallback', () => {
     expect(brief).toContain('Run ONLY targeted unit tests for the files you changed locally');
     expect(brief).toContain('never run the full suite locally (it runs in CI)');
     expect(brief).toContain('gh pr merge --auto --rebase');
-    expect(brief).toContain('Never push to main or approve deploy gates');
+    expect(brief).toContain('Never push to main directly or approve deploy gates');
     expect(brief).toContain('after three unsuccessful finish-merge requeues the watcher creates a prerequisite and alert');
     expect(brief).not.toContain('hub intake blocker');
   });
