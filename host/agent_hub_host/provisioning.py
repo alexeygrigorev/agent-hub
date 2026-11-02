@@ -18,7 +18,7 @@ import time
 import tomllib
 import zipfile
 
-from . import bus, config, hook_command, private_fs
+from . import bus, config, hook_command, private_fs, state_hook_commands
 
 LABEL = re.compile(r'[a-z][a-z0-9_-]{0,47}\Z')
 REV = re.compile(r'[a-f0-9-]{36}\Z')
@@ -261,6 +261,10 @@ def load_git_identity() -> dict[str, str]:
     return res
 
 
+def _windows_hooks():
+    return sys.platform == 'win32'
+
+
 def install_aplexer_state_hooks(bundle=None, home=None):
     """Install aplexer state-report hooks into managed engine home.
 
@@ -284,7 +288,10 @@ def install_aplexer_state_hooks(bundle=None, home=None):
 
     template_hooks = None
     user_codex_hooks = Path.home() / '.codex/hooks.json'
-    if user_codex_hooks.is_file():
+    # On Windows codex/zcodex run hooks through PowerShell, where the bash
+    # `|| true` / `2>/dev/null` forms are a parse error (every prompt shows
+    # 'Hook failed: hook exited with code 1'). Never copy a user template there.
+    if not _windows_hooks() and user_codex_hooks.is_file():
         try:
             template_hooks = json.loads(user_codex_hooks.read_text(encoding='utf-8'))
         except Exception:
@@ -293,13 +300,21 @@ def install_aplexer_state_hooks(bundle=None, home=None):
     if not template_hooks or not isinstance(template_hooks, dict) or 'hooks' not in template_hooks:
         a_cmd = hook_command.tool_command('a')
         aplexer_cmd = hook_command.tool_command('aplexer')
+        if _windows_hooks():
+            _exe = lambda name: shutil.which(name) or str(Path.home() / '.local' / 'bin' / name)
+            state_cmd = lambda st: state_hook_commands.hook_command(_exe('a'), 'state-report', st)
+            ctx_cmd = state_hook_commands.hook_command(
+                _exe('aplexer'), 'context', 'hook', '--engine', 'codex', quiet=True)
+        else:
+            state_cmd = lambda st: f"{a_cmd} state-report {st} || true"
+            ctx_cmd = f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1"
         template_hooks = {
             "hooks": {
                 "PostToolUse": [
                     {
                         "hooks": [
                             {
-                                "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
+                                "command": ctx_cmd,
                                 "timeout": 30,
                                 "type": "command"
                             }
@@ -310,7 +325,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{a_cmd} state-report working || true",
+                                "command": state_cmd('working'),
                                 "type": "command"
                             }
                         ]
@@ -318,7 +333,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
+                                "command": ctx_cmd,
                                 "timeout": 30,
                                 "type": "command"
                             }
@@ -329,7 +344,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{a_cmd} state-report idle || true",
+                                "command": state_cmd('idle'),
                                 "type": "command"
                             }
                         ]
@@ -339,7 +354,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{a_cmd} state-report working || true",
+                                "command": state_cmd('working'),
                                 "type": "command"
                             }
                         ]
@@ -347,7 +362,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
+                                "command": ctx_cmd,
                                 "timeout": 30,
                                 "type": "command"
                             }
@@ -1999,6 +2014,12 @@ def engine_environment(bundle, home, dest=None):
         runtime = locate_zcode_runtime(dest)
         if runtime:
             env['ZCODE_CJS'] = str(runtime)
+        # Without a warm mode the Codex host policy auto-approves only the
+        # 'safe' risk tier and denies every write/exec ("not auto-approved by
+        # the warm ZCode bridge"): sessions read but never edit or commit.
+        # RMTHZ goal routes run with yolo; keep an explicit operator override.
+        env.setdefault('ZCODE_WARM', '1')
+        env.setdefault('ZCODE_WARM_MODE', 'yolo')
     env['GH_CONFIG_DIR'] = os.environ.get('GH_CONFIG_DIR') or str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'gh')
     env.update(bundle.get('env') or {})
     shared = shared_dataops_dir()
