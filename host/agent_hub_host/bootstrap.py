@@ -90,7 +90,7 @@ def missing_engines(install_root):
     for package in ENGINES.values():
         name, version = package.rsplit('@', 1)
         try:
-            data = json.loads((install_root / 'engines/node_modules' / name / 'package.json').read_text())
+            data = json.loads((install_root / 'engines/node_modules' / name / 'package.json').read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = None
         if not isinstance(data, dict) or data.get('version') != version:
@@ -685,7 +685,7 @@ def publish_user_path(install_root):
             # Preserve shell profiles and refuse linked files outside HOME.
             if profile.is_symlink():
                 continue
-            old = profile.read_text() if profile.exists() else ''
+            old = profile.read_text(encoding="utf-8") if profile.exists() else ''
             if include not in old:
                 mode = stat.S_IMODE(profile.stat().st_mode) if profile.exists() else None
                 write_private(profile, old + include, mode=mode)
@@ -701,10 +701,10 @@ def configure_default_engine():
     settings = Path.home() / '.claude/settings.json'
     if any(p.is_symlink() for p in (native, native.parent, settings, settings.parent)):
         raise ValueError('Refusing linked engine configuration')
-    content = native.read_text() if native.exists() else 'version = 1\n'
+    content = native.read_text(encoding="utf-8") if native.exists() else 'version = 1\n'
     if 'default_engine' not in tomllib.loads(content):
         write_private(native, set_toml_top_level_keys(content, {'default_engine': 'claude'}))
-    data = json.loads(settings.read_text()) if settings.exists() else {}
+    data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
     if not isinstance(data, dict):
         raise ValueError('Invalid Claude settings; existing file preserved')
     data.setdefault('model', 'opus')
@@ -911,7 +911,7 @@ def configure(base_url):
         else:
             repository_access = 'configured' if repositories is not None else 'not_configured'
         if repositories:
-            data = json.loads(settings.read_text())
+            data = json.loads(settings.read_text(encoding="utf-8"))
             workspaces = data.setdefault('workspaces', {})
             for alias, path in repositories.items():
                 if alias in workspaces and workspaces[alias] != path:
