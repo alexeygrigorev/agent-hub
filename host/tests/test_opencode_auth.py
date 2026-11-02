@@ -113,6 +113,7 @@ def test_managed_bootstrap_preserves_device_contract_across_home_isolation(tmp_p
     prepare.assert_called_once_with(cfg)
     assert env['OPENCODE_DB'] == cfg['target_data'] + '/opencode/opencode.db'
     assert env['XDG_CONFIG_HOME'] == cfg['target_data'] + '/config'
+    assert env['APLEXER_CONFIG'] == str(Path(cfg['source_config']) / 'aplexer' / 'config.toml')
 
 
 def proof_config(tmp_path):

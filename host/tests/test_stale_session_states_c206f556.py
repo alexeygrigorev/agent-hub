@@ -109,8 +109,45 @@ class KernelContainmentReceiptTests(unittest.TestCase):
 
     def test_live_worker_report_stays_authoritative(self):
         self.events(0)
-        self.assertFalse(self.receipt(self.row(worker_alive=True)))
-        self.assertFalse(self.receipt(self.row(worker_alive=None)))
+        # A cached live bit is authoritative only while its recorded PID still
+        # exists; the direct probe must not turn a genuinely live worker into
+        # an exit receipt.
+        with patch('os.kill', return_value=None):
+            self.assertFalse(self.receipt(self.row(worker_alive=True)))
+            self.assertFalse(self.receipt(self.row(worker_alive=None)))
+
+    def test_windows_liveness_uses_native_receipt_without_signalling_pids(self):
+        live = self.row(worker_alive=True, containment_empty=True)
+        dead = self.row(worker_alive=False, containment_empty=True)
+        with patch('os.name', 'nt'), patch('os.kill') as kill:
+            self.assertFalse(kernel_containment_empty(dead))
+            self.assertFalse(confirmed_empty(live))
+            self.assertTrue(confirmed_empty(dead))
+        kill.assert_not_called()
+
+    def test_killed_worker_overrides_stale_alive_bit_and_reconciles_session(self):
+        from agent_hub_host.fleet import session_metadata
+        self.events(0)
+        row = self.row(worker_alive=True, phase='running', state='running')
+        row.update(id='11111111-1111-4111-8111-111111111111', tag='hub-killed',
+                   workspace=self.tmp.name, engine='codex')
+        from agent_hub_host import account_capacity
+        with patch('os.kill', side_effect=ProcessLookupError), \
+             patch.object(account_capacity, 'kernel_containment_empty', side_effect=self.receipt):
+            self.assertTrue(self.receipt(row))
+            self.assertTrue(confirmed_empty(row))
+            projected = session_metadata([row], {'subscriptions': []}, collect_tokens=False)[0]
+        self.assertEqual(projected['phase'], 'exited')
+        self.assertTrue(projected['confirmed_exit'])
+
+    def test_unknown_worker_liveness_is_marked_stale_in_each_census(self):
+        row = self.row(worker_alive=None, worker_pid=None, workload_pid=None,
+                       containment_empty=False, phase='running', state='running')
+        row.update(id='22222222-2222-4222-8222-222222222222', tag='hub-unknown',
+                   workspace=self.tmp.name, engine='codex')
+        projected = session_metadata([row], {'subscriptions': []}, collect_tokens=False)[0]
+        self.assertEqual(projected['phase'], 'uncertain')
+        self.assertFalse(projected['confirmed_exit'])
 
     def test_other_boot_or_foreign_path_is_not_proof(self):
         self.events(0)

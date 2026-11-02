@@ -476,6 +476,29 @@ def test_ack_verified_via_correlated_reply(env):
                                    corr).state == "unknown"
 
 
+def test_ack_proof_ignores_cached_message_log(env):
+    # Regression (main CI red, intake 7357a629): the shared message-log cache
+    # served the pre-reply snapshot, so a reply authored right after an
+    # "unknown" probe was never seen. ACK proof must always read a fresh log,
+    # even when the cache TTL would otherwise cover both reads.
+    from agent_hub_host import native_list_cache
+    env["monkeypatch"].setattr(native_list_cache, "LOG_TTL_S", 3600.0)
+    rec = seed_session(env)
+    target = make_target(env, "agent1", rec["id"])
+    body = "prompt for cache test"
+    sent, sender = ns.send_inbox(env["fake"], target, body, {"correlation_id": "ack-cache"})
+    corr = {"correlation_id": "ack-cache", "body_digest": ns.body_digest(body)}
+    ns.fetch_message_log(env["fake"], sender.workspace)  # prime the cache pre-reply
+    assert ns.verify_ack_via_reply(env["fake"], target, sender, sent.native_id, corr).state == "unknown"
+    reply_env = dict(os.environ, APLEXER_SESSION_ID=rec["id"])
+    rep = subprocess.run(
+        [env["fake"], "message", "reply", sent.native_id, "done ack-cache",
+         "--data", json.dumps(corr), "--json"],
+        capture_output=True, text=True, timeout=20, env=reply_env)
+    assert rep.returncode == 0, rep.stderr
+    assert ns.verify_ack_via_reply(env["fake"], target, sender, sent.native_id, corr).state == "acknowledged"
+
+
 # --- executor idempotency ------------------------------------------------------
 
 def test_executor_send_replay_and_conflict(env):

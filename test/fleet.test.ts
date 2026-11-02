@@ -1378,6 +1378,50 @@ describe('bare workspace labels resolve under advertised absolute roots', () => 
   }));
 });
 
+describe('goal placement respects per-host load budgets', () => {
+  it('moves an over-budget goal to another host while keeping account capacity fleet-wide', async () => fixture(async (s, sql) => {
+    await configure(s, true);
+    const goalRoutes = [{ engine: 'codex', account: 'shared-codex', profile: null }];
+    for (const machine of ['hetzner', 'win35']) {
+      sql.exec("UPDATE machines SET capabilities = ?, last_heartbeat = json_set(last_heartbeat, '$.load', json(?)) WHERE id = ?",
+        JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: goalRoutes }), '[1]', machine);
+    }
+    sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.load', json('[20]')) WHERE id = 'hetzner'");
+    sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.load', json('[3]')) WHERE id = 'win35'");
+    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'shared-codex', plan: 'pro', quota: {
+      status: 'ok', observed_at: iso(), details: { limit_reached: false },
+      windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } },
+    } }] }, 'PUT'), host('hetzner'));
+
+    const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep' }));
+    expect(plan.selected?.machine).toBe('win35');
+    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'host_load_high', load_limit: 12 }));
+    expect(s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).max_concurrency).toBe(1);
+  }));
+
+  it('prefers the lower-load host while both remain under budget', async () => fixture(async (s, sql) => {
+    await configure(s, true);
+    const goalRoutes = [{ engine: 'codex', account: 'shared-codex', profile: null }];
+    for (const [machine, load] of [['hetzner', 8], ['win35', 1]]) {
+      sql.exec("UPDATE machines SET capabilities = ?, last_heartbeat = json_set(last_heartbeat, '$.load', json(?)) WHERE id = ?",
+        JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: goalRoutes }), JSON.stringify([load]), machine);
+    }
+    const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep' }));
+    expect(plan.selected?.machine).toBe('win35');
+  }));
+
+  it('excludes an offline flagged Tabo route from automatic placement', async () => fixture(async (s, sql) => {
+    sql.exec(`INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities)
+      VALUES ('tabo','tabo','tabo',?,?,?,1,?)`, iso(-3600000), iso(-3600000), JSON.stringify({ load: [0], mem_avail_mb: 32000, disk_free_gb: 80 }), JSON.stringify({ engines: ['codex'], fleet_modes: ['interactive'], workspaces: ['demo'], cpu_count: 8 }));
+    const config = registry(true);
+    config.routes.push({ machine_id: 'tabo', engine: 'codex', account: 'shared-codex', profile: null });
+    expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(200);
+    const plan = s.plan(intent());
+    expect(plan.selected?.machine).not.toBe('tabo');
+    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'tabo', reason: 'machine_unavailable' }));
+  }));
+});
+
 describe('imported session lifecycle and non-resurrection in fleet catalog', () => {
   it('prevents late live-catalog snapshots from resurrecting stopped same-incarnation sessions while allowing new UUID tag reuse', async () => fixture(async (s, sql) => {
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);

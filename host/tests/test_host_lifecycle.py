@@ -26,7 +26,9 @@ class HostLifecycleTest(unittest.TestCase):
             if method == 'GET':
                 return {'sha': 'b' * 40}
             reports.append(body)
-        with patch.object(self_update, 'repo_root', return_value=None), patch.object(self_update, 'release_sha', return_value='a' * 40):
+        with patch.object(self_update.sys, 'platform', 'linux'), \
+             patch.object(self_update, 'repo_root', return_value=None), \
+             patch.object(self_update, 'release_sha', return_value='a' * 40):
             self.assertFalse(self_update.step_once(request, log=lambda *a, **k: None))
         self.assertEqual(reports[-1], {'current_sha': 'a' * 40, 'state': 'unsupported', 'error': 'immutable_layout_missing'})
 
@@ -58,3 +60,32 @@ class HostLifecycleTest(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertIn('-NonInteractive', calls[0])
             self.assertNotIn('RunAs', calls[0])
+
+    def test_windows_package_autostart_checks_the_controller_task(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            release = Path(tmp) / 'releases' / ('a' * 16 + '-' + 'b' * 12)
+            release.mkdir(parents=True)
+            runner = release / 'controller.ps1'
+            runner.touch()
+            calls = []
+
+            def run(argv, **kw):
+                calls.append(argv)
+                self.assertIn(str(runner), argv[-1])
+                self.assertIn('AgentHubController-', argv[-1])
+                self.assertIn("MultipleInstances -ne 'IgnoreNew'", argv[-1])
+                return subprocess.CompletedProcess(argv, 0, 'configured\n', '')
+
+            with patch.object(self_update.sys, 'platform', 'win32'), \
+                 patch('agent_hub_host.package_update.running_release', return_value=release):
+                self.assertEqual(self_update.ensure_windows_autostart(None, run), 'configured')
+            self.assertEqual(len(calls), 1)
+
+    def test_windows_package_autostart_reports_missing_wrapper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            release = Path(tmp) / 'releases' / ('a' * 16 + '-' + 'b' * 12)
+            release.mkdir(parents=True)
+            with patch.object(self_update.sys, 'platform', 'win32'), \
+                 patch('agent_hub_host.package_update.running_release', return_value=release):
+                self.assertEqual(self_update.ensure_windows_autostart(None), 'wrapper_missing')

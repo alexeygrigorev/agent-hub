@@ -68,6 +68,24 @@ In interactive mode:
 Headless sessions (`mode: headless`, e.g. `codex exec`, `opencode run`, `-p`) run as one-shot commands without an active interactive input channel.
 - Senders cannot inject input into a running headless execution; Hub fails fast with `send_unsupported_headless` rather than leaving sends stuck in `claimed`.
 - Follow-ups to headless work must go through `codex exec resume <thread-id> <prompt>` to resume execution in a completed thread.
+- An empty interactive start (no `--with-goal`) types no prompt, so no hook fires at first; the host seeds the session's reported state as `waiting` right after a verified start (intake 2fdcaef5) so queued TUI delivery is not refused forever. The first genuine harness event overwrites the seed.
+
+## Cross-device messaging (`hub msg`)
+
+Design and states: [SESSION-MESSAGING.md](SESSION-MESSAGING.md). Usage:
+
+```sh
+hub msg send --to session:<uuid> --body "…"        # TUI delivery (default from humans/named agents)
+hub msg send --to <tag>@<machine> --inbox --body … # native mailbox copy only
+hub msg --profile developer send --to session:<uuid> --body …   # as agent:developer
+hub msg status <id>        # state + audit events (accepted → dispatched → delivered → read → acked)
+hub msg reply <id> --body "…"   # inside a session, via its own credential
+hub msg --profile developer inbox [--wait 60]
+```
+
+- A session's sender is always `session:<uuid>`; replies thread back across hosts.
+- `delivery=tui` writes the native inbox copy first, then `aplexer message deliver` types the rendered text at a ready prompt (hooks must report `waiting|idle`). `not_ready` backs off without consuming attempts; the inbox copy stays authoritative. Each session provisiones its own messaging credential at bind (`msg:send msg:read` only); no tokens enter the engine environment.
+- The host relays native `a message reply` answers that reference a `hub-message` envelope back to Hub as the session.
 
 ## Non-goals and holds
 

@@ -58,8 +58,8 @@ describe('burn-aware fleet placement', () => {
     expect(plan.selected).toMatchObject({ account: 'shared-claude', engine: 'claude' });
     expect(plan.selected.burn_weight).toBeGreaterThan(3);
     expect(plan.selected.burn.waste_alert).toBe(true);
-    const codex = plan.candidates!.find((c: any) => c.account === 'shared-codex');
-    expect(plan.selected.score).toBeGreaterThan(2 * codex.score);
+    // A healthy preferred provider keeps Codex Luna out of plain-start candidates.
+    expect(plan.candidates!.some((c: any) => c.account === 'shared-codex' && c.selection?.id === 'luna')).toBe(false);
     // Deep work takes Claude Opus for the same reason.
     expect(fleet.plan(intent({ tier: 'deep' })).selected).toMatchObject({ account: 'shared-claude', selection: expect.objectContaining({ id: 'opus' }) });
     // Account status exposes the forecast for the dashboard and alert.

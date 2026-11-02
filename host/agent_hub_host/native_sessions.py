@@ -171,6 +171,7 @@ class NativeSession:
     processes: Optional[int] = None
     agent_state_at_ms: Optional[int] = None
     headless_exec: bool = False
+    worker_alive: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -438,6 +439,7 @@ def project_session(raw: Any) -> NativeSession:
         worker_pid=worker_pid if type(worker_pid) is int else None,
         workload_pid=workload_pid if type(workload_pid) is int else None,
         processes=processes if type(processes) is int else None,
+        worker_alive=raw.get("worker_alive") if type(raw.get("worker_alive")) is bool else None,
     )
 
 
@@ -1116,9 +1118,10 @@ def _confirm_workload_exit(before: NativeSession) -> tuple[bool, str]:
     """Confirm the owned workload is actually gone (stop oracle).
 
     A missing catalog entry or a lone ``kill`` exit 0 is NOT confirmation.
-    Stopped requires at least one positive containment/process proof from the
-    observed row: the workload cgroup path reaped (Linux), every observed PID
-    dead, or the catalog itself reporting containment empty. On Windows the
+    Stopped requires positive workload-containment proof from the observed
+    row: the workload cgroup path reaped (Linux) or the catalog itself
+    reporting containment empty. Dead PIDs are supporting evidence, not proof
+    that unrecorded descendants have exited. On Windows the
     cgroup path is never consulted; the Job Object proof is the catalog
     containment_empty flag (True) plus dead PIDs when observed. Anything else
     is unproven (unknown/unsupported oracle stays uncertain/held, never false
@@ -1138,11 +1141,42 @@ def _confirm_workload_exit(before: NativeSession) -> tuple[bool, str]:
         states = [_pid_dead(p) for p in pids]
         if any(s is False for s in states):
             return False, "observed workload PID still alive after kill"
-        if all(s is True for s in states):
-            return True, "observed workload PIDs dead after kill"
+        if not all(s is True for s in states):
+            return False, "observed workload PID liveness is unproven after kill"
     if before.containment_empty is True:
-        return True, "catalog reports containment empty after kill"
-    return False, "no containment/process proof available; exit unproven"
+        suffix = " and recorded workload PIDs dead" if pids else ""
+        return True, "catalog reports containment empty after kill%s" % suffix
+    return False, "no containment-empty/reaped proof available; exit unproven"
+
+
+def _confirm_native_process_gone(before: NativeSession) -> tuple[bool, str]:
+    """Confirm a killed/crashed session is already gone without sending a kill.
+
+    A stale catalog phase alone is not enough. POSIX requires every recorded
+    native worker/workload PID to be absent and the existing stop oracle to
+    prove workload containment empty. Windows uses the native worker and Job
+    Object receipts because ``os.kill(pid, 0)`` is not a safe PID probe there.
+    """
+    if os.name == "nt":
+        if before.worker_alive is not False or before.containment_empty is not True:
+            return False, "Windows worker/Job Object exit is unproven"
+        return True, "native worker dead and Job Object empty"
+
+    pids = [pid for pid in (before.worker_pid, before.workload_pid) if type(pid) is int and pid > 0]
+    if not pids:
+        return False, "no recorded process PID; exit unproven"
+    if any(_pid_dead(pid) is not True for pid in pids):
+        return False, "one or more recorded process PIDs remain live or unknown"
+    # Dead controller/workload PIDs alone do not prove that unrecorded
+    # descendants have left the owned workload. Require a distinct positive
+    # containment receipt before skipping native shutdown/recovery.
+    containment_gone = _workload_containment_gone(before.workload_cgroup)
+    if before.containment_empty is not True and containment_gone is not True:
+        return False, "workload containment is unproven"
+    confirmed, why = _confirm_workload_exit(before)
+    if not confirmed:
+        return False, why
+    return True, "recorded process PIDs dead and workload empty (%s)" % why
 
 
 STOP_ORACLE_VERSION = 1
@@ -1357,6 +1391,10 @@ def stop_session(
             "Native engine mismatch (reported %r, expected %r); refusing"
             % (before[0].engine, target.engine)
         )
+    already_gone, gone_reason = _confirm_native_process_gone(before[0])
+    if already_gone:
+        return StopResult(state="stopped", session_id=target.session_id,
+                          reason="native process already gone (%s)" % gone_reason)
     generation = before[0].created_at_ms
     oracle = _oracle_from_row(before[0])
     attempt = {"signal": signal, "grace_ms": grace_ms}

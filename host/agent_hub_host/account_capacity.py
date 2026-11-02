@@ -212,13 +212,28 @@ def kernel_containment_empty(session, *, cgroup_root=CGROUP_ROOT, boot_id_path=B
     """Kernel receipt for a row whose native worker died (intake c206f556).
 
     A dead worker can never refresh ``containment_empty``; its last value
-    stays False forever and Hub keeps the row running. Only the exact
-    same-boot workload scope reporting ``populated 0`` (or removed by systemd
-    on this boot) is accepted. A live worker's own report stays authoritative.
+    stays False forever and Hub keeps the row running. The cached
+    ``worker_alive`` bit can also remain True after a hard kill, so confirm the
+    recorded worker PID directly before trusting the exact same-boot workload
+    scope reporting ``populated 0`` (or removed by systemd on this boot).
+    Windows uses Job Objects and must rely on the native receipt; ``os.kill``
+    is not a safe PID-existence probe there.
     """
     import os
-    if session.get('worker_alive') is not False:
+    if os.name == 'nt':
         return False
+    if session.get('worker_alive') is not False:
+        worker_pid = session.get('worker_pid')
+        if type(worker_pid) is not int or worker_pid <= 0:
+            return False
+        try:
+            os.kill(worker_pid, 0)
+        except ProcessLookupError:
+            pass
+        except (OSError, ValueError, OverflowError):
+            return False
+        else:
+            return False
     path, identity = session.get('containment_cgroup'), session.get('containment_cgroup_identity')
     if (not isinstance(path, str) or not path.startswith(cgroup_root) or '/../' in path or path.endswith('/..')
             or not os.path.basename(path).startswith('aplexer-workload-') or not isinstance(identity, dict)):
@@ -243,6 +258,11 @@ def kernel_containment_empty(session, *, cgroup_root=CGROUP_ROOT, boot_id_path=B
 def confirmed_empty(session):
     """Only a native containment receipt plus absent recorded processes proves exit."""
     import os
+    if os.name == 'nt':
+        # aplexer reports worker liveness using the native Windows process
+        # handle and Job Object state. Never use os.kill(pid, 0) as a probe.
+        return (session.get('worker_alive') is False
+                and session.get('containment_empty') is True)
     if session.get('containment_empty') is not True and not kernel_containment_empty(session):
         return False
     pids = [session.get('workload_pid'), session.get('worker_pid')]

@@ -137,6 +137,7 @@ def environment(cfg, *, source=False, base=None):
     # Explicit DB prevents channel/ambient overrides from selecting another store.
     env['OPENCODE_DB'] = str(Path(data) / 'opencode' / 'opencode.db')
     env['GH_CONFIG_DIR'] = str(Path(cfg['source_config']) / 'gh')
+    env['APLEXER_CONFIG'] = str(Path(cfg['source_config']) / 'aplexer' / 'config.toml')
     # Managed profiles change XDG_CONFIG_HOME again. Carry this non-secret
     # machine-local path contract through the launcher instead of rediscovering
     # subscriptions.json inside an isolated engine home.

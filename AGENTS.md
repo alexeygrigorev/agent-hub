@@ -14,6 +14,7 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 
 ## Process
 
+0. Tests run in CI (Alexey 2026-11-02, t2558u, intake 178ec5bb; supersedes rules 4-5 where they conflict): «тесты запускать на CI/CD, пушим, делаем PR, тесты проходят, мерджим». Locally run only targeted unit tests for the files you changed; never run `scripts/test-full-local.sh` or any full suite on Hetzner. Flow: worktree from origin/main, push the branch, open a PR, CI runs the full suite, then `gh pr merge --auto --rebase`.
 1. Work through Agent Branches, the project's own tool (`~/git/agent-branches`, CLI `agent-branches`). Each implementer works in its own Agent Branches workspace. No git worktrees or long-lived git branches.
 2. Claim edit scope on the agents bus before editing; release when done. Claims are never written into documents.
 3. A task is done when a reviewer (same model allowed) approved the exact version and the head integrated it.
