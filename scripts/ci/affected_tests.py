@@ -23,6 +23,12 @@ MCP_FILES = frozenset({
     'src/mcp-tools.ts', 'src/mcp.ts', 'src/mcp-usage.ts', 'src/mcp-oauth.ts',
     'src/conversation-hub.ts', 'src/worker.ts', 'src/ui-pages.ts',
 })
+PARITY_FILES = frozenset({
+    'host/agent_hub_host/cli.py', 'scripts/mcp-cli-inventory.py',
+    'test/mcp-cli-commands.json', 'src/mcp-tools.ts',
+})
+PARITY_TESTS = ('test/test_mcp_parity.py', 'test/mcp.test.ts')
+HOST_CLI_RE = re.compile(r'^host/agent_hub_host/[^/]+_cli\.py$')
 HOST_CANARY_TESTS = frozenset({
     # Keep the recurring regressions found by Host canary hermeticity in the
     # pre-push lane for every host change. These cross-area contracts are not
@@ -68,6 +74,8 @@ def select(changed, root=ROOT):
     for path in changed:
         if path in MCP_FILES and (root / 'test/mcp.test.ts').is_file():
             picked.add('test/mcp.test.ts')
+        if path in PARITY_FILES or HOST_CLI_RE.match(path):
+            picked.update(test for test in PARITY_TESTS if (root / test).is_file())
         if not path.startswith(SOURCE_DIRS) or TEST_RE.match(path) or not (root / path).exists():
             continue
         stem = Path(path).stem
