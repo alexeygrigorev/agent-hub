@@ -3148,7 +3148,7 @@ class Dispatcher:
                 cpu_estimate = offer.get("expected_cpu_cores")
                 if type(cpu_estimate) in (int, float) and math.isfinite(cpu_estimate) and 0 <= cpu_estimate <= 65536:
                     payload["expected_cpu_cores"] = cpu_estimate
-                    if offer.get("expected_cpu_source") in ("repo_kind", "repo", "global", "default"):
+                    if offer.get("expected_cpu_source") in ("project_engine_model", "repo_kind", "repo", "global", "default"):
                         payload["expected_cpu_source"] = offer["expected_cpu_source"]
                 policy = offer.get("resource_management")
                 from .cpu_resources import sanitize_resource_choking

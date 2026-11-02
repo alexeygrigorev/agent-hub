@@ -50,7 +50,7 @@ describe('heavy utilization without choking',()=>{
   const win=(pct:number,span:number)=>usage(12*pct/100,{busy_percent_window:pct,window_s:span,psi_avg10:null,psi_full_avg10:null,memory_psi_full_avg10:null,io_psi_full_avg10:null});
   expect(cpuVerdict(win(40,30),12,1,0,cfg,now)).toMatchObject({admitted:true,reason:null,telemetry_state:'measured',cpu_saturated:false});
   expect(cpuVerdict(win(97.9,30),12,1,0,cfg,now)).toMatchObject({admitted:true,cpu_saturated:false});
-  expect(cpuVerdict(win(98,30),12,1,0,cfg,now)).toMatchObject({admitted:false,reason:'cpu_saturated',cpu_saturated:true,busy_percent_window:98});
+  expect(cpuVerdict(win(98,30),12,1,0,cfg,now)).toMatchObject({admitted:false,reason:'cpu_pressure',cpu_saturated:true,busy_percent_window:98});
   // A window shorter than 10s is unknown, never full; an instantaneous 100% alone never holds.
   expect(cpuVerdict(win(100,5),12,1,0,cfg,now)).toMatchObject({admitted:true,reason:null,cpu_saturated:null});
   expect(cpuVerdict({...usage(12),load:[100,100,100]},12,1,0,cfg,now)).toMatchObject({admitted:true,reason:null});

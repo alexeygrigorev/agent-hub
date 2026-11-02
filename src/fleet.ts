@@ -1331,7 +1331,7 @@ export class FleetService {
       // while retaining hard refusals for rejected or stale credentials.
       if (gateProjection && !gateRefusal) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, ...(routeQuota.reason !== 'eligible' || (gateProjection && !gateRefusal) ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: model, score, ...(routeQuota.reason !== 'eligible' || (gateProjection && !gateRefusal) ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
     }
     // Intake 06d2a0ac AC1: an account with no quota verdict at all (status
     // unknown: never observed, or only "unknown"/unavailable reports) is

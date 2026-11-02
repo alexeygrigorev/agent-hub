@@ -24,8 +24,8 @@ TASK_KINDS = ("implement", "review", "ask", "goal")
 
 def add_commands(sub) -> None:
     parser = sub.add_parser("resources", help="Show resource utilization, per-session usage and watchdog reaps")
-    parser.add_argument("view", nargs="?", choices=["sessions", "reaps", "throttles"], default=None,
-                        help="Ledger view (default: utilization overview)")
+    parser.add_argument("view", nargs="?", choices=["sessions", "ledger", "headroom", "reaps", "throttles"], default=None,
+                        help="View: sessions (raw ledger), ledger (per-task resource ledger), headroom (per-machine headroom); default: utilization overview")
     parser.add_argument("--project", default=None, help="Filter sessions by project label or workspace absolute path")
     parser.add_argument("--engine", default=None, help="Filter sessions by engine")
     parser.add_argument("--kind", default=None, help="Filter sessions by task kind")
@@ -113,7 +113,9 @@ def fetch_throttles() -> dict:
 
 def execute(args) -> dict:
     view = getattr(args, "view", None)
-    if view == "sessions":
+    if view == "headroom":
+        return fetch_overview()
+    if view in ("sessions", "ledger"):
         return fetch_sessions(project=getattr(args, "project", None),
                               engine=getattr(args, "engine", None),
                               kind=getattr(args, "kind", None),
@@ -172,9 +174,56 @@ def _fmt_runtime(value) -> str:
     return "%ds" % seconds
 
 
+def _fmt_pct(value) -> str:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    return "unknown" if f != f or f < 0 else "%.0f%%" % f
+
+
+def render_ledger(rows) -> str:
+    """One line per task/session: what it needed, so capacity decisions use evidence."""
+    lines = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        lines.append("task=%s project=%s engine=%s model=%s machine=%s state=%s runtime=%s "
+                     "rss_peak=%s rss_p50=%s cpu_avg=%s cpu_p95=%s session=%s" % (
+                         str(row.get("intake_id") or "-")[:8], row.get("project_label") or row.get("project") or "?",
+                         row.get("engine", "?"), row.get("model") or "?", row.get("machine_id", "?"),
+                         row.get("state", "?"), _fmt_runtime(row.get("runtime_s")),
+                         _fmt_mb(row.get("peak_rss_mb")), _fmt_mb(row.get("p50_rss_mb")),
+                         _fmt_avg(row.get("avg_cpu_cores")), _fmt_avg(row.get("p95_cpu_cores")),
+                         row.get("session_id", "?")))
+    return "\n".join(lines) if lines else "No sessions reported."
+
+
+def render_headroom(hosts) -> str:
+    lines = []
+    for host in hosts if isinstance(hosts, list) else []:
+        cap = host.get("capacity") if isinstance(host, dict) else None
+        if not isinstance(cap, dict):
+            continue
+        lines.append("%s %s cores=%s busy=%s (%s) busy10s=%s free_cores=%s mem_avail=%s/%s telemetry=%s" % (
+            cap.get("machine_id", "?"), "FULL(%s)" % ",".join(cap.get("full_reasons") or []) if cap.get("full") else "has-room",
+            cap.get("cores", "?"), _fmt_avg(cap.get("cpu_busy_cores")), _fmt_pct(cap.get("cpu_busy_percent")),
+            _fmt_pct(cap.get("cpu_busy_percent_10s")), _fmt_avg(cap.get("free_cores")),
+            _fmt_mb(cap.get("mem_available_mb")), _fmt_mb(cap.get("mem_total_mb")), cap.get("telemetry_state", "unknown")))
+        lines.append("  per-task estimate: cpu=%s cores mem=%s | fits more: by_cpu=%s by_mem=%s => %s" % (
+            _fmt_avg(cap.get("est_cpu_per_task")), _fmt_mb(cap.get("est_mem_per_task_mb")),
+            cap.get("extra_tasks_by_cpu", "unknown"), cap.get("extra_tasks_by_memory", "unknown"),
+            cap.get("extra_tasks") if cap.get("extra_tasks") is not None else "unknown"))
+    return "\n".join(lines) if lines else "No host capacity reported."
+
+
 def render_text(data: dict, view=None) -> str:
     if not isinstance(data, dict):
         raise ValueError("Invalid resources payload")
+    if view == "ledger":
+        return render_ledger(data.get("sessions"))
+    if view == "headroom":
+        return render_headroom(data.get("hosts"))
     if view == "sessions":
         rows = data.get("sessions")
         if not isinstance(rows, list) or not rows:
@@ -188,11 +237,11 @@ def render_text(data: dict, view=None) -> str:
             if row.get("finished_at"):
                 state = "%s finished=%s" % (state, row.get("finished_at"))
             lines.append("%s project=%s engine=%s model=%s tier=%s kind=%s state=%s "
-                         "peak_rss=%s peak_pss=%s cpu=%s avg_cpu=%s p95_cpu=%s runtime=%s%s" % (
+                         "peak_rss=%s p50_rss=%s peak_pss=%s cpu=%s avg_cpu=%s p95_cpu=%s runtime=%s%s" % (
                              row.get("session_id", "?"), row.get("project", "?"),
                              row.get("engine", "?"), row.get("model", "?"),
                              row.get("tier", "?"), row.get("kind", "?"), state,
-                             _fmt_mb(row.get("peak_rss_mb")), _fmt_mb(row.get("peak_pss_mb")),
+                             _fmt_mb(row.get("peak_rss_mb")), _fmt_mb(row.get("p50_rss_mb")), _fmt_mb(row.get("peak_pss_mb")),
                              _fmt_cpu(row.get("cpu_seconds")), _fmt_avg(row.get("avg_cpu_cores")),
                              _fmt_avg(row.get("p95_cpu_cores")), _fmt_runtime(row.get("runtime_s")), flag))
         return "\n".join(lines) if lines else "No sessions reported."
@@ -245,16 +294,16 @@ def render_text(data: dict, view=None) -> str:
             _fmt_mb(host.get("mem_total_mb")), host.get("load5", "?"),
             host.get("cores", "?"), host.get("running", "?"), host.get("queued", "?")))
         cpu = host.get("cpu") or {}
-        lines.append("  CPU current=%s expected=%s ramping=%s limit=%s cores reason=%s source=%s telemetry=%s" % (
+        lines.append("  CPU current=%s expected=%s ramping=%s limit=%s cores busy10s=%s reason=%s source=%s telemetry=%s" % (
             _fmt_avg(cpu.get("current_cpu_cores")), _fmt_avg(cpu.get("expected_cpu_cores")),
             _fmt_avg(cpu.get("ramping_cpu_cores")), _fmt_avg(cpu.get("limit_cpu_cores")),
-            cpu.get("reason") or "admitted", cpu.get("expected_cpu_source", "unknown"), cpu.get("telemetry_state", "unknown")))
+            _fmt_pct(cpu.get("busy_percent_window")), cpu.get("reason") or "admitted", cpu.get("expected_cpu_source", "unknown"), cpu.get("telemetry_state", "unknown")))
     stats = data.get("stats") if isinstance(data.get("stats"), list) else []
     for group in stats[:20]:
         if not isinstance(group, dict):
             continue
-        lines.append("p90 %s/%s/%s n=%s p50=%s p90=%s" % (
-            group.get("project", "?"), group.get("engine", "?"), group.get("kind", "?"),
+        lines.append("p90 %s/%s/%s/%s n=%s p50=%s p90=%s" % (
+            group.get("project", "?"), group.get("engine", "?"), group.get("model") or "?", group.get("kind", "?"),
             group.get("samples", "?"), _fmt_mb(group.get("p50_rss_mb")),
             _fmt_mb(group.get("p90_rss_mb"))))
     lines.append("recent reaps: %d" % len(reaps))

@@ -59,7 +59,7 @@ export function cpuVerdict(raw: unknown, cores: number, expected: number, rampin
     // CPU busy is measured on every OS; PSI exists on Linux only and is not required.
     telemetry_state:known ? 'measured' : 'unknown',
     advisory:known ? null : 'cpu_usage_unknown'};
-  const reason = known && usage.busy_percent_window!==null && usage.busy_percent_window>=CPU_SATURATED_PCT ? 'cpu_saturated'
+  const reason = known && usage.busy_percent_window!==null && usage.busy_percent_window>=CPU_SATURATED_PCT ? 'cpu_pressure'
     : fresh && usage.psi_full_avg10!==null && usage.psi_full_avg10 > config.cpu_psi_full_hard_cap_pct ? 'cpu_pressure'
     : fresh && usage.memory_psi_full_avg10!==null && usage.memory_psi_full_avg10 > config.memory_psi_full_hard_cap_pct ? 'memory_pressure'
     : fresh && (usage.host_oom_kills_delta ?? 0)>0 ? 'host_oom' : null;

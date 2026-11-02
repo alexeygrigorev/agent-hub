@@ -38,6 +38,7 @@ into Dispatcher.once.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -677,6 +678,33 @@ def _peak_key(session_id: str, native_id: str) -> str:
     return "%s\x00%s" % (session_id, native_id)
 
 
+RSS_BUCKET_MB = 16
+RSS_BUCKETS_MAX = 4096  # covers 64 GiB; larger samples land in the last bucket
+
+
+def _update_rss_median(prior: dict[str, Any], rss_mb: Any, *, frozen: bool = False) -> dict[str, Any]:
+    """Count anonymous-RSS samples in 16 MiB upper buckets and report the median.
+
+    One sample per observation (heartbeat), so p50 is the typical resident size
+    over the session life, unlike the monotonic peak. Unknown samples are
+    skipped; with no samples p50 stays None (never zero).
+    """
+    hist = prior.get("rss_histogram") if isinstance(prior.get("rss_histogram"), dict) else {}
+    value = _finite_number(rss_mb)
+    if value is not None and value > 0 and not frozen:
+        bucket = str(min(RSS_BUCKETS_MAX, math.ceil(value / RSS_BUCKET_MB)))
+        hist[bucket] = hist.get(bucket, 0) + 1
+    total = sum(hist.values())
+    p50 = None
+    accumulated = 0
+    for bucket in sorted(hist, key=int):
+        accumulated += hist[bucket]
+        if accumulated >= total * .5:
+            p50 = float(int(bucket) * RSS_BUCKET_MB)
+            break
+    return {"rss_histogram": hist, "p50_rss_mb": p50}
+
+
 def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample: dict[str, Any], observed_at: str, *, terminal: bool = False) -> dict[str, Any]:
     """Merge one sample into explicit high-water peaks (monotonic per field).
 
@@ -715,6 +743,7 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
     except (ValueError, TypeError, AttributeError):
         cpu_at = None
     cpu_frozen = prior.get("cpu_finalized") is True
+    rss_state = _update_rss_median(prior, sample.get("rss_mb"), frozen=cpu_frozen or terminal)
     distribution = update_cpu_distribution(prior, sample.get("cpu_seconds"), sample.get("cpu_identity"), cpu_at, terminal=terminal)
     peaks[key] = {
         **prior,
@@ -725,6 +754,7 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
         "avg_cpu_cores": prior.get("avg_cpu_cores") if cpu_frozen else _latest("avg_cpu_cores"),
         "current_mb": _latest("current_mb"),
         "observed_at": observed_at,
+        **rss_state,
         **distribution,
     }
     return peaks[key]
@@ -1057,7 +1087,7 @@ def _sample_row(sid: str, nid: str, peak: Any, observed_at: str) -> dict[str, An
     """Server report row: unknown fields are omitted (null), never zeroed."""
     row: dict[str, Any] = {"session_id": sid, "native_id": nid, "observed_at": observed_at}
     if isinstance(peak, dict):
-        for field in ("peak_rss_mb", "peak_pss_mb", "cpu_seconds", "runtime_s", "avg_cpu_cores", "p95_cpu_cores"):
+        for field in ("peak_rss_mb", "peak_pss_mb", "p50_rss_mb", "cpu_seconds", "runtime_s", "avg_cpu_cores", "p95_cpu_cores"):
             if _finite_number(peak.get(field)) is not None:
                 row[field] = peak[field]
     return row
