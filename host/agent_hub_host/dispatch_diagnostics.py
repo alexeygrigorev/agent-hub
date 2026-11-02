@@ -52,7 +52,23 @@ EXACT = {
     'Fresh admission refused': 'admission_refused',
     'Fresh admission timestamp required': 'admission_refused',
     'Selected model/effort requires verified admission': 'admission_refused',
+    # Intake ad8aa931: fixed pre-start refusals that read as a bare
+    # dispatch_internal_error on DESKTOP-FP4OP26 (35cf62ff, 8151fb8f).
+    'Selected model/effort is not configured locally': 'model_unsupported',
+    'Maintained launcher route is not configured': 'dispatch_route_unconfigured',
+    'Invalid provider profile': 'dispatch_route_unconfigured',
+    'Headless provider profile is not qualified': 'dispatch_route_unconfigured',
+    'Unsupported launch mode': 'dispatch_offer_invalid',
+    'workspace path exists and is not a git checkout': 'workspace_unavailable',
 }
+# Refusals whose text carries a variable tail (provider name, git stderr);
+# only the fixed slug leaves the host, never the tail.
+PREFIXES = (
+    ('Launcher provider ', 'dispatch_route_unconfigured'),
+    ('repo clone failed: ', 'workspace_unavailable'),
+    ('git fetch failed: ', 'workspace_unavailable'),
+    ('git checkout failed: ', 'workspace_unavailable'),
+)
 
 # Fixed admission-gate causes carried as gate_reason on admission_refused, so
 # a refused host is diagnosable remotely; any other gate text maps to
@@ -93,6 +109,8 @@ def classify(exc, *, workspace_available=True):
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
             reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            if reason == 'dispatch_internal_error':
+                reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
         if value.startswith('HTTP request failed with status '):
             reason = 'dispatch_claim_refused'
     elif isinstance(exc, (RuntimeError, OSError)):

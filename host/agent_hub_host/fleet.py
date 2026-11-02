@@ -195,6 +195,9 @@ DISPATCH_CONCURRENCY_MAX = 13
 # 30 s claim freshness and CLAIM_ADMISSION_REFRESH_S, so a shared observation
 # never forces a stale claim. Refusals are never shared.
 ADMISSION_SHARE_S = 8.0
+# Extra wait for output readers after a clean local-command exit; bounded so
+# a gate stays inside the 30 s admission window (intake ad8aa931).
+READER_GRACE_S = 10.0
 # Launcher plan rejection for a managed route without trusted quota evidence.
 QUOTA_SOURCE_REJECTION = 'quota source'
 # GET /api/fleet/offers transport retries (timeouts while the Hub is slow).
@@ -813,6 +816,12 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30, env=None):
                                     command=argv[0], exit_code=proc.returncode,
                                     stdout=bytes(stdout), stderr=bytes(stderr))
         for thread in threads: thread.join(timeout=1)
+        if proc.returncode == 0 and not overflow.is_set():
+            # A clean exit can outrun the readers on a CPU/GIL-starved Windows
+            # controller: give them a bounded grace before a completed gate is
+            # reported as a failed command (DESKTOP-FP4OP26 abe6bf8d, intake ad8aa931).
+            grace = time.monotonic() + READER_GRACE_S
+            for thread in threads: thread.join(timeout=max(0, grace - time.monotonic()))
         if proc.returncode != 0 or overflow.is_set() or any(t.is_alive() for t in threads):
             raise LocalCommandError(bytes(stdout + b'\n' + stderr).decode('utf-8', 'replace'),
                                     command=argv[0], exit_code=proc.returncode,
