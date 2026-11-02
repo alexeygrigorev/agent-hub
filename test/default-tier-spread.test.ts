@@ -40,7 +40,7 @@ describe('default tier policy', () => {
 });
 
 describe('default tier placement', () => {
-  it('spreads three unspecified starts over at least two engines including unmetered ones', async () => {
+  it('spreads unspecified starts across quota-ready and unmetered preferred engines', async () => {
     const now = Date.now();
     const iso = (d = 0) => new Date(now + d).toISOString();
     const bindings = env as unknown as Env;
@@ -59,12 +59,14 @@ describe('default tier placement', () => {
           { label: 'shared-codex', provider: 'codex', max_concurrency: 4, reserve_percent: 0, enabled: true },
           { label: 'shared-claude', provider: 'claude', max_concurrency: 4, reserve_percent: 0, enabled: true },
           { label: 'hub-antigravity', provider: 'gemini', max_concurrency: 4, reserve_percent: 0, enabled: true },
+          { label: 'shared-zai', provider: 'zai', max_concurrency: 4, reserve_percent: 0, enabled: true },
           { label: 'shared-go', provider: 'go', max_concurrency: 4, reserve_percent: 0, enabled: true },
         ],
         routes: [
           { machine_id: machine, engine: 'codex', account: 'shared-codex', profile: null },
           { machine_id: machine, engine: 'claude', account: 'shared-claude', profile: null },
           { machine_id: machine, engine: 'antigravity', account: 'hub-antigravity', profile: 'hub-hub-antigravity' },
+          { machine_id: machine, engine: 'zcodex', account: 'shared-zai', profile: null },
           { machine_id: machine, engine: 'opencode', account: 'shared-go', profile: null },
         ] }) }), admin);
       expect(put.status, await put.clone().text()).toBe(200);
@@ -74,6 +76,7 @@ describe('default tier placement', () => {
       sub('shared-claude', 'claude', metered(iso(), 27, now));
       // The probes for the unmetered engines fail on the host, as observed live.
       sub('hub-antigravity', 'gemini', broken(iso()));
+      sub('shared-zai', 'zai', metered(iso(), 60, now));
       sub('shared-go', 'go', broken(iso()));
 
       expect(fleet.accountStatus(hub.sql.exec("SELECT * FROM fleet_accounts WHERE label='hub-antigravity'").one())).toMatchObject({ status: 'ok' });
@@ -93,6 +96,7 @@ describe('default tier placement', () => {
       expect(engines.slice(0, 3).every(e => e === 'codex'), engines.join(',')).toBe(false);
       expect(engines).toContain('antigravity');
       expect(engines).toContain('opencode');
+      expect(engines).toContain('zcodex');
     });
   });
 
