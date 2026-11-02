@@ -37,6 +37,10 @@ class AdmissionTests(unittest.TestCase):
                         AGENT_HUB_HEAVY_TEST_SLOTS='1', AGENT_HUB_HEAVY_TEST_NORMAL_AGE_S='300', AGENT_HUB_HEAVY_TEST_WAIT_S='40',
                         AGENT_HUB_HEAVY_TEST_PRIORITY='normal')
         self.env.pop('AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN', None)
+        # The full-suite runner pins one run id so its separate discovery
+        # phases share a FIFO ticket. These tests exercise fresh admissions
+        # and must not inherit that cross-phase identity.
+        self.env.pop('AGENT_HUB_HEAVY_TEST_RUN_ID', None)
         self.holder = (self.root / 'slot-0.lock').open('a+')
         fcntl.flock(self.holder, fcntl.LOCK_EX)
 
@@ -286,11 +290,13 @@ class AdmissionTests(unittest.TestCase):
         self.holder.close()
         marker = self.root / 'started'
         term_marker = self.root / 'child-term'
+        child_ready = self.root / 'child-ready'
         child_pid = self.root / 'child.pid'
         child_code = (
             'import signal,sys,time; from pathlib import Path; '
             f"signal.signal(signal.SIGTERM, lambda *_: (Path({str(term_marker)!r}).touch(), "
-            'time.sleep(1),sys.exit(0))); time.sleep(300)'
+            'time.sleep(1),sys.exit(0))); '
+            f'Path({str(child_ready)!r}).touch(); time.sleep(300)'
         )
         code = f'''import signal,subprocess,sys,time
 from pathlib import Path
@@ -304,7 +310,7 @@ Path({str(marker)!r}).touch()
 time.sleep(30)
 '''
         holder = self.start('holder', code=code)
-        self.until(lambda: marker.exists() and child_pid.exists())
+        self.until(lambda: marker.exists() and child_pid.exists() and child_ready.exists())
         descendant = int(child_pid.read_text())
         signal_started = time.monotonic()
         holder.terminate()
