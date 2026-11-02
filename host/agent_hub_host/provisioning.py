@@ -377,6 +377,8 @@ def install_aplexer_state_hooks(bundle=None, home=None):
             }
         }
 
+    if not _windows_hooks():
+        template_hooks = hook_command.throttle_post_tool_use_hooks(template_hooks)
     content_bytes = json.dumps(template_hooks, indent=2).encode('utf-8')
     with private_fs.parent(codex_hooks, create=True):
         pass

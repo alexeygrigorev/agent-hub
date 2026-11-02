@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 from contextlib import closing
 import json
+from . import native_list_cache
 import math
 import os
 from pathlib import Path
@@ -3742,7 +3743,7 @@ class Dispatcher:
             unknown = [dict(sub, quota=dict(sub['quota'], status='unknown', observed_at=None)) for sub in reports]
             return self.request('PUT', '/api/fleet/subscriptions', {'subscriptions': unknown})
 
-    def report_catalog_bindings(self):
+    def report_catalog_bindings(self, fresh=False):
         """Share a census only if its sampling began after this call arrived.
 
         A census started before a native launch must not suppress its followup
@@ -3754,6 +3755,7 @@ class Dispatcher:
             if self._catalog_sampled_at >= requested_at:
                 return self._catalog_raw
             sampled_at = time.monotonic()
+            self._catalog_fresh = fresh
             raw = self._report_catalog_bindings()
             self._catalog_sampled_at, self._catalog_raw = sampled_at, raw
             return raw
@@ -3766,7 +3768,12 @@ class Dispatcher:
         native process alongside its reservation. Failure is safe to retry:
         this helper never launches anything.
         """
-        raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
+        aplexer_bin = self.settings.get("aplexer_bin", "aplexer")
+        # Shared host snapshot (<= 1 `aplexer list` per TTL); a just-confirmed
+        # start asks for a bounded-fresh one so its binding is not delayed.
+        raw = native_list_cache.list_raw(
+            aplexer_bin, lambda: self.runner([aplexer_bin, "list", "--all", "--json"]),
+            native_list_cache.FRESH_MAX_AGE_S if getattr(self, '_catalog_fresh', False) else None)
         from .session_progress import SessionProgress, stop_orphan
         from .worktree_guard import cleanup_permitted
         if not hasattr(self, '_session_progress'):
@@ -4102,7 +4109,7 @@ class Dispatcher:
             results.append(outcome)
             if outcome.get('state') == 'running':
                 try:
-                    self.report_catalog_bindings()
+                    self.report_catalog_bindings(fresh=True)
                 except Exception as exc:
                     # A catalog/binding transport error is not a failed
                     # launch. Keep its real receipt and retry next cycle.
