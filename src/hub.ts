@@ -359,6 +359,17 @@ export class Hub extends DurableObject {
     this.statusService.setAskSummary(() => this.askLedger.counts());
     this.intakeWatchdog = new IntakeWatchdog(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
       policy: () => liveQueuePolicy(env as unknown as Record<string, unknown>, this.sql, this.fleetService),
+      repoForProject: project => {
+        try {
+          const byOrigin = this.repoRegistry.resolveOrigin(project);
+          if (typeof byOrigin.repo === 'string') return byOrigin.repo;
+          const found = this.repoRegistry.get(project);
+          if (!found) return null;
+          const repo = this.repoRegistry.canonical(found);
+          if (repo.status !== 'active' || typeof repo.origin !== 'string') return null;
+          return this.repoRegistry.resolveOrigin(repo.origin).repo ?? repo.origin;
+        } catch { return null; }
+      },
       asks: now => this.askLedger.tick(now),
       asksDigest: () => this.askLedger.summaryLine(),
       stallThresholdSeconds: stallThreshold(env),

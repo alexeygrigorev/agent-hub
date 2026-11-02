@@ -76,9 +76,35 @@ class StopCliTests(unittest.TestCase):
                 {'id':'61bba72f-full','state':'stopped'}]) as request:
             result = cli.execute(args)
         self.assertEqual(result['stop_wait']['state'],'stopped')
+        rendered = cli.render_output(args, result)
+        self.assertEqual(rendered['command_id'], 'stop-1')
+        self.assertEqual(rendered['stop_wait']['state'], 'stopped')
+        self.assertIn('"command_id": "stop-1"', json.dumps(rendered))
+        self.assertIn('"state": "stopped"', json.dumps(rendered['stop_wait']))
         self.assertEqual(request.call_count,3)
         args = parser.parse_args(['sessions','stop','61bba72f','--no-wait'])
         self.assertFalse(args.wait)
+
+    def test_hub_main_prints_stop_command_id_and_final_state(self):
+        import contextlib
+        import io
+        import sys
+        from unittest.mock import patch
+        from agent_hub_host import cli as hub_cli
+        from agent_hub_host import session_control
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['hub', 'sessions', 'stop', '61bba72f', '--key', 'stop-test']), \
+             patch.object(session_control, 'request', side_effect=[
+                 {'command_id': 'stop-1', 'state': 'recorded'},
+                 {'commands': [{'id': 'stop-1', 'state': 'acked',
+                                'ack': {'outcome': 'delivered', 'confirmed_exit': True}}]},
+                 {'id': '61bba72f-full', 'state': 'stopped'},
+             ]), \
+             contextlib.redirect_stdout(output):
+            hub_cli.main()
+        printed = json.loads(output.getvalue())
+        self.assertEqual(printed['command_id'], 'stop-1')
+        self.assertEqual(printed['stop_wait']['state'], 'stopped')
 
     def test_ambiguous_prefix_diagnostic_lists_matching_ids(self):
         import io
@@ -93,6 +119,44 @@ class StopCliTests(unittest.TestCase):
 
 
 class LiveDeletedWorkspaceStopTests(unittest.TestCase):
+    def test_exact_dead_process_is_stopped_without_reissuing_native_kill(self):
+        from unittest.mock import patch
+        from agent_hub_host import native_sessions as ns
+        with tempfile.TemporaryDirectory() as directory:
+            target = ns.NativeTarget(str(uuid.uuid4()), 'owned-stop', directory, 100, engine='shell')
+            before = ns.NativeSession(target.session_id, target.tag, target.workspace,
+                                      engine='shell', phase='running', created_at_ms=100,
+                                      worker_pid=12345, workload_pid=12346,
+                                      containment_empty=True)
+            with patch.object(ns, 'list_sessions', return_value=[before]), \
+                 patch.object(ns, '_pid_dead', return_value=True), \
+                 patch.object(ns, 'run_native', side_effect=AssertionError('already-dead session must not be killed')):
+                result = ns.stop_session('aplexer', target)
+        self.assertEqual(result.state, 'stopped')
+        self.assertIn('native process already gone', result.reason)
+
+    def test_dead_pids_without_containment_do_not_skip_native_shutdown(self):
+        from unittest.mock import patch
+        import subprocess
+        from agent_hub_host import native_sessions as ns
+        with tempfile.TemporaryDirectory() as directory:
+            target = ns.NativeTarget(str(uuid.uuid4()), 'owned-stop', directory, 100, engine='shell')
+            before = ns.NativeSession(target.session_id, target.tag, target.workspace,
+                                      engine='shell', phase='running', created_at_ms=100,
+                                      worker_pid=12345, workload_pid=12346,
+                                      containment_empty=False)
+            after = ns.NativeSession(target.session_id, target.tag, target.workspace,
+                                     engine='shell', phase='exited', created_at_ms=100,
+                                     worker_pid=12345, workload_pid=12346,
+                                     containment_empty=False)
+            with patch.object(ns, 'list_sessions', side_effect=[[before], [after]]), \
+                 patch.object(ns, '_pid_dead', return_value=True), \
+                 patch.object(ns, 'run_native', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as run:
+                with self.assertRaises(ns.SessionUncertain):
+                    ns.stop_session('aplexer', target)
+        run.assert_called_once()
+        self.assertIn('kill', run.call_args.args[1])
+
     def test_only_stop_matches_exact_kernel_suffix_and_uses_observed_workspace(self):
         from unittest.mock import patch
         from dataclasses import replace

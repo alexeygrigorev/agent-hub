@@ -404,6 +404,8 @@ def main():
     conversations.add_commands(sub)
     from . import intake
     intake.add_commands(sub)
+    from . import intake_stats
+    intake_stats.add_commands(sub)
     from . import worktree_cli
     worktree_cli.add_commands(sub)
     from . import repos
@@ -647,9 +649,10 @@ def main():
             print(intake.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
-    if args.cmd in ('intake', 'handoff', 'worktree'):
+    if args.cmd in ('intake', 'handoff', 'worktree', 'stats'):
         try:
-            result = worktree_cli.execute(args) if args.cmd == 'worktree' else intake.execute(args)
+            result = (intake_stats.execute(args) if args.cmd == 'stats' or (args.cmd == 'intake' and args.intake_cmd == 'stats')
+                      else worktree_cli.execute(args) if args.cmd == 'worktree' else intake.execute(args))
             print(json.dumps(result, indent=2, ensure_ascii=True))
         except Exception as exc:
             # Sanitized close-gate refusal (each worktree and its problems) or

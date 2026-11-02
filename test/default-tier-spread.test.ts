@@ -89,8 +89,8 @@ describe('default tier placement', () => {
           idempotency_key: 'spread-' + i, mode: 'headless' }, { caller: admin.caller, scopes: ['admin'] });
         expect(reserved.status, JSON.stringify(reserved.value)).toBeLessThan(300);
       }
-      expect(new Set(engines).size, engines.join(',')).toBeGreaterThanOrEqual(3);
-      expect(engines.slice(0, 3).every(e => e === 'codex'), engines.join(',')).toBe(false);
+      expect(new Set(engines).size, engines.join(',')).toBeGreaterThanOrEqual(2);
+      expect(engines, engines.join(',')).not.toContain('codex');
       expect(engines).toContain('antigravity');
       expect(engines).toContain('opencode');
     });

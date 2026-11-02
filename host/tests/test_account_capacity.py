@@ -371,7 +371,8 @@ class AccountCapacityTests(unittest.TestCase):
             self.assertTrue(result['confirmed_exit'])
         with patch('os.kill', return_value=None):
             result = session_metadata([row], settings)[0]
-            self.assertEqual((result['phase'], result['workspace'], result['cwd']), ('running', '/repo', '/repo'))
+            # Unknown worker liveness is stale, not proof of exit or a live row.
+            self.assertEqual((result['phase'], result['workspace'], result['cwd']), ('uncertain', '/repo', '/repo'))
             self.assertFalse(result['confirmed_exit'])
 
     def test_empty_containment_with_dead_pids_proves_exit_and_unknown_does_not(self):
