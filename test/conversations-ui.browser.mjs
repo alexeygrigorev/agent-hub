@@ -462,7 +462,7 @@ async function runSuite(page) {
     await page.waitForSelector('#conv-list .dk-split__item');
     assert.equal(await page.locator('#conv-list .dk-split__item').count(), 4, 'four conversations listed');
     const names = await page.locator('#conv-list .dk-split__name').allTextContents();
-    assert.deepEqual(names, ['projA:worker-1', 'Milestone M2', 'Empty room', 'Removed member'], 'titles come from the server (summaries carry no members)');
+    assert.deepEqual(names, ['Milestone M2', 'Removed member', 'projA:worker-1', 'Empty room'], 'titles come from the server (summaries carry no members); unread-first sort puts the auto-opened read conversation after unread ones');
     // Desktop auto-opens the first conversation, which consumes its unread:
     // the thread view renders and the remaining badges are c2 + c-denied.
     await page.waitForSelector('.msg__body');
