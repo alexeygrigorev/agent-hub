@@ -795,6 +795,11 @@ describe('generic accounts and launch placement', () => {
   ])('requeues only a load-refused retry: factor=$factor pinned=$pinned', async ({factor,pinned,sendFactor}) => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    // Intake 9647e6d5: an unpinned launch draws weighted by headroom. This
+    // retry test needs deterministic placement, so it pins the draw to the
+    // top candidate (the pre-draw behavior) without touching the scenario.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
     const launch: any = await (await s.handle(request('/launches', intent(pinned ? { machine: 'hetzner' } : {})), admin)).json();
     expect(launch.machine).toBe('hetzner');
     const sessionId = crypto.randomUUID();
@@ -848,6 +853,7 @@ describe('generic accounts and launch placement', () => {
     beat(8 * 3);
     expect(restarted.drainCapacityQueue().promoted).toBeGreaterThan(0);
     expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({state:'offered',machine_id:'hetzner'});
+    } finally { random.mockRestore(); }
   }));
   it('gates and clears a memory-triggered host refusal using the reported MemAvailable floor', async () => fixture(async (s, sql) => {
     await configure(s);
