@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { readAccountCapacityHistory, sampleAccountCapacityHistory } from '../src/account-capacity-history';
+import { ACCOUNT_CAPACITY_HISTORY_MAX_ROWS, readAccountCapacityHistory, sampleAccountCapacityHistory } from '../src/account-capacity-history';
 import { FleetService } from '../src/fleet';
 
 const inDO: any = runInDurableObject;
@@ -31,6 +31,36 @@ it('records bounded rolling account-capacity observations and reads a half-open 
   });
 });
 
+it('stops sampling at the per-account cap without deleting any Hub data', async () => {
+  const stub = (env as any).HUB.get((env as any).HUB.idFromName(crypto.randomUUID()));
+  await inDO(stub, (hub: any) => {
+    const sql = hub.sql;
+    const start = Date.UTC(2026, 10, 1, 4, 20);
+    sampleAccountCapacityHistory(sql, start, () => []);
+    for (let i = 0; i < ACCOUNT_CAPACITY_HISTORY_MAX_ROWS; i++) {
+      sql.exec(`INSERT INTO fleet_account_capacity_history
+        (account, observed_at_ms, active, reserved, native_live, concurrency_limit)
+        VALUES ('capped-account', ?, 1, 1, 1, 4)`, start + i * 15 * 60_000);
+    }
+    const statements: string[] = [];
+    const observedSql = new Proxy(sql, {
+      get(target, key) {
+        if (key !== 'exec') return Reflect.get(target, key);
+        return (query: string, ...bindings: any[]) => {
+          statements.push(query);
+          return target.exec(query, ...bindings);
+        };
+      },
+    });
+    expect(sampleAccountCapacityHistory(observedSql, start + ACCOUNT_CAPACITY_HISTORY_MAX_ROWS * 15 * 60_000, () => [
+      { label: 'capped-account', active: 2, reserved: 2, native_live: 2, max_concurrency: 4 },
+    ])).toBe(0);
+    expect(statements.some(query => /^\s*DELETE\b/i.test(query))).toBe(false);
+    expect(Number(sql.exec("SELECT COUNT(*) AS n FROM fleet_account_capacity_history WHERE account='capped-account'").one().n))
+      .toBe(ACCOUNT_CAPACITY_HISTORY_MAX_ROWS);
+  });
+});
+
 it('serves capacity history through the bounded admin-only account API', async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName(crypto.randomUUID()));
   await inDO(stub, async (hub: any, state: any) => {
@@ -49,6 +79,7 @@ it('serves capacity history through the bounded admin-only account API', async (
     expect(allowed.status).toBe(200);
     expect(await allowed.json()).toMatchObject({
       account: 'history-account',
+      history_note: 'Capacity history starts at deployment; no historical backfill is available.',
       rows: [{ active: 7, reserved: 5, native_live: 4, limit: 13 }],
     });
     const forbidden = await service.handle(new Request(`https://hub.test${path}`), agent as any);
