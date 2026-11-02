@@ -1183,7 +1183,12 @@ def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
             cwd = cwd.removesuffix(' (deleted)')
         if exit_confirmed:
             phase = 'exited'
-        elif phase in ('exited', 'dead', 'pruned', 'forgotten'):
+        elif phase in ('exited', 'dead', 'pruned', 'forgotten') or (
+                phase in ('running', 'starting') and session.get('worker_alive') is not True):
+            # A complete census can observe a stale terminal row, or an active
+            # native row whose process liveness is unknown/dead without enough
+            # containment proof to retire it. Keep both out of the running
+            # projection until a later census supplies stronger evidence.
             phase = 'uncertain'
         clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": ws, "engine": engine,
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
@@ -3919,8 +3924,11 @@ class Dispatcher:
         with self._catalog_report_lock:
             # Enrichment is never authoritative for identity or lifecycle.
             # Replace, rather than grow, the cache on every complete sample.
+            source_by_id = {row.get('id'): row for row in catalog
+                            if isinstance(row, dict) and isinstance(row.get('id'), str)}
             self._catalog_enrichment = {
-                self._catalog_identity(row): {key: row[key] for key in ('progress', 'tokens') if key in row}
+                self._catalog_identity(row, source_by_id.get(row.get('native_id'))):
+                    {key: row[key] for key in ('progress', 'tokens') if key in row}
                 for row in enriched[:500]
             }
             # A native may have appeared during slow transcript/token sampling.
@@ -3929,10 +3937,13 @@ class Dispatcher:
             return self._report_native_bindings()
 
     @staticmethod
-    def _catalog_identity(row):
-        return tuple(row.get(key) for key in (
+    def _catalog_identity(row, source=None):
+        source = source if isinstance(source, dict) else {}
+        native_state = source.get('state') or source.get('phase', 'unknown')
+        return (*tuple(row.get(key) for key in (
             'native_id', 'tag', 'workspace', 'cwd', 'engine', 'profile',
-            'account', 'created_at_ms', 'phase', 'confirmed_exit'))
+            'account', 'created_at_ms', 'phase', 'confirmed_exit')),
+            native_state, source.get('worker_alive'))
 
     def report_native_bindings(self):
         """Report a bounded fresh census and its completeness verdict.
@@ -3965,8 +3976,11 @@ class Dispatcher:
         census_complete = valid_envelope and census_is_complete(
             raw_rows, catalog, limit=CATALOG_LIMIT, confirmed_exit=confirmed_empty)
         metadata = session_metadata(catalog, self.settings, collect_tokens=False)
+        source_by_id = {row.get('id'): row for row in catalog
+                        if isinstance(row, dict) and isinstance(row.get('id'), str)}
         for row in metadata:
-            row.update(self._catalog_enrichment.get(self._catalog_identity(row), {}))
+            row.update(self._catalog_enrichment.get(
+                self._catalog_identity(row, source_by_id.get(row.get('native_id'))), {}))
         metadata_done = time.monotonic()
         from .catalog_transport import report_catalog
         report_catalog(self.request, metadata, census_complete=census_complete)
