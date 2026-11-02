@@ -191,7 +191,7 @@ describe('stale alerts', () => {
         await hub.runChecks('liveness');
         let [alert]: any[] = hub.livenessService.alerts();
         expect(calls).toEqual(['https://hooks.example/alert','https://hooks.example/alert']);
-        expect(subjects.sort()).toEqual(['alert_routing:destination','machine:m']);
+        expect(subjects.sort()).toEqual(['alert_routing:destination','host_watch:m']);
         expect(alert.notify_error).toContain('nobody-registered');
         expect(JSON.parse(alert.delivered_to)[0]).toMatch(/^webhook:/);
         hub.sql.exec('UPDATE liveness_alerts SET notified_at = ?', new Date(Date.now() - 3600000).toISOString());
