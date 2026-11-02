@@ -139,7 +139,7 @@
       "provider": "codex",
       "engine": "codex",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "argon",
@@ -155,7 +155,7 @@
       "provider": "claude",
       "engine": "claude",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "luna",

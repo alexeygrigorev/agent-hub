@@ -100,7 +100,7 @@ describe('burn-aware model candidates', () => {
 
   it('routes Claude opus for deep and review work when it is expiring', () => {
     for (const tier of ['deep', 'review']) {
-      const [opus] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'opus', 'high', 'claude-acct'), claude, NOW);
+      const [opus] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'opus', 'medium', 'claude-acct'), claude, NOW);
       expect(opus?.id).toBe('opus');
       expect(opus.factors.burn).toBeGreaterThan(3);
     }
@@ -108,7 +108,7 @@ describe('burn-aware model candidates', () => {
 
   it('releases explicit-only Codex for daily/deep only while its weekly quota would expire unused', () => {
     const sol = ad('codex', 'gpt-6.1-sol', 'medium', 'codex-acct');
-    const astra = ad('codex', 'gpt-6-astra', 'high', 'codex-acct');
+    const astra = ad('codex', 'gpt-6-astra', 'medium', 'codex-acct');
     const idle = q(weekly(90, 30)); // 10% used in 138h -> ~88% would expire
     expect(burnReleasesExplicitOnly(burnForecast(idle, NOW))).toBe(true);
     expect(modelCandidates({ tier: 'daily' }, route('codex', 'codex'), sol, idle, NOW)).toHaveLength(1);

@@ -552,6 +552,11 @@ def test_launcher_metadata_mapping():
         'launcher_model': 'gpt-6.1-sol',
         'launcher_effort': 'medium',
     }
+    assert p.launcher_metadata('claude', {'args': ['--model', 'opus']}) == {
+        'launcher_provider': 'claude',
+        'launcher_model': 'opus',
+        'launcher_effort': 'medium',
+    }
     # With bundle override
     bundle_override = {'args': ['--model', 'gpt-6-astra', '--effort', 'max']}
     assert p.launcher_metadata('codex', bundle_override) == {
@@ -709,6 +714,13 @@ def test_gemini_launcher_metadata_defaults_to_native_gemini_2_5_pro():
     meta = p.launcher_metadata('gemini', {'args': []})
     assert meta['launcher_provider'] == 'gemini'
     assert meta['launcher_model'] == 'gemini-2.5-pro'
+    assert meta['launcher_effort'] == 'high'
+
+
+def test_gemini_argon_medium_launcher_metadata_defaults_to_medium_effort():
+    meta = p.launcher_metadata('gemini', {'args': ['--model', 'gemini-4-argon-medium']})
+    assert meta['launcher_model'] == 'gemini-4-argon-medium'
+    assert meta['launcher_effort'] == 'medium'
 
 
 def test_claude_engine_environment_clears_ambient_cloud_and_api_keys(tmp_path, monkeypatch):

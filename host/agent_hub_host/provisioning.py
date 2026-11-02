@@ -2161,13 +2161,13 @@ def launcher_metadata(provider, bundle=None):
         return {
             'launcher_provider': 'claude',
             'launcher_model': model or 'sonnet',
-            'launcher_effort': effort or 'high',
+            'launcher_effort': effort or 'medium',
         }
     elif provider == 'gemini':
         return {
             'launcher_provider': 'gemini',
             'launcher_model': model or 'gemini-2.5-pro',
-            'launcher_effort': effort or 'high',
+            'launcher_effort': effort or ('medium' if model == 'gemini-4-argon-medium' else 'high'),
         }
     elif provider == 'antigravity':
         return {

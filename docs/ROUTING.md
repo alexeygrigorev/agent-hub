@@ -131,7 +131,7 @@ The checked-in table and rules live in `config/model-routing.json`; the HTTP pol
 
 | Tier | Models | Aliases |
 |---|---|---|
-| `deep` | Codex Astra, Gemini Argon (medium), Claude Opus | `smart`, `hard`, `hard-reasoning` |
+| `deep` | Codex Astra (medium), Gemini Argon (medium), Claude Opus (medium) | `smart`, `hard`, `hard-reasoning` |
 | `daily` | GPT Sol, Claude Sonnet (medium effort; Claude Haiku is never routed), Z.ai **glm-5.3-flash**, OpenCode Muse Spark 1.3, OpenCode deepseek-v4.1-flash; Grok as eligible fallback | `everyday`, `good`, `volume` |
 | `quick` | GPT-6 Luna at **max** effort | `concrete`, `no-thinking` |
 
