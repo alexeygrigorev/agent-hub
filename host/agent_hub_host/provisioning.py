@@ -1931,6 +1931,21 @@ def managed_subscriptions():
     return subs
 
 
+def shared_dataops_dir():
+    """Hub-owned DataOps credential directory shared by every managed session.
+
+    Managed engines run with a private HOME, so the operator's own
+    ~/.config/dataops is invisible to them (intake 3bae55cf). An operator
+    provisions this directory once per host with
+    `DATAOPS_CONFIG_DIR=<dir> dataops login --label "<agent>@<host>"`; it lives
+    outside every repository and its contents are never printed.
+    """
+    try:
+        return Path(config.get_config_path()).parent / 'shared' / 'dataops'
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def engine_environment(bundle, home, dest=None):
     dest = dest or Path(home).parent
     env = {k: v for k, v in os.environ.items() if k not in ENV and k not in ('HUB_TOKEN', 'HUB_JOB_TOKEN', 'HUB_CONFIG_FILE', 'AGENT_HUB_MANAGED_DIR')}
@@ -1963,6 +1978,9 @@ def engine_environment(bundle, home, dest=None):
             env['ZCODE_CJS'] = str(runtime)
     env['GH_CONFIG_DIR'] = os.environ.get('GH_CONFIG_DIR') or str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'gh')
     env.update(bundle.get('env') or {})
+    shared = shared_dataops_dir()
+    if shared is not None and 'DATAOPS_CONFIG_DIR' not in env and (shared / 'credentials.json').is_file():
+        env['DATAOPS_CONFIG_DIR'] = str(shared)
     if bundle.get('provider') == 'go':
         from .fleet import load_settings
         from .opencode_auth import environment, prepare
