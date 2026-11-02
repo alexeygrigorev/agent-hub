@@ -24,6 +24,9 @@ class ManagedEffortTests(unittest.TestCase):
                         b = dict(label=label, provider='codex', version='0.163.0',
                                  revision=revision, files={'.codex/config.toml':
                                  'model_reasoning_effort = "xhigh"\n'}, env={}, args=[])
+                        # Older profile bundles also pinned high in argv. The
+                        # routed model policy must replace that profile default.
+                        b['args'] = ['-c', 'model_reasoning_effort="high"']
                         dest = managed / (label + '-' + revision)
                         dest.mkdir(mode=0o700)
                         p.write_json(dest / 'bundle.json', b)
@@ -42,21 +45,30 @@ class ManagedEffortTests(unittest.TestCase):
                         values = [a for a in argv if a.startswith('model_reasoning_effort=')]
                         self.assertEqual(values, ['model_reasoning_effort="' + expected + '"'])
 
-    def test_explicit_config_forms_and_bundle_override(self):
+    def test_caller_effort_is_explicit_but_bundle_effort_is_a_default(self):
         for override in (
             ['-c', 'model_reasoning_effort="xhigh"'],
             ['--config', 'model_reasoning_effort = "high"'],
             ['--config=model_reasoning_effort="low"'],
             ['-cmodel_reasoning_effort="high"'],
             ['--effort', 'high'],
+            ['--effort=high'],
         ):
-            for in_bundle in (False, True):
-                with self.subTest(override=override, in_bundle=in_bundle):
-                    b = dict(provider='codex', args=override if in_bundle else [])
-                    extra = ['exec', '--model', 'gpt-6.1-sol']
-                    if not in_bundle:
-                        extra += override
-                    self.assertEqual(p.managed_codex_effort_args(b, extra), [])
+            with self.subTest(override=override, source='caller'):
+                b = dict(provider='codex', args=[])
+                self.assertEqual(
+                    p.managed_codex_effort_args(b, ['exec', '--model', 'gpt-6.1-sol'] + override),
+                    [],
+                )
+            with self.subTest(override=override, source='profile'):
+                b = dict(provider='codex', args=override)
+                self.assertEqual(
+                    p.managed_codex_effort_args(b, ['exec', '--model', 'gpt-6.1-sol']),
+                    ['-c', 'model_reasoning_effort="medium"'],
+                )
+                cleaned, found = p.strip_codex_effort_args(override)
+                self.assertEqual(cleaned, [])
+                self.assertTrue(found)
 
     def test_no_model_required_and_diagnostics_unchanged(self):
         b = dict(provider='codex', args=[])
