@@ -654,6 +654,22 @@ class TerminalLockRepairTests(unittest.TestCase):
             self.assertEqual(report['released_count'], 0)
             self.assertTrue(guard.is_locked('git', tree))
 
+    def test_repair_passes_remaining_deadline_to_hub_request(self):
+        clock = [1000.0, 1029.5, 1030.0]
+        seen = []
+
+        def request(method, path, payload, timeout):
+            seen.append((method, path, payload, timeout))
+            return {'sessions': []}
+
+        with patch.object(guard.time, 'monotonic', side_effect=clock):
+            report = guard.repair_terminal_locks(request)
+        self.assertFalse(report['complete'])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], 'GET')
+        self.assertIsNone(seen[0][2])
+        self.assertAlmostEqual(seen[0][3], 0.5)
+
     def test_repair_preserves_live_and_human_protected_session_locks(self):
         cases = [
             {'terminal': False, 'protected': False, 'lock_release_permitted': True, 'human_owned': False},
@@ -990,6 +1006,24 @@ class LegacyTerminalLockRepairTests(unittest.TestCase):
             with open(guard.identity_directory() / ('e' * 32 + '.json'), 'w') as fh:
                 fh.write('{')
             report = guard.repair_terminal_locks(lambda *args: {'sessions': [malformed]}, apply=True)
+            self.assertEqual(report['candidate_count'], 0)
+            self.assertEqual(report['released_count'], 0)
+            self.assertTrue(guard.is_locked('git', tree))
+
+    def test_malformed_native_mapping_witness_blocks_legacy_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            main = _origin_repo(tmp)
+            tree = _legacy_wt(main, os.path.join(tmp, 'session-wt'))
+            sid = 'b' * 32
+            native_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            identity = guard.identity_directory()
+            identity.mkdir(parents=True)
+            (identity / ('native-' + native_id + '.json')).write_text('{malformed')
+            self.assertTrue(guard.lock_worktree('git', tree, guard.lock_reason(sid, 'proof-intake')))
+            # The UUID is recognizable, but the remaining tuple fields are
+            # invalid. Its present mapping must still prevent legacy fallback.
+            fact = _legacy_fact(sid, tree, native_id=native_id, native_created_at_ms='invalid')
+            report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]}, apply=True)
             self.assertEqual(report['candidate_count'], 0)
             self.assertEqual(report['released_count'], 0)
             self.assertTrue(guard.is_locked('git', tree))

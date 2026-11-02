@@ -4,7 +4,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from agent_hub_host import cli, intake, worktree_cli
+from agent_hub_host import bus, cli, intake, worktree_cli
 
 TASK = '4b161918-0000-4000-8000-000000000001'
 SESSION = '5c272a29-1111-4111-9111-111111111111'
@@ -35,6 +35,13 @@ class FakeClock:
 
 
 class TestWorktreeCli(unittest.TestCase):
+    def test_bus_request_uses_supplied_deadline_for_http(self):
+        with patch.object(bus.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict('os.environ', {'HUB_URL': 'https://hub.test', 'HUB_TOKEN': 'test-token'}), \
+                patch('agent_hub_host.api.safe_http_json', return_value={'sessions': []}) as transport:
+            self.assertEqual(bus._do_request('GET', '/api/test', timeout=0.25), {'sessions': []})
+        self.assertEqual(transport.call_args.kwargs['timeout'], 0.25)
+
     def test_terminal_lock_repair_defaults_to_read_only_and_uses_host_auth(self):
         report = {'mode': 'dry-run', 'complete': True, 'scanned': 1,
                   'candidate_count': 0, 'released_count': 0, 'candidates': []}

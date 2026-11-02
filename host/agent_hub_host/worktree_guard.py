@@ -960,9 +960,12 @@ def _identity_evidence_absent(fact: Any) -> bool:
     if not isinstance(fact, dict):
         return False
     channels: list[str] = []
-    native = _adoption_native_tuple(fact)
-    if native:
-        channels.append("native-" + native["native_id"] + ".json")
+    # The native mapping is a canonical witness even when the tuple in the
+    # Hub fact is incomplete. Do not let malformed tuple fields hide an
+    # existing mapping and downgrade the fact to the legacy path.
+    native_id = fact.get("native_id") or fact.get("id")
+    if isinstance(native_id, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", native_id):
+        channels.append("native-" + native_id + ".json")
     match = re.fullmatch(r"(?:task-)?hub-([0-9a-fA-F-]{8,64})", fact.get("tag") or "")
     if match:
         channels.append(match[1] + ".json")
@@ -1135,8 +1138,12 @@ def repair_terminal_locks(request: Callable, git_bin: str = "git", *,
         query = [("limit", min(GUARD_PAGE, remaining))]
         if cursor:
             query.append(("cursor", cursor))
+        request_timeout = deadline - time.monotonic()
+        if request_timeout <= 0:
+            complete = False
+            break
         try:
-            result = request("GET", GUARD_PATH + "?" + urlencode(query))
+            result = request("GET", GUARD_PATH + "?" + urlencode(query), None, request_timeout)
         except Exception:
             complete = False
             break
@@ -1202,6 +1209,9 @@ def repair_terminal_locks(request: Callable, git_bin: str = "git", *,
                                     intake_state="open" if intake_id else "none",
                                     intake_id=intake_id):
                 released += 1
+            if time.monotonic() >= deadline:
+                complete = False
+                break
     return {"mode": "apply" if apply else "dry-run", "complete": complete,
             "scanned": scanned, "candidate_count": len(candidates),
             "released_count": released, "candidates": candidates}
