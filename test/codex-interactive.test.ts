@@ -35,8 +35,9 @@ it('reports a dead Codex TUI as failed while retaining lifecycle and capacity un
     const task = { id: 'synthetic-task', title: 'Synthetic', project: 'demo', status: 'open', created_at: now - 60000,
       history: [{ kind: 'link', hub_session_id: id }] };
     // Failure is a diagnostic, not native exit: keep it visible without making
-    // this still-bound process eligible for a duplicate launch.
-    expect(watchdog.project([task])[0]).toMatchObject({ forgotten: false, ready: false,
+    // this still-bound process eligible for a duplicate launch. The projected
+    // recovery state routes it to the canonical stop-first path (b527e905).
+    expect(watchdog.project([task])[0]).toMatchObject({ forgotten: false, ready: false, state: 'recovering',
       last_session: { state: 'failed', lifecycle_state: 'running', failure_reason: 'codex_reconnect_failed' } });
     expect(watchdog.queue([task])[0]).toMatchObject({ state: 'needs_attention', reason: 'codex_reconnect_failed' });
     for (const phase of ['running', 'starting', 'broken']) {

@@ -2,6 +2,7 @@ import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES,
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
+import { stallThreshold } from './session_stall';
 import { liveQueuePolicy } from './intake-queue-policy';
 import { OpsLiveness } from './ops-liveness';
 import { IntakeTriage } from './intake-triage';
@@ -359,6 +360,17 @@ export class Hub extends DurableObject {
       policy: () => liveQueuePolicy(env as unknown as Record<string, unknown>, this.sql, this.fleetService),
       asks: now => this.askLedger.tick(now),
       asksDigest: () => this.askLedger.summaryLine(),
+      stallThresholdSeconds: stallThreshold(env),
+      claudeRecoveryEnabled: env.HUB_RECOVERY_CLAUDE_ENABLED === 'true',
+      stop: async (id, key) => {
+        // Canonical control only (intake b527e905): the stop endpoint fences
+        // protection, admission promotion and pending wakes inside its own
+        // transaction, including for intents this watchdog did not create.
+        const r = await this.sessionControlService.handle(new Request(`https://hub.internal/api/sessions/${encodeURIComponent(id)}/stop`,
+          { method: 'POST', body: JSON.stringify({ key }) }),
+          { caller: { isAdmin: true, actor: 'hub:service:intake-watchdog', kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
       start: async input => {
         const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
           { method: 'POST', body: JSON.stringify(input) }),
