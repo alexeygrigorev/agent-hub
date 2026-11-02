@@ -349,6 +349,12 @@ def test_package_update_schedules_once_per_served_archive(tmp_path):
     assert run(now=1000.0 + u.RETRY_S + 1) == 'pending'
     assert run(now=1000.0 + u.MIN_INTERVAL_S + 1) == 'scheduled'
     assert len(registered) == 2
+    # A newer served archive schedules immediately without waiting 12h.
+    assert u.step_once('https://hub.example', tmp_path, release=release,
+                       fetch=lambda url: 'f' * 64 + '\n',
+                       register=lambda *a: registered.append(a), free_gb=500,
+                       now=1000.0 + u.MIN_INTERVAL_S + 60) == 'scheduled'
+    assert len(registered) == 3
 
 
 def test_package_update_served_check_identifies_the_client(monkeypatch):
