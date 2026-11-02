@@ -19,8 +19,7 @@ CAPACITY_RETRY_RULE = (
     "its refusal marker, 'heavy-test slot not acquired', 'host_overload', or "
     "'no heavy-test slot free'), wait and retry with backoff instead of exiting: "
     "scripts/capped-test-retry.sh -- <command> (default 5 attempts, 30s base delay "
-    "doubling to 600s max); for the full gate run "
-    "scripts/capped-test-retry.sh -- scripts/test-full-local.sh --priority final. "
+    "doubling to 600s max). "
     "A refusal is a HOLD, not a code failure; a command's own exit 3 (e.g. pytest "
     "INTERNALERROR) is a FAIL and is never retried. Never abandon the session on a "
     "refusal; Hub re-places held offers on the next cycle once load clears."
@@ -34,7 +33,15 @@ CLEAN_EXIT_RULE = (
     "re-places the work, and keep the worktree while the intake is open. A clean result does NOT authorize pushing to main; push to "
     "main only with the orchestrator-main release slot."
 )
-SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + CAPACITY_RETRY_RULE + "\n" + CLEAN_EXIT_RULE
+CI_ONLY_TESTS_RULE = (
+    "Tests run in CI (Alexey t2558u, intake 178ec5bb): locally run ONLY targeted unit "
+    "tests for the files you changed. Never run a full suite locally (test-full-local.sh, "
+    "make test/test-all, manage.py test without labels, pytest playwright_tests). "
+    "Flow: worktree from origin/main, push your branch, open a PR, CI runs the full "
+    "suite, then gh pr merge --auto --rebase. This supersedes any push-to-main or "
+    "full-local-suite instruction below."
+)
+SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + CAPACITY_RETRY_RULE + "\n" + CLEAN_EXIT_RULE + "\n" + CI_ONLY_TESTS_RULE
 
 PREPUSH_TEST_RULE = (
     "Hub worker releases: after obtaining the orchestrator-main release slot, "

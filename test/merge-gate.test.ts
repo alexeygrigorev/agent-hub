@@ -116,7 +116,7 @@ describe('AC2/AC3 watcher and requeue', () => {
     const first = await mergeGateTick(gate, h.hooks as any);
     expect(first).toMatchObject({ flagged: 1, requeued: 1 });
     expect(h.calls.starts[0]).toMatchObject({ intake_task_id: t.id, cwd: WT, machine: 'hetzner' });
-    expect(h.calls.starts[0].brief).toContain('Push to main yourself');
+    expect(h.calls.starts[0].brief).toContain('gh pr merge --auto --rebase');
     expect(gate.get(t.id)!.state).toBe('requeued');
     for (let i = 1; i < MERGE_MAX_REQUEUES; i++) { age(c, t.id, MERGE_IDLE_MS + 1000); await mergeGateTick(gate, h.hooks as any); }
     expect(gate.get(t.id)!.requeues).toBe(MERGE_MAX_REQUEUES);

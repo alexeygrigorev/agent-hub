@@ -201,9 +201,9 @@ const LIVE = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncer
 export function finishBrief(task: Obj, r: Obj, problems: string[]): string {
   return `Finish-merge for Hub intake ${task.id} (${task.title ?? ''}). Hub flagged it unmerged: ${problems.join('; ')}. ` +
     `The work is in ${r.path ?? 'its intake worktree'} on branch ${r.branch ?? '?'} (host ${r.machine ?? '?'}). ` +
-    `Do not redo the feature. 1) Rebase on fresh origin/main and resolve conflicts. 2) Run the FULL local test suite (scripts/test-full-local.sh). ` +
+    `Do not redo the feature. 1) Rebase on fresh origin/main and resolve conflicts. 2) Run ONLY targeted unit tests for the files you changed locally; never run the full suite locally (it runs in CI). ` +
     `3) Get an independent review of the exact version (any model); if the reviewer fails with engine_auth_expired or similar, switch to another engine/account and open a prerequisite with hub intake blocker ${task.id}. ` +
-    `4) Push to main yourself as soon as tests pass; never wait for orchestrator permission. 5) Watch CI and the Deploy workflow until green and fix failures yourself. ` +
+    `4) Push the branch and open a PR; CI runs the full suite; fix CI failures yourself, then gh pr merge --auto --rebase. Never push to main directly. 5) Watch CI and the Deploy workflow until green; never approve deploy gates. ` +
     `6) Run hub intake merge-check ${task.id} so Hub records the evidence, then append the DONE note. If blocked (tests failing, auth expired, no capacity), run hub intake blocker ${task.id} --title ... --acceptance-criteria ... and stop.`;
 }
 
