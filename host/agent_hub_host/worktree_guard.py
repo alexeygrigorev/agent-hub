@@ -428,9 +428,21 @@ def protect_bound_worktree(git_bin: str, path: str, session_id: Any, intake_id: 
     if not roots:
         return True
     root = max(roots, key=lambda e: len(e["path"]))["path"]
-    if not os.path.isfile(os.path.join(root, ".git")):
+    # Scope this gate to Agent Hub worker worktrees. The main checkout and
+    # other projects retain their own hook/test policy.
+    worker = Path(root)
+    if not (worker / '.git').is_file():
         return True
-    return ensure_locked(git_bin, root, session_id, intake_id, runner, owner_terminal=owner_terminal)
+    try:
+        from .prepush import PrepushHookInstallError, install, required
+        if required(root, git_bin):
+            install(root, git_bin)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise PrepushHookInstallError() from exc
+    if os.path.isfile(os.path.join(root, ".git")):
+        if not ensure_locked(git_bin, root, session_id, intake_id, runner, owner_terminal=owner_terminal):
+            return False
+    return True
 
 
 GUARD_PATH = "/api/sessions/worktree-guards"
