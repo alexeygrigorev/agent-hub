@@ -1226,6 +1226,22 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _opencode_auth_health(settings):
+    """Project only confirmed source-login expiry as persistent route health."""
+    if not settings.get('opencode_auth'):
+        return None
+    from .opencode_auth import prepare, AuthBusy, AuthCheckUnavailable, AuthExpired
+    try:
+        prepare(settings['opencode_auth'])
+    except AuthExpired:
+        return {'engine': 'opencode', 'status': 'unavailable', 'reason': 'engine_auth_expired'}
+    except (AuthBusy, AuthCheckUnavailable):
+        # Transient checks are retried on the next poll/offer; they do not
+        # install a persistent route-health hold.
+        return None
+    return {'engine': 'opencode', 'status': 'ok', 'reason': 'device_auth_verified'}
+
+
 class Dispatcher:
     """One finite poll. Claim ambiguity and effect ambiguity are never retried automatically."""
     def __init__(self, settings, request=bus._do_request, runner=run_json, role_config=None, role_config_path=None, journal_dir=None):
@@ -4714,18 +4730,10 @@ class Dispatcher:
                 self.request('POST', '/api/fleet/probe', {'engine': engine, 'status': 'ok', 'reason': 'admission_configured'})
             except Exception:
                 pass  # A failed projection never replaces dispatch admission.
-        if self.settings.get('opencode_auth'):
-            from .opencode_auth import prepare, AuthBusy, AuthCheckUnavailable
+        auth_health = _opencode_auth_health(self.settings)
+        if auth_health:
             try:
-                prepare(self.settings['opencode_auth'])
-                auth_health = {'engine': 'opencode', 'status': 'ok', 'reason': 'device_auth_verified'}
-            except (AuthBusy, AuthCheckUnavailable):
-                auth_health = None
-            except ValueError:
-                auth_health = {'engine': 'opencode', 'status': 'unavailable', 'reason': 'engine_auth_expired'}
-            try:
-                if auth_health:
-                    self.request('POST', '/api/fleet/probe', auth_health)
+                self.request('POST', '/api/fleet/probe', auth_health)
             except Exception:
                 pass  # dispatch repeats the check before allowing any claim.
         _mark('probes')
