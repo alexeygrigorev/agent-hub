@@ -52,8 +52,11 @@ tick, no table scans. A tracked intake is due 60 minutes after its last activity
 3. not merged and deployed => state `unmerged`, a `UNMERGED:` note on the intake
    and a finish-merge session (same canonical admission as `assign`, `cwd` =
    the worktree, pinned to its host) whose brief says: rebase, run the full
-   suite, independent review of the exact version (switch engine/account when
-   the reviewer fails, e.g. `engine_auth_expired`, and file a prerequisite),
+   suite, independent review of the exact version. Review starts use canonical
+   Hub routing; after an auth/credential failure the session retries once with
+   a distinct provider engine and records a blocker event if that also fails.
+   Repeated failed finish-merge attempts create a prerequisite intake and alert
+   through the watcher,
    push to main yourself, watch CI/Deploy, `hub intake merge-check`, DONE;
 4. after 3 requeues the intake becomes `blocked`: Hub files a prerequisite
    through the prerequisite API (`POST /api/intake/tasks/ID/blocker`, intake
@@ -79,6 +82,12 @@ counts; the daily intake digest lists unmerged intakes.
 
 ## AC7 backfill
 
-`python3 scripts/backfill-unmerged-2e00e01f.py [--apply]` scans `~/git/*-wt-*`
-worktrees, resolves each to an open intake, records merge evidence and reports
-every unmerged one (dry run by default); the Hub watcher requeues them.
+`python3 scripts/backfill-unmerged-2e00e01f.py [--root DIR] [--apply]` scans
+`*-wt-*` worktrees under the shared git directory derived from this checkout
+(or the explicit `--root`), resolves each to an open intake, records merge
+evidence and reports every unmerged one (dry run by default). It refreshes
+`origin/main` once per repository and bounds Git commands; timeouts, fetch
+failures, denied intake lookups, and refused apply operations appear as
+`inspection_failed`, `fetch_failed`, `lookup_failed`, or `apply_failed` rows
+rather than being silently counted as merged or as no-intake work. The Hub
+watcher requeues recorded unmerged work.
