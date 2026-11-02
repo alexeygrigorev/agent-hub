@@ -121,6 +121,25 @@ class HostCredentialsTest(unittest.TestCase):
         if os.name != 'nt':
             self.assertEqual(stat.S_IMODE((self.ssh / hc.KEY_NAME).stat().st_mode), 0o600)
 
+    def test_windows_acl_is_restricted_before_any_bytes_exist(self):
+        """Review finding: 0o600 is ignored on Windows, so the ACL must be locked while the tmp file is still empty."""
+        real_open = os.open
+        events = []
+
+        def fake_open(path, flags, mode=0o600):
+            events.append(('open', bool(flags & os.O_CREAT)))
+            return real_open(path, flags, mode)
+
+        def fake_restrict(path):
+            events.append(('restrict', Path(path).stat().st_size))
+
+        self.ssh.mkdir(parents=True)
+        with mock.patch.object(hc, '_is_windows', return_value=True), mock.patch.object(hc.os, 'open', side_effect=fake_open), \
+                mock.patch.object(hc, '_restrict_windows', side_effect=fake_restrict):
+            hc._write_private(self.ssh / hc.KEY_NAME, PRIV)
+        self.assertEqual(events, [('open', True), ('restrict', 0), ('open', False)])
+        self.assertEqual((self.ssh / hc.KEY_NAME).read_text(), PRIV)
+
     def test_ssh_config_block_is_idempotent_and_replaced_in_place(self):
         block = hc._config_block(Path('/home/u/.ssh/' + hc.KEY_NAME))
         once = hc.merge_ssh_config('Host a\n  User x\n', block)

@@ -117,9 +117,13 @@ def _restrict_windows(path):
         raise HostCredentialError('icacls_failed')
 
 
+def _is_windows() -> bool:
+    return os.name == 'nt'
+
+
 def _write_private(path: Path, data: str):
     path.parent.mkdir(parents=True, exist_ok=True)
-    if os.name != 'nt':
+    if not _is_windows():
         try:
             os.chmod(path.parent, 0o700)
         except OSError:
@@ -128,12 +132,20 @@ def _write_private(path: Path, data: str):
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, 'O_BINARY', 0)
     fd = os.open(tmp, flags, 0o600)
     try:
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(data.encode())
-        if os.name == 'nt':
+        if _is_windows():
+            # 0o600 is ignored on Windows: restrict the still-empty file's ACL
+            # before any key material exists on disk.
+            os.close(fd)
+            fd = -1
             _restrict_windows(tmp)
+            fd = os.open(tmp, os.O_WRONLY | getattr(os, 'O_BINARY', 0))
+        with os.fdopen(fd, 'wb') as stream:
+            fd = -1
+            stream.write(data.encode())
         os.replace(tmp, path)
     finally:
+        if fd >= 0:
+            os.close(fd)
         try:
             os.unlink(tmp)
         except FileNotFoundError:
@@ -141,7 +153,10 @@ def _write_private(path: Path, data: str):
 
 
 def _config_block(key_path: Path):
-    return '\n'.join([BLOCK_BEGIN, 'Host github.com', '  HostName github.com', '  User git',
+    return '\n'.join([BLOCK_BEGIN,
+                      '# github.com ssh uses ONLY the shared agent-hub key below;',
+                      '# a personal key for github.com on this host is overridden while the block stands.',
+                      'Host github.com', '  HostName github.com', '  User git',
                       '  IdentityFile ' + json.dumps(key_path.as_posix()), '  IdentitiesOnly yes', BLOCK_END]) + '\n'
 
 
@@ -337,7 +352,9 @@ def add_parser(sub):
     source.add_argument('--token-file', help='Private file holding the token')
     source.add_argument('--stdin', action='store_true')
     key = commands.add_parser('generate-ssh-key', help='Generate the ONE shared ed25519 git key, store it in Hub, discard the local copy')
-    key.add_argument('--rotate', action='store_true', help='Replace an existing Hub key (hosts keep their old key files)')
+    key.add_argument('--rotate', action='store_true',
+                     help='Replace the Hub key: hosts overwrite the same key file on their next sync;'
+                          ' then run register-key for the new public key on GitHub (the old one stays registered there)')
     ident = commands.add_parser('set-identity', help='Commit identity every host applies to its global git config')
     ident.add_argument('--name', required=True)
     ident.add_argument('--email', required=True)
