@@ -56,7 +56,7 @@ it('returns every accounted reserved launch, including rows outside the latest-2
       get(target, key) {
         if (key !== 'exec') return Reflect.get(target, key);
         return (query: string, ...bindings: any[]) => {
-          if (query.includes('FROM fleet_launches l') && query.includes('fleet_sessions')) {
+          if (query.includes('FROM fleet_launches l') && query.includes('fleet_sessions') && query.includes('json_each')) {
             maxBindings = Math.max(maxBindings, bindings.length);
             queryPlan = target.exec('EXPLAIN QUERY PLAN ' + query, ...bindings).toArray().map((row: any) => String(row.detail));
           }
