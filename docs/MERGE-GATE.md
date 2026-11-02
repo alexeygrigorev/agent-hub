@@ -56,8 +56,11 @@ tick, no table scans. A tracked intake is due 60 minutes after its last activity
    Hub routing; after an auth/credential failure the session retries once with
    a distinct provider engine and records a blocker event if that also fails.
    Repeated failed finish-merge attempts create a prerequisite intake and alert
-   through the watcher,
-   push to main yourself, watch CI/Deploy, `hub intake merge-check`, DONE;
+   through the watcher. The session commits and pushes its feature branch, opens
+   a PR, lets CI run the full suite, fixes failures from CI logs, then runs
+   `gh pr merge --auto --rebase`. It watches CI/Deploy and runs
+   `hub intake merge-check` before DONE. It never pushes to main or approves
+   deploy gates;
 4. after 3 requeues the intake becomes `blocked`: Hub files a prerequisite
    through the prerequisite API (`POST /api/intake/tasks/ID/blocker`, intake
    8edc8f7c; before that lands it appends a `blocker` event), raises an
@@ -66,11 +69,14 @@ tick, no table scans. A tracked intake is due 60 minutes after its last activity
 
 States: `tracking`, `unmerged`, `requeued`, `blocked`, `merged`, `closed`.
 
-## AC5 pushing
+## AC5 branch PR and CI flow
 
-Sessions push to main themselves when the full tests pass and watch the Deploy
-to green. The watchdog restart brief, the finish-merge brief and the orchestrator
-brief say so. Nobody waits for orchestrator push permission.
+Sessions run only targeted unit tests for changed files locally, commit and push
+their feature branch, and open a PR. CI runs the full suite; sessions fix
+failures from CI logs, then use `gh pr merge --auto --rebase` after required
+checks pass. They watch CI and Deploy to green, never push to main, and never
+approve deploy gates. The watchdog restart brief, finish-merge brief, and
+orchestrator brief must say so.
 
 ## AC6 visibility
 
