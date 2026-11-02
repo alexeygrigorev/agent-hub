@@ -660,6 +660,15 @@ describe('private durable intake HTTP/SQLite', () => {
       expected_version: 1, session: { workspace: 'demo', brief: 'Synthetic foreign goal' }, provenance: source })).assigned_session.hub_session_id;
     expect((await call('/tasks/' + task.id + '/events', { key: 'foreign-link', expected_version: 2,
       event: { kind: 'link', hub_session_id: foreignSession, provenance: source } }, agent.token)).status).toBe(404);
+    // An intake grant cannot disclose another actor's session telemetry through stats.
+    await inDO(stub(), (h: any) => h.sql.exec('UPDATE session_control_sessions SET engine=?, state=?, binding_json=? WHERE id=?',
+      'foreign-fixture-engine', 'failed', JSON.stringify({ native_id: 'foreign-private-native', native_created_at_ms: Date.now() - 5000 }), foreignSession));
+    const foreignStats = (await ok('/tasks/' + foreign.id + '/stats', undefined, agent.token)).stats;
+    expect(foreignStats.failed_attempts).toBeNull();
+    expect(foreignStats.unknown_reasons.failed_attempts).toBe('session_owner_required');
+    expect(JSON.stringify(foreignStats)).not.toMatch(/foreign-fixture-engine|foreign-private-native/);
+    const table = await ok('/stats?project=demo', undefined, agent.token);
+    expect(table.items.find((s: any) => s.id === foreign.id).failed_attempts).toBeNull();
     // Without fleet:launch the canonical service refuses, so assignment fails.
     const plain = await seedAgent('demo:assistant');
     await grant(plain, 'project', 'demo', 'write');
@@ -1107,7 +1116,11 @@ describe('private durable intake HTTP/SQLite', () => {
   it('reconstruction from same durable SQLite retains tasks, receipts, rules and grants', async () => {
     const a = await seedAgent(); await grant(a); const created = await create();
     await inDO(stub(), (h: any, ctx: any) => { h.intakeService = new IntakeService(h.sql, fn => ctx.storage.transactionSync(fn)); h.intakeService.init(); });
-    expect((await ok('/tasks/' + created.task.id, undefined, a.token)).task).toEqual(created.task);
+    const retained = (await ok('/tasks/' + created.task.id, undefined, a.token)).task;
+    expect(retained).toEqual(created.task);
+    expect(retained.stats).toBeUndefined();
+    const withStats = (await ok('/tasks/' + created.task.id + '?include_stats=true', undefined, a.token)).task;
+    expect(withStats.stats).toMatchObject({ id: created.task.id, created_at: created.task.created_at, attempt_count: 0 });
   });
   it('streamed UTF-8 and field limits reject oversized content without private error echo', async () => {
     const before = await state();

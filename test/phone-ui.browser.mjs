@@ -106,17 +106,22 @@ try {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.evaluate(() => localStorage.setItem('dakit-theme', 'dark'));
   await page.goto(base + '/intake');
-  await page.getByText('Phone list task alpha', { exact: false }).waitFor();
+  await page.locator('#intake-stats-table tbody tr').first().waitFor();
+  assert.equal(await page.locator('#intake-stats-table tbody tr').count(), 2);
+  await page.locator('#stats-sort').selectOption('created_at');
+  await page.waitForFunction(() => document.querySelector('#intake-stats-table')?.textContent.includes('Median lead:'));
+  await capture('phone-intake-statistics-table-390-dark');
+  await page.locator('#intake-list').getByText('Phone list task alpha', { exact: false }).waitFor();
   // Filter narrows the list.
   await page.getByLabel('Filter tasks').fill('approval task beta');
-  await page.getByText('Phone approval task beta', { exact: false }).waitFor();
+  await page.locator('#intake-list').getByText('Phone approval task beta', { exact: false }).waitFor();
   assert.equal(await page.locator('.intake-item').count(), 1);
   await page.getByLabel('Filter tasks').fill('');
   await capture('phone-intake-filter-390-dark');
   checks.push('Intake list filter narrows to the matching task at phone width');
 
   // Read-only open: the detail shows every AC2 element.
-  await page.getByText('Phone list task alpha', { exact: false }).click();
+  await page.locator('#intake-list').getByText('Phone list task alpha', { exact: false }).click();
   await page.waitForURL('**/intake/*');
   const detailUrl = page.url();
   assert.ok(/\/intake\/[A-Za-z0-9._:-]+$/.test(new URL(detailUrl).pathname), 'detail uses /intake/<id>');
@@ -124,6 +129,8 @@ try {
   for (const label of ['Task ID', 'Project', 'Status', 'Version', 'Acceptance criteria', 'Linked sessions', 'History']) {
     assert.ok((await page.locator('#main-content').textContent()).includes(label), `detail shows ${label}`);
   }
+  assert.ok((await page.locator('#intake-detail-stats').textContent()).includes('Active time'));
+  assert.equal(await page.locator('#intake-stats-section').isVisible(), false);
   await capture('phone-intake-detail-390-dark');
   checks.push('Intake detail shows title, status, AC, history, linked sessions at phone width');
 

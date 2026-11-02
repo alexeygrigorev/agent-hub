@@ -14,6 +14,7 @@ import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
 import { MergeGate, MergeGateError, mergeGateTick, type MergeGateHooks } from './merge-gate';
+import { projectVisibleIntakeStats, readStatsSources, intakeStatsTable } from './intake-stats';
 
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
 export function currentHistory(task: Obj): Obj[] {
@@ -867,6 +868,16 @@ export class IntakeService {
   }
   private read(url: URL, p: Obj): Obj {
     const path = url.pathname.slice('/api/intake'.length); const revision = this.revision();
+    if (path === '/stats') {
+      try { return { snapshot_version: revision, ...intakeStatsTable(this.sql, this.statusAuthorizedTasks(p), url, Date.now(), p) }; }
+      catch (e) { if (e instanceof Error && /^invalid_stats_/.test(e.message)) fail(e.message); throw e; }
+    }
+    const statsMatch = /^\/tasks\/([A-Za-z0-9._:-]+)\/stats$/.exec(path);
+    if (statsMatch) {
+      const task = this.get('tasks', statsMatch[1]);
+      if (!task || !this.allowed(p, task)) fail('not_found', 404);
+      return { snapshot_version: revision, stats: projectVisibleIntakeStats(task, readStatsSources(this.sql), Date.now(), p) };
+    }
     if (path === '/storage') {
       this.operator(p);
       return { snapshot_version: revision, ...this.storageUsage(), warning: this.storageWarning() };
@@ -1067,7 +1078,9 @@ export class IntakeService {
         next_after: sizes.length > page.length ? page[page.length - 1].seq : null, total: task.history_archive?.count ?? 0,
         inline_sequences: inlineSequences, data_notice: DATA_NOTICE };
     }
-    return { snapshot_version: revision, task: this.view(task, p) };
+    return { snapshot_version: revision, task: { ...this.view(task, p),
+      ...(!match[2] && url.searchParams.get('include_stats') === 'true'
+        ? { stats: projectVisibleIntakeStats(task, readStatsSources(this.sql), Date.now(), p) } : {}) } };
   }
   private event(raw: Obj, task: Obj, p: Obj, now: number): Obj {
     // Session is the public spelling of an external session link. Keep the

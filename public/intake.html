@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css">
   <link rel="stylesheet" href="/intake.css">
   <script src="/auth.js"></script>
+  <script src="/intake-stats.js" defer></script>
   <script src="/intake.js" defer></script>
 </head>
 <body>
@@ -87,6 +88,15 @@
 
       <p id="intake-status" role="status" class="dk-muted">Loading intake…</p>
 
+      <section class="dk-card dk-stack intake-card" aria-label="Intake statistics" id="intake-stats-section">
+        <h2>Intake statistics</h2>
+        <div class="dk-cluster">
+          <label>Window <select id="stats-window" class="dk-select"><option>24h</option><option>7d</option><option>30d</option><option selected>all</option></select></label>
+          <label>Sort descending <select id="stats-sort" class="dk-select"><option value="attempt_count">Attempts</option><option value="created_at">Added</option><option value="done_at">DONE</option><option value="lead_time_ms">Lead time</option><option value="cycle_time_ms">Cycle time</option><option value="blocker_count">Blockers</option></select></label>
+        </div>
+        <div id="intake-stats-table" role="status">Loading statistics…</div>
+      </section>
+
       <section class="dk-card dk-stack intake-card" id="intake-list-section" aria-label="Intake tasks">
         <div class="dk-cluster intake-controls">
           <div class="intake-filter-wrap">
@@ -119,6 +129,7 @@
           <div class="sessions-card-item__badges" id="intake-detail-badges"></div>
         </div>
         <p id="intake-action-status" role="status" class="dk-muted"></p>
+        <div id="intake-detail-stats"></div>
         <div class="intake-detail__meta" id="intake-detail-meta"></div>
         <div class="dk-stack">
           <h3 class="session-detail__subtitle">Acceptance criteria</h3>
