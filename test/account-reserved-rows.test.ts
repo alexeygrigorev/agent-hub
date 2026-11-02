@@ -37,14 +37,13 @@ it('returns every accounted reserved launch, including rows outside the latest-2
 
     for (let i = 0; i < 205; i++) {
       const id = `launch-${String(i).padStart(3, '0')}`;
-      const nativeId = `native-${i}`;
       const created = new Date(NOW - (205 - i) * 60_000).toISOString();
+      // Unmatched reservations within TTL: no live native session, so the
+      // new-model predicate (reservationHoldsCapacity) holds capacity.
+      // Running with a live native would count as observed, not reserved.
       sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
-        VALUES(?,'fixture','human','fixture',?,'{}','live-machine','claude','hub-claude','headless','/repo','fixture','running',?,?,?)`,
-        id, id, nativeId, created, at);
-      sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,last_activity_at,workspace,account,created_at_ms)
-        VALUES('live-machine',?,?,'claude','running',?,?,'/repo','hub-claude',?)`,
-        nativeId, `task-hub-${id}`, at, at, NOW - (205 - i) * 60_000);
+        VALUES(?,'fixture','human','fixture',?,'{}','live-machine','claude','hub-claude','headless','/repo','fixture','offered',NULL,?,?)`,
+        id, id, created, at);
       if (i === 0) {
         sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,created_at,updated_at)
           VALUES('hub-session-old','fixture','key-old','{}',?,'live-machine','claude','headless','running',?,?)`, id, created, at);
@@ -57,7 +56,7 @@ it('returns every accounted reserved launch, including rows outside the latest-2
       get(target, key) {
         if (key !== 'exec') return Reflect.get(target, key);
         return (query: string, ...bindings: any[]) => {
-          if (query.includes('SELECT l.id, l.machine_id, l.state, l.native_id') && query.includes('fleet_sessions')) {
+          if (query.includes('FROM fleet_launches l') && query.includes('fleet_sessions')) {
             maxBindings = Math.max(maxBindings, bindings.length);
             queryPlan = target.exec('EXPLAIN QUERY PLAN ' + query, ...bindings).toArray().map((row: any) => String(row.detail));
           }
@@ -88,9 +87,9 @@ it('returns every accounted reserved launch, including rows outside the latest-2
     expect(status.reserved).toBe(205);
     expect(pages).toHaveLength(status.reserved);
     expect(pages[0]).toMatchObject({
-      id: 'launch-000', machine: 'live-machine', state: 'running', native_id: 'native-0',
-      hub_session_id: 'hub-session-old', phase: 'running', last_activity_at: at,
-      created_at_ms: NOW - 205 * 60_000,
+      id: 'launch-000', machine: 'live-machine', state: 'offered', native_id: null,
+      hub_session_id: 'hub-session-old', phase: null, last_activity_at: null,
+      created_at_ms: null,
     });
     expect(pages.some(row => row.id === 'launch-000' && !listedByAccountView.has(row.id))).toBe(true);
     expect(maxBindings).toBeLessThanOrEqual(100);
