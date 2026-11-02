@@ -27,6 +27,8 @@ import os
 import re
 import subprocess
 import time
+
+from . import native_list_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -373,7 +375,7 @@ def subprocess_runner(argv: list[str]) -> Any:
 def _list_rows(runner: Any, aplexer_bin: str) -> dict[str, dict[str, Any]]:
     """Live session rows by session id (best-effort; {} when unavailable)."""
     try:
-        raw = runner([aplexer_bin, "list", "--all", "--json"])
+        raw = native_list_cache.list_raw(aplexer_bin, lambda: runner([aplexer_bin, "list", "--all", "--json"]))
     except Exception:
         return {}
     rows = raw if isinstance(raw, list) else (raw.get("sessions") if isinstance(raw, dict) else None)
