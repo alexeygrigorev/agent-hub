@@ -9,7 +9,7 @@ from . import intake
 
 BASE = '/api/repos'
 HUMAN = ('label', 'purpose', 'stack', 'key_folders', 'urls', 'aliases')
-EDITABLE = HUMAN + ('status', 'canonical')
+EDITABLE = HUMAN + ('status', 'canonical', 'portable')  # portable: intake 178ec5bb
 SCAN = ('dir', 'origin', 'org', 'default_branch', 'status', 'canonical', 'last_commit', 'workflows', 'github_url', 'flags')
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
 
