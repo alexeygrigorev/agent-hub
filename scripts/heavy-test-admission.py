@@ -16,6 +16,7 @@ import time
 # wait budget), so --priority final really jumps a long queue of fresh and
 # moderately aged normal tickets (was 300s, which made every queued ticket
 # final-equivalent and the priority meaningless; position 33/35 observed).
+PRIORITIES = ('normal', 'final')
 NORMAL_AGE_S = 1500
 try:  # test hook / host tuning; invalid values keep the default
     _age = os.environ.get('AGENT_HUB_HEAVY_TEST_NORMAL_AGE_S', '')
@@ -90,10 +91,14 @@ class Queue:
                     or type(row.get('sequence')) is not int
                     or not 0 < row['sequence'] < state['next']
                     or row['sequence'] in sequences
-                    or row.get('priority') not in ('normal', 'final')
                     or type(row.get('created')) not in (float, int)
                     or not math.isfinite(row['created']) or row['created'] < 0):
                 raise ValueError('invalid heavy-test queue entry')
+            if row.get('priority') not in PRIORITIES:
+                # Self-heal (2026-11-02 incident: one 'intake' row refused every
+                # admission): an unknown priority is just a normal ticket.
+                print(f"capped-test-run: warning: queue ticket {lease} had invalid priority {row.get('priority')!r}; treating as normal", file=sys.stderr, flush=True)
+                row['priority'] = 'normal'
             sequences.add(row['sequence'])
         return state
 
@@ -273,7 +278,13 @@ def main():
     parser.add_argument('--wait', default=os.environ.get('AGENT_HUB_HEAVY_TEST_WAIT_S', '1800'))
     parser.add_argument('--run-timeout', default=os.environ.get(
         'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S'))
-    parser.add_argument('--priority', default=os.environ.get('AGENT_HUB_HEAVY_TEST_PRIORITY', 'normal'), choices=['normal', 'final'])
+    env_priority = os.environ.get('AGENT_HUB_HEAVY_TEST_PRIORITY', 'normal')
+    if env_priority not in PRIORITIES:
+        # argparse does not validate a default against choices; a bad env value
+        # used to be written into the shared queue and poison every contender.
+        print(f'capped-test-run: warning: ignoring invalid AGENT_HUB_HEAVY_TEST_PRIORITY={env_priority!r}; using normal', file=sys.stderr, flush=True)
+        env_priority = 'normal'
+    parser.add_argument('--priority', default=env_priority, choices=list(PRIORITIES))
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     root = Path(os.environ.get('AGENT_HUB_HEAVY_TEST_DIR', f'/run/user/{os.getuid()}/agent-hub/heavy-test'))

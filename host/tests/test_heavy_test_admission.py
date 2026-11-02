@@ -395,6 +395,24 @@ class QueueCostTests(unittest.TestCase):
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
 
+    def test_invalid_priority_row_is_coerced_not_fatal(self):
+        root = Path(tempfile.mkdtemp(dir=WRAPPER.parent.parent / '.local/tmp'))
+        (root / 'fifo-state.json').write_text(json.dumps({'version': 1, 'next': 5, 'active': {
+            '0': {'sequence': 3, 'priority': 'intake', 'created': 1.0}}}))
+        state = self.module.Queue(root).load()
+        self.assertEqual(state['active']['0']['priority'], 'normal')
+
+    def test_invalid_env_priority_default_is_coerced(self):
+        root = Path(tempfile.mkdtemp(dir=WRAPPER.parent.parent / '.local/tmp'))
+        env = dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=str(root), AGENT_HUB_HEAVY_TEST_PRIORITY='intake',
+                   AGENT_HUB_HEAVY_TEST_SLOTS='1', AGENT_HUB_HEAVY_TEST_WAIT_S='5')
+        env.pop('AGENT_HUB_HEAVY_TEST_HELD', None)
+        result = subprocess.run([sys.executable, str(WRAPPER.with_name('heavy-test-admission.py')), '--', 'true'],
+                                env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('invalid AGENT_HUB_HEAVY_TEST_PRIORITY', result.stderr)
+        self.assertIn('admitted normal ticket', result.stderr)
+
     def test_aged_normal_precedes_continuous_new_finals(self):
         state = {'active': {'0': {'sequence': 1, 'priority': 'normal', 'created': 0}}}
         for i in range(2, 1002):
