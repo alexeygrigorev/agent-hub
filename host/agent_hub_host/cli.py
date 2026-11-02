@@ -605,6 +605,10 @@ def main():
     p_workclaim.add_argument("--dry-run", action="store_true", help="Scan and redact without POSTing to Hub")
 
     args = parser.parse_args()
+    if args.cmd in ("run", "fleet-host", "bridge"):
+        # Long-running host commands: no console window for any child process.
+        from . import windows_no_window
+        windows_no_window.install()
     if args.cmd == 'engines':
         try:
             print(json.dumps(provisioning.command(args)))

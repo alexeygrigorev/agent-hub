@@ -63,6 +63,14 @@ class RealAutostartRegistrationTests(unittest.TestCase):
         self.assertEqual(interval, 'PT1M')  # durable one-minute timer
         record = pathlib.Path(self.directory.name) / 'autostart-task-name.txt'
         self.assertEqual(record.read_text(encoding='ascii').strip(), self.TASK)
+        # No console window at all, not even a flash (intake 446227dc).
+        act = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                              '$a=(Get-ScheduledTask -TaskName "' + self.TASK + '").Actions[0]; '
+                              '"$($a.Execute)|$($a.Arguments)"'],
+                             capture_output=True, text=True, timeout=120).stdout.strip()
+        self.assertTrue(act.lower().split('|')[0].endswith('conhost.exe'), act)
+        self.assertIn('--headless', act)
+        self.assertIn('-WindowStyle Hidden', act)
 
     def test_task_name_pick_upgrades_a_user_owned_legacy_task(self):
         """The pick must compare Task Scheduler's bare account form
