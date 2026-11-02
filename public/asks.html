@@ -7,24 +7,32 @@
   <link rel="stylesheet" href="/vendor/dakit/dakit.css">
   <link rel="stylesheet" href="/auth.css">
   <link rel="stylesheet" href="/engines.css">
+  <style>
+    .ask-list { display: grid; gap: 12px; }
+    .ask-card { min-width: 0; padding: 14px; border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-md); background: var(--dk-bg-muted); }
+    .ask-card__head, .ask-card__foot { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
+    .ask-card__text { margin: 12px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .ask-card__verbatim { margin: 8px 0; color: var(--dk-text-muted); }
+    .ask-card__verbatim summary { width: fit-content; cursor: pointer; }
+    .ask-card__meta { color: var(--dk-text-muted); font-size: var(--dk-text-xs); }
+    @media (max-width: 820px) { .ask-card__head, .ask-card__foot { align-items: flex-start; flex-direction: column; } }
+  </style>
   <script src="/auth.js"></script>
   <script src="/asks.js" defer></script>
 </head>
 <body>
 <main class="dk-main" id="main-content">
   <div class="dk-main__inner engine-page">
-    <nav aria-label="Navigation"><a href="/">Agent Hub</a> · <a href="/intake">Intake</a></nav>
+    <nav aria-label="Navigation"><a href="/">Agent Hub</a> · <a href="/intake">Tasks</a></nav>
     <h1>Ask ledger</h1>
     <p>Every message Alexey sends an agent, split into asks. Each ask must map to an intake acceptance-criteria line within 30 minutes; an intake cannot close while a mapped ask is not marked met.</p>
     <p id="status" role="status">Loading…</p>
+    <p><label for="ask-filter">Search asks</label><br><input id="ask-filter" class="dk-input" type="search" placeholder="Search verbatim text, source ID or intake ID"></p>
     <p><label>State <select id="state" class="dk-input">
-      <option value="">all</option><option>unmapped</option><option>pending</option><option>mapped</option><option>dropped_after_done</option>
+      <option value="unresolved">Unresolved mapping work</option><option value="">All states</option><option>unmapped</option><option>pending</option><option>mapped</option><option>dropped_after_done</option>
       <option>verified</option><option>not_an_ask</option><option>closed_unverified</option><option>cancelled</option>
     </select></label></p>
-    <div class="dk-table-wrap"><table class="dk-table">
-      <thead><tr><th>State</th><th>Source ref</th><th>Ask (verbatim)</th><th>Intake · AC line</th><th>Received</th></tr></thead>
-      <tbody id="rows"></tbody>
-    </table></div>
+    <div id="rows" class="ask-list" aria-label="Ask records"></div>
     <h2>Sources and gaps</h2>
     <div id="sources"></div>
   </div>
