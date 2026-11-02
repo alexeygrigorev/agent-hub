@@ -34,8 +34,16 @@ describe('Hub driver access bounds', () => {
     })).toBe(false);
     expect(driverIntakeMutationAllowed('/tasks/item/assign', {
       key: 'link-session', expected_version: 2,
-      session: { workspace: 'agent-hub', mode: 'interactive' }, provenance: 'unknown',
+      session: { workspace: 'agent-hub', mode: 'headless' }, provenance: 'unknown',
     })).toBe(true);
+    for (const session of [
+      { workspace: 'agent-hub', mode: 'interactive' },
+      { workspace: 'agent-hub', mode: 'headless', engine: 'codex' },
+      { workspace: 'agent-hub', mode: 'headless', machine: 'host-a' },
+      { workspace: 'agent-hub', mode: 'headless', parent_id: 'foreign-session' },
+    ]) expect(driverIntakeMutationAllowed('/tasks/item/assign', {
+      key: 'forbidden-link-session', expected_version: 2, session, provenance: 'unknown',
+    })).toBe(false);
     expect(driverIntakeMutationAllowed('/tasks/item', {
       key: 'clear-ac', expected_version: 2, acceptance_criteria: null,
     })).toBe(false);

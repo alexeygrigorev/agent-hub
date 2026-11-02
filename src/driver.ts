@@ -93,8 +93,16 @@ export class DriverService {
     // can become orphaned. Stable keys recover downstream effects after a crash.
     if (row.phase === 'starting') {
       const started = await this.start(row, auth);
-      if (started.status >= 400) return started;
       row = this.get(row.id)!;
+      if (started.status >= 400 && !row.session_id) {
+        // A terminal refusal with no session can be stopped locally. An
+        // uncertain create must keep its generation live for a later retry.
+        if (row.phase === 'rejected') {
+          this.sql.exec("UPDATE hub_drivers SET phase='stopped' WHERE id=?", row.id);
+          return reply({ ...(await this.view(this.get(row.id), auth)), stopped: true });
+        }
+        return reply({ error: 'driver_start_uncertain', retry_key: row.request_key }, 503);
+      }
     }
     if (row.schedule_id) {
       const paused = await this.call(this.schedules, '/api/session-schedules/' + row.schedule_id + '/pause', auth, {});
@@ -137,13 +145,25 @@ export class DriverService {
       row.session_id = started.body.id;
       this.sql.exec('UPDATE hub_drivers SET session_id=? WHERE id=?', row.session_id, row.id);
     }
-    if (started.status >= 400 || terminal.has(String(started.body.state ?? ''))) {
+    const sessionState = String(started.body.state ?? '');
+    const held = sessionState === 'held' && (started.status < 400 || started.status === 409);
+    if (terminal.has(sessionState)) {
       this.sql.exec("UPDATE hub_drivers SET phase='rejected' WHERE id=?", row.id);
       return reply({ error: 'driver_start_failed', detail: started.body, retry_key: row.request_key },
-        started.status >= 400 ? started.status : 503);
+        started.status >= 400 ? started.status : 409);
+    }
+    if (started.status >= 400 && !held) {
+      // 429 and server errors may follow a committed create or a transient
+      // service failure. Keep the singleton recoverable under the same key;
+      // only deterministic client refusals release the generation.
+      if (started.status === 429 || started.status >= 500) {
+        return reply({ error: 'driver_start_uncertain', detail: started.body, retry_key: row.request_key }, started.status);
+      }
+      this.sql.exec("UPDATE hub_drivers SET phase='rejected' WHERE id=?", row.id);
+      return reply({ error: 'driver_start_failed', detail: started.body, retry_key: row.request_key }, started.status);
     }
     if (!row.session_id) {
-      return reply({ error: 'driver_start_failed', detail: started.body, retry_key: row.request_key }, started.status >= 300 ? started.status : 503);
+      return reply({ error: 'driver_start_uncertain', detail: started.body, retry_key: row.request_key }, 503);
     }
     // Every engine starts at its normal empty interactive prompt. Deliver the
     // standing order through the existing durable, readiness-checked queue.
@@ -193,6 +213,8 @@ export class DriverService {
     if (op.result_id) {
       const prior = this.get(op.result_id)!;
       if (prior.phase === 'starting') return this.start(prior, this.rowAuth(auth, prior));
+      if (prior.phase === 'rejected') return reply({ error: 'driver_start_rejected',
+        ...(await this.view(prior, auth)), replay: true }, 409);
       return reply({ ...(await this.view(prior, auth)), replay: true });
     }
     let inherited: any = {};

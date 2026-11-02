@@ -153,7 +153,11 @@ export function driverIntakeMutationAllowed(path: string, payload: any): boolean
       Object.keys(payload.note).every(key => ['text', 'source'].includes(key)) && typeof payload.note.text === 'string';
   }
   if (/^\/tasks\/[A-Za-z0-9._:-]+\/assign$/.test(path)) {
-    return only(['key', 'expected_version', 'session', 'provenance', 'current_state', 'next_step', 'owner']);
+    if (!only(['key', 'expected_version', 'session', 'provenance', 'current_state', 'next_step', 'owner'])) return false;
+    const session = payload.session;
+    if (session === undefined) return true;
+    return !!session && typeof session === 'object' && !Array.isArray(session) &&
+      session.mode === 'headless' && !('engine' in session) && !('machine' in session) && !('parent_id' in session);
   }
   if (/^\/tasks\/[A-Za-z0-9._:-]+$/.test(path)) {
     return only(['key', 'expected_version', 'title', 'current_state', 'next_step', 'owner', 'uncertainty']);
