@@ -33,7 +33,11 @@ def test_invalid_goal_cli_has_no_http_effect(args):
     req.assert_not_called()
 
 
-def test_goal_native_start_uses_trusted_command_and_literal_argument():
+def test_goal_native_start_uses_trusted_command_and_literal_argument(monkeypatch):
+    # The shared preamble is larger than the engine goal limit, so compact it
+    # here to exercise the inline literal-argument path. The oversized path
+    # (pointer + private full brief) is covered by dedicated tests below.
+    monkeypatch.setattr(session_rules, 'SESSION_PREAMBLE', 'Hub session rules:\n' + AWS_MAIN_TEMP_RULE)
     with tempfile.TemporaryDirectory() as tmp:
         cfg = settings(Path(tmp))
         cfg['subscriptions'][0]['startup_argv'] = ['trusted-codex', '--safe']
@@ -56,8 +60,9 @@ def test_goal_native_start_uses_trusted_command_and_literal_argument():
             d.dispatch(offer(with_goal=True, mode='headless', prompt='fix'))
 
 
-def test_managed_codex_goal_route_has_admission_and_uses_installed_execution(tmp_path):
+def test_managed_codex_goal_route_has_admission_and_uses_installed_execution(tmp_path, monkeypatch):
     from agent_hub_host.model_contract import policy_models, native_model
+    monkeypatch.setattr(session_rules, 'SESSION_PREAMBLE', 'Hub session rules:\n' + AWS_MAIN_TEMP_RULE)
     selected = next(m for m in policy_models() if m['id'] == 'astra')
     sub = dict(service='codex', engine='codex', account_label='shared-codex',
                profile='hub-shared-codex', admission_argv=['managed-admission'],
@@ -104,10 +109,11 @@ ZCODEX_STARTUP_ARGV = ['/usr/local/bin/zcodex', '--dangerously-bypass-approvals-
                        '-c', 'check_for_update_on_startup=false']
 
 
-def test_zcodex_goal_route_advertised_and_started_from_trusted_argv(tmp_path):
+def test_zcodex_goal_route_advertised_and_started_from_trusted_argv(tmp_path, monkeypatch):
     """t1654u: zcodex supports /goal — an unmanaged zcodex subscription with a
     trusted startup argv advertises a goal route and the launcher delivers the
     /goal brief as the literal final argument (intake 28302c74 AC1/AC2)."""
+    monkeypatch.setattr(session_rules, 'SESSION_PREAMBLE', 'Hub session rules:\n' + AWS_MAIN_TEMP_RULE)
     cfg = settings(tmp_path)
     cfg['subscriptions'] += [dict(service='zai', engine='zcodex', account_label='shared-zai',
                                   profile=None, admission_argv=['gate'],
@@ -206,10 +212,11 @@ def test_plain_interactive_preamble_queues_same_workspace(tmp_path):
     assert not [c for c in calls if len(c[0]) > 2 and c[0][1:3] == ['message', 'send']]
 
 
-def test_claude_goal_route_advertised_and_started_with_goal(tmp_path):
+def test_claude_goal_route_advertised_and_started_with_goal(tmp_path, monkeypatch):
     """Claude Code supports /goal (intake bf0863c4): a launchable Claude
     subscription advertises a goal route and the goal text is the literal
     final argument of the trusted startup command."""
+    monkeypatch.setattr(session_rules, 'SESSION_PREAMBLE', 'Hub session rules:\n' + AWS_MAIN_TEMP_RULE)
     cfg = settings(tmp_path)
     cfg['subscriptions'] += [dict(service='claude', engine='claude', account_label='shared-claude',
                                   profile=None, admission_argv=['gate'],
