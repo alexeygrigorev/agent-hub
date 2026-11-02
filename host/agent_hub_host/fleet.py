@@ -4232,23 +4232,23 @@ class Dispatcher:
                             'observed_at': utcnow()})
                 elif sub.get('service') == 'codex':
                     reason = gate.get('reason', '')
-                    # Only a Hub quota verdict is a refusal; anything else
-                    # (Hub unreachable, local profile repair) carries no
-                    # credential verdict and stays fail-open server-side.
-                    if not re.fullmatch(r'codex_quota_gate_[a-z0-9_]{1,64}', reason):
-                        reason = 'codex_quota_gate_quota_check_failed'
-                    for mode in caps['fleet_modes']:
-                        caps['fleet_route_rejections'].append({
-                            'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
-                            'profile': sub.get('profile'), 'mode': mode,
-                            'reason': reason, 'observed_at': utcnow()})
+                    # Publish only a specific Hub quota verdict. A generic
+                    # admission response (or quota_check_failed, which means
+                    # the probe itself crashed) says nothing about this
+                    # account's credentials and must not become a route
+                    # refusal. The Worker intentionally fails open for that
+                    # diagnostic; dispatch rechecks admission before launch.
+                    if re.fullmatch(r'codex_quota_gate_[a-z0-9_]{1,64}', reason) \
+                            and reason != 'codex_quota_gate_quota_check_failed':
+                        for mode in caps['fleet_modes']:
+                            caps['fleet_route_rejections'].append({
+                                'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
+                                'profile': sub.get('profile'), 'mode': mode,
+                                'reason': reason, 'observed_at': utcnow()})
             except Exception:
-                if sub.get('service') == 'codex':
-                    for mode in caps['fleet_modes']:
-                        caps['fleet_route_rejections'].append({
-                            'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
-                            'profile': sub.get('profile'), 'mode': mode,
-                            'reason': 'codex_quota_gate_quota_check_failed', 'observed_at': utcnow()})
+                # Probe errors have no quota verdict. Do not turn transport or
+                # decoding failures into account-specific refusals.
+                continue
         return allowed, admitted_engines
 
     def _offers_lock_path(self):
