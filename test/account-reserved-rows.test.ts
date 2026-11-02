@@ -12,6 +12,19 @@ function request(path: string) {
   return new Request('https://hub.test/api/fleet' + path, { method: 'GET' });
 }
 
+function tableSnapshot(sql: any) {
+  const names = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+    .toArray().map((row: any) => String(row.name));
+  return names.map((name: string) => {
+    const count = Number(sql.exec(`SELECT COUNT(*) AS n FROM "${name}"`).one().n);
+    const columns = sql.exec(`PRAGMA table_info("${name}")`).toArray().map((column: any) => String(column.name));
+    const updatedAt = columns.includes('updated_at')
+      ? sql.exec(`SELECT updated_at FROM "${name}"`).toArray().map((row: any) => row.updated_at).sort((a: any, b: any) => String(a).localeCompare(String(b)))
+      : null;
+    return { name, count, updatedAt };
+  });
+}
+
 it('returns every accounted reserved launch, including rows outside the latest-200 fleet view', async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName(crypto.randomUUID()));
   await inDO(stub, async (hub: any, state: any) => {
@@ -56,6 +69,7 @@ it('returns every accounted reserved launch, including rows outside the latest-2
     service.init();
 
     const listedByAccountView = new Set(sql.exec('SELECT id FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => row.id));
+    const beforeReads = tableSnapshot(sql);
     const pages: any[] = [];
     let cursor: string | null = null;
     do {
@@ -69,6 +83,7 @@ it('returns every accounted reserved launch, including rows outside the latest-2
       cursor = page.next_cursor;
     } while (cursor);
 
+    expect(tableSnapshot(sql)).toEqual(beforeReads);
     const status = service.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='hub-claude'").one());
     expect(status.reserved).toBe(205);
     expect(pages).toHaveLength(status.reserved);

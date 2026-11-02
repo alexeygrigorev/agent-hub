@@ -27,6 +27,7 @@ export function sampleAccountCapacityHistory(
   if (latest !== null && latest !== undefined && Number.isFinite(Number(latest)) && nowMs - Number(latest) < SAMPLE_INTERVAL_MS) return 0;
 
   let recorded = 0;
+  let totalRows = Number(sql.exec('SELECT COUNT(*) AS n FROM fleet_account_capacity_history').one()?.n ?? 0);
   for (const account of getAccounts()) {
     if (typeof account?.label !== 'string' || !account.label ||
         !Number.isInteger(account.active) || account.active < 0 ||
@@ -34,18 +35,17 @@ export function sampleAccountCapacityHistory(
         !Number.isInteger(account.max_concurrency) || account.max_concurrency < 0 ||
         (account.native_live !== null && account.native_live !== undefined &&
           (!Number.isInteger(account.native_live) || account.native_live < 0))) continue;
-    sql.exec(`INSERT OR IGNORE INTO fleet_account_capacity_history
+    if (totalRows >= ACCOUNT_CAPACITY_HISTORY_MAX_TOTAL_ROWS) break;
+    const accountRows = Number(sql.exec('SELECT COUNT(*) AS n FROM fleet_account_capacity_history WHERE account = ?', account.label).one()?.n ?? 0);
+    if (accountRows >= ACCOUNT_CAPACITY_HISTORY_MAX_ROWS) continue;
+    const inserted = sql.exec(`INSERT OR IGNORE INTO fleet_account_capacity_history
       (account, observed_at_ms, active, reserved, native_live, concurrency_limit)
       VALUES (?, ?, ?, ?, ?, ?)`, account.label, nowMs, account.active, account.reserved,
-      account.native_live ?? null, account.max_concurrency);
-    sql.exec(`DELETE FROM fleet_account_capacity_history WHERE account = ? AND observed_at_ms NOT IN
-      (SELECT observed_at_ms FROM fleet_account_capacity_history WHERE account = ?
-       ORDER BY observed_at_ms DESC LIMIT ?)`, account.label, account.label, ACCOUNT_CAPACITY_HISTORY_MAX_ROWS);
-    recorded++;
+      account.native_live ?? null, account.max_concurrency).rowsWritten;
+    const added = inserted > 0 ? 1 : 0;
+    recorded += added;
+    totalRows += added;
   }
-  sql.exec('DELETE FROM fleet_account_capacity_history WHERE observed_at_ms < ?', nowMs - ACCOUNT_CAPACITY_HISTORY_MAX_WINDOW_MS);
-  sql.exec(`DELETE FROM fleet_account_capacity_history WHERE rowid NOT IN
-    (SELECT rowid FROM fleet_account_capacity_history ORDER BY observed_at_ms DESC LIMIT ?)`, ACCOUNT_CAPACITY_HISTORY_MAX_TOTAL_ROWS);
   return recorded;
 }
 
@@ -61,7 +61,8 @@ export function readAccountCapacityHistory(
       toMs - fromMs > ACCOUNT_CAPACITY_HISTORY_MAX_WINDOW_MS || !Number.isInteger(limit) || limit < 1 || limit > 100 ||
       (afterMs !== null && (!Number.isSafeInteger(afterMs) || afterMs < fromMs || afterMs >= toMs)))
     throw new Error('invalid_capacity_history_query');
-  initAccountCapacityHistory(sql);
+  const exists = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fleet_account_capacity_history'").toArray().length > 0;
+  if (!exists) return { rows: [], next_cursor: null };
   const rows = sql.exec(`SELECT observed_at_ms, active, reserved, native_live, concurrency_limit
     FROM fleet_account_capacity_history
     WHERE account = ? AND observed_at_ms >= ? AND observed_at_ms < ? AND (? IS NULL OR observed_at_ms > ?)

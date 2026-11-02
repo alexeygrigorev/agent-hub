@@ -21,7 +21,7 @@ import { LivenessService } from './liveness';
 import { SILENT_START_MS, SILENT_START_REASON, ABANDONED_RECOVERY_MS, abandonedLaunch, expireSilentStartRows } from './silent-start';
 import { reconcileAccountCapacity } from './account_capacity';
 import { ACTIVE_LAUNCH_STATES_SQL, countReservedLaunches, parseReservedLaunchCursor, reservedLaunchPage, type ReservedLaunchContext } from './account-reserved-launches';
-import { initAccountCapacityHistory, readAccountCapacityHistory } from './account-capacity-history';
+import { readAccountCapacityHistory } from './account-capacity-history';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
@@ -2248,14 +2248,11 @@ export class FleetService {
       if (accountRead[2] === 'reserved-launches') {
         try {
           const cursor = parseReservedLaunchCursor(params.get('cursor'));
-          return this.withMaintenance(() => {
-            this.reconcileCapacity();
-            const nowMs = this.now();
-            const liveIds = this.liveAccountMachines(nowMs).ids;
-            const page = reservedLaunchPage(this.sql, accountLabel,
-              this.reservedLaunchContext([...liveIds], nowMs), limit, cursor);
-            return response({ account: accountLabel, live_ids: [...liveIds].sort(), ...page });
-          });
+          const nowMs = this.now();
+          const liveIds = this.liveAccountMachines(nowMs).ids;
+          const page = reservedLaunchPage(this.sql, accountLabel,
+            this.reservedLaunchContext([...liveIds], nowMs), limit, cursor);
+          return response({ account: accountLabel, live_ids: [...liveIds].sort(), ...page });
         } catch (error) {
           return response({ error: error instanceof Error && error.message === 'invalid_reserved_launch_cursor' ? 'invalid_cursor' : 'reserved_launch_read_failed' }, 400);
         }
@@ -2267,9 +2264,9 @@ export class FleetService {
       const afterRaw = params.get('cursor');
       const afterMs = afterRaw === null ? null : /^\d{1,16}$/.test(afterRaw) ? Number(afterRaw) : NaN;
       try {
-        initAccountCapacityHistory(this.sql);
         const history = readAccountCapacityHistory(this.sql, accountLabel, fromMs, toMs, limit, afterMs);
-        return response({ account: accountLabel, from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), ...history });
+        return response({ account: accountLabel, from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(),
+          history_note: 'Capacity history starts at deployment; no historical backfill is available.', ...history });
       } catch {
         return response({ error: 'invalid_capacity_history_query' }, 400);
       }

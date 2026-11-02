@@ -6,32 +6,34 @@ from unittest.mock import patch
 
 
 class FleetAdminReadCliTest(unittest.TestCase):
-    def run_cli(self, argv):
+    def run_cli(self, argv, result=None):
         from agent_hub_host import cli, session_control
 
         calls = []
+        output = io.StringIO()
 
         def request(method, path, payload=None):
             calls.append((method, path, payload))
-            return {"rows": []}
+            return result if result is not None else {"rows": []}
 
         with patch.object(sys, "argv", ["hub", *argv]), \
                 patch.object(session_control, "request", side_effect=request), \
-                contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(output):
             cli.main()
-        return calls
+        return calls, output.getvalue()
 
     def test_reserved_launches_uses_admin_api_and_bounded_page(self):
-        calls = self.run_cli(["fleet-reservations", "hub claude", "--limit", "100", "--cursor", "next/page"])
+        calls, _ = self.run_cli(["fleet-reservations", "hub claude", "--limit", "100", "--cursor", "next/page"])
         self.assertEqual(calls, [("GET", "/api/fleet/accounts/hub%20claude/reserved-launches?limit=100&cursor=next%2Fpage", None)])
 
     def test_capacity_history_passes_account_window_and_limit(self):
-        calls = self.run_cli([
+        calls, output = self.run_cli([
             "fleet-capacity-history", "hub-claude",
             "--from", "2026-11-01T04:20:00Z", "--to", "2026-11-01T05:00:00Z",
             "--cursor", "1793507000000",
-        ])
+        ], {"history_note": "Capacity history starts at deployment; no historical backfill is available.", "rows": []})
         self.assertEqual(calls, [("GET", "/api/fleet/accounts/hub-claude/capacity-history?from=2026-11-01T04%3A20%3A00Z&to=2026-11-01T05%3A00%3A00Z&limit=100&cursor=1793507000000", None)])
+        self.assertIn("Capacity history starts at deployment; no historical backfill is available.", output)
 
     def test_reserved_launches_rejects_unbounded_page_before_network(self):
         from agent_hub_host import cli, session_control
