@@ -5,7 +5,7 @@
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { effectiveCheckin } from './registry';
-import { accountCapacityAlerts } from './account_capacity';
+import { accountCapacityAlerts, quotaProbeStaleAlerts } from './account_capacity';
 import { resolveMachineAliases, aliasDetail, projectAliasSessions } from './machine-alias';
 import { freshCatalogs } from './catalog-freshness';
 import { classifySessionStall, initSessionStalls, orphanFailure, toolCallStallThreshold } from './session_stall';
@@ -191,6 +191,7 @@ export class LivenessService {
     }
 
     subjects.push(...accountCapacityAlerts(this.sql, now));
+    subjects.push(...quotaProbeStaleAlerts(this.sql, now));
     subjects.push(...(this.pressureProjection?.() || []));
     for (const h of this.sql.exec('SELECT * FROM agent_heartbeats ORDER BY actor').toArray() as any[]) {
       const age = ageSeconds(h.at, now);

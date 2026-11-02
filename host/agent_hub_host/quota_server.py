@@ -10,6 +10,7 @@ import http.cookiejar
 import json
 import os
 import re
+import sys
 from pathlib import Path
 import stat
 import urllib.error
@@ -26,6 +27,19 @@ from . import config, quota_snapshot
 WIRE_PROVIDER = {'antigravity': 'gemini'}
 # Native account label -> managed account that owns the same login.
 NATIVE_ALIAS_OF = {'shared-gemini': 'hub-antigravity'}
+
+
+def expand_release_placeholders(argv):
+    """Resolve ``{python}`` and ``{host}`` to the release this collector itself runs from.
+
+    The managed-account reader then always matches the unit's release
+    drop-in: a host-release bump moves both together and no release path is
+    ever hardcoded in quota-server.json (intake e0af55f3).
+    """
+    if not isinstance(argv, list):
+        return argv
+    values = {'{python}': sys.executable, '{host}': str(Path(__file__).resolve().parents[1])}
+    return [values.get(a, a.replace('{host}', values['{host}'])) if isinstance(a, str) else a for a in argv]
 
 
 class CollectionError(ValueError):
@@ -83,7 +97,7 @@ def collect_accounts(settings, *, runner=None):
         entries = state
         if not isinstance(entries, list) or len(entries) > 32:
             raise ValueError('Invalid managed account catalog')
-        argv = settings.get('managed_quota_argv', ['hub', 'engines', 'quota'])
+        argv = expand_release_placeholders(settings.get('managed_quota_argv', ['hub', 'engines', 'quota']))
         try:
             # Probe the same install whose catalog was just read. Without
             # this the probe resolved its managed dir from HUB_CONFIG_FILE

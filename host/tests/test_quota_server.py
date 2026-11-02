@@ -252,3 +252,13 @@ class ServerQuotaTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn('CollectionError', out.getvalue())
             self.assertIn('odd-one', out.getvalue())
+
+
+class ReleasePlaceholderTests(unittest.TestCase):
+    def test_placeholders_follow_the_running_release(self):
+        import sys
+        argv = ['env', 'PYTHONPATH={host}', '{python}', '-m', 'agent_hub_host.cli', 'engines', 'quota']
+        out = quota_server.expand_release_placeholders(argv)
+        self.assertEqual(out[2], sys.executable)
+        self.assertTrue(out[1].startswith('PYTHONPATH=') and out[1].endswith('host'))
+        self.assertEqual(quota_server.expand_release_placeholders(['hub', 'engines', 'quota']), ['hub', 'engines', 'quota'])

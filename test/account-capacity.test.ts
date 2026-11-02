@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
 import { LivenessService } from '../src/liveness';
-import { reconcileAccountCapacity, accountCapacityAlerts } from '../src/account_capacity';
+import { reconcileAccountCapacity, accountCapacityAlerts, quotaProbeStaleAlerts } from '../src/account_capacity';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { SESSION_CONTROL_SCHEMA, SessionControlService } from '../src/session_control';
@@ -551,3 +551,18 @@ describe('phantom account reservations', () => {
   }));
 });
 
+
+describe('quota probe staleness alert', () => {
+  it('raises only when every server observation is older than 30 minutes', () => fixture(async (_f, sql) => {
+    sql.exec('CREATE TABLE IF NOT EXISTS server_quota_snapshots (account TEXT PRIMARY KEY, provider TEXT NOT NULL, captured_at TEXT NOT NULL, quota_json TEXT NOT NULL)');
+    expect(quotaProbeStaleAlerts(sql, now)).toEqual([]);
+    sql.exec("INSERT INTO server_quota_snapshots VALUES ('a','codex',?, '{}')", iso(-31 * 60000));
+    sql.exec("INSERT INTO server_quota_snapshots VALUES ('b','go',?, '{}')", iso(-90 * 60000));
+    const alerts = quotaProbeStaleAlerts(sql, now);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({ kind: 'agent', id: 'quota-server', state: 'stale' });
+    expect(alerts[0].detail).toContain('older than 30m');
+    sql.exec("UPDATE server_quota_snapshots SET captured_at = ? WHERE account = 'b'", iso(-60000));
+    expect(quotaProbeStaleAlerts(sql, now)).toEqual([]);
+  }));
+});
