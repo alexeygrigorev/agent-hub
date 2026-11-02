@@ -2679,7 +2679,7 @@ export class FleetService {
             (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup', 'terminal_error', 'goal_status', 'sampled_at', 'last_cpu_at']) ||
               (s.progress.sampled_at !== undefined && (typeof s.progress.sampled_at !== 'string' || !fresh(s.progress.sampled_at, this.now() + 60000, 366 * 86400000))) ||
               (s.progress.goal_status !== undefined && !GOAL_STATUSES.includes(s.progress.goal_status)) ||
-              (s.progress.terminal_error !== undefined && (!((s.progress.terminal_error === 'codex_reconnect_failed' && s.engine === 'codex') || (['zcodex_agent_exited', 'zcodex_reconnect_failed'].includes(s.progress.terminal_error) && s.engine === 'zcodex')) || s.progress.headless !== false)) ||
+              (s.progress.terminal_error !== undefined && (!((s.progress.terminal_error === 'codex_reconnect_failed' && s.engine === 'codex') || (['zcodex_agent_exited', 'zcodex_reconnect_failed'].includes(s.progress.terminal_error) && s.engine === 'zcodex') || (s.progress.terminal_error === 'goal_rejected' && s.engine === 'claude')) || s.progress.headless !== false)) ||
               typeof s.progress.last_progress_at !== 'string' || !fresh(s.progress.last_progress_at, this.now() + 60000, 366 * 86400000) ||
               (s.progress.last_cpu_at !== undefined && (typeof s.progress.last_cpu_at !== 'string' || !fresh(s.progress.last_cpu_at, this.now() + 60000, 366 * 86400000))) ||
               typeof s.progress.headless !== 'boolean' || ![true, false, null].includes(s.progress.agent_alive) ||
