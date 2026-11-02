@@ -94,6 +94,9 @@ def test_requested_models_resolve_through_the_gemini_policy_family():
     from agent_hub_host.model_contract import policy_models
     policy = policy_models()
     default = p.launcher_metadata('antigravity', {'args': []})['launcher_model']
+    # Intake 9647e6d5: default routing never uses high effort, so the managed
+    # default is gemini-4-argon-medium and gemini-4-argon-high is not policy
+    # listed at all anymore.
     assert default == 'gemini-4-argon-medium'
     assert p.managed_model_allowed('antigravity', default, policy)
     assert p.managed_model_allowed('antigravity', 'gemini-4-argon-medium', policy)

@@ -239,7 +239,10 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE fleet_accounts SET provider='gemini' WHERE label='shared-codex'");
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
     // Duplicate model ids are forbidden: each engine alternative has its own
-    // policy id (argon for antigravity, argon-gemini for gemini).
+    // policy id (argon for antigravity, argon-gemini for gemini). Default
+    // routing never uses high effort (intake 9647e6d5): antigravity resolves
+    // to gemini-4-argon-medium, the gemini engine to gemini-2.5-pro.
+    const expectedModel = { antigravity: 'gemini-4-argon-medium', gemini: 'gemini-2.5-pro' } as const;
     for (const [engine, modelId] of [['antigravity', 'argon'], ['gemini', 'argon-gemini']] as const) {
       sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
       sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
