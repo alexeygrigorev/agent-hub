@@ -82,14 +82,19 @@ CONTROLLER_MATCH_KEYS = ('id', 'tag', 'engine', 'created_at_ms', 'command')
 
 
 def same_controller(row, receipt):
-    return all(row.get(key) == receipt.get(key) for key in CONTROLLER_MATCH_KEYS)
+    return bool(row) and all(row.get(key) == receipt.get(key) for key in CONTROLLER_MATCH_KEYS)
 
 
-def controller_crash_service(row, receipt):
-    """A missing/changed receipt or observation timeout is never crash evidence."""
-    if (not same_controller(row, receipt) or receipt.get('engine') != 'shell'
-            or row.get('worker_alive') is not False
-            or row.get('phase') not in ('exited', 'broken', 'failed', 'dead', 'stopped')):
+def controller_crash_service(row, receipt, *, record_removed=False):
+    """Build health evidence for the exact dead child, including verified catalog absence."""
+    if receipt.get('engine') != 'shell' or not receipt.get('id'):
+        return None
+    if record_removed:
+        if (not receipt.get('tag') or type(receipt.get('created_at_ms')) is not int
+                or not isinstance(receipt.get('command'), list)):
+            return None
+    elif (not same_controller(row, receipt) or row.get('worker_alive') is not False
+          or row.get('phase') not in ('exited', 'broken', 'failed', 'dead', 'stopped')):
         return None
     from datetime import datetime, timezone
     stamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
@@ -98,9 +103,10 @@ def controller_crash_service(row, receipt):
                 reason='service_crash')
 
 
-def publish_controller_crash(row, receipt, health_path, *, collector_factory=None, publish=None):
+def publish_controller_crash(row, receipt, health_path, *, collector_factory=None, publish=None,
+                             service=None):
     """Report only this supervisor's exact dead child; never restart other workers."""
-    service = controller_crash_service(row, receipt)
+    service = service or controller_crash_service(row, receipt)
     if service is None:
         return False
     try:
@@ -161,7 +167,11 @@ def main():
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    command = [sys.executable, '-u', '-m', 'agent_hub_host.session_host',
+    boot_log = journal / 'session-host-bootstrap.log'
+    boot_wrapper = workspace / 'host' / 'agent_hub_host' / 'bootstrap_log.py'
+    command = [sys.executable, '-u', str(boot_wrapper),
+               '--log', str(boot_log),
+               '--', '-m', 'agent_hub_host.session_host',
                '--config', str(config_path),
                '--journal-dir', str(journal)]
     env_args = [
@@ -173,7 +183,8 @@ def main():
         if var in os.environ:
             env_args.extend(['--env', f'{var}={os.environ[var]}'])
     attempt = lambda: run_controller(args, workspace, command, tag_prefix='hub-controller-',
-                                     env_args=env_args, journal=journal, stop=stop)
+                                     env_args=env_args, journal=journal, stop=stop,
+                                     boot_log=boot_log)
     if args.control_dir and is_windows():
         # Windows Task Scheduler restarts a task only when it fails to LAUNCH,
         # never on a non-zero action exit, so one supervisor exception left
@@ -207,6 +218,63 @@ def failure_reason(error):
     return reason
 
 
+def bounded_text(error, limit=300):
+    """Sanitized single-line exception text, including native stderr when present."""
+    try:
+        from agent_hub_host.exit_evidence import sanitize
+        detail = getattr(error, 'stderr', None) or str(error)
+        text = sanitize(f'{type(error).__name__}: {detail}', limit)
+    except Exception:
+        text = ''
+    return ' '.join((text or '').split())[:limit] or type(error).__name__
+
+
+def boot_log_tail(path, limit=2048):
+    """Redacted tail of the bootstrap log, where startup stderr survives pruning."""
+    try:
+        with open(path, 'rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - 65536))
+            raw = stream.read(65537)
+    except OSError:
+        return None
+    try:
+        from agent_hub_host.exit_evidence import sanitize
+        return sanitize(raw.decode('utf-8', 'replace'), limit)
+    except Exception:
+        return None
+
+
+def boot_log_exit_code(path):
+    """Read this bootstrap attempt's explicit code when aplexer already pruned its row."""
+    try:
+        with open(path, 'rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - 262144))
+            raw = stream.read(262145)
+        text = raw.decode('utf-8', 'replace').rsplit('=== session_host bootstrap ', 1)[-1]
+        import re
+        matches = re.findall(r'(?m)^session_host_exit_code=(\d+)\s*$', text)
+        return int(matches[-1]) if matches else None
+    except (OSError, ValueError):
+        return None
+
+
+def status_or_absent(receipt):
+    """Return native status, or prove exact-receipt absence with a full listing."""
+    try:
+        return native('status', receipt['id']), None, None
+    except Exception as error:
+        failure = bounded_text(error)
+    try:
+        from agent_hub_host.bootstrap_control import receipt_absent
+        return None, bool(receipt_absent(receipt)), failure
+    except Exception as error:
+        return None, False, failure or bounded_text(error)
+
+
 _SECRETISH = None
 
 
@@ -218,17 +286,60 @@ def redact(text):
     return _SECRETISH.sub('[redacted]', text)
 
 
-def child_output_tail(receipt, limit=1500):
-    """Best-effort tail of the dead child's own output, which never reaches controller.log."""
+def child_output_tail(receipt, limit=2048):
+    """Best-effort redacted aplexer history tail before it is pruned."""
     try:
         ensure_runtime_bin_on_path()
-        result = subprocess.run(['aplexer', 'capture', receipt['id'], '--plain'], capture_output=True,
+        result = subprocess.run(['aplexer', 'capture', receipt['id'], '--bytes', '8192'], capture_output=True,
                                 text=True, timeout=15, stdin=subprocess.DEVNULL)
         if result.returncode:
             return None
-        return redact(result.stdout[-limit:])
+        from agent_hub_host.exit_evidence import sanitize
+        return sanitize(result.stdout, limit)
     except Exception:
         return None
+
+
+def child_exit_event(receipt, row, boot_log, crash_record, crash_posted, history_tail,
+                     status_error=None):
+    """Create the bounded cause record emitted before exact-child cleanup."""
+    event = {'id': receipt['id'],
+             'phase': row.get('phase') if isinstance(row, dict) else 'record_removed',
+             'worker_alive': row.get('worker_alive') if isinstance(row, dict) else None,
+             'crash_published': crash_posted if type(crash_posted) is bool else None,
+             'host_health_crash_record': crash_record,
+             'boot_log': str(boot_log)}
+    exit_info = row.get('exit') if isinstance(row, dict) else None
+    if isinstance(exit_info, dict):
+        if type(exit_info.get('code')) is int:
+            event['exit_code'] = exit_info['code']
+        if type(exit_info.get('signal')) is int:
+            event['exit_signal'] = exit_info['signal']
+    if 'exit_code' not in event:
+        exit_code = boot_log_exit_code(boot_log)
+        if exit_code is not None:
+            event['exit_code'] = exit_code
+    tail = boot_log_tail(boot_log)
+    if tail:
+        event['stderr_tail'] = tail
+    if history_tail:
+        event['history_tail'] = history_tail
+    if status_error:
+        event['status_error'] = status_error
+    return event
+
+
+def log_child_exit(receipt, row, boot_log, health_path, stop, status_error=None,
+                   record_removed=False):
+    crash_record = controller_crash_service(
+        row, receipt, record_removed=record_removed) if isinstance(row, dict) or record_removed else None
+    history_tail = child_output_tail(receipt)
+    log_event('controller_child_exit', **child_exit_event(
+        receipt, row, boot_log, crash_record, None, history_tail, status_error))
+    if not stop.is_set() and crash_record is not None:
+        crash_posted = publish_controller_crash(row, receipt, health_path, service=crash_record)
+        log_event('controller_child_health_publish', id=receipt['id'],
+                  published=bool(crash_posted), record=crash_record)
 
 
 def supervise_windows(attempt, stop, *, clock=None, replacing=lambda: False):
@@ -258,11 +369,16 @@ def supervise_windows(attempt, stop, *, clock=None, replacing=lambda: False):
                     break
 
 
-def confirm_owned_exit(receipt, *, polls=5, interval=2.0, sleep=None):
+def confirm_owned_exit(receipt, *, child_dead=False, polls=5, interval=2.0, sleep=None):
     """Positive Job Object exit proof for our exact child, killing it only if needed."""
     import time
     sleep = sleep or time.sleep
-    row = native('status', receipt['id'])
+    row, absent, status_error = status_or_absent(receipt)
+    if row is None and absent is True and child_dead:
+        return
+    if row is None:
+        raise RuntimeError('Controller status unavailable; exit is unproven'
+                           + (': ' + status_error if status_error else ''))
     if not same_controller(row, receipt):
         raise RuntimeError('Controller identity changed; exit is unproven')
     if row.get('worker_alive') is not False or row.get('containment_empty') is not True:
@@ -276,7 +392,12 @@ def confirm_owned_exit(receipt, *, polls=5, interval=2.0, sleep=None):
             # An already-exited child can refuse kill; status below decides.
             pass
     for index in range(polls):
-        row = native('status', receipt['id'])
+        row, absent, status_error = status_or_absent(receipt)
+        if row is None and absent is True and child_dead:
+            return
+        if row is None:
+            raise RuntimeError('Controller status unavailable; exit is unproven'
+                               + (': ' + status_error if status_error else ''))
         if not same_controller(row, receipt):
             raise RuntimeError('Controller identity changed; exit is unproven')
         if row.get('containment_empty') is True:
@@ -373,7 +494,8 @@ def start_child(workspace, command, tag, env_args):
     return receipt
 
 
-def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, stop):
+def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, stop, boot_log=None):
+    boot_log = pathlib.Path(boot_log or (pathlib.Path(journal) / 'session-host-bootstrap.log'))
     tag = tag_prefix + uuid.uuid4().hex[:12]
     with ExitStack() as stack:
         lease = None
@@ -412,9 +534,14 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
                 if lease and lease.stop_requested():
                     handing_over = True
                     break
-                try:
-                    row = native('status', receipt['id'])
-                except (RuntimeError, OSError, subprocess.TimeoutExpired):
+                row, absent, status_error = status_or_absent(receipt)
+                if row is None and absent is True:
+                    child_died = True
+                    log_child_exit(receipt, None, boot_log, pathlib.Path(journal) / 'host-health.json',
+                                   stop, status_error, record_removed=True)
+                    raise RuntimeError('Controller exited; native record was removed'
+                                       + (': ' + status_error if status_error else ''))
+                if row is None:
                     status_failures += 1
                     if status_failures < STATUS_FAILURES_BEFORE_KILL:
                         continue
@@ -422,7 +549,10 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
                     # Exit is proven only when the record was actually forgotten; otherwise the normal
                     # cleanup path decides (and marks the lease unproven so the loop retries).
                     wedge_recovered = forgotten
-                    raise RuntimeError('Controller wedged: status failed %d times; killed and forgotten' % status_failures)
+                    reason = 'Controller wedged: status failed %d times; killed and forgotten' % status_failures
+                    if status_error:
+                        reason += ': ' + status_error
+                    raise RuntimeError(reason)
                 status_failures = 0
                 if not same_controller(row, receipt):
                     raise RuntimeError('Controller identity changed')
@@ -437,16 +567,11 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
                         marker.unlink()
                         log_event('controller_release_restart', id=receipt['id'])
                         raise SystemExit(RELEASE_RESTART_EXIT)
-                    if not stop.is_set():
-                        publish_controller_crash(row, receipt, journal / 'host-health.json')
+                    log_child_exit(receipt, row, boot_log, pathlib.Path(journal) / 'host-health.json', stop)
                     raise RuntimeError('Controller exited; supervisor will restart')
         except BaseException as error:
             if not isinstance(error, SystemExit):
                 log_event('controller_failed', id=receipt['id'], **failure_reason(error))
-                if child_died:
-                    tail = child_output_tail(receipt)
-                    if tail:
-                        log_event('controller_child_output', id=receipt['id'], tail=tail)
             raise
         finally:
             # Only our exact receipt qualifies for stop. Missing records are not
@@ -458,12 +583,15 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
                     if lease:
                         lease.confirm_exit()
                 elif lease:
-                    confirm_owned_exit(receipt)
+                    confirm_owned_exit(receipt, child_dead=child_died)
                     lease.confirm_exit()
                 else:
-                    row = native('status', receipt['id'])
+                    row, absent, status_error = status_or_absent(receipt)
                     if same_controller(row, receipt):
                         native('kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '30000')
+                    elif not (child_died and absent is True):
+                        raise RuntimeError('Controller identity changed; exit is unproven'
+                                           + (': ' + status_error if status_error else ''))
             except Exception as cleanup_error:
                 if lease:
                     lease.mark_unproven()
