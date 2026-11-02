@@ -8,10 +8,20 @@ from unittest.mock import patch
 
 from agent_hub_host import bootstrap as b, bootstrap_control as c
 from agent_hub_host import installer_hygiene as h
-from . import test_bootstrap_control as base
 
 
-class LiveOrphanHandover(base.HandoverTests):
+class LiveOrphanHandover(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name) / 'control'
+        self.receipt = dict(id='owned', workspace='/release/package', tag='owned-controller',
+                            engine='shell', created_at_ms=1, command=['owned-python'])
+
+    def crash(self, boot='boot-before'):
+        with c.ControllerLease(self.directory, boot_probe=lambda: boot) as lease:
+            lease.publish(self.receipt)
+
     def live(self, **extra):
         return dict(self.receipt, containment_empty=False, **extra)
 
