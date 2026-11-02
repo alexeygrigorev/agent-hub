@@ -456,16 +456,19 @@
       "grok": 0.2
     },
     "low_headroom_percent": 30,
-    "desktop_excluded_providers": [
-      "codex"
-    ],
-    "desktop_hostnames": [
-      "DESKTOP-FP4OP26",
-      "desktop"
-    ],
-    "desktop_machine_ids": [
-      "0sJC0fDcz0bzhG4XQp5EeQ"
-    ],
+    "desktop_codex_guard": {
+      "enabled": true,
+      "reason": "codex-vpn guard (Alexey): OpenAI codex is not placed on the Windows desktop. Set enabled=false (or edit machine_ids/hostnames) to lift; other engines there, including zcodex/zai, stay eligible.",
+      "excluded_providers": [
+        "codex"
+      ],
+      "machine_ids": [
+        "0sJC0fDcz0bzhG4XQp5EeQ"
+      ],
+      "hostnames": [
+        "DESKTOP-FP4OP26"
+      ]
+    },
     "engine_capabilities": {
       "antigravity": {
         "tool_use": true,

@@ -414,18 +414,17 @@ export function isDesktopCodexExcluded(
   if (route.profile === 'zcodex' || route.engine === 'zcodex' || route.provider === 'zai' || family === 'zai') {
     return false;
   }
+  const guard = (policy.rules as any).desktop_codex_guard as
+    { enabled?: boolean; excluded_providers?: string[]; machine_ids?: string[]; hostnames?: string[] } | undefined;
+  if (!guard || guard.enabled === false) return false;
   const effProvider = String(family || route.provider || route.engine || '').toLowerCase();
-  const excludedProviders = (((policy.rules as any).desktop_excluded_providers as string[] | undefined) ?? ['codex']).map(p => p.toLowerCase());
-  if (!excludedProviders.includes(effProvider)) return false;
+  if (!(guard.excluded_providers ?? []).some(p => String(p).toLowerCase() === effProvider)) return false;
   const id = String(machine.id ?? '');
-  // Tabo's canonical machine ID is Linux even when synthetic tests name its hostname 'desktop'.
-  if (id === 'cBynxGDoKVPoGpGWxvCTvg') return false;
-  const desktopIds = ((policy.rules as any).desktop_machine_ids as string[] | undefined) ?? ['0sJC0fDcz0bzhG4XQp5EeQ'];
-  if (desktopIds.includes(id)) return true;
-  const desktopHosts = (((policy.rules as any).desktop_hostnames as string[] | undefined) ?? ['DESKTOP-FP4OP26', 'desktop']).map(h => h.toUpperCase());
+  if ((guard.machine_ids ?? []).includes(id)) return true;
+  const hosts = (guard.hostnames ?? []).map(h => String(h).toUpperCase());
   const hostname = String(machine.hostname ?? '').toUpperCase();
   const name = String(machine.name ?? '').toUpperCase();
-  return desktopHosts.includes(hostname) || desktopHosts.includes(name) || desktopHosts.includes(id.toUpperCase());
+  return hosts.includes(hostname) || hosts.includes(name);
 }
 
 export interface EngineDecisionInput {
