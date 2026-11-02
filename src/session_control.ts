@@ -3053,6 +3053,19 @@ export class SessionControlService {
       let session: any = null;
       if (UUID_RE.test(rawRef)) {
         session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', rawRef).toArray()[0] ?? null;
+        // A native UUID is also a lookup key for Hub-managed sessions. Resolve
+        // that exact identity before the Fleet launch alias below: launch IDs
+        // may be reused by retries/legacy rows and must not make an exact
+        // native UUID ambiguous.
+        if (!session) {
+          const matches = (this.sql.exec('SELECT * FROM session_control_sessions WHERE binding_json IS NOT NULL').toArray() as any[])
+            .filter(row => {
+              if (!this.ownerOk(row, caller)) return false;
+              try { return JSON.parse(row.binding_json).native_id === rawRef; } catch { return false; }
+            });
+          if (matches.length > 1) return response({ error: 'ambiguous_session_uuid', matches: matches.map(row => row.id) }, 409);
+          session = matches[0] ?? null;
+        }
         // Fleet launch UUIDs are also returned to operators. Resolve them to
         // their canonical control session, with the same ownership checks.
         // Hosts must keep using the exact session UUID for binding/retirement.
@@ -3063,18 +3076,6 @@ export class SessionControlService {
               ((request.method === 'GET' && (!sub || ['commands','wakes','pings'].includes(sub))) || (request.method === 'POST' && ['wake','ping','ping-clear'].includes(sub as string)))));
           if (matches.length > 1) return response({ error: 'ambiguous_name' }, 409);
           session = matches[0] ?? null;
-        }
-        if (!session) {
-          const rows = this.sql.exec('SELECT * FROM session_control_sessions WHERE binding_json IS NOT NULL').toArray() as any[];
-          for (const r of rows) {
-            try {
-              const b = JSON.parse(r.binding_json);
-              if (b?.native_id === rawRef) {
-                session = r;
-                break;
-              }
-            } catch {}
-          }
         }
         if (!session && sub !== 'binding' && sub !== 'retirement') {
           const matches = observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller));
