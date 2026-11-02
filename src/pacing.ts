@@ -8,6 +8,7 @@
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import policy from '../config/model-routing.json';
+import { burnForecast, type BurnForecast } from './burn';
 import {
   TBM_FLEET_POOL_ID,
   WINDOW_NOMINAL_CYCLE_MS,
@@ -264,7 +265,7 @@ export const FREE_POOL_PROVIDERS = policy.rules.preferred_providers;
 export const ROUTING_DEFAULTS = { codexPreference: 0.9, grokDemotion: 0.2, urgencyGamma: 1.5 };
 
 /** S(m) factors; the score is their product. */
-export interface RouteScoreFactors { fit: number; health: number; preference: number; headroom: number; urgency: number; pacing: number; grok: number; banked: number }
+export interface RouteScoreFactors { fit: number; health: number; preference: number; headroom: number; urgency: number; pacing: number; grok: number; banked: number; burn?: number }
 
 /** F_fit: exact tier 1.0, deep model on daily task 0.5, anything else (up-tiering) 0. */
 export function taskFit(modelTier: string, taskTier: string): number {
@@ -333,7 +334,13 @@ export type QuotaBurnStatus =
   | 'unmetered';
 
 export interface QuotaBurnAnalysis {
+  /** The one burn factor: pace penalty (<1) when ahead of schedule, else the larger of the pace boost and the expiry forecast boost. */
   factor: number;
+  /** Schedule-pace factor alone (scheduleBurnFactor). */
+  pace_factor: number;
+  /** Use-it-or-lose-it expiry boost alone (src/burn.ts); 1 when no forecast. */
+  expiry_factor: number;
+  forecast: BurnForecast | null;
   ratio: number | null;
   remaining: number | null;
   window_type: string | null;
@@ -343,8 +350,14 @@ export interface QuotaBurnAnalysis {
   windows_summary: string;
 }
 
-export function analyzeQuotaBurn(quota: any, nowMs: number, unmetered = false): QuotaBurnAnalysis {
+export function analyzeQuotaBurn(quota: any, nowMs: number, unmetered = false, opts: { reservePercent?: number; forecast?: boolean } = {}): QuotaBurnAnalysis {
   const base = scheduleBurnFactor(quota, nowMs);
+  // ONE burn notion: schedule pace and expiry forecast describe the same under-use, so they are
+  // combined with max() on the boost side instead of multiplied (no double counting); the
+  // low-headroom / ahead-of-schedule penalty always applies.
+  const forecast = opts.forecast === false ? null : burnForecast(quota, nowMs, Number(opts.reservePercent) || 0);
+  const expiryFactor = forecast ? forecast.factor : 1;
+  const combined = base.factor < 1 ? base.factor : Math.max(base.factor, expiryFactor);
   let bottleneckWindow: string | null = null;
   let bottleneckHours: number | null = null;
   let minRatio: number | null = null;
@@ -388,6 +401,10 @@ export function analyzeQuotaBurn(quota: any, nowMs: number, unmetered = false): 
   }
   return {
     ...base,
+    factor: combined,
+    pace_factor: base.factor,
+    expiry_factor: expiryFactor,
+    forecast,
     window_type: bottleneckWindow,
     hours_to_reset: bottleneckHours,
     depleted,
@@ -450,6 +467,10 @@ export interface EngineDecisionInput {
   tbmWeight: number;
   pinnedEngine?: string | null;
   overrideReason?: string | null;
+  /** Account reserve (percent) excluded from the expiry forecast. */
+  reservePercent?: number;
+  /** false for interactive sessions: no expiry boost (they are not burnable backlog). */
+  expiryForecast?: boolean;
 }
 
 export interface EngineDecisionResult {
@@ -464,6 +485,9 @@ export interface EngineDecisionResult {
     hours_to_reset: number | null;
     burn_ratio: number | null;
     burn_factor: number;
+    pace_factor: number;
+    expiry_factor: number;
+    projected_unused_percent: number | null;
     burn_status: QuotaBurnStatus;
     depleted: boolean;
     provider_weight: number;
@@ -482,7 +506,7 @@ export interface EngineDecisionResult {
 
 export function computeEngineDecision(input: EngineDecisionInput): EngineDecisionResult {
   const unmeteredProviders = ((policy.rules as any).unmetered_providers as string[] | undefined) ?? [];
-  const burn = analyzeQuotaBurn(input.quota, input.nowMs, unmeteredProviders.includes(input.provider));
+  const burn = analyzeQuotaBurn(input.quota, input.nowMs, unmeteredProviders.includes(input.provider), { reservePercent: input.reservePercent, forecast: input.expiryForecast !== false });
   const remainingPct = burn.remaining !== null ? burn.remaining : input.headroomPercent;
   const headroomFactor = Math.max(0.01, input.headroomPercent / 100);
   const pref = providerWeight(input.provider, input.project);
@@ -513,7 +537,7 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
   const overridePart = input.pinnedEngine && input.overrideReason
     ? ` override_reason=${JSON.stringify(input.overrideReason)}`
     : '';
-  const reason = `${mode}: ${input.engine}/${input.account ?? 'default'} (${modelLabel}) on ${input.machine} score=${score.toFixed(4)} [rem=${Math.round(remainingPct)}% ${winPart} ${ratioPart} status=${burn.burn_status} burn=${burn.factor.toFixed(2)}x pref=${pref.toFixed(2)}x tier=${input.tier}(${tierFit.toFixed(2)}x) load=acct:${acctActive}/${maxConc},fam:${famActive} fail=${failures}${overridePart}]`;
+  const reason = `${mode}: ${input.engine}/${input.account ?? 'default'} (${modelLabel}) on ${input.machine} score=${score.toFixed(4)} [rem=${Math.round(remainingPct)}% ${winPart} ${ratioPart} status=${burn.burn_status} burn=${burn.factor.toFixed(2)}x${burn.expiry_factor > 1 ? `(pace ${burn.pace_factor.toFixed(2)}x expiry ${burn.expiry_factor.toFixed(2)}x unused ${burn.forecast?.projected_unused_percent ?? 0}%)` : ""} pref=${pref.toFixed(2)}x tier=${input.tier}(${tierFit.toFixed(2)}x) load=acct:${acctActive}/${maxConc},fam:${famActive} fail=${failures}${overridePart}]`;
   return {
     mode,
     score,
@@ -526,6 +550,9 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
       hours_to_reset: burn.hours_to_reset,
       burn_ratio: burn.ratio !== null ? Math.round(burn.ratio * 1000) / 1000 : null,
       burn_factor: Math.round(burn.factor * 1000) / 1000,
+      pace_factor: Math.round(burn.pace_factor * 1000) / 1000,
+      expiry_factor: Math.round(burn.expiry_factor * 1000) / 1000,
+      projected_unused_percent: burn.forecast ? burn.forecast.projected_unused_percent : null,
       burn_status: burn.burn_status,
       depleted: burn.depleted,
       provider_weight: Math.round(pref * 1000) / 1000,
@@ -542,7 +569,8 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
     },
   };
 }
-export const routeScore = (f: RouteScoreFactors) => f.fit * f.health * f.preference * f.headroom * f.urgency * f.pacing * f.grok * f.banked;
+/** `burn` (src/burn.ts) is the use-it-or-lose-it multiplier; absent stays neutral. */
+export const routeScore = (f: RouteScoreFactors) => f.fit * f.health * f.preference * f.headroom * f.urgency * f.pacing * f.grok * f.banked * (f.burn ?? 1);
 
 /** Per-provider / per-account pacing context for routing, derived from tbm_* rows. */
 export interface ProviderPacing {

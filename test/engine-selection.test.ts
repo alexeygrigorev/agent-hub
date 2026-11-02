@@ -412,3 +412,25 @@ describe('desktop codex guard is config-driven (intake 83d27f69 review)', () => 
     expect(isDesktopCodexExcluded(desktop, { engine: 'codex', provider: 'codex' }, 'codex')).toBe(true);
   });
 });
+
+describe('single burn notion (pace + expiry forecast)', () => {
+  const now = Date.parse('2026-11-02T17:15:00Z');
+  it('combines schedule pace and expiry forecast with max, not a product', () => {
+    const q = makeQuota(now, { pct7d: 95, hours7d: 28 });
+    const a = analyzeQuotaBurn(q, now, false, { reservePercent: 0 });
+    expect(a.pace_factor).toBeGreaterThan(1);
+    expect(a.expiry_factor).toBeGreaterThan(1);
+    expect(a.factor).toBeCloseTo(Math.max(a.pace_factor, a.expiry_factor), 6);
+    expect(a.factor).toBeLessThan(a.pace_factor * a.expiry_factor);
+  });
+  it('ahead-of-schedule low headroom keeps its penalty and is never boosted', () => {
+    const q = makeQuota(now, { pct7d: 15, hours7d: 100.8 });
+    const a = analyzeQuotaBurn(q, now, false, { reservePercent: 0 });
+    expect(a.factor).toBe(a.pace_factor);
+    expect(a.factor).toBeLessThan(1);
+  });
+  it('interactive placement skips the expiry forecast', () => {
+    const q = makeQuota(now, { pct7d: 95, hours7d: 28 });
+    expect(analyzeQuotaBurn(q, now, false, { forecast: false }).expiry_factor).toBe(1);
+  });
+});

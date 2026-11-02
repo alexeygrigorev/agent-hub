@@ -27,6 +27,7 @@ import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql,
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { computeEngineDecision, isDesktopCodexExcluded, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
+import { burnFactor, burnForecast, type BurnForecast } from './burn';
 import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
 import { WORKER_SCOPE, workerAccessContext } from './worker-access';
 import { GOAL_STATUSES } from './intake-session';
@@ -807,11 +808,13 @@ export class FleetService {
     const routes = snapshot ? snapshot.routes.filter(r => r.account === account.label)
       : this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
     let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled; let healthy = false; let unmeteredOk = false;
+    let burn: BurnForecast | null = null;
     const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
     for (const route of routes) {
       const prov = this.observationProvenance(account, route, snapshot);
       if (!prov) continue;
       observed++;
+      burn ??= burnForecast(prov.quota, now, Math.max(Number(account.reserve_percent) || 0, reserves[provider] ?? 0));
       const adm = evaluateLaunchQuota({ provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: now, reserves });
       if (!adm.ok) {
         if (['limit_reached', 'cooldown_active'].includes(adm.reason)) blocked = true;
@@ -921,6 +924,8 @@ export class FleetService {
       placeable_slots: placeableMachines.size ? availableSlots : 0, placeable_machines: [...placeableMachines].sort(),
       placement_reasons: [...placementReasons].sort(),
       registry_drift: routes.length > 0 && placeableRoutes < routes.length,
+      // Projected unused quota at the next weekly/monthly reset (src/burn.ts).
+      burn_forecast: burn,
       machines: routes.map(r => r.machine_id) };
   }
 
@@ -1375,6 +1380,8 @@ export class FleetService {
       const familyLoad = [...accounts.values()].filter(a => a.provider === family).reduce((n, a) => n + a.active, 0);
       const cpuLoad = (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / Math.max(1, caps.cpu_count || 1);
       const isDegraded = Boolean(gateProjection && !gateRefusal);
+      const burn = request.mode === 'interactive' ? null : burnForecast(routeProv?.quota, this.now(), Number(account!.reserve_percent) || 0);
+      const burn_weight = burnFactor(burn);
       const decision = computeEngineDecision({
         machine: route.machine_id,
         engine: route.engine,
@@ -1396,6 +1403,8 @@ export class FleetService {
         recentAccountFailures: countRecentAccountFailures(route.account),
         degraded: isDegraded,
         tbmWeight: tbm_weight,
+        reservePercent: Number(account!.reserve_percent) || 0,
+        expiryForecast: request.mode !== 'interactive',
         pinnedEngine: request.engine ?? null,
         overrideReason: typeof input.engine_override_reason === 'string' && input.engine_override_reason.trim() ? input.engine_override_reason.trim() : null,
       });
@@ -1410,7 +1419,7 @@ export class FleetService {
       // while retaining hard refusals for rejected or stale credentials.
       if (isDegraded) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, decision_score: score, decision_reason: decision.reason, decision, ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, burn, burn_weight, decision_score: score, decision_reason: decision.reason, decision, ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
     }
     // Intake 06d2a0ac AC1: an account with no quota verdict at all (status
     // unknown: never observed, or only "unknown"/unavailable reports) is
@@ -1652,6 +1661,73 @@ export class FleetService {
     return { promoted, expired };
   }
 
+  /** Burn-aware re-placement (intake ebfe9d85 AC4).
+   *
+   * Unclaimed offers (no claim key, native id or launcher task) are re-planned
+   * with their stored intent; when the burn-aware plan now picks a different
+   * account whose use-it-or-lose-it factor is clearly higher, the offer moves
+   * in place, exactly like a queued->offered promotion. The claim fence
+   * (state='offered' + account/model match inside the DO transaction) makes a
+   * racing host claim of the old placement fail safely. Pins (engine, account,
+   * machine, tier) stay binding because the stored intent is re-planned.
+   * Held/queued intents need no move: their next promotion uses the same
+   * burn-aware plan(). Reports counts; never applies banked resets. */
+  rebalanceForBurn(opts: { apply: boolean; limit?: number }) {
+    return this.withMaintenance(() => this.transaction(() => {
+      const limit = opts.limit ?? 25;
+      const moved: any[] = []; const kept: any[] = [];
+      const rows = this.sql.exec("SELECT * FROM fleet_launches WHERE state = 'offered' AND native_id IS NULL AND launcher_task_id IS NULL AND claim_key IS NULL AND mode = 'headless' ORDER BY created_at LIMIT ?", limit).toArray() as any[];
+      const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map((a: any) => [a.label, a]));
+      for (const row of rows) {
+        if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) { kept.push({ id: row.id, reason: 'routing_job_selection' }); continue; }
+        let bound: any = null;
+        try { bound = JSON.parse(row.request_json); } catch { bound = null; }
+        if (!bound || typeof bound !== 'object') { kept.push({ id: row.id, reason: 'invalid_intent' }); continue; }
+        const input: any = { mode: bound.mode || 'headless', workspace: bound.workspace, prompt: bound.prompt ?? row.prompt ?? '', idempotency_key: 'burn-' + row.id };
+        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project', 'needs']) {
+          if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
+        }
+        let plan: any;
+        try { plan = this.plan(input); } catch { plan = null; }
+        const selected = plan && !plan.error ? plan.selected : null;
+        const def = definitions.get(row.account);
+        const route: any = this.sql.exec('SELECT * FROM fleet_routes WHERE machine_id = ? AND account = ? AND engine = ? AND profile IS ?', row.machine_id, row.account, row.engine, row.profile).toArray()[0];
+        const current = def && route ? burnForecast(this.observation(def, route), this.now(), Number(def.reserve_percent) || 0) : null;
+        const currentFactor = burnFactor(current);
+        const from = { machine: row.machine_id, engine: row.engine, account: row.account, burn_factor: currentFactor };
+        if (!selected) { kept.push({ id: row.id, ...from, reason: 'no_eligible_alternative' }); continue; }
+        if (canonicalAccountLabel(selected.account) === canonicalAccountLabel(row.account)) { kept.push({ id: row.id, ...from, reason: 'already_best' }); continue; }
+        if (!(selected.burn_weight > currentFactor + 0.25)) { kept.push({ id: row.id, ...from, reason: 'not_underused', candidate: selected.account, candidate_burn_factor: selected.burn_weight }); continue; }
+        const normalizedWorkspace = plan.request?.workspace ?? bound.workspace;
+        const controls: any[] = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length
+          ? this.sql.exec('SELECT * FROM session_control_sessions WHERE fleet_launch_id = ?', row.id).toArray() : [];
+        if (controls.some(s => s.binding_json !== null || s.host_family || !['offered', 'queued', 'held'].includes(s.state))) { kept.push({ id: row.id, ...from, reason: 'session_bound' }); continue; }
+        try {
+          if (this.admission.heldReason({ request_json: row.request_json, workspace: normalizedWorkspace, id: row.id })) { kept.push({ id: row.id, ...from, reason: 'admission_held' }); continue; }
+        } catch { kept.push({ id: row.id, ...from, reason: 'admission_held' }); continue; }
+        const to = { machine: selected.machine, engine: selected.engine, account: selected.account, burn_factor: selected.burn_weight, projected_unused_percent: selected.burn?.projected_unused_percent ?? null };
+        if (opts.apply) {
+          const at = new Date(this.now()).toISOString();
+          const patchedJson = JSON.stringify({ ...bound, workspace: normalizedWorkspace });
+          const written = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, model_selection_json = ?, updated_at = ? WHERE id = ? AND state = 'offered' AND native_id IS NULL AND launcher_task_id IS NULL AND claim_key IS NULL RETURNING id",
+            selected.machine, selected.engine, selected.account, selected.profile ?? null, normalizedWorkspace, patchedJson, JSON.stringify(selected.selection), at, row.id).toArray()[0];
+          if (!written) { kept.push({ id: row.id, ...from, reason: 'claimed_concurrently' }); continue; }
+          this.resources.freezeCpuStart(String(row.id), selected);
+          if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+            this.sql.exec("UPDATE session_control_sessions SET machine_id = ?, engine = ?, updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held')", selected.machine, selected.engine, at, row.id);
+          }
+        }
+        moved.push({ id: row.id, from, to });
+      }
+      let queued = 0, held = 0;
+      try { queued = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued'").one().n); } catch { queued = 0; }
+      try { held = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_sessions WHERE state = 'held'").one().n); } catch { held = 0; }
+      return { applied: opts.apply, examined: rows.length, moved_count: moved.length, moved, kept,
+        // Re-placed automatically by the burn-aware plan() at their next promotion/retry.
+        pending_burn_aware: { queued_launches: queued, held_sessions: held } };
+    }));
+  }
+
   /** All final placement gates, authority reads and capacity writes share this transaction. */
   reserve(input: any, auth: Auth, expectedAuthority?: EditAuthority, preview = false): { value: any; status: number } {
     return this.withMaintenance(() => this.reserveWithinMaintenance(input, auth, expectedAuthority, preview));
@@ -1879,6 +1955,12 @@ export class FleetService {
         if (input.apply) this.drainCapacityQueue();
         return response({ applied: input.apply, changes });
       });
+    }
+    if (path === '/api/fleet/burn/rebalance' && request.method === 'POST') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const input = await body(request);
+      if (!object(input, ['apply', 'limit']) || typeof input.apply !== 'boolean' || (input.limit !== undefined && (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100))) return response({ error: 'invalid_rebalance' }, 400);
+      return response(this.rebalanceForBurn({ apply: input.apply, limit: input.limit }));
     }
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
