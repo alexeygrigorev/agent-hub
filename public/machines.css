@@ -1,0 +1,29 @@
+.machine-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:var(--dk-gap-block); margin-block:var(--dk-space-4); }
+.machine-summary > div,.machine-card { border:1px solid var(--dk-border-default); border-radius:var(--dk-radius-md); background:var(--dk-bg-surface); padding:var(--dk-pad-panel); min-width:0; }
+.machine-summary strong { display:block; font-size:var(--dk-text-xl); font-variant-numeric:tabular-nums; }
+.machine-summary span,.machine-card p { color:var(--dk-text-muted); }
+.machine-list { display:grid; gap:var(--dk-gap-block); }
+.machine-card__heading { display:flex; align-items:flex-start; justify-content:space-between; gap:var(--dk-space-3); }
+.machine-card__heading h2 { margin:0; font-size:var(--dk-text-lg); overflow-wrap:anywhere; }
+.machine-card__meta { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:var(--dk-space-3); margin-block:var(--dk-space-3); }
+.machine-card__meta > div { min-width:0; }
+.machine-card__meta dt { color:var(--dk-text-muted); font-size:var(--dk-text-xs); }
+.machine-card__meta dd { margin:0; overflow-wrap:anywhere; }
+.machine-card details { border-top:1px solid var(--dk-border-default); padding-top:var(--dk-space-3); }
+.machine-card details p { margin-block:var(--dk-space-2); overflow-wrap:anywhere; }
+.machine-history { margin-top:var(--dk-space-4); padding:var(--dk-space-3); border:1px solid var(--dk-border-default); border-radius:var(--dk-radius-md); }
+.machine-status { white-space:nowrap; }
+.machine-status--healthy { color:var(--dk-success-text); }
+.machine-status--problem { color:var(--dk-danger-text); }
+.machine-empty { border:1px dashed var(--dk-border-default); padding:var(--dk-space-4); border-radius:var(--dk-radius-md); }
+.hub-mobile-nav { display:none; }
+@media(max-width:700px) {
+  .machine-summary { grid-template-columns:repeat(3,minmax(0,1fr)); gap:var(--dk-space-2); }
+  .machine-summary > div { padding:var(--dk-space-2); }
+  .machine-summary strong { font-size:var(--dk-text-lg); }
+  .machine-card { padding:var(--dk-space-3); }
+  .machine-card__meta { grid-template-columns:1fr; gap:var(--dk-space-2); }
+  .hub-mobile-nav { display:flex; position:fixed; z-index:30; inset:auto 0 0; justify-content:space-around; gap:var(--dk-space-1); padding:var(--dk-space-2); background:var(--dk-bg-surface); border-top:1px solid var(--dk-border-default); }
+  .hub-mobile-nav a { text-decoration:none; padding:var(--dk-space-2); }
+  .dk-main { padding-bottom:72px; }
+}

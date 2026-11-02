@@ -127,13 +127,15 @@ export default {
       '/vendor/dakit/fonts/inter-var.woff2', '/vendor/dakit/fonts/ibm-plex-mono-400.woff2', '/vendor/dakit/fonts/ibm-plex-mono-500.woff2'];
     // Explicit private-asset allowlist: every asset is served only after the
     // authenticated-session check below. No arbitrary path, credential file
-    // or vendored tool is exposed; the list covers exactly the conversations
-    // page, its app code, the shipped vendored dakit bundle files it loads,
-    // and the fonts those files reference.
+    // or vendored tool is exposed; the list covers Hub pages and the shipped
+    // vendored dakit bundle files they load.
     const PRIVATE_ASSETS = [
       '/', '/index.html',
       '/inbox', '/inbox.html', '/inbox.js', '/inbox.css',
       '/fleet', '/fleet.html', '/fleet.js', '/fleet.css',
+      '/machines', '/machines.html', '/machines.js', '/machines.css',
+      '/quota', '/quota.html', '/quota.js', '/quota.css',
+      '/settings', '/settings.html', '/settings.js', '/settings.css',
       '/hub-shell.js', '/hub-shell.css', '/hub-search.js',
       '/engines', '/engines.html', '/engines.js', '/engines.css',
       '/webhooks', '/webhooks.html', '/webhooks.js', '/webhooks.css',
@@ -171,6 +173,9 @@ export default {
     if (url.pathname === '/sessions') url.pathname = '/sessions.html';
     if (url.pathname === '/schedules') url.pathname = '/schedules.html';
     if (url.pathname === '/fleet') url.pathname = '/fleet.html';
+    if (url.pathname === '/machines') url.pathname = '/machines.html';
+    if (url.pathname === '/quota') url.pathname = '/quota.html';
+    if (url.pathname === '/settings') url.pathname = '/settings.html';
     if (url.pathname === '/conversations') url.pathname = '/conversations.html';
     if (url.pathname === '/engines') url.pathname = '/engines.html';
     if (url.pathname === '/webhooks') url.pathname = '/webhooks.html';
