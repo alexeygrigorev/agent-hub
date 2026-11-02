@@ -12,11 +12,17 @@ import subprocess
 import sys
 import time
 
-# A normal ticket only joins the final class after 25 minutes (inside the 30 minute
-# wait budget), so --priority final really jumps a long queue of fresh and
-# moderately aged normal tickets (was 300s, which made every queued ticket
-# final-equivalent and the priority meaningless; position 33/35 observed).
-PRIORITIES = ('normal', 'final')
+# Priority classes, lowest privilege first (intake 1293b560 AC3).
+# 'final' is a pre-push verification lane: it jumps queued normal tickets
+# younger than NORMAL_AGE_S. 'release' is the orchestrator-main
+# release/integration gate lane: it is admitted ahead of both normal and
+# final tickets, so main is never blocked behind worker test lanes. Only an
+# explicit --priority release / AGENT_HUB_HEAVY_TEST_PRIORITY=release takes
+# the release class; aging promotes a normal ticket to the final class only,
+# never to release. Older readers (before release existed) coerce an unknown
+# priority to 'normal' with a warning instead of failing the queue (see
+# Queue.load), so a release row degrades to normal instead of poisoning them.
+PRIORITIES = ('normal', 'final', 'release')
 NORMAL_AGE_S = 1500
 try:  # test hook / host tuning; invalid values keep the default
     _age = os.environ.get('AGENT_HUB_HEAVY_TEST_NORMAL_AGE_S', '')
@@ -24,12 +30,28 @@ try:  # test hook / host tuning; invalid values keep the default
         NORMAL_AGE_S = int(_age)
 except Exception:
     pass
-# Slot sizing (intake 167c6178 follow-up, 2026-11-02): RMTHZ (12 cores, 64G)
-# was capped at 2 slots with 40 sessions queued while ~65% CPU / 30G free.
-# The default is 6; a host may override it live, without restarting sessions,
-# by writing an integer to <heavy-test-dir>/slots (re-read on every start).
-# MAX_SLOTS is a hard ceiling that prevents the 2026-10-28 overload (46 vitest,
-# 21 workerd, 25 playwright at once); it also clamps AGENT_HUB_HEAVY_TEST_SLOTS.
+# Slot sizing (intake 1293b560 AC2, supersedes the 167c6178 follow-up note).
+# The slot count is ONE host-level setting: the integer in the live
+# <heavy-test-dir>/slots file, re-read by every admission. An explicit
+# --slots flag still wins (operator/tests); AGENT_HUB_HEAVY_TEST_SLOTS is
+# only a fallback for private pools and tests when the file is absent, never
+# a per-process override of the live host setting. Old worktrees already read
+# the same file when the env var is unset, so unsetting the env (see
+# docs/HETZNER-OVERLOAD-0689CE9C.md and AGENTS.md) keeps old and new
+# checkouts on the same count with no code change on their side.
+#
+# Sizing formula (measured 2026-11-02, RMTHZ: 12 cores, 62 GiB):
+#   load_budget = 1.5 * cores            (host 5-min load budget for tests)
+#   cpu_slots   = floor((load_budget - base_load_5min) / cpu_per_lane)
+#   mem_slots   = floor((MemAvailable_GiB - mem_reserve_GiB) / mem_per_lane_GiB)
+#   slots       = clamp(1, MAX_SLOTS, min(cpu_slots, mem_slots))
+# Measured per-lane cost: vitest lane ~0.71 cores / ~0.9 GiB, pytest lane
+# ~0.27 cores / ~0.64 GiB (two existing lanes, 2026-11-02). mem_reserve is
+# 6 GiB (at most 25% of RAM on small hosts, matching the host-dispatch
+# floor). Example: budget 18, base 5-min load 10-15 -> headroom 3-8 ->
+# cpu_slots 4-11 with the worst-case 0.71 lane; mem (33-6)/0.9 ~= 30, not
+# binding; MAX_SLOTS clamps to 8. The default below is the formula's
+# mid-range outcome; the live file carries the tuned value.
 DEFAULT_SLOTS = 6
 MAX_SLOTS = 8
 # Refusal channel (intake 9432731e): exit 3 alone is ambiguous because the
@@ -150,6 +172,29 @@ class Queue:
                 if lock_available(lease):
                     del state['active'][name]
 
+    def park_refused(self, state, name, now):
+        """Release a capacity-refused waiter's queue row but keep its place.
+
+        Intake 1293b560 AC1: a waiter refused after the full wait budget used
+        to leave its row behind with no run record refresh, so a retry with
+        the same AGENT_HUB_HEAVY_TEST_RUN_ID found its old sequence taken and
+        re-queued at the back. Parking deletes our own active row (our lease
+        unlocks on return anyway, so the row is dead) while refreshing the
+        run record with the original sequence and creation time. The retry
+        then reclaims the same sequence and age -- it keeps its queue
+        position (and any aging) instead of joining the tail. Callers without
+        a run id just drop the dead row so the shared state stays small.
+        """
+        row = state['active'].pop(name, None)
+        if row is None:
+            return
+        run = self.run_id()
+        if run is None:
+            return
+        record = {'sequence': row['sequence'], 'created': row['created'],
+                  'seen': now}
+        state.setdefault('runs', {})[run] = record
+
     @staticmethod
     def run_id():
         run = os.environ.get(RUN_ID_ENV, '')
@@ -176,10 +221,18 @@ class Queue:
 
     @staticmethod
     def order(row, now):
-        # An aged normal joins the final class with its original sequence.
-        # Later final arrivals cannot indefinitely overtake that normal.
-        preferred = row['priority'] == 'final' or now - row['created'] >= NORMAL_AGE_S
-        return (not preferred, row['sequence'])
+        # Release outranks everything; an aged normal joins the final class
+        # with its original sequence, but never the release class. Later
+        # final arrivals cannot indefinitely overtake that aged normal, and
+        # later arrivals of any lower class cannot overtake a release ticket.
+        priority = row['priority']
+        if priority == 'release':
+            rank = 0
+        elif priority == 'final' or now - row['created'] >= NORMAL_AGE_S:
+            rank = 1
+        else:
+            rank = 2
+        return (rank, row['sequence'])
 
     @classmethod
     def head(cls, state, now):
@@ -412,7 +465,7 @@ def run_command(command, slot, interrupted, run_timeout, identity):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--slots', default=os.environ.get('AGENT_HUB_HEAVY_TEST_SLOTS'))
+    parser.add_argument('--slots', default=None)
     parser.add_argument('--wait', default=os.environ.get('AGENT_HUB_HEAVY_TEST_WAIT_S', '1800'))
     parser.add_argument('--run-timeout', default=os.environ.get(
         'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S'))
@@ -427,15 +480,31 @@ def main():
     args = parser.parse_args()
     root = Path(os.environ.get('AGENT_HUB_HEAVY_TEST_DIR', f'/run/user/{os.getuid()}/agent-hub/heavy-test'))
     root.mkdir(parents=True, exist_ok=True)
+    # Precedence (intake 1293b560 AC2): explicit --slots, then the live
+    # host-level <dir>/slots file, then AGENT_HUB_HEAVY_TEST_SLOTS (fallback
+    # for private pools/tests when the file is absent), then DEFAULT_SLOTS.
+    # The file is authoritative: a per-process env value never overrides the
+    # live host setting, so old and new checkouts share one count.
     if args.slots is None:
         try:
             args.slots = (root / 'slots').read_text().strip()
+            slots_source = 'file'
         except OSError:
-            args.slots = str(DEFAULT_SLOTS)
-        if not args.slots.isascii() or not args.slots.isdecimal() or int(args.slots) < 1:
-            args.slots = str(DEFAULT_SLOTS)
+            args.slots = None
+            slots_source = None
+    else:
+        slots_source = 'flag'
+    if args.slots is None:
+        args.slots = os.environ.get('AGENT_HUB_HEAVY_TEST_SLOTS')
+        slots_source = 'env' if args.slots is not None else None
+    if args.slots is None:
+        args.slots = str(DEFAULT_SLOTS)
+        slots_source = 'default'
     if not args.slots.isascii() or not args.slots.isdecimal() or int(args.slots) < 1:
-        parser.error('invalid slot count')
+        if slots_source == 'file':
+            args.slots = str(DEFAULT_SLOTS)
+        else:
+            parser.error('invalid slot count')
     args.slots = str(min(int(args.slots), MAX_SLOTS))
     if not args.wait.isascii() or not args.wait.isdecimal():
         parser.error('invalid wait seconds')
@@ -444,7 +513,7 @@ def main():
              or not 1 <= int(args.run_timeout) <= 86400)):
         parser.error('invalid command run timeout seconds (expected 1..86400)')
     run_timeout = int(args.run_timeout) if args.run_timeout is not None else (
-        FINAL_RUN_TIMEOUT_S if args.priority == 'final' else DEFAULT_RUN_TIMEOUT_S)
+        FINAL_RUN_TIMEOUT_S if args.priority in ('final', 'release') else DEFAULT_RUN_TIMEOUT_S)
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('no command given')
@@ -528,6 +597,18 @@ def main():
                 if slot is None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        # Park our place before refusing (intake 1293b560
+                        # AC1): delete our own dead row but keep the run
+                        # record, so a retry with the same
+                        # AGENT_HUB_HEAVY_TEST_RUN_ID reclaims the original
+                        # sequence and age instead of re-queueing at the back.
+                        fcntl.flock(mutex, fcntl.LOCK_EX)
+                        try:
+                            state = queue.load()
+                            queue.park_refused(state, name, time.monotonic())
+                            queue.save(state)
+                        finally:
+                            fcntl.flock(mutex, fcntl.LOCK_UN)
                         print(f'capped-test-run: no heavy-test slot free after {args.wait}s ({args.slots} slots)', file=sys.stderr)
                         return refuse(f'no heavy-test slot free after {args.wait}s')
                     if not announced:

@@ -106,6 +106,59 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual([p.wait(timeout=40) for p in children], [0]*4)
         self.assertEqual(self.order(), ['final1', 'final2', 'normal1', 'normal2'])
 
+    def test_release_precedes_final_and_normal_without_preemption(self):
+        # Intake 1293b560 AC3: the orchestrator-main release gate lane is
+        # admitted ahead of both final and normal worker lanes.
+        children = [self.start('normal1'), self.start('final1', 'final'),
+                    self.start('release1', 'release'),
+                    self.start('normal2'), self.start('final2', 'final')]
+        self.assertFalse((self.root / 'order').exists())
+        self.holder.close()
+        self.assertEqual([p.wait(timeout=40) for p in children], [0]*5)
+        self.assertEqual(self.order(), ['release1', 'final1', 'final2', 'normal1', 'normal2'])
+
+    def test_release_env_priority_is_admitted_as_release(self):
+        env = dict(self.env, AGENT_HUB_HEAVY_TEST_PRIORITY='release')
+        child = subprocess.Popen([str(WRAPPER), '--wait', '40', '--',
+                                  sys.executable, '-c',
+                                  f"from pathlib import Path; Path({str(self.root / 'order')!r}).write_text('rel')"],
+                                 env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, start_new_session=True)
+        self.children.append(child)
+        self.holder.close()
+        stdout, stderr = child.communicate(timeout=40)
+        self.assertEqual(child.returncode, 0, stderr.decode(errors='replace'))
+        self.assertIn('admitted release ticket', stderr.decode(errors='replace'))
+        self.assertEqual((self.root / 'order').read_text(), 'rel')
+
+    def test_slots_file_is_authoritative_over_env(self):
+        # Intake 1293b560 AC2: the live <dir>/slots file is the single
+        # host-level setting; a per-process env value never overrides it.
+        holders = [self.holder]
+        for index in range(1, 9):
+            handle = (self.root / f'slot-{index}.lock').open('a+')
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            holders.append(handle)
+        try:
+            (self.root / 'slots').write_text('1\n')
+            env = dict(self.env, AGENT_HUB_HEAVY_TEST_SLOTS='9')
+            result = subprocess.run([str(WRAPPER), '--wait', '0', '--',
+                                     sys.executable, '-c', 'pass'],
+                                    env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn('(1 slots)', result.stderr)
+            # No file: the env value remains the fallback for private pools
+            # (clamped to the MAX_SLOTS ceiling).
+            (self.root / 'slots').unlink()
+            result = subprocess.run([str(WRAPPER), '--wait', '0', '--',
+                                     sys.executable, '-c', 'pass'],
+                                    env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn('(8 slots)', result.stderr)
+        finally:
+            for handle in holders[1:]:
+                handle.close()
+
     def test_aged_waiter_cannot_be_overtaken_by_new_finals(self):
         self.scheduler_clock_origin = time.monotonic()
         normal = self.start('normal')
@@ -471,6 +524,58 @@ class QueueCostTests(unittest.TestCase):
         self.assertEqual(queue.load()['runs'], {})
         with mock.patch.dict(os.environ, {self.module.RUN_ID_ENV: '../../bad id'}):
             self.assertIsNone(queue.run_id())
+
+    def test_release_outranks_final_and_aged_normal(self):
+        # Intake 1293b560 AC3: release is its own class above final; aging
+        # promotes a normal ticket to the final class only, never to release.
+        state = {'active': {
+            '0': {'sequence': 1, 'priority': 'normal', 'created': 0},
+            '1': {'sequence': 2, 'priority': 'final', 'created': 100},
+            '2': {'sequence': 3, 'priority': 'release', 'created': 100}}}
+        now = self.module.NORMAL_AGE_S + 1000
+        self.assertEqual(self.module.Queue.head(state, now), '2')
+        position, waiting = self.module.Queue.position(state, '2', now)
+        self.assertEqual((position, waiting), (1, 3))
+
+    def test_refused_retry_reclaims_place_and_age(self):
+        # Intake 1293b560 AC1: a capacity-refused retry with the same run id
+        # keeps its queue position (and age) instead of re-queueing at the
+        # back; the older ticket is admitted before newer arrivals.
+        queue = self.module.Queue(Path(tempfile.mkdtemp(dir=WRAPPER.parent.parent / '.local/tmp')))
+        state = {'version': 1, 'next': 1, 'active': {}, 'runs': {}}
+        with mock.patch.dict(os.environ, {self.module.RUN_ID_ENV: 'chain-1'}):
+            first, row = queue.new_ticket(state, 'normal', 1000.0)
+        state['active']['0'] = row
+        state['next'] += 1
+        state['active']['1'] = {'sequence': state['next'], 'priority': 'normal', 'created': 1100.0}
+        state['next'] += 1
+        state['active']['2'] = {'sequence': state['next'], 'priority': 'final', 'created': 1200.0}
+        state['next'] += 1
+        # Capacity refusal parks our row but keeps the run record.
+        with mock.patch.dict(os.environ, {self.module.RUN_ID_ENV: 'chain-1'}):
+            queue.park_refused(state, '0', 2000.0)
+        self.assertNotIn('0', state['active'])
+        # The retry reclaims the original sequence and creation time.
+        with mock.patch.dict(os.environ, {self.module.RUN_ID_ENV: 'chain-1'}):
+            again, again_row = queue.new_ticket(state, 'normal', 2500.0)
+        self.assertEqual(again, first)
+        self.assertEqual(again_row['created'], 1000.0)
+        state['active']['3'] = again_row
+        with mock.patch.object(self.module, 'NORMAL_AGE_S', 1500):
+            self.assertEqual(queue.head(state, 2500.0), '3')
+            position, _ = queue.position(state, '3', 2500.0)
+        self.assertEqual(position, 1)
+
+    def test_park_without_run_id_drops_dead_row(self):
+        queue = self.module.Queue(Path(tempfile.mkdtemp(dir=WRAPPER.parent.parent / '.local/tmp')))
+        state = {'version': 1, 'next': 3,
+                 'active': {'0': {'sequence': 1, 'priority': 'normal', 'created': 5.0}},
+                 'runs': {}}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.module.RUN_ID_ENV, None)
+            queue.park_refused(state, '0', 10.0)
+        self.assertEqual(state['active'], {})
+        self.assertEqual(state.get('runs'), {})
 
     def test_aged_normal_precedes_continuous_new_finals(self):
         state = {'active': {'0': {'sequence': 1, 'priority': 'normal', 'created': 0}}}

@@ -50,8 +50,12 @@ OpenCode (`oc`, `--engine opencode`) always runs Muse Spark 1.3 (`opencode-go/mu
 Heavy suites share a host-wide cap of two runs per user. The full runner acquires it
 automatically. `scripts/test-affected-local.sh` is the pre-push lane and takes its own slot. Wrap ad-hoc Vitest/workerd (including `npm test`), Playwright and
 full pytest commands with `scripts/capped-test-run.sh -- <command>`; use the
-same `AGENT_HUB_HEAVY_TEST_DIR` and `AGENT_HUB_HEAVY_TEST_SLOTS` across sessions.
-Defaults are `/run/user/<uid>/agent-hub/heavy-test`, two slots, and a 1800-second
+same `AGENT_HUB_HEAVY_TEST_DIR` across sessions (the live `<dir>/slots` file
+inside it is the single host-level slot count -- do not export
+AGENT_HUB_HEAVY_TEST_SLOTS per-process; it is only a fallback for private pools
+and tests when the file is absent).
+Defaults are `/run/user/<uid>/agent-hub/heavy-test`, six slots (live `<dir>/slots`
+file may override, hard ceiling 8), and a 1800-second
 wall-clock cap per admitted command (`--run-timeout` or
 `AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S` overrides the run cap). Never unlink
 live lock files or kill holders. See [heavy test admission](docs/HETZNER-OVERLOAD-0689CE9C.md).
