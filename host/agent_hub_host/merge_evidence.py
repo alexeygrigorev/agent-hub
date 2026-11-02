@@ -79,7 +79,9 @@ def hub_recorded_shas(merge_state: Any) -> list:
     earlier evidence). Without these a merged worktree whose intake carries no report/DONE
     sha yields no commits, hence no deploy evidence (intake 3f2011c2)."""
     state = merge_state if isinstance(merge_state, dict) else {}
-    refs = [state.get('head')] + [c.get('sha') for c in state.get('commits') or [] if isinstance(c, dict)]
+    recorded_commits = state.get('commits')
+    entries = recorded_commits if isinstance(recorded_commits, (list, tuple)) else []
+    refs = [state.get('head')] + [c.get('sha') for c in entries if isinstance(c, dict)]
     out = []
     for ref in refs:
         ref = str(ref or '').strip().lower()
@@ -109,10 +111,10 @@ def _is_ancestor(runner, repo, sha, ref):
 
 def deploy_state(repo: str, sha: str, runner: Callable = subprocess.run) -> dict:
     """Deploy outcome for ``sha`` on main: the earliest-or-any Deploy run whose
-    head contains it. [skip ci] commits never deploy on their own."""
+    head contains it. [skip ci] commits never deploy on their own, but a later
+    Deploy run for a descendant main SHA can still prove they were deployed."""
     subject = _run(runner, ['git', 'log', '-1', '--format=%B', sha], repo)
-    if subject is not None and subject.returncode == 0 and SKIP_CI.search(subject.stdout or ''):
-        return {'state': 'skipped', 'sha': sha}
+    skip_ci = subject is not None and subject.returncode == 0 and SKIP_CI.search(subject.stdout or '')
     proc = _run(runner, ['gh', 'run', 'list', '--workflow', DEPLOY_WORKFLOW, '--branch', 'main', '--limit', '40',
                          '--json', 'databaseId,headSha,conclusion,status,url'], repo, FETCH_TIMEOUT)
     if proc is None or proc.returncode != 0:
@@ -154,6 +156,8 @@ def deploy_state(repo: str, sha: str, runner: Callable = subprocess.run) -> dict
             return run_evidence('pending', run)
     if containing:
         return run_evidence('failure', containing[0])
+    if skip_ci:
+        return {'state': 'skipped', 'sha': sha}
     return {'state': 'missing', 'sha': sha}
 
 

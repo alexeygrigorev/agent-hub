@@ -42,6 +42,7 @@ class MergeEvidenceTests(unittest.TestCase):
     def test_hub_recorded_head_yields_deploy_evidence(self):
         self.assertEqual(me.hub_recorded_shas({'head': A.upper(), 'commits': [{'sha': B}, {'sha': 'zz'}, 'x']}), [A, B])
         self.assertEqual(me.hub_recorded_shas(None), [])
+        self.assertEqual(me.hub_recorded_shas({'head': A, 'commits': 7}), [A])
         runner_ok = FakeRunner(in_main=[A], runs=[{'databaseId': 41479858903, 'headSha': A, 'conclusion': 'success', 'status': 'completed', 'url': 'u'}])
         out = me.collect('/r', me.hub_recorded_shas({'head': A}), runner_ok, fetch=False, include_head=False)
         self.assertEqual(out['deploy']['state'], 'success')
@@ -81,6 +82,16 @@ class MergeEvidenceTests(unittest.TestCase):
         self.assertEqual(me.collect('/r', [], red)['deploy']['state'], 'failure')
         skip = FakeRunner(in_main=[A], subject='docs: x [skip ci]', runs=[])
         self.assertEqual(me.collect('/r', [], skip)['deploy']['state'], 'skipped')
+
+    def test_skip_ci_commit_is_proven_by_later_deploy_containing_it(self):
+        later = FakeRunner(
+            in_main=[A, B], subject='docs: x [skip ci]', cherry='', ancestors={B: [A]},
+            runs=[{'databaseId': 46, 'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'later'}],
+        )
+        self.assertEqual(me.deploy_state('/r', A, later), {
+            'state': 'success', 'sha': A, 'run': 'later', 'run_id': '46',
+            'conclusion': 'success', 'deployed_sha': B,
+        })
 
     def test_gh_failure_is_unknown_never_success(self):
         class NoGh(FakeRunner):
