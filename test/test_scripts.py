@@ -260,7 +260,10 @@ class TestCappedTestRun(unittest.TestCase):
             self.assertEqual([line.split("-")[0] for line in lines],
                              ["start", "end", "start", "end"])
 
-    def test_descendant_keeps_slot_after_parent_exits(self):
+    def test_descendant_never_outlives_the_slot_after_parent_exits(self):
+        # Safety property: a slot is never free while a process started by the test command still runs.
+        # Since 8e35ab4 the wrapper enforces it by sweeping the command's group (and FD-9 leakers) when the
+        # leader exits, so the slot is released only once the descendant is dead.
         import time
         with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
             env = {**os.environ, "AGENT_HUB_HEAVY_TEST_DIR": os.path.join(tmpdir, "heavy")}
@@ -268,13 +271,21 @@ class TestCappedTestRun(unittest.TestCase):
             child_pid = os.path.join(tmpdir, "child")
             parent = subprocess.Popen(
                 [self.capped, "--slots", "1", "--", "bash", "-c",
-                 'sleep 2 & echo $! > "$1"; exit 0', "bash", child_pid],
+                 'sleep 30 & echo $! > "$1"; exit 0', "bash", child_pid],
                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 self.assertEqual(parent.wait(timeout=15), 0)
-                held = self.run_capped("--slots", "1", "--wait", "0", "--", "true", env_extra=env)
-                self.assertEqual(held.returncode, 3)
-                time.sleep(2.1)
+                with open(child_pid) as fh:
+                    pid = int(fh.read().strip())
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    self.fail("descendant survived the wrapper's exit")
                 free = self.run_capped("--slots", "1", "--wait", "0", "--", "true", env_extra=env)
                 self.assertEqual(free.returncode, 0)
             finally:
