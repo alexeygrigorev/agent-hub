@@ -65,6 +65,42 @@ it('reports a dead Codex TUI as failed while retaining lifecycle and capacity un
   });
 });
 
+it('fails a Claude session whose /goal was rejected fast, never reporting it as running', async () => {
+  const bindings = env as unknown as Env;
+  const stub = bindings.HUB.get(bindings.HUB.idFromName('claude-goal-rejected-' + crypto.randomUUID()));
+  await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    const now = Date.parse('2026-11-02T12:00:00Z'), at = new Date(now).toISOString();
+    const tx = <T>(cb: () => T) => state.storage.transactionSync(cb);
+    const service = new SessionControlService(hub.sql, tx, () => now); service.init();
+    const fleet = new FleetService(hub.sql, tx, () => now); fleet.init();
+    const id = '33333333-3333-4333-8333-333333333333';
+    hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at) VALUES ('test-host', 'test-host', 'test-host', ?, ?)", at, at);
+    hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+      VALUES (?, 'test-admin', 'test', '{}', 'test-host', 'claude', 'interactive', 'running', ?, ?, ?)`, id,
+      JSON.stringify({ native_id: id, tag: 'hub-test', workspace: '/test', native_created_at_ms: now - 120000 }), at, at);
+    const row = { native_id: id, tag: 'hub-test', workspace: '/test', engine: 'claude', phase: 'running', agent_state: 'idle', profile: null, account: null,
+      created_at_ms: now - 120000, last_activity_at: at,
+      progress: { last_progress_at: new Date(now - 120000).toISOString(), headless: false, agent_alive: null, orphaned: false, cleanup: 'none', terminal_error: 'goal_rejected' } };
+    const report = (data: any) => fleet.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions: [data] }) }),
+      { caller: { machineId: 'test-host', kind: 'host', actor: 'machine:test-host' }, scopes: ['host'] });
+    // The error is accepted only for engine claude with an interactive session.
+    expect((await report({ ...row, engine: 'codex' })).status).toBe(400);
+    expect((await report({ ...row, progress: { ...row.progress, terminal_error: 'codex_reconnect_failed' } })).status).toBe(400);
+    expect((await report(row)).status).toBe(200);
+    const view = await (await service.handle(new Request('https://hub.test/api/sessions/' + id),
+      { caller: { isAdmin: true, kind: 'human', actor: 'test-admin' }, scopes: ['admin'] })).json();
+    expect(view).toMatchObject({ state: 'failed', stalled: false, failure_reason: 'goal_rejected', lifecycle_state: 'running', cleanup_pending: true });
+    expect(hub.sql.exec('SELECT state FROM session_control_sessions').toArray()[0].state).toBe('running');
+    expect(hub.sql.exec('SELECT * FROM session_control_commands').toArray()).toEqual([]);
+    const watchdog = new IntakeWatchdog(hub.sql, {} as any, tx, {}, () => now); watchdog.init();
+    const task = { id: 'synthetic-task', title: 'Synthetic', project: 'demo', status: 'open', created_at: now - 60000,
+      history: [{ kind: 'link', hub_session_id: id }] };
+    expect(watchdog.project([task])[0]).toMatchObject({ forgotten: false, ready: false, state: 'recovering',
+      last_session: { state: 'failed', lifecycle_state: 'running', failure_reason: 'goal_rejected' } });
+    expect(watchdog.queue([task])[0]).toMatchObject({ state: 'needs_attention', reason: 'goal_rejected' });
+  });
+});
+
 it('fails a dead zcodex session (phase exiting) fast, holds the engine route, and releases only on probe pass', async () => {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('zcodex-dead-' + crypto.randomUUID()));
