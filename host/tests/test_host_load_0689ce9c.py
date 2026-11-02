@@ -124,7 +124,7 @@ class CpuWindowTests(unittest.TestCase):
             clock["t"] += seconds
 
         with tempfile.TemporaryDirectory() as tmp:
-            result = host_load.measure_cpu_busy(
+            result = host_load.sample_cpu_busy(
                 read_fn=lambda: next(reads), sleep_fn=sleep, clock_fn=lambda: clock["t"],
                 state_path=pathlib.Path(tmp) / "state.json")
         return result, sleeps
@@ -149,7 +149,7 @@ class CpuWindowTests(unittest.TestCase):
             state = pathlib.Path(tmp) / "state.json"
             state.write_text('[{"at": 940.0, "ticks": [0, 0, 0, 0, 0, 0, 0, 0], "cores": 12}]')
             sleeps = []
-            result = host_load.measure_cpu_busy(
+            result = host_load.sample_cpu_busy(
                 read_fn=lambda: {"ticks": [50, 0, 0, 50, 0, 0, 0, 0], "cores": 12},
                 sleep_fn=sleeps.append, clock_fn=lambda: 1000.0, state_path=state)
         self.assertEqual(sleeps, [])

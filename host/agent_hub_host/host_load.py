@@ -63,7 +63,7 @@ def _state_path() -> Path:
                 or Path.home() / ".cache" / "agent-hub" / "host-load-cpu.json")
 
 
-def measure_cpu_busy(*, read_fn: Optional[Callable[[], Optional[dict]]] = None,
+def sample_cpu_busy(*, read_fn: Optional[Callable[[], Optional[dict]]] = None,
                      sleep_fn: Callable[[float], None] = time.sleep,
                      clock_fn: Callable[[], float] = time.time,
                      state_path: Optional[Path] = None,

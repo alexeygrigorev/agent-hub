@@ -117,6 +117,8 @@ def isolated_host_load(monkeypatch):
     from agent_hub_host import host_load
     monkeypatch.setattr(host_load, "os", SimpleNamespace(
         getloadavg=lambda: (0.0, 0.0, 0.0), cpu_count=lambda: 12))
+    monkeypatch.setattr(host_load, "measure_cpu_busy", lambda: (0.0, 10.0))
+    monkeypatch.setattr(host_load, "_default_mem", lambda: (30 * 1024 ** 3, 64 * 1024 ** 3))
 
 
 @pytest.fixture(autouse=True)
