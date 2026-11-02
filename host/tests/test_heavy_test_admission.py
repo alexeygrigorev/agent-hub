@@ -2,6 +2,7 @@
 import ast
 import errno
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -17,6 +18,11 @@ import unittest
 from types import SimpleNamespace
 
 WRAPPER = Path(__file__).resolve().parents[2] / 'scripts/capped-test-run.sh'
+_shared_spec = importlib.util.spec_from_file_location(
+    'shared_heavy_test_admission',
+    WRAPPER.parent.parent / 'host/agent_hub_host/heavy_test_admission.py')
+shared_admission = importlib.util.module_from_spec(_shared_spec)
+_shared_spec.loader.exec_module(shared_admission)
 
 
 def _admission_module():
@@ -473,6 +479,221 @@ catch (error) { console.log('REFUSED:' + error.message); process.exitCode = 3; }
                 holder.wait(timeout=10)
                 holder.stdin.close()
                 holder.stdout.close()
+
+
+class SharedReleaseDelegationTests(unittest.TestCase):
+    def setUp(self):
+        parent = WRAPPER.parent.parent / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=parent)
+        self.root = Path(self.temp.name)
+        releases = self.root / 'host-releases'
+        self.release = releases / 'd8740aaca3944a295680177a40148bb00accea78'
+        self.release.mkdir(parents=True)
+        executable = self.release / '.venv/bin/python'
+        executable.parent.mkdir(parents=True)
+        executable.write_text(
+            '#!/bin/sh\n'
+            'case "$1" in *verify-host-release.py) exit "${FAKE_VERIFY_STATUS:-0}";; esac\n'
+            'exec python3 "$@"\n', encoding='utf-8')
+        executable.chmod(0o755)
+        verifier = self.release / 'scripts/verify-host-release.py'
+        verifier.parent.mkdir(parents=True)
+        verifier.write_text('#!/usr/bin/env python3\nraise SystemExit(0)\n', encoding='utf-8')
+        self.fake_bin = self.root / 'bin'
+        self.fake_bin.mkdir()
+        systemctl = self.fake_bin / 'systemctl'
+        systemctl.write_text(
+            '#!/bin/sh\nprintf " { path=%s ; argv[]=%s }\\n" '
+            f'"{executable}" "{executable} -m agent_hub_host.session_host"\n',
+            encoding='utf-8')
+        systemctl.chmod(0o755)
+        self.marker = self.root / 'canonical-invoked'
+        self.env = dict(os.environ, AGENT_HUB_HOST_RELEASES_DIR=str(releases),
+                        PATH=f"{self.fake_bin}:{os.environ.get('PATH', '')}",
+                        AGENT_HUB_HEAVY_TEST_DIR=str(self.root / 'pool'),
+                        AGENT_HUB_HEAVY_TEST_SLOTS='1',
+                        AGENT_HUB_HEAVY_TEST_WAIT_S='0',
+                        AGENT_HUB_CANONICAL_TEST_MARKER=str(self.marker))
+        self.env.pop('AGENT_HUB_HEAVY_TEST_HELD', None)
+        self.env.pop('AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN', None)
+        self.pool = Path(self.env['AGENT_HUB_HEAVY_TEST_DIR'])
+        self.pool.mkdir()
+        self.holder = (self.pool / 'slot-0.lock').open('a+')
+        fcntl.flock(self.holder, fcntl.LOCK_EX)
+
+    def tearDown(self):
+        self.holder.close()
+        self.temp.cleanup()
+
+    def install_module(self, *, protocol=1, tamper=False):
+        source = (WRAPPER.parent.parent / 'host/agent_hub_host/heavy_test_admission.py').read_text()
+        source = source.replace('ADMISSION_PROTOCOL_VERSION = 1',
+                                f'ADMISSION_PROTOCOL_VERSION = {protocol}', 1)
+        source = ('from pathlib import Path\nimport os\n'
+                  'Path(os.environ["AGENT_HUB_CANONICAL_TEST_MARKER"]).write_text("selected")\n'
+                  + source)
+        module = self.release / 'host/agent_hub_host/heavy_test_admission.py'
+        module.parent.mkdir(parents=True)
+        module.write_text(source, encoding='utf-8')
+        digest = hashlib.sha256(module.read_bytes()).hexdigest()
+        if tamper:
+            digest = '0' * 64
+        (self.release / 'release-manifest.json').write_text(json.dumps({
+            'release_rev': self.release.name,
+            'files_sha256': {module.relative_to(self.release).as_posix(): digest},
+        }), encoding='utf-8')
+        return module
+
+    def test_verified_active_release_runs_shared_implementation(self):
+        self.install_module()
+        result = subprocess.run([str(WRAPPER), '--wait', '0', '--', sys.executable,
+                                 '-c', 'raise SystemExit(0)'], env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertTrue(self.marker.exists())
+        self.assertIn('no heavy-test slot free', result.stderr)
+
+    def test_unavailable_or_older_release_uses_worktree_fallback(self):
+        # A verified release before the fixed admission revision must not be
+        # selected even when it advertises the same protocol integer.
+        base = 'd8740aaca3944a295680177a40148bb00accea78'
+        old_rev = subprocess.check_output(
+            ['git', 'rev-parse', base + '^'], text=True).strip()
+        old_release = self.release.parent / old_rev
+        self.release.rename(old_release)
+        self.release = old_release
+        executable = self.release / '.venv/bin/python'
+        systemctl = self.fake_bin / 'systemctl'
+        systemctl.write_text(
+            '#!/bin/sh\nprintf " { path=%s ; argv[]=%s }\\n" '
+            f'"{executable}" "{executable} -m agent_hub_host.session_host"\n',
+            encoding='utf-8')
+        systemctl.chmod(0o755)
+        self.install_module()
+        result = subprocess.run([str(WRAPPER), '--wait', '0', '--', sys.executable,
+                                 '-c', 'raise SystemExit(0)'], env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertFalse(self.marker.exists())
+        self.assertIn('no heavy-test slot free', result.stderr)
+
+    def test_hash_mismatch_fails_closed_without_falling_back(self):
+        self.install_module(tamper=True)
+        result = subprocess.run([str(WRAPPER), '--wait', '0', '--', sys.executable,
+                                 '-c', 'print("must not run")'], env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 126, result.stdout + result.stderr)
+        self.assertIn('module hash mismatch', result.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_verifier_rejects_tampered_release_without_fallback(self):
+        self.install_module()
+        self.env['FAKE_VERIFY_STATUS'] = '1'
+        result = subprocess.run([str(WRAPPER), '--wait', '0', '--', sys.executable,
+                                 '-c', 'print("must not run")'], env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 126, result.stdout + result.stderr)
+        self.assertIn('release verification failed', result.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_unknown_protocol_rolls_back_to_local_script(self):
+        self.install_module(protocol=2)
+        result = subprocess.run([str(WRAPPER), '--wait', '0', '--', sys.executable,
+                                 '-c', 'raise SystemExit(0)'], env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertFalse(self.marker.exists())
+        self.assertIn('no heavy-test slot free', result.stderr)
+
+    def test_shared_implementation_rejects_nested_same_pool_admission(self):
+        self.install_module()
+        self.holder.close()
+        nested = (f"unset AGENT_HUB_HEAVY_TEST_HELD; exec {str(WRAPPER)!r} "
+                  "--slots 1 --wait 30 -- true")
+        outer = subprocess.Popen(
+            [str(WRAPPER), '--slots', '1', '--wait', '30', '--', 'bash', '-c', nested],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+        try:
+            stdout, stderr = outer.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(outer.pid, signal.SIGKILL)
+            outer.wait()
+            self.fail('shared nested admission waited for a second slot')
+        self.assertEqual(outer.returncode, 2,
+                         (stdout.decode(errors='replace'), stderr.decode(errors='replace')))
+        self.assertIn(b'nested heavy-test admission detected', stderr)
+        self.assertIn(b'"event": "heavy_test_admitted"', stderr)
+        self.assertIn(b'"admitted_at_utc":', stderr)
+        self.assertTrue(self.marker.exists())
+
+
+class NestedHoldReaperTests(unittest.TestCase):
+    def setUp(self):
+        parent = WRAPPER.parent.parent / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=parent)
+        self.pool = Path(self.temp.name) / 'pool'
+        (self.pool / 'leases').mkdir(parents=True)
+        (self.pool / 'slot-0.lock').touch()
+        (self.pool / 'leases/1.lock').touch()
+        state = {'version': 1, 'next': 2, 'active': {
+            '1': {'sequence': 1, 'priority': 'normal', 'created': 1.0}}}
+        shared_admission.Queue(self.pool).save(state)
+        self.slot = str((self.pool / 'slot-0.lock').resolve())
+        self.lease = str((self.pool / 'leases/1.lock').resolve())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def process(self, pid, ppid, pgid, *, cpu=0, tokens=(), fds=(), start=None):
+        return {'pid': pid, 'ppid': ppid, 'pgid': pgid, 'cpu': cpu,
+                'tokens': set(tokens), 'fds': set(fds), 'start': start or str(pid),
+                'intake_id': '96c0a099-7844-44bb-acb0-2dfa8151634f'}
+
+    def snapshots(self, *, nested=True, executing=False):
+        processes = {
+            100: self.process(100, 1, 100, tokens={'heavy-test-admission.py'}, fds={self.slot}),
+            101: self.process(101, 100 if nested else 999, 200, tokens={'heavy-test-admission.py'}, fds={self.lease}),
+        }
+        if executing:
+            processes[102] = self.process(102, 100, 200, tokens={'pytest'})
+        return ({'at': 20.0, 'processes': processes},
+                {'at': 10.0, 'processes': processes})
+
+    def test_detects_stable_nested_queued_waiter(self):
+        current, previous = self.snapshots()
+        with mock.patch.object(shared_admission, '_lock_is_held', return_value=True):
+            found = shared_admission.nested_hold_candidates(self.pool, current, previous, 20.0)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]['process_group'], 200)
+        self.assertEqual(found[0]['ticket_sequence'], 1)
+
+    def test_ignores_non_nested_queued_waiter(self):
+        current, previous = self.snapshots(nested=False)
+        with mock.patch.object(shared_admission, '_lock_is_held', return_value=True):
+            found = shared_admission.nested_hold_candidates(self.pool, current, previous, 20.0)
+        self.assertEqual(found, [])
+
+    def test_never_reaps_while_test_runner_is_present(self):
+        current, previous = self.snapshots(executing=True)
+        with mock.patch.object(shared_admission, '_lock_is_held', return_value=True):
+            found = shared_admission.nested_hold_candidates(self.pool, current, previous, 20.0)
+        self.assertEqual(found, [])
+
+    def test_reaper_signals_only_nested_command_group_and_posts_note(self):
+        current, previous = self.snapshots()
+        signaller, post_note = mock.Mock(), mock.Mock(return_value=True)
+        with mock.patch.object(shared_admission, 'proc_snapshot', return_value=current['processes']), \
+             mock.patch.object(shared_admission, '_lock_is_held', return_value=True):
+            _, events = shared_admission.reap_nested_holds(
+                self.pool, previous=previous, now=20.0,
+                signaller=signaller, post_note=post_note)
+        signaller.assert_called_once_with(200, signal.SIGTERM)
+        post_note.assert_called_once()
+        self.assertEqual(events[0]['intake_id'], '96c0a099-7844-44bb-acb0-2dfa8151634f')
+        self.assertTrue(events[0]['intake_note_posted'])
 
 
 class QueueCostTests(unittest.TestCase):

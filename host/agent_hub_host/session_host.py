@@ -465,6 +465,49 @@ def maybe_start_role_consumer_thread(current: Optional[threading.Thread], consum
 
 # Must stay below the supervisor kill grace (scripts/session-host-supervisor.py).
 DRAIN_TIMEOUT_S = 25.0
+_HEAVY_REAPER_SNAPSHOT = None
+
+
+def heavy_test_reaper_step_once(dispatcher):
+    """Reap nested queued admissions from the host release maintenance loop."""
+    global _HEAVY_REAPER_SNAPSHOT
+    if os.name != 'posix':
+        return
+    try:
+        from .heavy_test_admission import reap_nested_holds
+        current, events = reap_nested_holds(previous=_HEAVY_REAPER_SNAPSHOT)
+        _HEAVY_REAPER_SNAPSHOT = current
+        for event in events:
+            intake_id = event.get('intake_id')
+            posted = False
+            if isinstance(intake_id, str):
+                try:
+                    task_response = dispatcher.request('GET', f'/api/intake/tasks/{intake_id}')
+                    task = task_response.get('task', task_response) if isinstance(task_response, dict) else {}
+                    version = task.get('version') if isinstance(task, dict) else None
+                    if type(version) is int:
+                        key = (f"nested-heavy-{event['holder_pid']}-"
+                               f"{event['waiter_start']}")
+                        note = (f"Nested heavy-test admission was queued inside slot holder "
+                                f"PID {event['holder_pid']}; its idle command process group "
+                                f"{event['process_group']} was sent SIGTERM. No test runner was active.")
+                        dispatcher.request('POST', f'/api/intake/tasks/{intake_id}/events', {
+                            'key': key, 'expected_version': version,
+                            'event': {'kind': 'note', 'text': note},
+                        })
+                        posted = True
+                except Exception:
+                    posted = False
+            _log(json.dumps({
+                'event': 'nested_heavy_test_hold_reaped',
+                'holder_pid': event['holder_pid'],
+                'waiter_pid': event['waiter_pid'],
+                'process_group': event['process_group'],
+                'intake_note_posted': posted,
+            }), flush=True)
+    except Exception as error:
+        _log(json.dumps({'event': 'heavy_test_reaper_error',
+                         'type': type(error).__name__}), flush=True)
 
 
 def maintenance_step_once(dispatcher, quota_collector):
@@ -490,6 +533,7 @@ def maintenance_step_once(dispatcher, quota_collector):
                               'error': bool(quota_collector.last_error)}), flush=True)
     except Exception as error:
         _log(json.dumps({'event': 'quota_error', 'type': type(error).__name__}), flush=True)
+    heavy_test_reaper_step_once(dispatcher)
     _log(json.dumps({'event': 'maintenance_cycle',
                       'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
 

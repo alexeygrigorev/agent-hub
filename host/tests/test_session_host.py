@@ -2,6 +2,7 @@ import importlib.util
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 from unittest.mock import patch
 from agent_hub_host import session_host
@@ -30,6 +31,27 @@ class SessionHostTests(unittest.TestCase):
             args=execute.call_args.args[0]
             self.assertEqual(args.machine_id,'test-machine')
             self.assertEqual(args.sessions_cmd,'host-receive')
+
+    def test_heavy_test_reaper_posts_a_sanitized_intake_note(self):
+        from agent_hub_host import heavy_test_admission
+        event = {'holder_pid': 123, 'waiter_pid': 124, 'process_group': 124,
+                 'waiter_start': '456', 'ticket_sequence': 7, 'priority': 'normal',
+                 'intake_id': '96c0a099-7844-44bb-acb0-2dfa8151634f'}
+        dispatcher = SimpleNamespace(request=mock.Mock(side_effect=[
+            {'task': {'version': 9}}, {'ok': True}]))
+        current = {'at': 20, 'processes': {}}
+        with patch.object(heavy_test_admission, 'reap_nested_holds',
+                          return_value=(current, [event])), patch.object(session_host, '_log'):
+            session_host._HEAVY_REAPER_SNAPSHOT = None
+            session_host.heavy_test_reaper_step_once(dispatcher)
+        self.assertIs(session_host._HEAVY_REAPER_SNAPSHOT, current)
+        self.assertEqual(dispatcher.request.call_args_list[0].args,
+                         ('GET', '/api/intake/tasks/96c0a099-7844-44bb-acb0-2dfa8151634f'))
+        post = dispatcher.request.call_args_list[1]
+        self.assertEqual(post.args[:2], ('POST', '/api/intake/tasks/96c0a099-7844-44bb-acb0-2dfa8151634f/events'))
+        self.assertEqual(post.args[2]['expected_version'], 9)
+        self.assertEqual(post.args[2]['event']['kind'], 'note')
+        self.assertNotIn('intake_id', post.args[2]['event']['text'])
 
     def test_blocked_daemon_cannot_log_into_later_stdout(self):
         import contextlib
