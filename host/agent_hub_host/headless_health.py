@@ -6,6 +6,58 @@ from pathlib import Path
 
 REASON = 'engine_tool_permission_refused'
 MESSAGE = 'Headless engine refused write or network tools; route held until a successful execution probe.'
+PROMPT_REASON = 'engine_interactive_prompt'
+
+# Match the short, explicit choice screens that require a person before the
+# engine accepts work. Keep this separate from output/log inspection: task text
+# can mention login, trust, update, or onboarding without presenting a prompt.
+_PROMPT_PATTERNS = (
+    ('folder trust', re.compile(
+        r'(?is)(?:do you trust (?:the )?(?:contents|files) (?:of|in) this (?:folder|directory)\?'
+        r'|trust this (?:folder|directory)\?)(?=.{0,300}(?:yes|no|trust and continue|select))')),
+    ('login', re.compile(
+        r'(?im)^\s*(?:not logged in.{0,160}(?:run\s+)?/?login|login required|'
+        r'please\s+(?:log in|login|sign in)|sign in to continue|'
+        r'(?:sign in|continue) with (?:chatgpt|google)|'
+        r'open (?:this )?(?:url|link) to (?:log in|sign in)|authentication required)\b')),
+    ('update', re.compile(
+        r'(?im)^\s*(?:update available|new version available).{0,300}'
+        r'(?:restart|relaunch|install|update now|press enter|yes|later)|'
+        r'^\s*(?:restart|relaunch) to (?:install|apply) (?:the )?update')),
+    ('first-run setup', re.compile(
+        r'(?im)^\s*(?:choose|select) (?:a |your )?(?:theme|text style|login method)\b'
+        r'|^\s*welcome to (?:claude code|codex|opencode|gemini cli)[.!]?\s*'
+        r'(?:press enter|continue|choose|select|sign in|log in)\b')),
+)
+
+HEALTH_CAPTURE_TIMEOUT = 10.0
+
+
+def interactive_prompt(text):
+    """Return a bounded prompt kind only for recognizable engine choice screens."""
+    if not isinstance(text, str):
+        return None
+    screen = text[-32768:]
+    screen = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', screen)
+    screen = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', screen).replace('\r', '')
+    for kind, pattern in _PROMPT_PATTERNS:
+        if pattern.search(screen):
+            return kind
+    return None
+
+
+def prompt_failure(engine, kind):
+    """Safe typed diagnostic: never include the screen or task text."""
+    engine_name = str(engine)[:32] if isinstance(engine, str) else 'engine'
+    kind = kind if kind in {'folder trust', 'login', 'update', 'first-run setup'} else 'first-run'
+    return {
+        'reason': PROMPT_REASON,
+        'message': (f'The {engine_name} session stopped at an interactive {kind} prompt. '
+                    'No human input is available; the session was stopped and capacity '
+                    'will be released after exit is confirmed.'),
+        'error_type': 'InteractivePromptError',
+        'stage': 'dispatch_headless',
+    }
 
 
 def permission_refusal(text):
@@ -70,4 +122,21 @@ def launch_target(workspace, task_id, engine):
 
 def inspect(executable, target):
     from .native_sessions import capture_output
-    return failure() if permission_refusal(capture_output(executable, target, limit_bytes=131072).text) else None
+    # Choice screens do not reliably appear in native logs. Capture a scoped
+    # UUID/tag/workspace screen first while this launch is still in its startup
+    # window. Bound each identity check and native call within the 60-second
+    # startup health budget.
+    try:
+        screen = capture_output(executable, target, limit_bytes=32768, mode='screen',
+                                timeout=HEALTH_CAPTURE_TIMEOUT).text
+    except Exception:
+        screen = ''
+    kind = interactive_prompt(screen)
+    if kind:
+        return prompt_failure(target.engine, kind)
+    try:
+        output = capture_output(executable, target, limit_bytes=131072,
+                                timeout=HEALTH_CAPTURE_TIMEOUT).text
+    except Exception:
+        return None
+    return failure() if permission_refusal(output) else None

@@ -73,12 +73,162 @@ class DeviceActivation(unittest.TestCase):
         subs.write_text(json.dumps({'version': 1, 'subscriptions': [], 'workspaces': {'home': self.tmp.name}}))
         with patch.object(fleet, 'subscriptions_path', return_value=subs):
             hub_default = fleet.load_settings().get('opencode_auth')
+            explicit_default_path = fleet.load_settings(subs).get('opencode_auth')
+            explicit_default_str = fleet.load_settings(str(subs)).get('opencode_auth')
         self.assertTrue(hub_default and hub_default['source_data'].startswith(self.tmp.name))
+        self.assertEqual(explicit_default_path, hub_default)
+        self.assertEqual(explicit_default_str, hub_default)
+        other_subs = Path(self.tmp.name) / 'other-subs.json'
+        other_subs.write_text(json.dumps({'version': 1, 'subscriptions': [], 'workspaces': {'home': self.tmp.name}}))
+        with patch.object(fleet, 'subscriptions_path', return_value=subs):
+            self.assertNotIn('opencode_auth', fleet.load_settings(other_subs))
         explicit = {'binary': '/x/opencode', 'source_data': '/x/src', 'source_config': '/x/cfg', 'target_data': '/x/rt'}
         subs.write_text(json.dumps({'version': 1, 'subscriptions': [], 'workspaces': {'home': self.tmp.name},
                                     'opencode_auth': explicit}))
         with patch.object(fleet, 'subscriptions_path', return_value=subs):
             self.assertEqual(fleet.load_settings().get('opencode_auth'), explicit)
+            self.assertEqual(fleet.load_settings(subs).get('opencode_auth'), explicit)
+
+    def test_sync_and_managed_home_materialize_quse_auth_without_touching_runtime_store(self):
+        self.assertEqual(self.sync(), 'imported')
+        dest = Path(self.tmp.name) / 'shared-go-r1'
+        home = dest / 'home'
+        quse_auth = home / p.OPENCODE_QUSE_AUTH
+        self.assertTrue(quse_auth.is_file())
+        self.assertEqual(json.loads(quse_auth.read_text(encoding='utf-8')),
+                         {'opencode-go': {'type': 'api', 'key': 'A'}})
+        runtime_dir = Path(self.tmp.name) / 'opencode-device-shared-go' / 'runtime'
+        self.assertFalse((runtime_dir / 'opencode' / 'auth.json').exists())
+
+        # Stripped bundle receipt (files={} on disk after credentials.reconcile)
+        # and an existing 0o775 .local/share/opencode directory created by the
+        # engine CLI still materialize .local/share/opencode/auth.json cleanly.
+        quse_auth.unlink()
+        if os.name != 'nt':
+            os.chmod(quse_auth.parent, 0o775)
+        device_export = home / p.OPENCODE_DEVICE_EXPORT
+        device_export.parent.mkdir(parents=True, exist_ok=True)
+        device_export.write_text(EXPORT, encoding='utf-8')
+        stripped = dict(self.bundle, files={})
+        with patch.object(p, 'install_aplexer_state_hooks'), \
+             patch.object(p, 'install_managed_engine_permissions'), \
+             patch.object(p, 'load_git_identity', return_value={}):
+            p.provision_managed_home(stripped, home=home, dest=dest)
+        self.assertTrue(quse_auth.is_file())
+        if os.name != 'nt':
+            self.assertEqual(quse_auth.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(json.loads(quse_auth.read_text(encoding='utf-8')),
+                         {'opencode-go': {'type': 'api', 'key': 'A'}})
+
+    def test_actual_managed_go_offer_preserves_contract_and_passes_after_quse_auth(self):
+        self.sync()
+        subs = Path(self.tmp.name) / 'subs.json'
+        subs.write_text(json.dumps({
+            'version': 1,
+            'workspaces': {'demo': self.tmp.name},
+            'subscriptions': [{
+                'service': 'go',
+                'account_label': 'shared-go',
+                'engine': 'opencode',
+                'profile': 'hub-shared-go',
+                'admission_argv': ['maintained-gate'],
+                'launcher_provider': 'opencode',
+                'launcher_model': 'opencode-go/muse-spark-1.3-contributor',
+            }],
+            'launcher': {
+                'argv': ['python3', '-m', 'launcher'],
+                'root': self.tmp.name,
+                'config_dir': str(Path(self.tmp.name) / 'cfg'),
+            },
+        }))
+        with patch.object(fleet, 'subscriptions_path', return_value=subs):
+            cfg = fleet.load_settings(subs)
+        self.assertIn('opencode_auth', cfg)
+
+        actual_offer = {
+            'id': '608c8515-2b46-47d6-898a-66ec16e2ab08',
+            'account': 'shared-go',
+            'engine': 'opencode',
+            'profile': 'hub-shared-go',
+            'mode': 'headless',
+            'workspace': 'demo',
+            'prompt': 'Reply with hostname',
+            'selection': {
+                'id': 'muse',
+                'model': 'opencode-go/muse-spark-1.3-contributor',
+                'provider': 'go',
+                'engine': 'opencode',
+                'profile': None,
+                'effort': None,
+            },
+        }
+        plan_has_creds = {'ok': False}
+        submitted_payloads = []
+
+        def runner(argv, **kw):
+            if argv[0] == 'maintained-gate':
+                return {
+                    'launch_allowed': True,
+                    'profile_supported': True,
+                    'model_supported': True,
+                    'account_label': 'shared-go',
+                    'observed_at': fleet.utcnow(),
+                }
+            if 'submit' in argv:
+                submitted_payloads.append(json.loads(argv[argv.index('--payload') + 1]))
+                return {}
+            if 'plan' in argv:
+                if not plan_has_creds['ok']:
+                    return {'eligible': [], 'rejections': {'go': 'Error: no-credentials'}}
+                return {
+                    'eligible': [{
+                        'name': 'go',
+                        'provider': 'opencode',
+                        'model': 'opencode-go/muse-spark-1.3-contributor',
+                        'account_profile': 'hub-shared-go',
+                        'account_label': 'shared-go',
+                        'managed_dir': self.tmp.name,
+                        'health': 1.0,
+                        'task_fit': 1.0,
+                    }]
+                }
+            if 'run' in argv:
+                return {
+                    'backend': 'aplexer',
+                    'task_id': 'hub-' + actual_offer['id'],
+                    'receipt': {
+                        'session_id': 'native-go-1',
+                        'state': 'running',
+                        'first_action_verified': True,
+                        'engine': 'opencode',
+                        'model': 'opencode-go/muse-spark-1.3-contributor',
+                        'model_verified': True,
+                        'profile': 'hub-shared-go',
+                        'account_label': 'shared-go',
+                    },
+                }
+            return {}
+
+        dispatcher = fleet.Dispatcher(cfg, lambda *a, **kw: {}, runner, journal_dir=self.tmp.name)
+        prepared_cfgs = []
+        with patch('agent_hub_host.opencode_auth.prepare', side_effect=lambda c: prepared_cfgs.append(c) or {'ok': True}):
+            with self.assertRaisesRegex(ValueError, 'Fresh admission refused'):
+                dispatcher.dispatch(dict(actual_offer))
+        self.assertEqual(prepared_cfgs, [cfg['opencode_auth']])
+        self.assertEqual(len(submitted_payloads), 1)
+        self.assertEqual(submitted_payloads[0]['model_requirements'], {
+            'providers': ['opencode'],
+            'models': ['opencode-go/muse-spark-1.3-contributor'],
+        })
+        self.assertEqual(submitted_payloads[0]['account_profile'], 'hub-shared-go')
+        self.assertEqual(submitted_payloads[0]['account_label'], 'shared-go')
+        self.assertEqual(submitted_payloads[0]['managed_dir'], self.tmp.name)
+
+        plan_has_creds['ok'] = True
+        with patch('agent_hub_host.opencode_auth.prepare', side_effect=lambda c: prepared_cfgs.append(c) or {'ok': True}):
+            accepted = dispatcher.dispatch(dict(actual_offer, id='da1e2c52-880e-463c-8f03-7a5fc257774f'))
+        self.assertEqual(accepted['state'], 'running')
+        self.assertEqual(accepted['native_id'], 'native-go-1')
 
 
 class ZcodeManagedConfig(unittest.TestCase):

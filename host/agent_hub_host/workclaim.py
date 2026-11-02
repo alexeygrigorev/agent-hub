@@ -27,6 +27,8 @@ import os
 import re
 import subprocess
 import time
+
+from . import native_list_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -373,7 +375,7 @@ def subprocess_runner(argv: list[str]) -> Any:
 def _list_rows(runner: Any, aplexer_bin: str) -> dict[str, dict[str, Any]]:
     """Live session rows by session id (best-effort; {} when unavailable)."""
     try:
-        raw = runner([aplexer_bin, "list", "--all", "--json"])
+        raw = native_list_cache.list_raw(aplexer_bin, lambda: runner([aplexer_bin, "list", "--all", "--json"]))
     except Exception:
         return {}
     rows = raw if isinstance(raw, list) else (raw.get("sessions") if isinstance(raw, dict) else None)
@@ -665,8 +667,6 @@ def build_claim_items(
             "remaining_ttl_ms": remaining,
             "session_state": "running" if state == "running" else ("exited" if state == "exited" else "stale"),
         })
-        if len(items) >= MAX_ITEMS_PER_SYNC:
-            break
     return items, stats
 
 
@@ -816,8 +816,23 @@ def sync_once(
         settings = settings or {}
         binary = aplexer_bin or settings.get("aplexer_bin", "aplexer")
         resolved_state = state_dir or settings.get("aplexer_state_dir") or _state_dir()
-        host_machine = machine_id or settings.get("machine_id", "") or ""
-        if not isinstance(host_machine, str) or not host_machine or not _MACHINE_SEG_RE.match(host_machine):
+        host_machine = machine_id if isinstance(machine_id, str) and _MACHINE_SEG_RE.match(machine_id) else ""
+        if not host_machine:
+            candidate = settings.get("machine_id") if isinstance(settings, dict) else ""
+            if isinstance(candidate, str) and _MACHINE_SEG_RE.match(candidate):
+                host_machine = candidate
+        if not host_machine:
+            # Host-only flow: attest with the credential-bound machine id so the
+            # server's host identity check accepts the rows; hostname is a
+            # non-attested last resort the server rejects for host callers.
+            try:
+                from .config import load_host_config
+                candidate = (load_host_config() or {}).get("machine_id")
+                if isinstance(candidate, str) and _MACHINE_SEG_RE.match(candidate):
+                    host_machine = candidate
+            except Exception:
+                pass
+        if not host_machine:
             try:
                 import socket
                 host_machine = socket.gethostname().split(".")[0][:64] or "local"
@@ -831,26 +846,39 @@ def sync_once(
         envelopes, new_cursors, scan_stats = scan_work_messages(resolved_state, canonicals, cursors)
         claim_items, claim_stats = build_claim_items(declarations, canonicals, host_machine, moment)
         message_items, message_stats = build_message_items(envelopes, host_machine)
-        posted: dict[str, Any] = {"synced_claims": 0, "synced_messages": 0}
-        if claim_items or message_items:
+        posted: dict[str, Any] = {}
+        posted_errors: list[Any] = []
+        # The server caps one native-sync call at MAX_ITEMS_PER_SYNC rows per
+        # array; chunk claims so a busy host's full live set still syncs (a
+        # single truncated POST would drop the newest sessions indefinitely).
+        batches = [claim_items[i:i + MAX_ITEMS_PER_SYNC]
+                   for i in range(0, len(claim_items), MAX_ITEMS_PER_SYNC)] or [[]]
+        for index, batch in enumerate(batches if (claim_items or message_items) else []):
             try:
-                res = request("POST", "/api/bus/native-sync", {"claims": claim_items, "messages": message_items})
-                if isinstance(res, dict):
-                    posted = res
+                res = request("POST", "/api/bus/native-sync", {
+                    "claims": batch,
+                    "messages": message_items if index == 0 else [],
+                })
             except Exception as exc:
                 summary.update({
                     "ok": False,
                     "error": f"native_sync_post_failed:{type(exc).__name__}"[:120],
                     "claims": len(claim_items),
                     "messages": len(message_items),
+                    "batch": index,
                 })
                 return summary
+            if isinstance(res, dict):
+                for key in ("synced_claims", "released_claims", "synced_messages", "deduped_messages"):
+                    posted[key] = posted.get(key, 0) + (res.get(key) or 0)
+                posted_errors.extend(res.get("errors") or [])
             save_cursors(journal_dir if journal_dir is not None else settings.get("journal_dir"), new_cursors)
         summary.update({
             "ok": True,
             "claims": len(claim_items),
             "messages": len(message_items),
             "posted": {k: posted.get(k) for k in ("synced_claims", "released_claims", "synced_messages", "deduped_messages")},
+            "errors": [str(e.get("reason", e))[:120] for e in posted_errors][:3],
             "declaration_stats": claim_stats,
             "envelope_stats": {**scan_stats, "invalid": message_stats.get("invalid", 0)},
             "elapsed_ms": int((time.monotonic() - started) * 1000),

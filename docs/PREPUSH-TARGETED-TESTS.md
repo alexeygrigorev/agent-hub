@@ -49,9 +49,12 @@ base and fast-forward ancestry. Failures, exhausted capacity retries, absent
 runners, deletion/creation of main or source changes during tests refuse the
 push before any remote ref update. Non-main pushes pass through. Repositories
 without an affected-test lane refuse main updates until that lane is supplied.
-A shared Git-directory lock serializes verification across worker worktrees;
-the runners retain their heavy-test admission. Git compares the advertised old
-SHA atomically when updating main, so a concurrent remote push is refused.
+A shared Git-directory lock covers only the final fetch, comparison with the
+advertised main SHA, and source recheck. Tests and admission waits run before
+acquiring it, including the BROAD fallback; the runners retain their heavy-test
+admission. The hook releases this short lock before returning to its parent Git.
+Git's remote ref transaction locks and compares the advertised old SHA atomically
+when updating main, so a concurrent remote push is refused even after the hook.
 Integrate and rerun after main advances. The orchestrator release slot covers
 verification through push; this helper does not grant it.
 

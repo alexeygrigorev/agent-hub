@@ -453,6 +453,15 @@ def main():
     subscriptions = sub.add_parser('subscriptions', help='Inspect safe machine subscription metadata')
     subscriptions.add_argument('--config')
     subscriptions.add_argument('--report', action='store_true', help='Post metadata to the hub using this host credential')
+    subscriptions_cmds = subscriptions.add_subparsers(dest='subscriptions_cmd')
+    for verb in ('disable', 'enable'):
+        route = subscriptions_cmds.add_parser(verb, help=('Disable' if verb == 'disable' else 'Enable')
+                                              + ' one route on this machine only')
+        selector = route.add_mutually_exclusive_group(required=True)
+        selector.add_argument('--engine', help='Effective engine name on this machine')
+        selector.add_argument('--account', help='Local account label on this machine')
+        route.add_argument('--config', default=argparse.SUPPRESS,
+                           help='Subscriptions file (default host settings)')
     dispatch = sub.add_parser('fleet-host', help='Opt-in bounded host polling; no service is installed')
     dispatch.add_argument('--config')
     dispatch.add_argument('--cycles', type=int, default=1)
@@ -818,6 +827,16 @@ def main():
                 else:
                     result = session_control.request('GET', '/api/fleet')
             elif args.cmd in ('subscriptions', 'fleet-host'):
+                if args.cmd == 'subscriptions' and getattr(args, 'subscriptions_cmd', None):
+                    result = fleet.set_machine_route_disabled(
+                        disabled=args.subscriptions_cmd == 'disable',
+                        engine=getattr(args, 'engine', None),
+                        account=getattr(args, 'account', None),
+                        path=args.config)
+                    print('%s %s %s on this machine%s' % (
+                        result['kind'], result['target'], result['status'],
+                        '' if result['changed'] else ' (unchanged)'))
+                    return
                 settings = fleet.load_settings(args.config)
                 if args.cmd == 'fleet-host':
                     fleet.run_cycles(settings, args.cycles, args.interval)

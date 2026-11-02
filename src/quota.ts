@@ -6,6 +6,7 @@ import { syncTbmFromHostSnapshot, syncTbmFromServerAccounts } from "./tbm-ingest
 import { resolveMachineAliases } from "./machine-alias";
 import { isPlainObject, parseUtcIso, readBoundedJsonBody } from "./strict-json";
 import routingPolicy from "../config/model-routing.json";
+import { analyzeQuotaBurn, providerWeight } from "./pacing";
 
 /**
  * Providers whose engines expose no usable quota API on the host (Antigravity
@@ -1564,12 +1565,28 @@ export class QuotaStore {
       // Display the first healthy observation when one exists so a broken
       // sibling probe never masks known windows (e.g. 7d 80% with 5h absent).
       const displayObs = freshObs.find((o) => !observationUnavailable(o.quota)) ?? freshObs[0];
+      const canonProv = canonicalQuotaProvider(account.provider);
+      const canonAcct = canonicalAccountLabel(account.label);
+      const unmetered = isUnmeteredProvider(canonProv);
+      const burn = analyzeQuotaBurn(displayObs?.quota ?? null, nowMs, unmetered);
+      const effRem = remaining ?? (unmetered ? ((routingPolicy.rules as any).unmetered_headroom_percent ?? 50) : 0);
+      const pref = providerWeight(canonProv);
+      const disabled = Number(account.enabled) === 0;
+      const decisionScore = disabled || state === "exhausted" || state === "unavailable" || state === "stale" || state === "unknown"
+        ? 0
+        : Math.round((Math.max(0, effRem) / 100) * burn.factor * pref * 10000) / 10000;
+      const effBurnStatus = state === "exhausted" ? "exhausted" : burn.burn_status;
+      const decisionReason = disabled
+        ? `disabled: ${canonProv}/${canonAcct}`
+        : state === "exhausted"
+        ? `excluded: ${canonProv}/${canonAcct} quota_exhausted`
+        : `${canonProv}/${canonAcct} score=${decisionScore.toFixed(4)} [rem=${remaining !== null ? `${Math.round(remaining)}%` : 'unmetered'} win=${burn.windows_summary} ratio=${burn.ratio !== null ? burn.ratio.toFixed(2) : 'unmetered'} status=${effBurnStatus} burn=${burn.factor.toFixed(2)}x pref=${pref.toFixed(2)}x]`;
       pools.push({
-        provider: canonicalQuotaProvider(account.provider),
-        account: canonicalAccountLabel(account.label),
+        provider: canonProv,
+        account: canonAcct,
         // Operator-disabled (intake 06d2a0ac AC3): excluded from routing,
         // reversible; the quota row stays visible.
-        ...(Number(account.enabled) === 0 ? { routing: "disabled" } : {}),
+        ...(disabled ? { routing: "disabled" } : {}),
         state,
         source,
         windows: displayObs?.quota.windows || {},
@@ -1579,6 +1596,12 @@ export class QuotaStore {
           Number.isFinite(displayObs.quota.details.credits_remaining)
           ? {remaining: displayObs.quota.details.credits_remaining, unit: displayObs.quota.details.unit} : null,
         remaining_percent: remaining,
+        burn_ratio: burn.ratio !== null ? Math.round(burn.ratio * 1000) / 1000 : null,
+        burn_factor: Math.round(burn.factor * 1000) / 1000,
+        burn_status: effBurnStatus,
+        depleted: burn.depleted,
+        decision_score: decisionScore,
+        decision_reason: decisionReason,
         observed_at: observedAt,
         collector_version: collectorVersion,
         observed_by_hosts: [...new Set(freshObs.map((o) => o.machine))].sort(),

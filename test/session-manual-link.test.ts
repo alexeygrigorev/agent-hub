@@ -1,4 +1,4 @@
-/** Intake 27505f04 AC8: operator manual linkage of externally started sessions
+/** Intake 27505f04 AC8: manual linkage of externally started sessions
  * to Hub tasks, while running and after they ended. Honest provenance from the
  * retained canonical record (no live process or host heartbeat required for
  * historical linkage), idempotent retries, auditable conflict refusals,
@@ -149,7 +149,7 @@ describe('manual session-to-task linkage (27505f04 AC8)', () => {
     expect(links(first)).toHaveLength(firstLinks);
   }));
 
-  it('is operator-only and renders missing sessions and tasks without an oracle', async () => fixture(async ({ sc, task, observed }: any) => {
+  it('refuses unscoped callers and renders missing sessions and tasks without an oracle', async () => fixture(async ({ sc, task, observed }: any) => {
     const taskId = task('task-auth-' + crypto.randomUUID().slice(0, 8));
     const sid = observed('running').native_id;
     const forbidden = await sc.handle(linkReq(sid, taskId), agent);

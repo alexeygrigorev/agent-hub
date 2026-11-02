@@ -4,10 +4,11 @@ import { defaultEnv } from './m1-focus-setup';
 import type { Hub } from '../src/hub';
 import { ensureTbmQuotaSchema } from '../src/quota';
 import { modelCandidates, policy } from '../src/model-routing';
+import { burnForecast } from '../src/burn';
 import {
   bankedUrgencyMultiplier, baseTargetTpm, edfOrder, grokDemotion, hardFloorTokens, loadProviderPacing, netHeadroom,
   newPidState, pacingAlignment, pacingStep, providerPacing, providerPreference, refreshPacing, resetUrgency, routeScore,
-  selectBurnSource, softReserveTokens, taskFit, trancheUrgencyTpm, type PidState, type TbmPoolRow, type TbmTrancheRow,
+  scheduleBurnFactor, selectBurnSource, softReserveTokens, taskFit, trancheUrgencyTpm, type PidState, type TbmPoolRow, type TbmTrancheRow,
 } from '../src/pacing';
 
 const H = 3600000; const MIN = 60000; const NOW = Date.UTC(2026, 9, 22, 12);
@@ -19,6 +20,25 @@ const pool = (o: Partial<TbmPoolRow> = {}): TbmPoolRow => ({
 const tranche = (id: string, hours: number, remaining = 1_000_000, o: Partial<TbmTrancheRow> = {}): TbmTrancheRow => ({
   tranche_id: id, pool_id: 'zai:default', provider: 'zai', remaining_tokens: remaining, expires_at_ms: NOW + hours * H,
   status: 'active', banked_burn_rate_tpm: 0, target_banked_burn_rate_tpm: 0, expired_unused_tokens: 0, ...o,
+});
+
+describe('scheduleBurnFactor (burn-rate spread)', () => {
+  const win = (pct: number, hoursLeft: number) => ({ windows: { '7d': { present: true, percent_remaining: pct, reset_at: new Date(NOW + hoursLeft * H).toISOString() } } });
+  it('ranks the account most behind schedule highest', () => {
+    const behind = scheduleBurnFactor(win(48, 24), NOW); const onPace = scheduleBurnFactor(win(50, 84), NOW);
+    expect(behind.ratio).toBeCloseTo(0.48 / (24 / 168)); expect(behind.factor).toBeGreaterThan(onPace.factor);
+  });
+  it('makes a low-headroom account that is ahead of schedule lose to one with room', () => {
+    const claude = scheduleBurnFactor(win(15, 84), NOW); const other = scheduleBurnFactor(win(31, 84), NOW);
+    expect(claude.factor).toBeLessThan(0.1); expect(other.factor).toBeGreaterThan(5 * claude.factor);
+  });
+  it('does not penalise a low-headroom account that is behind schedule near its reset', () => {
+    expect(scheduleBurnFactor(win(15, 4), NOW).factor).toBe(3);
+  });
+  it('is neutral for unmetered windows', () => {
+    expect(scheduleBurnFactor({ windows: {} }, NOW).factor).toBe(1);
+    expect(scheduleBurnFactor(null, NOW).factor).toBe(1);
+  });
 });
 
 describe('safety floors', () => {
@@ -263,8 +283,10 @@ describe('routing score factors', () => {
     expect(netHeadroom(60, 20)).toBeCloseTo(0.5); expect(netHeadroom(10, 15)).toBe(0.05); expect(netHeadroom(100, 0)).toBe(1);
   });
   it('reset urgency grows near reset and is suppressed at the floor', () => {
-    expect(resetUrgency(1, 30)).toBe(1); expect(resetUrgency(1, 0)).toBeCloseTo(3.5);
-    expect(resetUrgency(0.5, 12)).toBeCloseTo(1 + 2.5 * 0.5 * Math.pow(0.5, 1.5));
+    // Hours outside the configured horizon (168h since intake ebfe9d85) stay neutral.
+    const h = policy.rules.reset_horizon_hours;
+    expect(resetUrgency(1, h + 30)).toBe(1); expect(resetUrgency(1, 0)).toBeCloseTo(3.5);
+    expect(resetUrgency(0.5, h / 2)).toBeCloseTo(1 + 2.5 * 0.5 * Math.pow(0.5, 1.5));
     expect(resetUrgency(0.05, 0)).toBeCloseTo(1.125);
   });
   it('pacing alignment boosts lagging providers up to 2.5x and damps over-burners to 0.2x', () => {
@@ -296,7 +318,7 @@ describe('routing score factors', () => {
       expect(after.factors.preference).toBe(1.8);
       expect(after.factors.headroom).toBe(0.2);
       expect(after.factors.urgency).toBeCloseTo(1 + 4 * 0.2 * Math.pow(0.75, 1.5));
-      expect(after.weight).toBeCloseTo(1.8 * 0.2 * after.factors.urgency);
+      expect(after.weight).toBeCloseTo(after.factors.preference * after.factors.headroom * after.factors.urgency * (after.factors.burn ?? 1));
       expect(after.weight).not.toBe(before.weight);
       expect(resetUrgency(1, Infinity)).toBe(1);
     } finally { Object.assign(policy.rules, original); }
@@ -332,8 +354,10 @@ describe('routing score factors', () => {
     const ads = [{ engine: 'opencode', profile: null, model: 'opencode-go/muse-spark-1.3-contributor', effort: null, account: 'g' }];
     const [neutral] = modelCandidates({ tier: 'daily' }, route, ads, quota, NOW) as any[];
     const urgency = resetUrgency(0.8, 2);
-    expect(neutral.factors).toEqual({ fit: 1, health: 1, preference: 1.3, headroom: 0.8, urgency, pacing: 1, grok: 1, banked: 1 });
-    expect(neutral.weight).toBeCloseTo(1.3 * 0.8 * urgency); expect(neutral.preempt).toBe(false);
+    const burn = burnForecast(quota, NOW)!.factor;
+    expect(burn).toBeGreaterThan(3);
+    expect(neutral.factors).toEqual({ fit: 1, health: 1, preference: 1.3, headroom: 0.8, urgency, pacing: 1, grok: 1, banked: 1, burn });
+    expect(neutral.weight).toBeCloseTo(1.3 * 0.8 * urgency * burn); expect(neutral.preempt).toBe(false);
     const lag = new Map([['go', { pacing: 2, banked: 3, preempt: true, halted: false }]]);
     const [boosted] = modelCandidates({ tier: 'daily' }, route, ads, quota, NOW, lag) as any[];
     expect(boosted.weight).toBeCloseTo(neutral.weight * 6); expect(boosted.preempt).toBe(true);

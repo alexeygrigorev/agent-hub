@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 from contextlib import closing
 import json
+from . import native_list_cache
 import math
 import os
 from pathlib import Path
@@ -38,7 +39,7 @@ def _terminal_fleet_state(reconciled_state, has_result, diagnostic_reason=None):
     forwarded result file settle as failed (failed-with-partial-work),
     never exited/done. Permission-refused and launcher-failed stay failed.
     """
-    if diagnostic_reason == 'engine_tool_permission_refused':
+    if diagnostic_reason in {'engine_tool_permission_refused', 'engine_interactive_prompt'}:
         return 'failed'
     if reconciled_state == 'failed':
         return 'failed'
@@ -539,6 +540,47 @@ def subscriptions_path():
     return base / "agent-hub" / "subscriptions.json"
 
 
+def set_machine_route_disabled(*, disabled, engine=None, account=None, path=None):
+    """Persist a machine-local route exclusion in subscriptions.json.
+
+    Exactly one engine or account selector is accepted. The host's fresh route
+    advertisement then omits matching routes, so Hub placement stops selecting
+    this machine without changing any other machine's account policy.
+    """
+    if not isinstance(disabled, bool) or (engine is None) == (account is None):
+        raise ValueError("Choose exactly one --engine or --account selector")
+    target = engine if engine is not None else account
+    if not isinstance(target, str) or not LABEL.fullmatch(target):
+        raise ValueError("Invalid engine or account label")
+    key = 'disabled_engines' if engine is not None else 'disabled_accounts'
+    path = Path(path) if path else subscriptions_path()
+    if path.exists():
+        if path.is_symlink():
+            raise ValueError("Subscription configuration must not be a symlink")
+        # Validate the complete existing file before changing any of it.
+        load_settings(path)
+        if path.stat().st_size > 65536:
+            raise ValueError("Subscription configuration exceeds 64 KiB")
+        data = json.loads(path.read_text(encoding='utf-8'))
+    else:
+        data = {'version': 1, 'subscriptions': [], 'workspaces': {'home': str(Path.home())}}
+    values = list(data.get(key, []))
+    changed = False
+    if disabled and target not in values:
+        values.append(target)
+        changed = True
+    elif not disabled and target in values:
+        values = [value for value in values if value != target]
+        changed = True
+    if changed:
+        data[key] = sorted(values)
+        from . import private_fs
+        private_fs.atomic_write(path, json.dumps(data, indent=2).encode('utf-8') + b'\n', 65536)
+    return {'scope': 'machine', 'kind': 'engine' if engine is not None else 'account',
+            'target': target, 'status': 'disabled' if disabled else 'enabled', 'changed': changed,
+            'config': str(path)}
+
+
 def validate_git_identity_config(conf):
     if not isinstance(conf, dict):
         raise ValueError("git identity setting must be a mapping")
@@ -604,19 +646,31 @@ def resolve_max_agents(value):
 def load_settings(path=None):
     """Explicit non-secret machine configuration, including several accounts per service."""
     default_path = path is None
-    path = Path(path) if path else subscriptions_path()
+    sub_path = subscriptions_path()
+    path = Path(path) if path else sub_path
+    try:
+        is_default_subscriptions = default_path or path.resolve() == sub_path.resolve()
+    except OSError:
+        is_default_subscriptions = default_path or path == sub_path
     if default_path and not path.exists():
         data = {'version': 1, 'subscriptions': [], 'workspaces': {'home': str(Path.home())}}
     else:
         if path.stat().st_size > 65536:
             raise ValueError("Subscription configuration exceeds 64 KiB")
         data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity", "opencode_auth", "host_load_factor"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity", "opencode_auth", "host_load_factor", "disabled_engines", "disabled_accounts"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
+    for key in ('disabled_engines', 'disabled_accounts'):
+        values = data.get(key, [])
+        if (not isinstance(values, list) or len(values) > 128
+                or any(not isinstance(value, str) or not LABEL.fullmatch(value) for value in values)
+                or len(values) != len(set(values))):
+            raise ValueError('Invalid ' + key.replace('_', ' ') + ' list')
+        data[key] = values
     if 'opencode_auth' in data:
         from .opencode_auth import validate
         validate(data['opencode_auth'])
-    elif default_path:
+    elif is_default_subscriptions:
         # Hub-provisioned default (central store device login); an explicit
         # opencode_auth above always wins (intake 5814e109 AC3).
         try:
@@ -750,6 +804,12 @@ def load_settings(path=None):
     # that accidentally drops unrelated native subscriptions and workspaces.
     managed_labels = {s['account_label'] for s in managed}
     data['subscriptions'] = [s for s in data['subscriptions'] if s['account_label'] not in managed_labels] + managed
+    from .model_contract import canonical_account_label
+    disabled_accounts = {canonical_account_label(label) for label in data['disabled_accounts']}
+    disabled_engines = set(data['disabled_engines'])
+    data['subscriptions'] = [sub for sub in data['subscriptions']
+        if canonical_account_label(sub['account_label']) not in disabled_accounts
+        and sub.get('engine', sub['service']) not in disabled_engines]
     return data
 
 
@@ -1223,6 +1283,22 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _opencode_auth_health(settings):
+    """Project only confirmed source-login expiry as persistent route health."""
+    if not settings.get('opencode_auth'):
+        return None
+    from .opencode_auth import prepare, AuthBusy, AuthCheckUnavailable, AuthExpired
+    try:
+        prepare(settings['opencode_auth'])
+    except AuthExpired:
+        return {'engine': 'opencode', 'status': 'unavailable', 'reason': 'engine_auth_expired'}
+    except (AuthBusy, AuthCheckUnavailable):
+        # Transient checks are retried on the next poll/offer; they do not
+        # install a persistent route-health hold.
+        return None
+    return {'engine': 'opencode', 'status': 'ok', 'reason': 'device_auth_verified'}
 
 
 class Dispatcher:
@@ -1942,7 +2018,8 @@ class Dispatcher:
             target = targets[0]
 
             if (not terminal_only and not record.get('health_stop_confirmed')
-                    and not record.get('routing_task_id')) and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused'):
+                    and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') in {
+                        'engine_tool_permission_refused', 'engine_interactive_prompt'})):
                 health = self._check_headless_health(offer_id, record['task_id'], record['workspace'], engine)
                 if health is not None:
                     reconciled.append(health)
@@ -2150,7 +2227,8 @@ class Dispatcher:
                 # Recovery of a spawned first-action failure retains its
                 # original dispatch cause; runtime measurements stay separate.
                 result_payload['diagnostic'] = record['dispatch_diagnostic']
-            elif record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
+            elif record.get('diagnostic', {}).get('reason') in {
+                    'engine_tool_permission_refused', 'engine_interactive_prompt'}:
                 result_payload['diagnostic'] = record['diagnostic']
             elif (fleet_state == 'failed' and record.get('retired_dispatch') is True
                     and isinstance(record.get('dispatch_failure'), dict)):
@@ -2983,15 +3061,24 @@ class Dispatcher:
         # Intake 0689ce9c: live host load gates every new launch before any
         # admission subprocess, claim or native start. Test processes spawned
         # INSIDE sessions are invisible to launcher admission; this 1-minute
-        # load check refuses new starts above factor x cores. For an unclaimed
-        # non-task offer, _dispatch_one refreshes the heartbeat before sending
-        # host_load_high so Hub keeps its retry queued until load clears.
+        # load check refuses starts only for its measured trigger. For an
+        # unclaimed non-task offer, _dispatch_one refreshes the heartbeat
+        # before sending the matching Hub refusal so its retry stays held.
         # Nothing already running is touched.
         from .host_load import check_live_load
         stages = [('start', time.monotonic())]
         check_live_load(self.settings)
         sub = self._route(offer)
         device_auth = self.settings.get('opencode_auth') if sub.get('launcher_provider') == 'opencode' else None
+        if not device_auth and sub.get('launcher_provider') == 'opencode' and sub.get('account_label') in getattr(self, '_managed_labels', ()):
+            try:
+                from . import provisioning
+                from .opencode_auth import validate as _validate_opencode_auth
+                device_auth = _validate_opencode_auth(
+                    json.loads(provisioning.opencode_device_default_path().read_text(encoding='utf-8'))
+                )
+            except (OSError, ValueError, TypeError, ImportError):
+                device_auth = None
         if device_auth:
             self._prepare_device_auth(device_auth)  # Before quota, submission and claim.
         selection = offer.get('selection')
@@ -3434,7 +3521,8 @@ class Dispatcher:
                     log_offsets=log_offsets,
                     routing_task_id=offer.get('task_id'),
                 )
-                health = None if offer.get('task_id') else self._check_headless_health(offer_id, task_id, workspace, offer.get('engine') or sub.get('engine'))
+                health = self._check_headless_health(offer_id, task_id, workspace,
+                                                     offer.get('engine') or sub.get('engine'))
                 if health is not None:
                     return health
         except Exception as exc:
@@ -3454,7 +3542,7 @@ class Dispatcher:
                     failure = launcher_record_cause(failure, workspace, t_id, l_at)
                 except Exception:
                     pass
-            if mode == "headless" and not offer.get("task_id") and t_id:
+            if mode == "headless" and t_id:
                 try:
                     health = self._check_headless_health(offer_id, t_id, workspace, engine_name)
                     if health is not None:
@@ -3742,7 +3830,7 @@ class Dispatcher:
             unknown = [dict(sub, quota=dict(sub['quota'], status='unknown', observed_at=None)) for sub in reports]
             return self.request('PUT', '/api/fleet/subscriptions', {'subscriptions': unknown})
 
-    def report_catalog_bindings(self):
+    def report_catalog_bindings(self, fresh=False):
         """Share a census only if its sampling began after this call arrived.
 
         A census started before a native launch must not suppress its followup
@@ -3754,6 +3842,7 @@ class Dispatcher:
             if self._catalog_sampled_at >= requested_at:
                 return self._catalog_raw
             sampled_at = time.monotonic()
+            self._catalog_fresh = fresh
             raw = self._report_catalog_bindings()
             self._catalog_sampled_at, self._catalog_raw = sampled_at, raw
             return raw
@@ -3766,7 +3855,12 @@ class Dispatcher:
         native process alongside its reservation. Failure is safe to retry:
         this helper never launches anything.
         """
-        raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
+        aplexer_bin = self.settings.get("aplexer_bin", "aplexer")
+        # Shared host snapshot (<= 1 `aplexer list` per TTL); a just-confirmed
+        # start asks for a bounded-fresh one so its binding is not delayed.
+        raw = native_list_cache.list_raw(
+            aplexer_bin, lambda: self.runner([aplexer_bin, "list", "--all", "--json"]),
+            native_list_cache.FRESH_MAX_AGE_S if getattr(self, '_catalog_fresh', False) else None)
         from .session_progress import SessionProgress, stop_orphan
         from .worktree_guard import cleanup_permitted
         if not hasattr(self, '_session_progress'):
@@ -4102,7 +4196,7 @@ class Dispatcher:
             results.append(outcome)
             if outcome.get('state') == 'running':
                 try:
-                    self.report_catalog_bindings()
+                    self.report_catalog_bindings(fresh=True)
                 except Exception as exc:
                     # A catalog/binding transport error is not a failed
                     # launch. Keep its real receipt and retry next cycle.
@@ -4156,21 +4250,42 @@ class Dispatcher:
             diagnostic = classify(exc, workspace_available=workspace_available)
             reason = diagnostic['reason']
             if reason == 'host_overload':
+                load_status = getattr(exc, 'host_load_status', None)
+                hub_reason = 'host_load_high'
+                hub_diagnostic = {
+                    'reason': hub_reason,
+                    'message': diagnostic['message'],
+                    'stage': 'dispatch_route',
+                    'error_type': 'ValueError',
+                }
+                if (isinstance(load_status, dict) and
+                        load_status.get('trigger') in {'mem_available', 'cpu_busy', 'load_runaway'}):
+                    from .host_load import hub_refusal
+                    hub_reason, host_load = hub_refusal(load_status)
+                    from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
+                    hub_diagnostic = {
+                        'reason': hub_reason,
+                        'message': _DISPATCH_MESSAGES[hub_reason],
+                        'stage': 'dispatch_route',
+                        'error_type': 'ValueError',
+                        'host_load': host_load,
+                    }
+                    reason = hub_reason
                 # Intake 0689ce9c: only an unclaimed non-task offer can be
                 # rejected. A pending claim may already own a native start,
                 # and routed task offers require their task-report path.
                 print(json.dumps({'event': 'dispatch_host_overload',
                                   'offer_id': offer.get('id'),
-                                  'diagnostic': diagnostic}), flush=True)
+                                  'diagnostic': hub_diagnostic}), flush=True)
                 pending_key = self._pending_claim_key(offer.get('id'))
                 if pending_key is not None or offer.get('task_id'):
                     # Never reject an ambiguous claim or a routed task offer.
                     if pending_key is not None:
                         self._persist_launch_record({'offer_id': offer.get('id'),
                             'state': 'claim_pending', 'claim_key': pending_key,
-                            'reason': reason, 'diagnostic': diagnostic, 'settled': False})
+                            'reason': reason, 'diagnostic': hub_diagnostic, 'settled': False})
                     results.append({'id': offer.get('id'), 'state': 'held',
-                                    'reason': reason, 'diagnostic': diagnostic})
+                                    'reason': reason, 'diagnostic': hub_diagnostic})
                     return
 
                 # Publish the same fresh load sample the local 1.5x-core
@@ -4183,24 +4298,20 @@ class Dispatcher:
                                     'stage': 'heartbeat_refresh'})
                     return
 
-                from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
-                hub_reason = 'host_load_high'
-                hub_diagnostic = {
-                    'reason': hub_reason,
-                    'message': _DISPATCH_MESSAGES[hub_reason],
-                    'stage': 'dispatch_route',
-                    'error_type': 'ValueError',
-                }
                 record = {'offer_id': offer.get('id'), 'state': 'dispatch_refused',
                           'reason': hub_reason, 'diagnostic': hub_diagnostic,
                           'settled': False}
                 self._persist_launch_record(record)
                 try:
-                    from .host_load import load_factor
+                    payload = {'reason': hub_reason, 'diagnostic': hub_diagnostic}
+                    if hub_reason == 'host_load_high':
+                        from .host_load import load_factor
+                        payload['host_load_factor'] = (load_status.get('factor')
+                                                       if isinstance(load_status, dict)
+                                                       else load_factor(self.settings))
                     rejected = self.request(
                         'POST', '/api/fleet/launches/' + offer['id'] + '/reject',
-                        {'reason': hub_reason, 'diagnostic': hub_diagnostic,
-                         'host_load_factor': load_factor(self.settings)})
+                        payload)
                     if (not isinstance(rejected, dict) or
                             not isinstance(rejected.get('id'), str) or
                             rejected['id'] == offer.get('id') or
@@ -4319,6 +4430,14 @@ class Dispatcher:
         self.settings['subscriptions'] = [s for s in self.settings['subscriptions'] if s['account_label'] not in self._managed_labels] + managed
         self._managed_labels = {s['account_label'] for s in managed}
         self._merge_native_subscriptions()
+        if 'opencode_auth' not in self.settings and self._managed_labels:
+            try:
+                from .opencode_auth import validate as _validate_opencode_auth
+                self.settings['opencode_auth'] = _validate_opencode_auth(
+                    json.loads(provisioning.opencode_device_default_path().read_text(encoding='utf-8'))
+                )
+            except (OSError, ValueError, TypeError, ImportError):
+                pass
         _mark('provisioning')
         # AC2: exactly one of the 60s timer loop and the 20s session-host
         # loop owns offers per cycle. The loser skips with a receipt instead
@@ -4707,18 +4826,10 @@ class Dispatcher:
                 self.request('POST', '/api/fleet/probe', {'engine': engine, 'status': 'ok', 'reason': 'admission_configured'})
             except Exception:
                 pass  # A failed projection never replaces dispatch admission.
-        if self.settings.get('opencode_auth'):
-            from .opencode_auth import prepare, AuthBusy, AuthCheckUnavailable
+        auth_health = _opencode_auth_health(self.settings)
+        if auth_health:
             try:
-                prepare(self.settings['opencode_auth'])
-                auth_health = {'engine': 'opencode', 'status': 'ok', 'reason': 'device_auth_verified'}
-            except (AuthBusy, AuthCheckUnavailable):
-                auth_health = None
-            except ValueError:
-                auth_health = {'engine': 'opencode', 'status': 'unavailable', 'reason': 'engine_auth_expired'}
-            try:
-                if auth_health:
-                    self.request('POST', '/api/fleet/probe', auth_health)
+                self.request('POST', '/api/fleet/probe', auth_health)
             except Exception:
                 pass  # dispatch repeats the check before allowing any claim.
         _mark('probes')

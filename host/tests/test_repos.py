@@ -123,6 +123,15 @@ class RepoTests(unittest.TestCase):
         self.assertIn('close matches: dtc-website', str(result))
         self.assertNotIn('bad.test', str(result))
 
+    def test_registered_repo_suggestion_is_safe_cli_diagnostic(self):
+        raw = json.dumps(dict(error='unknown_repo', repo='AI-Shipping-Labs/ai-shipping-labs',
+                              matches=['AI-Shipping-Labs/website', 'https://bad.test'])).encode()
+        err = urllib.error.HTTPError('https://example.test', 400, 'bad', {}, io.BytesIO(raw))
+        result = session_control.http_error(err)
+        self.assertIn('unknown repository: AI-Shipping-Labs/ai-shipping-labs', str(result))
+        self.assertIn('registered repositories: AI-Shipping-Labs/website', str(result))
+        self.assertNotIn('bad.test', str(result))
+
     def test_cli_filters_and_operator_edit(self):
         parser = argparse.ArgumentParser()
         repos.add_commands(parser.add_subparsers(dest='cmd'))

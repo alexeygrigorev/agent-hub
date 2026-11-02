@@ -156,7 +156,7 @@ export const TBM_DEFAULT_KAPPA = 1.5;
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
-const WINDOW_NOMINAL_CYCLE_MS: Record<string, number> = {
+export const WINDOW_NOMINAL_CYCLE_MS: Record<string, number> = {
   "1h": HOUR_MS,
   hourly: HOUR_MS,
   "5h": 5 * HOUR_MS,

@@ -74,27 +74,37 @@
   },
   "tiers": {
     "deep": [
-      "astra",
       "argon",
       "argon-gemini",
+      "astra",
       "opus"
     ],
     "ask": [
+      "argon",
+      "argon-gemini",
+      "muse",
+      "glm-flash",
+      "glm-flash-zcodex",
+      "astra",
       "opus",
       "sonnet"
     ],
     "review": [
-      "opus",
-      "astra",
       "argon",
-      "argon-gemini"
-    ],
-    "daily": [
-      "sonnet",
+      "argon-gemini",
+      "astra",
+      "muse",
       "glm-flash",
       "glm-flash-zcodex",
+      "opus"
+    ],
+    "daily": [
       "muse",
       "argon",
+      "argon-gemini",
+      "glm-flash",
+      "glm-flash-zcodex",
+      "sonnet",
       "deepseek-flash",
       "beam-free",
       "deepseek-v4-pro",
@@ -436,7 +446,78 @@
       "go"
     ],
     "provider_preference": 1.3,
-    "reset_horizon_hours": 24,
+    "provider_weights": {
+      "go": 1.2,
+      "gemini": 1.2,
+      "zai": 1.2,
+      "codex": 1.1,
+      "copilot": 1.0,
+      "claude": 0.85,
+      "grok": 0.2
+    },
+    "low_headroom_percent": 30,
+    "desktop_codex_guard": {
+      "enabled": true,
+      "reason": "codex-vpn guard (Alexey): OpenAI codex is not placed on the Windows desktop. Set enabled=false (or edit machine_ids/hostnames) to lift; other engines there, including zcodex/zai, stay eligible.",
+      "excluded_providers": [
+        "codex"
+      ],
+      "machine_ids": [
+        "0sJC0fDcz0bzhG4XQp5EeQ"
+      ],
+      "hostnames": [
+        "DESKTOP-FP4OP26"
+      ]
+    },
+    "engine_capabilities": {
+      "antigravity": {
+        "tool_use": true,
+        "context_tokens": 1000000,
+        "speed": "normal"
+      },
+      "gemini": {
+        "tool_use": true,
+        "context_tokens": 1000000,
+        "speed": "normal"
+      },
+      "opencode": {
+        "tool_use": true,
+        "context_tokens": 256000,
+        "speed": "fast"
+      },
+      "zcodex": {
+        "tool_use": true,
+        "context_tokens": 200000,
+        "speed": "fast"
+      },
+      "codex": {
+        "tool_use": true,
+        "context_tokens": 400000,
+        "speed": "normal"
+      },
+      "claude": {
+        "tool_use": true,
+        "context_tokens": 200000,
+        "speed": "normal"
+      },
+      "copilot": {
+        "tool_use": true,
+        "context_tokens": 128000,
+        "speed": "fast"
+      }
+    },
+    "project_preferences": {},
+    "reset_horizon_hours": 168,
+    "burn_urgency_factor": 3,
+    "burn_min_cycle_hours": 24,
+    "burn_min_elapsed_hours": 12,
+    "burn_waste_alert_percent": 30,
+    "explicit_only_burn_release_percent": 30,
+    "explicit_only_burn_release_tiers": [
+      "daily",
+      "deep",
+      "review"
+    ],
     "reset_urgency_factor": 2.5,
     "headroom_floor": 0.05,
     "reserve_percent": {

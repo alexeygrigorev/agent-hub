@@ -1008,7 +1008,7 @@ def test_managed_codex_config_keeps_update_check_boolean_type(tmp_path, provider
     home.chmod(0o700)
     # Reconcile a previously string-valued setting and keep the disable flag
     # boolean on subsequent syncs.
-    config.write_text('check_for_update_on_startup = "true"\n')
+    p.private_fs.atomic_write(config, b'check_for_update_on_startup = "true"\n', 131072)
 
     for _ in range(2):
         p.install_managed_engine_permissions({'provider': provider}, home)
@@ -1226,13 +1226,29 @@ def test_ensure_toml_trusted_projects():
 def test_ensure_toml_trusted_hooks(tmp_path):
     initial = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n'
     hooks_file = tmp_path / 'hooks.json'
+    hooks_doc = {'hooks': {'SessionStart': [{'hooks': [{'type': 'command', 'command': 'a state-report working'}]}]}}
+    p.private_fs.atomic_write(hooks_file, json.dumps(hooks_doc).encode('utf-8'), 131072)
     res = p.ensure_toml_trusted_hooks(initial, hooks_file)
-    for suffix in p.KNOWN_HOOK_HASHES:
-        assert f':{suffix}"]' in res
-        assert 'trusted_hash =' in res
+    trust = p.hook_trust.entries(str(hooks_file.resolve()), hooks_doc)
+    assert len(trust) == 1
+    for key, value in trust.items():
+        assert json.dumps(key) in res
+        assert f'trusted_hash = "{value}"' in res
     # Ensure idempotency
     res2 = p.ensure_toml_trusted_hooks(res, hooks_file)
     assert res2 == res
+
+
+def test_trust_refresh_removes_stale_hashes_when_generated_hooks_become_empty(tmp_path):
+    hooks_file = tmp_path / 'hooks.json'
+    p.private_fs.atomic_write(hooks_file, json.dumps({'hooks': {}}).encode('utf-8'), 131072)
+    key = str(hooks_file.resolve()) + ':SessionStart:0:0'
+    stale = ('approval_policy = "never"\n\n'
+             f'[hooks.state.{json.dumps(key)}]\n'
+             'trusted_hash = "sha256:stale-generated-hash"\n')
+    refreshed = p.ensure_toml_trusted_hooks(stale, hooks_file)
+    assert refreshed == 'approval_policy = "never"\n'
+    assert 'stale-generated-hash' not in refreshed
 
 
 def test_sync_rotation_cleans_readonly_go_mod_cache_and_preserves_profile(tmp_path, monkeypatch):
@@ -1392,6 +1408,8 @@ def test_codex_config_merge_is_idempotent_across_crlf_and_quoting(tmp_path):
     import tomllib
 
     hooks = tmp_path / 'hooks.json'
+    hooks_doc = {'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'a state-report idle'}]}]}}
+    p.private_fs.atomic_write(hooks, json.dumps(hooks_doc).encode('utf-8'), 131072)
     paths = ['/a/b', '/c']
     # Codex rewrote the file: CRLF endings and a literal-quoted table.
     base = ('approval_policy = "never"\r\n\r\n[projects."/a/b"]\r\ntrust_level = "untrusted"\r\n'
@@ -1405,7 +1423,7 @@ def test_codex_config_merge_is_idempotent_across_crlf_and_quoting(tmp_path):
     assert run(once) == once
     data = tomllib.loads(once)
     assert data['projects'][str(Path('/a/b').resolve())]['trust_level'] == 'trusted'
-    assert len(data['hooks']['state']) == len(p.KNOWN_HOOK_HASHES)
+    assert len(data['hooks']['state']) == len(p.hook_trust.entries(str(hooks.resolve()), hooks_doc))
 
 
 def test_repair_toml_duplicate_tables_fixes_already_broken_config():

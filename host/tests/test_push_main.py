@@ -192,6 +192,47 @@ sys.exit(subprocess.call(['python3', '-m', 'unittest', 'discover', '-s', 'host/t
         self.assertEqual(self.tip(), self.git('rev-parse', 'HEAD', cwd=peer))
         self.assertNotEqual(self.tip(), candidate)
 
+    def test_affected_and_broad_tests_can_acquire_release_lock(self):
+        # Real test children must be able to use this repository lock. Before
+        # fbe77435's follow-up this failed because the hook held it throughout
+        # the affected lane (and the BROAD fallback).
+        for index, (raw, broad) in enumerate(((False, False), (True, False),
+                                               (False, True), (True, True))):
+            with self.subTest(raw=raw, broad=broad):
+                self.write('host/tests/test_fixture.py', '''import unittest
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+from host.agent_hub_host.prepush import release_lock
+class Fixture(unittest.TestCase):
+    def test_lock_is_available(self):
+        with release_lock(Path.cwd()):
+            pass
+''' + f'# candidate {index}\n')
+                if broad:
+                    self.write('package.json', '{"version": "' + str(index) + '"}\n')
+                candidate = self.commit('tests use release lock')
+                if raw:
+                    self.install_for_launch()
+                result = self.raw_push() if raw else self.run_gate()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.tip(), candidate)
+                if broad:
+                    self.assertTrue((self.state / 'full-ran').exists())
+
+    def test_busy_final_lock_does_not_prevent_tests_then_retry_pushes(self):
+        from agent_hub_host.prepush import release_lock
+        candidate = self.passing_candidate()
+        with release_lock(self.repo):
+            result = self.run_gate()
+            self.assert_refused(result)
+            # Admission/tests happen before the short final critical section.
+            self.assertEqual((self.state / 'tested-base').read_text(), self.seed)
+            self.assertTrue((self.state / 'selected').exists())
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.tip(), candidate)
+
     def install_for_launch(self, repo=None):
         from agent_hub_host.worktree_guard import protect_bound_worktree
         self.assertTrue(protect_bound_worktree('git', str(repo or self.repo), 'a' * 32, None))
@@ -380,6 +421,26 @@ sys.exit(subprocess.call(['python3', '-m', 'unittest', 'discover', '-s', 'host/t
         self.assertEqual(diagnostic['reason'], 'dispatch_worktree_refused')
         self.assertEqual(diagnostic['error_type'], 'PrepushHookInstallError')
         self.assertNotIn('/private/credential', str(diagnostic))
+
+
+class VerifyEnvTests(unittest.TestCase):
+    def test_verify_strips_git_hook_env_from_test_runs(self):
+        from agent_hub_host import prepush
+        seen = []
+        root = Path(tempfile.mkdtemp())
+        (root / 'scripts').mkdir()
+        for name in ('capped-test-retry.sh', 'test-affected-local.sh'):
+            (root / 'scripts' / name).write_text('')
+        sha = 'a' * 40
+        with patch.dict(os.environ, {'GIT_DIR': '/real/.git', 'GIT_INDEX_FILE': '/real/index', 'KEEP_ME': '1'}), \
+                patch.object(prepush, 'git', return_value=sha), patch.object(prepush, 'clean', return_value=True), \
+                patch.object(prepush.subprocess, 'call', side_effect=lambda *a, **k: seen.append(k['env']) or 0):
+            prepush.verify(root, sha, 'b' * 40)
+        self.assertTrue(seen)
+        for env in seen:
+            self.assertFalse([k for k in env if k.startswith('GIT_')])
+            self.assertEqual(env['KEEP_ME'], '1')
+            self.assertEqual(env['AGENT_HUB_HEAVY_TEST_PRIORITY'], 'final')
 
 
 if __name__ == '__main__':

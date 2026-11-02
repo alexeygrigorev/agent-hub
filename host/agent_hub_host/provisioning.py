@@ -41,6 +41,7 @@ ANTIGRAVITY_ONBOARDING_JSON = json.dumps({'consumerOnboardingComplete': True,
                                           'onboardingComplete': True}, indent=2) + '\n'
 ANTIGRAVITY_TOKEN = '.gemini/antigravity-cli/antigravity-oauth-token'
 OPENCODE_DEVICE_EXPORT = '.local/share/opencode-hub/device-auth.json'
+OPENCODE_QUSE_AUTH = '.local/share/opencode/auth.json'
 ENV = {'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
        'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENCODE_API_KEY',
        'ZAI_API_KEY', 'ZAI_BASE_URL', 'ZAI_TOKEN'}
@@ -131,6 +132,69 @@ def _opencode_device_export(text):
     return text
 
 
+def opencode_device_access_token(bundle=None, home=None):
+    """Active OpenCode device-login access token from the Hub-delivered export."""
+    if isinstance(bundle, dict) and bundle.get('provider') != 'go':
+        return None
+    raw = (bundle.get('files') or {}).get(OPENCODE_DEVICE_EXPORT) if isinstance(bundle, dict) else None
+    if (not isinstance(raw, str) or not raw) and home is not None:
+        try:
+            raw = private_fs.read_bytes(Path(home) / OPENCODE_DEVICE_EXPORT, 32768, private=False).decode('utf-8')
+        except (OSError, UnicodeDecodeError, ValueError):
+            raw = None
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        rows = json.loads(raw)
+    except ValueError:
+        return None
+    active = [r for r in rows if isinstance(r, dict) and r.get('active') is True
+              and r.get('integrationID') == 'opencode'] if isinstance(rows, list) else []
+    value = active[0].get('value') if len(active) == 1 and isinstance(active[0].get('value'), dict) else {}
+    token = value.get('access')
+    return token if isinstance(token, str) and token else None
+
+
+def _ensure_opencode_quse_auth(bundle, home):
+    """Materialize the isolated managed-home auth.json that `quse go --json` reads.
+
+    OpenCode 2.x itself runs against the separate `opencode-device-<label>/runtime`
+    SQLite store (`XDG_DATA_HOME` / `OPENCODE_DB`), so it never reads `home`'s
+    `.local/share/opencode/auth.json`. The maintained launcher's managed-account
+    admission (`fetch_managed_quse`) runs `quse go --json` with `HOME=dest/home`
+    and `XDG_DATA_HOME` stripped, which otherwise fails with `no-credentials`.
+    """
+    token = opencode_device_access_token(bundle, home)
+    if not token or home is None:
+        return False
+    target = Path(home) / OPENCODE_QUSE_AUTH
+    expected = json.dumps({'opencode-go': {'type': 'api', 'key': token}})
+    try:
+        current = target.read_text(encoding='utf-8')
+    except OSError:
+        current = None
+    if current == expected:
+        return True
+    home_path = Path(home)
+    for directory in (home_path, home_path / '.local', home_path / '.local' / 'share', target.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+        if os.name != 'nt':
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:
+                pass
+        else:
+            with private_fs.parent(directory / '.private', create=True, owned=True):
+                pass
+    private_fs.atomic_write(target, expected.encode('utf-8'), 32768, engine_owned=True)
+    if os.name != 'nt':
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+    return True
+
+
 def opencode_device_default_path():
     return root() / 'opencode-device-default.json'
 
@@ -181,6 +245,7 @@ def sync_opencode_device(bundle, native=None):
         write_json(receipt, {'sha256': digest})
         status = 'imported'
     write_json(opencode_device_default_path(), cfg)
+    _ensure_opencode_quse_auth(bundle, dest / 'home')
     return status
 
 
@@ -377,6 +442,8 @@ def install_aplexer_state_hooks(bundle=None, home=None):
             }
         }
 
+    if not _windows_hooks():
+        template_hooks = hook_command.throttle_post_tool_use_hooks(template_hooks)
     content_bytes = json.dumps(template_hooks, indent=2).encode('utf-8')
     with private_fs.parent(codex_hooks, create=True):
         pass
@@ -615,32 +682,17 @@ def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
     return res
 
 
-KNOWN_HOOK_HASHES = {
-    'session_start:0:0': 'sha256:ac5079da741baea9d7cb457e131ce58f3b563b443cd750940bfa2e54be63a0ec',
-    'session_start:1:0': 'sha256:b8d459bbdbea59e7ff5bd6064a65ced7d9ea57686bb163d1c9fb40eef8ffd4f6',
-    'user_prompt_submit:0:0': 'sha256:db2f3aaa4d73a3c4ce637c104399b654efb2990cd46f72a7f3646cf9c783feac',
-    'user_prompt_submit:1:0': 'sha256:9110ecd5d2975cef72b5596811be8115687e1d437311d7b11f87caf911a24c9b',
-    'stop:0:0': 'sha256:6d270f46d79288e0768c5124346fd2289e3c1b694f38041892633190beb161f8',
-    'post_tool_use:0:0': 'sha256:9e4b66a5438f7470eba7321ae25b62a3ce845c416418da8d85cda2b3c41cca37',
-}
-
-
 def ensure_toml_trusted_hooks(content: str, hooks_file: Path) -> str:
-    """Ensure installed hooks in hooks_file are trusted in TOML content to prevent hook review prompts."""
-    res = repair_toml_duplicate_tables(content)
+    """Trust only handlers present in the actual generated hooks file."""
     try:
-        h_str = str(hooks_file.resolve())
+        hooks_file = Path(hooks_file).resolve()
+        raw = read_engine_file(hooks_file)
+        if raw is None:
+            return content
+        hooks_doc = json.loads(raw.decode('utf-8'))
     except Exception:
-        h_str = str(hooks_file)
-    present = {path for path, _ in _toml_sections(res) if path}
-    for suffix, hash_val in KNOWN_HOOK_HASHES.items():
-        key = f'{h_str}:{suffix}'
-        if ('hooks', 'state', key) in present:
-            continue
-        if res and not res.endswith('\n'):
-            res += '\n'
-        res += f'\n[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{hash_val}"\n'
-    return res
+        return content
+    return hook_trust.render(repair_toml_duplicate_tables(content), str(hooks_file), hooks_doc)
 
 
 def read_engine_file(target, limit=131072):
@@ -728,6 +780,9 @@ def ensure_claude_trusted_projects(config_path, paths):
     if config.get('hasCompletedOnboarding') is not True:
         config['hasCompletedOnboarding'] = True
         changed = True
+    if config.get('theme') != 'dark':
+        config['theme'] = 'dark'
+        changed = True
     for path in paths:
         for key in claude_project_keys(path):
             entry = projects.setdefault(key, {})
@@ -814,6 +869,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         settings['autoUpdates'] = False
         perms = settings.setdefault('permissions', {})
         if isinstance(perms, dict):
+            perms['defaultMode'] = 'bypassPermissions'
             perms.setdefault('deny', ['AskUserQuestion'])
         # Interactive claude sessions report semantic state through the same
         # hook contract as .codex/hooks.json: UserPromptSubmit/SessionStart ->
@@ -1030,6 +1086,10 @@ def provision_managed_home(bundle=None, home=None, dest=None):
                 os.chmod(target, 0o600)
             except OSError:
                 pass
+
+    # 2c. OpenCode Go quota-probe credentials for managed quse go --json.
+    if isinstance(bundle, dict) and bundle.get('provider') == 'go':
+        _ensure_opencode_quse_auth(bundle, home)
 
     # 3. Provision aplexer state hooks
     install_aplexer_state_hooks(bundle, home)
@@ -1713,6 +1773,8 @@ def install(bundle, request=None):
             and (bundle['provider'] != 'go' or _go_engine_current(bundle, dest))):
         provision_managed_home(bundle, home, dest)
         credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+        if bundle.get('provider') == 'go':
+            _ensure_opencode_quse_auth(bundle, home)
         credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
         if receipt != bundle:
             write_json(dest / 'bundle.json', bundle)
@@ -1812,6 +1874,8 @@ def install(bundle, request=None):
             raise ValueError('Native engine verification failed') from None
     provision_managed_home(bundle, home, dest)
     credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+    if bundle.get('provider') == 'go':
+        _ensure_opencode_quse_auth(bundle, home)
     credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
     write_json(dest / 'bundle.json', bundle)
 
@@ -2595,6 +2659,11 @@ def admission():
             bundle = installed_bundle()
         except Exception:
             bundle = None
+    if isinstance(bundle, dict) and bundle.get('provider') == 'go':
+        try:
+            _ensure_opencode_quse_auth(bundle, root() / f"{label}-{bundle.get('revision', '')}" / 'home')
+        except Exception:
+            pass
     # The managed profile is checked, and repaired under the lock, before Hub
     # stamps its verdict too: a repair waiting on a Windows reconcile after the
     # stamp aged the verdict past the 30 s window (admission_timestamp_stale).
@@ -2739,6 +2808,16 @@ def add_commands(sub):
     versions.add_argument('--json', dest='json', action='store_true', help='Machine-readable output (default)')
     versions.add_argument('--fleet', action='store_true', help='Fleet-wide per-host versions from Hub version reports instead of this host')
     versions.add_argument('--machine', default=None, help='With --fleet: only this registered host')
+    recommend = commands.add_parser('recommend', help='Recommend engine/account/model/host using Hub burn-rate decision logic without reserving')
+    recommend.add_argument('--tier', default=None, help='Task tier (daily, deep, quick, review, ask)')
+    recommend.add_argument('--workspace', default=None, help='Workspace name or path')
+    recommend.add_argument('--machine', default=None, help='Preferred machine id')
+    recommend.add_argument('--project', default=None, help='Project name')
+    recommend.add_argument('--needs', default=None, help='Comma-separated capability/OS labels')
+    recommend.add_argument('--mode', choices=['headless', 'interactive'], default='headless')
+    recommend.add_argument('--engine', default=None, help='Optional pinned engine (requires --reason)')
+    recommend.add_argument('--reason', default=None, help='Required explanation when --engine is pinned')
+    recommend.add_argument('--json', action='store_true', default=True, help='JSON output (default)')
 
 
 def central_login(args, prompt=None):
@@ -2962,6 +3041,17 @@ def engine_update_command(args):
 
 
 def command(args):
+    if args.engines_cmd == 'recommend':
+        import urllib.parse
+        if getattr(args, 'engine', None) and not (getattr(args, 'reason', None) and str(args.reason).strip()):
+            raise ValueError('engine_reason_required: --engine requires --reason')
+        q = {}
+        for k in ('tier', 'workspace', 'machine', 'project', 'needs', 'mode', 'engine', 'reason'):
+            v = getattr(args, k, None)
+            if v is not None and str(v).strip():
+                q[k] = str(v).strip()
+        qs = ('?' + urllib.parse.urlencode(q)) if q else ''
+        return bus._do_request('GET', '/api/fleet/recommend' + qs)
     if args.engines_cmd == 'quota':
         return quotas()
     if args.engines_cmd == 'login':

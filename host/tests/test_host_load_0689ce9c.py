@@ -105,6 +105,14 @@ class LiveLoadStatusTests(unittest.TestCase):
         self.assertTrue(message.startswith("host_overload: "))
         self.assertIn("80.0", message)
         self.assertNotIn("\n", message)
+        self.assertEqual(ctx.exception.host_load_status["trigger"], "load_runaway")
+
+    def test_hub_refusal_keeps_memory_trigger_measurement_and_floor(self):
+        status = host_load.live_load_status({}, **clear_probes(mem_fn=lambda: (3 * GIB, 64 * GIB)))
+        reason, report = host_load.hub_refusal(status)
+        self.assertEqual(reason, "memory_pressure")
+        self.assertEqual(report, {"trigger": "mem_available", "mem_avail_mb": 3072.0,
+                                  "mem_floor_mb": 6144.0})
 
     def test_check_passes_status_through_when_clear(self):
         status = host_load.check_live_load({}, **clear_probes(loadavg_fn=lambda: (36.0, 4.0, 4.0)))
@@ -269,9 +277,42 @@ class DispatchHoldsUnderLoadTests(unittest.TestCase):
                 "message": MESSAGES["host_load_high"],
                 "stage": "dispatch_route",
                 "error_type": "ValueError",
+                "host_load": {"trigger": "load_runaway", "load1": 80.0,
+                              "cores": 12, "factor": 6.0},
             })
             self.assertEqual(calls[1][2]["host_load_factor"], 6.0)
             self.assertEqual(persist.call_args_list[-1][0][0]["settled"], True)
+
+    def test_memory_overload_rejects_with_memory_reason_and_measured_floor(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dispatcher, _ = self.dispatcher(tmp)
+            results = []
+            calls = []
+            retry_id = "22345678-1234-1234-1234-123456789abc"
+            status = {"load1": None, "cores": 8, "factor": 6.0, "cpu_busy": None,
+                      "cpu_window_s": None, "mem_avail_gb": 3.1, "mem_avail_mb": 3174.0,
+                      "mem_floor_mb": 6144.0, "trigger": "mem_available",
+                      "overloaded": True, "unknown": False}
+
+            def request(method, path, payload=None):
+                calls.append((method, path, payload))
+                return {"id": retry_id, "state": "queued", "queued": True,
+                        "rejected": [{"reason": "memory_pressure"}]}
+
+            with patch.object(dispatcher, '_persist_launch_record') as persist, \
+                    patch.object(dispatcher, '_refresh_checkin', return_value=True), \
+                    patch.object(dispatcher, 'request', side_effect=request), \
+                    patch("agent_hub_host.host_load.live_load_status", return_value=status):
+                dispatcher._dispatch_one(self.offer(), results)
+            self.assertEqual(results[0]["rejected"][0]["reason"], "memory_pressure")
+            payload = calls[0][2]
+            self.assertEqual(payload["reason"], "memory_pressure")
+            self.assertEqual(payload["diagnostic"]["host_load"], {
+                "trigger": "mem_available", "mem_avail_mb": 3174.0, "mem_floor_mb": 6144.0})
+            self.assertNotIn("load1", payload["diagnostic"])
+            self.assertNotIn("host_load_factor", payload)
+            self.assertEqual(persist.call_args_list[-1][0][0]["reason"], "memory_pressure")
 
     def test_overload_reports_validated_local_factor(self):
         import tempfile

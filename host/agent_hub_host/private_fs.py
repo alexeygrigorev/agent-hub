@@ -5,6 +5,7 @@ share directory handles, protected owner DACLs, NTFS and Win32 no-follow opens.
 Same-user processes/admins are trusted, as with the native session registry.
 """
 from contextlib import contextmanager
+import errno
 import os
 from pathlib import Path
 import stat
@@ -136,7 +137,22 @@ def exclusive_lock(path):
             if _windows():
                 import msvcrt
                 os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    # Windows reports a held non-blocking region lock as a
+                    # locking violation (EACCES, surfaced as PermissionError),
+                    # while POSIX flock reports EAGAIN/BlockingIOError. A lock
+                    # file this process just opened O_RDWR can only fail here
+                    # through peer contention, so normalize to BlockingIOError:
+                    # every session-command caller handles contention through
+                    # that channel, and an unconverted PermissionError crashed
+                    # the controller command loop instead (intake 4038d834 AC5:
+                    # `hub sessions stop` stayed stop_pending on Tabo).
+                    if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLOCK):
+                        raise BlockingIOError(
+                            exc.errno, 'Lock held by a peer; reconcile, do not duplicate') from exc
+                    raise
             else:
                 import fcntl
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
