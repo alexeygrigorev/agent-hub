@@ -240,7 +240,9 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
         'INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)', machine, account, service, null, iso(), quota);
       sub('shared-codex', 'codex', metered(iso(), 60, now));
       sub('shared-claude', 'claude', metered(iso(), 27, now));
-      sub('zai-central', 'zai', metered(iso(), 31, now));
+      // Keep each preferred provider below the Luna fallback floor so this
+      // fixture exercises a draw across all five configured candidates.
+      sub('zai-central', 'zai', metered(iso(), 29, now));
       // The probes for the unmetered engines fail on the host, as observed live.
       sub('hub-antigravity', 'gemini', broken(iso()));
       sub('shared-go', 'go', broken(iso()));
