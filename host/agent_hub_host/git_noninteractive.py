@@ -30,7 +30,7 @@ AUTH_FAILED = "repo_clone_auth_failed"
 _AUTH_MARKERS = (
     "terminal prompts disabled", "could not read username", "could not read password",
     "authentication failed", "invalid credentials", "permission denied", "http 401",
-    "returned error: 403", "returned error: 401", "repository not found", "bad credentials",
+    "returned error: 403", "returned error: 401", "bad credentials",
     "no credential helper", "credential-manager", "host key verification failed",
 )
 
@@ -90,3 +90,9 @@ def session_env_pairs(*, platform: Optional[str] = None, gh_bin: Optional[str] =
 def is_auth_failure(text: str) -> bool:
     lowered = (text or "").lower()
     return any(marker in lowered for marker in _AUTH_MARKERS)
+
+
+def is_repo_not_found(text: str) -> bool:
+    """Recognize GitHub's fixed missing-origin response without forwarding it."""
+    lowered = (text or "").lower()
+    return "repository not found" in lowered or "remote repository does not exist" in lowered

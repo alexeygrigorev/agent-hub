@@ -10,6 +10,9 @@ MESSAGES = {
     'host_runtime_choking': 'Recent session or service failures require a placement cooldown.',
     'cpu_usage_unknown': 'Fresh real CPU usage is unavailable.',
     'workspace_unavailable': 'The requested workspace is not available on this host.',
+    'repo_clone_auth_failed': 'The host could not authenticate to GitHub while cloning the requested repository.',
+    'repo_not_found': 'The repository origin was not found during host cloning.',
+    'repo_clone_failed': 'The host could not clone the requested repository.',
     'dispatch_route_unconfigured': 'The offered account, engine and profile do not match a local route.',
     'goal_startup_unconfigured': 'This account has no trusted interactive goal startup command.',
     'dispatch_startup_invalid': 'The configured trusted startup command is invalid.',
@@ -108,7 +111,7 @@ def classify(exc, *, workspace_available=True):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
             if reason == 'dispatch_internal_error':
                 reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
         if value.startswith('HTTP request failed with status '):

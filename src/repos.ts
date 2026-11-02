@@ -49,6 +49,53 @@ export class RepoRegistry {
     if (!repo) throw new Error('canonical_repo_missing');
     return repo;
   }
+  /** Resolve a clone-on-host --repo slug only when it names a registered active origin. */
+  resolveOrigin(value: unknown): { repo?: string; error?: any } {
+    if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/.test(value) || value.split('/')[1].startsWith('.')) {
+      return { error: { error: 'invalid_repo' } };
+    }
+    const requested = value.toLowerCase();
+    const rows = this.all();
+    const originRows = rows.filter(r => typeof r.origin === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(r.origin));
+    const exact = originRows.filter(r => r.origin.toLowerCase() === requested);
+    const active = exact.filter(r => r.status === 'active');
+    if (active.length === 1) return { repo: active[0].origin };
+    if (active.length > 1) return { error: { error: 'ambiguous_repo', repo: value } };
+    if (exact.length) return { error: { error: 'repo_unavailable', repo: value } };
+
+    const [owner, name] = value.split('/');
+    // A common mistake is to form owner/name from the local registry name,
+    // even though that checkout's registered GitHub origin has another name.
+    const sameNamed = rows.find(r => r.name.toLowerCase() === name.toLowerCase() &&
+      String(r.org || r.origin?.split('/')[0] || '').toLowerCase() === owner.toLowerCase());
+    if (sameNamed) {
+      try {
+        const canonical = this.canonical(sameNamed);
+        if (canonical.status === 'active' && typeof canonical.origin === 'string' && canonical.origin) {
+          return { error: { error: 'unknown_repo', repo: value, matches: [canonical.origin] } };
+        }
+      } catch { /* report the bounded unavailable result below */ }
+      return { error: { error: 'repo_unavailable', repo: value } };
+    }
+
+    const candidates = originRows.filter(r => r.status === 'active');
+    const sameOwner = candidates.filter(r => r.origin.split('/')[0].toLowerCase() === owner.toLowerCase());
+    const pool = sameOwner.length ? sameOwner : candidates;
+    const needle = value.toLowerCase();
+    const distance = (candidate: string) => {
+      let prev = Array.from({ length: candidate.length + 1 }, (_, i) => i);
+      for (let i = 0; i < needle.length; i++) {
+        const next = [i + 1];
+        for (let j = 0; j < candidate.length; j++) next.push(Math.min(next[j] + 1, prev[j + 1] + 1, prev[j] + (needle[i] === candidate[j] ? 0 : 1)));
+        prev = next;
+      }
+      return prev[candidate.length];
+    };
+    const matches = [...new Set(pool.map(r => r.origin))]
+      .sort((a, b) => distance(a.toLowerCase()) - distance(b.toLowerCase()) || a.localeCompare(b))
+      .slice(0, 5);
+    return { error: { error: 'unknown_repo', repo: value, ...(matches.length ? { matches } : {}) } };
+  }
   private named(name: string): any | undefined {
     const row = this.sql.exec('SELECT data FROM repo_registry WHERE name = ?', name).toArray()[0];
     return row ? JSON.parse(String(row.data)) : undefined;

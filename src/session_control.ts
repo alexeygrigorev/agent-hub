@@ -8,7 +8,7 @@ import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } f
 import { linkedIntake, linkedTaskIds, hasOpenWork, nativeGoalStatus, sessionWakeState, openWorkPreventsIdleReap } from './intake-session';
 import { workerAccessContext, workerWakeAllowed } from './worker-access';
 import { registeredRepoLabel } from './repos';
-import { encodeRepoWorkspace } from './fleet';
+import { decodeRepoWorkspace, encodeRepoWorkspace } from './fleet';
 import { initResourceRequestProjection } from './sql-json-projection';
 import { abandonedLaunch, expireSilentStartRows } from './silent-start';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
@@ -403,7 +403,11 @@ export class SessionControlService {
     private sql: SqlStorage,
     private transaction: <T>(fn: () => T) => T,
     private now: () => number = Date.now,
-    private hooks: { reserve?: ReserveHook; wakeMissed?: (intakeId: string, wakeId: string) => void } = {},
+    private hooks: {
+      reserve?: ReserveHook;
+      resolveRepo?: (repo: unknown) => { repo?: string; error?: any };
+      wakeMissed?: (intakeId: string, wakeId: string) => void;
+    } = {},
     private options: SessionControlOptions = {},
   ) {
     this.maxPending = options.maxPendingCommands ?? 2000;
@@ -1265,6 +1269,9 @@ export class SessionControlService {
             admission_unconfigured: 'The host has no fresh admission adapter configured for this engine. Routing is held until it is configured and probed.',
             admission_refused: 'The host fresh admission gate refused this launch.',
             workspace_unavailable: 'The requested workspace is unavailable on this host.',
+            repo_clone_auth_failed: 'The host could not authenticate to GitHub while cloning the requested repository.',
+            repo_not_found: 'The repository origin was not found during host cloning.',
+            repo_clone_failed: 'The host could not clone the requested repository.',
             model_unsupported: 'The requested model is unsupported by the configured host adapter.',
             dispatch_refused: 'The host refused the dispatch before native start.',
             launcher_not_started: 'The maintained launcher did not start a native session.',
@@ -2303,15 +2310,34 @@ export class SessionControlService {
       if (!label(input.key)) return response({ error: 'invalid_session_request', field: 'key', detail: 'invalid_key' }, 400);
       // Intake 8028bb06: `repo` (owner/name) replaces a host path. The workspace
       // becomes a repo-identity id; the placed host clones its own work tree.
+      let repoIdentityResolved = false;
       if (input.repo !== undefined) {
         if (input.workspace !== undefined) return response({ error: 'invalid_session_request', field: 'repo', detail: 'repo_and_workspace' }, 400);
+        if (!encodeRepoWorkspace(input.repo, '00000000')) return response({ error: 'invalid_session_request', field: 'repo', detail: 'invalid_repo' }, 400);
+        if (!this.hooks.resolveRepo) return response({ error: 'repo_registry_unavailable', field: 'repo' }, 503);
+        const resolvedRepo = this.hooks.resolveRepo(input.repo);
+        if (resolvedRepo.error) return response({ ...resolvedRepo.error, field: 'repo' }, 400);
+        if (typeof resolvedRepo.repo !== 'string') return response({ error: 'repo_registry_unavailable', field: 'repo' }, 503);
         const seed = typeof input.intake_task_id === 'string' && /[0-9a-f]{8}/.test(input.intake_task_id.toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 8))
           ? input.intake_task_id.toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 8).padEnd(8, '0') : null;
         const id = seed ?? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(input.key))))).slice(0, 4).map(b => b.toString(16).padStart(2, '0')).join('');
-        const ws = encodeRepoWorkspace(input.repo, id);
+        const ws = encodeRepoWorkspace(resolvedRepo.repo, id);
         if (!ws) return response({ error: 'invalid_session_request', field: 'repo', detail: 'invalid_repo' }, 400);
         input.workspace = ws;
         delete input.repo;
+        repoIdentityResolved = true;
+      }
+      // The encoded repo workspace is an internal routing id, not a way to
+      // bypass the same registry check by sending it as `workspace` directly.
+      const repoWorkspace = decodeRepoWorkspace(input.workspace);
+      if (repoWorkspace && !repoIdentityResolved) {
+        if (!this.hooks.resolveRepo) return response({ error: 'repo_registry_unavailable', field: 'repo' }, 503);
+        const resolvedRepo = this.hooks.resolveRepo(repoWorkspace.repo);
+        if (resolvedRepo.error) return response({ ...resolvedRepo.error, field: 'repo' }, 400);
+        if (typeof resolvedRepo.repo !== 'string') return response({ error: 'repo_registry_unavailable', field: 'repo' }, 503);
+        const ws = encodeRepoWorkspace(resolvedRepo.repo, repoWorkspace.id);
+        if (!ws) return response({ error: 'invalid_session_request', field: 'repo', detail: 'invalid_repo' }, 400);
+        input.workspace = ws;
       }
       if (!workspaceOk(input.workspace) && !registeredRepoLabel(this.sql, input.workspace)) return response({ error: 'invalid_session_request', field: 'workspace', detail: 'invalid_workspace' }, 400);
       if (input.engine !== undefined && !label(input.engine)) return response({ error: 'invalid_session_request', field: 'engine', detail: 'invalid_engine' }, 400);

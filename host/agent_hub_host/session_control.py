@@ -149,10 +149,19 @@ def http_error(exc, key=None):
         if isinstance(err, str) and err and SAFE_ERROR.match(err):
             code = err
             name = ' (%s)' % err
-            if err == 'unknown_workspace' and isinstance(data.get('matches'), list):
-                matches = [m for m in data['matches'][:5] if isinstance(m, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', m)]
+            if err in ('unknown_workspace', 'unknown_repo') and isinstance(data.get('matches'), list):
+                if err == 'unknown_repo':
+                    pattern = r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}'
+                    label = 'registered repositories'
+                    requested = data.get('repo')
+                    if isinstance(requested, str) and re.fullmatch(pattern, requested):
+                        name += '; unknown repository: ' + requested
+                else:
+                    pattern = r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}'
+                    label = 'close matches'
+                matches = [m for m in data['matches'][:5] if isinstance(m, str) and re.fullmatch(pattern, m)]
                 if matches:
-                    name += '; close matches: ' + ', '.join(matches)
+                    name += '; ' + label + ': ' + ', '.join(matches)
             if err == 'ambiguous_session_prefix' and isinstance(data.get('matches'), list):
                 ids = [row.get('id') for row in data['matches'] if isinstance(row, dict)
                        and isinstance(row.get('id'), str) and re.fullmatch(r'[a-fA-F0-9-]{36}', row['id'])]

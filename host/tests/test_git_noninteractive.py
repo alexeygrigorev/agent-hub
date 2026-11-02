@@ -31,3 +31,9 @@ def test_clone_auth_failure_has_clear_reason(tmp_path):
     label = "repo-0123abcd-DataTalksClub__demo"
     with pytest.raises(ValueError, match="^repo_clone_auth_failed: DataTalksClub/demo"):
         repo_workspace.ensure_repo_workspace({"work_root": str(tmp_path)}, label, runner=runner, gh_bin="")
+
+
+def test_repository_not_found_is_not_mislabeled_as_auth_failure():
+    assert gn.is_repo_not_found('remote: Repository not found.')
+    assert not gn.is_auth_failure('remote: Repository not found.')
+    assert gn.is_auth_failure('fatal: Authentication failed')
