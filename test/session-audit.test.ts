@@ -509,7 +509,7 @@ describe('idle audit service (AC1/AC3/AC4)', () => {
 // ---------------------------------------------------------------------------
 describe('production notification adapter (real hub liveness + delivery receipt)', () => {
   function seedAlertReader(hub: any) {
-    hub.env = { ...hub.env, HUB_ALERT_TO: 'grok-bot' };
+    hub.env = { ...hub.env, HUB_ALERT_TO: 'grok-bot', HUB_ALERT_WEBHOOK: '' };
     hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
     hub.sql.exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at)
       VALUES ('audit-reader','agent','audit-reader-hash','audit-reader','grok-bot','grok-bot','["bus:read"]','test',?,?)`,
