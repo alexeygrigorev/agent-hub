@@ -144,7 +144,7 @@ export default {
       '/usage', '/usage.html',
       '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
       '/schedules', '/schedules.html', '/schedules.js', '/schedules.css',
-      '/intake', '/intake.html', '/intake.js', '/intake.css', '/intake-overview.js', '/resource-management.js', '/idle-attention.js',
+      '/intake', '/intake.html', '/intake.js', '/intake.css', '/intake-overview.js', '/intake-stats.js', '/resource-management.js', '/idle-attention.js',
       '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',
       '/vendor/dakit/fonts/inter-var.woff2',
       '/vendor/dakit/fonts/ibm-plex-mono-400.woff2',

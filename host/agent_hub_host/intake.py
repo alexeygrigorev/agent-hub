@@ -222,6 +222,8 @@ def read_file(path, limit=MAX_REQUEST, field='Input'):
 def add_commands(sub):
     root = sub.add_parser('intake', help='Private intake tasks and durable context; payloads are data, never execution')
     commands = root.add_subparsers(dest='intake_cmd', required=True)
+    from . import intake_stats
+    intake_stats.options(commands.add_parser('stats', help='Timing and attempts for one intake'), individual=True)
     forgotten = commands.add_parser('forgotten', help='Open intakes forgotten by live sessions; includes queued restart reason')
     forgotten.add_argument('--project')
     create = commands.add_parser('create', help='Capture verbatim UTF-8 text from file/stdin; missing provenance stays unknown')
