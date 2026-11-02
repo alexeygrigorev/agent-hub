@@ -47,7 +47,7 @@ All routes require authentication. A client token grants `routing:submit` only; 
 | `POST /api/fleet/tasks` | Submit one task or a batch; returns 201 and a job ID even if no machine is available |
 | `GET /api/fleet/tasks` | List the caller's latest 100 jobs (admins can list all) |
 | `GET /api/fleet/tasks/:id` | Status, selected machine/runner/model, report and sanitized artifacts |
-| `GET /api/fleet/routing/machines` | Machine capabilities, advertised model routes, concurrency, resources and freshness |
+| `GET /api/fleet/routing/machines` | Machine capabilities, advertised model routes, concurrency, resources and freshness. Every canonical registry machine is listed (alias re-enrollments resolve away): a host that never advertised appears with `advertised: false`, empty runners and its planned `installations`, so a missing profile or offline host is visible instead of absent |
 | `GET /api/fleet/routing/policy` | Tier table, aliases and current rules |
 | `PUT /api/fleet/routing/capabilities` | Host credential only: advertise this host's capabilities, exact runner/model/effort/account routes and max agents |
 | `POST /api/fleet/tasks/:id/artifacts` | Assigned host only: upload a sanitized PNG (`name`, `media_type`, `data_base64`, `sanitized: true`) |
