@@ -164,5 +164,6 @@
   "worktree list",
   "worktree refresh",
   "worktree register",
-  "worktree remove"
+  "worktree remove",
+  "worktree repair-locks"
 ]
