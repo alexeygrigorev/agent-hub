@@ -22,8 +22,12 @@ describe('resource ledger project labels',()=>{
 
 describe('host-proportional memory floor and robust estimate defaults',()=>{
  const config=resourceConfig();
- it('uses the median and caps outliers by default',()=>{
-  expect(config.estimate_percentile).toBe(50);
+ it('sizes reservations from the measured per-engine p90 and caps outliers by default',()=>{
+  // Intake 189f6cd6: reservations reflect what an engine really needs at p90
+  // (codex implement ~125 MiB, claude implement p90 ~943 MiB), so a host with
+  // ~1.6 GiB free admits light sessions until MemAvailable actually drops
+  // under the floor; the cap keeps a single heavy cohort from reserving gigabytes.
+  expect(config.estimate_percentile).toBe(90);
   expect(config.estimate_cap_mb).toBe(1024);
   expect(()=>resourceConfig({estimate_cap_mb:10})).toThrow();
  });

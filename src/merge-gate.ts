@@ -201,12 +201,12 @@ const LIVE = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncer
 export function finishBrief(task: Obj, r: Obj, problems: string[]): string {
   return `Finish-merge for Hub intake ${task.id} (${task.title ?? ''}). Hub flagged it unmerged: ${problems.join('; ')}. ` +
     `The work is in ${r.path ?? 'its intake worktree'} on branch ${r.branch ?? '?'} (host ${r.machine ?? '?'}). ` +
-    `Do not redo the feature. 1) Rebase on fresh origin/main and resolve conflicts. 2) Run only targeted unit tests for changed files locally. ` +
+    `Do not redo the feature. 1) Rebase on fresh origin/main and resolve conflicts. 2) Run ONLY targeted unit tests for the files you changed locally; never run the full suite locally (it runs in CI). ` +
     `3) Get an independent review of the exact version. Start it through canonical Hub auto/policy routing, for example: hub sessions start --task-kind review --tier deep --headless --workspace agent-hub --cwd <worktree> --intake-task-id ${task.id} --intake-worktree detached --key review-<unique> --brief-file review.txt; use the same intake id and worktree and do not pin an engine or machine. If that start or reviewer session fails with engine_auth_expired/credential rejection, immediately request one retry through canonical routing with a new request key. Fleet records the auth failure and excludes that engine route; inspect the returned session with hub sessions show and verify the retry uses a different provider engine/account. Never reuse the failed provider/account or count a refused start as a review. ` +
     `If the fallback also fails, get the current version with hub intake show ${task.id}, then pipe {"kind":"blocker","text":"Reviewer fallback failed: <sanitized reason>; no independent review was completed."} to hub intake append ${task.id} --version <current-version> --key merge-review-blocker-<attempt> --event-file -. Do not claim review passed; after three unsuccessful finish-merge requeues the watcher creates a prerequisite and alert. ` +
     `4) Commit and push your feature branch, then open a PR with gh pr create. Let CI run the full suite; fix failures from CI logs. ` +
-    `5) After required checks pass, run gh pr merge --auto --rebase. Never push to main or approve deploy gates. Watch CI and Deploy until green. ` +
-    `6) Run hub intake merge-check ${task.id} so Hub records the evidence, then append the DONE note. If blocked by tests, review auth, or capacity, record a blocker event and stop without claiming completion.`;
+    `5) After required checks pass, run gh pr merge --auto --rebase. Never push to main directly or approve deploy gates. Watch CI and Deploy until green. ` +
+    `6) Run hub intake merge-check ${task.id} so Hub records the evidence, then append the DONE note. If blocked by tests, review auth, or capacity, run hub intake blocker ${task.id} --title ... --acceptance-criteria ... and stop without claiming completion.`;
 }
 
 /** One watcher pass: flags unmerged intakes idle >= 60 min and requeues them. */

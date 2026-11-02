@@ -96,8 +96,10 @@ def ensure_windows_autostart(root, run=subprocess.run):
     """Upgrade the existing user supervisor task; never request elevation."""
     if sys.platform != 'win32':
         return None
+    if root is None:
+        return _windows_package_autostart(run)
     local = os.environ.get('LOCALAPPDATA')
-    if not local or root is None:
+    if not local:
         return 'wrapper_missing'
     runner = Path(local) / 'agent-hub' / 'run-session-host.ps1'
     script = Path(root) / 'scripts' / 'windows-host-autostart.ps1'
@@ -118,6 +120,46 @@ def ensure_windows_autostart(root, run=subprocess.run):
         return 'configured'
     except (OSError, subprocess.SubprocessError):
         return 'registration_failed'
+
+
+def _windows_package_autostart(run):
+    """Check the controller wrapper used by immutable Windows installs."""
+    try:
+        from .package_update import running_release
+        release = running_release()
+    except (ImportError, OSError, RuntimeError):
+        return 'wrapper_missing'
+    if release is None:
+        return 'wrapper_missing'
+    runner = Path(release) / 'controller.ps1'
+    if not runner.is_file():
+        return 'wrapper_missing'
+
+    quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+    powershell = (
+        "$ErrorActionPreference='Stop';"
+        "$id=[Security.Principal.WindowsIdentity]::GetCurrent();"
+        "$task=Get-ScheduledTask -TaskName ('AgentHubController-'+$id.User.Value) -ErrorAction SilentlyContinue;"
+        "if(-not $task -or $task.Actions.Count -ne 1 -or $task.Settings.MultipleInstances -ne 'IgnoreNew'){Write-Output 'wrapper_missing';exit 0};"
+        "$match=[regex]::Match($task.Actions[0].Arguments,'(?i)-File\\s+\"([^\"]+)\"');"
+        "if(-not $match.Success){Write-Output 'wrapper_missing';exit 0};"
+        "$actual=[IO.Path]::GetFullPath($match.Groups[1].Value);"
+        "$expected=[IO.Path]::GetFullPath(" + quote(runner) + ");"
+        "if(-not [string]::Equals($actual,$expected,[StringComparison]::OrdinalIgnoreCase)){Write-Output 'wrapper_missing';exit 0};"
+        "Write-Output 'configured'"
+    )
+    try:
+        code, output = _run(
+            run,
+            ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', powershell],
+            release,
+            90,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 'registration_failed'
+    if code != 0:
+        return 'registration_failed'
+    return 'configured' if output.splitlines()[-1:] == ['configured'] else 'wrapper_missing'
 
 
 def _install_and_smoke(run, root, python):
