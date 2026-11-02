@@ -64,13 +64,20 @@ class LiveLoadStatusTests(unittest.TestCase):
         self.assertFalse(status["overloaded"])
 
     def test_low_memory_is_busy(self):
-        status = host_load.live_load_status({}, **clear_probes(mem_fn=lambda: (1 * GIB, 64 * GIB)))
+        status = host_load.live_load_status({}, **clear_probes(mem_fn=lambda: (500 * 1024 ** 2, 64 * GIB)))
         self.assertEqual(status["trigger"], "mem_available")
 
     def test_memory_floor_scales_down_on_small_hosts(self):
         status = host_load.live_load_status({}, **clear_probes(mem_fn=lambda: (2634 * 1024 ** 2, 32 * GIB)))
         self.assertFalse(status["overloaded"])
-        self.assertEqual(status["mem_floor_mb"], 983.0)
+        self.assertEqual(status["mem_floor_mb"], 512.0)
+        below_former_floor = host_load.live_load_status(
+            {}, **clear_probes(mem_fn=lambda: (700 * 1024 ** 2, 32 * GIB)))
+        self.assertFalse(below_former_floor["overloaded"])
+        self.assertEqual(below_former_floor["mem_floor_mb"], 512.0)
+        below_floor = host_load.live_load_status(
+            {}, **clear_probes(mem_fn=lambda: (500 * 1024 ** 2, 32 * GIB)))
+        self.assertEqual(below_floor["trigger"], "mem_available")
         small = host_load.live_load_status({}, **clear_probes(mem_fn=lambda: (600 * 1024 ** 2, 8 * GIB)))
         self.assertFalse(small["overloaded"])
         self.assertEqual(small["mem_floor_mb"], 512.0)
@@ -112,11 +119,11 @@ class LiveLoadStatusTests(unittest.TestCase):
         self.assertEqual(ctx.exception.host_load_status["trigger"], "load_runaway")
 
     def test_hub_refusal_keeps_memory_trigger_measurement_and_floor(self):
-        status = host_load.live_load_status({}, **clear_probes(mem_fn=lambda: (1 * GIB, 64 * GIB)))
+        status = host_load.live_load_status({}, **clear_probes(mem_fn=lambda: (900 * 1024 ** 2, 64 * GIB)))
         reason, report = host_load.hub_refusal(status)
         self.assertEqual(reason, "memory_pressure")
-        self.assertEqual(report, {"trigger": "mem_available", "mem_avail_mb": 1024.0,
-                                  "mem_floor_mb": 1966.0})
+        self.assertEqual(report, {"trigger": "mem_available", "mem_avail_mb": 900.0,
+                                  "mem_floor_mb": 983.0})
 
     def test_check_passes_status_through_when_clear(self):
         status = host_load.check_live_load({}, **clear_probes(loadavg_fn=lambda: (36.0, 4.0, 4.0)))

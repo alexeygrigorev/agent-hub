@@ -75,7 +75,8 @@ Placement is gated on live data, not on a fixed sum of per-session reservations.
   - `estimate(new)` is the p90 `peak_rss_mb` for the same
     project/engine/kind from the ledger. It falls back to per-engine p90, then
     to a default.
-- **Floor:** 2 GiB MemAvailable (Alexey t1476u). OOM guard: when MemAvailable
+- **Floor:** 1.5% of total RAM, with a 512 MiB minimum and the configured
+  2048 MiB ceiling; an unknown total uses the ceiling. OOM guard: when MemAvailable
   is below the floor, new sessions stay queued (`launcher_memory_reserve`).
   Running sessions are never killed or stopped because of memory. Swap (a
   32 GiB partition) is the cushion.
@@ -154,7 +155,7 @@ hard-coded constants.
 | knob | default | used by |
 |---|---|---|
 | `memory_floor_mb` | 2048 | Hub `plan()` gate, launcher `check_resources`; effective floor is `memory_floor_pct` of host RAM (min 512 MiB) capped by this ceiling |
-| `memory_floor_pct` | 3 | Host-proportional share of total RAM for the effective floor (a 32 GiB laptop gets ~968 MiB) |
+| `memory_floor_pct` | 1.5 | Host-proportional share of total RAM for the effective floor (a 32 GiB laptop gets the 512 MiB minimum) |
 | `disk_floor_gb` | 15 | Hub `plan()` root-disk floor in GiB (fractional ok); below it the route is rejected as `disk_floor` (queued as capacity) |
 | `ramp_reserve_default_mb` | measured p90, fallback 512 | placement estimate |
 | `estimate_percentile` | 90 | placement estimate |
@@ -287,7 +288,8 @@ sessions are already in busy CPU, and queued sessions reserve no CPU. The
 claim path rechecks this formula excluding the offer's own commitment.
 The advisory includes current, expected, ramping and limit numbers and
 `predicted_over_target`; exceeding it alone never queues a session. Actual
-choking holds retain those numbers alongside their specific reason. The independent 2048 MiB memory floor still
+choking holds retain those numbers alongside their specific reason. The
+independent host-scaled memory floor (512 MiB minimum, 2048 MiB ceiling) still
 applies. Status labels name actual placement reasons instead of assuming memory.
 
 Session CPU seconds and average cores use the existing resource ledger and
@@ -342,5 +344,5 @@ Service failure admission requires an explicit `service_crash` or `service_timeo
 - **What is recorded per session** (`session_resource_usage` plus `session_rss_median` and `session_cpu_usage`): task/intake id, project (`project_label` is the repository name even when only a workspace path was known, on every OS), engine, model, machine, runtime, peak and p50 anonymous RSS, CPU seconds, average and p95 cores. The host reports on every heartbeat while the session runs and once more when it ends. p50 RSS is the median of per-heartbeat samples in 16 MiB buckets.
 - **Windows hosts** have no `/proc` or cgroups. CPU comes from `GetSystemTimes` (`cpu_resources.read_windows_cpu_stat`); a session's memory and CPU come from the exact descendant process tree through Win32 (`windows_process_stats.py`: working set as RSS, private bytes as PSS, kernel+user time as CPU seconds). PSI is not required for `telemetry=measured`.
 - **Placement estimate**: p90 `peak_rss_mb` and p95 cores for the same project + engine + model, then project + task kind, then project, then global history, then the default (`expected_cpu_source` = `project_engine_model`, `repo_kind`, `repo`, `global`, `default`). The memory estimate follows the same order.
-- **A host is full** only when measured busy CPU averaged over at least 10 s is 98% or more (`cpu_pressure`, window reported as `busy_percent_window`/`window_s`) or MemAvailable is below 6144 MiB (`MEMORY_FULL_MB`, shown by headroom). Load average never counts. The launcher memory floor (2048 MiB) and the PSI full-pressure/OOM holds are unchanged.
+- **Capacity reporting:** headroom labels a host full below 6144 MiB (`MEMORY_FULL_MB`) as a capacity indicator. That label is not the placement floor. Fresh placement uses measured p90 RAM estimates and the host-scaled floor (1.5% of total, 512 MiB minimum, 2048 MiB ceiling); CPU choking, PSI full pressure and OOM holds remain separate gates. Load average never counts.
 - **Views**: `hub resources ledger` (one line per task), `hub resources headroom` (per machine: busy cores and percent, 10 s busy, free cores, MemAvailable, full/has-room with reasons, per-task estimates and how many more typical tasks fit by CPU and by memory), `hub resources sessions` (raw ledger, now with p50 RSS). The overview also shows `busy10s` and the model in the p90 table.

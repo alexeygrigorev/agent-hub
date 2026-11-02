@@ -89,7 +89,7 @@ export function resourceConfig(value: any = {}): ResourceConfig {
   return result;
 }
 /** Floor scaled to the host: memory_floor_pct of total RAM, never above the configured ceiling and never below 512 MiB.
- * Unknown total keeps the configured value. A 32 GiB laptop gets ~960 MiB, a 16 GiB tablet 512 MiB, a 64 GiB server 1920 MiB. */
+ * Unknown total keeps the configured value. With the 1.5% default, a 32 GiB laptop gets 512 MiB, a 64 GiB server ~960 MiB. */
 export function effectiveFloorMb(config: ResourceConfig, totalMb: unknown): number {
   if (!finite(totalMb) || (totalMb as number) <= 0) return config.memory_floor_mb;
   return Math.min(config.memory_floor_mb, Math.max(512, Math.round((totalMb as number) * config.memory_floor_pct / 100)));
