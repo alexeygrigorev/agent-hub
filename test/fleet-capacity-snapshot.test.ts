@@ -69,11 +69,31 @@ describe('bounded real Fleet autonomous capacity snapshot',()=>{
     const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
     const bounded=s.accountStatus(a,s.queueCapacitySnapshot(now));
     const normal=s.accountStatus(a);
-    expect(bounded).toMatchObject({active:3,reserved:2,observed_sessions:1,native_live:3});
+    expect(bounded).toMatchObject({active:3,reserved:1,observed_sessions:2,native_live:3});
     expect(bounded).toEqual(normal);
     // A fresh legacy receipt alone is not complete-census evidence.
     sql.exec('DELETE FROM fleet_catalog_census');
-    expect(s.accountStatus(a,s.queueCapacitySnapshot(now))).toMatchObject({active:4,observed_sessions:2,native_live:null});
+    expect(s.accountStatus(a,s.queueCapacitySnapshot(now))).toMatchObject({active:4,reserved:1,observed_sessions:3,native_live:null});
+  }));
+  it('releases a running reservation whose exact native is absent from a fresh complete census',()=>fixture((s,sql)=>{
+    launch(sql,'stale-bound','running','stale-bound-native');
+    const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
+    const bounded=s.accountStatus(a,s.queueCapacitySnapshot(now));
+    expect(bounded).toMatchObject({active:0,available_slots:10,reserved:0,observed_sessions:0,native_live:0});
+    expect(bounded).toEqual(s.accountStatus(a));
+    // Capacity inspection is read-only: the launch history remains for reconciliation.
+    expect(sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions WHERE phase='running'").one().n).toBe(0);
+    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='stale-bound'").one().state).toBe('running');
+  }));
+  it.each(['missing','incomplete','stale','future'])('retains a missing-native reservation without usable census evidence: %s',kind=>fixture((s,sql)=>{
+    launch(sql,'unproven-bound','running','unproven-native');
+    if(kind==='missing') sql.exec('DELETE FROM fleet_catalog_census');
+    if(kind==='incomplete') sql.exec('UPDATE fleet_catalog_census SET complete=0');
+    if(kind==='stale') sql.exec('UPDATE fleet_catalog_census SET observed_at=?',iso(-180001));
+    if(kind==='future') sql.exec('UPDATE fleet_catalog_census SET observed_at=?',iso(60001));
+    const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
+    expect(s.accountStatus(a,s.queueCapacitySnapshot(now))).toMatchObject({active:1,reserved:1,native_live:null});
+    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='unproven-bound'").one().state).toBe('running');
   }));
   it.each(['missing','incomplete','stale','future'])('keeps idle reservations without a usable complete census: %s',kind=>fixture((s,sql)=>{
     launch(sql,'idle-bound','running','idle-native'); native(sql,'idle-native',iso(-3600000));
@@ -84,7 +104,21 @@ describe('bounded real Fleet autonomous capacity snapshot',()=>{
     if(kind==='future') sql.exec('UPDATE fleet_catalog_census SET observed_at=?',iso(60001));
     const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
     const bounded=s.accountStatus(a,s.queueCapacitySnapshot(now));
-    expect(bounded).toMatchObject({active:2,reserved:1,observed_sessions:1,native_live:null});
+    expect(bounded).toMatchObject({active:2,reserved:0,observed_sessions:2,native_live:null});
+    expect(bounded).toEqual(s.accountStatus(a));
+  }));
+  it('expires unmatched reservations after the bounded reservation TTL while keeping observed live sessions active',()=>fixture((s,sql)=>{
+    launch(sql,'stale-offered','offered',null);
+    launch(sql,'stale-starting','starting',null);
+    launch(sql,'stale-uncertain','uncertain',null);
+    sql.exec("UPDATE fleet_launches SET updated_at=? WHERE id IN ('stale-offered','stale-starting','stale-uncertain')",iso(-15*60000-1));
+    launch(sql,'fresh-starting','starting',null);
+    launch(sql,'old-bound','running','live-native');
+    sql.exec("UPDATE fleet_launches SET updated_at=? WHERE id='old-bound'",iso(-2*3600000));
+    native(sql,'live-native');
+    const a=sql.exec("SELECT * FROM fleet_accounts WHERE label='zai-main'").one();
+    const bounded=s.accountStatus(a,s.queueCapacitySnapshot(now));
+    expect(bounded).toMatchObject({active:2,reserved:1,observed_sessions:1,native_live:1});
     expect(bounded).toEqual(s.accountStatus(a));
   }));
   it.each(['running','uncertain'])('releases only physical absence with complete census for %s launches',state=>fixture((s,sql)=>{
