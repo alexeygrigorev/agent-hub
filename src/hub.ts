@@ -223,6 +223,7 @@ export class Hub extends DurableObject {
     // durable start/send/capture/stop intents over the existing fleet reserve.
     // Placement stays with FleetService; no second dispatcher or consumer here.
     this.sessionControlService = new SessionControlService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, {
+      resolveRepo: repo => this.repoRegistry.resolveOrigin(repo),
       reserve: (input, auth) => {
         const prepared = this.repoRegistry.prepareLaunch(input);
         return prepared.error ? { value: prepared.error, status: 400 } : this.fleetService.reserve(prepared.input, auth);

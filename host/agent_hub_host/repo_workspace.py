@@ -103,9 +103,11 @@ def ensure_repo_workspace(settings, label, *, home: Optional[str] = None,
         proc = run([git_bin, "clone", "--quiet", f"https://github.com/{slug}.git", str(path)], None, CLONE_TIMEOUT)
     if proc.returncode != 0:
         detail = (proc.stderr or "") + (proc.stdout or "")
+        if git_noninteractive.is_repo_not_found(detail):
+            raise ValueError("repo_not_found: " + slug + ": " + _short(proc))
         if git_noninteractive.is_auth_failure(detail):
             raise ValueError(git_noninteractive.AUTH_FAILED + ": " + slug + ": " + _short(proc))
-        raise ValueError("repo clone failed: " + _short(proc))
+        raise ValueError("repo_clone_failed: " + slug + ": " + _short(proc))
     for argv in ([git_bin, "fetch", "--quiet", "origin", "main"],
                  [git_bin, "checkout", "--quiet", "-B", "wt-" + id8, "origin/main"]):
         proc = run(argv, str(path), GIT_TIMEOUT)
