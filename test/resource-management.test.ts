@@ -513,7 +513,9 @@ describe('resource management',()=>{
   };
   for(let i=0;i<5;i++){add('big'+i,'/home/x/git/agent-hub','codex','gpt-big',2000,3);add('small'+i,'agent-hub','codex','gpt-small',200,0.2);}
   const big=r.estimate('agent-hub','codex','goal','gpt-big'),small=r.estimate('agent-hub','codex','goal','gpt-small');
-  expect(big).toBeGreaterThan(2000);
+  // b86a95d caps the estimate at 1 GiB; the cohort still ranks above the small model.
+  expect(big).toBe(1024);
+  expect(big).toBeGreaterThan(small);
   expect(small).toBeLessThan(400);
   expect(r.cpuEstimate('agent-hub','goal','codex','gpt-big')).toMatchObject({expected_cpu_source:'project_engine_model'});
   expect(r.cpuEstimate('agent-hub','goal','codex','gpt-big').expected_cpu_cores).toBeGreaterThan(3);
