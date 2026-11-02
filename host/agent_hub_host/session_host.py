@@ -987,6 +987,10 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     session_messages.provision_credentials(dispatcher.request, cfg.get('base_url'))
                 except Exception as error:
                     _log(json.dumps({'event': 'session_credentials_error', 'type': type(error).__name__}), flush=True)
+                try:
+                    session_messages.provision_intake_credentials(dispatcher.request, cfg.get('base_url'))
+                except Exception as error:
+                    _log(json.dumps({'event': 'session_intake_credentials_error', 'type': type(error).__name__}), flush=True)
                 # Intake 4b161918: intake-worktree status/remove commands run in
                 # one single-inflight daemon thread (git fetch can take a minute),
                 # polled every WORKTREE_POLL_S to bound Hub requests.

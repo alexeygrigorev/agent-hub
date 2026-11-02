@@ -1083,6 +1083,17 @@ export class Hub extends DurableObject {
         }
         return Response.json({ error: 'not_found' }, { status: 404 });
       }
+      // Native-session intake credentials: a scoped `worker:own-intake` credential for
+      // observed sessions (no fleet launch) with a server-verified intake link.
+      if (path === '/api/session-intake/credentials' || /^\/api\/sessions\/[0-9a-f-]{36}\/intake-credential$/.test(path)) {
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        if (path === '/api/session-intake/credentials') {
+          if (request.method !== 'GET') return Response.json({ error: 'not_found' }, { status: 404 });
+          return this.workerAccess.listNative(auth.caller, auth.scopes);
+        }
+        return this.workerAccess.issueNative(request, auth.caller, auth.scopes);
+      }
       if (path === '/api/session-messaging/credentials' || path.startsWith('/api/session-messaging/credentials/') ||
           /^\/api\/sessions\/[0-9a-f-]{36}\/messaging-credential$/.test(path)) {
         const auth = await this.authenticateBusRequest(request);
