@@ -118,11 +118,12 @@ describe('generic accounts and launch placement', () => {
     for (const [label] of entries) {
       expect(fleet.accounts.find((a: any) => a.label === label)).toMatchObject({ placeable_slots: 8, placement_reasons: [] });
     }
-    for (const [engine, tier, expected] of [['opus', 'deep', 'claude'], ['glm-flash', 'daily', 'zcodex']]) {
-      const plan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine, tier })), admin)).json() as any;
-      expect(plan.selected?.engine, JSON.stringify(plan.rejected)).toBe(expected);
-      expect(plan.rejected).toEqual([]);
-    }
+    const opusPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'opus', tier: 'deep' })), admin)).json() as any;
+    // The explicit Opus selector cannot resolve under the Sonnet-only Claude policy.
+    expect(opusPlan.selected).toBeNull();
+    const glmPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'glm-flash', tier: 'daily' })), admin)).json() as any;
+    expect(glmPlan.selected?.engine, JSON.stringify(glmPlan.rejected)).toBe('zcodex');
+    expect(glmPlan.rejected).toEqual([]);
     const grok = await (await s.handle(request('/plan', intent({ engine: 'grok', tier: 'daily' })), admin)).json() as any;
     expect(grok.error).toBe('model_disabled_by_policy');
     // Prefix siblings must never gain access when a root is added.
