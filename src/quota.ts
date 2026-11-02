@@ -1632,10 +1632,12 @@ export class QuotaStore {
           engines: { zcodex: "codex" },
           accounts: { ...LEGACY_ACCOUNT_LABELS },
         },
-        account_coverage: { total: pools.length,
-          fresh: pools.filter(p => p.state === "fresh" || p.state === "exhausted").map(p => p.account),
-          stale: pools.filter(p => p.state === "stale").map(p => p.account),
-          unavailable: pools.filter(p => p.state === "unavailable" || p.state === "unknown").map(p => p.account) },
+        // Operator-disabled/retired accounts are out of routing: their rows stay
+        // visible but never count as an unavailable-quota bug.
+        account_coverage: { total: pools.filter(p => p.routing !== "disabled").length,
+          fresh: pools.filter(p => p.routing !== "disabled" && (p.state === "fresh" || p.state === "exhausted")).map(p => p.account),
+          stale: pools.filter(p => p.routing !== "disabled" && p.state === "stale").map(p => p.account),
+          unavailable: pools.filter(p => p.routing !== "disabled" && (p.state === "unavailable" || p.state === "unknown")).map(p => p.account) },
       },
     };
   }
