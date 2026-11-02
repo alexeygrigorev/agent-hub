@@ -16,6 +16,7 @@ errors are sanitized by session_control.diagnostic at the cli boundary.
 PACING_PATH = "/api/quota/pacing"
 BANKED_PATH = "/api/quota/banked"
 KILL_SWITCH_PATH = "/api/quota/kill-switch"
+METRICS_PATH = "/api/quota/metrics"
 
 MAX_REASON_CHARS = 280
 
@@ -34,6 +35,11 @@ def get_pacing():
 def get_banked():
     from . import session_control
     return _require_dict(session_control.request("GET", BANKED_PATH), "banked")
+
+
+def get_metrics():
+    from . import session_control
+    return _require_dict(session_control.request("GET", METRICS_PATH), "metrics")
 
 
 def get_kill_switch():
@@ -137,9 +143,37 @@ def render_kill_switch_text(data):
     return "kill-switch: %s" % state
 
 
+def render_metrics_text(data):
+    if not isinstance(data, dict) or not isinstance(data.get("windows"), dict):
+        raise ValueError("Invalid TBM metrics payload")
+    lines = ["as_of: %s" % (data.get("as_of") or "unknown")]
+    for window in ("24h", "7d"):
+        section = data["windows"].get(window)
+        if not isinstance(section, dict):
+            continue
+        lines.append("[%s]" % window)
+        pools = section.get("pools") if isinstance(section.get("pools"), list) else []
+        for pool in pools:
+            if not isinstance(pool, dict):
+                continue
+            lines.append("%s:" % (pool.get("pool_id") or "unknown-pool"))
+            metrics = pool.get("metrics") if isinstance(pool.get("metrics"), dict) else {}
+            for name, metric in metrics.items():
+                if not isinstance(metric, dict):
+                    continue
+                value = metric.get("value")
+                shown = "unknown" if value is None else str(value)
+                unit = metric.get("unit") or ""
+                reason = metric.get("reason")
+                lines.append("  %s: %s %s%s" % (name, shown, unit, (" (%s)" % reason) if reason else ""))
+    return "\n".join(lines)
+
+
 def render_text(kind, data):
     if kind == "pacing":
         return render_pacing_text(data)
+    if kind == "metrics":
+        return render_metrics_text(data)
     if kind == "banked":
         return render_banked_text(data)
     if kind == "kill-switch":

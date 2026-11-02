@@ -215,6 +215,57 @@
     root.append(el('p', 'Earliest deadline first. Real token value of banked quota is unknown.', 'tbm-note'));
   }
 
+  const catalog = [
+    ['burn_rate_vs_pacing_target', 'Burn rate vs pacing target'],
+    ['leftover_quota_at_planned_reset', 'Leftover quota at planned reset'],
+    ['reserve_floor_breaches', 'Reserve floor breaches'],
+    ['useful_work_per_tokens', 'Useful work per tokens (eta)'],
+    ['idle_wasted_quota_over_time', 'Idle wasted quota over time'],
+    ['engine_mix', 'Engine mix'],
+    ['admission_rejects_rate', 'Admission rejects rate'],
+    ['no_eligible_route_rate', 'No eligible route rate'],
+    ['time_to_useful_outcome', 'Time to useful outcome'],
+    ['banked_remaining', 'Banked remaining'],
+    ['time_to_expiry', 'Time to expiry'],
+    ['expired_unused', 'Expired unused'],
+    ['banked_burn_rate', 'Banked burn rate'],
+  ];
+
+  function renderMetrics(data) {
+    const root = byId('tbm-metrics');
+    if (!root) return;
+    root.replaceChildren();
+    const windows = data && data.windows && typeof data.windows === 'object' ? data.windows : {};
+    for (const windowName of ['24h', '7d']) {
+      const section = windows[windowName];
+      const block = el('section', '', 'tbm-metric-window');
+      block.append(el('h4', windowName));
+      const pools = section && Array.isArray(section.pools) ? section.pools : [];
+      if (!pools.length) block.append(el('p', `No pool data for ${windowName}. Unknown is not zero.`, 'metrics-chart-empty'));
+      for (const pool of pools) {
+        const card = el('div', '', 'tbm-metric-pool');
+        card.append(el('h5', `${pool.provider || 'unknown'} · ${pool.account || 'unknown'} · ${pool.pool_id || 'pool'}`));
+        const table = document.createElement('table');
+        table.className = 'tbm-metric-table';
+        const body = document.createElement('tbody');
+        for (const [key, label] of catalog) {
+          const metric = pool.metrics && pool.metrics[key] && typeof pool.metrics[key] === 'object' ? pool.metrics[key] : {};
+          const row = document.createElement('tr');
+          const name = document.createElement('th'); name.scope = 'row'; name.textContent = label;
+          const val = document.createElement('td');
+          let value = metric.value;
+          if (value && typeof value === 'object') value = Object.entries(value).map(([k, v]) => `${k} ${(Number(v) * 100).toFixed(1)}%`).join(' · ');
+          val.textContent = value === null || value === undefined
+            ? `Unknown${metric.reason ? ` — ${metric.reason}` : ''}`
+            : `${value} ${metric.unit || ''}${metric.reason ? ` · ${metric.reason}` : ''}`;
+          row.append(name, val); body.append(row);
+        }
+        table.append(body); card.append(table); block.append(card);
+      }
+      root.append(block);
+    }
+  }
+
   function renderKill(data) {
     const root = byId('tbm-kill');
     if (!root) return;
@@ -282,7 +333,7 @@
   }
 
   function renderEmpty(reason) {
-    for (const id of ['tbm-pacing', 'tbm-banked', 'tbm-kill']) {
+    for (const id of ['tbm-pacing', 'tbm-metrics', 'tbm-banked', 'tbm-kill']) {
       const n = byId(id);
       if (n) n.replaceChildren(el('p', reason, 'metrics-chart-empty'));
     }
@@ -329,20 +380,25 @@
       const me = await apiGet('/auth/me');
       csrf = me.csrf_token || null;
       const user = me.email || 'authenticated';
-      const [pacing, banked, kill] = await Promise.allSettled([
-        apiGet('/api/quota/pacing'), apiGet('/api/quota/banked'), apiGet('/api/quota/kill-switch'),
+      const [pacing, metrics, banked, kill] = await Promise.allSettled([
+        apiGet('/api/quota/pacing'), apiGet('/api/quota/metrics'),
+        apiGet('/api/quota/banked'), apiGet('/api/quota/kill-switch'),
       ]);
-      const expired = [pacing, banked, kill].find(result => result.status === 'rejected' && result.reason?.code === 'expired');
+      const results = [pacing, metrics, banked, kill];
+      const expired = results.find(result => result.status === 'rejected' && result.reason?.code === 'expired');
       if (expired) throw expired.reason;
       if (pacing.status === 'fulfilled') renderPacing(pacing.value, pacing.value.routing_factors);
       else byId('tbm-pacing')?.replaceChildren(el('p', 'Burn pacing unavailable. Refresh to retry.'));
+      if (metrics.status === 'fulfilled') renderMetrics(metrics.value);
+      else byId('tbm-metrics')?.replaceChildren(el('p', 'Metric catalog unavailable. Refresh to retry.'));
       if (banked.status === 'fulfilled') renderBanked(banked.value);
       else byId('tbm-banked')?.replaceChildren(el('p', 'Banked deadlines unavailable. Refresh to retry.'));
       renderKill(kill.status === 'fulfilled' ? kill.value : null);
       await renderGrok();
-      if (status) status.textContent = [pacing, banked, kill].some(result => result.status === 'rejected')
+      const asOf = [pacing, metrics, banked].find(result => result.status === 'fulfilled')?.value?.as_of || 'unknown';
+      if (status) status.textContent = results.some(result => result.status === 'rejected')
         ? 'Burn pacing · partial: some sources unavailable.'
-        : `TBM · ${user} · as of ${pacing.value.as_of || banked.value.as_of || 'unknown'}`;
+        : `TBM · ${user} · as of ${asOf}`;
     } catch (e) {
       if (e && e.code === 'expired') { location.assign('/auth/login'); return; }
       const notice = byId('metrics-routing-notice');
@@ -354,7 +410,7 @@
   }
 
   function init() {
-    if (!byId('tbm-pacing') && !byId('tbm-banked') && !byId('tbm-kill')) return;
+    if (!byId('tbm-pacing') && !byId('tbm-metrics') && !byId('tbm-banked') && !byId('tbm-kill')) return;
     for (const id of ['tbm-refresh', 'routing-refresh']) {
       const btn = byId(id);
       if (btn) btn.addEventListener('click', () => { btn.disabled = true; refresh().finally(() => { btn.disabled = false; }); });
@@ -362,7 +418,7 @@
     refresh();
   }
 
-  window.HubTbm = { refresh, renderPacing, renderBanked, renderKill };
+  window.HubTbm = { refresh, renderPacing, renderMetrics, renderBanked, renderKill };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 })();

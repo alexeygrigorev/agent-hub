@@ -46,6 +46,8 @@ class TbmParserTests(unittest.TestCase):
         parser = make_parser()
         self.assertEqual(parser.parse_args(["quota", "pacing"]).tbm, "pacing")
         self.assertEqual(parser.parse_args(["quota", "banked"]).tbm, "banked")
+        self.assertEqual(parser.parse_args(["quota", "metrics"]).tbm, "metrics")
+        self.assertTrue(parser.parse_args(["quota", "metrics", "--json"]).json)
         args = parser.parse_args(["quota", "kill-switch"])
         self.assertEqual(args.tbm, "kill-switch")
         self.assertIsNone(args.kill_action)
@@ -97,6 +99,13 @@ class TbmDispatchTests(unittest.TestCase):
         data = quota_cli.execute(self._fleet_args(tbm="banked"))
         self.assertEqual(self.calls, [("GET", "/api/quota/banked", None)])
         self.assertIn("tranches", data)
+
+    def test_metrics_get(self):
+        payload = {"as_of": "now", "windows": {"24h": {"pools": []}, "7d": {"pools": []}}}
+        self.responses[("GET", "/api/quota/metrics")] = payload
+        data = quota_cli.execute(self._fleet_args(tbm="metrics"))
+        self.assertEqual(self.calls, [("GET", "/api/quota/metrics", None)])
+        self.assertEqual(data, payload)
 
     def test_kill_switch_get(self):
         self.responses[("GET", "/api/quota/kill-switch")] = {"active": False, "reason": ""}
@@ -151,6 +160,17 @@ class TbmDispatchTests(unittest.TestCase):
 
 
 class TbmRenderTests(unittest.TestCase):
+    def test_render_metrics_preserves_unknown_reasons(self):
+        data = {"as_of": "now", "windows": {"24h": {"pools": [{
+            "pool_id": "go:main", "metrics": {
+                "useful_work_per_tokens": {"value": 4.5, "unit": "VU/MTok"},
+                "burn_rate_vs_pacing_target": {"value": None, "unit": "ratio", "reason": "No history"},
+            }}]}, "7d": {"pools": []}}}
+        text = tbm_cli.render_text("metrics", data)
+        self.assertIn("go:main", text)
+        self.assertIn("4.5 VU/MTok", text)
+        self.assertIn("unknown ratio (No history)", text)
+
     def test_render_pacing_unknown_safe(self):
         text = tbm_cli.render_text("pacing", {"as_of": "2026-10-26T00:00:00Z", "pools": [
             {"pool_id": "codex:main", "target_burn_rate_tpm": None,

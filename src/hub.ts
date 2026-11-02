@@ -1269,7 +1269,7 @@ export class Hub extends DurableObject {
       }
       const jobsResponse = await this.handleJobsRoutes(request, path, url);
       if (jobsResponse) return jobsResponse;
-      if (['/api/quota/pacing', '/api/quota/banked', '/api/quota/kill-switch', '/api/quota/rewards', '/api/quota/reset-credits'].includes(path)) {
+      if (['/api/quota/pacing', '/api/quota/metrics', '/api/quota/banked', '/api/quota/kill-switch', '/api/quota/rewards', '/api/quota/reset-credits'].includes(path)) {
         const auth = await this.sessionControlAuth(request);
         if (auth.error) return auth.error;
         if (!auth.caller?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
