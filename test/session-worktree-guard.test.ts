@@ -279,7 +279,7 @@ describe('worktree guard (intake a0f01448)', () => {
       return (await res.json() as any).sessions;
     };
     expect((await facts())[0]).toMatchObject({ session_id: created.id, native_id: NATIVE_ID,
-      native_created_at_ms: NATIVE_CREATED, terminal: false, linked_intake_open: true });
+      native_created_at_ms: NATIVE_CREATED, terminal: false, linked_intake_open: true, human_owned: false });
     sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", created.id);
     sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
     closeFixtureIntake(sql);
@@ -309,6 +309,26 @@ describe('worktree guard (intake a0f01448)', () => {
     sql.exec("UPDATE session_control_sessions SET binding_json=NULL,state='refused' WHERE id=?",successor);
     expect((await facts()).find((f:any)=>f.session_id===created.id).lock_release_permitted).toBe(true);
     expect((await s.handle(request('/api/sessions/worktree-guards', undefined, 'GET'), agent())).status).toBe(403);
+  }));
+
+  it('reports human ownership even when a verified human headless worker is otherwise unprotected', async () => fixture(async (s, sql) => {
+    const at = new Date().toISOString();
+    const far = new Date(Date.now() + 30 * 86400000).toISOString();
+    sql.exec(`INSERT INTO credentials (id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at)
+      VALUES ('human-cred','human','hash-human-cred','human-family','alexey','human:alexey','["admin"]','alexey',?,?)`, at, far);
+    const createdResponse = await s.handle(request('/api/sessions',
+      { key: 'human-worktree-guard', workspace: 'demo', mode: 'headless' }), agent());
+    expect(createdResponse.status, await createdResponse.clone().text()).toBe(201);
+    const created = await createdResponse.json() as any;
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    sql.exec("UPDATE fleet_launches SET actor='human:alexey', requester_kind='human' WHERE id='launch-1'");
+    sql.exec("UPDATE session_control_sessions SET actor='human:alexey', owner_token_id='human-cred', owner_family='human-family', state='stopped' WHERE id=?", created.id);
+    sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE machine_id='hetzner' AND native_id=?", NATIVE_ID);
+    const response = await s.handle(request(`/api/sessions/worktree-guards?session_id=${created.id}`, undefined, 'GET'), host('hetzner'));
+    expect(response.status).toBe(200);
+    const fact = ((await response.json() as any).sessions as any[])[0];
+    expect(fact).toMatchObject({ human_owned: true, protected: false, terminal: true, native_terminal: true,
+      lock_release_permitted: true });
   }));
 
   it('releases a terminal session whose pruned native is only unobserved in the census', async () => fixture(async (s, sql) => {

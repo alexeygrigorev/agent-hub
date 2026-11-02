@@ -383,6 +383,20 @@ describe('remove action', () => {
     expect(s).toMatchObject({ present: true, merged: null, unmerged: null, dirty: null });
     expect(s.secret).toBeUndefined();
   }));
+
+  it('queues bounded status checks automatically for unknown worktrees at host check-in', async () => fixture(async c => {
+    const t = await createTask(c);
+    for (let i = 0; i < 12; i++) {
+      await register(c, t.id, `/home/alexey/git/demo-wt-auto-${i}`);
+    }
+    const first = (await host(c, HOST, '/commands')).body.commands;
+    expect(first).toHaveLength(10);
+    expect(first.every((command: any) => command.kind === 'status')).toBe(true);
+    expect(new Set(first.map((command: any) => command.worktree_id)).size).toBe(10);
+    const second = (await host(c, HOST, '/commands')).body.commands;
+    expect(second).toHaveLength(2);
+    expect(second.every((command: any) => command.kind === 'status')).toBe(true);
+  }));
 });
 
 describe('HTTP mount', () => {

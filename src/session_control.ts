@@ -2119,6 +2119,11 @@ export class SessionControlService {
         const protectedSession = binding
           ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.protected_session !== false
           : !((unstarted || receiptTerminal) && row.guard_owner_kind === 'agent' && !row.guard_explicit_protection);
+        // This response fact is derived only from canonical lifecycle refs.
+        // Missing refs are unknown and therefore human-owned for repair safety.
+        const humanOwned = binding
+          ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.human_owned !== false
+          : true;
         const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
         const nativeTerminal = unstarted || receiptTerminal || !!(native &&
           native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
@@ -2137,7 +2142,8 @@ export class SessionControlService {
           tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),
           workspace: binding?.workspace ?? null, native_created_at_ms: binding?.native_created_at_ms ?? null,
           terminal: ['stopped', 'finished', 'failed', 'refused', 'cancelled'].includes(row.state),
-          linked_intake_open: worktreeIntakeProtected(this.sql, row, worktreeLinks), protected: protectedSession };
+          linked_intake_open: worktreeIntakeProtected(this.sql, row, worktreeLinks), protected: protectedSession,
+          human_owned: humanOwned };
       });
       // A second binding alias must not weaken protections for the same
       // exact native incarnation. Never unlock through a terminal alias
@@ -2149,7 +2155,8 @@ export class SessionControlService {
           protected: aliases.some(other => other.protected),
           lock_release_permitted: aliases.every(other => other.lock_release_permitted) &&
             (!fact.intake_task_id || sessions.filter(other => other.intake_task_id === fact.intake_task_id).every(other => other.terminal && other.native_terminal && other.lock_release_permitted)),
-          linked_intake_open: aliases.some(other => other.linked_intake_open) };
+          linked_intake_open: aliases.some(other => other.linked_intake_open),
+          human_owned: aliases.some(other => other.human_owned) };
       });
       const wanted = scope.targets; // closure rows inform facts but are never returned
       const sessions_out = sessions.filter(fact => wanted.has(fact.session_id)).map(fact =>

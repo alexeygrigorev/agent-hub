@@ -15,6 +15,8 @@ const CLAIM_TIMEOUT_MS = 15 * 60000;
 const MAX_ROWS_PER_TASK = 32;
 const MAX_SESSIONS_PER_ROW = 64;
 const MAX_PENDING_PER_MACHINE = 200;
+const AUTO_STATUS_PER_CHECKIN = 10;
+const AUTO_STATUS_RETRY_MS = 5 * 60 * 1000;
 const STATUS_KEYS = ['present', 'dirty', 'dirty_count', 'unpushed', 'unmerged', 'merged', 'head', 'branch', 'checked_at', 'error'];
 
 export class WorktreeError extends Error {
@@ -354,9 +356,30 @@ export class IntakeWorktrees {
     return c ? this.commandView(c) : undefined;
   }
 
+  /** Queue a bounded check-in batch for active intake trees with no status yet. */
+  private queueMissingStatuses(machine: string, now: number) {
+    const queued = Number((this.sql.exec("SELECT COUNT(*) AS n FROM intake_worktree_commands WHERE machine = ? AND state IN ('queued','claimed')",
+      machine).toArray()[0] as Obj).n) || 0;
+    const room = Math.min(AUTO_STATUS_PER_CHECKIN, Math.max(0, MAX_PENDING_PER_MACHINE - queued));
+    if (!room) return;
+    const staleBefore = now - AUTO_STATUS_RETRY_MS;
+    const rows = this.sql.exec(`SELECT w.id, w.task_id, w.machine FROM intake_worktrees w
+      WHERE w.machine = ? AND w.state = 'active' AND w.status_json IS NULL
+        AND NOT EXISTS (SELECT 1 FROM intake_worktree_commands c WHERE c.worktree_id = w.id AND c.kind = 'status'
+          AND c.state IN ('done','failed') AND c.finished_at >= ?)
+        AND NOT EXISTS (SELECT 1 FROM intake_worktree_commands c WHERE c.worktree_id = w.id
+          AND c.state IN ('queued','claimed'))
+      ORDER BY w.created_at, w.id LIMIT ?`, machine, staleBefore, room).toArray() as Obj[];
+    for (const row of rows) {
+      this.sql.exec('INSERT INTO intake_worktree_commands (id, task_id, worktree_id, machine, kind, state, actor, created_at) VALUES (?,?,?,?,?,?,?,?)',
+        crypto.randomUUID(), row.task_id, row.id, machine, 'status', 'queued', 'hub:auto-status', now);
+    }
+  }
+
   /** Host poll: claim queued commands (re-offer stale claims). */
   hostCommands(machine: string): Obj[] {
     const now = this.now();
+    this.queueMissingStatuses(machine, now);
     const rows = this.sql.exec(`SELECT c.*, w.path, w.branch FROM intake_worktree_commands c JOIN intake_worktrees w ON w.id = c.worktree_id
       WHERE c.machine = ? AND (c.state = 'queued' OR (c.state = 'claimed' AND c.claimed_at < ?)) ORDER BY c.created_at LIMIT 10`,
       machine, now - CLAIM_TIMEOUT_MS).toArray() as Obj[];

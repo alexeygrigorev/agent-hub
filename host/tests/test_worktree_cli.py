@@ -35,6 +35,36 @@ class FakeClock:
 
 
 class TestWorktreeCli(unittest.TestCase):
+    def test_terminal_lock_repair_defaults_to_read_only_and_uses_host_auth(self):
+        report = {'mode': 'dry-run', 'complete': True, 'scanned': 1,
+                  'candidate_count': 0, 'released_count': 0, 'candidates': []}
+        with patch('agent_hub_host.bus._do_request') as request, \
+                patch('agent_hub_host.worktree_guard.repair_terminal_locks', return_value=report) as repair:
+            code, out, error = run_cli('worktree', 'repair-locks', '--dry-run')
+        self.assertEqual(code, 0, error)
+        repair.assert_called_once_with(request, apply=False, limit=1000)
+        self.assertEqual(json.loads(out), report)
+
+    def test_terminal_lock_repair_requires_explicit_apply_and_bounds_limit(self):
+        report = {'mode': 'apply', 'complete': True, 'scanned': 2,
+                  'candidate_count': 1, 'released_count': 1, 'candidates': []}
+        with patch('agent_hub_host.bus._do_request') as request, \
+                patch('agent_hub_host.worktree_guard.repair_terminal_locks', return_value=report) as repair:
+            code, out, error = run_cli('worktree', 'repair-locks', '--apply', '--limit', '12')
+        self.assertEqual(code, 0, error)
+        repair.assert_called_once_with(request, apply=True, limit=12)
+        self.assertEqual(json.loads(out), report)
+
+    def test_incomplete_terminal_lock_repair_prints_report_and_fails_closed(self):
+        report = {'mode': 'apply', 'complete': False, 'scanned': 1,
+                  'candidate_count': 1, 'released_count': 0, 'candidates': []}
+        with patch('agent_hub_host.bus._do_request'), \
+                patch('agent_hub_host.worktree_guard.repair_terminal_locks', return_value=report):
+            code, out, error = run_cli('worktree', 'repair-locks', '--apply', '--limit', '1')
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out), report)
+        self.assertIn('scan/time bound', error)
+
     def test_list_gets_intake_worktrees_with_prefix_passthrough(self):
         with patch.object(intake, 'request', return_value={'worktrees': []}) as transport:
             code, out, error = run_cli('worktree', 'list', '4b161918')

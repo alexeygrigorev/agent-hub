@@ -7,8 +7,7 @@ the single authority for:
 
 - the Hub lock reason format ``hub-session <id> intake <intake-id|none>``;
 - best-effort ``git worktree lock`` on start/adopt and release only when the
-  session is terminal AND (no linked intake, or the linked intake has a DONE
-  note / is archived);
+  exact lock owner is positively terminal in Hub;
 - the shared ``should_skip_cleanup`` predicate used by every automated
   cleanup path (locked, live session, or session linked to an open intake);
 - detecting a recreated worktree at a path whose original inode was deleted
@@ -32,6 +31,7 @@ from urllib.parse import urlencode
 
 SESSION_ID_RE = re.compile(r"[0-9a-fA-F-]{8,64}\Z")
 INTAKE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_INTAKE_UNSPECIFIED = object()
 GIT_TIMEOUT = 30.0
 GIT_OUTPUT_LIMIT = 1024 * 1024
 
@@ -568,11 +568,13 @@ def protect_successor_worktree(request, git_bin, path, session_id, intake_id):
 
 def release_session_lock(git_bin: str, path: str, session_id: Any,
                          *, terminal: bool, intake_state: str,
-                         runner: Optional[Callable] = None) -> bool:
-    """Release only this session's canonical Hub lock after its release gate.
+                         runner: Optional[Callable] = None,
+                         intake_id: Any = _INTAKE_UNSPECIFIED) -> bool:
+    """Release only this session's canonical Hub lock after terminal proof.
 
     Manual locks, other sessions' locks and unreadable registries stay intact.
-    Cleanup itself never unlocks; this is a session lifecycle operation.
+    An open intake remains protected from automatic cleanup by
+    ``should_skip_cleanup``; it does not keep a terminal session's Git lock.
     """
     if not can_unlock(terminal, intake_state):
         return False
@@ -586,7 +588,9 @@ def release_session_lock(git_bin: str, path: str, session_id: Any,
         with _ownership_guard(entry['path']):
             entry = find_entry(list_entries(git_bin, path, runner), entry['path'])
             owner = parse_lock_reason(entry.get("reason")) if entry else None
-            if not entry or not entry.get("locked") or not owner or owner[0] != session_id:
+            if (not entry or not entry.get("locked") or not owner
+                    or owner[0] != session_id
+                    or (intake_id is not _INTAKE_UNSPECIFIED and owner[1] != intake_id)):
                 return False
             return unlock_worktree(git_bin, entry["path"], runner)
     except Exception:
@@ -594,15 +598,16 @@ def release_session_lock(git_bin: str, path: str, session_id: Any,
 
 
 def can_unlock(session_terminal: Any, intake_state: Any) -> bool:
-    """Release gate (AC1): terminal AND (no intake, or DONE/archived intake).
+    """Release gate (AC1): exact owner terminal and intake state recognized.
 
-    ``intake_state`` is one of ``none`` (no linked intake), ``open``,
-    ``done`` (DONE note with live proof), ``archived``. Anything else fails
-    closed (False).
+    Intake state remains validated for callers that supply it, but open intakes
+    do not retain the terminal owner's lock. The separate cleanup gate keeps
+    open intake worktrees protected. Anything other than a known state fails
+    closed.
     """
     if session_terminal is not True:
         return False
-    return intake_state in ("none", "done", "archived")
+    return intake_state in ("none", "open", "done", "archived")
 
 
 def should_skip_cleanup(
@@ -737,10 +742,12 @@ _reconcile_offset = 0
 _reconcile_cursor = None
 
 def reconcile_terminal_locks(request: Callable, git_bin: str = "git") -> int:
-    """Retry non-destructive lifecycle unlocks, including late DONE/archive.
+    """Release locks whose exact Hub owner and native incarnation are terminal.
 
-    Server terminal + fresh intake gate, original repo evidence, and exact
-    lock ownership are all necessary. Manual/foreign/unknown locks remain.
+    Server terminal proof, explicit release permission, original repo evidence,
+    and exact lock ownership are all necessary. Open intakes remain protected
+    from automated cleanup independently. Manual, human-protected, foreign,
+    and unknown locks remain.
     """
     global _reconcile_offset, _reconcile_cursor
     released = 0
@@ -770,15 +777,141 @@ def reconcile_terminal_locks(request: Callable, git_bin: str = "git") -> int:
         if not paged:
             _reconcile_offset = position + 1
         fact = facts[position]
-        if not isinstance(fact, dict) or fact.get("terminal") is not True or fact.get("native_terminal") is not True or fact.get("linked_intake_open") is not False or fact.get("lock_release_permitted") is False or (fact.get("protected") is not False and fact.get("lock_release_permitted") is not True):
+        if (not isinstance(fact, dict)
+                or fact.get("terminal") is not True
+                or fact.get("native_terminal") is not True
+                or fact.get("lock_release_permitted") is False
+                or (fact.get("protected") is not False
+                    and fact.get("lock_release_permitted") is not True)):
             continue
         expected = expected_repository(fact)
         path = expected.get("workspace") if expected else None
         if not isinstance(path, str) or expected.get("repository") != repository_identity(path, git_bin):
             continue
-        if release_session_lock(git_bin, path, fact.get("session_id"), terminal=True, intake_state="done"):
+        intake_id = fact.get("intake_task_id")
+        intake_state = "open" if fact.get("linked_intake_open") is True else ("done" if intake_id else "none")
+        if release_session_lock(git_bin, path, fact.get("session_id"), terminal=True,
+                                 intake_state=intake_state, intake_id=intake_id):
             released += 1
     # Advance only past a fully-walked page: a deadline break re-reads it next pass.
     if paged and completed:
         _reconcile_cursor = next_cursor
     return released
+
+
+MAX_REPAIR_SESSIONS = 1000
+REPAIR_TIMEOUT_S = 30
+
+
+def _terminal_lock_candidate(fact: Any, git_bin: str) -> Optional[dict[str, Any]]:
+    """Return a currently exact, terminal Hub-owned lock; fail closed otherwise."""
+    if (not isinstance(fact, dict)
+            or fact.get("terminal") is not True
+            or fact.get("native_terminal") is not True
+            or fact.get("human_owned") is not False
+            or fact.get("protected") is not False
+            or fact.get("lock_release_permitted") is not True):
+        return None
+    session_id = fact.get("session_id")
+    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        return None
+    expected = expected_repository(fact)
+    path = expected.get("workspace") if expected else None
+    if (not isinstance(path, str) or not os.path.isabs(path)
+            or expected.get("repository") != repository_identity(path, git_bin)):
+        return None
+    intake_id = fact.get("intake_task_id")
+    try:
+        entries = list_entries(git_bin, path)
+        roots = [entry for entry in entries
+                 if path == entry["path"] or path.startswith(entry["path"] + os.sep)]
+        entry = max(roots, key=lambda item: len(item["path"])) if roots else None
+        if not entry:
+            return None
+        current = find_entry(entries, entry["path"])
+        owner = parse_lock_reason(current.get("reason")) if current else None
+        if (not current or not current.get("locked") or not owner
+                or owner[0] != session_id
+                or owner[1] != intake_id):
+            return None
+        return {"session_id": session_id, "intake_id": intake_id,
+                "path": current["path"], "reason": current["reason"]}
+    except Exception:
+        return None
+
+
+def repair_terminal_locks(request: Callable, git_bin: str = "git", *,
+                          apply: bool = False, limit: int = MAX_REPAIR_SESSIONS) -> dict[str, Any]:
+    """Bounded stale-lock repair; dry-run is read-only and apply is idempotent.
+
+    The Hub host endpoint supplies fresh terminal/native-terminal facts. Repair
+    additionally requires an explicit unprotected verdict, original repository
+    identity, and a lock reason naming the exact session (and intake, when
+    present). It never uses ``--force`` or removes worktrees. Incomplete scans
+    never apply a partial result.
+    """
+    if type(limit) is not int or not 1 <= limit <= MAX_REPAIR_SESSIONS:
+        raise ValueError("repair limit must be between 1 and %d" % MAX_REPAIR_SESSIONS)
+    deadline = time.monotonic() + REPAIR_TIMEOUT_S
+    cursor: Optional[str] = None
+    scanned = 0
+    candidates: list[dict[str, Any]] = []
+    complete = True
+    seen: set[tuple[str, str]] = set()
+    while scanned < limit:
+        remaining = limit - scanned
+        query = [("limit", min(GUARD_PAGE, remaining))]
+        if cursor:
+            query.append(("cursor", cursor))
+        try:
+            result = request("GET", GUARD_PATH + "?" + urlencode(query))
+        except Exception:
+            complete = False
+            break
+        if not isinstance(result, dict) or not isinstance(result.get("sessions"), list):
+            complete = False
+            break
+        facts = result["sessions"]
+        for fact in facts:
+            if time.monotonic() >= deadline or scanned >= limit:
+                complete = False
+                break
+            scanned += 1
+            candidate = _terminal_lock_candidate(fact, git_bin)
+            if candidate:
+                key = (candidate["path"], candidate["session_id"])
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(candidate)
+        if not complete:
+            break
+        if "next_cursor" not in result:
+            # Compatibility with an older Worker that returned one bounded
+            # list without keyset pagination.
+            break
+        next_cursor = result.get("next_cursor")
+        if next_cursor is None:
+            break
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            complete = False
+            break
+        if scanned >= limit:
+            complete = False
+            break
+        cursor = next_cursor
+
+    released = 0
+    if apply and complete:
+        for candidate in candidates:
+            if time.monotonic() >= deadline:
+                complete = False
+                break
+            intake_id = candidate["intake_id"]
+            if release_session_lock(git_bin, candidate["path"], candidate["session_id"],
+                                    terminal=True,
+                                    intake_state="open" if intake_id else "none",
+                                    intake_id=intake_id):
+                released += 1
+    return {"mode": "apply" if apply else "dry-run", "complete": complete,
+            "scanned": scanned, "candidate_count": len(candidates),
+            "released_count": released, "candidates": candidates}
