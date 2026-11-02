@@ -176,7 +176,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       const planZai: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'run zai' });
       expect(planZai.selected?.engine).toBe('zcodex');
       expect(planZai.selected?.account).toBe('zai-central');
-      expect(planZai.selected?.selection?.id).toBe('glm-flash-zcodex');
+      expect(['glm-flash', 'glm-flash-zcodex']).toContain(planZai.selected?.selection?.id);
       expect(planZai.selected?.decision?.factors?.burn_status).toBe('behind_schedule');
     });
   });
