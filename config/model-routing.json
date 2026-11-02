@@ -77,7 +77,7 @@
       "argon",
       "argon-gemini",
       "astra",
-      "opus"
+      "sonnet"
     ],
     "ask": [
       "argon",
@@ -86,7 +86,6 @@
       "glm-flash",
       "glm-flash-zcodex",
       "astra",
-      "opus",
       "sonnet"
     ],
     "review": [
@@ -96,7 +95,7 @@
       "muse",
       "glm-flash",
       "glm-flash-zcodex",
-      "opus"
+      "sonnet"
     ],
     "daily": [
       "muse",
@@ -148,14 +147,6 @@
       "model": "gemini-4-argon-high",
       "provider": "gemini",
       "engine": "antigravity",
-      "profile": null,
-      "effort": "high"
-    },
-    {
-      "id": "opus",
-      "model": "opus",
-      "provider": "claude",
-      "engine": "claude",
       "profile": null,
       "effort": "high"
     },
