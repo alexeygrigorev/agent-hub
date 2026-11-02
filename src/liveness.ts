@@ -39,6 +39,9 @@ export function thresholdsFrom(env: any): Thresholds {
   return t;
 }
 
+/** A machine with no check-in for longer than this opens a host_watch alert (Alexey 2026-11-02: 5 minutes; was 15). */
+export const HOST_WATCH_STALE_S = 300;
+
 /** States that open an alert. `idle`, `working`, `exited` and `drained` are not problems. */
 export const ALERT_STATES = new Set(['stale', 'offline', 'stalled', 'stuck', 'uncertain', 'missing', 'launcher_memory_reserve']);
 
@@ -231,10 +234,10 @@ export class LivenessService {
         existing = this.sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind='machine' AND subject IN (?,?) AND resolved_at IS NULL ORDER BY id LIMIT 1", m.id, m.name || m.id).toArray()[0];
         if (existing) this.sql.exec("UPDATE liveness_alerts SET subject_kind='host_watch',subject=? WHERE id=?", m.id, existing.id);
       }
-      if (!m.drained && (age === null || age > 900)) {
+      if (!m.drained && (age === null || age > HOST_WATCH_STALE_S)) {
         const opened = this.setAlert('host_watch', m.id, { state: 'offline', detail: `${m.name || m.id}: last_checkin_at=${checkin ?? 'never'}; no checkin for ${age ?? 'unknown'}s` });
         if (opened) notifications.push(opened);
-      } else if (existing && checkin && age !== null && age <= 900) {
+      } else if (existing && checkin && age !== null && age <= HOST_WATCH_STALE_S) {
         this.setAlert('host_watch', m.id, null);
         const recovered = this.setAlert('host_recovery', String(existing.id), { state: 'RECOVERED', detail: `${m.name || m.id}: last_checkin_at=${checkin}; incident ${existing.id}` });
         if (recovered) notifications.push(recovered);

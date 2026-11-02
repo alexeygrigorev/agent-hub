@@ -46,3 +46,64 @@ def test_supervisor_propagates_venv_python_to_owned_native_child(tmp_path):
     assert 'CLAUDE_CODE_GIT_BASH_PATH=/user/git/bash' in calls[0]
     assert 'UV_PYTHON_INSTALL_DIR=/user/python' in calls[0]
     assert calls[-1][:2] == ('kill', receipt['id'])
+
+
+def _load_supervisor():
+    script = Path(__file__).resolve().parents[2] / 'scripts' / 'session-host-supervisor.py'
+    spec = importlib.util.spec_from_file_location('supervisor_wedge_contract', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_wedged_controller_is_killed_by_pid_forgotten_and_never_respawned(tmp_path):
+    supervisor = _load_supervisor()
+    receipt = {'id': 'abc', 'tag': 't', 'engine': 'shell', 'created_at_ms': 1,
+               'command': ['x'], 'workspace': str(tmp_path)}
+    calls, killed = [], []
+
+    def native(*args):
+        calls.append(args)
+        if args[0] == 'start':
+            receipt.update(tag=args[args.index('--tag') + 1], workspace=str(tmp_path),
+                           command=list(args[args.index('--') + 1:]))
+            return dict(receipt)
+        if args[0] == 'status':
+            if len([c for c in calls if c[0] == 'status']) == 1:
+                return dict(receipt, phase='running', worker_alive=True, worker_pid=11, workload_pid=22)
+            raise supervisor.subprocess.TimeoutExpired('aplexer', 35)
+        return {}
+
+    class Stop:
+        def wait(self, _):
+            return False
+
+        def is_set(self):
+            return False
+
+    with patch.object(supervisor, 'native', side_effect=native), \
+         patch.object(supervisor, 'kill_pid', side_effect=lambda pid: killed.append(pid) or True), \
+         patch.object(supervisor, 'journal_lock_held', return_value=False), \
+         patch.object(supervisor, 'publish_controller_crash'):
+        try:
+            supervisor.run_controller(Mock(control_dir=None), tmp_path, ['x'], tag_prefix='p-', env_args=[],
+                                      journal=tmp_path, stop=Stop())
+            raise AssertionError('must raise')
+        except RuntimeError as error:
+            assert 'wedged' in str(error)
+    assert killed == [11, 22]
+    assert ('forget', 'abc', '--force') in calls
+    assert [c[0] for c in calls].count('start') == 1
+
+
+def test_no_second_controller_while_journal_lock_is_held(tmp_path):
+    supervisor = _load_supervisor()
+    with patch.object(supervisor, 'native') as native, \
+         patch.object(supervisor, 'journal_lock_held', return_value=True):
+        try:
+            supervisor.run_controller(Mock(control_dir=None), tmp_path, ['x'], tag_prefix='p-', env_args=[],
+                                      journal=tmp_path, stop=Mock())
+            raise AssertionError('must refuse')
+        except RuntimeError as error:
+            assert 'lock held' in str(error)
+    native.assert_not_called()

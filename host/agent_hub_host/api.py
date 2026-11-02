@@ -87,6 +87,50 @@ def replay_keyed(call, transient, *, delays=None, sleep=None, notify=None):
             (sleep or time.sleep)(delay)
 
 
+# Connectivity guard: when every Hub call fails at the transport level for this
+# long, say once which local setting is the likely suspect. A dead engine proxy
+# (2026-11-02 desktop) otherwise looks exactly like an offline machine.
+HUB_UNREACHABLE_LOG_AFTER_S = 120.0
+HUB_UNREACHABLE_RELOG_S = 600.0
+_hub_outage = {'since': None, 'logged_at': None, 'failures': 0}
+
+
+def hub_unreachable_suspect(error) -> str:
+    reason = getattr(error, 'reason', error)
+    if isinstance(reason, socket.gaierror):
+        return 'DNS resolution failed: check the host DNS/network'
+    proxies = [n for n in ('HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy') if os.environ.get(n)]
+    if getattr(reason, 'errno', None) in (10061, 111) or isinstance(reason, ConnectionRefusedError):
+        hint = 'connection refused'
+        if proxies:
+            hint += '; env proxy set (%s) but Hub calls bypass it, check a local proxy/VPN or firewall' % ','.join(proxies)
+        return hint + ': check a local firewall or an intercepting proxy/VPN'
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return 'timeouts: check the network path, VPN or clock'
+    return 'transport error %s' % type(reason).__name__
+
+
+def _note_hub_success():
+    _hub_outage.update(since=None, logged_at=None, failures=0)
+
+
+def _note_hub_failure(error, *, now=None, emit=None):
+    now = time.monotonic() if now is None else now
+    out = _hub_outage
+    out['failures'] += 1
+    if out['since'] is None:
+        out['since'] = now
+    if now - out['since'] < HUB_UNREACHABLE_LOG_AFTER_S:
+        return False
+    if out['logged_at'] is not None and now - out['logged_at'] < HUB_UNREACHABLE_RELOG_S:
+        return False
+    out['logged_at'] = now
+    line = json.dumps({'event': 'hub_unreachable', 'for_s': int(now - out['since']), 'failures': out['failures'],
+                       'suspect': hub_unreachable_suspect(error)})
+    (emit or (lambda l: print(l, flush=True)))(line)
+    return True
+
+
 def safe_http_json(req: urllib.request.Request, timeout: float = 10.0, *, _token_exchange=None):
     if _token_exchange is not None:
         _token_exchange.begin(req)
@@ -105,8 +149,13 @@ def safe_http_json(req: urllib.request.Request, timeout: float = 10.0, *, _token
             data = json.loads(body.decode("utf-8"))
             if _token_exchange is not None:
                 _token_exchange.record(data)
+            _note_hub_success()
             return data
     except urllib.error.HTTPError as e:
+        _note_hub_success()  # the Hub answered
+        raise
+    except (urllib.error.URLError, OSError) as e:
+        _note_hub_failure(e)
         raise
 
 from . import auth, system, config, gate
