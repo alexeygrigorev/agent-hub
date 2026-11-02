@@ -98,6 +98,18 @@ def missing_engines(install_root):
     return missing
 
 
+def engine_env(install_root, node):
+    """npm environment pinned to this release's own node, free of stale release PATH entries."""
+    from .installer_hygiene import prune_stale_release_paths
+    prefix = install_root / 'engines'
+    env = dict(os.environ, npm_config_prefix=str(prefix), npm_config_cache=str(install_root / 'cache/npm'),
+               NODE=str(node), npm_node_execpath=str(node))
+    engine_bin = prefix if sys.platform == 'win32' else prefix / 'bin'
+    rest = prune_stale_release_paths(env.get('PATH', '').split(os.pathsep), install_root.name)
+    env['PATH'] = os.pathsep.join([str(node.parent), str(engine_bin), *rest])
+    return env
+
+
 def ensure_engines(install_root):
     """Install only missing pinned engine CLIs in user scope; no-op when complete."""
     missing = missing_engines(install_root)
@@ -106,9 +118,7 @@ def ensure_engines(install_root):
     (install_root / 'tmp').mkdir(parents=True, exist_ok=True, mode=0o700)
     node, npm = ensure_node(install_root)
     prefix = install_root / 'engines'
-    env = dict(os.environ, npm_config_prefix=str(prefix), npm_config_cache=str(install_root / 'cache/npm'))
-    engine_bin = prefix if sys.platform == 'win32' else prefix / 'bin'
-    env['PATH'] = os.pathsep.join([str(node.parent), str(engine_bin), env.get('PATH', '')])
+    env = engine_env(install_root, node)
     run([node, npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', '--', *missing], env=env)
     return missing
 
@@ -363,10 +373,7 @@ def ensure_aplexer(install_root):
 
 def install_engines(install_root, node, npm):
     prefix = install_root / 'engines'
-    env = dict(os.environ, npm_config_prefix=str(prefix),
-               npm_config_cache=str(install_root / 'cache/npm'))
-    engine_bin = prefix if sys.platform == 'win32' else prefix / 'bin'
-    env['PATH'] = os.pathsep.join([str(node.parent), str(engine_bin), env.get('PATH', '')])
+    env = engine_env(install_root, node)
     # npm lifecycle scripts are required by native engine packaging; execute
     # only the explicit engine package allowlist, never a remotely supplied package.
     run([node, npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund',
@@ -666,7 +673,9 @@ def publish_user_path(install_root):
         quote = lambda s: "'" + str(s).replace("'", "''") + "'"
         ps = ('$old=[Environment]::GetEnvironmentVariable("Path","User");'
               '$add=@(' + ','.join(quote(p) for p in directories) + ');'
-              '$parts=@($add)+@($old -split ";" | Where-Object { $_ -and $_ -notin $add });'
+              '$cur=' + quote(install_root.name) + ';'
+              '$parts=@($add)+@($old -split ";" | Where-Object { $_ -and $_ -notin $add -and '
+              '-not ($_ -match "(?i)[/\\x5c]agent-hub[/\\x5c]releases[/\\x5c]([^/\\x5c]+)" -and $Matches[1] -ne $cur) });'
               '[Environment]::SetEnvironmentVariable("Path",($parts -join ";"),"User");'
               '[Environment]::SetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH",' +
               quote(git_root / 'usr/bin/bash.exe') + ',"User")')
@@ -689,7 +698,9 @@ def publish_user_path(install_root):
             if include not in old:
                 mode = stat.S_IMODE(profile.stat().st_mode) if profile.exists() else None
                 write_private(profile, old + include, mode=mode)
-    os.environ['PATH'] = os.pathsep.join([*(str(p) for p in directories), os.environ.get('PATH', '')])
+    from .installer_hygiene import prune_stale_release_paths
+    rest = prune_stale_release_paths(os.environ.get('PATH', '').split(os.pathsep), install_root.name)
+    os.environ['PATH'] = os.pathsep.join([*(str(p) for p in directories), *rest])
 
 
 def configure_default_engine():
@@ -946,8 +957,21 @@ def configure(base_url):
                       'repository_access': repository_access}), flush=True)
 
 
+def sanitize_installer_environment(install_root):
+    """Dead loopback proxies and stale release PATH entries must not break child steps."""
+    from .installer_hygiene import drop_dead_local_proxies, prune_stale_release_paths
+    dropped = drop_dead_local_proxies()
+    if dropped:
+        print('Ignoring dead local proxy settings: ' + ', '.join(dropped), flush=True)
+    parts = os.environ.get('PATH', '').split(os.pathsep)
+    kept = prune_stale_release_paths(parts, Path(install_root).name)
+    if len(kept) != len(parts):
+        os.environ['PATH'] = os.pathsep.join(kept)
+
+
 def main(argv=None):
     if argv is None and len(sys.argv) == 3 and sys.argv[1] == '--configure':
+        sanitize_installer_environment(root())
         return configure(sys.argv[2])
     if argv is None and len(sys.argv) == 2 and sys.argv[1] == '--ensure-engines':
         root_dir = Path(os.environ.get('HUB_INSTALL_RELEASE') or user_install_root())
@@ -975,6 +999,7 @@ def _install(args):
     if sys.platform == 'win32':
         install_root, ready = windows_release(args.archive, install_root)
         os.environ['HUB_INSTALL_RELEASE'] = str(install_root)
+    sanitize_installer_environment(install_root)
     for name in ('bin', 'tmp', 'cache'):
         (install_root / name).mkdir(parents=True, exist_ok=True, mode=0o700)
     print('Installing runtimes in user scope (0 elevation prompts).', flush=True)
