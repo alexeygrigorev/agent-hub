@@ -3755,11 +3755,12 @@ class Dispatcher:
             if self._catalog_sampled_at >= requested_at:
                 return self._catalog_raw
             sampled_at = time.monotonic()
-            raw = self._report_catalog_bindings(fresh=fresh)
+            self._catalog_fresh = fresh
+            raw = self._report_catalog_bindings()
             self._catalog_sampled_at, self._catalog_raw = sampled_at, raw
             return raw
 
-    def _report_catalog_bindings(self, fresh=False):
+    def _report_catalog_bindings(self):
         """Report authoritative native identity, then bind matching Hub starts.
 
         Repeat immediately after each confirmed start so later offers and
@@ -3772,7 +3773,7 @@ class Dispatcher:
         # start asks for a bounded-fresh one so its binding is not delayed.
         raw = native_list_cache.list_raw(
             aplexer_bin, lambda: self.runner([aplexer_bin, "list", "--all", "--json"]),
-            native_list_cache.FRESH_MAX_AGE_S if fresh else None)
+            native_list_cache.FRESH_MAX_AGE_S if getattr(self, '_catalog_fresh', False) else None)
         from .session_progress import SessionProgress, stop_orphan
         from .worktree_guard import cleanup_permitted
         if not hasattr(self, '_session_progress'):

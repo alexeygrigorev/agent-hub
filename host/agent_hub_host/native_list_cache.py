@@ -33,7 +33,7 @@ def ttl_s() -> float:
 
 def _entry(key: Any) -> dict[str, Any]:
     with _lock:
-        return _entries.setdefault(key, {"lock": threading.Lock(), "at": None, "value": None})
+        return _entries.setdefault(key, {"lock": threading.Lock(), "at": None, "value": None, "gen": 0})
 
 
 def cached(key: Any, fetch: Callable[[], Any], max_age: float) -> Any:
@@ -48,9 +48,11 @@ def cached(key: Any, fetch: Callable[[], Any], max_age: float) -> Any:
         at = entry["at"]
         if at is not None and (wanted_at - at <= max_age or at >= wanted_at):
             return entry["value"]
-        started = _clock()
+        started, gen = _clock(), entry["gen"]
         value = fetch()
-        entry["at"], entry["value"] = started, value
+        # An invalidation (start/kill) during the fetch makes this sample stale.
+        if entry["gen"] == gen:
+            entry["at"], entry["value"] = started, value
         return value
 
 
@@ -59,6 +61,7 @@ def invalidate(prefix: Any = None) -> None:
         for key, entry in _entries.items():
             if prefix is None or (isinstance(key, tuple) and key[0] == prefix):
                 entry["at"] = None
+                entry["gen"] = entry.get("gen", 0) + 1
 
 
 def list_raw(executable: str, fetch: Callable[[], Any], max_age: float | None = None) -> Any:

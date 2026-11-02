@@ -135,3 +135,17 @@ def test_throttle_only_touches_post_tool_use_awareness():
     assert "BASH_VERSION" in out["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
     assert out["hooks"]["SessionStart"] == t["hooks"]["SessionStart"]
     assert hook_command.throttle_post_tool_use_hooks(out) == out  # idempotent
+
+
+def test_invalidation_during_fetch_is_not_cached_as_fresh():
+    from agent_hub_host import native_list_cache as c
+    c.invalidate()
+    calls = []
+    def fetch():
+        calls.append(1)
+        if len(calls) == 1:
+            c.invalidate("list")  # a start/kill lands while the sample is in flight
+        return len(calls)
+    assert c.list_raw("aplexer-gen-test", fetch) == 1
+    assert c.list_raw("aplexer-gen-test", fetch) == 2
+    assert c.list_raw("aplexer-gen-test", fetch) == 2

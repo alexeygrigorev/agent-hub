@@ -183,3 +183,13 @@ def pytest_unconfigure(config):
         holder.stdin.close()
         holder.wait(timeout=30)
         config._agent_hub_heavy_slot_watcher.join(timeout=1)
+
+
+@pytest.fixture(autouse=True)
+def fresh_native_list_cache():
+    """The shared aplexer list snapshot is process-global (083607ae); each test
+    starts with no cached catalog so fakes from other tests never leak."""
+    from agent_hub_host import native_list_cache
+    native_list_cache.invalidate()
+    yield
+    native_list_cache.invalidate()

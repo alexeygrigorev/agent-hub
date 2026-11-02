@@ -441,6 +441,11 @@ def project_session(raw: Any) -> NativeSession:
     )
 
 
+def _fresh_list(executable):
+    native_list_cache.invalidate("list")  # act-on-state paths need a fresh catalog
+    return list_sessions(executable, include_exited=True)
+
+
 def list_sessions(
     executable: str = "aplexer",
     workspace: Optional[str] = None,
@@ -487,7 +492,8 @@ def qualify_target(
     Never infers idleness/readiness from phase flags: phase is liveness only.
     """
     target = target.validated()
-    sessions = [s for s in list_sessions(executable, include_exited=True, fresh=True)
+    native_list_cache.invalidate("list")  # stop/claim qualification needs a fresh catalog
+    sessions = [s for s in list_sessions(executable, include_exited=True)
                 if _stop_workspace_matches(s.workspace, target.workspace)]
     same_tag = [s for s in sessions if s.tag == target.tag]
     if len(same_tag) != 1:
@@ -1212,7 +1218,7 @@ def reconcile_stop_oracle(
     except (KeyError, TypeError, ValueError):
         return False, "oracle unqualified; reconcile manually"
     try:
-        rows = [s for s in list_sessions(executable, include_exited=True, fresh=True)
+        rows = [s for s in _fresh_list(executable)
                 if s.session_id.lower() == sid.lower()
                 and s.tag == tag
                 and _stop_workspace_matches(s.workspace, ws)]
@@ -1317,7 +1323,7 @@ def stop_session(
         raise SessionControlError("Signal must be HUP|TERM")
     if type(grace_ms) is not int or not 0 <= grace_ms <= 30000:
         raise SessionControlError("grace_ms must be 0..30000")
-    before = [s for s in list_sessions(executable, include_exited=True, fresh=True)
+    before = [s for s in _fresh_list(executable)
               if s.session_id.lower() == target.session_id.lower()
               and s.tag == target.tag
               and _stop_workspace_matches(s.workspace, target.workspace)]
@@ -1359,7 +1365,7 @@ def stop_session(
         raise _uncertain_with_oracle(
             "Kill reported failure; target exit unproven — reconcile",
             oracle, {**attempt, "killed": False, "result": "kill_failed"})
-    remaining = [s for s in list_sessions(executable, include_exited=True, fresh=True)
+    remaining = [s for s in _fresh_list(executable)
                    if s.session_id.lower() == target.session_id.lower()
                    and s.tag == target.tag
                    and _stop_workspace_matches(s.workspace, target.workspace)]
