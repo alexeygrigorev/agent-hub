@@ -75,6 +75,9 @@ def active_report_references(history: list) -> list:
     for index, event in enumerate(events):
         if not isinstance(event, dict) or event.get('kind') != 'report':
             continue
+        current_reference = event.get('reference')
+        if not isinstance(current_reference, str) or not SHA.fullmatch(current_reference.strip()):
+            continue
         targets = event.get('supersedes')
         if not isinstance(targets, list) or not targets or len(targets) > 32:
             continue
