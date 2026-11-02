@@ -23,6 +23,32 @@ async function loadMore() {
   updateMoreButton();
   updateView();
 }
+
+async function loadSessionPages() {
+  const sessions = [];
+  const known = new Set();
+  const cursors = new Set();
+  let cursor = null;
+  let activeCount;
+  do {
+    const params = new URLSearchParams({ limit: '100' });
+    if (!showAll) params.set('live', '1');
+    if (cursor) params.set('cursor', cursor);
+    const page = await api(`/api/sessions?${params.toString()}`);
+    if (activeCount === undefined) activeCount = page.active_count;
+    for (const session of page.sessions || []) {
+      if (!known.has(session.id)) {
+        known.add(session.id);
+        sessions.push(session);
+      }
+    }
+    cursor = page.next_cursor || null;
+    if (showAll) break; // Finished history remains available through Load more.
+    if (cursor && cursors.has(cursor)) throw new Error('Session list pagination repeated a cursor');
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
+  return { sessions, next_cursor: cursor, active_count: activeCount };
+}
 let selectedSessionId = null;
 let detailPollTimer = null;
 const autoCapturedSessions = new Set();
@@ -863,7 +889,7 @@ async function loadData() {
       if (e && e.message === 'Sign-in required') return;
     }
     const [sessionsData, treeData, auditData] = await Promise.all([
-      api(`/api/sessions?limit=50${showAll ? '' : '&live=1'}`),
+      loadSessionPages(),
       api(`/api/sessions/tree?limit=200${showAll ? '&include=all' : ''}`),
       // Admin-only; a 403 just means the panel stays hidden.
       api('/api/sessions/audit?last=5').catch(() => null)

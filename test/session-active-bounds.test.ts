@@ -33,19 +33,33 @@ describe('live/active reads are index-served and bounded (intake b2236d2c)', () 
       const s = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now, {}, {});
       s.init();
       await seed(hub, now);
+      for (let n = 701; n <= 830; n++) {
+        const created = new Date(now - 24 * 3600_000 + n * 1000).toISOString();
+        hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, created_at, updated_at)
+          VALUES (?, 'agent-b', ?, '{}', 'm1', 'codex', 'headless', 'queued', ?, ?)`, u(n), 'k' + n, created, created);
+      }
       // Credential-family liveness is covered elsewhere; here only the actor-scoped SQL path matters.
       (s as any).ownerOk = (row: any, c: any) => c.isAdmin === true || row.actor === c.actor;
       const json = async (p: string, a: any = admin) => await (await s.handle(get(p), a)).json() as any;
 
-      // list: live=1 pages through 40 fresh + 60 queued = 100 rows with a cursor
+      // list: live=1 pages through more than 100 sessions without losing older rows.
       const p1 = await json('/api/sessions?live=1&limit=30');
       expect(p1.sessions).toHaveLength(30);
       expect(p1.next_cursor).toBeTruthy();
       const p2 = await json('/api/sessions?live=1&limit=30&cursor=' + encodeURIComponent(p1.next_cursor));
       expect(p2.sessions).toHaveLength(30);
       expect(new Set([...p1.sessions, ...p2.sessions].map((r: any) => r.id)).size).toBe(60);
-      expect(p1.active_count).toBe(100);
+      expect(p1.active_count).toBe(230);
       expect(p1.active_count_capped).toBe(false);
+      const allLive = [...p1.sessions, ...p2.sessions];
+      let liveCursor = p2.next_cursor;
+      while (liveCursor) {
+        const page = await json('/api/sessions?live=1&limit=30&cursor=' + encodeURIComponent(liveCursor));
+        allLive.push(...page.sessions);
+        liveCursor = page.next_cursor;
+      }
+      expect(allLive).toHaveLength(230);
+      expect(new Set(allLive.map((r: any) => r.id)).size).toBe(230);
       // non-live default list also bounded (limit max 100)
       expect((await json('/api/sessions?limit=500')).sessions).toHaveLength(100);
 
@@ -57,8 +71,8 @@ describe('live/active reads are index-served and bounded (intake b2236d2c)', () 
 
       // tree: default limit 200, TREE_LIMIT_MAX 500, include=all capped & truncated
       const t = await json('/api/sessions/tree');
-      expect(t.total).toBe(100);
-      expect(t.truncated).toBe(false);
+      expect(t.total).toBe(200);
+      expect(t.truncated).toBe(true);
       const small = await json('/api/sessions/tree?limit=10');
       expect(small.total).toBe(10);
       expect(small.truncated).toBe(true);
@@ -80,7 +94,7 @@ describe('live/active reads are index-served and bounded (intake b2236d2c)', () 
       expect(r2.reconciled).toBe(90);
       expect(r2.remaining).toBe(0);
       expect((hub.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE state = 'running'`).toArray()[0] as any).n).toBe(40);
-      expect((hub.sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions').toArray()[0] as any).n).toBe(1000);
+      expect((hub.sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions').toArray()[0] as any).n).toBe(1130);
 
       // EXPLAIN QUERY PLAN: no base-table SCAN without an index, no temp b-tree
       const live = `state IN ('queued','held','offered','starting','running','uncertain')`;

@@ -29,12 +29,12 @@ class ClockStop:
 
 
 class FastBindingsTests(unittest.TestCase):
-    def test_idle_controller_does_not_add_hub_requests(self):
+    def test_idle_controller_publishes_external_session_census_every_45_seconds(self):
         dispatcher = SimpleNamespace(_inflight=0, _active_launches={},
-                                     report_catalog_bindings=Mock())
-        stop = ClockStop(dispatcher)
+                                     report_native_bindings=Mock(), report_catalog_bindings=Mock())
+        stop = ClockStop(dispatcher, until=95)
         session_host.bindings_loop(dispatcher, stop, clock=lambda: stop.now)
-        dispatcher.report_catalog_bindings.assert_not_called()
+        self.assertEqual(dispatcher.report_native_bindings.call_count, 3)
 
     def test_late_native_is_adopted_after_launcher_returns_then_observer_goes_idle(self):
         dispatcher = SimpleNamespace(_inflight=1, _active_launches={},

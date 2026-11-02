@@ -176,4 +176,25 @@ describe('dashboard badge (public/sessions.js)', () => {
     expect(sessionsJs).toMatch(/\['running', 'active', 'working', 'acked', 'delivered', 'done'\]\.includes\(s\)\) color = 'dk-badge--success'/);
     expect(sessionsJs).toMatch(/session\.state === 'stopped' && session\.worker_status === 'done' \? 'done'/);
   });
+  it('loads every live session page in the dashboard list', async () => {
+    const source = (sessionsJs as string).match(/async function loadSessionPages\(\) \{[\s\S]*?\n\}/)?.[0];
+    expect(source).toBeDefined();
+    const pages = [
+      { sessions: Array.from({ length: 100 }, (_, i) => ({ id: String(i) })), next_cursor: 'page-2', active_count: 230 },
+      { sessions: Array.from({ length: 100 }, (_, i) => ({ id: String(i + 100) })), next_cursor: 'page-3', active_count: 230 },
+      { sessions: Array.from({ length: 30 }, (_, i) => ({ id: String(i + 200) })), next_cursor: null, active_count: 230 },
+    ];
+    const paths: string[] = [];
+    const api = async (path: string) => {
+      paths.push(path);
+      return pages[paths.length - 1];
+    };
+    const load = new Function('showAll', 'api', `${source}\nreturn loadSessionPages;`) as (showAll: boolean, apiFn: (path: string) => Promise<any>) => () => Promise<any>;
+    const result = await load(false, api)();
+    expect(result.sessions).toHaveLength(230);
+    expect(result.next_cursor).toBeNull();
+    expect(paths).toHaveLength(3);
+    expect(new URLSearchParams(paths[0].split('?')[1]).get('live')).toBe('1');
+    expect(new URLSearchParams(paths[2].split('?')[1]).get('cursor')).toBe('page-3');
+  });
 });

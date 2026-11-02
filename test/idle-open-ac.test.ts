@@ -42,6 +42,18 @@ async function fixture(fn: (f: any) => Promise<void>) {
 }
 
 describe('idle with open acceptance criteria', () => {
+  it('makes a census-registered external native session visible in the live list', async () => fixture(async ({sql,sc}: any) => {
+    const nativeId = '55555555-5555-4555-8555-555555555555';
+    const native = {native_id:nativeId,tag:'external-codex',workspace:'/external',engine:'codex',model:'gpt-6',phase:'running',agent_state:'working',created_at_ms:at-5000};
+    expect(adoptObservedNativeSessions(sql,'idle-host',[native],at,'host-family').adopted).toBe(1);
+    sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,workspace,engine,phase,agent_state,observed_at,created_at_ms)
+      VALUES('idle-host',?,'external-codex','/external','codex','running','working',?,?)`,nativeId,new Date(at).toISOString(),native.created_at_ms);
+    const response = await sc.handle(new Request('https://hub/api/sessions?live=1&limit=100'),auth);
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(body.sessions).toContainEqual(expect.objectContaining({id:nativeId,engine:'codex',model:'gpt-6',machine:'idle-host'}));
+  }));
+
   it('recognizes the 95c1862c START-note shape, not RCA references or tag substrings', () => {
     const binding = { native_id: id, tag: 'test-goal' };
     const text = `START: Started via aplexer BACKUP: interactive Codex session hetzner:/test:test-goal (aplexer id ${id}, engine codex default GPT-6.1-Sol), /goal sent and active ('Pursuing goal').`;

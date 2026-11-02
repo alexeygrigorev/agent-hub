@@ -608,17 +608,19 @@ def worktree_step_once(dispatcher, machine_id: str, journal_dir: str):
 
 
 def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
-    """One observer for in-flight starts and a bounded late-adoption tail.
+    """Observe in-flight starts and publish an external-session census at most 45s apart.
 
     A launcher can await its child's first action for minutes. Its offer
     thread cannot report bindings during that wait, and the slow maintenance
     census is also minutes apart. Send a full native identity census while
     slow enrichment runs separately; this observer never claims or starts work.
-    Idle controllers make no additional HTTP requests. A recovered journal
-    receives the same short tail to adopt native starts after a restart.
+    Idle controllers still publish a lightweight census so externally started
+    aplexer sessions become visible without waiting for the slower maintenance
+    cycle. A recovered journal receives the same short enrichment tail.
     """
     records = getattr(dispatcher, '_active_launches', None)
     tail_until = clock() + 30 if isinstance(records, dict) and records else 0
+    next_census = clock()
     sampler = None
     try:
         while not stop.is_set():
@@ -627,8 +629,11 @@ def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
             active = type(inflight) is int and inflight > 0
             if active:
                 tail_until = clock() + 30
-            if clock() < tail_until:
+            now = clock()
+            if now < tail_until:
                 bindings_step_once(dispatcher)
+                if now >= next_census:
+                    next_census = now + 45
                 if callable(getattr(dispatcher, 'report_native_bindings', None)):
                     # At most one slow sampler, independent of fast reporting.
                     # Its existing lock serializes durable progress and exit
@@ -640,6 +645,9 @@ def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
                         sampler.start()
                 if active:
                     tail_until = clock() + 30
+            elif now >= next_census:
+                bindings_step_once(dispatcher)
+                next_census = now + 45
             stop.wait(max(0, 5 - (clock() - started)))
     finally:
         if sampler is not None:
