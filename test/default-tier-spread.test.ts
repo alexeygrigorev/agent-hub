@@ -89,10 +89,65 @@ describe('default tier placement', () => {
           idempotency_key: 'spread-' + i, mode: 'headless' }, { caller: admin.caller, scopes: ['admin'] });
         expect(reserved.status, JSON.stringify(reserved.value)).toBeLessThan(300);
       }
-      expect(new Set(engines).size, engines.join(',')).toBeGreaterThanOrEqual(2);
-      expect(engines, engines.join(',')).not.toContain('codex');
+      expect(new Set(engines).size, engines.join(',')).toBeGreaterThanOrEqual(3);
+      expect(engines.slice(0, 3).every(e => e === 'codex'), engines.join(',')).toBe(false);
       expect(engines).toContain('antigravity');
       expect(engines).toContain('opencode');
+    });
+  });
+
+  it('keeps healthy codex in the mix and starves depleted claude at the 2026-11-02 quota (claude 10, zai 8, muse 43, codex 45, antigravity 40)', async () => {
+    const now = Date.now();
+    const iso = (d = 0) => new Date(now + d).toISOString();
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('default-tier-mix-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+      const fleet = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
+      fleet.init();
+      const machine = 'cBynxGDoKVPoGpGWxvCTvg';
+      hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
+        machine, machine, machine, iso(), iso(), JSON.stringify({
+          mem_avail_mb: 32000, disk_free_gb: 80, cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() },
+        }), JSON.stringify({ engines: ['codex', 'claude', 'antigravity', 'opencode', 'zcodex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
+      const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] } as any;
+      const put = await fleet.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify({
+        accounts: [
+          { label: 'shared-codex', provider: 'codex', max_concurrency: 6, reserve_percent: 0, enabled: true },
+          { label: 'shared-claude', provider: 'claude', max_concurrency: 6, reserve_percent: 0, enabled: true },
+          { label: 'hub-antigravity', provider: 'gemini', max_concurrency: 6, reserve_percent: 0, enabled: true },
+          { label: 'shared-go', provider: 'go', max_concurrency: 6, reserve_percent: 0, enabled: true },
+          { label: 'zai-central', provider: 'zai', max_concurrency: 6, reserve_percent: 0, enabled: true },
+        ],
+        routes: [
+          { machine_id: machine, engine: 'codex', account: 'shared-codex', profile: null },
+          { machine_id: machine, engine: 'claude', account: 'shared-claude', profile: null },
+          { machine_id: machine, engine: 'antigravity', account: 'hub-antigravity', profile: 'hub-hub-antigravity' },
+          { machine_id: machine, engine: 'opencode', account: 'shared-go', profile: 'hub-shared-go' },
+          { machine_id: machine, engine: 'zcodex', account: 'zai-central', profile: null },
+        ] }) }), admin);
+      expect(put.status, await put.clone().text()).toBe(200);
+      const sub = (account: string, service: string, pct: number) => hub.sql.exec(
+        'INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)', machine, account, service, null, iso(), metered(iso(), pct, now));
+      sub('shared-codex', 'codex', 45);
+      sub('shared-claude', 'claude', 10);
+      sub('hub-antigravity', 'gemini', 40);
+      sub('shared-go', 'go', 43);
+      sub('zai-central', 'zai', 8);
+
+      const counts: Record<string, number> = {};
+      for (let i = 0; i < 10; i++) {
+        const prompt = 'mix ' + i;
+        const plan = fleet.plan({ machine, mode: 'headless', workspace: 'demo', prompt });
+        expect(plan.selected, JSON.stringify(plan.rejected)).toBeTruthy();
+        counts[plan.selected.engine] = (counts[plan.selected.engine] ?? 0) + 1;
+        const reserved = fleet.reserve({ workspace: 'demo', machine, engine: plan.selected.engine, account: plan.selected.account, prompt,
+          idempotency_key: 'mix-' + i, mode: 'headless' }, { caller: admin.caller, scopes: ['admin'] });
+        expect(reserved.status, JSON.stringify(reserved.value)).toBeLessThan(300);
+      }
+      console.log('ENGINE_MIX ' + JSON.stringify(counts));
+      expect(counts.codex ?? 0, JSON.stringify(counts)).toBeGreaterThanOrEqual(1);
+      expect(counts.claude ?? 0, JSON.stringify(counts)).toBeLessThanOrEqual(Math.min(counts.codex ?? 0, counts.antigravity ?? 0, counts.opencode ?? 0));
+      expect(Object.keys(counts).length, JSON.stringify(counts)).toBeGreaterThanOrEqual(3);
     });
   });
 
