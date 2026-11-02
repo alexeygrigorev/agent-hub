@@ -170,8 +170,8 @@ export class IntakeTriage {
     if (!candidates.length) return finish({ state: 'nothing_to_triage', checked_at: now });
     if (!this.hooks.start) return finish({ state: 'reviewer_launch_unavailable', checked_at: now, candidates: candidates.length });
     const slice = candidates.slice(0, TRIAGE_BATCH).map(t => t.id);
-    const input = { key: 'triage-' + crypto.randomUUID(), engine: 'claude', tier: 'review', task_kind: 'review', mode: 'headless',
-      engine_override_reason: 'Alexey d8d509d2 AC5: backlog triage runs on a Claude Opus reviewer', workspace: 'agent-hub',
+    // No engine pin: the review tier is placed by Hub's burn-aware routing (usage spread, 2026-11-02).
+    const input = { key: 'triage-' + crypto.randomUUID(), tier: 'review', task_kind: 'review', mode: 'headless', workspace: 'agent-hub',
       // Linked for accounting only: never the triage intake's worktree (79458f2d).
       intake_task_id: TRIAGE_INTAKE_ID, intake_worktree: 'detached', brief: triageBrief(slice) };
     // Persist the slice before awaiting so a lost reply never re-offers it within the retry window.

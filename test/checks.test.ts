@@ -33,11 +33,27 @@ async function fixture(fn: (checks: ChecksService, deps: ActionDeps & { log: any
 const row = (c: any) => { const v = validateCheck(c); if ('error' in v) throw new Error(v.error); return v.row; };
 
 describe('check definitions', () => {
-  it('seeds default liveness and dispatch-route checks', () => fixture(async checks => {
+  it('seeds default liveness, dispatch-route and burn-forecast checks', () => fixture(async checks => {
     expect(checks.list().map(c => [c.name, c.kind, c.interval_s, c.enabled])).toEqual([
+      ['burn-forecast', 'burn_forecast', 900, true],
       ['dispatch-route', 'dispatch_route', 300, true],
       ['liveness', 'liveness', 300, true],
     ]);
+  }));
+
+  it('adds the burn-forecast check once to deployments seeded before it existed', () => fixture(async (checks, deps, clock, sql) => {
+    checks.replace(checks.list().filter(c => c.kind !== 'burn_forecast').map(c => row({ name: c.name, kind: c.kind, interval_s: c.interval_s, params: c.params, action: { type: c.action.type }, enabled: c.enabled })));
+    sql.exec("DELETE FROM hub_meta WHERE key = 'burn_check_seeded'");
+    new ChecksService(sql, () => clock.t).init();
+    expect(checks.list().map(c => c.name)).toEqual(['burn-forecast', 'dispatch-route', 'liveness']);
+    // An operator removing it later keeps it removed.
+    checks.replace([]);
+    new ChecksService(sql, () => clock.t).init();
+    expect(checks.list()).toEqual([]);
+    // An empty operator configuration from before this feature stays empty too.
+    sql.exec("DELETE FROM hub_meta WHERE key = 'burn_check_seeded'");
+    new ChecksService(sql, () => clock.t).init();
+    expect(checks.list()).toEqual([]);
   }));
 
   it('keeps an intentionally empty configuration across restarts', () => fixture(async (checks, deps, clock, sql) => {
@@ -85,6 +101,24 @@ describe('check definitions', () => {
 });
 
 describe('running checks', () => {
+  it('alerts when an account is projected to waste more than 30% at reset (intake ebfe9d85 AC3)', () => fixture(async (checks, deps) => {
+    checks.replace([row({ name: 'burn-forecast', kind: 'burn_forecast', interval_s: 900, params: { min_percent: 30 } })]);
+    const forecast = (projected: number, rate: number | null = 0.04) => ({ window: '7d', remaining_percent: 95, reset_at: '2026-10-29T15:00:00.000Z', hours_to_reset: 27, cycle_hours: 168, burn_rate_percent_per_hour: rate, projected_unused_percent: projected, pressure: 0.8, factor: 3.4, waste_alert: rate !== null && projected > 30 });
+    deps.evaluateQuota = () => [
+      { label: 'shared-claude', enabled: true, status: 'ok', remaining_percent: 95, burn_forecast: forecast(94) },
+      { label: 'shared-codex', enabled: true, status: 'ok', remaining_percent: 82, burn_forecast: forecast(0) },
+      { label: 'fresh-week', enabled: true, status: 'ok', remaining_percent: 99, burn_forecast: forecast(99, null) },
+      { label: 'off', enabled: false, status: 'ok', remaining_percent: 99, burn_forecast: forecast(99) },
+    ];
+    const [result] = await checks.runDue(deps);
+    expect(result.status).toBe('fail');
+    expect(result.detail).toContain('shared-claude: ~94% of 7d quota unused');
+    expect(result.detail).not.toMatch(/shared-codex|fresh-week|off:/);
+    expect(result.action).toBe('alert opened');
+    expect('error' in validateCheck({ name: 'b', kind: 'burn_forecast', interval_s: 900, params: { min_percent: 130 } })).toBe(true);
+    expect('error' in validateCheck({ name: 'b', kind: 'burn_forecast', interval_s: 900, params: { url: 'https://x.test' } })).toBe(true);
+  }));
+
   it('runs a due check once per interval slot', () => fixture(async (checks, deps, clock) => {
     checks.replace([row({ name: 'quota-low', kind: 'quota', interval_s: 300, params: { min_percent: 20 } })]);
     const first = await checks.runDue(deps);

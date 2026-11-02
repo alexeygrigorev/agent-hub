@@ -101,6 +101,25 @@ class CommitExtractionTests(unittest.TestCase):
         self.assertEqual(me.existing_commits('/r', ['a5821c84', '89f55bd7'], runner), ['89f55bd7'])
         self.assertEqual(calls[0][:3], ['git', 'cat-file', '-e'])
 
+    def test_explicit_commit_refs_only_report_and_commit_sha_fields(self):
+        sha = '89f55bd76b37b85a8b2e862302ffd8d3b7c0fb9e'
+        history = [
+            {'kind': 'report', 'reference': sha},
+            {'kind': 'commit', 'reference': '  0C934B64 '},
+            {'kind': 'report', 'reference': sha},
+            {'kind': 'note', 'reference': sha},
+            {'kind': 'report', 'reference': 'c30f1f98-06ba-4f58-8a9b-3b3fec17e2a8'},
+            {'kind': 'commit', 'reference': 'not-a-commit'},
+            {'kind': 'commit', 'reference': ''},
+            {'kind': 'commit'},
+            {'kind': 'report', 'reference': 'abc123'},
+            'not-a-dict',
+            None,
+        ]
+        self.assertEqual(me.explicit_commit_refs(history), [sha, '0c934b64'])
+        self.assertEqual(me.explicit_commit_refs([]), [])
+        self.assertEqual(me.explicit_commit_refs(None), [])
+
     def test_collect_include_head_false_skips_head_and_cherry(self):
         runner = FakeRunner(in_main=[B], cherry='', runs=[{'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'u'}])
         out = me.collect('/r', [B], runner, fetch=False, include_head=False)

@@ -14,6 +14,7 @@
  * kind `message`; the bound host delivers it through the native mailbox and,
  * for `delivery=tui`, the native deliver guard (at most once into the TUI).
  */
+import { revokeNativeWorkerCredentials } from './worker-access';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { generateUlid } from './bus';
 import { backfillOnce } from './sql-probes';
@@ -414,6 +415,7 @@ export function mintSessionCredential(sql: SqlStorage, sessionId: string, machin
 export function revokeSessionCredentials(sql: SqlStorage, sessionId: string, now: number): void {
   sql.exec("UPDATE credentials SET revoked_at = ? WHERE kind = 'agent' AND registry_actor = ? AND revoked_at IS NULL",
     new Date(now).toISOString(), `${SESSION_PROJECT}:${sessionId}`);
+  revokeNativeWorkerCredentials(sql, sessionId, now);
   expireSessionMessages(sql, now, undefined, sessionId);
 }
 

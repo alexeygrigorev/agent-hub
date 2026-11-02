@@ -136,6 +136,7 @@ export default {
       '/fleet', '/fleet.html', '/fleet.js', '/fleet.css',
       '/engines', '/engines.html', '/engines.js', '/engines.css',
       '/webhooks', '/webhooks.html', '/webhooks.js', '/webhooks.css',
+      '/prompts', '/prompts.html', '/prompts.js', '/prompts.css',
       '/banked-resets.html', '/banked-resets.js',
       '/asks', '/asks.html', '/asks.js',
       '/conversations', '/conversations.html', '/conversations.js', '/conversations.css',
@@ -143,7 +144,7 @@ export default {
       '/usage', '/usage.html',
       '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
       '/schedules', '/schedules.html', '/schedules.js', '/schedules.css',
-      '/intake', '/intake.html', '/intake.js', '/intake.css', '/intake-overview.js', '/resource-management.js', '/idle-attention.js',
+      '/intake', '/intake.html', '/intake.js', '/intake.css', '/intake-overview.js', '/intake-stats.js', '/resource-management.js', '/idle-attention.js',
       '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',
       '/vendor/dakit/fonts/inter-var.woff2',
       '/vendor/dakit/fonts/ibm-plex-mono-400.woff2',
@@ -172,6 +173,7 @@ export default {
     if (url.pathname === '/conversations') url.pathname = '/conversations.html';
     if (url.pathname === '/engines') url.pathname = '/engines.html';
     if (url.pathname === '/webhooks') url.pathname = '/webhooks.html';
+    if (url.pathname === '/prompts') url.pathname = '/prompts.html';
     if (url.pathname === '/asks') url.pathname = '/asks.html';
     if (url.pathname === '/intake' || INTAKE_DETAIL.test(url.pathname)) url.pathname = '/intake.html';
     const asset = await env.ASSETS.fetch(new Request(url, request));

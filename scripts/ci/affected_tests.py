@@ -19,6 +19,19 @@ BROAD_PREFIX = ('tsconfig', 'scripts/heavy-', 'scripts/capped-', 'scripts/test-f
 SOURCE_DIRS = ('src/', 'public/', 'host/', 'scripts/', 'test/', 'migrations/')
 TEST_ROOTS = ('test', 'host/tests')
 TEST_RE = re.compile(r'(^test/.+\.test\.ts$|^test/test_.+\.py$|^host/tests/test_.+\.py$)')
+MCP_FILES = frozenset({
+    'src/mcp-tools.ts', 'src/mcp.ts', 'src/mcp-usage.ts', 'src/mcp-oauth.ts',
+    'src/conversation-hub.ts', 'src/worker.ts', 'src/ui-pages.ts',
+})
+HOST_CANARY_TESTS = frozenset({
+    # Keep the recurring regressions found by Host canary hermeticity in the
+    # pre-push lane for every host change. These cross-area contracts are not
+    # reliably connected to host files by import-based test discovery.
+    'host/tests/test_machine_binding.py',
+    'host/tests/test_release_completeness.py',
+    'host/tests/test_bootstrap_control.py',
+    'test/test_mcp_parity.py',
+})
 
 
 def git(*args, cwd=ROOT):
@@ -53,6 +66,8 @@ def select(changed, root=ROOT):
     texts = {}
     picked = {c for c in changed if TEST_RE.match(c) and (root / c).exists()}
     for path in changed:
+        if path in MCP_FILES and (root / 'test/mcp.test.ts').is_file():
+            picked.add('test/mcp.test.ts')
         if not path.startswith(SOURCE_DIRS) or TEST_RE.match(path) or not (root / path).exists():
             continue
         stem = Path(path).stem
@@ -62,6 +77,14 @@ def select(changed, root=ROOT):
                 texts[test] = (root / test).read_text(errors='replace')
             if Path(test).stem.replace('test_', '').startswith(stem) or path in texts[test] or rx.search(texts[test]):
                 picked.add(test)
+    if any(path.startswith('host/') for path in changed):
+        picked.update(test for test in HOST_CANARY_TESTS if (root / test).is_file())
+    if 'scripts/host-release-manifest.json' in changed and \
+            (root / 'host/tests/test_release_completeness.py').is_file():
+        picked.add('host/tests/test_release_completeness.py')
+    if any(path in {'scripts/ci/affected_tests.py', 'scripts/ci/test_affected_tests.py'}
+           for path in changed) and (root / 'scripts/ci/test_affected_tests.py').is_file():
+        picked.add('scripts/ci/test_affected_tests.py')
     ts = sorted(p for p in picked if p.endswith('.ts'))
     py = sorted(p for p in picked if p.endswith('.py'))
     return {

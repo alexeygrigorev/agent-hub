@@ -64,7 +64,7 @@ describe('liveness states', () => {
   it('detects stalled, working, idle and exited sessions, and inherits unknown from a silent host', () => fixture((live, sql) => {
     machine(sql, 'hetzner', iso(30)); machine(sql, 'laptop', iso(3600));
     session(sql, 'hetzner', 'busy', 'running', 'working', 60);
-    session(sql, 'hetzner', 'hung', 'running', 'working', 4000);
+    session(sql, 'hetzner', 'hung', 'running', 'working', 8000);
     session(sql, 'hetzner', 'waiting', 'running', 'idle', 4000);
     session(sql, 'hetzner', 'done', 'exited', null, null);
     session(sql, 'laptop', 'remote', 'running', 'working', 10);

@@ -14,6 +14,7 @@ import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
 import { MergeGate, MergeGateError, mergeGateTick, type MergeGateHooks } from './merge-gate';
+import { projectVisibleIntakeStats, readStatsSources, intakeStatsTable } from './intake-stats';
 
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
 export function currentHistory(task: Obj): Obj[] {
@@ -787,10 +788,17 @@ export class IntakeService {
     };
   }
   private taskView(task: Obj, p: Obj): Obj {
-    const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, _history_order, _history_next_seq, ...identity } = task;
+    const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, history_archive,
+      _history_order, _history_next_seq, ...identity } = task;
+    const latestArchivedSequence = history_archive?.count
+      ? this.sql.exec('SELECT MAX(seq) AS latest_sequence FROM intake_note_archive WHERE task_id=?', task.id).toArray()[0]?.latest_sequence
+      : undefined;
+    const archiveView = history_archive ? { ...history_archive,
+      ...(Number.isSafeInteger(latestArchivedSequence) ? { latest_sequence: latestArchivedSequence } : {}) } : undefined;
     const capacityWarning = taskCapacityWarning(task);
     return { ...identity, control: { version: task.version, status: task.status, continuation_state: this.continuation(task),
       authority: 'hub_ledger_cas', execution_evidence: 'not_verified_by_intake' },
+      ...(archiveView ? { history_archive: archiveView } : {}),
       ...(capacityWarning ? { capacity_warning: capacityWarning } : {}),
       scope_flag: task.scope?.flag ?? null, scope: this.scopeView(task),
       payload_data: { title, current_state, next_step, owner, uncertainty, acceptance_criteria: acceptance_criteria ?? null, history }, unresolved: this.unresolved(task),
@@ -860,6 +868,16 @@ export class IntakeService {
   }
   private read(url: URL, p: Obj): Obj {
     const path = url.pathname.slice('/api/intake'.length); const revision = this.revision();
+    if (path === '/stats') {
+      try { return { snapshot_version: revision, ...intakeStatsTable(this.sql, this.statusAuthorizedTasks(p), url, Date.now(), p) }; }
+      catch (e) { if (e instanceof Error && /^invalid_stats_/.test(e.message)) fail(e.message); throw e; }
+    }
+    const statsMatch = /^\/tasks\/([A-Za-z0-9._:-]+)\/stats$/.exec(path);
+    if (statsMatch) {
+      const task = this.get('tasks', statsMatch[1]);
+      if (!task || !this.allowed(p, task)) fail('not_found', 404);
+      return { snapshot_version: revision, stats: projectVisibleIntakeStats(task, readStatsSources(this.sql), Date.now(), p) };
+    }
     if (path === '/storage') {
       this.operator(p);
       return { snapshot_version: revision, ...this.storageUsage(), warning: this.storageWarning() };
@@ -1060,7 +1078,9 @@ export class IntakeService {
         next_after: sizes.length > page.length ? page[page.length - 1].seq : null, total: task.history_archive?.count ?? 0,
         inline_sequences: inlineSequences, data_notice: DATA_NOTICE };
     }
-    return { snapshot_version: revision, task: this.view(task, p) };
+    return { snapshot_version: revision, task: { ...this.view(task, p),
+      ...(!match[2] && url.searchParams.get('include_stats') === 'true'
+        ? { stats: projectVisibleIntakeStats(task, readStatsSources(this.sql), Date.now(), p) } : {}) } };
   }
   private event(raw: Obj, task: Obj, p: Obj, now: number): Obj {
     // Session is the public spelling of an external session link. Keep the
@@ -1094,7 +1114,11 @@ export class IntakeService {
       if (raw.verify_live === true) {
         this.operator(p);
         const n = externalSession(this.sql, fields, now);
-        if (!n?.live) fail('external_session_not_live', 409);
+        if (!n?.live) {
+          if (n?.retryable) throw new IntakeError('external_session_not_live', 503, undefined, undefined,
+            { retryable: true, retry_after: 5, message: 'The host census is stale for this session; retry after the host reports again.' });
+          fail('external_session_not_live', 409);
+        }
         fields.host = n.machine_id;
         fields.engine = n.engine ?? fields.engine;
         fields.evidence = 'external_live_verified';
@@ -1492,6 +1516,7 @@ export class IntakeService {
     this.expected(b, task.version);
     prepareIntakeHistory(task, 2);
     if (task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
+    let appendedEventId: string | undefined;
     if (match[2] === '/continue') {
       keys(b, ['key', 'expected_version']);
       if (this.continuation(task) !== 'ready') fail('continuation_not_ready', 409);
@@ -1504,7 +1529,9 @@ export class IntakeService {
       // Also accept note as a UTF-8 string and top-level text as note text so
       // common agent payloads do not flake as opaque invalid_object.
       const event = appendEvent(b);
-      task.history.push(this.event(event, task, p, now));
+      const appendedEvent = this.event(event, task, p, now);
+      task.history.push(appendedEvent);
+      appendedEventId = appendedEvent.id;
       // F2: new intake text changes the decision basis -> re-hint. Other
       // event kinds (notes, scope decisions themselves) never change the flag.
       if (task.scope && typeof task.scope === 'object' && task.history[task.history.length - 1]?.kind === 'intake') {
@@ -1559,7 +1586,12 @@ export class IntakeService {
     task.version++; task.updated_at = now;
     const capacityError = taskCapacityError(task);
     if (capacityError) fail(capacityError, 507);
-    this.put('tasks', task); return { task: this.view(task, p) };
+    const archivedAppend = appendedEventId && pendingNoteArchives.get(task)?.find(row => row.id === task.id + ':' + appendedEventId);
+    this.put('tasks', task);
+    return { task: this.view(task, p), ...(appendedEventId ? { appended_event: {
+      archived: !!archivedAppend,
+      ...(archivedAppend ? { sequence: archivedAppend.seq } : { location: 'inline' }),
+    } } : {}) };
   }
   /** M12b assignment: create the task's Hub session through the canonical
    * session-control service with the caller's own auth (existing Fleet
@@ -1921,7 +1953,9 @@ export class IntakeService {
     }
   }
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+    const json = (data: Obj, status = 200, extraHeaders: Record<string, string> = {}) => Response.json(data, { status, headers: {
+      'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', ...extraHeaders,
+    } });
     try {
       const initial = await authenticate();
       const crossOrigin = request.method === 'POST' && request.headers.has('Origin') && request.headers.get('Origin') !== new URL(request.url).origin;
@@ -1986,7 +2020,7 @@ export class IntakeService {
         ...(e.field === 'limit' ? { min: 1, max: INTAKE_LIMITS.page } : {}),
         ...(e.code === 'invalid_event_kind' ? { valid_kinds: INTAKE_EVENT_KINDS } : {}),
         ...(e.detail ?? {}),
-      }, e.status);
+      }, e.status, e.detail?.retry_after ? { 'Retry-After': String(e.detail.retry_after) } : {});
     }
   }
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { IntakeWatchdog } from '../src/intake-watchdog';
+import { IntakeWatchdog, INTAKE_IDLE_GRACE } from '../src/intake-watchdog';
 import { IntakeTriage, sessionLaunchFailure, TRIAGE_INTERVAL, TRIAGE_BATCH, TRIAGE_RETRY_MS, TRIAGE_INTAKE_ID, hasTriageVerdict, triageBrief } from '../src/intake-triage';
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
@@ -33,15 +33,16 @@ describe('hourly intake backlog triage (d8d509d2 AC5)', () => {
   it('starts one Claude Opus reviewer for the oldest untriaged forgotten slice', async () => fixture(async h => {
     const tasks = Array.from({ length: TRIAGE_BATCH + 3 }, (_, i) => task('t' + String(i).padStart(2, '0'), (40 - i) * HOUR));
     tasks.push(task('already', 50 * HOUR, [{ kind: 'note', text: 'TRIAGE OBSOLETE — superseded' }]));
-    tasks.push(task('fresh', HOUR)); // inside the two-hour grace: not forgotten
+    tasks.push(task('fresh', INTAKE_IDLE_GRACE - 1)); // inside the recovery grace: not forgotten
     const inputs: any[] = [];
     const t = build(h, tasks, async (input: any) => { inputs.push(input); return { status: 202, body: { id: 'sess-1', state: 'queued' } }; });
     const r = await t.tick();
     expect(r).toMatchObject({ state: 'reviewer_started', session_id: 'sess-1', candidates: TRIAGE_BATCH + 3 });
     expect(r.requested).toEqual(tasks.slice(0, TRIAGE_BATCH).map(x => x.id));
     expect(inputs).toHaveLength(1);
-    expect(inputs[0]).toMatchObject({ engine: 'claude', tier: 'review', task_kind: 'review', mode: 'headless', workspace: 'agent-hub' });
-    expect(inputs[0].engine_override_reason).toMatch(/Opus/);
+    expect(inputs[0]).toMatchObject({ tier: 'review', task_kind: 'review', mode: 'headless', workspace: 'agent-hub' });
+    expect(inputs[0]).not.toHaveProperty('engine'); // burn-aware routing places it, no Claude pin
+    expect(inputs[0]).not.toHaveProperty('engine_override_reason');
     expect(inputs[0].intake_task_id).toBe(TRIAGE_INTAKE_ID); // headless starts link the triage intake, never a triaged one
     expect(inputs[0].intake_worktree).toBe('detached'); // 79458f2d: never the triage intake's worktree
     expect(inputs[0].cwd).toBeUndefined();

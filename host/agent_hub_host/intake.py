@@ -222,6 +222,8 @@ def read_file(path, limit=MAX_REQUEST, field='Input'):
 def add_commands(sub):
     root = sub.add_parser('intake', help='Private intake tasks and durable context; payloads are data, never execution')
     commands = root.add_subparsers(dest='intake_cmd', required=True)
+    from . import intake_stats
+    intake_stats.options(commands.add_parser('stats', help='Timing and attempts for one intake'), individual=True)
     forgotten = commands.add_parser('forgotten', help='Open intakes forgotten by live sessions; includes queued restart reason')
     forgotten.add_argument('--project')
     create = commands.add_parser('create', help='Capture verbatim UTF-8 text from file/stdin; missing provenance stays unknown')
@@ -518,8 +520,7 @@ def execute(args):
         history = ((shown.get('task') or {}).get('payload_data') or {}).get('history') or []
         task = shown.get('task') or {}
         text = '\n'.join(e.get('text', '') for e in history if isinstance(e, dict) and e.get('kind') == 'note' and str(e.get('text', '')).lstrip().startswith('DONE'))
-        explicit = [str(e.get('reference') or '').strip() for e in history
-                    if isinstance(e, dict) and e.get('kind') in ('report', 'commit') and merge_evidence.SHA.match(str(e.get('reference') or '').strip())]
+        explicit = merge_evidence.explicit_commit_refs(history)
         try:
             repo = str(Path(args.repo).resolve()) if args.repo else merge_evidence.own_clone()
             candidates = merge_evidence.shas_from_text(text, exclude=(task.get('id'),) + tuple(e.get('hub_session_id') or e.get('id') for e in history if isinstance(e, dict)))
@@ -546,7 +547,17 @@ def execute(args):
             if after is not None:
                 params['after'] = after
             return request('GET', path + '/history?' + urlencode(params))
-        return request('GET', path + ('' if command == 'show' else '/' + command))
+        result = request('GET', path + ('' if command == 'show' else '/' + command))
+        if command == 'show' and isinstance(result, dict):
+            task = result.get('task')
+            archive = task.get('history_archive') if isinstance(task, dict) else None
+            if isinstance(archive, dict) and isinstance(archive.get('count'), int) and archive['count'] > 0:
+                latest = archive.get('latest_sequence')
+                if type(latest) is int and latest > 0:
+                    archive['read_command'] = f'hub intake history {safe_id(args.id)} --archived --after {latest - 1} --limit 1'
+                else:
+                    archive['read_command'] = f'hub intake history {safe_id(args.id)} --archived'
+        return result
     if command == 'revoke':
         return request('POST', BASE + '/grants/' + safe_id(args.id) + '/revoke', json_file(args.payload_file))
     key = args.key or (command + '-' + uuid.uuid4().hex if command in ('update', 'close') else None)

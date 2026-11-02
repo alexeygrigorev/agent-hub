@@ -375,3 +375,45 @@ class EngineOwnedExistingTests(unittest.TestCase):
             fs._existing(None, Path('C:/x/state.json'))
         # private=False -> win32 private(protected=False, inherited=True): owner + owner-only ACEs still proven.
         self.assertEqual(seen, [False, True])
+
+
+class WindowsLockContentionTests4038d834(unittest.TestCase):
+    """Intake 4038d834 AC5: a held lock must surface as BlockingIOError on
+    Windows too, never as PermissionError. Session-command callers handle
+    contention only through BlockingIOError; the raw PermissionError from
+    msvcrt.locking crashed the Tabo controller command loop instead, so
+    `hub sessions stop` stayed stop_pending and processes kept running."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lock = str(Path(self.tmp.name) / 'cmd.lock')
+        # The adapter must create the private leaf first: Windows temp parents
+        # are not guaranteed owner-only, and exclusive_lock proves the DACL.
+        fs.atomic_write(self.lock, b'lock', 1024)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows msvcrt locking evidence only')
+    def test_held_lock_raises_blocking_io_error_not_permission_error(self):
+        import msvcrt
+        holder = os.open(self.lock, os.O_CREAT | os.O_RDWR)
+        try:
+            os.lseek(holder, 0, os.SEEK_SET)
+            msvcrt.locking(holder, msvcrt.LK_NBLCK, 1)
+            with self.assertRaises(BlockingIOError) as raised:
+                with fs.exclusive_lock(self.lock):
+                    self.fail('contended lock obtained')
+            self.assertNotIsInstance(raised.exception, PermissionError)
+        finally:
+            os.close(holder)
+        # The kernel releases the region lock on close; the next attempt works.
+        with fs.exclusive_lock(self.lock):
+            self.assertTrue(Path(self.lock).is_file())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows msvcrt locking evidence only')
+    def test_non_contention_lock_errors_still_propagate(self):
+        import msvcrt
+        with patch.object(msvcrt, 'locking', side_effect=OSError(22, 'Invalid argument')):
+            with self.assertRaises(OSError) as raised:
+                with fs.exclusive_lock(self.lock):
+                    self.fail('lock obtained')
+        self.assertNotIsInstance(raised.exception, BlockingIOError)

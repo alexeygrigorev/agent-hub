@@ -149,10 +149,19 @@ def http_error(exc, key=None):
         if isinstance(err, str) and err and SAFE_ERROR.match(err):
             code = err
             name = ' (%s)' % err
-            if err == 'unknown_workspace' and isinstance(data.get('matches'), list):
-                matches = [m for m in data['matches'][:5] if isinstance(m, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', m)]
+            if err in ('unknown_workspace', 'unknown_repo') and isinstance(data.get('matches'), list):
+                if err == 'unknown_repo':
+                    pattern = r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}'
+                    label = 'registered repositories'
+                    requested = data.get('repo')
+                    if isinstance(requested, str) and re.fullmatch(pattern, requested):
+                        name += '; unknown repository: ' + requested
+                else:
+                    pattern = r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}'
+                    label = 'close matches'
+                matches = [m for m in data['matches'][:5] if isinstance(m, str) and re.fullmatch(pattern, m)]
                 if matches:
-                    name += '; close matches: ' + ', '.join(matches)
+                    name += '; ' + label + ': ' + ', '.join(matches)
             if err == 'ambiguous_session_prefix' and isinstance(data.get('matches'), list):
                 ids = [row.get('id') for row in data['matches'] if isinstance(row, dict)
                        and isinstance(row.get('id'), str) and re.fullmatch(r'[a-fA-F0-9-]{36}', row['id'])]
@@ -544,7 +553,7 @@ def add_commands(sub):
     count.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     tree = commands.add_parser('tree', help='Display session lineage tree')
     tree.add_argument('--json', action='store_true', help='Output machine-readable JSON')
-    link = commands.add_parser('link', help='Link a session to an intake (operator only; works while it runs and after it ended, from the retained session record; repeats are idempotent, a different existing linkage is refused)')
+    link = commands.add_parser('link', help='Link a session to an intake (operator or same-intake/machine/workspace worker credential; works while it runs and after it ended; repeats are idempotent, a different existing linkage is refused)')
     link.add_argument('session')
     link.add_argument('--intake-task-id', required=True)
     link.add_argument('--key')
@@ -600,9 +609,11 @@ def add_commands(sub):
     send = commands.add_parser('send', help='Enqueue one prompt delivery on a bound session')
     send.add_argument('id')
     body_src = send.add_mutually_exclusive_group(required=True)
+    body_src.add_argument('--prompt-id', help='Library prompt id, slug or slug@version (rendered by Hub; see --var)')
     body_src.add_argument('--body-file', help='UTF-8 prompt file, or - for stdin (max 16 KiB)')
     body_src.add_argument('--prompt', default=None,
                           help='Inline UTF-8 prompt text (max 16 KiB; same boundaries as --body-file)')
+    send.add_argument('--var', action='append', metavar='KEY=VALUE', help='Variable for {{var.KEY}} in a --prompt-id prompt (repeatable)')
     send.add_argument('--require-ready', dest='require_ready', action='store_true',
                       help='Refuse send immediately if target session has no recent reported state')
     send.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
@@ -619,7 +630,7 @@ def add_commands(sub):
     stop = commands.add_parser('stop', help='Enqueue stop; the hub releases capacity only on confirmed native exit')
     stop.add_argument('id')
     stop.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
-    add_wait(stop, timeout=10.0, interval=1.0)
+    add_wait(stop, timeout=30.0, interval=1.0)
     stop.set_defaults(wait=True)
     stop.add_argument('--no-wait', dest='wait', action='store_false', help='Record the stop intent without waiting for verified exit')
     cancel = commands.add_parser('cancel', help='Cancel an owned held, queued or unclaimed offered intent before native start')
@@ -1041,7 +1052,14 @@ def _execute(args):
         if cmd == 'send':
             if getattr(args, 'prompt', None) is not None and getattr(args, 'body_file', None):
                 raise SessionInputError('Cannot specify both --body-file and --prompt')
-            if getattr(args, 'prompt', None) is not None:
+            if getattr(args, 'prompt_id', None):
+                from .prompt_schedules import parse_vars
+                rendered = request('POST', '/api/prompts/' + __import__("urllib.parse").parse.quote(args.prompt_id, safe='@') + '/render',
+                                   {'vars': parse_vars(getattr(args, 'var', None)) or {}})
+                body = rendered.get('text') or ''
+                if not body.strip():
+                    raise SessionInputError('Prompt rendered empty')
+            elif getattr(args, 'prompt', None) is not None:
                 body = read_prompt_text(args.prompt, limit=MAX_BODY, field='Prompt')
             elif getattr(args, 'body_file', None):
                 body = read_file(args.body_file, limit=MAX_BODY, field='Body file')
@@ -1229,11 +1247,11 @@ def render_breakdown(result):
 
 def render_table(sessions):
     """Render a compact table for `hub sessions list` with columns:
-    TYPE, NAME, HOST, ENGINE, ACCOUNT, MODEL, STATE, WORKSPACE, UPDATED and runtime warnings.
+    TYPE, NAME, HOST, ENGINE, ACCOUNT, MODEL, EFFORT, STATE, WORKSPACE, UPDATED and runtime warnings.
     """
     if not sessions:
         return 'No sessions found.'
-    headers = ['TYPE', 'NAME', 'HOST', 'ENGINE', 'ACCOUNT', 'MODEL', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
+    headers = ['TYPE', 'NAME', 'HOST', 'ENGINE', 'ACCOUNT', 'MODEL', 'EFFORT', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
     rows = []
     for s in sessions:
         stype = s.get('session_type') or ('aplexer' if s.get('mode') == 'interactive' else 'headless')
@@ -1250,7 +1268,7 @@ def render_table(sessions):
         upd = (s.get('updated_at') or '')[:19].replace('T', ' ')
         host = s.get('machine') or '-'
         account = s.get('account') or '-'
-        rows.append([stype, name, host, engine, account, s.get('model_id') or s.get('model') or '-', state, ws, upd, str(s.get('long_running', False)).lower(),
+        rows.append([stype, name, host, engine, account, s.get('model_id') or s.get('model') or '-', s.get('effort') or '-', state, ws, upd, str(s.get('long_running', False)).lower(),
                      format_duration(s.get('runtime')), format_duration(s.get('idle_for')), s.get('activity_state', '-')])
 
     widths = [len(h) for h in headers]

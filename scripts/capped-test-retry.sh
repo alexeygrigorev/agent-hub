@@ -3,10 +3,12 @@
 #
 # Usage: scripts/capped-test-retry.sh [--attempts N] [--base-delay S] [--max-delay S] -- COMMAND...
 #        scripts/capped-test-retry.sh [options] -- scripts/test-full-local.sh --priority final
+#        scripts/capped-test-retry.sh [options] -- scripts/test-affected-local.sh
 #
 # Runs COMMAND via scripts/capped-test-run.sh. The full runner
-# (scripts/test-full-local.sh) is run directly instead: it takes its own slot
-# per heavy phase, and an outer slot could deadlock it.
+# (scripts/test-full-local.sh) and targeted runner
+# (scripts/test-affected-local.sh) run directly instead: they take their own
+# slots, and an outer slot could deadlock them.
 #
 # Only a genuine capacity-gate refusal is a HOLD: exit 3 plus the refusal
 # marker that the admission gate (or the full runner, for a pure hold) writes
@@ -70,17 +72,22 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPTS_DIR}/heavy-phase-status.sh"
 SLEEP="${CAPPED_TEST_RETRY_SLEEP:-sleep}"
 
-if [ "$(basename -- "$1")" = "test-full-local.sh" ]; then
+case "$(basename -- "$1")" in
+  test-full-local.sh|test-affected-local.sh)
   RUN=("$@")
-else
+  ;;
+  *)
   RUN=("${SCRIPTS_DIR}/capped-test-run.sh" -- "$@")
-fi
+  ;;
+esac
 
 TMP_PARENT="${TMPDIR:-${SCRIPTS_DIR}/../.local/tmp}"
 mkdir -p "${TMP_PARENT}" || exit 1
 MARKER_DIR="$(mktemp -d -p "${TMP_PARENT}" retry-XXXXXX)" || exit 1
 trap 'rm -rf -- "${MARKER_DIR}"' EXIT
 MARKER="${MARKER_DIR}/refused"
+# Every attempt keeps the first attempt's queue place (intake cb5c362e).
+export AGENT_HUB_HEAVY_TEST_RUN_ID="${AGENT_HUB_HEAVY_TEST_RUN_ID:-retry-$$-$(date +%s)}"
 
 attempt=1
 while :; do

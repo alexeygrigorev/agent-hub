@@ -18,7 +18,9 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from . import private_fs
@@ -165,6 +167,12 @@ def report_rejection(label, generation, reason, request):
 CODEX_USAGE = 'https://chatgpt.com/backend-api/wham/usage'
 CODEX_RESET_CREDITS = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
 CLAUDE_USAGE = 'https://api.anthropic.com/api/oauth/usage'
+GO_USAGE = 'https://opencode.ai/zen/go/v1/usage'
+GO_DEVICE_AUTH = Path('.local/share/opencode-hub/device-auth.json')
+ZAI_USAGE = 'https://api.z.ai/api/monitor/usage/quota/limit'
+ZAI_CONFIG = Path('.config/goz/config.json')
+AGY_TOKEN = Path('.gemini/antigravity-cli/antigravity-oauth-token')
+AGY_QUOTA = 'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary'
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -276,6 +284,135 @@ def claude_quota(body, now=None):
     return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limit}, 'windows': windows}
 
 
+def go_quota(body, now=None):
+    """Map an OpenCode Go ``zen/go/v1/usage`` body (used percent) to the quota route shape."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    usage = body.get('usage') if isinstance(body, dict) and isinstance(body.get('usage'), dict) else None
+    if usage is None:
+        return None
+
+    def win(w, rolling=False):
+        if not isinstance(w, dict):
+            return {'percent_remaining': None, 'reset_at': None, 'present': False, 'rolling': rolling}
+        used = w.get('percent', w.get('usagePercent'))
+        return {'percent_remaining': _remaining(used), 'reset_at': _iso(w.get('resetsAt')), 'present': True, 'rolling': rolling}
+    windows = {'5h': win(usage.get('rolling'), True), '7d': win(usage.get('weekly')), 'monthly': win(usage.get('monthly'))}
+    limited = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values()) or any(
+        isinstance(usage.get(k), dict) and str(usage[k].get('status', '')).lower().replace('_', '-') in ('exhausted', 'limited', 'rate-limited')
+        for k in ('rolling', 'weekly', 'monthly'))
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limited}, 'windows': windows}
+
+
+def _go_access_token(home):
+    """Active OpenCode device-login access token from the Hub-materialized export."""
+    entries = json.loads(private_fs.read_bytes(Path(home) / GO_DEVICE_AUTH, MAX_FILE * 2, private=False))
+    active = [e for e in entries if isinstance(e, dict) and e.get('active') is True] if isinstance(entries, list) else []
+    value = active[0].get('value') if active else None
+    token = value.get('access') if isinstance(value, dict) else None
+    return token if isinstance(token, str) and token else None
+
+
+def zai_quota(body, now=None):
+    """Map a Z.AI ``monitor/usage/quota/limit`` body (used percent) to the quota route shape."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    data = body.get('data') if isinstance(body, dict) and isinstance(body.get('data'), dict) else body
+    limits = data.get('limits') if isinstance(data, dict) and isinstance(data.get('limits'), list) else None
+    if limits is None:
+        return None
+    windows = {'5h': {'percent_remaining': None, 'reset_at': None, 'present': False},
+               '7d': {'percent_remaining': None, 'reset_at': None, 'present': False}}
+    for item in limits:
+        if not isinstance(item, dict) or item.get('type') != 'TOKENS_LIMIT':
+            continue
+        name = {3: '5h', 6: '7d'}.get(item.get('unit'))
+        if name is None or windows[name]['present']:
+            continue
+        windows[name] = {'percent_remaining': _remaining(item.get('percentage', 0)),
+                         'reset_at': _iso(item.get('nextResetTime')), 'present': True}
+    if not any(w['present'] for w in windows.values()):
+        return None
+    limited = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values())
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limited}, 'windows': windows}
+
+
+def antigravity_quota(body, now=None):
+    """Map Antigravity ``retrieveUserQuotaSummary`` groups to the 5h/7d windows (tightest group wins)."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    groups = body.get('groups') if isinstance(body, dict) and isinstance(body.get('groups'), list) else None
+    if not groups:
+        return None
+    windows = {'5h': {'percent_remaining': None, 'reset_at': None, 'present': False},
+               '7d': {'percent_remaining': None, 'reset_at': None, 'present': False}}
+    for group in groups[:16]:
+        buckets = group.get('buckets') if isinstance(group, dict) and isinstance(group.get('buckets'), list) else []
+        for bucket in buckets[:16]:
+            if not isinstance(bucket, dict):
+                continue
+            name = {'5h': '5h', 'weekly': '7d'}.get(bucket.get('window'))
+            fraction = bucket.get('remainingFraction')
+            if name is None or isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+                continue
+            percent = max(0.0, min(100.0, float(fraction) * 100))
+            current = windows[name]
+            if not current['present'] or percent < current['percent_remaining']:
+                windows[name] = {'percent_remaining': percent, 'reset_at': _iso(bucket.get('resetTime')), 'present': True}
+    if not any(w['present'] for w in windows.values()):
+        return None
+    limited = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values())
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limited}, 'windows': windows}
+
+
+def _zai_token(home):
+    """Plaintext Z.AI coding-plan key from the managed home; the ZCode app's encrypted store is not usable."""
+    config = json.loads(private_fs.read_bytes(Path(home) / ZAI_CONFIG, MAX_FILE * 2, private=False))
+    token = config.get('zai_token') if isinstance(config, dict) else None
+    if not isinstance(token, str) or not token or token.startswith('enc:') or any(c.isspace() for c in token):
+        return None
+    return token
+
+
+def _agy_read_token(home):
+    stored = json.loads(private_fs.read_bytes(Path(home) / AGY_TOKEN, MAX_FILE * 2, private=False))
+    token = stored.get('token') if isinstance(stored, dict) else None
+    if not isinstance(token, dict) or not isinstance(token.get('access_token'), str):
+        return None, None
+    expiry = None
+    if isinstance(token.get('expiry'), str):
+        try:
+            expiry = dt.datetime.fromisoformat(re.sub(r'(\.\d{6})\d+', r'\1', token['expiry'].replace('Z', '+00:00')))
+        except ValueError:
+            expiry = None
+    return token['access_token'], expiry if expiry is not None and expiry.tzinfo is not None else None
+
+
+def _agy_refresh(home, timeout=60):
+    """Let the pinned vendor binary refresh its own login (``agy models``: no inference).
+
+    The Antigravity OAuth application is not ours to embed; the engine rotates
+    the managed home's token itself and the host syncs it back to Hub.
+    """
+    binaries = sorted((Path(home).parent / 'engine' / 'bin').glob('agy*'))
+    if not binaries:
+        return
+    env = {k: os.environ[k] for k in ('PATH', 'SYSTEMROOT', 'TEMP', 'TMP') if k in os.environ}
+    env.update(HOME=str(home), USERPROFILE=str(home))
+    try:
+        subprocess.run([str(binaries[0]), 'models'], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _agy_access_token(home, now, refresh=_agy_refresh):
+    """Antigravity access token from the managed home, refreshed by the engine when expired."""
+    token, expiry = _agy_read_token(home)
+    if token is not None and expiry is not None and expiry > now + dt.timedelta(seconds=60):
+        return token
+    refresh(home)
+    token, expiry = _agy_read_token(home)
+    return token if token is not None and (expiry is None or expiry > now) else None
+
+
 def probe_quota(provider, home, opener=None, timeout=15):
     """Read quota straight from the provider with the materialized Hub credential.
 
@@ -303,11 +440,39 @@ def probe_quota(provider, home, opener=None, timeout=15):
             headers = {'Authorization': 'Bearer ' + creds['claudeAiOauth']['accessToken'], 'Accept': 'application/json',
                        'anthropic-beta': 'oauth-2025-04-20', 'User-Agent': 'Claude-Code/2.1.198'}
             url, parse = CLAUDE_USAGE, claude_quota
+        elif provider == 'go':
+            # OpenCode Go reads usage with the device-login access token. The
+            # endpoint rejects the default urllib agent (Cloudflare 1010).
+            token = _go_access_token(home)
+            if token is None:
+                return {}
+            headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json', 'User-Agent': 'opencode/1.19'}
+            url, parse = GO_USAGE, go_quota
+        elif provider == 'zai':
+            # Plaintext coding-plan key only: the ZCode app's encrypted store
+            # ("enc:...") cannot authenticate the monitor API.
+            token = _zai_token(home)
+            if token is None:
+                return {}
+            headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json', 'Content-Type': 'application/json',
+                       'User-Agent': 'agent-hub-quota/1'}
+            url, parse = ZAI_USAGE, zai_quota
+        elif provider == 'antigravity':
+            token = _agy_access_token(home, dt.datetime.now(dt.timezone.utc))
+            if token is None:
+                return {}
+            request = urllib.request.Request(AGY_QUOTA, data=b'{}', method='POST', headers={
+                'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'User-Agent': 'antigravity'})
+            with opener.open(request, timeout=timeout) as response:
+                body = json.loads(response.read(131072))
+            route = antigravity_quota(body) if isinstance(body, dict) else None
+            return {provider: route} if route else {}
         else:
             return {}
         with opener.open(urllib.request.Request(url, headers=headers, method='GET'), timeout=timeout) as response:
             body = json.loads(response.read(131072))
-        return {provider: parse(body)} if isinstance(body, dict) else {}
+        route = parse(body) if isinstance(body, dict) else None
+        return {provider: route} if route else {}
     except urllib.error.HTTPError as error:
         error.close()
         return {'unauthorized': True} if error.code == 401 else {}

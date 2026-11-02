@@ -61,3 +61,19 @@ export function accountCapacityAlerts(sql: SqlStorage, now: number) {
   }
   return subjects;
 }
+
+/** The server quota collector stopped refreshing: every stored server observation is older than
+ * 30 minutes, so `hub quota` would silently show old numbers. Raised through the liveness alert path
+ * (agent-kind stale subject) and resolved by the next stored snapshot. Empty storage raises nothing. */
+export const QUOTA_PROBE_STALE_MS = 30 * 60 * 1000;
+export function quotaProbeStaleAlerts(sql: SqlStorage, now: number) {
+  let rows: any[] = [];
+  try { rows = sql.exec('SELECT captured_at FROM server_quota_snapshots').toArray() as any[]; } catch { return []; }
+  const times = rows.map(r => Date.parse(String(r.captured_at))).filter(Number.isFinite);
+  if (!times.length) return [];
+  const newest = Math.max(...times);
+  if (now - newest <= QUOTA_PROBE_STALE_MS) return [];
+  const minutes = Math.floor((now - newest) / 60000);
+  return [{ kind: 'agent' as const, id: 'quota-server', state: 'stale',
+    detail: `quota probe stale: all ${rows.length} server quota observations are older than 30m (newest ${minutes}m ago); check agent-hub-quota-server.timer and its release drop-in on the Hub backend` }];
+}

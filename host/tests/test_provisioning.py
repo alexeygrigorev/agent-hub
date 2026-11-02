@@ -1008,7 +1008,7 @@ def test_managed_codex_config_keeps_update_check_boolean_type(tmp_path, provider
     home.chmod(0o700)
     # Reconcile a previously string-valued setting and keep the disable flag
     # boolean on subsequent syncs.
-    config.write_text('check_for_update_on_startup = "true"\n')
+    p.private_fs.atomic_write(config, b'check_for_update_on_startup = "true"\n', 131072)
 
     for _ in range(2):
         p.install_managed_engine_permissions({'provider': provider}, home)
@@ -1154,6 +1154,13 @@ def test_execute_bypasses_permissions_for_goal_and_interactive(tmp_path, monkeyp
     assert argv.count('--dangerously-bypass-approvals-and-sandbox') == 1
     calls.clear()
 
+    # Case 2b: headless `exec` also gets the flag, before the subcommand
+    monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', 'exec', '--json', 'task'])
+    p.execute()
+    cmd, argv, env = calls[0]
+    assert argv.index('--dangerously-bypass-approvals-and-sandbox') < argv.index('exec')
+    calls.clear()
+
     # Case 3: Diagnostic --version does NOT append bypass flag
     monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', '--version'])
     p.execute()
@@ -1219,13 +1226,29 @@ def test_ensure_toml_trusted_projects():
 def test_ensure_toml_trusted_hooks(tmp_path):
     initial = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n'
     hooks_file = tmp_path / 'hooks.json'
+    hooks_doc = {'hooks': {'SessionStart': [{'hooks': [{'type': 'command', 'command': 'a state-report working'}]}]}}
+    p.private_fs.atomic_write(hooks_file, json.dumps(hooks_doc).encode('utf-8'), 131072)
     res = p.ensure_toml_trusted_hooks(initial, hooks_file)
-    for suffix in p.KNOWN_HOOK_HASHES:
-        assert f':{suffix}"]' in res
-        assert 'trusted_hash =' in res
+    trust = p.hook_trust.entries(str(hooks_file.resolve()), hooks_doc)
+    assert len(trust) == 1
+    for key, value in trust.items():
+        assert json.dumps(key) in res
+        assert f'trusted_hash = "{value}"' in res
     # Ensure idempotency
     res2 = p.ensure_toml_trusted_hooks(res, hooks_file)
     assert res2 == res
+
+
+def test_trust_refresh_removes_stale_hashes_when_generated_hooks_become_empty(tmp_path):
+    hooks_file = tmp_path / 'hooks.json'
+    p.private_fs.atomic_write(hooks_file, json.dumps({'hooks': {}}).encode('utf-8'), 131072)
+    key = str(hooks_file.resolve()) + ':SessionStart:0:0'
+    stale = ('approval_policy = "never"\n\n'
+             f'[hooks.state.{json.dumps(key)}]\n'
+             'trusted_hash = "sha256:stale-generated-hash"\n')
+    refreshed = p.ensure_toml_trusted_hooks(stale, hooks_file)
+    assert refreshed == 'approval_policy = "never"\n'
+    assert 'stale-generated-hash' not in refreshed
 
 
 def test_sync_rotation_cleans_readonly_go_mod_cache_and_preserves_profile(tmp_path, monkeypatch):
@@ -1385,6 +1408,8 @@ def test_codex_config_merge_is_idempotent_across_crlf_and_quoting(tmp_path):
     import tomllib
 
     hooks = tmp_path / 'hooks.json'
+    hooks_doc = {'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'a state-report idle'}]}]}}
+    p.private_fs.atomic_write(hooks, json.dumps(hooks_doc).encode('utf-8'), 131072)
     paths = ['/a/b', '/c']
     # Codex rewrote the file: CRLF endings and a literal-quoted table.
     base = ('approval_policy = "never"\r\n\r\n[projects."/a/b"]\r\ntrust_level = "untrusted"\r\n'
@@ -1398,7 +1423,7 @@ def test_codex_config_merge_is_idempotent_across_crlf_and_quoting(tmp_path):
     assert run(once) == once
     data = tomllib.loads(once)
     assert data['projects'][str(Path('/a/b').resolve())]['trust_level'] == 'trusted'
-    assert len(data['hooks']['state']) == len(p.KNOWN_HOOK_HASHES)
+    assert len(data['hooks']['state']) == len(p.hook_trust.entries(str(hooks.resolve()), hooks_doc))
 
 
 def test_repair_toml_duplicate_tables_fixes_already_broken_config():
@@ -1470,9 +1495,9 @@ def test_profile_command_imports_package_without_launcher_pythonpath(tmp_path, m
 
 def _fake_windows_go_install(revision='33333333-3333-4333-8333-333333333333'):
     dest = p.root() / ('go-account-' + revision)
-    package = dest / 'engine' / 'node_modules' / 'opencode-windows-x64'
-    (package / 'bin').mkdir(parents=True)
-    (package / 'package.json').write_text(json.dumps({'version': '1.0.0'}))
+    package = dest / 'engine' / 'node_modules' / '@opencode' / 'cli-windows-x64'
+    (package / 'bin').mkdir(parents=True, exist_ok=True)
+    (package / 'package.json').write_text(json.dumps({'version': p.GO_CLI_VERSION}))
     executable = package / 'bin' / 'opencode.exe'
     executable.write_bytes(b'MZ')
     return dict(label='go-account', provider='go', version='1.0.0', revision=revision,
@@ -1491,6 +1516,23 @@ def test_windows_go_bundle_pins_managed_opencode_engine(monkeypatch):
     assert '# BEGIN HUB MANAGED ENGINES' in text
     p.profiles([])  # bundle withdrawn: the pin goes with the managed block
     assert '[engines.opencode]' not in p.profile_path().read_text()
+
+
+def test_go_engine_is_the_2x_cli_that_can_import_the_central_device_login(tmp_path, monkeypatch):
+    # Intake 5814e109 / e0af55f3: opencode-ai 1.x has no `auth import`, so the
+    # Hub-central muse login could never be installed on a host; the managed go
+    # engine is the pinned @opencode/cli 2.x whatever version the bundle carries.
+    assert p.PACKAGES['go'][0] == '@opencode/cli' and p.GO_CLI_VERSION == '2.0.32'
+    bundle, executable = _fake_windows_go_install()
+    bundle['version'] = '1.19.3'
+    dest = p.root() / ('go-account-' + bundle['revision'])
+    assert p.executable_path(bundle, dest, is_windows=True) == executable
+    assert p._go_engine_current(bundle, dest) is True
+    old_tree = p.root() / 'go-account-old' / 'engine' / 'node_modules'
+    (old_tree / 'opencode-ai').mkdir(parents=True)
+    assert p._go_engine_current(bundle, old_tree.parent.parent) is False  # leftover 1.x without the 2.x CLI
+    (old_tree / '@opencode' / 'cli').mkdir(parents=True)
+    assert p._go_engine_current(bundle, old_tree.parent.parent) is True
 
 
 def test_opencode_engine_pin_absent_off_windows_and_for_operator_tables(monkeypatch):
@@ -1569,3 +1611,45 @@ def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, exp
     p.execute()
     overrides = [arg for arg in calls[0] if arg.startswith('model_reasoning_effort=')]
     assert overrides == ['model_reasoning_effort="' + expected + '"']
+
+
+def test_antigravity_environment_drops_user_proxy_variables(tmp_path, monkeypatch):
+    # Desktop: HTTPS_PROXY=127.0.0.1:8899 made agy's OAuth refresh fail ('Authentication required')
+    # with a valid, Hub-identical token; the same home answered OK without the proxy env.
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY'):
+        monkeypatch.setenv(key, 'http://127.0.0.1:8899')
+    b = {'label': 'agy', 'provider': 'antigravity', 'revision': '66666666-6666-4666-8666-666666666666',
+         'version': '1.4.12', 'files': {}, 'env': {}, 'args': []}
+    env = p.engine_environment(b, root_dir / 'agy-x' / 'home', root_dir / 'agy-x')
+    assert not [k for k in env if k.lower().endswith('_proxy')]
+    codex = p.engine_environment(dict(b, provider='codex'), root_dir / 'c' / 'home', root_dir / 'c')
+    assert codex.get('HTTPS_PROXY') == 'http://127.0.0.1:8899' or codex.get('https_proxy')  # other engines untouched
+
+
+def test_antigravity_home_is_seeded_past_theme_and_data_sharing_prompts(tmp_path, monkeypatch):
+    # Desktop agy sessions stopped at the theme picker and the data-sharing consent.
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    tmp_path = root_dir
+    home = tmp_path / 'home'
+    b = {'label': 'agy', 'provider': 'antigravity', 'revision': '55555555-5555-4555-8555-555555555555',
+         'version': '1.4.12', 'files': {}, 'env': {}, 'args': []}
+    p.provision_managed_home(b, home, tmp_path)
+    marker = home / p.ANTIGRAVITY_ONBOARDING
+    data = json.loads(marker.read_text())
+    assert data['onboardingComplete'] is True and data['consumerOnboardingComplete'] is True
+    marker.write_text('{"onboardingComplete": true, "kept": 1}')
+    p.provision_managed_home(b, home, tmp_path)  # idempotent, never overwrites engine state
+    assert json.loads(marker.read_text())['kept'] == 1
+    # The CLI's own incomplete marker (written on a first headless start) is completed, keeping other keys.
+    marker.write_text('{"onboardingComplete": false, "enterpriseOnboardingComplete": false, "kept": 2}')
+    p.provision_managed_home(b, home, tmp_path)
+    fixed = json.loads(marker.read_text())
+    assert fixed['onboardingComplete'] is True and fixed['kept'] == 2
+    other = tmp_path / 'other'
+    p.provision_managed_home(dict(b, provider='codex'), other, tmp_path)
+    assert not (other / p.ANTIGRAVITY_ONBOARDING).exists()

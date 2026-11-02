@@ -42,7 +42,16 @@ if ($existing -and -not (& $ownedByMe $existing.Principal.UserId)) {
   throw 'Existing task belongs to another user'
 }
 $psExe = (Get-Command powershell.exe).Source
-$action = New-ScheduledTaskAction -Execute $psExe -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runnerPath`""
+$psArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runnerPath`""
+# -WindowStyle Hidden still flashes a console for an Interactive-logon task
+# (Alexey, intake 446227dc: terminal pop-ups are distracting). conhost
+# --headless starts the console host with no window at all.
+$conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+if (Test-Path -LiteralPath $conhost) {
+  $action = New-ScheduledTaskAction -Execute $conhost -Argument "--headless `"$psExe`" $psArgs"
+} else {
+  $action = New-ScheduledTaskAction -Execute $psExe -Argument $psArgs
+}
 # BootTrigger registration requires admin. A durable repeating time trigger
 # catches reboot/wake with StartWhenAvailable and does not require a logon.
 # No repetition duration means indefinite repetition (Task Scheduler v2).

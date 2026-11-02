@@ -660,6 +660,15 @@ describe('private durable intake HTTP/SQLite', () => {
       expected_version: 1, session: { workspace: 'demo', brief: 'Synthetic foreign goal' }, provenance: source })).assigned_session.hub_session_id;
     expect((await call('/tasks/' + task.id + '/events', { key: 'foreign-link', expected_version: 2,
       event: { kind: 'link', hub_session_id: foreignSession, provenance: source } }, agent.token)).status).toBe(404);
+    // An intake grant cannot disclose another actor's session telemetry through stats.
+    await inDO(stub(), (h: any) => h.sql.exec('UPDATE session_control_sessions SET engine=?, state=?, binding_json=? WHERE id=?',
+      'foreign-fixture-engine', 'failed', JSON.stringify({ native_id: 'foreign-private-native', native_created_at_ms: Date.now() - 5000 }), foreignSession));
+    const foreignStats = (await ok('/tasks/' + foreign.id + '/stats', undefined, agent.token)).stats;
+    expect(foreignStats.failed_attempts).toBeNull();
+    expect(foreignStats.unknown_reasons.failed_attempts).toBe('session_owner_required');
+    expect(JSON.stringify(foreignStats)).not.toMatch(/foreign-fixture-engine|foreign-private-native/);
+    const table = await ok('/stats?project=demo', undefined, agent.token);
+    expect(table.items.find((s: any) => s.id === foreign.id).failed_attempts).toBeNull();
     // Without fleet:launch the canonical service refuses, so assignment fails.
     const plain = await seedAgent('demo:assistant');
     await grant(plain, 'project', 'demo', 'write');
@@ -677,7 +686,7 @@ describe('private durable intake HTTP/SQLite', () => {
     });
     const data=await ok('/forgotten?project=demo');
     expect(data.items.some((t:any)=>t.id===task.id)).toBe(true);
-    expect(data.items.find((t:any)=>t.id===task.id)).toMatchObject({reason:'no_live_session_over_two_hours',last_session:null});
+    expect(data.items.find((t:any)=>t.id===task.id)).toMatchObject({reason:'no_live_session_over_25_minutes',last_session:null});
     expect(data.watchdog).toHaveProperty('last_checked_at');
     expect(data.watchdog).not.toHaveProperty('result');
     expect(data.watchdog).not.toHaveProperty('forgotten_count');
@@ -1107,7 +1116,11 @@ describe('private durable intake HTTP/SQLite', () => {
   it('reconstruction from same durable SQLite retains tasks, receipts, rules and grants', async () => {
     const a = await seedAgent(); await grant(a); const created = await create();
     await inDO(stub(), (h: any, ctx: any) => { h.intakeService = new IntakeService(h.sql, fn => ctx.storage.transactionSync(fn)); h.intakeService.init(); });
-    expect((await ok('/tasks/' + created.task.id, undefined, a.token)).task).toEqual(created.task);
+    const retained = (await ok('/tasks/' + created.task.id, undefined, a.token)).task;
+    expect(retained).toEqual(created.task);
+    expect(retained.stats).toBeUndefined();
+    const withStats = (await ok('/tasks/' + created.task.id + '?include_stats=true', undefined, a.token)).task;
+    expect(withStats.stats).toMatchObject({ id: created.task.id, created_at: created.task.created_at, attempt_count: 0 });
   });
   it('streamed UTF-8 and field limits reject oversized content without private error echo', async () => {
     const before = await state();
@@ -1232,6 +1245,27 @@ describe('private durable intake HTTP/SQLite', () => {
       expect(() => h.sql.exec('UPDATE intake_note_archive SET data=data WHERE task_id=?', task.id)).toThrow(/append_only_note_archive/);
     });
     expect((await call('/tasks/' + task.id + '/history?archived=1&limit=101')).status).toBe(400);
+  });
+
+  it('reports an appended note archived at inline capacity and makes it readable from archive history', async () => {
+    const { task } = await create();
+    const noteText = 'This note was archived during append ' + 'x'.repeat(7000);
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one().data);
+      while (new TextEncoder().encode(JSON.stringify(data)).length < INTAKE_LIMITS.taskBytes - 1024) data.history.push({
+        id: crypto.randomUUID(), kind: 'decision', text: '界'.repeat(2700), source });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+    });
+
+    const result = await append(task.id, task.version, { kind: 'note', text: noteText, source }, undefined, 'archived-on-append');
+    expect(result.appended_event).toMatchObject({ archived: true, sequence: expect.any(Number) });
+    const sequence = result.appended_event.sequence;
+    const shown = await ok('/tasks/' + task.id);
+    expect(shown.task.history_archive.count).toBeGreaterThan(0);
+    expect(shown.task.history_archive.latest_sequence).toBe(sequence);
+    expect(shown.task.payload_data.history.some((event: any) => event.text === noteText)).toBe(false);
+    const history = await ok('/tasks/' + task.id + '/history?archived=1&after=' + (sequence - 1) + '&limit=1');
+    expect(history.items).toEqual([{ sequence, event: expect.objectContaining({ kind: 'note', text: noteText }) }]);
   });
 
   it('archives superseded link and worktree events when ordinary notes are exhausted at the event cap', async () => {

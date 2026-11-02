@@ -14,6 +14,7 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 
 ## Process
 
+0. Tests run in CI (Alexey 2026-11-02, t2558u, intake 178ec5bb; supersedes rules 4-5 where they conflict): «тесты запускать на CI/CD, пушим, делаем PR, тесты проходят, мерджим». Locally run only targeted unit tests for the files you changed; never run `scripts/test-full-local.sh` or any full suite on Hetzner. Flow: worktree from origin/main, push the branch, open a PR, CI runs the full suite, then `gh pr merge --auto --rebase`.
 1. Work through Agent Branches, the project's own tool (`~/git/agent-branches`, CLI `agent-branches`). Each implementer works in its own Agent Branches workspace. No git worktrees or long-lived git branches.
 2. Claim edit scope on the agents bus before editing; release when done. Claims are never written into documents.
 3. A task is done when a reviewer (same model allowed) approved the exact version and the head integrated it.
@@ -50,9 +51,19 @@ OpenCode (`oc`, `--engine opencode`) always runs Muse Spark 1.3 (`opencode-go/mu
 Heavy suites share a host-wide cap of two runs per user. The full runner acquires it
 automatically. `scripts/test-affected-local.sh` is the pre-push lane and takes its own slot. Wrap ad-hoc Vitest/workerd (including `npm test`), Playwright and
 full pytest commands with `scripts/capped-test-run.sh -- <command>`; use the
-same `AGENT_HUB_HEAVY_TEST_DIR` and `AGENT_HUB_HEAVY_TEST_SLOTS` across sessions.
-Defaults are `/run/user/<uid>/agent-hub/heavy-test` and two slots. Never unlink
+same `AGENT_HUB_HEAVY_TEST_DIR` across sessions (the live `<dir>/slots` file
+inside it is the single host-level slot count -- do not export
+AGENT_HUB_HEAVY_TEST_SLOTS per-process; it is only a fallback for private pools
+and tests when the file is absent).
+Defaults are `/run/user/<uid>/agent-hub/heavy-test`, six slots (live `<dir>/slots`
+file may override, hard ceiling 8), and a 1800-second
+wall-clock cap per admitted command (`--run-timeout` or
+`AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S` overrides the run cap). Never unlink
 live lock files or kill holders. See [heavy test admission](docs/HETZNER-OVERLOAD-0689CE9C.md).
+If the affected lane prints a capacity HOLD, retry it directly with
+`scripts/capped-test-retry.sh -- scripts/test-affected-local.sh`; it inherits
+`AGENT_HUB_HEAVY_TEST_PRIORITY` when set. Never nest the lane in another
+admission wrapper or clear `AGENT_HUB_HEAVY_TEST_HELD` in a child shell.
 
 Before installing dependencies in a fresh checkout, run
 `python3 scripts/local-dependencies.py` to reuse a validated matching canonical

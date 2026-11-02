@@ -1,0 +1,115 @@
+// Intake 3d1f8702: unspecified starts must spread by quota headroom across engines
+// (Claude sonnet, Z.ai, OpenCode muse, Antigravity, Codex luna) instead of always
+// landing on Codex luna, and unmetered engines (no host quota API) must stay placeable.
+import { describe, expect, it } from 'vitest';
+import { env, runInDurableObject } from 'cloudflare:test';
+import { FleetService } from '../src/fleet';
+import { policy } from '../src/model-routing';
+import { freshCpu } from './cpu-fixture';
+import type { Hub } from '../src/hub';
+import type { Env } from '../src/env';
+
+// Windows are half elapsed (on schedule for scheduleBurnFactor), so this test exercises the load/headroom spread
+// and not the burn-rate boost a nearly-expired window gives the fullest account.
+const metered = (at: string, pct: number, now: number) => JSON.stringify({
+  status: 'ok', error: null, observed_at: at, details: { limit_reached: false },
+  windows: {
+    '5h': { present: true, percent_remaining: pct, reset_at: new Date(now + 2.5 * 3600000).toISOString(), error: null },
+    '7d': { present: true, percent_remaining: pct, reset_at: new Date(now + 3.5 * 86400000).toISOString(), error: null },
+  },
+});
+const broken = (at: string) => JSON.stringify({ status: 'unknown', error: 'unavailable', observed_at: at, details: { limit_reached: null }, windows: {} });
+
+describe('default tier policy', () => {
+  it('does not list luna first and excludes haiku, sol-high and GLM on opencode', () => {
+    const daily = policy.tiers.daily as string[];
+    expect(policy.default_tier).toBe('daily');
+    expect(daily[0]).not.toBe('luna');
+    expect(daily.indexOf('luna')).toBeGreaterThan(daily.indexOf('sonnet'));
+    expect(daily.indexOf('luna')).toBeGreaterThan(daily.indexOf('muse'));
+    const byId = new Map((policy.models as any[]).map(m => [m.id, m]));
+    for (const id of daily) {
+      const m = byId.get(id);
+      expect(/haiku/i.test(m.model), id).toBe(false);
+      expect(m.id === 'sol' && m.effort === 'high', id).toBe(false);
+      expect(m.engine === 'opencode' && /glm/i.test(m.model), id).toBe(false);
+    }
+    expect(byId.get('luna')).toMatchObject({ effort: 'max' });
+    expect(byId.get('sonnet')).toMatchObject({ effort: 'medium' });
+  });
+});
+
+describe('default tier placement', () => {
+  it('spreads three unspecified starts over at least two engines including unmetered ones', async () => {
+    const now = Date.now();
+    const iso = (d = 0) => new Date(now + d).toISOString();
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('default-tier-spread-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+      const fleet = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
+      fleet.init();
+      const machine = 'cBynxGDoKVPoGpGWxvCTvg';
+      hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
+        machine, machine, machine, iso(), iso(), JSON.stringify({
+          mem_avail_mb: 32000, disk_free_gb: 80, cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() },
+        }), JSON.stringify({ engines: ['codex', 'claude', 'antigravity', 'opencode'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
+      const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] } as any;
+      const put = await fleet.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify({
+        accounts: [
+          { label: 'shared-codex', provider: 'codex', max_concurrency: 4, reserve_percent: 0, enabled: true },
+          { label: 'shared-claude', provider: 'claude', max_concurrency: 4, reserve_percent: 0, enabled: true },
+          { label: 'hub-antigravity', provider: 'gemini', max_concurrency: 4, reserve_percent: 0, enabled: true },
+          { label: 'shared-go', provider: 'go', max_concurrency: 4, reserve_percent: 0, enabled: true },
+        ],
+        routes: [
+          { machine_id: machine, engine: 'codex', account: 'shared-codex', profile: null },
+          { machine_id: machine, engine: 'claude', account: 'shared-claude', profile: null },
+          { machine_id: machine, engine: 'antigravity', account: 'hub-antigravity', profile: 'hub-hub-antigravity' },
+          { machine_id: machine, engine: 'opencode', account: 'shared-go', profile: null },
+        ] }) }), admin);
+      expect(put.status, await put.clone().text()).toBe(200);
+      const sub = (account: string, service: string, quota: string) => hub.sql.exec(
+        'INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)', machine, account, service, null, iso(), quota);
+      sub('shared-codex', 'codex', metered(iso(), 60, now));
+      sub('shared-claude', 'claude', metered(iso(), 27, now));
+      // The probes for the unmetered engines fail on the host, as observed live.
+      sub('hub-antigravity', 'gemini', broken(iso()));
+      sub('shared-go', 'go', broken(iso()));
+
+      expect(fleet.accountStatus(hub.sql.exec("SELECT * FROM fleet_accounts WHERE label='hub-antigravity'").one())).toMatchObject({ status: 'ok' });
+      expect(fleet.accountStatus(hub.sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-go'").one())).toMatchObject({ status: 'ok' });
+
+      const engines: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        const prompt = 'start ' + i;
+        const plan = fleet.plan({ machine, mode: 'headless', workspace: 'demo', prompt });
+        expect(plan.selected, JSON.stringify(plan.rejected)).toBeTruthy();
+        engines.push(plan.selected.engine);
+        const reserved = fleet.reserve({ workspace: 'demo', machine, engine: plan.selected.engine, account: plan.selected.account, prompt,
+          idempotency_key: 'spread-' + i, mode: 'headless' }, { caller: admin.caller, scopes: ['admin'] });
+        expect(reserved.status, JSON.stringify(reserved.value)).toBeLessThan(300);
+      }
+      expect(new Set(engines).size, engines.join(',')).toBeGreaterThanOrEqual(2);
+      expect(engines, engines.join(',')).not.toContain('codex');
+      expect(engines).toContain('antigravity');
+      expect(engines).toContain('opencode');
+    });
+  });
+
+  it('still withholds an unmetered engine that reports positive exhaustion', async () => {
+    const now = Date.now();
+    const iso = (d = 0) => new Date(now + d).toISOString();
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('unmetered-exhausted-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+      const fleet = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
+      fleet.init();
+      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-go','go',2,0,1)");
+      hub.sql.exec("INSERT INTO fleet_routes VALUES ('m1','opencode','shared-go',NULL)");
+      hub.sql.exec('INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)', 'm1', 'shared-go', 'go', null, iso(),
+        JSON.stringify({ status: 'unknown', error: 'unavailable', observed_at: iso(), details: { limit_reached: true }, windows: {} }));
+      const status = fleet.accountStatus(hub.sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-go'").one());
+      expect(status.status).toBe('blocked');
+    });
+  });
+});

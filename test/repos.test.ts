@@ -117,6 +117,40 @@ describe('private repo registry', () => {
     expect(r.prepareLaunch({ workspace: 'dtc-websit', prompt: 'x' }).error.matches[0]).toBe('dtc-website');
     expect(r.prepareLaunch({ workspace: 'dtc-website', prompt: '', mode: 'interactive' }).input.prompt).toBe('');
   }));
+  it('routes portable repos as repo identities instead of pinning the registry machine (178ec5bb)', () => fixture(async r => {
+    await seed(r);
+    expect((await r.handle(req('/dtc-website', 'PATCH', { portable: 'yes' }), admin)).status).toBe(400);
+    expect((await r.handle(req('/dtc-website', 'PATCH', { portable: true }), agent)).status).toBe(403);
+    expect((await r.handle(req('/dtc-website', 'PATCH', { portable: true }), admin)).status).toBe(200);
+    const result = r.prepareLaunch({ workspace: 'dtc-website', prompt: 'x', mode: 'headless', intake_task_id: '178ec5bb-99c4-41da-80d5-8c8d7e367422' }).input;
+    expect(result.machine).toBeUndefined();
+    expect(result.workspace).toMatch(/^repo-178ec5bb-/);
+    expect(r.prepareLaunch({ workspace: 'dtc-website', machine: 'hetzner', prompt: 'x' }).input.workspace).toBe('/srv/git/dtc-website');
+  }));
+  it('validates --repo against registered origins before placement and suggests the canonical origin', () => fixture(async (r, hub) => {
+    await seed(r, [repo({ name: 'ai-shipping-labs', org: 'AI-Shipping-Labs', origin: 'AI-Shipping-Labs/website' })]);
+    const start = (value: string, key: string) => hub.sessionControlService.handle(new Request('https://hub.test/api/sessions', {
+      method: 'POST', body: JSON.stringify({ repo: value, key, mode: 'interactive' }),
+    }), admin);
+    const startWorkspace = (value: string, key: string) => hub.sessionControlService.handle(new Request('https://hub.test/api/sessions', {
+      method: 'POST', body: JSON.stringify({ workspace: value, key, mode: 'interactive' }),
+    }), admin);
+
+    const invalid = await start('AI-Shipping-Labs/ai-shipping-labs', 'bad-origin');
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({
+      error: 'unknown_repo', repo: 'AI-Shipping-Labs/ai-shipping-labs', matches: ['AI-Shipping-Labs/website'], field: 'repo',
+    });
+    const bypass = await startWorkspace('repo-0123abcd-AI-Shipping-Labs__ai-shipping-labs', 'synthetic-bypass');
+    expect(bypass.status).toBe(400);
+    expect(await bypass.json()).toMatchObject({ error: 'unknown_repo', matches: ['AI-Shipping-Labs/website'], field: 'repo' });
+    expect(hub.sql.exec("SELECT COUNT(*) AS n FROM session_control_sessions WHERE actor='admin'").one().n).toBe(0);
+
+    const valid = await start('AI-Shipping-Labs/website', 'registered-origin');
+    expect(valid.status).not.toBe(400);
+    const accepted = await valid.json() as any;
+    expect(accepted.workspace).toMatch(/^repo-[0-9a-f]{8}-AI-Shipping-Labs__website$/);
+  }));
   it('refuses missing canonical entries, loops and missing dirs', () => fixture(async r => {
     await seed(r, [repo({ status: 'duplicate', canonical: 'absent' })]);
     expect(r.prepareLaunch({ workspace: 'dtc-website', prompt: 'x' }).error.error).toBe('canonical_repo_missing');

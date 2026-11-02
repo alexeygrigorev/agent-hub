@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import uuid
 import math
 import os
 import platform
@@ -18,7 +19,7 @@ import time
 import tomllib
 import zipfile
 
-from . import bus, config, hook_command, private_fs
+from . import bus, config, hook_command, hook_trust, private_fs, state_hook_commands
 
 LABEL = re.compile(r'[a-z][a-z0-9_-]{0,47}\Z')
 REV = re.compile(r'[a-f0-9-]{36}\Z')
@@ -26,13 +27,21 @@ PACKAGES = {
     'codex': ('@openai/codex', 'codex', 'codex'),
     'claude': ('@anthropic-ai/claude-code', 'claude', 'claude'),
     'gemini': ('@google/gemini-cli', 'gemini', 'gemini'),
-    'go': ('opencode-ai', 'opencode', 'opencode'),
+    # OpenCode 2.x (`@opencode/cli`): the only line with `auth export|import`, i.e. the
+    # Hub-central device login. opencode-ai 1.x cannot import it (no such subcommand).
+    'go': ('@opencode/cli', 'opencode', 'opencode'),
     'zai': ('codex-zcode', 'zcodex', 'codex'),
     # Native binary from the reviewed release pin, never npm (intake 5814e109 AC8).
     'antigravity': ('antigravity-cli', 'agy', 'antigravity'),
 }
+GO_CLI_VERSION = '2.0.32'  # exact pin of @opencode/cli; the bundle version of a go account is ignored
+ANTIGRAVITY_ONBOARDING = '.gemini/antigravity-cli/cache/onboarding.json'
+ANTIGRAVITY_ONBOARDING_JSON = json.dumps({'consumerOnboardingComplete': True,
+                                          'enterpriseOnboardingComplete': False,
+                                          'onboardingComplete': True}, indent=2) + '\n'
 ANTIGRAVITY_TOKEN = '.gemini/antigravity-cli/antigravity-oauth-token'
 OPENCODE_DEVICE_EXPORT = '.local/share/opencode-hub/device-auth.json'
+OPENCODE_QUSE_AUTH = '.local/share/opencode/auth.json'
 ENV = {'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
        'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENCODE_API_KEY',
        'ZAI_API_KEY', 'ZAI_BASE_URL', 'ZAI_TOKEN'}
@@ -123,6 +132,69 @@ def _opencode_device_export(text):
     return text
 
 
+def opencode_device_access_token(bundle=None, home=None):
+    """Active OpenCode device-login access token from the Hub-delivered export."""
+    if isinstance(bundle, dict) and bundle.get('provider') != 'go':
+        return None
+    raw = (bundle.get('files') or {}).get(OPENCODE_DEVICE_EXPORT) if isinstance(bundle, dict) else None
+    if (not isinstance(raw, str) or not raw) and home is not None:
+        try:
+            raw = private_fs.read_bytes(Path(home) / OPENCODE_DEVICE_EXPORT, 32768, private=False).decode('utf-8')
+        except (OSError, UnicodeDecodeError, ValueError):
+            raw = None
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        rows = json.loads(raw)
+    except ValueError:
+        return None
+    active = [r for r in rows if isinstance(r, dict) and r.get('active') is True
+              and r.get('integrationID') == 'opencode'] if isinstance(rows, list) else []
+    value = active[0].get('value') if len(active) == 1 and isinstance(active[0].get('value'), dict) else {}
+    token = value.get('access')
+    return token if isinstance(token, str) and token else None
+
+
+def _ensure_opencode_quse_auth(bundle, home):
+    """Materialize the isolated managed-home auth.json that `quse go --json` reads.
+
+    OpenCode 2.x itself runs against the separate `opencode-device-<label>/runtime`
+    SQLite store (`XDG_DATA_HOME` / `OPENCODE_DB`), so it never reads `home`'s
+    `.local/share/opencode/auth.json`. The maintained launcher's managed-account
+    admission (`fetch_managed_quse`) runs `quse go --json` with `HOME=dest/home`
+    and `XDG_DATA_HOME` stripped, which otherwise fails with `no-credentials`.
+    """
+    token = opencode_device_access_token(bundle, home)
+    if not token or home is None:
+        return False
+    target = Path(home) / OPENCODE_QUSE_AUTH
+    expected = json.dumps({'opencode-go': {'type': 'api', 'key': token}})
+    try:
+        current = target.read_text(encoding='utf-8')
+    except OSError:
+        current = None
+    if current == expected:
+        return True
+    home_path = Path(home)
+    for directory in (home_path, home_path / '.local', home_path / '.local' / 'share', target.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+        if os.name != 'nt':
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:
+                pass
+        else:
+            with private_fs.parent(directory / '.private', create=True, owned=True):
+                pass
+    private_fs.atomic_write(target, expected.encode('utf-8'), 32768, engine_owned=True)
+    if os.name != 'nt':
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+    return True
+
+
 def opencode_device_default_path():
     return root() / 'opencode-device-default.json'
 
@@ -152,6 +224,14 @@ def sync_opencode_device(bundle, native=None):
         directory.mkdir(parents=True, exist_ok=True)
         if os.name != 'nt':
             os.chmod(directory, 0o700)
+        else:
+            # Windows: mkdir inherits ambient ACEs, so the first private_fs read
+            # of the receipt failed 'Private owner/protected DACL required' and
+            # the central OpenCode login was never imported (laptop/Tabo/desktop:
+            # engine_auth_expired 'device login configuration required').
+            # owned=True re-protects the owner-only leaf, repairing old dirs too.
+            with private_fs.parent(directory / '.private', create=True, owned=True):
+                pass
     digest = hashlib.sha256(export.encode('utf-8')).hexdigest()
     receipt = base / 'store-receipt.json'
     if (read_json(receipt, {}) or {}).get('sha256') == digest and (Path(cfg['source_data']) / 'opencode' / 'opencode.db').is_file():
@@ -165,6 +245,7 @@ def sync_opencode_device(bundle, native=None):
         write_json(receipt, {'sha256': digest})
         status = 'imported'
     write_json(opencode_device_default_path(), cfg)
+    _ensure_opencode_quse_auth(bundle, dest / 'home')
     return status
 
 
@@ -250,6 +331,10 @@ def load_git_identity() -> dict[str, str]:
     return res
 
 
+def _windows_hooks():
+    return sys.platform == 'win32'
+
+
 def install_aplexer_state_hooks(bundle=None, home=None):
     """Install aplexer state-report hooks into managed engine home.
 
@@ -273,7 +358,10 @@ def install_aplexer_state_hooks(bundle=None, home=None):
 
     template_hooks = None
     user_codex_hooks = Path.home() / '.codex/hooks.json'
-    if user_codex_hooks.is_file():
+    # On Windows codex/zcodex run hooks through PowerShell, where the bash
+    # `|| true` / `2>/dev/null` forms are a parse error (every prompt shows
+    # 'Hook failed: hook exited with code 1'). Never copy a user template there.
+    if not _windows_hooks() and user_codex_hooks.is_file():
         try:
             template_hooks = json.loads(user_codex_hooks.read_text(encoding='utf-8'))
         except Exception:
@@ -282,13 +370,21 @@ def install_aplexer_state_hooks(bundle=None, home=None):
     if not template_hooks or not isinstance(template_hooks, dict) or 'hooks' not in template_hooks:
         a_cmd = hook_command.tool_command('a')
         aplexer_cmd = hook_command.tool_command('aplexer')
+        if _windows_hooks():
+            _exe = lambda name: shutil.which(name) or str(Path.home() / '.local' / 'bin' / name)
+            state_cmd = lambda st: state_hook_commands.hook_command(_exe('a'), 'state-report', st)
+            ctx_cmd = state_hook_commands.hook_command(
+                _exe('aplexer'), 'context', 'hook', '--engine', 'codex', quiet=True)
+        else:
+            state_cmd = lambda st: f"{a_cmd} state-report {st} || true"
+            ctx_cmd = f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1"
         template_hooks = {
             "hooks": {
                 "PostToolUse": [
                     {
                         "hooks": [
                             {
-                                "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
+                                "command": ctx_cmd,
                                 "timeout": 30,
                                 "type": "command"
                             }
@@ -299,7 +395,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{a_cmd} state-report working || true",
+                                "command": state_cmd('working'),
                                 "type": "command"
                             }
                         ]
@@ -307,7 +403,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
+                                "command": ctx_cmd,
                                 "timeout": 30,
                                 "type": "command"
                             }
@@ -318,7 +414,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{a_cmd} state-report idle || true",
+                                "command": state_cmd('idle'),
                                 "type": "command"
                             }
                         ]
@@ -328,7 +424,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{a_cmd} state-report working || true",
+                                "command": state_cmd('working'),
                                 "type": "command"
                             }
                         ]
@@ -336,7 +432,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     {
                         "hooks": [
                             {
-                                "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
+                                "command": ctx_cmd,
                                 "timeout": 30,
                                 "type": "command"
                             }
@@ -346,10 +442,13 @@ def install_aplexer_state_hooks(bundle=None, home=None):
             }
         }
 
+    if not _windows_hooks():
+        template_hooks = hook_command.throttle_post_tool_use_hooks(template_hooks)
     content_bytes = json.dumps(template_hooks, indent=2).encode('utf-8')
     with private_fs.parent(codex_hooks, create=True):
         pass
     private_fs.atomic_write(codex_hooks, content_bytes, 65536)
+    hook_trust.refresh(codex_home / "config.toml", codex_hooks, template_hooks)
     if os.name != 'nt':
         try:
             os.chmod(codex_hooks, 0o600)
@@ -362,6 +461,7 @@ def install_aplexer_state_hooks(bundle=None, home=None):
         with private_fs.parent(zcodex_hooks, create=True):
             pass
         private_fs.atomic_write(zcodex_hooks, content_bytes, 65536)
+        hook_trust.refresh(zcodex_home / "config.toml", zcodex_hooks, template_hooks)
         if os.name != 'nt':
             try:
                 os.chmod(zcodex_hooks, 0o600)
@@ -582,32 +682,17 @@ def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
     return res
 
 
-KNOWN_HOOK_HASHES = {
-    'session_start:0:0': 'sha256:ac5079da741baea9d7cb457e131ce58f3b563b443cd750940bfa2e54be63a0ec',
-    'session_start:1:0': 'sha256:b8d459bbdbea59e7ff5bd6064a65ced7d9ea57686bb163d1c9fb40eef8ffd4f6',
-    'user_prompt_submit:0:0': 'sha256:db2f3aaa4d73a3c4ce637c104399b654efb2990cd46f72a7f3646cf9c783feac',
-    'user_prompt_submit:1:0': 'sha256:9110ecd5d2975cef72b5596811be8115687e1d437311d7b11f87caf911a24c9b',
-    'stop:0:0': 'sha256:6d270f46d79288e0768c5124346fd2289e3c1b694f38041892633190beb161f8',
-    'post_tool_use:0:0': 'sha256:9e4b66a5438f7470eba7321ae25b62a3ce845c416418da8d85cda2b3c41cca37',
-}
-
-
 def ensure_toml_trusted_hooks(content: str, hooks_file: Path) -> str:
-    """Ensure installed hooks in hooks_file are trusted in TOML content to prevent hook review prompts."""
-    res = repair_toml_duplicate_tables(content)
+    """Trust only handlers present in the actual generated hooks file."""
     try:
-        h_str = str(hooks_file.resolve())
+        hooks_file = Path(hooks_file).resolve()
+        raw = read_engine_file(hooks_file)
+        if raw is None:
+            return content
+        hooks_doc = json.loads(raw.decode('utf-8'))
     except Exception:
-        h_str = str(hooks_file)
-    present = {path for path, _ in _toml_sections(res) if path}
-    for suffix, hash_val in KNOWN_HOOK_HASHES.items():
-        key = f'{h_str}:{suffix}'
-        if ('hooks', 'state', key) in present:
-            continue
-        if res and not res.endswith('\n'):
-            res += '\n'
-        res += f'\n[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{hash_val}"\n'
-    return res
+        return content
+    return hook_trust.render(repair_toml_duplicate_tables(content), str(hooks_file), hooks_doc)
 
 
 def read_engine_file(target, limit=131072):
@@ -695,6 +780,9 @@ def ensure_claude_trusted_projects(config_path, paths):
     if config.get('hasCompletedOnboarding') is not True:
         config['hasCompletedOnboarding'] = True
         changed = True
+    if config.get('theme') != 'dark':
+        config['theme'] = 'dark'
+        changed = True
     for path in paths:
         for key in claude_project_keys(path):
             entry = projects.setdefault(key, {})
@@ -781,6 +869,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         settings['autoUpdates'] = False
         perms = settings.setdefault('permissions', {})
         if isinstance(perms, dict):
+            perms['defaultMode'] = 'bypassPermissions'
             perms.setdefault('deny', ['AskUserQuestion'])
         # Interactive claude sessions report semantic state through the same
         # hook contract as .codex/hooks.json: UserPromptSubmit/SessionStart ->
@@ -998,11 +1087,39 @@ def provision_managed_home(bundle=None, home=None, dest=None):
             except OSError:
                 pass
 
+    # 2c. OpenCode Go quota-probe credentials for managed quse go --json.
+    if isinstance(bundle, dict) and bundle.get('provider') == 'go':
+        _ensure_opencode_quse_auth(bundle, home)
+
     # 3. Provision aplexer state hooks
     install_aplexer_state_hooks(bundle, home)
 
     # 4. Provision engine permissions (approvals disabled, full access)
     install_managed_engine_permissions(bundle, home)
+
+    # 5. Antigravity first-run: the colour-scheme picker and the data-sharing
+    # consent otherwise block every interactive agy start on a fresh home. The
+    # marker below is what the CLI itself writes after the theme choice
+    # (default 'terminal') and the Terms screen with the improve-the-product
+    # data-sharing box left UNCHECKED; no consent is recorded or granted here.
+    if isinstance(bundle, dict) and bundle.get('provider') == 'antigravity':
+        marker = home / ANTIGRAVITY_ONBOARDING
+        try:
+            current = json.loads(marker.read_bytes())
+        except (OSError, ValueError):
+            current = None
+        # The CLI itself writes onboardingComplete:false on a first headless start, and
+        # then fails with 'plan model not specified' (desktop). Only a completed marker
+        # is left alone.
+        if not (isinstance(current, dict) and current.get('onboardingComplete') is True):
+            merged = dict(current) if isinstance(current, dict) else {}
+            merged.update(json.loads(ANTIGRAVITY_ONBOARDING_JSON))
+            # Plain write: the CLI creates cache/ itself with inherited (non-private) ACEs on Windows,
+            # which private_fs refuses; this marker is non-secret engine state.
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            staged = marker.with_name(marker.name + '.' + uuid.uuid4().hex + '.tmp')
+            staged.write_text(json.dumps(merged, indent=2) + chr(10), encoding='utf-8')
+            os.replace(staged, marker)
 
     return home
 
@@ -1099,6 +1216,58 @@ def profile_path():
     return base / 'aplexer' / 'config.toml'
 
 
+def _windows_exe_launcher(command, label, stub=None):
+    import io
+    import zipfile
+    if stub is None:
+        stub_name = 't64-arm.exe' if platform.machine().lower() in ('arm64', 'aarch64') else 't64.exe'
+        candidates = [Path(sys.base_prefix) / 'Lib' / 'site-packages' / 'pip' / '_vendor' / 'distlib' / stub_name]
+        try:
+            import pip._vendor.distlib as _distlib
+            candidates.append(Path(_distlib.__file__).parent / stub_name)
+        except Exception:
+            pass
+        stub = next((c for c in candidates if c.is_file()), None)
+    if stub is None:
+        return command
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, 'w') as z:
+        z.writestr('__main__.py', command[2])
+    shebang = ('#!"' + command[0] + '"').encode('utf-8') + bytes((13, 10))
+    path = root() / 'engine-launch' / (label + '.exe')
+    try:
+        with private_fs.parent(path, create=True):
+            pass
+        private_fs.atomic_write(path, stub.read_bytes() + shebang + archive.getvalue(), 4 * 1024 * 1024)
+    except (OSError, ValueError):
+        return command
+    return [str(path), label]
+
+
+def _posix_engine_launcher(command, label, windows=False):
+    """Command whose first element tolerates the engine subcommand aplexer injects after it.
+
+    `a task run --engine opencode --profile X` builds [command[0], 'run', *command[1:], ...]; with
+    command[0] = python that is `python run -c ...` ("can't open file 'run'"). A tiny sh launcher takes
+    that argument order and hands it to the same python -c; execute() puts `run` back after the label."""
+    import shlex
+    if windows:
+        # aplexer (Rust) refuses a .cmd as the task child when an argument holds a newline or other
+        # batch-unsafe characters, and every real prompt does. Use a native console-script style
+        # launcher (pip's distlib stub + shebang + zipped __main__.py): it execs `python <exe> args...`.
+        return _windows_exe_launcher(command, label)
+    path = root() / 'engine-launch' / (label + '.sh')
+    body = '#!/bin/sh' + chr(10) + 'exec ' + shlex.quote(command[0]) + ' -c ' + shlex.quote(command[2]) + ' "$@"' + chr(10)
+    try:
+        with private_fs.parent(path, create=True):
+            pass
+        private_fs.atomic_write(path, body.encode('utf-8'), 65536)
+        os.chmod(path, 0o700)
+    except (OSError, ValueError):
+        return command
+    return [str(path), label]
+
+
 def module_command(handler, label, managed_dir=None):
     # Profiles run outside the launcher environment, whose .cmd is what puts
     # <release>/package/host on PYTHONPATH (intake 608a2f9a): without an
@@ -1186,15 +1355,60 @@ def profiles(bundles, path=None, is_windows=None):
             raise ValueError('Operator profile collision')
         # Only public label and paths go into native registry command metadata.
         command = module_command('execute', b['label'])
+        if b.get('provider') == 'go':
+            command = _posix_engine_launcher(command, b['label'], windows=(os.name == 'nt' if is_windows is None else bool(is_windows)))
         block += '\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
     # After our block is stripped, any [engines.opencode] left in the file is
     # operator-owned and wins over the managed pin (duplicate tables would not
     # even parse for aplexer).
+    text = _drop_stale_release_opencode_pin(text)
     if not re.search(r'(?m)^\s*\[engines\.opencode\]\s*$', text):
         pin = _opencode_engine_pin(bundles, is_windows=is_windows)
         if pin:
             block += '\n[engines.opencode]\ncommand = ' + json.dumps(pin) + '\n'
     private_fs.atomic_write(path, (text.rstrip() + '\n\n' + block + END).encode(), 262144)
+
+
+_ENGINE_TABLE = re.compile(r'(?m)^\s*\[engines\.opencode\]\s*$')
+
+
+def _drop_stale_release_opencode_pin(text):
+    """Remove an [engines.opencode] table pinned to a Hub release directory.
+
+    `a doctor --fix` (or older Hub code) pins the absolute opencode path found at that moment;
+    on Windows that was <agent-hub>/releases/<old sha>/engines/node_modules/opencode-ai/..., which
+    kept `a engines` and plain `--engine opencode` on the OLD release after every release switch
+    (laptop: 56715fc...). A table whose command lives under an agent-hub releases directory is Hub
+    state, not operator state: drop it so the managed pin (current engine) is written instead.
+    Tables pointing anywhere else stay operator-owned and untouched."""
+    match = _ENGINE_TABLE.search(text)
+    if not match:
+        return text
+    rest = text[match.end():]
+    nxt = re.search(r'(?m)^\s*\[', rest)
+    body = rest[:nxt.start()] if nxt else rest
+    command = re.search(r'(?m)^\s*command\s*=\s*(.*)$', body)
+    if not command:
+        return text
+    normalized = command.group(1).replace('\\\\', '/').replace('\\', '/').lower()
+    if '/agent-hub/releases/' not in normalized:
+        return text
+    end = match.end() + (nxt.start() if nxt else len(rest))
+    return text[:match.start()] + text[end:].lstrip('\n')
+
+
+def _ensure_builtin_provider(res_dir):
+    """ZCode reads glm/provider/zcode-builtin.json ('Built-in Provider Config').
+
+    The Linux deb ships that file only as config/provider/zcode-builtin.json (the
+    Windows app has both), so a runtime taken from the deb failed with 'ZCode cannot
+    locate its Built-in Provider Config' (Windows laptop)."""
+    res_dir = Path(res_dir)
+    target = res_dir / 'glm' / 'provider' / 'zcode-builtin.json'
+    source = res_dir / 'config' / 'provider' / 'zcode-builtin.json'
+    if (res_dir / 'glm').is_dir() and not target.is_file() and source.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
 
 
 def _copy_runtime_resources(src_res_dir, dst_res_dir):
@@ -1206,6 +1420,7 @@ def _copy_runtime_resources(src_res_dir, dst_res_dir):
             if dst_entry.is_dir():
                 shutil.rmtree(dst_entry)
             shutil.copytree(src_entry, dst_entry)
+    _ensure_builtin_provider(dst_res_dir)
 
 
 def parse_deb_manifest(manifest_text):
@@ -1250,9 +1465,56 @@ def locate_zcode_runtime(dest=None):
     return None
 
 
+def _extract_deb_resources(deb_path, target):
+    """Pure-Python `dpkg-deb -x` for opt/ZCode/resources only (works on Windows)."""
+    import tarfile
+    prefix = 'opt/ZCode/resources/'
+    with open(deb_path, 'rb') as f:
+        if f.read(8) != b'!<arch>' + chr(10).encode():
+            raise ValueError('Invalid ZCode deb')
+        while True:
+            header = f.read(60)
+            if len(header) < 60:
+                raise ValueError('ZCode deb has no data archive')
+            name = header[:16].decode('ascii', 'replace').strip().rstrip('/')
+            size = int(header[48:58].decode('ascii').strip())
+            if name.startswith('data.tar'):
+                if name not in ('data.tar', 'data.tar.xz', 'data.tar.gz'):
+                    raise ValueError('Unsupported ZCode deb compression')
+                f.seek(f.tell())
+                start = f.tell()
+                break
+            f.seek(size + (size & 1), 1)
+        import io
+        buf = io.BytesIO(f.read(size))
+    root_dir = Path(target).resolve()
+    with tarfile.open(fileobj=buf, mode='r:*') as tar:
+        for member in tar:
+            rel = member.name[2:] if member.name.startswith('./') else member.name
+            if not rel.startswith(prefix) or not (member.isfile() or member.isdir() or member.islnk() or member.issym()):
+                continue
+            out = (root_dir / rel).resolve()
+            if not out.is_relative_to(root_dir / prefix):
+                raise ValueError('Unsafe path in ZCode deb')
+            if member.isdir():
+                out.mkdir(parents=True, exist_ok=True)
+                continue
+            out.parent.mkdir(parents=True, exist_ok=True)
+            src = tar.extractfile(member)
+            if src is None:
+                continue
+            with open(out, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+
+
 def ensure_zcode_runtime(dest=None):
     runtime = locate_zcode_runtime(dest)
     if runtime:
+        for candidate in {runtime.parent.parent, runtime.parent}:
+            try:
+                _ensure_builtin_provider(candidate)
+            except OSError:
+                pass
         if dest and not runtime.resolve().is_relative_to(dest.resolve()):
             src_res = runtime.parent.parent if runtime.parent.name == 'glm' else runtime.parent
             if src_res.is_dir():
@@ -1262,9 +1524,11 @@ def ensure_zcode_runtime(dest=None):
                     return local_cjs
         return runtime
 
-    system = sys.platform
     cpu = platform.machine().lower()
-    if system != 'linux' or cpu not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
+    # zcode.cjs is plain JavaScript, byte-identical in the Windows installer and
+    # the Linux package (sha256 verified), so every OS takes it from the Linux deb;
+    # Windows hosts previously failed with 'distribution unsupported on this platform'.
+    if cpu not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
         raise ValueError('Automatic ZCode runtime distribution unsupported on this platform')
     platform_name = 'linux-aarch64' if cpu in ('aarch64', 'arm64') else 'linux-x86_64'
     manifest_url = f'https://zcode.z.ai/api/v1/releases/electron/manifest?platform={platform_name}&channel=1'
@@ -1275,7 +1539,7 @@ def ensure_zcode_runtime(dest=None):
         manifest_path = tmp_dir / 'manifest.json'
         subprocess.run(['curl', '-fSL', manifest_url, '-o', str(manifest_path)],
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
-        manifest_text = manifest_path.read_text()
+        manifest_text = manifest_path.read_text(encoding='utf-8', errors='replace')
         deb_url, sha512_expected = parse_deb_manifest(manifest_text)
         if not deb_url:
             raise ValueError('ZCode deb asset not found in release manifest')
@@ -1295,8 +1559,7 @@ def ensure_zcode_runtime(dest=None):
             raise ValueError('Official ZCode deb SHA-512 mismatch')
         tmp_unpack = tmp_dir / 'unpack'
         tmp_unpack.mkdir(parents=True, exist_ok=True)
-        subprocess.run(['dpkg-deb', '-x', str(deb_path), str(tmp_unpack)],
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+        _extract_deb_resources(deb_path, tmp_unpack)
         src_res = tmp_unpack / 'opt/ZCode/resources'
         if not (src_res / 'glm/zcode.cjs').is_file():
             raise ValueError('Extracted deb missing zcode.cjs')
@@ -1392,10 +1655,10 @@ def executable_path(bundle, dest, is_windows=None):
         else:
             target = ('windows' if system == 'win32' else system) + '-' + cpu
             variants = ['-baseline' + musl, musl] if cpu == 'x64' else [musl]
-            candidates = [(modules / ('opencode-' + target + suffix), 'bin/' + binary + ('.exe' if system == 'win32' else '')) for suffix in variants]
+            candidates = [(modules / ('@opencode/cli-' + target + suffix), 'bin/' + binary + ('.exe' if system == 'win32' else '')) for suffix in variants]
         for package, relative in candidates:
             metadata = package / 'package.json'
-            if metadata.is_file() and json.loads(metadata.read_text()).get('version') == bundle['version']:
+            if metadata.is_file() and json.loads(metadata.read_text()).get('version') == (GO_CLI_VERSION if bundle['provider'] == 'go' else bundle['version']):
                 executable = package / relative
                 if not executable.is_file():
                     # A session-side updater can leave exactly one renamed
@@ -1483,6 +1746,20 @@ def _fetch_checksummed_zcodex_asset(tag, asset, cache_dir, tmp_download):
         raise ValueError('Managed engine installation failed') from None
 
 
+def _go_engine_current(bundle, dest):
+    """True when the installed OpenCode engine is the pinned 2.x `@opencode/cli`.
+
+    Same-revision installs made while the pin was opencode-ai 1.x (no
+    `auth import`) must be replaced in place, not skipped as already installed."""
+    modules = Path(dest) / 'engine' / 'node_modules'
+    try:
+        # Only a leftover opencode-ai 1.x tree without the 2.x CLI is stale; an empty or
+        # not-yet-installed tree is the ordinary install path's business.
+        return not ((modules / 'opencode-ai').is_dir() and not (modules / '@opencode' / 'cli').is_dir())
+    except OSError:
+        return True
+
+
 def install(bundle, request=None):
     from . import credentials
     validate(bundle)
@@ -1492,9 +1769,12 @@ def install(bundle, request=None):
     # A new Hub credential generation is not a new install: only the
     # immutable snapshot (engine, version, config) triggers reinstallation.
     paths = bundle.get('credential_paths') or []
-    if receipt is not None and credentials.install_snapshot(receipt, paths) == credentials.install_snapshot(bundle, paths):
+    if (receipt is not None and credentials.install_snapshot(receipt, paths) == credentials.install_snapshot(bundle, paths)
+            and (bundle['provider'] != 'go' or _go_engine_current(bundle, dest))):
         provision_managed_home(bundle, home, dest)
         credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+        if bundle.get('provider') == 'go':
+            _ensure_opencode_quse_auth(bundle, home)
         credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
         if receipt != bundle:
             write_json(dest / 'bundle.json', bundle)
@@ -1544,7 +1824,9 @@ def install(bundle, request=None):
                 if _is_windows():
                     # No npm/shell fallback: the checksummed release exe lands
                     # beside the wrapper (intake 608a2f9a, mirrors agy.exe).
-                    arch = 'arm64' if cpu in ('aarch64', 'arm64') else 'amd64'
+                    # The codex-zcode release publishes only zcodex-windows-amd64.exe; Windows on ARM (Tabo)
+                    # runs it under x64 emulation, so every Windows CPU takes the amd64 asset.
+                    arch = 'amd64'
                     asset = f'zcodex-windows-{arch}.exe'
                     verified = _fetch_checksummed_zcodex_asset(tag, asset, root() / 'zcodex-cache', tmp_download)
                     binary = dest / 'engine' / 'bin' / 'zcodex.exe'
@@ -1578,7 +1860,7 @@ def install(bundle, request=None):
     else:
         npm_cmd = resolve_npm_command()
         try:
-            subprocess.run(npm_cmd + ['install', '--prefix', str(dest / 'engine'), '--ignore-scripts', '--no-audit', '--no-fund', '--', pkg + '@' + bundle['version']],
+            subprocess.run(npm_cmd + ['install', '--prefix', str(dest / 'engine'), '--ignore-scripts', '--no-audit', '--no-fund', '--', pkg + '@' + (GO_CLI_VERSION if bundle['provider'] == 'go' else bundle['version'])],
                            env=clean_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=True)
         except (subprocess.SubprocessError, OSError):
             raise ValueError('Managed engine installation failed') from None
@@ -1592,6 +1874,8 @@ def install(bundle, request=None):
             raise ValueError('Native engine verification failed') from None
     provision_managed_home(bundle, home, dest)
     credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+    if bundle.get('provider') == 'go':
+        _ensure_opencode_quse_auth(bundle, home)
     credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
     write_json(dest / 'bundle.json', bundle)
 
@@ -1931,6 +2215,21 @@ def managed_subscriptions():
     return subs
 
 
+def shared_dataops_dir():
+    """Hub-owned DataOps credential directory shared by every managed session.
+
+    Managed engines run with a private HOME, so the operator's own
+    ~/.config/dataops is invisible to them (intake 3bae55cf). An operator
+    provisions this directory once per host with
+    `DATAOPS_CONFIG_DIR=<dir> dataops login --label "<agent>@<host>"`; it lives
+    outside every repository and its contents are never printed.
+    """
+    try:
+        return Path(config.get_config_path()).parent / 'shared' / 'dataops'
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def engine_environment(bundle, home, dest=None):
     dest = dest or Path(home).parent
     env = {k: v for k, v in os.environ.items() if k not in ENV and k not in ('HUB_TOKEN', 'HUB_JOB_TOKEN', 'HUB_CONFIG_FILE', 'AGENT_HUB_MANAGED_DIR')}
@@ -1961,8 +2260,17 @@ def engine_environment(bundle, home, dest=None):
         runtime = locate_zcode_runtime(dest)
         if runtime:
             env['ZCODE_CJS'] = str(runtime)
+        # Without a warm mode the Codex host policy auto-approves only the
+        # 'safe' risk tier and denies every write/exec ("not auto-approved by
+        # the warm ZCode bridge"): sessions read but never edit or commit.
+        # RMTHZ goal routes run with yolo; keep an explicit operator override.
+        env.setdefault('ZCODE_WARM', '1')
+        env.setdefault('ZCODE_WARM_MODE', 'yolo')
     env['GH_CONFIG_DIR'] = os.environ.get('GH_CONFIG_DIR') or str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'gh')
     env.update(bundle.get('env') or {})
+    shared = shared_dataops_dir()
+    if shared is not None and 'DATAOPS_CONFIG_DIR' not in env and (shared / 'credentials.json').is_file():
+        env['DATAOPS_CONFIG_DIR'] = str(shared)
     if bundle.get('provider') == 'go':
         from .fleet import load_settings
         from .opencode_auth import environment, prepare
@@ -2009,6 +2317,12 @@ def engine_environment(bundle, home, dest=None):
         # The managed agy binary only moves with the reviewed pin.
         env['ANTIGRAVITY_DISABLE_AUTO_UPDATE'] = '1'
         env['AGY_DISABLE_AUTO_UPDATE'] = '1'
+        # A user-level HTTP(S)_PROXY (desktop: 127.0.0.1:8899) breaks agy's Google OAuth
+        # refresh: a valid Hub token then answers 'Authentication required' (same account,
+        # identical token, OK without the proxy env on the same host).
+        for key in list(env):
+            if key.lower() in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'):
+                env.pop(key)
     return env
 
 
@@ -2027,9 +2341,10 @@ def probe_native_claude_quota(bundle, dest, model=None):
 def quotas():
     """For the dedicated server collector: dynamic isolated accounts, sanitized only.
 
-    Reads each provider directly with the Hub-materialized credential; no
-    quota CLI is invoked (intake 5814e109 I4). Hub itself also reads these
-    accounts centrally; this is the backend fallback path.
+    Reads each provider with the Hub-materialized credential. Antigravity's
+    read-only `/usage` command is used because its quota service is distinct
+    from Gemini CLI's native Google Code Assist API. Hub itself also reads
+    these accounts centrally; this is the backend fallback path.
     """
     from .fleet import quota_metadata
     from . import credentials
@@ -2045,6 +2360,10 @@ def quotas():
                 if b.get('provider') == 'gemini':
                     from . import native_google_quota
                     raw = native_google_quota.probe(b, dest)
+                elif b.get('provider') == 'antigravity':
+                    from . import native_antigravity_quota
+                    binary = dest / 'engine/bin' / ('agy.exe' if os.name == 'nt' else 'agy')
+                    raw = native_antigravity_quota.probe(binary, dest / 'home')
                 elif b.get('provider') == 'claude' and not credentials.managed_paths(b):
                     from . import native_claude_quota
                     raw = native_claude_quota.probe(b, dest)
@@ -2057,7 +2376,8 @@ def quotas():
                 # No direct reading: report nothing rather than an error row
                 # that would mask Hub's own fresh observation.
                 continue
-            accounts.append({'account': entry['label'], 'provider': entry['provider'], 'quota': quota_metadata(raw, entry['provider'])})
+            quota_provider = 'gemini' if entry['provider'] == 'antigravity' else entry['provider']
+            accounts.append({'account': entry['label'], 'provider': entry['provider'], 'quota': quota_metadata(raw, quota_provider)})
     return {'accounts': accounts}
 
 
@@ -2130,7 +2450,17 @@ def managed_codex_effort_args(bundle, extra_argv):
     return ['-c', 'model_reasoning_effort=' + json.dumps(effort)] if effort else []
 
 
+def normalize_engine_argv(argv):
+    """`prog run <label> ...` (engine subcommand injected before the label) -> `prog <label> run ...`."""
+    argv = list(argv)
+    if len(argv) > 2 and argv[1] == 'run' and LABEL.fullmatch(argv[2]):
+        argv[1], argv[2] = argv[2], 'run'
+    return argv
+
+
 def execute():
+    # `a task run --engine opencode --profile X` hands over `run <label> ...` (see _posix_engine_launcher).
+    sys.argv[:] = normalize_engine_argv(sys.argv)
     label = sys.argv[1]
     if not LABEL.fullmatch(label):
         raise ValueError('Invalid managed label')
@@ -2193,6 +2523,11 @@ def execute():
                     continue
                 run_cmd.append(extra_argv[i])
                 i += 1
+            # OpenCode 2.x `run` otherwise attaches to / starts the shared per-user background service
+            # (fixed port), which is another store's server: 'port already in use' or
+            # 'Database is not empty and has no session table'. A private server per store is isolated.
+            if '--standalone' not in run_cmd:
+                run_cmd.insert(1, '--standalone')
             argv = command + run_cmd
         else:
             is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
@@ -2200,8 +2535,10 @@ def execute():
             if not is_diagnostic:
                 if b['provider'] in ('codex', 'zai'):
                     if '--dangerously-bypass-approvals-and-sandbox' not in extra_argv and '--dangerously-bypass-approvals-and-sandbox' not in b.get('args', []):
-                        if not extra_argv or extra_argv[0] != 'exec':
-                            bypass_flags = ['--dangerously-bypass-approvals-and-sandbox']
+                        # Also for `exec`: the flag is a top-level option placed before
+                        # the subcommand. Without it headless zcodex/codex runs wait on
+                        # approvals or deny every write (hung exec on DESKTOP-FP4OP26).
+                        bypass_flags = ['--dangerously-bypass-approvals-and-sandbox']
                 elif b['provider'] == 'claude':
                     if '--dangerously-skip-permissions' not in extra_argv and '--dangerously-skip-permissions' not in b.get('args', []):
                         bypass_flags = ['--dangerously-skip-permissions']
@@ -2290,6 +2627,11 @@ def admission():
             bundle = installed_bundle()
         except Exception:
             bundle = None
+    if isinstance(bundle, dict) and bundle.get('provider') == 'go':
+        try:
+            _ensure_opencode_quse_auth(bundle, root() / f"{label}-{bundle.get('revision', '')}" / 'home')
+        except Exception:
+            pass
     # The managed profile is checked, and repaired under the lock, before Hub
     # stamps its verdict too: a repair waiting on a Windows reconcile after the
     # stamp aged the verdict past the 30 s window (admission_timestamp_stale).
@@ -2434,6 +2776,16 @@ def add_commands(sub):
     versions.add_argument('--json', dest='json', action='store_true', help='Machine-readable output (default)')
     versions.add_argument('--fleet', action='store_true', help='Fleet-wide per-host versions from Hub version reports instead of this host')
     versions.add_argument('--machine', default=None, help='With --fleet: only this registered host')
+    recommend = commands.add_parser('recommend', help='Recommend engine/account/model/host using Hub burn-rate decision logic without reserving')
+    recommend.add_argument('--tier', default=None, help='Task tier (daily, deep, quick, review, ask)')
+    recommend.add_argument('--workspace', default=None, help='Workspace name or path')
+    recommend.add_argument('--machine', default=None, help='Preferred machine id')
+    recommend.add_argument('--project', default=None, help='Project name')
+    recommend.add_argument('--needs', default=None, help='Comma-separated capability/OS labels')
+    recommend.add_argument('--mode', choices=['headless', 'interactive'], default='headless')
+    recommend.add_argument('--engine', default=None, help='Optional pinned engine (requires --reason)')
+    recommend.add_argument('--reason', default=None, help='Required explanation when --engine is pinned')
+    recommend.add_argument('--json', action='store_true', default=True, help='JSON output (default)')
 
 
 def central_login(args, prompt=None):
@@ -2657,6 +3009,17 @@ def engine_update_command(args):
 
 
 def command(args):
+    if args.engines_cmd == 'recommend':
+        import urllib.parse
+        if getattr(args, 'engine', None) and not (getattr(args, 'reason', None) and str(args.reason).strip()):
+            raise ValueError('engine_reason_required: --engine requires --reason')
+        q = {}
+        for k in ('tier', 'workspace', 'machine', 'project', 'needs', 'mode', 'engine', 'reason'):
+            v = getattr(args, k, None)
+            if v is not None and str(v).strip():
+                q[k] = str(v).strip()
+        qs = ('?' + urllib.parse.urlencode(q)) if q else ''
+        return bus._do_request('GET', '/api/fleet/recommend' + qs)
     if args.engines_cmd == 'quota':
         return quotas()
     if args.engines_cmd == 'login':

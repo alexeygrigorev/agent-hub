@@ -2,6 +2,7 @@ import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES,
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
+import { stallThreshold } from './session_stall';
 import { liveQueuePolicy } from './intake-queue-policy';
 import { OpsLiveness } from './ops-liveness';
 import { IntakeTriage } from './intake-triage';
@@ -55,6 +56,7 @@ import { MetricsStore, handleMetricsRoutes } from './metrics';
 import { MonitoringService } from './monitoring';
 import { BackupService } from './backup';
 import { WebhookService } from './webhooks';
+import { PromptLibraryService, SessionSchedulesService } from './scheduled_prompts';
 import { LaunchSchedulesService } from './launch_schedules';
 import { isValidMachineId } from './machine-id';
 import { HostHistoryService } from './host-history';
@@ -153,6 +155,8 @@ export class Hub extends DurableObject {
   public backupService: BackupService;
   public hostHistoryService: HostHistoryService;
   public webhookService: WebhookService;
+  public promptLibrary: PromptLibraryService;
+  public sessionSchedules: SessionSchedulesService;
   public launchSchedules: LaunchSchedulesService;
 
   private idleWork: IdleWorkService;
@@ -219,6 +223,7 @@ export class Hub extends DurableObject {
     // durable start/send/capture/stop intents over the existing fleet reserve.
     // Placement stays with FleetService; no second dispatcher or consumer here.
     this.sessionControlService = new SessionControlService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, {
+      resolveRepo: repo => this.repoRegistry.resolveOrigin(repo),
       reserve: (input, auth) => {
         const prepared = this.repoRegistry.prepareLaunch(input);
         return prepared.error ? { value: prepared.error, status: 400 } : this.fleetService.reserve(prepared.input, auth);
@@ -244,6 +249,16 @@ export class Hub extends DurableObject {
       () => this.sessionControlService,
       validSessionSecret(this.env) ? this.env.SESSION_SECRET : null);
     this.webhookService.init();
+    // Prompt library + session schedules (intake 19ec91c2 AC8-AC10): schedules
+    // enqueue into the webhook delivery queue (same durable redelivery).
+    const txn = <T>(fn: () => T): T => this.ctx.storage.transactionSync(fn);
+    this.promptLibrary = new PromptLibraryService(this.sql, txn, Date.now);
+    this.promptLibrary.init();
+    this.webhookService.setPromptResolver(ref => this.promptLibrary.resolve(ref));
+    this.sessionSchedules = new SessionSchedulesService(this.sql, txn, Date.now, this.promptLibrary,
+      (source, sourceId, key, target, body) => this.webhookService.enqueueDelivery(source, sourceId, key, target, body),
+      (source, sourceId, key, target, body) => this.webhookService.insertDelivery(source, sourceId, key, target, body),
+      () => this.webhookService.pumpQueue());
     // Cron launch schedules (intake a839dfb6): each due tick creates a Hub
     // intake (source schedule) and starts the linked headless session through
     // the canonical admission path below; placement/capacity gates are never
@@ -344,8 +359,30 @@ export class Hub extends DurableObject {
     this.statusService.setAskSummary(() => this.askLedger.counts());
     this.intakeWatchdog = new IntakeWatchdog(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
       policy: () => liveQueuePolicy(env as unknown as Record<string, unknown>, this.sql, this.fleetService),
+      repoForProject: project => {
+        try {
+          const byOrigin = this.repoRegistry.resolveOrigin(project);
+          if (typeof byOrigin.repo === 'string') return byOrigin.repo;
+          const found = this.repoRegistry.get(project);
+          if (!found) return null;
+          const repo = this.repoRegistry.canonical(found);
+          if (repo.status !== 'active' || typeof repo.origin !== 'string') return null;
+          return this.repoRegistry.resolveOrigin(repo.origin).repo ?? repo.origin;
+        } catch { return null; }
+      },
       asks: now => this.askLedger.tick(now),
       asksDigest: () => this.askLedger.summaryLine(),
+      stallThresholdSeconds: stallThreshold(env),
+      claudeRecoveryEnabled: env.HUB_RECOVERY_CLAUDE_ENABLED === 'true',
+      stop: async (id, key) => {
+        // Canonical control only (intake b527e905): the stop endpoint fences
+        // protection, admission promotion and pending wakes inside its own
+        // transaction, including for intents this watchdog did not create.
+        const r = await this.sessionControlService.handle(new Request(`https://hub.internal/api/sessions/${encodeURIComponent(id)}/stop`,
+          { method: 'POST', body: JSON.stringify({ key }) }),
+          { caller: { isAdmin: true, actor: 'hub:service:intake-watchdog', kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
       start: async input => {
         const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
           { method: 'POST', body: JSON.stringify(input) }),
@@ -982,6 +1019,9 @@ export class Hub extends DurableObject {
           hostRepositoryAuthorizer(this.sql, auth.caller,
             (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller)))(request);
       }
+      if (path === '/api/engines/recommend') {
+        return this.fleetService.handle(request, await this.sessionControlAuth(request));
+      }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
         const url = new URL(request.url);
         if (path === '/api/engines' && url.searchParams.getAll('view').length === 1 && url.searchParams.get('view') === 'worker') {
@@ -1072,6 +1112,17 @@ export class Hub extends DurableObject {
         }
         return Response.json({ error: 'not_found' }, { status: 404 });
       }
+      // Native-session intake credentials: a scoped `worker:own-intake` credential for
+      // observed sessions (no fleet launch) with a server-verified intake link.
+      if (path === '/api/session-intake/credentials' || /^\/api\/sessions\/[0-9a-f-]{36}\/intake-credential$/.test(path)) {
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        if (path === '/api/session-intake/credentials') {
+          if (request.method !== 'GET') return Response.json({ error: 'not_found' }, { status: 404 });
+          return this.workerAccess.listNative(auth.caller, auth.scopes);
+        }
+        return this.workerAccess.issueNative(request, auth.caller, auth.scopes);
+      }
       if (path === '/api/session-messaging/credentials' || path.startsWith('/api/session-messaging/credentials/') ||
           /^\/api\/sessions\/[0-9a-f-]{36}\/messaging-credential$/.test(path)) {
         const auth = await this.authenticateBusRequest(request);
@@ -1142,6 +1193,12 @@ export class Hub extends DurableObject {
       }
       if (path === '/webhooks' || path.startsWith('/webhooks/')) {
         return this.webhookService.handleIngest(request, path);
+      }
+      if (path === '/api/prompts' || path.startsWith('/api/prompts/')) {
+        return this.promptLibrary.handle(request, await this.sessionControlAuth(request));
+      }
+      if (path === '/api/session-schedules' || path.startsWith('/api/session-schedules/')) {
+        return this.sessionSchedules.handle(request, await this.sessionControlAuth(request));
       }
       // Cron launch schedules (intake a839dfb6). Admin management under
       // /api/schedules with the same operator/cookie authority as webhooks;
@@ -2315,6 +2372,8 @@ export class Hub extends DurableObject {
     // enqueue sessions through the canonical admission path. Runs on both
     // crons (every 5 minutes); a manual single-check run never fires them.
     if (!only) {
+      try { await m('session_schedules', () => this.sessionSchedules.tick()); }
+      catch { console.warn('session_schedule_tick_failed'); }
       try { await m('launch_schedules', () => this.launchSchedules.tick('cron')); }
       catch { console.warn('launch_schedule_tick_failed'); }
     }

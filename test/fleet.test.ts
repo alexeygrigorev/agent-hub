@@ -2,7 +2,7 @@ import policy from '../config/model-routing.json';
 import {freshCpu} from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { FleetService, isCapacityOnlyHold } from '../src/fleet';
+import { FleetService, isCapacityOnlyHold, PLACEMENT_PRESSURE_REASONS } from '../src/fleet';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { SESSION_CONTROL_SCHEMA, SessionControlService } from '../src/session_control';
@@ -215,7 +215,7 @@ describe('generic accounts and launch placement', () => {
     sessions.init();
     sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at) VALUES ('quick-test', 'owner', 'quick-key', '{}', ?, 'hetzner', 'codex', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
     const view = (sessions as any).view(sql.exec("SELECT * FROM session_control_sessions WHERE id='quick-test'").one());
-    expect(view).toMatchObject({ engine: 'codex', model_id: 'luna', model: 'gpt-6-luna' });
+    expect(view).toMatchObject({ engine: 'codex', model_id: 'luna', model: 'gpt-6-luna', effort: 'max' });
   }));
   it('carries hub_session_id and intake_task_id on offers for the host worktree lock (AC1)', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -737,7 +737,7 @@ describe('generic accounts and launch placement', () => {
     expect(account.active).toBe(1);
     expect(account.available_slots).toBe(account.max_concurrency - 1);
   }));
-  it.each(['workspace_unavailable', 'admission_unconfigured', 'admission_refused', 'dispatch_refused', 'goal_startup_unconfigured', 'dispatch_route_unconfigured', 'dispatch_internal_error', 'codex_quota_gate_quota_unavailable', 'codex_quota_gate_codex_reserve_required', 'codex_quota_gate_stale_window_evidence', 'codex_quota_gate_quota_check_failed'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
+  it.each(['workspace_unavailable', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'admission_unconfigured', 'admission_refused', 'dispatch_refused', 'goal_startup_unconfigured', 'dispatch_route_unconfigured', 'dispatch_internal_error', 'codex_quota_gate_quota_unavailable', 'codex_quota_gate_codex_reserve_required', 'codex_quota_gate_stale_window_evidence', 'codex_quota_gate_quota_check_failed'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
@@ -768,6 +768,122 @@ describe('generic accounts and launch placement', () => {
     await s.handle(request('/launches/' + claimed.id + '/claim', { gate_allowed: true, model: 'gpt-6-luna', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', claimed.id).one().state).toBe('starting');
+  }));
+  it('keeps fresh placement load advisory after upgrading legacy hold rows', async () => fixture(async (s, sql) => {
+    sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_machine');
+    sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_factor');
+    sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_trigger');
+    sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_limit');
+    sql.exec("INSERT INTO fleet_memory_holds (launch_id, since, rejected_json) VALUES ('legacy-hold', ?, '[]')", iso());
+    s.init();
+    expect(sql.exec("SELECT rejected_json, host_load_machine, host_load_factor, host_load_trigger, host_load_limit FROM fleet_memory_holds WHERE launch_id='legacy-hold'").one()).toMatchObject({rejected_json:'[]',host_load_machine:null,host_load_factor:null,host_load_trigger:null,host_load_limit:null});
+    await configure(s);
+    const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
+    heartbeat.load = [100, 100, 100];
+    sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    expect(s.plan(intent({ machine: 'hetzner' })).selected?.machine).toBe('hetzner');
+    expect(isCapacityOnlyHold([{reason:'host_load_high'}])).toBe(true);
+    expect(PLACEMENT_PRESSURE_REASONS.has('host_load_high')).toBe(true);
+  }));
+  it.each([
+    {factor:6,pinned:true,sendFactor:false},
+    {factor:7,pinned:true,sendFactor:true},
+    {factor:6,pinned:false,sendFactor:true},
+  ])('requeues only a load-refused retry: factor=$factor pinned=$pinned', async ({factor,pinned,sendFactor}) => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const launch: any = await (await s.handle(request('/launches', intent(pinned ? { machine: 'hetzner' } : {})), admin)).json();
+    expect(launch.machine).toBe('hetzner');
+    const sessionId = crypto.randomUUID();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES (?, 'test-admin', ?, '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", sessionId, sessionId, launch.id, iso(), iso());
+    const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
+    const beat = (load: number, memory=32000) => {
+      heartbeat.load = [load, 5, 2]; heartbeat.mem_avail_mb = memory; heartbeat.at = iso();
+      sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    };
+    const diagnostic = {
+      reason: 'host_load_high',
+      message: 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
+      stage: 'dispatch_route', error_type: 'ValueError',
+    };
+    beat(8 * factor + 1);
+    for (const bad of [null, true, 0.1, 9, '2']) {
+      expect((await s.handle(request('/launches/' + launch.id + '/reject', {reason:'host_load_high',diagnostic,host_load_factor:bad}), host('hetzner'))).status).toBe(400);
+    }
+    const retry: any = await (await s.handle(request('/launches/' + launch.id + '/reject', {
+      reason: 'host_load_high', diagnostic, ...(sendFactor ? {host_load_factor:factor} : {}),
+    }), host('hetzner'))).json();
+    expect(retry.id).not.toBe(launch.id);
+    expect(sql.exec('SELECT state, verification_status, exit_reason FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({state:'failed',verification_status:'not_started',exit_reason:'host_load_high'});
+    expect(sql.exec('SELECT fleet_launch_id FROM session_control_sessions WHERE id = ?', sessionId).one().fleet_launch_id).toBe(retry.id);
+    if (!pinned) {
+      expect(retry).toMatchObject({state:'offered',queued:false});
+      expect(sql.exec('SELECT machine_id FROM fleet_launches WHERE id = ?', retry.id).one().machine_id).toBe('win35');
+      return;
+    }
+    expect(retry).toMatchObject({state:'queued',queued:true});
+    expect(sql.exec('SELECT state, machine_id FROM session_control_sessions WHERE id = ?', sessionId).one()).toMatchObject({state:'queued',machine_id:null});
+    expect(sql.exec('SELECT host_load_machine, host_load_factor FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one()).toMatchObject({host_load_machine:'hetzner',host_load_factor:factor});
+    // An intervening memory hold must not erase the host's refusal context.
+    beat(8 * factor, 1);
+    s.drainCapacityQueue();
+    expect(JSON.parse(String(sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one().rejected_json))).toContainEqual(expect.objectContaining({reason:'launcher_memory_reserve'}));
+    const restarted = new FleetService(sql, cb => cb(), () => now);
+    restarted.init();
+    beat(8 * factor + 1);
+    restarted.drainCapacityQueue();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('queued');
+    expect(JSON.parse(String(sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one().rejected_json))).toContainEqual(expect.objectContaining({reason:'host_load_high',load_limit:8*factor}));
+    // Load average below the runaway cap never holds, but measured CPU >= 98% over >= 10s does.
+    const usage = (window: number) => ({ cores: 8, busy_percent: window, busy_cores: window * 8 / 100, busy_percent_window: window, window_s: 10, interval_s: 1, observed_at: iso() });
+    heartbeat.cpu_usage = usage(99);
+    beat(8 * 3);
+    restarted.drainCapacityQueue();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('queued');
+    expect(JSON.parse(String(sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one().rejected_json))).toContainEqual(expect.objectContaining({reason:'host_load_high',cpu_busy_window:99}));
+    heartbeat.cpu_usage = usage(60);
+    beat(8 * 3);
+    expect(restarted.drainCapacityQueue().promoted).toBeGreaterThan(0);
+    expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({state:'offered',machine_id:'hetzner'});
+  }));
+  it('gates and clears a memory-triggered host refusal using the reported MemAvailable floor', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
+    heartbeat.load = [null, null, null];
+    heartbeat.mem_avail_mb = 3174;
+    heartbeat.mem_total_mb = 65536;
+    heartbeat.at = iso();
+    sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    const diagnostic = {
+      reason: 'memory_pressure',
+      message: 'Host memory full pressure exceeds the safety cap.',
+      stage: 'dispatch_route', error_type: 'ValueError',
+      host_load: { trigger: 'mem_available', mem_avail_mb: 3174, mem_floor_mb: 6144 },
+    };
+    const retry: any = await (await s.handle(request('/launches/' + launch.id + '/reject', {
+      reason: 'memory_pressure', diagnostic,
+    }), host('hetzner'))).json();
+    expect(retry).toMatchObject({ state: 'queued', queued: true });
+    expect(retry.rejected).toContainEqual(expect.objectContaining({
+      reason: 'memory_pressure', host_load: diagnostic.host_load,
+    }));
+    expect(retry.rejected[0]).not.toHaveProperty('load1');
+    expect(sql.exec('SELECT host_load_machine, host_load_trigger, host_load_limit FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one()).toMatchObject({
+      host_load_machine: 'hetzner', host_load_trigger: 'mem_available', host_load_limit: 6144,
+    });
+
+    s.drainCapacityQueue();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('queued');
+    expect(JSON.parse(String(sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one().rejected_json))).toContainEqual(expect.objectContaining({
+      reason: 'memory_pressure', host_load: { trigger: 'mem_available', mem_avail_mb: 3174, mem_floor_mb: 6144 },
+    }));
+
+    heartbeat.mem_avail_mb = 7168;
+    heartbeat.at = iso();
+    sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    expect(s.drainCapacityQueue().promoted).toBeGreaterThan(0);
+    expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({ state: 'offered', machine_id: 'hetzner' });
   }));
   it('round-trips a full host diagnostic and surfaces it on the session', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -1262,6 +1378,50 @@ describe('bare workspace labels resolve under advertised absolute roots', () => 
   }));
 });
 
+describe('goal placement respects per-host load budgets', () => {
+  it('moves an over-budget goal to another host while keeping account capacity fleet-wide', async () => fixture(async (s, sql) => {
+    await configure(s, true);
+    const goalRoutes = [{ engine: 'codex', account: 'shared-codex', profile: null }];
+    for (const machine of ['hetzner', 'win35']) {
+      sql.exec("UPDATE machines SET capabilities = ?, last_heartbeat = json_set(last_heartbeat, '$.load', json(?)) WHERE id = ?",
+        JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: goalRoutes }), '[1]', machine);
+    }
+    sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.load', json('[20]')) WHERE id = 'hetzner'");
+    sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.load', json('[3]')) WHERE id = 'win35'");
+    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'shared-codex', plan: 'pro', quota: {
+      status: 'ok', observed_at: iso(), details: { limit_reached: false },
+      windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } },
+    } }] }, 'PUT'), host('hetzner'));
+
+    const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep' }));
+    expect(plan.selected?.machine).toBe('win35');
+    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'host_load_high', load_limit: 12 }));
+    expect(s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).max_concurrency).toBe(1);
+  }));
+
+  it('prefers the lower-load host while both remain under budget', async () => fixture(async (s, sql) => {
+    await configure(s, true);
+    const goalRoutes = [{ engine: 'codex', account: 'shared-codex', profile: null }];
+    for (const [machine, load] of [['hetzner', 8], ['win35', 1]]) {
+      sql.exec("UPDATE machines SET capabilities = ?, last_heartbeat = json_set(last_heartbeat, '$.load', json(?)) WHERE id = ?",
+        JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: goalRoutes }), JSON.stringify([load]), machine);
+    }
+    const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep' }));
+    expect(plan.selected?.machine).toBe('win35');
+  }));
+
+  it('excludes an offline flagged Tabo route from automatic placement', async () => fixture(async (s, sql) => {
+    sql.exec(`INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities)
+      VALUES ('tabo','tabo','tabo',?,?,?,1,?)`, iso(-3600000), iso(-3600000), JSON.stringify({ load: [0], mem_avail_mb: 32000, disk_free_gb: 80 }), JSON.stringify({ engines: ['codex'], fleet_modes: ['interactive'], workspaces: ['demo'], cpu_count: 8 }));
+    const config = registry(true);
+    config.routes.push({ machine_id: 'tabo', engine: 'codex', account: 'shared-codex', profile: null });
+    expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(200);
+    const plan = s.plan(intent());
+    expect(plan.selected?.machine).not.toBe('tabo');
+    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'tabo', reason: 'machine_unavailable' }));
+  }));
+});
+
 describe('imported session lifecycle and non-resurrection in fleet catalog', () => {
   it('prevents late live-catalog snapshots from resurrecting stopped same-incarnation sessions while allowing new UUID tag reuse', async () => fixture(async (s, sql) => {
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
@@ -1341,5 +1501,58 @@ describe('imported session lifecycle and non-resurrection in fleet catalog', () 
     expect(sql.exec('SELECT state,actor,owner_token_id FROM session_control_sessions WHERE id = ?', NATIVE_ID_2).one()).toMatchObject({state:'running',actor:'unknown',owner_token_id:null});
     // And the canonically stopped same-incarnation row was not resurrected.
     expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_ID_1).toArray()[0].state).toBe('stopped');
+  }));
+});
+
+// Host-owned abandonment of a durable pre-native claim, intake 4a9304c5.
+describe('pending claim reserve refusal', () => {
+  it('requires exact owning claim, preserves effects and requeues with a new identity', async () => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const launch: any = await (await s.handle(request('/launches', intent({machine:'hetzner'})), admin)).json();
+    const key = 'a'.repeat(32);
+    const sessionId = crypto.randomUUID();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES (?, 'test-admin', ?, '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", sessionId, sessionId, launch.id, iso(), iso());
+    const payload = {reason:'codex_quota_gate_codex_reserve_required', claim_key:key};
+    const snapshot = () => ({
+      launches:sql.exec('SELECT * FROM fleet_launches ORDER BY id').toArray(),
+      sessions:sql.exec('SELECT * FROM session_control_sessions ORDER BY id').toArray(),
+      holds:sql.exec('SELECT * FROM fleet_memory_holds ORDER BY launch_id').toArray(),
+    });
+    // Keyed release is never the ordinary offered-state rejection protocol,
+    // even if an offered row happens to retain that exact key.
+    for (const storedKey of [null, key]) {
+      sql.exec('UPDATE fleet_launches SET claim_key=? WHERE id=?', storedKey, launch.id);
+      const before = snapshot();
+      const refused = await s.handle(request('/launches/'+launch.id+'/reject', payload), host('hetzner'));
+      expect(refused.status).toBe(409); expect(await refused.json()).toEqual({error:'claim_key_mismatch'});
+      expect(snapshot()).toEqual(before);
+    }
+    sql.exec("UPDATE fleet_launches SET state='starting', claim_key=? WHERE id=?", key, launch.id);
+    sql.exec("UPDATE session_control_sessions SET state='starting' WHERE id=?", sessionId);
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', payload), host('win35'))).status).toBe(404);
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', {reason:payload.reason}), host('hetzner'))).status).toBe(409);
+    const beforeWrong = snapshot();
+    const wrong = await s.handle(request('/launches/'+launch.id+'/reject', {...payload,claim_key:'b'.repeat(32)}), host('hetzner'));
+    expect(wrong.status).toBe(409); expect(await wrong.json()).toEqual({error:'claim_key_mismatch'});
+    expect(snapshot()).toEqual(beforeWrong);
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', {...payload,claim_key:''}), host('hetzner'))).status).toBe(400);
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', {...payload,reason:'dispatch_refused'}), host('hetzner'))).status).toBe(400);
+    for (const column of ['native_id','launcher_task_id']) {
+      sql.exec(`UPDATE fleet_launches SET ${column}=? WHERE id=?`, 'existing-effect', launch.id);
+      expect((await s.handle(request('/launches/'+launch.id+'/reject', payload), host('hetzner'))).status).toBe(409);
+      expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('starting');
+      sql.exec(`UPDATE fleet_launches SET ${column}=NULL WHERE id=?`, launch.id);
+    }
+    // A real quota hold keeps the retry queued; no quota/admission gate is bypassed.
+    sql.exec("UPDATE host_quota_snapshots SET routes_json=? WHERE host_id='hetzner'", JSON.stringify({codex:{status:'ok',observed_at:iso(),details:{limit_reached:true},windows:{weekly:{present:true,percent_remaining:5,reset_at:iso(86400000)}}}}));
+    const result = await s.handle(request('/launches/'+launch.id+'/reject', payload), host('hetzner'));
+    expect(result.status).toBe(200);
+    const retry:any = await result.json();
+    expect(retry.id).not.toBe(launch.id); expect(retry.state).toBe('queued'); expect(retry.queued).toBe(true);
+    expect(sql.exec('SELECT state,verification_status,exit_reason FROM fleet_launches WHERE id=?', launch.id).one()).toMatchObject({state:'failed',verification_status:'not_started',exit_reason:payload.reason});
+    expect(sql.exec('SELECT fleet_launch_id,state,binding_json FROM session_control_sessions WHERE id=?', sessionId).one()).toMatchObject({fleet_launch_id:retry.id,state:'queued',binding_json:null});
+    // Replaying an obsolete release can never release the replacement's claim.
+    expect((await s.handle(request('/launches/'+launch.id+'/reject', payload), host('hetzner'))).status).toBe(409);
   }));
 });

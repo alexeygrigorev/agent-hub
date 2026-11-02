@@ -10,7 +10,7 @@ scripts/capped-test-run.sh -- uv run --with pytest python -m pytest
 scripts/capped-test-run.sh -- node scripts/test-browser-local.mjs
 ```
 
-All checkouts under the same host user share two slots by default. The Linux
+All checkouts under the same host user share one host-level slot count (intake 1293b560 AC2): the integer in the live <heavy-test-dir>/slots file, re-read by every admission (default 6, hard ceiling 8; was 2 until 2026-11-02). An explicit --slots flag still wins for tests/emergencies; AGENT_HUB_HEAVY_TEST_SLOTS is only a fallback for private pools and tests when the file is absent -- do not export it per-process, it no longer overrides the live host setting, so old and new checkouts stay on the same count. Sizing formula (measured 2026-11-02, RMTHZ 12 cores / 62 GiB): slots = clamp(1, 8, min(floor((1.5*cores - base_load_5min)/cpu_per_lane), floor((MemAvailable_GiB - 6)/mem_per_lane_GiB))) with per-lane worst case vitest ~0.71 cores / ~0.9 GiB and pytest ~0.27 cores / ~0.64 GiB (typical base 5-min load 10-15 gives 4-8 slots; memory is not binding). Use --priority final to jump the queue ahead of normal tickets younger than 25 minutes; --priority release (orchestrator-main release/integration gates only) is admitted ahead of both final and normal, so main is never blocked behind worker test lanes. A capacity-refused waiter parks its place: a retry with the same AGENT_HUB_HEAVY_TEST_RUN_ID (set automatically by scripts/capped-test-retry.sh and the affected/full runners) reclaims the original sequence and age instead of re-queueing at the back. The Linux
 `flock` locks live under `/run/user/<uid>/agent-hub/heavy-test`. The supervising
 wrapper retains its lock until the command finishes, even if a runtime closes
 inherited descriptors. Kernel locks release automatically when holders exit.
@@ -20,20 +20,62 @@ pass through. The full runner captures the shared directory before switching
 Python to a disposable HOME and removing live credential selectors.
 
 `AGENT_HUB_HEAVY_TEST_SLOTS`, `AGENT_HUB_HEAVY_TEST_WAIT_S`, and
-`AGENT_HUB_HEAVY_TEST_DIR` configure slots, wait budget, and lock location.
-Use the same slot count and directory across participating sessions; a private
+`AGENT_HUB_HEAVY_TEST_DIR` configure the slot-count fallback (used only when
+the live `<dir>/slots` file is absent), wait budget, and lock location.
+Use the same directory across participating sessions; a private
 lock directory is appropriate only for isolated wrapper tests.
 
-Host dispatch samples the live one-minute load before admission preparation
-and again immediately before claim. Above 1.5 times the core count, offers are
-held for retry without rejecting them or touching running sessions. This counts
-load from subprocesses that start inside already admitted sessions, including
-Vitest workerd pools and Chromium. Existing launcher memory, quota and pressure
-gates still apply. Unreadable load inputs report unknown and preserve existing
-admission behavior. The optional local `host_load_factor` setting overrides the
-default within 0.5–8. Heartbeat gates publish overload as `host_overload`; server
-placement still treats the aggregate gate as advisory, so dispatch enforces the
-live check on every execution path.
+Each admitted command has a 1800-second wall-clock limit by default. Configure
+it with `--run-timeout SECONDS` or `AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S` (1 to
+86400 seconds). On expiry the wrapper sends TERM to the command's process group,
+waits 10 seconds, then sends KILL; the slot stays held through that cleanup.
+Timeout exits 124 and is a test failure, not a capacity HOLD. The run cap does
+not change the shared slot count. Queue wait and command runtime are separate
+budgets (`--wait` and `--run-timeout`).
+Direct Vitest/pytest hooks watch their holder process and terminate the test
+process if the holder reaches its cap, so the suite cannot continue after its
+slot is released.
+
+Host dispatch samples live host busyness before admission preparation and
+again immediately before claim. A host is busy only on a **measured** signal
+(Alexey t2358u-t2363u, 2026-11-02):
+
+- CPU busy >= 98% averaged over >= 10s (`/proc/stat` deltas, iowait counted
+  idle; snapshots persist in `~/.cache/agent-hub/host-load-cpu.json` so only
+  the first sample after a gap sleeps, at most 10s);
+- MemAvailable below 6 GiB (at most 25% of RAM on small hosts);
+- a **runaway** 1-minute load above 6x cores (the 2026-10-28 incident was load
+  275-295 on 12 cores, ~24x). This is a safety cap only: load average counts
+  IO-wait and runnable threads, so 1.5x cores is routine (RMTHZ at load 24-37
+  on 12 cores measured 35-70% CPU with 30 GiB free, and the old 1.5x gate held
+  24 sessions queued for no reason). Load is never a reason below the cap.
+
+When busy, the host does not start new work or touch running sessions. For an
+unclaimed, non-task offer it refreshes the heartbeat and refuses that attempt
+as `host_load_high` (heartbeat gates publish `host_overload`); Hub records the
+attempt as not started and durably retains the refusing host and its factor on
+the retry hold. Hub re-evaluates that retry live from the host's heartbeat:
+fresh `cpu_usage.busy_percent_window` >= 98 or load above `max(stored factor,
+6) x cores`. Legacy holds that stored factor 1.5 therefore release as soon as
+the host is not actually busy. Fresh placement keeps its existing advisory-load
+policy; launcher memory, quota and PSI/OOM gates still apply. Unreadable inputs
+fail open. The optional local `host_load_factor` setting (0.5-8, default 6)
+only moves the runaway cap; it is a valid `subscriptions.json` key (it was
+missing from the validator until 2026-11-02, which made every host cycle fail
+with "Invalid subscription configuration"). The host rechecks before every
+claim as the final admission boundary.
+
+A reserve refusal can also arrive while a prior claim response is still pending.
+For `codex_quota_gate_codex_reserve_required` only, the host may abandon its
+own persisted `claim_pending` attempt under the per-offer and journal locks.
+It sends the existing attempt key; Hub matches the owning machine and key,
+requires no native/task binding, retains the original as not started, and
+creates a retry through ordinary quota/admission placement. A valid retry
+receipt settles the local record. A different key in Hub's effect-free
+starting offer supersedes only the old local pending record; it does not
+mutate Hub's claim. Missing keys, native-start fences, uncertain records and
+routed tasks never use this release path. Transport failures retain ownership
+until an authenticated receipt is obtained. No claim keys appear in reports.
 
 The fleet-host oneshot template uses `TimeoutStartSec=600`. It performs sequential
 provisioning, quota, catalog, reconciliation and dispatch work, whose combined
@@ -79,13 +121,18 @@ Run the full runner directly: it acquires and releases a slot for each heavy
 phase. Never put `test-full-local.sh` inside `capped-test-run.sh`: an outer
 wrapper would hold a slot while its phases queue again. The full runner refuses
 an inherited `AGENT_HUB_HEAVY_TEST_HELD=1` with exit 2 before starting any phase
-and prints the direct invocation above. `--priority normal|final` sets the
+and prints the direct invocation above. `--priority normal|final|release` sets the
 priority for every phase; the existing priority environment variable also works.
 
 `normal` is the default. `final` precedes normal waiters; reserve it for the last
-exact-source pre-push verification, not routine development runs. The shared
+exact-source pre-push verification, not routine development runs. `release` precedes
+both final and normal; reserve it for orchestrator-main release/integration gates
+(intake 1293b560 AC3), never for routine lanes. The shared
 host user can set this environment variable: it is scheduling policy, not an
 authorization boundary. Admissions log the requested class and ticket number.
+Waiting diagnostics include the current queue position and waiter count (for
+example, `queue position 3/8`); this snapshot can change as normal tickets age
+into the final class.
 After 300 seconds a normal waiter joins the final class with its original
 sequence, preventing later final arrivals from overtaking it indefinitely.
 Priority and aging never preempt a running suite or increase the slot cap.
@@ -99,8 +146,9 @@ other sessions to migrate them. Prototype tickets left by an earlier local
 candidate are not read or deleted by the indexed scheduler.
 
 TERM/INT sent only to the wrapper retain the running command's slot until it
-exits. To stop an owned test run, signal its owning process group/session using
-its normal lifecycle controls. An uncatchable wrapper-only crash releases its
+exits; the wrapper forwards shutdown to the command group and escalates after
+the 10-second grace period. The bounded command run timeout applies the same
+cleanup to hung commands and ordinary descendants. An uncatchable wrapper-only crash releases its
 descriptors, so commands that close inherited descriptors must also remain
 inside their owning session's lifecycle containment. Supported Vitest/pytest
 hooks use `AGENT_HUB_HEAVY_TEST_HELD=1` to avoid requesting a second slot.
@@ -120,6 +168,7 @@ exiting:
 ```bash
 scripts/capped-test-retry.sh -- ./my-heavy-step.sh
 scripts/capped-test-retry.sh --attempts 8 --base-delay 60 --max-delay 600 -- scripts/test-full-local.sh --priority final
+scripts/capped-test-retry.sh -- scripts/test-affected-local.sh
 ```
 
 Exit 3 alone is ambiguous: the admitted command can exit 3 itself (pytest
@@ -134,6 +183,12 @@ refused phase as `HOLD` and a command's own exit 3 as `FAIL`. It exits 3 and
 writes the caller's marker only when every failure was a hold; any real
 failure makes it exit 1. The retry wrapper runs the full runner directly,
 without an outer slot, because the runner takes a slot per heavy phase.
+The affected lane takes one slot for its heavy block and prints the direct retry
+command shown above on a capacity HOLD. Run it directly through
+`capped-test-retry.sh`; never nest `test-affected-local.sh` inside
+`capped-test-run.sh` or `heavy-test-admission.py`, or clear
+`AGENT_HUB_HEAVY_TEST_HELD` in a child shell to bypass the nested-admission
+guard. The retry command inherits `AGENT_HUB_HEAVY_TEST_PRIORITY` when set.
 `--priority final` and the AGENTS.md push gates are unchanged. Direct
 `npx vitest` / `pytest` runs that hit the in-process hooks (`heavy-test slot
 not acquired`) must be rerun under `capped-test-retry.sh`, not abandoned.

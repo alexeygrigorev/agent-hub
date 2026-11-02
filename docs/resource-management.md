@@ -85,7 +85,7 @@ Placement is gated on live data, not on a fixed sum of per-session reservations.
   explanatory measurements, never independent holds (Alexey t1511u).
 - Tune if it crashes: if the OOM killer fires or MemAvailable stays below the
   floor, raise the floor or the estimate multiplier one step and record that here.
-- The cgroup `MemoryMax` per worker (1500M, or 4096M for managed Codex) is a
+- The cgroup `MemoryMax` per worker (6144M ceiling; was 1500M, which OOM-killed test-heavy sessions at 1.5 GiB while 31 GiB was free) is a
   per-session safety cap. It is separate from the placement estimate.
 
 ### 4. Watchdog (memory reaper)
@@ -153,10 +153,12 @@ hard-coded constants.
 
 | knob | default | used by |
 |---|---|---|
-| `memory_floor_mb` | 2048 | Hub `plan()` gate, launcher `check_resources` |
+| `memory_floor_mb` | 2048 | Hub `plan()` gate, launcher `check_resources`; effective floor is `memory_floor_pct` of host RAM (min 512 MiB) capped by this ceiling |
+| `memory_floor_pct` | 3 | Host-proportional share of total RAM for the effective floor (a 32 GiB laptop gets ~968 MiB) |
 | `disk_floor_gb` | 15 | Hub `plan()` root-disk floor in GiB (fractional ok); below it the route is rejected as `disk_floor` (queued as capacity) |
 | `ramp_reserve_default_mb` | measured p90, fallback 512 | placement estimate |
 | `estimate_percentile` | 90 | placement estimate |
+| `estimate_cap_mb` | 1024 | Ceiling for one session's measured estimate |
 | `estimate_multiplier` | 1.25 | measured estimate growth allowance |
 | `ramp_seconds` | 180 | additional reserve window after starting |
 | `cpu_load_factor` | 3.0 | Deprecated compatibility field; never gates CPU |
@@ -332,3 +334,13 @@ managed-engine paths, launcher arguments and the existing journal directory.
 Native aliases share one physical accounting record per machine/native ID. The watchdog catalog selects the Fleet binding over an earlier automatic native import; the import’s inferred interactive mode does not override that binding. An explicit interactive alias or any keep/protection flag protects the physical worker across all aliases. Reports already in flight under an older alias remain valid, and an existing ledger ID, CPU history and memory peaks survive later Fleet adoption. Host reports split the complete catalog across byte- and count-bounded requests; the per-request sample limit never truncates the catalog.
 
 Service failure admission requires an explicit `service_crash` or `service_timeout` observation. A missing native worker (`worker_broken`) can reflect an ordinary stop and does not establish host choking. Generic service cooldown rows cannot establish a crash independently; service admission uses the current fresh positive observation. Verified Fleet runtime failures and host OOM retain their bounded cooldown. CPU busy usage, PSI SOME and predicted ramp totals remain advisory.
+
+## Per-task resource ledger and machine headroom (Alexey, 2026-11-02, intake 6aadd6c9)
+
+> "each time we launch a task we note how much resources it requires so later we can make a more informed decisions if a machine can take more tasks or not"
+
+- **What is recorded per session** (`session_resource_usage` plus `session_rss_median` and `session_cpu_usage`): task/intake id, project (`project_label` is the repository name even when only a workspace path was known, on every OS), engine, model, machine, runtime, peak and p50 anonymous RSS, CPU seconds, average and p95 cores. The host reports on every heartbeat while the session runs and once more when it ends. p50 RSS is the median of per-heartbeat samples in 16 MiB buckets.
+- **Windows hosts** have no `/proc` or cgroups. CPU comes from `GetSystemTimes` (`cpu_resources.read_windows_cpu_stat`); a session's memory and CPU come from the exact descendant process tree through Win32 (`windows_process_stats.py`: working set as RSS, private bytes as PSS, kernel+user time as CPU seconds). PSI is not required for `telemetry=measured`.
+- **Placement estimate**: p90 `peak_rss_mb` and p95 cores for the same project + engine + model, then project + task kind, then project, then global history, then the default (`expected_cpu_source` = `project_engine_model`, `repo_kind`, `repo`, `global`, `default`). The memory estimate follows the same order.
+- **A host is full** only when measured busy CPU averaged over at least 10 s is 98% or more (`cpu_pressure`, window reported as `busy_percent_window`/`window_s`) or MemAvailable is below 6144 MiB (`MEMORY_FULL_MB`, shown by headroom). Load average never counts. The launcher memory floor (2048 MiB) and the PSI full-pressure/OOM holds are unchanged.
+- **Views**: `hub resources ledger` (one line per task), `hub resources headroom` (per machine: busy cores and percent, 10 s busy, free cores, MemAvailable, full/has-room with reasons, per-task estimates and how many more typical tasks fit by CPU and by memory), `hub resources sessions` (raw ledger, now with p50 RSS). The overview also shows `busy10s` and the model in the p90 table.

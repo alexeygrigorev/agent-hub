@@ -32,7 +32,7 @@ it.each(['headless','interactive'])('seeks the candidate launch while preserving
     }});
     const f=new FleetService(measured,fn=>state.storage.transactionSync(fn));
     const read=()=>f.accountStatus(account);
-    expect(read()).toMatchObject({active:220,reserved:200,observed_sessions:20});
+    expect(read()).toMatchObject({active:220,reserved:199,observed_sessions:21});
     expect(plan.some(detail=>/SEARCH l .*\(id=\?\)/.test(detail)),JSON.stringify(plan)).toBe(true);
     for(const [column,bad,good] of [
       ['workspace','/foreign','/repo/subdir'], ['engine','claude','codex'],

@@ -117,6 +117,8 @@ def isolated_host_load(monkeypatch):
     from agent_hub_host import host_load
     monkeypatch.setattr(host_load, "os", SimpleNamespace(
         getloadavg=lambda: (0.0, 0.0, 0.0), cpu_count=lambda: 12))
+    monkeypatch.setattr(host_load, "measure_cpu_busy", lambda: (0.0, 10.0))
+    monkeypatch.setattr(host_load, "_default_mem", lambda: (30 * 1024 ** 3, 64 * 1024 ** 3))
 
 
 @pytest.fixture(autouse=True)
@@ -138,8 +140,11 @@ def heavy_slot_wanted(env, platform):
 
 
 def pytest_configure(config):
+    import os
+    import signal
     import subprocess
     import sys
+    import threading
     if not heavy_slot_wanted(os.environ, sys.platform) or hasattr(config, "workerinput"):
         return  # xdist workers run under their controller's slot
     wrapper = Path(__file__).resolve().parents[2] / "scripts" / "capped-test-run.sh"
@@ -155,11 +160,36 @@ def pytest_configure(config):
             raise pytest.UsageError("heavy-test slot not acquired; host test cap is full")
         return
     config._agent_hub_heavy_slot = holder
+    holder_released = threading.Event()
+
+    def stop_tests_if_slot_expires():
+        status = holder.wait()
+        if not holder_released.is_set():
+            print(f"pytest: heavy-test slot holder exited unexpectedly ({status}); stopping this test process",
+                  file=sys.stderr, flush=True)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    watcher = threading.Thread(target=stop_tests_if_slot_expires, daemon=True)
+    watcher.start()
+    config._agent_hub_heavy_slot_released = holder_released
+    config._agent_hub_heavy_slot_watcher = watcher
     os.environ["AGENT_HUB_HEAVY_TEST_HELD"] = "1"  # nested runners reuse this slot
 
 
 def pytest_unconfigure(config):
     holder = getattr(config, "_agent_hub_heavy_slot", None)
     if holder is not None:
+        config._agent_hub_heavy_slot_released.set()
         holder.stdin.close()
         holder.wait(timeout=30)
+        config._agent_hub_heavy_slot_watcher.join(timeout=1)
+
+
+@pytest.fixture(autouse=True)
+def fresh_native_list_cache():
+    """The shared aplexer list snapshot is process-global (083607ae); each test
+    starts with no cached catalog so fakes from other tests never leak."""
+    from agent_hub_host import native_list_cache
+    native_list_cache.invalidate()
+    yield
+    native_list_cache.invalidate()

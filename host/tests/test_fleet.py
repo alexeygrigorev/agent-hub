@@ -225,12 +225,16 @@ class FleetTests(unittest.TestCase):
             dispatcher = fleet.Dispatcher(cfg, lambda *a: http.append(a) or {}, runner)
             result = dispatcher.dispatch(offer(profile='secondary'))
             self.assertEqual(result['state'], 'running')
-            self.assertEqual(calls[-1][0][0:2], ['aplexer', 'start'])
-            self.assertIn('--profile', calls[-1][0]); self.assertNotIn('exec', calls[-1][0])
+            # Empty interactive start ends with the readiness seed (intake 2fdcaef5).
+            self.assertEqual(calls[-1][0], ['aplexer', 'state-report', 'waiting'])
+            self.assertEqual(calls[-1][1].get('env', {}).get('APLEXER_SESSION_ID'), 'native-session')
+            start_call = calls[-2]
+            self.assertEqual(start_call[0][0:2], ['aplexer', 'start'])
+            self.assertIn('--profile', start_call[0]); self.assertNotIn('exec', start_call[0])
             # Intake 4b161918: the worktree plan query precedes the claim.
             self.assertTrue([a for a in http if not a[1].startswith('/api/worktree-host/')][0][1].endswith('/claim'))
-            start_argv = calls[-1][0]
-            self.assertEqual(start_argv[start_argv.index('--memory') + 1], '1500M')
+            start_argv = start_call[0]
+            self.assertEqual(start_argv[start_argv.index('--memory') + 1], '6144M')
             self.assertEqual(start_argv[start_argv.index('--pids') + 1], '256')
             self.assertEqual(start_argv[start_argv.index('--cpu-quota-us') + 1], '100000')
             self.assertEqual(start_argv[start_argv.index('--cpu-period-us') + 1], '100000')
@@ -278,6 +282,33 @@ class FleetTests(unittest.TestCase):
                 return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()} if argv[0] == 'maintained-gate' else {'id': 'wrong', 'workspace': '/other', 'tag': 'impostor'}
             d = fleet.Dispatcher(settings(Path(tmp)), lambda *a: {}, runner)
             self.assertEqual(d.dispatch(offer())['state'], 'uncertain')
+
+    def test_interactive_readiness_seed_only_for_empty_starts_and_never_breaks_launch(self):
+        # Intake 2fdcaef5: a fresh empty prompt has no harness state, so
+        # aplexer message deliver refuses every queued envelope; the host
+        # seeds the truthful 'waiting' report. Goal starts type their own
+        # prompt (hook events fire) and must not seed. A failed seed never
+        # fails the launch.
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            def runner(argv, **kw):
+                calls.append((argv, kw))
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if argv[-1:] == ['waiting']:
+                    raise RuntimeError('seed failed')
+                return {'id': 'native-session', 'workspace': tmp, 'tag': 'hub-' + offer()['id'], 'engine': 'codex', 'profile': None, 'phase': 'running'}
+            d = fleet.Dispatcher(settings(Path(tmp)), lambda *a: {}, runner)
+            self.assertEqual(d.dispatch(offer())['state'], 'running')
+            seeds = [c for c in calls if c[0][-1:] == ['waiting']]
+            self.assertEqual([c[0] for c in seeds], [['aplexer', 'state-report', 'waiting']])
+            self.assertEqual(seeds[0][1].get('env', {}).get('APLEXER_SESSION_ID'), 'native-session')
+            cfg_goal = settings(Path(tmp))
+            cfg_goal['subscriptions'][0]['startup_argv'] = ['codex']
+            d_goal = fleet.Dispatcher(cfg_goal, lambda *a: {}, runner)
+            calls.clear()
+            self.assertEqual(d_goal.dispatch(offer(with_goal=True, prompt='pursue the goal'))['state'], 'running')
+            self.assertFalse([c for c in calls if c[0][-1:] == ['waiting']])
 
     def test_headless_uses_maintained_launcher_and_requires_account_aware_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -639,7 +670,9 @@ class FleetTests(unittest.TestCase):
             dispatcher = fleet.Dispatcher(cfg, lambda *a: http.append(a) or {}, runner)
             result = dispatcher.dispatch(offer())
             self.assertEqual(result['state'], 'running')
-            start_argv = calls[-1][0]
+            # Runner call order per empty interactive dispatch: [gate?, preamble-send,
+            # start, state-report seed] — the start argv is calls[-2] (intake 2fdcaef5).
+            start_argv = calls[-2][0]
             # Exact argv prefix applied
             expected_prefix = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--property=KillMode=process", "--", "aplexer", "start"]
             self.assertEqual(start_argv[:len(expected_prefix)], expected_prefix)
@@ -652,7 +685,7 @@ class FleetTests(unittest.TestCase):
             dispatcher2 = fleet.Dispatcher(cfg, lambda *a: {}, runner)
             result2 = dispatcher2.dispatch(offer())
             self.assertEqual(result2['state'], 'running')
-            self.assertEqual(calls[-1][0][:len(sub_prefix) + 2], sub_prefix + ["aplexer", "start"])
+            self.assertEqual(calls[-2][0][:len(sub_prefix) + 2], sub_prefix + ["aplexer", "start"])
 
             # Default unchanged when prefix omitted
             cfg_no_prefix = settings(Path(tmp))
@@ -660,7 +693,7 @@ class FleetTests(unittest.TestCase):
             dispatcher3 = fleet.Dispatcher(cfg_no_prefix, lambda *a: {}, runner)
             result3 = dispatcher3.dispatch(offer())
             self.assertEqual(result3['state'], 'running')
-            self.assertEqual(calls[-1][0][:2], ["aplexer", "start"])
+            self.assertEqual(calls[-2][0][:2], ["aplexer", "start"])
 
             # Git identity settings are passed as fallback env to interactive start
             cfg_git = settings(Path(tmp))
@@ -672,7 +705,7 @@ class FleetTests(unittest.TestCase):
             dispatcher4 = fleet.Dispatcher(cfg_git, lambda *a: {}, runner)
             result4 = dispatcher4.dispatch(offer())
             self.assertEqual(result4['state'], 'running')
-            start_argv4 = calls[-1][0]
+            start_argv4 = calls[-2][0]
             self.assertIn("--env", start_argv4)
             self.assertIn("GIT_AUTHOR_NAME=Alexey Grigorev", start_argv4)
             self.assertIn("GIT_AUTHOR_EMAIL=alexey.s.grigoriev@gmail.com", start_argv4)

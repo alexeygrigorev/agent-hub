@@ -7,6 +7,29 @@ $ErrorActionPreference = 'Continue'
 $Base = if ($env:HUB_BASE_URL) { $env:HUB_BASE_URL.TrimEnd('/') } else { 'https://hub.dtcdev.click' }
 $Root = Join-Path $env:LOCALAPPDATA 'Programs\agent-hub'
 $Bin = Join-Path $Root 'bin'
+# A proxy variable aimed at a loopback port with nothing listening (codex-vpn on
+# 127.0.0.1:8899) breaks every download and uv/npm/pip child: drop it for this
+# session only, and never route the Hub host through a proxy.
+foreach ($ProxyVar in 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy','npm_config_proxy','npm_config_https_proxy') {
+    $ProxyValue = [Environment]::GetEnvironmentVariable($ProxyVar, 'Process')
+    if (-not $ProxyValue) { continue }
+    $ProxyUri = $null
+    if (-not [Uri]::TryCreate($(if ($ProxyValue -match '://') { $ProxyValue } else { "http://$ProxyValue" }), [UriKind]::Absolute, [ref]$ProxyUri)) { continue }
+    if ($ProxyUri.Host -notin '127.0.0.1','localhost','[::1]','::1' -or $ProxyUri.Port -le 0) { continue }
+    $Listening = $false
+    try {
+        $Tcp = New-Object System.Net.Sockets.TcpClient
+        $Iar = $Tcp.BeginConnect($ProxyUri.Host.Trim('[',']'), $ProxyUri.Port, $null, $null)
+        $Listening = $Iar.AsyncWaitHandle.WaitOne(1000) -and $Tcp.Connected
+        $Tcp.Close()
+    } catch { $Listening = $false }
+    if (-not $Listening) {
+        Write-Host "Ignoring dead local proxy setting $ProxyVar"
+        [Environment]::SetEnvironmentVariable($ProxyVar, $null, 'Process')
+    }
+}
+$env:NO_PROXY = (@($env:NO_PROXY -split ',' | Where-Object { $_ }) + 'hub.dtcdev.click' | Select-Object -Unique) -join ','
+$env:no_proxy = $env:NO_PROXY
 $TempRoot = Join-Path $Root 'tmp'
 New-Item -ItemType Directory -Force -Path $Bin,$TempRoot -ErrorAction Stop | Out-Null
 $Work = Join-Path $TempRoot ([guid]::NewGuid().ToString('N'))

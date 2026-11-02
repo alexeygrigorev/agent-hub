@@ -12,7 +12,7 @@ it('watches hosts without configured checks, deduplicates incidents and recovers
     const at = (age: number) => new Date(now - age * 1000).toISOString();
     const live = new LivenessService(hub.sql, undefined, () => now);
     live.init();
-    hub.sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES(?,?,?,?,?)', 'tabo', 'Tabo', 'tabo', at(86400), at(900));
+    hub.sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES(?,?,?,?,?)', 'tabo', 'Tabo', 'tabo', at(86400), at(300));
     expect(live.watchHosts()).toEqual([]);
     now += 1000;
     const opened = live.watchHosts();
@@ -28,7 +28,7 @@ it('watches hosts without configured checks, deduplicates incidents and recovers
     hub.sql.exec("UPDATE machines SET drained=0,last_checkin_at=? WHERE id='tabo'", at(0));
     expect(live.watchHosts()[0]).toMatchObject({ subject_kind: 'host_recovery', state: 'RECOVERED' });
     expect(live.watchHosts()).toEqual([]);
-    now += 901000;
+    now += 301000;
     expect(live.watchHosts()).toHaveLength(1);
   });
 });

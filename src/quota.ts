@@ -5,6 +5,33 @@ import { getSession, allowedCallbackUrls, verifyCsrf } from "./auth/session";
 import { syncTbmFromHostSnapshot, syncTbmFromServerAccounts } from "./tbm-ingestion";
 import { resolveMachineAliases } from "./machine-alias";
 import { isPlainObject, parseUtcIso, readBoundedJsonBody } from "./strict-json";
+import routingPolicy from "../config/model-routing.json";
+import { analyzeQuotaBurn, providerWeight } from "./pacing";
+
+/**
+ * Providers whose engines expose no usable quota API on the host (Antigravity
+ * /Gemini and OpenCode Go). A probe failure there is the absence of a meter,
+ * never evidence the engine is down: the real-run health holds, credential
+ * holds and positive exhaustion (limit_reached/cooldown) remain the only
+ * reasons to withhold placement (intake 3d1f8702).
+ */
+export function isUnmeteredProvider(provider: unknown): boolean {
+  const list: string[] = (routingPolicy.rules as any).unmetered_providers ?? [];
+  return typeof provider === "string" && list.includes(canonicalQuotaProvider(provider));
+}
+
+/** Observation Hub synthesizes for an unmetered provider; carries no percentage. */
+export function unmeteredObservation(observedAt: string): Record<string, any> {
+  return { status: "ok", error: null, observed_at: observedAt,
+    details: { limit_reached: false, unmetered: true, source: "hub-unmetered-engine" }, windows: {} };
+}
+
+/** True when a reading carries positive exhaustion/backoff evidence. */
+export function quotaPositivelyBlocked(quota: any, nowMs: number): boolean {
+  if (quota?.details?.limit_reached === true) return true;
+  const until = Date.parse(quota?.details?.cooldown_until);
+  return Number.isFinite(until) && until > nowMs;
+}
 
 export const QUOTA_MAX_BODY_BYTES = 32_768;
 export const QUOTA_STALE_MS = 1_200_000; // 1200 seconds (20 minutes) conservative boundary
@@ -1515,16 +1542,51 @@ export class QuotaStore {
       } else if (hasStale) {
         state = "stale";
       }
+      // Unmetered engines (no quota API): a failed/absent probe is not an outage.
+      // Fresh when a routed machine is live and its engine has no health hold;
+      // percentage stays unknown. Positive exhaustion keeps its own state.
+      if (["unavailable", "unknown", "stale"].includes(state) && Number(account.enabled) !== 0 && isUnmeteredProvider(account.provider) &&
+          !freshObs.some((o) => quotaPositivelyBlocked(o.quota, nowMs))) {
+        const liveRoute = routes.find((r) => {
+          const m: any = this.sql.exec("SELECT last_checkin_at, drained FROM machines WHERE id = ? AND revoked_at IS NULL", r.machine_id).toArray()[0];
+          if (!m || m.drained || !isFreshTs(m.last_checkin_at, nowMs, 180_000)) return false;
+          const held = this.sql.exec("SELECT 1 FROM fleet_engine_health WHERE engine = ? AND status = 'unavailable' AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL) LIMIT 1", r.engine, r.machine_id).toArray().length;
+          return !held;
+        });
+        if (liveRoute) {
+          state = "fresh";
+          remaining = null;
+          observedAt = new Date(nowMs).toISOString();
+          source = "unmetered-engine";
+          freshObs.splice(0, freshObs.length, { machine: liveRoute.machine_id, quota: unmeteredObservation(observedAt), kind: "unmetered" });
+        }
+      }
       const routeEngines = routes.length ? [...new Set(routes.map((r) => r.engine))].sort() : [canonicalQuotaProvider(account.provider)];
       // Display the first healthy observation when one exists so a broken
       // sibling probe never masks known windows (e.g. 7d 80% with 5h absent).
       const displayObs = freshObs.find((o) => !observationUnavailable(o.quota)) ?? freshObs[0];
+      const canonProv = canonicalQuotaProvider(account.provider);
+      const canonAcct = canonicalAccountLabel(account.label);
+      const unmetered = isUnmeteredProvider(canonProv);
+      const burn = analyzeQuotaBurn(displayObs?.quota ?? null, nowMs, unmetered);
+      const effRem = remaining ?? (unmetered ? ((routingPolicy.rules as any).unmetered_headroom_percent ?? 50) : 0);
+      const pref = providerWeight(canonProv);
+      const disabled = Number(account.enabled) === 0;
+      const decisionScore = disabled || state === "exhausted" || state === "unavailable" || state === "stale" || state === "unknown"
+        ? 0
+        : Math.round((Math.max(0, effRem) / 100) * burn.factor * pref * 10000) / 10000;
+      const effBurnStatus = state === "exhausted" ? "exhausted" : burn.burn_status;
+      const decisionReason = disabled
+        ? `disabled: ${canonProv}/${canonAcct}`
+        : state === "exhausted"
+        ? `excluded: ${canonProv}/${canonAcct} quota_exhausted`
+        : `${canonProv}/${canonAcct} score=${decisionScore.toFixed(4)} [rem=${remaining !== null ? `${Math.round(remaining)}%` : 'unmetered'} win=${burn.windows_summary} ratio=${burn.ratio !== null ? burn.ratio.toFixed(2) : 'unmetered'} status=${effBurnStatus} burn=${burn.factor.toFixed(2)}x pref=${pref.toFixed(2)}x]`;
       pools.push({
-        provider: canonicalQuotaProvider(account.provider),
-        account: canonicalAccountLabel(account.label),
+        provider: canonProv,
+        account: canonAcct,
         // Operator-disabled (intake 06d2a0ac AC3): excluded from routing,
         // reversible; the quota row stays visible.
-        ...(Number(account.enabled) === 0 ? { routing: "disabled" } : {}),
+        ...(disabled ? { routing: "disabled" } : {}),
         state,
         source,
         windows: displayObs?.quota.windows || {},
@@ -1534,6 +1596,12 @@ export class QuotaStore {
           Number.isFinite(displayObs.quota.details.credits_remaining)
           ? {remaining: displayObs.quota.details.credits_remaining, unit: displayObs.quota.details.unit} : null,
         remaining_percent: remaining,
+        burn_ratio: burn.ratio !== null ? Math.round(burn.ratio * 1000) / 1000 : null,
+        burn_factor: Math.round(burn.factor * 1000) / 1000,
+        burn_status: effBurnStatus,
+        depleted: burn.depleted,
+        decision_score: decisionScore,
+        decision_reason: decisionReason,
         observed_at: observedAt,
         collector_version: collectorVersion,
         observed_by_hosts: [...new Set(freshObs.map((o) => o.machine))].sort(),
@@ -1632,10 +1700,12 @@ export class QuotaStore {
           engines: { zcodex: "codex" },
           accounts: { ...LEGACY_ACCOUNT_LABELS },
         },
-        account_coverage: { total: pools.length,
-          fresh: pools.filter(p => p.state === "fresh" || p.state === "exhausted").map(p => p.account),
-          stale: pools.filter(p => p.state === "stale").map(p => p.account),
-          unavailable: pools.filter(p => p.state === "unavailable" || p.state === "unknown").map(p => p.account) },
+        // Operator-disabled/retired accounts are out of routing: their rows stay
+        // visible but never count as an unavailable-quota bug.
+        account_coverage: { total: pools.filter(p => p.routing !== "disabled").length,
+          fresh: pools.filter(p => p.routing !== "disabled" && (p.state === "fresh" || p.state === "exhausted")).map(p => p.account),
+          stale: pools.filter(p => p.routing !== "disabled" && p.state === "stale").map(p => p.account),
+          unavailable: pools.filter(p => p.routing !== "disabled" && (p.state === "unavailable" || p.state === "unknown")).map(p => p.account) },
       },
     };
   }

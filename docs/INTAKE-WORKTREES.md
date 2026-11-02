@@ -4,7 +4,7 @@ Intake 4b161918. Every intake owns its own dedicated git worktree(s). Hub
 records them, resumes follow-up sessions in them, refuses to close an intake
 while any of them is unmerged or still on disk, and removes them on the owning
 host through the host agent. Complements the disk-GC intake 1f1f1877, which
-owns any automatic deletion; nothing here deletes automatically.
+owns any automatic deletion; this workflow never deletes automatically.
 
 ## Registry (Hub)
 
@@ -103,7 +103,11 @@ audit `close` row carries `force: <reason>`.
 ## Host commands (AC4, AC5)
 
 A machine-scoped queue `intake_worktree_commands` (kinds `status`, `remove`).
-The host agent polls each cycle:
+On host check-in, Hub queues a status command for up to 10 active worktrees
+whose status is still unknown, respecting the machine queue cap. A failed
+unknown-status command is retried after five minutes. This also covers
+worktrees registered before this behavior was deployed; no manual refresh is
+needed just to populate `status_at`. The host agent polls each cycle:
 
 - `GET /api/worktree-host/commands` returns `{commands: [{id, kind, worktree_id, task_id, path, branch}]}`
   (queued commands are claimed; claims older than 15 minutes are re-offered).
@@ -138,3 +142,23 @@ User endpoints (intake auth and grants):
 CLI: `hub worktree list|refresh|remove|register <intake|session>`,
 `hub intake close <id> [--force --reason TEXT]`,
 `hub intake update --status closed` (alias of `done`) `[--force]`.
+
+## Terminal lock release and repair
+
+When a Hub session and its native incarnation are positively terminal, the
+host releases its worktree lock only if the current Git lock reason names that
+exact session (and intake when present). A live successor that has taken
+ownership keeps its own lock. Open intakes remain protected from automatic
+cleanup through the separate cleanup guard; they do not retain a dead
+session's lock.
+
+On the owning host, `hub worktree repair-locks --dry-run` lists existing
+Hub-session locks whose holder is positively terminal, explicitly unprotected
+and not human-owned according to Hub, matches the original repository identity,
+and exactly owns the lock reason. Review the full listing first, then run
+`hub worktree repair-locks --apply` to release eligible locks. The scan is
+bounded to 1,000 terminal Hub facts and 30 seconds; an incomplete scan applies
+nothing. Repeating the command is safe. It uses `git worktree unlock` only;
+it never uses `--force` or removes worktrees. Human-owned or human-protected sessions,
+non-terminal sessions, manual locks, foreign locks, unknown repository
+identities, and mismatched lock reasons remain untouched.

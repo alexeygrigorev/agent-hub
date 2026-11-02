@@ -404,6 +404,8 @@ def main():
     conversations.add_commands(sub)
     from . import intake
     intake.add_commands(sub)
+    from . import intake_stats
+    intake_stats.add_commands(sub)
     from . import worktree_cli
     worktree_cli.add_commands(sub)
     from . import repos
@@ -449,6 +451,15 @@ def main():
     subscriptions = sub.add_parser('subscriptions', help='Inspect safe machine subscription metadata')
     subscriptions.add_argument('--config')
     subscriptions.add_argument('--report', action='store_true', help='Post metadata to the hub using this host credential')
+    subscriptions_cmds = subscriptions.add_subparsers(dest='subscriptions_cmd')
+    for verb in ('disable', 'enable'):
+        route = subscriptions_cmds.add_parser(verb, help=('Disable' if verb == 'disable' else 'Enable')
+                                              + ' one route on this machine only')
+        selector = route.add_mutually_exclusive_group(required=True)
+        selector.add_argument('--engine', help='Effective engine name on this machine')
+        selector.add_argument('--account', help='Local account label on this machine')
+        route.add_argument('--config', default=argparse.SUPPRESS,
+                           help='Subscriptions file (default host settings)')
     dispatch = sub.add_parser('fleet-host', help='Opt-in bounded host polling; no service is installed')
     dispatch.add_argument('--config')
     dispatch.add_argument('--cycles', type=int, default=1)
@@ -457,6 +468,8 @@ def main():
     webhooks_cli.add_parser(sub)
     from . import schedules as schedules_cli
     schedules_cli.add_parser(sub)
+    from . import prompt_schedules as prompt_schedules_cli
+    prompt_schedules_cli.add_parser(sub)
     from . import ops_liveness
     ops_liveness.add_parser(sub)
     from . import limits_cli
@@ -605,6 +618,10 @@ def main():
     p_workclaim.add_argument("--dry-run", action="store_true", help="Scan and redact without POSTing to Hub")
 
     args = parser.parse_args()
+    if args.cmd in ("run", "fleet-host", "bridge"):
+        # Long-running host commands: no console window for any child process.
+        from . import windows_no_window
+        windows_no_window.install()
     if args.cmd == 'engines':
         try:
             print(json.dumps(provisioning.command(args)))
@@ -632,9 +649,10 @@ def main():
             print(intake.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
-    if args.cmd in ('intake', 'handoff', 'worktree'):
+    if args.cmd in ('intake', 'handoff', 'worktree', 'stats'):
         try:
-            result = worktree_cli.execute(args) if args.cmd == 'worktree' else intake.execute(args)
+            result = (intake_stats.execute(args) if args.cmd == 'stats' or (args.cmd == 'intake' and args.intake_cmd == 'stats')
+                      else worktree_cli.execute(args) if args.cmd == 'worktree' else intake.execute(args))
             print(json.dumps(result, indent=2, ensure_ascii=True))
         except Exception as exc:
             # Sanitized close-gate refusal (each worktree and its problems) or
@@ -702,6 +720,16 @@ def main():
                 print(json.dumps(rendered, indent=2, ensure_ascii=True))
         except Exception as exc:
             print(webhooks_cli.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd in ('prompts', 'schedules'):
+        from . import prompt_schedules as ps_cli
+        try:
+            result = ps_cli.execute_prompts(args) if args.cmd == 'prompts' else ps_cli.execute_schedules(args)
+            rendered = ps_cli.render_output(args, result)
+            print(rendered if isinstance(rendered, str) else json.dumps(rendered, indent=2, ensure_ascii=True))
+        except Exception as exc:
+            print(ps_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'schedule':
@@ -778,6 +806,16 @@ def main():
                 else:
                     result = session_control.request('GET', '/api/fleet')
             elif args.cmd in ('subscriptions', 'fleet-host'):
+                if args.cmd == 'subscriptions' and getattr(args, 'subscriptions_cmd', None):
+                    result = fleet.set_machine_route_disabled(
+                        disabled=args.subscriptions_cmd == 'disable',
+                        engine=getattr(args, 'engine', None),
+                        account=getattr(args, 'account', None),
+                        path=args.config)
+                    print('%s %s %s on this machine%s' % (
+                        result['kind'], result['target'], result['status'],
+                        '' if result['changed'] else ' (unchanged)'))
+                    return
                 settings = fleet.load_settings(args.config)
                 if args.cmd == 'fleet-host':
                     fleet.run_cycles(settings, args.cycles, args.interval)

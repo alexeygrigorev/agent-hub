@@ -19,6 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import git_noninteractive
+
 REPO_WORKSPACE = re.compile(r"repo-([0-9a-f]{8})-([A-Za-z0-9][A-Za-z0-9-]{0,38})__([A-Za-z0-9_-]{1,60})\Z")
 REPO_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
 CLONE_TIMEOUT = 900.0
@@ -54,7 +56,7 @@ def repo_path(settings, label, home: Optional[str] = None) -> Path:
 
 
 def _run(argv: list[str], cwd: Optional[str], timeout: float) -> subprocess.CompletedProcess:
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="true", LC_ALL="C")
+    env = git_noninteractive.noninteractive_env()
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False,
                           cwd=cwd, env=env, stdin=subprocess.DEVNULL)
 
@@ -87,20 +89,30 @@ def ensure_repo_workspace(settings, label, *, home: Optional[str] = None,
     if path.is_dir():
         if (path / ".git").exists():
             return path.resolve()
-        raise ValueError("workspace path exists and is not a git checkout")
+        if not any(path.iterdir()):
+            path.rmdir()  # empty leftover of an interrupted clone; nothing to lose
+        else:
+            raise ValueError("workspace path exists and is not a git checkout")
     path.parent.mkdir(parents=True, exist_ok=True)
     slug = f"{owner}/{name}"
-    gh = gh_bin if gh_bin is not None else shutil.which("gh")
+    gh = gh_bin if gh_bin is not None else git_noninteractive.find_gh()
     proc = None
     if gh:
         proc = run([gh, "repo", "clone", slug, str(path)], None, CLONE_TIMEOUT)
     if proc is None or proc.returncode != 0:
         proc = run([git_bin, "clone", "--quiet", f"https://github.com/{slug}.git", str(path)], None, CLONE_TIMEOUT)
     if proc.returncode != 0:
-        raise ValueError("repo clone failed: " + _short(proc))
+        detail = (proc.stderr or "") + (proc.stdout or "")
+        if git_noninteractive.is_repo_not_found(detail):
+            raise ValueError("repo_not_found: " + slug + ": " + _short(proc))
+        if git_noninteractive.is_auth_failure(detail):
+            raise ValueError(git_noninteractive.AUTH_FAILED + ": " + slug + ": " + _short(proc))
+        raise ValueError("repo_clone_failed: " + slug + ": " + _short(proc))
     for argv in ([git_bin, "fetch", "--quiet", "origin", "main"],
                  [git_bin, "checkout", "--quiet", "-B", "wt-" + id8, "origin/main"]):
         proc = run(argv, str(path), GIT_TIMEOUT)
         if proc.returncode != 0:
+            if git_noninteractive.is_auth_failure((proc.stderr or "") + (proc.stdout or "")):
+                raise ValueError(git_noninteractive.AUTH_FAILED + f": git {argv[1]}: " + _short(proc))
             raise ValueError(f"git {argv[1]} failed: " + _short(proc))
     return path.resolve()

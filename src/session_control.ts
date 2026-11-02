@@ -8,7 +8,7 @@ import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } f
 import { linkedIntake, linkedTaskIds, hasOpenWork, nativeGoalStatus, sessionWakeState, openWorkPreventsIdleReap } from './intake-session';
 import { workerAccessContext, workerWakeAllowed } from './worker-access';
 import { registeredRepoLabel } from './repos';
-import { encodeRepoWorkspace } from './fleet';
+import { decodeRepoWorkspace, encodeRepoWorkspace } from './fleet';
 import { initResourceRequestProjection } from './sql-json-projection';
 import { abandonedLaunch, expireSilentStartRows } from './silent-start';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
@@ -39,7 +39,8 @@ export const WORKER_CHILD_CONCURRENT = 4;
 export const WORKER_CHILD_PER_HOUR = 12;
 export const WORKER_CHILD_PER_INTAKE = 8;
 import { ResourceManagement } from './resource-management';
-import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold } from './session_stall';
+import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold, toolCallStallThreshold } from './session_stall';
+import { recoveryProtected, recoveryWakePending } from './intake-recovery';
 import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, stopHostOnline, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
@@ -68,6 +69,9 @@ import {
 export const SESSION_CONTROL_WAKE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_control_wakes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, wake_at_ms INTEGER NOT NULL, wake_at TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, command_id TEXT, intake_task_id TEXT, owner_token_id TEXT, owner_family TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, delivered_at TEXT, acked_at TEXT, UNIQUE(session_id, actor, request_key));
 CREATE INDEX IF NOT EXISTS session_control_wakes_due ON session_control_wakes(state, wake_at_ms);
+CREATE INDEX IF NOT EXISTS session_control_wakes_due_order ON session_control_wakes(state, wake_at_ms, created_at, id);
+CREATE INDEX IF NOT EXISTS session_control_wakes_delivery_order ON session_control_wakes(state, delivered_at, id);
+CREATE INDEX IF NOT EXISTS session_control_wakes_resolution_order ON session_control_wakes(state, updated_at);
 CREATE INDEX IF NOT EXISTS session_control_wakes_session ON session_control_wakes(session_id, state);
 CREATE TABLE IF NOT EXISTS session_control_wake_alerts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, wake_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, intake_task_id TEXT, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_control_wake_alerts_session ON session_control_wake_alerts(session_id, created_at);
@@ -83,6 +87,8 @@ CREATE INDEX IF NOT EXISTS intake_queue_session_task ON session_control_sessions
 CREATE INDEX IF NOT EXISTS session_control_machine_created ON session_control_sessions(machine_id, created_at, id);
 CREATE INDEX IF NOT EXISTS session_control_machine_created_state ON session_control_sessions(machine_id, created_at, id, state);
 CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sessions(machine_id, state, created_at);
+CREATE INDEX IF NOT EXISTS session_control_live_created ON session_control_sessions(created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
+CREATE INDEX IF NOT EXISTS session_control_live_actor_created ON session_control_sessions(actor, created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
@@ -91,7 +97,7 @@ CREATE TABLE IF NOT EXISTS session_worktree_episodes (subject TEXT PRIMARY KEY, 
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 `;
 
-type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string };
+type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string; tokenHash?: string };
 type Auth = { caller?: Caller; scopes?: string[]; error?: Response };
 type ReserveHook = (input: any, auth: Auth) => { value: any; status: number };
 /** Worktree-guard follow-up hooks (intake a0f01448 AC4). Wired in hub.ts;
@@ -154,6 +160,13 @@ function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
       AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id') AND f.observed_at >= ?)))`,
     params: [cutoff],
   };
+}
+/** Literal must match the partial indexes session_control_live_created / _live_actor_created. */
+const LIVE_STATES_SQL = `state IN ('queued','held','offered','starting','running','uncertain')`;
+const ACTIVE_COUNT_CAP = 1000;
+/** FROM clause for live-only reads: forces the partial live index so only non-terminal rows are walked. */
+function liveFrom(admin: boolean): string {
+  return `session_control_sessions INDEXED BY ${admin ? 'session_control_live_created' : 'session_control_live_actor_created'}`;
 }
 const TREE_LIMIT_DEFAULT = 200;
 const TREE_LIMIT_MAX = 500;
@@ -390,7 +403,11 @@ export class SessionControlService {
     private sql: SqlStorage,
     private transaction: <T>(fn: () => T) => T,
     private now: () => number = Date.now,
-    private hooks: { reserve?: ReserveHook; wakeMissed?: (intakeId: string, wakeId: string) => void } = {},
+    private hooks: {
+      reserve?: ReserveHook;
+      resolveRepo?: (repo: unknown) => { repo?: string; error?: any };
+      wakeMissed?: (intakeId: string, wakeId: string) => void;
+    } = {},
     private options: SessionControlOptions = {},
   ) {
     this.maxPending = options.maxPendingCommands ?? 2000;
@@ -501,11 +518,31 @@ export class SessionControlService {
     } catch { return {}; }
   }
 
+  /** An automatic stop must recheck protection/admission/waiting after its
+   * body. Existing receipts still replay; explicit operator stops remain
+   * available (intake b527e905, reviewer B1). */
+  private recoveryStopHold(session: any, key: string, caller: Caller): string | null {
+    if (caller.isAdmin !== true || caller.kind !== 'human' || caller.actor !== 'hub:service:intake-watchdog') return null;
+    if (recoveryProtected(this.sql, session)) return 'session_protected';
+    if (!session.binding_json && session.fleet_launch_id) {
+      const launch: any = this.sql.exec('SELECT state,native_id,launcher_task_id FROM fleet_launches WHERE id=?',session.fleet_launch_id).toArray()[0];
+      // The host may have promoted a queued resource retry while the body
+      // streamed. Preserve that admission; only explicit operators cancel it.
+      if (launch && (['offered','starting','running','uncertain'].includes(launch.state) || launch.native_id || launch.launcher_task_id)) return 'session_admission_in_progress';
+    }
+    if (this.sql.exec("SELECT id FROM session_control_commands WHERE session_id=? AND actor=? AND request_key=? AND kind='stop' LIMIT 1",
+      session.id,actorName(caller),key).toArray().length) return null;
+    return recoveryWakePending(this.sql,session,this.now()) ? 'session_waiting_until' : null;
+  }
+
   private cancelOwnerLive(row: any, caller: Caller, operatorStop = false): boolean {
     // Explicit human operators already may stop any bound session. Apply the
     // same authority to a provably unstarted intent, without broadening the
     // owner-only /cancel endpoint or trusting a collapsed browser actor.
     if (operatorStop && caller.isAdmin === true && caller.kind === 'human') {
+      // The internal recovery service uses the same canonical stop/cancellation
+      // transaction as operators. HTTP authentication never issues this actor.
+      if (caller.actor === 'hub:service:intake-watchdog') return true;
       if (typeof caller.actor === 'string' && caller.actor.startsWith('human:admin-token:')) return true;
       if (caller.tokenId) {
         const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
@@ -820,10 +857,14 @@ export class SessionControlService {
   }
 
   public nextWakeTime(): number | null {
+    // Seek the earliest row of each indexed queue; never aggregate retained
+    // outstanding history or apply julianday to every delivery. Keep the
+    // active-ping deadline in the same alarm calculation.
     const row: any = this.sql.exec(`SELECT MIN(deadline) AS deadline FROM (
-      SELECT wake_at_ms AS deadline FROM session_control_wakes WHERE state='pending'
-      UNION ALL SELECT CAST((julianday(delivered_at)-2440587.5)*86400000 AS INTEGER)+600000
-      FROM session_control_wakes WHERE state='delivered'
+      SELECT (SELECT wake_at_ms FROM session_control_wakes WHERE state='pending'
+        ORDER BY wake_at_ms, created_at, id LIMIT 1) AS deadline
+      UNION ALL SELECT CAST((julianday((SELECT delivered_at FROM session_control_wakes
+        WHERE state='delivered' AND delivered_at IS NOT NULL ORDER BY delivered_at, id LIMIT 1))-2440587.5)*86400000 AS INTEGER)+600000
       UNION ALL SELECT next_at_ms AS deadline FROM session_control_pings WHERE state='active')`).toArray()[0];
     return typeof row?.deadline === 'number' ? row.deadline : null;
   }
@@ -1158,7 +1199,7 @@ export class SessionControlService {
     } : null;
     const hostFresh = nativeObservationFresh(this.sql, native, this.now());
     const terminalError = hostFresh ? sessionTerminalError(row, observed) : null;
-    const stall = classifySessionStall(this.sql, native, this.now(), stallThreshold(this.options.env), hostFresh);
+    const stall = classifySessionStall(this.sql, native, this.now(), stallThreshold(this.options.env), hostFresh, toolCallStallThreshold(this.options.env));
     const intake = linkedIntake(this.sql, row);
     const goalStatus = nativeGoalStatus(native);
     const wake = sessionWakeState(this.sql, row.id, this.now());
@@ -1228,6 +1269,9 @@ export class SessionControlService {
             admission_unconfigured: 'The host has no fresh admission adapter configured for this engine. Routing is held until it is configured and probed.',
             admission_refused: 'The host fresh admission gate refused this launch.',
             workspace_unavailable: 'The requested workspace is unavailable on this host.',
+            repo_clone_auth_failed: 'The host could not authenticate to GitHub while cloning the requested repository.',
+            repo_not_found: 'The repository origin was not found during host cloning.',
+            repo_clone_failed: 'The host could not clone the requested repository.',
             model_unsupported: 'The requested model is unsupported by the configured host adapter.',
             dispatch_refused: 'The host refused the dispatch before native start.',
             launcher_not_started: 'The maintained launcher did not start a native session.',
@@ -1274,11 +1318,13 @@ export class SessionControlService {
       stalled: waitingActive ? false : (row.state === 'running' && !terminalError && stall.stalled),
       stall_reason: waitingActive ? 'waiting_until' : (terminalError ?? (orphanFailure(native) ? 'agent_exited_children_running' : stall.reason)), stalled_since: waitingActive ? null : stall.since,
       ...(terminalError ? { failure_reason: terminalError, cleanup_pending: true } : {}),
-      stall_threshold: stallThreshold(this.options.env), lifecycle_state: row.state,
+      stall_threshold: stallThreshold(this.options.env), tool_call_stall_threshold: toolCallStallThreshold(this.options.env), lifecycle_state: row.state,
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
       ...sessionAccount(launchAccount, observed?.account),
-      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? request.model ?? null,
+      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? request.model ?? null, effort: modelSelection?.effort ?? null,
+      decision_score: modelSelection?.decision_score ?? null, decision_reason: modelSelection?.decision_reason ?? null, decision: modelSelection?.decision ?? null,
+      engine_override_reason: request.engine_override_reason ?? modelSelection?.decision?.override_reason ?? null,
       expected_cpu_cores:expectedCpu?.expected_cpu_cores ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_cores ?? null,
       expected_cpu_source:expectedCpu?.expected_cpu_source ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_source ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
@@ -2119,6 +2165,11 @@ export class SessionControlService {
         const protectedSession = binding
           ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.protected_session !== false
           : !((unstarted || receiptTerminal) && row.guard_owner_kind === 'agent' && !row.guard_explicit_protection);
+        // This response fact is derived only from canonical lifecycle refs.
+        // Missing refs are unknown and therefore human-owned for repair safety.
+        const humanOwned = binding
+          ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.human_owned !== false
+          : true;
         const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
         const nativeTerminal = unstarted || receiptTerminal || !!(native &&
           native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
@@ -2137,7 +2188,8 @@ export class SessionControlService {
           tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),
           workspace: binding?.workspace ?? null, native_created_at_ms: binding?.native_created_at_ms ?? null,
           terminal: ['stopped', 'finished', 'failed', 'refused', 'cancelled'].includes(row.state),
-          linked_intake_open: worktreeIntakeProtected(this.sql, row, worktreeLinks), protected: protectedSession };
+          linked_intake_open: worktreeIntakeProtected(this.sql, row, worktreeLinks), protected: protectedSession,
+          human_owned: humanOwned };
       });
       // A second binding alias must not weaken protections for the same
       // exact native incarnation. Never unlock through a terminal alias
@@ -2149,7 +2201,8 @@ export class SessionControlService {
           protected: aliases.some(other => other.protected),
           lock_release_permitted: aliases.every(other => other.lock_release_permitted) &&
             (!fact.intake_task_id || sessions.filter(other => other.intake_task_id === fact.intake_task_id).every(other => other.terminal && other.native_terminal && other.lock_release_permitted)),
-          linked_intake_open: aliases.some(other => other.linked_intake_open) };
+          linked_intake_open: aliases.some(other => other.linked_intake_open),
+          human_owned: aliases.some(other => other.human_owned) };
       });
       const wanted = scope.targets; // closure rows inform facts but are never returned
       const sessions_out = sessions.filter(fact => wanted.has(fact.session_id)).map(fact =>
@@ -2257,15 +2310,34 @@ export class SessionControlService {
       if (!label(input.key)) return response({ error: 'invalid_session_request', field: 'key', detail: 'invalid_key' }, 400);
       // Intake 8028bb06: `repo` (owner/name) replaces a host path. The workspace
       // becomes a repo-identity id; the placed host clones its own work tree.
+      let repoIdentityResolved = false;
       if (input.repo !== undefined) {
         if (input.workspace !== undefined) return response({ error: 'invalid_session_request', field: 'repo', detail: 'repo_and_workspace' }, 400);
+        if (!encodeRepoWorkspace(input.repo, '00000000')) return response({ error: 'invalid_session_request', field: 'repo', detail: 'invalid_repo' }, 400);
+        if (!this.hooks.resolveRepo) return response({ error: 'repo_registry_unavailable', field: 'repo' }, 503);
+        const resolvedRepo = this.hooks.resolveRepo(input.repo);
+        if (resolvedRepo.error) return response({ ...resolvedRepo.error, field: 'repo' }, 400);
+        if (typeof resolvedRepo.repo !== 'string') return response({ error: 'repo_registry_unavailable', field: 'repo' }, 503);
         const seed = typeof input.intake_task_id === 'string' && /[0-9a-f]{8}/.test(input.intake_task_id.toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 8))
           ? input.intake_task_id.toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 8).padEnd(8, '0') : null;
         const id = seed ?? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(input.key))))).slice(0, 4).map(b => b.toString(16).padStart(2, '0')).join('');
-        const ws = encodeRepoWorkspace(input.repo, id);
+        const ws = encodeRepoWorkspace(resolvedRepo.repo, id);
         if (!ws) return response({ error: 'invalid_session_request', field: 'repo', detail: 'invalid_repo' }, 400);
         input.workspace = ws;
         delete input.repo;
+        repoIdentityResolved = true;
+      }
+      // The encoded repo workspace is an internal routing id, not a way to
+      // bypass the same registry check by sending it as `workspace` directly.
+      const repoWorkspace = decodeRepoWorkspace(input.workspace);
+      if (repoWorkspace && !repoIdentityResolved) {
+        if (!this.hooks.resolveRepo) return response({ error: 'repo_registry_unavailable', field: 'repo' }, 503);
+        const resolvedRepo = this.hooks.resolveRepo(repoWorkspace.repo);
+        if (resolvedRepo.error) return response({ ...resolvedRepo.error, field: 'repo' }, 400);
+        if (typeof resolvedRepo.repo !== 'string') return response({ error: 'repo_registry_unavailable', field: 'repo' }, 503);
+        const ws = encodeRepoWorkspace(resolvedRepo.repo, repoWorkspace.id);
+        if (!ws) return response({ error: 'invalid_session_request', field: 'repo', detail: 'invalid_repo' }, 400);
+        input.workspace = ws;
       }
       if (!workspaceOk(input.workspace) && !registeredRepoLabel(this.sql, input.workspace)) return response({ error: 'invalid_session_request', field: 'workspace', detail: 'invalid_workspace' }, 400);
       if (input.engine !== undefined && !label(input.engine)) return response({ error: 'invalid_session_request', field: 'engine', detail: 'invalid_engine' }, 400);
@@ -2558,6 +2630,7 @@ export class SessionControlService {
         ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
         ...(input.intake_task_id ? {project:parsed(this.sql.exec('SELECT data FROM intake_tasks WHERE id=?',input.intake_task_id).toArray()[0]?.data,{}).project} : {}),
         mode, machine: input.machine ?? worktreeMachine, engine: input.engine, tier: input.tier,
+        ...(input.engine_override_reason ? { engine_override_reason: input.engine_override_reason } : {}),
         ...(input.needs !== undefined ? {needs: input.needs} : {}),
         workspace: input.workspace, cwd: input.cwd ?? null,
         prompt: input.brief || '', access: input.access, ...(input.with_goal === true ? { with_goal: true } : {}),
@@ -2610,11 +2683,12 @@ export class SessionControlService {
       const treeLimit = Math.min(TREE_LIMIT_MAX, Math.max(1, Number(url.searchParams.get('limit')) || TREE_LIMIT_DEFAULT));
       const treeAll = url.searchParams.get('include') === 'all';
       const activeFrag = activeSessionsSql(this.now());
-      const stateSql = treeAll ? '' : `AND ${activeFrag.sql}`;
+      const stateSql = treeAll ? '' : `AND ${LIVE_STATES_SQL} AND ${activeFrag.sql}`;
+      const treeFrom = treeAll ? 'session_control_sessions' : liveFrom(admin);
       const stateArgs: any[] = treeAll ? [] : activeFrag.params;
       const treeRows = (admin
-        ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE 1 = 1 ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...stateArgs, treeLimit + 1).toArray()
-        : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...stateArgs, treeLimit + 1).toArray()
+        ? this.sql.exec(`SELECT * FROM ${treeFrom} WHERE 1 = 1 ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...stateArgs, treeLimit + 1).toArray()
+        : this.sql.exec(`SELECT * FROM ${treeFrom} WHERE actor = ? ${stateSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...stateArgs, treeLimit + 1).toArray()
       ) as any[];
       const truncatedTree = treeRows.length > treeLimit;
       const allRows = treeRows.slice(0, treeLimit).reverse().filter((r: any) => this.ownerOk(r, caller));
@@ -2708,23 +2782,27 @@ export class SessionControlService {
       const cursor = url.searchParams.get('cursor');
       const params: any[] = [];
       let cursorSql = this.cursorClause(cursor, params, true);
-      if (url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1') {
+      const liveOnly = url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1';
+      const listFrom = liveOnly ? liveFrom(admin) : 'session_control_sessions';
+      if (liveOnly) {
         const frag = activeSessionsSql(this.now());
-        cursorSql += ` AND ${frag.sql}`;
+        cursorSql += ` AND ${LIVE_STATES_SQL} AND ${frag.sql}`;
         params.push(...frag.params);
       }
       const rows = (admin
-        ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE 1 = 1 ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...params, limit + 1).toArray()
-        : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...params, limit + 1).toArray()
+        ? this.sql.exec(`SELECT * FROM ${listFrom} WHERE 1 = 1 ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...params, limit + 1).toArray()
+        : this.sql.exec(`SELECT * FROM ${listFrom} WHERE actor = ? ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...params, limit + 1).toArray()
       ).filter((r: any) => this.ownerOk(r, caller));
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
       const countFrag = activeSessionsSql(this.now());
+      // Capped count over the partial live index: bounded by ACTIVE_COUNT_CAP matches, never a base-table scan.
+      const countFrom = liveFrom(admin);
       const activeCount = Number((admin
-        ? this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE ${countFrag.sql}`, ...countFrag.params)
-        : this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE actor = ? AND ${countFrag.sql}`, caller.actor, ...countFrag.params)
+        ? this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, ...countFrag.params, ACTIVE_COUNT_CAP)
+        : this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE actor = ? AND ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, caller.actor, ...countFrag.params, ACTIVE_COUNT_CAP)
       ).toArray()[0]?.n ?? 0);
-      return response({ sessions: page.map(r => this.view(r, threshold)), next_cursor: next, active_count: activeCount });
+      return response({ sessions: page.map(r => this.view(r, threshold)), next_cursor: next, active_count: activeCount, active_count_capped: activeCount >= ACTIVE_COUNT_CAP });
     }
 
     // M15c lifecycle durable seams (narrow; command auth/effect code untouched).
@@ -3001,6 +3079,19 @@ export class SessionControlService {
       let session: any = null;
       if (UUID_RE.test(rawRef)) {
         session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', rawRef).toArray()[0] ?? null;
+        // A native UUID is also a lookup key for Hub-managed sessions. Resolve
+        // that exact identity before the Fleet launch alias below: launch IDs
+        // may be reused by retries/legacy rows and must not make an exact
+        // native UUID ambiguous.
+        if (!session) {
+          const matches = (this.sql.exec('SELECT * FROM session_control_sessions WHERE binding_json IS NOT NULL').toArray() as any[])
+            .filter(row => {
+              if (!this.ownerOk(row, caller)) return false;
+              try { return JSON.parse(row.binding_json).native_id === rawRef; } catch { return false; }
+            });
+          if (matches.length > 1) return response({ error: 'ambiguous_session_uuid', matches: matches.map(row => row.id) }, 409);
+          session = matches[0] ?? null;
+        }
         // Fleet launch UUIDs are also returned to operators. Resolve them to
         // their canonical control session, with the same ownership checks.
         // Hosts must keep using the exact session UUID for binding/retirement.
@@ -3012,26 +3103,24 @@ export class SessionControlService {
           if (matches.length > 1) return response({ error: 'ambiguous_name' }, 409);
           session = matches[0] ?? null;
         }
-        if (!session) {
-          const rows = this.sql.exec('SELECT * FROM session_control_sessions WHERE binding_json IS NOT NULL').toArray() as any[];
-          for (const r of rows) {
-            try {
-              const b = JSON.parse(r.binding_json);
-              if (b?.native_id === rawRef) {
-                session = r;
-                break;
-              }
-            } catch {}
-          }
-        }
         if (!session && sub !== 'binding' && sub !== 'retirement') {
           const matches = observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller));
           if (matches.length > 1) return response({error:'ambiguous_session_prefix'}, 409);
           session = matches[0] ?? null;
         }
       } else if (/^[a-f0-9][a-f0-9-]{7,34}$/i.test(rawRef) && sub !== 'binding' && sub !== 'retirement') {
-        const matches = [...new Map([...visibleSessionPrefixMatches(this.sql, rawRef, row => this.ownerOk(row, caller)),
-          ...observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller))].map(row => [row.id, row])).values()];
+        const linkWorker = sub === 'link' ? workerAccessContext(this.sql, caller.tokenId, this.now()) : null;
+        const visibleToCaller = (row: any) => {
+          if (this.ownerOk(row, caller)) return true;
+          if (!linkWorker || linkWorker.actor !== caller.actor || linkWorker.token_hash !== caller.tokenHash ||
+              row.machine_id !== linkWorker.machine_id) return false;
+          const intent = parsed(row.request_json, {}), binding = parsed(row.binding_json, {});
+          const workspace = typeof binding.workspace === 'string' ? binding.workspace : intent.workspace;
+          return intent.provenance === 'observed_native' && binding.provenance === 'observed_native' &&
+            workspace === linkWorker.workspace;
+        };
+        const matches = [...new Map([...visibleSessionPrefixMatches(this.sql, rawRef, visibleToCaller),
+          ...observedHubTagMatches(this.sql, rawRef, visibleToCaller)].map(row => [row.id, row])).values()];
         if (matches.length > 1) return response({ error: 'ambiguous_session_prefix',
           matches: matches.map(row => ({ id: row.id, name: parsed(row.request_json, {}).name ?? null })) }, 409);
         session = matches[0] ?? null;
@@ -3086,7 +3175,10 @@ export class SessionControlService {
         session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0] ?? session;
       }
       if (sub === 'link' && request.method === 'POST') {
-        if (!admin) return response({ error: 'forbidden' }, 403);
+        const initialWorker = admin ? null : workerAccessContext(this.sql, caller.tokenId, this.now());
+        const workerIdentityOk = !!initialWorker && initialWorker.actor === caller.actor &&
+          initialWorker.token_hash === caller.tokenHash;
+        if (!admin && !workerIdentityOk) return response({ error: 'forbidden' }, 403);
         // Unknown or foreign refs resolve to no row: render not_found, never a 500 oracle.
         if (!session) return response({ error: 'not_found' }, 404);
         const input = await body(request);
@@ -3096,10 +3188,20 @@ export class SessionControlService {
         }
         return this.transaction(() => {
           const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', session.id).toArray()[0];
-          if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
+          if (!live) return response({ error: 'not_found' }, 404);
           const tasks: any[] = this.sql.exec("SELECT id FROM intake_tasks WHERE id=? OR substr(id,1,?)=? LIMIT 2",
             input.intake_task_id, input.intake_task_id.length, input.intake_task_id).toArray();
           if (tasks.length !== 1) return response({ error: tasks.length ? 'ambiguous_intake' : 'unknown_intake_task' }, 409);
+          const worker = admin ? null : workerAccessContext(this.sql, caller.tokenId, this.now());
+          const intent = parsed(live.request_json, {}), binding = parsed(live.binding_json, {});
+          const workspace = typeof binding.workspace === 'string' ? binding.workspace : intent.workspace;
+          const workerOwnsSession = !!worker && (worker.session_id === live.id || worker.launch_id === live.id ||
+            (typeof binding.native_id === 'string' && binding.native_id === worker.native_binding?.native_id));
+          const observedNative = intent.provenance === 'observed_native' && binding.provenance === 'observed_native';
+          const scopedWorker = !!worker && worker.actor === caller.actor && worker.token_hash === caller.tokenHash &&
+            worker.task_id === tasks[0].id && worker.machine_id === live.machine_id &&
+            worker.workspace === workspace && (workerOwnsSession || observedNative);
+          if (!this.ownerOk(live, caller) && !scopedWorker) return response({ error: 'forbidden' }, 403);
           // AC8 (27505f04): manual linkage also works after the session ended
           // — the retained canonical row is the identity evidence, no live
           // process or host heartbeat required. Repeats are idempotent; a
@@ -3114,7 +3216,6 @@ export class SessionControlService {
                 (!e.hub_session_id && typeof bound === 'string' && e.native_id === bound && e.host === live.machine_id), 5);
           } catch { /* projection tables absent: the start-intent check below still applies */ }
           if (ledgerTasks.some((id: string) => id !== tasks[0].id)) return response({ error: 'intake_link_conflict' }, 409);
-          const intent = parsed(live.request_json, {});
           if (intent.intake_task_id && intent.intake_task_id !== tasks[0].id) return response({ error: 'intake_link_conflict' }, 409);
           const ledgerAlready = ledgerTasks.includes(tasks[0].id);
           const already = intent.intake_task_id === tasks[0].id || ledgerAlready;
@@ -3124,11 +3225,11 @@ export class SessionControlService {
             this.sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', live.request_json, live.id);
           }
           const appended = ledgerAlready ? false : recordIntakeSessionLink(this.sql, live, this.now(), undefined, {
-            link_source: 'manual', linked_by: caller.actor ?? 'operator',
+            link_source: scopedWorker ? 'scoped_worker' : 'manual', linked_by: caller.actor ?? 'operator',
             session_state_at_link: live.state, session_updated_at: live.updated_at ?? null,
           });
           return response({ ...this.view(live, threshold), already_linked: already || !appended,
-            link: { intake_task_id: tasks[0].id, source: 'manual' } });
+            link: { intake_task_id: tasks[0].id, source: scopedWorker ? 'scoped_worker' : 'manual' } });
         });
       }
       if (sub === 'binding') {
@@ -3522,6 +3623,8 @@ export class SessionControlService {
           if (!writer || !live || !this.cancelOwnerLive(live, caller, sub === 'stop')) {
             return response({ error: 'not_found' }, 404);
           }
+          const recoveryHold = sub === 'stop' ? this.recoveryStopHold(live, input.key, caller) : null;
+          if (recoveryHold) return response({ error: recoveryHold }, 409);
           const prior: any = this.sql.exec('SELECT * FROM session_control_cancellations WHERE session_id = ?', live.id).toArray()[0];
           if (prior) {
             if (prior.actor !== actorName(caller) || prior.request_key !== input.key) return response({ error: 'idempotency_conflict' }, 409);
@@ -3716,6 +3819,8 @@ export class SessionControlService {
           const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
           if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
           if (!new Set([...STOPPABLE, 'stopped']).has(live.state)) return response({ error: 'session_not_stoppable' }, 409);
+          const recoveryHold = this.recoveryStopHold(live, input.key, caller);
+          if (recoveryHold) return response({ error: recoveryHold }, 409);
           const actor = actorName(caller);
           const resp = this.enqueue(live, kind, actor, caller, input.key, {});
           if (resp.status >= 400) return resp;
@@ -4367,7 +4472,8 @@ export function reconcileStaleSessions(sql: SqlStorage, nowMs: number, batch = 2
     sql.exec("INSERT OR IGNORE INTO session_stale_reconciliations (session_id, previous_state, reason, at) VALUES (?, ?, 'stale_no_heartbeat', ?)", row.id, row.state, at);
     sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, row.id);
   }
-  const remaining = Number((sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE ${where}`, grace, ...frag.params).toArray()[0] as any)?.n ?? 0);
+  // LIMIT 1 probe: 1 means "at least one more batch", 0 means converged.
+  const remaining = sql.exec(`SELECT 1 AS n FROM session_control_sessions WHERE ${where} LIMIT 1`, grace, ...frag.params).toArray().length;
   return { reconciled: rows.length, remaining };
 }
 

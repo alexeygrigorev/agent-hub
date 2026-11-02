@@ -161,6 +161,10 @@ class ReportPrivacy(unittest.TestCase):
 
     def test_routed_terminal_exit_includes_evidence_on_assigned_job_result(self):
         from host.tests import test_tbm_routed_results as routed
+        # This fixture replaces the native runner; discard any host-wide
+        # census cached by preceding unittest cases before exercising it.
+        from agent_hub_host import native_list_cache
+        native_list_cache.invalidate("list")
         case=routed.RoutedResultsTests();case.setUp()
         try:
             # Drive the production catalog snapshot writer. Reconciliation

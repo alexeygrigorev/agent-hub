@@ -16,6 +16,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -64,6 +65,7 @@ class HeavyEnv:
                    AGENT_HUB_HEAVY_TEST_SLOTS="1", AGENT_HUB_HEAVY_TEST_WAIT_S="0",
                    CAPPED_TEST_RETRY_SLEEP=str(self.fake_sleep), TMPDIR=str(self.root))
         env.pop(MARKER_ENV, None)
+        env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
         env.update(extra)
         return env
 
@@ -245,6 +247,93 @@ class RetryWrapperTests(unittest.TestCase):
                              ["--priority final|", "--priority final|"])
             self.assertEqual(heavy.recorded_sleeps(), [5])
 
+    def test_affected_runner_is_run_directly_and_its_hold_retries(self):
+        with scratch() as temp:
+            heavy = HeavyEnv(Path(temp))
+            tree = Path(temp) / "repo" / "scripts"
+            tree.mkdir(parents=True)
+            for name in ("capped-test-retry.sh", "heavy-phase-status.sh"):
+                shutil.copyfile(SCRIPTS / name, tree / name)
+            outer = Path(temp) / "outer-wrapper-called"
+            write_exec(tree / "capped-test-run.sh", f"#!/usr/bin/env bash\ntouch {outer}\nexit 99\n")
+            runs = Path(temp) / "runs"
+            write_exec(tree / "test-affected-local.sh",
+                       "#!/usr/bin/env bash\n"
+                       f"echo \"$*|${{AGENT_HUB_HEAVY_TEST_HELD:-}}\" >> {runs}\n"
+                       f"if [ \"$(wc -l < {runs})\" -eq 1 ]; then\n"
+                       f"  echo 'no heavy-test slot free' > \"${{{MARKER_ENV}}}\"; exit 3\n"
+                       "fi\nexit 0\n")
+            env = heavy.env()
+            env.pop("AGENT_HUB_HEAVY_TEST_HELD", None)
+            result = run(["bash", "scripts/capped-test-retry.sh", "--base-delay", "5", "--",
+                          "scripts/test-affected-local.sh"], env=env, cwd=tree.parent)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(outer.exists())
+            self.assertEqual(runs.read_text().splitlines(), ["|", "|"])
+            self.assertEqual(heavy.recorded_sleeps(), [5])
+        affected = (SCRIPTS / "test-affected-local.sh").read_text()
+        self.assertIn("AGENT_HUB_HEAVY_TEST_REFUSAL_FILE}", affected)
+        retry_command = "scripts/capped-test-retry.sh -- scripts/test-affected-local.sh"
+        self.assertIn(retry_command, affected)
+        self.assertIn("printf -v PRIORITY_ASSIGNMENT", affected)
+        self.assertIn("AGENT_HUB_HEAVY_TEST_PRIORITY=%q", affected)
+
+    def test_affected_hold_message_includes_direct_retry_command_and_one_slot(self):
+        with scratch() as temp:
+            heavy = HeavyEnv(Path(temp))
+            repo = Path(temp) / "repo"
+            scripts = repo / "scripts"
+            ci = scripts / "ci"
+            scripts.mkdir(parents=True)
+            ci.mkdir()
+            for name in ("test-affected-local.sh", "capped-test-run.sh",
+                         "capped-test-retry.sh", "heavy-phase-status.sh",
+                         "heavy-test-admission.py"):
+                shutil.copy2(SCRIPTS / name, scripts / name)
+
+            # Keep the affected runner itself real. These shims make its plan
+            # empty and its preflight checks cheap, then the real capped runner
+            # refuses because this test owns the only private slot.
+            (scripts / "local-dependencies.py").write_text("raise SystemExit(0)\n")
+            (ci / "scope_guard.py").write_text("raise SystemExit(0)\n")
+            base_log = Path(temp) / "bases"
+            bindir = Path(temp) / "bin"
+            bindir.mkdir()
+            write_exec(bindir / "python3",
+                       "#!/usr/bin/env bash\n"
+                       "if [ \"${1:-}\" = scripts/ci/affected_tests.py ]; then\n"
+                       f"  printf '%s\\n' \"$2\" >> {base_log}\n"
+                       "  printf '%s\\n' '{\"broad\":\"\",\"vitest\":[],\"pytest\":[],\"workflows\":0,\"typecheck\":0,\"build\":0}'\n"
+                       "  exit 0\n"
+                       "fi\n"
+                       "if [ \"${1:-}\" = scripts/local-dependencies.py ] || [ \"${1:-}\" = scripts/ci/scope_guard.py ]; then exit 0; fi\n"
+                       "exec /usr/bin/python3 \"$@\"\n")
+
+            base = "feature with spaces; [special] $HOME $(touch injected)"
+            env = heavy.env(PATH=f"{bindir}:{os.environ['PATH']}",
+                            AGENT_HUB_HEAVY_TEST_PRIORITY="final")
+            env.pop("AGENT_HUB_HEAVY_TEST_HELD", None)
+            with heavy.occupied():
+                held = run(["scripts/test-affected-local.sh", "--base", base],
+                           env=env, cwd=repo, timeout=15)
+            self.assertEqual(held.returncode, 3, held.stdout + held.stderr)
+            self.assertRegex(held.stdout, r"(?m)^HOLD: .*; retry with: ")
+            match = re.search(r"(?m)^HOLD: .*; retry with: (.+)$", held.stdout)
+            self.assertIsNotNone(match, held.stdout)
+            retry_command = match.group(1)
+            self.assertIn("AGENT_HUB_HEAVY_TEST_PRIORITY=final", retry_command)
+            self.assertIn("scripts/capped-test-retry.sh -- scripts/test-affected-local.sh", retry_command)
+
+            # Execute the emitted shell command. Its second invocation must
+            # reach the same real runner with the identical argv, directly
+            # under the retry wrapper and with the sole slot now available.
+            retried = run(["bash", "-c", retry_command], env=env, cwd=repo, timeout=20)
+            self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+            self.assertIn("PASS: affected tests passed", retried.stdout)
+            self.assertEqual(base_log.read_text().splitlines(), [base, base])
+            self.assertFalse((repo / "injected").exists())
+            self.assertEqual(heavy.recorded_sleeps(), [])
+
 
 GIT_ENV = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t",
                GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
@@ -398,8 +487,11 @@ class SessionRulesTests(unittest.TestCase):
         from agent_hub_host.session_rules import (
             CAPACITY_RETRY_RULE, CLEAN_EXIT_RULE, SESSION_PREAMBLE,
             compose_prompt)
-        self.assertIn("scripts/capped-test-retry.sh -- scripts/test-full-local.sh --priority final",
-                      CAPACITY_RETRY_RULE)
+        self.assertIn("scripts/capped-test-retry.sh -- <command>", CAPACITY_RETRY_RULE)
+        self.assertNotIn("test-full-local.sh", CAPACITY_RETRY_RULE)
+        from agent_hub_host.session_rules import CI_ONLY_TESTS_RULE
+        self.assertIn("gh pr merge --auto --rebase", CI_ONLY_TESTS_RULE)
+        self.assertIn(CI_ONLY_TESTS_RULE, SESSION_PREAMBLE)
         self.assertIn("exit 3", CAPACITY_RETRY_RULE)
         self.assertIn("HOLD", CAPACITY_RETRY_RULE)
         self.assertIn("never retried", CAPACITY_RETRY_RULE)

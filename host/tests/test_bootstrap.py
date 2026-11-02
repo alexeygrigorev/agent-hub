@@ -592,6 +592,27 @@ class BootstrapTests(unittest.TestCase):
         for line in requirements:
             self.assertRegex(line, r'^https://.+\.whl --hash=sha256:[a-f0-9]{64}$')
 
+    def test_missing_max_agents_defaults_to_resource_sized_heartbeat_advertisement(self):
+        from agent_hub_host import fleet, host_sizing
+        settings_path = self.root / 'subscriptions.json'
+        settings_path.write_text(json.dumps({'version': 1, 'subscriptions': [], 'capabilities': []}))
+
+        settings = fleet.load_settings(settings_path)
+        self.assertEqual(settings['max_agents'], 'auto')
+        dispatcher = fleet.Dispatcher(settings, request=lambda method, path, body: None)
+        with patch.object(host_sizing, 'auto_max_agents', side_effect=[4, 6]):
+            self.assertEqual(dispatcher.capabilities_put_payload()['max_agents'], 4)
+            self.assertEqual(dispatcher.capabilities_put_payload()['max_agents'], 6)
+
+    def test_installer_migrates_missing_max_agents_on_update(self):
+        settings_path = self.root / 'subscriptions.json'
+        state = self.root / 'state'
+        settings_path.write_text(json.dumps({'version': 1, 'subscriptions': [], 'capabilities': []}))
+
+        self.assertTrue(b.migrate_installer_max_agents(settings_path, state))
+        self.assertEqual(json.loads(settings_path.read_text())['max_agents'], 'auto')
+        self.assertFalse(b.migrate_installer_max_agents(settings_path, state))
+
     def test_fresh_settings_advertise_routing_and_temporary_repo_outages_keep_service(self):
         from agent_hub_host import api, auth, config, fleet, provisioning
         errors = [urllib.error.HTTPError('https://hub.test', 503, 'Unavailable', {},

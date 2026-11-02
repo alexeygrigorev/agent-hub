@@ -24,7 +24,12 @@ SKIP_CI = re.compile(r'\[(?:skip ci|ci skip|no ci)\]', re.I)
 
 def _run(runner: Callable, argv: list, cwd: str, timeout: int = GIT_TIMEOUT):
     try:
-        return runner(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+        extra = {}
+        if runner is subprocess.run:
+            from .git_noninteractive import noninteractive_env
+            extra['env'] = noninteractive_env()
+            extra['stdin'] = subprocess.DEVNULL
+        return runner(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False, **extra)
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -51,6 +56,22 @@ def existing_commits(repo: str, candidates: list, runner: Callable = subprocess.
     """Candidates that are real commits in ``repo`` (git cat-file -e <sha>^{commit})."""
     return [c for c in candidates
             if (p := _run(runner, ['git', 'cat-file', '-e', c + '^{commit}'], repo)) is not None and p.returncode == 0]
+
+
+def explicit_commit_refs(history: list) -> list:
+    """Commit SHAs from explicit report/commit event fields (reference = sha).
+
+    Only ``report``/``commit`` entries whose ``reference`` is a 7-40 hex SHA
+    count. Note text, intake/session/launch ids and uuid fragments never count
+    here; free-text candidates go through ``shas_from_text`` + ``existing_commits``."""
+    refs = []
+    for entry in history or []:
+        if not isinstance(entry, dict) or entry.get('kind') not in ('report', 'commit'):
+            continue
+        ref = str(entry.get('reference') or '').strip()
+        if SHA.match(ref) and ref.lower() not in refs:
+            refs.append(ref.lower())
+    return refs
 
 
 def own_clone(runner: Callable = subprocess.run, remote: Optional[str] = None) -> str:

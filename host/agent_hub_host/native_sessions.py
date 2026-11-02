@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from . import native_list_cache
 from .native_bridge import (
     NativeServiceBinding,
     canonicalize_workspace,
@@ -170,6 +171,7 @@ class NativeSession:
     processes: Optional[int] = None
     agent_state_at_ms: Optional[int] = None
     headless_exec: bool = False
+    worker_alive: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -339,6 +341,20 @@ def run_native(
         raise SessionControlError("Sender identity override (--from) is forbidden")
     if "--pane" in args or "--no-ack" in args or "--enter" in args:
         raise SessionControlError("--pane/--no-ack/--enter transports are forbidden")
+    if args[0] in ("start", "kill"):
+        try:
+            return _run_native_uncached(executable, args, timeout, cwd, env)
+        finally:  # effect may have happened even on timeout: never serve the old snapshot
+            native_list_cache.invalidate("list")
+    if args[0] == "message" and len(args) > 1 and args[1] in ("send", "deliver", "ack"):
+        try:
+            return _run_native_uncached(executable, args, timeout, cwd, env)
+        finally:
+            native_list_cache.invalidate("log")
+    return _run_native_uncached(executable, args, timeout, cwd, env)
+
+
+def _run_native_uncached(executable, args, timeout, cwd, env):
     from .aplexer_client import client_call
     ensure_runtime_bin_on_path()
     native = client_call(executable, args, env=env)
@@ -423,25 +439,44 @@ def project_session(raw: Any) -> NativeSession:
         worker_pid=worker_pid if type(worker_pid) is int else None,
         workload_pid=workload_pid if type(workload_pid) is int else None,
         processes=processes if type(processes) is int else None,
+        worker_alive=raw.get("worker_alive") if type(raw.get("worker_alive")) is bool else None,
     )
+
+
+def _fresh_list(executable):
+    native_list_cache.invalidate("list")  # act-on-state paths need a fresh catalog
+    return list_sessions(executable, include_exited=True)
 
 
 def list_sessions(
     executable: str = "aplexer",
     workspace: Optional[str] = None,
     include_exited: bool = False,
+    fresh: bool = False,
+    timeout: float = QUICK_TIMEOUT,
 ) -> list[NativeSession]:
-    """List native sessions, optionally filtered to one canonical workspace (read-only)."""
-    args = ["list", "--json"]
-    if include_exited:
-        args.append("--all")
-    proc = run_native(executable, args)
-    if proc.returncode != 0:
-        raise SessionControlError("Native list failed")
-    rows = _parse_json_output(proc, "list")
-    if not isinstance(rows, list):
-        raise SessionControlError("Native list output is not an array")
+    """List native sessions, optionally filtered to one canonical workspace (read-only).
+
+    Served from the shared host snapshot (see ``native_list_cache``): at most one
+    ``aplexer list --all --json`` per TTL. ``fresh=True`` (claim re-qualify, stop,
+    reap confirmation) accepts a snapshot at most ``FRESH_MAX_AGE_S`` old.
+    Every native call stays within ``timeout`` so startup health and stop
+    paths keep their bounded ceilings (intake 4038d834).
+    """
+    def fetch() -> list[Any]:
+        proc = run_native(executable, ["list", "--json", "--all"], timeout=timeout)
+        if proc.returncode != 0:
+            raise SessionControlError("Native list failed")
+        rows = _parse_json_output(proc, "list")
+        if not isinstance(rows, list):
+            raise SessionControlError("Native list output is not an array")
+        return rows
+
+    rows = native_list_cache.list_raw(
+        executable, fetch, native_list_cache.FRESH_MAX_AGE_S if fresh else None)
     sessions = [project_session(r) for r in rows[:500]]
+    if not include_exited:
+        sessions = [s for s in sessions if s.phase not in TERMINAL_PHASES]
     if workspace is not None:
         canonical = canonicalize_workspace(workspace)
         sessions = [s for s in sessions if canonicalize_workspace(s.workspace) == canonical]
@@ -452,6 +487,7 @@ def qualify_target(
     executable: str,
     target: NativeTarget,
     live_only: bool = True,
+    timeout: float = QUICK_TIMEOUT,
 ) -> NativeSession:
     """Re-qualify tag -> (UUID, workspace, generation) immediately before an effect.
 
@@ -462,7 +498,8 @@ def qualify_target(
     Never infers idleness/readiness from phase flags: phase is liveness only.
     """
     target = target.validated()
-    sessions = [s for s in list_sessions(executable, include_exited=True)
+    native_list_cache.invalidate("list")  # stop/claim qualification needs a fresh catalog
+    sessions = [s for s in list_sessions(executable, include_exited=True, timeout=timeout)
                 if _stop_workspace_matches(s.workspace, target.workspace)]
     same_tag = [s for s in sessions if s.tag == target.tag]
     if len(same_tag) != 1:
@@ -811,6 +848,8 @@ def fetch_message_log(
     executable: str,
     workspace: str,
     limit: int = MAX_LOG_ROWS,
+    *,
+    fresh: bool = False,
 ) -> list[dict[str, Any]]:
     """Retrieve the actual native message log for the exact workspace (bounded, read-only).
 
@@ -822,16 +861,20 @@ def fetch_message_log(
     canonical = canonicalize_workspace(workspace)
     if type(limit) is not int or not 1 <= limit <= MAX_LOG_ROWS:
         raise SessionControlError(f"Log bound must be 1..{MAX_LOG_ROWS}")
-    proc = run_native(
-        executable,
-        ["message", "log", "--workspace", canonical, "--json"],
-        timeout=QUICK_TIMEOUT,
-    )
-    if proc.returncode != 0:
-        raise SessionUncertain("Native message log unavailable; reconciliation deferred")
-    rows = _parse_json_output(proc, "message log")
-    if not isinstance(rows, list):
-        raise SessionUncertain("Native message log is not an array; reconciliation deferred")
+    def fetch() -> list[Any]:
+        proc = run_native(
+            executable,
+            ["message", "log", "--workspace", canonical, "--json"],
+            timeout=QUICK_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            raise SessionUncertain("Native message log unavailable; reconciliation deferred")
+        rows = _parse_json_output(proc, "message log")
+        if not isinstance(rows, list):
+            raise SessionUncertain("Native message log is not an array; reconciliation deferred")
+        return rows
+
+    rows = native_list_cache.message_log(executable, canonical, fetch, force=fresh)
     return [r for r in rows if isinstance(r, dict)][-limit:]
 
 
@@ -879,7 +922,10 @@ def verify_ack_via_reply(
     except SessionControlError as exc:
         return AckResult(state="unknown", reason=f"target requalification failed: {exc}")
     try:
-        log = fetch_message_log(executable, sender.workspace)
+        # ACK proof depends on the latest recipient reply. A cached log could
+        # miss a reply that arrived after the last poll, so always read a fresh
+        # native snapshot for this decision.
+        log = fetch_message_log(executable, sender.workspace, fresh=True)
     except SessionUncertain as exc:
         return AckResult(state="unknown", reason=f"proof transport unqualified: {exc}")
     except SessionControlError as exc:
@@ -964,6 +1010,7 @@ def capture_output(
     target: NativeTarget,
     limit_bytes: int = MAX_CAPTURE_BYTES,
     mode: str = "tail",
+    timeout: float = QUICK_TIMEOUT,
 ) -> CaptureResult:
     """Bounded capture: ``capture --bytes N`` tail or ``--screen --plain`` snapshot."""
     target = target.validated()
@@ -971,14 +1018,14 @@ def capture_output(
         raise SessionControlError(f"Capture bound must be 1..{MAX_CAPTURE_LIMIT}")
     if mode not in ("tail", "screen"):
         raise SessionControlError("Capture mode must be tail|screen")
-    qualify_target(executable, target, live_only=False)
+    qualify_target(executable, target, live_only=False, timeout=timeout)
     if mode == "screen":
         args = ["capture", "--workspace", target.workspace, "--tag", target.tag,
                 "--screen", "--plain"]
     else:
         args = ["capture", "--workspace", target.workspace, "--tag", target.tag,
                 "--bytes", str(limit_bytes)]
-    proc = run_native(executable, args, timeout=QUICK_TIMEOUT)
+    proc = run_native(executable, args, timeout=timeout)
     if proc.returncode != 0:
         raise SessionControlError("Native capture failed")
     text = proc.stdout
@@ -1071,9 +1118,10 @@ def _confirm_workload_exit(before: NativeSession) -> tuple[bool, str]:
     """Confirm the owned workload is actually gone (stop oracle).
 
     A missing catalog entry or a lone ``kill`` exit 0 is NOT confirmation.
-    Stopped requires at least one positive containment/process proof from the
-    observed row: the workload cgroup path reaped (Linux), every observed PID
-    dead, or the catalog itself reporting containment empty. On Windows the
+    Stopped requires positive workload-containment proof from the observed
+    row: the workload cgroup path reaped (Linux) or the catalog itself
+    reporting containment empty. Dead PIDs are supporting evidence, not proof
+    that unrecorded descendants have exited. On Windows the
     cgroup path is never consulted; the Job Object proof is the catalog
     containment_empty flag (True) plus dead PIDs when observed. Anything else
     is unproven (unknown/unsupported oracle stays uncertain/held, never false
@@ -1093,11 +1141,42 @@ def _confirm_workload_exit(before: NativeSession) -> tuple[bool, str]:
         states = [_pid_dead(p) for p in pids]
         if any(s is False for s in states):
             return False, "observed workload PID still alive after kill"
-        if all(s is True for s in states):
-            return True, "observed workload PIDs dead after kill"
+        if not all(s is True for s in states):
+            return False, "observed workload PID liveness is unproven after kill"
     if before.containment_empty is True:
-        return True, "catalog reports containment empty after kill"
-    return False, "no containment/process proof available; exit unproven"
+        suffix = " and recorded workload PIDs dead" if pids else ""
+        return True, "catalog reports containment empty after kill%s" % suffix
+    return False, "no containment-empty/reaped proof available; exit unproven"
+
+
+def _confirm_native_process_gone(before: NativeSession) -> tuple[bool, str]:
+    """Confirm a killed/crashed session is already gone without sending a kill.
+
+    A stale catalog phase alone is not enough. POSIX requires every recorded
+    native worker/workload PID to be absent and the existing stop oracle to
+    prove workload containment empty. Windows uses the native worker and Job
+    Object receipts because ``os.kill(pid, 0)`` is not a safe PID probe there.
+    """
+    if os.name == "nt":
+        if before.worker_alive is not False or before.containment_empty is not True:
+            return False, "Windows worker/Job Object exit is unproven"
+        return True, "native worker dead and Job Object empty"
+
+    pids = [pid for pid in (before.worker_pid, before.workload_pid) if type(pid) is int and pid > 0]
+    if not pids:
+        return False, "no recorded process PID; exit unproven"
+    if any(_pid_dead(pid) is not True for pid in pids):
+        return False, "one or more recorded process PIDs remain live or unknown"
+    # Dead controller/workload PIDs alone do not prove that unrecorded
+    # descendants have left the owned workload. Require a distinct positive
+    # containment receipt before skipping native shutdown/recovery.
+    containment_gone = _workload_containment_gone(before.workload_cgroup)
+    if before.containment_empty is not True and containment_gone is not True:
+        return False, "workload containment is unproven"
+    confirmed, why = _confirm_workload_exit(before)
+    if not confirmed:
+        return False, why
+    return True, "recorded process PIDs dead and workload empty (%s)" % why
 
 
 STOP_ORACLE_VERSION = 1
@@ -1183,7 +1262,7 @@ def reconcile_stop_oracle(
     except (KeyError, TypeError, ValueError):
         return False, "oracle unqualified; reconcile manually"
     try:
-        rows = [s for s in list_sessions(executable, include_exited=True)
+        rows = [s for s in _fresh_list(executable)
                 if s.session_id.lower() == sid.lower()
                 and s.tag == tag
                 and _stop_workspace_matches(s.workspace, ws)]
@@ -1288,7 +1367,7 @@ def stop_session(
         raise SessionControlError("Signal must be HUP|TERM")
     if type(grace_ms) is not int or not 0 <= grace_ms <= 30000:
         raise SessionControlError("grace_ms must be 0..30000")
-    before = [s for s in list_sessions(executable, include_exited=True)
+    before = [s for s in _fresh_list(executable)
               if s.session_id.lower() == target.session_id.lower()
               and s.tag == target.tag
               and _stop_workspace_matches(s.workspace, target.workspace)]
@@ -1312,6 +1391,10 @@ def stop_session(
             "Native engine mismatch (reported %r, expected %r); refusing"
             % (before[0].engine, target.engine)
         )
+    already_gone, gone_reason = _confirm_native_process_gone(before[0])
+    if already_gone:
+        return StopResult(state="stopped", session_id=target.session_id,
+                          reason="native process already gone (%s)" % gone_reason)
     generation = before[0].created_at_ms
     oracle = _oracle_from_row(before[0])
     attempt = {"signal": signal, "grace_ms": grace_ms}
@@ -1322,7 +1405,7 @@ def stop_session(
         executable,
         ["kill", target.session_id, "--workspace", before[0].workspace, "--tag", target.tag,
          "--signal", signal, "--grace-ms", str(grace_ms), "--keep-record", "--json"],
-        timeout=QUICK_TIMEOUT + grace_ms / 1000.0 + 10,
+        timeout=QUICK_TIMEOUT,
     )
     if proc.returncode != 0:
         # No exit proof: the session may be gone because it was forgotten/pruned
@@ -1330,7 +1413,7 @@ def stop_session(
         raise _uncertain_with_oracle(
             "Kill reported failure; target exit unproven — reconcile",
             oracle, {**attempt, "killed": False, "result": "kill_failed"})
-    remaining = [s for s in list_sessions(executable, include_exited=True)
+    remaining = [s for s in _fresh_list(executable)
                    if s.session_id.lower() == target.session_id.lower()
                    and s.tag == target.tag
                    and _stop_workspace_matches(s.workspace, target.workspace)]

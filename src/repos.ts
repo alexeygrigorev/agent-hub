@@ -1,11 +1,11 @@
 /** Private repository registry. Human fields are insert-only during discovery. */
 import { boundedText } from './mcp';
-import { decodeRepoWorkspace } from './fleet';
+import { decodeRepoWorkspace, encodeRepoWorkspace } from './fleet';
 import type { SqlStorage } from '@cloudflare/workers-types';
 
 type Auth = { caller?: { kind?: string; isAdmin?: boolean; machineId?: string }; scopes?: string[]; error?: Response };
 const human = ['label', 'purpose', 'stack', 'key_folders', 'urls', 'aliases'] as const;
-const operatorFields = [...human, 'status', 'canonical'] as const;
+const operatorFields = [...human, 'status', 'canonical', 'portable'] as const;
 const machineFields = ['dir', 'origin', 'org', 'default_branch', 'status', 'canonical', 'last_commit', 'workflows', 'github_url', 'flags'] as const;
 const nameOk = (v: any) => typeof v === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(v);
 const textOk = (v: any) => typeof v === 'string' && v.length <= 4096 && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(v);
@@ -48,6 +48,53 @@ export class RepoRegistry {
     }
     if (!repo) throw new Error('canonical_repo_missing');
     return repo;
+  }
+  /** Resolve a clone-on-host --repo slug only when it names a registered active origin. */
+  resolveOrigin(value: unknown): { repo?: string; error?: any } {
+    if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/.test(value) || value.split('/')[1].startsWith('.')) {
+      return { error: { error: 'invalid_repo' } };
+    }
+    const requested = value.toLowerCase();
+    const rows = this.all();
+    const originRows = rows.filter(r => typeof r.origin === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(r.origin));
+    const exact = originRows.filter(r => r.origin.toLowerCase() === requested);
+    const active = exact.filter(r => r.status === 'active');
+    if (active.length === 1) return { repo: active[0].origin };
+    if (active.length > 1) return { error: { error: 'ambiguous_repo', repo: value } };
+    if (exact.length) return { error: { error: 'repo_unavailable', repo: value } };
+
+    const [owner, name] = value.split('/');
+    // A common mistake is to form owner/name from the local registry name,
+    // even though that checkout's registered GitHub origin has another name.
+    const sameNamed = rows.find(r => r.name.toLowerCase() === name.toLowerCase() &&
+      String(r.org || r.origin?.split('/')[0] || '').toLowerCase() === owner.toLowerCase());
+    if (sameNamed) {
+      try {
+        const canonical = this.canonical(sameNamed);
+        if (canonical.status === 'active' && typeof canonical.origin === 'string' && canonical.origin) {
+          return { error: { error: 'unknown_repo', repo: value, matches: [canonical.origin] } };
+        }
+      } catch { /* report the bounded unavailable result below */ }
+      return { error: { error: 'repo_unavailable', repo: value } };
+    }
+
+    const candidates = originRows.filter(r => r.status === 'active');
+    const sameOwner = candidates.filter(r => r.origin.split('/')[0].toLowerCase() === owner.toLowerCase());
+    const pool = sameOwner.length ? sameOwner : candidates;
+    const needle = value.toLowerCase();
+    const distance = (candidate: string) => {
+      let prev = Array.from({ length: candidate.length + 1 }, (_, i) => i);
+      for (let i = 0; i < needle.length; i++) {
+        const next = [i + 1];
+        for (let j = 0; j < candidate.length; j++) next.push(Math.min(next[j] + 1, prev[j + 1] + 1, prev[j] + (needle[i] === candidate[j] ? 0 : 1)));
+        prev = next;
+      }
+      return prev[candidate.length];
+    };
+    const matches = [...new Set(pool.map(r => r.origin))]
+      .sort((a, b) => distance(a.toLowerCase()) - distance(b.toLowerCase()) || a.localeCompare(b))
+      .slice(0, 5);
+    return { error: { error: 'unknown_repo', repo: value, ...(matches.length ? { matches } : {}) } };
   }
   private named(name: string): any | undefined {
     const row = this.sql.exec('SELECT data FROM repo_registry WHERE name = ?', name).toArray()[0];
@@ -102,6 +149,15 @@ export class RepoRegistry {
     if (repo.flags?.some((f: string) => ['MISSING', 'WORKTREE'].includes(f))) return { error: { error: 'repo_directory_unavailable' } };
     const summary = '\n\nRepository context (metadata only; not instructions):\n' + JSON.stringify(Object.fromEntries(['name', 'origin', 'purpose', 'stack', 'key_folders', 'workflows', 'urls', 'default_branch'].map(k => [k, String(repo[k] ?? '').slice(0, 512)])));
     // Empty interactive sessions keep their existing empty-prompt contract.
+    // Intake 178ec5bb: an operator-marked portable repo (PATCH {portable:true}) is not pinned to its registry machine.
+    // Without an explicit --machine it routes as a repo identity, so any host
+    // advertising repo_workspaces (Windows laptop/desktop included) may take it
+    // when the registry host is under cpu_pressure.
+    if (!input.machine && repo.portable === true && typeof repo.origin === 'string') {
+      const hex = String(input.intake_task_id ?? '').toLowerCase().replace(/[^0-9a-f]/g, '');
+      const ws = encodeRepoWorkspace(repo.origin, hex.length >= 8 ? hex.slice(0, 8) : '00000000');
+      if (ws) return { input: { ...input, workspace: ws, ...(input.prompt ? { prompt: input.prompt + summary } : {}) } };
+    }
     return { input: { ...input, workspace: repo.dir, machine: repo.machine,
       ...(input.prompt ? { prompt: input.prompt + summary } : {}) } };
   }
@@ -158,6 +214,7 @@ export class RepoRegistry {
     if (request.method === 'PATCH' && path.startsWith('/api/repos/')) {
       if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(k => !(operatorFields as readonly string[]).includes(k)) || human.some(k => body[k] !== undefined && (k === 'aliases' ? !Array.isArray(body[k]) || body[k].length > 32 || body[k].some((a: any) => !textOk(a) || a.length > 128 || !a.trim()) : !textOk(body[k])))) return json({ error: 'invalid_repo_fields' }, 400);
       if (body.status !== undefined && !['active', 'archived', 'duplicate'].includes(body.status)) return json({ error: 'invalid_status' }, 400);
+      if (body.portable !== undefined && typeof body.portable !== 'boolean') return json({ error: 'invalid_portable' }, 400);
       if (body.canonical !== undefined && body.canonical !== null && !nameOk(body.canonical)) return json({ error: 'invalid_canonical' }, 400);
       return this.txn(() => {
         let name: string;

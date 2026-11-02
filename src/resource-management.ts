@@ -5,6 +5,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import defaults from '../config/resource-management.json';
 import { IntakeService } from './intake';
 import { policy } from './model-routing';
+import { CPU_SATURATED_PCT } from './cpu-headroom';
 import { cpuVerdict } from './cpu-headroom';
 import { resolveMachineAliases } from './machine-alias';
 import { jsonFields, resourceRequest } from './sql-json-projection';
@@ -18,6 +19,8 @@ export const NEXT_SLOT_MB = defaults.ramp_reserve_default_mb;
 // window is already counted in the host's MemAvailable, and the host re-runs
 // its own memory gate before every claim.
 export const IN_FLIGHT_RESERVE_SECONDS = 600;
+/** A host is memory-full only below this MemAvailable (Alexey t2362u-t2363u); CPU-full is >=98% busy over >=10s (CPU_SATURATED_PCT). */
+export const MEMORY_FULL_MB = 6144;
 export const CPU_LOAD_FACTOR = defaults.cpu_load_factor;
 export type ResourceConfig = typeof defaults;
 const parse = (s: any): any => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
@@ -30,6 +33,8 @@ CREATE INDEX IF NOT EXISTS resource_queue_choking_recent ON resource_choking_eve
 CREATE TABLE IF NOT EXISTS resource_cpu_samples (launch_id TEXT PRIMARY KEY, current_cpu_cores REAL NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_cpu_starts (launch_id TEXT PRIMARY KEY, expected_cpu_cores REAL NOT NULL, expected_cpu_source TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_usage (session_id TEXT PRIMARY KEY, p95_cpu_cores REAL, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_rss_median (session_id TEXT PRIMARY KEY, p50_rss_mb REAL, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_oom_kills (session_id TEXT PRIMARY KEY, oom_kills INTEGER NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_finalized (session_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_metadata (session_id TEXT PRIMARY KEY, workspace TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_ramps (launch_id TEXT PRIMARY KEY, started_at TEXT NOT NULL);
@@ -51,6 +56,16 @@ CREATE INDEX IF NOT EXISTS resource_reaps_native ON resource_reaps(machine_id,na
 CREATE TABLE IF NOT EXISTS resource_throttles (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, machine_id TEXT NOT NULL, native_id TEXT NOT NULL, intake_id TEXT, action TEXT NOT NULL, cap_cores REAL, sustain_s REAL, cpu_max TEXT, outcome TEXT, at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS resource_throttles_native ON resource_throttles(machine_id,native_id,session_id);
 `;
+/** Ledger project label: a registered project name, or the repo directory when only a workspace path is known
+ * (C:\Users\User\work\1e0bc141\agent-hub, ~/git/agent-hub-wt-x). Never changes registry names. */
+export function projectLabel(value: any): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const text = value.trim();
+  if (!/[\\/]/.test(text)) return text;
+  const parts = text.split(/[\\/]+/).filter(Boolean);
+  const last = parts.at(-1) ?? '';
+  return last.replace(/-wt-.*$/, '') || null;
+}
 export function percentile(values: number[], p: number): number | null {
   if (!values.length) return null;
   const sorted = values.slice().sort((a,b) => a-b);
@@ -59,7 +74,7 @@ export function percentile(values: number[], p: number): number | null {
 export function resourceConfig(value: any = {}): ResourceConfig {
   const result = { ...defaults };
   const bounds: Record<string, number[]> = {
-    memory_floor_mb: [128, 1048576], disk_floor_gb: [1, 1048576], ramp_reserve_default_mb: [64, 65536], estimate_percentile: [50,100],
+    memory_floor_mb: [128, 1048576], disk_floor_gb: [1, 1048576], ramp_reserve_default_mb: [64, 65536], estimate_percentile: [50,100], estimate_cap_mb: [64,65536], memory_floor_pct: [.5,20],
     estimate_multiplier: [1,4], ramp_seconds: [30,900], cpu_load_factor: [.5,4],
     watchdog_interval_s: [300,600], idle_minutes: [10,10080], rss_flag_gb: [.125,1024],
     cpu_target_utilization:[.1,1],cpu_default_cores:[.05,128],cpu_estimate_multiplier:[1,4],cpu_psi_hard_cap_pct:[1,100],cpu_psi_full_hard_cap_pct:[.1,100],memory_psi_full_hard_cap_pct:[.1,100],choking_cooldown_seconds:[30,3600],
@@ -68,13 +83,19 @@ export function resourceConfig(value: any = {}): ResourceConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_resource_config');
   for (const [k,v] of Object.entries(value)) {
     if (!bounds[k] || !finite(v) || (v as number) < bounds[k][0] || (v as number) > bounds[k][1]) throw new Error('invalid_resource_config');
-    if (!['disk_floor_gb','cpu_load_factor','estimate_multiplier','rss_flag_gb','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct','cpu_psi_full_hard_cap_pct','memory_psi_full_hard_cap_pct','cpu_throttle_cores'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
+    if (!['disk_floor_gb','cpu_load_factor','estimate_multiplier','rss_flag_gb','memory_floor_pct','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct','cpu_psi_full_hard_cap_pct','memory_psi_full_hard_cap_pct','cpu_throttle_cores'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
     (result as any)[k] = v;
   }
   return result;
 }
-export function memoryVerdict(available: number, ramp: number, estimate: number, config: ResourceConfig) {
-  return finite(available) && finite(ramp) && finite(estimate) && available - ramp - estimate >= config.memory_floor_mb;
+/** Floor scaled to the host: memory_floor_pct of total RAM, never above the configured ceiling and never below 512 MiB.
+ * Unknown total keeps the configured value. A 32 GiB laptop gets ~960 MiB, a 16 GiB tablet 512 MiB, a 64 GiB server 1920 MiB. */
+export function effectiveFloorMb(config: ResourceConfig, totalMb: unknown): number {
+  if (!finite(totalMb) || (totalMb as number) <= 0) return config.memory_floor_mb;
+  return Math.min(config.memory_floor_mb, Math.max(512, Math.round((totalMb as number) * config.memory_floor_pct / 100)));
+}
+export function memoryVerdict(available: number, ramp: number, estimate: number, config: ResourceConfig, totalMb?: unknown) {
+  return finite(available) && finite(ramp) && finite(estimate) && available - ramp - estimate >= effectiveFloorMb(config, totalMb);
 }
 // Idle-reap authority reads only request.intake_task_id; skip copying and
 // re-parsing whole retained prompts per session. Invalid JSON passes through
@@ -168,47 +189,62 @@ export class ResourceManagement {
     this.readSnapshot?.set(key,rows);
     return rows;
   }
+  /** Config as forwarded to one host: memory floor scaled to that host's RAM. */
+  configFor(machine: string): ResourceConfig {
+    const config = this.config();
+    const m: any = this.readRows('SELECT last_heartbeat FROM machines WHERE id=?', machine)[0];
+    return { ...config, memory_floor_mb: effectiveFloorMb(config, parse(m?.last_heartbeat).mem_total_mb) };
+  }
   config(): ResourceConfig { return resourceConfig(parse(this.readRows('SELECT data FROM resource_settings WHERE id=1')[0]?.data)); }
   configure(value: any) {
     const config = resourceConfig(value);
     this.sql.exec('INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', JSON.stringify(config));
     return config;
   }
-  estimate(project: string | null, engine: string | null, kind: string | null) {
+  estimate(project: string | null, engine: string | null, kind: string | null, model: string | null = null) {
     this.refreshHistory();
-    const key = JSON.stringify([project, engine, kind]);
+    const key = JSON.stringify([project, engine, kind, model]);
     const cached = this.memoryEstimates.get(key);
     if (cached !== undefined) return cached;
     const config = this.config();
     // Only actual measurements, never a cgroup cap or fabricated zero. Bounded recent history.
     let rows = this.memoryHistory.get(engine);
     if (!rows) {
-      rows = this.sql.exec('SELECT project,kind,peak_rss_mb FROM session_resource_usage WHERE engine IS ? AND finished_at IS NOT NULL AND peak_rss_mb > 0 ORDER BY observed_at DESC LIMIT 500', engine).toArray() as any[];
+      // Typical resident size (p50 of the session's own samples) when recorded, else its peak. A multi-day goal session's
+      // test-run peak is not what a new launch needs.
+      rows = this.sql.exec('SELECT u.project,u.kind,u.model,COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.engine IS ? AND u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500', engine).toArray() as any[];
       if (this.memoryHistory.size >= 64) this.memoryHistory.clear();
       this.memoryHistory.set(engine, rows);
     }
-    const specific = rows.filter(r => r.project === project && r.kind === kind);
-    const measured = percentile((specific.length ? specific : rows).map(r => Number(r.peak_rss_mb)), config.estimate_percentile);
-    const result = Math.ceil(Math.max(64, measured === null ? config.ramp_reserve_default_mb : measured * config.estimate_multiplier));
+    // Most specific cohort with data wins: project+engine+model, project+kind, then the engine.
+    const label = projectLabel(project);
+    const sameProject = rows.filter(r => projectLabel(r.project) === label);
+    const byModel = model ? sameProject.filter(r => r.model === model) : [];
+    const specific = sameProject.filter(r => r.kind === kind);
+    const cohort = byModel.length ? byModel : specific.length ? specific : rows;
+    const measured = percentile(cohort.map(r => Number(r.peak_rss_mb)), config.estimate_percentile);
+    const result = Math.ceil(Math.min(config.estimate_cap_mb, Math.max(64, measured === null ? config.ramp_reserve_default_mb : measured * config.estimate_multiplier)));
     if (this.memoryEstimates.size >= 2048) this.memoryEstimates.clear();
     this.memoryEstimates.set(key, result);
     return result;
   }
-  cpuEstimate(project: string | null, kind: string | null) {
+  cpuEstimate(project: string | null, kind: string | null, engine: string | null = null, model: string | null = null) {
     this.refreshHistory();
-    const key = JSON.stringify([project, kind]);
+    const key = JSON.stringify([project, kind, engine, model]);
     const cached = this.cpuEstimates.get(key);
     if (cached) return {...cached};
-    const rows = this.cpuHistory ??= this.sql.exec(`SELECT u.project,u.kind,c.p95_cpu_cores FROM session_resource_usage u
+    const rows = this.cpuHistory ??= this.sql.exec(`SELECT u.project,u.kind,u.engine,u.model,c.p95_cpu_cores FROM session_resource_usage u
       JOIN session_cpu_usage c ON c.session_id=u.session_id WHERE u.finished_at IS NOT NULL
       AND c.p95_cpu_cores IS NOT NULL ORDER BY u.observed_at DESC LIMIT 500`).toArray() as any[];
-    const specific = rows.filter(r=>r.project===project && r.kind===kind);
-    const repo = rows.filter(r=>r.project===project);
-    const cohort = specific.length ? specific : repo.length ? repo : rows;
+    const label = projectLabel(project);
+    const sameProject = rows.filter(r=>projectLabel(r.project)===label);
+    const byModel = engine && model ? sameProject.filter(r=>r.engine===engine && r.model===model) : [];
+    const specific = sameProject.filter(r=>r.kind===kind);
+    const cohort = byModel.length ? byModel : specific.length ? specific : sameProject.length ? sameProject : rows;
     const config=this.config();
     const measured=percentile(cohort.map(r=>Number(r.p95_cpu_cores)),95);
     const result = {expected_cpu_cores:measured === null ? config.cpu_default_cores : measured*config.cpu_estimate_multiplier,
-      expected_cpu_source:specific.length?'repo_kind':repo.length?'repo':rows.length?'global':'default'};
+      expected_cpu_source:byModel.length?'project_engine_model':specific.length?'repo_kind':sameProject.length?'repo':rows.length?'global':'default'};
     if (this.cpuEstimates.size >= 2048) this.cpuEstimates.clear();
     this.cpuEstimates.set(key, result);
     return {...result};
@@ -227,7 +263,7 @@ export class ResourceManagement {
     const m:any=this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine)[0];
     const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
     const inFlightCutoff=new Date(now-IN_FLIGHT_RESERVE_SECONDS*1000).toISOString();
-    const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal');
+    const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal',input.engine ?? null,input.model ?? null);
     // Expose the common state range to the machine/state index; the CASE below
     // applies the running-ramp cutoff or the bounded in-flight window and is
     // NULL (no reservation) for any other state, so the index filter stays
@@ -320,8 +356,8 @@ export class ResourceManagement {
       reserved += Math.max(0, estimate - (finite(row.resident_mb) ? row.resident_mb : 0));
     }
     return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
-      reserved_mb: reserved, floor_mb: config.memory_floor_mb,
-      requested_mb: this.estimate(input.project || input.workspace || null, engine, input.task_kind || input.kind || 'goal'),
+      reserved_mb: reserved, floor_mb: effectiveFloorMb(config, hb.mem_total_mb),
+      requested_mb: this.estimate(input.project || input.workspace || null, engine, input.task_kind || input.kind || 'goal', input.model ?? null),
       observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null };
   }
   private boundSessions(machine?: string) {
@@ -604,7 +640,7 @@ export class ResourceManagement {
     for (const sample of value.samples) {
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
-      for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
+      for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores','oom_kills']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
       const at=Date.parse(sample.observed_at);
       if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
       const old:any=this.sql.exec('SELECT * FROM session_resource_usage WHERE machine_id=? AND native_id=?',machine,session.native_id).toArray()[0];
@@ -621,6 +657,8 @@ export class ResourceManagement {
           if (TERMINAL.has(session.state)) this.sql.exec('INSERT OR IGNORE INTO session_cpu_finalized VALUES(?,?)',ledgerId,sample.observed_at);
         }
       }
+      if (finite(sample.oom_kills) && Number.isInteger(sample.oom_kills) && sample.oom_kills>=0) this.sql.exec('INSERT INTO session_oom_kills VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET oom_kills=MAX(session_oom_kills.oom_kills,excluded.oom_kills),observed_at=excluded.observed_at',ledgerId,sample.oom_kills,sample.observed_at);
+      if (finite(sample.p50_rss_mb)) this.sql.exec('INSERT INTO session_rss_median VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p50_rss_mb=excluded.p50_rss_mb,observed_at=excluded.observed_at WHERE excluded.observed_at>=session_rss_median.observed_at',ledgerId,sample.p50_rss_mb,sample.observed_at);
       if (session.fleet_launch_id && finite(sample.current_rss_mb)) this.sql.exec('INSERT INTO resource_resident_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET resident_mb=excluded.resident_mb,observed_at=excluded.observed_at WHERE excluded.observed_at>=resource_resident_samples.observed_at',session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
       const max = (k:string) => finite(sample[k]) ? Math.max(old?.[k] ?? 0,sample[k]) : old?.[k] ?? null;
       const cpu=max('cpu_seconds'),runtime=max('runtime_s');
@@ -691,7 +729,7 @@ export class ResourceManagement {
       const key=r.machine_id+':'+r.native_id;
       if (!latestThrottle.has(key)) latestThrottle.set(key,r.action);
     }
-    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)==='throttled'}));
+    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,p50_rss_mb:this.sql.exec('SELECT p50_rss_mb FROM session_rss_median WHERE session_id=?',r.session_id).toArray()[0]?.p50_rss_mb ?? null,oom_kills:this.sql.exec('SELECT oom_kills FROM session_oom_kills WHERE session_id=?',r.session_id).toArray()[0]?.oom_kills ?? null,project_label:projectLabel(r.project),rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)==='throttled'}));
   }
   reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
   throttles() {
@@ -706,6 +744,30 @@ export class ResourceManagement {
     }
     return rows.map((r:any)=>({...r,active:latest.get(r.machine_id+':'+r.native_id)?.id===r.id && r.action==='throttled'}));
   }
+  /** Per-machine headroom: measured CPU and memory, the fullness verdict, and how many more
+   * typical tasks fit by the ledger's own p90 estimates. Never derived from load average. */
+  capacity(m: any, hb: any, caps: any, cpu: any) {
+    const memAvail = finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null;
+    const cores = Number.isSafeInteger(caps.cpu_count) && caps.cpu_count > 0 ? caps.cpu_count : null;
+    const busy = finite(cpu.current_cpu_cores) ? cpu.current_cpu_cores : null;
+    const reasons: string[] = [];
+    if (cpu.cpu_saturated === true) reasons.push('cpu_busy_over_'+CPU_SATURATED_PCT+'pct_10s');
+    if (memAvail !== null && memAvail < MEMORY_FULL_MB) reasons.push('mem_available_below_'+MEMORY_FULL_MB+'mb');
+    const perTaskCpu = this.cpuEstimate(null, null).expected_cpu_cores;
+    const rows = this.sql.exec('SELECT COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500').toArray() as any[];
+    const p90 = percentile(rows.map(r => Number(r.peak_rss_mb)), this.config().estimate_percentile);
+    const perTaskMem = Math.ceil(Math.min(this.config().estimate_cap_mb, Math.max(64, p90 === null ? this.config().ramp_reserve_default_mb : p90 * this.config().estimate_multiplier)));
+    const freeCores = cores !== null && busy !== null ? Math.max(0, cores - busy) : null;
+    const byCpu = freeCores !== null && perTaskCpu > 0 ? Math.floor(freeCores / perTaskCpu) : null;
+    const byMem = memAvail !== null ? Math.max(0, Math.floor((memAvail - MEMORY_FULL_MB) / perTaskMem)) : null;
+    const known = [byCpu, byMem].filter((v): v is number => v !== null);
+    return { machine_id: String(m.id), cores, cpu_busy_cores: busy, cpu_busy_percent: finite(cpu.current_cpu_cores) && cores ? Math.round(cpu.current_cpu_cores / cores * 1000) / 10 : null,
+      cpu_busy_percent_10s: cpu.busy_percent_window ?? null, cpu_window_s: cpu.window_s ?? null, free_cores: freeCores,
+      mem_available_mb: memAvail, mem_total_mb: hb.mem_total_mb ?? null, full: reasons.length > 0, full_reasons: reasons,
+      telemetry_state: cpu.telemetry_state ?? 'unknown', est_cpu_per_task: perTaskCpu, est_mem_per_task_mb: perTaskMem,
+      extra_tasks_by_cpu: byCpu, extra_tasks_by_memory: byMem,
+      extra_tasks: reasons.length ? 0 : known.length ? Math.min(...known) : null };
+  }
   overview() {
     const rows=this.sql.exec('SELECT id,hostname,drained,capabilities,last_heartbeat,last_checkin_at FROM machines WHERE drained=0 AND revoked_at IS NULL').toArray() as any[];
     // Intake 4398ce2a: a stale re-registered record of the same physical host
@@ -718,17 +780,17 @@ export class ResourceManagement {
         return {id:String(m.id),hostname:m.hostname,drained:m.drained,last_seen_ms:Number.isFinite(at)?at:null};})).aliasOf;
     } catch { aliasOf=new Map(); }
     const hosts=rows.filter((m:any)=>!aliasOf.has(String(m.id))).map((m:any)=>{
-      const hb=parse(m.last_heartbeat),caps=parse(m.capabilities),headroom=this.headroom(m.id);
+      const hb=parse(m.last_heartbeat),caps=parse(m.capabilities),headroom=this.headroom(m.id),cpuView=this.cpuHeadroom(m.id);
       return {machine_id:m.id,aliases:[...aliasOf].filter(([,c])=>c===String(m.id)).map(([a])=>a).sort(),mem_total_mb:hb.mem_total_mb??null,
         mem_used_mb:finite(hb.mem_total_mb)&&finite(hb.mem_avail_mb)?hb.mem_total_mb-hb.mem_avail_mb:null,
-        load5:hb.load?.[1]??null,cores:caps.cpu_count??null,...headroom,cpu:this.cpuHeadroom(m.id),host_observed_at:m.last_checkin_at,
+        load5:hb.load?.[1]??null,cores:caps.cpu_count??null,...headroom,cpu:cpuView,capacity:this.capacity(m,hb,caps,cpuView),host_observed_at:m.last_checkin_at,
         running:Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id=? AND phase='running'",m.id).one().n),
         queued:Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state='queued' AND (machine_id=? OR machine_id='')",m.id).one().n)};
     });
     const sessions=this.usage(),groups=new Map<string,any[]>();
-    for (const row of sessions as any[]) {const key=JSON.stringify([row.project,row.engine,row.kind]); if(!groups.has(key))groups.set(key,[]);groups.get(key)!.push(row);}
+    for (const row of sessions as any[]) {const key=JSON.stringify([row.project_label,row.engine,row.model,row.kind]); if(!groups.has(key))groups.set(key,[]);groups.get(key)!.push(row);}
     const throttles=this.throttles();
-    return {config:this.config(),hosts,sessions,stats:[...groups.values()].map(rows=>({project:rows[0].project,engine:rows[0].engine,kind:rows[0].kind,samples:rows.length,
+    return {config:this.config(),hosts,sessions,stats:[...groups.values()].map(rows=>({project:rows[0].project_label,engine:rows[0].engine,model:rows[0].model,kind:rows[0].kind,samples:rows.length,
       p50_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),50),p90_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),90)})),reaps:this.reaps(),
       throttles,active_throttles:throttles.filter((t:any)=>t.active).length};
   }

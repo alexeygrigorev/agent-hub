@@ -59,19 +59,28 @@ class EnsureTests(unittest.TestCase):
 
     def test_clone_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as home:
-            run = lambda argv, cwd, timeout: subprocess.CompletedProcess(argv, 128, '', 'fatal: repository not found')
-            with self.assertRaisesRegex(ValueError, 'repo clone failed'):
+            run = lambda argv, cwd, timeout: subprocess.CompletedProcess(argv, 128, '', 'fatal: unable to access: Could not resolve host')
+            with self.assertRaisesRegex(ValueError, '^repo_clone_failed: alexeygrigorev/agent-hub'):
+                repo_workspace.ensure_repo_workspace({}, LABEL, home=home, runner=run, gh_bin='')
+
+    def test_missing_origin_has_its_own_reason(self):
+        with tempfile.TemporaryDirectory() as home:
+            run = lambda argv, cwd, timeout: subprocess.CompletedProcess(argv, 128, '', 'remote: Repository not found.')
+            with self.assertRaisesRegex(ValueError, '^repo_not_found: alexeygrigorev/agent-hub'):
                 repo_workspace.ensure_repo_workspace({}, LABEL, home=home, runner=run, gh_bin='')
 
 
 class DispatchIntegrationTests(unittest.TestCase):
-    def test_route_and_resolve_accept_repo_workspace_without_a_path(self):
+    def test_antigravity_and_codex_routes_accept_repo_workspace_without_a_path(self):
         with tempfile.TemporaryDirectory() as root:
             settings = {'workspaces': {}, 'work_root': root, 'subscriptions': [
-                {'service': 'gemini', 'account_label': 'shared-gemini', 'engine': 'antigravity', 'admission_argv': ['true']}]}
-            sub = fleet.Dispatcher(settings)._route({'account': 'shared-gemini', 'engine': 'antigravity',
-                                                     'profile': None, 'workspace': LABEL})
-            self.assertEqual(sub['account_label'], 'shared-gemini')
+                {'service': 'gemini', 'account_label': 'shared-gemini', 'engine': 'antigravity', 'admission_argv': ['true']},
+                {'service': 'codex', 'account_label': 'shared-codex', 'engine': 'codex', 'admission_argv': ['true']} ]}
+            dispatcher = fleet.Dispatcher(settings)
+            for engine, account in (('antigravity', 'shared-gemini'), ('codex', 'shared-codex')):
+                with self.subTest(engine=engine):
+                    sub = dispatcher._route({'account': account, 'engine': engine, 'profile': None, 'workspace': LABEL})
+                    self.assertEqual(sub['account_label'], account)
             with self.assertRaises(ValueError):
                 fleet.resolve_workspace_path(settings, LABEL)  # not cloned yet
             (Path(root) / '8028bb06' / 'agent-hub').mkdir(parents=True)

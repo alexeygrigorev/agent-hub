@@ -63,7 +63,7 @@ describe('stalled running sessions', () => {
         progress: { last_progress_at: progressAt, headless: true, agent_alive: true, orphaned: false, cleanup: 'none' },
       }] }) }), { caller: { machineId: 'test-host', kind: 'host', actor: 'machine:test-host' }, scopes: ['host'] });
       expect(response.status).toBe(200);
-      expect(await view(s)).toMatchObject({ state: 'stalled', stalled: true, lifecycle_state: 'running', activity_state: 'idle', stall_reason: 'no_native_progress' });
+      expect(await view(s)).toMatchObject({ state: 'stalled', stalled: true, lifecycle_state: 'running', activity_state: 'idle', stall_reason: 'hung_tool_call' });
       expect((await view(s)).idle_for).toBeGreaterThan(1800);
       expect(live.evaluate().subjects.find(x => x.kind === 'session')?.state).toBe('stalled');
     }
@@ -172,4 +172,33 @@ describe('stalled running sessions', () => {
     expect(await view(s)).toMatchObject({ state: 'stalled', long_running: true, warning_active: false });
     expect(live.reconcileAlerts(live.evaluate().subjects)).toHaveLength(1);
   }));
+});
+
+describe('active tool calls (intake 167c6178)', () => {
+  const idleFor = (sql: any, seconds: number, agentState: string, progress: any = null) => {
+    sql.exec('UPDATE fleet_sessions SET last_activity_at = ?, agent_state = ?, progress_json = ?',
+      new Date(start - seconds * 1000).toISOString(), agentState, progress && JSON.stringify(progress));
+  };
+  const live = (idle: number, cpuAgo: number) => ({ last_progress_at: new Date(start - idle * 1000).toISOString(), headless: true, agent_alive: true,
+    orphaned: false, cleanup: 'none', last_cpu_at: new Date(start - cpuAgo * 1000).toISOString() });
+  it('flags an idle session past 30 minutes (control)', async () => fixture(async (s, _l, sql) => {
+    idleFor(sql, 2400, 'idle');
+    expect((await view(s)).stalled).toBe(true);
+  }));
+  it('does not flag a Working session past the 30 minute bound', async () => fixture(async (s, _l, sql) => {
+    idleFor(sql, 2400, 'working');
+    expect(await view(s)).toMatchObject({ stalled: false, stall_reason: null });
+  }));
+  it('does not flag a live headless leader past the 30 minute bound', async () => fixture(async (s, _l, sql) => {
+    idleFor(sql, 2400, 'idle', live(2400, 60));
+    expect((await view(s)).stalled).toBe(false);
+  }));
+  it('flags a Working session with no output past the longer bound', async () => fixture(async (s, _l, sql) => {
+    idleFor(sql, 7300, 'working');
+    expect(await view(s)).toMatchObject({ stalled: true, stall_reason: 'hung_tool_call', tool_call_stall_threshold: 7200 });
+  }));
+  it('keeps a long-silent tool call alive while its CPU advances, flags it when CPU is also idle', async () => {
+    await fixture(async (s, _l, sql) => { idleFor(sql, 7300, 'idle', live(7300, 120)); expect((await view(s)).stalled).toBe(false); });
+    await fixture(async (s, _l, sql) => { idleFor(sql, 7300, 'idle', live(7300, 7300)); expect((await view(s)).stalled).toBe(true); });
+  });
 });

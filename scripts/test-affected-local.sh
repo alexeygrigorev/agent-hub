@@ -13,6 +13,7 @@ if [ "${AGENT_HUB_HEAVY_TEST_HELD:-}" = "1" ]; then
   echo "test-affected-local: do not wrap in capped-test-run.sh; it takes its own slot" >&2
   exit 2
 fi
+ORIGINAL_ARGS=("$@")
 BASE="origin/main"; DRY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -69,6 +70,7 @@ while IFS= read -r name; do
 done < <(compgen -e)
 export AFFECTED_PYENV="${PY_ENV[*]}"
 MARKER="${RUN_TMP_ABS}/refused"
+export AGENT_HUB_HEAVY_TEST_RUN_ID="${AGENT_HUB_HEAVY_TEST_RUN_ID:-affected-$$-$(date +%s)}"
 AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${MARKER}" "${REPO_ROOT}/scripts/capped-test-run.sh" -- bash -c '
 rc=0
 if [ "$AFFECTED_TYPECHECK" = 1 ]; then echo "=== typecheck ==="; npm run typecheck || { echo "FAIL: typecheck"; rc=1; }; fi
@@ -89,7 +91,22 @@ if [ "$AFFECTED_BUILD" = 1 ]; then echo "=== worker dry-run build ==="; npm run 
 exit $rc'
 RC=$?
 if [ "${RC}" -eq 3 ] && [ -f "${MARKER}" ]; then
-  echo "HOLD: $(cat "${MARKER}"); retry later"; exit 3
+  # capped-test-retry.sh runs this self-admitting script directly so it does
+  # not hold a second outer slot. Propagate its private refusal marker to the
+  # retry wrapper's marker, preserving the distinction from a command exit 3.
+  if [ -n "${AGENT_HUB_HEAVY_TEST_REFUSAL_FILE:-}" ]; then
+    printf '%s\n' "$(cat "${MARKER}")" > "${AGENT_HUB_HEAVY_TEST_REFUSAL_FILE}"
+  fi
+  RETRY_ARGS=""
+  if [ "${#ORIGINAL_ARGS[@]}" -gt 0 ]; then
+    printf -v RETRY_ARGS ' %q' "${ORIGINAL_ARGS[@]}"
+  fi
+  RETRY_COMMAND="scripts/capped-test-retry.sh -- scripts/test-affected-local.sh${RETRY_ARGS}"
+  if [ -n "${AGENT_HUB_HEAVY_TEST_PRIORITY:-}" ]; then
+    printf -v PRIORITY_ASSIGNMENT 'AGENT_HUB_HEAVY_TEST_PRIORITY=%q ' "${AGENT_HUB_HEAVY_TEST_PRIORITY}"
+    RETRY_COMMAND="${PRIORITY_ASSIGNMENT}${RETRY_COMMAND}"
+  fi
+  echo "HOLD: $(cat "${MARKER}"); retry with: ${RETRY_COMMAND}"; exit 3
 fi
 [ "${RC}" -ne 0 ] && FAILURES=$((FAILURES + 1))
 if [ "${FAILURES}" -eq 0 ]; then echo "PASS: affected tests passed (full suite runs post-push in CI)"; exit 0; fi

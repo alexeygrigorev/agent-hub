@@ -48,7 +48,9 @@ class WorktreeSuccessorTests(unittest.TestCase):
         self.assertEqual(entry['reason'], guard.lock_reason(self.new, 'intake-test'))
         self.assertNotEqual(_run(['git', 'worktree', 'remove', self.tree], self.repo).returncode, 0)
         self.assertFalse(guard.release_session_lock('git', self.tree, self.old, terminal=True, intake_state='done'))
-        self.assertFalse(guard.release_session_lock('git', self.tree, self.new, terminal=True, intake_state='open'))
+        self.assertTrue(guard.release_session_lock('git', self.tree, self.new, terminal=True, intake_state='open'))
+        self.assertFalse(guard.is_locked('git', self.tree))
+        self.assertTrue(guard.ensure_locked('git', self.tree, self.new, 'intake-test'))
         self.assertTrue(guard.release_session_lock('git', self.tree, self.new, terminal=True, intake_state='done'))
 
     def test_live_unknown_foreign_or_unlinked_owner_remains_locked(self):

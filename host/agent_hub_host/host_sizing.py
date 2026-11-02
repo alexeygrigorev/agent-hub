@@ -9,7 +9,7 @@ import os
 from typing import Callable, Optional
 
 AUTO = 'auto'
-# Matches the launcher worker memory cap (1500 MiB) and keeps headroom for the
+# Typical admitted-session footprint (NOT the 6 GiB per-session MemoryMax ceiling in fleet.WORKER_MEMORY); keeps headroom for the
 # OS, the desktop session and the controller itself.
 WORKER_MB = 1536
 RESERVED_MB = 4096

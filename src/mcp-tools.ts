@@ -21,10 +21,10 @@ tool('heartbeat', 'POST', '/api/heartbeat', 'Report own agent liveness (health:r
 for (const [name, mode] of [['start_agent', 'headless'], ['start_session', 'interactive'], ['plan_agent', 'plan']] as const) {
   tool(name, 'POST', mode === 'plan' ? '/api/fleet/plan' : '/api/fleet/launches', `Legacy fleet ${mode}: provide the same JSON as the CLI; placement/admission unchanged.`, [name.replaceAll('_', '-')]);
 }
-tool('sessions_link', 'POST', '/api/sessions/{id}/link', 'Operator intake link (key, intake_task_id), also after session end; idempotent; conflict is 409.', ['sessions link']);
+tool('sessions_link', 'POST', '/api/sessions/{id}/link', 'Link intake; scoped workers must match task, machine and workspace; idempotent.', ['sessions link']);
 tool('sessions_list', 'GET', '/api/sessions', 'List sessions; query view=lifecycle grouped, view=breakdown&by=host,engine,account counts; state, limit, cursor filter.', ['sessions', 'sessions list', 'sessions count']);
 tool('sessions_tree', 'GET', '/api/sessions/tree', 'Session requester/parent tree.', ['sessions tree']);
-tool('sessions_start', 'POST', '/api/sessions', 'Queue durable session intent: workspace, brief, name, mode=headless|interactive, parent_id, intake_task_id, key, with_goal. Omit engine for tier policy; explicit engine REQUIRES engine_override_reason. Non-interactive starts REQUIRE intake_task_id and nonempty AC. Scope flags are informational only and never hold a start. needs filters advertised machine labels; unmet needs hold with needs_unmet. Quota/admission unchanged. Use interactive with_goal for follow-ups; headless uses native resume. Poll sessions_show/commands: queued or transported is not acknowledged execution.', ['sessions start', 'sessions override']);
+tool('sessions_start', 'POST', '/api/sessions', 'Queue durable session intent: workspace or registered repo owner/name, brief, name, mode=headless|interactive, parent_id, intake_task_id, key, with_goal. Omit engine for tier policy; explicit engine REQUIRES engine_override_reason. Non-interactive starts REQUIRE intake_task_id and nonempty AC. Scope flags never block starts. needs filters advertised machine labels; unmet needs hold with needs_unmet. Admission unchanged. Use interactive with_goal for follow-ups; headless uses native resume. Poll sessions_show/commands: queued or transported is not acknowledged execution.', ['sessions start', 'sessions override']);
 tool('sessions_show', 'GET', '/api/sessions/{id}', 'Session binding and observed state.', ['sessions show']);
 tool('sessions_commands', 'GET', '/api/sessions/{id}/commands', 'Read command results; recorded/transported is not acknowledged execution.', ['sessions commands']);
 for (const action of ['send', 'capture', 'stop']) tool(`sessions_${action}`, 'POST', `/api/sessions/{id}/${action}`,
@@ -60,6 +60,8 @@ tool('jobs_list', 'GET', '/api/fleet/tasks', 'Recent routed tasks.', ['jobs']);
 tool('jobs_show', 'GET', '/api/fleet/tasks/{id}', 'Task state, report and artifacts.', ['job']);
 tool('task_result', 'POST', '/api/fleet/tasks/{id}/result', 'Assigned host only: status/report/artifacts/confirmed_exit.', ['task-result']);
 tool('artifact', 'GET', '/api/fleet/tasks/{id}/artifacts/{name}', 'Fetch a sanitized PNG as the API base64 DTO.', ['artifact']);
+tool('stats', 'GET', '/api/intake/stats', 'Authorized intake timing table and DONE aggregates. Query window=24h|7d|30d|all, project, sort, order=asc|desc. Unknown values include reasons.', ['stats']);
+tool('intake_stats', 'GET', '/api/intake/tasks/{id}/stats', 'Intake creation, first native start, DONE, lead/cycle/wall/active durations, attempts, engines/accounts and blockers, with unknown reasons.', ['intake stats']);
 tool('asks_read', 'GET', '/api/asks/{view}', 'Ask ledger view list (query state, agent_id, intake), messages (agent_id, role, since) or summary.', ['asks list', 'asks tail', 'asks search', 'asks summary']);
 tool('asks_write', 'POST', '/api/asks/{op}', "Ask ledger op ingest: Alexey's message verbatim, idempotent on agent+msg_id, {source:'bot', agents:[{agent_id, agent_name, messages:[{msg_id:'tNNNNu', role:'user', ts, text, intake_id?}]}]}; map/dismiss/verify: ask_id + intake_id, ac_line? / reason / evidence; check; settings.", ['asks record', 'asks map', 'asks dismiss', 'asks verify', 'asks check', 'asks settings']);
 tool('intake_create', 'POST', '/api/intake/tasks', 'File verbatim task: payload key, project, title, text, transcription, source {type,reference,timestamp}, optional acceptance_criteria (nullable bounded text; required non-empty before assign/start).', ['intake create']);
@@ -129,6 +131,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'engines maintain': 'Operator trigger for Hub credential refresh and direct provider quota; the cron already runs it.',
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',
   'engines remove': 'Operator credential withdrawal stays in the explicit credential-management CLI/UI workflow.',
+  'engines recommend': 'Read-only placement recommendation preview for CLI/backup callers; MCP callers use plan_agent or sessions_start (intake 83d27f69).',
   'engines status': 'Operator read of per-host engine sync status; deliberate CLI step, not an agent tool.',
   'engines cancel': 'Admin cancel of a pending engine rollout that restores the prior bundle version (intake 8cc9e31a, rollout 0de287c8); an operator incident action, never an agent tool.',
   'engines update': 'Operator rollout of Hub-managed engine versions to hosts (intake 8cc9e31a); a fleet-wide change, never an agent tool.',
@@ -141,6 +144,8 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'run': 'Local foreground host daemon; remote MCP must not install or start another host executor.',
   'fleet-host': 'Local host dispatcher; existing enrolled hosts own execution.',
   'subscriptions': 'Local subscription collection/reporting requires host files and host identity; safe reported subscriptions are in fleet.',
+  'subscriptions disable': 'Local-only host subscription change; MCP cannot edit host subscription files.',
+  'subscriptions enable': 'Local-only host subscription change; MCP cannot edit host subscription files.',
   'bridge': 'Local native mailbox bridge; existing hosts own it.',
   'bridge-resume': 'Local journal acknowledgement, no server API.',
   'workclaim-sync': 'Local native work-claim bridge; existing hosts own it.',
@@ -163,6 +168,21 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'schedule resume': 'Operator cron lifecycle control stays an explicit operator action in the CLI.',
   'schedule runs': 'Run history inspection is operator-only product scope; operators use the CLI or dashboard.',
   'schedule tick': 'A manual tick fires sessions outside their cron; stays an explicit operator action in the CLI.',
+  'worktree repair-locks': 'Host-local repair of git worktree locks left by terminal Hub sessions (intake f49b4d69); runs on the owning host against its own checkouts, dry-run by default - never an agent tool.',
+  'prompts create': 'Operator-owned prompt library content that later launches sessions (intake 19ec91c2); deliberate CLI/UI step, not a model tool.',
+  'prompts delete': 'Operator-only destructive prompt library administration stays in the explicit CLI workflow.',
+  'prompts list': 'Prompt library inventory is operator-only product scope; operators use the CLI or /prompts.html.',
+  'prompts show': 'Prompt library detail is operator-only product scope; operators use the CLI or /prompts.html.',
+  'prompts render': 'Rendering previews operator-owned prompt templates; operator-only product scope, use the CLI or /prompts.html.',
+  'prompts update': 'Operator-owned prompt library edits stay an explicit CLI/UI step, not a model tool.',
+  'schedules create': 'Operator-owned session schedules launch work on a timer (intake 19ec91c2); deliberate CLI/UI step, not a model tool.',
+  'schedules delete': 'Operator-only destructive session schedule administration stays in the explicit CLI workflow.',
+  'schedules deliveries': 'Schedule delivery inspection is operator-only product scope; operators use the CLI or dashboard.',
+  'schedules fire': 'A manual fire enqueues a session outside its schedule; stays an explicit operator action in the CLI.',
+  'schedules list': 'Session schedule inventory is operator-only product scope; operators use the CLI or dashboard.',
+  'schedules pause': 'Operator schedule lifecycle control stays an explicit operator action in the CLI.',
+  'schedules resume': 'Operator schedule lifecycle control stays an explicit operator action in the CLI.',
+  'schedules show': 'Session schedule detail is operator-only product scope; operators use the CLI or dashboard.',
   'ops heartbeat': 'Host ops-watchdog and orchestrator tick reports for Hub-side liveness (intake 500fd60b); a model tool must not fake liveness for the session it runs in.',
   'ops status': 'Operator view of orchestrator/watchdog liveness and backlog idle episodes; alerts reach operators through the existing alert path.',
 };

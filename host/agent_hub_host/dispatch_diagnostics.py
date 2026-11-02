@@ -1,6 +1,7 @@
 """Fixed pre-start reasons plus bounded, redacted typed command evidence."""
 MESSAGES = {
-    'host_overload': 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
+    'host_overload': 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
+    'host_load_high': 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
     'dispatch_worktree_refused': 'The worktree could not be protected before native start.',
     'cpu_headroom': 'Host CPU usage plus expected session demand exceeds the CPU target.',
     'cpu_pressure': 'Host CPU pressure exceeds the safety cap.',
@@ -9,6 +10,9 @@ MESSAGES = {
     'host_runtime_choking': 'Recent session or service failures require a placement cooldown.',
     'cpu_usage_unknown': 'Fresh real CPU usage is unavailable.',
     'workspace_unavailable': 'The requested workspace is not available on this host.',
+    'repo_clone_auth_failed': 'The host could not authenticate to GitHub while cloning the requested repository.',
+    'repo_not_found': 'The repository origin was not found during host cloning.',
+    'repo_clone_failed': 'The host could not clone the requested repository.',
     'dispatch_route_unconfigured': 'The offered account, engine and profile do not match a local route.',
     'goal_startup_unconfigured': 'This account has no trusted interactive goal startup command.',
     'dispatch_startup_invalid': 'The configured trusted startup command is invalid.',
@@ -51,7 +55,23 @@ EXACT = {
     'Fresh admission refused': 'admission_refused',
     'Fresh admission timestamp required': 'admission_refused',
     'Selected model/effort requires verified admission': 'admission_refused',
+    # Intake ad8aa931: fixed pre-start refusals that read as a bare
+    # dispatch_internal_error on DESKTOP-FP4OP26 (35cf62ff, 8151fb8f).
+    'Selected model/effort is not configured locally': 'model_unsupported',
+    'Maintained launcher route is not configured': 'dispatch_route_unconfigured',
+    'Invalid provider profile': 'dispatch_route_unconfigured',
+    'Headless provider profile is not qualified': 'dispatch_route_unconfigured',
+    'Unsupported launch mode': 'dispatch_offer_invalid',
+    'workspace path exists and is not a git checkout': 'workspace_unavailable',
 }
+# Refusals whose text carries a variable tail (provider name, git stderr);
+# only the fixed slug leaves the host, never the tail.
+PREFIXES = (
+    ('Launcher provider ', 'dispatch_route_unconfigured'),
+    ('repo clone failed: ', 'workspace_unavailable'),
+    ('git fetch failed: ', 'workspace_unavailable'),
+    ('git checkout failed: ', 'workspace_unavailable'),
+)
 
 # Fixed admission-gate causes carried as gate_reason on admission_refused, so
 # a refused host is diagnosable remotely; any other gate text maps to
@@ -91,7 +111,9 @@ def classify(exc, *, workspace_available=True):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'host_overload', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            if reason == 'dispatch_internal_error':
+                reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
         if value.startswith('HTTP request failed with status '):
             reason = 'dispatch_claim_refused'
     elif isinstance(exc, (RuntimeError, OSError)):
@@ -113,7 +135,7 @@ def classify(exc, *, workspace_available=True):
 
 # Fixed protocol enums only: token-shaped arbitrary strings can still be secrets.
 HTTP_SLUGS = frozenset({
-    'fresh_admission_required', 'account_capacity', 'account_concurrency',
+    'fresh_admission_required', 'account_capacity', 'account_concurrency', 'host_load_high',
     'machine_capacity', 'account_unavailable', 'provider_disabled',
     'quota_unavailable', 'no_quota_evidence', 'quota_unknown', 'quota_stale',
     'quota_exhausted', 'reserve_required', 'limit_reached', 'stale_window_evidence',

@@ -27,17 +27,17 @@ const host={caller:{machineId:'host',kind:'host',actor:'machine:host'},scopes:['
 const ledger=(extra={})=>({active_mem_mb:0,active_disk_mb:19456,disk_floor_mb:20480,next_disk_mb:512,disk_aliases:{demo:"/srv/demo"},disk_task_ids:[],observed_at:iso(),...extra});
 describe('headless disk admission and failure evidence',()=>{
  it('holds all eight burst requests at placement with real disk reason',()=>fixture(async(f,sql,beat)=>{
-  beat(0,{disk_free_gb:35,launcher_resources:ledger()});
+  beat(0,{disk_free_gb:30,launcher_resources:ledger()});
   const burst=await Promise.all(Array.from({length:8},async()=>f.reserve(req(),admin)));
-  for(const r of burst){expect(r.status).toBe(202);expect(r.value.state).toBe('queued');expect(r.value.rejected).toContainEqual(expect.objectContaining({reason:'launcher_disk_reserve',disk:expect.objectContaining({reserved_disk_mb:19456,required_disk_gb:39.5})}));}
+  for(const r of burst){expect(r.status).toBe(202);expect(r.value.state).toBe('queued');expect(r.value.rejected).toContainEqual(expect.objectContaining({reason:'launcher_disk_reserve',disk:expect.objectContaining({reserved_disk_mb:19456,required_disk_gb:34.5})}));}
   expect(sql.exec("SELECT COUNT(*) n FROM fleet_launches WHERE state='failed'").one().n).toBe(0);
  }));
  it('admits eight when disk fits and accounts for offers between heartbeats',()=>fixture(async(f,sql,beat)=>{
-  beat(0,{disk_free_gb:24,launcher_resources:ledger({active_disk_mb:0})});
+  beat(0,{disk_free_gb:19,launcher_resources:ledger({active_disk_mb:0})});
   const burst=await Promise.all(Array.from({length:8},async()=>f.reserve(req(),admin)));
   expect(burst.map(r=>r.status)).toEqual(Array(8).fill(201));
   const ninth=f.reserve(req(),admin);expect(ninth.status).toBe(202);
-  expect(ninth.value.rejected[0]).toMatchObject({reason:'launcher_disk_reserve',disk:{pending_disk_mb:4096,required_disk_gb:24.5}});
+  expect(ninth.value.rejected[0]).toMatchObject({reason:'launcher_disk_reserve',disk:{pending_disk_mb:4096,required_disk_gb:19.5}});
  }));
  it('does not charge launcher-covered offers twice and uses workspace filesystem',()=>fixture(async(f,sql,beat)=>{
   const first=f.reserve(req(),admin);expect(first.status).toBe(201);
@@ -47,6 +47,13 @@ describe('headless disk admission and failure evidence',()=>{
   beat(0,{disk_free_gb:35,launcher_resources:ledger({disk_paths:[{path:'/data/owned',free_gb:190}]})});
   expect(f.plan(req({workspace:'/data/owned/review'})).selected).toBeTruthy();
   expect(f.plan(req({workspace:'/data/owned-other/review'})).selected).toBeNull();
+ }));
+ it('a5464408: absolute floor and capped active reservations admit at 52 GiB free',()=>fixture(async(f,sql,beat)=>{
+  sql.exec('UPDATE machines SET capabilities=? WHERE id=?',JSON.stringify({engines:['codex'],fleet_modes:['interactive','headless'],workspaces:['/srv/demo'],cpu_count:8}),'host');
+  beat(0,{disk_free_gb:52.6,launcher_resources:ledger({active_disk_mb:26112,disk_floor_mb:15360,active_disk_cap_mb:8192,disk_paths:[{path:'/srv/demo',free_gb:52.6}]})});
+  const plan=f.plan(req({workspace:'/srv/demo'}));expect(plan.selected).toBeTruthy();
+  beat(0,{disk_free_gb:14,launcher_resources:ledger({active_disk_mb:0,disk_floor_mb:15360,active_disk_cap_mb:8192,disk_paths:[{path:'/srv/demo',free_gb:14}]})});
+  expect(f.plan(req({workspace:'/srv/demo'})).selected).toBeNull();
  }));
  it('keeps absent and stale projection advisory, preserving the real disk floor',()=>fixture(async(f,sql,beat)=>{
   beat(0,{disk_free_gb:35});expect(f.plan(req()).selected).toBeTruthy();
@@ -101,7 +108,7 @@ describe('headless disk admission and failure evidence',()=>{
    beat(0,extra);expect(f.drainCapacityQueue().promoted).toBe(0);expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?',q.id).one().state).toBe('queued');
   }
   advance(2);
-  beat(0,{launcher_resources:ledger({active_disk_mb:0,observed_at:iso(1),disk_paths:[{path:'/srv/demo',free_gb:80},{path:'/srv/demo/.local/tmp',free_gb:19}]})});
+  beat(0,{launcher_resources:ledger({active_disk_mb:0,observed_at:iso(1),disk_paths:[{path:'/srv/demo',free_gb:80},{path:'/srv/demo/.local/tmp',free_gb:14}]})});
   expect(f.drainCapacityQueue().promoted).toBe(0);
   beat(0,{launcher_resources:ledger({active_disk_mb:0,observed_at:iso(1),disk_paths:[{path:'/srv/demo',free_gb:80},{path:'/srv/demo/.local/tmp',free_gb:80}]})});expect(f.drainCapacityQueue().promoted).toBe(1);
  }));

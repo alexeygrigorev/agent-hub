@@ -46,14 +46,31 @@ export function observationIntakeRevision(sql: SqlStorage, machine: string): str
     (id INTEGER PRIMARY KEY CHECK(id=1), cursor TEXT NOT NULL, complete INTEGER NOT NULL, revision INTEGER NOT NULL)`);
   sql.exec("INSERT OR IGNORE INTO session_observation_intake_meta VALUES(1,'',0,0)");
   sql.exec('CREATE TABLE IF NOT EXISTS session_observation_intakes(task_id TEXT PRIMARY KEY, events TEXT NOT NULL)');
+  sql.exec(`CREATE TABLE IF NOT EXISTS session_observation_intake_schema
+    (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)`);
+  sql.exec('INSERT OR IGNORE INTO session_observation_intake_schema VALUES(1,0)');
   const events = (data: string) => `(SELECT json_group_array(json_object(
     'hub_session_id',json_extract(e.value,'$.hub_session_id'),
     'native_id',json_extract(e.value,'$.native_id'),'host',json_extract(e.value,'$.host'),
-    'kind',json_extract(e.value,'$.kind'),'text',CASE WHEN json_extract(e.value,'$.kind')='note'
+    'kind',json_extract(e.value,'$.kind'),'intake_key',json_extract(e.value,'$.intake_key'),
+    'text',CASE WHEN json_extract(e.value,'$.kind')='note'
       THEN json_extract(e.value,'$.text') ELSE NULL END))
     FROM json_each(${data},'$.history') e WHERE json_extract(e.value,'$.hub_session_id') IS NOT NULL
       OR json_extract(e.value,'$.native_id') IS NOT NULL
-      OR (json_extract(e.value,'$.kind')='note' AND upper(ltrim(json_extract(e.value,'$.text'))) LIKE 'START%'))`;
+      OR (json_extract(e.value,'$.kind')='note' AND (
+        upper(ltrim(json_extract(e.value,'$.text'))) LIKE 'START%'
+        OR json_extract(e.value,'$.intake_key') GLOB 'note-aplexer-*')))`;
+  const schema: any = sql.exec('SELECT version FROM session_observation_intake_schema WHERE id=1').toArray()[0];
+  const rebuildAplexerNotes = Number(schema?.version ?? 0) < 2;
+  if (rebuildAplexerNotes) {
+    // Existing deployments have triggers and a compact projection built before
+    // note-aplexer events were accepted. Rebuild the projection in bounded
+    // pages below, and replace the trigger definitions before recording v2.
+    sql.exec('DROP TRIGGER IF EXISTS session_observation_intake_insert');
+    sql.exec('DROP TRIGGER IF EXISTS session_observation_intake_update');
+    sql.exec('DROP TRIGGER IF EXISTS session_observation_intake_delete');
+    sql.exec("UPDATE session_observation_intake_meta SET cursor='',complete=0,revision=revision+1 WHERE id=1");
+  }
   for (const op of ['INSERT','UPDATE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS session_observation_intake_${op.toLowerCase()}
     AFTER ${op} ON intake_tasks BEGIN
       INSERT INTO session_observation_intakes(task_id,events) VALUES(NEW.id,${events('NEW.data')})
@@ -63,6 +80,7 @@ export function observationIntakeRevision(sql: SqlStorage, machine: string): str
   sql.exec(`CREATE TRIGGER IF NOT EXISTS session_observation_intake_delete AFTER DELETE ON intake_tasks BEGIN
     DELETE FROM session_observation_intakes WHERE task_id=OLD.id;
     UPDATE session_observation_intake_meta SET revision=revision+1 WHERE id=1; END`);
+  if (rebuildAplexerNotes) sql.exec('UPDATE session_observation_intake_schema SET version=2 WHERE id=1');
   let meta: any = sql.exec('SELECT * FROM session_observation_intake_meta WHERE id=1').toArray()[0];
   if (!meta.complete) {
     const batch = sql.exec(`SELECT id,${events('data')} AS events FROM intake_tasks WHERE id>? ORDER BY id LIMIT 100`, meta.cursor).toArray();
@@ -99,7 +117,12 @@ export function observedIntakeCandidates(sql: SqlStorage, machine: string, rows:
         if (ids.has(event.hub_session_id) || (ids.has(event.native_id) && (!event.host || event.host === machine))) {
           matches.add(String(task.task_id)); break;
         }
-        if (event.kind !== 'note' || typeof event.text !== 'string' || !/^START(?:ED)?\b/i.test(event.text.trim())) continue;
+        if (event.kind !== 'note' || typeof event.text !== 'string') continue;
+        const nativeKey = typeof event.intake_key === 'string'
+          ? /^note-aplexer-([a-f0-9-]{8,36})$/i.exec(event.intake_key)?.[1] : undefined;
+        const keyedAplexerStart = !!nativeKey && [...ids].some(id =>
+          String(id).toLowerCase().startsWith(nativeKey.toLowerCase()));
+        if (!/^START(?:ED)?\b/i.test(event.text.trim()) && !keyedAplexerStart) continue;
         const tokens: string[] = event.text.split(/[^A-Za-z0-9_.:/~-]+/);
         if (tokens.some(token => ids.has(token) || token === binding.tag || token.endsWith(':' + binding.tag))) {
           matches.add(String(task.task_id)); break;

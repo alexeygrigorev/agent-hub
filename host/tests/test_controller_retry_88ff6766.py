@@ -307,7 +307,7 @@ class ReviewFindingTests(unittest.TestCase):
             release = base / 'releases' / ('0' * 16 + '-' + '1' * 12)
             release.mkdir(parents=True)
             seen = []
-            def handover(directory):
+            def handover(directory, **_kw):
                 seen.append((directory / c.REPLACE_MARKER).exists())
                 raise RuntimeError('unconfirmed')
             with patch.object(b.sys, 'platform', 'win32'), \

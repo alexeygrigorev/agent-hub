@@ -163,3 +163,35 @@ restarts everything on the new code without a crash alert.
 The first run of a host that predates this feature needs one manual
 bootstrap on the machine: `scripts/windows-host-update.ps1` (see
 [DEPLOY.md](DEPLOY.md#windows-tabo-session-host-arm64-under-x64-emulation)).
+
+## Windows package installs (immutable release trees): supported update path
+
+Hosts installed via `irm https://hub.dtcdev.click/host/install.ps1 | iex`
+(see [HOST-INSTALL.md](HOST-INSTALL.md)) run from an immutable release tree
+(`%LOCALAPPDATA%\Programs\agent-hub\releases\<16hex>-<12hex>`), not a git
+checkout (intake c8908c3e; LAPTOP-PHA6TCNC). For these hosts:
+
+- `hub host-release --machine <id> --sha <sha>` does NOT apply. The poll in
+  `host/agent_hub_host/self_update.py:step_once` finds no checkout
+  (`repo_root() is None`), reads the running SHA from `release-manifest.json`,
+  and delegates to `host/agent_hub_host/immutable_release.py:apply`, which
+  reports `host_release.state=unsupported`,
+  `error=immutable_platform_unsupported` on any non-Linux platform (and
+  `not_a_git_checkout` on the checkout path). `desired_sha` is ignored;
+  `current_sha` stays on the running release.
+- Supported path is automatic via the served `hub.pyz` archive
+  (`host/agent_hub_host/package_update.py`, intake bf0863c4), checked from the
+  same host-release loop: when the served `hub.pyz.sha256` differs from the
+  running release's `runtime-ready.json` `archive_sha256`, the host registers a
+  one-shot per-user scheduled task (`AgentHubUpdate-<SID>`) that reruns the
+  public installer (no admin, no UAC). The installer verifies the archive
+  checksum, builds a new release beside the old one, and hands the controller
+  over, exactly as a manual rerun does. One attempt per served archive per
+  6 h (`RETRY_S`), at least 12 h between updates (`MIN_INTERVAL_S`), 50 GiB
+  free required (`DISK_FLOOR_GB`); a bounded operator hold
+  (`package-update-hold.json`, at most 72 h) skips the installer via preflight
+  exit 75. Manual path: rerun the same install command on the machine.
+- Verify via `hub routing-machines` (`host_release.current_sha`,
+  `state=current`, `desired_sha=null`) and the `package_update` event
+  (`current`/`scheduled`/`held`/`disk_low`/`served_unknown`); a Hub pin staying
+  `null` with `state=current` is the healthy steady state for these hosts.

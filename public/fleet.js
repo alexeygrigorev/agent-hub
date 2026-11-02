@@ -25,6 +25,13 @@ async function api(path, method = 'GET', data) {
   if (!r.ok) throw Error(`Hub request failed (${r.status}); request may need reconciliation.`);
   return r.json();
 }
+// Projected unused quota at the next weekly/monthly reset (intake ebfe9d85 AC3).
+function burnCell(f) {
+  if (!f) return 'no forecast';
+  const unused = `~${Math.round(f.projected_unused_percent)}% unused at ${f.window} reset in ${Math.round(f.hours_to_reset)}h`;
+  if (f.burn_rate_percent_per_hour === null) return `${unused} (burn rate unknown)`;
+  return f.waste_alert ? `${unused} — will waste` : unused;
+}
 function slotCell(a) {
   // Counted vs live: active splits into launch reservations + orphan observed
   // sessions; live is the host-catalog verified native process count;
@@ -63,7 +70,7 @@ function render(data) {
     if (!subscriptions.length) { const p = document.createElement('p'); p.textContent = 'No subscription report. Configure this machine and enable its metadata collector.'; section.append(p); }
     root.append(section);
   }
-  root.append(table(['Shared account', 'Service', 'Status', 'Remaining', 'Active / limit', 'Machines'], data.accounts.map(a => [a.label, a.provider, a.status + (a.placement_reasons && a.placement_reasons.length ? ` (${a.placement_reasons.join(', ')})` : ''), a.remaining_percent === null ? 'unknown' : `${a.remaining_percent}%`, slotCell(a), a.machines.join(', ')])));
+  root.append(table(['Shared account', 'Service', 'Status', 'Remaining', 'Burn forecast', 'Active / limit', 'Machines'], data.accounts.map(a => [a.label, a.provider, a.status + (a.placement_reasons && a.placement_reasons.length ? ` (${a.placement_reasons.join(', ')})` : ''), a.remaining_percent === null ? 'unknown' : `${a.remaining_percent}%`, burnCell(a.burn_forecast), slotCell(a), a.machines.join(', ')])));
   const map = new Map(data.launches.map(a => [a.id, a]));
   const depth = launch => { const seen = new Set(); let p = launch, n = 0; while (p.parent_id && map.has(p.parent_id) && !seen.has(p.parent_id) && n < 20) { seen.add(p.parent_id); p = map.get(p.parent_id); n++; } return n; };
   byId('hub-agents').replaceChildren(table(['Agent / parent', 'Kind', 'Machine', 'Mode', 'Requested by / when', 'Task', 'State / native reference'], data.launches.map(a => [`${'↳ '.repeat(depth(a))}${a.id}${a.parent_id ? `; parent ${a.parent_id}` : '; root request'}`, `${a.engine} / ${a.profile || 'default'} / ${a.account}`, a.machine_id, a.mode, `${a.actor} (${a.requester_kind}) / ${a.created_at}`, a.summary, `${a.state} / ${a.native_id || 'none yet'}`])));

@@ -71,7 +71,7 @@ def config_path():
         return path
     match = LAUNCH.fullmatch(os.environ.get('APLEXER_TAG', ''))
     if not match:
-        return None
+        return native_session_path()
     workspace = os.environ.get('APLEXER_WORKSPACE')
     if workspace:
         root = Path(workspace)
@@ -83,6 +83,23 @@ def config_path():
         if (root / '.git').exists():
             return root / '.local' / 'hub-worker-auth' / (match[1] + '.json')
     return None
+
+
+NATIVE_ID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z')
+
+
+def native_session_path():
+    """Intake-scoped profile of an observed native session (no Hub launch), e.g.
+    an aplexer drain brief. The host writes it once an operator-verified intake
+    link exists (session_messages.provision_intake_credentials); selected by the
+    aplexer session identity, never by env secrets. Returns None when absent so
+    unlinked sessions keep the normal profile resolution."""
+    native = os.environ.get('APLEXER_SESSION_ID', '').strip().lower()
+    workspace = os.environ.get('APLEXER_WORKSPACE')
+    if not NATIVE_ID.fullmatch(native) or not workspace or not Path(workspace).is_absolute():
+        return None
+    path = Path(workspace) / '.local' / 'hub-worker-auth' / (native + '.json')
+    return path if path.is_file() else None
 
 
 def provision(workspace, launch_id, request):

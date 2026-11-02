@@ -12,6 +12,16 @@ import uuid
 from contextlib import ExitStack
 
 
+def _bypass_proxy_for_hub():
+    """Dead engine proxy env must not silence the supervisor or its children (2026-11-02)."""
+    for name in ('NO_PROXY', 'no_proxy'):
+        have = [h.strip() for h in os.environ.get(name, '').split(',') if h.strip()]
+        os.environ[name] = ','.join(have + [h for h in ('hub.dtcdev.click', '.dtcdev.click') if h not in have])
+
+
+_bypass_proxy_for_hub()
+
+
 def ensure_runtime_bin_on_path():
     """The logon task may lack the installer PATH; find <root>/bin next to venv/Scripts."""
     if sys.platform != 'win32':
@@ -29,7 +39,12 @@ def native(*argv):
     command.insert(command.index('--') if '--' in command else len(command), '--json')
     result = subprocess.run(command, capture_output=True, text=True, timeout=35)
     if result.returncode:
-        raise RuntimeError('Native controller operation failed')
+        error = RuntimeError('Native controller operation failed')
+        # The reason (e.g. "a: no matching session") used to be discarded, which hid
+        # why 238 controller restarts failed (2026-11-02); failure_reason logs it.
+        error.exit_code = result.returncode
+        error.stderr = (result.stderr or '').strip()[-300:]
+        raise error
     if len(result.stdout) > 131072:
         raise RuntimeError('Native response exceeded capacity')
     return json.loads(result.stdout)
@@ -185,7 +200,11 @@ def log_event(event, **fields):
 def failure_reason(error):
     """Bounded, credential-free reason for controller.log (type + short message)."""
     text = redact(str(error))[:240]
-    return {'type': type(error).__name__, 'detail': text}
+    reason = {'type': type(error).__name__, 'detail': text}
+    if getattr(error, 'exit_code', None) is not None:
+        reason['exit_code'] = error.exit_code
+        reason['stderr'] = redact(str(getattr(error, 'stderr', '')))[:200]
+    return reason
 
 
 _SECRETISH = None
@@ -267,6 +286,74 @@ def confirm_owned_exit(receipt, *, polls=5, interval=2.0, sleep=None):
     raise RuntimeError('Owned controller exit is unproven')
 
 
+# A wedged controller (its aplexer worker stops answering RPCs, journal files
+# freeze) used to make `aplexer status` time out forever: the supervisor then
+# respawned a controller every ~20 s, each hung on the held journal lock (Tabo,
+# 2026-11-02: 22 respawns). After this many consecutive status failures the
+# supervisor kills the exact controller PIDs it last saw, forgets the record and
+# retries, and it never starts a second controller while the journal lock is held.
+STATUS_FAILURES_BEFORE_KILL = 3
+
+
+def journal_lock_held(journal):
+    """True when another process holds the controller's exclusive journal lock."""
+    lock_path = pathlib.Path(journal) / 'host.lock'
+    if not lock_path.exists():
+        return False
+    try:
+        with lock_path.open('a') as lock:
+            if os.name == 'nt':
+                import msvcrt
+                if os.fstat(lock.fileno()).st_size == 0:
+                    return False
+                os.lseek(lock.fileno(), 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    return True
+                os.lseek(lock.fileno(), 0, os.SEEK_SET)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                return False
+            import fcntl
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+
+
+def kill_pid(pid):
+    """Force-kill one PID and its tree; the PIDs come only from our own receipt's status rows."""
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], capture_output=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+        return True
+    except Exception:
+        return False
+
+
+def recover_wedged_controller(receipt, pids, *, kill=None, forget=None):
+    """Kill the wedged controller by PID and drop its aplexer record (aplexer forget --force)."""
+    kill = kill or kill_pid
+    forget = forget or (lambda rid: native('forget', rid, '--force'))
+    killed = [pid for pid in pids if kill(pid)]
+    try:
+        forget(receipt['id'])
+        forgotten = True
+    except Exception:
+        forgotten = False
+    log_event('controller_wedge_recovered', id=receipt['id'], killed_pids=killed, forgotten=forgotten)
+    return killed, forgotten
+
+
 def start_child(workspace, command, tag, env_args):
     receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
                      '--tag', tag, '--engine', 'shell',
@@ -301,6 +388,9 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
             if replace_pending(args.control_dir):
                 log_event('controller_replace_exit')
                 raise SystemExit(HANDOVER_EXIT)
+        if journal_lock_held(journal):
+            log_event('controller_spawn_blocked', reason='journal lock held by another controller')
+            raise RuntimeError('Journal lock held by another controller; not starting a second one')
         try:
             receipt = start_child(workspace, command, tag, env_args)
         except BaseException:
@@ -311,6 +401,9 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
             raise
         handing_over = False
         child_died = False
+        wedge_recovered = False
+        status_failures = 0
+        last_pids = []
         try:
             if lease:
                 lease.publish(receipt)
@@ -319,9 +412,21 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
                 if lease and lease.stop_requested():
                     handing_over = True
                     break
-                row = native('status', receipt['id'])
+                try:
+                    row = native('status', receipt['id'])
+                except (RuntimeError, OSError, subprocess.TimeoutExpired):
+                    status_failures += 1
+                    if status_failures < STATUS_FAILURES_BEFORE_KILL:
+                        continue
+                    _killed, forgotten = recover_wedged_controller(receipt, last_pids)
+                    # Exit is proven only when the record was actually forgotten; otherwise the normal
+                    # cleanup path decides (and marks the lease unproven so the loop retries).
+                    wedge_recovered = forgotten
+                    raise RuntimeError('Controller wedged: status failed %d times; killed and forgotten' % status_failures)
+                status_failures = 0
                 if not same_controller(row, receipt):
                     raise RuntimeError('Controller identity changed')
+                last_pids = [p for p in (row.get('worker_pid'), row.get('workload_pid')) if isinstance(p, int)]
                 if row.get('phase') != 'running' or row.get('worker_alive') is False:
                     child_died = True
                     marker = journal / 'host-release-restart'
@@ -347,7 +452,12 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
             # Only our exact receipt qualifies for stop. Missing records are not
             # exit proof, and never cause another tag or PID to be selected.
             try:
-                if lease:
+                if wedge_recovered:
+                    # Exit was forced by PID and the record forgotten, so a status
+                    # query has nothing left to prove; do not mark the lease unproven.
+                    if lease:
+                        lease.confirm_exit()
+                elif lease:
                     confirm_owned_exit(receipt)
                     lease.confirm_exit()
                 else:

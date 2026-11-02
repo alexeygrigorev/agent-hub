@@ -107,6 +107,9 @@ def stabilize_host_load():
     from types import SimpleNamespace
     from . import host_load
     host_load.os = SimpleNamespace(getloadavg=lambda: (0.0, 0.0, 0.0), cpu_count=lambda: 12)
+    # CPU and memory readers too: an idle, roomy host, never the shared machine.
+    host_load.measure_cpu_busy = lambda: (0.0, 10.0)
+    host_load._default_mem = lambda: (30 * 1024 ** 3, 64 * 1024 ** 3)
 
 
 def auto_isolate():

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 import urllib.error
 import zipfile
@@ -90,12 +91,24 @@ def missing_engines(install_root):
     for package in ENGINES.values():
         name, version = package.rsplit('@', 1)
         try:
-            data = json.loads((install_root / 'engines/node_modules' / name / 'package.json').read_text())
+            data = json.loads((install_root / 'engines/node_modules' / name / 'package.json').read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = None
         if not isinstance(data, dict) or data.get('version') != version:
             missing.append(package)
     return missing
+
+
+def engine_env(install_root, node):
+    """npm environment pinned to this release's own node, free of stale release PATH entries."""
+    from .installer_hygiene import prune_stale_release_paths
+    prefix = install_root / 'engines'
+    env = dict(os.environ, npm_config_prefix=str(prefix), npm_config_cache=str(install_root / 'cache/npm'),
+               NODE=str(node), npm_node_execpath=str(node))
+    engine_bin = prefix if sys.platform == 'win32' else prefix / 'bin'
+    rest = prune_stale_release_paths(env.get('PATH', '').split(os.pathsep), install_root.name)
+    env['PATH'] = os.pathsep.join([str(node.parent), str(engine_bin), *rest])
+    return env
 
 
 def ensure_engines(install_root):
@@ -106,9 +119,7 @@ def ensure_engines(install_root):
     (install_root / 'tmp').mkdir(parents=True, exist_ok=True, mode=0o700)
     node, npm = ensure_node(install_root)
     prefix = install_root / 'engines'
-    env = dict(os.environ, npm_config_prefix=str(prefix), npm_config_cache=str(install_root / 'cache/npm'))
-    engine_bin = prefix if sys.platform == 'win32' else prefix / 'bin'
-    env['PATH'] = os.pathsep.join([str(node.parent), str(engine_bin), env.get('PATH', '')])
+    env = engine_env(install_root, node)
     run([node, npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', '--', *missing], env=env)
     return missing
 
@@ -235,12 +246,20 @@ def run(argv, *, env=None, capture=False, timeout=900):
     return result.stdout.strip() if capture else None
 
 
+DOWNLOAD_SLEEP = time.sleep
+
+
 def download(url, target):
     if not url.startswith('https://'):
         raise ValueError('Runtime downloads require HTTPS')
+    from .installer_hygiene import retry_transient
     req = urllib.request.Request(url, headers={'User-Agent': 'agent-hub-installer/1'})
-    with urllib.request.urlopen(req, timeout=120) as source, Path(target).open('wb') as out:
-        shutil.copyfileobj(source, out)
+
+    def fetch():
+        with urllib.request.urlopen(req, timeout=120) as source, Path(target).open('wb') as out:
+            shutil.copyfileobj(source, out)
+    # DNS hiccups (www.7-zip.org) killed whole installs: back off 1, 2, 4 s before giving up.
+    retry_transient(fetch, attempts=4, base_delay=1.0, sleep=DOWNLOAD_SLEEP)
 
 
 def verify(path, sums, name):
@@ -363,15 +382,39 @@ def ensure_aplexer(install_root):
 
 def install_engines(install_root, node, npm):
     prefix = install_root / 'engines'
-    env = dict(os.environ, npm_config_prefix=str(prefix),
-               npm_config_cache=str(install_root / 'cache/npm'))
-    engine_bin = prefix if sys.platform == 'win32' else prefix / 'bin'
-    env['PATH'] = os.pathsep.join([str(node.parent), str(engine_bin), env.get('PATH', '')])
+    env = engine_env(install_root, node)
     # npm lifecycle scripts are required by native engine packaging; execute
     # only the explicit engine package allowlist, never a remotely supplied package.
     run([node, npm, 'install', '--global', '--prefix', prefix, '--no-audit', '--no-fund',
          '--', *ENGINES.values()], env=env)
     return env
+
+
+def reuse_git_runtime(install_root, target):
+    """Copy an existing verified PortableGit (install root or a previous release) instead of downloading it."""
+    name = Path(target).name
+    base = Path(install_root).parent.parent if Path(install_root).parent.name == 'releases' else Path(install_root)
+    candidates = [base / 'runtimes' / name]
+    releases = base / 'releases'
+    if releases.is_dir():
+        found = [r / 'runtimes' / name for r in releases.iterdir() if r != Path(install_root)]
+        candidates += sorted(found, key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    for source in candidates:
+        try:
+            if source.is_symlink() or not (source / 'cmd/git.exe').is_file() or not (source / 'usr/bin/bash.exe').is_file():
+                continue
+            if GIT_VERSION.rsplit('.', 1)[0] not in run([source / 'cmd/git.exe', '--version'], capture=True, timeout=30):
+                continue
+            staging = Path(install_root) / 'tmp' / ('git-reuse-' + uuid.uuid4().hex[:8])
+            shutil.copytree(source, staging, symlinks=False)
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(staging, target, dirs_exist_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+            print('Reusing existing Portable Git from ' + str(source), flush=True)
+            return source
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            continue
+    return None
 
 
 def ensure_windows_git(install_root):
@@ -380,6 +423,8 @@ def ensure_windows_git(install_root):
         return None
     target = install_root / 'runtimes' / ('git-' + GIT_VERSION + '-' + architecture())
     git, bash = target / 'cmd/git.exe', target / 'usr/bin/bash.exe'
+    if not git.is_file() or not bash.is_file():
+        reuse_git_runtime(install_root, target)
     if not git.is_file() or not bash.is_file():
         cpu = '64-bit' if architecture() == 'x64' else 'arm64'
         name = 'PortableGit-' + GIT_VERSION + '-' + cpu + '.7z.exe'
@@ -666,7 +711,10 @@ def publish_user_path(install_root):
         quote = lambda s: "'" + str(s).replace("'", "''") + "'"
         ps = ('$old=[Environment]::GetEnvironmentVariable("Path","User");'
               '$add=@(' + ','.join(quote(p) for p in directories) + ');'
-              '$parts=@($add)+@($old -split ";" | Where-Object { $_ -and $_ -notin $add });'
+              '$cur=' + quote(install_root.name) + ';'
+              '$parts=@($add)+@($old -split ";" | Where-Object { $_ -and $_ -notin $add -and '
+              '-not ($_ -match "(?i)[/\\x5c]Programs[/\\x5c]aplexer([/\\x5c]|$)") -and '
+              '-not ($_ -match "(?i)[/\\x5c]agent-hub[/\\x5c]releases[/\\x5c]([^/\\x5c]+)" -and $Matches[1] -ne $cur) });'
               '[Environment]::SetEnvironmentVariable("Path",($parts -join ";"),"User");'
               '[Environment]::SetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH",' +
               quote(git_root / 'usr/bin/bash.exe') + ',"User")')
@@ -685,11 +733,13 @@ def publish_user_path(install_root):
             # Preserve shell profiles and refuse linked files outside HOME.
             if profile.is_symlink():
                 continue
-            old = profile.read_text() if profile.exists() else ''
+            old = profile.read_text(encoding="utf-8") if profile.exists() else ''
             if include not in old:
                 mode = stat.S_IMODE(profile.stat().st_mode) if profile.exists() else None
                 write_private(profile, old + include, mode=mode)
-    os.environ['PATH'] = os.pathsep.join([*(str(p) for p in directories), os.environ.get('PATH', '')])
+    from .installer_hygiene import prune_stale_release_paths
+    rest = prune_stale_release_paths(os.environ.get('PATH', '').split(os.pathsep), install_root.name)
+    os.environ['PATH'] = os.pathsep.join([*(str(p) for p in directories), *rest])
 
 
 def configure_default_engine():
@@ -701,14 +751,27 @@ def configure_default_engine():
     settings = Path.home() / '.claude/settings.json'
     if any(p.is_symlink() for p in (native, native.parent, settings, settings.parent)):
         raise ValueError('Refusing linked engine configuration')
-    content = native.read_text() if native.exists() else 'version = 1\n'
+    content = native.read_text(encoding="utf-8") if native.exists() else 'version = 1\n'
     if 'default_engine' not in tomllib.loads(content):
         write_private(native, set_toml_top_level_keys(content, {'default_engine': 'claude'}))
-    data = json.loads(settings.read_text()) if settings.exists() else {}
+    data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
     if not isinstance(data, dict):
         raise ValueError('Invalid Claude settings; existing file preserved')
     data.setdefault('model', 'opus')
-    write_private(settings, json.dumps(data, indent=2) + '\n')
+    write_claude_settings(settings, json.dumps(data, indent=2) + '\n')
+
+
+def write_claude_settings(settings, text, *, sleep=None):
+    """A running Claude can lock settings.json (access denied): back off and retry, never abort the install."""
+    from .installer_hygiene import retry_transient
+    kwargs = {'sleep': sleep} if sleep else {}
+    try:
+        retry_transient(lambda: write_private(settings, text), **kwargs)
+    except OSError as error:
+        print('Claude default model not written (' + type(error).__name__ + '); the file is locked, continuing. '
+              'Rerun the installer to apply it.', flush=True)
+        return False
+    return True
 
 
 def install_service(install_root, command):
@@ -734,7 +797,7 @@ def install_service(install_root, command):
         # makes it and the runner loop exit 76 so the task stops (88ff6766).
         request_replace(control)
         try:
-            handover(control)
+            handover(control, journal=state_root(install_root) / 'journal')
         except BaseException:
             clear_replace(control)
             raise
@@ -774,8 +837,10 @@ def install_service(install_root, command):
               ' while($old -and $old.State -eq "Running" -and (Get-Date) -lt $until) {'
               ' Start-Sleep -Milliseconds 500; $old=Get-ScheduledTask -TaskName $name; };'
               ' if($old -and $old.State -eq "Running") { throw "Existing controller has not exited; preserved"; };'
-              ' $a=New-ScheduledTaskAction -Execute "powershell.exe" -Argument '
-              + quote('-NoProfile -ExecutionPolicy Bypass -File "' + str(runner) + '"') + ';'
+              ' $psa=' + quote('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + str(runner) + '"') + ';'
+              ' $ch=Join-Path $env:SystemRoot "System32\\conhost.exe"; $ps=(Get-Command powershell.exe).Source;'
+              ' if(Test-Path -LiteralPath $ch){ $a=New-ScheduledTaskAction -Execute $ch -Argument ("--headless `\"$ps`\" "+$psa) }'
+              ' else { $a=New-ScheduledTaskAction -Execute $ps -Argument $psa };'
               ' $t=New-ScheduledTaskTrigger -AtLogOn -User $id.Name;'
               ' $p=New-ScheduledTaskPrincipal -UserId $id.Name -LogonType Interactive -RunLevel Limited;'
               ' $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero)'
@@ -834,7 +899,7 @@ def install_service(install_root, command):
 
 
 def migrate_installer_max_agents(settings, state):
-    """Once per install, lift the old installer default (max_agents 1) to "auto".
+    """Once per install, lift the old installer default (max_agents 1 or missing) to "auto".
 
     Earlier installers wrote 1 on every host, so 32 GB Windows desktops
     advertised a single slot (intake 88ff6766). The marker keeps a value an
@@ -844,7 +909,7 @@ def migrate_installer_max_agents(settings, state):
     if marker.exists() or not Path(settings).exists():
         return False
     data = json.loads(Path(settings).read_text(encoding='utf-8'))
-    changed = isinstance(data, dict) and data.get('max_agents') == 1
+    changed = isinstance(data, dict) and (data.get('max_agents') == 1 or ('version' in data and 'max_agents' not in data))
     if changed:
         data['max_agents'] = 'auto'
         write_private(settings, json.dumps(data, indent=2) + '\n')
@@ -911,7 +976,7 @@ def configure(base_url):
         else:
             repository_access = 'configured' if repositories is not None else 'not_configured'
         if repositories:
-            data = json.loads(settings.read_text())
+            data = json.loads(settings.read_text(encoding="utf-8"))
             workspaces = data.setdefault('workspaces', {})
             for alias, path in repositories.items():
                 if alias in workspaces and workspaces[alias] != path:
@@ -944,8 +1009,21 @@ def configure(base_url):
                       'repository_access': repository_access}), flush=True)
 
 
+def sanitize_installer_environment(install_root):
+    """Dead loopback proxies and stale release PATH entries must not break child steps."""
+    from .installer_hygiene import drop_dead_local_proxies, prune_stale_release_paths
+    dropped = drop_dead_local_proxies()
+    if dropped:
+        print('Ignoring dead local proxy settings: ' + ', '.join(dropped), flush=True)
+    parts = os.environ.get('PATH', '').split(os.pathsep)
+    kept = prune_stale_release_paths(parts, Path(install_root).name)
+    if len(kept) != len(parts):
+        os.environ['PATH'] = os.pathsep.join(kept)
+
+
 def main(argv=None):
     if argv is None and len(sys.argv) == 3 and sys.argv[1] == '--configure':
+        sanitize_installer_environment(root())
         return configure(sys.argv[2])
     if argv is None and len(sys.argv) == 2 and sys.argv[1] == '--ensure-engines':
         root_dir = Path(os.environ.get('HUB_INSTALL_RELEASE') or user_install_root())
@@ -973,6 +1051,7 @@ def _install(args):
     if sys.platform == 'win32':
         install_root, ready = windows_release(args.archive, install_root)
         os.environ['HUB_INSTALL_RELEASE'] = str(install_root)
+    sanitize_installer_environment(install_root)
     for name in ('bin', 'tmp', 'cache'):
         (install_root / name).mkdir(parents=True, exist_ok=True, mode=0o700)
     print('Installing runtimes in user scope (0 elevation prompts).', flush=True)

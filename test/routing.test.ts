@@ -100,10 +100,16 @@ describe('configured model tiers and ranking', () => {
   it('blocks Grok, requires explicit Codex, and excludes full GLM and GLM in OpenCode', () => {
     const route = { provider: 'codex', engine: 'codex', profile: null, account: 'a' };
     const ads = [{ engine:'codex',profile:null,account:'a',model:'gpt-6.1-sol',effort:'medium' }];
-    expect(modelCandidates({}, route, ads, quota, now)).toHaveLength(0);
-    expect(modelCandidates({preferred_runner:'codex'}, route, ads, quota, now)).toHaveLength(1);
+    // A Codex account that is burning normally stays explicit-only (70% used in 6 of 7 days).
+    const burning = { ...quota, windows: { weekly: { present: true, percent_remaining: 30, reset_at: at(86400000) } } };
+    expect(modelCandidates({}, route, ads, burning, now)).toHaveLength(0);
+    expect(modelCandidates({preferred_runner:'codex'}, route, ads, burning, now)).toHaveLength(1);
+    // Burn-aware release (intake ebfe9d85 AC2): 80% left a day before the weekly
+    // reset would expire unused, so tier-only daily work may use Codex; quick may not.
+    expect(modelCandidates({}, route, ads, quota, now)).toHaveLength(1);
+    expect(modelCandidates({tier:'quick'}, route, [{ engine:'codex',profile:null,account:'a',model:'gpt-6-luna',effort:'max' }], quota, now)).toHaveLength(0);
     expect(modelCandidates({}, {provider:'grok',engine:'grok',profile:null,account:'a'}, [{engine:'grok',profile:null,account:'a',model:'grok',effort:null}], quota, now)).toHaveLength(0);
-    expect(modelCandidates({}, {provider:'claude',engine:'claude',profile:null,account:'a'}, [{engine:'claude',profile:null,account:'a',model:'sonnet',effort:'high'}], quota, now)).toHaveLength(1);
+    expect(modelCandidates({}, {provider:'claude',engine:'claude',profile:null,account:'a'}, [{engine:'claude',profile:null,account:'a',model:'sonnet',effort:'medium'}], quota, now)).toHaveLength(1);
     expect(modelCandidates({}, {provider:'go',engine:'opencode',profile:null,account:'a'}, [{engine:'opencode',profile:null,account:'a',model:'glm-5.3',effort:null}], quota, now)).toHaveLength(0);
   });
   it('redacts codes, auth URLs, bearer and named secrets', () => { expect(redact('SMS code: 123456; Bearer abc; https://auth.test/code?token=x; sk-abcdef')).not.toMatch(/123456|abc|https:/); });

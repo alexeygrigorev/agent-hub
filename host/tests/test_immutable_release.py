@@ -233,6 +233,27 @@ class ImmutableReleaseTest(unittest.TestCase):
         self.assertIn(str(self.root.parent / self.target), effective)
         self.assertEqual(self.template.with_suffix('.conf.disabled').read_text(), self.text)
 
+    def test_release_bump_moves_fleet_host_and_quota_server_drop_ins(self):
+        """Scratch simulation: one switch moves every managed companion unit to the new release."""
+        self.template = self.unit_dir / ('zz~~~~' + self.before[:8] + '-switch-release.conf')
+        self.template.write_text(self.text)
+        user_dir = self.unit_dir.parent
+        companion = (update.MARKER + '[Service]\nWorkingDirectory=' + str(self.root) + '\nExecStart=\nExecStart='
+                     + str(self.root) + '/.venv/bin/python -m agent_hub_host.quota_server --config /keep/quota.json\n')
+        for name in ('agent-hub-fleet-host.service.d', 'agent-hub-quota-server.service.d'):
+            (user_dir / name).mkdir()
+            (user_dir / name / update.DROPIN).write_text(companion)
+        unmanaged = user_dir / 'agent-hub-fleet-host.service.d' / 'zz~~other.conf'
+        unmanaged.write_text('[Service]\nExecStart=' + str(self.root) + '/x\n')
+        self.assertEqual(self.manual_switch(), 0)
+        new_release = str(self.root.parent / self.target)
+        for name in ('agent-hub-fleet-host.service.d', 'agent-hub-quota-server.service.d'):
+            text = (user_dir / name / update.DROPIN).read_text()
+            self.assertIn(new_release, text)
+            self.assertNotIn(str(self.root), text)
+            self.assertIn('--config /keep/quota.json', text)
+        self.assertIn(str(self.root), unmanaged.read_text())
+
     def test_manual_bootstrap_refuses_foreign_later_override(self):
         self.template = self.unit_dir / 'zz~~~~foreign.conf'
         self.template.write_text(self.text)
