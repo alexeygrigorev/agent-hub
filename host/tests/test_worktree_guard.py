@@ -613,6 +613,47 @@ class TerminalLockRepairTests(unittest.TestCase):
             self.assertEqual(repeated['candidate_count'], 0)
             self.assertEqual(repeated['released_count'], 0)
 
+    def test_repair_time_budget_is_hard_across_git_calls(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            repo = _make_repo(tmp)
+            tree = _add_worktree(repo, tmp)
+            launch, sid = 'a' * 32, 'b' * 32
+            self.assertTrue(guard.remember_repository(launch, tree))
+            self.assertTrue(guard.protect_bound_worktree('git', tree, sid, 'proof-intake'))
+            fact = dict(session_id=sid, intake_task_id='proof-intake', tag='task-hub-' + launch,
+                        terminal=True, native_terminal=True, linked_intake_open=True,
+                        human_owned=False, protected=False, lock_release_permitted=True)
+            request = lambda *args: {'sessions': [fact]}
+            clock = [1000.0]
+            seen = []
+
+            def slow_git(argv, cwd, timeout):
+                seen.append(timeout)
+                clock[0] += timeout  # each git call consumes its entire allowed timeout
+                raise TimeoutError('slow git')
+
+            real = guard._default_runner
+            with patch.object(guard.time, 'monotonic', lambda: clock[0]), \
+                    patch.object(guard, '_default_runner', slow_git):
+                for apply in (False, True):
+                    clock[0], seen[:] = 1000.0, []
+                    report = guard.repair_terminal_locks(request, apply=apply)
+                    self.assertFalse(report['complete'])
+                    self.assertEqual(report['released_count'], 0)
+                    self.assertLessEqual(clock[0] - 1000.0, guard.REPAIR_TIMEOUT_S)
+                    self.assertTrue(all(t <= guard.REPAIR_TIMEOUT_S for t in seen))
+            self.assertTrue(guard.is_locked('git', tree))
+
+            # Budget consumed by the Hub request itself: no git work, incomplete.
+            def slow_request(*args):
+                clock[0] += guard.REPAIR_TIMEOUT_S + 1
+                return {'sessions': [fact]}
+            with patch.object(guard.time, 'monotonic', lambda: clock[0]):
+                report = guard.repair_terminal_locks(slow_request, apply=True)
+            self.assertFalse(report['complete'])
+            self.assertEqual(report['released_count'], 0)
+            self.assertTrue(guard.is_locked('git', tree))
+
     def test_repair_preserves_live_and_human_protected_session_locks(self):
         cases = [
             {'terminal': False, 'protected': False, 'lock_release_permitted': True, 'human_owned': False},

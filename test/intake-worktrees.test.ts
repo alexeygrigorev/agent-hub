@@ -397,6 +397,20 @@ describe('remove action', () => {
     expect(second).toHaveLength(2);
     expect(second.every((command: any) => command.kind === 'status')).toBe(true);
   }));
+
+  it('records status_at for a terminal intake worktree from the automatic host status result, without a manual refresh', async () => fixture(async c => {
+    const t = await createTask(c);
+    await register(c, t.id);
+    await doneNote(c, t.id);
+    const before = (await intake(c, '/tasks/' + t.id + '/worktrees')).body.worktrees[0];
+    expect(before.status_at).toBeNull();
+    const offers = await hostRun(c, HOST, () => ({ outcome: 'ok', status: status() }));
+    expect(offers).toHaveLength(1);
+    expect(offers[0].kind).toBe('status');
+    const after = (await intake(c, '/tasks/' + t.id + '/worktrees')).body.worktrees[0];
+    expect(after.status_at).not.toBeNull();
+    expect(after.status).toMatchObject({ present: true, merged: true });
+  }));
 });
 
 describe('HTTP mount', () => {

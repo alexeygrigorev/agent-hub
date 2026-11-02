@@ -803,7 +803,17 @@ MAX_REPAIR_SESSIONS = 1000
 REPAIR_TIMEOUT_S = 30
 
 
-def _terminal_lock_candidate(fact: Any, git_bin: str) -> Optional[dict[str, Any]]:
+def _deadline_runner(deadline: float) -> Callable:
+    """Git runner whose per-call timeout is the time left before `deadline`."""
+    def run(argv: list[str], cwd: str, timeout: float = GIT_TIMEOUT):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("repair time budget exhausted")
+        return _default_runner(argv, cwd, min(timeout, remaining))
+    return run
+
+
+def _terminal_lock_candidate(fact: Any, git_bin: str, runner: Optional[Callable] = None) -> Optional[dict[str, Any]]:
     """Return a currently exact, terminal Hub-owned lock; fail closed otherwise."""
     if (not isinstance(fact, dict)
             or fact.get("terminal") is not True
@@ -818,11 +828,11 @@ def _terminal_lock_candidate(fact: Any, git_bin: str) -> Optional[dict[str, Any]
     expected = expected_repository(fact)
     path = expected.get("workspace") if expected else None
     if (not isinstance(path, str) or not os.path.isabs(path)
-            or expected.get("repository") != repository_identity(path, git_bin)):
+            or expected.get("repository") != repository_identity(path, git_bin, runner)):
         return None
     intake_id = fact.get("intake_task_id")
     try:
-        entries = list_entries(git_bin, path)
+        entries = list_entries(git_bin, path, runner)
         roots = [entry for entry in entries
                  if path == entry["path"] or path.startswith(entry["path"] + os.sep)]
         entry = max(roots, key=lambda item: len(item["path"])) if roots else None
@@ -853,6 +863,7 @@ def repair_terminal_locks(request: Callable, git_bin: str = "git", *,
     if type(limit) is not int or not 1 <= limit <= MAX_REPAIR_SESSIONS:
         raise ValueError("repair limit must be between 1 and %d" % MAX_REPAIR_SESSIONS)
     deadline = time.monotonic() + REPAIR_TIMEOUT_S
+    runner = _deadline_runner(deadline)
     cursor: Optional[str] = None
     scanned = 0
     candidates: list[dict[str, Any]] = []
@@ -868,6 +879,9 @@ def repair_terminal_locks(request: Callable, git_bin: str = "git", *,
         except Exception:
             complete = False
             break
+        if time.monotonic() >= deadline:
+            complete = False
+            break
         if not isinstance(result, dict) or not isinstance(result.get("sessions"), list):
             complete = False
             break
@@ -877,7 +891,10 @@ def repair_terminal_locks(request: Callable, git_bin: str = "git", *,
                 complete = False
                 break
             scanned += 1
-            candidate = _terminal_lock_candidate(fact, git_bin)
+            candidate = _terminal_lock_candidate(fact, git_bin, runner)
+            if time.monotonic() >= deadline:
+                complete = False
+                break
             if candidate:
                 key = (candidate["path"], candidate["session_id"])
                 if key not in seen:
@@ -908,7 +925,7 @@ def repair_terminal_locks(request: Callable, git_bin: str = "git", *,
                 break
             intake_id = candidate["intake_id"]
             if release_session_lock(git_bin, candidate["path"], candidate["session_id"],
-                                    terminal=True,
+                                    terminal=True, runner=runner,
                                     intake_state="open" if intake_id else "none",
                                     intake_id=intake_id):
                 released += 1
