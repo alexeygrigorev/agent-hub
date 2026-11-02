@@ -28,7 +28,7 @@ import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
 import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, reservationHoldsCapacity, RESERVATION_TTL_MS, INFLIGHT_LAUNCH_ID_SQL, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
-import { computeEngineDecision, isDesktopCodexExcluded, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
+import { computeEngineDecision, fallbackModelIds, isDesktopCodexExcluded, isHealthyAlternative, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
 import { burnFactor, burnForecast, type BurnForecast } from './burn';
 import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
 import { WORKER_SCOPE, workerAccessContext } from './worker-access';
@@ -1150,7 +1150,7 @@ export class FleetService {
     if (input.tier !== undefined) request.tier = input.tier;
     const needs: string[] = Array.isArray(input.needs) ? [...input.needs] : [];
     if (needs.length) request.needs = needs;
-    const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = []; const gateDegraded = new Set<number>();
+    const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = []; const redecide = new Map<any, (healthyAlt: boolean) => any>(); const gateDegraded = new Set<number>();
     // Hub-held credential state (intake 5814e109 I5): an account whose Hub
     // credential the provider rejected is offered nowhere, and a host that
     // reported a generation rejected is not offered that account again until
@@ -1460,7 +1460,7 @@ export class FleetService {
       const isDegraded = Boolean(gateProjection && !gateRefusal);
       const burn = request.mode === 'interactive' ? null : burnForecast(routeProv?.quota, this.now(), Number(account!.reserve_percent) || 0);
       const burn_weight = burnFactor(burn);
-      const decision = computeEngineDecision({
+      const decide = (healthyAlt: boolean) => computeEngineDecision({ healthyAlternative: healthyAlt,
         machine: route.machine_id,
         engine: route.engine,
         account: route.account,
@@ -1486,6 +1486,7 @@ export class FleetService {
         pinnedEngine: request.engine ?? null,
         overrideReason: typeof input.engine_override_reason === 'string' && input.engine_override_reason.trim() ? input.engine_override_reason.trim() : null,
       });
+      const decision = decide(false);
       const score = decision.score;
       const selectionWithDecision = { ...model, decision_score: score, decision_reason: decision.reason, decision };
       // Windows hosts are overflow for work that does not ask for Windows:
@@ -1493,11 +1494,13 @@ export class FleetService {
       // is held (loaded, capped or quota-limited). Pinned and os:windows
       // requests are unaffected (intake a3227276 AC3).
       const overflow = overflowMachine(machine, needs);
+      const registerRedo = (c: any) => redecide.set(c, decide);
       // A failed probe has no credential verdict. Prefer an admitted sibling,
       // while retaining hard refusals for rejected or stale credentials.
       if (isDegraded) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
         ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, burn, burn_weight, decision_score: score, decision_reason: decision.reason, decision, ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+      registerRedo(candidates[candidates.length - 1]);
     }
     // Intake 06d2a0ac AC1: an account with no quota verdict at all (status
     // unknown: never observed, or only "unknown"/unavailable reports) is
@@ -1514,23 +1517,17 @@ export class FleetService {
         candidates.splice(i, 1);
       }
     }
-    // Plain starts prefer routes with usable quota headroom from Claude
-    // Sonnet, Antigravity, Z.ai, and OpenCode Muse. Codex Luna is a fallback
-    // only when none of those eligible routes reaches the configured floor.
-    const preferredModelIds = new Set(policy.models.filter(m =>
-      m.id === 'sonnet' || (m.provider === 'gemini' && m.engine === 'antigravity') || m.provider === 'zai' || (m.id === 'muse' && m.engine === 'opencode'))
-      .map(m => m.id));
-    const configuredHeadroomFloor = (policy.rules as any).low_headroom_percent;
-    const headroomFloor = Number.isFinite(configuredHeadroomFloor) ? configuredHeadroomFloor : 30;
-    const plainAutomaticStart = input.engine == null && input.tier == null && input.account == null;
-    const preferredHeadroomAvailable = plainAutomaticStart && candidates.some(candidate => {
-      const remaining = candidate.decision?.factors?.remaining_pct;
-      return preferredModelIds.has(candidate.selection?.id) && Number.isFinite(remaining) && remaining >= headroomFloor;
-    });
-    if (preferredHeadroomAvailable) {
-      for (let i = candidates.length - 1; i >= 0; i--) {
-        if (candidates[i].selection?.id === 'luna') candidates.splice(i, 1);
-      }
+    // Fallback models (rules.fallback_models) are down-weighted INSIDE computeEngineDecision
+    // while a healthy non-fallback route exists. Nothing is removed and no engine is preferred
+    // by raw headroom: pacing/burn and provider weights stay the only ranking inputs.
+    const fallbackIds = fallbackModelIds();
+    const healthyAlternative = candidates.some(c => !fallbackIds.has(c.selection?.id) && isHealthyAlternative(c.decision));
+    for (const c of candidates) {
+      const redo = redecide.get(c);
+      if (!redo || !fallbackIds.has(c.selection?.id)) continue;
+      const d = redo(healthyAlternative);
+      c.score = c.decision_score = d.score; c.decision_reason = d.reason; c.decision = d;
+      c.selection = { ...c.selection, decision_score: d.score, decision_reason: d.reason, decision: d };
     }
     candidates.sort((a, b) =>
       Number(!!a.overflow) - Number(!!b.overflow)
