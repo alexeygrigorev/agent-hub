@@ -74,6 +74,22 @@ def explicit_commit_refs(history: list) -> list:
     return refs
 
 
+def hub_recorded_shas(merge_state: Any) -> list:
+    """Commit SHAs Hub already tracks for the worktree (branch head from host status plus
+    earlier evidence). Without these a merged worktree whose intake carries no report/DONE
+    sha yields no commits, hence no deploy evidence (intake 3f2011c2)."""
+    state = merge_state if isinstance(merge_state, dict) else {}
+    recorded_commits = state.get('commits')
+    entries = recorded_commits if isinstance(recorded_commits, (list, tuple)) else []
+    refs = [state.get('head')] + [c.get('sha') for c in entries if isinstance(c, dict)]
+    out = []
+    for ref in refs:
+        ref = str(ref or '').strip().lower()
+        if SHA.match(ref) and ref not in out:
+            out.append(ref)
+    return out
+
+
 def own_clone(runner: Callable = subprocess.run, remote: Optional[str] = None) -> str:
     """Private checkout of the project repo (never the caller's cwd)."""
     remote = remote or os.environ.get('AGENT_HUB_MERGE_CHECK_REMOTE') or DEFAULT_REMOTE
@@ -95,12 +111,12 @@ def _is_ancestor(runner, repo, sha, ref):
 
 def deploy_state(repo: str, sha: str, runner: Callable = subprocess.run) -> dict:
     """Deploy outcome for ``sha`` on main: the earliest-or-any Deploy run whose
-    head contains it. [skip ci] commits never deploy on their own."""
+    head contains it. [skip ci] commits never deploy on their own, but a later
+    Deploy run for a descendant main SHA can still prove they were deployed."""
     subject = _run(runner, ['git', 'log', '-1', '--format=%B', sha], repo)
-    if subject is not None and subject.returncode == 0 and SKIP_CI.search(subject.stdout or ''):
-        return {'state': 'skipped', 'sha': sha}
+    skip_ci = subject is not None and subject.returncode == 0 and SKIP_CI.search(subject.stdout or '')
     proc = _run(runner, ['gh', 'run', 'list', '--workflow', DEPLOY_WORKFLOW, '--branch', 'main', '--limit', '40',
-                         '--json', 'headSha,conclusion,status,url'], repo, FETCH_TIMEOUT)
+                         '--json', 'databaseId,headSha,conclusion,status,url'], repo, FETCH_TIMEOUT)
     if proc is None or proc.returncode != 0:
         return {'state': 'unknown', 'sha': sha}
     import json
@@ -111,16 +127,37 @@ def deploy_state(repo: str, sha: str, runner: Callable = subprocess.run) -> dict
     containing = []
     for run in runs if isinstance(runs, list) else []:
         head = run.get('headSha') if isinstance(run, dict) else None
-        if isinstance(head, str) and _is_ancestor(runner, repo, sha, head):
+        if isinstance(head, str) and SHA.match(head) and _is_ancestor(runner, repo, sha, head):
             containing.append(run)
+
+    def run_evidence(state: str, run: dict) -> dict:
+        head = run.get('headSha')
+        run_id = run.get('databaseId')
+        if isinstance(run_id, int) and not isinstance(run_id, bool):
+            run_id = str(run_id)
+        elif not isinstance(run_id, str):
+            run_id = ''
+        result = {'state': state, 'sha': sha}
+        if run_id.strip():
+            result['run_id'] = run_id.strip()[:32]
+        if isinstance(run.get('conclusion'), str) and run['conclusion'].strip():
+            result['conclusion'] = run['conclusion'].strip()[:32]
+        if isinstance(head, str) and SHA.match(head):
+            result['deployed_sha'] = head.lower()
+        if isinstance(run.get('url'), str) and run['url'].strip():
+            result['run'] = run['url'].strip()[:300]
+        return result
+
     for run in containing:
         if run.get('conclusion') == 'success':
-            return {'state': 'success', 'sha': sha, 'run': run.get('url')}
+            return run_evidence('success', run)
     for run in containing:
         if run.get('status') in ('queued', 'in_progress', 'waiting', 'requested', 'pending'):
-            return {'state': 'pending', 'sha': sha, 'run': run.get('url')}
+            return run_evidence('pending', run)
     if containing:
-        return {'state': 'failure', 'sha': sha, 'run': containing[0].get('url')}
+        return run_evidence('failure', containing[0])
+    if skip_ci:
+        return {'state': 'skipped', 'sha': sha}
     return {'state': 'missing', 'sha': sha}
 
 
@@ -131,7 +168,7 @@ def fetch_origin(repo: str, runner: Callable = subprocess.run) -> None:
 
 
 def collect(repo: str, shas: Optional[list] = None, runner: Callable = subprocess.run, fetch: bool = True,
-            deploy: bool = True, include_head: bool = True) -> dict:
+            deploy: bool = True, include_head: bool = True, preferred_deploy_sha: Optional[str] = None) -> dict:
     """Evidence body for POST /api/intake/tasks/<id>/merge-evidence."""
     out: dict[str, Any] = {}
     if fetch:
@@ -147,7 +184,8 @@ def collect(repo: str, shas: Optional[list] = None, runner: Callable = subproces
     if cherry is not None and cherry.returncode == 0:
         out['unmerged'] = sum(1 for line in (cherry.stdout or '').splitlines() if line.startswith('+'))
     wanted = []
-    for sha in (shas or []) + ([head_sha] if head_sha else []):
+    preferred = preferred_deploy_sha.lower() if SHA.match(preferred_deploy_sha or '') else ''
+    for sha in ([preferred] if preferred else []) + (shas or []) + ([head_sha] if head_sha else []):
         if SHA.match(sha or '') and sha.lower() not in wanted:
             wanted.append(sha.lower())
     commits = []
@@ -170,7 +208,14 @@ def collect(repo: str, shas: Optional[list] = None, runner: Callable = subproces
         merged = [c for c in commits if c['in_main']]
         # The deploy that matters is the newest merged commit named in the evidence.
         if merged and len(merged) == len(commits):
-            out['deploy'] = deploy_state(repo, merged[0]['sha'], runner)
+            # For the private clone, the Hub-recorded worktree head is the intended
+            # target; when an explicit repo is supplied, its observed HEAD takes
+            # precedence. A green deploy for an older report SHA must not prove a
+            # newer worktree head that only has a pending or failed deploy.
+            local_head = head_sha if include_head else ''
+            merged_shas = {c['sha'] for c in merged}
+            target = local_head if local_head in merged_shas else preferred if preferred in merged_shas else merged[0]['sha']
+            out['deploy'] = deploy_state(repo, target, runner)
         elif merged:
             out['deploy'] = {'state': 'pending', 'sha': merged[0]['sha']}
         else:

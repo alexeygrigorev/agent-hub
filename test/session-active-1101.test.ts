@@ -80,6 +80,20 @@ describe('shared active definition + stale reconciliation (hub-1101-outage-20261
       const recovered = hub.sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', id2).toArray()[0] as any;
       expect(recovered.state).toBe('running');
       expect(hub.sql.exec('SELECT COUNT(*) AS n FROM session_stale_reconciliations WHERE session_id = ?', id2).toArray()[0]).toEqual({ n: 0 });
+
+      // Prefix lookup resolves fleet_launch_id and bound native_id prefixes (e.g. 988b8d49).
+      const id3 = '15acde15-2852-434e-9bdf-123c883e311c';
+      const launch3 = '988b8d49-cacf-4a5e-900c-a214a6402808';
+      const native3 = '5a613cb2-f06d-4cc7-9435-af49e67107c5';
+      hub.sql.exec(
+        `INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+         VALUES (?, 'a', 'k13', '{}', ?, 'm1', 'zcodex', 'interactive', 'running', ?, ?, ?)`,
+        id3, launch3, JSON.stringify({ native_id: native3, tag: 'hub-' + launch3, workspace: '/w' }), fresh, fresh,
+      );
+      const byLaunchPrefix = await (await s.handle(get('/api/sessions/988b8d49'), admin)).json() as any;
+      expect(byLaunchPrefix.id).toBe(id3);
+      const byNativePrefix = await (await s.handle(get('/api/sessions/5a613cb2'), admin)).json() as any;
+      expect(byNativePrefix.id).toBe(id3);
     });
   });
 });
