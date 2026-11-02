@@ -1,6 +1,7 @@
 /** CPU admission primitives. Load average is context only, never an admission input. */
 export interface CpuUsage {
   busy_percent: number | null; busy_cores: number | null; cores: number | null;
+  busy_percent_window: number | null; window_s: number | null;
   psi_avg10: number | null; observed_at: string; interval_s: number | null;
   psi_full_avg10: number | null; memory_psi_full_avg10: number | null; io_psi_full_avg10: number | null; oom_kills_delta: number | null; host_oom_kills_delta: number | null;
 }
@@ -9,6 +10,8 @@ export interface CpuConfig {
   cpu_default_cores: number; cpu_estimate_multiplier: number;
   cpu_psi_full_hard_cap_pct: number; memory_psi_full_hard_cap_pct: number;
 }
+/** A host is CPU-full only when measured busy CPU averaged over >=10s reaches this (Alexey t2362u-t2363u; never from load average). */
+export const CPU_SATURATED_PCT = 98;
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
 export function sanitizeCpuAdmission(value:any):Record<string,any>|null {
   const required=['expected_cpu_cores','ramping_cpu_cores','limit_cpu_cores','target_utilization'];
@@ -29,8 +32,11 @@ export function sanitizeCpuUsage(value: any): CpuUsage | null {
   const cores=Number.isSafeInteger(value.cores)&&value.cores>=1&&value.cores<=65536 ? value.cores : null;
   const measured=cores!==null&&finite(value.busy_percent)&&value.busy_percent<=100&&finite(value.busy_cores)
     &&value.busy_cores<=cores&&Math.abs(value.busy_cores-value.busy_percent*cores/100)<=.01;
+  // Average busy CPU over a window of at least 10s (host snapshots). Unknown stays null.
+  const windowed=measured&&finite(value.busy_percent_window)&&value.busy_percent_window<=100&&finite(value.window_s)&&value.window_s>=10&&value.window_s<=180;
   const pressure=(key:string)=>finite(value[key])&&value[key]<=100 ? value[key] : null;
   return {busy_percent:measured?value.busy_percent:null,busy_cores:measured?value.busy_cores:null,cores,
+    busy_percent_window:windowed?value.busy_percent_window:null,window_s:windowed?value.window_s:null,
     psi_avg10:pressure('psi_avg10'),psi_full_avg10:pressure('psi_full_avg10'),memory_psi_full_avg10:pressure('memory_psi_full_avg10'),
     io_psi_full_avg10:pressure('io_psi_full_avg10'),
     oom_kills_delta:Number.isSafeInteger(value.oom_kills_delta)&&value.oom_kills_delta>=0&&value.oom_kills_delta<=1e9 ? value.oom_kills_delta : null,
@@ -48,9 +54,13 @@ export function cpuVerdict(raw: unknown, cores: number, expected: number, rampin
     io_psi_full_avg10:usage?.io_psi_full_avg10 ?? null,
     oom_kills_delta:usage?.oom_kills_delta ?? null,host_oom_kills_delta:usage?.host_oom_kills_delta ?? null,observed_at:usage?.observed_at ?? null,
     predicted_over_target:known ? usage.busy_cores!+expected+ramping>cores*config.cpu_target_utilization : null,
-    telemetry_state:known && usage.psi_full_avg10!==null && usage.memory_psi_full_avg10!==null ? 'measured' : 'unknown',
+    busy_percent_window:known ? usage.busy_percent_window : null,window_s:known ? usage.window_s : null,
+    cpu_saturated:known && usage.busy_percent_window!==null ? usage.busy_percent_window>=CPU_SATURATED_PCT : null,
+    // CPU busy is measured on every OS; PSI exists on Linux only and is not required.
+    telemetry_state:known ? 'measured' : 'unknown',
     advisory:known ? null : 'cpu_usage_unknown'};
-  const reason = fresh && usage.psi_full_avg10!==null && usage.psi_full_avg10 > config.cpu_psi_full_hard_cap_pct ? 'cpu_pressure'
+  const reason = known && usage.busy_percent_window!==null && usage.busy_percent_window>=CPU_SATURATED_PCT ? 'cpu_saturated'
+    : fresh && usage.psi_full_avg10!==null && usage.psi_full_avg10 > config.cpu_psi_full_hard_cap_pct ? 'cpu_pressure'
     : fresh && usage.memory_psi_full_avg10!==null && usage.memory_psi_full_avg10 > config.memory_psi_full_hard_cap_pct ? 'memory_pressure'
     : fresh && (usage.host_oom_kills_delta ?? 0)>0 ? 'host_oom' : null;
   return {...numbers,reason,admitted:reason === null};
