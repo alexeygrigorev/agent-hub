@@ -27,6 +27,11 @@ class BackfillTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs['timeout'], BACKFILL.GIT_TIMEOUT)
         self.assertLess(BACKFILL.GIT_TIMEOUT, 60)
 
+    def test_nonzero_git_exit_is_reported_as_unknown(self):
+        failed = subprocess.CompletedProcess(['git', 'status'], 128, stdout='', stderr='bad repository')
+        with patch.object(BACKFILL.subprocess, 'run', return_value=failed):
+            self.assertIsNone(BACKFILL.git('/repo', 'status', '--porcelain'))
+
     def test_forbidden_intake_lookup_is_not_misreported_as_no_intake(self):
         with patch.object(BACKFILL, 'git', return_value=None), \
              patch.object(BACKFILL.intake, 'request', side_effect=BACKFILL.intake.IntakeHTTPError(403, 'worker_scope_forbidden')):
