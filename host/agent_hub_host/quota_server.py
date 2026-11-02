@@ -24,6 +24,8 @@ from . import config, quota_snapshot
 # family name on ingest (intake e0af55f3: the catalog gained hub-antigravity and
 # the whole collection aborted on the unknown provider).
 WIRE_PROVIDER = {'antigravity': 'gemini'}
+# Native account label -> managed account that owns the same login.
+NATIVE_ALIAS_OF = {'shared-gemini': 'hub-antigravity'}
 
 
 class CollectionError(ValueError):
@@ -162,6 +164,18 @@ def collect_accounts(settings, *, runner=None):
             results.append({'account': label, 'provider': wire, 'quota': quota})
         if unobserved_managed:
             results = [r for r in results if _canonical_account(r.get('account', '')) not in unobserved_managed]
+        # shared-gemini is the host's native agy home, whose login Hub installs
+        # from the hub-antigravity credential (sync_native_antigravity): one
+        # Google login, one quota. Mirror the managed reading so the alias never
+        # reads unavailable (intake 3d1f8702); a missing reading stays missing.
+        for alias, source in NATIVE_ALIAS_OF.items():
+            target = next((r for r in results if isinstance(r, dict) and r.get('account') == source
+                           and isinstance(r.get('quota'), dict) and r['quota'].get('status') == 'ok'), None)
+            if target is None:
+                continue
+            for index, row in enumerate(results):
+                if isinstance(row, dict) and row.get('account') == alias:
+                    results[index] = {**row, 'quota': target['quota']}
     return {'captured_at': quota_snapshot.format_iso_utc(datetime.datetime.now(datetime.timezone.utc)), 'accounts': results}
 
 

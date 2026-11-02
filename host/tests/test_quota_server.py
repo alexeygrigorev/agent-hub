@@ -221,6 +221,22 @@ class ServerQuotaTests(unittest.TestCase):
             row = quota_server.collect_accounts(settings, runner=runner)['accounts'][1]
             self.assertEqual((row['account'], row['provider'], row['quota']['status']), ('hub-antigravity', 'gemini', 'ok'))
 
+    def test_shared_gemini_mirrors_managed_antigravity_login(self):
+        """Intake 3d1f8702: shared-gemini (native agy home, Hub-installed token) never reads unavailable."""
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps([{'label': 'hub-antigravity', 'provider': 'antigravity', 'revision': 'rev-a'}]))
+            def runner(argv, **kwargs):
+                if isinstance(argv, str):
+                    return {}
+                return {'accounts': [{'account': 'hub-antigravity', 'provider': 'antigravity', 'quota': {
+                    'status': 'ok', 'details': {'limit_reached': False},
+                    'windows': {'5h': {'percent_remaining': 60.0, 'reset_at': '2030-01-01T05:00:00Z'}}}}]}
+            settings = {'accounts': [{'provider': 'gemini', 'account': 'shared-gemini'}], 'managed_state_file': str(state)}
+            rows = {r['account']: r for r in quota_server.collect_accounts(settings, runner=runner)['accounts']}
+            self.assertEqual(rows['shared-gemini']['quota']['status'], 'ok')
+            self.assertEqual(rows['shared-gemini']['quota']['windows']['5h']['percent_remaining'], 60.0)
+
     def test_failure_log_names_class_and_account_without_secrets(self):
         import contextlib, io
         with tempfile.TemporaryDirectory() as directory:
