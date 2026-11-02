@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -172,8 +173,6 @@ ZAI_USAGE = 'https://api.z.ai/api/monitor/usage/quota/limit'
 ZAI_CONFIG = Path('.config/goz/config.json')
 AGY_TOKEN = Path('.gemini/antigravity-cli/antigravity-oauth-token')
 AGY_QUOTA = 'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary'
-GOOGLE_TOKEN = 'https://oauth2.googleapis.com/token'
-AGY_CLIENT_PREFIX = b'1071006060591-'
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -372,53 +371,46 @@ def _zai_token(home):
     return token
 
 
-def _agy_client(agy_binary):
-    """The Antigravity desktop OAuth application values embedded in the installed vendor binary.
-
-    Public application configuration, read at runtime and never stored or logged.
-    """
-    import mmap
-    with open(agy_binary, 'rb') as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
-        match = re.search(re.escape(AGY_CLIENT_PREFIX) + rb'[a-z0-9]{20,40}\.apps\.googleusercontent\.com', data)
-        if not match:
-            return None, []
-        secrets = [m.group().decode() for m in re.finditer(rb'GOCSPX-[A-Za-z0-9_-]{20,}', data)][:8]
-        return match.group().decode(), secrets
-
-
-def _agy_access_token(home, opener, timeout, now):
-    """Antigravity access token from the managed home; refreshed in memory only when expired."""
+def _agy_read_token(home):
     stored = json.loads(private_fs.read_bytes(Path(home) / AGY_TOKEN, MAX_FILE * 2, private=False))
     token = stored.get('token') if isinstance(stored, dict) else None
     if not isinstance(token, dict) or not isinstance(token.get('access_token'), str):
-        return None
+        return None, None
     expiry = None
     if isinstance(token.get('expiry'), str):
         try:
             expiry = dt.datetime.fromisoformat(re.sub(r'(\.\d{6})\d+', r'\1', token['expiry'].replace('Z', '+00:00')))
         except ValueError:
             expiry = None
-    if expiry is not None and expiry.tzinfo is not None and expiry > now + dt.timedelta(seconds=60):
-        return token['access_token']
-    refresh = token.get('refresh_token')
+    return token['access_token'], expiry if expiry is not None and expiry.tzinfo is not None else None
+
+
+def _agy_refresh(home, timeout=60):
+    """Let the pinned vendor binary refresh its own login (``agy models``: no inference).
+
+    The Antigravity OAuth application is not ours to embed; the engine rotates
+    the managed home's token itself and the host syncs it back to Hub.
+    """
     binaries = sorted((Path(home).parent / 'engine' / 'bin').glob('agy*'))
-    if not isinstance(refresh, str) or not refresh or not binaries:
-        return token['access_token'] if expiry is None else None
-    client_id, secrets = _agy_client(binaries[0])
-    for secret in secrets:
-        form = urllib.parse.urlencode({'grant_type': 'refresh_token', 'refresh_token': refresh,
-                                       'client_id': client_id, 'client_secret': secret}).encode()
-        request = urllib.request.Request(GOOGLE_TOKEN, data=form, method='POST',
-                                         headers={'Content-Type': 'application/x-www-form-urlencoded'})
-        try:
-            with opener.open(request, timeout=timeout) as response:
-                value = json.loads(response.read(65536))
-        except urllib.error.HTTPError as error:
-            error.close()
-            continue
-        if isinstance(value, dict) and isinstance(value.get('access_token'), str):
-            return value['access_token']
-    return None
+    if not binaries:
+        return
+    env = {k: os.environ[k] for k in ('PATH', 'SYSTEMROOT', 'TEMP', 'TMP') if k in os.environ}
+    env.update(HOME=str(home), USERPROFILE=str(home))
+    try:
+        subprocess.run([str(binaries[0]), 'models'], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _agy_access_token(home, now, refresh=_agy_refresh):
+    """Antigravity access token from the managed home, refreshed by the engine when expired."""
+    token, expiry = _agy_read_token(home)
+    if token is not None and expiry is not None and expiry > now + dt.timedelta(seconds=60):
+        return token
+    refresh(home)
+    token, expiry = _agy_read_token(home)
+    return token if token is not None and (expiry is None or expiry > now) else None
 
 
 def probe_quota(provider, home, opener=None, timeout=15):
@@ -466,7 +458,7 @@ def probe_quota(provider, home, opener=None, timeout=15):
                        'User-Agent': 'agent-hub-quota/1'}
             url, parse = ZAI_USAGE, zai_quota
         elif provider == 'antigravity':
-            token = _agy_access_token(home, opener, timeout, dt.datetime.now(dt.timezone.utc))
+            token = _agy_access_token(home, dt.datetime.now(dt.timezone.utc))
             if token is None:
                 return {}
             request = urllib.request.Request(AGY_QUOTA, data=b'{}', method='POST', headers={

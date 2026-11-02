@@ -84,6 +84,19 @@ def test_antigravity_expired_token_without_engine_reports_nothing(tmp_path):
     assert opener.requests == []
 
 
+def test_antigravity_expired_token_is_refreshed_by_the_engine(tmp_path):
+    import datetime as dt
+    home = _agy_home(tmp_path, '2000-01-01T00:00:00Z')
+    calls = []
+
+    def refresh(path):
+        calls.append(path)
+        (path / credentials.AGY_TOKEN).write_text(json.dumps({'token': {
+            'access_token': 'fresh', 'expiry': '2999-01-01T00:00:00.737548539+01:00'}}))
+    token = credentials._agy_access_token(home, dt.datetime.now(dt.timezone.utc), refresh=refresh)
+    assert token == 'fresh' and calls == [home]
+
+
 def test_antigravity_exhausted_marks_limit():
     body = {'groups': [{'buckets': [{'window': 'weekly', 'resetTime': '2026-11-09T10:01:47Z', 'remainingFraction': 0}]}]}
     assert credentials.antigravity_quota(body)['details']['limit_reached'] is True
