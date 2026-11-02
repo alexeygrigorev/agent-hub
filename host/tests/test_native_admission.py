@@ -66,12 +66,12 @@ class NativeAdmissionTest(unittest.TestCase):
         self.assertTrue(result['launch_allowed'])
         self.assertTrue(result['model_supported'])
         self.assertEqual((result['model'], result['effort']), (native['model'], native['effort']))
-        # The widening is zai-only: a zcodex entry never satisfies a codex engine route,
-        # and a tampered selection (wrong effort) is still refused.
+        # The widening is zai-only: a zcodex entry never satisfies a codex engine route.
         with self.assertRaises(ValueError):
             configured_selection(native, 'codex', 'codex')
+        self.assertEqual(configured_selection(dict(native, effort='medium'), 'zcodex', 'zai')['effort'], 'medium')
         with self.assertRaises(ValueError):
-            configured_selection(dict(native, effort='max'), 'zcodex', 'zai')
+            configured_selection(dict(native, effort='xhigh'), 'zcodex', 'zai')
 
     def test_grok_model_family_denied_across_providers_and_modes(self):
         for value in ('grok', 'grok-4-7', 'opencode-go/grok-4.7', 'xai/GROK', 'muse/gRoK'):
