@@ -361,7 +361,9 @@ class ControllerLease:
 
 
 def handover(directory, *, timeout=90, boot_probe=None, observe=None, stop=None, journal=None, force_wait=60,
-             lock_held=None, sleep=time.sleep):
+             lock_held=None, sleep=None):
+    # Resolved per call: a default bound at import ignores patches of time.sleep (hung the frozen-clock test).
+    sleep = sleep or time.sleep
     absent = receipt_absent if observe is None else None
     tag_absent = pending_tag_absent if observe is None else None
     if stop is None and observe is None:
@@ -385,7 +387,8 @@ def handover(directory, *, timeout=90, boot_probe=None, observe=None, stop=None,
 
 
 def _handover(directory, timeout, boot_probe, observe, absent=None, tag_absent=None, stop=None, force_wait=60,
-              sleep=time.sleep):
+              sleep=None):
+    sleep = sleep or time.sleep
     stack = ExitStack()
     try:
         stack.enter_context(private_fs.exclusive_lock(directory / 'owner.lock'))

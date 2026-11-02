@@ -112,7 +112,7 @@ class WindowsReleaseTests(unittest.TestCase):
              patch.object(b, 'run') as run:
             with self.assertRaisesRegex(RuntimeError, 'unconfirmed'):
                 b.install_service(release, ['owned-python', '-m', 'supervisor'])
-        handover.assert_called_once_with(self.base / 'controller')
+        handover.assert_called_once_with(self.base / 'controller', journal=b.state_root(self.base) / 'journal')
         run.assert_not_called()
         self.assertEqual(runner.read_text(), 'previous working runner')
 
