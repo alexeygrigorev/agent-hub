@@ -219,4 +219,24 @@ describe('register shared key on GitHub (AC7)', () => {
       expect(await res.json()).toMatchObject({ status: 'missing_scope_admin_public_key' });
     });
   });
+  it('hosts hold an unregistered key without churn; a successful registration forces one sync', async () => {
+    const gh = github({ ...okUser, 'POST https://api.github.com/user/keys': { status: 201, json: { id: 1 } } });
+    await fixture(gh.fn, async svc => {
+      await setup(svc);
+      // Before registration the payload travels but says so; a host without a
+      // working ssh must not be told to re-sync in a loop (nothing would change).
+      const held = await sync(svc, 'rmthz');
+      expect(held.credentials.git_ssh_key.registered).toBe(false);
+      const report = (ok: boolean) => svc.handle(req('/api/host-credentials/status', 'POST', { gh: { logged_in: true }, ssh: { authenticated: ok, error: ok ? null : 'key_not_installed' }, generations: { gh_token: 1, git_ssh_key: 1 } }), hostAuth('rmthz'));
+      expect(await (await report(false)).json()).toMatchObject({ resync: false });
+      expect(await sync(svc, 'rmthz', 'gh_token:1,git_ssh_key:1,git_identity:1').then(r => r.forced)).toBe(false);
+      expect(await (await svc.registerKey()).json()).toMatchObject({ status: 'registered' });
+      // Registration succeeds: one forced sync delivers the key (generation unchanged).
+      expect(await (await report(false)).json()).toMatchObject({ resync: true });
+      const forced = await sync(svc, 'rmthz', 'gh_token:1,git_ssh_key:1,git_identity:1');
+      expect(forced.forced).toBe(true);
+      expect(forced.credentials.git_ssh_key).toMatchObject({ generation: 1, registered: true });
+      expect((await sync(svc, 'rmthz', 'gh_token:1,git_ssh_key:1,git_identity:1')).forced).toBe(false);
+    });
+  });
 });
