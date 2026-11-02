@@ -467,6 +467,17 @@ def sample_session_tree(
                         ticked = True
                 if ticked:
                     cpu_seconds = total_ticks / _clk_tck()
+        elif os.name == "nt" and proc_root == "/proc":
+            # Windows has no /proc or cgroups: measure the exact descendant
+            # tree through the Win32 process APIs (working set, private bytes,
+            # kernel+user CPU time). Unreadable stays unknown.
+            if not roots:
+                return None
+            from .windows_process_stats import sample_tree
+            win = sample_tree(roots)
+            if win is None:
+                return None
+            rss_mb, pss_mb, cpu_seconds = win["rss_mb"], win["pss_mb"], win["cpu_seconds"]
         else:
             if not roots:
                 return None
