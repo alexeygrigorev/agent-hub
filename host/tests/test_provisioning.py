@@ -1470,9 +1470,9 @@ def test_profile_command_imports_package_without_launcher_pythonpath(tmp_path, m
 
 def _fake_windows_go_install(revision='33333333-3333-4333-8333-333333333333'):
     dest = p.root() / ('go-account-' + revision)
-    package = dest / 'engine' / 'node_modules' / 'opencode-windows-x64'
+    package = dest / 'engine' / 'node_modules' / '@opencode' / 'cli-windows-x64'
     (package / 'bin').mkdir(parents=True)
-    (package / 'package.json').write_text(json.dumps({'version': '1.0.0'}))
+    (package / 'package.json').write_text(json.dumps({'version': p.GO_CLI_VERSION}))
     executable = package / 'bin' / 'opencode.exe'
     executable.write_bytes(b'MZ')
     return dict(label='go-account', provider='go', version='1.0.0', revision=revision,
@@ -1491,6 +1491,20 @@ def test_windows_go_bundle_pins_managed_opencode_engine(monkeypatch):
     assert '# BEGIN HUB MANAGED ENGINES' in text
     p.profiles([])  # bundle withdrawn: the pin goes with the managed block
     assert '[engines.opencode]' not in p.profile_path().read_text()
+
+
+def test_go_engine_is_the_2x_cli_that_can_import_the_central_device_login(tmp_path, monkeypatch):
+    # Intake 5814e109 / e0af55f3: opencode-ai 1.x has no `auth import`, so the
+    # Hub-central muse login could never be installed on a host; the managed go
+    # engine is the pinned @opencode/cli 2.x whatever version the bundle carries.
+    assert p.PACKAGES['go'][0] == '@opencode/cli' and p.GO_CLI_VERSION == '2.0.32'
+    bundle, executable = _fake_windows_go_install()
+    bundle['version'] = '1.19.3'
+    dest = p.root() / ('go-account-' + bundle['revision'])
+    assert p.executable_path(bundle, dest, is_windows=True) == executable
+    assert p._go_engine_current(bundle, dest) in (True, False)  # platform dependent, must not raise
+    stale = dict(bundle, revision='44444444-4444-4444-8444-444444444444')
+    assert p._go_engine_current(stale, p.root() / ('go-account-' + stale['revision'])) is False
 
 
 def test_opencode_engine_pin_absent_off_windows_and_for_operator_tables(monkeypatch):

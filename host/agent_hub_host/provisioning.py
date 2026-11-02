@@ -26,11 +26,14 @@ PACKAGES = {
     'codex': ('@openai/codex', 'codex', 'codex'),
     'claude': ('@anthropic-ai/claude-code', 'claude', 'claude'),
     'gemini': ('@google/gemini-cli', 'gemini', 'gemini'),
-    'go': ('opencode-ai', 'opencode', 'opencode'),
+    # OpenCode 2.x (`@opencode/cli`): the only line with `auth export|import`, i.e. the
+    # Hub-central device login. opencode-ai 1.x cannot import it (no such subcommand).
+    'go': ('@opencode/cli', 'opencode', 'opencode'),
     'zai': ('codex-zcode', 'zcodex', 'codex'),
     # Native binary from the reviewed release pin, never npm (intake 5814e109 AC8).
     'antigravity': ('antigravity-cli', 'agy', 'antigravity'),
 }
+GO_CLI_VERSION = '2.0.32'  # exact pin of @opencode/cli; the bundle version of a go account is ignored
 ANTIGRAVITY_TOKEN = '.gemini/antigravity-cli/antigravity-oauth-token'
 OPENCODE_DEVICE_EXPORT = '.local/share/opencode-hub/device-auth.json'
 ENV = {'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
@@ -152,6 +155,14 @@ def sync_opencode_device(bundle, native=None):
         directory.mkdir(parents=True, exist_ok=True)
         if os.name != 'nt':
             os.chmod(directory, 0o700)
+        else:
+            # Windows: mkdir inherits ambient ACEs, so the first private_fs read
+            # of the receipt failed 'Private owner/protected DACL required' and
+            # the central OpenCode login was never imported (laptop/Tabo/desktop:
+            # engine_auth_expired 'device login configuration required').
+            # owned=True re-protects the owner-only leaf, repairing old dirs too.
+            with private_fs.parent(directory / '.private', create=True, owned=True):
+                pass
     digest = hashlib.sha256(export.encode('utf-8')).hexdigest()
     receipt = base / 'store-receipt.json'
     if (read_json(receipt, {}) or {}).get('sha256') == digest and (Path(cfg['source_data']) / 'opencode' / 'opencode.db').is_file():
@@ -1392,10 +1403,10 @@ def executable_path(bundle, dest, is_windows=None):
         else:
             target = ('windows' if system == 'win32' else system) + '-' + cpu
             variants = ['-baseline' + musl, musl] if cpu == 'x64' else [musl]
-            candidates = [(modules / ('opencode-' + target + suffix), 'bin/' + binary + ('.exe' if system == 'win32' else '')) for suffix in variants]
+            candidates = [(modules / ('@opencode/cli-' + target + suffix), 'bin/' + binary + ('.exe' if system == 'win32' else '')) for suffix in variants]
         for package, relative in candidates:
             metadata = package / 'package.json'
-            if metadata.is_file() and json.loads(metadata.read_text()).get('version') == bundle['version']:
+            if metadata.is_file() and json.loads(metadata.read_text()).get('version') == (GO_CLI_VERSION if bundle['provider'] == 'go' else bundle['version']):
                 executable = package / relative
                 if not executable.is_file():
                     # A session-side updater can leave exactly one renamed
@@ -1483,6 +1494,17 @@ def _fetch_checksummed_zcodex_asset(tag, asset, cache_dir, tmp_download):
         raise ValueError('Managed engine installation failed') from None
 
 
+def _go_engine_current(bundle, dest):
+    """True when the installed OpenCode engine is the pinned 2.x `@opencode/cli`.
+
+    Same-revision installs made while the pin was opencode-ai 1.x (no
+    `auth import`) must be replaced in place, not skipped as already installed."""
+    try:
+        return executable_path(bundle, dest).is_file()
+    except (ValueError, OSError, KeyError):
+        return False
+
+
 def install(bundle, request=None):
     from . import credentials
     validate(bundle)
@@ -1492,7 +1514,8 @@ def install(bundle, request=None):
     # A new Hub credential generation is not a new install: only the
     # immutable snapshot (engine, version, config) triggers reinstallation.
     paths = bundle.get('credential_paths') or []
-    if receipt is not None and credentials.install_snapshot(receipt, paths) == credentials.install_snapshot(bundle, paths):
+    if (receipt is not None and credentials.install_snapshot(receipt, paths) == credentials.install_snapshot(bundle, paths)
+            and (bundle['provider'] != 'go' or _go_engine_current(bundle, dest))):
         provision_managed_home(bundle, home, dest)
         credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
         credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
@@ -1578,7 +1601,7 @@ def install(bundle, request=None):
     else:
         npm_cmd = resolve_npm_command()
         try:
-            subprocess.run(npm_cmd + ['install', '--prefix', str(dest / 'engine'), '--ignore-scripts', '--no-audit', '--no-fund', '--', pkg + '@' + bundle['version']],
+            subprocess.run(npm_cmd + ['install', '--prefix', str(dest / 'engine'), '--ignore-scripts', '--no-audit', '--no-fund', '--', pkg + '@' + (GO_CLI_VERSION if bundle['provider'] == 'go' else bundle['version'])],
                            env=clean_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=True)
         except (subprocess.SubprocessError, OSError):
             raise ValueError('Managed engine installation failed') from None

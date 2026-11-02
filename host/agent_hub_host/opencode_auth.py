@@ -12,6 +12,7 @@ import signal
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -80,6 +81,13 @@ def environment(cfg, *, source=False, base=None):
     return env
 
 
+_WINDOWS_ENV_WRAPPER = (
+    'import json,os,subprocess,sys;'
+    's=json.loads(sys.argv[1]);e=dict(os.environ);'
+    '[e.pop(k,None) for k in s["unset"]];e.update(s["set"]);'
+    'sys.exit(subprocess.call(sys.argv[2:],env=e))')
+
+
 def launch_argv(cfg, argv):
     """Apply the same store to nested trusted env wrappers and native children."""
     env = environment(cfg, base={})
@@ -89,6 +97,11 @@ def launch_argv(cfg, argv):
         if sep and key in STRIP:
             continue
         clean.append(key + '=' + env[key] if sep and key in env else arg)
+    if os.name == 'nt':
+        # Windows has no /usr/bin/env (every opencode launch failed with
+        # dispatch_local_command_failed). Same contract through a tiny wrapper.
+        spec = json.dumps({'unset': sorted(STRIP), 'set': env}, sort_keys=True)
+        return [sys.executable, '-c', _WINDOWS_ENV_WRAPPER, spec] + clean
     prefix = ['/usr/bin/env']
     for key in STRIP:
         prefix += ['-u', key]

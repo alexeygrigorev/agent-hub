@@ -126,5 +126,22 @@ class ZcodeManagedConfig(unittest.TestCase):
             self.assertEqual(cli.read_text(), edited)
 
 
+class WindowsLaunchArgv(unittest.TestCase):
+    def test_windows_launch_argv_has_no_usr_bin_env_and_applies_the_store(self):
+        import subprocess
+        from unittest import mock
+        from agent_hub_host import opencode_auth
+        base = Path(tempfile.mkdtemp())
+        cfg = {'binary': str(base / 'oc'), 'source_data': str(base / 's'),
+               'source_config': str(base / 'sc'), 'target_data': str(base / 't')}
+        code = 'import os;print(os.environ["XDG_DATA_HOME"]);print("OPENCODE_SERVER_PASSWORD" in os.environ)'
+        with mock.patch.object(opencode_auth.os, 'name', 'nt'):
+            argv = opencode_auth.launch_argv(cfg, [sys.executable, '-c', code])
+        self.assertNotIn('/usr/bin/env', argv)
+        out = subprocess.run(argv, capture_output=True, text=True, env={**os.environ, 'OPENCODE_SERVER_PASSWORD': 'x'})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.split(), [cfg['target_data'], 'False'])
+
+
 if __name__ == "__main__":
     unittest.main()
