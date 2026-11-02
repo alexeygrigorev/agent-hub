@@ -368,11 +368,15 @@ class TestCappedTestRun(unittest.TestCase):
             env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
             ready = os.path.join(tmpdir, "ready")
             release = os.path.join(tmpdir, "release")
-            program = ("from pathlib import Path; import os,sys,time; os.close(9); "
+            termed = os.path.join(tmpdir, "termed")
+            # The command ignores the wrapper's forwarded SIGTERM (recording that it
+            # arrived), so the slot stays held until release, with no timing race.
+            program = ("from pathlib import Path; import os,signal,sys,time; os.close(9); "
+                       "signal.signal(signal.SIGTERM, lambda *_: Path(sys.argv[3]).touch()); "
                        "Path(sys.argv[1]).touch(); "
                        "exec('while not Path(sys.argv[2]).exists(): time.sleep(.02)')")
             child = subprocess.Popen([self.capped, "--slots", "1", "--", sys.executable,
-                                      "-c", program, ready, release], env=env)
+                                      "-c", program, ready, release, termed], env=env)
             try:
                 deadline = time.monotonic() + 10
                 while not os.path.exists(ready):
@@ -384,6 +388,11 @@ class TestCappedTestRun(unittest.TestCase):
                 self.assertEqual(held.returncode, 3, held.stderr)
                 self.assertIsNone(child.poll(), "Contender must leave holder running")
                 child.terminate()  # Interrupt only this fixture's wrapper.
+                deadline = time.monotonic() + 10
+                while not os.path.exists(termed):  # wrapper forwarded TERM to the group
+                    self.assertIsNone(child.poll())
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.02)
                 still_held = self.run_capped("--slots", "1", "--wait", "0", "--", "true", env_extra=env)
                 self.assertEqual(still_held.returncode, 3, still_held.stderr)
                 self.assertIsNone(child.poll(), "Interrupted wrapper must retain the child's slot")
