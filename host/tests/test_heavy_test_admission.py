@@ -160,18 +160,6 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(waiter.wait(timeout=40), 0)
         self.assertEqual(self.order(), ['next'])
 
-    def test_escaped_descendant_holding_fd9_does_not_keep_slot(self):
-        self.holder.close()
-        pidfile = self.root / 'leaker.pid'
-        code = ('import os,sys,subprocess; from pathlib import Path\n'
-                'p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"],pass_fds=(9,),start_new_session=True)\n'
-                f'Path({str(pidfile)!r}).write_text(str(p.pid))')
-        self.assertEqual(self.start('leaker', code=code).wait(timeout=20), 0)
-        leaker = int(pidfile.read_text())
-        self.until(lambda: not Path(f'/proc/{leaker}').exists() or Path(f'/proc/{leaker}/stat').read_text().split(')')[-1].split()[0] == 'Z')
-        self.assertEqual(self.start('after').wait(timeout=20), 0)
-        self.assertEqual(self.order(), ['after'])
-
     def test_overdue_unbounded_holder_is_reclaimed_by_waiter(self):
         self.holder.close()
         stub = self.root / 'stub' / 'heavy-test-admission.py'

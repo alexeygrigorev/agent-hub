@@ -263,7 +263,7 @@ def proc_ppid_pgid(pid):
         return None
 
 
-def lock_holders(path, only_fd=None):
+def lock_holders(path):
     """PIDs of this user's processes with the lock file open (fuser-like /proc scan)."""
     try:
         target = path.stat()
@@ -274,7 +274,7 @@ def lock_holders(path, only_fd=None):
         if not entry.isdecimal():
             continue
         try:
-            for fd in ([str(only_fd)] if only_fd is not None else os.listdir(f'/proc/{entry}/fd')):
+            for fd in os.listdir(f'/proc/{entry}/fd'):
                 try:
                     info = os.stat(f'/proc/{entry}/fd/{fd}')
                 except OSError:
@@ -310,18 +310,6 @@ def stop_group(pgid):
     signal_group(pgid, signal.SIGKILL)
 
 
-def reap_slot_leakers(slot_path):
-    """After our command ended: kill descendants that escaped its group but kept FD 9.
-
-    Only FD 9 counts: waiters briefly open slot files to probe them, on other FDs."""
-    for pid in lock_holders(slot_path, only_fd=9):
-        if pid != os.getpid():
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
-
 def reap_overdue_holders(root, slots):
     """Stop the test group of any slot holder older than OVERDUE_HOLDER_S.
 
@@ -350,7 +338,7 @@ def reap_overdue_holders(root, slots):
                     stop_group(int(child))
 
 
-def run_command(command, slot, interrupted, run_timeout, identity, slot_path):
+def run_command(command, slot, interrupted, run_timeout, identity):
     global COMMAND_STARTED
     # Reserve/inherit the historical FD9. Parent retains its own descriptor
     # even when the command closes FD9. Descendants retaining it also keep
@@ -410,21 +398,11 @@ def run_command(command, slot, interrupted, run_timeout, identity, slot_path):
                     break
                 time.sleep(0.1)
                 continue
-            # Observe the leader's exit without reaping it so its group can be
-            # swept below before the PGID could be reused.
             try:
-                exited = os.waitid(os.P_PID, child.pid,
-                                   os.WEXITED | os.WNOHANG | os.WNOWAIT)
-            except ChildProcessError:
-                exited = None
-            if exited is not None and exited.si_pid:
-                signal_group(child_pgid, signal.SIGKILL)
-                result = child.wait()
+                result = child.wait(timeout=0.1)
                 break
-            time.sleep(0.1)
-        # Survivors that escaped the group but kept FD 9 would hold the slot
-        # forever once the wrapper is gone.
-        reap_slot_leakers(slot_path)
+            except subprocess.TimeoutExpired:
+                continue
         if timed_out:
             return 124
         return interrupted() or (128 - result if result < 0 else result)
@@ -516,7 +494,6 @@ def main():
         with ticket:
             announced = False
             slot = None
-            slot_path = None
             next_reap = time.monotonic() + REAP_INTERVAL_S
             while slot is None:
                 fcntl.flock(mutex, fcntl.LOCK_EX)
@@ -536,7 +513,6 @@ def main():
                             candidate = (root / f'slot-{index}.lock').open('a+')
                             if lock_available(candidate):
                                 slot = candidate
-                                slot_path = root / f'slot-{index}.lock'
                                 break
                             candidate.close()
                     if slot is not None:
@@ -568,7 +544,7 @@ def main():
                 running = True
                 print(f'capped-test-run: admitted {args.priority} ticket {sequence}', file=sys.stderr, flush=True)
                 print(f'capped-test-run: run timeout {run_timeout}s', file=sys.stderr, flush=True)
-                return run_command(command, slot, lambda: interrupted, run_timeout, identity, slot_path)
+                return run_command(command, slot, lambda: interrupted, run_timeout, identity)
 
 
 if __name__ == '__main__':
