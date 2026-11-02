@@ -1292,6 +1292,46 @@ def locate_zcode_runtime(dest=None):
     return None
 
 
+def _extract_deb_resources(deb_path, target):
+    """Pure-Python `dpkg-deb -x` for opt/ZCode/resources only (works on Windows)."""
+    import tarfile
+    prefix = 'opt/ZCode/resources/'
+    with open(deb_path, 'rb') as f:
+        if f.read(8) != b'!<arch>' + chr(10).encode():
+            raise ValueError('Invalid ZCode deb')
+        while True:
+            header = f.read(60)
+            if len(header) < 60:
+                raise ValueError('ZCode deb has no data archive')
+            name = header[:16].decode('ascii', 'replace').strip().rstrip('/')
+            size = int(header[48:58].decode('ascii').strip())
+            if name.startswith('data.tar'):
+                if name not in ('data.tar', 'data.tar.xz', 'data.tar.gz'):
+                    raise ValueError('Unsupported ZCode deb compression')
+                f.seek(f.tell())
+                start = f.tell()
+                break
+            f.seek(size + (size & 1), 1)
+        import io
+        buf = io.BytesIO(f.read(size))
+    root_dir = Path(target).resolve()
+    with tarfile.open(fileobj=buf, mode='r:*') as tar:
+        for member in tar:
+            rel = member.name[2:] if member.name.startswith('./') else member.name
+            if not rel.startswith(prefix) or not (member.isfile() or member.isdir()):
+                continue
+            out = (root_dir / rel).resolve()
+            if not out.is_relative_to(root_dir / prefix):
+                raise ValueError('Unsafe path in ZCode deb')
+            if member.isdir():
+                out.mkdir(parents=True, exist_ok=True)
+                continue
+            out.parent.mkdir(parents=True, exist_ok=True)
+            src = tar.extractfile(member)
+            with open(out, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+
+
 def ensure_zcode_runtime(dest=None):
     runtime = locate_zcode_runtime(dest)
     if runtime:
@@ -1304,9 +1344,11 @@ def ensure_zcode_runtime(dest=None):
                     return local_cjs
         return runtime
 
-    system = sys.platform
     cpu = platform.machine().lower()
-    if system != 'linux' or cpu not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
+    # zcode.cjs is plain JavaScript, byte-identical in the Windows installer and
+    # the Linux package (sha256 verified), so every OS takes it from the Linux deb;
+    # Windows hosts previously failed with 'distribution unsupported on this platform'.
+    if cpu not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
         raise ValueError('Automatic ZCode runtime distribution unsupported on this platform')
     platform_name = 'linux-aarch64' if cpu in ('aarch64', 'arm64') else 'linux-x86_64'
     manifest_url = f'https://zcode.z.ai/api/v1/releases/electron/manifest?platform={platform_name}&channel=1'
@@ -1317,7 +1359,7 @@ def ensure_zcode_runtime(dest=None):
         manifest_path = tmp_dir / 'manifest.json'
         subprocess.run(['curl', '-fSL', manifest_url, '-o', str(manifest_path)],
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
-        manifest_text = manifest_path.read_text()
+        manifest_text = manifest_path.read_text(encoding='utf-8', errors='replace')
         deb_url, sha512_expected = parse_deb_manifest(manifest_text)
         if not deb_url:
             raise ValueError('ZCode deb asset not found in release manifest')
@@ -1337,8 +1379,7 @@ def ensure_zcode_runtime(dest=None):
             raise ValueError('Official ZCode deb SHA-512 mismatch')
         tmp_unpack = tmp_dir / 'unpack'
         tmp_unpack.mkdir(parents=True, exist_ok=True)
-        subprocess.run(['dpkg-deb', '-x', str(deb_path), str(tmp_unpack)],
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+        _extract_deb_resources(deb_path, tmp_unpack)
         src_res = tmp_unpack / 'opt/ZCode/resources'
         if not (src_res / 'glm/zcode.cjs').is_file():
             raise ValueError('Extracted deb missing zcode.cjs')
