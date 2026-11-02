@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from agent_hub_host import fleet, worker_auth, config, provisioning
+from agent_hub_host import fleet, worker_auth, config, provisioning, launch_diagnostics
 
 LAUNCH = '11111111-2222-4333-8444-555555555555'
 NATIVE = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
@@ -123,6 +123,25 @@ class WorkerLaunchContextTests(unittest.TestCase):
             self.assertEqual(result['state'],'uncertain')
             self.assertFalse(runner_calls)
             self.assertNotIn('PRIVATE_RESPONSE',json.dumps(result))
+            self.assertEqual(result['diagnostic']['reason'], 'launcher_worker_auth_unknown')
+
+    def test_worker_credential_diagnostics_expose_only_fixed_reason_categories(self):
+        categories = {
+            'hub_refused_duplicate': 'launcher_worker_auth_hub_refused_duplicate',
+            'hub_refused': 'launcher_worker_auth_hub_refused',
+            'hub_unreachable': 'launcher_worker_auth_hub_unreachable',
+            'invalid_response': 'launcher_worker_auth_invalid_response',
+            'expired': 'launcher_worker_auth_expired',
+            'workspace_unwritable': 'launcher_worker_auth_workspace_unwritable',
+            'unknown': 'launcher_worker_auth_unknown',
+        }
+        for category, reason in categories.items():
+            with self.subTest(category=category):
+                diag = launch_diagnostics.diagnostic(
+                    'ValueError: Worker Hub credential unavailable (' + category + ')')
+                self.assertEqual(diag['reason'], reason)
+                self.assertNotIn('access_token', json.dumps(diag))
+                self.assertNotIn('server text', json.dumps(diag))
 
     def test_managed_environment_keeps_discovery_identity_and_scrubs_operator_tokens(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
