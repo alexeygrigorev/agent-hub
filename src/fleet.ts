@@ -20,6 +20,8 @@ import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { SILENT_START_MS, SILENT_START_REASON, ABANDONED_RECOVERY_MS, abandonedLaunch, expireSilentStartRows } from './silent-start';
 import { reconcileAccountCapacity } from './account_capacity';
+import { ACTIVE_LAUNCH_STATES_SQL, countReservedLaunches, parseReservedLaunchCursor, reservedLaunchPage, type ReservedLaunchContext } from './account-reserved-launches';
+import { initAccountCapacityHistory, readAccountCapacityHistory } from './account-capacity-history';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
@@ -78,7 +80,7 @@ const CLAIM_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 // yet, but it canonicalizes to provider `codex` (the second Codex account)
 // on every read path. Never register new accounts under it.
 const PROVIDERS = new Set(['codex', 'codex-orin', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
-const ACTIVE = "('offered','starting','running','uncertain')";
+const ACTIVE = ACTIVE_LAUNCH_STATES_SQL;
 // A native catalog can observe spawn before the launcher posts its receipt.
 // Correlate that narrow in-flight window without trusting a tag alone.
 const NATIVE_IN_FLIGHT = `(
@@ -648,6 +650,7 @@ export class FleetService {
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_machine_state ON fleet_launches(machine_id,state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_expiry ON fleet_launches(state,created_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state ON fleet_launches(account,state)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state_id ON fleet_launches(account,state,id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_account_phase ON fleet_sessions(account,phase)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_machine_phase ON fleet_sessions(machine_id,phase)');
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_recent ON fleet_launches(machine_id,finished_at) WHERE state = 'failed' AND mode = 'headless' AND verification_status = 'unverified'");
@@ -818,6 +821,54 @@ export class FleetService {
     return this.withMaintenance(() => this.accountStatusWithinMaintenance(account));
   }
 
+  private reservedLaunchContext(liveIds: string[], nowMs = this.now(), catalogs?: Set<string>): ReservedLaunchContext {
+    const completeCatalogs = catalogs ?? freshCompleteCatalogs(this.sql, nowMs);
+    let boundNativeIdSql = 'NULL';
+    let boundNativeCreatedAtSql = 'NULL';
+    try {
+      const hasControlStore = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
+      if (hasControlStore) {
+        const bindingWhere = `c.machine_id = l.machine_id AND c.fleet_launch_id = l.id AND c.engine = l.engine
+          AND c.state IN ('running','uncertain') AND c.binding_json IS NOT NULL`;
+        boundNativeIdSql = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(
+          CASE WHEN json_valid(c.binding_json) THEN
+            CASE WHEN json_type(c.binding_json, '$.native_id') = 'text' AND json_type(c.binding_json, '$.native_created_at_ms') = 'integer'
+              THEN json_extract(c.binding_json, '$.native_id') END
+          END) END
+        FROM session_control_sessions c WHERE ${bindingWhere})`;
+        boundNativeCreatedAtSql = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(
+            CASE WHEN json_valid(c.binding_json) THEN
+              CASE WHEN json_type(c.binding_json, '$.native_created_at_ms') = 'integer'
+                THEN json_extract(c.binding_json, '$.native_created_at_ms') END
+            END) END
+          FROM session_control_sessions c WHERE ${bindingWhere})`;
+      }
+    } catch { /* Fleet-only stores have no session-control binding to join. */ }
+    return {
+      live_ids: liveIds,
+      stale_cutoff: new Date(nowMs - 48 * 3600000).toISOString(),
+      idle_cutoff_ms: nowMs - this.resources.config().idle_minutes * 60000,
+      complete_catalogs: completeCatalogs,
+      bound_native_id_sql: boundNativeIdSql,
+      bound_native_created_at_sql: boundNativeCreatedAtSql,
+    };
+  }
+
+  private liveAccountMachines(nowMs = this.now(), machines?: readonly any[]): { ids: Set<string>; engines: Map<string, Set<string>> } {
+    const ids = new Set<string>();
+    const engines = new Map<string, Set<string>>();
+    try {
+      for (const machine of (machines ?? this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines WHERE revoked_at IS NULL').toArray()) as any[]) {
+        if (machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), nowMs, 180000)) continue;
+        const id = String(machine.id);
+        ids.add(id);
+        const advertised = parsed(machine.capabilities)?.engines;
+        if (Array.isArray(advertised)) engines.set(id, new Set(advertised.filter((engine: unknown) => typeof engine === 'string')));
+      }
+    } catch { /* fail closed below when the live set is empty */ }
+    return { ids, engines };
+  }
+
   private accountStatusWithinMaintenance(account: any, snapshot?: FleetCapacitySnapshot) {
     // Budget reads must never trigger global expiry/reconciliation scans.
     // Canonical placement continues to own its normal maintenance path.
@@ -859,21 +910,9 @@ export class FleetService {
     // must not hold quota forever; running launches may be long-lived and stay.
     // Both bound and orphan sessions idle past the configured threshold
     // release admission slots; parked PTYs must not pin account capacity.
-    const liveIds = new Set<string>();
-    const liveEnginesByMachine = new Map<string, Set<string>>();
-    try {
-      for (const m of (snapshot?.machines ?? this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines WHERE revoked_at IS NULL').toArray()) as any[]) {
-        if (m.drained) continue;
-        if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), now, 180000)) continue;
-        liveIds.add(String(m.id));
-        // Same advertised-engine rule as plan(): a route stays placeable only
-        // while its machine's fresh capabilities still list the engine. A host
-        // release that drops a subscription stops serving the engine, and its
-        // leftover registry routes must not read as placeable capacity.
-        const engines = parsed(m.capabilities)?.engines;
-        if (Array.isArray(engines)) liveEnginesByMachine.set(String(m.id), new Set(engines.filter((e: unknown) => typeof e === 'string')));
-      }
-    } catch { /* fail closed below when the live set is empty */ }
+    const liveMachines = this.liveAccountMachines(now, snapshot?.machines);
+    const liveIds = liveMachines.ids;
+    const liveEnginesByMachine = liveMachines.engines;
     const liveList = [...liveIds];
     const reservationCutoff = new Date(now - RESERVATION_TTL_MS).toISOString();
     const idleCutoff = now - this.resources.config().idle_minutes * 60000;
@@ -2194,6 +2233,47 @@ export class FleetService {
     // disabled account keeps its registry row, routes, credentials and
     // history, but accountStatus() reports it blocked so plan() never offers
     // it. Re-enabling restores placement; nothing is deleted.
+    const accountRead = /^\/api\/fleet\/accounts\/([^/]+)\/(reserved-launches|capacity-history)$/.exec(path);
+    if (accountRead && request.method === 'GET') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      let accountLabel = '';
+      try { accountLabel = decodeURIComponent(accountRead[1]); } catch { accountLabel = ''; }
+      if (!label(accountLabel)) return response({ error: 'invalid_account' }, 400);
+      const account = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', accountLabel).toArray()[0] as any;
+      if (!account) return response({ error: 'unknown_account' }, 404);
+      const params = new URL(request.url).searchParams;
+      const limitRaw = params.get('limit') ?? '100';
+      const limit = /^\d{1,3}$/.test(limitRaw) ? Number(limitRaw) : 0;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) return response({ error: 'invalid_limit' }, 400);
+      if (accountRead[2] === 'reserved-launches') {
+        try {
+          const cursor = parseReservedLaunchCursor(params.get('cursor'));
+          return this.withMaintenance(() => {
+            this.reconcileCapacity();
+            const nowMs = this.now();
+            const liveIds = this.liveAccountMachines(nowMs).ids;
+            const page = reservedLaunchPage(this.sql, accountLabel,
+              this.reservedLaunchContext([...liveIds], nowMs), limit, cursor);
+            return response({ account: accountLabel, live_ids: [...liveIds].sort(), ...page });
+          });
+        } catch (error) {
+          return response({ error: error instanceof Error && error.message === 'invalid_reserved_launch_cursor' ? 'invalid_cursor' : 'reserved_launch_read_failed' }, 400);
+        }
+      }
+      const fromRaw = params.get('from');
+      const toRaw = params.get('to');
+      const fromMs = fromRaw ? Date.parse(fromRaw) : NaN;
+      const toMs = toRaw ? Date.parse(toRaw) : NaN;
+      const afterRaw = params.get('cursor');
+      const afterMs = afterRaw === null ? null : /^\d{1,16}$/.test(afterRaw) ? Number(afterRaw) : NaN;
+      try {
+        initAccountCapacityHistory(this.sql);
+        const history = readAccountCapacityHistory(this.sql, accountLabel, fromMs, toMs, limit, afterMs);
+        return response({ account: accountLabel, from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), ...history });
+      } catch {
+        return response({ error: 'invalid_capacity_history_query' }, 400);
+      }
+    }
     const accountToggle = /^\/api\/fleet\/accounts\/([^/]+)$/.exec(path);
     if (accountToggle && request.method === 'PATCH') {
       if (!admin) return response({ error: 'forbidden' }, 403);
