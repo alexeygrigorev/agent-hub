@@ -213,6 +213,28 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
     return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] === '/events';
   }
   if (path === '/api/sessions') return ['GET', 'POST'].includes(request.method);
+  const link = /^\/api\/sessions\/([^/]{8,128})\/link$/.exec(path);
+  if (link) {
+    if (request.method !== 'POST') return false;
+    let ref: string;
+    try { ref = decodeURIComponent(link[1]); } catch { return false; }
+    if (!/^[0-9a-f-]{8,36}$/i.test(ref)) return false;
+    const targets = sql.exec(`SELECT id,machine_id,request_json,binding_json FROM session_control_sessions
+      WHERE id LIKE ? ORDER BY id LIMIT 101`, ref.toLowerCase() + '%').toArray() as any[];
+    return targets.some(row => {
+      let intent: any = {}, binding: any = {};
+      try { intent = JSON.parse(row.request_json || '{}'); } catch { return false; }
+      try { binding = JSON.parse(row.binding_json || '{}'); } catch { return false; }
+      const workspace = typeof binding.workspace === 'string' ? binding.workspace : intent.workspace;
+      const observed = intent.provenance === 'observed_native' && binding.provenance === 'observed_native';
+      const own = row.id === worker.session_id || row.id === worker.launch_id ||
+        (typeof binding.native_id === 'string' && binding.native_id === worker.native_binding?.native_id);
+      // The endpoint rechecks the exact intake id under its write transaction.
+      // This front-door gate limits the target to the worker's machine/workspace
+      // and either that worker's own session or an observed native session.
+      return row.machine_id === worker.machine_id && workspace === worker.workspace && (own || observed);
+    });
+  }
   const session = /^\/api\/sessions\/([0-9a-f-]{36})(?:\/(commands|capture|send|stop|wake|wakes|ping|ping-clear|pings))?$/.exec(path);
   if (session) {
     if ([worker.session_id,worker.launch_id,worker.native_binding?.native_id].includes(session[1])) return (request.method === 'GET' && (!session[2] || ['commands','wakes','pings'].includes(session[2]))) ||

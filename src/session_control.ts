@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS session_worktree_episodes (subject TEXT PRIMARY KEY, 
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 `;
 
-type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string };
+type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string; tokenHash?: string };
 type Auth = { caller?: Caller; scopes?: string[]; error?: Response };
 type ReserveHook = (input: any, auth: Auth) => { value: any; status: number };
 /** Worktree-guard follow-up hooks (intake a0f01448 AC4). Wired in hub.ts;
@@ -3083,8 +3083,18 @@ export class SessionControlService {
           session = matches[0] ?? null;
         }
       } else if (/^[a-f0-9][a-f0-9-]{7,34}$/i.test(rawRef) && sub !== 'binding' && sub !== 'retirement') {
-        const matches = [...new Map([...visibleSessionPrefixMatches(this.sql, rawRef, row => this.ownerOk(row, caller)),
-          ...observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller))].map(row => [row.id, row])).values()];
+        const linkWorker = sub === 'link' ? workerAccessContext(this.sql, caller.tokenId, this.now()) : null;
+        const visibleToCaller = (row: any) => {
+          if (this.ownerOk(row, caller)) return true;
+          if (!linkWorker || linkWorker.actor !== caller.actor || linkWorker.token_hash !== caller.tokenHash ||
+              row.machine_id !== linkWorker.machine_id) return false;
+          const intent = parsed(row.request_json, {}), binding = parsed(row.binding_json, {});
+          const workspace = typeof binding.workspace === 'string' ? binding.workspace : intent.workspace;
+          return intent.provenance === 'observed_native' && binding.provenance === 'observed_native' &&
+            workspace === linkWorker.workspace;
+        };
+        const matches = [...new Map([...visibleSessionPrefixMatches(this.sql, rawRef, visibleToCaller),
+          ...observedHubTagMatches(this.sql, rawRef, visibleToCaller)].map(row => [row.id, row])).values()];
         if (matches.length > 1) return response({ error: 'ambiguous_session_prefix',
           matches: matches.map(row => ({ id: row.id, name: parsed(row.request_json, {}).name ?? null })) }, 409);
         session = matches[0] ?? null;
@@ -3139,7 +3149,10 @@ export class SessionControlService {
         session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0] ?? session;
       }
       if (sub === 'link' && request.method === 'POST') {
-        if (!admin) return response({ error: 'forbidden' }, 403);
+        const initialWorker = admin ? null : workerAccessContext(this.sql, caller.tokenId, this.now());
+        const workerIdentityOk = !!initialWorker && initialWorker.actor === caller.actor &&
+          initialWorker.token_hash === caller.tokenHash;
+        if (!admin && !workerIdentityOk) return response({ error: 'forbidden' }, 403);
         // Unknown or foreign refs resolve to no row: render not_found, never a 500 oracle.
         if (!session) return response({ error: 'not_found' }, 404);
         const input = await body(request);
@@ -3149,10 +3162,20 @@ export class SessionControlService {
         }
         return this.transaction(() => {
           const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', session.id).toArray()[0];
-          if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
+          if (!live) return response({ error: 'not_found' }, 404);
           const tasks: any[] = this.sql.exec("SELECT id FROM intake_tasks WHERE id=? OR substr(id,1,?)=? LIMIT 2",
             input.intake_task_id, input.intake_task_id.length, input.intake_task_id).toArray();
           if (tasks.length !== 1) return response({ error: tasks.length ? 'ambiguous_intake' : 'unknown_intake_task' }, 409);
+          const worker = admin ? null : workerAccessContext(this.sql, caller.tokenId, this.now());
+          const intent = parsed(live.request_json, {}), binding = parsed(live.binding_json, {});
+          const workspace = typeof binding.workspace === 'string' ? binding.workspace : intent.workspace;
+          const workerOwnsSession = !!worker && (worker.session_id === live.id || worker.launch_id === live.id ||
+            (typeof binding.native_id === 'string' && binding.native_id === worker.native_binding?.native_id));
+          const observedNative = intent.provenance === 'observed_native' && binding.provenance === 'observed_native';
+          const scopedWorker = !!worker && worker.actor === caller.actor && worker.token_hash === caller.tokenHash &&
+            worker.task_id === tasks[0].id && worker.machine_id === live.machine_id &&
+            worker.workspace === workspace && (workerOwnsSession || observedNative);
+          if (!this.ownerOk(live, caller) && !scopedWorker) return response({ error: 'forbidden' }, 403);
           // AC8 (27505f04): manual linkage also works after the session ended
           // — the retained canonical row is the identity evidence, no live
           // process or host heartbeat required. Repeats are idempotent; a
@@ -3167,7 +3190,6 @@ export class SessionControlService {
                 (!e.hub_session_id && typeof bound === 'string' && e.native_id === bound && e.host === live.machine_id), 5);
           } catch { /* projection tables absent: the start-intent check below still applies */ }
           if (ledgerTasks.some((id: string) => id !== tasks[0].id)) return response({ error: 'intake_link_conflict' }, 409);
-          const intent = parsed(live.request_json, {});
           if (intent.intake_task_id && intent.intake_task_id !== tasks[0].id) return response({ error: 'intake_link_conflict' }, 409);
           const ledgerAlready = ledgerTasks.includes(tasks[0].id);
           const already = intent.intake_task_id === tasks[0].id || ledgerAlready;
@@ -3177,11 +3199,11 @@ export class SessionControlService {
             this.sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', live.request_json, live.id);
           }
           const appended = ledgerAlready ? false : recordIntakeSessionLink(this.sql, live, this.now(), undefined, {
-            link_source: 'manual', linked_by: caller.actor ?? 'operator',
+            link_source: scopedWorker ? 'scoped_worker' : 'manual', linked_by: caller.actor ?? 'operator',
             session_state_at_link: live.state, session_updated_at: live.updated_at ?? null,
           });
           return response({ ...this.view(live, threshold), already_linked: already || !appended,
-            link: { intake_task_id: tasks[0].id, source: 'manual' } });
+            link: { intake_task_id: tasks[0].id, source: scopedWorker ? 'scoped_worker' : 'manual' } });
         });
       }
       if (sub === 'binding') {
