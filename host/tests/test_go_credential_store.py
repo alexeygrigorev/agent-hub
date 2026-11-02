@@ -135,9 +135,13 @@ class WindowsLaunchArgv(unittest.TestCase):
         cfg = {'binary': str(base / 'oc'), 'source_data': str(base / 's'),
                'source_config': str(base / 'sc'), 'target_data': str(base / 't')}
         code = 'import os;print(os.environ["XDG_DATA_HOME"]);print("OPENCODE_SERVER_PASSWORD" in os.environ)'
-        # os.name='nt' on Linux makes pathlib treat POSIX paths as relative, so validate() would reject them;
-        # this test checks the argv wrapper, not path validation.
-        with mock.patch.object(opencode_auth.os, 'name', 'nt'), mock.patch.object(opencode_auth, 'validate', lambda c: c):
+        # Patching the real os.name to 'nt' on Linux breaks pathlib (cannot instantiate WindowsPath).
+        # Only opencode_auth's own view of the platform needs to look like Windows.
+        class WindowsOs:
+            name = 'nt'
+            def __getattr__(self, attr):
+                return getattr(os, attr)
+        with mock.patch.object(opencode_auth, 'os', WindowsOs()):
             argv = opencode_auth.launch_argv(cfg, [sys.executable, '-c', code])
         self.assertNotIn('/usr/bin/env', argv)
         out = subprocess.run(argv, capture_output=True, text=True, env={**os.environ, 'OPENCODE_SERVER_PASSWORD': 'x'})
