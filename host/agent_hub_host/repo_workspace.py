@@ -89,7 +89,10 @@ def ensure_repo_workspace(settings, label, *, home: Optional[str] = None,
     if path.is_dir():
         if (path / ".git").exists():
             return path.resolve()
-        raise ValueError("workspace path exists and is not a git checkout")
+        if not any(path.iterdir()):
+            path.rmdir()  # empty leftover of an interrupted clone; nothing to lose
+        else:
+            raise ValueError("workspace path exists and is not a git checkout")
     path.parent.mkdir(parents=True, exist_ok=True)
     slug = f"{owner}/{name}"
     gh = gh_bin if gh_bin is not None else shutil.which("gh")
