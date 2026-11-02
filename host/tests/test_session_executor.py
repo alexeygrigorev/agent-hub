@@ -794,3 +794,72 @@ def test_status_probe_is_read_only(env):
     target = make_target(env, "agent1", rec["id"])
     info = se.session_status(env["fake"], target, custody=custody())
     assert info["phase"] == "running" and info["status_proven"] is True
+
+
+# --- M4 AC3: qualify by UUID when the canonical workspace is gone -----------
+
+def test_qualify_by_uuid_when_workspace_deleted(env):
+    # The canonical worktree is gone; the catalog row keeps the old path.
+    # Qualification proceeds by exact UUID (+ tag/generation/engine).
+    rec = seed_session(env, tag="ghost1", engine="codex")
+    gone = os.path.join(env["base"], "worktree-gone")
+    assert not os.path.exists(gone)
+    target = NativeTarget(session_id=rec["id"], tag="ghost1", workspace=gone,
+                          created_at_ms=1700000000000, engine="codex")
+    row = ns.qualify_target(env["fake"], target)
+    assert row.session_id == rec["id"]
+
+
+def test_qualify_uuid_fallback_still_checks_generation_and_engine(env):
+    rec = seed_session(env, tag="ghost2", engine="codex")
+    gone = os.path.join(env["base"], "worktree-gone")
+    with pytest.raises(SessionControlError):
+        ns.qualify_target(env["fake"], NativeTarget(
+            session_id=rec["id"], tag="ghost2", workspace=gone,
+            created_at_ms=123, engine="codex"))
+    with pytest.raises(SessionControlError):
+        ns.qualify_target(env["fake"], NativeTarget(
+            session_id=rec["id"], tag="ghost2", workspace=gone,
+            created_at_ms=1700000000000, engine="claude"))
+
+
+def test_qualify_uuid_fallback_refuses_unknown_uuid(env):
+    gone = os.path.join(env["base"], "worktree-gone")
+    with pytest.raises(SessionControlError) as exc:
+        ns.qualify_target(env["fake"], NativeTarget(
+            session_id=str(uuid.uuid4()), tag="nobody", workspace=gone))
+    assert "UUID alone" in str(exc.value)
+
+
+def test_no_uuid_fallback_while_workspace_exists(env):
+    # The same UUID+tag living in another EXISTING workspace must NOT qualify
+    # for this workspace: tag-reuse protection stays strict while the
+    # expected workspace exists.
+    seed_session(env, tag="agent1", engine="go")
+    rec = seed_session(env, tag="agent9", engine="go")
+    other = os.path.join(env["base"], "other")
+    os.makedirs(other)
+    # rec's real UUID+tag addressed at another existing workspace: the row in
+    # the original workspace must NOT be picked by UUID.
+    with pytest.raises(SessionControlError) as exc:
+        ns.qualify_target(env["fake"], NativeTarget(
+            session_id=rec["id"], tag="agent9", workspace=other))
+    assert "UUID alone" not in str(exc.value)
+
+
+def test_validated_tolerates_deleted_workspace_when_canonicalize_raises(env, monkeypatch):
+    # Windows canonicalization opens a real handle and raises for a deleted
+    # worktree; an existing path still refuses.
+    rec = seed_session(env, tag="ghost3", engine="codex")
+    gone = os.path.join(env["base"], "worktree-gone")
+
+    def boom(path):
+        raise PermissionError("Cannot canonicalize native workspace")
+
+    monkeypatch.setattr(ns, "canonicalize_workspace", boom)
+    target = NativeTarget(session_id=rec["id"], tag="ghost3",
+                          workspace=gone).validated()
+    assert target.workspace == os.path.abspath(gone)
+    with pytest.raises(PermissionError):
+        NativeTarget(session_id=rec["id"], tag="ghost3",
+                     workspace=env["work"]).validated()
