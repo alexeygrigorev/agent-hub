@@ -1493,7 +1493,7 @@ export class FleetService {
     // Sonnet, Antigravity, Z.ai, and OpenCode Muse. Codex Luna is a fallback
     // only when none of those eligible routes reaches the configured floor.
     const preferredModelIds = new Set(policy.models.filter(m =>
-      m.id === 'sonnet' || m.provider === 'gemini' || m.provider === 'zai' || (m.id === 'muse' && m.engine === 'opencode'))
+      m.id === 'sonnet' || (m.provider === 'gemini' && m.engine === 'antigravity') || m.provider === 'zai' || (m.id === 'muse' && m.engine === 'opencode'))
       .map(m => m.id));
     const configuredHeadroomFloor = (policy.rules as any).low_headroom_percent;
     const headroomFloor = Number.isFinite(configuredHeadroomFloor) ? configuredHeadroomFloor : 30;

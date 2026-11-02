@@ -132,7 +132,8 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       const withPreferredHeadroom: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'ordinary start' });
       expect(withPreferredHeadroom.selected?.selection).toMatchObject({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
       expect(withPreferredHeadroom.candidates.some((c: any) => c.selection?.id === 'argon')).toBe(true);
-      expect(withPreferredHeadroom.candidates.some((c: any) => c.selection?.id === 'glm-flash-zcodex')).toBe(true);
+      expect(withPreferredHeadroom.candidates.some((c: any) =>
+        c.engine === 'zcodex' && c.account === 'zai-central' && c.selection?.provider === 'zai')).toBe(true);
       expect(withPreferredHeadroom.candidates.some((c: any) => c.selection?.id === 'muse')).toBe(true);
       expect(withPreferredHeadroom.candidates.some((c: any) => c.selection?.id === 'luna')).toBe(false);
 
