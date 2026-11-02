@@ -320,6 +320,36 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await tick(v, clock);
     expect(starts[0].workspace).not.toMatch(/-wt-/);
   }));
+  it('never pins a concrete host path from a prior session; falls back to the registry label', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
+    const v = verifier(h, starts, clock);
+    const t = await task(h, { title: 'Deploy to prod' });
+    const at = new Date(Date.now() - 120000).toISOString();
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      VALUES('impl-abs','human:operator','k-abs',?,'claude','headless','exited',?,?)`, JSON.stringify({ intake_task_id: t.id, workspace: '/home/alexey/git/drain-b9cae412' }), at, at);
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      VALUES('impl-win','human:operator','k-win',?,'claude','headless','exited',?,?)`, JSON.stringify({ intake_task_id: t.id, workspace: 'C:\\Users\\User\\work\\rr-70d53dbd' }), at, at);
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    expect(starts[0].workspace).toBe('agent-hub');
+  }));
+  it('retries a verifier whose start failed on a host-side reason once instead of escalating', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = []; const alerts: string[] = [];
+    const v = verifier(h, starts, clock, alerts);
+    const t = await task(h, { title: 'Deploy to prod' });
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    running(h, 'verifier-1', t.id);
+    h.sql.exec("UPDATE session_control_sessions SET state='failed' WHERE id='verifier-1'");
+    h.sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, launch_error_json, created_at, updated_at)
+      VALUES ('launch-verifier-1', 'hub:service:intake-verifier', 'human', 'verify', 'k-lv1', '{}', 'hetzner', 'claude', 'acct', 'p', 'headless', 'demo', '', 'failed', ?, ?, ?)`,
+      JSON.stringify({ reason: 'workspace_unavailable' }), new Date().toISOString(), new Date().toISOString());
+    expect(await tick(v, clock)).toMatchObject({ escalated: 0, launched: 1 });
+    expect(starts).toHaveLength(2);
+    expect(alerts).toHaveLength(0);
+  }));
 });
 
 describe('human-needed holds alert once (AC8)', () => {
