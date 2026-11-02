@@ -153,10 +153,12 @@ hard-coded constants.
 
 | knob | default | used by |
 |---|---|---|
-| `memory_floor_mb` | 2048 | Hub `plan()` gate, launcher `check_resources` |
+| `memory_floor_mb` | 2048 | Hub `plan()` gate, launcher `check_resources`; effective floor is `memory_floor_pct` of host RAM (min 512 MiB) capped by this ceiling |
+| `memory_floor_pct` | 3 | Host-proportional share of total RAM for the effective floor (a 32 GiB laptop gets ~968 MiB) |
 | `disk_floor_gb` | 15 | Hub `plan()` root-disk floor in GiB (fractional ok); below it the route is rejected as `disk_floor` (queued as capacity) |
 | `ramp_reserve_default_mb` | measured p90, fallback 512 | placement estimate |
 | `estimate_percentile` | 90 | placement estimate |
+| `estimate_cap_mb` | 1024 | Ceiling for one session's measured estimate |
 | `estimate_multiplier` | 1.25 | measured estimate growth allowance |
 | `ramp_seconds` | 180 | additional reserve window after starting |
 | `cpu_load_factor` | 3.0 | Deprecated compatibility field; never gates CPU |
