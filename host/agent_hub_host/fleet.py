@@ -710,11 +710,12 @@ def load_settings(path=None):
     needs = data.get('capabilities', [])
     if not isinstance(needs, list) or len(needs) > 64 or any(not isinstance(n, str) or not re.fullmatch(r'[a-z0-9][a-z0-9:_-]{0,95}', n) for n in needs) or len(set(needs)) != len(needs):
         raise ValueError('Invalid task capabilities')
-    maximum = data.get('max_agents', 1)
+    maximum = data.get('max_agents', 'auto')
     # 'auto' stays raw here so settings written back keep it; it is resolved
     # from CPU/RAM only when advertised (intake 88ff6766).
     if maximum != 'auto' and (type(maximum) is not int or not 1 <= maximum <= 100):
         raise ValueError('Invalid machine concurrency')
+    data['max_agents'] = maximum
     # A relabel lists ONE side: the local label or its canonical alias, never
     # both. Two subscriptions canonicalizing to the same (engine, profile,
     # account) identity would make _route() ambiguous, so fail fast here.

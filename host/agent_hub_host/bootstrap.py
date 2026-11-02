@@ -836,7 +836,7 @@ def install_service(install_root, command):
 
 
 def migrate_installer_max_agents(settings, state):
-    """Once per install, lift the old installer default (max_agents 1) to "auto".
+    """Once per install, lift the old installer default (max_agents 1 or missing) to "auto".
 
     Earlier installers wrote 1 on every host, so 32 GB Windows desktops
     advertised a single slot (intake 88ff6766). The marker keeps a value an
@@ -846,7 +846,7 @@ def migrate_installer_max_agents(settings, state):
     if marker.exists() or not Path(settings).exists():
         return False
     data = json.loads(Path(settings).read_text(encoding='utf-8'))
-    changed = isinstance(data, dict) and data.get('max_agents') == 1
+    changed = isinstance(data, dict) and (data.get('max_agents') == 1 or ('version' in data and 'max_agents' not in data))
     if changed:
         data['max_agents'] = 'auto'
         write_private(settings, json.dumps(data, indent=2) + '\n')
