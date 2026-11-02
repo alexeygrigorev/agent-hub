@@ -104,6 +104,41 @@ describe('idle with open acceptance criteria', () => {
     adoptObservedNativeSessions(counted as any,'idle-host',natives,at+1000);
     expect(reads.some(q=>q.includes('FROM intake_tasks'))).toBe(false);
   }));
+  it('links the ca6092b2 note-aplexer START evidence in the first observation cycle', async () => fixture(async ({sql,task}: any) => {
+    const native={native_id:'ca6092b2-d6ce-4bde-9bd9-4b3d027c6a1e',tag:'fix-6ce3c560',
+      workspace:'/test/agent-hub-wt-6ce3c560',engine:'codex',created_at_ms:at-1000,phase:'running'};
+    task.history.push({id:crypto.randomUUID(),kind:'note',intake_key:'note-aplexer-ca6092b2',
+      text:`Hub start held: Started via aplexer backup on Hetzner: session ${native.native_id}, tag ${native.tag}, worktree ${native.workspace}.`});
+    sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(task),taskId);
+    // Recreate a completed pre-fix projection. Its old triggers omitted this
+    // note and would otherwise keep the live intake invisible after upgrade.
+    sql.exec(`CREATE TABLE session_observation_intake_meta
+      (id INTEGER PRIMARY KEY CHECK(id=1), cursor TEXT NOT NULL, complete INTEGER NOT NULL, revision INTEGER NOT NULL)`);
+    sql.exec("INSERT INTO session_observation_intake_meta VALUES(1,?,1,7)",taskId);
+    sql.exec('CREATE TABLE session_observation_intakes(task_id TEXT PRIMARY KEY, events TEXT NOT NULL)');
+    sql.exec("INSERT INTO session_observation_intakes VALUES(?, '[]')",taskId);
+    sql.exec(`CREATE TRIGGER session_observation_intake_insert AFTER INSERT ON intake_tasks BEGIN
+      UPDATE session_observation_intake_meta SET revision=revision+1 WHERE id=1; END`);
+    sql.exec(`CREATE TRIGGER session_observation_intake_update AFTER UPDATE ON intake_tasks BEGIN
+      UPDATE session_observation_intake_meta SET revision=revision+1 WHERE id=1; END`);
+    sql.exec(`CREATE TRIGGER session_observation_intake_delete AFTER DELETE ON intake_tasks BEGIN
+      UPDATE session_observation_intake_meta SET revision=revision+1 WHERE id=1; END`);
+
+    expect(adoptObservedNativeSessions(sql,'idle-host',[native],at).adopted).toBe(1);
+    const row=sql.exec('SELECT request_json FROM session_control_sessions WHERE id=?',native.native_id).one();
+    expect(JSON.parse(row.request_json).intake_task_id).toBe(taskId);
+    const recordedTask=JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id=?',taskId).one().data);
+    expect(recordedTask.history.some((event:any)=>event.kind==='link' && event.native_id===native.native_id)).toBe(true);
+
+    // The replacement trigger also indexes newly appended note-aplexer notes.
+    const next={native_id:'daedba5e-2a20-4f06-bb11-9c8cd4f63f30',tag:'fix-next-task',
+      workspace:native.workspace,engine:'codex',created_at_ms:at-500,phase:'running'};
+    recordedTask.history.push({id:crypto.randomUUID(),kind:'note',intake_key:'note-aplexer-daedba5e',
+      text:`Started via aplexer: session ${next.native_id}, tag ${next.tag}.`});
+    sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(recordedTask),taskId);
+    adoptObservedNativeSessions(sql,'idle-host',[next],at+1000);
+    expect(JSON.parse(sql.exec('SELECT request_json FROM session_control_sessions WHERE id=?',next.native_id).one().request_json).intake_task_id).toBe(taskId);
+  }));
   it('backfills large ledgers in bounded pages and observes late START notes without native changes', async () => fixture(async ({sql,task}: any) => {
     const native={native_id:crypto.randomUUID(),tag:'late-manual',workspace:'/late-manual',engine:'codex',created_at_ms:at-1000,phase:'running'};
     for (let n=0;n<120;n++) {
