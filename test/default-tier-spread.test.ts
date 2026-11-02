@@ -52,7 +52,7 @@ describe('default tier placement', () => {
       hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
         machine, machine, machine, iso(), iso(), JSON.stringify({
           mem_avail_mb: 32000, disk_free_gb: 80, cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() },
-        }), JSON.stringify({ engines: ['codex', 'claude', 'antigravity', 'opencode'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
+        }), JSON.stringify({ engines: ['codex', 'claude', 'antigravity', 'zcodex', 'opencode'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
       const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] } as any;
       const put = await fleet.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify({
         accounts: [
