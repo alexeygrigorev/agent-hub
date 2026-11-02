@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS liveness_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT
 CREATE INDEX IF NOT EXISTS liveness_alerts_open ON liveness_alerts (subject_kind, subject, resolved_at);
 CREATE INDEX IF NOT EXISTS liveness_alerts_open_kind ON liveness_alerts (subject_kind) WHERE resolved_at IS NULL;
 CREATE INDEX IF NOT EXISTS liveness_alerts_resolved ON liveness_alerts (resolved_at) WHERE resolved_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS alert_backfill_suppressed (alert_id INTEGER PRIMARY KEY, suppressed_at INTEGER NOT NULL);
 `;
 
 export type Thresholds = { machineStaleS: number; machineOfflineS: number; agentStallS: number; agentToolCallStallS: number; heartbeatStaleS: number; launchStuckS: number };
@@ -272,10 +273,16 @@ export class LivenessService {
     for (const alert of open) {
       const key = alert.subject_kind + ':' + alert.subject; const current = problems.get(key);
       if (alert.state === 'stalled' && unknown.has(key)) continue;
-      if (!current) this.sql.exec('UPDATE liveness_alerts SET resolved_at = ? WHERE id = ?', at, alert.id);
+      if (!current) {
+        this.sql.exec('UPDATE liveness_alerts SET resolved_at = ? WHERE id = ?', at, alert.id);
+        this.sql.exec('DELETE FROM alert_backfill_suppressed WHERE alert_id = ?', alert.id);
+      }
       else {
         openKeys.add(key);
-        if (current.state !== alert.state || current.detail !== alert.detail) this.sql.exec('UPDATE liveness_alerts SET state = ?, detail = ? WHERE id = ?', current.state, current.detail, alert.id);
+        if (current.state !== alert.state) {
+          this.sql.exec(`UPDATE liveness_alerts SET state = ?, detail = ?, notify_error = NULL, notified_at = NULL, delivered_to = '[]' WHERE id = ?`, current.state, current.detail, alert.id);
+          this.sql.exec('DELETE FROM alert_backfill_suppressed WHERE alert_id = ?', alert.id);
+        } else if (current.detail !== alert.detail) this.sql.exec('UPDATE liveness_alerts SET detail = ? WHERE id = ?', current.detail, alert.id);
       }
     }
     for (const [key, s] of problems) {
@@ -290,8 +297,25 @@ export class LivenessService {
   setAlert(kind: string, subject: string, problem: { state: string; detail: string } | null): any | null {
     const at = new Date(this.now()).toISOString();
     const existing: any = this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NULL AND subject_kind = ? AND subject = ?', kind, subject).toArray()[0];
-    if (!problem) { if (existing) this.sql.exec('UPDATE liveness_alerts SET resolved_at = ? WHERE id = ?', at, existing.id); return null; }
-    if (existing) { this.sql.exec('UPDATE liveness_alerts SET state = ?, detail = ? WHERE id = ?', problem.state, problem.detail, existing.id); return null; }
+    if (!problem) {
+      if (existing) {
+        this.sql.exec('UPDATE liveness_alerts SET resolved_at = ? WHERE id = ?', at, existing.id);
+        this.sql.exec('DELETE FROM alert_backfill_suppressed WHERE alert_id = ?', existing.id);
+      }
+      return null;
+    }
+    if (existing) {
+      const stateChanged = existing.state !== problem.state;
+      const suppressed = Boolean(this.sql.exec('SELECT 1 AS yes FROM alert_backfill_suppressed WHERE alert_id = ?', existing.id).toArray()[0]);
+      const currentOperationalFailure = ['alert_routing', 'bus_auth', 'check'].includes(kind);
+      if (stateChanged || (suppressed && currentOperationalFailure)) {
+        this.sql.exec(`UPDATE liveness_alerts SET state = ?, detail = ?, notify_error = NULL, notified_at = NULL, delivered_to = '[]' WHERE id = ?`, problem.state, problem.detail, existing.id);
+        this.sql.exec('DELETE FROM alert_backfill_suppressed WHERE alert_id = ?', existing.id);
+        return this.sql.exec('SELECT * FROM liveness_alerts WHERE id = ?', existing.id).one();
+      }
+      if (existing.detail !== problem.detail) this.sql.exec('UPDATE liveness_alerts SET detail = ? WHERE id = ?', problem.detail, existing.id);
+      return null;
+    }
     return this.sql.exec('INSERT INTO liveness_alerts (subject_kind, subject, state, detail, opened_at) VALUES (?, ?, ?, ?, ?) RETURNING *', kind, subject, problem.state, problem.detail, at).one();
   }
 
@@ -310,7 +334,10 @@ export class LivenessService {
    */
   undelivered(retryAfterS: number) {
     const cutoff = new Date(this.now() - retryAfterS * 1000).toISOString();
-    return this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NULL AND ((notify_error IS NOT NULL AND notified_at <= ?) OR (notified_at IS NULL AND opened_at <= ?)) ORDER BY id LIMIT 20', cutoff, cutoff).toArray();
+    return this.sql.exec(`SELECT * FROM liveness_alerts a WHERE a.resolved_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM alert_backfill_suppressed s WHERE s.alert_id = a.id)
+      AND ((a.notify_error IS NOT NULL AND a.notified_at <= ?) OR (a.notified_at IS NULL AND a.opened_at <= ?))
+      ORDER BY a.id LIMIT 20`, cutoff, cutoff).toArray();
   }
 
   alerts(limit = 100, subject?: string) {
