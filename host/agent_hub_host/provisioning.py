@@ -2172,7 +2172,7 @@ def launcher_metadata(provider, bundle=None):
     elif provider == 'antigravity':
         return {
             'launcher_provider': 'antigravity',
-            'launcher_model': model or 'gemini-4-argon-high',
+            'launcher_model': model or 'gemini-4-argon-medium',
             'launcher_effort': effort,
         }
     return {}
