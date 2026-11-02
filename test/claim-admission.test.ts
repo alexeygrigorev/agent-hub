@@ -1,5 +1,5 @@
 import {freshCpu} from './cpu-fixture';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
 import { RoutingService } from '../src/routing';
@@ -500,6 +500,11 @@ describe('scope lifecycle adoption boundaries', () => {
   }));
 
   it('holds old unbound edit effects rather than guessing their authority or disjointness', () => fleetFixture(async (f, sql, bus) => {
+    // Intake 9647e6d5: an unpinned launch draws weighted by headroom. This
+    // authority test needs deterministic placement, so it pins the draw to
+    // the top candidate (the pre-draw behavior) without touching the scenario.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
     const initial = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000);
     const launched: any = await (await f.handle(req('/api/fleet/launches', intent({ access: editAccess(initial.id) })), holder)).json();
     const retained = JSON.parse(sql.exec('SELECT request_json FROM fleet_launches').one().request_json);
@@ -509,6 +514,7 @@ describe('scope lifecycle adoption boundaries', () => {
     expect((await f.handle(req('/api/fleet/launches', intent({ access: editAccess(separate.id, 'docs/guide.md') })), holder)).status).toBe(409);
     expect((await f.handle(req('/api/fleet/launches/' + launched.id + '/claim', nativeStart), host())).status).toBe(409);
     expect(f.accountStatus(sql.exec('SELECT * FROM fleet_accounts').one()).active).toBe(1);
+    } finally { random.mockRestore(); }
   }));
 
   it('checks the final reservation even if claims change immediately after a successful preview', () => fleetFixture(async (f, sql, bus) => {

@@ -1,6 +1,6 @@
 import policy from '../config/model-routing.json';
 import {freshCpu} from './cpu-fixture';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService, isCapacityOnlyHold, PLACEMENT_PRESSURE_REASONS } from '../src/fleet';
 import type { Hub } from '../src/hub';
@@ -1041,6 +1041,11 @@ describe('generic accounts and launch placement', () => {
   }));
   it.each([false, true])('keeps unsupported-model session alive with fallback or explicit hold (pinned=%s)', async pinned => fixture(async (s, sql) => {
     await configure(s);
+    // Intake 9647e6d5: an unpinned launch draws weighted by headroom. This
+    // fallback test needs deterministic placement, so it pins the draw to the
+    // top candidate (the pre-draw behavior) without touching the scenario.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     const input = intent({ ...(pinned ? { machine: 'hetzner' } : {}), access: { mode: 'read' } });
     const launch: any = await (await s.handle(request('/launches', input), admin)).json();
@@ -1073,6 +1078,7 @@ describe('generic accounts and launch placement', () => {
       await s.handle(request('/launches/' + refusal.id + '/claim', { gate_allowed: true, model: 'gpt-6-luna', observed_at: iso(), account: 'desktop-codex', profile_supported: true }), host('win35'));
       expect((await s.handle(request('/launches/' + refusal.id + '/reject', { reason: 'model_unsupported' }), host('win35'))).status).toBe(409);
     }
+    } finally { random.mockRestore(); }
   }));
   it('excludes a host-advertised unsupported route only for its account and mode', async () => fixture(async (s, sql) => {
     await configure(s);
