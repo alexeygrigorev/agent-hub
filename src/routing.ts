@@ -10,6 +10,7 @@ import { ensureTbmControllerSchema, recordSessionOutcomeReward } from './tbm-con
 import type { FleetService } from './fleet';
 import { sha256, randomString } from './auth/crypto';
 import { effectiveCheckin } from './registry';
+import { resolveMachineAliases } from './machine-alias';
 import { sameIntent, sameEditCaller, type EditAuthority } from './claim_admission';
 import { blockedEngines, healthRowsFor, runnerHealth } from './engine-health';
 import { HostGoals } from './host-goals';
@@ -293,8 +294,37 @@ export class RoutingService {
       } catch { return []; } })();
       const releases = new Map((this.sql.exec('SELECT * FROM host_release_targets').toArray() as any[]).map(r => [r.machine_id, { desired_sha: r.sha ?? null, current_sha: r.current_sha ?? null, state: r.state ?? null, autostart_state: r.autostart_state ?? null, autostart_error: r.autostart_error ?? null, error: r.error ?? null, reported_at: r.reported_at ?? null, set_at: r.set_at ?? null }]));
       const launchers = new Map((this.sql.exec('SELECT * FROM launcher_release_targets').toArray() as any[]).map(r => [r.machine_id, { root: r.root ?? null, desired_sha: r.sha ?? null, current_sha: r.current_sha ?? null, state: r.state ?? null, error: r.error ?? null, reported_at: r.reported_at ?? null, set_at: r.set_at ?? null }]));
-      return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.os, m.arch, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id WHERE m.revoked_at IS NULL').toArray() as any[]).map(m => ({ id: m.machine_id, last_checkin_at: effectiveCheckin(m.machine_id, m.last_checkin_at) ?? null, host_goal: new HostGoals(this.sql, this.fleet, this.now).view(m.machine_id), host_release: releases.get(m.machine_id) ?? null, launcher_release: launchers.get(m.machine_id) ?? null, hostname: m.hostname, os: m.os ?? '', arch: (m as any).arch ?? '', needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json).map((rn: any) => ({ ...rn, ...runnerHealth(healthRowsFor(unavailableRows, rn.engine, m.machine_id), this.now()) })), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), // Command-channel health (intake 3aa850b4): `unknown` when the check-in is stale (host liveness owns it), `unreachable` with reason command_channel_unreachable when fresh check-ins coexist with undelivered commands; such hosts are excluded from placement.
-        command_channel: commandChannelHealth(this.sql, { id: m.machine_id, last_checkin_at: m.last_checkin_at, drained: m.drained }, this.now()), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
+      // Intake 0ea34d42 AC1: every canonical registry machine stays listed. A
+      // host that never posted capabilities (enrolled but its host has not
+      // run yet) must appear with advertised:false and its planned
+      // installations instead of silently vanishing from this view. Alias
+      // records resolve to their canonical host like the fleet view, so
+      // re-enrollments never duplicate a row. Revoked machines stay hard
+      // hidden (intake 298e50f9).
+      const machineRows = this.sql.exec('SELECT id, hostname, os, arch, capabilities, last_heartbeat, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL').toArray() as any[];
+      const aliasOf = resolveMachineAliases(machineRows.map((m: any) => {
+        const persisted = typeof m.last_checkin_at === 'string' ? Date.parse(m.last_checkin_at) : NaN;
+        return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(persisted) ? persisted : null };
+      })).aliasOf;
+      const ads = new Map((this.sql.exec('SELECT * FROM routing_machines').toArray() as any[]).map(r => [r.machine_id, r]));
+      const installations: Record<string, string[]> = {};
+      try {
+        for (const row of this.sql.exec('SELECT machine_id, label FROM engine_installations ORDER BY label').toArray() as any[]) (installations[row.machine_id] ??= []).push(row.label);
+      } catch { /* engine_installations may not exist in older databases */ }
+      const safeParse = (text: any, fallback: any) => { try { return JSON.parse(text); } catch { return fallback; } };
+      const goals = new HostGoals(this.sql, this.fleet, this.now);
+      const machines = machineRows
+        .filter((m: any) => !aliasOf.has(String(m.id)))
+        .sort((a: any, b: any) => (String(a.hostname) < String(b.hostname) ? -1 : String(a.hostname) > String(b.hostname) ? 1 : String(a.id) < String(b.id) ? -1 : 1))
+        .map((m: any) => {
+          const id = String(m.id);
+          const ad = ads.get(id);
+          const checkin = effectiveCheckin(id, m.last_checkin_at);
+          const common = { id, last_checkin_at: checkin ?? null, host_goal: goals.view(id), host_release: releases.get(id) ?? null, launcher_release: launchers.get(id) ?? null, hostname: m.hostname, os: m.os ?? '', arch: m.arch ?? '', capabilities: safeParse(m.capabilities, {}), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(safeParse(m.last_heartbeat || '{}', {})), installations: installations[id] ?? [], command_channel: commandChannelHealth(this.sql, { id, last_checkin_at: m.last_checkin_at, drained: m.drained }, this.now()) };
+          if (!ad) return { ...common, needs: [], max_agents: null, runners: [], advertised: false, online: !m.drained && this.now() - Date.parse(checkin || '') <= 180000 };
+          return { ...common, needs: safeParse(ad.needs_json, []), max_agents: ad.max_agents, runners: safeParse(ad.runners_json, []).map((rn: any) => ({ ...rn, ...runnerHealth(healthRowsFor(unavailableRows, rn.engine, id), this.now()) })), advertised: true, online: !m.drained && this.now() - Date.parse(ad.observed_at) <= 180000 && this.now() - Date.parse(checkin || '') <= 180000 };
+        });
+      return reply({ machines });
     }
     if (path === '/api/routing/policy/grok') {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);
