@@ -874,6 +874,38 @@ describe('absolute workspace identifiers and friendly names', () => {
       });
     });
 
+    it('resolves a full native UUID before colliding Fleet launch aliases and reports ambiguous prefixes', async () => {
+      await fixture(async (s, sql) => {
+        const nativeId = 'abcdef01-2345-4678-9abc-def012345678';
+        const now = new Date().toISOString();
+        const insert = (id: string, launchId: string, binding: any = null) => sql.exec(
+          `INSERT INTO session_control_sessions
+            (id,actor,request_key,request_json,fleet_launch_id,mode,state,binding_json,created_at,updated_at)
+            VALUES (?,'admin',?, ?, ?, 'interactive', 'running', ?, ?, ?)`,
+          id, `resolver-${id}`, JSON.stringify({ name: 'colliding-name' }), launchId,
+          binding ? JSON.stringify(binding) : null, now, now);
+
+        // A Hub-managed row owns this native UUID, while two other rows share
+        // it as a stale/reused Fleet launch alias. Exact identity wins.
+        const nativeSession = 'abcdef01-1111-4111-8111-111111111111';
+        insert(nativeSession, '22222222-2222-4222-8222-222222222222', { native_id: nativeId });
+        insert('abcdef01-2222-4222-8222-222222222222', nativeId);
+        insert('44444444-4444-4444-8444-444444444444', nativeId);
+
+        const exact = await s.handle(request(`/api/sessions/${nativeId}`, undefined, 'GET'), admin);
+        expect(exact.status).toBe(200);
+        expect(((await exact.json()) as any).id).toBe(nativeSession);
+
+        const short = await s.handle(request('/api/sessions/abcdef01', undefined, 'GET'), admin);
+        expect(short.status).toBe(409);
+        const shortBody = await short.json() as any;
+        expect(shortBody.error).toBe('ambiguous_session_prefix');
+        expect(shortBody.matches.map((row: any) => row.id)).toEqual([
+          nativeSession, 'abcdef01-2222-4222-8222-222222222222',
+        ]);
+      });
+    });
+
     it('refuses collisions / reused tags with 409 ambiguous_name (no latest-wins)', async () => {
       await fixture(async (s, sql) => {
         seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());

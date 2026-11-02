@@ -737,7 +737,7 @@ describe('generic accounts and launch placement', () => {
     expect(account.active).toBe(1);
     expect(account.available_slots).toBe(account.max_concurrency - 1);
   }));
-  it.each(['workspace_unavailable', 'admission_unconfigured', 'admission_refused', 'dispatch_refused', 'goal_startup_unconfigured', 'dispatch_route_unconfigured', 'dispatch_internal_error', 'codex_quota_gate_quota_unavailable', 'codex_quota_gate_codex_reserve_required', 'codex_quota_gate_stale_window_evidence', 'codex_quota_gate_quota_check_failed'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
+  it.each(['workspace_unavailable', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'admission_unconfigured', 'admission_refused', 'dispatch_refused', 'goal_startup_unconfigured', 'dispatch_route_unconfigured', 'dispatch_internal_error', 'codex_quota_gate_quota_unavailable', 'codex_quota_gate_codex_reserve_required', 'codex_quota_gate_stale_window_evidence', 'codex_quota_gate_quota_check_failed'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
@@ -772,9 +772,11 @@ describe('generic accounts and launch placement', () => {
   it('keeps fresh placement load advisory after upgrading legacy hold rows', async () => fixture(async (s, sql) => {
     sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_machine');
     sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_factor');
+    sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_trigger');
+    sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_limit');
     sql.exec("INSERT INTO fleet_memory_holds (launch_id, since, rejected_json) VALUES ('legacy-hold', ?, '[]')", iso());
     s.init();
-    expect(sql.exec("SELECT rejected_json, host_load_machine, host_load_factor FROM fleet_memory_holds WHERE launch_id='legacy-hold'").one()).toMatchObject({rejected_json:'[]',host_load_machine:null,host_load_factor:null});
+    expect(sql.exec("SELECT rejected_json, host_load_machine, host_load_factor, host_load_trigger, host_load_limit FROM fleet_memory_holds WHERE launch_id='legacy-hold'").one()).toMatchObject({rejected_json:'[]',host_load_machine:null,host_load_factor:null,host_load_trigger:null,host_load_limit:null});
     await configure(s);
     const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
     heartbeat.load = [100, 100, 100];
@@ -843,6 +845,45 @@ describe('generic accounts and launch placement', () => {
     beat(8 * 3);
     expect(restarted.drainCapacityQueue().promoted).toBeGreaterThan(0);
     expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({state:'offered',machine_id:'hetzner'});
+  }));
+  it('gates and clears a memory-triggered host refusal using the reported MemAvailable floor', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
+    heartbeat.load = [null, null, null];
+    heartbeat.mem_avail_mb = 3174;
+    heartbeat.mem_total_mb = 65536;
+    heartbeat.at = iso();
+    sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    const diagnostic = {
+      reason: 'memory_pressure',
+      message: 'Host memory full pressure exceeds the safety cap.',
+      stage: 'dispatch_route', error_type: 'ValueError',
+      host_load: { trigger: 'mem_available', mem_avail_mb: 3174, mem_floor_mb: 6144 },
+    };
+    const retry: any = await (await s.handle(request('/launches/' + launch.id + '/reject', {
+      reason: 'memory_pressure', diagnostic,
+    }), host('hetzner'))).json();
+    expect(retry).toMatchObject({ state: 'queued', queued: true });
+    expect(retry.rejected).toContainEqual(expect.objectContaining({
+      reason: 'memory_pressure', host_load: diagnostic.host_load,
+    }));
+    expect(retry.rejected[0]).not.toHaveProperty('load1');
+    expect(sql.exec('SELECT host_load_machine, host_load_trigger, host_load_limit FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one()).toMatchObject({
+      host_load_machine: 'hetzner', host_load_trigger: 'mem_available', host_load_limit: 6144,
+    });
+
+    s.drainCapacityQueue();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('queued');
+    expect(JSON.parse(String(sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one().rejected_json))).toContainEqual(expect.objectContaining({
+      reason: 'memory_pressure', host_load: { trigger: 'mem_available', mem_avail_mb: 3174, mem_floor_mb: 6144 },
+    }));
+
+    heartbeat.mem_avail_mb = 7168;
+    heartbeat.at = iso();
+    sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    expect(s.drainCapacityQueue().promoted).toBeGreaterThan(0);
+    expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({ state: 'offered', machine_id: 'hetzner' });
   }));
   it('round-trips a full host diagnostic and surfaces it on the session', async () => fixture(async (s, sql) => {
     await configure(s);

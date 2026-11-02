@@ -68,7 +68,7 @@ class StopCliTests(unittest.TestCase):
         cli.add_commands(parser.add_subparsers(dest='cmd'))
         args = parser.parse_args(['sessions','stop','61bba72f','--key','stop-test'])
         self.assertTrue(args.wait)
-        self.assertEqual(args.timeout,10)
+        self.assertEqual(args.timeout,30)
         self.assertEqual(args.interval,1)
         with patch.object(cli,'request',side_effect=[
                 {'command_id':'stop-1','state':'recorded'},
@@ -115,6 +115,24 @@ class LiveDeletedWorkspaceStopTests(unittest.TestCase):
             literal = Path(directory)/'gone (deleted)'
             literal.mkdir()
             self.assertFalse(ns._stop_workspace_matches(str(literal),target.workspace))
+
+    def test_stop_kill_call_has_a_30_second_ceiling(self):
+        from unittest.mock import patch
+        from dataclasses import replace
+        import subprocess
+        from agent_hub_host import native_sessions as ns
+        with tempfile.TemporaryDirectory() as directory:
+            target = ns.NativeTarget(str(uuid.uuid4()), 'owned-stop', directory, 100, engine='shell')
+            before = ns.NativeSession(target.session_id, target.tag, target.workspace,
+                                      engine='shell', phase='running', created_at_ms=100)
+            after = replace(before, phase='exited', containment_empty=True)
+            with patch.object(ns, 'list_sessions', side_effect=[[before], [after]]), \
+                 patch.object(ns, 'run_native', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as run, \
+                 patch.object(ns, '_confirm_workload_exit', return_value=(True, 'verified empty')):
+                result = ns.stop_session('aplexer', target)
+            self.assertEqual(result.state, 'stopped')
+            self.assertEqual(run.call_args.kwargs['timeout'], ns.QUICK_TIMEOUT)
+            self.assertLessEqual(run.call_args.kwargs['timeout'], 30)
 
     def test_kernel_suffix_never_waives_native_incarnation(self):
         from unittest.mock import patch

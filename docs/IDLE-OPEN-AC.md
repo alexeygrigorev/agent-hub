@@ -1,9 +1,11 @@
 # Idle sessions with unfinished intake work
 
-Hub links adopted native sessions using explicit intake links or an unambiguous
-`START:` note containing the exact native ID or qualified tag. An operator can
-link manually with `hub sessions link SESSION --intake-task-id INTAKE --key KEY`;
-the equivalent REST route is `POST /api/sessions/SESSION/link` and MCP tool is
+Hub links adopted native sessions using explicit intake links, an unambiguous
+`START:`/`STARTED` note containing the exact native ID or qualified tag, or a
+`note-aplexer-<native-id-prefix>` note containing that exact identity. An
+operator can link manually with `hub sessions link SESSION --intake-task-id INTAKE --key KEY`; a worker credential scoped to that intake,
+machine and workspace can link an observed native session in the same scope.
+The REST route is `POST /api/sessions/SESSION/link` and the MCP tool is
 `sessions_link`. Linking never grants native-control authority.
 
 A running session with a linked open intake becomes `idle_with_open_ac` when

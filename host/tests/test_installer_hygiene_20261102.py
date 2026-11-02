@@ -1,4 +1,4 @@
-﻿"""Windows rollout defects of 2026-11-02: live orphan controller, dead proxy, stale PATH, locked settings."""
+"""Windows rollout defects of 2026-11-02: live orphan controller, dead proxy, stale PATH, locked settings."""
 import json
 import os
 from pathlib import Path, PureWindowsPath
@@ -127,6 +127,128 @@ class LockedSettings(unittest.TestCase):
     def test_persistent_lock_never_aborts_install(self):
         with patch.object(b, 'write_private', side_effect=PermissionError(13, 'denied')):
             self.assertFalse(b.write_claude_settings(Path('s'), '{}', sleep=lambda s: None))
+
+
+class BusyHostHandover(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name) / 'control'
+        self.receipt = dict(id='owned', workspace='/release/package', tag='owned-controller',
+                            engine='shell', created_at_ms=1, command=['owned-python'])
+
+    def run_handover(self, lease, stop, observe, **kwargs):
+        import threading
+        errors = []
+        def go():
+            try:
+                c.handover(self.directory, timeout=0, boot_probe=lambda: 'b', observe=observe, stop=stop,
+                           force_wait=5, **kwargs)
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+        thread = threading.Thread(target=go)
+        thread.start()
+        return thread, errors
+
+    def test_unresponsive_busy_owner_is_force_stopped_then_exit_proven(self):
+        import threading
+        signals, killed = [], threading.Event()
+        def stop(receipt, signal='TERM'):
+            signals.append(signal)
+            killed.set()
+        with c.ControllerLease(self.directory, boot_probe=lambda: 'b', observe=lambda r: None) as lease:
+            lease.publish(self.receipt)
+            thread, errors = self.run_handover(lease, stop, lambda r: dict(self.receipt, containment_empty=True))
+            self.assertTrue(killed.wait(5))
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(signals[0], 'TERM')
+        self.assertFalse((self.directory / 'owner.json').exists())
+        proof = c._read(next((self.directory / 'archive').iterdir()))['proof']
+        self.assertEqual(proof, 'exact_receipt_containment_empty')
+
+    def test_owner_that_survives_force_stop_keeps_evidence(self):
+        with c.ControllerLease(self.directory, boot_probe=lambda: 'b', observe=lambda r: None) as lease:
+            lease.publish(self.receipt)
+            c_wait = c.time.sleep
+            thread, errors = self.run_handover(lease, lambda r, signal='TERM': None, lambda r: None,
+                                               sleep=lambda s: c_wait(0.01))
+            thread.join(30)
+        self.assertEqual([type(e) for e in errors], [RuntimeError])
+        self.assertTrue((self.directory / 'owner.json').exists())
+
+    def test_journal_lock_is_awaited_bounded(self):
+        held = iter([True, True, False])
+        naps = []
+        c.handover(self.directory, timeout=0, boot_probe=lambda: 'b', observe=lambda r: None,
+                   stop=lambda r, signal='TERM': None, journal=self.directory, lock_held=lambda j: next(held),
+                   sleep=naps.append)
+        self.assertEqual(len(naps), 2)
+        with self.assertRaises(c.NeedsAttention):
+            c.handover(self.directory, timeout=0, boot_probe=lambda: 'b', observe=lambda r: None,
+                       stop=lambda r, signal='TERM': None, journal=self.directory, lock_held=lambda j: True,
+                       force_wait=0.01, sleep=lambda s: None)
+
+
+class GitRuntimeReuse(unittest.TestCase):
+    def make_git(self, root):
+        for name in ('cmd/git.exe', 'usr/bin/bash.exe'):
+            f = root / name
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text('x')
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name) / 'agent-hub'
+        self.name = 'git-' + b.GIT_VERSION + '-x64'
+        self.release = self.base / 'releases' / 'new-1'
+        (self.release / 'tmp').mkdir(parents=True)
+
+    def test_previous_release_runtime_is_copied_without_download(self):
+        self.make_git(self.base / 'releases' / 'old-0' / 'runtimes' / self.name)
+        target = self.release / 'runtimes' / self.name
+        with patch.object(b, 'run', return_value='git version ' + b.GIT_VERSION.rsplit('.', 1)[0] + '.windows.4'):
+            self.assertIsNotNone(b.reuse_git_runtime(self.release, target))
+        self.assertTrue((target / 'cmd/git.exe').is_file() and (target / 'usr/bin/bash.exe').is_file())
+
+    def test_install_root_runtime_wins_and_ensure_never_downloads(self):
+        self.make_git(self.base / 'runtimes' / self.name)
+        with patch.object(b.sys, 'platform', 'win32'), patch.object(b, 'architecture', return_value='x64'), \
+                patch.object(b, 'run', return_value='git version ' + b.GIT_VERSION.rsplit('.', 1)[0]), \
+                patch.object(b, 'download', side_effect=AssertionError('must not download')), \
+                patch.dict(os.environ, {'PATH': ''}):
+            target = b.ensure_windows_git(self.release)
+        self.assertTrue((target / 'cmd/git.exe').is_file())
+
+    def test_wrong_version_or_missing_runtime_is_not_reused(self):
+        self.make_git(self.base / 'releases' / 'old-0' / 'runtimes' / self.name)
+        target = self.release / 'runtimes' / self.name
+        with patch.object(b, 'run', return_value='git version 1.0.0'):
+            self.assertIsNone(b.reuse_git_runtime(self.release, target))
+        self.assertFalse(target.exists())
+
+
+class DownloadRetry(unittest.TestCase):
+    def test_dns_failure_is_retried_with_backoff(self):
+        import urllib.error
+        import io
+        calls, naps = [], []
+        class Resp(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def opener(req, timeout=0):
+            calls.append(1)
+            if len(calls) < 3:
+                raise urllib.error.URLError('getaddrinfo failed')
+            return Resp(b'data')
+        with tempfile.TemporaryDirectory() as t, patch.object(b.urllib.request, 'urlopen', opener), \
+                patch.object(b, 'DOWNLOAD_SLEEP', naps.append):
+            target = Path(t) / 'f'
+            b.download('https://example.test/f', target)
+            self.assertEqual(target.read_bytes(), b'data')
+        self.assertEqual(naps, [1.0, 2.0])
 
 
 if __name__ == '__main__':

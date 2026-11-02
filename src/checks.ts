@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hub_check_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, at TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, action TEXT);
 ` + CHECK_SLOT_SCHEMA;
 
-export const CHECK_KINDS = ['liveness', 'quota', 'http', 'inbox_backlog', 'conversation_backlog', 'delivery_slo', 'dispatch_route', 'routine'] as const;
+export const CHECK_KINDS = ['liveness', 'quota', 'http', 'inbox_backlog', 'conversation_backlog', 'delivery_slo', 'dispatch_route', 'burn_forecast', 'routine'] as const;
 // 40 characters keeps check-<name>-<slot> within the 64-character fleet idempotency key.
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -54,7 +54,8 @@ export function validateCheck(c: any): { row: any } | { error: string } {
     if (!url || url.protocol !== 'https:' || url.username || url.password || params.url.length > 512) return { error: 'invalid_http_url' };
     if (params.expect_status !== undefined && (!Number.isInteger(params.expect_status) || params.expect_status < 100 || params.expect_status > 599)) return { error: 'invalid_expect_status' };
   }
-  if (c.kind === 'quota' && params.min_percent !== undefined && (typeof params.min_percent !== 'number' || params.min_percent < 0 || params.min_percent > 100)) return { error: 'invalid_min_percent' };
+  if (['quota', 'burn_forecast'].includes(c.kind) && params.min_percent !== undefined && (typeof params.min_percent !== 'number' || !Number.isFinite(params.min_percent) || params.min_percent < 0 || params.min_percent > 100)) return { error: 'invalid_min_percent' };
+  if (c.kind === 'burn_forecast' && !plain(params, ['min_percent'])) return { error: 'invalid_params' };
   if (c.kind === 'dispatch_route') {
     if (!plain(params, ['max_consecutive', 'window_s'])) return { error: 'invalid_params' };
     if (params.max_consecutive !== undefined && (!Number.isInteger(params.max_consecutive) || params.max_consecutive < 2 || params.max_consecutive > 20)) return { error: 'invalid_max_consecutive' };
@@ -91,12 +92,17 @@ export function validateCheck(c: any): { row: any } | { error: string } {
   return { row };
 }
 
+const BURN_FORECAST_CHECK = { name: 'burn-forecast', kind: 'burn_forecast', interval_s: 900, params: { min_percent: 30 }, action: { type: 'alert' }, enabled: true };
+
 export const DEFAULT_CHECKS = [
   { name: 'liveness', kind: 'liveness', interval_s: 300, params: {}, action: { type: 'alert' }, enabled: true },
   // Dispatch-route streak: N consecutive pre-start dispatch failures with the
   // same reason inside the window (e.g. a bad relabel breaking every offer).
   // Seeded by default; an operator who removes all checks keeps an empty list.
   { name: 'dispatch-route', kind: 'dispatch_route', interval_s: 300, params: { max_consecutive: 3, window_s: 900 }, action: { type: 'alert' }, enabled: true },
+  // Burn forecast (intake ebfe9d85 AC3): an account projected to let more than
+  // min_percent of its quota expire unused at the next weekly/monthly reset.
+  BURN_FORECAST_CHECK,
 ];
 
 export class ChecksService {
@@ -108,6 +114,15 @@ export class ChecksService {
     if (!this.sql.exec("SELECT 1 FROM hub_meta WHERE key = 'checks_seeded'").toArray().length) {
       if (!Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_checks').one().n)) this.replace(DEFAULT_CHECKS.map(c => (validateCheck(c) as any).row));
       this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('checks_seeded', ?)", new Date(this.now()).toISOString());
+      this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('burn_check_seeded', ?)", new Date(this.now()).toISOString());
+    }
+    // Deployments seeded before the burn forecast existed get it once; removing it later sticks.
+    if (!this.sql.exec("SELECT 1 FROM hub_meta WHERE key = 'burn_check_seeded'").toArray().length) {
+      if (Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_checks').one().n) > 0 && !this.sql.exec("SELECT 1 FROM hub_checks WHERE name = ? OR kind = 'burn_forecast'", BURN_FORECAST_CHECK.name).toArray().length) {
+        const r = (validateCheck(BURN_FORECAST_CHECK) as any).row;
+        this.sql.exec('INSERT INTO hub_checks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', r.name, r.kind, r.interval_s, JSON.stringify(r.params), JSON.stringify(r.action), Number(r.enabled), new Date(this.now()).toISOString(), null, null, null);
+      }
+      this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('burn_check_seeded', ?)", new Date(this.now()).toISOString());
     }
   }
 
@@ -240,6 +255,13 @@ export class ChecksService {
         const min = p.min_percent ?? 20;
         const low = deps.evaluateQuota().filter(a => a.enabled && (a.status === 'blocked' || (typeof a.remaining_percent === 'number' && a.remaining_percent < min)));
         return low.length ? { status: 'fail', detail: low.map(a => `${a.label}: ${a.status}, ${a.remaining_percent ?? 'unknown'}% left`).join('; ') } : { status: 'pass', detail: `no account below ${min}%` };
+      }
+      case 'burn_forecast': {
+        const min = p.min_percent ?? 30;
+        const wasting = deps.evaluateQuota().filter(a => a.enabled && a.status === 'ok' && a.burn_forecast
+          && a.burn_forecast.burn_rate_percent_per_hour !== null && a.burn_forecast.projected_unused_percent > min);
+        const fmt = (a: any) => `${a.label}: ~${Math.round(a.burn_forecast.projected_unused_percent)}% of ${a.burn_forecast.window} quota unused at reset ${a.burn_forecast.reset_at} (${a.burn_forecast.remaining_percent}% left, ${a.burn_forecast.hours_to_reset}h)`;
+        return wasting.length ? { status: 'fail', detail: wasting.map(fmt).join('; ') } : { status: 'pass', detail: `no account projected to waste more than ${min}%` };
       }
       case 'http': {
         const expected = p.expect_status ?? 200;

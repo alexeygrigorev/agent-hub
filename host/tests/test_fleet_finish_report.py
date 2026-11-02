@@ -174,6 +174,49 @@ class TestReadHubFinishReport(unittest.TestCase):
         self.assertEqual(seen["payload"].get("report_status"), "waiting-on-human")
         self.assertIn("Need input", seen["payload"].get("report", ""))
 
+    def test_interactive_prompt_diagnostic_survives_terminal_receipt(self):
+        d, tmp = _dispatcher()
+        self.addCleanup(tmp.cleanup)
+        ws, _res = _mk_results(tmp.name)
+        offer = "11111111-2222-4333-8444-555555555555"
+        native_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        diagnostic = {
+            'reason': 'engine_interactive_prompt',
+            'message': 'The claude session stopped at an interactive login prompt.',
+            'error_type': 'InteractivePromptError',
+            'stage': 'dispatch_headless',
+        }
+        result_path = ws / ".local" / "hub-results" / (offer + ".json")
+        result_path.write_text(json.dumps({"status": "done", "report": "Finished task."}))
+        d._active_launches[offer] = {
+            "offer_id": offer, "task_id": "hub-" + offer, "mode": "headless",
+            "workspace": str(ws), "target_cwd": str(ws), "engine": "claude",
+            "native_id": native_id, "tag": "task-hub-" + offer,
+            "incarnation": 1700000000000, "state": "running", "settled": False,
+            "result_path": str(result_path), "diagnostic": diagnostic,
+        }
+        seen = {}
+
+        def request(method, path, payload=None):
+            seen['payload'] = payload
+            return {"id": offer, "state": (payload or {}).get("state")}
+
+        with patch.object(Dispatcher, "_persist_launch_record", lambda self, r: None), \
+             patch.object(Dispatcher, "_maybe_cleanup_worktree", lambda self, w, n=None: None), \
+             patch("agent_hub_host.fleet.verify_native_retirement",
+                   return_value=(True, {"finished_at_ms": 1700000001000}, "retired_tombstone_verified")), \
+             patch.object(d, "_check_headless_health", return_value=None), \
+             patch.object(d, "request", side_effect=request), \
+             patch.object(d, "runner", return_value={"state": "completed-awaiting-review",
+                   "native_id": native_id, "resources_reserved": False}):
+            d.settings["launcher"] = {"argv": ["x"], "root": tmp.name, "config_dir": tmp.name}
+            result = d.reconcile_launches()
+
+        self.assertTrue(any(row.get('id') == offer for row in result))
+        self.assertEqual(seen['payload']['state'], 'failed')
+        self.assertTrue(seen['payload']['confirmed_exit'])
+        self.assertEqual(seen['payload']['diagnostic'], diagnostic)
+
 
 class TestWorkerCliAuthProvisioning(unittest.TestCase):
     def test_normal_gh_config_directory_survives_managed_home_without_auth_file_copy(self):

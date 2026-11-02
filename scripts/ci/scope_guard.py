@@ -171,6 +171,15 @@ def approved_adr(repo, base, body):
     return False
 
 
+def event_head():
+    event_path = os.environ.get('GITHUB_EVENT_PATH')
+    if event_path:
+        event = json.loads(Path(event_path).read_text())
+        if 'pull_request' in event and event['pull_request'].get('head', {}).get('sha'):
+            return event['pull_request']['head']['sha']
+    return 'HEAD'
+
+
 def event_base(repo, head):
     event_path = os.environ.get('GITHUB_EVENT_PATH')
     if event_path:
@@ -244,7 +253,7 @@ def main():
     p.add_argument('--product', choices=('hub', 'pocketshell'), default='hub')
     p.add_argument('--repo', default='.')
     p.add_argument('--base')
-    p.add_argument('--head', default='HEAD')
+    p.add_argument('--head')
     p.add_argument('--working', action='store_true')
     args = p.parse_args()
     try:
@@ -254,7 +263,8 @@ def main():
             pr = event.get('pull_request', {})
             labels = [x['name'] for x in pr.get('labels', [])]
             body = pr.get('body') or ''
-        violations, warnings, count = check(args.repo, args.product, args.base or event_base(args.repo, args.head), args.head, working=args.working, labels=labels, pr_body=body)
+        head = args.head or event_head()
+        violations, warnings, count = check(args.repo, args.product, args.base or event_base(args.repo, head), head, working=args.working, labels=labels, pr_body=body)
         for warning in warnings:
             print('WARNING:', *warning[:3])
         for revision, path, line, token in violations:

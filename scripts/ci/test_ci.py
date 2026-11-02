@@ -149,6 +149,16 @@ class TestWranglerRetry(unittest.TestCase):
 class TestDeployWorkflowRetryWiring(unittest.TestCase):
     """Both production deploy paths must route through the shared retry wrapper."""
 
+    def test_push_ci_cannot_enter_production_deploy(self):
+        content = DEPLOY_WORKFLOW.read_text()
+        match = re.search(r"(?ms)^  deploy:\n(?P<job>.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", content)
+        self.assertIsNotNone(match, "deploy job")
+        guard = re.search(r"(?m)^    if: \|\n(?P<condition>(?:^      [^\n]*\n)+)", match.group("job"))
+        self.assertIsNotNone(guard, "deploy condition")
+        condition = guard.group("condition")
+        self.assertIn("github.event_name == 'workflow_dispatch'", {line.strip() for line in condition.splitlines()})
+        self.assertNotRegex(condition, r"\bpush\b")
+
     def test_both_deploy_steps_use_retry_wrapper(self):
         content = DEPLOY_WORKFLOW.read_text()
         self.assertTrue(RETRY_SCRIPT.is_file())

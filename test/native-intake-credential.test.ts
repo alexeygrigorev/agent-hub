@@ -58,6 +58,32 @@ describe('native session intake credential', () => {
     expect(await (await call('/api/session-intake/credentials')).json()).toEqual({ sessions: [] });
 
     const api = (p: string, b?: any, tok = cred.access_token) => call(p, b, tok);
+    const targetNative = uuid(), targetSession = targetNative;
+    const linkAt = new Date().toISOString();
+    await runInDurableObject<Hub, any>(stub, (h: any) => {
+      h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+        VALUES(?,'unknown',? ,?,'native-host','shell','interactive','running',?,?,?)`, targetSession, 'target-' + targetSession,
+        JSON.stringify({ provenance:'observed_native', observation_only:true, workspace:'/home/u/git/drain-x' }),
+        JSON.stringify({ native_id:targetNative, tag:'another-drain', workspace:'/home/u/git/drain-x', provenance:'observed_native' }), linkAt, linkAt);
+    });
+    const linked = await api('/api/sessions/' + targetNative.slice(0, 8) + '/link', { key: 'worker-link-' + uuid(), intake_task_id: task });
+    expect(linked.status, await linked.clone().text()).toBe(200);
+    expect((await linked.json() as any).link.source).toBe('scoped_worker');
+    await runInDurableObject<Hub, any>(stub, (h: any) => {
+      expect(JSON.parse(h.sql.exec('SELECT request_json FROM session_control_sessions WHERE id=?', targetSession).one().request_json).intake_task_id).toBe(task);
+    });
+    // The scoped credential cannot link a different intake or a same-host session from another workspace.
+    expect((await api('/api/sessions/' + targetSession + '/link', { key: 'wrong-task-' + uuid(), intake_task_id: other })).status).toBe(403);
+    const foreignSession = uuid();
+    await runInDurableObject<Hub, any>(stub, (h: any) => {
+      h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+        VALUES(?,'unknown',? ,?,'native-host','shell','interactive','running',?,?,?)`, foreignSession, 'foreign-' + foreignSession,
+        JSON.stringify({ provenance:'observed_native', observation_only:true, workspace:'/home/u/git/other-repo' }),
+        JSON.stringify({ native_id:uuid(), tag:'foreign-drain', workspace:'/home/u/git/other-repo', provenance:'observed_native' }), linkAt, linkAt);
+    });
+    expect((await api('/api/sessions/' + foreignSession + '/link', { key: 'wrong-workspace-' + uuid(), intake_task_id: task })).status).toBe(403);
+    // A host credential without the intake-scoped worker capability still cannot link it.
+    expect((await call('/api/sessions/' + foreignSession + '/link', { key: 'host-link-' + uuid(), intake_task_id: task })).status).toBe(403);
     // Own intake: read and append a DONE-style note.
     const shown = await api('/api/intake/tasks/' + task);
     expect(shown.status, await shown.clone().text()).toBe(200);

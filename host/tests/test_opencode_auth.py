@@ -44,8 +44,14 @@ def test_device_login_sync_tracks_new_login_and_preserves_runtime_refresh(tmp_pa
     assert sum(a == ['auth', 'import'] for a, _ in calls) == 2
 
 
-@pytest.mark.parametrize('failure', ['legacy-key', 'missing', '401', '403', 'contaminated'])
-def test_auth_failure_is_sanitized_and_never_inference(tmp_path, failure):
+@pytest.mark.parametrize(('failure', 'expected'), [
+    ('legacy-key', auth.AuthExpired), ('missing', auth.AuthExpired),
+    ('401', auth.AuthExpired), ('403', auth.AuthExpired),
+    # A valid source credential plus a contaminated Hub target is repaired;
+    # if the target remains wrong after import, this is not proof of expiry.
+    ('contaminated', auth.AuthCheckUnavailable),
+])
+def test_auth_failure_is_sanitized_and_never_inference(tmp_path, failure, expected):
     cfg = config(tmp_path)
     def native(cfg, args, env, payload=None):
         assert args[0] in ('auth', 'api')
@@ -59,9 +65,8 @@ def test_auth_failure_is_sanitized_and_never_inference(tmp_path, failure):
                                     access='fixture-secret', refresh='fixture-refresh'))]
         if args[:2] == ['auth', 'list']:
             return [dict(id='opencode-go', connections=[dict(method='key')])]
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(expected) as exc:
         auth.prepare(cfg, native=native)
-    assert str(exc.value).startswith('engine_auth_expired:')
     assert 'fixture-secret' not in str(exc.value)
 
 

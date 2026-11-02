@@ -35,6 +35,9 @@ class TestNamedPreStartRefusals(unittest.TestCase):
     def test_variable_tails_map_by_prefix_and_are_never_forwarded(self):
         cases = {"Launcher provider 'x' is not supported for headless execution": 'dispatch_route_unconfigured',
                  'repo clone failed: fatal: could not read Username for https://github.com': 'workspace_unavailable',
+                 'repo_clone_auth_failed: owner/name: fatal: could not read Username for https://github.com': 'repo_clone_auth_failed',
+                 'repo_not_found: owner/name: remote: Repository not found.': 'repo_not_found',
+                 'repo_clone_failed: owner/name: fatal: unable to access': 'repo_clone_failed',
                  'git fetch failed: exit 128': 'workspace_unavailable',
                  'git checkout failed: error: pathspec': 'workspace_unavailable'}
         for message, slug in cases.items():

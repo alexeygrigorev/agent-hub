@@ -36,6 +36,18 @@ CLEAN_EXIT_RULE = (
 )
 SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + CAPACITY_RETRY_RULE + "\n" + CLEAN_EXIT_RULE
 
+PREPUSH_TEST_RULE = (
+    "Hub worker releases: after obtaining the orchestrator-main release slot, "
+    "use `scripts/push-main.sh` from the Agent Hub checkout to push to main. "
+    "The helper installs the same pre-push hook that Hub installs before worker "
+    "launch/adoption; plain git pushes to main also run the gate. "
+    "It runs affected tests against the remote's advertised main SHA (full tests for "
+    "BROAD changes), refuses failures before push, and pushes only the tested "
+    "commit from a clean tree. If main advances, integrate and rerun the helper. "
+    "Never disable the hook or use --no-verify; post-push CI is not pre-push evidence."
+)
+SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + PREPUSH_TEST_RULE
+
 # Incident 504d662b (2026-10-31): a reviewer session ran
 #   TMPDIR=$(mktemp -d) && HOME=$(mktemp -d) ... python3 -m pytest ...; rm -rf "$TMPDIR" "$HOME"
 # `HOME=... cmd` sets HOME only for that one command, so the shell's $HOME was

@@ -23,16 +23,39 @@ class SelectTests(unittest.TestCase):
             'host/tests/test_jobs.py': 'from agent_hub_host import jobs',
             'host/tests/test_misc.py': 'import agent_hub_host.jobs as j',
             'host/tests/test_unrelated.py': 'import os',
+            'host/tests/test_machine_binding.py': '',
+            'host/tests/test_release_completeness.py': '',
+            'host/tests/test_bootstrap_control.py': '',
+            'test/test_mcp_parity.py': '',
+            'scripts/ci/test_affected_tests.py': '',
         }.items():
             (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.root / rel).write_text(text)
 
     def test_source_change_selects_importers_only(self):
-        plan = m.select(['src/quota.ts', 'host/agent_hub_host/jobs.py'], self.root)
+        plan = m.select(['src/quota.ts'], self.root)
         self.assertEqual(plan['vitest'], ['test/quota.test.ts'])
-        self.assertEqual(plan['pytest'], ['host/tests/test_jobs.py', 'host/tests/test_misc.py'])
+        self.assertEqual(plan['pytest'], [])
         self.assertTrue(plan['typecheck'])
         self.assertEqual(plan['broad'], [])
+
+    def test_host_change_selects_canary_regressions_in_addition_to_importers(self):
+        plan = m.select(['host/agent_hub_host/jobs.py'], self.root)
+        self.assertEqual(plan['pytest'], sorted([
+            'host/tests/test_jobs.py', 'host/tests/test_misc.py',
+            'host/tests/test_machine_binding.py',
+            'host/tests/test_release_completeness.py',
+            'host/tests/test_bootstrap_control.py',
+            'test/test_mcp_parity.py',
+        ]))
+
+    def test_release_manifest_change_selects_completeness_test(self):
+        plan = m.select(['scripts/host-release-manifest.json'], self.root)
+        self.assertEqual(plan['pytest'], ['host/tests/test_release_completeness.py'])
+
+    def test_selector_change_selects_its_focused_test(self):
+        plan = m.select(['scripts/ci/affected_tests.py'], self.root)
+        self.assertEqual(plan['pytest'], ['scripts/ci/test_affected_tests.py'])
 
     def test_docs_only_selects_nothing(self):
         plan = m.select(['docs/x.md'], self.root)

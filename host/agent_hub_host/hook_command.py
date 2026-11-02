@@ -61,3 +61,42 @@ def repair_state_report_command(command: str, a_cmd: str) -> str:
     if base not in ('a', 'a.exe'):
         return command
     return state_report_command(a_cmd, m.group('state'))
+
+
+AWARENESS_MARKER = 'aplexer-managed-awareness-hook-v1'
+AWARENESS_THROTTLE_S = 5
+_THROTTLE_MARK = 'aplexer-awareness-throttle-v1'
+
+
+def throttle_awareness_command(command: str, seconds: int = AWARENESS_THROTTLE_S) -> str:
+    """Prefix a PostToolUse awareness hook with a pure-bash per-workspace throttle.
+
+    The hook fires on every tool call and each fire costs a shell plus an
+    ``aplexer`` process. Within ``seconds`` of the last run in the same working
+    directory the wrapper drains stdin and exits 0 without spawning anything
+    (bash builtins only); awareness already suppresses unchanged fingerprints,
+    so only new context is delayed, by at most ``seconds``. Non-bash shells run
+    the hook unthrottled.
+    """
+    if AWARENESS_MARKER not in command or _THROTTLE_MARK in command:
+        return command
+    guard = (
+        'if [ -n "$BASH_VERSION" ]; then '
+        'f="${TMPDIR:-/tmp}/aplexer-ctx-hook-$UID-${PWD//[^A-Za-z0-9]/_}"; '
+        "printf -v n '%(%s)T' -1; read -r l < \"$f\" 2>/dev/null; "
+        f'if [ "${{l:-0}}" -gt "$((n-{int(seconds)}))" ] 2>/dev/null; then cat >/dev/null; exit 0; fi; '
+        'echo "$n" > "$f" 2>/dev/null; fi; '
+        f'# {_THROTTLE_MARK}\n'
+    )
+    return guard + command
+
+
+def throttle_post_tool_use_hooks(template: dict, seconds: int = AWARENESS_THROTTLE_S) -> dict:
+    """Return ``template`` with awareness commands under PostToolUse throttled (copy)."""
+    import copy
+    out = copy.deepcopy(template)
+    for group in (out.get('hooks') or {}).get('PostToolUse') or []:
+        for hook in (group.get('hooks') or []) if isinstance(group, dict) else []:
+            if isinstance(hook, dict) and isinstance(hook.get('command'), str):
+                hook['command'] = throttle_awareness_command(hook['command'], seconds)
+    return out

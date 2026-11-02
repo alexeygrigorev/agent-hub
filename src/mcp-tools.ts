@@ -21,10 +21,10 @@ tool('heartbeat', 'POST', '/api/heartbeat', 'Report own agent liveness (health:r
 for (const [name, mode] of [['start_agent', 'headless'], ['start_session', 'interactive'], ['plan_agent', 'plan']] as const) {
   tool(name, 'POST', mode === 'plan' ? '/api/fleet/plan' : '/api/fleet/launches', `Legacy fleet ${mode}: provide the same JSON as the CLI; placement/admission unchanged.`, [name.replaceAll('_', '-')]);
 }
-tool('sessions_link', 'POST', '/api/sessions/{id}/link', 'Operator intake link (key, intake_task_id), also after session end; idempotent; conflict is 409.', ['sessions link']);
+tool('sessions_link', 'POST', '/api/sessions/{id}/link', 'Link intake; scoped workers must match task, machine and workspace; idempotent.', ['sessions link']);
 tool('sessions_list', 'GET', '/api/sessions', 'List sessions; query view=lifecycle grouped, view=breakdown&by=host,engine,account counts; state, limit, cursor filter.', ['sessions', 'sessions list', 'sessions count']);
 tool('sessions_tree', 'GET', '/api/sessions/tree', 'Session requester/parent tree.', ['sessions tree']);
-tool('sessions_start', 'POST', '/api/sessions', 'Queue session intent: workspace, brief, name, mode=headless|interactive, parent_id, intake_task_id, key, effort, with_goal. Omit engine for tier policy; explicit engine REQUIRES engine_override_reason. Non-interactive starts REQUIRE intake_task_id and nonempty AC. Scope flags are informational only and never hold a start. needs filters advertised machine labels; unmet needs hold with needs_unmet. Quota/admission unchanged. Use interactive with_goal for follow-ups; headless uses native resume. Poll sessions_show/commands: queued or transported is not acknowledged execution.', ['sessions start', 'sessions override']);
+tool('sessions_start', 'POST', '/api/sessions', 'Queue durable session intent: workspace or registered repo owner/name, brief, name, mode=headless|interactive, parent_id, intake_task_id, key, effort, with_goal. Omit engine for tier policy; explicit engine REQUIRES engine_override_reason. Non-interactive starts REQUIRE intake_task_id and nonempty AC. Scope flags never block starts. needs filters advertised machine labels; unmet needs hold with needs_unmet. Admission unchanged. Use interactive with_goal for follow-ups; headless uses native resume. Poll sessions_show/commands: queued or transported is not acknowledged execution.', ['sessions start', 'sessions override']);
 tool('sessions_show', 'GET', '/api/sessions/{id}', 'Session binding and observed state.', ['sessions show']);
 tool('sessions_commands', 'GET', '/api/sessions/{id}/commands', 'Read command results; recorded/transported is not acknowledged execution.', ['sessions commands']);
 for (const action of ['send', 'capture', 'stop']) tool(`sessions_${action}`, 'POST', `/api/sessions/{id}/${action}`,
@@ -129,6 +129,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'engines maintain': 'Operator trigger for Hub credential refresh and direct provider quota; the cron already runs it.',
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',
   'engines remove': 'Operator credential withdrawal stays in the explicit credential-management CLI/UI workflow.',
+  'engines recommend': 'Read-only placement recommendation preview for CLI/backup callers; MCP callers use plan_agent or sessions_start (intake 83d27f69).',
   'engines status': 'Operator read of per-host engine sync status; deliberate CLI step, not an agent tool.',
   'engines cancel': 'Admin cancel of a pending engine rollout that restores the prior bundle version (intake 8cc9e31a, rollout 0de287c8); an operator incident action, never an agent tool.',
   'engines update': 'Operator rollout of Hub-managed engine versions to hosts (intake 8cc9e31a); a fleet-wide change, never an agent tool.',

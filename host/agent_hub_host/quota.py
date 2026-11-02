@@ -135,11 +135,13 @@ def render_text(data):
                 left += "; windows " + ", ".join(measured)
         harness = pool.get("harness") or pool.get("engines") or []
         harness_text = ", ".join(h for h in harness if isinstance(h, str)) if isinstance(harness, list) else "unknown"
-        lines.append("%s/%s/%s: %s (%s left, observed %s by %s)" % (
+        decision_suffix = (" — %s" % pool["decision_reason"]) if pool.get("decision_reason") else ""
+        lines.append("%s/%s/%s: %s (%s left, observed %s by %s)%s" % (
             harness_text or "unknown", pool.get("provider", "?"), pool.get("account", "?"),
             pool.get("state", "unknown") + (" [DISABLED: excluded from routing]" if pool.get("routing") == "disabled" else ""),
             left, pool.get("observed_at") or "never",
-            ", ".join(pool.get("observed_by_hosts") or []) or "no host"))
+            ", ".join(pool.get("observed_by_hosts") or []) or "no host",
+            decision_suffix))
     coverage = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}
     account_coverage = data.get("account_coverage")
     if isinstance(account_coverage, dict):

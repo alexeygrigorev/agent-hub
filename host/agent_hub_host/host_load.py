@@ -138,10 +138,9 @@ def live_load_status(settings: Optional[dict] = None, *,
                      mem_fn: Optional[Callable[[], Optional[tuple]]] = None) -> dict[str, Any]:
     """Measure the host. Never raises.
 
-    Returns load1, cores, factor, cpu_busy (percent) with cpu_window_s,
-    mem_avail_gb, ``overloaded`` (a measured signal tripped), ``trigger``
-    (``cpu_busy``/``mem_available``/``load_runaway`` or None) and ``unknown``
-    (no signal at all was readable).
+    Returns load1, cores, factor, CPU usage/window and MemAvailable/floor in
+    measured units, plus ``overloaded``, the triggering signal, and whether
+    all signals were unreadable.
     """
     factor = load_factor(settings)
     load1: Optional[float] = None
@@ -178,17 +177,20 @@ def live_load_status(settings: Optional[dict] = None, *,
     except Exception:
         pass
 
+    mem_floor = min(MEM_FLOOR_BYTES, mem_total // 4) if mem_total else None
     trigger = None
     if runaway:
         trigger = "load_runaway"
     elif cpu_busy is not None and cpu_busy >= CPU_SATURATED_PCT:
         trigger = "cpu_busy"
-    elif mem_avail is not None and mem_total and mem_avail < min(MEM_FLOOR_BYTES, mem_total // 4):
+    elif mem_avail is not None and mem_floor is not None and mem_avail < mem_floor:
         trigger = "mem_available"
     known = load1 is not None or cpu_busy is not None or mem_avail is not None
-    return {"load1": None if load1 is None else round(load1, 2), "cores": cores, "factor": factor,
+    return {"load1": load1, "cores": cores, "factor": factor,
             "cpu_busy": cpu_busy, "cpu_window_s": cpu_window,
             "mem_avail_gb": None if mem_avail is None else round(mem_avail / 1024 ** 3, 1),
+            "mem_avail_mb": None if mem_avail is None else mem_avail / 1024 ** 2,
+            "mem_floor_mb": None if mem_floor is None else mem_floor / 1024 ** 2,
             "trigger": trigger, "overloaded": trigger is not None, "unknown": not known}
 
 
@@ -208,8 +210,38 @@ def check_live_load(settings: Optional[dict] = None, **kwargs) -> dict[str, Any]
     """Raise ``ValueError("host_overload: ...")`` when the host is overloaded."""
     status = live_load_status(settings, **kwargs)
     if status["overloaded"]:
-        raise ValueError(f"{overload_reason(status)}; launch held")
+        error = ValueError(f"{overload_reason(status)}; launch held")
+        # Preserve the exact sample that caused the refusal. The dispatcher
+        # uses it to report and persist a trigger-specific retry gate without
+        # taking a second (potentially different) sample.
+        error.host_load_status = status
+        raise error
     return status
+
+
+def hub_refusal(status: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Return the Hub reason and bounded measurements for an overload."""
+    trigger = status.get("trigger")
+    if trigger == "mem_available":
+        return "memory_pressure", {
+            "trigger": trigger,
+            "mem_avail_mb": status.get("mem_avail_mb"),
+            "mem_floor_mb": status.get("mem_floor_mb"),
+        }
+    if trigger == "cpu_busy":
+        return "cpu_pressure", {
+            "trigger": trigger,
+            "cpu_busy_pct": status.get("cpu_busy"),
+            "cpu_window_s": status.get("cpu_window_s"),
+        }
+    if trigger == "load_runaway":
+        return "host_load_high", {
+            "trigger": trigger,
+            "load1": status.get("load1"),
+            "cores": status.get("cores"),
+            "factor": status.get("factor"),
+        }
+    raise ValueError("host overload status has no measured trigger")
 
 
 def gate_with_live_load(gate: dict[str, Any], settings: Optional[dict] = None,

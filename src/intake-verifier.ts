@@ -2,8 +2,7 @@
  * intake's work reports DONE, Hub decides from the intake's `verification`
  * field (required|skip|auto, default auto) whether a SEPARATE verifier agent
  * must check it. The verifier only verifies: it never implements. It may run
- * on the same model as the implementer (Claude Opus by default; no forced
- * engine switch). A pass closes the intake through the ordinary
+ * on the same model as the implementer (placement is burn-aware, no engine pin). A pass closes the intake through the ordinary
  * close rules (DONE evidence + worktree gate); a fail appends the gap to the
  * AC, which invalidates the DONE claim so the watchdog re-queues the work.
  * Only DONE claims made after this service was first enabled are handled;
@@ -137,10 +136,11 @@ export class IntakeVerifier {
   }
   private async launch(task: Obj, claim: Obj, row: Obj): Promise<boolean> {
     if (!this.hooks.start) return false;
-    const engine = 'claude';
+    // No engine pin (Alexey 2026-11-02, usage draining while claude kept being picked): the review
+    // tier is placed by Hub's burn-aware routing, so a low-headroom Claude loses to the engine most behind schedule.
+    const engine = 'auto';
     const attempt = (row.attempts ?? 0) + 1;
-    const input = { key: 'verify-' + crypto.randomUUID(), engine, tier: 'review', task_kind: 'review', mode: 'headless',
-      engine_override_reason: 'Alexey t1936u: separate Claude Opus verifier after DONE',
+    const input = { key: 'verify-' + crypto.randomUUID(), tier: 'review', task_kind: 'review', mode: 'headless',
       // Detached (79458f2d): a live owner session on the intake's worktree never blocks the verifier.
       workspace: this.workspace(task), intake_task_id: task.id, intake_worktree: 'detached', brief: verifierBrief(task, claim, attempt) };
     this.set(task, claim, { state: 'starting', engine, request_key: input.key, attempts: attempt, session_id: null });

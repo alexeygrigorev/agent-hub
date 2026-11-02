@@ -377,6 +377,8 @@ def install_aplexer_state_hooks(bundle=None, home=None):
             }
         }
 
+    if not _windows_hooks():
+        template_hooks = hook_command.throttle_post_tool_use_hooks(template_hooks)
     content_bytes = json.dumps(template_hooks, indent=2).encode('utf-8')
     with private_fs.parent(codex_hooks, create=True):
         pass
@@ -615,32 +617,17 @@ def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
     return res
 
 
-KNOWN_HOOK_HASHES = {
-    'session_start:0:0': 'sha256:ac5079da741baea9d7cb457e131ce58f3b563b443cd750940bfa2e54be63a0ec',
-    'session_start:1:0': 'sha256:b8d459bbdbea59e7ff5bd6064a65ced7d9ea57686bb163d1c9fb40eef8ffd4f6',
-    'user_prompt_submit:0:0': 'sha256:db2f3aaa4d73a3c4ce637c104399b654efb2990cd46f72a7f3646cf9c783feac',
-    'user_prompt_submit:1:0': 'sha256:9110ecd5d2975cef72b5596811be8115687e1d437311d7b11f87caf911a24c9b',
-    'stop:0:0': 'sha256:6d270f46d79288e0768c5124346fd2289e3c1b694f38041892633190beb161f8',
-    'post_tool_use:0:0': 'sha256:9e4b66a5438f7470eba7321ae25b62a3ce845c416418da8d85cda2b3c41cca37',
-}
-
-
 def ensure_toml_trusted_hooks(content: str, hooks_file: Path) -> str:
-    """Ensure installed hooks in hooks_file are trusted in TOML content to prevent hook review prompts."""
-    res = repair_toml_duplicate_tables(content)
+    """Trust only handlers present in the actual generated hooks file."""
     try:
-        h_str = str(hooks_file.resolve())
+        hooks_file = Path(hooks_file).resolve()
+        raw = read_engine_file(hooks_file)
+        if raw is None:
+            return content
+        hooks_doc = json.loads(raw.decode('utf-8'))
     except Exception:
-        h_str = str(hooks_file)
-    present = {path for path, _ in _toml_sections(res) if path}
-    for suffix, hash_val in KNOWN_HOOK_HASHES.items():
-        key = f'{h_str}:{suffix}'
-        if ('hooks', 'state', key) in present:
-            continue
-        if res and not res.endswith('\n'):
-            res += '\n'
-        res += f'\n[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{hash_val}"\n'
-    return res
+        return content
+    return hook_trust.render(repair_toml_duplicate_tables(content), str(hooks_file), hooks_doc)
 
 
 def read_engine_file(target, limit=131072):
@@ -728,6 +715,9 @@ def ensure_claude_trusted_projects(config_path, paths):
     if config.get('hasCompletedOnboarding') is not True:
         config['hasCompletedOnboarding'] = True
         changed = True
+    if config.get('theme') != 'dark':
+        config['theme'] = 'dark'
+        changed = True
     for path in paths:
         for key in claude_project_keys(path):
             entry = projects.setdefault(key, {})
@@ -814,6 +804,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         settings['autoUpdates'] = False
         perms = settings.setdefault('permissions', {})
         if isinstance(perms, dict):
+            perms['defaultMode'] = 'bypassPermissions'
             perms.setdefault('deny', ['AskUserQuestion'])
         # Interactive claude sessions report semantic state through the same
         # hook contract as .codex/hooks.json: UserPromptSubmit/SessionStart ->
@@ -1156,13 +1147,46 @@ def profile_path():
     return base / 'aplexer' / 'config.toml'
 
 
-def _posix_engine_launcher(command, label):
+def _windows_exe_launcher(command, label, stub=None):
+    import io
+    import zipfile
+    if stub is None:
+        stub_name = 't64-arm.exe' if platform.machine().lower() in ('arm64', 'aarch64') else 't64.exe'
+        candidates = [Path(sys.base_prefix) / 'Lib' / 'site-packages' / 'pip' / '_vendor' / 'distlib' / stub_name]
+        try:
+            import pip._vendor.distlib as _distlib
+            candidates.append(Path(_distlib.__file__).parent / stub_name)
+        except Exception:
+            pass
+        stub = next((c for c in candidates if c.is_file()), None)
+    if stub is None:
+        return command
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, 'w') as z:
+        z.writestr('__main__.py', command[2])
+    shebang = ('#!"' + command[0] + '"').encode('utf-8') + bytes((13, 10))
+    path = root() / 'engine-launch' / (label + '.exe')
+    try:
+        with private_fs.parent(path, create=True):
+            pass
+        private_fs.atomic_write(path, stub.read_bytes() + shebang + archive.getvalue(), 4 * 1024 * 1024)
+    except (OSError, ValueError):
+        return command
+    return [str(path), label]
+
+
+def _posix_engine_launcher(command, label, windows=False):
     """Command whose first element tolerates the engine subcommand aplexer injects after it.
 
     `a task run --engine opencode --profile X` builds [command[0], 'run', *command[1:], ...]; with
     command[0] = python that is `python run -c ...` ("can't open file 'run'"). A tiny sh launcher takes
     that argument order and hands it to the same python -c; execute() puts `run` back after the label."""
     import shlex
+    if windows:
+        # aplexer (Rust) refuses a .cmd as the task child when an argument holds a newline or other
+        # batch-unsafe characters, and every real prompt does. Use a native console-script style
+        # launcher (pip's distlib stub + shebang + zipped __main__.py): it execs `python <exe> args...`.
+        return _windows_exe_launcher(command, label)
     path = root() / 'engine-launch' / (label + '.sh')
     body = '#!/bin/sh' + chr(10) + 'exec ' + shlex.quote(command[0]) + ' -c ' + shlex.quote(command[2]) + ' "$@"' + chr(10)
     try:
@@ -1262,17 +1286,46 @@ def profiles(bundles, path=None, is_windows=None):
             raise ValueError('Operator profile collision')
         # Only public label and paths go into native registry command metadata.
         command = module_command('execute', b['label'])
-        if b.get('provider') == 'go' and (os.name != 'nt' if is_windows is None else not is_windows):
-            command = _posix_engine_launcher(command, b['label'])
-        block +='\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
+        if b.get('provider') == 'go':
+            command = _posix_engine_launcher(command, b['label'], windows=(os.name == 'nt' if is_windows is None else bool(is_windows)))
+        block += '\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
     # After our block is stripped, any [engines.opencode] left in the file is
     # operator-owned and wins over the managed pin (duplicate tables would not
     # even parse for aplexer).
+    text = _drop_stale_release_opencode_pin(text)
     if not re.search(r'(?m)^\s*\[engines\.opencode\]\s*$', text):
         pin = _opencode_engine_pin(bundles, is_windows=is_windows)
         if pin:
             block += '\n[engines.opencode]\ncommand = ' + json.dumps(pin) + '\n'
     private_fs.atomic_write(path, (text.rstrip() + '\n\n' + block + END).encode(), 262144)
+
+
+_ENGINE_TABLE = re.compile(r'(?m)^\s*\[engines\.opencode\]\s*$')
+
+
+def _drop_stale_release_opencode_pin(text):
+    """Remove an [engines.opencode] table pinned to a Hub release directory.
+
+    `a doctor --fix` (or older Hub code) pins the absolute opencode path found at that moment;
+    on Windows that was <agent-hub>/releases/<old sha>/engines/node_modules/opencode-ai/..., which
+    kept `a engines` and plain `--engine opencode` on the OLD release after every release switch
+    (laptop: 56715fc...). A table whose command lives under an agent-hub releases directory is Hub
+    state, not operator state: drop it so the managed pin (current engine) is written instead.
+    Tables pointing anywhere else stay operator-owned and untouched."""
+    match = _ENGINE_TABLE.search(text)
+    if not match:
+        return text
+    rest = text[match.end():]
+    nxt = re.search(r'(?m)^\s*\[', rest)
+    body = rest[:nxt.start()] if nxt else rest
+    command = re.search(r'(?m)^\s*command\s*=\s*(.*)$', body)
+    if not command:
+        return text
+    normalized = command.group(1).replace('\\\\', '/').replace('\\', '/').lower()
+    if '/agent-hub/releases/' not in normalized:
+        return text
+    end = match.end() + (nxt.start() if nxt else len(rest))
+    return text[:match.start()] + text[end:].lstrip('\n')
 
 
 def _ensure_builtin_provider(res_dir):
@@ -1629,10 +1682,13 @@ def _go_engine_current(bundle, dest):
 
     Same-revision installs made while the pin was opencode-ai 1.x (no
     `auth import`) must be replaced in place, not skipped as already installed."""
+    modules = Path(dest) / 'engine' / 'node_modules'
     try:
-        return executable_path(bundle, dest).is_file()
-    except (ValueError, OSError, KeyError):
-        return False
+        # Only a leftover opencode-ai 1.x tree without the 2.x CLI is stale; an empty or
+        # not-yet-installed tree is the ordinary install path's business.
+        return not ((modules / 'opencode-ai').is_dir() and not (modules / '@opencode' / 'cli').is_dir())
+    except OSError:
+        return True
 
 
 def install(bundle, request=None):
@@ -2654,6 +2710,16 @@ def add_commands(sub):
     versions.add_argument('--json', dest='json', action='store_true', help='Machine-readable output (default)')
     versions.add_argument('--fleet', action='store_true', help='Fleet-wide per-host versions from Hub version reports instead of this host')
     versions.add_argument('--machine', default=None, help='With --fleet: only this registered host')
+    recommend = commands.add_parser('recommend', help='Recommend engine/account/model/host using Hub burn-rate decision logic without reserving')
+    recommend.add_argument('--tier', default=None, help='Task tier (daily, deep, quick, review, ask)')
+    recommend.add_argument('--workspace', default=None, help='Workspace name or path')
+    recommend.add_argument('--machine', default=None, help='Preferred machine id')
+    recommend.add_argument('--project', default=None, help='Project name')
+    recommend.add_argument('--needs', default=None, help='Comma-separated capability/OS labels')
+    recommend.add_argument('--mode', choices=['headless', 'interactive'], default='headless')
+    recommend.add_argument('--engine', default=None, help='Optional pinned engine (requires --reason)')
+    recommend.add_argument('--reason', default=None, help='Required explanation when --engine is pinned')
+    recommend.add_argument('--json', action='store_true', default=True, help='JSON output (default)')
 
 
 def central_login(args, prompt=None):
@@ -2877,6 +2943,17 @@ def engine_update_command(args):
 
 
 def command(args):
+    if args.engines_cmd == 'recommend':
+        import urllib.parse
+        if getattr(args, 'engine', None) and not (getattr(args, 'reason', None) and str(args.reason).strip()):
+            raise ValueError('engine_reason_required: --engine requires --reason')
+        q = {}
+        for k in ('tier', 'workspace', 'machine', 'project', 'needs', 'mode', 'engine', 'reason'):
+            v = getattr(args, k, None)
+            if v is not None and str(v).strip():
+                q[k] = str(v).strip()
+        qs = ('?' + urllib.parse.urlencode(q)) if q else ''
+        return bus._do_request('GET', '/api/fleet/recommend' + qs)
     if args.engines_cmd == 'quota':
         return quotas()
     if args.engines_cmd == 'login':
