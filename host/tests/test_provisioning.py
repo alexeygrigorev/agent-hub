@@ -1478,7 +1478,7 @@ def test_profile_command_imports_package_without_launcher_pythonpath(tmp_path, m
 def _fake_windows_go_install(revision='33333333-3333-4333-8333-333333333333'):
     dest = p.root() / ('go-account-' + revision)
     package = dest / 'engine' / 'node_modules' / '@opencode' / 'cli-windows-x64'
-    (package / 'bin').mkdir(parents=True)
+    (package / 'bin').mkdir(parents=True, exist_ok=True)
     (package / 'package.json').write_text(json.dumps({'version': p.GO_CLI_VERSION}))
     executable = package / 'bin' / 'opencode.exe'
     executable.write_bytes(b'MZ')
@@ -1509,9 +1509,12 @@ def test_go_engine_is_the_2x_cli_that_can_import_the_central_device_login(tmp_pa
     bundle['version'] = '1.19.3'
     dest = p.root() / ('go-account-' + bundle['revision'])
     assert p.executable_path(bundle, dest, is_windows=True) == executable
-    assert p._go_engine_current(bundle, dest) in (True, False)  # platform dependent, must not raise
-    stale = dict(bundle, revision='44444444-4444-4444-8444-444444444444')
-    assert p._go_engine_current(stale, p.root() / ('go-account-' + stale['revision'])) is False
+    assert p._go_engine_current(bundle, dest) is True
+    old_tree = p.root() / 'go-account-old' / 'engine' / 'node_modules'
+    (old_tree / 'opencode-ai').mkdir(parents=True)
+    assert p._go_engine_current(bundle, old_tree.parent.parent) is False  # leftover 1.x without the 2.x CLI
+    (old_tree / '@opencode' / 'cli').mkdir(parents=True)
+    assert p._go_engine_current(bundle, old_tree.parent.parent) is True
 
 
 def test_opencode_engine_pin_absent_off_windows_and_for_operator_tables(monkeypatch):

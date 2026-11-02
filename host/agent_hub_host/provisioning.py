@@ -1156,13 +1156,46 @@ def profile_path():
     return base / 'aplexer' / 'config.toml'
 
 
-def _posix_engine_launcher(command, label):
+def _windows_exe_launcher(command, label, stub=None):
+    import io
+    import zipfile
+    if stub is None:
+        stub_name = 't64-arm.exe' if platform.machine().lower() in ('arm64', 'aarch64') else 't64.exe'
+        candidates = [Path(sys.base_prefix) / 'Lib' / 'site-packages' / 'pip' / '_vendor' / 'distlib' / stub_name]
+        try:
+            import pip._vendor.distlib as _distlib
+            candidates.append(Path(_distlib.__file__).parent / stub_name)
+        except Exception:
+            pass
+        stub = next((c for c in candidates if c.is_file()), None)
+    if stub is None:
+        return command
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, 'w') as z:
+        z.writestr('__main__.py', command[2])
+    shebang = ('#!"' + command[0] + '"').encode('utf-8') + bytes((13, 10))
+    path = root() / 'engine-launch' / (label + '.exe')
+    try:
+        with private_fs.parent(path, create=True):
+            pass
+        private_fs.atomic_write(path, stub.read_bytes() + shebang + archive.getvalue(), 4 * 1024 * 1024)
+    except (OSError, ValueError):
+        return command
+    return [str(path), label]
+
+
+def _posix_engine_launcher(command, label, windows=False):
     """Command whose first element tolerates the engine subcommand aplexer injects after it.
 
     `a task run --engine opencode --profile X` builds [command[0], 'run', *command[1:], ...]; with
     command[0] = python that is `python run -c ...` ("can't open file 'run'"). A tiny sh launcher takes
     that argument order and hands it to the same python -c; execute() puts `run` back after the label."""
     import shlex
+    if windows:
+        # aplexer (Rust) refuses a .cmd as the task child when an argument holds a newline or other
+        # batch-unsafe characters, and every real prompt does. Use a native console-script style
+        # launcher (pip's distlib stub + shebang + zipped __main__.py): it execs `python <exe> args...`.
+        return _windows_exe_launcher(command, label)
     path = root() / 'engine-launch' / (label + '.sh')
     body = '#!/bin/sh' + chr(10) + 'exec ' + shlex.quote(command[0]) + ' -c ' + shlex.quote(command[2]) + ' "$@"' + chr(10)
     try:
@@ -1262,17 +1295,46 @@ def profiles(bundles, path=None, is_windows=None):
             raise ValueError('Operator profile collision')
         # Only public label and paths go into native registry command metadata.
         command = module_command('execute', b['label'])
-        if b.get('provider') == 'go' and (os.name != 'nt' if is_windows is None else not is_windows):
-            command = _posix_engine_launcher(command, b['label'])
-        block +='\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
+        if b.get('provider') == 'go':
+            command = _posix_engine_launcher(command, b['label'], windows=(os.name == 'nt' if is_windows is None else bool(is_windows)))
+        block += '\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
     # After our block is stripped, any [engines.opencode] left in the file is
     # operator-owned and wins over the managed pin (duplicate tables would not
     # even parse for aplexer).
+    text = _drop_stale_release_opencode_pin(text)
     if not re.search(r'(?m)^\s*\[engines\.opencode\]\s*$', text):
         pin = _opencode_engine_pin(bundles, is_windows=is_windows)
         if pin:
             block += '\n[engines.opencode]\ncommand = ' + json.dumps(pin) + '\n'
     private_fs.atomic_write(path, (text.rstrip() + '\n\n' + block + END).encode(), 262144)
+
+
+_ENGINE_TABLE = re.compile(r'(?m)^\s*\[engines\.opencode\]\s*$')
+
+
+def _drop_stale_release_opencode_pin(text):
+    """Remove an [engines.opencode] table pinned to a Hub release directory.
+
+    `a doctor --fix` (or older Hub code) pins the absolute opencode path found at that moment;
+    on Windows that was <agent-hub>/releases/<old sha>/engines/node_modules/opencode-ai/..., which
+    kept `a engines` and plain `--engine opencode` on the OLD release after every release switch
+    (laptop: 56715fc...). A table whose command lives under an agent-hub releases directory is Hub
+    state, not operator state: drop it so the managed pin (current engine) is written instead.
+    Tables pointing anywhere else stay operator-owned and untouched."""
+    match = _ENGINE_TABLE.search(text)
+    if not match:
+        return text
+    rest = text[match.end():]
+    nxt = re.search(r'(?m)^\s*\[', rest)
+    body = rest[:nxt.start()] if nxt else rest
+    command = re.search(r'(?m)^\s*command\s*=\s*(.*)$', body)
+    if not command:
+        return text
+    normalized = command.group(1).replace('\\\\', '/').replace('\\', '/').lower()
+    if '/agent-hub/releases/' not in normalized:
+        return text
+    end = match.end() + (nxt.start() if nxt else len(rest))
+    return text[:match.start()] + text[end:].lstrip('\n')
 
 
 def _ensure_builtin_provider(res_dir):
@@ -1629,10 +1691,13 @@ def _go_engine_current(bundle, dest):
 
     Same-revision installs made while the pin was opencode-ai 1.x (no
     `auth import`) must be replaced in place, not skipped as already installed."""
+    modules = Path(dest) / 'engine' / 'node_modules'
     try:
-        return executable_path(bundle, dest).is_file()
-    except (ValueError, OSError, KeyError):
-        return False
+        # Only a leftover opencode-ai 1.x tree without the 2.x CLI is stale; an empty or
+        # not-yet-installed tree is the ordinary install path's business.
+        return not ((modules / 'opencode-ai').is_dir() and not (modules / '@opencode' / 'cli').is_dir())
+    except OSError:
+        return True
 
 
 def install(bundle, request=None):
