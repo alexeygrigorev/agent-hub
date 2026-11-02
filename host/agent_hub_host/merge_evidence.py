@@ -58,6 +58,22 @@ def existing_commits(repo: str, candidates: list, runner: Callable = subprocess.
             if (p := _run(runner, ['git', 'cat-file', '-e', c + '^{commit}'], repo)) is not None and p.returncode == 0]
 
 
+def explicit_commit_refs(history: list) -> list:
+    """Commit SHAs from explicit report/commit event fields (reference = sha).
+
+    Only ``report``/``commit`` entries whose ``reference`` is a 7-40 hex SHA
+    count. Note text, intake/session/launch ids and uuid fragments never count
+    here; free-text candidates go through ``shas_from_text`` + ``existing_commits``."""
+    refs = []
+    for entry in history or []:
+        if not isinstance(entry, dict) or entry.get('kind') not in ('report', 'commit'):
+            continue
+        ref = str(entry.get('reference') or '').strip()
+        if SHA.match(ref) and ref.lower() not in refs:
+            refs.append(ref.lower())
+    return refs
+
+
 def own_clone(runner: Callable = subprocess.run, remote: Optional[str] = None) -> str:
     """Private checkout of the project repo (never the caller's cwd)."""
     remote = remote or os.environ.get('AGENT_HUB_MERGE_CHECK_REMOTE') or DEFAULT_REMOTE

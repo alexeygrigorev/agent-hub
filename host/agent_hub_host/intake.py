@@ -518,8 +518,7 @@ def execute(args):
         history = ((shown.get('task') or {}).get('payload_data') or {}).get('history') or []
         task = shown.get('task') or {}
         text = '\n'.join(e.get('text', '') for e in history if isinstance(e, dict) and e.get('kind') == 'note' and str(e.get('text', '')).lstrip().startswith('DONE'))
-        explicit = [str(e.get('reference') or '').strip() for e in history
-                    if isinstance(e, dict) and e.get('kind') in ('report', 'commit') and merge_evidence.SHA.match(str(e.get('reference') or '').strip())]
+        explicit = merge_evidence.explicit_commit_refs(history)
         try:
             repo = str(Path(args.repo).resolve()) if args.repo else merge_evidence.own_clone()
             candidates = merge_evidence.shas_from_text(text, exclude=(task.get('id'),) + tuple(e.get('hub_session_id') or e.get('id') for e in history if isinstance(e, dict)))
