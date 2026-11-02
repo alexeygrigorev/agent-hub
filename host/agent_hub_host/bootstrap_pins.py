@@ -76,6 +76,6 @@ PYTHON_WHEELS = {'aplexer-client': {'requires_dist': None,
 # Maintained Agent Quota Launcher (public alexeygrigorev/agent-quota-launcher),
 # the headless fleet-mode backend. Immutable release named by its source SHA;
 # the GitHub commit archive is pinned by content, not by its mutable URL alone.
-LAUNCHER_RELEASE = {'sha': 'ccb291af99e95018178f321869585d39c8e3589e',
-                    'url': 'https://codeload.github.com/alexeygrigorev/agent-quota-launcher/zip/ccb291af99e95018178f321869585d39c8e3589e',
-                    'sha256': '3a3d288394f6202f718406161dd6ab7143d248f7d9368835d658a12668185088'}
+LAUNCHER_RELEASE = {'sha': '8c8620637f64ce0232955d088fd629aeb05c2e77',
+                    'url': 'https://codeload.github.com/alexeygrigorev/agent-quota-launcher/zip/8c8620637f64ce0232955d088fd629aeb05c2e77',
+                    'sha256': '671e084335b4b033e2ac23537209492f1d6032e341bebedaaea5af16414b9d8f'}
