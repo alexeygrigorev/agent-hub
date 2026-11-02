@@ -2284,8 +2284,10 @@ def execute():
             if not is_diagnostic:
                 if b['provider'] in ('codex', 'zai'):
                     if '--dangerously-bypass-approvals-and-sandbox' not in extra_argv and '--dangerously-bypass-approvals-and-sandbox' not in b.get('args', []):
-                        if not extra_argv or extra_argv[0] != 'exec':
-                            bypass_flags = ['--dangerously-bypass-approvals-and-sandbox']
+                        # Also for `exec`: the flag is a top-level option placed before
+                        # the subcommand. Without it headless zcodex/codex runs wait on
+                        # approvals or deny every write (hung exec on DESKTOP-FP4OP26).
+                        bypass_flags = ['--dangerously-bypass-approvals-and-sandbox']
                 elif b['provider'] == 'claude':
                     if '--dangerously-skip-permissions' not in extra_argv and '--dangerously-skip-permissions' not in b.get('args', []):
                         bypass_flags = ['--dangerously-skip-permissions']

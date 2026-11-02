@@ -1154,6 +1154,13 @@ def test_execute_bypasses_permissions_for_goal_and_interactive(tmp_path, monkeyp
     assert argv.count('--dangerously-bypass-approvals-and-sandbox') == 1
     calls.clear()
 
+    # Case 2b: headless `exec` also gets the flag, before the subcommand
+    monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', 'exec', '--json', 'task'])
+    p.execute()
+    cmd, argv, env = calls[0]
+    assert argv.index('--dangerously-bypass-approvals-and-sandbox') < argv.index('exec')
+    calls.clear()
+
     # Case 3: Diagnostic --version does NOT append bypass flag
     monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', '--version'])
     p.execute()
