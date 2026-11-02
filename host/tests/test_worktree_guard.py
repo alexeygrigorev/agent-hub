@@ -823,3 +823,272 @@ class TestStoppedIntakeRestart(unittest.TestCase):
         with patch.object(guard, "release_session_lock") as release:
             self.assertEqual(guard.reconcile_terminal_locks(lambda *args: {"sessions": facts}), 0)
         release.assert_not_called()
+
+
+ORIGIN_URL = "https://example.test/demo.git"
+
+
+def _origin_repo(git_root, name="proj", url=ORIGIN_URL):
+    """Main checkout with an origin remote under an arbitrary parent."""
+    main = os.path.join(git_root, name)
+    os.makedirs(main)
+    assert _run(["git", "init", "-q", main], git_root).returncode == 0
+    assert _run(["git", "-C", main, "config", "user.email", "t@t"], git_root).returncode == 0
+    assert _run(["git", "-C", main, "config", "user.name", "t"], git_root).returncode == 0
+    with open(os.path.join(main, "f.txt"), "w") as fh:
+        fh.write("x")
+    assert _run(["git", "-C", main, "add", "f.txt"], git_root).returncode == 0
+    assert _run(["git", "-C", main, "commit", "-qm", "init"], git_root).returncode == 0
+    assert _run(["git", "-C", main, "remote", "add", "origin", url], git_root).returncode == 0
+    return main
+
+
+def _legacy_wt(main, path, branch="feature-x"):
+    proc = _run(["git", "-C", main, "worktree", "add", path, "-b", branch], main)
+    assert proc.returncode == 0, proc.stderr
+    return path
+
+
+def _legacy_fact(sid, workspace, intake="proof-intake", **overrides):
+    """Terminal releasable fact with no launch identity evidence on disk."""
+    fact = dict(session_id=sid, intake_task_id=intake, tag="task-hub-" + "c" * 32,
+                terminal=True, native_terminal=True, human_owned=False,
+                protected=False, lock_release_permitted=True, workspace=workspace)
+    fact.update(overrides)
+    return fact
+
+
+class LegacyTerminalLockRepairTests(unittest.TestCase):
+    """Legacy repair path (intake f49b4d69 AC4): no evidence file, identity
+    derived from the locked worktree, exact lock reason + Hub facts + path
+    containment/naming all required."""
+
+    def test_legacy_absent_evidence_derives_identity_from_the_locked_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"HUB_WORKTREE_IDENTITY_DIR": tmp + '/identity'}):
+            main = _origin_repo(tmp)
+            tree = _legacy_wt(main, os.path.join(tmp, 'session-wt'))
+            sid = 'b' * 32
+            reason = guard.lock_reason(sid, 'proof-intake')
+            self.assertTrue(guard.lock_worktree('git', tree, reason))
+            fact = _legacy_fact(sid, tree)
+            request = lambda *args: {'sessions': [fact]}
+            preview = guard.repair_terminal_locks(request)
+            self.assertTrue(preview['complete'])
+            self.assertEqual(preview['candidate_count'], 1)
+            self.assertEqual(preview['candidates'], [{
+                'session_id': sid, 'intake_id': 'proof-intake',
+                'path': os.path.normpath(tree), 'reason': reason,
+                'origin': ORIGIN_URL, 'legacy': True}])
+            self.assertTrue(guard.is_locked('git', tree))
+            self.assertFalse(os.path.isdir(guard.identity_directory()))
+            applied = guard.repair_terminal_locks(request, apply=True)
+            self.assertEqual(applied['released_count'], 1)
+            self.assertFalse(guard.is_locked('git', tree))
+            again = guard.repair_terminal_locks(request, apply=True)
+            self.assertEqual(again['candidate_count'], 0)
+            self.assertEqual(again['released_count'], 0)
+
+    def test_legacy_naming_route_requires_hub_contract_and_matching_hint_origin(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity', 'HOME': tmp + '/home'}):
+            home_git = os.path.join(tmp, 'home', 'git')
+            os.makedirs(home_git)
+            main = _origin_repo(home_git)
+            tree = _legacy_wt(main, os.path.join(home_git, 'proj-wt-a'))
+            deep = os.path.join(tree, 'deep', 'work')
+            os.makedirs(deep)
+            sid = 'b' * 32
+            reason = guard.lock_reason(sid, 'proof-intake')
+            self.assertTrue(guard.lock_worktree('git', tree, reason))
+            # The recorded workspace sits inside the locked tree; only the
+            # documented Hub naming contract ties the tree to this Hub.
+            fact = _legacy_fact(sid, deep)
+            preview = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]})
+            self.assertTrue(preview['complete'])
+            self.assertEqual(preview['candidate_count'], 1)
+            self.assertEqual(preview['candidates'][0]['path'], os.path.normpath(tree))
+            self.assertTrue(guard.is_locked('git', tree))
+
+    def test_legacy_lists_and_releases_every_lock_named_for_the_session(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity', 'HOME': tmp + '/home'}):
+            home_git = os.path.join(tmp, 'home', 'git')
+            os.makedirs(home_git)
+            main = _origin_repo(home_git)
+            tree_a = _legacy_wt(main, os.path.join(home_git, 'proj-wt-a'), branch='feat-a')
+            tree_b = _legacy_wt(main, os.path.join(home_git, 'proj-wt-b'), branch='feat-b')
+            sid = 'b' * 32
+            reason = guard.lock_reason(sid, 'proof-intake')
+            self.assertTrue(guard.lock_worktree('git', tree_a, reason))
+            self.assertTrue(guard.lock_worktree('git', tree_b, reason))
+            fact = _legacy_fact(sid, tree_a)
+            request = lambda *args: {'sessions': [fact]}
+            preview = guard.repair_terminal_locks(request)
+            self.assertEqual(preview['candidate_count'], 2)
+            self.assertEqual({c['path'] for c in preview['candidates']},
+                             {os.path.normpath(tree_a), os.path.normpath(tree_b)})
+            applied = guard.repair_terminal_locks(request, apply=True)
+            self.assertEqual(applied['released_count'], 2)
+            self.assertFalse(guard.is_locked('git', tree_a))
+            self.assertFalse(guard.is_locked('git', tree_b))
+
+    def test_legacy_refuses_non_releasable_hub_facts(self):
+        overrides = [
+            {'terminal': False}, {'native_terminal': False}, {'human_owned': True},
+            {'human_owned': None}, {'protected': True}, {'lock_release_permitted': False},
+        ]
+        for change in overrides:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp, \
+                    patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+                main = _origin_repo(tmp)
+                tree = _legacy_wt(main, os.path.join(tmp, 'session-wt'))
+                sid = 'b' * 32
+                self.assertTrue(guard.lock_worktree('git', tree, guard.lock_reason(sid, 'proof-intake')))
+                fact = _legacy_fact(sid, tree, **change)
+                report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]}, apply=True)
+                self.assertTrue(report['complete'])
+                self.assertEqual(report['candidate_count'], 0)
+                self.assertEqual(report['released_count'], 0)
+                self.assertTrue(guard.is_locked('git', tree))
+
+    def test_legacy_lock_reason_must_name_the_exact_session_and_intake(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            main = _origin_repo(tmp)
+            tree = _legacy_wt(main, os.path.join(tmp, 'session-wt'))
+            sid = 'b' * 32
+            fact = _legacy_fact(sid, tree)
+            for wrong in (guard.lock_reason('d' * 32, 'proof-intake'),
+                          guard.lock_reason(sid, None),
+                          'manual preservation'):
+                with self.subTest(reason=wrong):
+                    self.assertTrue(guard.lock_worktree('git', tree, wrong))
+                    report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]})
+                    self.assertEqual(report['candidate_count'], 0)
+                    self.assertTrue(guard.is_locked('git', tree))
+                    self.assertTrue(guard.unlock_worktree('git', tree))
+            self.assertTrue(guard.lock_worktree('git', tree, guard.lock_reason(sid, None)))
+            none_fact = _legacy_fact(sid, tree, intake=None)
+            preview = guard.repair_terminal_locks(lambda *args: {'sessions': [none_fact]})
+            self.assertEqual(preview['candidate_count'], 1)
+            self.assertTrue(guard.is_locked('git', tree))
+
+    def test_legacy_never_runs_when_identity_evidence_exists(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            main = _origin_repo(tmp)
+            tree = _legacy_wt(main, os.path.join(tmp, 'session-wt'))
+            sid = 'b' * 32
+            # A valid witness answers through the evidence path (no legacy
+            # marker on the candidate): existing evidence is never downgraded.
+            self.assertTrue(guard.remember_repository('c' * 32, tree))
+            self.assertTrue(guard.lock_worktree('git', tree, guard.lock_reason(sid, 'proof-intake')))
+            fact = _legacy_fact(sid, tree)
+            preview = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]})
+            self.assertEqual(preview['candidate_count'], 1)
+            self.assertNotIn('legacy', preview['candidates'][0])
+            self.assertTrue(guard.is_locked('git', tree))
+            # A witness that exists but is malformed refuses the repair
+            # instead of downgrading the fact to the legacy path.
+            malformed = _legacy_fact(sid, tree, tag='task-hub-' + 'e' * 32)
+            with open(guard.identity_directory() / ('e' * 32 + '.json'), 'w') as fh:
+                fh.write('{')
+            report = guard.repair_terminal_locks(lambda *args: {'sessions': [malformed]}, apply=True)
+            self.assertEqual(report['candidate_count'], 0)
+            self.assertEqual(report['released_count'], 0)
+            self.assertTrue(guard.is_locked('git', tree))
+
+    def test_legacy_refuses_locks_outside_the_workspace_and_hub_naming(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            main = _origin_repo(tmp)
+            sid = 'b' * 32
+            reason = guard.lock_reason(sid, 'proof-intake')
+            # (a) same-repo tree without the -wt- contract, outside the workspace.
+            stray = _legacy_wt(main, os.path.join(tmp, 'stray-tree'), branch='feat-stray')
+            self.assertTrue(guard.lock_worktree('git', stray, reason))
+            fact = _legacy_fact(sid, main)
+            report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]})
+            self.assertEqual(report['candidate_count'], 0)
+            self.assertTrue(guard.is_locked('git', stray))
+            # (b) -wt- basename but not directly under <home>/git.
+            with patch.dict(os.environ, {'HOME': tmp + '/home'}):
+                named = _legacy_wt(main, os.path.join(tmp, 'proj-wt-x'), branch='feat-x')
+                self.assertTrue(guard.lock_worktree('git', named, reason))
+                report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]})
+                self.assertEqual(report['candidate_count'], 0)
+                self.assertTrue(guard.is_locked('git', named))
+
+    def test_legacy_naming_route_refuses_hint_origin_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity', 'HOME': tmp + '/home'}):
+            home_git = os.path.join(tmp, 'home', 'git')
+            os.makedirs(home_git)
+            main = _origin_repo(home_git, name='proj')
+            _origin_repo(home_git, name='decoy', url='https://example.test/other.git')
+            # A tree named for the decoy hint that belongs to the proj repo.
+            tree = _legacy_wt(main, os.path.join(home_git, 'decoy-wt-x'))
+            deep = os.path.join(tree, 'deep')
+            os.makedirs(deep)
+            sid = 'b' * 32
+            self.assertTrue(guard.lock_worktree('git', tree, guard.lock_reason(sid, 'proof-intake')))
+            fact = _legacy_fact(sid, deep)
+            report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]})
+            self.assertEqual(report['candidate_count'], 0)
+            self.assertTrue(guard.is_locked('git', tree))
+
+    def test_legacy_refuses_repository_without_origin(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            main = _make_repo(tmp)
+            tree = _legacy_wt(main, os.path.join(tmp, 'session-wt'))
+            sid = 'b' * 32
+            self.assertTrue(guard.lock_worktree('git', tree, guard.lock_reason(sid, 'proof-intake')))
+            fact = _legacy_fact(sid, tree)
+            report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]})
+            self.assertEqual(report['candidate_count'], 0)
+            self.assertTrue(guard.is_locked('git', tree))
+
+    def test_legacy_refuses_when_the_locked_path_holds_a_different_repository(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            main = _origin_repo(tmp)
+            nested = _legacy_wt(main, os.path.join(main, 'nested-wt'))
+            sid = 'b' * 32
+            self.assertTrue(guard.lock_worktree('git', nested, guard.lock_reason(sid, 'proof-intake')))
+            fact = _legacy_fact(sid, main)
+            # Recreate the locked path as a foreign repository: the registry
+            # still lists the locked entry, but the derived common dir of the
+            # tree no longer matches the workspace repository.
+            os.rename(nested, nested + '-moved')
+            _make_repo(main)
+            os.rename(os.path.join(main, 'origin'), nested)
+            report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]})
+            self.assertEqual(report['candidate_count'], 0)
+
+    def test_legacy_requires_an_absolute_existing_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            main = _origin_repo(tmp)
+            tree = _legacy_wt(main, os.path.join(tmp, 'session-wt'))
+            sid = 'b' * 32
+            self.assertTrue(guard.lock_worktree('git', tree, guard.lock_reason(sid, 'proof-intake')))
+            for workspace in (None, 'relative/path', os.path.join(tmp, 'missing')):
+                with self.subTest(workspace=workspace):
+                    fact = _legacy_fact(sid, workspace)
+                    report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]})
+                    self.assertTrue(report['complete'])
+                    self.assertEqual(report['candidate_count'], 0)
+            self.assertTrue(guard.is_locked('git', tree))
+
+    def test_legacy_time_budget_is_hard_across_git_calls(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            main = _origin_repo(tmp)
+            tree = _legacy_wt(main, os.path.join(tmp, 'session-wt'))
+            sid = 'b' * 32
+            self.assertTrue(guard.lock_worktree('git', tree, guard.lock_reason(sid, 'proof-intake')))
+            fact = _legacy_fact(sid, tree)
+            clock = [1000.0]
+
+            def slow_git(argv, cwd, timeout):
+                clock[0] += timeout  # each git call consumes its entire allowed timeout
+                raise TimeoutError('slow git')
+
+            with patch.object(guard.time, 'monotonic', lambda: clock[0]), \
+                    patch.object(guard, '_default_runner', slow_git):
+                report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]}, apply=True)
+            self.assertFalse(report['complete'])
+            self.assertEqual(report['released_count'], 0)
+            self.assertLessEqual(clock[0] - 1000.0, guard.REPAIR_TIMEOUT_S)
+            self.assertTrue(guard.is_locked('git', tree))

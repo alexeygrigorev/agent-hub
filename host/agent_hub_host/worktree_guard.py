@@ -10,11 +10,15 @@ the single authority for:
   exact lock owner is positively terminal in Hub;
 - the shared ``should_skip_cleanup`` predicate used by every automated
   cleanup path (locked, live session, or session linked to an open intake);
-  - detecting a recreated worktree at a path whose original inode was deleted
+- detecting a recreated worktree at a path whose original inode was deleted
   (stale `` (deleted)`` kernel label), so it is not treated as missing;
 - transferring a same-intake lock from a proven stale native owner without
   unlocking the worktree, and reporting other Hub lock owners in a bounded
-  refusal grammar (intake 40316358).
+  refusal grammar (intake 40316358);
+- a bounded stale-lock repair whose legacy path (intake f49b4d69) derives
+  the repository identity from the locked worktree itself when no launch
+  identity evidence file exists, under the same exact lock-reason, Hub-fact
+  and path-containment gates.
 
 Stdlib only. All git calls are argv arrays (no shell). Tests use disposable
 synthetic repos wholly inside the owned private test TMPDIR.
@@ -912,6 +916,7 @@ def reconcile_terminal_locks(request: Callable, git_bin: str = "git") -> int:
 
 MAX_REPAIR_SESSIONS = 1000
 REPAIR_TIMEOUT_S = 30
+MAX_ORIGIN_LENGTH = 512
 
 
 def _deadline_runner(deadline: float) -> Callable:
@@ -924,8 +929,13 @@ def _deadline_runner(deadline: float) -> Callable:
     return run
 
 
-def _terminal_lock_candidate(fact: Any, git_bin: str, runner: Optional[Callable] = None) -> Optional[dict[str, Any]]:
-    """Return a currently exact, terminal Hub-owned lock; fail closed otherwise."""
+def _releasable_session_id(fact: Any) -> Optional[str]:
+    """Exact session id only when the Hub facts are freshly releasable.
+
+    Shared by the evidence-based and the legacy lock-repair candidates: any
+    missing or non-positive verdict (terminal, native-terminal, not
+    human-owned, unprotected, release-permitted) fails closed.
+    """
     if (not isinstance(fact, dict)
             or fact.get("terminal") is not True
             or fact.get("native_terminal") is not True
@@ -935,6 +945,141 @@ def _terminal_lock_candidate(fact: Any, git_bin: str, runner: Optional[Callable]
         return None
     session_id = fact.get("session_id")
     if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        return None
+    return session_id
+
+
+def _identity_evidence_absent(fact: Any) -> bool:
+    """True only when no launch identity evidence file exists for this fact.
+
+    Every canonical evidence channel (the native adoption mapping, the hub
+    launch tag) that the fact could have must have no file at all. A file
+    that exists but is unreadable or malformed keeps the repair failed
+    closed: a broken witness never downgrades a fact to the legacy path.
+    """
+    if not isinstance(fact, dict):
+        return False
+    channels: list[str] = []
+    native = _adoption_native_tuple(fact)
+    if native:
+        channels.append("native-" + native["native_id"] + ".json")
+    match = re.fullmatch(r"(?:task-)?hub-([0-9a-fA-F-]{8,64})", fact.get("tag") or "")
+    if match:
+        channels.append(match[1] + ".json")
+    if not channels:
+        return False
+    directory = identity_directory()
+    return all(not (directory / name).exists() for name in channels)
+
+
+def _worktree_origin(path: str, git_bin: str, runner: Optional[Callable] = None) -> Optional[str]:
+    """Origin remote URL of the checkout at `path`, bounded and validated.
+
+    Hub-managed clones always carry an origin (status and removal depend on
+    it), so a missing, unreadable or malformed URL refuses the legacy path.
+    """
+    try:
+        run = runner or _default_runner
+        proc = run([git_bin, "remote", "get-url", "origin"], path, GIT_TIMEOUT)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    url = (proc.stdout or "").strip()
+    if not url or len(url) > MAX_ORIGIN_LENGTH or any(c.isspace() or ord(c) < 32 for c in url):
+        return None
+    return url
+
+
+def _hub_worktree_path(path: str, home: Optional[str] = None) -> bool:
+    """True when `path` follows the documented Hub worktree naming contract.
+
+    The same rules as intake_worktree.path_guard: absolute, normalized,
+    symlink-free, directly under ``<home>/git``, ``-wt-`` in the basename,
+    never ``/prod``.
+    """
+    try:
+        from .intake_worktree import path_guard
+        path_guard(path, home)
+        return True
+    except Exception:
+        return False
+
+
+def _legacy_lock_candidates(fact: Any, git_bin: str, runner: Optional[Callable],
+                            registries: dict, home: Optional[str] = None) -> list[dict[str, Any]]:
+    """Derive terminal-lock candidates from the locked worktrees themselves.
+
+    Legacy sessions (intake f49b4d69 AC4) predate the pre-start launch
+    identity evidence file, so ``expected_repository`` fails closed even
+    though the Hub facts are releasable. The lock's own worktree supplies
+    the repository identity instead (``git rev-parse --git-common-dir`` +
+    ``remote get-url origin``) and is accepted only when
+
+    - the lock reason exactly names this session id and intake;
+    - the locked path lies under the fact's recorded workspace, or follows
+      the documented Hub worktree naming contract with a repo-hint main
+      checkout that shares the worktree's origin URL;
+    - the derived repository identity still matches the recorded workspace's
+      repository, so a recreated tree of a different repo refuses.
+
+    Bounded: the registry is listed once per repository, every git call runs
+    on the caller's deadline runner, and nothing is mutated.
+    """
+    session_id = _releasable_session_id(fact)
+    if session_id is None:
+        return []
+    workspace = fact.get("workspace")
+    if not isinstance(workspace, str) or not workspace or not os.path.isabs(workspace):
+        return []
+    intake_id = fact.get("intake_task_id")
+    base = repository_identity(workspace, git_bin, runner)
+    if base is None:
+        return []
+    common = base["common_dir"]
+    entries = registries.get(common)
+    if entries is None:
+        try:
+            entries = list_entries(git_bin, workspace, runner)
+        except Exception:
+            entries = []
+        registries[common] = entries
+    candidates: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("locked"):
+            continue
+        owner = parse_lock_reason(entry.get("reason"))
+        if not owner or owner[0] != session_id or owner[1] != intake_id:
+            continue
+        path = os.path.normpath(str(entry.get("path") or ""))
+        if not os.path.isabs(path):
+            continue
+        identity = repository_identity(path, git_bin, runner)
+        if identity is None or identity["common_dir"] != common:
+            continue
+        origin = _worktree_origin(path, git_bin, runner)
+        if origin is None:
+            continue
+        if not (path == workspace or path.startswith(workspace + os.sep)):
+            # Outside the recorded workspace, only the documented Hub
+            # worktree naming contract may tie the tree to this Hub; the
+            # repo-hint main checkout must share the worktree's origin.
+            from .intake_worktree import repo_hint_for
+            if not _hub_worktree_path(path, home):
+                continue
+            hint = repo_hint_for(path)
+            if not isinstance(hint, str) or _worktree_origin(hint, git_bin, runner) != origin:
+                continue
+        candidates.append({"session_id": session_id, "intake_id": intake_id,
+                           "path": path, "reason": entry.get("reason"),
+                           "origin": origin, "legacy": True})
+    return candidates
+
+
+def _terminal_lock_candidate(fact: Any, git_bin: str, runner: Optional[Callable] = None) -> Optional[dict[str, Any]]:
+    """Return a currently exact, terminal Hub-owned lock; fail closed otherwise."""
+    session_id = _releasable_session_id(fact)
+    if session_id is None:
         return None
     expected = expected_repository(fact)
     path = expected.get("workspace") if expected else None
@@ -968,13 +1113,18 @@ def repair_terminal_locks(request: Callable, git_bin: str = "git", *,
     The Hub host endpoint supplies fresh terminal/native-terminal facts. Repair
     additionally requires an explicit unprotected verdict, original repository
     identity, and a lock reason naming the exact session (and intake, when
-    present). It never uses ``--force`` or removes worktrees. Incomplete scans
+    present). Facts whose launch identity evidence file is entirely absent
+    (legacy sessions, intake f49b4d69) may still qualify through
+    ``_legacy_lock_candidates``, which derives the repository identity from
+    the locked worktree itself under the same exact lock-reason and fact
+    gates. It never uses ``--force`` or removes worktrees. Incomplete scans
     never apply a partial result.
     """
     if type(limit) is not int or not 1 <= limit <= MAX_REPAIR_SESSIONS:
         raise ValueError("repair limit must be between 1 and %d" % MAX_REPAIR_SESSIONS)
     deadline = time.monotonic() + REPAIR_TIMEOUT_S
     runner = _deadline_runner(deadline)
+    registries: dict[str, list] = {}
     cursor: Optional[str] = None
     scanned = 0
     candidates: list[dict[str, Any]] = []
@@ -1011,6 +1161,18 @@ def repair_terminal_locks(request: Callable, git_bin: str = "git", *,
                 if key not in seen:
                     seen.add(key)
                     candidates.append(candidate)
+            elif _identity_evidence_absent(fact):
+                for legacy in _legacy_lock_candidates(fact, git_bin, runner, registries):
+                    if time.monotonic() >= deadline:
+                        complete = False
+                        break
+                    key = (legacy["path"], legacy["session_id"])
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(legacy)
+                if time.monotonic() >= deadline:
+                    complete = False
+                    break
         if not complete:
             break
         if "next_cursor" not in result:

@@ -162,3 +162,19 @@ nothing. Repeating the command is safe. It uses `git worktree unlock` only;
 it never uses `--force` or removes worktrees. Human-owned or human-protected sessions,
 non-terminal sessions, manual locks, foreign locks, unknown repository
 identities, and mismatched lock reasons remain untouched.
+
+Legacy sessions (those started before the pre-start launch identity evidence
+file existed) have no repository witness on disk, so the identity-based check
+above fails closed for them. The repair has a reviewed legacy path for
+exactly that case: when no evidence file exists for any canonical channel of
+the fact (a present-but-invalid file still refuses), the repository identity
+is derived from the locked worktree itself (`git rev-parse --git-common-dir`
+plus `git remote get-url origin`) and accepted only when the lock reason
+names that exact session and intake, the Hub facts remain terminal,
+native-terminal, not human-owned, unprotected and release-permitted, and the
+locked path lies under the session's recorded workspace or follows the Hub
+worktree naming contract (`<home>/git/<name>-wt-<suffix>`, symlink-free)
+with a repo-hint main checkout that shares the worktree's origin URL. The
+same bounds, dry-run default, idempotent apply and never-`--force`/
+never-remove rules apply; candidates carry a `legacy` marker and the derived
+origin so the dry-run listing stays reviewable.
