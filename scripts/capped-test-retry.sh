@@ -86,6 +86,8 @@ mkdir -p "${TMP_PARENT}" || exit 1
 MARKER_DIR="$(mktemp -d -p "${TMP_PARENT}" retry-XXXXXX)" || exit 1
 trap 'rm -rf -- "${MARKER_DIR}"' EXIT
 MARKER="${MARKER_DIR}/refused"
+# Every attempt keeps the first attempt's queue place (intake cb5c362e).
+export AGENT_HUB_HEAVY_TEST_RUN_ID="${AGENT_HUB_HEAVY_TEST_RUN_ID:-retry-$$-$(date +%s)}"
 
 attempt=1
 while :; do

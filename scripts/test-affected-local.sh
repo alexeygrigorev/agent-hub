@@ -70,6 +70,7 @@ while IFS= read -r name; do
 done < <(compgen -e)
 export AFFECTED_PYENV="${PY_ENV[*]}"
 MARKER="${RUN_TMP_ABS}/refused"
+export AGENT_HUB_HEAVY_TEST_RUN_ID="${AGENT_HUB_HEAVY_TEST_RUN_ID:-affected-$$-$(date +%s)}"
 AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${MARKER}" "${REPO_ROOT}/scripts/capped-test-run.sh" -- bash -c '
 rc=0
 if [ "$AFFECTED_TYPECHECK" = 1 ]; then echo "=== typecheck ==="; npm run typecheck || { echo "FAIL: typecheck"; rc=1; }; fi

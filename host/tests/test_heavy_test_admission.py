@@ -160,6 +160,45 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(waiter.wait(timeout=40), 0)
         self.assertEqual(self.order(), ['next'])
 
+    def test_escaped_descendant_holding_fd9_does_not_keep_slot(self):
+        self.holder.close()
+        pidfile = self.root / 'leaker.pid'
+        code = ('import os,sys,subprocess; from pathlib import Path\n'
+                'p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"],pass_fds=(9,),start_new_session=True)\n'
+                f'Path({str(pidfile)!r}).write_text(str(p.pid))')
+        self.assertEqual(self.start('leaker', code=code).wait(timeout=20), 0)
+        leaker = int(pidfile.read_text())
+        self.until(lambda: not Path(f'/proc/{leaker}').exists() or Path(f'/proc/{leaker}/stat').read_text().split(')')[-1].split()[0] == 'Z')
+        self.assertEqual(self.start('after').wait(timeout=20), 0)
+        self.assertEqual(self.order(), ['after'])
+
+    def test_overdue_unbounded_holder_is_reclaimed_by_waiter(self):
+        self.holder.close()
+        stub = self.root / 'stub' / 'heavy-test-admission.py'
+        stub.parent.mkdir()
+        stub.write_text(
+            'import fcntl,subprocess,sys,time\n'
+            f'h=open({str(self.root / "slot-0.lock")!r},"a+"); fcntl.flock(h,fcntl.LOCK_EX)\n'
+            'c=subprocess.Popen([sys.executable,"-c","import time; time.sleep(120)"],start_new_session=True)\n'
+            f'open({str(self.root / "stub-started")!r},"w").close()\n'
+            'c.wait()\n')
+        env = {k: v for k, v in self.env.items() if k != 'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S'}
+        old = subprocess.Popen([sys.executable, str(stub)], env=env, start_new_session=True)
+        self.children.append(old)
+        self.until((self.root / 'stub-started').exists)
+        module = _admission_module()
+        module.OVERDUE_HOLDER_S = 1
+        module.TERMINATE_GRACE_S = 2
+        time.sleep(1.2 + 0.1)
+        # Younger than the threshold: untouched.
+        module.OVERDUE_HOLDER_S = 3600
+        module.reap_overdue_holders(self.root, 1)
+        self.assertIsNone(old.poll())
+        module.OVERDUE_HOLDER_S = 1
+        module.reap_overdue_holders(self.root, 1)
+        self.assertEqual(old.wait(timeout=10), 0)
+        self.assertEqual(self.start('after').wait(timeout=20), 0)
+
     def test_run_timeout_terminates_command_and_releases_slot(self):
         self.holder.close()
         marker = self.root / 'started'
@@ -412,6 +451,38 @@ class QueueCostTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('invalid AGENT_HUB_HEAVY_TEST_PRIORITY', result.stderr)
         self.assertIn('admitted normal ticket', result.stderr)
+
+    def test_run_id_keeps_queue_place_across_phases(self):
+        queue = self.module.Queue(Path(tempfile.mkdtemp(dir=WRAPPER.parent.parent / '.local/tmp')))
+        state = {'version': 1, 'next': 1, 'active': {}}
+        with mock.patch.dict(os.environ, {self.module.RUN_ID_ENV: 'full-1'}):
+            first, row = queue.new_ticket(state, 'final', 10.0)
+        for other in range(5):
+            state['active'][str(other)] = {'sequence': state['next'], 'priority': 'final', 'created': 20.0}
+            state['next'] += 1
+        with mock.patch.dict(os.environ, {self.module.RUN_ID_ENV: 'full-1'}):
+            again, row = queue.new_ticket(state, 'final', 500.0)
+        self.assertEqual(again, first)
+        self.assertEqual(row['created'], 10.0)
+        state['active']['9'] = row
+        self.assertEqual(queue.head(state, 600.0), '9')
+        # No run id, or an expired one, takes a fresh tail sequence.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.module.RUN_ID_ENV, None)
+            fresh, _ = queue.new_ticket(state, 'final', 600.0)
+        self.assertEqual(fresh, state['next'] - 1)
+        with mock.patch.dict(os.environ, {self.module.RUN_ID_ENV: 'full-1'}):
+            expired, _ = queue.new_ticket(state, 'final', 500.0 + self.module.RUN_AFFINITY_S + 1)
+        self.assertGreater(expired, first)
+
+    def test_run_id_garbage_and_bad_run_records_are_not_fatal(self):
+        root = Path(tempfile.mkdtemp(dir=WRAPPER.parent.parent / '.local/tmp'))
+        (root / 'fifo-state.json').write_text(json.dumps({'version': 1, 'next': 5, 'active': {},
+                                                          'runs': {'a': {'sequence': 'x'}, 'b': 3}}))
+        queue = self.module.Queue(root)
+        self.assertEqual(queue.load()['runs'], {})
+        with mock.patch.dict(os.environ, {self.module.RUN_ID_ENV: '../../bad id'}):
+            self.assertIsNone(queue.run_id())
 
     def test_aged_normal_precedes_continuous_new_finals(self):
         state = {'active': {'0': {'sequence': 1, 'priority': 'normal', 'created': 0}}}

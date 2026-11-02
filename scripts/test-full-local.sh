@@ -56,6 +56,9 @@ DISPOSABLE_HOME="${RUN_TMP_ABSOLUTE}/home"
 mkdir "${DISPOSABLE_HOME}" || exit 1
 
 export AGENT_HUB_HEAVY_TEST_DIR="${AGENT_HUB_HEAVY_TEST_DIR:-/run/user/$(id -u)/agent-hub/heavy-test}"
+# One run id for every phase ticket: later phases keep this run's queue place
+# instead of rejoining the back of the queue (intake cb5c362e).
+export AGENT_HUB_HEAVY_TEST_RUN_ID="${AGENT_HUB_HEAVY_TEST_RUN_ID:-full-$$-$(date +%s)}"
 
 FAILURES=0
 HOLDS=0

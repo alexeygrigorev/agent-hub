@@ -42,6 +42,25 @@ COMMAND_STARTED = False
 DEFAULT_RUN_TIMEOUT_S = 1800
 FINAL_RUN_TIMEOUT_S = 7200
 TERMINATE_GRACE_S = 10
+# Run affinity (intake cb5c362e, 2026-11-02: 33 queued tickets, pushes blocked).
+# A full gate takes one ticket per heavy phase and a capacity retry takes a new
+# ticket per attempt; each used to rejoin the back of the queue, so one run paid
+# the whole queue wait four or five times. Tickets that carry the same
+# AGENT_HUB_HEAVY_TEST_RUN_ID reuse the run's first sequence number (and age) for
+# RUN_AFFINITY_S, so a started run finishes ahead of newer arrivals.
+RUN_ID_ENV = 'AGENT_HUB_HEAVY_TEST_RUN_ID'
+RUN_AFFINITY_S = 7200
+# Holders of an unbounded wrapper (written before the run timeout existed) never
+# release. A waiter reclaims a slot whose holder wrapper is older than this
+# (longest run + longest wait + slack) by stopping the holder's test group.
+OVERDUE_HOLDER_S = FINAL_RUN_TIMEOUT_S + 1800 + 600
+try:  # test hook; invalid values keep the default
+    _overdue = os.environ.get('AGENT_HUB_HEAVY_TEST_OVERDUE_S', '')
+    if _overdue.isascii() and _overdue.isdecimal() and 1 <= int(_overdue) <= 86400:
+        OVERDUE_HOLDER_S = int(_overdue)
+except Exception:
+    pass
+REAP_INTERVAL_S = 60
 
 
 def refuse(reason):
@@ -100,6 +119,17 @@ class Queue:
                 print(f"capped-test-run: warning: queue ticket {lease} had invalid priority {row.get('priority')!r}; treating as normal", file=sys.stderr, flush=True)
                 row['priority'] = 'normal'
             sequences.add(row['sequence'])
+        runs = state.get('runs')
+        if not isinstance(runs, dict):
+            runs = {}
+        # Affinity is an optimisation: a malformed run record is dropped, never fatal.
+        state['runs'] = {
+            run: record for run, record in runs.items()
+            if isinstance(record, dict) and type(record.get('sequence')) is int
+            and 0 < record['sequence'] < state['next']
+            and type(record.get('created')) in (float, int)
+            and math.isfinite(record['created']) and type(record.get('seen')) in (float, int)
+            and math.isfinite(record['seen'])}
         return state
 
     def save(self, state):
@@ -119,6 +149,30 @@ class Queue:
             with self.open_lease(name) as lease:
                 if lock_available(lease):
                     del state['active'][name]
+
+    @staticmethod
+    def run_id():
+        run = os.environ.get(RUN_ID_ENV, '')
+        if run and len(run) <= 64 and run.isascii() and all(c.isalnum() or c in '_.-' for c in run):
+            return run
+        return None
+
+    def new_ticket(self, state, priority, now):
+        """Allocate a ticket row; a known run reuses its original sequence."""
+        runs = state.setdefault('runs', {})
+        for run in [r for r, v in runs.items() if now - v['seen'] > RUN_AFFINITY_S]:
+            del runs[run]
+        taken = {row['sequence'] for row in state['active'].values()}
+        run = self.run_id()
+        record = runs.get(run) if run else None
+        if record is not None and record['sequence'] not in taken:
+            sequence, created = record['sequence'], record['created']
+        else:
+            sequence, created = state['next'], now
+            state['next'] += 1
+        if run:
+            runs[run] = {'sequence': sequence, 'created': created, 'seen': now}
+        return sequence, {'sequence': sequence, 'priority': priority, 'created': created}
 
     @staticmethod
     def order(row, now):
@@ -200,7 +254,103 @@ def nested_holder_ancestor(identity):
     return None
 
 
-def run_command(command, slot, interrupted, run_timeout, identity):
+def proc_ppid_pgid(pid):
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        fields = stat[stat.rfind(')') + 1:].split()
+        return int(fields[1]), int(fields[2])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def lock_holders(path, only_fd=None):
+    """PIDs of this user's processes with the lock file open (fuser-like /proc scan)."""
+    try:
+        target = path.stat()
+    except OSError:
+        return []
+    found = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdecimal():
+            continue
+        try:
+            for fd in ([str(only_fd)] if only_fd is not None else os.listdir(f'/proc/{entry}/fd')):
+                try:
+                    info = os.stat(f'/proc/{entry}/fd/{fd}')
+                except OSError:
+                    continue
+                if (info.st_ino, info.st_dev) == (target.st_ino, target.st_dev):
+                    found.append(int(entry))
+                    break
+        except OSError:
+            continue
+    return found
+
+
+def process_age_s(pid):
+    start = process_start_time(pid)
+    if start is None:
+        return None
+    try:
+        uptime = float(Path('/proc/uptime').read_text().split()[0])
+        return uptime - int(start) / os.sysconf('SC_CLK_TCK')
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def stop_group(pgid):
+    signal_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + TERMINATE_GRACE_S
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    signal_group(pgid, signal.SIGKILL)
+
+
+def reap_slot_leakers(slot_path):
+    """After our command ended: kill descendants that escaped its group but kept FD 9.
+
+    Only FD 9 counts: waiters briefly open slot files to probe them, on other FDs."""
+    for pid in lock_holders(slot_path, only_fd=9):
+        if pid != os.getpid():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def reap_overdue_holders(root, slots):
+    """Stop the test group of any slot holder older than OVERDUE_HOLDER_S.
+
+    Only an admission wrapper that declared no bound of its own (no
+    --run-timeout / run-timeout env) is touched, and only its command's
+    process group; the wrapper then exits normally and releases the slot.
+    """
+    for index in range(slots):
+        for pid in lock_holders(root / f'slot-{index}.lock'):
+            try:
+                argv = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+                bounded = (b'--run-timeout' in argv or b'AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S='
+                           in Path(f'/proc/{pid}/environ').read_bytes())
+            except OSError:
+                continue
+            if not any(a.endswith(b'heavy-test-admission.py') for a in argv[:3]) or bounded:
+                continue
+            age = process_age_s(pid)
+            if age is None or age < OVERDUE_HOLDER_S:
+                continue
+            for child in os.listdir('/proc'):
+                if child.isdecimal() and proc_ppid_pgid(int(child)) == (pid, int(child)):
+                    print(f'capped-test-run: reclaiming slot-{index}: holder wrapper PID {pid} is {int(age)}s old '
+                          f'(> {OVERDUE_HOLDER_S}s, no run bound); stopping its command group {child}',
+                          file=sys.stderr, flush=True)
+                    stop_group(int(child))
+
+
+def run_command(command, slot, interrupted, run_timeout, identity, slot_path):
     global COMMAND_STARTED
     # Reserve/inherit the historical FD9. Parent retains its own descriptor
     # even when the command closes FD9. Descendants retaining it also keep
@@ -260,11 +410,21 @@ def run_command(command, slot, interrupted, run_timeout, identity):
                     break
                 time.sleep(0.1)
                 continue
+            # Observe the leader's exit without reaping it so its group can be
+            # swept below before the PGID could be reused.
             try:
-                result = child.wait(timeout=0.1)
+                exited = os.waitid(os.P_PID, child.pid,
+                                   os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
+                exited = None
+            if exited is not None and exited.si_pid:
+                signal_group(child_pgid, signal.SIGKILL)
+                result = child.wait()
                 break
-            except subprocess.TimeoutExpired:
-                continue
+            time.sleep(0.1)
+        # Survivors that escaped the group but kept FD 9 would hold the slot
+        # forever once the wrapper is gone.
+        reap_slot_leakers(slot_path)
         if timed_out:
             return 124
         return interrupted() or (128 - result if result < 0 else result)
@@ -348,16 +508,16 @@ def main():
             if not lock_available(ticket):
                 ticket.close()
                 raise ValueError('unindexed heavy-test lease is locked')
-            sequence = state['next']
-            state['next'] += 1
-            state['active'][name] = {'sequence': sequence, 'priority': args.priority,
-                                     'created': time.monotonic()}
+            sequence, state['active'][name] = queue.new_ticket(
+                state, args.priority, time.monotonic())
             queue.save(state)
         finally:
             fcntl.flock(mutex, fcntl.LOCK_UN)
         with ticket:
             announced = False
             slot = None
+            slot_path = None
+            next_reap = time.monotonic() + REAP_INTERVAL_S
             while slot is None:
                 fcntl.flock(mutex, fcntl.LOCK_EX)
                 try:
@@ -376,6 +536,7 @@ def main():
                             candidate = (root / f'slot-{index}.lock').open('a+')
                             if lock_available(candidate):
                                 slot = candidate
+                                slot_path = root / f'slot-{index}.lock'
                                 break
                             candidate.close()
                     if slot is not None:
@@ -396,13 +557,18 @@ def main():
                     if not announced:
                         position, waiting = queue.position(state, name, time.monotonic())
                         print(f'capped-test-run: all {args.slots} heavy-test slots busy; waiting up to {args.wait}s ({args.priority} ticket {sequence}), queue position {position}/{waiting}', file=sys.stderr, flush=True)
+                        if waiting > 2 * int(args.slots):
+                            print('capped-test-run: queue is deep; prefer targeted verification (scripts/test-affected-local.sh, see docs/PREPUSH-TARGETED-TESTS.md) over the full suite', file=sys.stderr, flush=True)
                         announced = True
+                    if time.monotonic() >= next_reap:
+                        next_reap = time.monotonic() + REAP_INTERVAL_S
+                        reap_overdue_holders(root, int(args.slots))
                     time.sleep(min(random.uniform(1, 2), remaining))
             with slot:
                 running = True
                 print(f'capped-test-run: admitted {args.priority} ticket {sequence}', file=sys.stderr, flush=True)
                 print(f'capped-test-run: run timeout {run_timeout}s', file=sys.stderr, flush=True)
-                return run_command(command, slot, lambda: interrupted, run_timeout, identity)
+                return run_command(command, slot, lambda: interrupted, run_timeout, identity, slot_path)
 
 
 if __name__ == '__main__':
