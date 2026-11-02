@@ -4,6 +4,7 @@ import { FleetService } from '../src/fleet';
 import { SESSION_CONTROL_SCHEMA } from '../src/session_control';
 
 const NOW = Date.UTC(2026, 10, 1, 22);
+const inDO: any = runInDurableObject;
 const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] };
 const agent = { caller: { actor: 'test-agent', kind: 'agent' }, scopes: ['fleet:launch'] };
 
@@ -13,7 +14,7 @@ function request(path: string) {
 
 it('returns every accounted reserved launch, including rows outside the latest-200 fleet view', async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName(crypto.randomUUID()));
-  await runInDurableObject(stub, async (hub: any, state: DurableObjectState) => {
+  await inDO(stub, async (hub: any, state: any) => {
     const sql = hub.sql;
     const at = new Date(NOW).toISOString();
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(part => part.trim())) sql.exec(statement);
@@ -43,7 +44,7 @@ it('returns every accounted reserved launch, including rows outside the latest-2
       get(target, key) {
         if (key !== 'exec') return Reflect.get(target, key);
         return (query: string, ...bindings: any[]) => {
-          if (query.includes('FROM fleet_launches l') && query.includes('fleet_sessions')) {
+          if (query.includes('SELECT l.id, l.machine_id, l.state, l.native_id') && query.includes('fleet_sessions')) {
             maxBindings = Math.max(maxBindings, bindings.length);
             queryPlan = target.exec('EXPLAIN QUERY PLAN ' + query, ...bindings).toArray().map((row: any) => String(row.detail));
           }

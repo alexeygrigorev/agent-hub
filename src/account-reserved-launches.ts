@@ -4,7 +4,7 @@ export type ReservedLaunchContext = {
   live_ids: string[];
   stale_cutoff: string;
   idle_cutoff_ms: number;
-  complete_catalogs: Set<string>;
+  complete_catalogs: Map<string, number>;
   bound_native_id_sql: string;
   bound_native_created_at_sql: string;
 };
