@@ -302,6 +302,14 @@ def sync(request=None, runner=subprocess.run, clock=time.monotonic, force=False,
         item = credentials.get(kind)
         if not isinstance(item, dict) or not isinstance(item.get('payload'), dict) or not isinstance(item.get('generation'), int):
             continue
+        if kind == 'git_ssh_key' and item.get('registered') is not True:
+            # GitHub does not accept the shared key yet; installing it would
+            # override this host's working github.com identity with a dead key.
+            # Hold the generation so the key is not re-sent every poll; Hub
+            # forces one sync once registration succeeds.
+            gens[kind] = item['generation']
+            errors[kind] = 'awaiting_github_registration'
+            continue
         try:
             apply(item['payload'], runner)
             gens[kind] = item['generation']
