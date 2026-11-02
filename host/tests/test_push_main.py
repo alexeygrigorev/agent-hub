@@ -423,5 +423,25 @@ class Fixture(unittest.TestCase):
         self.assertNotIn('/private/credential', str(diagnostic))
 
 
+class VerifyEnvTests(unittest.TestCase):
+    def test_verify_strips_git_hook_env_from_test_runs(self):
+        from agent_hub_host import prepush
+        seen = []
+        root = Path(tempfile.mkdtemp())
+        (root / 'scripts').mkdir()
+        for name in ('capped-test-retry.sh', 'test-affected-local.sh'):
+            (root / 'scripts' / name).write_text('')
+        sha = 'a' * 40
+        with patch.dict(os.environ, {'GIT_DIR': '/real/.git', 'GIT_INDEX_FILE': '/real/index', 'KEEP_ME': '1'}), \
+                patch.object(prepush, 'git', return_value=sha), patch.object(prepush, 'clean', return_value=True), \
+                patch.object(prepush.subprocess, 'call', side_effect=lambda *a, **k: seen.append(k['env']) or 0):
+            prepush.verify(root, sha, 'b' * 40)
+        self.assertTrue(seen)
+        for env in seen:
+            self.assertFalse([k for k in env if k.startswith('GIT_')])
+            self.assertEqual(env['KEEP_ME'], '1')
+            self.assertEqual(env['AGENT_HUB_HEAVY_TEST_PRIORITY'], 'final')
+
+
 if __name__ == '__main__':
     unittest.main()

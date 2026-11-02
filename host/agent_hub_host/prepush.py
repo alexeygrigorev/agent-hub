@@ -155,7 +155,10 @@ def verify(root, candidate, base):
     if git(root, 'rev-parse', 'HEAD') != candidate or not clean(root):
         raise RuntimeError('push must name the committed HEAD of a clean working tree')
     git(root, 'merge-base', '--is-ancestor', base, candidate)
-    env = dict(os.environ, AGENT_HUB_HEAVY_TEST_PRIORITY='final')
+    # Git exports GIT_DIR/GIT_INDEX_FILE/... to hooks; tests that create
+    # fixture repos would otherwise commit into (and rewrite) this worktree.
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env['AGENT_HUB_HEAVY_TEST_PRIORITY'] = 'final'
     retry = root / 'scripts/capped-test-retry.sh'
     affected = root / 'scripts/test-affected-local.sh'
     if not retry.is_file() or not affected.is_file():
