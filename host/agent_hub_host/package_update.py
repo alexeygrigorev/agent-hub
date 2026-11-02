@@ -213,8 +213,10 @@ def register_task(base_url, state_dir, run=None):
     # Per-user task like the controller's: no password, RunAs or UAC.
     ps = (" $id=[Security.Principal.WindowsIdentity]::GetCurrent();"
           " $name='AgentHubUpdate-'+$id.User.Value;"
-          " $a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "
-          + quote('-NoProfile -ExecutionPolicy Bypass -File "' + str(script) + '"') + ";"
+          " $psa=" + quote('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + str(script) + '"') + ";"
+          ' $ch=Join-Path $env:SystemRoot "System32\\conhost.exe"; $ps=(Get-Command powershell.exe).Source;'
+          ' if(Test-Path -LiteralPath $ch){ $a=New-ScheduledTaskAction -Execute $ch -Argument ("--headless `\"$ps`\" "+$psa) }'
+          ' else { $a=New-ScheduledTaskAction -Execute $ps -Argument $psa };'
           " $t=New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(15);"
           " $p=New-ScheduledTaskPrincipal -UserId $id.Name -LogonType Interactive -RunLevel Limited;"
           " $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew"
