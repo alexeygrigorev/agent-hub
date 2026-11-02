@@ -12,9 +12,15 @@ from test_fleet import settings, offer
 
 
 def _silent_cycle(cfg, request, runner, journal=None):
-    """Run once() with the usual heavy seams stubbed; return (results, events)."""
+    """Run once() with the usual heavy seams stubbed.
+
+    Returns (dispatcher, results, events, reconcile_runs); reconcile_runs has
+    one entry per reconcile_launches call so a skipped maintenance phase is
+    distinguishable from a run one after the patches have been restored.
+    """
     dispatcher = fleet.Dispatcher(cfg, request, runner,
                                   journal_dir=str(journal) if journal else None)
+    reconcile_runs: list = []
     buf = io.StringIO()
     with contextlib.ExitStack() as stack:
         stack.enter_context(patch('agent_hub_host.provisioning.tick'))
@@ -23,13 +29,16 @@ def _silent_cycle(cfg, request, runner, journal=None):
         stack.enter_context(patch('agent_hub_host.api.get_heartbeat_payload', return_value={}))
         stack.enter_context(patch('agent_hub_host.workclaim.sync_once', return_value={'ok': True}))
         stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
-        for method, value in [('report_catalog_bindings', []), ('reconcile_launches', []),
-                              ('reconcile_imported_sessions', []), ('_derive_qualified_role_jobs', [])]:
+        for method, value in [('report_catalog_bindings', []), ('reconcile_imported_sessions', []),
+                              ('_derive_qualified_role_jobs', [])]:
             stack.enter_context(patch.object(dispatcher, method, return_value=value))
+        stack.enter_context(patch.object(
+            dispatcher, 'reconcile_launches',
+            side_effect=lambda *a, **k: reconcile_runs.append(1) or []))
         with contextlib.redirect_stdout(buf):
             results = dispatcher.once()
     events = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
-    return dispatcher, results, events
+    return dispatcher, results, events, reconcile_runs
 
 
 def _base_request_factory(calls, offers=(), fail_paths=()):
@@ -55,7 +64,7 @@ def test_phases_published_with_expected_keys():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = settings(Path(tmp))
         calls = []
-        dispatcher, results, events = _silent_cycle(
+        dispatcher, results, events, _ = _silent_cycle(
             cfg, _base_request_factory(calls), _base_runner, journal=Path(tmp))
         phase_events = [e for e in events if e.get('event') == 'fleet_cycle_phases']
         assert len(phase_events) == 1, events
@@ -169,46 +178,39 @@ def test_already_claimed_loser_holds_without_reject():
         assert not any(p.endswith('/reject') for _, p in calls), calls
 
 
-def test_concurrent_cycle_skips_with_receipt_and_releases():
+def test_concurrent_maintenance_skips_only_the_phase_and_releases():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = settings(Path(tmp))
         calls = []
-        first, _, _ = _silent_cycle(cfg, _base_request_factory(calls), _base_runner,
+        first, _, _, _ = _silent_cycle(cfg, _base_request_factory(calls), _base_runner,
                                     journal=Path(tmp))
         marked = len(calls)
-        # Hold the lock manually to simulate the sibling loop owning offers.
+        # Hold the maintenance lock manually to simulate the sibling controller
+        # (60s fleet-host timer vs 20s session-host loop).
         held = first._acquire_cycle_lock()
         assert held not in (False, None)
         try:
-            second = fleet.Dispatcher(cfg, _base_request_factory(calls), _base_runner,
-                                      journal_dir=str(Path(tmp)))
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                results = second.once()
-            assert results == [{'id': 'cycle', 'state': 'skipped',
-                                'reason': 'concurrent_cycle'}], results
-            events = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
-            assert any(e.get('event') == 'fleet_cycle_skipped' for e in events), events
-            assert not any(m == 'GET' and p == '/api/fleet/offers'
-                           for m, p in calls[marked:]), calls[marked:]
+            second, results, events, reconcile_runs = _silent_cycle(cfg, _base_request_factory(calls),
+                                                    _base_runner, journal=Path(tmp))
+            # Intake 8cc2848c AC1: the cycle itself still runs while the
+            # sibling owns the maintenance phase — heartbeat and offers happen.
+            assert not any(e.get('event') == 'fleet_cycle_skipped' for e in events), events
+            assert any(e.get('event') == 'fleet_maintenance_skipped' for e in events), events
+            recent = calls[marked:]
+            assert any(m == 'GET' and p == '/api/fleet/offers' for m, p in recent), recent
+            assert any(m == 'POST' and p == '/api/host/poll' for m, p in recent), recent
+            phases = next(e for e in events if e.get('event') == 'fleet_cycle_phases')['phases']
+            assert 'reconcile' in phases and 'watchdog' in phases
+            assert reconcile_runs == []
+            assert not any(r.get('reason') == 'concurrent_cycle' for r in results), results
         finally:
             held.close()
         before = len(calls)
-        buf = io.StringIO()
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(patch('agent_hub_host.provisioning.tick'))
-            stack.enter_context(patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]))
-            stack.enter_context(patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}}))
-            stack.enter_context(patch('agent_hub_host.api.get_heartbeat_payload', return_value={}))
-            stack.enter_context(patch('agent_hub_host.workclaim.sync_once', return_value={'ok': True}))
-            stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
-            for method, value in [('report_catalog_bindings', []), ('reconcile_launches', []),
-                                  ('reconcile_imported_sessions', []), ('_derive_qualified_role_jobs', [])]:
-                stack.enter_context(patch.object(second, method, return_value=value))
-            with contextlib.redirect_stdout(buf):
-                results = second.once()
+        third, _, events, reconcile_runs = _silent_cycle(cfg, _base_request_factory(calls), _base_runner,
+                                                         journal=Path(tmp))
         assert any(m == 'GET' and p == '/api/fleet/offers' for m, p in calls[before:]), calls[before:]
-        assert not any(r.get('reason') == 'concurrent_cycle' for r in results), results
+        assert not any(e.get('event') == 'fleet_maintenance_skipped' for e in events), events
+        assert reconcile_runs
 
 
 def test_journal_less_dispatchers_keep_legacy_behavior():

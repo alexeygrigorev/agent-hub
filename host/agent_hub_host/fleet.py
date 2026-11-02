@@ -134,20 +134,29 @@ def worker_resource_argv(engine: str | None = None) -> list[str]:
 # derivation costs ~7 s per cycle on DEFLf4 and only feeds registration).
 ROLE_JOBS_CACHE_TTL_S = 120.0
 
-# Single-flight offer-claim lock shared by the 60s fleet-host timer and the
-# 20s session-host maintenance loop (intake eff9a5ce AC2). Both load the same
-# host settings, so the journal dir resolves to the same path and exactly
-# one loop owns offers per cycle. fcntl locks release on process death, so
-# a SIGTERMed cycle (TimeoutStartSec=240s) never wedges the other loop.
+# Single-flight lock for the stateful slow-maintenance phase of a fleet
+# cycle, shared by the 60s fleet-host timer and the 20s session-host loop
+# (intake eff9a5ce AC2; per-phase scope since intake 8cc2848c). Both load the
+# same host settings, so the journal dir resolves to the same path and
+# exactly one controller runs launcher reconcile effects, the native reaper
+# and the watchdog at a time. It no longer covers the whole cycle (8cc2848c
+# AC1: the old whole-cycle lock let a long-running sibling starve the timer,
+# ~2000 fleet_cycle_skipped concurrent_cycle/24h): register, heartbeat,
+# capabilities, probes, catalog, subscriptions, workclaim, offers and
+# dispatch are idempotent or per-offer locked and always run, so heartbeat,
+# offers and worktree refresh happen every minute. fcntl locks release on
+# process death, so a SIGTERMed controller (TimeoutStartSec=240s) never
+# wedges the other loop.
 CYCLE_LOCK_NAME = "fleet-cycle.lock"
 # Holder metadata ({pid, acquired_at}) is written into the lock file on every
 # acquisition so a loser can tell a sibling that is cycling normally from a
 # wedged one. flock already releases on process death; a live holder whose
 # current acquisition is older than this (2x the timer TimeoutStartSec=240 s;
-# a healthy session-host cycle takes ~90-130 s) or whose recorded pid is gone
-# (fd inherited by a surviving child) is treated as stuck: the loser logs
-# fleet_cycle_lock_takeover and runs the cycle without the lock instead of
-# skipping forever. Override with settings "cycle_lock_stale_s".
+# the guarded maintenance phase takes seconds to ~2 min) or whose recorded
+# pid is gone (fd inherited by a surviving child) is treated as stuck: the
+# loser logs fleet_maintenance_lock_takeover and runs the phase without the
+# lock instead of skipping forever. Override with settings
+# "cycle_lock_stale_s".
 CYCLE_LOCK_STALE_S = 480.0
 
 # Intake 4398ce2a: the full fleet cycle (provisioning, probes, reconcile,
@@ -4197,11 +4206,12 @@ class Dispatcher:
         return Path(base) / CYCLE_LOCK_NAME
 
     def _acquire_cycle_lock(self):
-        """Non-blocking single claim-owner lock. True holder: file object.
+        """Non-blocking single-owner lock for the slow-maintenance phase.
 
-        Returns the open lock file when this cycle owns offers, False when
-        a sibling loop (timer vs session-host) already owns them, or None
-        when no journal is configured (unit-test callers keep legacy
+        Returns the open lock file when this controller owns the phase,
+        False when a sibling controller (timer vs session-host) already
+        owns it — the caller skips only this phase, never the cycle — or
+        None when no journal is configured (unit-test callers keep legacy
         behavior) or the platform lacks fcntl. The caller must close the
         file to release; fcntl also releases on process death.
         """
@@ -4236,10 +4246,11 @@ class Dispatcher:
         return value if value > 0 else CYCLE_LOCK_STALE_S
 
     def _cycle_lock_holder(self, now: Optional[float] = None) -> dict:
-        """Describe the current cycle-lock holder for a losing caller.
+        """Describe the current maintenance-lock holder for a losing caller.
 
         Returns {holder_pid, held_s, holder_alive, stale}. Missing/garbled
-        metadata (pre-upgrade holder) is never stale: skip as before.
+        metadata (pre-upgrade holder) is never stale: skip the phase as
+        before.
         """
         info: dict[str, Any] = {"holder_pid": None, "held_s": None, "holder_alive": None, "stale": False}
         path = self._cycle_lock_path()
@@ -4576,6 +4587,14 @@ class Dispatcher:
         self._native_labels = {s['account_label'] for s in native}
 
     def once(self):
+        # AC1 (intake 8cc2848c): the cycle never skips wholesale. The former
+        # whole-cycle lock made the losing controller (60s fleet-host timer vs
+        # the 20s session-host loop) drop its heartbeat, register, catalog and
+        # offer work whenever the sibling ran long, which starved placement
+        # freshness (~2000 fleet_cycle_skipped concurrent_cycle/24h). Only the
+        # stateful slow-maintenance region stays single-flight, via the
+        # per-phase lock inside _once_locked; offers additionally race safely
+        # through per-offer locks and atomic Hub claims.
         # AC1: per-phase timings, published as a fleet_cycle_phases event.
         phases: dict[str, float] = {}
         _mark_at = [time.monotonic()]
@@ -4608,39 +4627,9 @@ class Dispatcher:
             except (OSError, ValueError, TypeError, ImportError):
                 pass
         _mark('provisioning')
-        # AC2: exactly one of the 60s timer loop and the 20s session-host
-        # loop owns offers per cycle. The loser skips with a receipt instead
-        # of racing claims into already_claimed -> +1 cycle delays.
-        cycle_lock = self._acquire_cycle_lock()
-        if cycle_lock is False:
-            holder = self._cycle_lock_holder()
-            if not holder['stale']:
-                phases['lock'] = 0.0
-                self.last_cycle_phases = phases
-                print(json.dumps({'event': 'fleet_cycle_skipped',
-                                  'reason': 'concurrent_cycle',
-                                  'holder_pid': holder['holder_pid'],
-                                  'held_s': holder['held_s']}), flush=True)
-                return [{'id': 'cycle', 'state': 'skipped', 'reason': 'concurrent_cycle'}]
-            # Stuck holder (pid gone, or one acquisition held past
-            # CYCLE_LOCK_STALE_S): never let it starve every other loop.
-            # flock cannot be stolen from a live process, so run this cycle
-            # unlocked; Hub claims stay atomic (losers settle as
-            # already_claimed) and the offers lock still serialises dispatch.
-            print(json.dumps({'event': 'fleet_cycle_lock_takeover',
-                              'holder_pid': holder['holder_pid'],
-                              'held_s': holder['held_s'],
-                              'holder_alive': holder['holder_alive'],
-                              'stale_after_s': self._cycle_lock_stale_s()}), flush=True)
-            cycle_lock = None
         try:
             return self._once_locked(phases, _mark, _skip_telemetry)
         finally:
-            try:
-                if cycle_lock is not None:
-                    cycle_lock.close()
-            except Exception:
-                pass
             self.last_cycle_phases = dict(phases)
 
     def _admission_projection(self, caps):
@@ -5043,35 +5032,78 @@ class Dispatcher:
             except Exception as exc:
                 _skip_telemetry('capabilities', exc)
         _mark('capabilities')
-        reconciled = self.reconcile_launches()
-        self.reconcile_operator_adoptions()
-        imported_reconciled = self.reconcile_imported_sessions()
-        # e37b0e83 AC1: stop native trees whose Hub session is terminal or
-        # missing. Bounded per cycle; the server authorizes each incarnation.
-        if self.journal_dir and raw is not None:
-            from .session_reaper import reconcile as reconcile_native_trees
-            native_rows = raw if isinstance(raw, list) else raw.get('sessions') if isinstance(raw, dict) else None
-            reap = reconcile_native_trees(self.request, native_rows, self.journal_dir,
-                                          executable=self.settings.get('aplexer_bin', 'aplexer'))
-            if any(reap.values()):
-                print(json.dumps({'event': 'fleet_native_reconcile', **reap}), flush=True)
-        _mark('reconcile')
-        # Resource management (intake 4fcd3139): per-session exact sampler +
-        # safe watchdog. Best-effort only with durable local state in the
-        # journal dir; never fails the poll cycle and installs no scheduler.
-        # Skipped without a journal dir: peaks/reap journals require durable
-        # state, and existing callers without one keep their exact call shape.
-        if self.journal_dir:
+        # Intake 8cc2848c AC1: per-phase single-flight lock for the stateful
+        # slow-maintenance region (launcher reconcile/late-report effects,
+        # operator adoptions, native reaper, watchdog journal state). A
+        # sibling controller (60s fleet-host timer vs the 20s session-host
+        # loop) holding the lock only skips THIS region; heartbeat, offers
+        # and everything idempotent above and below still run every minute.
+        # A stale holder (pid gone, or held past cycle_lock_stale_s) never
+        # starves maintenance: flock cannot be stolen from a live process,
+        # so the takeover runs the region unlocked — launcher effects stay
+        # guarded by durable journal records and atomic Hub result POSTs.
+        reconciled: list = []
+        imported_reconciled: list = []
+        maintenance_lock = self._acquire_cycle_lock()
+        run_maintenance = True
+        if maintenance_lock is False:
+            holder = self._cycle_lock_holder()
+            if holder['stale']:
+                print(json.dumps({'event': 'fleet_maintenance_lock_takeover',
+                                  'holder_pid': holder['holder_pid'],
+                                  'held_s': holder['held_s'],
+                                  'holder_alive': holder['holder_alive'],
+                                  'stale_after_s': self._cycle_lock_stale_s()}), flush=True)
+                maintenance_lock = None
+            else:
+                # Fresh live holder: a receipt for the skipped phase only,
+                # never the whole cycle. Both phase marks stay in the
+                # fleet_cycle_phases event so freshness monitors keep their keys.
+                _mark('reconcile')
+                _mark('watchdog')
+                print(json.dumps({'event': 'fleet_maintenance_skipped',
+                                  'reason': 'concurrent_maintenance',
+                                  'holder_pid': holder['holder_pid'],
+                                  'held_s': holder['held_s']}), flush=True)
+                maintenance_lock = None
+                run_maintenance = False
+        if run_maintenance:
             try:
-                from . import resource_management as _rm
-                _ = _rm.run_watchdog_cycle(
-                    self.request,
-                    journal_dir=self.journal_dir,
-                    aplexer_bin=self.settings.get("aplexer_bin", "aplexer"),
-                )
-            except Exception:
-                pass
-        _mark('watchdog')
+                reconciled = self.reconcile_launches()
+                self.reconcile_operator_adoptions()
+                imported_reconciled = self.reconcile_imported_sessions()
+                # e37b0e83 AC1: stop native trees whose Hub session is terminal or
+                # missing. Bounded per cycle; the server authorizes each incarnation.
+                if self.journal_dir and raw is not None:
+                    from .session_reaper import reconcile as reconcile_native_trees
+                    native_rows = raw if isinstance(raw, list) else raw.get('sessions') if isinstance(raw, dict) else None
+                    reap = reconcile_native_trees(self.request, native_rows, self.journal_dir,
+                                                  executable=self.settings.get('aplexer_bin', 'aplexer'))
+                    if any(reap.values()):
+                        print(json.dumps({'event': 'fleet_native_reconcile', **reap}), flush=True)
+                _mark('reconcile')
+                # Resource management (intake 4fcd3139): per-session exact sampler +
+                # safe watchdog. Best-effort only with durable local state in the
+                # journal dir; never fails the poll cycle and installs no scheduler.
+                # Skipped without a journal dir: peaks/reap journals require durable
+                # state, and existing callers without one keep their exact call shape.
+                if self.journal_dir:
+                    try:
+                        from . import resource_management as _rm
+                        _ = _rm.run_watchdog_cycle(
+                            self.request,
+                            journal_dir=self.journal_dir,
+                            aplexer_bin=self.settings.get("aplexer_bin", "aplexer"),
+                        )
+                    except Exception:
+                        pass
+                _mark('watchdog')
+            finally:
+                try:
+                    if maintenance_lock is not None:
+                        maintenance_lock.close()
+                except Exception:
+                    pass
         # Quota monitoring does not prove launch capability. Group by engine:
         # a monitor-only account must not disable another runnable account on
         # the same engine. Never fabricate an admission adapter or bypass it.
