@@ -45,7 +45,7 @@ class NativeAdmissionTest(unittest.TestCase):
         self.assertFalse(admission.probe(payload, 'claude', 'shared-claude', 'claude', hub(OSError('down')))['launch_allowed'])
 
     def test_model_selection_is_validated_locally(self):
-        for service, engine, model_id in [('claude', 'claude', 'opus'), ('zai', 'zcodex', 'glm-flash')]:
+        for service, engine, model_id in [('claude', 'claude', 'sonnet'), ('zai', 'zcodex', 'glm-flash')]:
             with self.subTest(service=service):
                 model = next(m for m in policy_models() if m['id'] == model_id)
                 payload = dict(account='shared-' + service, engine=engine, profile=None, mode='headless', selection=model)
@@ -54,6 +54,13 @@ class NativeAdmissionTest(unittest.TestCase):
                 self.assertTrue(result['model_supported'])
                 self.assertEqual(result['model'], model['model'])
                 self.assertEqual(configured_selection(model, engine, service), model)
+
+    def test_claude_routes_reject_non_sonnet_or_non_medium_even_if_policy_is_stale(self):
+        for model, effort in [('haiku', None), ('claude-haiku-5-5', None), ('opus', 'high'), ('sonnet', 'high')]:
+            with self.subTest(model=model, effort=effort):
+                with self.assertRaisesRegex(ValueError, 'Claude routes require Sonnet at medium effort'):
+                    configured_selection(dict(id=model, model=model, engine='claude', provider='claude', effort=effort),
+                                         'claude', 'claude')
 
     def test_native_zcodex_policy_entry_admits_shared_zai_8d006dc3(self):
         # Hub offers the native ZCode route with the engine=zcodex policy entry;

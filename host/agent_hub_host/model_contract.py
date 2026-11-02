@@ -93,6 +93,12 @@ def configured_selection(selection, engine, provider):
               # Legacy route configs keyed by the old `codex-orin` provider
               # name still resolve to the canonical `codex` family.
               'codex-orin': 'codex'}.get(provider, provider)
+    # Hub's routing policy can arrive from an older server before the host
+    # updates its vendored policy. Keep the Claude model contract invariant at
+    # the host boundary so stale Haiku/Opus offers cannot reach a native launch.
+    if family == 'claude' and (selection.get('model') != 'sonnet' or
+                               selection.get('effort') != 'medium'):
+        raise ValueError('model_unsupported: Claude routes require Sonnet at medium effort')
     # Native ZCode uses engine=zcodex; managed ZAI uses codex/profile=zcodex.
     # The policy lists both shapes (glm-flash: codex, glm-flash-zcodex: zcodex);
     # mapping zcodex only to codex made the native entry unmatchable, so Hub's
