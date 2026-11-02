@@ -360,7 +360,7 @@ describe('singleton Hub driver', () => {
       const stopped = await recovering.handle(req('/api/driver/stop', { key: 'driver-stop-during-recovery' }), admin);
       expect(stopped.status).toBe(200);
       expect(await stopped.json()).toMatchObject({ stopped: true, driver: { phase: 'stopped' } });
-      expect(starts).toHaveLength(2);
+      expect(starts).toHaveLength(1); // stop never resumes POST /api/sessions, even for a starting generation
     });
   });
 
