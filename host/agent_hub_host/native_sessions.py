@@ -139,7 +139,17 @@ class NativeTarget:
             raise SessionControlError(f"Invalid native tag: {self.tag!r}")
         if not isinstance(self.workspace, str) or not Path(self.workspace).is_absolute():
             raise SessionControlError("Workspace must be an absolute path")
-        canonical = canonicalize_workspace(self.workspace)
+        try:
+            canonical = canonicalize_workspace(self.workspace)
+        except (OSError, PermissionError, ValueError):
+            # M4 AC3: a deleted worktree has no canonicalizable workspace
+            # (Windows opens a real handle). When the path is verifiably gone,
+            # keep the normalized absolute path so qualification can proceed
+            # by session UUID instead of refusing; an existing path still
+            # refuses — canonicalization must succeed there.
+            if os.path.exists(self.workspace):
+                raise
+            canonical = os.path.abspath(self.workspace)
         if canonical != self.workspace:
             raise SessionControlError("Workspace must already be canonical (no symlinks)")
         if self.created_at_ms is not None and type(self.created_at_ms) is not int:
@@ -518,13 +528,25 @@ def qualify_target(
     Tag reuse (same tag, different UUID) or workspace drift refuses with no effect.
     When the target carries ``created_at_ms``, the row must carry the same native
     generation (a hub counter alone is not provenance); a stale generation refuses.
+    M4 AC3: when the canonical workspace no longer exists (deleted worktree),
+    the workspace match is dropped and exactly one row matching UUID+tag
+    qualifies — generation, engine and liveness checks still apply.
     Never infers idleness/readiness from phase flags: phase is liveness only.
     """
     target = target.validated()
     native_list_cache.invalidate("list")  # stop/claim qualification needs a fresh catalog
-    sessions = [s for s in list_sessions(executable, include_exited=True, timeout=timeout)
+    catalog = [s for s in list_sessions(executable, include_exited=True, timeout=timeout)]
+    sessions = [s for s in catalog
                 if _stop_workspace_matches(s.workspace, target.workspace)]
     same_tag = [s for s in sessions if s.tag == target.tag]
+    if not same_tag and not os.path.exists(target.workspace):
+        uuid_rows = [s for s in catalog if s.session_id.lower() == target.session_id.lower()]
+        same_tag = [s for s in uuid_rows if s.tag == target.tag]
+        if len(same_tag) != 1:
+            raise SessionControlError(
+                f"Tag {target.tag!r} is absent and workspace {target.workspace!r} is gone "
+                f"(UUID rows: {len(same_tag)}); refusing to address by UUID alone"
+            )
     if len(same_tag) != 1:
         raise SessionControlError(
             f"Tag {target.tag!r} is ambiguous or absent in workspace "
@@ -1351,18 +1373,35 @@ def _worktree_parent_workspace(observed: str) -> Optional[str]:
     return None
 
 
+def _canonical_or_abspath(path: str) -> str:
+    """Canonicalize a workspace, tolerating a verifiably deleted path.
+
+    M4 AC3: canonicalization may need a live filesystem object (Windows opens
+    a real handle). For a path that no longer exists, fall back to the
+    normalized absolute path so UUID-based qualification (not refusal) can
+    proceed; existing paths keep the strict canonical form.
+    """
+    try:
+        return canonicalize_workspace(path)
+    except (OSError, PermissionError, ValueError):
+        if os.path.exists(path):
+            raise
+        return os.path.abspath(path)
+
+
 def _stop_workspace_matches(observed: str, expected: str) -> bool:
     """Only stop/qualify may match an exact kernel annotation or git worktree of the same workspace.
 
     Keep UUID/tag/incarnation/engine checks, and never alias an existing
-    directory whose literal name ends in the annotation.
+    directory whose literal name ends in the annotation. A deleted path that
+    cannot be canonicalized compares by normalized absolute path.
     """
-    if canonicalize_workspace(observed) == expected:
+    if _canonical_or_abspath(observed) == expected:
         return True
     if _worktree_parent_workspace(observed) == expected:
         return True
     return (observed.endswith(' (deleted)') and not Path(observed).exists()
-            and canonicalize_workspace(observed.removesuffix(' (deleted)')) == expected)
+            and _canonical_or_abspath(observed.removesuffix(' (deleted)')) == expected)
 
 
 def _stop_workspace_matches_nested(observed: str, expected: str) -> bool:

@@ -289,7 +289,9 @@ no Ctrl-C).
 - Hook readiness on Windows must be verified for codex and claude; until
   verified, `delivery=tui` to a Windows session falls back to `inbox` with
   `state_reason=tui_unverified_platform` (no silent typing into an unknown
-  state).
+  state). The host enforces this per engine via the
+  `AGENT_HUB_WINDOWS_TUI_ENGINES` allowlist (operator-set after the live
+  proof); an unknown or unlisted engine always takes the inbox fallback.
 - Workspace identity: if the canonical workspace no longer exists, the host
   qualifies by session UUID alone (aplexer accepts UUID selectors) instead of
   refusing.
@@ -512,6 +514,13 @@ How it maps onto the design:
 
 Not built yet (follow-ups): named agent forwarding (`agent:orchestrator-main`
 → its current session) — today those coordinators are reachable once they are
-Hub sessions (operator adoption), as `<tag>@<machine>`; the
-`tui_unverified_platform` fallback (Windows TUI
-delivery is proven on Tabo instead).
+Hub sessions (operator adoption), as `<tag>@<machine>`; capture-marker
+resolution of `uncertain` deliveries (they stay `uncertain` with the inbox
+copy authoritative). The `tui_unverified_platform` fallback (M4 AC2) is built:
+on Windows a `delivery=tui` request whose engine is not listed in the host
+`AGENT_HUB_WINDOWS_TUI_ENGINES` environment allowlist is delivered inbox-only
+and acked `delivered` with reason `tui_unverified_platform`, which Hub keeps
+as `state_reason`; the operator adds an engine only after its live hook
+readiness (waiting|idle) proof. UUID qualification of a deleted worktree
+(M4 AC3) is built: when the canonical workspace no longer exists the host
+qualifies by exact session UUID (+ tag/generation/engine/liveness).

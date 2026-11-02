@@ -4731,7 +4731,10 @@ export class SessionControlService {
     if (messageId) {
       const envelope = typeof input.proof?.native_message_id === 'string' ? input.proof.native_message_id.slice(0, 128) : undefined;
       const messageState = state === 'acked' ? 'delivered' : state === 'uncertain' ? 'uncertain' : state === 'transported' ? 'dispatched' : 'undeliverable';
-      setMessageState(this.sql, messageId, messageState, state === 'acked' ? null : reason, null, machine, now,
+      // M4 AC2: a delivered ack may carry a fallback reason (e.g.
+      // tui_unverified_platform). Keep it as state_reason so
+      // `hub msg status` shows why the TUI was skipped.
+      setMessageState(this.sql, messageId, messageState, reason, null, machine, now,
         { command_id: row.id, delivery: payload.delivery, ...(envelope ? { native_message_id: envelope } : {}) });
       if (input.outcome === 'refused' && reason === 'session_ended') {
         const msg: any = this.sql.exec('SELECT * FROM messages WHERE id = ?', messageId).toArray()[0];
