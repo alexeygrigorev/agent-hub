@@ -24,10 +24,28 @@ async function fixture(fn: (h: any) => any) {
 }
 function session(h: any, id: string, t: any, state: string, extra: any = {}) {
   h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at,machine_id,binding_json)
-    VALUES(?,?,?,?,?,'headless',?,?,?,?,?)`, id, 'fixture', id, JSON.stringify({ intake_task_id: t.id, workspace: 'fixture' }), 'codex', state,
+    VALUES(?,?,?,?,?,'headless',?,?,?,?,?)`, id, 'fixture', id, JSON.stringify({ intake_task_id: t.id, workspace: 'fixture', ...(extra.request || {}) }), 'codex', state,
     new Date(NOW - 3600000).toISOString(), new Date(NOW - 1800000).toISOString(), extra.machine || null, extra.binding ? JSON.stringify(extra.binding) : null);
 }
 describe('forgotten intake watchdog', () => {
+  it('restarts a registered project by repo identity instead of reusing a host path', async () => fixture(async h => {
+    const t = task('repo-queue');
+    t.project = 'agent-hub';
+    session(h, 'old-path-session', t, 'failed', { request: { workspace: '/home/rmthz/git/agent-hub', cwd: '/home/rmthz/git/agent-hub/docs' } });
+    h.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, capabilities) VALUES ('repo-host','repo-host','repo-host',?,?,?)",
+      new Date(NOW).toISOString(), new Date(NOW).toISOString(), JSON.stringify({ repo_workspaces: true }));
+    let started: any = null;
+    const w = new IntakeWatchdog(h.sql, { statusAuthorizedTasks: () => [t] } as any, f => f(), {
+      repoForProject: project => project === 'agent-hub' ? 'alexeygrigorev/agent-hub' : null,
+      start: async input => { started = input; return { status: 202, body: { id: 'repo-session', state: 'queued' } }; },
+    }, () => NOW);
+    w.init();
+    await w.tick();
+    expect(started).toMatchObject({ repo: 'alexeygrigorev/agent-hub', intake_task_id: t.id });
+    expect(started.workspace).toBeUndefined();
+    expect(started.cwd).toBeUndefined();
+  }));
+
   it('examines overdue restarts outside the cursor with a bounded indexed lane', async () => fixture(h => {
     const normal=Array.from({length:64},(_,i)=>task('a-'+String(i).padStart(3,'0')));
     const overdue=Array.from({length:12},(_,i)=>task('z-'+String(i).padStart(3,'0')));

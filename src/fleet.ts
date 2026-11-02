@@ -141,6 +141,8 @@ const CAPACITY_REASONS = new Set(['route_not_advertised', 'route_advertisement_o
 /** Runaway-load cap (multiple of cores). Load average counts IO-wait and runnable threads, so it only
  * guards the 2026-10-28 incident (load 275-295 on 12 cores); real busyness is measured CPU/memory. */
 const HOST_LOAD_FACTOR = 6;
+/** Per-host load budget factor for automatic goal placement (1.5x cores; 18 on 12-core RMTHZ). */
+const GOAL_LOAD_FACTOR = 1.5;
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -1346,6 +1348,14 @@ export class FleetService {
         return runaway || (usage?.busy_percent_window != null && age <= 180000 && age >= -30000 && usage.busy_percent_window >= CPU_SATURATED_PCT);
       })()) reason = loadRefusal.trigger === 'mem_available' ? 'memory_pressure'
         : loadRefusal.trigger === 'cpu_busy' ? 'cpu_pressure' : 'host_load_high';
+      // A goal placement has a per-host load budget, independent of account
+      // concurrency. When this host is over budget, continue checking other
+      // eligible machines so a busy host does not freeze the fleet-wide pool.
+      else if (
+        request.with_goal === true && Number.isFinite(hb?.load?.[0]) &&
+        Number.isFinite(caps?.cpu_count) && caps.cpu_count > 0 &&
+        hb.load[0] > GOAL_LOAD_FACTOR * caps.cpu_count
+      ) reason = 'host_load_high';
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         memory().reserved_mb,
         memory().requested_mb, this.resources.config(), hb.mem_total_mb)) reason = 'launcher_memory_reserve';
@@ -1361,6 +1371,7 @@ export class FleetService {
       else if (account.available_slots < 1) reason = 'account_concurrency';
       if (reason) {
         evidence();
+        const refusalOnRoute = loadRefusal !== undefined && loadRefusal.machine === route.machine_id ? loadRefusal : undefined;
         rejected.push({
           machine: route.machine_id, engine: route.engine, reason,
           ...(reason.startsWith('route_') ? { account: route.account, profile: route.profile ?? null } : {}),
@@ -1370,10 +1381,10 @@ export class FleetService {
           ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}),
           ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}),
           ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}),
-          ...(reason === 'host_load_high' ? { ...(Number.isFinite(hb?.load?.[0]) ? { load1: hb.load[0] } : {}), cpu_count: caps.cpu_count, load_limit: (loadRefusal!.trigger === 'load_runaway' ? loadRefusal!.factor : Math.max(loadRefusal!.factor, HOST_LOAD_FACTOR)) * caps.cpu_count, cpu_busy_window: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window ?? null } : {}),
-          ...(reason === 'memory_pressure' && loadRefusal?.trigger === 'mem_available' ? { host_load: { trigger: 'mem_available', mem_avail_mb: hb.mem_avail_mb, mem_floor_mb: loadRefusal.limit } } : {}),
-          ...(reason === 'cpu_pressure' && loadRefusal?.trigger === 'cpu_busy' ? { host_load: { trigger: 'cpu_busy', cpu_busy_pct: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window, cpu_window_s: sanitizeCpuUsage(hb.cpu_usage)?.window_s } } : {}),
-          ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) && !((reason === 'memory_pressure' && loadRefusal?.trigger === 'mem_available') || (reason === 'cpu_pressure' && loadRefusal?.trigger === 'cpu_busy')) ? {cpu:cpu()} : {}),
+          ...(reason === 'host_load_high' ? { ...(Number.isFinite(hb?.load?.[0]) ? { load1: hb.load[0] } : {}), cpu_count: caps.cpu_count, load_limit: (refusalOnRoute ? (refusalOnRoute.trigger === 'load_runaway' ? refusalOnRoute.factor : Math.max(refusalOnRoute.factor, HOST_LOAD_FACTOR)) : GOAL_LOAD_FACTOR) * caps.cpu_count, cpu_busy_window: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window ?? null } : {}),
+          ...(reason === 'memory_pressure' && refusalOnRoute?.trigger === 'mem_available' ? { host_load: { trigger: 'mem_available', mem_avail_mb: hb.mem_avail_mb, mem_floor_mb: refusalOnRoute.limit } } : {}),
+          ...(reason === 'cpu_pressure' && refusalOnRoute?.trigger === 'cpu_busy' ? { host_load: { trigger: 'cpu_busy', cpu_busy_pct: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window, cpu_window_s: sanitizeCpuUsage(hb.cpu_usage)?.window_s } } : {}),
+          ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) && !((reason === 'memory_pressure' && refusalOnRoute?.trigger === 'mem_available') || (reason === 'cpu_pressure' && refusalOnRoute?.trigger === 'cpu_busy')) ? {cpu:cpu()} : {}),
         });
         continue;
       }
@@ -1411,7 +1422,10 @@ export class FleetService {
       // the single highest-percentage family.
       const headroomPercent = routeQuota.remaining ?? (isUnmeteredProvider(family) ? (policy.rules as any).unmetered_headroom_percent : 5);
       const familyLoad = [...accounts.values()].filter(a => a.provider === family).reduce((n, a) => n + a.active, 0);
-      const cpuLoad = (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / Math.max(1, caps.cpu_count || 1);
+      const observedLoad = Number.isFinite(hb?.load?.[0]) && Number.isFinite(caps?.cpu_count) && caps.cpu_count > 0
+        ? hb.load[0] / caps.cpu_count : 0;
+      const busyRatio = (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / Math.max(1, caps.cpu_count || 1);
+      const cpuLoad = Math.max(busyRatio, observedLoad);
       const isDegraded = Boolean(gateProjection && !gateRefusal);
       const burn = request.mode === 'interactive' ? null : burnForecast(routeProv?.quota, this.now(), Number(account!.reserve_percent) || 0);
       const burn_weight = burnFactor(burn);
