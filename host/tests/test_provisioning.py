@@ -88,7 +88,8 @@ def test_add_rotate_remove_and_preserve_operator_profile(monkeypatch):
     assert not p.managed_subscriptions()
     assert '[profiles.operator]' in path.read_text()
     assert 'hub-test-account' not in path.read_text()
-    assert requests[-2][0] == 'POST'
+    hub_calls = [r for r in requests if r[1] != '/api/engines/sync-report']  # AC9 status report is separate
+    assert hub_calls[-2][0] == 'POST'
 
 
 @pytest.mark.parametrize('relative', ['../escape', '/absolute', 'a/../../escape', 'a//b', 'a/./b'])
@@ -121,7 +122,9 @@ def test_install_failure_does_not_publish_profile_or_ack():
     with patch.object(p.subprocess, 'run', side_effect=OSError('secret stderr')):
         with pytest.raises(ValueError, match='^Managed engine installation failed$'):
             p.sync(request)
-    assert len(calls) == 1
+    acks = [c for c in calls if c[1] != "/api/engines/sync-report"]  # failure report is not an ack (5814e109 AC9)
+    assert len(acks) == 1
+    assert "secret stderr" not in repr(calls)
     assert not p.managed_subscriptions()
     assert 'hub-test-account' not in p.profile_path().read_text()
 
@@ -149,6 +152,27 @@ def test_cli_refuses_public_bundle_file(tmp_path):
         with pytest.raises(PermissionError):
             p.command(SimpleNamespace(engines_cmd='add', file=str(path)))
         request.assert_not_called()
+
+
+def test_engines_list_worker_view_requests_sanitized_endpoint():
+    from types import SimpleNamespace
+    with patch.object(p.bus, '_do_request', return_value={'schema_version': '1.0', 'engines': []}) as request:
+        assert p.command(SimpleNamespace(engines_cmd='list', view='worker')) == {'schema_version': '1.0', 'engines': []}
+        assert p.command(SimpleNamespace(engines_cmd='list', view=None)) == {'schema_version': '1.0', 'engines': []}
+    assert request.call_args_list[0].args == ('GET', '/api/engines?view=worker')
+    assert request.call_args_list[1].args == ('GET', '/api/engines')
+
+
+def test_engines_list_parser_accepts_only_worker_view():
+    import argparse
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    p.add_commands(sub)
+    args = parser.parse_args(['engines', 'list', '--view', 'worker'])
+    assert args.view == 'worker'
+    assert parser.parse_args(['engines', 'list']).view is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(['engines', 'list', '--view', 'operator'])
 
 
 def test_native_auth_import_is_one_command_and_does_not_echo_secret(tmp_path):
@@ -277,6 +301,12 @@ def test_go_import_refuses_legacy_credentials_and_uses_machine_login(tmp_path):
         with pytest.raises(ValueError, match='device login'):
             p.command(args)
         request.assert_not_called()
+        export = d/'export.json'
+        export.write_text(json.dumps([{'id':'c1','active':True,'integrationID':'opencode','value':{'type':'oauth','methodID':'device','access':'A','refresh':'R'}}]));export.chmod(0o600)
+        args.auth_file = str(export)
+        p.command(args)
+        stored = request.call_args.args[2]
+        assert list(stored['files']) == [p.OPENCODE_DEVICE_EXPORT] and 'auth_method' not in stored
         args.auth_file = None
         p.command(args)
     payload=request.call_args.args[2]
@@ -520,7 +550,7 @@ def test_launcher_metadata_mapping():
     assert p.launcher_metadata('codex') == {
         'launcher_provider': 'codex',
         'launcher_model': 'gpt-6.1-sol',
-        'launcher_effort': 'high',
+        'launcher_effort': 'medium',
     }
     # With bundle override
     bundle_override = {'args': ['--model', 'gpt-6-astra', '--effort', 'max']}
@@ -552,7 +582,7 @@ def test_admission_payload_matching(tmp_path, monkeypatch):
     payload_valid = json.dumps({
         'profile': 'hub-test-account',
         'account': 'test-account',
-        'selection': {'model': 'gpt-6.1-sol', 'effort': 'high'},
+        'selection': {'model': 'gpt-6.1-sol', 'effort': 'medium'},
     })
     import io, sys
     monkeypatch.setattr(sys, 'stdin', io.StringIO(payload_valid))
@@ -918,6 +948,8 @@ def test_managed_home_rebootstrap_reapplies_state_hooks(tmp_path, monkeypatch):
 
 
 def test_set_toml_top_level_keys():
+    import tomllib
+
     # 1. Empty content
     res1 = p.set_toml_top_level_keys("", {"approval_policy": "never", "sandbox_mode": "danger-full-access"})
     assert 'approval_policy = "never"' in res1
@@ -942,6 +974,70 @@ def test_set_toml_top_level_keys():
     assert 'approval_policy = "on-request"' not in res3
     assert 'sandbox_mode = "workspace-write"' not in res3
     assert 'model = "gpt-5"' in res3
+
+    typed = p.set_toml_top_level_keys('approval_policy = "never"\n', {
+        'check_for_update_on_startup': False,
+    })
+    parsed = tomllib.loads(typed)
+    assert parsed['check_for_update_on_startup'] is False
+    assert parsed['approval_policy'] == 'never'
+
+    array_tables = ('[[profiles]]\nname = "one"\n\n[[profiles]]\nname = "two"\n')
+    array_update = p.set_toml_top_level_keys(array_tables, {'check_for_update_on_startup': False})
+    assert tomllib.loads(array_update) == {
+        'check_for_update_on_startup': False,
+        'profiles': [{'name': 'one'}, {'name': 'two'}],
+    }
+
+    windows_path = p.set_toml_top_level_keys('model = "gpt-5"\n', {
+        'model': r'C:\Users\test',
+    })
+    assert tomllib.loads(windows_path)['model'] == r'C:\Users\test'
+
+
+@pytest.mark.parametrize(('provider', 'config_path'), [
+    ('codex', '.codex/config.toml'),
+    ('zai', '.zcodex/config.toml'),
+])
+def test_managed_codex_config_keeps_update_check_boolean_type(tmp_path, provider, config_path):
+    import tomllib
+
+    home = tmp_path / 'home'
+    config = home / config_path
+    config.parent.mkdir(parents=True, mode=0o700)
+    home.chmod(0o700)
+    # Reconcile a previously string-valued setting and keep the disable flag
+    # boolean on subsequent syncs.
+    config.write_text('check_for_update_on_startup = "true"\n')
+
+    for _ in range(2):
+        p.install_managed_engine_permissions({'provider': provider}, home)
+        parsed = tomllib.loads(config.read_text())
+        assert parsed['check_for_update_on_startup'] is False
+        assert parsed['approval_policy'] == 'never'
+        assert parsed['sandbox_mode'] == 'danger-full-access'
+
+
+@pytest.mark.parametrize(('provider', 'config_path'), [
+    ('codex', '.codex/config.toml'),
+    ('zai', '.zcodex/config.toml'),
+])
+def test_rollout_self_update_disable_writes_and_verifies_toml_boolean(tmp_path, provider, config_path):
+    import tomllib
+    from agent_hub_host import engine_rollout
+
+    home = tmp_path / 'home'
+    home.mkdir(mode=0o700)
+    config = home / config_path
+    config.parent.mkdir(mode=0o700)
+    config.write_text('check_for_update_on_startup = "false"\n')
+    config.chmod(0o600)
+
+    assert not engine_rollout.self_update_disabled_ok(home, provider)
+    engine_rollout.ensure_self_update_disabled(home, provider)
+    parsed = tomllib.loads(config.read_text())
+    assert parsed['check_for_update_on_startup'] is False
+    assert engine_rollout.self_update_disabled_ok(home, provider)
 
 
 def test_provision_managed_home_permissions_for_all_engines(tmp_path, monkeypatch):
@@ -1056,6 +1152,13 @@ def test_execute_bypasses_permissions_for_goal_and_interactive(tmp_path, monkeyp
     assert len(calls) == 1
     cmd, argv, env = calls[0]
     assert argv.count('--dangerously-bypass-approvals-and-sandbox') == 1
+    calls.clear()
+
+    # Case 2b: headless `exec` also gets the flag, before the subcommand
+    monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', 'exec', '--json', 'task'])
+    p.execute()
+    cmd, argv, env = calls[0]
+    assert argv.index('--dangerously-bypass-approvals-and-sandbox') < argv.index('exec')
     calls.clear()
 
     # Case 3: Diagnostic --version does NOT append bypass flag
@@ -1283,3 +1386,252 @@ def test_failed_reinstall_keeps_offered_bundle_dir_and_logs_type_only_6cbb862a(t
         desired[:] = [orin]  # Hub withdrew the account: only then is the dir removed
         assert p.sync(request)['profiles'] == ['hub-codex-orin']
     assert not shared_dir.exists()
+
+
+def test_codex_config_merge_is_idempotent_across_crlf_and_quoting(tmp_path):
+    import tomllib
+
+    hooks = tmp_path / 'hooks.json'
+    paths = ['/a/b', '/c']
+    # Codex rewrote the file: CRLF endings and a literal-quoted table.
+    base = ('approval_policy = "never"\r\n\r\n[projects."/a/b"]\r\ntrust_level = "untrusted"\r\n'
+            '\r\n[projects.\'/c\']\r\ntrust_level = "trusted"\r\n')
+
+    def run(text):
+        out = p.ensure_toml_trusted_projects(text, paths)
+        return p.ensure_toml_trusted_hooks(out, hooks)
+
+    once = run(base)
+    assert run(once) == once
+    data = tomllib.loads(once)
+    assert data['projects'][str(Path('/a/b').resolve())]['trust_level'] == 'trusted'
+    assert len(data['hooks']['state']) == len(p.KNOWN_HOOK_HASHES)
+
+
+def test_repair_toml_duplicate_tables_fixes_already_broken_config():
+    import tomllib
+
+    broken = ('[projects."C:\\\\x"]\ntrust_level = "trusted"\n\n[hooks.state]\n\n[tui]\na = 1\n\n'
+              '[projects."C:\\\\x"]\ntrust_level = "trusted"\n\n[hooks.state]\n')
+    with pytest.raises(tomllib.TOMLDecodeError):
+        tomllib.loads(broken)
+    fixed = p.repair_toml_duplicate_tables(broken.replace('\n', '\r\n'))
+    assert '\r' not in fixed
+    assert tomllib.loads(fixed) == {
+        'projects': {'C:\\x': {'trust_level': 'trusted'}},
+        'hooks': {'state': {}},
+        'tui': {'a': 1},
+    }
+
+
+@pytest.mark.parametrize('multiline', [
+    'description = """\n[tui]\nmodel = "inside string"\ncheck_for_update_on_startup = "false"\nnot_a_table = true\n"""\n',
+    "description = '''\n[tui]\nmodel = \"inside string\"\ncheck_for_update_on_startup = \"false\"\nnot_a_table = true\n'''\n",
+])
+def test_repair_toml_duplicate_tables_ignores_headers_inside_multiline_strings(multiline):
+    import tomllib
+
+    content = multiline + 'model = "gpt-5"\n\n[tui]\nshow_tooltips = false\n'
+    repaired = p.repair_toml_duplicate_tables(content)
+    parsed = tomllib.loads(repaired)
+    expected_description = '[tui]\nmodel = "inside string"\ncheck_for_update_on_startup = "false"\nnot_a_table = true\n'
+    assert parsed['description'] == expected_description
+    assert parsed['model'] == 'gpt-5'
+    assert parsed['tui'] == {'show_tooltips': False}
+
+    updated = p.set_toml_top_level_keys(content, {
+        'model': r'C:\Users\test',
+        'check_for_update_on_startup': False,
+    })
+    updated_parsed = tomllib.loads(updated)
+    assert updated_parsed['description'] == parsed['description']
+    assert updated_parsed['model'] == r'C:\Users\test'
+    assert updated_parsed['tui'] == parsed['tui']
+
+
+def test_set_toml_top_level_keys_replaces_multiline_value():
+    import tomllib
+
+    source = 'check_for_update_on_startup = """false\nlegacy detail\n"""\nmodel = "gpt-5"\n'
+    updated = p.set_toml_top_level_keys(source, {'check_for_update_on_startup': False})
+    assert tomllib.loads(updated) == {
+        'check_for_update_on_startup': False,
+        'model': 'gpt-5',
+    }
+def test_profile_command_imports_package_without_launcher_pythonpath(tmp_path, monkeypatch):
+    # Intake 608a2f9a (A): hub-* profiles run outside the launcher .cmd, so the
+    # -c command must carry the package parent itself instead of relying on
+    # PYTHONPATH=<release>/package/host.
+    managed = tmp_path / 'managed'
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR', str(managed))
+    argv = p.module_command('execute', 'test-account', managed_dir=managed)
+    assert argv[0] == sys.executable and argv[1] == '-c' and argv[3] == 'test-account'
+    assert str(Path(p.__file__).resolve().parents[1]) in argv[2]
+    setup = argv[2].split('; from agent_hub_host', 1)[0]
+    env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+    env['PYTHONDONTWRITEBYTECODE'] = '1'
+    probe = subprocess.run([sys.executable, '-c', setup + '; import agent_hub_host.provisioning'],
+                           env=env, capture_output=True, text=True, timeout=60)
+    assert probe.returncode == 0, probe.stderr
+
+
+def _fake_windows_go_install(revision='33333333-3333-4333-8333-333333333333'):
+    dest = p.root() / ('go-account-' + revision)
+    package = dest / 'engine' / 'node_modules' / '@opencode' / 'cli-windows-x64'
+    (package / 'bin').mkdir(parents=True, exist_ok=True)
+    (package / 'package.json').write_text(json.dumps({'version': p.GO_CLI_VERSION}))
+    executable = package / 'bin' / 'opencode.exe'
+    executable.write_bytes(b'MZ')
+    return dict(label='go-account', provider='go', version='1.0.0', revision=revision,
+                files={}, env={}, args=['--model', 'opencode-go/muse-spark-1.3-contributor']), executable
+
+
+def test_windows_go_bundle_pins_managed_opencode_engine(monkeypatch):
+    # Intake 608a2f9a (B): aplexer's bare `opencode` resolves to the npm shim
+    # on Windows (exit 127); the managed block pins the native binary and the
+    # pin follows each installed revision.
+    bundle, executable = _fake_windows_go_install()
+    p.profiles([bundle], is_windows=True)
+    text = p.profile_path().read_text()
+    assert text.count('[engines.opencode]') == 1
+    assert json.dumps([str(executable)]) in text
+    assert '# BEGIN HUB MANAGED ENGINES' in text
+    p.profiles([])  # bundle withdrawn: the pin goes with the managed block
+    assert '[engines.opencode]' not in p.profile_path().read_text()
+
+
+def test_go_engine_is_the_2x_cli_that_can_import_the_central_device_login(tmp_path, monkeypatch):
+    # Intake 5814e109 / e0af55f3: opencode-ai 1.x has no `auth import`, so the
+    # Hub-central muse login could never be installed on a host; the managed go
+    # engine is the pinned @opencode/cli 2.x whatever version the bundle carries.
+    assert p.PACKAGES['go'][0] == '@opencode/cli' and p.GO_CLI_VERSION == '2.0.32'
+    bundle, executable = _fake_windows_go_install()
+    bundle['version'] = '1.19.3'
+    dest = p.root() / ('go-account-' + bundle['revision'])
+    assert p.executable_path(bundle, dest, is_windows=True) == executable
+    assert p._go_engine_current(bundle, dest) is True
+    old_tree = p.root() / 'go-account-old' / 'engine' / 'node_modules'
+    (old_tree / 'opencode-ai').mkdir(parents=True)
+    assert p._go_engine_current(bundle, old_tree.parent.parent) is False  # leftover 1.x without the 2.x CLI
+    (old_tree / '@opencode' / 'cli').mkdir(parents=True)
+    assert p._go_engine_current(bundle, old_tree.parent.parent) is True
+
+
+def test_opencode_engine_pin_absent_off_windows_and_for_operator_tables(monkeypatch):
+    bundle, executable = _fake_windows_go_install()
+    p.profiles([bundle], is_windows=False)  # POSIX engines resolve natively, no pin
+    assert '[engines.opencode]' not in p.profile_path().read_text()
+    path = p.profile_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('version = 1\n[engines.opencode]\ncommand = ["C:\\\\ops\\\\opencode.exe"]\n')
+    p.profiles([bundle], is_windows=True)  # operator table outside our block wins
+    text = path.read_text()
+    assert text.count('[engines.opencode]') == 1
+    assert 'C:\\\\ops\\\\opencode.exe' in text and str(executable) not in text
+
+
+def test_install_fetches_windows_zcodex_release_exe(tmp_path, monkeypatch):
+    # Intake 608a2f9a (C): with no native zcodex on a Windows host, the managed
+    # install fetches the checksummed release exe instead of failing closed.
+    import hashlib
+    b = {'label': 'zai-win', 'provider': 'zai', 'version': '0.155.1',
+         'revision': '88888888-8888-4888-8888-888888888888',
+         'files': {}, 'env': {'ZAI_API_KEY': 'tok'}, 'args': ['--model', 'glm-5.3-flash']}
+    monkeypatch.setattr(p, 'locate_native_zcodex', lambda bundle=None, is_windows=None: None)
+    monkeypatch.setattr(p, 'root', lambda: tmp_path / 'managed-engines')
+    monkeypatch.setattr(p, '_is_windows', lambda: True)
+    monkeypatch.setattr(p, 'locate_zcode_runtime', lambda dest=None: None)
+    payload = b'fake-zcodex-exe'
+    sha = hashlib.sha256(payload).hexdigest()
+
+    def fake_run(cmd, *args, **kwargs):
+        cmd_str = ' '.join(str(c) for c in cmd)
+        for i, arg in enumerate(cmd):
+            if arg == '-o':
+                out = Path(cmd[i + 1])
+                if 'SHA256SUMS' in cmd_str:
+                    out.write_text(f'{sha}  zcodex-windows-amd64.exe\n')
+                elif any(str(c).startswith('https://github.com') and str(c).endswith('.exe') for c in cmd):
+                    out.write_bytes(payload)
+                return subprocess.CompletedProcess(cmd, 0)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    with pytest.raises(ValueError, match='ZCode runtime missing'):
+        p.install(b)
+    dest = tmp_path / 'managed-engines' / 'zai-win-88888888-8888-4888-8888-888888888888'
+    assert (dest / 'engine' / 'bin' / 'zcodex.exe').read_bytes() == payload
+    wrapper = (dest / 'engine' / 'bin' / 'zcodex.cmd').read_text()
+    assert 'zcodex.exe' in wrapper
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX execve command capture')
+@pytest.mark.parametrize('label', ['shared-codex', 'codex-orin'])
+@pytest.mark.parametrize('model,explicit,expected', [
+    ('gpt-6.1-sol', None, 'medium'),
+    ('gpt-6-luna', None, 'max'),
+    ('gpt-6.1-sol', 'high', 'high'),
+])
+def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, explicit, expected):
+    managed = tmp_path / 'managed'
+    managed.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: managed)
+    monkeypatch.delenv('CODEX_LAUNCH_WRAPPER', raising=False)
+    b = bundle()
+    b.update(provider='codex', label=label, args=[])
+    b['files']['.codex/config.toml'] = 'model_reasoning_effort = "xhigh"\n'
+    dest = managed / (label + '-' + b['revision'])
+    dest.mkdir(mode=0o700)
+    p.write_json(dest / 'bundle.json', b)
+    p.write_json(managed / 'state.json', [{'label': label, 'revision': b['revision'], 'provider': 'codex'}])
+    calls = []
+    monkeypatch.setattr(p.os, 'execve', lambda cmd, argv, env: calls.append(argv))
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda *a: (True, 'ok'))
+    args = ['execute', label, 'exec', '--model', model]
+    if explicit:
+        args += ['-c', 'model_reasoning_effort="' + explicit + '"']
+    monkeypatch.setattr(sys, 'argv', args + ['task'])
+    p.execute()
+    overrides = [arg for arg in calls[0] if arg.startswith('model_reasoning_effort=')]
+    assert overrides == ['model_reasoning_effort="' + expected + '"']
+
+
+def test_antigravity_environment_drops_user_proxy_variables(tmp_path, monkeypatch):
+    # Desktop: HTTPS_PROXY=127.0.0.1:8899 made agy's OAuth refresh fail ('Authentication required')
+    # with a valid, Hub-identical token; the same home answered OK without the proxy env.
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY'):
+        monkeypatch.setenv(key, 'http://127.0.0.1:8899')
+    b = {'label': 'agy', 'provider': 'antigravity', 'revision': '66666666-6666-4666-8666-666666666666',
+         'version': '1.4.12', 'files': {}, 'env': {}, 'args': []}
+    env = p.engine_environment(b, root_dir / 'agy-x' / 'home', root_dir / 'agy-x')
+    assert not [k for k in env if k.lower().endswith('_proxy')]
+    codex = p.engine_environment(dict(b, provider='codex'), root_dir / 'c' / 'home', root_dir / 'c')
+    assert codex.get('HTTPS_PROXY') == 'http://127.0.0.1:8899' or codex.get('https_proxy')  # other engines untouched
+
+
+def test_antigravity_home_is_seeded_past_theme_and_data_sharing_prompts(tmp_path, monkeypatch):
+    # Desktop agy sessions stopped at the theme picker and the data-sharing consent.
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    tmp_path = root_dir
+    home = tmp_path / 'home'
+    b = {'label': 'agy', 'provider': 'antigravity', 'revision': '55555555-5555-4555-8555-555555555555',
+         'version': '1.4.12', 'files': {}, 'env': {}, 'args': []}
+    p.provision_managed_home(b, home, tmp_path)
+    marker = home / p.ANTIGRAVITY_ONBOARDING
+    data = json.loads(marker.read_text())
+    assert data['onboardingComplete'] is True and data['consumerOnboardingComplete'] is True
+    marker.write_text('{"onboardingComplete": true, "kept": 1}')
+    p.provision_managed_home(b, home, tmp_path)  # idempotent, never overwrites engine state
+    assert json.loads(marker.read_text())['kept'] == 1
+    # The CLI's own incomplete marker (written on a first headless start) is completed, keeping other keys.
+    marker.write_text('{"onboardingComplete": false, "enterpriseOnboardingComplete": false, "kept": 2}')
+    p.provision_managed_home(b, home, tmp_path)
+    fixed = json.loads(marker.read_text())
+    assert fixed['onboardingComplete'] is True and fixed['kept'] == 2
+    other = tmp_path / 'other'
+    p.provision_managed_home(dict(b, provider='codex'), other, tmp_path)
+    assert not (other / p.ANTIGRAVITY_ONBOARDING).exists()

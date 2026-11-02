@@ -3,13 +3,22 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import type { Env } from './env';
 import { validSessionSecret } from './auth/session';
 import type { FleetService } from './fleet';
+import { GOAL_PROVIDERS } from './goal-engines';
 import { canonicalQuotaProvider, canonicalAccountLabel, validateQuotaSnapshotPayload } from './quota';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
-import { CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claudeAuthorization, claudeExchange, credentialFreshness, credentialSubset,
+import { effectiveCheckin } from './registry';
+import { bumpEngineEpoch } from './engine-epoch';
+import { cancelEngineRollout } from './engine-rollout-cancel';
+import { CLAUDE_OAUTH, CREDENTIAL_PATHS, CREDENTIAL_SCHEMA, accessExpiry, claudeAuthorization, claudeExchange, credentialFreshness, credentialSubset,
   fetchQuota, needsRefresh, refreshCredential, refreshable, structurallyValid, validCredentialFiles, type CredentialFiles, type FetchLike } from './credentials';
 
 const LABEL = /^[a-z][a-z0-9_-]{0,47}$/;
+// Hosts check in about every minute (persisted at least every 5 min); silence
+// beyond this reads as offline, and the host reconciles on reconnect.
+const SYNC_STALE_MS = 10 * 60000;
 const MIGRATION_GRACE_MS = 2 * 3600000;
+// A Hub-central login waits this long for the pasted code (intake 8ff6b3d8).
+export const CREDENTIAL_LOGIN_TTL_MS = 30 * 60000;
 // One maintenance pass per isolate: overlapping cron/manual runs would refresh
 // the same single-use token twice and raise a false rejection.
 let maintaining = false;
@@ -19,10 +28,15 @@ export const PACKAGES: Record<string, { pkg: string; bin: string; engine: string
   gemini: { pkg: '@google/gemini-cli', bin: 'gemini', engine: 'gemini' },
   go: { pkg: 'opencode-ai', bin: 'opencode', engine: 'opencode' },
   zai: { pkg: 'zcodex', bin: 'zcodex', engine: 'codex' },
+  // Antigravity is a native binary: hosts install the release pinned in
+  // host/agent_hub_host/bootstrap_pins.py (sha512-checked), never npm (AC8).
+  antigravity: { pkg: 'antigravity-cli', bin: 'agy', engine: 'antigravity' },
 };
+// The Antigravity harness spends the Google (Gemini) quota pool.
+export const accountProvider = (provider: string) => provider === 'antigravity' ? 'gemini' : provider;
 // Provider default slot limit for a Hub-central account created by import or
 // central login (t1248u). An explicit `max_concurrency` on create wins.
-export const PROVIDER_DEFAULT_MAX_CONCURRENCY: Record<string, number> = { codex: 8, claude: 8, gemini: 8, go: 8, zai: 8 };
+export const PROVIDER_DEFAULT_MAX_CONCURRENCY: Record<string, number> = { codex: 8, claude: 8, gemini: 8, go: 8, zai: 8, antigravity: 8 };
 export const providerDefaultMaxConcurrency = (provider: string) => PROVIDER_DEFAULT_MAX_CONCURRENCY[provider] ?? 8;
 const IMPLICIT_MAX_MIGRATION = 'managed_account_max_concurrency_default_v1';
 const explicitMax = (v: unknown) => v === undefined || v === null ? undefined : Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 100 ? v as number : NaN;
@@ -36,7 +50,11 @@ export function validBundle(v: any): boolean {
     ? Object.keys(v.files || {}).some(k => /oauth|credential|token/i.test(k))
     : v.auth_method !== undefined || typeof v.files?.['.gemini/oauth_creds.json'] !== 'string'))) return false;
   if (!object(v.files) || Object.keys(v.files).length > 24 || !object(v.env) || Object.keys(v.env).length > 12) return false;
-  if (v.provider === 'go' && (Object.keys(v.files).length || Object.keys(v.env).length)) return false;
+  // OpenCode: no env secrets; the only file is the Hub-held device-login export.
+  if (v.provider === 'go' && (Object.keys(v.env).length || (Object.keys(v.files).length && JSON.stringify(Object.keys(v.files)) !== JSON.stringify(CREDENTIAL_PATHS.go)))) return false;
+  // Antigravity: exactly the Hub-held OAuth token file, no env secrets.
+  if (v.provider === 'antigravity' && (Object.keys(v.env).length || v.auth_method !== undefined ||
+    JSON.stringify(Object.keys(v.files)) !== JSON.stringify(CREDENTIAL_PATHS.antigravity))) return false;
   for (const [path, value] of Object.entries(v.files)) {
     if (path.length > 200 || !path.split('/').every(p => /^[A-Za-z0-9_.-]+$/.test(p) && p !== '.' && p !== '..') || typeof value !== 'string' || value.length > 16000) return false;
   }
@@ -55,9 +73,37 @@ export class ProvisioningService {
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_bundles (label TEXT PRIMARY KEY, provider TEXT NOT NULL, version TEXT NOT NULL, revision TEXT NOT NULL, ciphertext TEXT NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_logins (id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL, url TEXT, code_ciphertext TEXT, expires_at INTEGER NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_installations (machine_id TEXT NOT NULL, label TEXT NOT NULL, revision TEXT NOT NULL, PRIMARY KEY(machine_id,label))');
+    // Per-host sync visibility (AC9): what each host last reported per account.
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_sync_status (machine_id TEXT NOT NULL, label TEXT NOT NULL, revision TEXT NOT NULL, state TEXT NOT NULL, error TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(machine_id,label))');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_sync_hosts (machine_id TEXT PRIMARY KEY, state TEXT NOT NULL, last_sync_at INTEGER NOT NULL)');
     for (const ddl of CREDENTIAL_SCHEMA) this.sql.exec(ddl);
+    // A7: the credential generation each host acknowledged installing, per account.
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_credential_acks (machine_id TEXT NOT NULL, label TEXT NOT NULL, generation INTEGER NOT NULL, acked_at INTEGER NOT NULL, PRIMARY KEY(machine_id,label))');
     this.sql.exec('CREATE TABLE IF NOT EXISTS engine_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL, detail TEXT NOT NULL)');
     this.migrateImplicitMaxConcurrency();
+    this.initEngineRollout();
+  }
+  // ---- Hub-managed engine version rollout (intake 8cc9e31a) ----
+  // Desired versions mirror host/agent_hub_host/bootstrap_pins.py ENGINE_PACKAGES
+  // plus the reviewed Antigravity pin. zcodex tracks the reviewed codex CLI
+  // version (release tag ``zcode-<runtime>-codex-<version>``). Update both
+  // places in the same change.
+  private rolloutDesired(): Record<string, string> {
+    return { codex: '0.166.0', claude: '2.1.312', opencode: '1.19.5', agy: '1.4.10', zcodex: '0.166.0' };
+  }
+  private rolloutProvider(engine: string): string | null {
+    return { codex: 'codex', claude: 'claude', opencode: 'go', agy: 'antigravity', zcodex: 'zai' }[engine] ?? null;
+  }
+  private initEngineRollout() {
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_rollout_desired (engine TEXT PRIMARY KEY, version TEXT NOT NULL, latest TEXT, source TEXT NOT NULL, updated_at INTEGER NOT NULL)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_version_reports (machine_id TEXT NOT NULL, engine TEXT NOT NULL, installed TEXT, latest TEXT, result TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(machine_id,engine))');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS engine_rollouts (id TEXT PRIMARY KEY, engine TEXT NOT NULL, target_version TEXT NOT NULL, previous_json TEXT NOT NULL, canary_machine TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, detail TEXT NOT NULL)');
+    const desired = this.rolloutDesired();
+    for (const [engine, version] of Object.entries(desired)) {
+      const row: any = this.sql.exec('SELECT version FROM engine_rollout_desired WHERE engine=?', engine).toArray()[0];
+      if (!row) this.sql.exec('INSERT INTO engine_rollout_desired VALUES (?,?,?,?,?)', engine, version, version, 'bootstrap_pins', this.now());
+      else if (row.version !== version) this.sql.exec('UPDATE engine_rollout_desired SET version=?, source=?, updated_at=? WHERE engine=?', version, 'bootstrap_pins', this.now(), engine);
+    }
   }
   /**
    * Managed accounts used to be created at an implicit max_concurrency of 1.
@@ -75,6 +121,36 @@ export class ProvisioningService {
     });
   }
   private now() { return Date.now(); }
+  /**
+   * One row per registered host and managed account: `synced` (current revision
+   * installed), `failed` (host reported an install error for it), `pending`
+   * (not yet acknowledged). A host silent for SYNC_STALE_MS is `offline`, and it
+   * reconciles on reconnect.
+   */
+  syncStatus() {
+    const now = this.now();
+    const engines = this.sql.exec('SELECT label, provider, revision FROM engine_bundles ORDER BY label').toArray() as any[];
+    const machines = this.sql.exec('SELECT id, name, last_checkin_at FROM machines WHERE registered_at IS NOT NULL AND revoked_at IS NULL ORDER BY id').toArray() as any[];
+    const hosts = new Map((this.sql.exec('SELECT * FROM engine_sync_hosts').toArray() as any[]).map(h => [h.machine_id, h]));
+    const installed = new Set((this.sql.exec('SELECT machine_id,label,revision FROM engine_installations').toArray() as any[]).map(i => i.machine_id + '|' + i.label + '|' + i.revision));
+    const status = new Map((this.sql.exec('SELECT * FROM engine_sync_status').toArray() as any[]).map(r => [r.machine_id + '|' + r.label, r]));
+    const acks = new Map((this.sql.exec('SELECT machine_id,label,generation,acked_at FROM engine_credential_acks').toArray() as any[]).map(r => [r.machine_id + '|' + r.label, r]));
+    const current = new Map((this.sql.exec('SELECT label,generation FROM engine_credentials').toArray() as any[]).map(r => [r.label, r.generation]));
+    return machines.map(m => {
+      const h: any = hosts.get(m.id);
+      // Liveness comes from the machine check-in, so sync reports need only be sent on change.
+      const seen = Date.parse(effectiveCheckin(m.id, m.last_checkin_at) || '');
+      const online = Number.isFinite(seen) && now - seen <= SYNC_STALE_MS;
+      return { machine_id: m.id, machine: m.name, last_sync_at: h?.last_sync_at ?? null, host_state: h?.state ?? 'never', online,
+        accounts: engines.map(e => {
+          const r: any = status.get(m.id + '|' + e.label);
+          const state = installed.has(m.id + '|' + e.label + '|' + e.revision) ? 'synced' : r?.revision === e.revision && r.state === 'failed' ? 'failed' : 'pending';
+          const ack: any = acks.get(m.id + '|' + e.label);
+          return { label: e.label, provider: e.provider, state, ...(state === 'failed' && r.error ? { error: r.error } : {}),
+            ...(current.has(e.label) ? { credential_generation: current.get(e.label), acked_generation: ack?.generation ?? null, acked_at: ack?.acked_at ?? null } : {}) };
+        }) };
+    });
+  }
   private credentialRow(label: string): any { return this.sql.exec('SELECT * FROM engine_credentials WHERE label=?', label).toArray()[0]; }
   private async sealCredential(label: string, generation: number, files: CredentialFiles) {
     return this.seal({ label, files }, 'credential:' + generation);
@@ -88,6 +164,7 @@ export class ProvisioningService {
       credentialFreshness(provider, files), accessExpiry(provider, files), 'ok', null, by, this.now(), null,
       this.credentialRow(label)?.quota_attempt_at ?? null);
     this.sql.exec('DELETE FROM engine_credential_rejections WHERE label=? AND generation<?', label, generation);
+    bumpEngineEpoch(this.sql, this.now());
   }
   /** Non-secret credential metadata for operators. */
   credentialStatus() {
@@ -123,7 +200,8 @@ export class ProvisioningService {
     const rows = () => this.sql.exec('SELECT * FROM engine_bundles ORDER BY label').toArray() as any[];
     if (path === '/api/engines' && request.method === 'GET') {
       if (!admin) return reply({ error: 'forbidden' }, 403);
-      return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => ({ ...meta, supports_goal: ['codex', 'zai'].includes(meta.provider) })), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray(),
+      return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => ({ ...meta, supports_goal: GOAL_PROVIDERS.has(meta.provider) })), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray(),
+        sync_status: this.syncStatus(),
         credentials: this.credentialStatus(), credential_rejections: this.sql.exec('SELECT machine_id,label,generation,reason,observed_at FROM engine_credential_rejections ORDER BY label,machine_id').toArray(),
         account_migrations: this.sql.exec('SELECT name,applied_at,detail FROM engine_migrations ORDER BY name').toArray().map((m: any) => ({ name: m.name, applied_at: m.applied_at, ...JSON.parse(m.detail) })) });
     }
@@ -152,7 +230,10 @@ export class ProvisioningService {
       return reply({ launch_allowed: !reason, profile_supported: !!installed || (native && !!a), ...(reason ? { reason } : {}),
         ...(quotaStatus === 'unknown' ? { quota_warning: 'quota_probe_unavailable' } : {}),
         ...(cred ? { credential_generation: cred.generation } : {}),
-        account_label: data.label, observed_at: new Date().toISOString() });
+        // Compatibility with installed hosts whose clocks lag Hub slightly. Backdating
+        // consumes freshness budget; it never extends the 30-second stale cutoff.
+        account_label: data.label, observed_at: new Date(Date.now() - 5_000).toISOString(),
+        server_observed_at: new Date().toISOString() });
     }
     if (path === '/api/engines/logins' && request.method === 'POST') {
       if (!admin) return reply({error:'forbidden'},403);
@@ -202,6 +283,81 @@ export class ProvisioningService {
     }
     const credentialLogin = await this.handleCredentialLogin(request, path, admin);
     if (credentialLogin) return credentialLogin;
+    if (path === '/api/engines/sync-report' && request.method === 'POST') {
+      if (!host) return reply({ error: 'forbidden' }, 403);
+      const data = await request.json().catch(() => null) as any;
+      if (!object(data) || !['synced', 'held'].includes(data.state) || !Array.isArray(data.items) || data.items.length > 32) return reply({ error: 'invalid_report' }, 400);
+      return this.tx(() => {
+        const machine = auth.caller.machineId as string;
+        if (!this.hostAllowed(machine, auth.caller)) return reply({ error: 'forbidden' }, 403);
+        const now = this.now();
+        for (const it of data.items) {
+          if (!object(it) || !LABEL.test(it.label) || !['installed', 'failed'].includes(it.state)) continue;
+          const row: any = this.sql.exec('SELECT revision FROM engine_bundles WHERE label=?', it.label).toArray()[0];
+          if (!row || it.revision !== row.revision) continue;
+          // Error is a bounded exception-type name, never provider output.
+          const error = it.state === 'failed' && typeof it.error === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(it.error) ? it.error : null;
+          // Only failures are stored (synced comes from engine_installations), and only
+          // on change: Free-plan Durable Object row writes are a daily budget.
+          const prior: any = this.sql.exec('SELECT revision,state,error FROM engine_sync_status WHERE machine_id=? AND label=?', machine, it.label).toArray()[0];
+          if (it.state === 'installed') {
+            if (Number.isInteger(it.credential_generation) && it.credential_generation >= 0) {
+              const ack: any = this.sql.exec('SELECT generation FROM engine_credential_acks WHERE machine_id=? AND label=?', machine, it.label).toArray()[0];
+              if (!ack || ack.generation !== it.credential_generation) this.sql.exec('INSERT OR REPLACE INTO engine_credential_acks VALUES (?,?,?,?)', machine, it.label, it.credential_generation, now);
+            }
+            if (prior) this.sql.exec('DELETE FROM engine_sync_status WHERE machine_id=? AND label=?', machine, it.label);
+            continue;
+          }
+          if (prior && prior.revision === row.revision && prior.state === it.state && (prior.error ?? null) === error) continue;
+          this.sql.exec('INSERT OR REPLACE INTO engine_sync_status VALUES (?,?,?,?,?,?)', machine, it.label, row.revision, it.state, error, now);
+        }
+        this.sql.exec('INSERT OR REPLACE INTO engine_sync_hosts VALUES (?,?,?)', machine, data.state, now);
+        return reply({ status: 'recorded' });
+      });
+    }
+    // Hub-managed engine version rollout (intake 8cc9e31a). These paths sort
+    // before the generic /api/engines/<label> match below ('versions' and
+    // 'update' would otherwise parse as labels).
+    const cancel = /^\/api\/engines\/rollouts\/([^/]+)\/cancel$/.exec(path);
+    if (cancel && request.method === 'POST') {
+      if (!admin) return reply({ error: 'forbidden' }, 403);
+      const result = await cancelEngineRollout({ sql: this.sql, tx: this.tx, now: () => this.now(),
+        open: row => this.open(row), seal: (bundle, revision) => this.seal(bundle, revision) },
+        cancel[1], await request.json().catch(() => null));
+      const status = 'error' in result ? result.error === 'rollout_not_found' ? 404
+        : result.error === 'bundle_decryption_unavailable' ? 503
+        : ['invalid_rollout_id', 'invalid_cancel_request', 'invalid_cancel_reason'].includes(result.error) ? 400 : 409 : 200;
+      return reply(result, status);
+    }
+    if (path === '/api/engines/versions' && request.method === 'GET') {
+      if (!admin && !host) return reply({ error: 'forbidden' }, 403);
+      const machine = new URL(request.url).searchParams.get('machine') || undefined;
+      return reply(this.rolloutVersions(machine ?? (host ? auth.caller.machineId : undefined)));
+    }
+    if (path === '/api/engines/version-report' && request.method === 'POST') {
+      if (!host) return reply({ error: 'forbidden' }, 403);
+      const data = await request.json().catch(() => null) as any;
+      const res: any = await this.reportEngineVersions(auth.caller.machineId, data);
+      if (res.error) return reply(res, 400);
+      if (data && typeof data.alert === 'object' && data.alert !== null) {
+        const detail = typeof data.alert.detail === 'string' ? data.alert.detail.slice(0, 500) : 'engine rollout canary failed';
+        this.sql.exec('INSERT OR REPLACE INTO engine_migrations VALUES (?,?,?)', 'engine_rollout_host_alert_v1', this.now(),
+          JSON.stringify({ at: this.now(), machine: auth.caller.machineId, detail }));
+      }
+      return reply(res);
+    }
+    if (path === '/api/engines/update' && request.method === 'POST') {
+      if (!admin) return reply({ error: 'forbidden' }, 403);
+      const data = await request.json().catch(() => null) as any;
+      if (data && typeof data.alert === 'object') {
+        this.sql.exec('INSERT OR REPLACE INTO engine_migrations VALUES (?,?,?)', 'engine_rollout_host_alert_v1', this.now(),
+          JSON.stringify({ at: this.now(), detail: typeof data.alert.detail === 'string' ? data.alert.detail.slice(0, 500) : 'engine rollout canary failed' }));
+        return reply({ status: 'alert_recorded' });
+      }
+      const res: any = await this.startEngineRollout(data);
+      if (res.error) return reply(res, 400);
+      return reply(res);
+    }
     const credentialMatch = /^\/api\/engines\/([a-z][a-z0-9_-]{0,47})\/(credential|rejection)$/.exec(path);
     if (credentialMatch) {
       if (!host) return reply({ error: 'forbidden' }, 403);
@@ -232,7 +388,9 @@ export class ProvisioningService {
       this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', label);
       this.sql.exec('DELETE FROM engine_logins WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_installations WHERE label=?', label);
+      this.sql.exec('DELETE FROM engine_sync_status WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_bundles WHERE label=?', label);
+      bumpEngineEpoch(this.sql, this.now());
       this.sql.exec('DELETE FROM engine_credentials WHERE label=?', label);
       this.sql.exec('DELETE FROM engine_credential_rejections WHERE label=?', label);
       this.sql.exec('DELETE FROM fleet_accounts WHERE label=?', label);
@@ -265,7 +423,11 @@ export class ProvisioningService {
       // Canonical provider family: `codex-orin` rows are the second Codex
       // account under provider `codex`, never a separate provider.
       const providerFamily = canonicalQuotaProvider(existing?.provider);
-      if (existing && providerFamily !== bundle.provider) return reply({ error: 'account_provider_mismatch' }, 409);
+      if (existing && providerFamily !== accountProvider(bundle.provider)) return reply({ error: 'account_provider_mismatch' }, 409);
+      // Same quota family is not enough: a managed label never switches harness
+      // (gemini <-> antigravity), which would strand its credential under other paths.
+      const prior: any = this.sql.exec('SELECT provider FROM engine_bundles WHERE label=?', label).toArray()[0];
+      if (prior && prior.provider !== bundle.provider) return reply({ error: 'account_provider_mismatch' }, 409);
       if (!managed && existing) {
         // An explicit recovery may attach credentials to a stale registry pool,
         // but must neither rename the quota pool nor reset its limits.
@@ -275,11 +437,12 @@ export class ProvisioningService {
       }
       if (!managed && rows().length >= 32) return reply({ error: 'bundle_capacity' }, 409);
       this.sql.exec('INSERT OR REPLACE INTO engine_bundles VALUES (?,?,?,?,?)', label, bundle.provider, bundle.version, revision, ciphertext);
+      bumpEngineEpoch(this.sql, this.now());
       this.sql.exec('DELETE FROM engine_installations WHERE label=?', label);
       this.sql.exec('DELETE FROM fleet_routes WHERE account=?', label);
       this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', label);
       // An existing pool keeps its limits; a new one inherits the provider default.
-      if (!existing) this.sql.exec('INSERT INTO fleet_accounts VALUES (?,?,?,?,?)', label, bundle.provider, requestedMax ?? providerDefaultMaxConcurrency(bundle.provider), bundle.provider === 'codex' ? 15 : 0, 1);
+      if (!existing) this.sql.exec('INSERT INTO fleet_accounts VALUES (?,?,?,?,?)', label, accountProvider(bundle.provider), requestedMax ?? providerDefaultMaxConcurrency(bundle.provider), bundle.provider === 'codex' ? 15 : 0, 1);
       if (credentialCipher) {
         if (Number(this.credentialRow(label)?.generation ?? 0) + 1 !== generation) return reply({ error: 'credential_changed' }, 409);
         this.writeCredential(label, bundle.provider, generation, credentialCipher, credential, 'import');
@@ -368,18 +531,39 @@ export class ProvisioningService {
       let sealed: string;
       try { sealed = await this.seal({ label: data.label, verifier, state, version: data.version ?? null, adopt: data.adopt === true, max_concurrency: explicitMax(data.max_concurrency) ?? null }, 'login:' + id); }
       catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
-      this.sql.exec('INSERT INTO engine_credential_logins VALUES (?,?,?,?,?)', id, data.label, 'claude', sealed, this.now() + 600000);
-      return reply({ id, url, expires_in: 600 });
+      const expiresAt = this.now() + CREDENTIAL_LOGIN_TTL_MS;
+      this.sql.exec('INSERT INTO engine_credential_logins VALUES (?,?,?,?,?)', id, data.label, 'claude', sealed, expiresAt);
+      return reply({ id, url, expires_in: CREDENTIAL_LOGIN_TTL_MS / 1000, expires_at: new Date(expiresAt).toISOString() });
     }
     const row: any = this.sql.exec('SELECT * FROM engine_credential_logins WHERE id=?', m[1]).toArray()[0];
-    if (!row) return reply({ error: 'not_found' }, 404);
-    if (!data || typeof data.code !== 'string' || data.code.length > 4096 || !/^[A-Za-z0-9_\-#.~]+$/.test(data.code.trim())) return reply({ error: 'invalid_code' }, 400);
+    // Expired rows were purged above, so a missing row is an expired (or
+    // already used) login: tell the operator to start over.
+    if (!row) return reply({ error: 'login_expired' }, 410);
     let login: any;
     try { login = await this.open({ label: row.label, revision: 'login:' + row.id, ciphertext: row.sealed }); } catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
+    const install = (files: CredentialFiles) => this.installCentralCredential(row.label, 'claude', login.version, files, login.adopt === true, explicitMax(login.max_concurrency));
+    // Host fallback upload: the CLI host exchanged the code itself because
+    // Worker egress to the provider was blocked (like grantRefreshLease).
+    if (data && data.files !== undefined) {
+      if (!validCredentialFiles('claude', data.files) || !structurallyValid('claude', data.files)) return reply({ error: 'invalid_credential' }, 400);
+      this.sql.exec('DELETE FROM engine_credential_logins WHERE id=?', row.id);
+      return install(data.files);
+    }
+    if (!data || typeof data.code !== 'string' || data.code.length > 4096 || !/^[A-Za-z0-9_\-#.~]+$/.test(data.code.trim())) return reply({ error: 'invalid_code' }, 400);
     this.sql.exec('DELETE FROM engine_credential_logins WHERE id=?', row.id);
     const result = await claudeExchange(data.code, login.verifier, login.state, this.fetchFn, this.now());
-    if (!result.ok) return reply({ error: result.reason }, 400);
-    return this.installCentralCredential(row.label, 'claude', login.version, result.files, login.adopt === true, explicitMax(login.max_concurrency));
+    if (result.ok) return install(result.files);
+    if (result.blocked) {
+      // The provider never judged the code: keep the login so the CLI host can
+      // exchange it from its own network and upload the credential.
+      this.sql.exec('INSERT OR REPLACE INTO engine_credential_logins VALUES (?,?,?,?,?)', row.id, row.label, row.provider, row.sealed, row.expires_at);
+      const sanitized = { provider_status: result.providerStatus ?? null, reason: result.detail ?? null };
+      if (data.host_fallback !== true) return reply({ error: 'login_exchange_blocked', ...sanitized }, 502);
+      return reply({ status: 'host_exchange_required', ...sanitized, expires_at: new Date(row.expires_at).toISOString(),
+        exchange: { token_url: CLAUDE_OAUTH.token, profile_url: CLAUDE_OAUTH.profile, client_id: CLAUDE_OAUTH.client, redirect_uri: CLAUDE_OAUTH.redirect,
+          scopes: CLAUDE_OAUTH.scopes, state: login.state, code_verifier: login.verifier } }, 202);
+    }
+    return reply({ error: result.reason, provider_status: result.providerStatus ?? null, reason: result.detail ?? null }, 400);
   }
 
   /** Store a Hub-minted credential: create the account bundle on first login, else publish a new generation. */
@@ -552,5 +736,160 @@ export class ProvisioningService {
       syncTbmFromServerAccounts(this.sql, [{ account, provider: family, quota: stored }], nowMs);
       return true;
     });
+  }
+
+  // ---- Engine rollout state machine (intake 8cc9e31a) ----
+  /** Fleet-wide per-host version view (AC5): installed/latest/last result. */
+  rolloutVersions(machine?: string) {
+    const desired = (this.sql.exec('SELECT engine, version, latest, updated_at FROM engine_rollout_desired ORDER BY engine').toArray() as any[]);
+    const reports = (machine
+      ? this.sql.exec('SELECT * FROM engine_version_reports WHERE machine_id=? ORDER BY engine', machine)
+      : this.sql.exec('SELECT * FROM engine_version_reports ORDER BY machine_id, engine').toArray() as any[]);
+    const rollouts = (this.sql.exec('SELECT id, engine, target_version, canary_machine, state, created_at, updated_at, detail FROM engine_rollouts ORDER BY created_at DESC LIMIT 10').toArray() as any[])
+      .map((r: any) => ({ ...r, detail: (() => { try { return JSON.parse(r.detail); } catch { return {}; } })() }));
+    return { desired: Object.fromEntries(desired.map((d: any) => [d.engine, { version: d.version, latest: d.latest ?? d.version, updated_at: d.updated_at }])), reports, rollouts };
+  }
+
+  /** Host check-in of its per-engine versions (AC5 source: a check run on that host). */
+  async reportEngineVersions(machineId: string, body: any) {
+    const engines = body?.engines;
+    if (!object(engines) || Object.keys(engines).length > 8) return { error: 'invalid_report' };
+    const now = this.now();
+    const applied: string[] = [];
+    for (const [engine, row] of Object.entries(engines)) {
+      if (!this.rolloutProvider(engine) || !object(row)) continue;
+      const installed = typeof (row as any).installed === 'string' && /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test((row as any).installed) ? (row as any).installed : null;
+      const latest = typeof (row as any).latest === 'string' && /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test((row as any).latest) ? (row as any).latest : null;
+      const result = typeof (row as any).result === 'string' && /^[A-Za-z0-9_]{1,32}$/.test((row as any).result) ? (row as any).result : null;
+      this.sql.exec('INSERT OR REPLACE INTO engine_version_reports VALUES (?,?,?,?,?,?)', machineId, engine, installed, latest, result, now);
+      applied.push(engine);
+      // Canary gate (AC3): the canary host reporting green promotes the
+      // rollout; a failure rolls back to the previous versions.
+      const pending: any = this.sql.exec("SELECT * FROM engine_rollouts WHERE engine=? AND canary_machine=? AND state='canary_pending' ORDER BY created_at DESC LIMIT 1", engine, machineId).toArray()[0];
+      if (pending && (result === 'green' || installed)) {
+        if (result === 'green') {
+          this.sql.exec("UPDATE engine_rollouts SET state='rolling', updated_at=?, detail=? WHERE id=?", now,
+            JSON.stringify({ ...JSON.parse(pending.detail || '{}'), canary: 'green', canary_at: now }), pending.id);
+        } else if (result && result !== 'green' && installed !== pending.target_version) {
+          await this.rollbackEngineRollout(pending, `canary ${result}`);
+        }
+      }
+    }
+    return { status: 'recorded', engines: applied };
+  }
+
+  /** Roll one rollout back to its previous bundle versions. Keeps serving the old build. */
+  private async rollbackEngineRollout(pending: any, reason: string) {
+    const now = this.now();
+    try {
+      const previous = JSON.parse(pending.previous_json || '{}') as Record<string, string>;
+      for (const [label, version] of Object.entries(previous)) {
+        const row: any = this.sql.exec('SELECT * FROM engine_bundles WHERE label=?', label).toArray()[0];
+        if (!row) continue;
+        const bundle = await this.open(row);
+        if (bundle.version === version) continue;
+        bundle.version = version;
+        delete (bundle as any).revision;
+        const revision = crypto.randomUUID();
+        const ciphertext = await this.seal(bundle, revision);
+        this.tx(() => {
+          this.sql.exec('UPDATE engine_bundles SET version=?, revision=?, ciphertext=? WHERE label=?', version, revision, ciphertext, label);
+          this.sql.exec('DELETE FROM engine_installations WHERE label=?', label);
+          this.sql.exec('DELETE FROM fleet_routes WHERE account=?', label);
+          this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', label);
+          bumpEngineEpoch(this.sql, now);
+        });
+      }
+    } catch { /* rollback best-effort; the rollout row still records the failure */ }
+    this.sql.exec("UPDATE engine_rollouts SET state='rolled_back', updated_at=?, detail=? WHERE id=?", now,
+      JSON.stringify({ reason, rolled_back_at: now }), pending.id);
+  }
+
+  /**
+   * On-demand rollout (AC1): bump central bundle versions for one engine
+   * (default: every supported engine whose bundles lag the desired pin),
+   * canary first. Hosts pick the new revision up on sync; the previous
+   * revision dir stays until live sessions drain (host-side AC2).
+   */
+  async startEngineRollout(input: any) {
+    const now = this.now();
+    const engine = typeof input?.engine === 'string' ? input.engine : null;
+    const engines = engine ? [engine] : Object.keys(this.rolloutDesired());
+    for (const e of engines) if (!this.rolloutProvider(e)) return { error: 'invalid_engine' };
+    const canary = typeof input?.canary === 'string' && input.canary.length >= 1 && input.canary.length <= 64
+      ? input.canary : typeof input?.machine === 'string' && input.machine ? input.machine : 'RMTHZ';
+    const out: any[] = [];
+    for (const e of engines) {
+      const provider = this.rolloutProvider(e)!;
+      const target = (this.sql.exec('SELECT version FROM engine_rollout_desired WHERE engine=?', e).toArray()[0] as any)?.version
+        ?? this.rolloutDesired()[e];
+      const rows = this.sql.exec('SELECT label, version FROM engine_bundles WHERE provider=? ORDER BY label', provider).toArray() as any[];
+      const lagging = rows.filter(r => r.version !== target);
+      const previous: Record<string, string> = Object.fromEntries(rows.map(r => [r.label, r.version]));
+      let bumped: string[] = [];
+      if (lagging.length && !input?.check_only) {
+        for (const r of lagging) {
+          const row: any = this.sql.exec('SELECT * FROM engine_bundles WHERE label=?', r.label).toArray()[0];
+          if (!row) continue;
+          try {
+            const bundle = await this.open(row);
+            bundle.version = target;
+            delete (bundle as any).revision;
+            const revision = crypto.randomUUID();
+            const ciphertext = await this.seal(bundle, revision);
+            this.tx(() => {
+              this.sql.exec('UPDATE engine_bundles SET version=?, revision=?, ciphertext=? WHERE label=?', target, revision, ciphertext, r.label);
+              this.sql.exec('DELETE FROM engine_installations WHERE label=?', r.label);
+              this.sql.exec('DELETE FROM fleet_routes WHERE account=?', r.label);
+              this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', r.label);
+              bumpEngineEpoch(this.sql, now);
+            });
+            bumped.push(r.label);
+          } catch { return { error: 'bundle_decryption_unavailable' }; }
+        }
+      }
+      const open: any = this.sql.exec("SELECT id FROM engine_rollouts WHERE engine=? AND state IN ('canary_pending','rolling') ORDER BY created_at DESC LIMIT 1", e).toArray()[0];
+      if (open && !input?.restart) {
+        out.push({ engine: e, state: 'already_running', rollout_id: open.id, bumped });
+        continue;
+      }
+      const id = crypto.randomUUID();
+      this.sql.exec('INSERT INTO engine_rollouts VALUES (?,?,?,?,?,?,?,?,?)', id, e, target, JSON.stringify(previous), canary,
+        lagging.length || bumped.length ? 'canary_pending' : 'done', now, now,
+        JSON.stringify({ bumped, requested_machine: input?.machine ?? null }));
+      out.push({ engine: e, state: lagging.length || bumped.length ? 'canary_pending' : 'current', rollout_id: id, canary, target_version: target, bumped });
+    }
+    return { rollouts: out };
+  }
+
+  /** Daily scheduled check (AC1): compare upstream latest vs desired pins. */
+  async tickEngineRollout(nowMs = this.now(), fetchLatest?: (pkg: string) => Promise<string | null>): Promise<Array<{ subject: string; problem: { state: string; detail: string } | null }>> {
+    const last: any = this.sql.exec("SELECT detail FROM engine_migrations WHERE name='engine_rollout_daily_v1'").toArray()[0];
+    const lastAt = last ? (() => { try { return JSON.parse(last.detail).at ?? 0; } catch { return 0; } })() : 0;
+    if (nowMs - lastAt < 20 * 3600 * 1000) return [];
+    const fetchFn = fetchLatest ?? (async (pkg: string) => {
+      try {
+        const res = await fetch('https://registry.npmjs.org/' + pkg + '/latest', { signal: AbortSignal.timeout(10000) });
+        if (!res.ok) return null;
+        const data: any = await res.json();
+        return typeof data?.version === 'string' && /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(data.version) ? data.version : null;
+      } catch { return null; }
+    });
+    const pkgFor: Record<string, string | null> = { codex: '@openai/codex', claude: '@anthropic-ai/claude-code', opencode: 'opencode-ai', agy: null, zcodex: null };
+    const found: Array<{ subject: string; problem: { state: string; detail: string } | null }> = [];
+    for (const [engine, pkg] of Object.entries(pkgFor)) {
+      if (!pkg) continue;
+      const latest = await fetchFn(pkg);
+      if (!latest) continue;
+      const row: any = this.sql.exec('SELECT version, latest FROM engine_rollout_desired WHERE engine=?', engine).toArray()[0];
+      if (!row) continue;
+      if (latest !== row.latest) this.sql.exec('UPDATE engine_rollout_desired SET latest=?, updated_at=? WHERE engine=?', latest, nowMs, engine);
+      if (latest !== row.version && latest !== row.latest) {
+        found.push({ subject: engine, problem: { state: 'attention',
+          detail: `Engine update available: ${engine} ${row.version} -> ${latest}. Run \`hub engines update --engine ${engine}\` (canary on RMTHZ, real smoke, then fleet rollout).` } });
+      }
+    }
+    this.sql.exec('INSERT OR REPLACE INTO engine_migrations VALUES (?,?,?)', 'engine_rollout_daily_v1', nowMs, JSON.stringify({ at: nowMs }));
+    return found.slice(0, 1);
   }
 }

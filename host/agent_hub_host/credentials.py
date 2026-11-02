@@ -17,7 +17,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from . import private_fs
@@ -162,7 +165,14 @@ def report_rejection(label, generation, reason, request):
 # ---------- Direct provider quota (replaces quse for managed accounts) ----------
 
 CODEX_USAGE = 'https://chatgpt.com/backend-api/wham/usage'
+CODEX_RESET_CREDITS = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
 CLAUDE_USAGE = 'https://api.anthropic.com/api/oauth/usage'
+GO_USAGE = 'https://opencode.ai/zen/go/v1/usage'
+GO_DEVICE_AUTH = Path('.local/share/opencode-hub/device-auth.json')
+ZAI_USAGE = 'https://api.z.ai/api/monitor/usage/quota/limit'
+ZAI_CONFIG = Path('.config/goz/config.json')
+AGY_TOKEN = Path('.gemini/antigravity-cli/antigravity-oauth-token')
+AGY_QUOTA = 'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary'
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -205,7 +215,7 @@ def _span(seconds, fallback):
     return '%ds' % seconds
 
 
-def codex_quota(body, now=None):
+def codex_quota(body, banked=None, banked_error=None, now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
     rl = body.get('rate_limit') if isinstance(body, dict) and isinstance(body.get('rate_limit'), dict) else {}
     present = [w for w in (rl.get('primary_window'), rl.get('secondary_window')) if isinstance(w, dict)]
@@ -216,7 +226,50 @@ def codex_quota(body, now=None):
         windows[name] = {'percent_remaining': _remaining(w.get('used_percent')), 'reset_at': _iso(w.get('reset_at')), 'present': True}
     weekly = windows['7d']
     limit = rl.get('limit_reached') is True or (weekly['present'] and weekly['percent_remaining'] == 0)
-    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limit}, 'windows': windows}
+    details = {'limit_reached': limit}
+    # A credits failure is explicit unknown (intake 7bf6f6ee): an empty grant
+    # list with this error must never read as "no banked resets".
+    if banked is not None or banked_error is not None:
+        details['banked_resets'] = banked if banked is not None else []
+        if banked_error is not None:
+            details['banked_resets_error'] = banked_error
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': details, 'windows': windows}
+
+
+def codex_banked(opener, headers, timeout=15):
+    """Read-only reset-credit probe: (grants, error).
+
+    Failures are explicit unknown, never an empty grant list mistaken for "no
+    resets". Only fixed reason codes travel; no provider output is retained.
+    """
+    try:
+        with opener.open(urllib.request.Request(CODEX_RESET_CREDITS, headers=headers, method='GET'), timeout=timeout) as response:
+            body = json.loads(response.read(131072))
+        if not isinstance(body, dict) or not isinstance(body.get('credits'), list):
+            return [], 'quota_invalid_response'
+        grants = []
+        for item in body['credits'][:32]:
+            if not isinstance(item, dict):
+                continue
+            expires = _iso(item.get('expires_at'))
+            if expires is None:
+                continue
+            label = item.get('title')
+            if not isinstance(label, str) or not label or not re.fullmatch(r'[A-Za-z0-9 ._-]{0,80}', label):
+                label = 'Full reset'
+            grants.append({'expires_at': expires, 'available': item.get('status') == 'available', 'label': label})
+        return grants, None
+    except urllib.error.HTTPError as error:
+        try:
+            error.close()
+        except Exception:
+            pass
+        if error.code in (401, 403, 429):
+            return [], 'quota_blocked'
+        return [], 'quota_http_%d' % error.code
+    except Exception:
+        # Exceptions may carry provider bodies or credential paths; report nothing.
+        return [], 'quota_unreachable'
 
 
 def claude_quota(body, now=None):
@@ -229,6 +282,135 @@ def claude_quota(body, now=None):
     windows = {'5h': win(body.get('five_hour')), '7d': win(body.get('seven_day'))}
     limit = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values())
     return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limit}, 'windows': windows}
+
+
+def go_quota(body, now=None):
+    """Map an OpenCode Go ``zen/go/v1/usage`` body (used percent) to the quota route shape."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    usage = body.get('usage') if isinstance(body, dict) and isinstance(body.get('usage'), dict) else None
+    if usage is None:
+        return None
+
+    def win(w, rolling=False):
+        if not isinstance(w, dict):
+            return {'percent_remaining': None, 'reset_at': None, 'present': False, 'rolling': rolling}
+        used = w.get('percent', w.get('usagePercent'))
+        return {'percent_remaining': _remaining(used), 'reset_at': _iso(w.get('resetsAt')), 'present': True, 'rolling': rolling}
+    windows = {'5h': win(usage.get('rolling'), True), '7d': win(usage.get('weekly')), 'monthly': win(usage.get('monthly'))}
+    limited = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values()) or any(
+        isinstance(usage.get(k), dict) and str(usage[k].get('status', '')).lower().replace('_', '-') in ('exhausted', 'limited', 'rate-limited')
+        for k in ('rolling', 'weekly', 'monthly'))
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limited}, 'windows': windows}
+
+
+def _go_access_token(home):
+    """Active OpenCode device-login access token from the Hub-materialized export."""
+    entries = json.loads(private_fs.read_bytes(Path(home) / GO_DEVICE_AUTH, MAX_FILE * 2, private=False))
+    active = [e for e in entries if isinstance(e, dict) and e.get('active') is True] if isinstance(entries, list) else []
+    value = active[0].get('value') if active else None
+    token = value.get('access') if isinstance(value, dict) else None
+    return token if isinstance(token, str) and token else None
+
+
+def zai_quota(body, now=None):
+    """Map a Z.AI ``monitor/usage/quota/limit`` body (used percent) to the quota route shape."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    data = body.get('data') if isinstance(body, dict) and isinstance(body.get('data'), dict) else body
+    limits = data.get('limits') if isinstance(data, dict) and isinstance(data.get('limits'), list) else None
+    if limits is None:
+        return None
+    windows = {'5h': {'percent_remaining': None, 'reset_at': None, 'present': False},
+               '7d': {'percent_remaining': None, 'reset_at': None, 'present': False}}
+    for item in limits:
+        if not isinstance(item, dict) or item.get('type') != 'TOKENS_LIMIT':
+            continue
+        name = {3: '5h', 6: '7d'}.get(item.get('unit'))
+        if name is None or windows[name]['present']:
+            continue
+        windows[name] = {'percent_remaining': _remaining(item.get('percentage', 0)),
+                         'reset_at': _iso(item.get('nextResetTime')), 'present': True}
+    if not any(w['present'] for w in windows.values()):
+        return None
+    limited = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values())
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limited}, 'windows': windows}
+
+
+def antigravity_quota(body, now=None):
+    """Map Antigravity ``retrieveUserQuotaSummary`` groups to the 5h/7d windows (tightest group wins)."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    groups = body.get('groups') if isinstance(body, dict) and isinstance(body.get('groups'), list) else None
+    if not groups:
+        return None
+    windows = {'5h': {'percent_remaining': None, 'reset_at': None, 'present': False},
+               '7d': {'percent_remaining': None, 'reset_at': None, 'present': False}}
+    for group in groups[:16]:
+        buckets = group.get('buckets') if isinstance(group, dict) and isinstance(group.get('buckets'), list) else []
+        for bucket in buckets[:16]:
+            if not isinstance(bucket, dict):
+                continue
+            name = {'5h': '5h', 'weekly': '7d'}.get(bucket.get('window'))
+            fraction = bucket.get('remainingFraction')
+            if name is None or isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+                continue
+            percent = max(0.0, min(100.0, float(fraction) * 100))
+            current = windows[name]
+            if not current['present'] or percent < current['percent_remaining']:
+                windows[name] = {'percent_remaining': percent, 'reset_at': _iso(bucket.get('resetTime')), 'present': True}
+    if not any(w['present'] for w in windows.values()):
+        return None
+    limited = any(w['present'] and w['percent_remaining'] == 0 for w in windows.values())
+    return {'status': 'ok', 'observed_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'details': {'limit_reached': limited}, 'windows': windows}
+
+
+def _zai_token(home):
+    """Plaintext Z.AI coding-plan key from the managed home; the ZCode app's encrypted store is not usable."""
+    config = json.loads(private_fs.read_bytes(Path(home) / ZAI_CONFIG, MAX_FILE * 2, private=False))
+    token = config.get('zai_token') if isinstance(config, dict) else None
+    if not isinstance(token, str) or not token or token.startswith('enc:') or any(c.isspace() for c in token):
+        return None
+    return token
+
+
+def _agy_read_token(home):
+    stored = json.loads(private_fs.read_bytes(Path(home) / AGY_TOKEN, MAX_FILE * 2, private=False))
+    token = stored.get('token') if isinstance(stored, dict) else None
+    if not isinstance(token, dict) or not isinstance(token.get('access_token'), str):
+        return None, None
+    expiry = None
+    if isinstance(token.get('expiry'), str):
+        try:
+            expiry = dt.datetime.fromisoformat(re.sub(r'(\.\d{6})\d+', r'\1', token['expiry'].replace('Z', '+00:00')))
+        except ValueError:
+            expiry = None
+    return token['access_token'], expiry if expiry is not None and expiry.tzinfo is not None else None
+
+
+def _agy_refresh(home, timeout=60):
+    """Let the pinned vendor binary refresh its own login (``agy models``: no inference).
+
+    The Antigravity OAuth application is not ours to embed; the engine rotates
+    the managed home's token itself and the host syncs it back to Hub.
+    """
+    binaries = sorted((Path(home).parent / 'engine' / 'bin').glob('agy*'))
+    if not binaries:
+        return
+    env = {k: os.environ[k] for k in ('PATH', 'SYSTEMROOT', 'TEMP', 'TMP') if k in os.environ}
+    env.update(HOME=str(home), USERPROFILE=str(home))
+    try:
+        subprocess.run([str(binaries[0]), 'models'], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _agy_access_token(home, now, refresh=_agy_refresh):
+    """Antigravity access token from the managed home, refreshed by the engine when expired."""
+    token, expiry = _agy_read_token(home)
+    if token is not None and expiry is not None and expiry > now + dt.timedelta(seconds=60):
+        return token
+    refresh(home)
+    token, expiry = _agy_read_token(home)
+    return token if token is not None and (expiry is None or expiry > now) else None
 
 
 def probe_quota(provider, home, opener=None, timeout=15):
@@ -247,17 +429,50 @@ def probe_quota(provider, home, opener=None, timeout=15):
                        'User-Agent': 'codex_cli_rs/0.162.1', 'originator': 'codex_cli_rs'}
             if isinstance(tokens.get('account_id'), str):
                 headers['ChatGPT-Account-Id'] = tokens['account_id']
-            url, parse = CODEX_USAGE, codex_quota
+            with opener.open(urllib.request.Request(CODEX_USAGE, headers=headers, method='GET'), timeout=timeout) as response:
+                body = json.loads(response.read(131072))
+            if not isinstance(body, dict):
+                return {}
+            banked, banked_error = codex_banked(opener, headers, timeout=timeout)
+            return {provider: codex_quota(body, banked=banked, banked_error=banked_error)}
         elif provider == 'claude':
             creds = json.loads(private_fs.read_bytes(home / '.claude' / '.credentials.json', MAX_FILE * 2, private=False))
             headers = {'Authorization': 'Bearer ' + creds['claudeAiOauth']['accessToken'], 'Accept': 'application/json',
                        'anthropic-beta': 'oauth-2025-04-20', 'User-Agent': 'Claude-Code/2.1.198'}
             url, parse = CLAUDE_USAGE, claude_quota
+        elif provider == 'go':
+            # OpenCode Go reads usage with the device-login access token. The
+            # endpoint rejects the default urllib agent (Cloudflare 1010).
+            token = _go_access_token(home)
+            if token is None:
+                return {}
+            headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json', 'User-Agent': 'opencode/1.19'}
+            url, parse = GO_USAGE, go_quota
+        elif provider == 'zai':
+            # Plaintext coding-plan key only: the ZCode app's encrypted store
+            # ("enc:...") cannot authenticate the monitor API.
+            token = _zai_token(home)
+            if token is None:
+                return {}
+            headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json', 'Content-Type': 'application/json',
+                       'User-Agent': 'agent-hub-quota/1'}
+            url, parse = ZAI_USAGE, zai_quota
+        elif provider == 'antigravity':
+            token = _agy_access_token(home, dt.datetime.now(dt.timezone.utc))
+            if token is None:
+                return {}
+            request = urllib.request.Request(AGY_QUOTA, data=b'{}', method='POST', headers={
+                'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'User-Agent': 'antigravity'})
+            with opener.open(request, timeout=timeout) as response:
+                body = json.loads(response.read(131072))
+            route = antigravity_quota(body) if isinstance(body, dict) else None
+            return {provider: route} if route else {}
         else:
             return {}
         with opener.open(urllib.request.Request(url, headers=headers, method='GET'), timeout=timeout) as response:
             body = json.loads(response.read(131072))
-        return {provider: parse(body)} if isinstance(body, dict) else {}
+        route = parse(body) if isinstance(body, dict) else None
+        return {provider: route} if route else {}
     except urllib.error.HTTPError as error:
         error.close()
         return {'unauthorized': True} if error.code == 401 else {}
@@ -316,6 +531,77 @@ def refresh_files(provider, files, opener=None, now=None):
     except Exception:
         return None
     return None
+
+
+CLAUDE_REDIRECT = 'https://platform.claude.com/oauth/code/callback'
+CLAUDE_PROFILE = 'https://api.anthropic.com/api/oauth/profile'
+_OAUTH_SLUG = re.compile(r'[a-z][a-z0-9_.-]{0,63}\Z')
+
+
+class LoginExchangeError(ValueError):
+    """A refused host-side code exchange: provider HTTP status + sanitized reason only."""
+
+    def __init__(self, provider_status, reason):
+        self.provider_status = provider_status
+        self.reason = reason
+        super().__init__('provider HTTP %s (%s)' % (provider_status if provider_status is not None else 'unreachable', reason))
+
+
+def exchange_login_code(pasted, exchange, opener=None, now=None):
+    """Host fallback for a Hub-central Claude login (intake 8ff6b3d8).
+
+    When Worker egress to the provider is blocked, Hub hands the CLI host the
+    PKCE verifier of the operator's own pending login; the host exchanges the
+    pasted code from its own network and returns credential files for upload.
+    Endpoints and client are pinned locally, never taken from the server.
+    Never raises or prints with token, code or verifier content.
+    """
+    opener = opener or urllib.request.build_opener(_NoRedirect())
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if not isinstance(exchange, dict) or not isinstance(exchange.get('code_verifier'), str) or not isinstance(exchange.get('state'), str):
+        raise LoginExchangeError(None, 'invalid_exchange')
+    if exchange.get('client_id', CLAUDE_CLIENT) != CLAUDE_CLIENT or exchange.get('redirect_uri', CLAUDE_REDIRECT) != CLAUDE_REDIRECT \
+            or exchange.get('token_url', CLAUDE_TOKEN) != CLAUDE_TOKEN:
+        raise LoginExchangeError(None, 'unexpected_provider_endpoint')
+    code, _, returned_state = pasted.strip().partition('#')
+    if not code or (returned_state and returned_state != exchange['state']):
+        raise LoginExchangeError(None, 'login_state_mismatch')
+    body = {'grant_type': 'authorization_code', 'code': code, 'state': exchange['state'], 'redirect_uri': CLAUDE_REDIRECT,
+            'client_id': CLAUDE_CLIENT, 'code_verifier': exchange['code_verifier']}
+    req = urllib.request.Request(CLAUDE_TOKEN, data=json.dumps(body).encode(), method='POST',
+                                 headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+    try:
+        with opener.open(req, timeout=20) as response:
+            tok = json.loads(response.read(65536))
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read(65536)).get('error')
+        except Exception:
+            err = None
+        raise LoginExchangeError(e.code, err if isinstance(err, str) and _OAUTH_SLUG.match(err) else 'http_%d' % e.code) from None
+    except Exception:
+        raise LoginExchangeError(None, 'provider_unreachable') from None
+    if not isinstance(tok, dict) or not isinstance(tok.get('access_token'), str):
+        raise LoginExchangeError(200, 'invalid_token_response')
+    oauth = {'accessToken': tok['access_token'], 'scopes': list(CLAUDE_SCOPES)}
+    if isinstance(tok.get('refresh_token'), str):
+        oauth['refreshToken'] = tok['refresh_token']
+    if isinstance(tok.get('expires_in'), (int, float)):
+        oauth['expiresAt'] = int(now.timestamp() * 1000 + tok['expires_in'] * 1000)
+    if isinstance(tok.get('scope'), str):
+        oauth['scopes'] = tok['scope'].split()
+    try:
+        preq = urllib.request.Request(CLAUDE_PROFILE, headers={'Authorization': 'Bearer ' + oauth['accessToken'], 'anthropic-beta': 'oauth-2025-04-20'})
+        with opener.open(preq, timeout=15) as response:
+            org = (json.loads(response.read(65536)) or {}).get('organization') or {}
+        sub = {'claude_max': 'max', 'claude_pro': 'pro'}.get(org.get('organization_type'))
+        if sub:
+            oauth['subscriptionType'] = sub
+        if isinstance(org.get('rate_limit_tier'), str):
+            oauth['rateLimitTier'] = org['rate_limit_tier']
+    except Exception:
+        pass
+    return {'.claude/.credentials.json': json.dumps({'claudeAiOauth': oauth})}
 
 
 def leased_refresh(label, bundle, home, request, opener=None):

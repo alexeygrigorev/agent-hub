@@ -14,6 +14,7 @@ smoke test restores the previous commit (the tree was clean, so nothing is
 lost) and keeps the running controller.
 """
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -55,10 +56,10 @@ class UpdateRefused(Exception):
         self.reason = reason
 
 
-def _run(run, argv, cwd, timeout, env=None):
+def _run(run, argv, cwd, timeout, env=None, umask=-1):
     result = run(argv, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                  stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace',
-                 timeout=timeout, env=env)
+                 timeout=timeout, env=env, umask=umask)
     return result.returncode, (result.stdout or '').strip()
 
 
@@ -71,6 +72,52 @@ def current_sha(root, run=subprocess.run):
         return None
     code, out = _git(run, root, 'rev-parse', 'HEAD', timeout=30)
     return out.lower() if code == 0 and SHA.match(out.lower()) else None
+
+
+def release_sha(package=None):
+    """Immutable releases carry build provenance rather than a .git directory."""
+    root = Path(package or __file__).resolve().parent.parent.parent
+    try:
+        manifest = json.loads((root / 'release-manifest.json').read_text(encoding='utf-8'))
+        sha = manifest.get('release_rev')
+        return sha.lower() if isinstance(sha, str) and SHA.fullmatch(sha.lower()) else None
+    except (OSError, ValueError, TypeError):
+        pass
+    # Zipapp and wheel distributions carry the build stamp instead.
+    try:
+        from . import _build_info
+        sha = _build_info.BUILD_COMMIT
+        return sha.lower() if isinstance(sha, str) and SHA.fullmatch(sha.lower()) else None
+    except (ImportError, AttributeError):
+        return None
+
+
+def ensure_windows_autostart(root, run=subprocess.run):
+    """Upgrade the existing user supervisor task; never request elevation."""
+    if sys.platform != 'win32':
+        return None
+    local = os.environ.get('LOCALAPPDATA')
+    if not local or root is None:
+        return 'wrapper_missing'
+    runner = Path(local) / 'agent-hub' / 'run-session-host.ps1'
+    script = Path(root) / 'scripts' / 'windows-host-autostart.ps1'
+    if not runner.is_file() or not script.is_file():
+        return 'wrapper_missing'
+    marker = runner.parent / 'autostart-version.sha256'
+    digest = hashlib.sha256(script.read_bytes()).hexdigest()
+    try:
+        if marker.read_text(encoding='ascii').strip() == digest:
+            return 'configured'
+    except (OSError, UnicodeError):
+        pass
+    try:
+        code, _ = _run(run, ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script), '-Runner', str(runner)], root, 90)
+        if code:
+            return 'registration_failed'
+        marker.write_text(digest + '\n', encoding='ascii')
+        return 'configured'
+    except (OSError, subprocess.SubprocessError):
+        return 'registration_failed'
 
 
 def _install_and_smoke(run, root, python):
@@ -126,26 +173,49 @@ def step_once(request, *, root=None, run=subprocess.run, python=None, log=print)
     target = (request('GET', '/api/fleet/routing/host-release') or {}).get('sha')
     target = target.lower() if isinstance(target, str) and SHA.match(target.lower()) else None
     if root is None:
-        state, error, sha = 'unsupported', 'not_a_git_checkout', None
+        sha = release_sha()
+        if sha and target and sha != target:
+            request('POST', '/api/fleet/routing/host-release/report', {'current_sha': sha, 'state': 'updating', 'error': None})
+            from .immutable_release import apply as apply_immutable
+            state, error, sha = apply_immutable(target, sha, request,
+                root=Path(__file__).resolve().parent.parent.parent, run=run, python=python)
+        else:
+            state, error = ('current', None) if sha else ('unsupported', 'release_provenance_missing')
     elif target is None:
         sha = current_sha(root, run)
         state, error = ('current', None) if sha else ('unsupported', 'not_a_git_checkout')
     else:
         state, error, sha = apply(target, root, run=run, python=python)
-    request('POST', '/api/fleet/routing/host-release/report', {'current_sha': sha, 'state': state, 'error': error})
+    report = {'current_sha': sha, 'state': state, 'error': error}
+    autostart = ensure_windows_autostart(root, run)
+    if autostart is not None:
+        report['autostart_state'] = autostart
+    request('POST', '/api/fleet/routing/host-release/report', report)
     log(json.dumps({'event': 'host_release', 'state': state, 'error': error, 'sha': sha}), flush=True)
     return state == 'updated'
 
 
-def loop(request, stop, *, root=None, interval=POLL_S, clock=time.monotonic):
+def loop(request, stop, *, root=None, interval=POLL_S, clock=time.monotonic, launcher_settings=None, log=print):
     """Daemon body: poll until an update lands, then set ``stop`` so the
     controller drains and exits; the supervisor restarts it on the new code."""
     while not stop.is_set():
         started = clock()
         try:
-            if step_once(request, root=root):
+            if step_once(request, root=root, log=log):
                 stop.set()
                 return
         except Exception as exc:
-            print(json.dumps({'event': 'host_release_error', 'type': type(exc).__name__}), flush=True)
+            log(json.dumps({'event': 'host_release_error', 'type': type(exc).__name__}), flush=True)
+        try:
+            from . import fleet, launcher_update
+            launcher_update.step_once(request, launcher_settings() if launcher_settings else fleet.load_settings())
+        except Exception as exc:
+            log(json.dumps({'event': 'launcher_release_error', 'type': type(exc).__name__}), flush=True)
+        try:
+            # Windows package installs are not checkouts: rerun the public
+            # installer when the served archive changes (intake bf0863c4).
+            from . import package_update
+            package_update.maybe_update()
+        except Exception as exc:
+            log(json.dumps({'event': 'package_update_error', 'type': type(exc).__name__}), flush=True)
         stop.wait(max(1.0, interval - (clock() - started)))

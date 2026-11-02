@@ -1,9 +1,12 @@
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { IdleWorkService } from './idle-work';
-import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
+import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
+import { liveQueuePolicy } from './intake-queue-policy';
+import { OpsLiveness } from './ops-liveness';
 import { IntakeTriage } from './intake-triage';
 import { IntakeVerifier } from './intake-verifier';
+import { AskLedger } from './asks';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
 import { RepoRegistry } from './repos';
 import { hostReconcileFact, validReconcileNative } from './host-reconcile';
@@ -34,7 +37,10 @@ import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
 import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { ProvisioningService } from './provisioning';
+import { hostRepositoryAccess } from './host-repo-access';
+import { hostRepositoryAuthorizer } from './host-repo-authority';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
+import { HostGoals } from './host-goals';
 import { BankedResets } from './banked-resets';
 import { ChecksService, validateCheck, type ActionDeps } from './checks';
 import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
@@ -49,11 +55,17 @@ import { MetricsStore, handleMetricsRoutes } from './metrics';
 import { MonitoringService } from './monitoring';
 import { BackupService } from './backup';
 import { WebhookService } from './webhooks';
+import { PromptLibraryService, SessionSchedulesService } from './scheduled_prompts';
+import { LaunchSchedulesService } from './launch_schedules';
 import { isValidMachineId } from './machine-id';
 import { HostHistoryService } from './host-history';
 import { HISTORY_RETENTION_MS } from './host-history';
 import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validateTokenPayload } from './token-history';
 import { placementPressureSubjects } from './host-pressure';
+import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
+
+const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
+const METER_FLUSH_INTERVAL_MS = 5 * 60_000;
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -122,8 +134,10 @@ export class Hub extends DurableObject {
   public intakeService: IntakeService;
   private workerAccess: WorkerAccess;
   public intakeWatchdog: IntakeWatchdog;
+  public opsLiveness: OpsLiveness;
   public intakeTriage: IntakeTriage;
   public intakeVerifier: IntakeVerifier;
+  public askLedger: AskLedger;
   public sessionAudit: SessionAuditService;
   public busService: BusService;
   public jobsService: JobsService;
@@ -140,14 +154,24 @@ export class Hub extends DurableObject {
   public backupService: BackupService;
   public hostHistoryService: HostHistoryService;
   public webhookService: WebhookService;
+  public promptLibrary: PromptLibraryService;
+  public sessionSchedules: SessionSchedulesService;
+  public launchSchedules: LaunchSchedulesService;
 
   private idleWork: IdleWorkService;
+  readonly meter = new RowsMeter();
+  private rowsAlertCheckedHour = -1;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
-    this.sql = ctx.storage.sql;
-    this.initDb();
+    // DO rows-read meter (intake 8081a05a): every cursor is attributed to
+    // the current alarm step / route scope and flushed once per alarm.
+    this.sql = this.meter.wrap(ctx.storage.sql);
+    this.meter.runSync('init:schema', () => {
+      this.initDb();
+      for (const stmt of ROWS_STATS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
+    });
 
     const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
     // M12b intake assignment (narrow seam, owned by platform-intake-live):
@@ -157,9 +181,10 @@ export class Hub extends DurableObject {
     // The closure resolves sessionControlService at call time (it is
     // constructed just below); intake records only the returned real id.
     this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn), {
+      queue: tasks => ({ items: this.intakeWatchdog.queue(tasks), observed_at: Date.now(), watchdog: this.intakeWatchdog.status() }),
       forgotten: tasks => {
         const items = this.intakeWatchdog.project(tasks).filter(t => t.forgotten);
-        return { items, forgotten_count: items.length, observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };
+        return { items, forgotten_count: items.length, unmerged: this.intakeService.mergeGate.counts(), observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };
       },
       startSession: async (input, auth) => {
         const res = await this.sessionControlService.handle(
@@ -222,6 +247,35 @@ export class Hub extends DurableObject {
       () => this.sessionControlService,
       validSessionSecret(this.env) ? this.env.SESSION_SECRET : null);
     this.webhookService.init();
+    // Prompt library + session schedules (intake 19ec91c2 AC8-AC10): schedules
+    // enqueue into the webhook delivery queue (same durable redelivery).
+    const txn = <T>(fn: () => T): T => this.ctx.storage.transactionSync(fn);
+    this.promptLibrary = new PromptLibraryService(this.sql, txn, Date.now);
+    this.promptLibrary.init();
+    this.webhookService.setPromptResolver(ref => this.promptLibrary.resolve(ref));
+    this.sessionSchedules = new SessionSchedulesService(this.sql, txn, Date.now, this.promptLibrary,
+      (source, sourceId, key, target, body) => this.webhookService.enqueueDelivery(source, sourceId, key, target, body),
+      (source, sourceId, key, target, body) => this.webhookService.insertDelivery(source, sourceId, key, target, body),
+      () => this.webhookService.pumpQueue());
+    // Cron launch schedules (intake a839dfb6): each due tick creates a Hub
+    // intake (source schedule) and starts the linked headless session through
+    // the canonical admission path below; placement/capacity gates are never
+    // bypassed, and tick outcomes land in the per-schedule run history.
+    this.launchSchedules = new LaunchSchedulesService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, {
+      createIntake: async payload => {
+        const r = await this.intakeService.handle(new Request('https://hub.internal/api/intake/tasks',
+          { method: 'POST', body: JSON.stringify(payload) }),
+          async () => ({ caller: { isAdmin: true, actor: 'hub:service:launch-schedules', kind: 'human' }, scopes: ['admin'] }));
+        return { status: r.status, body: await r.json() as any };
+      },
+      startSession: async input => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
+          { method: 'POST', body: JSON.stringify(input) }),
+          { caller: { isAdmin: true, actor: 'hub:service:launch-schedules', kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+    });
+    this.launchSchedules.init();
     this.idleWork = new IdleWorkService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.sessionControlService, env);
     this.idleWork.init();
     this.statusService.setSessionAttention(() => this.sessionControlService.attention());
@@ -232,6 +286,11 @@ export class Hub extends DurableObject {
     this.sql.exec('CREATE INDEX IF NOT EXISTS lifecycle_decision_latest ON session_lifecycle_decisions(session_key,created_at DESC,decision_id DESC)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS status_observation_latest ON status_observations(hub_session_id,kind,observed_at DESC,received_at DESC)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_fleet_lookup ON session_control_sessions(fleet_launch_id,machine_id)');
+    // Capacity fallback probes need only two live binding candidates. Exclude
+    // retained terminal controls before that limit, rather than scanning them.
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS session_control_capacity_binding
+      ON session_control_sessions(fleet_launch_id,machine_id,engine)
+      WHERE state IN ('running','uncertain') AND binding_json IS NOT NULL`);
     // Status attention reads only running sessions; avoid scanning retained prompts.
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_state ON session_control_sessions(state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native ON fleet_launches(machine_id,native_id)');
@@ -240,6 +299,7 @@ export class Hub extends DurableObject {
     this.provisioningService = new ProvisioningService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env, this.fleetService,
       (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller));
     this.provisioningService.init();
+    new HostGoals(this.sql, this.fleetService).init();
     // Hub-owned credentials (intake 5814e109): a provider rejection opens one
     // alert per account; the next successful provider read resolves it.
     const pendingCredentialAlerts: any[] = [];
@@ -271,12 +331,65 @@ export class Hub extends DurableObject {
     }
     this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
     this.livenessService.init();
+    // Ask ledger (intake 55c10deb): Alexey's verbatim messages -> asks -> intake AC
+    // lines. Its pass runs on the watchdog tick and its close gate sits beside
+    // DONE evidence and the worktree gate.
+    this.askLedger = new AskLedger(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
+      notify: async (kind, subject, detail) => {
+        const alert = this.livenessService.setAlert(kind, subject, detail === null ? null : { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
+        return !!alert;
+      },
+      start: async input => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
+          { method: 'POST', body: JSON.stringify(input) }),
+          { caller: { isAdmin: true, actor: 'hub:service:ask-reconciler', kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+      sessionState: id => (this.sql.exec('SELECT state FROM session_control_sessions WHERE id=?', id).toArray()[0] as any)?.state ?? null,
+      hostFresh: machineId => {
+        const m = this.sql.exec('SELECT last_checkin_at FROM machines WHERE id=?', machineId).toArray()[0] as any;
+        return !!m?.last_checkin_at && Date.now() - Date.parse(m.last_checkin_at) < 15 * 60000;
+      },
+    });
+    this.askLedger.init();
+    this.intakeService.addCloseGate((task, unverified) => this.askLedger.closeGate(task, unverified));
+    this.statusService.setAskSummary(() => this.askLedger.counts());
     this.intakeWatchdog = new IntakeWatchdog(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
+      policy: () => liveQueuePolicy(env as unknown as Record<string, unknown>, this.sql, this.fleetService),
+      asks: now => this.askLedger.tick(now),
+      asksDigest: () => this.askLedger.summaryLine(),
       start: async input => {
         const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
           { method: 'POST', body: JSON.stringify(input) }),
           { caller: { isAdmin: true, actor: 'hub:service:intake-watchdog', kind: 'human' }, scopes: ['admin'] });
         return { status: r.status, body: await r.json() as any };
+      },
+      observe: async id => {
+        const row: any = this.sql.exec('SELECT actor FROM session_control_sessions WHERE id=?', id).toArray()[0];
+        if (!row) return { status: 404, body: { error: 'not_found' } };
+        const r = await this.sessionControlService.handle(new Request(`https://hub.internal/api/sessions/${id}`),
+          { caller: { isAdmin: true, actor: row.actor, kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+      command: async (id, action, key) => {
+        const row: any = this.sql.exec('SELECT actor FROM session_control_sessions WHERE id=?', id).toArray()[0];
+        if (!row) return { status: 404, body: { error: 'not_found' } };
+        if (row.actor !== 'hub:service:intake-watchdog')
+          return { status: 403, body: { error: 'watchdog_session_not_owned' } };
+        // Canonical retry preserves the stored intent's actor/key; stop retains
+        // native-incarnation fences and requires the normal host exit receipt.
+        const r = await this.sessionControlService.handle(new Request(`https://hub.internal/api/sessions/${id}/${action}`,
+          { method: 'POST', body: JSON.stringify(action === 'retry' ? {} : { key }) }),
+          { caller: { isAdmin: true, actor: row.actor, kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+      note: async (task, text, key) => {
+        if ((task.history || []).some((e: any) => e.intake_key === key)) return true;
+        const r = await this.intakeService.handle(new Request(`https://hub.internal/api/intake/tasks/${task.id}/events`,
+          { method: 'POST', body: JSON.stringify({ key, expected_version: task.version, event: { kind: 'note', text } }) }),
+          async () => ({ caller: { isAdmin: true, actor: 'hub:service:intake-watchdog', kind: 'human' }, scopes: ['admin'] }));
+        return r.ok;
       },
       notify: async (kind, subject, detail) => {
         if (kind === 'intake_digest' && this.sql.exec('SELECT id FROM liveness_alerts WHERE subject_kind=? AND subject=? LIMIT 1', kind, subject).toArray().length) return false;
@@ -286,6 +399,20 @@ export class Hub extends DurableObject {
       },
     });
     this.intakeWatchdog.init();
+    // Independent orchestrator/backlog liveness (intake 500fd60b): Hub-side, so a dead
+    // ops session, dead host watchdog or dead host is still detected and work restarts.
+    this.opsLiveness = new OpsLiveness(this.sql, {
+      enabled: () => this.env.HUB_OPS_LIVENESS !== 'false',
+      queuePolicy: () => liveQueuePolicy(env as unknown as Record<string, unknown>, this.sql, this.fleetService),
+      kick: async () => this.env.HUB_BACKLOG_IDLE_KICK === 'false' ? { task_id: null, reason: 'idle_kick_disabled' } : this.intakeWatchdog.idleKick(),
+      holdReasons: () => Object.fromEntries((this.sql.exec("SELECT reason, COUNT(*) AS n FROM intake_restart_queue GROUP BY reason ORDER BY n DESC LIMIT 12").toArray() as any[]).map(r => [r.reason, r.n])),
+      alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('ops_liveness', subject, detail === null ? null : { state: 'recovery_failed', detail });
+        if (alert) await this.notifyAlert(alert);
+        return !!alert;
+      },
+    });
+    this.opsLiveness.init();
     // Hourly backlog triage (intake d8d509d2 AC5): one Claude Opus reviewer
     // session per slice of forgotten intakes, started through the canonical path.
     this.intakeTriage = new IntakeTriage(this.sql, this.intakeService, this.intakeWatchdog, fn => this.ctx.storage.transactionSync(fn), {
@@ -294,6 +421,11 @@ export class Hub extends DurableObject {
           { method: 'POST', body: JSON.stringify(input) }),
           { caller: { isAdmin: true, actor: 'hub:service:intake-triage', kind: 'human' }, scopes: ['admin'] });
         return { status: r.status, body: await r.json() as any };
+      },
+      // Intake 79458f2d: a refused or failed reviewer start is alerted once, never silent.
+      alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('intake_triage', subject, detail === null ? null : { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
       },
     });
     this.intakeTriage.init();
@@ -536,7 +668,10 @@ export class Hub extends DurableObject {
       last_heartbeat: 'JSON',
       drained: 'INTEGER DEFAULT 0',
       notes: 'TEXT',
-      approval_seq: 'INTEGER'
+      approval_seq: 'INTEGER',
+      revoked_at: 'TEXT',
+      revoked_reason: 'TEXT',
+      revoked_by: 'TEXT'
     });
 
     // R5 R2: server-owned enrollment authority migration.
@@ -595,7 +730,10 @@ export class Hub extends DurableObject {
       claim_source: 'TEXT',
       worktree: 'TEXT',
       session_state: 'TEXT',
-      native_claim_id: 'TEXT'
+      native_claim_id: 'TEXT',
+      // Full host-attested identity for worker releases; holder is a display
+      // address containing only an eight-hex native id prefix.
+      native_session_id: 'TEXT'
     });
 
     // If audit was upgraded from SPEC §6 where ts existed instead of at:
@@ -612,10 +750,47 @@ export class Hub extends DurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
+    let scope = 'route:?';
+    try { scope = 'route:' + normalizeRoute(request.method, new URL(request.url).pathname); } catch {}
+    try { return await this.meter.run(scope, () => this.routeFetch(request)); }
+    finally { this.maybeFlushRowsMeter(); }
+  }
+
+  private lastMeterFlush = 0;
+
+  /** Meter totals are persisted at most every 5 minutes (each flush writes one
+   * row per active scope). A hibernating DO can be evicted before its next
+   * alarm, so requests and WebSocket messages flush too, and the first call
+   * after a cold start flushes the constructor's schema reads at once. */
+  private maybeFlushRowsMeter() {
+    const now = Date.now();
+    if (now - this.lastMeterFlush < METER_FLUSH_INTERVAL_MS) return;
+    this.lastMeterFlush = now;
+    try { this.meter.flush(this.sql); } catch { console.warn('rows_meter_flush_failed'); }
+  }
+
+  private async routeFetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
-    
+    if (path === '/api/metrics/rows-read') {
+      const auth = await this.sessionControlAuth(request);
+      if (auth.error) return auth.error;
+      if (!(auth.caller as any)?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const hours = Number(url.searchParams.get('hours') || 24);
+      const report = rowsReadReport(this.sql, Date.now(), Number.isFinite(hours) ? hours : 24, this.meter.snapshot());
+      return Response.json({ ...report, statements: this.meter.statementTop(Math.min(100, Number(url.searchParams.get('statements')) || 30)), target_per_day: ROWS_READ_TARGET_PER_DAY, alert_per_day: rowsReadAlertThreshold(this.env), meter_started_at: new Date(this.meter.startedAt).toISOString() });
+    }
+
     try {
+      if (path === '/api/asks' || path.startsWith('/api/asks/')) {
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        const c: any = auth.caller;
+        const admin = !!c?.isAdmin && c.kind === 'human';
+        const host = !admin && c?.kind === 'host' && this.sessionControlService.hostObservationAllowed(c.machineId, c);
+        return this.askLedger.handle(request, admin || host ? { admin, actor: c.actor ?? (host ? 'host:' + c.machineId : 'admin'), machineId: host ? c.machineId : null } : null);
+      }
       if (path === '/api/intake' || path.startsWith('/api/intake/')) {
         return this.intakeService.handle(request, async () => {
           if (request.headers.has('Authorization') && request.headers.has('Cookie')) return { error: Response.json({ error: 'mixed_authority' }, { status: 403 }) };
@@ -809,10 +984,30 @@ export class Hub extends DurableObject {
       }
 
       if (path === '/api/agents' || path.startsWith('/api/agents/')) return this.handleAgentRegistry(request, path);
-      if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/')) {
+      if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/') || path === '/api/ops/heartbeat' || path === '/api/ops/liveness') {
         return this.handleWatchRoutes(request, path);
       }
+      if (path === '/api/host/repositories' || path === '/api/host/repositories/token') {
+        if (request.headers.has('Cookie')) return Response.json({ error: 'mixed_authority' }, { status: 403 });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        return hostRepositoryAccess(() => this.env.HOST_REPO_ACCESS_POLICY,
+          hostRepositoryAuthorizer(this.sql, auth.caller,
+            (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller)))(request);
+      }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
+        const url = new URL(request.url);
+        if (path === '/api/engines' && url.searchParams.getAll('view').length === 1 && url.searchParams.get('view') === 'worker') {
+          // Sanitized engine verification view (intake f28929eb): worker scope
+          // only. The operator engines surface (bundles, logins, credential
+          // metadata) stays admin-only behind the same path.
+          const auth = await this.authenticateBusRequest(request);
+          if (auth.error) return auth.error;
+          if (auth.caller?.kind !== 'agent' || !auth.scopes?.includes(WORKER_SCOPE)) {
+            return Response.json({ error: 'forbidden' }, { status: 403 });
+          }
+          return Response.json(this.quotaStore.getWorkerEnginesView(), { headers: { 'Cache-Control': 'private, no-store' } });
+        }
         return this.provisioningService.handle(request, await this.authenticateBusRequest(request));
       }
       if (path === '/api/repos' || path.startsWith('/api/repos/')) {
@@ -890,6 +1085,17 @@ export class Hub extends DurableObject {
         }
         return Response.json({ error: 'not_found' }, { status: 404 });
       }
+      // Native-session intake credentials: a scoped `worker:own-intake` credential for
+      // observed sessions (no fleet launch) with a server-verified intake link.
+      if (path === '/api/session-intake/credentials' || /^\/api\/sessions\/[0-9a-f-]{36}\/intake-credential$/.test(path)) {
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        if (path === '/api/session-intake/credentials') {
+          if (request.method !== 'GET') return Response.json({ error: 'not_found' }, { status: 404 });
+          return this.workerAccess.listNative(auth.caller, auth.scopes);
+        }
+        return this.workerAccess.issueNative(request, auth.caller, auth.scopes);
+      }
       if (path === '/api/session-messaging/credentials' || path.startsWith('/api/session-messaging/credentials/') ||
           /^\/api\/sessions\/[0-9a-f-]{36}\/messaging-credential$/.test(path)) {
         const auth = await this.authenticateBusRequest(request);
@@ -943,7 +1149,7 @@ export class Hub extends DurableObject {
       if (path === '/api/sessions' || path.startsWith('/api/sessions/') ||
           path === '/api/session-commands' || path.startsWith('/api/session-commands/')) {
         const result = await this.sessionControlService.handle(request, await this.sessionControlAuth(request));
-        if (request.method === 'POST' && /\/wakes?$/.test(path) && result.ok) {
+        if (request.method === 'POST' && /\/(wakes?|ping|ping-clear)$/.test(path) && result.ok) {
           // Commit the durable wake before arming the existing alarm. Never postpone
           // an earlier alarm owned by another Hub service.
           const current = await this.ctx.storage.getAlarm();
@@ -960,6 +1166,18 @@ export class Hub extends DurableObject {
       }
       if (path === '/webhooks' || path.startsWith('/webhooks/')) {
         return this.webhookService.handleIngest(request, path);
+      }
+      if (path === '/api/prompts' || path.startsWith('/api/prompts/')) {
+        return this.promptLibrary.handle(request, await this.sessionControlAuth(request));
+      }
+      if (path === '/api/session-schedules' || path.startsWith('/api/session-schedules/')) {
+        return this.sessionSchedules.handle(request, await this.sessionControlAuth(request));
+      }
+      // Cron launch schedules (intake a839dfb6). Admin management under
+      // /api/schedules with the same operator/cookie authority as webhooks;
+      // ticks run on the existing 5-minute checks cron.
+      if (path === '/api/schedules' || path.startsWith('/api/schedules/')) {
+        return this.launchSchedules.handle(request, await this.sessionControlAuth(request));
       }
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
@@ -1257,13 +1475,14 @@ export class Hub extends DurableObject {
           return Response.json({ error: 'Invalid payload' }, { status: 400 });
         }
         
-        const allowedScopes = ['host', 'bus:send', 'bus:read', 'health:report', 'jobs:create', 'lease:root', 'fleet:launch'];
+        const allowedScopes = ['host', 'bus:send', 'bus:read', 'health:report', 'jobs:create', 'lease:root', 'fleet:launch', 'repositories:read'];
         for (const scope of body.requested_scopes) {
           if (!allowedScopes.includes(scope)) {
             return Response.json({ error: 'invalid_scope' }, { status: 400 });
           }
         }
         if (body.client_kind === 'host' && body.requested_scopes.includes('fleet:launch')) return Response.json({ error: 'invalid_scope' }, { status: 400 });
+        if (body.client_kind !== 'host' && body.requested_scopes.includes('repositories:read')) return Response.json({ error: 'invalid_scope' }, { status: 400 });
         
         if (body.requested_scopes.includes('lease:root') || body.requested_scopes.includes('jobs:create') || (body.client_kind === 'agent' && body.requested_scopes.includes('host'))) return Response.json({ error: 'invalid_scope' }, { status: 400 });
         
@@ -1425,6 +1644,7 @@ export class Hub extends DurableObject {
               this.sql.exec("UPDATE device_pairings SET status = 'consumed' WHERE device_code_hash = ?", deviceCodeHash);
               return { expires, scopes: ['admin'] as string[], machineId: null as string | null };
             }
+            if (current.client_kind === 'host' && current.machine_id && this.sql.exec('SELECT 1 FROM machines WHERE id = ? AND revoked_at IS NOT NULL', current.machine_id).toArray().length) return null;
             const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
             this.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, approval_seq)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, credId, current.client_kind, tokens.accessHash, tokens.refreshHash, familyId, current.name, current.machine_id, current.actor, current.granted_scopes, current.approved_by_sub, new Date().toISOString(), expires, issuanceSeq);
@@ -1455,7 +1675,7 @@ export class Hub extends DurableObject {
           if (state !== 'pending') return new Response(deviceResult(state, session.email), {headers:UI_HEADERS});
           return new Response(deviceReviewHuman(pairing, session.email, Date.now()), {headers:UI_HEADERS});
         }
-        const machines = this.sql.exec('SELECT id, name FROM machines WHERE registered_at IS NOT NULL ORDER BY id').toArray() as any[];
+        const machines = this.sql.exec('SELECT id, name FROM machines WHERE registered_at IS NOT NULL AND revoked_at IS NULL ORDER BY id').toArray() as any[];
         let address = registryAddress(pairing.actor || '');
         if (address && !address.project) {
           const registered = this.sql.exec('SELECT project FROM agents WHERE tag = ?', address.tag).toArray() as any[];
@@ -1468,6 +1688,20 @@ export class Hub extends DurableObject {
           ? deviceReview(pairing, session.email, address, registeredMachine, machines, Date.now(), displayedActor)
           : deviceResult(state, session.email);
         return new Response(html, {headers:UI_HEADERS});
+      }
+
+      // Operator listing of pending host/agent pairings registered by
+      // /api/device/code, so a code printed to an invisible console is still
+      // discoverable. Admin only; the device secret hash is never returned.
+      if (path === '/api/device/pending') {
+        if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        if (!auth.caller?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+        const rows = this.sql.exec(
+          "SELECT user_code, client_kind, name, hostname, ip_country, requested_scopes, created_at, expires_at FROM device_pairings WHERE status = 'pending' AND client_kind != 'human' AND expires_at > ? ORDER BY created_at DESC LIMIT 50",
+          new Date().toISOString()).toArray();
+        return Response.json({ pending: rows });
       }
 
       if (path.startsWith('/api/device/approve') || path.startsWith('/api/device/deny') || path.startsWith('/api/device/info')) {
@@ -2014,7 +2248,14 @@ export class Hub extends DurableObject {
       const result = this.livenessService.recordHeartbeat(caller.actor, caller.machineId ?? null, await safeJson(request));
       return 'error' in result ? json(result, 400) : json({ status: 'recorded' });
     }
+    if (path === '/api/ops/heartbeat') {
+      if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+      if (!admin && !(caller.kind === 'agent' && auth.scopes?.includes('health:report'))) return json({ error: 'forbidden' }, 403);
+      const result = this.opsLiveness.record(await safeJson(request));
+      return 'error' in result ? json(result, 400) : json({ status: 'recorded', ops: this.opsLiveness.status() });
+    }
     if (!admin) return json({ error: 'forbidden' }, 403);
+    if (path === '/api/ops/liveness' && request.method === 'GET') return json(this.opsLiveness.status());
     if (path === '/api/liveness' && request.method === 'GET') {
       // Read one subject's retained history even when newer open alerts fill
       // the default page. A history read never reconciles or resolves alerts.
@@ -2060,7 +2301,7 @@ export class Hub extends DurableObject {
     for (const to of targets) {
       if (delivered.has('inbox:' + to)) continue;
       try {
-        this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: `alert-${alert.id}-${to}-${Date.now()}` });
+        this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: `alert-${alert.id}-${to}` });
         delivered.add('inbox:' + to);
       } catch (e: any) { errors.push(`${to}: ${String(e?.message || e).slice(0, 80)}`); }
     }
@@ -2076,7 +2317,7 @@ export class Hub extends DurableObject {
     // A delivered informational digest is not an ongoing incident. Preserve its
     // receipt/history, but keep it out of the unresolved incident queue. Failed
     // targets stay open for the ordinary retry path.
-    if (alert.subject_kind === 'intake_digest' && anyTarget && !errors.length) {
+    if (['intake_digest', 'host_recovery'].includes(alert.subject_kind) && anyTarget && !errors.length) {
       this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
     }
     return { delivered: [...delivered], errors };
@@ -2095,11 +2336,36 @@ export class Hub extends DurableObject {
   }
 
   async runChecks(only?: string) {
-    this.runTbmTick();
-    if (!only) await this.maintainCredentials();
-    for (const alert of new BankedResets(this.sql, this.livenessService).run()) await this.notifyAlert(alert);
-    this.livenessService.prune();
-    const results = await this.checksService.runDue({
+    try { return await this.meter.run('rpc:runChecks', () => this.runChecksMetered(only)); } finally { this.maybeFlushRowsMeter(); }
+  }
+
+  private async runChecksMetered(only?: string) {
+    const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('checks:' + step, fn);
+    // Cron launch schedules (intake a839dfb6): due ticks create intakes and
+    // enqueue sessions through the canonical admission path. Runs on both
+    // crons (every 5 minutes); a manual single-check run never fires them.
+    if (!only) {
+      try { await m('session_schedules', () => this.sessionSchedules.tick()); }
+      catch { console.warn('session_schedule_tick_failed'); }
+      try { await m('launch_schedules', () => this.launchSchedules.tick('cron')); }
+      catch { console.warn('launch_schedule_tick_failed'); }
+    }
+    for (const alert of await m('watch_hosts', () => this.livenessService.watchHosts())) await this.notifyAlert(alert);
+    await m('host_goals', () => new HostGoals(this.sql, this.fleetService).reconcile());
+    await m('tbm', () => this.runTbmTick());
+    // A10 (290b935a/55c10deb): the 5-min slot starts the ask reconciler when new asks wait.
+    if (!only) { try { await m('ask_reconcile', () => this.askLedger.reconcileDue()); } catch (e) { console.error('ask reconcile', e); } }
+    if (!only) await m('credentials', () => this.maintainCredentials());
+    // Engine rollout daily check (intake 8cc9e31a AC1): compares upstream
+    // latest vs desired pins; at most one actionable alert per day. Runs on
+    // the 5-minute cron but rate-limits internally to ~daily.
+    if (!only) for (const p of await m('engine_rollout', () => this.provisioningService.tickEngineRollout())) {
+      const alert = this.livenessService.setAlert('engine_rollout', p.subject, p.problem);
+      if (alert) await this.notifyAlert(alert);
+    }
+    for (const alert of await m('banked_resets', () => new BankedResets(this.sql, this.livenessService).run())) await this.notifyAlert(alert);
+    await m('liveness_prune', () => this.livenessService.prune());
+    const results = await m('run_due', () => this.checksService.runDue({
       liveness: this.livenessService,
       notify: alert => this.notifyAlert(alert).then(() => undefined),
       message: async (to, body, key) => this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body, idempotencyKey: 'check-' + key }).id,
@@ -2113,20 +2379,25 @@ export class Hub extends DurableObject {
       fetch: (url, init) => fetch(url, init),
       evaluateQuota: () => dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => this.fleetService.accountStatus(a)),
       ...this.extraCheckDeps(),
-    }, only);
+    }, only));
     // Retry alerts whose delivery failed or had no target yet, at most every 15 minutes each.
     for (const alert of this.livenessService.undelivered(900)) await this.notifyAlert(alert);
     return results;
   }
 
   async scheduledTick(slotOverride?: string, source = 'scheduled') {
+    try { return await this.meter.run('tick:' + source, () => this.scheduledTickMetered(slotOverride, source)); } finally { this.maybeFlushRowsMeter(); }
+  }
+
+  private async scheduledTickMetered(slotOverride?: string, source = 'scheduled') {
+    const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('tick:' + step, fn);
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
     // 1. Bus retention cleanup
-    const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
+    const cleanup = await m('bus_retention', () => this.busService.retentionCleanup(now.getTime(), 100));
 
     // 1b. Webhook delivery pump (intake 19ec91c2): safety net beside the DO
     // alarm so queued deliveries also advance on the cron cadence.
-    try { await this.webhookService.pump(); } catch { console.warn('webhook_delivery_pump_failed'); }
+    try { await m('webhooks', () => this.webhookService.pump()); } catch { console.warn('webhook_delivery_pump_failed'); }
 
     // 2. Jobs root slot tick
     let slotDate: Date;
@@ -2178,23 +2449,31 @@ export class Hub extends DurableObject {
       return { status: 'refused', reason: 'future_slot_refused', slot: slotDate.toISOString() };
     }
 
-    await this.idleWork.tick();
+    await m('idle_work', () => this.idleWorkTick());
     // The verifier registers fresh DONE claims first, so the watchdog never alerts
     // a person about a completion the verifier owns (AC8).
     let intakeVerifier: any;
-    try { intakeVerifier = await this.intakeVerifier.tick(source); }
+    try { intakeVerifier = await m('intake_verifier', () => this.intakeVerifier.tick(source)); }
     catch (e: any) { intakeVerifier = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
-    const intakeWatchdog = await this.intakeWatchdog.tick(source);
+    const intakeWatchdog = await m('intake_watchdog', () => this.intakeWatchdog.tick(source));
     // The audit must never break the scheduler slot for the jobs/watchdog;
     // failures surface in the tick result and the next run retries.
     let sessionAudit: any;
-    try { sessionAudit = await this.sessionAudit.tick(source); }
+    try { sessionAudit = await m('session_audit', () => this.sessionAudit.tick(source)); }
     catch (e: any) { sessionAudit = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     let intakeTriage: any;
-    try { intakeTriage = await this.intakeTriage.tick(source); }
+    try { intakeTriage = await m('intake_triage', () => this.intakeTriage.tick(source)); }
     catch (e: any) { intakeTriage = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
+    // Merge gate (2e00e01f): unmerged intakes idle >= 60 min are flagged and requeued.
+    let mergeGate: any;
+    try {
+      mergeGate = await this.intakeService.mergeGateRun({ alert: async (subject, detail) => {
+        const alert = this.livenessService.setAlert('intake_unmerged', subject, detail === null ? null : { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
+      } });
+    } catch (e: any) { mergeGate = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     const slotStartIso = slotDate.toISOString();
-    const tickResult = this.jobsService.tickRootSlot(slotStartIso);
+    const tickResult = await m('root_slot', () => this.jobsService.tickRootSlot(slotStartIso));
 
     // 3. Process alarms & expiry
     const nextAlarm = this.jobsService.processAlarms();
@@ -2216,7 +2495,7 @@ export class Hub extends DurableObject {
       }
     }
 
-    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit, intake_triage: intakeTriage, intake_verifier: intakeVerifier };
+    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit, intake_triage: intakeTriage, intake_verifier: intakeVerifier, merge_gate: mergeGate };
   }
 
   async sampleHostHistory() {
@@ -2239,41 +2518,92 @@ export class Hub extends DurableObject {
   }
 
   async alarm() {
+    // Every step is metered (intake 8081a05a); totals flush once per alarm.
+    const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('alarm:' + step, fn);
+    try { await m('intake_watchdog', () => this.intakeWatchdog.tick('alarm')); } catch { console.warn('intake_queue_tick_failed'); }
+    try { await m('ops_liveness', () => this.opsLiveness.tick()); } catch { console.warn('ops_liveness_tick_failed'); }
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
-    this.ctx.storage.transactionSync(() => {
+    await m('expire_messages', () => this.ctx.storage.transactionSync(() => {
       expireSessionMessages(this.sql, now.getTime());
       expireMessageEvents(this.sql, now.getTime());
-    });
-    this.runTbmTick(now.getTime());
+    }));
+    await m('tbm', () => this.runTbmTick(now.getTime()));
     // Reuse the existing minute alarm so configured idle delays do not wait
     // for a root slot. Durable episode/command keys fence duplicate delivery.
-    try { await this.idleWork.tick(); } catch { console.warn('idle_work_tick_failed'); }
-    try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
-    const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
-    let nextAlarm = this.jobsService.processAlarms();
+    try { await m('idle_work', () => this.idleWorkTick()); } catch { console.warn('idle_work_tick_failed'); }
+    try { await m('host_history', () => this.hostHistoryService.sample()); } catch { console.warn('resource_history_sampling_failed'); }
+    const cleanup = await m('bus_retention', () => this.busService.retentionCleanup(now.getTime(), 100));
+    let nextAlarm = await m('jobs_alarms', () => this.jobsService.processAlarms());
     // Webhook delivery pump (intake 19ec91c2): pending redeliveries pull the
     // next alarm forward so a returning session is served without waiting
     // for the full cadence.
     try {
-      const webhookNext = await this.webhookService.pump();
+      const webhookNext = await m('webhooks', () => this.webhookService.pump());
       if (webhookNext !== undefined) {
         const current = nextAlarm ?? undefined;
         nextAlarm = current === undefined ? webhookNext : Math.min(current, webhookNext);
       }
     } catch { console.warn('webhook_delivery_pump_failed'); }
     try {
-      this.ctx.storage.transactionSync(() => {
+      await m('due_wakes', () => this.ctx.storage.transactionSync(() => {
         try { (this.sessionControlService as any).processDueWakes?.(); } catch {}
-      });
+      }));
     } catch {}
+    try { await this.flushRowsMeter(); } catch { console.warn('rows_meter_flush_failed'); }
 
-    if (cleanup.hasMore) {
+    // A backlog drains fast, but a stuck hasMore must never pin the DO to a
+    // 1s alarm forever: at most 30 consecutive 1s re-arms, then the minute cadence.
+    this.fastRearms = cleanup.hasMore ? this.fastRearms + 1 : 0;
+    if (cleanup.hasMore && this.fastRearms <= 30) {
       await this.ctx.storage.setAlarm(Date.now() + 1000);
     } else {
+      if (cleanup.hasMore) console.warn(JSON.stringify({ event: 'bus_retention_rearm_capped', consecutive: this.fastRearms }));
       try {
         await this.ctx.storage.setAlarm(Math.max(Date.now(), Math.min(nextAlarm || Infinity, Date.now() + 60000)));
       } catch {}
     }
+  }
+
+  private fastRearms = 0;
+  private idleWorkAt = 0;
+
+  /** Idle recovery acts on 30-minute nudge delays, so a census at most every
+   * 5 minutes is enough; the minute alarm used to rerun it (intake 8081a05a).
+   * The gate is in memory and on the wall clock: a cold start runs a census at
+   * once, and HUB_IDLE_OPEN_AC_NUDGE_MINUTES below 5 acts within ~5 minutes. */
+  private async idleWorkTick() {
+    const now = Date.now();
+    if (now - this.idleWorkAt < IDLE_WORK_INTERVAL_MS) return;
+    this.idleWorkAt = now;
+    await this.idleWork.tick();
+  }
+
+  /** Persist meter totals; once per hour compare the last full hour, x24,
+   * with the rows-read/day budget (AC: alert at 20,000/day) and open or resolve
+   * a liveness alert. An open alert notifies once; later hours only refresh its
+   * projected number and top scopes until the budget is met and it resolves. */
+  private async flushRowsMeter() {
+    // The hourly budget check is independent of the flush gate: request and
+    // WebSocket flushes share lastMeterFlush and would otherwise starve it.
+    const now = Date.now(), hour = Math.floor(now / 3_600_000);
+    const checkDue = hour !== this.rowsAlertCheckedHour;
+    if (checkDue || now - this.lastMeterFlush >= METER_FLUSH_INTERVAL_MS) {
+      this.lastMeterFlush = now;
+      this.meter.flush(this.sql);
+    }
+    if (!checkDue) return;
+    this.rowsAlertCheckedHour = hour;
+    const alert = this.meter.runSync('meter:alert', () => {
+      const report = rowsReadReport(this.sql, Date.now(), 2);
+      const projected = report.projected_rows_read_per_day;
+      if (projected === null) return null;
+      const limit = rowsReadAlertThreshold(this.env);
+      const top = report.scopes.slice(0, 3).map(s => `${s.scope}=${s.rows_read}`).join(', ');
+      return this.livenessService.setAlert('do_rows_read_budget', 'hub', projected > limit
+        ? { state: 'over_budget', detail: `DO rows read projected ${projected}/day (last full hour x24) > budget ${limit}/day; top: ${top}` }
+        : null);
+    });
+    if (alert) await this.notifyAlert(alert);
   }
 
   /** M12e session control auth (narrow seam, owned by platform-session-api-r2):
@@ -2413,7 +2743,7 @@ export class Hub extends DurableObject {
     }
 
     if (scopes.includes(WORKER_SCOPE) && !workerRequestAllowed(this.sql, request, cred.id)) {
-      return { error: Response.json({ error: 'worker_scope_forbidden' }, { status: 403 }) };
+      return { error: Response.json({ error: workerDenialCode(this.sql, request, cred.id) }, { status: 403 }) };
     }
 
     const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
@@ -3011,17 +3341,17 @@ export class Hub extends DurableObject {
           const existingId = liveByScope.get(scope);
           if (existingId) {
             this.sql.exec(
-              'UPDATE claims SET project = ?, holder = ?, expires_at = ?, work_key = ?, claim_mode = ?, worktree = ?, session_state = ? WHERE id = ?',
+              'UPDATE claims SET project = ?, holder = ?, expires_at = ?, work_key = ?, claim_mode = ?, worktree = ?, session_state = ?, native_session_id = ? WHERE id = ?',
               clean.project, actor, expiresAt, clean.work_key, clean.mode,
-              typeof clean.worktree === 'string' ? clean.worktree : null, stateValue, existingId,
+              typeof clean.worktree === 'string' ? clean.worktree : null, stateValue, clean.holder.session_id, existingId,
             );
           } else {
             this.sql.exec(
-              "INSERT INTO claims (id, project, scope, holder, created_at, expires_at, released_at, work_key, claim_mode, claim_source, worktree, session_state, native_claim_id) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 'native', ?, ?, ?)",
+              "INSERT INTO claims (id, project, scope, holder, created_at, expires_at, released_at, work_key, claim_mode, claim_source, worktree, session_state, native_claim_id, native_session_id) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 'native', ?, ?, ?, ?)",
               generateUlid(now), clean.project, redactedScope, actor, now, expiresAt,
               clean.work_key, clean.mode,
               typeof clean.worktree === 'string' ? String(redactForBus(clean.worktree)) : null,
-              stateValue, clean.claim_id,
+              stateValue, clean.claim_id, clean.holder.session_id,
             );
           }
           syncedClaims++;
@@ -3291,7 +3621,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin') && !auth.scopes?.includes(WORKER_SCOPE)) {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
@@ -3310,6 +3640,7 @@ export class Hub extends DurableObject {
       }
 
       try {
+        if (auth.scopes?.includes(WORKER_SCOPE)) return this.workerAccess.releaseClaim(auth.caller!, target);
         this.busService.releaseClaim(auth.caller!, target, Date.now(), leaseEpoch);
         return Response.json({ status: 'ok' });
       } catch (e: any) {
@@ -4398,14 +4729,14 @@ export class Hub extends DurableObject {
   }
 
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    handleWebSocketMessageRegistry(ws, message, this.sql);
+    try { return this.meter.runSync('ws:message', () => handleWebSocketMessageRegistry(ws, message, this.sql)); } finally { this.maybeFlushRowsMeter(); }
   }
 
   webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
-    handleWebSocketCloseRegistry(ws, this.sql);
+    try { return this.meter.runSync('ws:close', () => handleWebSocketCloseRegistry(ws, this.sql)); } finally { this.maybeFlushRowsMeter(); }
   }
 
   webSocketError(ws: WebSocket, error: any) {
-    handleWebSocketCloseRegistry(ws, this.sql);
+    try { return this.meter.runSync('ws:error', () => handleWebSocketCloseRegistry(ws, this.sql)); } finally { this.maybeFlushRowsMeter(); }
   }
 }

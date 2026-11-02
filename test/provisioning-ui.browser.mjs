@@ -6,7 +6,7 @@ import { launchBrowser } from './playwright.mjs';
 import {readFile,mkdir} from 'node:fs/promises';
 import {resolve,extname} from 'node:path';
 const root=resolve(import.meta.dirname,'..');
-const bundle=await build({entryPoints:[resolve(root,'test/provisioning-docker-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers']});
+const bundle=await build({entryPoints:[resolve(root,'test/provisioning-docker-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers','node:async_hooks']});
 const mime={'.html':'text/html','.css':'text/css','.js':'text/javascript','.woff2':'font/woff2'};
 const mf=new Miniflare(convertV4MiniflareOptions({host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{
  name:'provisioning-ui-local',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',compatibilityFlags:['nodejs_compat'],durableObjects:{HUB:{className:'Hub',useSQLite:true}},bindings:{SESSION_SECRET:'synthetic-browser-only-session-secret-32',HUB_ADMINS:'admin@fake.local',AUTH_BASE_URL:'https://auth.fake.local',AUTH_CALLBACK_URL:'https://auth.fake.local/auth/callback',AUTH_CLIENT_ID:'local-only'},

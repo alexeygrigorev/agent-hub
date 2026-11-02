@@ -17,7 +17,7 @@ if(nativeWorkspace) {
 }
 const tag=own?.tag||'browser-worker',actor='pair-local:'+tag;
 const key=randomBytes(32).toString('hex'),secret=randomBytes(32).toString('hex');
-const bundled=await build({entryPoints:[resolve(root,'test/machine-pairing-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers']});
+const bundled=await build({entryPoints:[resolve(root,'test/machine-pairing-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers','node:async_hooks']});
 const mime={'.css':'text/css','.js':'text/javascript','.woff2':'font/woff2'};
 const mf=new Miniflare(convertV4MiniflareOptions({host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{
  name:'machine-pairing-local',script:bundled.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',compatibilityFlags:['nodejs_compat'],

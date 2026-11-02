@@ -136,3 +136,40 @@ class TestGetAvailableMachinesAuth(unittest.TestCase):
             api.get_available_machines("https://hub.invalid")
         self.assertIn("500", str(ctx.exception))
         mock_refresh.assert_not_called()
+
+
+def test_hub_opener_ignores_environment_proxy(monkeypatch):
+    import urllib.request
+    monkeypatch.setenv('HTTPS_PROXY', 'http://127.0.0.1:1')
+    monkeypatch.setenv('HTTP_PROXY', 'http://127.0.0.1:1')
+    from agent_hub_host import api
+    handlers = [h for h in api._get_opener().handlers if isinstance(h, urllib.request.ProxyHandler)]
+    assert all(not h.proxies for h in handlers)  # empty ProxyHandler registers no *_open methods
+
+
+def test_hub_unreachable_guard_logs_once_with_suspect(monkeypatch):
+    import socket
+    import urllib.error
+    from agent_hub_host import api
+    api._note_hub_success()
+    monkeypatch.setenv('HTTPS_PROXY', 'http://127.0.0.1:8899')
+    lines = []
+    err = urllib.error.URLError(ConnectionRefusedError(10061, 'refused'))
+    assert not api._note_hub_failure(err, now=1000.0, emit=lines.append)
+    assert not api._note_hub_failure(err, now=1100.0, emit=lines.append)
+    assert api._note_hub_failure(err, now=1121.0, emit=lines.append)
+    assert not api._note_hub_failure(err, now=1200.0, emit=lines.append)
+    assert len(lines) == 1 and 'HTTPS_PROXY' in lines[0] and 'refused' in lines[0] and '8899' not in lines[0]
+    api._note_hub_success()
+    assert api._hub_outage['since'] is None
+    dns = urllib.error.URLError(socket.gaierror(11001, 'no host'))
+    assert 'DNS' in api.hub_unreachable_suspect(dns)
+
+
+def test_package_import_adds_hub_to_no_proxy():
+    from agent_hub_host import ensure_hub_no_proxy
+    env = {'NO_PROXY': 'localhost'}
+    ensure_hub_no_proxy(env)
+    ensure_hub_no_proxy(env)
+    assert env['NO_PROXY'] == 'localhost,hub.dtcdev.click,.dtcdev.click'
+    assert env['no_proxy'] == 'hub.dtcdev.click,.dtcdev.click'

@@ -56,7 +56,11 @@ hub repos edit dtc-website --file human-fields.json
 ```
 
 The edit file is a JSON object containing any of `label`, `aliases` (string array),
-`purpose`, `stack`, `key_folders`, `urls`. Edit/seed require an operator. A host can
+`purpose`, `stack`, `key_folders`, `urls`, `status`, and `canonical`. For example,
+`{"status":"duplicate","canonical":"dtc-website"}` marks an entry as a duplicate.
+The target must already exist and be active; self-links, missing/inactive targets,
+and duplicate cycles are rejected without changing the entry. Setting status to
+`active` or `archived` clears its canonical link. Edit/seed require an operator. A host can
 refresh only entries owned by its authenticated machine. Authorized host and
 agent readers can list/show. API routes are `GET /api/repos`,
 `GET /api/repos/{name}`, `PATCH /api/repos/{name}`, `POST /api/repos/seed`,

@@ -63,6 +63,18 @@ class BoundaryTests(unittest.TestCase):
         self.commit()
         self.assertTrue(self.check())
 
+    def test_aplexer_runtime_release_url_is_not_a_pocketshell_package(self):
+        def patch_for(code):
+            return '+++ b/host/bootstrap.py\n@@ -0,0 +1 @@\n+' + code
+        url = 'https://github.com/PocketShell-io/aplexer/releases/download/v1/runtime'
+        self.assertEqual(g.hits('hub', patch_for('download("' + url + '")')), [])
+        for code in ('download("' + url + '"); import "pocketshell-client";',
+                     'download("https://github.com/PocketShell-io/aplexer-other/runtime")',
+                     'download("https://github.com/PocketShell-io/pocketshell/runtime")',
+                     'download("https://other.test/PocketShell-io/aplexer/runtime")'):
+            with self.subTest(code=code):
+                self.assertTrue(g.hits('hub', patch_for(code)))
+
     def test_skip_ci_and_reverted_intermediate_commit_fail(self):
         self.write('src/proxy.ts', 'import "ssh2";\n')
         self.commit('proxy [skip ci]')

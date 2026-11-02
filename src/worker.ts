@@ -87,7 +87,25 @@ export default {
     // Public CLI installer seam (server routing only; CLI worker owns artifacts).
     // Anonymous READ ONLY for exactly these static assets; nothing else under
     // /cli/ is exposed and no API/static private artifact is opened up.
-    if (url.pathname === '/cli/install.sh' || url.pathname === '/cli/install.ps1' || url.pathname === '/cli/hub.pyz' ||
+    // Short one-liner aliases: irm .../host/install.ps1 | iex, curl .../host/install.sh | sh.
+    const HOST_ALIASES: Record<string, string> = { '/host/install.ps1': '/cli/host-install.ps1', '/host/install.sh': '/cli/host-install.sh' };
+    const hostAlias = HOST_ALIASES[url.pathname];
+    if (hostAlias) {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
+      }
+      if (!env.ASSETS) return new Response('Not found', { status: 404 });
+      const target = new URL(url);
+      target.pathname = hostAlias;
+      const asset = await env.ASSETS.fetch(new Request(target, request));
+      if (!asset.ok) return new Response('Not found', { status: 404 });
+      const headers = new Headers(asset.headers);
+      headers.set('Cache-Control', 'public, max-age=300');
+      headers.set('X-Content-Type-Options', 'nosniff');
+      return new Response(asset.body, { status: asset.status, headers });
+    }
+    if (url.pathname === '/cli/install.sh' || url.pathname === '/cli/install.ps1' ||
+        url.pathname === '/cli/host-install.sh' || url.pathname === '/cli/host-install.ps1' || url.pathname === '/cli/hub.pyz' ||
         url.pathname === '/cli/hub.pyz.sha256' || url.pathname === '/cli/manifest.json') {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
@@ -117,11 +135,15 @@ export default {
       '/inbox', '/inbox.html', '/inbox.js', '/inbox.css',
       '/fleet', '/fleet.html', '/fleet.js', '/fleet.css',
       '/engines', '/engines.html', '/engines.js', '/engines.css',
+      '/webhooks', '/webhooks.html', '/webhooks.js', '/webhooks.css',
+      '/prompts', '/prompts.html', '/prompts.js', '/prompts.css',
       '/banked-resets.html', '/banked-resets.js',
+      '/asks', '/asks.html', '/asks.js',
       '/conversations', '/conversations.html', '/conversations.js', '/conversations.css',
       '/metrics', '/metrics.html', '/metrics.js', '/metrics-charts.js', '/metrics.css', '/host-health-charts.js', '/tbm.js', '/tbm.css', '/usage-history.js',
       '/usage', '/usage.html',
       '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
+      '/schedules', '/schedules.html', '/schedules.js', '/schedules.css',
       '/intake', '/intake.html', '/intake.js', '/intake.css', '/intake-overview.js', '/resource-management.js', '/idle-attention.js',
       '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',
       '/vendor/dakit/fonts/inter-var.woff2',
@@ -146,9 +168,13 @@ export default {
     if (url.pathname === '/inbox') url.pathname = '/inbox.html';
     if (url.pathname === '/metrics' || url.pathname === '/usage' || url.pathname === '/usage.html') url.pathname = '/metrics.html';
     if (url.pathname === '/sessions') url.pathname = '/sessions.html';
+    if (url.pathname === '/schedules') url.pathname = '/schedules.html';
     if (url.pathname === '/fleet') url.pathname = '/fleet.html';
     if (url.pathname === '/conversations') url.pathname = '/conversations.html';
     if (url.pathname === '/engines') url.pathname = '/engines.html';
+    if (url.pathname === '/webhooks') url.pathname = '/webhooks.html';
+    if (url.pathname === '/prompts') url.pathname = '/prompts.html';
+    if (url.pathname === '/asks') url.pathname = '/asks.html';
     if (url.pathname === '/intake' || INTAKE_DETAIL.test(url.pathname)) url.pathname = '/intake.html';
     const asset = await env.ASSETS.fetch(new Request(url, request));
     const headers = new Headers(asset.headers);

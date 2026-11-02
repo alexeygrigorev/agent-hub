@@ -42,6 +42,10 @@ class IntakeTransportError(ValueError):
     pass
 
 
+class IntakeResponseTooLarge(IntakeTransportError):
+    """A bounded response was refused before returning any page items."""
+
+
 class IntakeInputError(ValueError):
     """A client diagnostic containing only fixed labels and limits."""
 
@@ -82,6 +86,19 @@ def _bounded_text(value, limit=1024):
     return value[:limit] if isinstance(value, str) else None
 
 
+def merge_gate_refusal(body):
+    """Sanitized merge-gate refusal: the problems and the unmerged commit ids."""
+    problems = body.get('problems') if isinstance(body.get('problems'), list) else []
+    commits = body.get('unmerged_commits') if isinstance(body.get('unmerged_commits'), list) else []
+    result = {'error': 'merge_gate', 'state': _bounded_text(body.get('state'), 32),
+              'problems': [_bounded_text(p, 300) for p in problems[:32] if isinstance(p, str)],
+              'unmerged_commits': [c[:40] for c in commits[:64] if isinstance(c, str) and re.fullmatch(r'[0-9a-f]{7,40}', c)]}
+    hint = _bounded_text(body.get('hint'), 512)
+    if hint:
+        result['hint'] = hint
+    return result
+
+
 def close_gate_refusal(body):
     """Keep only the documented gate fields; json.dumps escapes controls."""
     worktrees = body.get('worktrees') if isinstance(body.get('worktrees'), list) else []
@@ -118,6 +135,8 @@ def http_error(exc, method, payload):
     if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', key):
         key = None
     gate = close_gate_refusal(body) if code == 'worktree_close_gate' and isinstance(body, dict) else None
+    if code == 'merge_gate' and isinstance(body, dict):
+        gate = merge_gate_refusal(body)
     result = IntakeHTTPError(exc.code, code, key, gate)
     detail = ''
     if isinstance(body, dict):
@@ -138,8 +157,12 @@ def http_error(exc, method, payload):
         detail += '; provide --reason and --superseded-by, or reason containing dropped by Alexey'
     if code == 'worktree_close_gate':
         detail += '; worktrees block close: hub worktree refresh <intake> | hub worktree remove <intake> | --force --reason TEXT'
+    if code == 'merge_gate':
+        detail += '; commits must be in origin/main with a green Deploy: merge, wait for CI, then hub intake merge-check <intake> (operator override: --force --reason TEXT)'
     if code == 'invalid_event_kind':
         detail += '; valid kinds: ' + ', '.join(EVENT_KINDS)
+    if code == 'worker_event_forbidden':
+        detail += '; workers may append only note, report, or blocker events; pass JSON like {"kind":"note","text":"..."} to --event-file (use - for stdin)'
     # Only locally generated wording is printed, never arbitrary server messages.
     result.args = (str(result) + detail,)
     return result
@@ -166,7 +189,8 @@ def request(method, path, payload=None):
             reason = ('Intake response error: invalid JSON or UTF-8 response'
                       if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)) else diagnostic(exc))
             recovery = '; mutation outcome unknown; inspect before retrying with the same key and payload' if method != 'GET' else ''
-            raise IntakeTransportError(reason + recovery) from None
+            error_type = IntakeResponseTooLarge if isinstance(exc, RuntimeError) and str(exc) == 'Response too large' else IntakeTransportError
+            raise error_type(reason + recovery) from None
 
     try:
         return send(token)
@@ -223,9 +247,11 @@ def add_commands(sub):
     listing.add_argument('--after')
     listing.add_argument('--revision', type=int)
     listing.add_argument('--authorization-valid-until', type=int)
-    listing.add_argument('--limit', type=int, default=25, help='Positive integer; default 25, server clamps above max 100')
+    listing.add_argument('--limit', type=int, default=None, help='Positive integer; default 25 (100 with --all), server clamps above max 100')
     listing.add_argument('--all', action='store_true', help='Follow all pages with a pinned snapshot; restart if it changes')
     listing.add_argument('--archived', action='store_true', help='List archived intakes')
+    summary = commands.add_parser('summary', help='Current authorized task counts and five recent tasks; no histories')
+    summary.add_argument('--project')
     audit = commands.add_parser('audit', help='Durable lifecycle events for one intake, or recent events')
     audit.add_argument('id', nargs='?')
     audit.add_argument('--limit', type=int, default=25)
@@ -234,6 +260,10 @@ def add_commands(sub):
     for name in ('show', 'history', 'links', 'context'):
         command = commands.add_parser(name)
         command.add_argument('id')
+        if name == 'history':
+            command.add_argument('--archived', action='store_true', help='Read one page of losslessly retained note history')
+            command.add_argument('--after', type=int)
+            command.add_argument('--limit', type=int, default=100)
     start = commands.add_parser('continue', help='CAS ready -> active context only; does not start a session')
     start.add_argument('id')
     start.add_argument('--version', type=int, required=True)
@@ -257,6 +287,14 @@ def add_commands(sub):
     close.add_argument('--reason', help='Close reason; required with --force or --outcome')
     close.add_argument('--outcome', choices=['closed_unverified'],
                        help='Operator only: close without DONE evidence, recorded as closed_unverified with --reason (never counted as verified)')
+    merge_check = commands.add_parser('merge-check', help='Collect git ancestry + Deploy evidence for this intake and record it in Hub (merge gate)')
+    merge_check.add_argument('id')
+    merge_check.add_argument('--repo', default=None, help='Git checkout holding the work, also checked for its HEAD (default: a private clone of the project repo, independent of the current directory)')
+    merge_check.add_argument('--sha', action='append', default=[], help='Extra commit to verify (the DONE note commits and HEAD are always checked)')
+    merge_check.add_argument('--key', help='Stable retry key; generated automatically when omitted')
+    merge_check.add_argument('--dry-run', action='store_true', help='Print the evidence without recording it')
+    merge_state = commands.add_parser('merge-state', help='Merge state of one intake, or the list of unmerged intakes')
+    merge_state.add_argument('id', nargs='?')
     event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
     event.add_argument('id')
     event.add_argument('--version', type=int, required=True)
@@ -366,8 +404,22 @@ def list_all(params):
         raise IntakeInputError('--all cannot be combined with --after')
     items, seen, cursors = [], set(), set()
     first = None
+    reduced = False
     for _ in range(10001):
-        page = request('GET', BASE + '/tasks?' + urlencode(params))
+        while True:
+            try:
+                page = request('GET', BASE + '/tasks?' + urlencode(params))
+                break
+            except IntakeResponseTooLarge:
+                # Retry only an oversized GET, with the same cursor/revision.
+                # The limit strictly decreases, so there are at most 7 such
+                # reductions across the entire export; transport/auth/stale
+                # failures keep their existing fail-closed behavior.
+                current = min(params.get('limit', 25), 100)
+                if current <= 1:
+                    raise
+                params['limit'] = max(1, current // 2)
+                reduced = True
         if first is None:
             first = page
         elif (page['snapshot_version'] != first['snapshot_version'] or
@@ -383,7 +435,10 @@ def list_all(params):
         if not after:
             if len(items) != first['total']:
                 raise IntakeInputError('Incomplete snapshot; retry the command')
-            return dict(first, items=items, next=None, total=len(items))
+            result = dict(first, items=items, next=None, total=len(items))
+            if reduced:
+                result.update(effective_limit=page.get('effective_limit', min(params.get('limit', 25), 100)), page_size_reduced=True)
+            return result
         if after in cursors or not page['items']:
             raise IntakeInputError('Invalid snapshot cursor; retry the command')
         cursors.add(after)
@@ -424,8 +479,11 @@ def execute(args):
         if getattr(args, 'verification', None) is not None:
             body['verification'] = args.verification
         return request('POST', BASE + '/tasks', body)
+    if command == 'summary':
+        params = {'project': args.project} if args.project is not None else {}
+        return request('GET', BASE + '/summary?' + urlencode(params))
     if command == 'list':
-        params = {'limit': args.limit}
+        params = {'limit': args.limit if args.limit is not None else (100 if args.all else 25)}
         if args.status is not None:
             params['status'] = args.status
         if args.archived:
@@ -452,11 +510,41 @@ def execute(args):
             if getattr(args, field, None) is not None:
                 params[field] = getattr(args, field)
         return request('GET', BASE + '/grantees?' + urlencode(params))
+    if command == 'merge-state':
+        return request('GET', BASE + ('/tasks/' + safe_id(args.id) + '/merge-state' if args.id else '/merge-state'))
+    if command == 'merge-check':
+        from . import merge_evidence
+        shown = request('GET', BASE + '/tasks/' + safe_id(args.id))
+        history = ((shown.get('task') or {}).get('payload_data') or {}).get('history') or []
+        task = shown.get('task') or {}
+        text = '\n'.join(e.get('text', '') for e in history if isinstance(e, dict) and e.get('kind') == 'note' and str(e.get('text', '')).lstrip().startswith('DONE'))
+        explicit = merge_evidence.explicit_commit_refs(history)
+        try:
+            repo = str(Path(args.repo).resolve()) if args.repo else merge_evidence.own_clone()
+            candidates = merge_evidence.shas_from_text(text, exclude=(task.get('id'),) + tuple(e.get('hub_session_id') or e.get('id') for e in history if isinstance(e, dict)))
+            merge_evidence.fetch_origin(repo)
+            wanted = explicit + merge_evidence.existing_commits(repo, candidates) + [x for x in args.sha if isinstance(x, str)]
+            evidence = merge_evidence.collect(str(Path(repo).resolve()), wanted, fetch=False, include_head=args.repo is not None)
+        except RuntimeError as exc:
+            raise IntakeInputError(str(exc)) from None
+        if args.dry_run:
+            return {'dry_run': True, 'evidence': evidence}
+        key = args.key or 'merge-check-' + uuid.uuid4().hex
+        valid_key(key)
+        return request('POST', BASE + '/tasks/' + safe_id(args.id) + '/merge-evidence', {'key': key, **evidence})
     if command in ('rules', 'grants'):
         return request('POST' if args.payload_file else 'GET', BASE + '/' + command,
                        json_file(args.payload_file) if args.payload_file else None)
     path = BASE + '/tasks/' + safe_id(args.id)
     if command in ('show', 'history', 'links', 'context'):
+        if command == 'history' and getattr(args, 'archived', False):
+            limit, after = getattr(args, 'limit', 100), getattr(args, 'after', None)
+            if not 1 <= limit <= 100 or (after is not None and after < 0):
+                raise IntakeInputError('Invalid archive page: limit is 1-100 and after is a nonnegative sequence')
+            params = {'archived': '1', 'limit': limit}
+            if after is not None:
+                params['after'] = after
+            return request('GET', path + '/history?' + urlencode(params))
         return request('GET', path + ('' if command == 'show' else '/' + command))
     if command == 'revoke':
         return request('POST', BASE + '/grants/' + safe_id(args.id) + '/revoke', json_file(args.payload_file))
@@ -549,3 +637,17 @@ def cas_update(path, payload, automatic, key):
             version_info = f'; attempted version: {attempted}' if attempted is not None else ''
             raise IntakeTransportError(f'{diagnostic(exc)}; Intake update outcome unknown; inspect the task before retrying. Retry key: {key}{version_info}') from None
     raise IntakeInputError('Intake update did not complete')
+
+
+def summary_main():
+    """Small shared entry point; skip unrelated CLI imports/registration."""
+    import argparse
+    parser = argparse.ArgumentParser(prog='hub intake summary', description='Current task counts and five recent tasks; no histories')
+    parser.add_argument('--project')
+    args = parser.parse_args(sys.argv[3:])
+    args.cmd, args.intake_cmd = 'intake', 'summary'
+    try:
+        print(json.dumps(execute(args), ensure_ascii=True))
+    except Exception as exc:
+        print(diagnostic(exc), file=sys.stderr)
+        sys.exit(1)

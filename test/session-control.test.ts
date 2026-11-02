@@ -300,6 +300,29 @@ describe('hub session control durable queue', () => {
     }, fake.hook);
   });
 
+  it('answers capture/send before the native binding with a clear pending state (intake e1ed7abe)', async () => {
+    const fake = fakeReserve();
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, {}, admin, 'pending-1');
+      for (const [sub, body] of [['capture', { key: 'p-cap' }], ['send', { key: 'p-send', body: 'hi' }]] as const) {
+        const res = await s.handle(request(`/api/sessions/${session.id}/${sub}`, body), admin);
+        expect(res.status).toBe(409);
+        const out: any = await res.json();
+        expect(out.error).toBe('session_not_bound');
+        expect(out.pending).toBe(true);
+        expect(['queued', 'held', 'offered', 'starting']).toContain(out.state);
+        expect(out.retry_after_s).toBeGreaterThan(0);
+        expect(out.message).toContain('no native binding yet');
+      }
+      // A finished session is not pending: no retry hint, so clients stop waiting.
+      sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", session.id);
+      const gone: any = await (await s.handle(request(`/api/sessions/${session.id}/capture`, { key: 'p-gone' }), admin)).json();
+      expect(gone.error).toBe('session_not_bound');
+      expect(gone.pending).toBe(false);
+      expect(gone.retry_after_s).toBeUndefined();
+    }, fake.hook);
+  });
+
   it('enqueues send with idempotent keys and rejects conflicts', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {
@@ -649,6 +672,18 @@ describe('send proof validator (host-verified native reply provenance)', () => {
       .toMatchObject({ ok: false, error: 'proof_reply_mismatch' });
     expect(validateSendProof({ ...good, reply_digest: 'short' }, expected))
       .toMatchObject({ ok: false, error: 'invalid_proof_shape' });
+  });
+  it('accepts an exact native delivery receipt without a reply envelope, never a malformed one', () => {
+    const receipt = { kind: 'native_delivery', status: 'submitted', native_message_id: 'nmsg-1',
+      sender_native_id: NATIVE_ID, sender_tag: NATIVE_TAG, sender_workspace: NATIVE_WS,
+      sender_generation: 1, sender_created_at_ms: NATIVE_CREATED };
+    expect(validateSendProof(receipt, expected)).toEqual({ ok: true });
+    expect(validateSendProof({ ...receipt, status: 'busy' }, expected))
+      .toMatchObject({ ok: false, error: 'invalid_proof_shape' });
+    expect(validateSendProof({ ...receipt, reply_digest: 'b'.repeat(64) }, expected))
+      .toMatchObject({ ok: false, error: 'invalid_proof_shape' });
+    expect(validateSendProof({ ...receipt, sender_created_at_ms: 1 }, expected))
+      .toMatchObject({ ok: false, error: 'proof_generation_stale' });
   });
 });
 
@@ -1827,6 +1862,30 @@ describe('bounded command custody recovery', () => {
       const sendStaleRefuse = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'stale-refuse', body: 'hi', require_ready: true }), admin);
       expect(sendStaleRefuse.status).toBe(409);
       expect(((await sendStaleRefuse.json()) as any).error).toBe('target_not_ready');
+    }, fakeReserve().hook);
+  });
+
+  it('treats an idle-waiting session as ready while the host census is fresh, refuses once the census or live phase lapses (intake bb3109c2)', async () => {
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, { machine: 'hetzner' });
+      await bindHttp(s, sql, session.id);
+      const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+      // Idle-waiting adopted session: the row last changed 2 h ago (census PUT skips unchanged rows).
+      sql.exec("UPDATE fleet_sessions SET agent_state = 'waiting', observed_at = ? WHERE native_id = ?", ago(2 * 3600000), NATIVE_ID);
+      sql.exec('CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL)');
+      sql.exec('INSERT OR REPLACE INTO fleet_catalog_seen VALUES (?, ?)', 'hetzner', ago(30000));
+      const ok = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'idle-ok', body: 'ping', require_ready: true }), admin);
+      expect(ok.status).toBe(201);
+      expect(((await ok.json()) as any).warning).toBeUndefined();
+      // Host census lapsed: no recent state again.
+      sql.exec('UPDATE fleet_catalog_seen SET observed_at = ? WHERE machine_id = ?', ago(10 * 60000), 'hetzner');
+      const stale = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'idle-stale', body: 'ping', require_ready: true }), admin);
+      expect(stale.status).toBe(409);
+      // Fresh census but the session left the live catalog: no credit.
+      sql.exec('UPDATE fleet_catalog_seen SET observed_at = ? WHERE machine_id = ?', ago(30000), 'hetzner');
+      sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE native_id = ?", NATIVE_ID);
+      const gone = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'idle-gone', body: 'ping', require_ready: true }), admin);
+      expect(gone.status).toBe(409);
     }, fakeReserve().hook);
   });
 

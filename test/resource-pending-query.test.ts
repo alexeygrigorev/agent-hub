@@ -51,6 +51,9 @@ it('bounds reservation reads by active launches while preserving ramp, host and 
     const input = {project:'pending',workspace:'/fixture',task_kind:'goal'};
     const memory = current.headroom('pending-host',input,'codex');
     expect(memory).toEqual(baseline.headroom('pending-host',input,'codex'));
+    // Intake 63a9ee3a: the 2000 fresh terminal/queued rows never reserve,
+    // even when the baseline strips the state IN (...) filter.
+    expect(baseline.headroom('pending-host',input,'codex').reserved_mb).toBe(6*current.estimate('pending','codex','goal'));
     // Four active states, the exact boundary, and an old launch with a fresh
     // ramp count. Old ramps, foreign hosts and terminal/queued history do not.
     expect(memory.reserved_mb).toBe(6*current.estimate('pending','codex','goal'));

@@ -65,6 +65,40 @@ describe('private repo registry', () => {
     expect(r.get('dtc-website').machine).toBe('hetzner');
     expect((await r.handle(req('/dtc-website', 'PATCH', { dir: '/outside' }), admin)).status).toBe(400);
   }));
+  it('lets operators classify duplicates and clears canonical when status changes away', () => fixture(async r => {
+    await seed(r);
+    await seed(r, [repo({ name: 'old-site', status: 'active', canonical: null, aliases: [] })]);
+    const response = await r.handle(req('/old-site', 'PATCH', { status: 'duplicate', canonical: 'dtc-website' }), admin);
+    expect(response.status).toBe(200);
+    expect(r.get('old-site')).toMatchObject({ status: 'duplicate', canonical: 'dtc-website' });
+    const refresh = await r.handle(req('/refresh', 'POST', { repos: [{ name: 'old-site', machine: 'hetzner', dir: '/srv/git/old-site', status: 'active', flags: [] }] }), host);
+    expect(refresh.status).toBe(200);
+    expect(r.get('old-site')).toMatchObject({ status: 'duplicate', canonical: 'dtc-website' });
+    const changed = await r.handle(req('/old-site', 'PATCH', { status: 'archived' }), admin);
+    expect(changed.status).toBe(200);
+    expect(r.get('old-site')).toMatchObject({ status: 'archived', canonical: null });
+  }));
+  it('rejects invalid duplicate mutations atomically', () => fixture(async r => {
+    await seed(r);
+    await seed(r, [repo({ name: 'old-site', status: 'active', canonical: null, aliases: [] })]);
+    await seed(r, [repo({ name: 'archived-site', status: 'archived', canonical: null, aliases: [] })]);
+    await seed(r, [repo({ name: 'legacy-loop', status: 'duplicate', canonical: 'old-site', aliases: [] })]);
+    const invalid = [
+      { status: 'unknown', purpose: 'must roll back' },
+      { status: 'duplicate' },
+      { status: 'duplicate', canonical: 'absent' },
+      { status: 'duplicate', canonical: 'old-site' },
+      { status: 'duplicate', canonical: 'archived-site' },
+      { status: 'duplicate', canonical: 'legacy-loop' },
+      { canonical: 'dtc-website' },
+    ];
+    for (const update of invalid) {
+      expect((await r.handle(req('/old-site', 'PATCH', update), admin)).status).toBe(400);
+      expect(r.get('old-site')).toMatchObject({ status: 'active', canonical: null });
+    }
+    expect((await r.handle(req('/old-site', 'PATCH', { status: 'duplicate', canonical: 'dtc-website', purpose: 'updated' }), agent)).status).toBe(403);
+    expect(r.get('old-site')).toMatchObject({ status: 'active', canonical: null, purpose: repo().purpose });
+  }));
   it('rejects invalid whole batches without partial writes', () => fixture(async r => {
     expect((await seed(r, [repo(), repo({ name: 'bad', dir: '/srv/../outside' })])).status).toBe(400);
     expect(r.all()).toHaveLength(0);

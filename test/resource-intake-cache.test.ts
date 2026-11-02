@@ -71,6 +71,11 @@ it('bypasses snapshot retention for oversized input and missing structural gener
   sql.exec('INSERT INTO intake_task_projection VALUES(?,?,?)', 'large', '{}', JSON.stringify([{kind: 'link', pad: 'x'.repeat(2100000)}]));
   r.sessions('cache-host');
   sql.exec("UPDATE fleet_sessions SET last_activity_at='2026-10-28T12:34:56Z'");
+  expect(r.sessions('cache-host')[0].last_activity_at).toBe('2026-10-28T12:34:56Z');
+  expect(scans()).toBe(1);
+  // Activity overlays stay fresh without rebuilding canonical metadata. A
+  // metadata write must still rescan oversized intake input instead of retaining it.
+  sql.exec("UPDATE fleet_sessions SET tag=tag || '-updated'");
   r.sessions('cache-host');
   expect(scans()).toBe(2);
   sql.exec("DELETE FROM intake_task_projection WHERE id='large'");

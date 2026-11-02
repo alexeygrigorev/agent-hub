@@ -712,6 +712,34 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
     });
   });
 
+  it('accepts the banked probe-failure marker on v1.1 routes and rejects overlong or mistyped markers', async () => {
+    // Intake 7bf6f6ee AC3: `banked_resets_error` must survive validation so
+    // downstream banked views read it as unknown, never as 0 banked. Opaque
+    // short string only; overlong/non-string markers are refused.
+    const tNow = 1760430000000;
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.quotaStore.setClock(() => tNow);
+      try {
+        const capIso = new Date(tNow - 1000).toISOString();
+        const snap: any = buildValidSnapshot(hostAlpha.machineId, capIso, { schema_version: '1.1' } as any);
+        snap.routes.codex.details.banked_resets = [];
+        snap.routes.codex.details.banked_resets_error = 'quota_unreachable';
+        const res = instance.quotaStore.putSnapshot(hostAlpha.machineId, snap, tNow);
+        expect(res.ok).toBe(true);
+        const stored = instance.sql.exec('SELECT routes_json FROM host_quota_snapshots WHERE host_id = ?', hostAlpha.machineId).toArray()[0] as any;
+        expect(JSON.parse(stored.routes_json).codex.details.banked_resets_error).toBe('quota_unreachable');
+
+        for (const bad of ['', 'x'.repeat(257), 42, true]) {
+          const badSnap: any = buildValidSnapshot(hostAlpha.machineId, new Date(tNow - 500).toISOString(), { schema_version: '1.1' } as any);
+          badSnap.routes.codex.details.banked_resets_error = bad;
+          expect(instance.quotaStore.putSnapshot(hostAlpha.machineId, badSnap, tNow + 1000).ok).toBe(false);
+        }
+      } finally {
+        instance.quotaStore.setClock(undefined);
+      }
+    });
+  });
+
   it('enforces data-driven window names regex, 32-window limit, native details.stale, and window error fail-closed propagation', async () => {
     const tBase = 1760425000000;
 

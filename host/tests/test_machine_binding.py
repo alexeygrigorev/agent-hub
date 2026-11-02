@@ -50,7 +50,7 @@ class TestMachineBinding(unittest.TestCase):
         flow = auth._device_flow()
         real_login = flow.device_login
         patch.object(flow, "device_login", side_effect=lambda *a, **kw: real_login(
-            *a, **kw, sleeper=lambda _: None, prompt=lambda _: None)).start()
+            *a, **{**kw, "sleeper": lambda _: None, "prompt": lambda _: None})).start()
         self.old = {
             "base_url": "https://hub.example", "access_token": "fixture-old-access",
             "refresh_token": "fixture-old-refresh", "machine_id": "old-machine",
@@ -287,6 +287,8 @@ class TestMachineBinding(unittest.TestCase):
     def test_refresh_http_network_json_and_content_type_failures_preserve_binding(self):
         errors = [urllib.error.HTTPError("fixture", code, "fixture", {}, io.BytesIO(b'{}'))
                   for code in (403, 429, 500)]
+        for error in errors:
+            self.addCleanup(error.close)
         errors.append(urllib.error.URLError("fixture"))
         for error in errors:
             with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
@@ -309,6 +311,7 @@ class TestMachineBinding(unittest.TestCase):
             with self.subTest(code=code):
                 before = self.path.read_bytes()
                 error = urllib.error.HTTPError("fixture", code, "fixture", {}, io.BytesIO(b'{"error":"invalid_grant"}'))
+                self.addCleanup(error.close)
                 with patch.object(auth, "device_login", side_effect=RuntimeError("fixture pairing failure")), contextlib.redirect_stdout(io.StringIO()):
                     with self.assertRaisesRegex(RuntimeError, "pairing failure"):
                         self.refresh(None, error)

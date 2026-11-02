@@ -5,6 +5,7 @@
  * through the host agent; unknown host state stays null, never invented.
  * Nothing here deletes automatically (auto-GC belongs to intake 1f1f1877). */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import { decodeRepoWorkspace } from './fleet';
 
 type Obj = Record<string, any>;
 
@@ -14,6 +15,8 @@ const CLAIM_TIMEOUT_MS = 15 * 60000;
 const MAX_ROWS_PER_TASK = 32;
 const MAX_SESSIONS_PER_ROW = 64;
 const MAX_PENDING_PER_MACHINE = 200;
+const AUTO_STATUS_PER_CHECKIN = 10;
+const AUTO_STATUS_RETRY_MS = 5 * 60 * 1000;
 const STATUS_KEYS = ['present', 'dirty', 'dirty_count', 'unpushed', 'unmerged', 'merged', 'head', 'branch', 'checked_at', 'error'];
 
 export class WorktreeError extends Error {
@@ -38,6 +41,12 @@ export function worktreePathAllowed(path: unknown): path is string {
   return parts.length >= 3 && parts[parts.length - 2] === 'git' && base.includes('-wt-');
 }
 
+/** A path naming an intake worktree anywhere (the tree itself, a subdirectory, a
+ * relative segment): detached starts (79458f2d) must never run inside one. */
+export function namesWorktree(path: unknown): boolean {
+  return typeof path === 'string' && path.split(/[\\/]/).some(seg => seg.includes('-wt-'));
+}
+
 function branchOk(branch: unknown): branch is string {
   return typeof branch === 'string' && branch.length > 0 && branch.length <= 255 && /^[A-Za-z0-9._\/-]+$/.test(branch)
     && !branch.startsWith('-') && !branch.includes('..');
@@ -58,7 +67,11 @@ function cleanStatus(raw: any): Obj | null {
 
 const shortReason = (v: unknown, fallback: string) => typeof v === 'string' && v.trim() ? v.trim().slice(0, 1024) : fallback;
 
+export type WorktreeListener = { record?: (taskId: string, row: Obj) => void; status?: (taskId: string, status: Obj) => void };
+
 export class IntakeWorktrees {
+  /** Merge gate (2e00e01f) follows every recorded worktree and host status result. */
+  public listener: WorktreeListener = {};
   constructor(private sql: SqlStorage, private now: () => number = Date.now) {}
 
   init() {
@@ -101,6 +114,10 @@ export class IntakeWorktrees {
     return { id: r.id, task_id: r.task_id, machine: r.machine, path: r.path, branch: r.branch ?? null, created_at: r.created_at,
       updated_at: r.updated_at, session_ids: parsed(r.session_ids, []), origin: r.origin, state: r.state,
       status: parsed(r.status_json, null), status_at: r.status_at ?? null, last_remove: parsed(r.last_remove_json, null), pending };
+  }
+  /** Hub sessions that ever used this intake's worktrees (bounded). */
+  sessionIdsFor(taskId: string): string[] {
+    return [...new Set(this.rows(taskId).flatMap(r => parsed(r.session_ids, []) as string[]))].slice(-32);
   }
   list(taskId: string): Obj[] { return this.rows(taskId).map(r => this.view(r)); }
 
@@ -162,11 +179,19 @@ export class IntakeWorktrees {
         this.sql.exec('UPDATE intake_worktrees SET session_ids = ?, updated_at = ? WHERE id = ?', JSON.stringify(ids), now, row.id);
       }
     }
-    return { row: this.row(row.id)!, fresh };
+    const out = this.row(row.id)!;
+    this.listener.record?.(taskId, out);
+    return { row: out, fresh };
+  }
+
+  /** State of this intake's newest row for a path (any machine); null when never recorded. */
+  lastStateFor(taskId: string, path: string): string | null {
+    const r = this.sql.exec('SELECT state FROM intake_worktrees WHERE task_id = ? AND path = ? ORDER BY updated_at DESC LIMIT 1', taskId, path).toArray()[0] as Obj | undefined;
+    return r ? String(r.state) : null;
   }
 
   /** Session start: refuse another intake's worktree; pin to the recorded host. */
-  startGuard(taskId: string | null | undefined, request: { machine?: string | null; workspace?: string | null; cwd?: string | null }):
+  startGuard(taskId: string | null | undefined, request: { machine?: string | null; workspace?: string | null; cwd?: string | null; detached?: boolean }):
     { error?: Obj; machine?: string } {
     if (!taskId) return {}; // unlinked (operator/debug) starts are not intake work
     for (const candidate of [request.cwd, request.workspace]) {
@@ -176,7 +201,8 @@ export class IntakeWorktrees {
         owner_task_id: owner.task_id, machine: owner.machine,
         detail: 'Two intakes never share a worktree; start this intake in its own worktree.' } };
     }
-    if (request.machine || request.cwd) return {};
+    // Detached starts (79458f2d) never use the intake's worktree, so they are not pinned to its host.
+    if (request.detached || request.machine || request.cwd) return {};
     const pinned = this.sql.exec("SELECT machine FROM intake_worktrees WHERE task_id = ? AND state = 'active' ORDER BY updated_at DESC LIMIT 1",
       taskId).toArray()[0] as Obj | undefined;
     return pinned ? { machine: String(pinned.machine) } : {};
@@ -197,6 +223,18 @@ export class IntakeWorktrees {
     const taskId = ctx?.request?.intake_task_id;
     if (!ctx || typeof taskId !== 'string' || !taskId) return { plan: { mode: 'none' }, events: [] };
     const request = ctx.request;
+    // Intake 79458f2d: a detached start runs in its workspace root and never
+    // resumes, creates or locks the linked intake's worktree.
+    if (request.intake_worktree === 'detached') return { plan: { mode: 'none', task_id: taskId, detached: true }, events: [] };
+    // Repo-identity start (intake 8028bb06): the host clones its own fresh work tree.
+    if (decodeRepoWorkspace(request.workspace)) return { plan: { mode: 'none', task_id: taskId, repo_workspace: true }, events: [] };
+    // Intake afab8367: a successor start replaces a LIVE predecessor that keeps
+    // its worktree lock until the replacement itself is running, so the lock
+    // can never move (dispatch_worktree_refused). Plan a fresh sibling
+    // worktree instead of the held tree; the predecessor's uncommitted state
+    // stays in its own tree and is never inherited.
+    if (request.intake_worktree === 'successor')
+      return { plan: { mode: 'create', task_id: taskId, suffix: 'wt-r-' + String(ctx.session.id).replace(/-/g, '').slice(0, 8).toLowerCase() }, events: [] };
     for (const candidate of [request.cwd, request.workspace]) {
       if (!worktreePathAllowed(candidate)) continue;
       // The start named its own worktree: record it, launch as requested.
@@ -253,7 +291,7 @@ export class IntakeWorktrees {
       const req = parsed(s.request_json, {});
       const samePath = req.cwd === r.path || req.workspace === r.path;
       // A live session of the same intake on the same host resumes in this worktree.
-      const sameIntakeHost = req.intake_task_id === r.task_id && (!s.machine_id || s.machine_id === r.machine);
+      const sameIntakeHost = req.intake_task_id === r.task_id && req.intake_worktree !== 'detached' && (!s.machine_id || s.machine_id === r.machine);
       if (ids.includes(s.id) || samePath || sameIntakeHost) out.push({ id: s.id, state: s.state });
     }
     return out;
@@ -318,9 +356,30 @@ export class IntakeWorktrees {
     return c ? this.commandView(c) : undefined;
   }
 
+  /** Queue a bounded check-in batch for active intake trees with no status yet. */
+  private queueMissingStatuses(machine: string, now: number) {
+    const queued = Number((this.sql.exec("SELECT COUNT(*) AS n FROM intake_worktree_commands WHERE machine = ? AND state IN ('queued','claimed')",
+      machine).toArray()[0] as Obj).n) || 0;
+    const room = Math.min(AUTO_STATUS_PER_CHECKIN, Math.max(0, MAX_PENDING_PER_MACHINE - queued));
+    if (!room) return;
+    const staleBefore = now - AUTO_STATUS_RETRY_MS;
+    const rows = this.sql.exec(`SELECT w.id, w.task_id, w.machine FROM intake_worktrees w
+      WHERE w.machine = ? AND w.state = 'active' AND w.status_json IS NULL
+        AND NOT EXISTS (SELECT 1 FROM intake_worktree_commands c WHERE c.worktree_id = w.id AND c.kind = 'status'
+          AND c.state IN ('done','failed') AND c.finished_at >= ?)
+        AND NOT EXISTS (SELECT 1 FROM intake_worktree_commands c WHERE c.worktree_id = w.id
+          AND c.state IN ('queued','claimed'))
+      ORDER BY w.created_at, w.id LIMIT ?`, machine, staleBefore, room).toArray() as Obj[];
+    for (const row of rows) {
+      this.sql.exec('INSERT INTO intake_worktree_commands (id, task_id, worktree_id, machine, kind, state, actor, created_at) VALUES (?,?,?,?,?,?,?,?)',
+        crypto.randomUUID(), row.task_id, row.id, machine, 'status', 'queued', 'hub:auto-status', now);
+    }
+  }
+
   /** Host poll: claim queued commands (re-offer stale claims). */
   hostCommands(machine: string): Obj[] {
     const now = this.now();
+    this.queueMissingStatuses(machine, now);
     const rows = this.sql.exec(`SELECT c.*, w.path, w.branch FROM intake_worktree_commands c JOIN intake_worktrees w ON w.id = c.worktree_id
       WHERE c.machine = ? AND (c.state = 'queued' OR (c.state = 'claimed' AND c.claimed_at < ?)) ORDER BY c.created_at LIMIT 10`,
       machine, now - CLAIM_TIMEOUT_MS).toArray() as Obj[];
@@ -347,6 +406,7 @@ export class IntakeWorktrees {
         const gone = status.present === false && status.merged === true && r.state === 'active';
         this.sql.exec('UPDATE intake_worktrees SET status_json = ?, status_at = ?, state = ?, updated_at = ? WHERE id = ?',
           JSON.stringify(status), now, gone ? 'gone' : r.state, now, r.id);
+        this.listener.status?.(c.task_id, status);
       }
       if (c.kind === 'remove') {
         const removed = outcome === 'ok' && result.removed;

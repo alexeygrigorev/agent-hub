@@ -306,6 +306,13 @@ def sanitize_provider(
             grants.append({"expires_at": format_iso_utc(expiry), "available": grant["available"], "label": label})
         if grants or not raw_details["banked_resets"]:
             sanitized_details["banked_resets"] = grants
+    # A reset-credits sub-probe failure is explicit unknown, never proof that
+    # banked grants disappeared (intake 7bf6f6ee: an ok-status route with an
+    # empty grant list and a dropped error marked live tranches exhausted).
+    # Opaque short reason only; never provider output.
+    raw_banked_error = raw_details.get("banked_resets_error")
+    if isinstance(raw_banked_error, str) and 1 <= len(raw_banked_error) <= 256:
+        sanitized_details["banked_resets_error"] = raw_banked_error
     for native_key, native_val in extract_native_fields(raw_details).items():
         if native_val is not None:
             sanitized_details[native_key] = native_val
@@ -530,6 +537,36 @@ def _read_stream_capped(
             pass
 
 
+# Providers whose native probe can launch an interactive/browser login when the
+# credential is missing or stale. `quse` maps antigravity/agy to `gemini` and
+# runs `agy -p /quota`, whose print mode falls back to OAuth in a browser tab
+# (intake 5814e109: 384 tabs on the desktop, one per 10-minute probe). Hosts
+# never authenticate: credentials come from the central store and Hub reads
+# managed quota itself, so the host-side native probe must not touch them.
+INTERACTIVE_AUTH_PROVIDERS = ("gemini",)
+
+
+def _is_native_quse_argv(argv: List[str]) -> bool:
+    name = re.split(r"[\\/]", argv[0])[-1].lower()
+    return name in ("quse", "quse.exe") or any(a in ("quse", "quse.cli") for a in argv[1:3])
+
+
+def guard_native_quse_argv(argv: List[str]) -> List[str]:
+    """Pin the native quse probe to explicit providers that never prompt for login.
+
+    Argv that already names providers, or is not the quse CLI (trusted JSON
+    adapters such as `hub engines quota`), is returned unchanged. Opt in to the
+    interactive-capable probe with AGENT_HUB_HOST_PROBE_INTERACTIVE_AUTH=1.
+    """
+    if (not argv or os.environ.get("AGENT_HUB_HOST_PROBE_INTERACTIVE_AUTH") == "1"
+            or not _is_native_quse_argv(argv)):
+        return argv
+    known = set(ALLOWED_PROVIDERS) | set(INTERACTIVE_AUTH_PROVIDERS)
+    if any(a in known for a in argv[1:]):
+        return argv
+    return list(argv) + [p for p in ALLOWED_PROVIDERS if p not in INTERACTIVE_AUTH_PROVIDERS]
+
+
 def execute_quse(
     quse_cmd: Union[str, List[str]] = "quse",
     timeout: float = 30.0,
@@ -575,7 +612,7 @@ def execute_quse(
     stderr_state = {"overflow": False}
     try:
         proc = subprocess.Popen(
-            [quse_cmd, "--json"] if isinstance(quse_cmd, str) else quse_cmd,
+            guard_native_quse_argv([quse_cmd, "--json"] if isinstance(quse_cmd, str) else quse_cmd),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

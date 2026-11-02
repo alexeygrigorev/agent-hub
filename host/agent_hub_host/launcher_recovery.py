@@ -72,6 +72,36 @@ def settle_unstarted(launcher, task_id, workspace, target_cwd, diagnostic=None):
         return False
 
 
+def _env_mb(name, default):
+    import os
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return int(value) if 0 <= value <= 10**9 else default
+
+
+def _launcher_disk_floor_mb(workspace_paths=None):
+    """min(AGENT_DISK_FLOOR_GB (default 15) GiB, 5% of the workspace filesystem)."""
+    import os
+    import shutil
+    try:
+        floor_gb = float(os.environ.get('AGENT_DISK_FLOOR_GB', 15))
+        if not 0 <= floor_gb <= 10**6:
+            floor_gb = 15
+    except (TypeError, ValueError):
+        floor_gb = 15
+    floor = int(floor_gb * 1024)
+    for raw in sorted(set(workspace_paths or []))[:1] or [os.path.expanduser('~')]:
+        try:
+            total = shutil.disk_usage(raw).total
+            if type(total) in (int, float) and total > 0:
+                floor = min(floor, int(total * 0.05 / (1024 * 1024)))
+        except (OSError, TypeError, ValueError):
+            pass
+    return floor
+
+
 def reconcile_resources(launcher, runner, *, workspace_paths=None, workspace_aliases=None):
     """Periodic launcher reconciliation also covers stops/failures without journals.
 
@@ -89,10 +119,13 @@ def reconcile_resources(launcher, runner, *, workspace_paths=None, workspace_ali
         projected = {"active_mem_mb": memory, "observed_at": observed_at}
         disk = result.get('active_disk_mb')
         if type(disk) in (int, float) and 0 <= disk <= 10**9:
-            # Maintained launcher/resources.py contract: 20 GiB plus the
-            # ledger's active disk promises and one bounded 512 MiB spike.
-            # This mirrors the gate; it never lowers or configures it.
-            projected.update(active_disk_mb=disk, disk_floor_mb=20480, next_disk_mb=512)
+            # Maintained launcher/resources.py contract (intake a5464408):
+            # absolute floor min(AGENT_DISK_FLOOR_GB=15, 5% of the filesystem)
+            # plus active disk promises capped at AGENT_ACTIVE_DISK_RESERVE_CAP_MB
+            # (8 GiB; written data already left the free figure) and one
+            # bounded 512 MiB spike. This mirrors the gate; it never lowers it.
+            projected.update(active_disk_mb=disk, disk_floor_mb=_launcher_disk_floor_mb(workspace_paths),
+                             active_disk_cap_mb=_env_mb('AGENT_ACTIVE_DISK_RESERVE_CAP_MB', 8192), next_disk_mb=512)
             if workspace_paths is not None:
                 import shutil
                 paths = []

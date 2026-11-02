@@ -11,6 +11,7 @@ Coordinates job offers, gate checks, claim races, lease renewals, and completion
 from __future__ import annotations
 
 import datetime
+from contextlib import closing
 import json
 import logging
 import os
@@ -63,34 +64,38 @@ class JobsClient:
         try:
             return api.safe_http_json(req, timeout=self.timeout)
         except urllib.error.HTTPError as e:
-            if e.code == 409:
+            with closing(e):
+                if e.code == 409:
+                    try:
+                        err_body = e.read().decode("utf-8")
+                        parsed = json.loads(err_body)
+                        if isinstance(parsed, dict):
+                            parsed.setdefault("error", "conflict")
+                            parsed["status_code"] = 409
+                            return parsed
+                    except Exception:
+                        pass
+                    return {"error": "conflict", "status_code": 409}
+                if e.code == 401:
+                    if is_job_token:
+                        return {"error": "unauthorized", "status_code": 401}
+                    try:
+                        new_token = auth.refresh_token()
+                        headers["Authorization"] = f"Bearer {new_token}"
+                        retry_req = urllib.request.Request(url, data=body, headers=headers, method=method)
+                        return api.safe_http_json(retry_req, timeout=self.timeout)
+                    except urllib.error.HTTPError as retry:
+                        retry.close()
+                        return {"error": "unauthorized", "status_code": 401}
+                    except Exception:
+                        return {"error": "unauthorized", "status_code": 401}
                 try:
                     err_body = e.read().decode("utf-8")
                     parsed = json.loads(err_body)
-                    if isinstance(parsed, dict):
-                        parsed.setdefault("error", "conflict")
-                        parsed["status_code"] = 409
-                        return parsed
+                    parsed["status_code"] = e.code
+                    return parsed
                 except Exception:
-                    pass
-                return {"error": "conflict", "status_code": 409}
-            if e.code == 401:
-                if is_job_token:
-                    return {"error": "unauthorized", "status_code": 401}
-                try:
-                    new_token = auth.refresh_token()
-                    headers["Authorization"] = f"Bearer {new_token}"
-                    retry_req = urllib.request.Request(url, data=body, headers=headers, method=method)
-                    return api.safe_http_json(retry_req, timeout=self.timeout)
-                except Exception:
-                    return {"error": "unauthorized", "status_code": 401}
-            try:
-                err_body = e.read().decode("utf-8")
-                parsed = json.loads(err_body)
-                parsed["status_code"] = e.code
-                return parsed
-            except Exception:
-                return {"error": f"HTTP {e.code}", "status_code": e.code}
+                    return {"error": f"HTTP {e.code}", "status_code": e.code}
 
     def claim_job(
         self,

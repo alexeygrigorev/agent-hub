@@ -1,15 +1,17 @@
 /** Post-DONE verification (intake d8d509d2, Alexey t1936u–t1937u). When an
  * intake's work reports DONE, Hub decides from the intake's `verification`
  * field (required|skip|auto, default auto) whether a SEPARATE verifier agent
- * must check it. The verifier only verifies: it never implements, and it runs
- * on a different model than the implementer (Claude Opus by default, Codex
- * when Claude implemented). A pass closes the intake through the ordinary
+ * must check it. The verifier only verifies: it never implements. It may run
+ * on the same model as the implementer (Claude Opus by default; no forced
+ * engine switch). A pass closes the intake through the ordinary
  * close rules (DONE evidence + worktree gate); a fail appends the gap to the
  * AC, which invalidates the DONE claim so the watchdog re-queues the work.
  * Only DONE claims made after this service was first enabled are handled;
  * older held completions belong to the operator. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { currentHistory, intakeCompletionHoldReason, intakeHasDoneEvidence } from './intake';
+import { namesWorktree } from './intake-worktrees';
+import { sessionLaunchFailure, staleHeldReviewer } from './intake-triage';
 type Obj = Record<string, any>;
 export const VERIFIER_INTERVAL = 25 * 60000; // runs from the */30 scheduler slot
 export const VERIFIER_LAUNCH_BUDGET = 3;
@@ -97,28 +99,10 @@ export class IntakeVerifier {
     const counts = Object.fromEntries(this.rows('SELECT state, COUNT(*) AS n FROM intake_verifications GROUP BY state').map(r => [r.state, r.n]));
     return { enabled_at: m.enabled_at ?? null, last_checked_at: m.last_tick ?? null, last_result: parse(m.last_result), states: counts };
   }
-  /** Engine of the implementation behind this DONE claim. The claim's author
-   * wins when it is a canonical launch worker (hub-workers:worker-<launch id>);
-   * otherwise the newest non-review session for the intake created before the
-   * claim. Review sessions (verifiers, triage) never count, and unverified
-   * history links are never trusted for routing (null => Claude Opus default). */
-  private implementerEngine(task: Obj, claim: Obj): string | null {
-    const author = /^hub-workers:worker-(.+)$/.exec(String(claim.actor ?? ''))?.[1];
-    if (author) {
-      const s = this.rows('SELECT engine,request_json FROM session_control_sessions WHERE fleet_launch_id=?', author)[0];
-      const req = parse(s?.request_json);
-      if (s && typeof s.engine === 'string' && req.intake_task_id === task.id && req.task_kind !== 'review') return s.engine;
-    }
-    const at = claim.captured_at ?? Number.MAX_SAFE_INTEGER;
-    const ids = new Set((task.history || []).map((e: Obj) => e.hub_session_id).filter(Boolean));
-    const sessions = this.rows('SELECT id,engine,request_json,created_at FROM session_control_sessions').map((s): Obj => ({ ...s, req: parse(s.request_json) }))
-      .filter(s => (ids.has(s.id) || s.req.intake_task_id === task.id) && s.req.task_kind !== 'review' && typeof s.engine === 'string' && ms(s.created_at) <= at)
-      .sort((a, b) => ms(b.created_at) - ms(a.created_at));
-    return sessions.length ? sessions[0].engine : null;
-  }
   private workspace(task: Obj): string {
     const prior = this.rows('SELECT request_json FROM session_control_sessions ORDER BY created_at DESC')
-      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace);
+      // Never an intake worktree path: the verifier runs detached from it (79458f2d).
+      .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace && !namesWorktree(r.workspace));
     if (prior) return prior.workspace;
     const configured = this.rows('SELECT capabilities FROM machines').some(m => {
       const roots = parse(m.capabilities).workspaces;
@@ -153,19 +137,19 @@ export class IntakeVerifier {
   }
   private async launch(task: Obj, claim: Obj, row: Obj): Promise<boolean> {
     if (!this.hooks.start) return false;
-    const claudeImplemented = this.implementerEngine(task, claim) === 'claude';
-    const engine = claudeImplemented ? 'codex' : 'claude';
+    const engine = 'claude';
     const attempt = (row.attempts ?? 0) + 1;
     const input = { key: 'verify-' + crypto.randomUUID(), engine, tier: 'review', task_kind: 'review', mode: 'headless',
-      engine_override_reason: claudeImplemented ? 'Alexey t1936u: verifier must differ from the Claude implementer'
-        : 'Alexey t1936u: separate Claude Opus verifier after DONE',
-      workspace: this.workspace(task), intake_task_id: task.id, brief: verifierBrief(task, claim, attempt) };
+      engine_override_reason: 'Alexey t1936u: separate Claude Opus verifier after DONE',
+      // Detached (79458f2d): a live owner session on the intake's worktree never blocks the verifier.
+      workspace: this.workspace(task), intake_task_id: task.id, intake_worktree: 'detached', brief: verifierBrief(task, claim, attempt) };
     this.set(task, claim, { state: 'starting', engine, request_key: input.key, attempts: attempt, session_id: null });
     let result: { status: number; body: Obj };
     try { result = await this.hooks.start(input); } catch { result = { status: 502, body: { error: 'admission_outcome_unknown' } }; }
-    const id = typeof result.body?.id === 'string' ? result.body.id : null;
+    // Only a 2xx created a startable session; a 400 refusal also carries an id (state "refused").
+    const id = result.status < 300 && typeof result.body?.id === 'string' ? result.body.id : null;
     if (id) { this.set(task, claim, { state: 'requested', session_id: id, detail: null }); return true; }
-    const code = String(result.body?.error || 'admission_refused').slice(0, 128);
+    const code = String(result.body?.reason || result.body?.error || 'admission_refused').slice(0, 128);
     // Refusals that need a person (missing AC) are escalated; capacity refusals retry next tick.
     if (['acceptance_criteria_required'].includes(code)) await this.escalate(task, claim, 'verifier start refused: ' + code);
     else this.set(task, claim, { state: result.status >= 500 ? 'starting' : 'pending', detail: 'verifier start refused: ' + code, attempts: result.status >= 500 ? attempt : attempt - 1 });
@@ -248,8 +232,20 @@ export class IntakeVerifier {
         const r = await this.write(`/tasks/${task.id}`, { key: 'verifier-gap-' + claim.id, expected_version: task.version, acceptance_criteria: ac.slice(-8000) });
         if (r.status < 300) { this.set(task, claim, { state: 'failed', detail: gap.slice(0, 500) }); counts.failed++; }
       } else {
-        const s = this.rows('SELECT state FROM session_control_sessions WHERE id=?', row.session_id)[0];
-        if (s && ACTIVE.has(s.state)) { counts.waiting++; continue; }
+        const s = this.rows('SELECT state,created_at,hold_json FROM session_control_sessions WHERE id=?', row.session_id)[0];
+        if (s && ACTIVE.has(s.state)) {
+          // Held/queued for placement too long: alert once, keep waiting, never a duplicate or cancel (79458f2d).
+          const held = staleHeldReviewer(s, now);
+          const marker = held && `${held} (session ${row.session_id})`.slice(0, 500);
+          if (marker && row.detail !== marker) {
+            this.set(task, claim, { detail: marker });
+            if (this.hooks.alert) await this.hooks.alert(`${task.id}:verification-held`, `Verifier for intake ${task.id} has waited for placement too long: ${marker}`.slice(0, 1000));
+          }
+          counts.waiting++; continue;
+        }
+        // A start that failed before running (any launch_error) is surfaced once, never retried silently.
+        const failure = sessionLaunchFailure(this.sql, row.session_id);
+        if (failure) { await this.escalate(task, claim, `verifier session ${row.session_id} failed to start: ${failure}`); counts.escalated++; continue; }
         if (row.attempts >= VERIFIER_MAX_ATTEMPTS) { await this.escalate(task, claim, `verifier ended ${row.attempts}x without a verdict`); counts.escalated++; }
         else if (budget > 0) { budget--; if (await this.launch(task, claim, row)) counts.launched++; }
       }

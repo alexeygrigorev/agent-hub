@@ -38,6 +38,7 @@ into Dispatcher.once.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -407,12 +408,18 @@ def sample_session_tree(
         roots = [p for p in (worker_pid, workload_pid) if type(p) is int and p > 0]
         cg = _cgroup_path(cgroup, roots or None)
         current_mb: Optional[float] = None
+        oom_kills: Optional[int] = None
         if cg is not None:
             mem_stat = _read_text(os.path.join(cg, "memory.stat"))
             if mem_stat is not None:
                 anon_bytes = _parse_kv_int(mem_stat, "anon")
                 if anon_bytes is not None and anon_bytes > 0:
                     rss_mb = anon_bytes / (1024 * 1024)
+            events_raw = _read_text(os.path.join(cg, "memory.events"))
+            if events_raw is not None:
+                oom_n = _parse_kv_int(events_raw, "oom_kill")
+                if oom_n is not None and oom_n >= 0:
+                    oom_kills = oom_n
             current_raw = _read_text(os.path.join(cg, "memory.current"))
             if current_raw is not None:
                 try:
@@ -467,6 +474,17 @@ def sample_session_tree(
                         ticked = True
                 if ticked:
                     cpu_seconds = total_ticks / _clk_tck()
+        elif os.name == "nt" and proc_root == "/proc":
+            # Windows has no /proc or cgroups: measure the exact descendant
+            # tree through the Win32 process APIs (working set, private bytes,
+            # kernel+user CPU time). Unreadable stays unknown.
+            if not roots:
+                return None
+            from .windows_process_stats import sample_tree
+            win = sample_tree(roots)
+            if win is None:
+                return None
+            rss_mb, pss_mb, cpu_seconds = win["rss_mb"], win["pss_mb"], win["cpu_seconds"]
         else:
             if not roots:
                 return None
@@ -516,6 +534,7 @@ def sample_session_tree(
             "runtime_s": float(runtime_s) if runtime_s is not None else None,
             "avg_cpu_cores": float(avg_cpu) if avg_cpu is not None else None,
             "current_mb": float(current_mb) if current_mb is not None else None,
+            "oom_kills": oom_kills,
             "cpu_identity": cpu_identity,
             "cgroup_path": cg,
         }
@@ -666,6 +685,33 @@ def _peak_key(session_id: str, native_id: str) -> str:
     return "%s\x00%s" % (session_id, native_id)
 
 
+RSS_BUCKET_MB = 16
+RSS_BUCKETS_MAX = 4096  # covers 64 GiB; larger samples land in the last bucket
+
+
+def _update_rss_median(prior: dict[str, Any], rss_mb: Any, *, frozen: bool = False) -> dict[str, Any]:
+    """Count anonymous-RSS samples in 16 MiB upper buckets and report the median.
+
+    One sample per observation (heartbeat), so p50 is the typical resident size
+    over the session life, unlike the monotonic peak. Unknown samples are
+    skipped; with no samples p50 stays None (never zero).
+    """
+    hist = prior.get("rss_histogram") if isinstance(prior.get("rss_histogram"), dict) else {}
+    value = _finite_number(rss_mb)
+    if value is not None and value > 0 and not frozen:
+        bucket = str(min(RSS_BUCKETS_MAX, math.ceil(value / RSS_BUCKET_MB)))
+        hist[bucket] = hist.get(bucket, 0) + 1
+    total = sum(hist.values())
+    p50 = None
+    accumulated = 0
+    for bucket in sorted(hist, key=int):
+        accumulated += hist[bucket]
+        if accumulated >= total * .5:
+            p50 = float(int(bucket) * RSS_BUCKET_MB)
+            break
+    return {"rss_histogram": hist, "p50_rss_mb": p50}
+
+
 def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample: dict[str, Any], observed_at: str, *, terminal: bool = False) -> dict[str, Any]:
     """Merge one sample into explicit high-water peaks (monotonic per field).
 
@@ -704,6 +750,7 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
     except (ValueError, TypeError, AttributeError):
         cpu_at = None
     cpu_frozen = prior.get("cpu_finalized") is True
+    rss_state = _update_rss_median(prior, sample.get("rss_mb"), frozen=cpu_frozen or terminal)
     distribution = update_cpu_distribution(prior, sample.get("cpu_seconds"), sample.get("cpu_identity"), cpu_at, terminal=terminal)
     peaks[key] = {
         **prior,
@@ -713,7 +760,9 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
         "runtime_s": prior.get("runtime_s") if cpu_frozen else _latest("runtime_s"),
         "avg_cpu_cores": prior.get("avg_cpu_cores") if cpu_frozen else _latest("avg_cpu_cores"),
         "current_mb": _latest("current_mb"),
+        "oom_kills": _peak_max("oom_kills", "oom_kills"),
         "observed_at": observed_at,
+        **rss_state,
         **distribution,
     }
     return peaks[key]
@@ -1046,7 +1095,7 @@ def _sample_row(sid: str, nid: str, peak: Any, observed_at: str) -> dict[str, An
     """Server report row: unknown fields are omitted (null), never zeroed."""
     row: dict[str, Any] = {"session_id": sid, "native_id": nid, "observed_at": observed_at}
     if isinstance(peak, dict):
-        for field in ("peak_rss_mb", "peak_pss_mb", "cpu_seconds", "runtime_s", "avg_cpu_cores", "p95_cpu_cores"):
+        for field in ("peak_rss_mb", "peak_pss_mb", "p50_rss_mb", "cpu_seconds", "runtime_s", "avg_cpu_cores", "p95_cpu_cores", "oom_kills"):
             if _finite_number(peak.get(field)) is not None:
                 row[field] = peak[field]
     return row

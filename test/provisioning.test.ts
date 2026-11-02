@@ -17,6 +17,23 @@ async function fixture(fn: (s: ProvisioningService, sql: any, allow: (v: boolean
   });
 }
 describe('central engine provisioning', () => {
+  it('backdates admission conservatively for installed hosts with small negative skew', async () => fixture(async (s, sql) => {
+    sql.exec("INSERT INTO fleet_accounts VALUES ('test-account','codex',4,15,1)");
+    const before = Date.now();
+    const result: any = await (await s.handle(req('/admission', 'POST', { label: 'test-account', native: true }), host)).json();
+    const after = Date.now();
+    const stamp = Date.parse(result.observed_at);
+    expect(stamp).toBeGreaterThanOrEqual(before - 5000);
+    expect(stamp).toBeLessThanOrEqual(after - 5000);
+    expect(Date.parse(result.server_observed_at)).toBeGreaterThanOrEqual(before);
+    // Old installed hosts still require 0..30 seconds, now including a lagging laptop.
+    for (const skew of [-1700, 0]) {
+      const age = (after + skew - stamp) / 1000;
+      expect(age).toBeGreaterThanOrEqual(0);
+      expect(age).toBeLessThanOrEqual(30);
+    }
+    expect((after + 31000 - stamp) / 1000).toBeGreaterThan(30);
+  }));
   it('adopts the Codex Orin quota alias without merging accounts or changing its quota identity', async () => fixture(async (s, sql) => {
     sql.exec("INSERT INTO fleet_accounts VALUES ('test-account','codex-orin',4,15,1)");
     expect((await s.handle(req('/test-account?adopt=true', 'PUT', bundle), admin)).status).toBe(200);
@@ -54,6 +71,65 @@ describe('central engine provisioning', () => {
     expect(sql.exec('SELECT * FROM fleet_routes').toArray()).toHaveLength(1);
     expect((await s.handle(req('/test-account', 'DELETE'), admin)).status).toBe(200);
     for (const t of ['engine_bundles', 'engine_installations', 'fleet_routes', 'fleet_accounts']) expect(sql.exec('SELECT * FROM ' + t).toArray()).toHaveLength(0);
+  }));
+  it('reports per-host sync status: pending, failed, synced, offline, and clears it on removal', async () => fixture(async (s, sql) => {
+    sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('test-machine','Test','t','2026-01-01'), ('other-machine','Other','o','2026-01-01')");
+    const rev: any = await (await s.handle(req('/test-account', 'PUT', bundle), admin)).json();
+    const status = async () => ((await (await s.handle(req(), admin)).json()) as any).sync_status;
+    const cell = (st: any[], m: string) => st.find(h => h.machine_id === m);
+    expect(cell(await status(), 'test-machine').accounts[0].state).toBe('pending');
+    expect(cell(await status(), 'test-machine').host_state).toBe('never');
+    const report = (state: string, items: any[]) => s.handle(req('/sync-report', 'POST', { state, items }), host);
+    expect((await report('held', [{ label: 'test-account', revision: rev.revision, state: 'failed', error: 'OSError' }])).status).toBe(200);
+    let st = await status();
+    expect(cell(st, 'test-machine').accounts[0]).toMatchObject({ state: 'failed', error: 'OSError' });
+    expect(cell(st, 'other-machine').accounts[0].state).toBe('pending');
+    // Free-text errors and stale revisions are never stored.
+    await report('held', [{ label: 'test-account', revision: 'old', state: 'failed', error: 'x' }, { label: 'test-account', revision: rev.revision, state: 'failed', error: 'secret /path: text' }]);
+    expect(cell(await status(), 'test-machine').accounts[0].error).toBeUndefined();
+    await s.handle(req('/test-account', 'POST', { revision: rev.revision }), host);
+    expect(cell(await status(), 'test-machine').accounts[0].state).toBe('synced');
+    // An unchanged report rewrites no account row (Free-plan row-write budget).
+    const before: any = sql.exec("SELECT updated_at FROM engine_sync_status WHERE machine_id='test-machine'").toArray()[0];
+    sql.exec("UPDATE engine_sync_status SET updated_at = 1 WHERE machine_id='test-machine'");
+    await report('synced', [{ label: 'test-account', revision: rev.revision, state: 'failed', error: 'secret /path: text' }]);
+    expect(sql.exec("SELECT updated_at FROM engine_sync_status WHERE machine_id='test-machine'").toArray()[0]).toMatchObject({ updated_at: 1 });
+    expect(before.updated_at).toBeGreaterThan(1);
+    // Online follows the machine check-in, not report frequency.
+    sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id='test-machine'", new Date(Date.now() - 3600000).toISOString());
+    expect(cell(await status(), 'test-machine').online).toBe(false);
+    sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id='test-machine'", new Date().toISOString());
+    expect(cell(await status(), 'test-machine').online).toBe(true);
+    // A later successful install clears the stored failure.
+    await report('synced', [{ label: 'test-account', revision: rev.revision, state: 'installed' }]);
+    expect(sql.exec('SELECT * FROM engine_sync_status').toArray()).toHaveLength(0);
+    await report('held', [{ label: 'test-account', revision: rev.revision, state: 'failed', error: 'OSError' }]);
+    await s.handle(req('/test-account', 'DELETE'), admin);
+    expect(sql.exec('SELECT * FROM engine_sync_status').toArray()).toHaveLength(0);
+    expect(cell(await status(), 'test-machine').accounts).toHaveLength(0);
+    expect((await s.handle(req('/sync-report', 'POST', { state: 'bad', items: [] }), host)).status).toBe(400);
+    expect((await s.handle(req('/sync-report', 'POST', { state: 'synced', items: [] }), admin)).status).toBe(403);
+  }));
+  it('registers an Antigravity account as a new engine type every host installs (5814e109 AC8)', async () => fixture(async (s, sql) => {
+    const token = '.gemini/antigravity-cli/antigravity-oauth-token';
+    const agy = { label: 'shared-agy', provider: 'antigravity', version: '1.4.10', files: { [token]: 'synthetic-agy-token' }, env: {}, args: [] };
+    for (const bad of [{ ...agy, files: {} }, { ...agy, env: { GEMINI_API_KEY: 'x' } }, { ...agy, files: { [token]: 'x', '.gemini/settings.json': '{}' } }, { ...agy, auth_method: 'machine-login' }])
+      expect((await s.handle(req('/shared-agy', 'PUT', bad), admin)).status).toBe(400);
+    const add: any = await (await s.handle(req('/shared-agy', 'PUT', agy), admin)).json();
+    expect(add.status).toBe('configured');
+    // The harness is Antigravity; the quota pool is the Google (Gemini) family.
+    expect(sql.exec("SELECT provider FROM fleet_accounts WHERE label='shared-agy'").one().provider).toBe('gemini');
+    expect(JSON.stringify(sql.exec('SELECT * FROM engine_credentials').toArray())).not.toContain('synthetic-agy-token');
+    const synced: any = await (await s.handle(req('/sync'), host)).json();
+    expect(synced.engines[0]).toMatchObject({ provider: 'antigravity', version: '1.4.10', credential_paths: [token] });
+    expect(synced.engines[0].files[token]).toBe('synthetic-agy-token');
+    expect((await s.handle(req('/shared-agy', 'POST', { revision: add.revision }), host)).status).toBe(200);
+    expect(sql.exec('SELECT engine, account, profile FROM fleet_routes').toArray()).toEqual([{ engine: 'antigravity', account: 'shared-agy', profile: 'hub-shared-agy' }]);
+    // Re-import keeps the same pool (no provider mismatch against gemini)...
+    expect((await s.handle(req('/shared-agy', 'PUT', agy), admin)).status).toBe(200);
+    // ...but the label never switches harness within the Gemini family.
+    expect((await s.handle(req('/shared-agy', 'PUT', { ...agy, provider: 'gemini', files: { '.gemini/oauth_creds.json': '{}' } }), admin)).status).toBe(409);
+    expect(sql.exec("SELECT provider FROM engine_bundles WHERE label='shared-agy'").one().provider).toBe('antigravity');
   }));
   it('denies unauthenticated, agents, stale host families and admin download of credentials', async () => fixture(async (s, _sql, allow) => {
     expect((await s.handle(req(), {})).status).toBe(401);

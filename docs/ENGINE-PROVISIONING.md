@@ -85,6 +85,9 @@ hub engines add --file "$HOME/.config/agent-hub/import/work-codex.json"
 The add command is the only account-add operation. Re-running it rotates the entire bundle
 and causes each machine to replace its installation. `hub engines list` shows
 public metadata and acknowledged installation revisions, never credentials.
+Worker-scoped sessions cannot read this operator surface; they verify their
+engines with `hub engines list --view worker` (sanitized five-field rows —
+see [WORKER-ENGINES-VIEW.md](WORKER-ENGINES-VIEW.md)).
 
 Supported npm engines: `codex` (`@openai/codex`), `claude`
 (`@anthropic-ai/claude-code`), `gemini` (`@google/gemini-cli`), and `go`
@@ -256,6 +259,20 @@ hub engines list        # credentials[]: generation, status, expiry - never secr
 hub engines maintain    # operator: run central refresh + direct quota now
 ```
 
+A pending login stays open for 30 minutes (`expires_in: 1800`); the CLI prints
+the expiry time next to the URL. A code submitted after that, or twice, gets
+`410 login_expired` and the CLI says `login expired (login_expired, HTTP 410) --
+rerun hub engines login`. A code the provider refuses returns
+`login_code_rejected` with the provider HTTP status and a sanitized reason (the
+OAuth error slug, never the body). When Worker egress to `platform.claude.com`
+is blocked (bot challenge or unreachable), Hub keeps the login and, because the
+CLI opts in with `host_fallback`, answers `202 host_exchange_required` with the
+PKCE verifier of that login; the CLI host exchanges the code from its own
+network (endpoints pinned locally) and uploads the resulting credential files to
+the same login id, as with a refresh lease. Every `hub engines` failure prints
+one sanitized line: HTTP status plus the server's error/reason slugs, never
+codes, verifiers or tokens.
+
 Gemini accounts may import their OAuth cache (`--provider gemini --auth-file
 ~/.gemini/oauth_creds.json`); Google refresh tokens do not rotate. OpenCode Go
 keeps host-local device login (see OPENCODE-AUTH.md). Bundles imported before
@@ -267,6 +284,33 @@ The native-login relay is Linux-only and has bounded five-minute login processes
 Its protocol and UI are tested with synthetic consent; no real Google consent is
 claimed. Existing per-provider credential expiry or provider revocation can require
 renewal. Codex and Claude refresh-token rotation is centralized (see above).
+
+## Sync to every host, and per-host status (intake 5814e109 AC7-AC9)
+
+Every host reconciles with Hub on each heartbeat (about once a minute) and on
+reconnect: an account added in Hub is installed and its `hub-<label>` aplexer
+profile appears, and a removed account's profile and bundle are withdrawn, with
+no per-host step. `hub engines status` shows, per registered host, whether it is
+online (machine check-in within 10 minutes) and each account's state: `synced`
+(current revision installed), `failed:<ExceptionType>` or `pending`. Hosts send
+the sync report only when it changes (plus a 30-minute refresh), and Hub stores
+only failures, so the status costs almost no Durable Object row writes.
+
+Antigravity is a Hub engine type too. Import its token once:
+
+```
+hub engines add --provider antigravity --label shared-agy \
+  --auth-file ~/.gemini/antigravity-cli/antigravity-oauth-token
+```
+
+Hosts install the sha512-pinned Antigravity CLI release from
+`host/agent_hub_host/bootstrap_pins.py` into the bundle (never npm or a mutable
+latest). Each host installs the pin of its own release, so a pin bump never
+strands an account imported earlier; the bundle version is display-only. The
+account joins the Gemini quota pool with engine `antigravity`, requested models
+resolve through the Gemini policy family, and a label never switches between
+`gemini` and `antigravity`.
+No direct quota probe exists for it yet, so admission reports quota unknown.
 
 ## Canonical managed-engine root (intake 59a6f44a AC1)
 

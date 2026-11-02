@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { IntakeVerifier, classifyVerification, latestDoneClaim } from '../src/intake-verifier';
-import { IntakeWatchdog } from '../src/intake-watchdog';
+import { IntakeWatchdog, queuePolicyFrom } from '../src/intake-watchdog';
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
 const admin = { caller: { isAdmin: true, actor: 'human:operator', kind: 'human' }, scopes: ['admin'] } as any;
@@ -28,7 +28,7 @@ const DONE_EVIDENCE = 'DONE\nevidence: agent-hub@0123456789abcdef pushed\nlive c
 async function fixture(fn: (h: any) => any) {
   return inDO(stub(), async (h: any) => {
     for (const t of ['tasks', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    for (const t of ['intake_verifications', 'intake_verifier_meta', 'intake_human_alerts', 'intake_restart_queue', 'intake_watchdog_meta', 'session_control_sessions'])
+    for (const t of ['intake_verifications', 'intake_verifier_meta', 'intake_human_alerts', 'intake_restart_queue', 'intake_watchdog_meta', 'session_control_sessions', 'fleet_launches'])
       h.sql.exec('DELETE FROM ' + t);
     tickDO = h;
     return fn(h);
@@ -103,7 +103,8 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await note(h, t.id, DONE_EVIDENCE);
     clock.now = Date.now();
     expect(await tick(v, clock)).toMatchObject({ state: 'checked', launched: 1 });
-    expect(starts[0]).toMatchObject({ engine: 'claude', tier: 'review', task_kind: 'review', mode: 'headless', intake_task_id: t.id });
+    expect(starts[0]).toMatchObject({ engine: 'claude', tier: 'review', task_kind: 'review', mode: 'headless', intake_task_id: t.id,
+      intake_worktree: 'detached' }); // 79458f2d: never the intake's (possibly locked) worktree
     expect(starts[0].brief).toMatch(/verification ONLY/);
     running(h, 'verifier-1', t.id);
     expect(await tick(v, clock)).toMatchObject({ launched: 0, waiting: 1 }); // one verifier per claim while it runs
@@ -128,7 +129,7 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     expect(after.payload_data.acceptance_criteria).toMatch(/Verification gap \(.*\): bucket x still holds 40 objects$/);
     expect(latestDoneClaim({ ...after, ...after.payload_data })).toBeNull(); // AC change starts a new context
   }));
-  it('uses a different model than a Claude implementer', async () => fixture(async h => {
+  it('does not force an engine switch for a Claude implementer', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
     const v = verifier(h, starts, clock);
     const t = await task(h, { title: 'Change session placement' });
@@ -138,43 +139,9 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await note(h, t.id, DONE_EVIDENCE);
     clock.now = Date.now();
     await tick(v, clock);
-    expect(starts[0]).toMatchObject({ engine: 'codex', workspace: 'demo' });
+    expect(starts[0]).toMatchObject({ engine: 'claude', workspace: 'demo' });
   }));
-  it('picks the newest non-review implementer before the claim: old Claude review + latest Codex work gets Claude', async () => fixture(async h => {
-    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
-    const v = verifier(h, starts, clock);
-    const t = await task(h, { title: 'Change session placement' });
-    const row = (id: string, engine: string, kind: string | null, ageMs: number) => h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
-      VALUES(?,'fixture',?,?,?,'headless','exited',?,?)`, id, id, JSON.stringify({ intake_task_id: t.id, workspace: 'demo', ...(kind ? { task_kind: kind } : {}) }),
-      engine, new Date(Date.now() - ageMs).toISOString(), new Date(Date.now() - ageMs).toISOString());
-    row('old-claude-impl', 'claude', null, 3 * 3600000);
-    row('claude-review', 'claude', 'review', 2 * 3600000);
-    row('latest-codex-impl', 'codex', null, 3600000);
-    await note(h, t.id, DONE_EVIDENCE);
-    row('later-claude-after-claim', 'claude', null, -60000); // after the claim: not the implementer of it
-    clock.now = Date.now();
-    await tick(v, clock);
-    expect(starts[0]).toMatchObject({ engine: 'claude' });
-  }));
-  it('the DONE author (canonical launch worker) decides the implementer over a newer different-model session', async () => fixture(async h => {
-    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
-    const v = verifier(h, starts, clock);
-    const t = await task(h, { title: 'Change session placement' });
-    const row = (id: string, launch: string, engine: string, ageMs: number) => h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,engine,mode,state,created_at,updated_at)
-      VALUES(?,'fixture',?,?,?,?,'headless','running',?,?)`, id, id, JSON.stringify({ intake_task_id: t.id, workspace: 'demo' }), launch, engine,
-      new Date(Date.now() - ageMs).toISOString(), new Date(Date.now() - ageMs).toISOString());
-    row('claude-author', 'launch-claude', 'claude', 2 * 3600000);
-    row('newer-codex', 'launch-codex', 'codex', 3600000);
-    await note(h, t.id, DONE_EVIDENCE);
-    // Attribute the claim to the older Claude worker, as its worker credential would.
-    const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', t.id).one().data);
-    data.history[data.history.length - 1].actor = 'hub-workers:worker-launch-claude';
-    h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), t.id);
-    clock.now = Date.now();
-    await tick(v, clock);
-    expect(starts[0]).toMatchObject({ engine: 'codex' });
-  }));
-  it('never routes on unverified history link engines', async () => fixture(async h => {
+  it('ignores history link engines for verifier routing', async () => fixture(async h => {
     const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
     const v = verifier(h, starts, clock);
     const t = await task(h, { title: 'Change session placement' });
@@ -272,6 +239,85 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     expect(alerts).toHaveLength(1);
     expect(alerts[0]).toContain(t.id);
   }));
+  it('escalates a verifier start that failed with a launch_error once, without a silent retry (79458f2d AC2)', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = []; const alerts: string[] = [];
+    const v = verifier(h, starts, clock, alerts);
+    const t = await task(h, { title: 'Deploy to prod' });
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    expect(await tick(v, clock)).toMatchObject({ launched: 1 });
+    running(h, 'verifier-1', t.id);
+    h.sql.exec("UPDATE session_control_sessions SET state='failed' WHERE id='verifier-1'");
+    h.sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, launch_error_json, created_at, updated_at)
+      VALUES ('launch-verifier-1', 'hub:service:intake-verifier', 'human', 'verify', 'k-lv1', '{}', 'hetzner', 'claude', 'acct', 'p', 'headless', 'demo', '', 'failed', ?, ?, ?)`,
+      JSON.stringify({ reason: 'dispatch_worktree_refused' }), new Date().toISOString(), new Date().toISOString());
+    expect(await tick(v, clock)).toMatchObject({ escalated: 1, launched: 0 });
+    await tick(v, clock);
+    expect(starts).toHaveLength(1);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain('dispatch_worktree_refused');
+    expect(v.status().states).toMatchObject({ needs_human: 1 });
+  }));
+  it('retries a verifier that ran and failed at runtime instead of escalating it as a start failure (review r1)', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = []; const alerts: string[] = [];
+    const v = verifier(h, starts, clock, alerts);
+    const t = await task(h, { title: 'Deploy to prod' });
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    running(h, 'verifier-1', t.id);
+    h.sql.exec("UPDATE session_control_sessions SET state='failed' WHERE id='verifier-1'");
+    h.sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launch_error_json, created_at, updated_at)
+      VALUES ('launch-verifier-1', 'hub:service:intake-verifier', 'human', 'verify', 'k-lv1', '{}', 'hetzner', 'claude', 'acct', 'p', 'headless', 'demo', '', 'failed', 'native-1', ?, ?, ?)`,
+      JSON.stringify({ reason: 'engine_exited_without_result', stage: 'runtime' }), new Date().toISOString(), new Date().toISOString());
+    expect(await tick(v, clock)).toMatchObject({ escalated: 0, launched: 1 });
+    expect(alerts).toHaveLength(0);
+  }));
+  it('treats a 400 refusal carrying a session id as not started (review r1)', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
+    const v = new IntakeVerifier(h.sql, h.intakeService, (f: any) => f(), {
+      start: async (input: any) => { starts.push(input); return { status: 400, body: { id: 'refused-' + starts.length, state: 'refused', reason: 'needs_unmet' } }; },
+      write: (path: string, payload: any) => call(h, path, payload),
+    }, () => clock.now);
+    v.init();
+    const t = await task(h, { title: 'Deploy to prod' });
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    const row = h.sql.exec('SELECT state, session_id, detail FROM intake_verifications WHERE task_id = ?', t.id).one();
+    expect(row).toMatchObject({ state: 'pending', session_id: null, detail: 'verifier start refused: needs_unmet' });
+  }));
+  it('alerts once on a verifier held for placement past an hour, keeps waiting, never relaunches or escalates (79458f2d)', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = []; const alerts: string[] = [];
+    const v = verifier(h, starts, clock, alerts);
+    const t = await task(h, { title: 'Deploy to prod' });
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    const old = new Date(Date.now() - 2 * 3600000).toISOString();
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,hold_json,created_at,updated_at)
+      VALUES('verifier-1','hub:service:intake-verifier','kv1',?,'headless','held',?,?,?)`,
+      JSON.stringify({ intake_task_id: t.id, task_kind: 'review' }), JSON.stringify({ reason: 'claude_dispatch_paused' }), old, old);
+    expect(await tick(v, clock)).toMatchObject({ waiting: 1, launched: 0, escalated: 0 });
+    await tick(v, clock);
+    expect(starts).toHaveLength(1);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain(':verification-held');
+    expect(alerts[0]).toContain('reviewer_held:claude_dispatch_paused');
+    expect(v.status().states).toMatchObject({ requested: 1 });
+  }));
+  it('never starts the verifier in a prior session\'s intake worktree path', async () => fixture(async h => {
+    const clock = { now: Date.now() - 60000 }; const starts: any[] = [];
+    const v = verifier(h, starts, clock);
+    const t = await task(h, { title: 'Deploy to prod' });
+    const at = new Date(Date.now() - 120000).toISOString();
+    h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      VALUES('impl-wt','human:operator','k-wt',?,'claude','headless','running',?,?)`, JSON.stringify({ intake_task_id: t.id, workspace: '/home/alexey/git/demo-wt-aaaa1111' }), at, at);
+    await note(h, t.id, DONE_EVIDENCE);
+    clock.now = Date.now();
+    await tick(v, clock);
+    expect(starts[0].workspace).not.toMatch(/-wt-/);
+  }));
 });
 
 describe('human-needed holds alert once (AC8)', () => {
@@ -282,7 +328,8 @@ describe('human-needed holds alert once (AC8)', () => {
     const notes: any[] = [];
     const clock = { now: NOW };
     const w = new IntakeWatchdog(h.sql, { statusAuthorizedTasks: () => tasks } as any, (f: any) => f(),
-      { start: async () => ({ status: 202, body: { id: 'x' } }), notify: async (kind: string, subject: string, detail: any) => { if (kind === 'intake_human_hold') notes.push(detail); return true; } }, () => clock.now);
+      { policy: () => queuePolicyFrom({ HUB_INTAKE_QUEUE_ENABLED: 'true', HUB_INTAKE_QUEUE_PROJECTS: 'nowhere-configured' }),
+        start: async () => ({ status: 202, body: { id: 'x' } }), notify: async (kind: string, subject: string, detail: any) => { if (kind === 'intake_human_hold') notes.push(detail); return true; } }, () => clock.now);
     w.init();
     expect(((await w.tick()) as any).human_hold_alerts).toBe(2);
     expect(notes).toHaveLength(1);

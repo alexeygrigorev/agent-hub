@@ -24,13 +24,17 @@ export const CREDENTIAL_PATHS: Record<string, string[]> = {
   claude: ['.claude/.credentials.json'],
   zai: ['.zcode/v2/credentials.json'],
   gemini: ['.gemini/oauth_creds.json'],
-  go: [],
+  antigravity: ['.gemini/antigravity-cli/antigravity-oauth-token'],
+  // OpenCode device login: the `opencode auth export opencode` JSON, held
+  // centrally and imported into each host's Hub-owned device store (5814e109).
+  go: ['.local/share/opencode-hub/device-auth.json'],
 };
 
 export const CODEX_OAUTH = {
   token: 'https://auth.openai.com/oauth/token',
   client: 'app_EMoamEEZ73f0CkXaXp7hrann',
   usage: 'https://chatgpt.com/backend-api/wham/usage',
+  resetCredits: 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits',
 };
 export const CLAUDE_OAUTH = {
   authorize: 'https://claude.com/cai/oauth/authorize',
@@ -118,7 +122,7 @@ export function needsRefresh(provider: string, files: CredentialFiles, nowMs: nu
   return exp === null || exp - nowMs <= CLAUDE_MIN_VALIDITY_MS;
 }
 
-export type RefreshResult = { ok: true; files: CredentialFiles } | { ok: false; invalid: boolean; reason: string };
+export type RefreshResult = { ok: true; files: CredentialFiles } | { ok: false; invalid: boolean; reason: string; providerStatus?: number; detail?: string; blocked?: boolean };
 
 const INVALID_GRANT = /invalid_grant|refresh_token_(?:expired|reused|invalidated)|invalid_refresh_token|token_revoked/;
 
@@ -195,7 +199,7 @@ export async function claudeExchange(pasted: string, verifier: string, state: st
   if (!code || (returnedState && returnedState !== state)) return { ok: false, invalid: true, reason: 'login_state_mismatch' };
   try {
     const r = await postJson(fetchFn, CLAUDE_OAUTH.token, { grant_type: 'authorization_code', code, state, redirect_uri: CLAUDE_OAUTH.redirect, client_id: CLAUDE_OAUTH.client, code_verifier: verifier });
-    if (r.status !== 200 || typeof r.json?.access_token !== 'string') return r.status === 200 ? { ok: false, invalid: false, reason: 'login_invalid_response' } : { ...refusal(r.status, r.text), reason: 'login_code_rejected' };
+    if (r.status !== 200 || typeof r.json?.access_token !== 'string') return r.status === 200 ? { ok: false, invalid: false, reason: 'login_invalid_response', providerStatus: 200, detail: 'invalid_token_response' } : loginRefusal(r.status, r.text);
     const oauth: any = claudeOauthFrom(r.json, { scopes: CLAUDE_OAUTH.scopes }, nowMs);
     try {
       const p = await fetchFn(CLAUDE_OAUTH.profile, { headers: { Authorization: 'Bearer ' + oauth.accessToken, 'anthropic-beta': 'oauth-2025-04-20' }, signal: AbortSignal.timeout(TIMEOUT_MS) });
@@ -207,14 +211,33 @@ export async function claudeExchange(pasted: string, verifier: string, state: st
     } catch {}
     return { ok: true, files: { '.claude/.credentials.json': JSON.stringify({ claudeAiOauth: oauth }) } };
   } catch {
-    return { ok: false, invalid: false, reason: 'login_unreachable' };
+    // Worker egress to the provider failed outright: the code was never seen
+    // by the provider, so the CLI host may still exchange it (I8 fallback).
+    return { ok: false, invalid: false, reason: 'login_unreachable', detail: 'egress_unreachable', blocked: true };
   }
+}
+
+const OAUTH_SLUG = /^[a-z][a-z0-9_.-]{0,63}$/;
+
+/**
+ * Classify a refused authorization-code exchange without retaining its body:
+ * the provider HTTP status plus a sanitized reason (the OAuth `error` slug, or
+ * a fixed label). A bot challenge (no OAuth error document on 401/403/429) is
+ * Worker egress blocking, which the CLI host can bypass with its own exchange.
+ */
+export function loginRefusal(status: number, text: string): { ok: false; invalid: boolean; reason: string; providerStatus: number; detail: string; blocked: boolean } {
+  const body = parse(text);
+  const oauth = body && typeof body.error === 'string' && OAUTH_SLUG.test(body.error) ? body.error : null;
+  const blocked = !oauth && (status === 401 || status === 403 || status === 429);
+  const detail = oauth ?? (blocked ? 'egress_blocked' : status >= 500 ? 'provider_unavailable' : 'http_' + status);
+  return { ok: false, invalid: !!oauth, reason: 'login_code_rejected', providerStatus: status, detail, blocked };
 }
 
 // ---------- Direct provider quota (no host, no quse) ----------
 
 export type QuotaWindow = { percent_remaining: number | null; reset_at: string | null; present: boolean; rolling: boolean };
-export type QuotaRoute = { status: 'ok' | 'error' | 'unknown'; error: 'unavailable' | null; observed_at: string | null; details: { limit_reached: boolean | null }; windows: Record<string, QuotaWindow> };
+export type QuotaBankedGrant = { expires_at: string; available: boolean; label: string };
+export type QuotaRoute = { status: 'ok' | 'error' | 'unknown'; error: 'unavailable' | null; observed_at: string | null; details: { limit_reached: boolean | null; banked_resets?: QuotaBankedGrant[]; banked_resets_error?: string | null }; windows: Record<string, QuotaWindow> };
 export type QuotaResult = { ok: true; quota: QuotaRoute } | { ok: false; unauthorized: boolean; reason: string };
 
 const pct = (used: unknown) => typeof used === 'number' && Number.isFinite(used) ? Math.max(0, Math.min(100, 100 - used)) : null;
@@ -247,6 +270,29 @@ export function codexQuotaFrom(body: any, nowMs: number): QuotaRoute {
   return { status: 'ok', error: null, observed_at: new Date(nowMs).toISOString(), details: { limit_reached: limit }, windows };
 }
 
+const BANKED_LABEL = /^[A-Za-z0-9 ._-]{0,80}$/;
+
+/** Map a ChatGPT `wham/rate-limit-reset-credits` body to banked grant details.
+ *
+ * A failed sub-probe is explicit unknown (`banked_resets_error`), never an
+ * empty grant list: downstream banked views must not read it as "no resets"
+ * (intake 7bf6f6ee). Only fixed reason codes travel; no provider output.
+ */
+export function codexResetCreditsFrom(body: any): { banked_resets: QuotaBankedGrant[]; banked_resets_error: string | null } {
+  const credits = body?.credits;
+  if (!Array.isArray(credits)) return { banked_resets: [], banked_resets_error: 'quota_invalid_response' };
+  const grants: QuotaBankedGrant[] = [];
+  for (const item of credits.slice(0, 32)) {
+    if (!item || typeof item !== 'object') continue;
+    const expires_at = isoFrom((item as any).expires_at);
+    if (expires_at === null) continue;
+    const rawLabel = (item as any).title;
+    const label = typeof rawLabel === 'string' && BANKED_LABEL.test(rawLabel) && rawLabel ? rawLabel : 'Full reset';
+    grants.push({ expires_at, available: (item as any).status === 'available', label });
+  }
+  return { banked_resets: grants, banked_resets_error: null };
+}
+
 /** Map an Anthropic `oauth/usage` body to the Hub quota route shape. */
 export function claudeQuotaFrom(body: any, nowMs: number): QuotaRoute {
   const win = (w: any): QuotaWindow => w && typeof w === 'object'
@@ -260,12 +306,14 @@ export function claudeQuotaFrom(body: any, nowMs: number): QuotaRoute {
 export async function fetchQuota(provider: string, files: CredentialFiles, fetchFn: FetchLike, nowMs: number): Promise<QuotaResult> {
   try {
     let res: Response;
+    let codexHeaders: Record<string, string> | null = null;
     if (provider === 'codex') {
       const auth = parse(files['.codex/auth.json']);
       const token = auth?.tokens?.access_token;
       if (typeof token !== 'string') return { ok: false, unauthorized: true, reason: 'credential_missing' };
-      res = await fetchFn(CODEX_OAUTH.usage, { redirect: 'manual', headers: { Authorization: 'Bearer ' + token, Accept: 'application/json',
-        ...(typeof auth.tokens.account_id === 'string' ? { 'ChatGPT-Account-Id': auth.tokens.account_id } : {}), 'User-Agent': 'codex_cli_rs/0.162.1', originator: 'codex_cli_rs' }, signal: AbortSignal.timeout(TIMEOUT_MS) });
+      codexHeaders = { Authorization: 'Bearer ' + token, Accept: 'application/json',
+        ...(typeof auth.tokens.account_id === 'string' ? { 'ChatGPT-Account-Id': auth.tokens.account_id } : {}), 'User-Agent': 'codex_cli_rs/0.162.1', originator: 'codex_cli_rs' };
+      res = await fetchFn(CODEX_OAUTH.usage, { redirect: 'manual', headers: codexHeaders, signal: AbortSignal.timeout(TIMEOUT_MS) });
     } else if (provider === 'claude') {
       const token = parse(files['.claude/.credentials.json'])?.claudeAiOauth?.accessToken;
       if (typeof token !== 'string') return { ok: false, unauthorized: true, reason: 'credential_missing' };
@@ -279,7 +327,34 @@ export async function fetchQuota(provider: string, files: CredentialFiles, fetch
     if (res.status !== 200) return { ok: false, unauthorized: false, reason: 'quota_http_' + res.status };
     const body = parse(text);
     if (!body) return { ok: false, unauthorized: false, reason: 'quota_invalid_response' };
-    return { ok: true, quota: provider === 'codex' ? codexQuotaFrom(body, nowMs) : claudeQuotaFrom(body, nowMs) };
+    if (provider !== 'codex') return { ok: true, quota: claudeQuotaFrom(body, nowMs) };
+    const quota = codexQuotaFrom(body, nowMs);
+    // Banked reset grants ride the same account token. A credits failure
+    // leaves the quota usable but marks banked explicitly unknown so no
+    // consumer reads an empty list as "no resets" (intake 7bf6f6ee).
+    try {
+      const creditsRes = await fetchFn(CODEX_OAUTH.resetCredits, { redirect: 'manual', headers: codexHeaders!, signal: AbortSignal.timeout(TIMEOUT_MS) });
+      const creditsText = (await creditsRes.text()).slice(0, 131072);
+      if (creditsRes.status !== 200) {
+        quota.details.banked_resets = [];
+        quota.details.banked_resets_error = creditsRes.status === 401 || creditsRes.status === 403 || creditsRes.status === 429
+          ? 'quota_blocked' : 'quota_http_' + creditsRes.status;
+      } else {
+        const creditsBody = parse(creditsText);
+        if (!creditsBody) {
+          quota.details.banked_resets = [];
+          quota.details.banked_resets_error = 'quota_invalid_response';
+        } else {
+          const mapped = codexResetCreditsFrom(creditsBody);
+          quota.details.banked_resets = mapped.banked_resets;
+          if (mapped.banked_resets_error !== null) quota.details.banked_resets_error = mapped.banked_resets_error;
+        }
+      }
+    } catch {
+      quota.details.banked_resets = [];
+      quota.details.banked_resets_error = 'quota_unreachable';
+    }
+    return { ok: true, quota };
   } catch {
     return { ok: false, unauthorized: false, reason: 'quota_unreachable' };
   }

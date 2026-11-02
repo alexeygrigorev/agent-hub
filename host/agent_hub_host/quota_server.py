@@ -4,10 +4,13 @@ Run on the Hub's credential-bearing server every five minutes. Only sanitized
 account observations cross the wire. Provider credentials remain server-local.
 """
 import argparse
+import contextlib
 import datetime
 import http.cookiejar
 import json
+import os
 import re
+import sys
 from pathlib import Path
 import stat
 import urllib.error
@@ -17,9 +20,50 @@ import urllib.request
 from . import config, quota_snapshot
 
 
+# Managed harness providers that report on a policy family's quota route.
+# Antigravity is a harness on the Gemini family; the Worker only accepts the
+# family name on ingest (intake e0af55f3: the catalog gained hub-antigravity and
+# the whole collection aborted on the unknown provider).
+WIRE_PROVIDER = {'antigravity': 'gemini'}
+# Native account label -> managed account that owns the same login.
+NATIVE_ALIAS_OF = {'shared-gemini': 'hub-antigravity'}
+
+
+def expand_release_placeholders(argv):
+    """Resolve ``{python}`` and ``{host}`` to the release this collector itself runs from.
+
+    The managed-account reader then always matches the unit's release
+    drop-in: a host-release bump moves both together and no release path is
+    ever hardcoded in quota-server.json (intake e0af55f3).
+    """
+    if not isinstance(argv, list):
+        return argv
+    values = {'{python}': sys.executable, '{host}': str(Path(__file__).resolve().parents[1])}
+    return [values.get(a, a.replace('{host}', values['{host}'])) if isinstance(a, str) else a for a in argv]
+
+
+class CollectionError(ValueError):
+    """Failure that names its stage and (non-secret) account label."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+@contextlib.contextmanager
+def _managed_dir_env(directory):
+    """Pin AGENT_HUB_MANAGED_DIR for the managed probe subprocess, then restore."""
+    key = 'AGENT_HUB_MANAGED_DIR'
+    previous = os.environ.get(key)
+    os.environ[key] = str(Path(directory).absolute())
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
 def collect_accounts(settings, *, runner=None):
@@ -53,9 +97,15 @@ def collect_accounts(settings, *, runner=None):
         entries = state
         if not isinstance(entries, list) or len(entries) > 32:
             raise ValueError('Invalid managed account catalog')
-        argv = settings.get('managed_quota_argv', ['hub', 'engines', 'quota'])
+        argv = expand_release_placeholders(settings.get('managed_quota_argv', ['hub', 'engines', 'quota']))
         try:
-            managed = quota_snapshot.execute_quse(argv, runner=runner).get('accounts', [])
+            # Probe the same install whose catalog was just read. Without
+            # this the probe resolved its managed dir from HUB_CONFIG_FILE
+            # and could read an orphaned copy of a rotating OAuth bundle:
+            # intake 798f0f8c, codex-orin read unknown from a stale copy
+            # (last_refresh Oct 18) while the host's live copy was healthy.
+            with _managed_dir_env(state_path.parent):
+                managed = quota_snapshot.execute_quse(argv, runner=runner).get('accounts', [])
         except Exception:
             managed = []
         if not isinstance(managed, list):
@@ -83,26 +133,63 @@ def collect_accounts(settings, *, runner=None):
             if isinstance(row, dict) and isinstance(row.get('account'), str):
                 by_account.setdefault(_canonical_account(row['account']), idx)
         managed_seen = set()
+        unobserved_managed = set()
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ValueError('Invalid managed account catalog')
             label, provider = entry.get('label'), entry.get('provider')
-            if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', label) or provider not in quota_snapshot.ALLOWED_PROVIDERS:
-                raise ValueError('Invalid managed account catalog')
+            if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', label):
+                raise CollectionError('managed catalog: invalid account label')
+            wire = WIRE_PROVIDER.get(provider, provider)
+            if wire not in quota_snapshot.ALLOWED_PROVIDERS:
+                raise CollectionError('managed catalog: account %s has unsupported provider' % label)
             key = _canonical_account(label)
             if key in managed_seen:
-                raise ValueError('Invalid managed account catalog')
+                raise CollectionError('managed catalog: duplicate account %s' % label)
             managed_seen.add(key)
-            row = next((r for r in managed if isinstance(r, dict) and r.get('account') == label and r.get('provider') == provider), {})
-            quota = quota_snapshot.sanitize_provider(provider, row.get('quota'), now)
+            row = next((r for r in managed if isinstance(r, dict) and r.get('account') == label and r.get('provider') == provider), None)
+            if row is None:
+                # quotas() omits a managed account it could not read instead of
+                # masking Hub's own fresh observation with an error row; this
+                # merge must preserve that omission. Publishing a synthesized
+                # observed_at=None error row for a missing reading overwrote the
+                # fresher central row and degraded the pool on every transient
+                # host probe failure (intake b9658e6a: hub-claude flapped
+                # between "unavailable (observed never by hub-server)" and
+                # fresh as the backend collector raced Hub's direct probe).
+                # The managed catalog still owns its canonical account this
+                # cycle (f6709905): a personal row for the same account is
+                # dropped too, never published as a fallback — a healthy
+                # personal token must not mask an unread managed credential.
+                # The stored central row keeps answering: Hub probes managed
+                # credentials directly every few minutes, and a genuinely dead
+                # credential still fails closed there (invalid status, then
+                # staleness) without this host inventing evidence.
+                unobserved_managed.add(key)
+                continue
+            quota = quota_snapshot.sanitize_provider(wire, row.get('quota'), now)
             if key in by_account:
-                results[by_account[key]] = {'account': label, 'provider': provider, 'quota': quota}
+                results[by_account[key]] = {'account': label, 'provider': wire, 'quota': quota}
                 continue
             if len(results) >= 32:
                 raise ValueError('Too many account observations')
             seen.add(label)
             by_account[key] = len(results)
-            results.append({'account': label, 'provider': provider, 'quota': quota})
+            results.append({'account': label, 'provider': wire, 'quota': quota})
+        if unobserved_managed:
+            results = [r for r in results if _canonical_account(r.get('account', '')) not in unobserved_managed]
+        # shared-gemini is the host's native agy home, whose login Hub installs
+        # from the hub-antigravity credential (sync_native_antigravity): one
+        # Google login, one quota. Mirror the managed reading so the alias never
+        # reads unavailable (intake 3d1f8702); a missing reading stays missing.
+        for alias, source in NATIVE_ALIAS_OF.items():
+            target = next((r for r in results if isinstance(r, dict) and r.get('account') == source
+                           and isinstance(r.get('quota'), dict) and r['quota'].get('status') == 'ok'), None)
+            if target is None:
+                continue
+            for index, row in enumerate(results):
+                if isinstance(row, dict) and row.get('account') == alias:
+                    results[index] = {**row, 'quota': target['quota']}
     return {'captured_at': quota_snapshot.format_iso_utc(datetime.datetime.now(datetime.timezone.utc)), 'accounts': results}
 
 
@@ -162,9 +249,15 @@ def main(argv=None):
         publish(settings, payload)
         print('Hub server quota: stored %d account observations.' % len(payload['accounts']))
         return 0
-    except Exception:
-        # Provider errors/HTTP bodies/config paths may contain private material.
-        print('Hub server quota collection failed; inspect configuration and provider authentication.')
+    except Exception as error:
+        # Provider errors/HTTP bodies/config paths may contain private material:
+        # report only the error class and, for CollectionError, its curated
+        # message (stage + account label), never str() of an arbitrary error.
+        detail = str(error) if isinstance(error, CollectionError) else ''
+        if isinstance(error, urllib.error.HTTPError):
+            detail = 'http %d' % error.code
+        print('Hub server quota collection failed: %s%s; inspect configuration and provider authentication.'
+              % (type(error).__name__, ' (%s)' % detail if detail else ''))
         return 1
 
 

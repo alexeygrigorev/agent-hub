@@ -218,6 +218,31 @@ def cmd_auth_logout(args):
     else:
         print("Logged out. Human profile removed; host profile preserved.")
 
+def cmd_machines_revoke(args):
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.machine_id or ""):
+        print("Invalid machine id", file=sys.stderr)
+        sys.exit(1)
+    if not args.confirm:
+        print("--confirm is required: revoking a machine permanently kills its credentials.", file=sys.stderr)
+        sys.exit(1)
+    if not args.reason or not args.reason.strip():
+        print("A non-empty --reason is required (the action is audited).", file=sys.stderr)
+        sys.exit(1)
+    from . import bus
+    try:
+        result = bus._do_request(
+            "POST", f"/api/fleet/machines/{args.machine_id}/revoke", {"confirm": True, "reason": args.reason.strip()}
+        )
+    except Exception as e:
+        print(f"Failed to revoke machine: {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{result.get('machine_id', args.machine_id)} {result.get('status', 'revoked')} (credentials revoked: {result.get('credentials_revoked', 0)})")
+
+
 def cmd_machines_available(args):
     try:
         cfg = config.load_config()
@@ -226,14 +251,18 @@ def cmd_machines_available(args):
             sys.exit(1)
         machines = api.get_available_machines(cfg["base_url"])
         
-        # machines.py compatible output:
-        # {"reachable": [ {machine} ], "count": N}
+        # machines.py compatible output: {"reachable": [ {machine} ], "count": N}.
+        # The Worker returns {"machines": [...]} (src/registry.ts); a bare list
+        # and an already-shaped {"reachable": [...]} are accepted too.
         if isinstance(machines, list):
-            output = {"reachable": machines, "count": len(machines)}
-        elif isinstance(machines, dict) and "reachable" in machines:
-            output = machines
+            reachable = machines
+        elif isinstance(machines, dict) and isinstance(machines.get("reachable"), list):
+            reachable = machines["reachable"]
+        elif isinstance(machines, dict) and isinstance(machines.get("machines"), list):
+            reachable = machines["machines"]
         else:
-            output = {"reachable": machines, "count": len(machines)} if isinstance(machines, list) else machines
+            raise RuntimeError("unexpected /api/machines/available response shape")
+        output = {"reachable": reachable, "count": len(reachable)}
 
         if args.json:
             print(json.dumps(output, indent=2, sort_keys=True))
@@ -352,6 +381,12 @@ def add_bridge_resume_command(sub):
 
 
 def main():
+    # Summary is a latency-sensitive single read. Avoid importing/registering
+    # every unrelated command (and computing version metadata) on this path.
+    if sys.argv[1:3] == ['intake', 'summary']:
+        from . import intake
+        intake.summary_main()
+        return
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     parser.add_argument("--version", action="version", version=f"%(prog)s {format_version()}")
     parser.add_argument("--profile", default=None, help="Named agent profile for messaging commands (e.g. developer; see hub msg --help)")
@@ -424,6 +459,16 @@ def main():
     dispatch.add_argument('--interval', type=int, default=60)
     from . import webhooks as webhooks_cli
     webhooks_cli.add_parser(sub)
+    from . import schedules as schedules_cli
+    schedules_cli.add_parser(sub)
+    from . import prompt_schedules as prompt_schedules_cli
+    prompt_schedules_cli.add_parser(sub)
+    from . import ops_liveness
+    ops_liveness.add_parser(sub)
+    from . import limits_cli
+    limits_cli.add_parser(sub)
+    from . import asks as asks_cli
+    asks_cli.add_parser(sub)
     
     p_login = sub.add_parser("login", help="Login to Agent Hub")
     p_login.add_argument("base_url", help="Base URL of the Agent Hub")
@@ -444,6 +489,12 @@ def main():
     m_sub = p_machines.add_subparsers(dest="m_cmd", required=True)
     p_available = m_sub.add_parser("available", help="List available machines")
     p_available.add_argument("--json", action="store_true", help="Output JSON")
+    for _name in ("revoke", "remove"):
+        p_revoke = m_sub.add_parser(_name, help="Admin only: hard-revoke a machine (credentials dead, hidden from routing/fleet)")
+        p_revoke.add_argument("machine_id")
+        p_revoke.add_argument("--confirm", action="store_true", help="Required acknowledgement")
+        p_revoke.add_argument("--reason", default=None, help="Required audit reason")
+        p_revoke.add_argument("--json", action="store_true", help="Output JSON")
     
     p_status = sub.add_parser("status", help="One-call authorized status (single GET /api/status)")
     p_status.add_argument("--since", default=None, help="Filter to changes since duration (e.g. 2h) or ISO time")
@@ -560,11 +611,15 @@ def main():
     p_workclaim.add_argument("--dry-run", action="store_true", help="Scan and redact without POSTing to Hub")
 
     args = parser.parse_args()
+    if args.cmd in ("run", "fleet-host", "bridge"):
+        # Long-running host commands: no console window for any child process.
+        from . import windows_no_window
+        windows_no_window.install()
     if args.cmd == 'engines':
         try:
             print(json.dumps(provisioning.command(args)))
-        except Exception:
-            print('Hub engine operation failed; check authentication, bundle permissions and host prerequisites.', file=sys.stderr)
+        except Exception as exc:
+            print(provisioning.engine_error_message(exc, getattr(args, 'engines_cmd', None)), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'shared-config':
@@ -633,7 +688,7 @@ def main():
                       'Retry create/send with the same key and payload after uncertain results.', file=sys.stderr)
             sys.exit(1)
         return
-    if args.cmd == 'sessions':
+    if args.cmd in ('sessions', 'loop'):
         try:
             result = session_control.execute(args)
             rendered = session_control.render_output(args, result)
@@ -643,6 +698,27 @@ def main():
                 print(json.dumps(rendered, indent=2, ensure_ascii=True))
         except Exception as exc:
             print(session_control.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'ops':
+        from . import ops_liveness
+        ops_liveness.run(args)
+        return
+    if args.cmd == 'limits':
+        from . import limits_cli
+        limits_cli.run(args)
+        return
+    if args.cmd == 'asks':
+        from . import asks as asks_cli
+        try:
+            result = asks_cli.execute(args)
+            rendered = asks_cli.render_output(args, result)
+            if isinstance(rendered, str):
+                print(rendered)
+            else:
+                print(json.dumps(rendered, indent=2, ensure_ascii=False))
+        except Exception as exc:
+            print(asks_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'webhooks':
@@ -658,6 +734,29 @@ def main():
             print(webhooks_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
+    if args.cmd in ('prompts', 'schedules'):
+        from . import prompt_schedules as ps_cli
+        try:
+            result = ps_cli.execute_prompts(args) if args.cmd == 'prompts' else ps_cli.execute_schedules(args)
+            rendered = ps_cli.render_output(args, result)
+            print(rendered if isinstance(rendered, str) else json.dumps(rendered, indent=2, ensure_ascii=True))
+        except Exception as exc:
+            print(ps_cli.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'schedule':
+        from . import schedules as schedules_cli
+        try:
+            result = schedules_cli.execute(args)
+            rendered = schedules_cli.render_output(args, result)
+            if isinstance(rendered, str):
+                print(rendered)
+            else:
+                print(json.dumps(rendered, indent=2, ensure_ascii=True))
+        except Exception as exc:
+            print(schedules_cli.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
     if args.cmd == 'msg':
         from . import msg_cli
         try:
@@ -667,7 +766,7 @@ def main():
             print('hub msg failed: ' + str(exc)[:300], file=sys.stderr)
             sys.exit(msg_cli.exit_code_for(exc))
         return
-    if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact', 'host-release'):
+    if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'device-pending', 'model-policy', 'task-artifact', 'artifact', 'host-release', 'launcher-release', 'host-goal'):
         try:
             print(json.dumps(routing.execute(args), indent=2))
         except Exception:
@@ -786,6 +885,8 @@ def main():
     elif args.cmd == "machines":
         if args.m_cmd == "available":
             cmd_machines_available(args)
+        elif args.m_cmd in ("revoke", "remove"):
+            cmd_machines_revoke(args)
     elif args.cmd == "status":
         if getattr(args, 'local_only', False):
             cmd_status(args)

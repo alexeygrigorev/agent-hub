@@ -40,24 +40,8 @@ def resolve_base_url(explicit=None) -> str:
 
 
 def _poster(exchange=None):
-    def post(url, body):
-        request = urllib.request.Request(
-            url, data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            if exchange is not None and url == exchange.url:
-                return 200, api.safe_http_json(request, _token_exchange=exchange)
-            return 200, api.safe_http_json(request)
-        except urllib.error.HTTPError as exc:
-            try:
-                payload = json.loads(exc.read().decode("utf-8"))
-            except Exception as error:
-                raise RuntimeError("Token error: malformed response") from error
-            if not isinstance(payload, dict):
-                payload = {}
-            return exc.code, payload
-    return post
+    from .device_transport import poster
+    return poster(exchange)
 
 
 def _flow():

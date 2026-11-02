@@ -13,7 +13,9 @@
 #   S5  stale dedupe: repeat inside the window sends nothing
 #   S6  --dry-run stale -> would-alert line, zero mail, no state write
 #   S7  test-path guard: /tmp dirs route ALL mail to ALERT_OPS_TO, never ALERT_TO
-#   S8  drill never mails: FAIL/RECOVERED to the sink only, DRILL=1 state, --drill misuse\n#       refused, symlinked sink fails closed
+#   S8  drills never mail: each drill (stale FAIL, recovery, --backup-failed --drill)
+#       prints exactly one [DRILL] ... mail=none log line; DRILL=1 state;
+#       --drill without --backup-failed is refused
 #   S9  drill must not suppress a real stale page (real recipients, marker dropped)
 #   S10 no real recipient ever appears in captured mail; stub MTAs intercept all
 set -euo pipefail

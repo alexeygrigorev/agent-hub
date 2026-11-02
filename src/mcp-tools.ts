@@ -21,8 +21,8 @@ tool('heartbeat', 'POST', '/api/heartbeat', 'Report own agent liveness (health:r
 for (const [name, mode] of [['start_agent', 'headless'], ['start_session', 'interactive'], ['plan_agent', 'plan']] as const) {
   tool(name, 'POST', mode === 'plan' ? '/api/fleet/plan' : '/api/fleet/launches', `Legacy fleet ${mode}: provide the same JSON as the CLI; placement/admission unchanged.`, [name.replaceAll('_', '-')]);
 }
-tool('sessions_link', 'POST', '/api/sessions/{id}/link', 'Operator manual intake linkage; payload key, intake_task_id. Existing different linkage is refused.', ['sessions link']);
-tool('sessions_list', 'GET', '/api/sessions', 'List sessions; query view=lifecycle gives grouped lifecycle; state, limit, cursor filter.', ['sessions', 'sessions list']);
+tool('sessions_link', 'POST', '/api/sessions/{id}/link', 'Operator intake link (key, intake_task_id), also after session end; idempotent; conflict is 409.', ['sessions link']);
+tool('sessions_list', 'GET', '/api/sessions', 'List sessions; query view=lifecycle grouped, view=breakdown&by=host,engine,account counts; state, limit, cursor filter.', ['sessions', 'sessions list', 'sessions count']);
 tool('sessions_tree', 'GET', '/api/sessions/tree', 'Session requester/parent tree.', ['sessions tree']);
 tool('sessions_start', 'POST', '/api/sessions', 'Queue durable session intent: workspace, brief, name, mode=headless|interactive, parent_id, intake_task_id, key, with_goal. Omit engine for tier policy; explicit engine REQUIRES engine_override_reason. Non-interactive starts REQUIRE intake_task_id and nonempty AC. Scope flags are informational only and never hold a start. needs filters advertised machine labels; unmet needs hold with needs_unmet. Quota/admission unchanged. Use interactive with_goal for follow-ups; headless uses native resume. Poll sessions_show/commands: queued or transported is not acknowledged execution.', ['sessions start', 'sessions override']);
 tool('sessions_show', 'GET', '/api/sessions/{id}', 'Session binding and observed state.', ['sessions show']);
@@ -33,6 +33,9 @@ for (const action of ['send', 'capture', 'stop']) tool(`sessions_${action}`, 'PO
 tool('sessions_cancel', 'POST', '/api/sessions/{id}/cancel', 'Cancel an owned held, queued or unclaimed offered intent before start authorization. payload: key. Reuse the stable key; the no_native_start receipt is cancellation, not confirmed native stop.', ['sessions cancel']);
 tool('sessions_protect', 'POST', '/api/sessions/{id}/protect', 'Permanently protect an owned session from automated cleanup. payload: key. No unprotect or native effect. Exact current owner credential family is required.', ['sessions protect']);
 tool('sessions_wake', 'POST', '/api/sessions/{id}/wake', 'Durable verified-send wake. Payload: key, at (ISO or now), prompt. Future wake suppresses stall recovery; missing ack after 10m opens attention and intake note. Read history via sessions_show.', ['sessions wake']);
+tool('sessions_ping', 'POST', '/api/sessions/{id}/ping', 'Recurring Hub ping (external /loop, any engine). Payload: every_seconds 60..604800, prompt. Coalesces while busy; ends with the session; replaces an existing ping.', ['sessions ping create', 'loop set']);
+tool('sessions_ping_clear', 'POST', '/api/sessions/{id}/ping-clear', 'Clear the ping; the session may clear its own when done. Payload: reason.', ['sessions ping disable', 'loop clear']);
+tool('sessions_pings', 'GET', '/api/sessions/{id}/pings', 'Ping state, history, failures.', ['sessions ping show', 'loop show']);
 tool('sessions_cleanup', 'POST', '/api/sessions/cleanup', 'DESTRUCTIVE when dry_run=false: plan/apply cleanup through existing custody guards. Explicit payload dry_run=true for a preview.', ['sessions cleanup']);
 tool('sessions_observe', 'POST', '/api/sessions/observations', 'Host-only lifecycle observation; ownership remains server validated.', ['sessions observe']);
 for (const action of ['send', 'reply']) tool(`bus_${action}`, 'POST', `/api/bus/${action}`, 'DESTRUCTIVE: send a durable message using payload from_actor, to_actor, kind, body, idempotency_key and optional thread_id, reply_to, lease_epoch' + (action === 'send' ? '; to_actor session:<id> or tag@machine types into a session on any host' : '') + '.', action === 'send' ? [action, 'msg send'] : [action, 'msg reply']);
@@ -51,13 +54,17 @@ tool('claims_create', 'POST', '/api/bus/claims', 'Claim a scope using project, s
 tool('claims_release', 'POST', '/api/bus/claims/{id}/release', 'Release a claim; id may be project:scope (encoded as one segment).', ['release']);
 tool('tasks_submit', 'POST', '/api/fleet/tasks', 'Submit authorized work; payload prompt, approved_action, needs, workspace, idempotency_key and routing preferences, or tasks batch.', ['submit']);
 tool('routing_machines', 'GET', '/api/fleet/routing/machines', 'Capability and model advertisements.', ['routing-machines']);
+tool('device_pending', 'GET', '/api/device/pending', 'Pending host/agent device approvals (admin).', ['device-pending']);
 tool('model_policy', 'GET', '/api/fleet/routing/policy', 'Configured model policy.', ['model-policy']);
 tool('jobs_list', 'GET', '/api/fleet/tasks', 'Recent routed tasks.', ['jobs']);
 tool('jobs_show', 'GET', '/api/fleet/tasks/{id}', 'Task state, report and artifacts.', ['job']);
 tool('task_result', 'POST', '/api/fleet/tasks/{id}/result', 'Assigned host only: status/report/artifacts/confirmed_exit.', ['task-result']);
 tool('artifact', 'GET', '/api/fleet/tasks/{id}/artifacts/{name}', 'Fetch a sanitized PNG as the API base64 DTO.', ['artifact']);
+tool('asks_read', 'GET', '/api/asks/{view}', 'Ask ledger view list (query state, agent_id, intake), messages (agent_id, role, since) or summary.', ['asks list', 'asks tail', 'asks search', 'asks summary']);
+tool('asks_write', 'POST', '/api/asks/{op}', "Ask ledger op ingest: Alexey's message verbatim, idempotent on agent+msg_id, {source:'bot', agents:[{agent_id, agent_name, messages:[{msg_id:'tNNNNu', role:'user', ts, text, intake_id?}]}]}; map/dismiss/verify: ask_id + intake_id, ac_line? / reason / evidence; check; settings.", ['asks record', 'asks map', 'asks dismiss', 'asks verify', 'asks check', 'asks settings']);
 tool('intake_create', 'POST', '/api/intake/tasks', 'File verbatim task: payload key, project, title, text, transcription, source {type,reference,timestamp}, optional acceptance_criteria (nullable bounded text; required non-empty before assign/start).', ['intake create']);
-tool('intake_list', 'GET', '/api/intake/tasks', 'One revision-pinned page: query status, project, archived=true (archived only), all=true (include archived), after, revision, authorization_valid_until, limit. Default hides archives. limit accepts a positive integer or numeric string, defaults to 25, clamps above max 100; response effective_limit states the applied size. Follow next as after with snapshot_version as revision and non-null authorization_valid_until from the first page; restart on stale_snapshot. CLI hub intake list --all follows all pages automatically.', ['intake list']);
+tool('intake_summary', 'GET', '/api/intake/summary', 'Authorized counts/recent tasks; optional project.', ['intake summary']);
+tool('intake_list', 'GET', '/api/intake/tasks', 'Revision-pinned page. query: status, project, archived=true (archives only), all=true (include archives), after, revision, authorization_valid_until, limit. Archives hidden by default. Positive integer/numeric-string limit defaults to 25, max 100; see effective_limit. Next page: next as after, snapshot_version as revision, and non-null first-page authorization_valid_until. Restart on stale_snapshot. CLI --all follows every page.', ['intake list']);
 tool('intake_forgotten', 'GET', '/api/intake/forgotten', 'Authorized forgotten open intakes: id, title, age_ms, last_session, state, reason, restart queue; optional project query.', ['intake forgotten']);
 tool('intake_audit', 'GET', '/api/intake/tasks/{id}/audit', 'Append-only lifecycle audit for full id or prefix; survives task row.', ['intake audit']);
 tool('intake_audit_recent', 'GET', '/api/intake/audit', 'Recent authorized lifecycle events; query limit, after, revision.');
@@ -94,9 +101,19 @@ tool('fleet_claim_policy_write', 'PUT', '/api/fleet/claim-policy', 'Operator-onl
 tool('monitoring_disk', 'GET', '/api/monitoring/disk', 'Authorized disk monitoring dashboard.');
 tool('monitoring_health', 'GET', '/api/monitoring/health', 'Authorized host health monitoring dashboard.');
 tool('accounts_write', 'PUT', '/api/fleet/accounts', 'Operator-only account registry update.');
+tool('limits', 'GET', '/api/fleet/limits', 'Operator-only per-engine and per-account concurrency caps with current usage.', ['limits show']);
+tool('limits_set', 'PATCH', '/api/fleet/limits', 'Operator-only live, persisted concurrency cap set: payload target (engine or account), max_concurrency 1..100, allow_lower. Raise-only unless allow_lower.', ['limits set']);
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
+  'intake merge-check': 'Host-local: runs git and gh in a checkout, then records merge evidence; deliberate CLI step. The close gate itself is enforced for MCP intake_update (intake 2e00e01f).',
+  'intake merge-state': 'Read of the merge gate; shown on intake_show (merge_state) and GET /api/intake/merge-state.',
+  'machines remove': 'Operator-only machine retirement; deliberate CLI step, not an agent tool.',
+  'machines revoke': 'Admin-only hard hide of a machine with credential kill; deliberate CLI step, not an agent tool.',
+  'host-goal': 'Operator set/inspect of durable host bring-up state; deliberate CLI step, not an agent tool.',
+  'limits disable': 'Operator-only reversible account routing switch; deliberate CLI step, not an agent tool.',
+  'limits enable': 'Operator-only reversible account routing switch; deliberate CLI step, not an agent tool.',
   'host-release': 'Operator release pin for a checkout-installed host; deliberate CLI step, not an agent tool.',
+  'launcher-release': 'Operator release pin for a checkout-installed launcher; deliberate CLI step, not an agent tool.',
   'msg agent-credential': 'Writes a new private local credential file; MCP cannot write host files.',
   'msg agent-delegate': 'Operator grant of named-agent delegation to an MCP client; deliberate CLI step.',
   'msg readdress': 'Operator re-address of an undelivered session message; deliberate CLI step.',
@@ -114,6 +131,10 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'engines maintain': 'Operator trigger for Hub credential refresh and direct provider quota; the cron already runs it.',
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',
   'engines remove': 'Operator credential withdrawal stays in the explicit credential-management CLI/UI workflow.',
+  'engines status': 'Operator read of per-host engine sync status; deliberate CLI step, not an agent tool.',
+  'engines cancel': 'Admin cancel of a pending engine rollout that restores the prior bundle version (intake 8cc9e31a, rollout 0de287c8); an operator incident action, never an agent tool.',
+  'engines update': 'Operator rollout of Hub-managed engine versions to hosts (intake 8cc9e31a); a fleet-wide change, never an agent tool.',
+  'engines versions': 'Operator read of the Hub-managed engine version catalog and per-host rollout state (intake 8cc9e31a); CLI view.',
   'engines sync': 'Local enrolled-host engine installation; no second remote executor.',
   'engines quota': 'Local private-account probes for the server collector; model tools read sanitized server quota instead.',
   'login': 'Host/agent pairing is performed outside model tools using hub login and explicit device approval; never return credentials in tool output.',
@@ -136,16 +157,53 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'webhooks show': 'Route administration detail is operator-only product scope; operators use the CLI or dashboard.',
   'webhooks deliveries': 'Delivery inspection is operator-only product scope; operators use the CLI or dashboard.',
   'webhooks test': 'Injects payloads into live sessions; stays an explicit operator action in the CLI, not a model tool.',
+  'schedule create': 'Operator-owned cron configuration launches sessions on a timer; deliberate CLI/UI step, not a model tool.',
+  'schedule delete': 'Operator-only destructive schedule administration stays in the explicit CLI workflow.',
+  'schedule list': 'Schedule administration inventory is operator-only product scope; operators use the CLI or dashboard.',
+  'schedule show': 'Schedule administration detail is operator-only product scope; operators use the CLI or dashboard.',
+  'schedule pause': 'Operator cron lifecycle control stays an explicit operator action in the CLI.',
+  'schedule resume': 'Operator cron lifecycle control stays an explicit operator action in the CLI.',
+  'schedule runs': 'Run history inspection is operator-only product scope; operators use the CLI or dashboard.',
+  'schedule tick': 'A manual tick fires sessions outside their cron; stays an explicit operator action in the CLI.',
+  'worktree repair-locks': 'Host-local repair of git worktree locks left by terminal Hub sessions (intake f49b4d69); runs on the owning host against its own checkouts, dry-run by default - never an agent tool.',
+  'prompts create': 'Operator-owned prompt library content that later launches sessions (intake 19ec91c2); deliberate CLI/UI step, not a model tool.',
+  'prompts delete': 'Operator-only destructive prompt library administration stays in the explicit CLI workflow.',
+  'prompts list': 'Prompt library inventory is operator-only product scope; operators use the CLI or /prompts.html.',
+  'prompts show': 'Prompt library detail is operator-only product scope; operators use the CLI or /prompts.html.',
+  'prompts render': 'Rendering previews operator-owned prompt templates; operator-only product scope, use the CLI or /prompts.html.',
+  'prompts update': 'Operator-owned prompt library edits stay an explicit CLI/UI step, not a model tool.',
+  'schedules create': 'Operator-owned session schedules launch work on a timer (intake 19ec91c2); deliberate CLI/UI step, not a model tool.',
+  'schedules delete': 'Operator-only destructive session schedule administration stays in the explicit CLI workflow.',
+  'schedules deliveries': 'Schedule delivery inspection is operator-only product scope; operators use the CLI or dashboard.',
+  'schedules fire': 'A manual fire enqueues a session outside its schedule; stays an explicit operator action in the CLI.',
+  'schedules list': 'Session schedule inventory is operator-only product scope; operators use the CLI or dashboard.',
+  'schedules pause': 'Operator schedule lifecycle control stays an explicit operator action in the CLI.',
+  'schedules resume': 'Operator schedule lifecycle control stays an explicit operator action in the CLI.',
+  'schedules show': 'Session schedule detail is operator-only product scope; operators use the CLI or dashboard.',
+  'ops heartbeat': 'Host ops-watchdog and orchestrator tick reports for Hub-side liveness (intake 500fd60b); a model tool must not fake liveness for the session it runs in.',
+  'ops status': 'Operator view of orchestrator/watchdog liveness and backlog idle episodes; alerts reach operators through the existing alert path.',
 };
 export function publicTools() {
   return routes.map(r => {
     const slots = [...r.path.matchAll(/\{(\w+)\}/g)].map(m => m[1]);
     const properties: Record<string, unknown> = Object.fromEntries(slots.map(s => [s, { type: 'string', minLength: 1, maxLength: 256 }]));
     if (r.method === 'GET' || r.name === 'sessions_cleanup') properties.query = { type: 'object', additionalProperties: { type: ['string', 'number', 'boolean'] } };
-    if (r.method !== 'GET') properties.payload = { type: 'object', description: 'JSON request body.', additionalProperties: true };
+    // JSON Schema already admits any object keys; additionalProperties:true would only add bytes.
+    if (r.method !== 'GET') properties.payload = { type: 'object', description: 'JSON request body.' };
     return { name: r.name, description: r.description, inputSchema: { type: 'object', properties, ...(slots.length ? { required: slots } : {}), additionalProperties: false },
-      annotations: { readOnlyHint: r.method === 'GET', destructiveHint: r.method !== 'GET' && r.name !== 'sessions_capture', idempotentHint: r.method === 'GET', openWorldHint: false } };
+      annotations: toolAnnotations(r) };
   });
+}
+/** Tools that POST only to queue a read of native state; they never type into or alter a session. */
+const READ_ONLY_POSTS = new Set(['sessions_capture']);
+/** MCP annotation hints, emitting only values that differ from the spec's conservative defaults
+ * (readOnlyHint=false, idempotentHint=false) or that clients must see explicitly. destructiveHint
+ * stays explicit on every tool; idempotentHint is meaningful only for non-read-only tools and no
+ * write route is advertised as idempotent, so it is never emitted. */
+export function toolAnnotations(r: Pick<ToolRoute, 'name' | 'method'>) {
+  const readOnly = r.method === 'GET' || READ_ONLY_POSTS.has(r.name);
+  return readOnly ? { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+    : { destructiveHint: true, openWorldHint: false };
 }
 export function toolRequest(origin: string, name: string, args: unknown, authorization: string): Request {
   const route = routes.find(r => r.name === name);

@@ -199,3 +199,30 @@ def test_plain_interactive_preamble_queues_same_workspace(tmp_path):
         d = fleet.Dispatcher(cfg, request, runner)
         assert d.dispatch(offer(with_goal=True, prompt='Literal goal'))['state'] == 'running'
     assert not [c for c in calls if len(c[0]) > 2 and c[0][1:3] == ['message', 'send']]
+
+
+def test_claude_goal_route_advertised_and_started_with_goal(tmp_path):
+    """Claude Code supports /goal (intake bf0863c4): a launchable Claude
+    subscription advertises a goal route and the goal text is the literal
+    final argument of the trusted startup command."""
+    cfg = settings(tmp_path)
+    cfg['subscriptions'] += [dict(service='claude', engine='claude', account_label='shared-claude',
+                                  profile=None, admission_argv=['gate'],
+                                  startup_argv=['trusted-claude', '--dangerously-skip-permissions'])]
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        if argv[0] == 'gate':
+            return {'launch_allowed': True, 'profile_supported': True,
+                    'account_label': 'shared-claude', 'observed_at': fleet.utcnow()}
+        return {'id': 'native', 'workspace': str(tmp_path), 'tag': 'hub-' + offer()['id'],
+                'engine': 'claude', 'profile': None, 'phase': 'running'}
+
+    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
+        d = fleet.Dispatcher(cfg, lambda *a: {}, runner)
+        assert {'engine': 'claude', 'account': 'shared-claude', 'profile': None} in d.goal_routes()
+        result = d.dispatch(offer(engine='claude', account='shared-claude', with_goal=True, prompt='Ship the fix'))
+    assert result['state'] == 'running'
+    assert calls[-1][-4:-1] == ['--', 'trusted-claude', '--dangerously-skip-permissions']
+    assert calls[-1][-1].startswith('/goal ' + compose_prompt('Ship the fix') + '\n')

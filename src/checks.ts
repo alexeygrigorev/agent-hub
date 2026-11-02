@@ -229,8 +229,10 @@ export class ChecksService {
     switch (check.kind) {
       case 'liveness': {
         const { subjects } = deps.liveness.evaluate();
+        for (const alert of deps.liveness.watchHosts()) await deps.notify(alert);
         // Liveness keeps one alert per subject; the check itself only summarizes.
-        for (const alert of deps.liveness.reconcileAlerts(subjects)) await deps.notify(alert);
+        // Mandatory watchHosts owns host incidents and recovery notifications.
+        for (const alert of deps.liveness.reconcileAlerts(subjects.filter(s => s.kind !== 'machine'), ['session', 'launch', 'agent'])) await deps.notify(alert);
         const bad = subjects.filter(s => ['stale', 'offline', 'stalled', 'stuck', 'uncertain', 'missing'].includes(s.state));
         return bad.length ? { status: 'fail', detail: bad.map(s => `${s.kind} ${s.id}: ${s.state}`).join('; ') } : { status: 'pass', detail: `${subjects.length} subjects healthy or idle` };
       }

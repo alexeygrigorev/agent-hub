@@ -126,9 +126,9 @@ function randomToken(): string {
  * can never silently leak markup into a live session prompt — and payload
  * content that itself contains braces is delivered verbatim. Output is
  * capped at the session send limit. */
-export function renderTemplate(template: string | null, bodyText: string): { text: string; warnings: string[] } {
+export function renderTemplate(template: string | null, bodyText: string, vars: Record<string, string> = {}): { text: string; warnings: string[] } {
   const warnings: string[] = [];
-  const KNOWN = /^payload(_json|(\.[A-Za-z0-9_.-]+))?$/;
+  const KNOWN = /^(payload(_json|(\.[A-Za-z0-9_.-]+))?|var\.[A-Za-z0-9_-]+)$/;
   let parsedBody: any;
   let parseTried = false;
   const tryParse = () => {
@@ -140,7 +140,12 @@ export function renderTemplate(template: string | null, bodyText: string): { tex
     warnings.push(`unknown_placeholder:${inner}`);
     return '';
   });
-  text = text.replace(/\{\{\s*payload(_json|(\.[A-Za-z0-9_.-]+))?\s*\}\}/g, (_match, whole: string, dotPath?: string) => {
+  text = text.replace(/\{\{\s*(?:var\.([A-Za-z0-9_-]+)|payload(_json|(\.[A-Za-z0-9_.-]+))?)\s*\}\}/g, (_match, varName: string | undefined, whole: string, dotPath?: string) => {
+    if (varName !== undefined) {
+      if (Object.prototype.hasOwnProperty.call(vars, varName)) return String(vars[varName]);
+      warnings.push(`missing_var:${varName}`);
+      return '';
+    }
     if (whole === '_json') {
       const value = tryParse();
       return value === undefined ? bodyText : JSON.stringify(value, null, 2);
@@ -189,7 +194,53 @@ export class WebhookService {
       const trimmed = statement.trim();
       if (trimmed) this.sql.exec(trimmed);
     }
+    // Prompt-library binding (intake 19ec91c2 AC10): additive columns.
+    for (const column of ['prompt_id TEXT', 'prompt_vars TEXT']) {
+      try { this.sql.exec(`ALTER TABLE webhook_routes ADD COLUMN ${column}`); } catch { /* already present */ }
+    }
   }
+
+  /** Prompt-library resolver (wired by Hub): slug|id[@version] -> body. */
+  private promptResolver: ((ref: string) => { id: string; slug: string; version: number; body: string } | null) | null = null;
+  setPromptResolver(fn: (ref: string) => { id: string; slug: string; version: number; body: string } | null) { this.promptResolver = fn; }
+
+  /** Render the route's delivery text: a library prompt (when bound) or the
+   * inline template, with the payload and route variables substituted. */
+  private renderRoute(route: any, bodyText: string): { text: string; warnings: string[] } {
+    let template: string | null = route.template;
+    const warnings: string[] = [];
+    if (route.prompt_id) {
+      const prompt = this.promptResolver ? this.promptResolver(route.prompt_id) : null;
+      if (prompt) template = prompt.body; else warnings.push(`prompt_unavailable:${route.prompt_id}`);
+    }
+    const rendered = renderTemplate(template, bodyText, parsed(route.prompt_vars, {}));
+    return { text: rendered.text, warnings: [...warnings, ...rendered.warnings] };
+  }
+
+  /** Enqueue a delivery from another source (schedules) through the same
+   * durable queue; idempotent on (source_id, delivery_key). */
+  /** Synchronous insert (usable inside a caller's transaction). */
+  insertDelivery(source: string, sourceId: string, deliveryKey: string, targetLabel: string, body: string): { id: string; replayed: boolean } {
+    const existing: any = this.sql.exec(
+      'SELECT * FROM session_deliveries WHERE source_id = ? AND delivery_key = ?', sourceId, deliveryKey).toArray()[0];
+    if (existing) return { id: existing.id, replayed: true };
+    const at = this.at();
+    const deliveryId = crypto.randomUUID();
+    this.sql.exec(
+      `INSERT INTO session_deliveries (id, source, source_id, delivery_key, target_label, body, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)`,
+      deliveryId, source, sourceId, deliveryKey, targetLabel, body.slice(0, MAX_SEND_BODY), at, at, at);
+    return { id: deliveryId, replayed: false };
+  }
+
+  async enqueueDelivery(source: string, sourceId: string, deliveryKey: string, targetLabel: string, body: string, pumpNow = true): Promise<{ id: string; status: string; replayed: boolean }> {
+    const result = this.txn(() => this.insertDelivery(source, sourceId, deliveryKey, targetLabel, body));
+    if (pumpNow && !result.replayed) { try { await this.pump(); } catch { /* queue retries */ } }
+    const row: any = this.sql.exec('SELECT status FROM session_deliveries WHERE id = ?', result.id).toArray()[0];
+    return { id: result.id, status: row?.status ?? 'pending', replayed: result.replayed };
+  }
+
+  async pumpQueue(): Promise<void> { try { await this.pump(); } catch { /* queue retries */ } }
 
   private at(): string { return new Date(this.now()).toISOString(); }
 
@@ -278,7 +329,7 @@ export class WebhookService {
     }
     if (!deliveryKey) deliveryKey = 'd-' + crypto.randomUUID();
 
-    const { text, warnings } = renderTemplate(route.template, bodyText);
+    const { text, warnings } = this.renderRoute(route, bodyText);
     const insert = this.txn(() => {
       // Re-check inside the transaction: a concurrent retry with the same
       // delivery id must attach to the original, never duplicate.
@@ -403,6 +454,14 @@ export class WebhookService {
     if (!targetLabel || targetLabel.length > 200) return json({ error: 'invalid_target_label' }, 400);
     const template = input.template === undefined || input.template === null ? null : input.template;
     if (template !== null && (typeof template !== 'string' || template.length > 4096)) return json({ error: 'invalid_template' }, 400);
+    const promptId = input.prompt_id === undefined || input.prompt_id === null ? null : input.prompt_id;
+    if (promptId !== null) {
+      if (typeof promptId !== 'string' || !promptId.length || promptId.length > 100) return json({ error: 'invalid_prompt_id' }, 400);
+      if (!this.promptResolver || !this.promptResolver(promptId)) return json({ error: 'prompt_not_found' }, 400);
+    }
+    const promptVars = input.prompt_vars === undefined || input.prompt_vars === null ? null : input.prompt_vars;
+    if (promptVars !== null && (typeof promptVars !== 'object' || Array.isArray(promptVars) || JSON.stringify(promptVars).length > 4096
+      || Object.values(promptVars).some(v => typeof v !== 'string'))) return json({ error: 'invalid_prompt_vars' }, 400);
     const authMode = input.auth_mode === undefined ? 'token' : input.auth_mode;
     if (authMode !== 'token' && authMode !== 'hmac') return json({ error: 'invalid_auth_mode' }, 400);
     if (authMode === 'hmac' && !this.sessionSecret) return json({ error: 'hmac_unavailable', detail: 'server session secret not configured' }, 503);
@@ -423,14 +482,15 @@ export class WebhookService {
       }
       const at = this.at();
       this.sql.exec(
-        `INSERT INTO webhook_routes (id, name, target_label, template, auth_mode, secret_storage, rate_limit_per_min, max_body_bytes, enabled, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        id, name, targetLabel, template, authMode, secretStorage, rate, maxBody, enabled ? 1 : 0, actor, at, at);
+        `INSERT INTO webhook_routes (id, name, target_label, template, auth_mode, secret_storage, rate_limit_per_min, max_body_bytes, enabled, created_by, created_at, updated_at, prompt_id, prompt_vars)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id, name, targetLabel, template, authMode, secretStorage, rate, maxBody, enabled ? 1 : 0, actor, at, at,
+        promptId, promptVars === null ? null : JSON.stringify(promptVars));
       this.audit('webhook.create', actor, name, { webhook_id: id, auth_mode: authMode, target_label: targetLabel });
       // The secret appears exactly once, in this create response; every other
       // surface (list/show/UI) reports routes without secret material.
       return json({
-        id, name, target_label: targetLabel, url_path: '/webhooks/' + id,
+        id, name, target_label: targetLabel, prompt_id: promptId, url_path: '/webhooks/' + id,
         auth_mode: authMode, rate_limit_per_min: rate, max_body_bytes: maxBody,
         enabled, created_at: at, secret,
         secret_note: 'shown once; store it now (private 0600 file, never logs/reports)',
@@ -441,6 +501,7 @@ export class WebhookService {
   private publicRoute(row: any) {
     return {
       id: row.id, name: row.name, target_label: row.target_label, template: row.template,
+      prompt_id: row.prompt_id ?? null, prompt_vars: parsed(row.prompt_vars, null),
       auth_mode: row.auth_mode, rate_limit_per_min: row.rate_limit_per_min,
       max_body_bytes: row.max_body_bytes, enabled: Boolean(row.enabled),
       url_path: '/webhooks/' + row.id, created_at: row.created_at, updated_at: row.updated_at,
@@ -470,7 +531,7 @@ export class WebhookService {
     if (bodyText.length > Number(route.max_body_bytes)) return json({ error: 'payload_too_large' }, 413);
     const deliveryKey = typeof input?.delivery_key === 'string' && DELIVERY_KEY_RE.test(input.delivery_key)
       ? input.delivery_key : 'test-' + crypto.randomUUID();
-    const { text, warnings } = renderTemplate(route.template, bodyText);
+    const { text, warnings } = this.renderRoute(route, bodyText);
     const result = this.txn(() => {
       const existing: any = this.sql.exec(
         'SELECT * FROM session_deliveries WHERE source_id = ? AND delivery_key = ?', route.id, deliveryKey).toArray()[0];
@@ -697,6 +758,13 @@ export class WebhookService {
       this.retryOrFailed(delivery, error);
     }
 
+    // 3b. Scheduled deliveries whose schedule was deleted or paused never
+    // pile up behind a down session.
+    for (const delivery of (this.sql.exec(
+      `SELECT d.id FROM session_deliveries d LEFT JOIN session_schedules s ON s.id = d.source_id
+       WHERE d.status IN ('pending','queued') AND d.source = 'schedule' AND (s.id IS NULL OR s.enabled = 0) LIMIT ?`, this.maxBatch).toArray() as any[])) {
+      this.txn(() => this.transition(delivery.id, { status: 'failed', last_error: 'schedule_removed', next_attempt_at: null }, ['pending', 'queued']));
+    }
     // 3. Pending/queued deliveries whose route was deleted: fail them honestly.
     for (const delivery of (this.sql.exec(
       `SELECT d.id, d.target_label FROM session_deliveries d LEFT JOIN webhook_routes r ON r.id = d.source_id

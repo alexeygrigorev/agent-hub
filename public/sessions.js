@@ -3,6 +3,26 @@ const byId = id => document.getElementById(id);
 let activeTab = 'list';
 let cachedSessions = [];
 let cachedTree = { tree: [] };
+// Live-only by default; "Show finished" and "Load more" are explicit (hub-1101-outage-20261031).
+let showAll = false;
+let nextCursor = null;
+let activeCount = null;
+
+function updateMoreButton() {
+  const more = byId('sessions-more');
+  if (more) more.hidden = !nextCursor;
+  const toggle = byId('sessions-show-all');
+  if (toggle) toggle.textContent = showAll ? 'Live only' : 'Show finished';
+}
+
+async function loadMore() {
+  if (!nextCursor) return;
+  const data = await api(`/api/sessions?limit=50${showAll ? '' : '&live=1'}&cursor=${encodeURIComponent(nextCursor)}`);
+  cachedSessions = cachedSessions.concat(data.sessions || []);
+  nextCursor = data.next_cursor || null;
+  updateMoreButton();
+  updateView();
+}
 let selectedSessionId = null;
 let detailPollTimer = null;
 const autoCapturedSessions = new Set();
@@ -55,11 +75,20 @@ function typeBadge(type) {
   return span;
 }
 
+// A cleanly stopped session whose worker reported done is a completion,
+// not a failure (intake 17e774f8); every other stop keeps its own badge.
+function sessionDisplayState(s) {
+  if (s.waiting_confirmation || s.agent_state === 'waiting') return 'waiting-confirmation';
+  if (s.agent_state === 'idle' && s.state === 'running') return 'idle';
+  if (s.state === 'stopped' && s.worker_status === 'done') return 'done';
+  return s.state;
+}
+
 function stateBadge(state) {
   const span = document.createElement('span');
   const s = state || 'unknown';
   let color = 'dk-badge--neutral';
-  if (['running', 'active', 'working', 'acked', 'delivered'].includes(s)) color = 'dk-badge--success';
+  if (['running', 'active', 'working', 'acked', 'delivered', 'done'].includes(s)) color = 'dk-badge--success';
   else if (['stale', 'stalled', 'uncertain', 'offered', 'starting', 'recorded', 'transported', 'claimed', 'held', 'waiting', 'waiting-confirmation', 'waiting_confirmation', 'waiting-idle', 'waiting_until', 'idle'].includes(s)) color = 'dk-badge--warning';
   else if (['failed', 'refused', 'stopped', 'offline', 'error', 'cancelled'].includes(s)) color = 'dk-badge--danger';
   span.className = `dk-badge ${color}`;
@@ -143,7 +172,7 @@ function renderSessionCards(filtered, emptyMessage) {
     chev.className = 'sessions-card-item__chev';
     chev.setAttribute('aria-hidden', 'true');
     chev.textContent = '›';
-    const displayState = (s.waiting_confirmation || s.agent_state === 'waiting') ? 'waiting-confirmation' : (s.agent_state === 'idle' && s.state === 'running' ? 'idle' : s.state);
+    const displayState = sessionDisplayState(s);
     badges.append(stateBadge(displayState), typeBadge(s.session_type), chev);
     head.append(badges);
     card.append(head);
@@ -240,7 +269,7 @@ function renderTable(sessions, filter = '') {
 
     const tdState = document.createElement('td');
     tdState.dataset.label = 'State';
-    const displayState = (s.waiting_confirmation || s.agent_state === 'waiting') ? 'waiting-confirmation' : (s.agent_state === 'idle' && s.state === 'running' ? 'idle' : s.state);
+    const displayState = sessionDisplayState(s);
     tdState.append(stateBadge(displayState));
     tr.append(tdState);
 
@@ -442,7 +471,7 @@ function renderSessionDetail(session, commands = []) {
   const displayTitle = session.qualified_alias || session.name || session.id || 'Session';
   if (titleEl) titleEl.textContent = displayTitle;
   if (badgesEl) {
-    badgesEl.replaceChildren(stateBadge(session.state), typeBadge(session.session_type));
+    badgesEl.replaceChildren(stateBadge(session.state === 'stopped' && session.worker_status === 'done' ? 'done' : session.state), typeBadge(session.session_type));
   }
 
   const isRunning = (session.lifecycle_state || session.state) === 'running';
@@ -470,6 +499,12 @@ function renderSessionDetail(session, commands = []) {
       addMetaItem(metaEl, 'Native Binding', `${session.binding.tag || '-'} (${session.binding.native_id || '-'})`);
     }
     addMetaItem(metaEl, 'Updated', (session.updated_at || '').slice(0, 19).replace('T', ' ') || '-');
+    if (session.ping && session.ping.state === 'active') {
+      const ping = session.ping;
+      let text = `every ${Math.round(ping.every_seconds / 60)} min, next ${String(ping.next_at || '').slice(0, 19).replace('T', ' ')}, sent ${ping.delivered_count}, skipped ${ping.skipped_count}`;
+      if (ping.last_error) text += `, FAILING: ${ping.last_error}`;
+      addMetaItem(metaEl, 'Ping', text);
+    }
     if (session.waiting_until) {
       addMetaItem(metaEl, 'Waiting until', String(session.waiting_until).slice(0, 19).replace('T', ' ') || String(session.waiting_until));
     }
@@ -828,19 +863,22 @@ async function loadData() {
       if (e && e.message === 'Sign-in required') return;
     }
     const [sessionsData, treeData, auditData] = await Promise.all([
-      api('/api/sessions?limit=100'),
-      api('/api/sessions/tree'),
+      api(`/api/sessions?limit=50${showAll ? '' : '&live=1'}`),
+      api(`/api/sessions/tree?limit=200${showAll ? '&include=all' : ''}`),
       // Admin-only; a 403 just means the panel stays hidden.
       api('/api/sessions/audit?last=5').catch(() => null)
     ]);
     cachedSessions = sessionsData.sessions || [];
+    nextCursor = sessionsData.next_cursor || null;
+    activeCount = sessionsData.active_count;
+    updateMoreButton();
     cachedTree = treeData || { tree: [] };
     renderAudit(auditData);
     updateView();
     if (selectedSessionId) {
       await refreshSessionDetail(selectedSessionId);
     }
-    status.textContent = `Authenticated · ${cachedSessions.length} session${cachedSessions.length === 1 ? '' : 's'}`;
+    status.textContent = `Authenticated · ${activeCount ?? cachedSessions.length} active`;
   } catch (err) {
     status.textContent = 'Sessions could not be refreshed.';
     updateView();
@@ -962,6 +1000,8 @@ function setupEvents() {
   refreshBtn?.addEventListener('click', () => {
     loadData();
   });
+  byId('sessions-show-all')?.addEventListener('click', () => { showAll = !showAll; updateMoreButton(); loadData(); });
+  byId('sessions-more')?.addEventListener('click', () => { loadMore().catch(() => {}); });
 
   byId('session-detail-back')?.addEventListener('click', () => {
     closeSessionDetail();

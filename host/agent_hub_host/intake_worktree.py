@@ -65,7 +65,8 @@ def default_runner(argv: list[str], cwd: str, timeout: float = GIT_TIMEOUT):
     """Run one git argv (no shell), bounded in time and output, never prompting."""
     if not isinstance(argv, list) or any(not isinstance(a, str) or not a for a in argv):
         raise SessionControlError("git argv must be a non-empty string list")
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="true", LC_ALL="C")
+    from . import git_noninteractive
+    env = git_noninteractive.noninteractive_env()
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
                           check=False, cwd=cwd, env=env, stdin=subprocess.DEVNULL)
     for stream in (proc.stdout, proc.stderr):

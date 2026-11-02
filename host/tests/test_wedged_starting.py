@@ -109,6 +109,28 @@ class WedgedStartingTests(unittest.TestCase):
         self.assertEqual(result['runtime']['outcome'], 'reported')
         self.assertTrue((self.ws / '.local/hub-results' / (self.offer + '.json')).exists())
 
+    def test_running_receipt_landed_but_binding_and_finish_lost_reports_finish(self):
+        # Intake 0b87eb29 (16b0300e): Hub holds the native id from the running
+        # receipt but no server binding; the hub-results report must land.
+        self.completed()
+        self.row['native_id'] = self.native
+        self.assertEqual(reconcile_claimed_launch(self.d, self.row)['state'], 'exited')
+        result = self.d.request.call_args.args[2]
+        self.assertEqual((result['native_id'], result['report_status'], result['report']), (self.native, 'done', 'Finished.'))
+        self.assertTrue(result['confirmed_exit'])
+
+    def test_known_native_is_never_fenced_as_no_start_or_matched_to_another_binding(self):
+        self.row['native_id'] = self.native
+        self.assertIsNone(reconcile_claimed_launch(self.d, self.row))
+        self.assertEqual(self.state(), 'queued')
+        self.completed()
+        self.row['native_id'] = '33333333-3333-4333-8333-333333333333'
+        self.assertIsNone(reconcile_claimed_launch(self.d, self.row))
+        self.row['native_id'] = self.native
+        self.row['binding'] = {'native_id': self.native}
+        self.assertIsNone(reconcile_claimed_launch(self.d, self.row))
+        self.d.request.assert_not_called()
+
     def test_lost_receipt_with_retained_terminal_record_uses_full_runtime_path(self):
         self.completed()
         self.receipt['native_status']='dead'

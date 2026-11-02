@@ -26,7 +26,15 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
             self.assertEqual(loaded['subscriptions'], native + managed)
             self.assertEqual(len({s['account_label'] for s in loaded['subscriptions']}), 4)
 
-    def test_dispatcher_advertises_all_configured_subscription_engines(self):
+    def _advertise_and_report(self, disabled_providers, antigravity_credential=True):
+        """One dispatcher cycle under an EXPLICIT routing policy (intake 611d57e0).
+
+        Returns (registered_engines, reported_accounts). Only disabled_providers
+        is overridden, on top of the real repo policy, and only around the cycle;
+        repo runtime semantics are unchanged.
+        """
+        from agent_hub_host.native_admission import routing_rules
+        real_rules = routing_rules()
         calls = []
 
         def request(method, path, body=None):
@@ -79,26 +87,56 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
             }
 
             with patch("agent_hub_host.system.get_system_info", return_value={"capabilities": {}, "hostname": "hetzner", "os": "linux", "network": "home", "roles": []}), \
-                 patch("agent_hub_host.api.get_heartbeat_payload", return_value={"type": "heartbeat"}):
+                 patch("agent_hub_host.api.get_heartbeat_payload", return_value={"type": "heartbeat"}), \
+                 patch("agent_hub_host.native_admission.routing_rules",
+                       return_value=dict(real_rules, disabled_providers=list(disabled_providers))), \
+                 patch("agent_hub_host.account_registry.native_credential_present",
+                       return_value=antigravity_credential), \
+                 patch("agent_hub_host.native_antigravity_quota.probe", return_value={}):
                 dispatcher = fleet.Dispatcher(cfg, request, runner)
                 dispatcher.once()
 
             register_calls = [c for c in calls if c[0] == "POST" and c[1] == "/api/machines/register"]
             self.assertEqual(len(register_calls), 1)
             registered_engines = register_calls[0][2]["capabilities"]["engines"]
-            expected_engines = sorted(["claude", "codex", "antigravity", "opencode", "grok", "zcodex"])
-            self.assertEqual(registered_engines, expected_engines)
 
             sub_calls = [c for c in calls if c[0] == "PUT" and c[1] == "/api/fleet/subscriptions"]
             self.assertEqual(len(sub_calls), 1)
             reported_subs = sub_calls[0][2]["subscriptions"]
-            reported_accounts = [s["account"] for s in reported_subs]
-            self.assertIn("shared-claude", reported_accounts)
-            self.assertIn("shared-codex", reported_accounts)
-            self.assertIn("shared-gemini", reported_accounts)
-            self.assertIn("shared-go", reported_accounts)
-            self.assertIn("shared-grok", reported_accounts)
-            self.assertIn("shared-zai", reported_accounts)
+            return registered_engines, [s["account"] for s in reported_subs]
+
+    def test_dispatcher_advertises_all_configured_subscription_engines(self):
+        # Every provider explicitly enabled: all configured engines and accounts.
+        registered_engines, reported_accounts = self._advertise_and_report(disabled_providers=[])
+        expected_engines = sorted(["claude", "codex", "antigravity", "opencode", "grok", "zcodex"])
+        self.assertEqual(registered_engines, expected_engines)
+        self.assertIn("shared-claude", reported_accounts)
+        self.assertIn("shared-codex", reported_accounts)
+        self.assertIn("shared-gemini", reported_accounts)
+        self.assertIn("shared-go", reported_accounts)
+        self.assertIn("shared-grok", reported_accounts)
+        self.assertIn("shared-zai", reported_accounts)
+
+    def test_routing_disabled_provider_is_omitted_from_subscription_report_only(self):
+        # Paired regression (611d57e0): Hub rejects the whole report when one entry
+        # has no route, and a routing-disabled provider is never routed. Only the
+        # subscription report omits it; engine advertisement is unchanged.
+        registered_engines, reported_accounts = self._advertise_and_report(disabled_providers=["grok"])
+        expected_engines = sorted(["claude", "codex", "antigravity", "opencode", "grok", "zcodex"])
+        self.assertEqual(registered_engines, expected_engines)
+        self.assertNotIn("shared-grok", reported_accounts)
+        self.assertEqual(sorted(reported_accounts),
+                         ["shared-claude", "shared-codex", "shared-gemini", "shared-go", "shared-zai"])
+
+    def test_antigravity_without_credential_is_dropped_only_then(self):
+        # Decision for intake 3d1f8702: antigravity/shared-gemini stay advertised
+        # whenever the host has a real Antigravity login (engine passes a real
+        # run); they are dropped only when that credential is truly missing.
+        registered_engines, reported_accounts = self._advertise_and_report(
+            disabled_providers=[], antigravity_credential=False)
+        self.assertNotIn("shared-gemini", reported_accounts)
+        self.assertIn("shared-go", reported_accounts)
+        self.assertIn("shared-claude", reported_accounts)
 
     def test_monitor_only_account_does_not_disable_runnable_account_on_same_engine(self):
         from unittest.mock import Mock

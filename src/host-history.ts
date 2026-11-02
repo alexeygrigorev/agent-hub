@@ -271,7 +271,7 @@ export class HostHistoryService {
     const cached=this.cache.get(cacheKey);
     if (cached && now-cached.at<MINUTE) return cached.data;
     const step = range === '1h' ? MINUTE : range === '24h' ? 5 * MINUTE : range === '7d' ? 30 * MINUTE : 2 * 3600000;
-    const machines = this.rows('SELECT id,name,hostname,drained,last_checkin_at FROM machines ORDER BY id LIMIT 128');
+    const machines = this.rows('SELECT id,name,hostname,drained,last_checkin_at FROM machines WHERE revoked_at IS NULL ORDER BY id LIMIT 128');
     const aliases = resolveMachineAliases(machines.map(m => ({id:String(m.id),hostname:m.hostname,drained:m.drained,last_seen_ms:Number.isFinite(Date.parse(m.last_checkin_at)) ? Date.parse(m.last_checkin_at) : null}))).aliasOf;
     const canonical = (id: string) => aliases.get(id) || id;
     const groups = new Map<string, any>();

@@ -60,6 +60,33 @@ describe('resource management',()=>{
   expect(read()).toBeUndefined();
  }));
 
+ it('keeps native activity and metadata fresh across independent updates and rollbacks',async()=>fixture(async(r,sql,f)=>{
+  r.initCatalogCache();
+  const read=()=>(r as any).canonicalSessions('host').find((s:any)=>s.native_id==='native');
+  expect(read().last_activity_at).toBe(iso(-3600001));
+  sql.exec("UPDATE fleet_sessions SET last_activity_at=?,observed_at=? WHERE native_id='native'",iso(-1000),iso());
+  expect(read().last_activity_at).toBe(iso(-1000));
+  const tx=(f as any).transaction;
+  expect(()=>tx(()=>{
+   sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='native'",iso(-500));
+   expect(read().last_activity_at).toBe(iso(-500));
+   throw new Error('activity rollback');
+  })).toThrow('activity rollback');
+  expect(read().last_activity_at).toBe(iso(-1000));
+  // Fleet-only identities take their tag and start time from the native row.
+  sql.exec("DELETE FROM session_control_sessions WHERE id='session'");
+  read();
+  sql.exec("UPDATE fleet_sessions SET tag='changed',created_at_ms=? WHERE native_id='native'",now-1234);
+  expect(read()).toMatchObject({tag:'changed',native_created_at_ms:now-1234,started_at:iso(-1234)});
+  expect(()=>tx(()=>{
+   sql.exec("UPDATE fleet_sessions SET tag='transient' WHERE native_id='native'");
+   expect(read().tag).toBe('transient');
+   throw new Error('native metadata rollback');
+  })).toThrow('native metadata rollback');
+  sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='native'",iso(-200));
+  expect(read()).toMatchObject({tag:'changed',last_activity_at:iso(-200),started_at:iso(-1234)});
+ }));
+
  it('bypasses incomplete or oversized canonical caches and does not share nested legacy data',async()=>fixture(async(r,sql)=>{
   r.initCatalogCache();
   let builds=0;const build=(r as any).buildCanonicalSessions.bind(r);
@@ -146,7 +173,7 @@ describe('resource management',()=>{
   expect(JSON.parse(read()).keep).toBe(true);
   sql.exec('DELETE FROM resource_request_projection WHERE source=? AND id=?',table,id);
   expect(r.sessions('host')[0].keep).toBe(true); // Missing projection falls back safely.
-  initResourceRequestProjection(sql,table);
+  initResourceRequestProjection(sql,table,{repair:true}); // backfill runs once per DB; repair reruns it
   expect(JSON.parse(read()).keep).toBe(true);
   expect(read().length).toBeLessThan(300);
   sql.exec(`UPDATE ${table} SET id=? WHERE id=?`,id+'-renamed',id);
@@ -192,7 +219,7 @@ describe('resource management',()=>{
     expect(r.headroom('host').reserved_mb).toBe(412);
   });
   sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id='launch'");
-  r.configure({memory_floor_mb:4096});
+  r.configure({memory_floor_mb:4096,memory_floor_pct:20});
   sql.exec('INSERT INTO resource_choking_events(machine_id,reason,observed_at) VALUES(?,?,?)','host','host_oom',iso());
   r.withReadSnapshot(()=>{
     expect(r.cpuHeadroom('host')).toMatchObject({ramping_cpu_cores:0,reason:'host_oom',admitted:false});
@@ -202,6 +229,7 @@ describe('resource management',()=>{
  it('invalidates measured-history caches on writes, configuration changes and rolled-back generations',async()=>fixture(async(r,sql,f)=>{
   r.report('host',{samples:[sample()],reaps:[]});
   sql.exec("UPDATE session_resource_usage SET finished_at=?,peak_rss_mb=200 WHERE session_id='session'",iso());
+  r.configure({estimate_cap_mb:65536});
   expect(r.estimate('demo','opencode','goal')).toBe(250);
   sql.exec("UPDATE session_resource_usage SET peak_rss_mb=400 WHERE session_id='session'");
   expect(r.estimate('demo','opencode','goal')).toBe(500);
@@ -214,7 +242,7 @@ describe('resource management',()=>{
   // would incorrectly keep the estimate computed in the aborted transaction.
   sql.exec("UPDATE session_resource_usage SET peak_rss_mb=900 WHERE session_id='session'");
   expect(r.estimate('demo','opencode','goal')).toBe(1125);
-  r.configure({estimate_multiplier:2});
+  r.configure({estimate_multiplier:2,estimate_cap_mb:65536});
   expect(r.estimate('demo','opencode','goal')).toBe(1800);
   sql.exec("INSERT INTO session_cpu_usage VALUES('session',1,?)",iso());
   expect(r.cpuEstimate('demo','goal').expected_cpu_cores).toBe(r.config().cpu_estimate_multiplier);
@@ -429,7 +457,7 @@ describe('resource management',()=>{
   expect((await f.handle(req('/report','POST',{samples:[],reaps:[]}),{caller:{kind:'agent',actor:'agent'},scopes:['fleet:launch']})).status).toBe(403);
   expect((await f.handle(req('/watchdog'),{caller:{kind:'host',machineId:'host'},scopes:['host']})).status).toBe(200);
   const admin={caller:{isAdmin:true,actor:'admin',kind:'human'},scopes:['admin']};
-  expect((await f.handle(req('/config','PUT',{memory_floor_mb:4096}),admin)).status).toBe(200);
+  expect((await f.handle(req('/config','PUT',{memory_floor_mb:4096,memory_floor_pct:20}),admin)).status).toBe(200);
   expect(r.headroom('host').floor_mb).toBe(4096);
  }));
  it('refuses watchdog evidence while the linked intake is open and resumes after DONE (AC2)',async()=>fixture(async(r,sql)=>{
@@ -468,4 +496,51 @@ describe('resource management',()=>{
   expect(read().linked_intake_open).toBe(true);
  }));
 
+
+ it('records p50 RSS per task and normalizes workspace-path projects in the ledger (resource ledger)',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample({p50_rss_mb:140,peak_rss_mb:300})],reaps:[]});
+  const row=r.usage().find((u:any)=>u.native_id==='native')!;
+  expect(row).toMatchObject({peak_rss_mb:300,p50_rss_mb:140,model:null,machine_id:'host',intake_id:'task'});
+  sql.exec("UPDATE session_resource_usage SET project=? WHERE native_id='native'",'C:\\Users\\User\\work\\1e0bc141\\agent-hub');
+  expect(r.usage().find((u:any)=>u.native_id==='native')!.project_label).toBe('agent-hub');
+  expect(r.overview().stats.find((g:any)=>g.project==='agent-hub')).toMatchObject({samples:1,p50_rss_mb:300});
+ }));
+
+ it('counts OOM kills per session in the ledger and never lowers the count',async()=>fixture(async(r)=>{
+  r.report('host',{samples:[sample({peak_rss_mb:300,oom_kills:3})],reaps:[]});
+  r.report('host',{samples:[sample({peak_rss_mb:300,oom_kills:1})],reaps:[]});
+  expect(r.usage().find((u:any)=>u.native_id==='native')!.oom_kills).toBe(3);
+ }));
+
+ it('estimates memory and CPU from project+engine+model history before coarser cohorts',async()=>fixture(async(r,sql)=>{
+  const add=(id:string,project:string,engine:string,model:string,rss:number,cpu:number)=>{
+   sql.exec('INSERT INTO session_resource_usage VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id,'host','n-'+id,null,null,project,engine,model,'daily','goal',iso(-9000),iso(-1000),'exited',rss,rss,10,100,0.1,iso(-500));
+   sql.exec('INSERT INTO session_cpu_usage VALUES(?,?,?)',id,cpu,iso(-500));
+  };
+  for(let i=0;i<5;i++){add('big'+i,'/home/x/git/agent-hub','codex','gpt-big',2000,3);add('small'+i,'agent-hub','codex','gpt-small',200,0.2);}
+  const big=r.estimate('agent-hub','codex','goal','gpt-big'),small=r.estimate('agent-hub','codex','goal','gpt-small');
+  // b86a95d caps the estimate at 1 GiB; the cohort still ranks above the small model.
+  expect(big).toBe(1024);
+  expect(big).toBeGreaterThan(small);
+  expect(small).toBeLessThan(400);
+  expect(r.cpuEstimate('agent-hub','goal','codex','gpt-big')).toMatchObject({expected_cpu_source:'project_engine_model'});
+  expect(r.cpuEstimate('agent-hub','goal','codex','gpt-big').expected_cpu_cores).toBeGreaterThan(3);
+  expect(r.cpuEstimate('agent-hub','goal','codex','gpt-small').expected_cpu_cores).toBeLessThan(0.5);
+  // An unseen model falls back to the project cohort, then the default is never silently 1.0 when history exists.
+  expect(r.cpuEstimate('agent-hub','goal','codex','unseen').expected_cpu_source).toBe('repo_kind');
+  expect(r.cpuEstimate('other','review','codex','unseen').expected_cpu_source).toBe('global');
+ }));
+
+ it('reports per-machine headroom: full only when CPU>=98% over 10s or MemAvailable<6G, never from load',async()=>fixture(async(r,sql)=>{
+  const hb=(extra:any)=>sql.exec("UPDATE machines SET capabilities=?,last_heartbeat=? WHERE id='host'",JSON.stringify({cpu_count:8}),
+   JSON.stringify({mem_avail_mb:20000,mem_total_mb:32000,load:[90,90,90],cpu_usage:{busy_percent:50,busy_cores:4,cores:8,interval_s:.2,observed_at:iso(),busy_percent_window:50,window_s:30},...extra}));
+  const cap=()=>r.overview().hosts.find((h:any)=>h.machine_id==='host')!.capacity;
+  hb({});
+  expect(cap()).toMatchObject({full:false,full_reasons:[],cores:8,telemetry_state:'measured',cpu_busy_cores:4,free_cores:4});
+  expect(cap().extra_tasks).toBeGreaterThan(0);
+  hb({cpu_usage:{busy_percent:99,busy_cores:7.92,cores:8,interval_s:.2,observed_at:iso(),busy_percent_window:99,window_s:30}});
+  expect(cap()).toMatchObject({full:true,full_reasons:['cpu_busy_over_98pct_10s'],extra_tasks:0});
+  hb({mem_avail_mb:5000});
+  expect(cap()).toMatchObject({full:true,full_reasons:['mem_available_below_6144mb']});
+ }));
 });

@@ -27,17 +27,17 @@ const host={caller:{machineId:'host',kind:'host',actor:'machine:host'},scopes:['
 const ledger=(extra={})=>({active_mem_mb:0,active_disk_mb:19456,disk_floor_mb:20480,next_disk_mb:512,disk_aliases:{demo:"/srv/demo"},disk_task_ids:[],observed_at:iso(),...extra});
 describe('headless disk admission and failure evidence',()=>{
  it('holds all eight burst requests at placement with real disk reason',()=>fixture(async(f,sql,beat)=>{
-  beat(0,{disk_free_gb:35,launcher_resources:ledger()});
+  beat(0,{disk_free_gb:30,launcher_resources:ledger()});
   const burst=await Promise.all(Array.from({length:8},async()=>f.reserve(req(),admin)));
-  for(const r of burst){expect(r.status).toBe(202);expect(r.value.state).toBe('queued');expect(r.value.rejected).toContainEqual(expect.objectContaining({reason:'launcher_disk_reserve',disk:expect.objectContaining({reserved_disk_mb:19456,required_disk_gb:39.5})}));}
+  for(const r of burst){expect(r.status).toBe(202);expect(r.value.state).toBe('queued');expect(r.value.rejected).toContainEqual(expect.objectContaining({reason:'launcher_disk_reserve',disk:expect.objectContaining({reserved_disk_mb:19456,required_disk_gb:34.5})}));}
   expect(sql.exec("SELECT COUNT(*) n FROM fleet_launches WHERE state='failed'").one().n).toBe(0);
  }));
  it('admits eight when disk fits and accounts for offers between heartbeats',()=>fixture(async(f,sql,beat)=>{
-  beat(0,{disk_free_gb:24,launcher_resources:ledger({active_disk_mb:0})});
+  beat(0,{disk_free_gb:19,launcher_resources:ledger({active_disk_mb:0})});
   const burst=await Promise.all(Array.from({length:8},async()=>f.reserve(req(),admin)));
   expect(burst.map(r=>r.status)).toEqual(Array(8).fill(201));
   const ninth=f.reserve(req(),admin);expect(ninth.status).toBe(202);
-  expect(ninth.value.rejected[0]).toMatchObject({reason:'launcher_disk_reserve',disk:{pending_disk_mb:4096,required_disk_gb:24.5}});
+  expect(ninth.value.rejected[0]).toMatchObject({reason:'launcher_disk_reserve',disk:{pending_disk_mb:4096,required_disk_gb:19.5}});
  }));
  it('does not charge launcher-covered offers twice and uses workspace filesystem',()=>fixture(async(f,sql,beat)=>{
   const first=f.reserve(req(),admin);expect(first.status).toBe(201);
@@ -48,6 +48,13 @@ describe('headless disk admission and failure evidence',()=>{
   expect(f.plan(req({workspace:'/data/owned/review'})).selected).toBeTruthy();
   expect(f.plan(req({workspace:'/data/owned-other/review'})).selected).toBeNull();
  }));
+ it('a5464408: absolute floor and capped active reservations admit at 52 GiB free',()=>fixture(async(f,sql,beat)=>{
+  sql.exec('UPDATE machines SET capabilities=? WHERE id=?',JSON.stringify({engines:['codex'],fleet_modes:['interactive','headless'],workspaces:['/srv/demo'],cpu_count:8}),'host');
+  beat(0,{disk_free_gb:52.6,launcher_resources:ledger({active_disk_mb:26112,disk_floor_mb:15360,active_disk_cap_mb:8192,disk_paths:[{path:'/srv/demo',free_gb:52.6}]})});
+  const plan=f.plan(req({workspace:'/srv/demo'}));expect(plan.selected).toBeTruthy();
+  beat(0,{disk_free_gb:14,launcher_resources:ledger({active_disk_mb:0,disk_floor_mb:15360,active_disk_cap_mb:8192,disk_paths:[{path:'/srv/demo',free_gb:14}]})});
+  expect(f.plan(req({workspace:'/srv/demo'})).selected).toBeNull();
+ }));
  it('keeps absent and stale projection advisory, preserving the real disk floor',()=>fixture(async(f,sql,beat)=>{
   beat(0,{disk_free_gb:35});expect(f.plan(req()).selected).toBeTruthy();
   beat(0,{disk_free_gb:35,launcher_resources:ledger({observed_at:iso(-180001)})});expect(f.plan(req()).selected).toBeTruthy();
@@ -55,7 +62,7 @@ describe('headless disk admission and failure evidence',()=>{
  }));
  it('enriches only an owning host legacy fenced terminal failure without retry',()=>fixture(async(f,sql)=>{
   const launch=f.reserve(req(),admin).value;
-  expect((await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6.1-sol',observed_at:iso(),account:'test-codex',profile_supported:true}),host)).status).toBe(200);
+  expect((await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6-luna',observed_at:iso(),account:'test-codex',profile_supported:true}),host)).status).toBe(200);
   const base={state:'failed',confirmed_exit:true,reason:'launcher_command_failed',launcher_task_id:'hub-'+launch.id,diagnostic:{reason:'launcher_command_failed',message:'The launcher command failed; unrecognized output was withheld.',error_type:'ValueError',stage:'dispatch_headless',exit_code:1}};
   expect((await f.handle(http('/launches/'+launch.id+'/result',base),host)).status).toBe(200);
   const diagnostic={...base.diagnostic,reason:'launcher_disk_reserve',message:'Host disk headroom after launcher reservations is below the maintained disk floor.'};
@@ -69,7 +76,7 @@ describe('headless disk admission and failure evidence',()=>{
   const launch=f.reserve(req(),admin).value;
   const sid=crypto.randomUUID();
   sql.exec("INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,mode,state,created_at,updated_at) VALUES(?,?,?,?,?,NULL,'headless','queued',?,?)",sid,'admin',sid,'{}',launch.id,iso(),iso());
-  expect((await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6.1-sol',observed_at:iso(),account:'test-codex',profile_supported:true}),host)).status).toBe(200);
+  expect((await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6-luna',observed_at:iso(),account:'test-codex',profile_supported:true}),host)).status).toBe(200);
   const diagnostic={reason:'launcher_disk_reserve',message:'Host disk headroom after launcher reservations is below the maintained disk floor.',error_type:'ValueError',exit_code:1,stage:'dispatch_headless'};
   const receipt={state:'failed',confirmed_exit:true,reason:diagnostic.reason,diagnostic,launcher_task_id:'hub-'+launch.id};
   beat(0,{disk_free_gb:35,launcher_resources:ledger()});
@@ -93,7 +100,7 @@ describe('headless disk admission and failure evidence',()=>{
  }));
  it('requires newer real disk evidence after a proven no-start disk refusal',()=>fixture(async(f,sql,beat,advance)=>{
   beat(0,{disk_free_gb:80,launcher_resources:ledger({active_disk_mb:0})});const launch=f.reserve(req(),admin).value;
-  await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6.1-sol',observed_at:iso(),account:'test-codex',profile_supported:true}),host);
+  await f.handle(http('/launches/'+launch.id+'/claim',{gate_allowed:true,model:'gpt-6-luna',observed_at:iso(),account:'test-codex',profile_supported:true}),host);
   const diagnostic={reason:'launcher_disk_reserve',message:'Host disk headroom after launcher reservations is below the maintained disk floor.',error_type:'ValueError',exit_code:1,stage:'dispatch_headless'};
   const q:any=await(await f.handle(http('/launches/'+launch.id+'/result',{state:'failed',confirmed_exit:true,reason:diagnostic.reason,diagnostic,launcher_task_id:'hub-'+launch.id}),host)).json();
   beat(8,{cpu_usage:{...freshCpu(iso(),8,8),psi_full_avg10:6}});expect(f.drainCapacityQueue().promoted).toBe(0);
@@ -101,7 +108,7 @@ describe('headless disk admission and failure evidence',()=>{
    beat(0,extra);expect(f.drainCapacityQueue().promoted).toBe(0);expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?',q.id).one().state).toBe('queued');
   }
   advance(2);
-  beat(0,{launcher_resources:ledger({active_disk_mb:0,observed_at:iso(1),disk_paths:[{path:'/srv/demo',free_gb:80},{path:'/srv/demo/.local/tmp',free_gb:19}]})});
+  beat(0,{launcher_resources:ledger({active_disk_mb:0,observed_at:iso(1),disk_paths:[{path:'/srv/demo',free_gb:80},{path:'/srv/demo/.local/tmp',free_gb:14}]})});
   expect(f.drainCapacityQueue().promoted).toBe(0);
   beat(0,{launcher_resources:ledger({active_disk_mb:0,observed_at:iso(1),disk_paths:[{path:'/srv/demo',free_gb:80},{path:'/srv/demo/.local/tmp',free_gb:80}]})});expect(f.drainCapacityQueue().promoted).toBe(1);
  }));

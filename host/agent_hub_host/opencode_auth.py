@@ -12,6 +12,7 @@ import signal
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -23,7 +24,13 @@ VERIFICATION_TTL_S = 60
 STRIP = ('OPENCODE_API_KEY', 'OPENCODE_GO_API_KEY', 'OPENCODE_ZEN_API_KEY', 'OPENCODE_CONFIG',
          'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CONFIG_DIR', 'OPENCODE_DB',
          'OPENCODE_SERVER', 'OPENCODE_SERVER_URL', 'OPENCODE_SERVER_PASSWORD',
-         'AGENT_HUB_OPENCODE_AUTH')
+         'AGENT_HUB_OPENCODE_AUTH',
+         # A user-level proxy that cannot serve the provider catalogue (desktop:
+         # HTTP(S)_PROXY=127.0.0.1:8899) made `api model.list` return only the free
+         # 'opencode' provider, so a valid Hub login read as 'device login unavailable'.
+         # The Hub client already ignores these (0fe413b); the OpenCode store does too.
+         'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+         'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')
 
 
 class AuthBusy(ValueError):
@@ -80,6 +87,13 @@ def environment(cfg, *, source=False, base=None):
     return env
 
 
+_WINDOWS_ENV_WRAPPER = (
+    'import json,os,subprocess,sys;'
+    's=json.loads(sys.argv[1]);e=dict(os.environ);'
+    '[e.pop(k,None) for k in s["unset"]];e.update(s["set"]);'
+    'sys.exit(subprocess.call(sys.argv[2:],env=e))')
+
+
 def launch_argv(cfg, argv):
     """Apply the same store to nested trusted env wrappers and native children."""
     env = environment(cfg, base={})
@@ -89,6 +103,11 @@ def launch_argv(cfg, argv):
         if sep and key in STRIP:
             continue
         clean.append(key + '=' + env[key] if sep and key in env else arg)
+    if os.name == 'nt':
+        # Windows has no /usr/bin/env (every opencode launch failed with
+        # dispatch_local_command_failed). Same contract through a tiny wrapper.
+        spec = json.dumps({'unset': sorted(STRIP), 'set': env}, sort_keys=True)
+        return [sys.executable, '-c', _WINDOWS_ENV_WRAPPER, spec] + clean
     prefix = ['/usr/bin/env']
     for key in STRIP:
         prefix += ['-u', key]

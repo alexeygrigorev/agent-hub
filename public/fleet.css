@@ -13,6 +13,10 @@
 .machine h3 { margin-bottom: var(--dk-space-3); font-size: var(--dk-text-lg); }
 .dk-table td { overflow-wrap: anywhere; }
 .fleet-row-link { cursor: pointer; }
+.fleet-breakdown-controls label { display: inline-flex; align-items: center; gap: var(--dk-space-1); }
+.fleet-breakdown-summary { font-weight: var(--dk-weight-semibold); color: var(--dk-text-default) !important; }
+.fleet-breakdown td:nth-last-child(-n+4), .fleet-breakdown th:nth-last-child(-n+4) { text-align: right; font-variant-numeric: tabular-nums; }
+.fleet-breakdown-total td { font-weight: var(--dk-weight-semibold); }
 .fleet-row-link:hover td { background: var(--dk-bg-hover); }
 .fleet-row-link:focus-visible { outline: 2px solid var(--dk-border-focus); outline-offset: -2px; }
 @media (max-width: 820px) {
@@ -25,6 +29,7 @@
   .fleet-section tr { padding-block: var(--dk-space-2); margin-bottom: var(--dk-space-2); border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-md); background: var(--dk-bg-muted); }
   .fleet-section td::before { content: attr(data-label); display: block; font-family: var(--dk-font-sans); font-size: var(--dk-text-xs); color: var(--dk-text-muted); }
   .fleet-section td:empty { display: none; }
+  .fleet-breakdown td:nth-last-child(-n+4) { text-align: left; display: inline-block; width: auto; min-width: 22%; }
 }
 
 .disk-consumers { font-family: var(--dk-font-mono, monospace); font-size: var(--dk-text-xs, 0.75rem); line-height: 1.4; max-height: 120px; overflow-y: auto; }

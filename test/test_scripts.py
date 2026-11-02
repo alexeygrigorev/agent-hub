@@ -206,6 +206,7 @@ class TestCappedTestRun(unittest.TestCase):
 
     def run_capped(self, *args, env_extra=None):
         env = dict(os.environ)
+        env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
         if env_extra:
             env.update(env_extra)
         return subprocess.run([self.capped, *args], capture_output=True,
@@ -263,6 +264,7 @@ class TestCappedTestRun(unittest.TestCase):
         import time
         with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
             env = {**os.environ, "AGENT_HUB_HEAVY_TEST_DIR": os.path.join(tmpdir, "heavy")}
+            env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
             child_pid = os.path.join(tmpdir, "child")
             parent = subprocess.Popen(
                 [self.capped, "--slots", "1", "--", "bash", "-c",
@@ -283,6 +285,7 @@ class TestCappedTestRun(unittest.TestCase):
     def test_two_slots_allow_two_holders_and_hold_third(self):
         with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
             env = {**os.environ, "AGENT_HUB_HEAVY_TEST_DIR": os.path.join(tmpdir, "heavy")}
+            env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
             holders = [subprocess.Popen([self.capped, "--slots", "2", "--", "bash", "-c",
                          'echo ready; read -r line'], env=env, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -362,13 +365,18 @@ class TestCappedTestRun(unittest.TestCase):
         import time
         with tempfile.TemporaryDirectory(dir=self.local_tmp) as tmpdir:
             env = dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=os.path.join(tmpdir, "heavy"))
+            env.pop("AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN", None)
             ready = os.path.join(tmpdir, "ready")
             release = os.path.join(tmpdir, "release")
-            program = ("from pathlib import Path; import os,sys,time; os.close(9); "
+            termed = os.path.join(tmpdir, "termed")
+            # The command ignores the wrapper's forwarded SIGTERM (recording that it
+            # arrived), so the slot stays held until release, with no timing race.
+            program = ("from pathlib import Path; import os,signal,sys,time; os.close(9); "
+                       "signal.signal(signal.SIGTERM, lambda *_: Path(sys.argv[3]).touch()); "
                        "Path(sys.argv[1]).touch(); "
                        "exec('while not Path(sys.argv[2]).exists(): time.sleep(.02)')")
             child = subprocess.Popen([self.capped, "--slots", "1", "--", sys.executable,
-                                      "-c", program, ready, release], env=env)
+                                      "-c", program, ready, release, termed], env=env)
             try:
                 deadline = time.monotonic() + 10
                 while not os.path.exists(ready):
@@ -380,6 +388,11 @@ class TestCappedTestRun(unittest.TestCase):
                 self.assertEqual(held.returncode, 3, held.stderr)
                 self.assertIsNone(child.poll(), "Contender must leave holder running")
                 child.terminate()  # Interrupt only this fixture's wrapper.
+                deadline = time.monotonic() + 10
+                while not os.path.exists(termed):  # wrapper forwarded TERM to the group
+                    self.assertIsNone(child.poll())
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.02)
                 still_held = self.run_capped("--slots", "1", "--wait", "0", "--", "true", env_extra=env)
                 self.assertEqual(still_held.returncode, 3, still_held.stderr)
                 self.assertIsNone(child.poll(), "Interrupted wrapper must retain the child's slot")

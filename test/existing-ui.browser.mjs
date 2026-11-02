@@ -9,7 +9,7 @@ import {resolve,extname} from 'node:path';
 const root=resolve(import.meta.dirname,'..'),out=resolve(process.env.UI_EVIDENCE_DIR||resolve(root,'.local/ui-evidence'));
 await mkdir(out,{recursive:true,mode:0o700});
 const key=randomBytes(32).toString('hex'),secret=randomBytes(32).toString('hex'),adminToken=randomBytes(32).toString('hex');
-const bundle=await build({entryPoints:[resolve(root,'test/existing-ui-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers']});
+const bundle=await build({entryPoints:[resolve(root,'test/existing-ui-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers','node:async_hooks']});
 const mime={'.html':'text/html','.css':'text/css','.js':'text/javascript','.woff2':'font/woff2'};
 const mf=new Miniflare(convertV4MiniflareOptions({host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{
  name:'existing-ui-local',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',compatibilityFlags:['nodejs_compat'],durableObjects:{HUB:{className:'Hub',useSQLite:true}},bindings:{SESSION_SECRET:secret,HUB_ADMINS:'admin@fake.local',LOCAL_FIXTURE_KEY:key,HUB_ADMIN_TOKEN_SHA256:createHash('sha256').update(adminToken).digest('hex'),AUTH_BASE_URL:'https://auth.fake.local',AUTH_CALLBACK_URL:'https://auth.fake.local/auth/callback',AUTH_CLIENT_ID:'local-only'},
@@ -43,8 +43,8 @@ try{
  for(const theme of ['light','dark'])for(const width of [1440,390]){
   await context.clearCookies();await page.setViewportSize({width,height:900});await page.goto(base+'/auth/token');await page.evaluate(t=>localStorage.setItem('dakit-theme',t),theme);await page.reload();await capture(`signin-${width}-${theme}`);
   await page.getByLabel('Admin token').fill('wrong-local-token');await page.getByRole('button',{name:'Sign in',exact:true}).click();await page.getByRole('alert').waitFor();await capture(`signin-refused-${width}-${theme}`);
-  await cookie(human.cookie);await page.goto(base+'/fleet.html');await page.getByText('Authenticated · updated',{exact:false}).waitFor();assert.ok((await page.locator('#sessions').textContent()).includes('local-session'));assert.ok((await page.locator('#machine-view').textContent()).includes('ui-account'));await capture(`fleet-${width}-${theme}`);
-  for (const [section,id] of [['start','launch'],['machines','machine-view'],['agents','hub-agents'],['sessions','sessions']]) {await page.locator('#'+id).scrollIntoViewIfNeeded();await capture(`fleet-${section}-${width}-${theme}`);}
+  await cookie(human.cookie);await page.goto(base+'/fleet.html');await page.getByText('Authenticated · updated',{exact:false}).waitFor();assert.ok((await page.locator('#sessions').textContent()).includes('local-session'));assert.ok((await page.locator('#machine-view').textContent()).includes('ui-account'));await page.locator('#live-sessions-panel .fleet-breakdown-summary').waitFor();assert.match(await page.locator('#live-sessions-panel').textContent(),/\d+ live sessions: \d+ running, \d+ queued, \d+ stalled/);await capture(`fleet-${width}-${theme}`);
+  for (const [section,id] of [['live-sessions','live-sessions'],['start','launch'],['machines','machine-view'],['agents','hub-agents'],['sessions','sessions']]) {await page.locator('#'+id).scrollIntoViewIfNeeded();await capture(`fleet-${section}-${width}-${theme}`);}
   await page.locator('#main-content').evaluate(el=>el.scrollTop=0);
   if(width===390){const menu=page.getByRole('button',{name:'Open navigation',exact:true});await menu.focus();await page.keyboard.press('Enter');await page.getByRole('link',{name:'Pair a device',exact:true}).waitFor();assert.equal(await page.locator('#dk-sidebar').getAttribute('role'),'dialog');await page.keyboard.press('Escape');assert.equal(await menu.getAttribute('aria-expanded'),'false');}
   await page.goto(base+'/device');await capture(`device-entry-${width}-${theme}`);

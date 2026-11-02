@@ -93,6 +93,16 @@ class RepoTests(unittest.TestCase):
             self.assertIn('GH_ERROR', result['flags'])
             self.assertNotIn('default_branch', result)
 
+    def test_scan_preserves_operator_confirmed_duplicate_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'old-site'
+            (path / '.git').mkdir(parents=True)
+            old = dict(name='old-site', machine='host', dir=str(path), origin='Example/site', org='Example',
+                       status='duplicate', canonical='main-site', flags=[])
+            result = repos.scan(tmp, 'host', [old], self.runner)[0]
+            self.assertEqual(result['status'], 'duplicate')
+            self.assertEqual(result['canonical'], 'main-site')
+
     def test_registry_absolute_paths_keep_existing_host_confinement(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'git'
@@ -119,3 +129,9 @@ class RepoTests(unittest.TestCase):
         with patch.object(repos.intake, 'request', return_value={}) as request:
             repos.execute(parser.parse_args(['repos', 'list', '--org', 'Example', '--status', 'active', '--flagged']))
             self.assertEqual(request.call_args.args, ('GET', '/api/repos?org=Example&status=active&flagged=true'))
+
+            with tempfile.TemporaryDirectory() as tmp:
+                fields = Path(tmp) / 'repo.json'
+                fields.write_text(json.dumps({'label': 'Old site', 'status': 'duplicate', 'canonical': 'main-site'}))
+                repos.execute(parser.parse_args(['repos', 'edit', 'old-site', '--file', str(fields)]))
+            self.assertEqual(request.call_args.args, ('PATCH', '/api/repos/old-site', {'label': 'Old site', 'status': 'duplicate', 'canonical': 'main-site'}))

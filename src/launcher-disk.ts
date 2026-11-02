@@ -18,10 +18,16 @@ export function launcherDiskHeadroom(hb: any, pendingIds: string[], configuredFl
   if (!Number.isFinite(free)) return null;
   const covered = new Set(Array.isArray(r.disk_task_ids) ? r.disk_task_ids : []);
   const pending = pendingIds.filter(id => !covered.has('hub-' + id)).length;
-  const floor = Math.max(configuredFloorGb * 1024, r.disk_floor_mb);
-  const required = floor + r.active_disk_mb + (pending + 1) * r.next_disk_mb;
+  // Intake a5464408: absolute free-space floor. The host reports the launcher's
+  // computed floor (min 15 GiB / 5% of the filesystem); the smaller of that and
+  // the configured floor applies. Active reservations are capped when the host
+  // reports a cap: data already written is missing from the free figure.
+  const floor = Math.min(configuredFloorGb * 1024, r.disk_floor_mb);
+  const cap = typeof r.active_disk_cap_mb === 'number' && Number.isFinite(r.active_disk_cap_mb) && r.active_disk_cap_mb >= 0 ? r.active_disk_cap_mb : Infinity;
+  const active = Math.min(r.active_disk_mb, cap);
+  const required = floor + active + (pending + 1) * r.next_disk_mb;
   return { disk_free_gb: free, disk_floor_gb: floor / 1024,
-    reserved_disk_mb: r.active_disk_mb, pending_disk_mb: pending * r.next_disk_mb,
+    reserved_disk_mb: active, pending_disk_mb: pending * r.next_disk_mb,
     requested_disk_mb: r.next_disk_mb, required_disk_gb: required / 1024,
     admitted: Number.isFinite(free) && free * 1024 >= required };
 }

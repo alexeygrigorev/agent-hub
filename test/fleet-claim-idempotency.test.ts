@@ -35,7 +35,7 @@ const intent = (extra = {}) => ({ workspace: 'demo', prompt: 'private test goal'
 async function configure(s: FleetService) {
   expect((await s.handle(request('/accounts', registry(), 'PUT'), admin)).status).toBe(200);
 }
-const baseClaim = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true };
+const baseClaim = { gate_allowed: true, model: 'gpt-6-luna', observed_at: iso(), account: 'shared-codex', profile_supported: true };
 
 describe('intake 488b860e: idempotent same-host re-claim', () => {
   it('replays a same-key retry on an effect-free starting launch exactly once', async () => fixture(async (s, sql) => {

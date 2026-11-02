@@ -94,8 +94,19 @@ class WorkspaceRootsTests(unittest.TestCase):
             conn.commit()
             conn.close()
             d = fleet.Dispatcher({"workspaces": {}, "subscriptions": []})
-            d._drop_queued_launcher_task({"config_dir": tmp}, "hub-offer-1")
-            d._drop_queued_launcher_task({"config_dir": tmp}, "hub-offer-2")
+            connections = []
+            connect = sqlite3.connect
+            def tracked_connect(*args, **kwargs):
+                connection = connect(*args, **kwargs)
+                connections.append(connection)
+                return connection
+            with mock.patch.object(sqlite3, 'connect', side_effect=tracked_connect):
+                d._drop_queued_launcher_task({"config_dir": tmp}, "hub-offer-1")
+                d._drop_queued_launcher_task({"config_dir": tmp}, "hub-offer-2")
+            self.assertEqual(len(connections), 2)
+            for connection in connections:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute('SELECT 1')
             conn = sqlite3.connect(str(db))
             states = dict(conn.execute("SELECT id, state FROM tasks").fetchall())
             conn.close()

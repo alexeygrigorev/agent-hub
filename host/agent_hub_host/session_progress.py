@@ -1,8 +1,12 @@
 """Bounded native progress sampling; never upload argv, filenames or process data.
 
 Polling, PTY chatter, CPU use and shared workspace changes are not agent
-progress. Only transcript writes and provider events count. Only exact owned headless
-incarnations can have orphan children reaped through the native stop oracle.
+progress. Only transcript writes and provider events count. The leader's
+CPU advance time is published as bounded evidence so the Hub can separate
+a genuinely hung tool call (no output and no CPU) from a long-running one
+(intake 167c6178); it never advances last_progress_at. Only exact owned
+headless incarnations can have orphan children reaped through the native
+stop oracle.
 """
 from __future__ import annotations
 
@@ -82,6 +86,11 @@ class SessionProgress:
                                 and r.get('cleanup') in ('none', 'reaped', 'uncertain')
                                 and all(type(r.get(k)) is bool for k in ('seen_alive', 'attempted', 'orphaned'))):
                             self.samples[(r['id'], r['incarnation'])] = {k: r[k] for k in ('last', 'seen_alive', 'attempted', 'cleanup', 'orphaned')}
+                            if (type(r.get('cpu')) is int and r['cpu'] >= 0 and type(r.get('last_cpu')) is int and r['last_cpu'] >= 0
+                                    and type(r.get('cpu_start')) is int and r['cpu_start'] >= 0):
+                                self.samples[(r['id'], r['incarnation'])]['cpu'] = r['cpu']
+                                self.samples[(r['id'], r['incarnation'])]['last_cpu'] = r['last_cpu']
+                                self.samples[(r['id'], r['incarnation'])]['cpu_start'] = r['cpu_start']
                             checked = r.get('screen_checked')
                             error = r.get('terminal_error')
                             if (type(checked) is int and 0 <= checked <= self.now_ms() + 60000
@@ -95,11 +104,18 @@ class SessionProgress:
     def persist(self):
         if self.state_path:
             from . import private_fs
-            rows = [dict(id=sid, incarnation=incarnation, basis='native_output_v2',
-                         screen_checked=self.screen_checks.get((sid, incarnation), (0, None))[0],
-                         terminal_error=self.screen_checks.get((sid, incarnation), (0, None))[1],
-                         **{k: row[k] for k in ('last', 'seen_alive', 'attempted', 'cleanup', 'orphaned')})
-                    for (sid, incarnation), row in self.samples.items()]
+            rows = []
+            for (sid, incarnation), row in self.samples.items():
+                out = dict(id=sid, incarnation=incarnation, basis='native_output_v2',
+                           screen_checked=self.screen_checks.get((sid, incarnation), (0, None))[0],
+                           terminal_error=self.screen_checks.get((sid, incarnation), (0, None))[1],
+                           **{k: row[k] for k in ('last', 'seen_alive', 'attempted', 'cleanup', 'orphaned')})
+                if type(row.get('cpu')) is int and row['cpu'] >= 0 and type(row.get('last_cpu')) is int and row['last_cpu'] >= 0 \
+                        and type(row.get('cpu_start')) is int and row['cpu_start'] >= 0:
+                    out['cpu'] = row['cpu']
+                    out['last_cpu'] = row['last_cpu']
+                    out['cpu_start'] = row['cpu_start']
+                rows.append(out)
             private_fs.atomic_write(self.state_path, json.dumps(rows).encode(), 512 * 1024)
 
     def sample(self, rows, records=None):
@@ -126,6 +142,15 @@ class SessionProgress:
             headless = bool(owned or (row.get('engine') != 'shell' and isinstance(command, list)
                                      and any(x in ('exec', 'run', '-p', '--print') for x in command[:12])))
             alive = isinstance(leader, dict) if leader is not None else None
+            # Bounded CPU evidence for the Hub's hung-tool-call bound (intake
+            # 167c6178): the time this monitor last saw the leader's CPU ticks
+            # advance. Read from the same /proc snapshot as liveness; the tick
+            # count itself never leaves the host.
+            cpu, last_cpu = previous.get('cpu'), previous.get('last_cpu')
+            if headless and alive is True and type(leader.get('cpu')) is int and leader['cpu'] >= 0:
+                if type(cpu) is not int or leader['cpu'] > cpu:
+                    last_cpu = now
+                cpu = leader['cpu']
             orphan = headless and alive is False and row.get('containment_empty') is False
             cleanup = previous.get('cleanup', 'none')
             # Require a live leader observed by this monitor first. Existing
@@ -152,9 +177,24 @@ class SessionProgress:
                                  'seen_alive': previous.get('seen_alive', False) or (headless and alive is True),
                                  'attempted': previous.get('attempted', False), 'cleanup': cleanup,
                                  'orphaned': orphan or previous.get('orphaned', False)}
+            terminal = None
+            # zcodex exits non-zero on reconnect exhaustion or loses its core
+            # to the cgroup OOM killer; surviving children keep the scope
+            # non-empty, which Hub otherwise shows as idle for hours.
+            if (row.get('engine') == 'zcodex' and not headless and alive is False
+                    and row.get('containment_empty') is False):
+                terminal = 'zcodex_agent_exited'
+            if type(cpu) is int and cpu >= 0 and type(last_cpu) is int and last_cpu >= 0:
+                self.samples[key]['cpu'] = cpu
+                self.samples[key]['last_cpu'] = last_cpu
             result[sid] = {'last_progress_at': dt.datetime.fromtimestamp(min(last, now) / 1000, dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
                            'headless': headless, 'agent_alive': alive if headless else None,
                            'orphaned': self.samples[key]['orphaned'], 'cleanup': cleanup}
+            if headless and alive is True and type(self.samples[key].get('last_cpu')) is int:
+                result[sid]['last_cpu_at'] = dt.datetime.fromtimestamp(
+                    min(self.samples[key]['last_cpu'], now) / 1000, dt.timezone.utc).isoformat().replace('+00:00', 'Z')
+            if terminal:
+                result[sid]['terminal_error'] = terminal
             if output is not None:
                 result[sid]['sampled_at'] = dt.datetime.fromtimestamp(now / 1000, dt.timezone.utc).isoformat().replace('+00:00', 'Z')
         if hasattr(self.output, 'goal_status'):

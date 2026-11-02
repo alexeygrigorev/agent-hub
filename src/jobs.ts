@@ -88,6 +88,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   outcome_evidence JSON
 );
 
+-- Intake e8a22f4c: host polls and the alarm look at offered jobs only, so the
+-- partial index keeps those reads independent of finished-job history.
+CREATE INDEX IF NOT EXISTS jobs_offered ON jobs(offer_expires_at) WHERE status = 'offered';
+
 CREATE TABLE IF NOT EXISTS leases (
   name TEXT PRIMARY KEY,
   holder_job_id TEXT,
@@ -655,7 +659,7 @@ export class JobsService {
   }
 
   private getCandidates(now: Date, excludeIds: string[], slotKeyOrDate?: string | Date): Machine[] {
-    const machines = this.sql.exec("SELECT * FROM machines").toArray() as unknown as Machine[];
+    const machines = this.sql.exec("SELECT * FROM machines WHERE revoked_at IS NULL").toArray() as unknown as Machine[];
     const candidates: Machine[] = [];
     const nowMs = now.getTime();
 

@@ -171,7 +171,7 @@ def main():
                 if m.get("workspace") == ws: out.append(m)
             print(json.dumps(out))
         elif sub == "deliver":
-            print(json.dumps({"id": "x", "status": "submitted", "detail": "delivered into target pane"}))
+            print(json.dumps({"id": "x", "status": os.environ.get("FAKE_DELIVER_STATUS", "submitted"), "detail": "delivered into target pane"}))
         else: sys.exit(1)
     else: sys.exit(1)
 main()
@@ -290,7 +290,8 @@ def test_claim_translation_accepts_both_expiry_forms():
         se.verify_server_claim(expired, now_ms=now_ms)
 
 
-def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env):
+def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env, monkeypatch):
+    monkeypatch.setenv("FAKE_DELIVER_STATUS", "not-ready")
     rec = seed(env)
     target = NativeTarget(session_id=rec["id"], tag="agent1", workspace=env["work"],
                           created_at_ms=1700000000000)
@@ -315,11 +316,8 @@ def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env):
     assert all(p != "/ack" and not p.endswith("/ack") for _, p, _ in sent["acked"])
     assert any(p.endswith("/status") for _, p, _ in sent["acked"])
     status_payload = next(b for m, p, b in sent["acked"] if p.endswith("/status"))
-    # The guard submitted the envelope (delivery_state transported): the host
-    # must report the reply-pending class, NOT absence-class inbox-waiting —
-    # the hub expires the former to uncertain (late reply can still promote
-    # to acked), the latter to terminal failed recipient_not_ready.
-    assert status_payload["status"] == "delivered; awaiting recipient reply"
+    # The guard refused (recipient busy): the envelope stays in the inbox.
+    assert status_payload["status"] == "waiting in inbox for recipient"
     original_id = outcome["original_native_message_id"]
     assert original_id and original_id != rec["id"]
     # The target replies in the native log with correlation + digest echo.

@@ -8,6 +8,7 @@ import { queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdopt
 import { IntakeWorktrees } from '../src/intake-worktrees';
 import { ResourceManagement } from '../src/resource-management';
 import { IdleWorkService } from '../src/idle-work';
+import { FleetService } from '../src/fleet';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -259,6 +260,32 @@ describe('idle with open acceptance criteria', () => {
     await idle.tick();
     expect(sql.exec('SELECT * FROM session_control_commands').toArray()).toHaveLength(1);
   }));
+  it('accepts and projects Codex goal store states, rejecting unknown values', async () => fixture(async ({sql,clock,view}: any) => {
+    const fleet = new FleetService(sql, (cb: any) => cb(), () => clock.now); fleet.init();
+    const progress = { last_progress_at: new Date(at).toISOString(), headless: false, agent_alive: null, orphaned: false, cleanup: 'none' };
+    const report = (goal_status: string) => fleet.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions: [
+      { native_id: id, tag: 'test-goal', workspace: '/test', engine: 'zcodex', phase: 'running', agent_state: 'idle', profile: null, account: null, created_at_ms: at - 3600000, progress: { ...progress, goal_status } }] }) }),
+      { caller: { machineId: 'idle-host', kind: 'host', actor: 'machine:idle-host' }, scopes: ['host'] });
+    for (const status of ['active', 'usage_limited', 'budget_limited', 'unregistered']) {
+      expect((await report(status)).status).toBe(200);
+      expect((await view()).goal_status).toBe(status);
+    }
+    expect((await report('pursuing')).status).toBe(400);
+    expect((await view()).goal_status).toBe('unregistered');
+  }));
+  it('does not prefix /goal resume when the launch goal was never registered', async () => fixture(async ({sql,clock,tx,sc}: any) => {
+    sql.exec("UPDATE fleet_sessions SET progress_json=?",JSON.stringify({last_progress_at:new Date(at).toISOString(),goal_status:'unregistered'}));
+    const idle = new IdleWorkService(sql,tx,sc,{},()=>clock.now); idle.init();
+    for (const minutes of [0, 30, 31]) {
+      clock.now=at+minutes*60000; sql.exec('UPDATE fleet_catalog_seen SET observed_at=?',new Date(clock.now).toISOString());
+      sql.exec("UPDATE fleet_sessions SET progress_json=json_set(progress_json,'$.sampled_at',?)",new Date(clock.now).toISOString());
+      await idle.tick();
+    }
+    const commands=sql.exec('SELECT * FROM session_control_commands').toArray();
+    expect(commands).toHaveLength(1);
+    expect(JSON.parse(commands[0].payload_json).body).not.toContain('/goal resume');
+    expect(JSON.parse(commands[0].payload_json).body).toContain('AC2 retain evidence');
+  }));
   it('detects one episode note; sends durable nudge with full AC and resume; rate limits', async () => fixture(async ({sql,clock,tx,sc}: any) => {
     sql.exec("UPDATE fleet_sessions SET progress_json=json_set(progress_json,'$.last_progress_at',?)",new Date(at).toISOString());
     const idle = new IdleWorkService(sql,tx,sc,{},()=>clock.now); idle.init();
@@ -313,6 +340,11 @@ describe('idle with open acceptance criteria', () => {
   }));
   it('replaces after two unsuccessful nudges and stops old only after fresh bound replacement runs', async () => fixture(async ({sql,clock,tx,sc}: any) => {
     sql.exec("UPDATE fleet_sessions SET progress_json=json_set(progress_json,'$.last_progress_at',?)",new Date(at).toISOString());
+    // afab8367: the live predecessor's recorded worktree gets a status report queued.
+    new IntakeWorktrees(sql,()=>at).init();
+    const heldTree=crypto.randomUUID();
+    sql.exec(`INSERT INTO intake_worktrees(id,task_id,machine,path,created_at,updated_at,session_ids,origin,state)
+      VALUES(?,?,'idle-host','/home/alexey/git/demo-wt-idleproof',?,?,?,?,'active')`,heldTree,taskId,at,at,JSON.stringify([id]),'session_cwd');
     const idle = new IdleWorkService(sql,tx,sc,{},()=>clock.now); idle.init();
     const tick = async (minutes: number) => { clock.now=at+minutes*60000; sql.exec('UPDATE fleet_catalog_seen SET observed_at=?',new Date(clock.now).toISOString()); sql.exec("UPDATE fleet_sessions SET progress_json=json_set(COALESCE(progress_json,'{}'),'$.sampled_at',?) WHERE native_id=?",new Date(clock.now).toISOString(),id); await idle.tick(); };
     await tick(0); await tick(30); await tick(60); await tick(90); await tick(120);
@@ -322,8 +354,12 @@ describe('idle with open acceptance criteria', () => {
     expect(openWorkPreventsIdleReap(sql,old,clock.now)).toBe(true);
     const replacement=sql.exec('SELECT * FROM session_control_sessions WHERE id=?',episode.replacement_id).toArray()[0];
     expect(replacement.parent_id).toBe(id);
-    expect(JSON.parse(replacement.request_json)).toMatchObject({intake_task_id:taskId,mode:'interactive',with_goal:true});
+    expect(JSON.parse(replacement.request_json)).toMatchObject({intake_task_id:taskId,mode:'interactive',with_goal:true,intake_worktree:'successor'});
+    expect(JSON.parse(replacement.request_json).cwd).toBeNull();
     expect(JSON.parse(replacement.request_json).brief).toContain('AC2 retain evidence');
+    const saved=JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id=?',taskId).toArray()[0].data);
+    expect(saved.history.some((e:any)=>e.kind==='note'&&e.text.includes('intake_worktree=successor')&&e.text.includes('stays locked and untouched'))).toBe(true);
+    expect(sql.exec("SELECT * FROM intake_worktree_commands WHERE worktree_id=? AND kind='status'",heldTree).toArray()).toHaveLength(1);
     expect(sql.exec("SELECT * FROM session_control_commands WHERE kind='stop'").toArray()).toHaveLength(0);
     const nativeId='33333333-3333-4333-8333-333333333333';
     sql.exec("UPDATE session_control_sessions SET state='running',machine_id='idle-host',binding_json=? WHERE id=?",

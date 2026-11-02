@@ -345,3 +345,171 @@ def test_positive_utilization_with_null_reset_fails_closed(profile):
     result = read(profile, server)
     assert result['status'] == 'unknown'
     assert result['error'] == 'native_claude_malformed_windows'
+
+
+# Intake 798f0f8c: launch bursts (plan + run probe per launch) hit the usage
+# endpoint's rate limit; one good reading is shared per token across processes.
+def test_recent_reading_is_reused_without_another_request(profile, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(q, '_clock', lambda: clock[0])
+    server = Server(usage_payload(u5=30.0))
+    first = read(profile, server)
+    clock[0] += q.USAGE_REUSE_S - 1
+    second = read(profile, server)
+    assert len(server.calls) == 1
+    assert second == first and second['details']['source'] == 'native_claude_oauth_usage'
+    raw = (profile[1] / q.USAGE_CACHE_FILE).read_bytes()
+    assert b'synthetic-claude-token-a' not in raw
+
+
+def test_rate_limit_falls_back_to_recent_reading_only(profile, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(q, '_clock', lambda: clock[0])
+    read(profile, Server(usage_payload(u5=30.0)))
+    clock[0] += q.USAGE_REUSE_S + 1
+    limited = Server(429)
+    result = read(profile, limited)
+    assert len(limited.calls) == 1
+    assert result['status'] == 'ok' and result['windows']['5h']['percent_remaining'] == 70.0
+    clock[0] += q.USAGE_RATE_LIMITED_REUSE_S
+    assert read(profile, Server(429))['error'] == 'native_claude_rate_limited'
+
+
+def test_cached_reading_never_crosses_tokens_or_survives_a_passed_reset(profile, monkeypatch):
+    monkeypatch.setattr(q, '_clock', lambda: 1000.0)
+    bundle, dest = profile
+    q.probe(bundle, dest, opener=Server(usage_payload()), now=NOW)
+    rotated = dict(bundle, env={'CLAUDE_CODE_OAUTH_TOKEN': 'synthetic-claude-token-rotated'})
+    server = Server(usage_payload(u5=50.0))
+    assert q.probe(rotated, dest, opener=server, now=NOW)['claude']['windows']['5h']['percent_remaining'] == 50.0
+    assert len(server.calls) == 1
+    later = NOW + dt.timedelta(days=6)
+    assert q.probe(rotated, dest, opener=Server(429), now=later)['claude']['status'] == 'unknown'
+
+
+def test_429_persists_backoff_and_suppresses_fresh_process_requests(profile, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(q, '_clock', lambda: clock[0])
+    limited = Server((429, {'Retry-After': '300'}, {}))
+    assert read(profile, limited)['error'] == 'native_claude_rate_limited'
+    path = q._backoff_path(profile[1], profile[0]['env']['CLAUDE_CODE_OAUTH_TOKEN'])
+    entry = json.loads(path.read_text())
+    assert entry['until'] == 1300 and entry['failures'] == 1
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert 'synthetic-claude-token' not in path.read_text()
+    clock[0] = 1299
+    server = Server(usage_payload())
+    assert read(profile, server)['error'] == 'native_claude_rate_limited'
+    assert not server.calls
+    clock[0] = 1300
+    assert read(profile, server)['status'] == 'ok'
+    assert len(server.calls) == 1
+    assert json.loads(path.read_text())['failures'] == 0
+
+
+def test_429_backoff_grows_exponentially_and_honors_http_date(profile, monkeypatch):
+    from email.utils import format_datetime
+    clock = [NOW.timestamp()]
+    monkeypatch.setattr(q, '_clock', lambda: clock[0])
+    read(profile, Server(429))
+    token = profile[0]['env']['CLAUDE_CODE_OAUTH_TOKEN']
+    first = q._read_backoff(profile[1], token)
+    assert first['until'] - first['at'] == 120
+    clock[0] += 120
+    read(profile, Server(429))
+    second = q._read_backoff(profile[1], token)
+    assert second['until'] - second['at'] == 240
+    clock[0] += 240
+    retry = format_datetime(dt.datetime.fromtimestamp(clock[0] + 900, dt.timezone.utc))
+    read(profile, Server((429, {'Retry-After': retry}, {})))
+    third = q._read_backoff(profile[1], token)
+    assert third['until'] - third['at'] == 900
+
+
+@pytest.mark.parametrize('age,used,reset_delta,expected', [
+    (1799, 30, 3600, 'ok'), (1801, 30, 3600, 'unknown'),
+    (120, 100, 3600, 'unknown'), (120, 30, -1, 'unknown'),
+])
+def test_backoff_last_good_is_bounded_and_safe(profile, monkeypatch, age, used, reset_delta, expected):
+    clock = [1000.0]
+    monkeypatch.setattr(q, '_clock', lambda: clock[0])
+    read(profile, Server(usage_payload(u5=used, r5=(NOW + dt.timedelta(seconds=3600)).isoformat())))
+    clock[0] += age
+    token = profile[0]['env']['CLAUDE_CODE_OAUTH_TOKEN']
+    q._record_rate_limit(profile[1], token, {'Retry-After': '3600'})
+    current = NOW if reset_delta > 0 else NOW + dt.timedelta(seconds=3601)
+    server = Server(usage_payload())
+    result = q.probe(profile[0], profile[1], opener=server, now=current)['claude']
+    assert result['status'] == expected
+    assert not server.calls
+
+
+def test_backoff_checks_applicable_model_limit(profile, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(q, '_clock', lambda: clock[0])
+    read(profile, Server(usage_payload(seven_day_opus={'utilization': 100, 'resets_at': (NOW + dt.timedelta(days=1)).isoformat()})))
+    clock[0] += 61
+    result = read(profile, Server(429), model='opus')
+    assert result['error'] == 'native_claude_rate_limited'
+
+
+def test_backoff_is_token_specific_and_corrupt_stamp_does_not_block_probe(profile, monkeypatch):
+    monkeypatch.setattr(q, '_clock', lambda: 1000.0)
+    read(profile, Server(429))
+    bundle, dest = profile
+    rotated = dict(bundle, env={'CLAUDE_CODE_OAUTH_TOKEN': 'rotated-token'})
+    server = Server(usage_payload())
+    assert q.probe(rotated, dest, opener=server, now=NOW)['claude']['status'] == 'ok'
+    assert len(server.calls) == 1
+    q._backoff_path(dest, bundle['env']['CLAUDE_CODE_OAUTH_TOKEN']).write_text('bad-json')
+    server = Server(usage_payload())
+    assert read(profile, server)['status'] == 'ok'
+    assert len(server.calls) == 1
+
+
+def test_count_tokens_429_also_suppresses_followup_network(profile, monkeypatch):
+    monkeypatch.setattr(q, '_clock', lambda: 1000.0)
+    server = Server(403, 429)
+    assert read(profile, server)['error'] == 'native_claude_rate_limited'
+    assert len(server.calls) == 2
+    later = Server(usage_payload())
+    assert read(profile, later)['error'] == 'native_claude_rate_limited'
+    assert not later.calls
+
+
+def test_parallel_probe_lock_contender_never_calls_provider(profile, monkeypatch):
+    monkeypatch.setattr(q, '_clock', lambda: 1000.0)
+    bundle, dest = profile
+    token = bundle['env']['CLAUDE_CODE_OAUTH_TOKEN']
+    lock = dest / ('claude-usage-' + q._token_key(token) + '.lock')
+    with private_fs.exclusive_lock(lock):
+        server = Server(usage_payload())
+        assert read(profile, server)['error'] == 'native_claude_rate_limited'
+        assert not server.calls
+
+def test_null_five_hour_is_an_inactive_window(profile):
+    # Anthropic returns "five_hour": null when no 5-hour session window is active.
+    payload = {
+        'five_hour': None,
+        'seven_day': {
+            'utilization': 36.0,
+            'resets_at': (NOW + dt.timedelta(days=5)).isoformat().replace('+00:00', 'Z'),
+        },
+        'seven_day_opus': None,
+    }
+    server = Server(payload)
+    result = read(profile, server, model='claude-opus-4-8')
+    assert result['status'] == 'ok'
+    assert result['windows']['5h'] == {'percent_remaining': 100.0, 'reset_at': None, 'inactive': True}
+    assert result['windows']['7d']['percent_remaining'] == 64.0
+
+
+@pytest.mark.parametrize('payload', [
+    {'seven_day': {'utilization': 10.0, 'resets_at': '2099-01-01T00:00:00Z'}},
+    {'five_hour': None, 'seven_day': None},
+    {'five_hour': 'x', 'seven_day': {'utilization': 10.0, 'resets_at': '2099-01-01T00:00:00Z'}},
+])
+def test_missing_or_bad_windows_still_fail_closed(profile, payload):
+    server = Server(payload)
+    result = read(profile, server)
+    assert result['status'] != 'ok'

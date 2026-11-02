@@ -21,7 +21,7 @@ function request(path: string, data?: any, method = 'POST') {
 }
 
 function claim(launchId: string, account = 'opencode-main', model?: string) {
-  const resolvedModel = model || (account === 'opencode-main' ? 'opencode-go/muse-spark-1.3-contributor' : (account.startsWith('zcodex') ? 'glm-5.3-flash' : 'gpt-6.1-sol'));
+  const resolvedModel = model || (account === 'opencode-main' ? 'opencode-go/muse-spark-1.3-contributor' : (account.startsWith('zcodex') ? 'glm-5.3-flash' : 'gpt-6-luna'));
   return request(`/launches/${launchId}/claim`, {
     gate_allowed: true,
     observed_at: iso(),

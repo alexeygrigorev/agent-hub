@@ -12,18 +12,25 @@ and environment are preserved and only the release path changes.
 Usage:
   switch-host-release.py --release <dir> --template <conf> --dropin <conf> [--restart]
 
---dropin should sort after every other drop-in for the unit (systemd applies
-the last ExecStart=). --restart reloads user units and restarts the service,
+--dropin must be the shared zz~~hub-desired-release.conf managed override.
+--restart reloads user units and restarts the service,
 then waits for it to report active.
 """
 import argparse
+import shlex
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'host'))
+from agent_hub_host.immutable_release import (legacy_switches, migration_lock,
+    retire_switches, validate_switches, UpdateRefused)
+
 VERIFY = REPO / "scripts" / "verify-host-release.py"
+DROPIN = 'zz~~hub-desired-release.conf'
+MARKER = '# Managed by Agent Hub desired host release.\n'
 # Full old release directory path: any non-space run ending in a 40-hex
 # release segment, followed by /, whitespace, quote or end of line. Matching
 # the full path (not just the sha segment) keeps the substitution exact.
@@ -45,6 +52,34 @@ def substitute_release(template_text, new_release):
     return new_text
 
 
+# Units that run host code next to the session host and must follow the same
+# release: their own managed drop-in is rewritten in the same switch, so the
+# next timer run (oneshot, picked up by the daemon-reload below) uses the new
+# release. A companion without a managed drop-in is left alone.
+COMPANION_SERVICES = ("agent-hub-fleet-host.service", "agent-hub-quota-server.service")
+
+
+def refresh_companions(dropin, release):
+    """Point each companion unit's managed drop-in at ``release``; returns the paths written."""
+    written = []
+    for service in COMPANION_SERVICES:
+        path = dropin.parent.parent / (service + ".d") / DROPIN
+        if path.is_symlink() or not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if not text.startswith(MARKER):
+            continue
+        try:
+            new_text = substitute_release(text, str(release))
+        except SystemExit:
+            continue
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(new_text, encoding="utf-8")
+        temporary.replace(path)
+        written.append(path)
+    return written
+
+
 def run(*argv):
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
     if proc.returncode != 0:
@@ -60,13 +95,44 @@ def main():
     parser.add_argument("--dropin", required=True)
     parser.add_argument("--service", default="agent-hub-session-host.service")
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument('--migration-lock-fd', type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    dropin = Path(args.dropin)
+    if dropin.name != DROPIN:
+        raise SystemExit('switch-host-release: REFUSED: use managed ' + DROPIN)
+    if dropin.is_symlink() or (dropin.exists() and
+            (not dropin.is_file() or not dropin.read_text(encoding='utf-8').startswith(MARKER))):
+        raise SystemExit('switch-host-release: REFUSED: unmanaged destination')
+    dropin.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with migration_lock(dropin.parent.resolve(), args.migration_lock_fd):
+            return activate(args, dropin)
+    except UpdateRefused as exc:
+        raise SystemExit('switch-host-release: REFUSED: ' + exc.reason)
+
+
+def activate(args, dropin):
+    if dropin.is_symlink() or (dropin.exists() and
+            (not dropin.is_file() or not dropin.read_text(encoding='utf-8').startswith(MARKER))):
+        raise SystemExit('switch-host-release: REFUSED: unmanaged destination')
+    template_text = Path(args.template).read_text(encoding='utf-8')
+    old_dirs = sorted(set(m.group(0) for m in SHA.finditer(template_text)))
+    if len(old_dirs) != 1:
+        raise SystemExit('switch-host-release: REFUSED: template must reference exactly one release dir')
+    old_root = Path(old_dirs[0])
+    paths = run('systemctl', '--user', 'show', args.service,
+                '--property=DropInPaths', '--value').stdout
+    # Include files not yet loaded by systemd as well as reported search paths.
+    dropins = set(Path(p) for p in shlex.split(paths)) | set(dropin.parent.glob('*.conf'))
+    legacy = legacy_switches(dropins, dropin.parent.resolve(), old_root)
     release = Path(args.release).resolve()
     rc = subprocess.run([sys.executable, str(VERIFY), str(release)]).returncode
     if rc != 0:
         raise SystemExit("switch-host-release: REFUSED: release failed verification")
     template_text = Path(args.template).read_text(encoding="utf-8")
     new_text = substitute_release(template_text, str(release))
+    if not new_text.startswith(MARKER):
+        new_text = MARKER + new_text
     if "PYTHONDONTWRITEBYTECODE" not in new_text:
         # Keep the release tree verifiable at runtime: no bytecode caches
         # are ever written next to the hashed sources (startup cost only).
@@ -74,10 +140,12 @@ def main():
         insert_at = next((i for i, line in enumerate(lines) if line.startswith("ExecStart=")), len(lines))
         lines.insert(insert_at, "Environment=PYTHONDONTWRITEBYTECODE=1\n")
         new_text = "".join(lines)
-    dropin = Path(args.dropin)
-    dropin.parent.mkdir(parents=True, exist_ok=True)
+    validate_switches(legacy)
     dropin.write_text(new_text, encoding="utf-8")
+    retire_switches(legacy, release.parent / '.host-release-switch-journal.jsonl')
     print("switch-host-release: wrote " + str(dropin))
+    for companion in refresh_companions(dropin, release):
+        print("switch-host-release: wrote " + str(companion))
     run("systemctl", "--user", "daemon-reload")
     if args.restart:
         run("systemctl", "--user", "restart", args.service)

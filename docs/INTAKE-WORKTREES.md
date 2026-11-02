@@ -4,7 +4,7 @@ Intake 4b161918. Every intake owns its own dedicated git worktree(s). Hub
 records them, resumes follow-up sessions in them, refuses to close an intake
 while any of them is unmerged or still on disk, and removes them on the owning
 host through the host agent. Complements the disk-GC intake 1f1f1877, which
-owns any automatic deletion; nothing here deletes automatically.
+owns any automatic deletion; this workflow never deletes automatically.
 
 ## Registry (Hub)
 
@@ -42,12 +42,38 @@ asks Hub for the plan:
 `POST /api/worktree-host/plan {launch_id}` returns one of
 
 - `{mode: "none"}`: no intake, or the start named its own cwd. Launch as before.
+- `{mode: "none", task_id, detached: true}`: the start set
+  `intake_worktree: "detached"` (intake 79458f2d). It keeps the intake link but
+  runs in its workspace root: Hub never pins it to the worktree's machine,
+  resumes, creates or locks the intake worktree for it, and never counts it as
+  a live session bound to that worktree. A detached start may not name a
+  workspace or cwd with any `-wt-` path segment (the tree, a subdirectory or a relative name). The hourly backlog triage and the post-DONE
+  verifier use it.
 - `{mode: "resume", task_id, worktree_id, path, branch}`: use that worktree. If
   the directory is missing on the host, create it again from fresh
   `origin/main` at the same path (`git worktree add`), then report `recreated`.
 - `{mode: "create", task_id, suffix}`: create `<dirname(ws)>/<basename(ws)>-<suffix>`
   on branch `<basename(ws)>-<suffix>` from fresh `origin/main`, where `ws` is
-  the resolved workspace repo and `suffix` is `wt-<first 8 of intake id>`.
+  the resolved workspace repo and `suffix` is `wt-<first 8 of intake id>` for
+  ordinary starts, or `wt-r-<first 8 of the session id>` for successor starts.
+
+### Successor starts (intake afab8367)
+
+A successor start (`intake_worktree: "successor"`) is the idle-work
+replacement of a LIVE predecessor. Idle-work keeps the predecessor running
+until the replacement itself is running, but the host worktree lock only
+moves to a proven-terminal owner (intake 1c8d915e), so a replacement into the
+same worktree is always refused as `dispatch_worktree_refused`. Instead Hub
+plans a fresh sibling worktree (create mode above): the replacement runs in
+its own workspace, the predecessor's tree stays locked and untouched, and no
+lock is ever stolen or force-unlocked. A successor start may not name a `cwd`
+(it would resolve against the live-held tree). The predecessor's uncommitted
+state is reported, never copied or force-taken: when idle-work submits the
+replacement it queues a `status` command for the held worktree and notes the
+situation on the intake; the dirty/unpushed/unmerged report lands in the
+worktree registry row (visible via `hub worktree list`). Successors of the
+same intake therefore leave several active worktree rows; the close gate and
+the remove guards cover all of them.
 
 The host then launches with cwd = the worktree and reports
 `POST /api/worktree-host/observe {launch_id, action, path, branch, error?}`
@@ -77,7 +103,11 @@ audit `close` row carries `force: <reason>`.
 ## Host commands (AC4, AC5)
 
 A machine-scoped queue `intake_worktree_commands` (kinds `status`, `remove`).
-The host agent polls each cycle:
+On host check-in, Hub queues a status command for up to 10 active worktrees
+whose status is still unknown, respecting the machine queue cap. A failed
+unknown-status command is retried after five minutes. This also covers
+worktrees registered before this behavior was deployed; no manual refresh is
+needed just to populate `status_at`. The host agent polls each cycle:
 
 - `GET /api/worktree-host/commands` returns `{commands: [{id, kind, worktree_id, task_id, path, branch}]}`
   (queued commands are claimed; claims older than 15 minutes are re-offered).
@@ -112,3 +142,23 @@ User endpoints (intake auth and grants):
 CLI: `hub worktree list|refresh|remove|register <intake|session>`,
 `hub intake close <id> [--force --reason TEXT]`,
 `hub intake update --status closed` (alias of `done`) `[--force]`.
+
+## Terminal lock release and repair
+
+When a Hub session and its native incarnation are positively terminal, the
+host releases its worktree lock only if the current Git lock reason names that
+exact session (and intake when present). A live successor that has taken
+ownership keeps its own lock. Open intakes remain protected from automatic
+cleanup through the separate cleanup guard; they do not retain a dead
+session's lock.
+
+On the owning host, `hub worktree repair-locks --dry-run` lists existing
+Hub-session locks whose holder is positively terminal, explicitly unprotected
+and not human-owned according to Hub, matches the original repository identity,
+and exactly owns the lock reason. Review the full listing first, then run
+`hub worktree repair-locks --apply` to release eligible locks. The scan is
+bounded to 1,000 terminal Hub facts and 30 seconds; an incomplete scan applies
+nothing. Repeating the command is safe. It uses `git worktree unlock` only;
+it never uses `--force` or removes worktrees. Human-owned or human-protected sessions,
+non-terminal sessions, manual locks, foreign locks, unknown repository
+identities, and mismatched lock reasons remain untouched.

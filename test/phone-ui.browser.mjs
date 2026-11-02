@@ -28,7 +28,7 @@ const checks = [], shots = [];
 const key = randomBytes(32).toString('hex');
 const secret = randomBytes(32).toString('hex');
 const adminToken = randomBytes(32).toString('hex');
-const bundle = await build({ entryPoints: [resolve(root, 'test/existing-ui-worker.ts')], bundle: true, write: false, format: 'esm', platform: 'browser', external: ['cloudflare:workers'] });
+const bundle = await build({ entryPoints: [resolve(root, 'test/existing-ui-worker.ts')], bundle: true, write: false, format: 'esm', platform: 'browser', external:['cloudflare:workers','node:async_hooks'] });
 const mime = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.woff2': 'font/woff2' };
 const mf = new Miniflare(convertV4MiniflareOptions({
   host: '127.0.0.1', port: 0, log: new Log(LogLevel.ERROR), workers: [{
@@ -138,6 +138,8 @@ try {
   await page.getByLabel('New status').selectOption('in_progress');
   await page.getByRole('button', { name: 'Save status', exact: true }).click();
   await page.getByText('Status saved.', { exact: false }).waitFor();
+  // The save acknowledgement precedes the asynchronous detail refresh.
+  await page.locator('.intake-history-card').nth(2).waitFor();
   checks.push('Intake status action works from phone width');
 
   // Opening never started a session: no link events, no assigned sessions.

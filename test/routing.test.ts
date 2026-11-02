@@ -99,11 +99,11 @@ describe('configured model tiers and ranking', () => {
   it('keeps aliases and never substitutes tiers', () => { expect(taskTier({tier:'smart'})).toBe('deep'); expect(taskTier({difficulty:'concrete'})).toBe('quick'); });
   it('blocks Grok, requires explicit Codex, and excludes full GLM and GLM in OpenCode', () => {
     const route = { provider: 'codex', engine: 'codex', profile: null, account: 'a' };
-    const ads = [{ engine:'codex',profile:null,account:'a',model:'gpt-6.1-sol',effort:'high' }];
+    const ads = [{ engine:'codex',profile:null,account:'a',model:'gpt-6.1-sol',effort:'medium' }];
     expect(modelCandidates({}, route, ads, quota, now)).toHaveLength(0);
     expect(modelCandidates({preferred_runner:'codex'}, route, ads, quota, now)).toHaveLength(1);
     expect(modelCandidates({}, {provider:'grok',engine:'grok',profile:null,account:'a'}, [{engine:'grok',profile:null,account:'a',model:'grok',effort:null}], quota, now)).toHaveLength(0);
-    expect(modelCandidates({}, {provider:'claude',engine:'claude',profile:null,account:'a'}, [{engine:'claude',profile:null,account:'a',model:'sonnet',effort:'high'}], quota, now)).toHaveLength(1);
+    expect(modelCandidates({}, {provider:'claude',engine:'claude',profile:null,account:'a'}, [{engine:'claude',profile:null,account:'a',model:'sonnet',effort:'medium'}], quota, now)).toHaveLength(1);
     expect(modelCandidates({}, {provider:'go',engine:'opencode',profile:null,account:'a'}, [{engine:'opencode',profile:null,account:'a',model:'glm-5.3',effort:null}], quota, now)).toHaveLength(0);
   });
   it('redacts codes, auth URLs, bearer and named secrets', () => { expect(redact('SMS code: 123456; Bearer abc; https://auth.test/code?token=x; sk-abcdef')).not.toMatch(/123456|abc|https:/); });
@@ -202,6 +202,7 @@ describe('account pinning and existing native occupancy', () => {
   }));
   it('releases long-idle unlinked observed sessions from account capacity', () => fixture(async (r, f, sql) => {
     sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", at());
+    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1)", at());
     const active = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one()).active;
     expect(active()).toBe(0);
     sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,last_activity_at) VALUES ('hetzner','idle-old','idle-old','zcodex','running',?,'tasks','shared-zai',?)", at(), at(-10 * 3600000));

@@ -25,8 +25,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
+import sys
 from pathlib import Path
 
 from . import private_fs
@@ -137,6 +139,126 @@ def diff_subscriptions(settings, accounts):
             raise ValueError("Refusing to render an ambiguous canonical route: " + str(key[0]))
         canonical_routes.add(key)
     return entries, changes
+
+
+# Native (host-home) catalog accounts a host renders by itself when the engine
+# CLI and its login are present locally (intake 608a2f9a). Claude is covered by
+# the managed hub-claude bundle and Grok is a disabled provider, so neither is
+# auto-rendered.
+NATIVE_BINARIES = {"zcodex": ("zcodex",), "antigravity": ("agy", "antigravity"), "opencode": ("opencode",)}
+# User-scope install locations outside PATH (scripts/windows/add-hub-engines.ps1).
+NATIVE_BINARY_DIRS = ("~/.local/bin", "~/bin")
+WINDOWS_BINARY_DIRS = (("APPDATA", "npm"), ("LOCALAPPDATA", "Programs/Antigravity/bin"), ("LOCALAPPDATA", "Programs/agy"))
+NATIVE_LAUNCHER = {"zai": "zai", "gemini": "antigravity", "go": "opencode"}
+# The login file inside the credential home (same paths provisioning imports).
+# The CLIs create the home directories themselves, so a directory alone is not
+# a login (intake 06d2a0ac: never advertise logged-out accounts).
+NATIVE_CREDENTIAL_MARKERS = {
+    "zai": "v2/credentials.json",
+    # The catalog's Gemini-family native harness is Antigravity. Its login is
+    # separate from Gemini CLI's oauth_creds.json (intake 3d1f8702).
+    "gemini": "antigravity-cli/antigravity-oauth-token",
+    "go": "auth.json",
+}
+
+
+def _default_launcher_model(provider, harness):
+    from .model_contract import policy_models
+    for model in policy_models():
+        if model.get("provider") == provider and model.get("engine") == harness:
+            return model
+    return None
+
+
+def _find_binary(names, which=shutil.which, home=None):
+    dirs = [Path(expand_home(d, home)) for d in NATIVE_BINARY_DIRS]
+    if sys.platform == "win32":
+        dirs += [Path(os.environ[var]) / sub for var, sub in WINDOWS_BINARY_DIRS if os.environ.get(var)]
+    suffixes = (".exe", ".cmd", "") if sys.platform == "win32" else ("",)
+    for name in names:
+        found = which(name)
+        if found:
+            return found
+        for directory in dirs:
+            for suffix in suffixes:
+                candidate = directory / (name + suffix)
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+    return None
+
+
+def native_credential_present(account, home=None):
+    """Check the exact host-home credential expected by a native catalog route."""
+    provider, harness = account.get("provider"), account.get("harness")
+    credential = account.get("credential")
+    if not isinstance(credential, dict) or credential.get("mode") != "host-home":
+        return False
+    marker_name = NATIVE_CREDENTIAL_MARKERS.get(provider)
+    if not marker_name:
+        return False
+    home_path = Path(home) if home is not None else Path.home()
+    marker = Path(expand_home(credential.get("path", ""), home)) / marker_name
+    try:
+        current = marker
+        while current != home_path and home_path in current.parents:
+            if current.is_symlink():
+                return False
+            current = current.parent
+        if current.is_symlink() or marker.is_symlink() or not marker.is_file() or marker.stat().st_size <= 2:
+            return False
+        if provider == "gemini" and harness == "antigravity":
+            token = json.loads(marker.read_text(encoding="utf-8")).get("token")
+            return (isinstance(token, dict)
+                    and isinstance(token.get("access_token"), str) and bool(token["access_token"])
+                    and isinstance(token.get("refresh_token"), str) and bool(token["refresh_token"]))
+        return True
+    except (OSError, UnicodeError, ValueError, AttributeError):
+        return False
+
+
+def native_subscriptions(settings, accounts=None, which=shutil.which, home=None, python=None):
+    """Subscription entries for catalog host-home accounts usable on this host.
+
+    An account is rendered only when no configured entry already maps to it,
+    its provider is enabled, the engine CLI resolves locally and its login
+    file is present and non-empty. Operator entries always win; nothing is written.
+    """
+    if accounts is None:
+        accounts = policy_accounts()
+    from .native_admission import routing_rules
+    disabled = set(routing_rules().get("disabled_providers", []))
+    configured = {canonical_account_label(s.get("account_label")) for s in settings.get("subscriptions", [])
+                  if isinstance(s, dict)}
+    python = python or sys.executable
+    subs = []
+    for account in accounts:
+        provider, harness = account["provider"], account["harness"]
+        if (account["credential"]["mode"] != "host-home" or provider not in NATIVE_LAUNCHER
+                or provider in disabled or account["account"] in configured):
+            continue
+        binary = _find_binary(NATIVE_BINARIES.get(harness, (harness,)), which=which, home=home)
+        if not binary or not native_credential_present(account, home=home):
+            continue
+        sub = {
+            "service": provider,
+            "account_label": account["account"],
+            "engine": harness,
+            "profile": None,
+            "admission_argv": [python, "-m", "agent_hub_host.native_admission", "--service", provider,
+                               "--account", account["account"], "--engine", harness],
+            "launcher_provider": NATIVE_LAUNCHER[provider],
+        }
+        model = _default_launcher_model(provider, harness)
+        if model:
+            sub["launcher_model"] = model["model"]
+            if model.get("effort"):
+                sub["launcher_effort"] = model["effort"]
+        if harness == "zcodex":
+            # Goal routes need a trusted local start command (same as RMTHZ).
+            sub["startup_argv"] = [binary, "--dangerously-bypass-approvals-and-sandbox",
+                                   "-c", "check_for_update_on_startup=false"]
+        subs.append(sub)
+    return subs
 
 
 def read_text(path, limit=262144):

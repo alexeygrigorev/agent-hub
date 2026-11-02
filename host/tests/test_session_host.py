@@ -31,6 +31,63 @@ class SessionHostTests(unittest.TestCase):
             self.assertEqual(args.machine_id,'test-machine')
             self.assertEqual(args.sessions_cmd,'host-receive')
 
+    def test_blocked_daemon_cannot_log_into_later_stdout(self):
+        import contextlib
+        import io
+        import threading
+        release, entered = threading.Event(), threading.Event()
+        threads = []
+
+        def slow_observer(current, collector):
+            def step():
+                session_host._log('observer_started')
+                entered.set()
+                release.wait(5)
+                session_host._log('disk_cycle')
+            thread = session_host._background_thread(target=step, daemon=True)
+            threads.append(thread)
+            thread.start()
+            self.assertTrue(entered.wait(1))
+            return thread
+
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',return_value=SimpleNamespace(session_id='test-native',workspace=str(pathlib.Path.cwd()))), patch.object(session_host.fleet,'Dispatcher'), patch.object(session_host.session_control,'execute'), patch.object(session_host,'maybe_start_disk_thread',side_effect=slow_observer), contextlib.redirect_stdout(io.StringIO()) as controller_stdout:
+                session_host.run('synthetic-settings',directory,cycles=1)
+                self.assertIn('observer_started', controller_stdout.getvalue())
+                self.assertFalse(release.is_set())
+                self.assertTrue(threads[0].is_alive())
+            with contextlib.redirect_stdout(io.StringIO()) as later_stdout:
+                release.set()
+                threads[0].join(2)
+            self.assertFalse(threads[0].is_alive())
+            self.assertEqual(later_stdout.getvalue(), '')
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(2)
+
+    def test_release_poller_error_line_after_exit_does_not_reach_stdout(self):
+        # self_update.loop's error lines used plain print, so a poller still
+        # inside a network call when run() returned wrote into whatever owned
+        # stdout next (Host canary flake, intake 26fc40d3).
+        import io
+        import threading
+        from contextlib import redirect_stdout
+        gate = threading.Event()
+        finished = threading.Event()
+
+        def late_loop(request, stop, *, log=print, **kwargs):
+            gate.wait(timeout=10)
+            log('LATE-RELEASE-LINE', flush=True)
+            finished.set()
+
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',return_value=SimpleNamespace(session_id='test-native',workspace=str(pathlib.Path.cwd()))), patch.object(session_host.fleet,'Dispatcher'), patch.object(session_host.session_control,'execute'), patch.object(session_host.self_update,'loop',late_loop), redirect_stdout(buf):
+            session_host.run('synthetic-settings',directory,cycles=1)
+            gate.set()
+            self.assertTrue(finished.wait(timeout=5))
+        self.assertNotIn('LATE-RELEASE-LINE', buf.getvalue())
+
     def test_unbound_controller_has_no_fleet_or_command_effects(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(session_host.config,'load_config',return_value={'machine_id':'test-machine','access_token':'synthetic'}), patch.object(session_host.fleet,'load_settings',return_value={}), patch.object(session_host,'qualify_sender_binding',side_effect=ValueError('unbound')), patch.object(session_host.fleet,'Dispatcher') as dispatcher, patch.object(session_host.session_control,'execute') as execute:
             with self.assertRaises(ValueError):session_host.run('synthetic-settings',directory,cycles=1)
@@ -45,6 +102,15 @@ class SessionHostTests(unittest.TestCase):
         for key,value in [('id','replacement'),('created_at_ms',2),('engine','opencode'),('command',['another','command'])]:
             changed=dict(receipt);changed[key]=value
             self.assertFalse(module.same_controller(changed,receipt))
+
+    def test_supervisor_identity_ignores_observed_workspace_drift(self):
+        # aplexer 0.1.23 moved a live Windows controller's workspace to %TEMP%
+        # (DESKTOP-FP4OP26, intake bf0863c4); that is not a different controller.
+        path=pathlib.Path(__file__).resolve().parents[2]/'scripts/session-host-supervisor.py'
+        spec=importlib.util.spec_from_file_location('host_supervisor',path)
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        receipt=dict(id='synthetic-id',tag='controller',workspace='/synthetic',engine='shell',created_at_ms=1,command=['python','host'])
+        self.assertTrue(module.same_controller(dict(receipt,workspace='C:/Users/u/AppData/Local/Temp'),receipt))
 
     def test_session_host_loads_role_config_independently_of_disabled_consumer(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -197,7 +263,14 @@ class SessionHostTests(unittest.TestCase):
                  patch.object(session_host, 'qualify_sender_binding', return_value=SimpleNamespace(session_id='test-native', workspace=str(pathlib.Path.cwd()))), \
                  patch.object(session_host.fleet, 'Dispatcher') as dispatcher, \
                  patch.object(session_host, 'RoleConsumer'), \
+                 patch.object(session_host, 'offers_loop', lambda *a, **k: None), \
+                 patch.object(session_host, 'maybe_start_maintenance_thread', return_value=None), \
+                 patch.object(session_host, 'maybe_start_token_thread', return_value=None), \
                  patch.object(session_host.session_control, 'execute'):
+                # The real offers loop raises offers_polling while it polls
+                # (which, by design, defers the swap) and background steps
+                # may consume the second load_settings value; keep them out
+                # so the swap is deterministic.
                 session_host.run(settings_file, directory, cycles=1)
                 instance = dispatcher.return_value
                 self.assertEqual(instance.settings, v2)

@@ -75,6 +75,57 @@ async function startAndBind(s: SessionControlService, sql: any, key: string) {
 }
 
 describe('session scheduled wakes', () => {
+  it('does not let a null delivered timestamp hide the next alarm', async () => {
+    await fixture(async (_s, sql, _hub, state) => {
+      const at = new Date(Date.now() + 12345).toISOString();
+      sql.exec(`INSERT INTO session_control_wakes
+        (id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at,delivered_at)
+        VALUES('alarm-valid','gone','test','valid',0,?,'resume','delivered',?,?,?)`, at, at, at, at);
+      sql.exec(`INSERT INTO session_control_wakes
+        (id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at,delivered_at)
+        VALUES('alarm-null','gone','test','null',0,?,'resume','delivered',?,?,NULL)`, at, at, at);
+      const expected = sql.exec(`SELECT CAST((julianday(?) - 2440587.5) * 86400000 AS INTEGER) + 600000 AS deadline`, at).toArray()[0].deadline;
+      const service = new SessionControlService(sql, cb => state.storage.transactionSync(cb), () => Date.now(), {}, {});
+      expect(service.nextWakeTime()).toBe(expected);
+    });
+  });
+
+  it('seeks indexed wake queues and caps each sweep with retained production history', async () => {
+    await fixture(async (_s, sql, _hub, state) => {
+      const now = Date.now(), at = new Date(now).toISOString();
+      state.storage.transactionSync(() => {
+        for (let i = 0; i < 5000; i++) sql.exec(`INSERT INTO session_control_wakes
+          (id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at,delivered_at)
+          VALUES(?,?,'test',?,?,?,'retained prompt',?,?,?,?)`,
+          `history-${i}`, 'gone', `history-${i}`, now + 3600000, at,
+          i % 2 ? 'acked' : 'resolved', at, at, at);
+        for (const phase of ['pending', 'delivered']) for (let i = 0; i < 101; i++) sql.exec(`INSERT INTO session_control_wakes
+          (id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at,delivered_at)
+          VALUES(?,?,'test',?,?,?,'resume',?,?,?,?)`,
+          `${phase}-${i}`, 'gone', `${phase}-${i}`, now - 1000, at, phase, at, at, at);
+      });
+      const reads: {query: string; bindings: any[]}[] = [];
+      const traced = { exec(query: string, ...bindings: any[]) {
+        if (/SELECT/i.test(query) && /session_control_wakes/.test(query)) reads.push({query, bindings});
+        return sql.exec(query, ...bindings);
+      }};
+      const service = new SessionControlService(traced as any, cb => state.storage.transactionSync(cb), () => now, {}, {});
+      expect(service.nextWakeTime()).toBe(now - 1000);
+      expect(service.processDueWakes()).toEqual({ delivered: 0, acked: 0, missed: 200 });
+      for (const phase of ['pending', 'delivered']) {
+        expect(sql.exec('SELECT COUNT(*) AS n FROM session_control_wakes WHERE state=?', phase).toArray()[0].n).toBe(1);
+      }
+      // Inspect the actual service queries: LIMIT alone must not hide a full
+      // retained-history sort. SQLite must seek each ordered queue by index.
+      expect(reads).toHaveLength(4);
+      for (const {query, bindings} of reads) {
+        const plan = sql.exec('EXPLAIN QUERY PLAN ' + query, ...bindings).toArray().map((r: any) => r.detail).join('\n');
+        expect(plan).not.toMatch(/SCAN session_control_wakes|USE TEMP B-TREE/);
+        expect(plan).toMatch(/SEARCH session_control_wakes USING/);
+      }
+    });
+  });
+
   it.each(['offered', 'starting', 'uncertain'])('retries a due wake during %s and delivers after startup', async (phase) => {
       await fixture(async (s, sql) => {
         const sess = await startAndBind(s, sql, 'wake-startup-' + phase);

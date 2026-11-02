@@ -1,5 +1,6 @@
 """Foreground Fleet/command host; runs only inside its real native controller session."""
 import argparse
+import builtins
 try:
     import fcntl
 except ImportError:
@@ -20,12 +21,41 @@ from .disk_monitor import DiskMonitor
 from .host_health_monitor import HostHealthMonitor
 from .jobs import JobDispatcher
 from .metrics_producer import MetricsProducer
-from .native_sessions import qualify_sender_binding
+from .native_sessions import ensure_runtime_bin_on_path, qualify_sender_binding
 from .quota_snapshot import QuotaCollector
 from .token_usage import TokenCollector
 from .role_dispatch import TrustedRoleConfig, load_role_config
 from .runtime import RuntimeManager
 from .status_runtime import StatusCollector
+
+
+# Each controller owns its daemon output lifetime. A blocked I/O operation may
+# finish after run() returns, but must not write into the next stdout owner.
+_output_context = threading.local()
+
+
+def _log(*args, **kwargs):
+    state = getattr(_output_context, 'state', None)
+    if state is None:
+        builtins.print(*args, **kwargs)
+        return
+    stopped, lock = state
+    with lock:
+        if not stopped.is_set():
+            builtins.print(*args, **kwargs)
+
+
+def _background_thread(*, target, args=(), **kwargs):
+    state = getattr(_output_context, 'state', None)
+
+    def invoke():
+        _output_context.state = state
+        try:
+            target(*args)
+        finally:
+            del _output_context.state
+
+    return threading.Thread(target=invoke, **kwargs)
 
 
 def status_step_once(collector) -> None:
@@ -39,7 +69,7 @@ def status_step_once(collector) -> None:
     try:
         result = collector.step(submit=True)
     except Exception as error:
-        print(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
         return
     try:
         if not isinstance(result, dict) or result.get('rate_limited') or result.get('disabled'):
@@ -47,12 +77,12 @@ def status_step_once(collector) -> None:
         observations = result.get('observations')
         skipped = result.get('skipped')
         errors = result.get('errors')
-        print(json.dumps({'event': 'status_cycle',
+        _log(json.dumps({'event': 'status_cycle',
                           'observations': len(observations) if isinstance(observations, list) else 0,
                           'skipped': len(skipped) if isinstance(skipped, list) else 0,
                           'errors': len(errors) if isinstance(errors, list) else 0}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
 
 
 def resolve_quse_cmd():
@@ -74,12 +104,12 @@ def maybe_start_status_thread(current: Optional[threading.Thread], collector) ->
     try:
         if current is not None and current.is_alive():
             return current
-        thread = threading.Thread(target=status_step_once, args=(collector,),
+        thread = _background_thread(target=status_step_once, args=(collector,),
                                   daemon=True, name='status-observe')
         thread.start()
         return thread
     except Exception as error:
-        print(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
         return current
 
 
@@ -93,17 +123,17 @@ def metrics_step_once(collector) -> None:
     try:
         result = collector.step(submit=True)
     except Exception as error:
-        print(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
         return
     try:
         if not isinstance(result, dict) or result.get('rate_limited') or result.get('disabled'):
             return
         errors = result.get('errors')
-        print(json.dumps({'event': 'metrics_cycle',
+        _log(json.dumps({'event': 'metrics_cycle',
                           'posted': bool(result.get('posted')),
                           'errors': len(errors) if isinstance(errors, list) else 0}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
 
 
 def maybe_start_metrics_thread(current: Optional[threading.Thread], collector) -> Optional[threading.Thread]:
@@ -116,12 +146,12 @@ def maybe_start_metrics_thread(current: Optional[threading.Thread], collector) -
     try:
         if current is not None and current.is_alive():
             return current
-        thread = threading.Thread(target=metrics_step_once, args=(collector,),
+        thread = _background_thread(target=metrics_step_once, args=(collector,),
                                   daemon=True, name='metrics-produce')
         thread.start()
         return thread
     except Exception as error:
-        print(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
         return current
 
 
@@ -135,17 +165,17 @@ def token_step_once(collector) -> None:
     try:
         result = collector.step()
     except Exception as error:
-        print(json.dumps({'event': 'token_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'token_error', 'type': type(error).__name__}), flush=True)
         return
     try:
         if not isinstance(result, dict):
             return
-        print(json.dumps({'event': 'token_cycle',
+        _log(json.dumps({'event': 'token_cycle',
                           'hours': result.get('hours', 0),
                           'held': bool(collector.last_hold),
                           'error': bool(collector.last_error)}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'token_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'token_error', 'type': type(error).__name__}), flush=True)
 
 
 def maybe_start_token_thread(current: Optional[threading.Thread], collector) -> Optional[threading.Thread]:
@@ -158,12 +188,12 @@ def maybe_start_token_thread(current: Optional[threading.Thread], collector) -> 
     try:
         if current is not None and current.is_alive():
             return current
-        thread = threading.Thread(target=token_step_once, args=(collector,),
+        thread = _background_thread(target=token_step_once, args=(collector,),
                                   daemon=True, name='token-collect')
         thread.start()
         return thread
     except Exception as error:
-        print(json.dumps({'event': 'token_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'token_error', 'type': type(error).__name__}), flush=True)
         return current
 
 
@@ -177,19 +207,19 @@ def disk_step_once(collector) -> None:
     try:
         result = collector.step(submit=True)
     except Exception as error:
-        print(json.dumps({'event': 'disk_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'disk_error', 'type': type(error).__name__}), flush=True)
         return
     try:
         if not isinstance(result, dict) or result.get('rate_limited') or result.get('disabled'):
             return
         errors = result.get('errors')
         filesystems = result.get('filesystems')
-        print(json.dumps({'event': 'disk_cycle',
+        _log(json.dumps({'event': 'disk_cycle',
                           'posted': bool(result.get('posted')),
                           'filesystems': len(filesystems) if isinstance(filesystems, list) else 0,
                           'errors': len(errors) if isinstance(errors, list) else 0}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'disk_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'disk_error', 'type': type(error).__name__}), flush=True)
 
 
 def maybe_start_disk_thread(current: Optional[threading.Thread], collector) -> Optional[threading.Thread]:
@@ -202,12 +232,12 @@ def maybe_start_disk_thread(current: Optional[threading.Thread], collector) -> O
     try:
         if current is not None and current.is_alive():
             return current
-        thread = threading.Thread(target=disk_step_once, args=(collector,),
+        thread = _background_thread(target=disk_step_once, args=(collector,),
                                   daemon=True, name='disk-monitor')
         thread.start()
         return thread
     except Exception as error:
-        print(json.dumps({'event': 'disk_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'disk_error', 'type': type(error).__name__}), flush=True)
         return current
 
 
@@ -221,17 +251,17 @@ def host_health_step_once(collector) -> None:
     try:
         result = collector.step(submit=True)
     except Exception as error:
-        print(json.dumps({'event': 'host_health_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'host_health_error', 'type': type(error).__name__}), flush=True)
         return
     try:
         if not isinstance(result, dict) or result.get('rate_limited') or result.get('disabled'):
             return
         errors = result.get('errors')
-        print(json.dumps({'event': 'host_health_cycle',
+        _log(json.dumps({'event': 'host_health_cycle',
                           'posted': bool(result.get('posted')),
                           'errors': len(errors) if isinstance(errors, list) else 0}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'host_health_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'host_health_error', 'type': type(error).__name__}), flush=True)
 
 
 def maybe_start_host_health_thread(current: Optional[threading.Thread], collector) -> Optional[threading.Thread]:
@@ -244,12 +274,12 @@ def maybe_start_host_health_thread(current: Optional[threading.Thread], collecto
     try:
         if current is not None and current.is_alive():
             return current
-        thread = threading.Thread(target=host_health_step_once, args=(collector,),
+        thread = _background_thread(target=host_health_step_once, args=(collector,),
                                   daemon=True, name='host-health-monitor')
         thread.start()
         return thread
     except Exception as error:
-        print(json.dumps({'event': 'host_health_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'host_health_error', 'type': type(error).__name__}), flush=True)
         return current
 
 
@@ -291,10 +321,10 @@ def maybe_reload_fleet_settings(settings_path, last_mtime: Optional[float]):
     try:
         reloaded = fleet.load_settings(settings_path)
     except Exception as error:
-        print(json.dumps({'event': 'settings_reload_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'settings_reload_error', 'type': type(error).__name__}), flush=True)
         return None, current
     if not isinstance(reloaded, dict):
-        print(json.dumps({'event': 'settings_reload_error', 'type': 'invalid_settings'}), flush=True)
+        _log(json.dumps({'event': 'settings_reload_error', 'type': 'invalid_settings'}), flush=True)
         return None, current
     return reloaded, current
 
@@ -397,22 +427,22 @@ def role_consumer_step_once(consumer: RoleConsumer) -> None:
     try:
         result = consumer.step()
     except Exception as error:
-        print(json.dumps({"event": "role_consumer_error", "type": type(error).__name__}), flush=True)
+        _log(json.dumps({"event": "role_consumer_error", "type": type(error).__name__}), flush=True)
         return
     try:
         if not isinstance(result, dict) or result.get("rate_limited") or result.get("disabled") or result.get("idle"):
             return
         if result.get("error"):
-            print(json.dumps({"event": "role_consumer_error", "type": result["error"]}), flush=True)
+            _log(json.dumps({"event": "role_consumer_error", "type": result["error"]}), flush=True)
             return
-        print(json.dumps({
+        _log(json.dumps({
             "event": "role_cycle",
             "dispatched": result.get("dispatched", 0),
             "recovered": result.get("recovered", 0),
             "errors": result.get("errors", 0)
         }), flush=True)
     except Exception as error:
-        print(json.dumps({"event": "role_consumer_error", "type": type(error).__name__}), flush=True)
+        _log(json.dumps({"event": "role_consumer_error", "type": type(error).__name__}), flush=True)
 
 
 def maybe_start_role_consumer_thread(current: Optional[threading.Thread], consumer: RoleConsumer) -> Optional[threading.Thread]:
@@ -424,12 +454,12 @@ def maybe_start_role_consumer_thread(current: Optional[threading.Thread], consum
     try:
         if current is not None and current.is_alive():
             return current
-        thread = threading.Thread(target=role_consumer_step_once, args=(consumer,),
+        thread = _background_thread(target=role_consumer_step_once, args=(consumer,),
                                   daemon=True, name="role-consumer")
         thread.start()
         return thread
     except Exception as error:
-        print(json.dumps({"event": "role_consumer_error", "type": type(error).__name__}), flush=True)
+        _log(json.dumps({"event": "role_consumer_error", "type": type(error).__name__}), flush=True)
         return current
 
 
@@ -442,25 +472,25 @@ def maintenance_step_once(dispatcher, quota_collector):
     started = time.monotonic()
     try:
         results = dispatcher.once()
-        print(json.dumps({'event': 'fleet_cycle', 'results': len(results)}), flush=True)
+        _log(json.dumps({'event': 'fleet_cycle', 'results': len(results)}), flush=True)
         for result in results:
             if (isinstance(result, dict) and result.get('state') in {'failed', 'held'}
                     and result.get('reason') in DISPATCH_MESSAGES):
                 # Whitelist diagnostics; no arbitrary exception text or payload.
-                print(json.dumps({'event': 'fleet_dispatch_refused',
+                _log(json.dumps({'event': 'fleet_dispatch_refused',
                                   'state': result['state'], 'reason': result['reason']}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'fleet_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'fleet_error', 'type': type(error).__name__}), flush=True)
     try:
         before = quota_collector.last_collect_monotonic
         snapshot = quota_collector.step()
         if before != quota_collector.last_collect_monotonic:
-            print(json.dumps({'event': 'quota_cycle', 'reported': snapshot is not None,
+            _log(json.dumps({'event': 'quota_cycle', 'reported': snapshot is not None,
                               'held': bool(quota_collector.last_hold),
                               'error': bool(quota_collector.last_error)}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'quota_error', 'type': type(error).__name__}), flush=True)
-    print(json.dumps({'event': 'maintenance_cycle',
+        _log(json.dumps({'event': 'quota_error', 'type': type(error).__name__}), flush=True)
+    _log(json.dumps({'event': 'maintenance_cycle',
                       'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
 
 
@@ -469,12 +499,12 @@ def telemetry_step_once(dispatcher):
     started = time.monotonic()
     try:
         hb = dispatcher.telemetry_tick()
-        print(json.dumps({'event': 'telemetry_cycle', 'posted': True,
+        _log(json.dumps({'event': 'telemetry_cycle', 'posted': True,
                           'launcher_resources': 'launcher_resources' in hb,
                           'gate': bool((hb.get('gate') or {}).get('launch_allowed')),
                           'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'telemetry_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'telemetry_error', 'type': type(error).__name__}), flush=True)
 
 
 def checkin_step_once(dispatcher):
@@ -486,10 +516,10 @@ def checkin_step_once(dispatcher):
     started = time.monotonic()
     try:
         dispatcher.checkin_tick()
-        print(json.dumps({'event': 'checkin_cycle', 'posted': True,
+        _log(json.dumps({'event': 'checkin_cycle', 'posted': True,
                           'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'checkin_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'checkin_error', 'type': type(error).__name__}), flush=True)
 
 
 def offers_step_once(dispatcher):
@@ -498,15 +528,15 @@ def offers_step_once(dispatcher):
         from .offer_claims import poll
         out = poll(dispatcher)
         if out.get('offers'):
-            print(json.dumps({'event': 'offers_cycle', 'offers': out['offers'],
+            _log(json.dumps({'event': 'offers_cycle', 'offers': out['offers'],
                               'dispatch_max_s': out['dispatch_max_s']}), flush=True)
         for result in out.get('results', []):
             if (isinstance(result, dict) and result.get('state') in {'failed', 'held'}
                     and result.get('reason') in DISPATCH_MESSAGES):
-                print(json.dumps({'event': 'fleet_dispatch_refused',
+                _log(json.dumps({'event': 'fleet_dispatch_refused',
                                   'state': result['state'], 'reason': result['reason']}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'offers_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'offers_error', 'type': type(error).__name__}), flush=True)
 
 
 def terminal_step_once(dispatcher):
@@ -515,10 +545,10 @@ def terminal_step_once(dispatcher):
     started = time.monotonic()
     try:
         results = poll(dispatcher)
-        print(json.dumps({'event': 'terminal_reports_cycle', 'reconciled': len(results),
+        _log(json.dumps({'event': 'terminal_reports_cycle', 'reconciled': len(results),
                           'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'terminal_reports_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'terminal_reports_error', 'type': type(error).__name__}), flush=True)
 
 
 WORKTREE_POLL_S = 30
@@ -535,10 +565,10 @@ def worktree_commands_step_once(dispatcher):
         out = poll_commands_once(dispatcher.request,
                                  git_bin=(getattr(dispatcher, 'settings', None) or {}).get('git_bin', 'git'))
         if out.get('handled') or out.get('errors'):
-            print(json.dumps({'event': 'worktree_commands_cycle', 'handled': out['handled'],
+            _log(json.dumps({'event': 'worktree_commands_cycle', 'handled': out['handled'],
                               'errors': out['errors']}), flush=True)
     except Exception as error:
-        print(json.dumps({'event': 'worktree_commands_error', 'type': type(error).__name__}), flush=True)
+        _log(json.dumps({'event': 'worktree_commands_error', 'type': type(error).__name__}), flush=True)
 
 
 def bindings_step_once(dispatcher, *, enrich=False):
@@ -548,7 +578,7 @@ def bindings_step_once(dispatcher, *, enrich=False):
         report = (dispatcher.report_catalog_bindings if enrich else
                   getattr(dispatcher, 'report_native_bindings', dispatcher.report_catalog_bindings))
         report()
-        print(json.dumps({'event': 'bindings_enrichment_cycle' if enrich else 'bindings_cycle',
+        _log(json.dumps({'event': 'bindings_enrichment_cycle' if enrich else 'bindings_cycle',
                           'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
     except Exception as error:
         # Preserve dispatch and keep diagnostics bounded, including the common
@@ -556,7 +586,7 @@ def bindings_step_once(dispatcher, *, enrich=False):
         status = getattr(error, 'code', None)
         if type(status) is not int:
             status = 400 if 'status 400' in str(error) else None
-        print(json.dumps({'event': 'bindings_enrichment_error' if enrich else 'bindings_error',
+        _log(json.dumps({'event': 'bindings_enrichment_error' if enrich else 'bindings_error',
                           'type': type(error).__name__,
                           'http_status': status,
                           'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
@@ -572,9 +602,9 @@ def worktree_step_once(dispatcher, machine_id: str, journal_dir: str):
         from .worktree_guard import reconcile_terminal_locks
         result = observe_catalog(rows, dispatcher.request, machine_id, journal_dir)
         result["locks_released"] = reconcile_terminal_locks(dispatcher.request)
-        print(json.dumps({"event": "worktree_observation_cycle", **result}), flush=True)
+        _log(json.dumps({"event": "worktree_observation_cycle", **result}), flush=True)
     except Exception as error:
-        print(json.dumps({"event": "worktree_observation_error", "type": type(error).__name__}), flush=True)
+        _log(json.dumps({"event": "worktree_observation_error", "type": type(error).__name__}), flush=True)
 
 
 def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
@@ -604,7 +634,7 @@ def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
                     # Its existing lock serializes durable progress and exit
                     # evidence with maintenance and post-dispatch sampling.
                     if sampler is None or not sampler.is_alive():
-                        sampler = threading.Thread(
+                        sampler = _background_thread(
                             target=lambda: bindings_step_once(dispatcher, enrich=True),
                             daemon=True, name='fleet-binding-enrichment')
                         sampler.start()
@@ -616,10 +646,38 @@ def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
             sampler.join(timeout=1)
 
 
+def offers_loop(dispatcher, stop, polling=None, *, clock=time.monotonic, poll_s=None):
+    """Claim offers on their own cadence, never behind the main loop body.
+
+    The main loop also runs host-receive, credential provisioning and other
+    steps whose combined iteration can take tens of seconds on a loaded
+    host. Polling offers from that loop made a fresh launch wait one full
+    iteration before its claim (intake e1ed7abe, offered->bound 40-180 s).
+    Each poll is bounded and spawns its own launch workers, so this loop only
+    fetches and hands off; ``polling`` is set for the duration of a poll so
+    the settings reload never swaps configuration mid-fetch.
+    """
+    interval = fleet.OFFERS_POLL_S if poll_s is None else poll_s
+    while not stop.is_set():
+        started = clock()
+        if polling is not None:
+            polling.set()
+        try:
+            offers_step_once(dispatcher)
+        except Exception as error:
+            # offers_step_once reports its own errors; this keeps an unexpected one from
+            # ending claim polling for the controller's lifetime.
+            _log(json.dumps({'event': 'offers_loop_error', 'type': type(error).__name__}), flush=True)
+        finally:
+            if polling is not None:
+                polling.clear()
+        stop.wait(max(0.0, interval - (clock() - started)))
+
+
 def maybe_start_named_thread(current, target, args, name):
     if current is not None and current.is_alive():
         return current
-    thread = threading.Thread(target=target, args=args, daemon=True, name=name)
+    thread = _background_thread(target=target, args=args, daemon=True, name=name)
     thread.start()
     return thread
 
@@ -636,7 +694,7 @@ def drain_inflight_dispatch(dispatcher, timeout_s=DRAIN_TIMEOUT_S, clock=time.mo
     while getattr(dispatcher, '_inflight', 0) > 0 and clock() < deadline:
         sleep(0.2)
     drained = getattr(dispatcher, '_inflight', 0) <= 0
-    print(json.dumps({'event': 'dispatch_drain', 'drained': drained}), flush=True)
+    _log(json.dumps({'event': 'dispatch_drain', 'drained': drained}), flush=True)
     return drained
 
 
@@ -645,7 +703,7 @@ def maybe_start_maintenance_thread(current, dispatcher, quota_collector):
     # controller or native-effect receiver, and no unbounded executor pool.
     if current is not None and current.is_alive():
         return current
-    thread = threading.Thread(target=maintenance_step_once,
+    thread = _background_thread(target=maintenance_step_once,
                               args=(dispatcher, quota_collector),
                               daemon=True, name='fleet-maintenance')
     thread.start()
@@ -685,6 +743,31 @@ def acquire_journal_lock(lock):
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def ensure_private_journal(journal) -> None:
+    """Re-protect an inherited-DACL journal tree we own before first use.
+
+    mkdir(mode=0o700) applies a protected owner DACL only to a NEW directory;
+    a journal that predates it (Windows hosts: created while os.mkdir ignored
+    the mode) inherits ambient ACEs and then fails every private_fs journal
+    operation forever, so session commands are never claimed (intake
+    61bba72f: stop_not_claimed with 0 attempts). Best-effort and bounded: an
+    unrepairable journal keeps the previous fail-closed per-operation
+    behavior, surfacing as the bounded commands_error log.
+    """
+    if os.name != 'nt':
+        return
+    try:
+        from . import win32_fs
+        repaired = win32_fs.repair_private_tree(str(journal))
+    except Exception as error:
+        _log(json.dumps({'event': 'journal_repair_failed',
+                          'type': type(error).__name__}), flush=True)
+        return
+    if repaired:
+        _log(json.dumps({'event': 'journal_repaired',
+                          'entries': repaired}), flush=True)
+
+
 def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=None):
     if interval < 1 or fleet_interval < interval:
         raise ValueError('Invalid host polling intervals')
@@ -693,15 +776,17 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         raise ValueError('An enrolled private host configuration is required')
     journal = Path(journal_dir).resolve()
     journal.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ensure_private_journal(journal)
     # One controller per journal; a supervisor restart cannot duplicate effects.
     with (journal / 'host.lock').open('a') as lock, acquire_journal_lock(lock):
         settings = fleet.load_settings(settings_path)
         native = settings.get('aplexer_bin', 'aplexer')
+        ensure_runtime_bin_on_path()
         binding = qualify_sender_binding(native, str(Path.cwd().resolve()))
         # M15d narrow plumbing: surface the trusted cleanup-root allowlist
         # size (no auto-delete daemon here; tree removal is explicit CLI only).
         roots = get_cleanup_roots(settings)
-        print(json.dumps({'event': 'host_ready', 'native_controller': binding.session_id,
+        _log(json.dumps({'event': 'host_ready', 'native_controller': binding.session_id,
                           'cleanup_roots': len(roots)}), flush=True)
         stop = threading.Event()
         previous = {}
@@ -805,8 +890,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         telemetry_thread = None
         next_checkin = 0
         checkin_thread = None
-        next_offers = 0
         offers_thread = None
+        offers_polling = threading.Event()
         bindings_thread = None
         terminal_thread = None
         next_terminal = 0
@@ -821,25 +906,32 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         # good settings (see maybe_reload_fleet_settings).
         settings_mtime = fleet_settings_mtime(settings_path)
         release_stop = threading.Event()
+        previous_output = getattr(_output_context, 'state', None)
+        output_stopped, output_lock = threading.Event(), threading.Lock()
+        _output_context.state = (output_stopped, output_lock)
+        release_thread = None
         try:
             bindings_thread = maybe_start_named_thread(
                 None, bindings_loop, (dispatcher, stop), 'fleet-bindings')
+            offers_thread = maybe_start_named_thread(
+                None, offers_loop, (dispatcher, stop, offers_polling), 'fleet-offers')
             # Intake a3227276: Hub-pinned host release for checkout installs
             # (Windows hosts without ssh). An applied update sets ``stop``;
             # the supervisor restarts the controller on the new code.
-            maybe_start_named_thread(
-                None, self_update.loop, (lambda *a: dispatcher.request(*a), release_stop), 'host-release')
+            release_thread = maybe_start_named_thread(
+                None, lambda *args: self_update.loop(*args, launcher_settings=lambda: dispatcher.settings, log=_log),
+                (lambda *a: dispatcher.request(*a), release_stop), 'host-release')
             while not stop.is_set() and (cycles is None or count < cycles):
                 if release_stop.is_set():
                     (journal / RELEASE_RESTART_MARKER).write_text('restart\n', encoding='utf-8')
-                    print(json.dumps({'event': 'host_release_restart'}), flush=True)
+                    _log(json.dumps({'event': 'host_release_restart'}), flush=True)
                     break
                 # Apply settings between maintenance/startup rounds, so an in-flight
                 # dispatch cannot mix the old allowlist with new credentials.
                 reloaded = None
                 from .offer_claims import has_inflight
                 if ((maintenance_thread is None or not maintenance_thread.is_alive())
-                        and (offers_thread is None or not offers_thread.is_alive())
+                        and not offers_polling.is_set()
                         and not has_inflight(dispatcher)):
                     reloaded, settings_mtime = maybe_reload_fleet_settings(settings_path, settings_mtime)
                 if reloaded is not None:
@@ -847,7 +939,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     dispatcher.settings = reloaded
                     native = reloaded.get('aplexer_bin', 'aplexer')
                     roots = get_cleanup_roots(reloaded)
-                    print(json.dumps({'event': 'settings_reloaded'}), flush=True)
+                    _log(json.dumps({'event': 'settings_reloaded'}), flush=True)
                 if time.monotonic() >= next_fleet:
                     maintenance_thread = maybe_start_maintenance_thread(
                         maintenance_thread, dispatcher, quota_collector)
@@ -870,10 +962,6 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                         worktree_thread, worktree_step_once,
                         (dispatcher, cfg['machine_id'], str(journal)), 'worktree-observer')
                     next_worktree = time.monotonic() + 60
-                if time.monotonic() >= next_offers:
-                    offers_thread = maybe_start_named_thread(
-                        offers_thread, offers_step_once, (dispatcher,), 'fleet-offers')
-                    next_offers = time.monotonic() + fleet.OFFERS_POLL_S
                 from .terminal_reports import POLL_SECONDS
                 if time.monotonic() >= next_terminal:
                     terminal_thread = maybe_start_named_thread(
@@ -892,13 +980,17 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                         # stops are unaffected.
                         cleanup_roots=roots, settings=None))
                 except Exception as error:
-                    print(json.dumps({'event': 'commands_error', 'type': type(error).__name__}), flush=True)
+                    _log(json.dumps({'event': 'commands_error', 'type': type(error).__name__}), flush=True)
                 # Per-session messaging credentials (throttled to one pass a
                 # minute inside; docs/SESSION-MESSAGING.md §8).
                 try:
                     session_messages.provision_credentials(dispatcher.request, cfg.get('base_url'))
                 except Exception as error:
-                    print(json.dumps({'event': 'session_credentials_error', 'type': type(error).__name__}), flush=True)
+                    _log(json.dumps({'event': 'session_credentials_error', 'type': type(error).__name__}), flush=True)
+                try:
+                    session_messages.provision_intake_credentials(dispatcher.request, cfg.get('base_url'))
+                except Exception as error:
+                    _log(json.dumps({'event': 'session_intake_credentials_error', 'type': type(error).__name__}), flush=True)
                 # Intake 4b161918: intake-worktree status/remove commands run in
                 # one single-inflight daemon thread (git fetch can take a minute),
                 # polled every WORKTREE_POLL_S to bound Hub requests.
@@ -934,8 +1026,24 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 drain_inflight_dispatch(dispatcher)
             except Exception:
                 pass
+            # Observers that wake on ``stop`` exit promptly; bounded joins keep
+            # them from outliving run() in the normal case (they were joined
+            # before the output fence landed and callers rely on it).
             if bindings_thread is not None:
                 bindings_thread.join(timeout=1)
+            if offers_thread is not None:
+                offers_thread.join(timeout=2)
+            # The release poller wakes on ``release_stop``; give it a moment to
+            # exit so its own error line is not written after the fence closes
+            # (bounded: it may be inside a network call).
+            if release_thread is not None:
+                release_thread.join(timeout=2)
+            # Fence output instead of joining daemons that may be blocked on
+            # network, subprocess or filesystem I/O. The lock also completes
+            # any cycle line already being written before returning.
+            with output_lock:
+                output_stopped.set()
+            _output_context.state = previous_output
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 

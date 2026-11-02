@@ -287,6 +287,35 @@ class CensusIsolationTests(unittest.TestCase):
                 dispatcher.report_native_bindings()
                 self.assertEqual(sum(path.endswith('/binding') for _, path, _ in requests), 1)
 
+    def test_skipped_binding_is_logged_with_a_sanitized_reason(self):
+        # Intake 1c8d915e: a held predecessor worktree lock or a server refusal
+        # kept a running native unbound (row stuck offered) with no trace.
+        from agent_hub_host.bus import HttpRequestError
+        rows = [self.row(native='native-new', tag='hub-new-launch')]
+        requests = []
+        with tempfile.TemporaryDirectory() as directory:
+            dispatcher = self.dispatcher(directory, rows, requests)
+            out = io.StringIO()
+            with patch('agent_hub_host.worktree_guard.protect_adoption', return_value=False), \
+                    contextlib.redirect_stdout(out):
+                dispatcher.report_native_bindings()
+            events = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith('{')]
+            self.assertIn({'event': 'bindings_skipped', 'skipped': [{'session': 'hub-sess', 'reason': 'worktree_lock_held'}]}, events)
+            real = dispatcher.request
+
+            def refuse(method, path, body=None):
+                if path.endswith('/binding'):
+                    raise HttpRequestError(409, b'{"error":"fleet_native_unreported","secret":"x"}')
+                return real(method, path, body)
+
+            dispatcher.request = refuse
+            out = io.StringIO()
+            with patch('agent_hub_host.worktree_guard.protect_adoption', return_value=True), \
+                    contextlib.redirect_stdout(out):
+                dispatcher.report_native_bindings()
+            self.assertIn('"reason": "binding_http_409"', out.getvalue())
+            self.assertNotIn('secret', out.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()

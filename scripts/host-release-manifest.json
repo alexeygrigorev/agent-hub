@@ -4,6 +4,9 @@
     "config/model-routing.json",
     "scripts/session-host-supervisor.py",
     "scripts/metrics-dashboard-export.py",
+    "scripts/build-host-release.py",
+    "scripts/verify-host-release.py",
+    "scripts/switch-host-release.py",
     "pyproject.toml",
     "uv.lock"
   ],

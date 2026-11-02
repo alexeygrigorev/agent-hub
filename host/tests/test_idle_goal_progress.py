@@ -39,6 +39,73 @@ class IdleGoalProgressTests(unittest.TestCase):
             path.write_text(path.read_text() + json.dumps(dict(type='response_item', payload=dict(type='message', text='update_goal status blocked'))) + '\n')
             self.assertEqual(sampler.goal_status(row), 'active')
 
+    def codex_home_rollout(self, temp, thread, events):
+        import sqlite3
+        home = Path(temp) / '.zcodex'
+        path = home / 'sessions/2026/10/29' / f'rollout-2026-10-29T03-18-22-{thread}.jsonl'
+        path.parent.mkdir(parents=True)
+        meta = dict(type='session_meta', payload=dict(id=thread, cwd='/w', timestamp='2026-10-29T02:18:22.745Z'))
+        path.write_text('\n'.join(map(json.dumps, [meta] + events)) + '\n')
+        with sqlite3.connect(home / 'goals_1.sqlite') as db:
+            db.execute('CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY, goal_id TEXT, objective TEXT, status TEXT, '
+                       'token_budget INTEGER, tokens_used INTEGER, time_used_seconds INTEGER, created_at_ms INTEGER, updated_at_ms INTEGER)')
+        return home, path
+
+    def set_stored_goal(self, home, thread, status):
+        import sqlite3
+        with sqlite3.connect(home / 'goals_1.sqlite') as db:
+            db.execute("INSERT OR REPLACE INTO thread_goals VALUES (?, 'g', 'objective', ?, NULL, 0, 0, 1, 2)", (thread, status))
+
+    def test_codex_goal_store_is_authoritative_for_the_bound_thread(self):
+        with tempfile.TemporaryDirectory() as temp:
+            # The creating event scrolled out of a long rollout's 256 KiB tail.
+            home, path = self.codex_home_rollout(temp, 'own-thread', [
+                dict(type='event_msg', payload=dict(type='thread_goal_updated', goal=dict(status='active'))),
+                dict(type='response_item', payload=dict(type='message', role='assistant', content=[dict(type='output_text', text='x' * 300000)]))])
+            row = dict(id='own-native', created_at_ms=1000, engine='zcodex')
+            sampler = NativeTranscriptProgress(roots=lambda _: [])
+            sampler.paths[('own-native', 1000)] = path
+            self.assertIsNone(sampler.goal_status(row))
+            self.set_stored_goal(home, 'other-thread', 'blocked')
+            self.assertIsNone(sampler.goal_status(row))
+            for status in ('active', 'blocked', 'usage_limited', 'budget_limited', 'complete'):
+                self.set_stored_goal(home, 'own-thread', status)
+                self.assertEqual(sampler.goal_status(row), status)
+            # Store wins over a stale rollout event too.
+            path.write_text(path.read_text() + json.dumps(dict(type='event_msg', payload=dict(type='thread_goal_updated', goal=dict(status='active')))) + '\n')
+            self.assertEqual(sampler.goal_status(row), 'complete')
+
+    def test_goal_launch_sent_as_plain_text_reports_unregistered(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, path = self.codex_home_rollout(temp, 'own-thread', [
+                dict(type='response_item', payload=dict(type='message', role='user', content=[dict(type='input_text', text='# AGENTS.md instructions')])),
+                dict(type='response_item', payload=dict(type='message', role='user', content=[dict(type='input_text', text='/goal Hub session rules:\nDo the work')]))])
+            row = dict(id='own-native', created_at_ms=1000, engine='zcodex')
+            sampler = NativeTranscriptProgress(roots=lambda _: [])
+            sampler.paths[('own-native', 1000)] = path
+            self.assertEqual(sampler.goal_status(row), 'unregistered')
+            # An unreadable store proves nothing: never claim unregistered.
+            store = Path(temp) / '.zcodex/goals_1.sqlite'
+            store.rename(store.with_suffix('.moved'))
+            self.assertIsNone(sampler.goal_status(row))
+            store.write_bytes(b'not a sqlite database' * 10)
+            self.assertIsNone(sampler.goal_status(row))
+            store.unlink()
+            store.with_suffix('.moved').rename(store)
+            self.assertEqual(sampler.goal_status(row), 'unregistered')
+            # A later executed goal update means Codex does track a goal.
+            path.write_text(path.read_text() + json.dumps(dict(type='event_msg', payload=dict(type='thread_goal_updated', goal=dict(status='paused')))) + '\n')
+            self.assertEqual(sampler.goal_status(row), 'paused')
+
+    def test_plain_session_without_goal_text_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, path = self.codex_home_rollout(temp, 'own-thread', [
+                dict(type='response_item', payload=dict(type='message', role='user', content=[dict(type='input_text', text='please mention /goal in docs')]))])
+            row = dict(id='own-native', created_at_ms=1000, engine='codex')
+            sampler = NativeTranscriptProgress(roots=lambda _: [])
+            sampler.paths[('own-native', 1000)] = path
+            self.assertIsNone(sampler.goal_status(row))
+
     @patch('agent_hub_host.session_progress.process', return_value={'pid': 1})
     def test_goal_stalled_screen_is_metadata_not_an_enter_or_stop(self, _):
         row = dict(id='own-native', created_at_ms=1000, engine='codex', tag='hub-own', workspace='/own', workload_pid=1, command=['codex'])

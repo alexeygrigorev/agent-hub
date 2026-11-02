@@ -151,6 +151,12 @@ class _TokenExchange:
         cfg = copy.deepcopy(self.starting_config)
         cfg.update(metadata)
         cfg["access_token"] = data["access_token"]
+        # Requested scopes describe login intent, not the approver's consent.
+        # The authenticated token response is also authoritative on refresh.
+        if isinstance(data.get("scope"), str):
+            cfg["granted_scopes"] = data["scope"].split()
+        elif self.path == "/api/device/token":
+            cfg.pop("granted_scopes", None)
         if self.path == "/api/device/token":
             cfg["base_url"] = self.base_url
         refresh = data.get("refresh_token", cfg.get("refresh_token") if self.path == "/api/token/refresh" else None)

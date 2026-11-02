@@ -841,7 +841,10 @@ class TestHostHealthMonitor(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp_dir:
             submit_mock = MagicMock()
-            now_iso = "2026-10-18T00:00:00.000Z"
+            # Fresh evidence relative to the real clock: the monitor judges
+            # month-to-date freshness against now, so a fixed date became a
+            # time bomb at the 2026-11-01 month rollover.
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             budget_ev = {
                 "complete_account_coverage": True,
                 "observed_at": now_iso,

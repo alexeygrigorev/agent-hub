@@ -205,9 +205,11 @@ def relay_replies(*, journal_dir: str, executable: str, request: Callable,
                         or reply_id in record.get("relayed", []) or not isinstance(env.get("body"), str)):
                     continue
                 try:
+                    # The bus limits UTF-8 bytes; drop a partial trailing code point.
+                    body = env["body"].encode("utf-8", "replace")[:16384].decode("utf-8", "ignore")
                     sent = request("POST", "/api/bus/send", {
                         "from_actor": "session:" + record["hub_session_id"], "to_actor": record["from_actor"],
-                        "kind": "reply", "body": env["body"][:16000], "reply_to": record["message_id"],
+                        "kind": "reply", "body": body, "reply_to": record["message_id"],
                         "idempotency_key": "native-" + reply_id})
                 except Exception as exc:
                     relayed.append({"message_id": record["message_id"], "error": type(exc).__name__})
@@ -257,5 +259,43 @@ def provision_credentials(request: Callable, base_url: Optional[str], *, auth_di
                   "hub_session_id": sid}
         private_fs.atomic_write(os.path.join(str(target_dir), native + ".json"),
                                 json.dumps(record).encode("utf-8"), 16384)
+        written.append(sid)
+    return written
+
+
+_last_intake_provision = [0.0]
+
+
+def provision_intake_credentials(request: Callable, base_url: Optional[str], *,
+                                 clock: Callable[[], float] = time.monotonic, force: bool = False) -> list[str]:
+    """Mint and store the intake-scoped credential of each running native
+    session that has an operator-verified intake link. The file lands owner-only
+    at ``<workspace>/.local/hub-worker-auth/<native_id>.json`` (the session's own
+    workspace, gitignored) and is found by ``hub`` through APLEXER_SESSION_ID +
+    APLEXER_WORKSPACE (worker_auth.native_session_path). It never enters the
+    engine environment. The server revokes it when the session stops."""
+    if not force and clock() - _last_intake_provision[0] < PROVISION_INTERVAL_S:
+        return []
+    _last_intake_provision[0] = clock()
+    if not base_url:
+        return []
+    from . import private_fs
+    pending = (request("GET", "/api/session-intake/credentials", None) or {}).get("sessions", [])
+    written = []
+    for row in pending[:10]:
+        sid, native = row.get("session_id"), str(row.get("native_id", "")).lower()
+        workspace = row.get("workspace")
+        if not isinstance(sid, str) or len(native) != 36 or not isinstance(workspace, str) or not os.path.isabs(workspace):
+            continue
+        minted = request("POST", "/api/sessions/" + sid + "/intake-credential", {})
+        if (not isinstance(minted, dict) or not str(minted.get("access_token", "")).startswith("hubt_")
+                or not str(minted.get("refresh_token", "")).startswith("hubr_")):
+            continue
+        profile = {"base_url": minted.get("base_url") or base_url, "client_kind": "agent",
+                   "access_token": minted["access_token"], "refresh_token": minted["refresh_token"],
+                   "worker_launch_id": sid, "worker_expires_at": minted.get("worker_expires_at")}
+        target_dir = os.path.join(workspace, ".local", "hub-worker-auth")
+        os.makedirs(target_dir, mode=0o700, exist_ok=True)
+        private_fs.atomic_write(os.path.join(target_dir, native + ".json"), json.dumps(profile).encode("utf-8"), 32768)
         written.append(sid)
     return written

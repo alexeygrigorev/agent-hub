@@ -394,6 +394,17 @@ path) — so machine + tag + native id + state + the sessions report carry the
 reconciliation instead, and the host still re-qualifies
 the exact target (UUID + tag + workspace + incarnation) before every effect.
 
+### Native delivery receipt (no model reply required)
+
+A guarded pane delivery of the original envelope (`submitted`,
+`already-submitted` or `recipient-acked` from the native deliver guard, or a
+`pane` entry for that exact envelope in the native log) acks `delivered` with
+a `proof.kind = "native_delivery"` receipt. It proves delivery to the exact
+recipient incarnation, not processing. The receipt is journaled so a lost ack
+POST or host restart replays the identical ack; the proof id is prefixed
+`delivery:` so it dedups per envelope and cannot collide with reply ids. A
+busy recipient stays `waiting in inbox`; a later receipt promotes it, once. A terminal target with no receipt ends `refused`, never `delivered`.
+
 ### Correlated delivery proof (host-verified native reply provenance)
 
 Deliberately NOT cryptographic target authentication: the hub cannot verify
@@ -481,6 +492,59 @@ hub sessions wake <session-id|name> --at <ISO8601|now> (--prompt TEXT | --body-f
 hub sessions host-receive --once --machine-id hetzner [--actor machine:hetzner]
     [--credential-family host:hetzner] [--journal-dir ABS] [--aplexer-bin aplexer] [--limit 20]
 ```
+
+### Capture or send before the session is bound (intake e1ed7abe)
+
+A session has no native binding while it is `queued`, `held`, `offered` or
+`starting` (target: offered -> bound under 60 s). `capture` and `send` in that
+window answer `409` with a retryable pending state instead of a bare error:
+
+```json
+{"error":"session_not_bound","state":"offered","pending":true,"retry_after_s":5,
+ "message":"session is offered: no native binding yet; retry in 5s (...)"}
+```
+
+Once the session is `stopped`, `failed` or `cancelled` the same `409` carries
+`pending:false` and no `retry_after_s`: nothing is coming. `hub sessions capture`
+(with its default wait) polls the session for up to 90 s until it is `running`,
+then enqueues the capture and waits for the acknowledgement with the full
+`--timeout` (so the bind wait is separate from, and not bounded by, `--timeout`);
+`--no-wait` returns the pending error immediately. `send` does not wait: it fails
+fast with the same pending 409 and its `retry_after_s`. Webhook delivery already
+retries `session_not_bound`.
+
+The host claims offers on a dedicated thread (`offers_loop`, every
+`OFFERS_POLL_S` = 2 s), independent of the main loop, and logs one
+`offer_dispatch_stages` event per claimed offer with the seconds spent in the
+admission, workspace, worktree, submit/plan and claim stages.
+### Session pings (external /loop, engine-agnostic)
+
+Hub, not the engine, delivers a message to an existing live session every
+interval through the normal verified send path. Works for claude, codex,
+zcodex, antigravity and opencode. This is not `hub schedule` (new session per
+tick) and not `hub sessions wake` (one shot).
+
+```
+hub sessions ping create <session> --every 15m (--prompt TEXT | --body-file F)   # alias: hub loop set
+hub sessions ping disable <session> [--reason TEXT]                               # alias: hub loop clear
+hub sessions ping show <session>                                                  # alias: hub loop show
+```
+
+- `hub loop ...` without a session id targets the current session
+  (`HUB_SESSION_ID`, else `aplexer whoami`). The session clears its own ping
+  with its worker/agent credential when the goal is reached; the owner can too.
+- Interval 1m..7d; one active ping per session (create replaces).
+- Ticks coalesce: while the session still has an unfinished command the tick is
+  skipped (counted), never queued up.
+- The ping ends automatically when the session ends.
+- Failed or uncertain deliveries are never silent: a `ping_failed` alert row,
+  an intake note when the session is linked to an intake, and a
+  `session_ping` attention item until the next delivery is acknowledged.
+- Visible as `ping` in `hub sessions show` / the session detail page.
+- REST: `POST /api/sessions/:id/ping {every_seconds, prompt}`,
+  `POST /api/sessions/:id/ping-clear {reason}`, `GET /api/sessions/:id/pings`.
+  MCP: `sessions_ping`, `sessions_ping_clear`, `sessions_pings`.
+- Storage: `session_control_pings` (one row per ping, `state` active|ended).
 
 ### Scheduled wakes (waiting on an external event = register a Hub wake)
 
@@ -646,6 +710,21 @@ failed Fleet attempt. An exact launcher binding plus confirmed native death
 also recovers a lost finish receipt and forwards the bounded `hub-results`
 report. A result file alone cannot prove exit. Recovery does not launch or
 stop a native session, delete data, or clean a worktree.
+
+Hub itself abandons a claimed headless launch that bound no native within
+15 minutes (`worker_silent_start`, verification `unverified`); its unbound
+session leaves `offered`/`starting` as `failed`. `sessions stop` applies the
+same bound immediately, so a wedged claim no longer returns
+`session_not_cancellable` once it is older than 15 minutes; the receipt is
+`effect: no_native_start` with `launch: abandoned_unverified`, because the
+abandonment is not exit proof. For 24 hours the abandoned launch stays a
+reconciliation candidate for its owning host only. The host's later exact
+receipt supersedes the abandonment: a fenced no-start becomes
+`not_started`; a recovered completion (also when the running receipt landed
+but the binding and finish were lost) is recorded as the finish with its
+`hub-results` report and the session becomes `stopped`; a late native start
+is tracked as `running` again, and if the operator already cancelled the
+session a `launch`/`late_native_start` alert opens instead of stranding it.
 
 MCP exposes the same guarded operation as `sessions_cancel` with arguments
 `{"id":"SESSION","payload":{"key":"STABLE_KEY"}}`. It re-enters ordinary

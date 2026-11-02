@@ -66,9 +66,16 @@ def resolve_aplexer_state_dir(state_dir: Optional[str] = None) -> str:
     return canonicalize_workspace(os.path.expanduser("~/.local/state/aplexer"))
 
 
+def _workspaces_nested(a: str, b: str) -> bool:
+    """True when one canonical workspace is the other or lies inside it."""
+    a, b = canonicalize_workspace(a), canonicalize_workspace(b)
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep) or b.startswith(a.rstrip(os.sep) + os.sep)
+
+
 def validate_retired_tombstone(
     tombstone_path: str,
     target: NativeTarget,
+    allow_nested_workspace: bool = False,
 ) -> dict[str, Any]:
     """Validate a genuine retired native tombstone against target expectations.
 
@@ -79,7 +86,9 @@ def validate_retired_tombstone(
     - `cause` must equal "finished" (clean exit / accepted completion; forgotten/pruned refuse).
     - `id` must match target.session_id (case-insensitive normalized UUID).
     - `tag` must match target.tag exactly.
-    - `workspace` canonical realpath must match target.workspace canonical realpath.
+    - `workspace` canonical realpath must match target.workspace canonical realpath
+      (stop only: `allow_nested_workspace` also accepts a subdirectory/parent of it;
+      UUID, tag and cause still bind the tombstone).
     - `finished_at_ms` must be a non-negative integer (fractions/floats/booleans rejected).
       If target carries created_at_ms, finished_at_ms must be >= target.created_at_ms.
     """
@@ -153,7 +162,8 @@ def validate_retired_tombstone(
         raw_ws = raw_ws[:-10]
     canonical_tombstone_ws = canonicalize_workspace(raw_ws)
     from .native_sessions import _stop_workspace_matches
-    if not _stop_workspace_matches(raw_ws, target.workspace):
+    if not _stop_workspace_matches(raw_ws, target.workspace) and not (
+            allow_nested_workspace and _workspaces_nested(raw_ws, target.workspace)):
         raise SessionControlError(
             f"Tombstone workspace mismatch (tombstone: {canonical_tombstone_ws!r}, target: {target.workspace!r})"
         )
@@ -178,8 +188,14 @@ def verify_native_retirement(
     executable: str,
     target: NativeTarget,
     state_dir: Optional[str] = None,
+    sessions: Optional[list] = None,
+    allow_nested_workspace: bool = False,
 ) -> tuple[bool, Optional[dict[str, Any]], str]:
     """Verify natural retirement of an owned native session.
+
+    `sessions` is an already fetched `list_sessions(..., include_exited=True)`
+    census; callers verifying several candidate workspaces pass it so the
+    catalog is queried once, not once per candidate.
 
     Returns: `(is_retired, tombstone_dict_or_none, detail_reason)`
 
@@ -195,12 +211,13 @@ def verify_native_retirement(
     except SessionControlError as exc:
         return False, None, f"invalid_target: {exc}"
 
-    try:
-        sessions = list_sessions(executable, include_exited=True)
-    except (SessionControlError, SessionUncertain) as exc:
-        return False, None, f"live_catalog_query_failed: {exc}"
-    except Exception as exc:
-        return False, None, f"live_catalog_query_error_{type(exc).__name__}: {exc}"
+    if sessions is None:
+        try:
+            sessions = list_sessions(executable, include_exited=True)
+        except (SessionControlError, SessionUncertain) as exc:
+            return False, None, f"live_catalog_query_failed: {exc}"
+        except Exception as exc:
+            return False, None, f"live_catalog_query_error_{type(exc).__name__}: {exc}"
 
     # Target UUID must NOT appear in live catalog
     for s in sessions:
@@ -224,11 +241,52 @@ def verify_native_retirement(
         return False, None, f"retired_tombstone_absent: {tombstone_path}"
 
     try:
-        tombstone = validate_retired_tombstone(tombstone_path, target)
+        tombstone = validate_retired_tombstone(tombstone_path, target, allow_nested_workspace)
     except SessionControlError as exc:
         return False, None, f"retired_tombstone_invalid: {exc}"
 
     return True, tombstone, "retired_tombstone_verified"
+
+
+def launch_workspace_targets(record: dict[str, Any]) -> list[str]:
+    """Workspaces a launch's native may be bound to, engine cwd first.
+
+    The launcher binds the native session (and its tombstone and catalog row)
+    to the engine cwd, which differs from the workspace root for `--cwd`
+    launches (intake 2a944c3f).
+    """
+    return list(dict.fromkeys(
+        w for w in (record.get("target_cwd"), record.get("workspace")) if isinstance(w, str) and w))
+
+
+def verify_retirement_in_targets(
+    executable: str,
+    targets: list[NativeTarget],
+    state_dir: Optional[str] = None,
+    sessions: Optional[list] = None,
+    verify=None,
+) -> tuple[bool, Optional[NativeTarget], Optional[dict[str, Any]], str]:
+    """Retirement proof against candidate workspaces with one catalog query.
+
+    Later candidates are tried only after a tombstone workspace mismatch;
+    any other refusal does not depend on the workspace.
+    """
+    verify = verify or verify_native_retirement
+    if sessions is None:
+        try:
+            sessions = list_sessions(executable, include_exited=True)
+        except Exception:
+            # Let the verifier report the unavailable census in its own words.
+            ok, tomb, detail = verify(executable, targets[0], state_dir=state_dir)
+            return ok, (targets[0] if ok else None), tomb, detail
+    detail = "no_target"
+    for candidate in targets:
+        ok, tomb, detail = verify(executable, candidate, state_dir=state_dir, sessions=sessions)
+        if ok:
+            return True, candidate, tomb, detail
+        if "Tombstone workspace mismatch" not in detail:
+            break
+    return False, None, None, detail
 
 
 def capture_retired_history(

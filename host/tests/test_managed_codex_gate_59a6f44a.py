@@ -40,7 +40,8 @@ def _admission_setup(monkeypatch, tmp_path, gate_result):
     p.write_json(tmp_path / 'state.json', [{'label': label, 'revision': rev, 'provider': 'codex'}])
     dest = tmp_path / (label + '-' + rev)
     bundle = {'label': label, 'provider': 'codex', 'version': '0.163.0',
-              'revision': rev, 'files': {}, 'env': {}, 'args': []}
+              'revision': rev, 'files': {'.codex/auth.json': '{"synthetic": true}'}, 'env': {}, 'args': []}
+    # A logged-in profile: the 06d2a0ac login probe refuses one without a credential.
     p.write_json(dest / 'bundle.json', bundle)
     monkeypatch.setattr(p.sys, 'argv', ['provisioning', label])
     allowed, reason = gate_result
@@ -155,7 +156,7 @@ def test_reconcile_rejects_symlink_hardlink_directory_fifo_and_parent_symlink(mo
         p.provision_managed_home(b, home)
 
 
-def test_host_publishes_account_refusal_even_when_sibling_admits(monkeypatch, tmp_path):
+def test_host_publishes_only_real_account_quota_refusals_when_sibling_admits(monkeypatch, tmp_path):
     from agent_hub_host import fleet, system, api, workclaim
     monkeypatch.setattr(p, 'tick', lambda: None)
     monkeypatch.setattr(p, 'managed_subscriptions', lambda: [])
@@ -166,7 +167,8 @@ def test_host_publishes_account_refusal_even_when_sibling_admits(monkeypatch, tm
         {'service': 'codex', 'account_label': label, 'plan': 'pro', 'engine': 'codex',
          'profile': 'hub-' + label, 'admission_argv': ['gate', label]}
         for label in ['shared-codex', 'codex-orin']]}
-    for broken in (False, True):
+    for probe_result in ('quota_refusal', 'quota_check_failed', 'timeout', 'unrelated_refusal',
+                         'no_sibling_admits', 'probe_errors_no_sibling'):
         calls = []
         def request(method, path, body=None):
             calls.append((path, body))
@@ -175,18 +177,45 @@ def test_host_publishes_account_refusal_even_when_sibling_admits(monkeypatch, tm
             if argv[0] != 'gate':
                 return []
             label = argv[1]
-            if label == 'shared-codex' and broken:
+            if label == 'shared-codex':
+                if probe_result == 'timeout' or probe_result == 'probe_errors_no_sibling':
+                    raise TimeoutError()
+                if probe_result == 'unrelated_refusal':
+                    return {'launch_allowed': False, 'profile_supported': True,
+                            'account_label': label, 'observed_at': fleet.utcnow(),
+                            'reason': 'admission_transport_unavailable'}
+                if probe_result == 'quota_check_failed':
+                    return {'launch_allowed': False, 'profile_supported': True,
+                            'account_label': label, 'observed_at': fleet.utcnow(),
+                            'reason': 'codex_quota_gate_quota_check_failed'}
+            if probe_result == 'probe_errors_no_sibling':
                 raise TimeoutError()
+            if label == 'codex-orin' and probe_result == 'no_sibling_admits':
+                return {'launch_allowed': False, 'profile_supported': True,
+                        'account_label': label, 'observed_at': fleet.utcnow(),
+                        'reason': 'codex_quota_gate_quota_unavailable'}
             return {'launch_allowed': label == 'codex-orin', 'profile_supported': True,
                     'account_label': label, 'observed_at': fleet.utcnow(),
                     'reason': 'codex_quota_gate_quota_unavailable'}
         fleet.Dispatcher(cfg, request, runner).once()
         caps = next(body['capabilities'] for path, body in calls if path == '/api/machines/register')
         refusals = caps['fleet_route_rejections']
-        assert len(refusals) == 1
-        assert refusals[0]['account'] == 'shared-codex'
-        assert refusals[0]['profile'] == 'hub-shared-codex'
-        assert refusals[0]['mode'] == 'interactive'
-        assert refusals[0]['reason'] == ('codex_quota_gate_quota_check_failed' if broken else 'codex_quota_gate_quota_unavailable')
+        if probe_result in ('quota_check_failed', 'timeout', 'unrelated_refusal', 'probe_errors_no_sibling'):
+            # A crashed probe or unrelated gate error has no quota verdict.
+            # Do not report it as a credential/quota refusal; dispatch
+            # rechecks admission before it claims work.
+            assert refusals == []
+        elif probe_result == 'quota_refusal':
+            assert len(refusals) == 1
+            assert refusals[0]['account'] == 'shared-codex'
+            assert refusals[0]['profile'] == 'hub-shared-codex'
+            assert refusals[0]['mode'] == 'interactive'
+            assert refusals[0]['reason'] == 'codex_quota_gate_quota_unavailable'
+        else:
+            # With no admitted sibling the host gate remains closed, while
+            # each explicit account verdict stays visible and no synthetic
+            # quota_check_failed is introduced.
+            assert len(refusals) == 2
+            assert all(r['reason'] == 'codex_quota_gate_quota_unavailable' for r in refusals)
         hb = next(body for path, body in calls if path == '/api/host/poll')
-        assert hb['gate']['launch_allowed'] is True
+        assert hb['gate']['launch_allowed'] is (probe_result not in ('no_sibling_admits', 'probe_errors_no_sibling'))

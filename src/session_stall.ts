@@ -32,6 +32,14 @@ export function stallThreshold(env?: any): number {
   return Number.isFinite(n) && n > 0 && n <= 604800 ? n : 1800;
 }
 
+/** Intake 167c6178: an active tool call must not trip the 30-minute
+ * no_native_progress stall. It gets its own, longer hung-call bound
+ * (default two hours) instead. */
+export function toolCallStallThreshold(env?: any): number {
+  const n = Number(env?.HUB_AGENT_TOOLCALL_STALL_S);
+  return Number.isFinite(n) && n > 0 && n <= 604800 ? n : 7200;
+}
+
 export function nativeProgress(native: any): number | null {
   let progress: any = null;
   try { progress = JSON.parse(native?.progress_json ?? 'null'); } catch { /* unknown */ }
@@ -55,6 +63,12 @@ export function nativeTerminalError(native: any): string | null {
   try {
     const p = JSON.parse(native?.progress_json ?? 'null');
     // Match the phases Fleet invalidates on an absent complete census.
+    if (native?.engine === 'zcodex') {
+      // A dead zcodex leader leaves its scope in 'exiting' with live children.
+      return ['running', 'starting', 'broken', 'exiting'].includes(native?.phase)
+        && p?.headless === false && ['zcodex_agent_exited', 'zcodex_reconnect_failed'].includes(p?.terminal_error)
+        ? p.terminal_error : null;
+    }
     return ['running', 'starting', 'broken'].includes(native?.phase)
       && native?.engine === 'codex' && p?.headless === false && p?.terminal_error === 'codex_reconnect_failed'
       ? p.terminal_error : null;
@@ -65,7 +79,7 @@ export function nativeTerminalError(native: any): string | null {
 export function sessionTerminalError(row: any, native: any): string | null {
   try {
     const binding = JSON.parse(row?.binding_json ?? 'null');
-    return row?.state === 'running' && row?.mode === 'interactive' && row?.engine === 'codex'
+    return row?.state === 'running' && row?.mode === 'interactive' && (row?.engine === 'codex' || row?.engine === 'zcodex')
       && native?.machine_id === row.machine_id && native?.native_id === binding?.native_id
       && native?.tag === binding?.tag && native?.workspace === binding?.workspace
       && Number.isInteger(binding?.native_created_at_ms) && binding.native_created_at_ms > 0
@@ -73,8 +87,17 @@ export function sessionTerminalError(row: any, native: any): string | null {
   } catch { return null; }
 }
 
+/** An active tool call: the engine's Working state or a live headless leader
+ * (live child process). `progress.last_cpu_at` — host-published time of the
+ * leader's last CPU advance — separates a genuinely hung call (no output and
+ * no CPU) from a long-running one that only lacks transcript writes. */
+export function activeToolCall(native: any, progress: any): boolean {
+  return (native?.agent_state === 'working' && native?.engine !== 'shell') ||
+    (progress?.headless === true && progress?.agent_alive === true);
+}
+
 export function classifySessionStall(sql: SqlStorage, native: any, now: number,
-  threshold = 1800, hostFresh = true): { stalled: boolean; reason: string | null; since: string | null; idle_for: number | null } {
+  threshold = 1800, hostFresh = true, toolCallThreshold = 7200): { stalled: boolean; reason: string | null; since: string | null; idle_for: number | null } {
   if (!native) return { stalled: false, reason: null, since: null, idle_for: null };
   let progress: any = null;
   try { progress = JSON.parse(native.progress_json ?? 'null'); } catch { /* unknown */ }
@@ -82,11 +105,20 @@ export function classifySessionStall(sql: SqlStorage, native: any, now: number,
   const idle = last === null ? null : Math.max(0, (now - last) / 1000);
   const terminal = ['exited', 'dead', 'pruned', 'forgotten'].includes(native.phase);
   const orphan = progress?.agent_alive === false && progress?.headless === true && !terminal;
+  const toolCall = activeToolCall(native, progress);
+  // A hung tool call needs both bounds: no output and no observed CPU advance
+  // beyond the long threshold. Hosts without CPU evidence keep the output-only
+  // long bound. CPU is never progress, so it cannot clear the output stall.
+  const cpuAt = typeof progress?.last_cpu_at === 'string' ? Date.parse(progress.last_cpu_at) : NaN;
+  const cpuIdle = Number.isFinite(cpuAt) ? Math.max(0, (now - cpuAt) / 1000) : null;
   // Unknown/stale observations cannot establish recovery or erase an open stall.
   const observable = hostFresh && !['unknown', 'unobserved'].includes(native.phase);
   // A fresh complete catalog that no longer observes this native binding is
   // lack of progress, not exit proof. It must not leave Hub running forever.
-  const candidate = !terminal && (orphan || (hostFresh && idle !== null && idle > threshold));
+  const idleCandidate = hostFresh && idle !== null &&
+    (toolCall ? idle > toolCallThreshold && (cpuIdle === null || cpuIdle > toolCallThreshold)
+              : idle > threshold);
+  const candidate = !terminal && (orphan || idleCandidate);
   let saved: any = sql.exec('SELECT * FROM session_stalls WHERE machine_id = ? AND native_id = ?', native.machine_id, native.native_id).toArray()[0];
   const incarnation = native.created_at_ms ?? 0;
   if (saved && saved.incarnation !== incarnation) {
@@ -108,6 +140,7 @@ export function classifySessionStall(sql: SqlStorage, native: any, now: number,
       saved.recovery_ms = now;
     }
   }
-  return { stalled: !!saved, reason: saved ? (orphan ? (progress?.orphaned ? 'agent_exited_children_running' : 'agent_exited') : 'no_native_progress') : null,
+  return { stalled: !!saved, reason: saved ? (orphan ? (progress?.orphaned ? 'agent_exited_children_running' : 'agent_exited')
+    : toolCall ? 'hung_tool_call' : 'no_native_progress') : null,
     since: saved ? new Date(saved.since_ms).toISOString() : null, idle_for: idle };
 }

@@ -15,7 +15,7 @@ export function recordUsageQuota(sql: SqlStorage, account: string, provider: str
   const fields = ['percent_remaining','reset_at','present','rolling','error','credits_remaining','spend_used','spend_limit','unit'];
   const windows = Object.fromEntries(Object.entries(quota.windows || {}).slice(0,32).filter(([,w])=>w && typeof w==='object')
     .map(([name,w]:any)=>[name,Object.fromEntries(fields.filter(k=>Object.hasOwn(w,k)).map(k=>[k,w[k]]))]));
-  const details = Object.fromEntries(['limit_reached','stale','credits_remaining','spend_used','spend_limit','unit','banked_resets']
+  const details = Object.fromEntries(['limit_reached','stale','credits_remaining','spend_used','spend_limit','unit','banked_resets','banked_resets_error']
     .filter(k=>Object.hasOwn(quota.details || {},k)).map(k=>[k,quota.details[k]]));
   const payload=JSON.stringify({status:quota.status,error:quota.error,windows,details,observed_at:new Date(at).toISOString()});
   let engines: string[]=[];

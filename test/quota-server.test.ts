@@ -50,6 +50,28 @@ describe('Hub server account quota', () => {
     });
   });
 
+  it('a second managed account of the same provider gets its own server reading (intake 798f0f8c)', async () => {
+    // Managed catalog rows: both Codex homes report canonical provider
+    // `codex`; codex-orin must read its own fresh observation, never
+    // unavailable/observed-never behind the shared-codex row.
+    await runInDurableObject(stub, (hub: Hub) => {
+      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-codex', 'codex', 4, 0, 1)");
+      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('codex-orin', 'codex', 4, 0, 1)");
+      hub.sql.exec("INSERT INTO fleet_routes VALUES ('tabo', 'codex', 'codex-orin', 'hub-codex-orin')");
+      hub.sql.exec("INSERT INTO fleet_routes VALUES ('tabo', 'codex', 'shared-codex', 'hub-shared-codex')");
+    });
+    expect((await post([{ account: 'shared-codex', provider: 'codex', quota: observation(77) },
+      { account: 'codex-orin', provider: 'codex', quota: observation(41) }])).status).toBe(200);
+    const q = await view();
+    const orin = q.pools.find((p: any) => p.account === 'codex-orin');
+    expect(orin).toMatchObject({ provider: 'codex', state: 'fresh', source: 'server', remaining_percent: 41,
+      observed_by_hosts: ['hub-server'], profiles: ['hub-codex-orin'] });
+    expect(orin.observed_at).toEqual(expect.any(String));
+    expect(q.pools.find((p: any) => p.account === 'shared-codex')).toMatchObject({ state: 'fresh', remaining_percent: 77 });
+    expect(q.account_coverage).toMatchObject({ total: 2, unavailable: [] });
+    expect([...q.account_coverage.fresh].sort()).toEqual(['codex-orin', 'shared-codex']);
+  });
+
   it('adds account definitions while retaining live launches and existing account policy', async () => {
     await runInDurableObject(stub, async (hub: Hub) => {
       hub.sql.exec("INSERT INTO fleet_accounts VALUES ('main', 'codex', 4, 15, 1)");

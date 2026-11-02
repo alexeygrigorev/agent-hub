@@ -350,6 +350,26 @@ describe("AC1 tbm live ingestion", () => {
 });
 
 
+it('never marks a live tranche exhausted on an explicit banked-probe failure', async () => {
+  // Intake 7bf6f6ee AC2/AC3: an ok-status route whose reset-credits sub-probe
+  // failed carries an empty grant list plus banked_resets_error. That is
+  // explicit unknown, not a consumed grant: the tranche stays active.
+  await runInDurableObject(stub, (hub: Hub) => {
+    const sql: any = hub.sql;
+    const quota: any = { status: 'ok', details: { banked_resets: [
+      { available: true, expires_at: new Date(NOW+2*HOUR).toISOString(), label: 'Full reset' },
+    ] }, windows: { '5h': { present: true, percent_remaining: 80, reset_at: new Date(NOW+5*HOUR).toISOString() } } };
+    syncTbmFromServerAccounts(sql, [{ provider: 'codex', account: 'banked-unknown', quota }], NOW);
+    quota.details.banked_resets = [];
+    quota.details.banked_resets_error = 'quota_unreachable';
+    syncTbmFromServerAccounts(sql, [{ provider: 'codex', account: 'banked-unknown', quota }], NOW+60000);
+    const rows: any[] = sql.exec("SELECT * FROM tbm_banked_tranches WHERE pool_id='codex:banked-unknown:5h'").toArray();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe('active');
+  });
+});
+
+
 it('settles a banked expiry once even if a collection removes the expired grant before the next tick', async () => {
   await runInDurableObject(stub, (hub: Hub) => {
     const sql: any = hub.sql;

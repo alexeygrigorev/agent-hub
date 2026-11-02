@@ -1,28 +1,35 @@
+import { engineEpoch } from './engine-epoch';
+import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
+import { GOAL_ENGINES, GOAL_PROVIDERS } from './goal-engines';
 import { observationModel } from './session-observation';
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 import { sanitizeCommandFields } from './command-diagnostics';
-import {sanitizeCpuAdmission,sanitizeCpuUsage} from './cpu-headroom';
+import {sanitizeCpuAdmission,sanitizeCpuUsage,CPU_SATURATED_PCT} from './cpu-headroom';
 import { launcherDiskHeadroom } from './launcher-disk';
 /** Generic account registry and placement. Provider credentials never enter this service. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
-import { effectiveCheckin } from './registry';
+import { effectiveCheckin, effectiveRoutesAt } from './registry';
 import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
-import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
+import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
-import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './session_control';
+import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
+import { SILENT_START_MS, SILENT_START_REASON, ABANDONED_RECOVERY_MS, abandonedLaunch, expireSilentStartRows } from './silent-start';
 import { reconcileAccountCapacity } from './account_capacity';
+import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
-import { freshCatalogs } from './catalog-freshness';
+import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
+import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency } from './pacing';
 import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
 import { WORKER_SCOPE, workerAccessContext } from './worker-access';
+import { GOAL_STATUSES } from './intake-session';
 // Host telemetry freshness windows (intake 4398ce2a). The host posts a fast
 // heartbeat every TELEMETRY_REFRESH_S (host/agent_hub_host/fleet.py, 45 s);
 // keep LAUNCHER_TELEMETRY_STALE_MS >= 3x that (host regression test parses it).
@@ -31,12 +38,14 @@ export const GATE_STALE_MS = 300000;
 /** Engine holds that expire into a single retrial after this cooldown. */
 export const ENGINE_HEALTH_RETRY_MS = 600000;
 export const UNCLAIMED_OFFER_TTL_MS = 15 * 60 * 1000;
-export const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused']);
+export const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused', 'worker_silent_start']);
+export { SILENT_START_MS, SILENT_START_REASON };
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS fleet_catalog_census (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, complete INTEGER NOT NULL CHECK (complete IN (0, 1)));
 CREATE TABLE IF NOT EXISTS fleet_queue_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), after_rowid INTEGER NOT NULL, high_water INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT, evidence_json TEXT);
+CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT, evidence_json TEXT, host_load_machine TEXT, host_load_factor REAL);
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
 CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
@@ -44,10 +53,20 @@ CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id T
 CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, runtime_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS fleet_engine_health (engine TEXT NOT NULL, machine_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL, diagnostics_json TEXT, PRIMARY KEY(engine, machine_id));
 CREATE TABLE IF NOT EXISTS operator_notices (notice_key TEXT PRIMARY KEY, engine TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS fleet_login_holds (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT NOT NULL DEFAULT '', held_at_ms INTEGER NOT NULL, PRIMARY KEY(machine_id, engine, account, profile));
 CREATE TABLE IF NOT EXISTS placement_rejections (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, created_at_ms INTEGER NOT NULL, actor TEXT NOT NULL, reasons_json TEXT NOT NULL, detail TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_placement_rejections_recent ON placement_rejections(created_at_ms);
 `;
 type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
+/** Periodic host reports and read-only probes cannot change capacity or the placement queue. They arrive many times a
+ * minute per host; counting them as writes made every offers poll re-run planning (intake e8a22f4c). */
+const QUIET_FLEET_WRITES = /^\/api\/(?:fleet\/(?:sessions|subscriptions|probe)$|fleet\/resources(?:\/|$)|(?:fleet\/)?routing\/(?:capabilities|host-release|host-goal)(?:\/|$))/;
+export function marksMaintenanceDirty(method: string, path: string): boolean {
+  return method !== 'GET' && !QUIET_FLEET_WRITES.test(path);
+}
+
+/** Longest an idle offers poll may reuse the previous capacity maintenance pass (intake e8a22f4c). */
+const POLL_MAINTENANCE_MS = 20000;
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 // Idempotency key for same-host claim retries (intake 488b860e): per launch
 // plus host attempt, so a late-landing original claim plus a retry replays
@@ -74,10 +93,10 @@ const NATIVE_IN_FLIGHT = `(
       THEN json_extract(l.request_json, '$.cwd')
       ELSE rtrim(l.workspace, '/') || '/' || json_extract(l.request_json, '$.cwd') END
     END = s.workspace AND
-  (SELECT COUNT(*) FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
+  (SELECT COUNT(*) FROM (SELECT 1 FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
    AND spawned.tag = s.tag AND spawned.engine = s.engine AND spawned.account = s.account
    AND spawned.profile IS s.profile AND spawned.workspace = s.workspace
-   AND spawned.phase IN ('starting','running','broken','unknown','uncertain')) = 1 AND
+   AND spawned.phase IN ('starting','running','broken','unknown','uncertain') LIMIT 2)) = 1 AND
   ((l.mode = 'headless' AND s.tag = 'task-hub-' || l.id) OR
    (l.mode = 'interactive' AND s.tag = 'hub-' || l.id)))`;
 // Separate exact native identity from the in-flight predicate so SQLite can
@@ -109,7 +128,18 @@ function disabledEngines(): Set<string> {
   return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
 }
 /** Reject reasons that mean "no free slot right now" (transient capacity). */
-const CAPACITY_REASONS = new Set(['disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+// route_not_advertised: the host's latest capabilities do not list this
+// (engine, account, profile); it holds until the host re-advertises the route
+// instead of failing dispatch_route_unconfigured on the host (intake 6cbb862a).
+// route_advertisement_overflow: the host's complete route list did not fit a
+// heartbeat, so no membership is known and every route on it holds (never a
+// fallback to older or registry-only evidence).
+// route_advertisement_stale: the host's last complete list aged out (it
+// stopped posting /api/host/routes); every route holds.
+const CAPACITY_REASONS = new Set(['route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high']);
+/** Runaway-load cap (multiple of cores). Load average counts IO-wait and runnable threads, so it only
+ * guards the 2026-10-28 incident (load 275-295 on 12 cores); real busyness is measured CPU/memory. */
+const HOST_LOAD_FACTOR = 6;
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -119,7 +149,7 @@ import { MEMORY_FLOOR_MB, NEXT_SLOT_MB, ResourceManagement, memoryVerdict } from
 export { MEMORY_FLOOR_MB, NEXT_SLOT_MB };
 /** Placement-pressure reasons that degrade host health and raise operator
  * alerts: any launch rejected or held for memory/capacity. */
-export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high']);
 /** Incidental per-route reasons that may accompany capacity but never queue alone
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
@@ -132,12 +162,14 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   memory_pressure: 'Host memory full pressure exceeds the safety cap.',
   host_oom: 'A recent host OOM kill requires a placement cooldown.',
   host_runtime_choking: 'Recent session or service failures require a placement cooldown.',
+  host_load_high: 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
   "workspace_unavailable": "The requested workspace is not available on this host.",
+  "mode_unavailable": "This host does not advertise the requested session mode (e.g. headless without a maintained launcher).",
   "dispatch_route_unconfigured": "The offered account, engine and profile do not match a local route.",
   "goal_startup_unconfigured": "This account has no trusted interactive goal startup command.",
   "dispatch_startup_invalid": "The configured trusted startup command is invalid.",
   "dispatch_cwd_invalid": "The requested working directory is not confined to the workspace.",
-  "dispatch_goal_invalid": "Goal work requires an interactive Codex-family route and nonempty text.",
+  "dispatch_goal_invalid": "Goal work requires an interactive goal-capable (Codex-family or Claude) route and nonempty text.",
   "dispatch_prompt_unsupported": "Interactive prompt injection requires an explicit goal start.",
   "dispatch_offer_invalid": "The offered launch or task identifier is invalid.",
   "dispatch_capability_unavailable": "The required task capabilities are unavailable on this host.",
@@ -147,15 +179,17 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "model_unsupported": "The selected model or effort is unsupported by this local route.",
   "admission_unconfigured": "This local route has no maintained fresh admission adapter.",
   "admission_refused": "Fresh admission refused this account or could not verify its timestamp and model.",
+  "admission_quota_unverified": "The maintained launcher could not read a trusted quota observation for this managed account (probe unavailable or rate-limited).",
   "engine_auth_expired": "The engine authentication is unavailable or expired.",
   "credential_rejected": "The host's copy of the Hub-held engine credential was rejected.",
+  "not_logged_in": "The engine profile on this host is not logged in (no credential).",
   "codex_quota_gate_quota_unavailable": "The managed Codex account quota gate refused launch before execution.",
   "codex_quota_gate_codex_reserve_required": "The managed Codex account is below the configured weekly reserve.",
   "codex_quota_gate_stale_window_evidence": "The managed Codex quota evidence is stale.",
   "codex_quota_gate_quota_check_failed": "The managed Codex quota check failed."
 };
-const CLAIM_HTTP_SLUGS = new Set<string>(["account_capacity", "account_concurrency", "account_unavailable", "already_claimed", "claim_actor_ambiguous", "claim_authority_changed", "claim_authority_unsupported", "claim_conflict", "claim_holder_mismatch", "claim_inactive", "claim_project_mismatch", "claim_required", "claim_scope_mismatch", "claim_workspace_unconfigured", "cooldown_active", "cpu_headroom", "cpu_pressure", "cpu_usage_unknown", "forbidden", "fresh_admission_required", "future_observation", "grok_entitlement", "host_oom", "host_runtime_choking", "invalid_claim", "invalid_observed_at", "limit_reached", "machine_capacity", "malformed", "memory_pressure", "model_unsupported", "no_available_window", "no_quota_evidence", "not_found", "provider_disabled", "quota_exhausted", "quota_stale", "quota_unavailable", "quota_unknown", "reserve", "reserve_required", "reset_passed_since_observation", "route_not_ok", "route_stale", "stale_observation", "stale_window_evidence", "unauthorized", "window_unavailable", "worker_scope_forbidden"]);
-const RETRYABLE_CLAIM_ERRORS = new Set<string>(["account_capacity", "account_concurrency", "cpu_headroom", "cpu_pressure", "fresh_admission_required", "host_oom", "host_runtime_choking", "machine_capacity", "memory_pressure"]);
+const CLAIM_HTTP_SLUGS = new Set<string>(["account_capacity", "account_concurrency", "account_unavailable", "already_claimed", "claim_actor_ambiguous", "claim_authority_changed", "claim_authority_unsupported", "claim_conflict", "claim_holder_mismatch", "claim_inactive", "claim_project_mismatch", "claim_required", "claim_scope_mismatch", "claim_workspace_unconfigured", "cooldown_active", "cpu_headroom", "cpu_pressure", "cpu_usage_unknown", "forbidden", "fresh_admission_required", "future_observation", "grok_entitlement", "host_oom", "host_runtime_choking", "host_load_high", "invalid_claim", "invalid_observed_at", "limit_reached", "machine_capacity", "malformed", "memory_pressure", "model_unsupported", "no_available_window", "no_quota_evidence", "not_found", "provider_disabled", "quota_exhausted", "quota_stale", "quota_unavailable", "quota_unknown", "reserve", "reserve_required", "reset_passed_since_observation", "route_not_ok", "route_stale", "stale_observation", "stale_window_evidence", "unauthorized", "window_unavailable", "worker_scope_forbidden"]);
+const RETRYABLE_CLAIM_ERRORS = new Set<string>(["account_capacity", "account_concurrency", "cpu_headroom", "cpu_pressure", "fresh_admission_required", "host_oom", "host_runtime_choking", "host_load_high", "machine_capacity", "memory_pressure"]);
 function claimFieldsValid(d: any): boolean {
   const fields = ['http_status', 'hub_error', 'hub_reason', 'retryable'];
   if (d.reason !== 'dispatch_claim_refused') return fields.every(k => d[k] === undefined);
@@ -163,10 +197,23 @@ function claimFieldsValid(d: any): boolean {
   if (['hub_error', 'hub_reason'].some(k => d[k] !== undefined && !CLAIM_HTTP_SLUGS.has(d[k]))) return false;
   return d.retryable === undefined || (typeof d.retryable === 'boolean' && (!d.retryable || (d.http_status === 409 && RETRYABLE_CLAIM_ERRORS.has(d.hub_error))));
 }
+// Fixed host admission-gate causes (host dispatch_diagnostics.GATE_REASONS),
+// only on admission_refused, so a refusing host is diagnosable remotely.
+const GATE_REASONS = new Set(['local_bundle_missing', 'local_lock_unavailable', 'local_profile_missing',
+  'profile_mismatch', 'account_mismatch', 'model_mismatch', 'hub_unreachable', 'profile_not_installed',
+  'account_unmapped', 'credential_invalid', 'credential_rejected', 'quota_exhausted', 'profile_unsupported',
+  'account_label_mismatch', 'admission_timestamp_stale', 'model_unverified', 'gate_refused', 'not_logged_in']);
+function gateReasonValid(d: any): boolean {
+  const timing = ['gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s'];
+  if (timing.some(k => d[k] !== undefined && (d.reason !== 'admission_refused' ||
+      typeof d[k] !== 'number' || !Number.isFinite(d[k]) || Math.abs(d[k]) > 86400 ||
+      ((k === 'gate_duration_s' || k === 'gate_post_stamp_s') && d[k] < 0)))) return false;
+  return d.gate_reason === undefined || (d.reason === 'admission_refused' && GATE_REASONS.has(d.gate_reason));
+}
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
 // tier exclusion or a recorded route refusal); it never frees up, so it must not
 // turn a capacity wait into a hard 409.
-const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured']);
+const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'not_logged_in']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
@@ -176,6 +223,33 @@ const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_poli
  * remain visible; without a capacity rejection they never queue alone.
  * Any other class (workspace/mode capability, admission, resources, quota
  * evidence) stays a hard reject with its slug visible. */
+/** Latest host route advertisement (intake 6cbb862a AC a). The heartbeat's
+ * fleet_routes is authoritative while fresh and advertises nothing once
+ * stale; a host that has never sent it (pre-release) is judged by its fresh
+ * routing runners' exact tuples, and by nothing once those are stale. Only a
+ * host with no route evidence at all (no list, no or empty runners) returns
+ * null and keeps registry-only placement. */
+export function advertisedRoutes(hb: any, runners: { runners_json?: unknown; observed_at?: unknown } | null | undefined, nowMs: number): any[] | null {
+  if (Array.isArray(hb?.fleet_routes)) return fresh(hb.fleet_routes_at, nowMs, 180000) ? hb.fleet_routes : [];
+  if (runners) {
+    let list: unknown = null;
+    try { list = JSON.parse(String(runners.runners_json)); } catch { list = null; }
+    if (!Array.isArray(list)) return [];
+    if (!list.length) return null; // no launcher-model runners: no route evidence either way
+    return fresh(runners.observed_at, nowMs, 180000) ? list : [];
+  }
+  return null;
+}
+function routeAdvertised(routes: any[] | null, route: { engine: string; account: string; profile?: string | null }): boolean {
+  return routes === null || hostAdvertisesRoute(routes, route);
+}
+/** Exact (engine, canonical account, profile) membership, as the host's dispatch _route() matches. */
+export function hostAdvertisesRoute(routes: unknown, route: { engine: string; account: string; profile?: string | null }): boolean {
+  if (!Array.isArray(routes)) return false;
+  const account = canonicalAccountLabel(route.account);
+  return routes.some((r: any) => r && r.engine === route.engine && typeof r.account === 'string'
+    && canonicalAccountLabel(r.account) === account && (r.profile ?? null) === (route.profile ?? null));
+}
 export function isCapacityOnlyHold(rejected: unknown): rejected is { machine: string; engine: string; reason: string }[] {
   if (!Array.isArray(rejected) || rejected.length === 0) return false;
   let capacity = false;
@@ -288,6 +362,11 @@ function sanitizedQuota(raw: any): any {
         !object(g, ['expires_at', 'available', 'label']) || typeof g.available !== 'boolean' ||
         typeof g.expires_at !== 'string' || !UTC_ISO.test(g.expires_at) || !Number.isFinite(Date.parse(g.expires_at)) ||
         typeof g.label !== 'string' || !/^[A-Za-z0-9 ._-]{0,80}$/.test(g.label))) return null;
+    } else if (key === 'banked_resets_error') {
+      // Reset-credits sub-probe failure marker (intake 7bf6f6ee): an opaque
+      // short reason that keeps an ok-status empty grant list from reading
+      // as "no banked resets". Null/omitted means no known probe failure.
+      if (value !== null && (typeof value !== 'string' || value.length === 0 || value.length > 256)) return null;
     } else return null;
     details[key] = value;
   }
@@ -363,6 +442,7 @@ function workspaceCapable(capsWorkspaces: any, request: any): boolean {
 export function resolveLabelUnderRoots(capsWorkspaces: any, request: any): string {
   if (typeof request !== 'string' || !request) return request;
   if (!LABEL.test(request)) return request;
+  if (decodeRepoWorkspace(request)) return request; // repo identity, never a path under a root
   if (workspaceCapable(capsWorkspaces, request)) return request;
   if (!Array.isArray(capsWorkspaces)) return request;
   for (const w of capsWorkspaces) {
@@ -382,6 +462,41 @@ export function resolveLabelUnderRoots(capsWorkspaces: any, request: any): strin
   return request;
 }
 
+/** Repo-identity workspace (intake 8028bb06). A start that names a repository
+ * (`owner/name`) instead of a host path carries a label-safe workspace id,
+ * `repo-<id8>-<owner>__<name>` (`.` in the name is written `_d_`). It names no
+ * filesystem path: each host that advertises `repo_workspaces` clones the repo
+ * into its own work root (Windows: %USERPROFILE%\work\<id8>\<name>) at dispatch,
+ * so placement never needs a host-specific (e.g. Linux) path. */
+const REPO_WORKSPACE = /^repo-([0-9a-f]{8})-([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))__([A-Za-z0-9_-]{1,60})$/;
+const REPO_OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const REPO_NAME = /^[A-Za-z0-9._-]{1,100}$/;
+export function decodeRepoWorkspace(value: unknown): { id: string; repo: string } | null {
+  if (typeof value !== 'string') return null;
+  const m = REPO_WORKSPACE.exec(value);
+  if (!m) return null;
+  const name = m[3].replace(/_d_/g, '.');
+  if (!REPO_NAME.test(name) || name === '.' || name === '..' || name.startsWith('.')) return null;
+  return { id: m[1], repo: m[2] + '/' + name };
+}
+export function encodeRepoWorkspace(repo: unknown, id: unknown): string | null {
+  if (typeof repo !== 'string' || typeof id !== 'string' || !/^[0-9a-f]{8}$/.test(id)) return null;
+  const parts = repo.split('/');
+  if (parts.length !== 2 || !REPO_OWNER.test(parts[0]) || !REPO_NAME.test(parts[1])) return null;
+  if (parts[1].includes('_d_') || parts[1].includes('__') || parts[1].startsWith('.')) return null;
+  const out = `repo-${id}-${parts[0]}__${parts[1].replace(/\./g, '_d_')}`;
+  const back = decodeRepoWorkspace(out);
+  return LABEL.test(out) && back && back.repo === repo && back.id === id ? out : null;
+}
+
+/** A host can take the workspace when it advertises the path/label, or when the
+ * workspace is a repo identity and the host advertises it clones its own work
+ * tree (`repo_workspaces`), on any OS. */
+function workspaceReady(caps: any, workspace: any): boolean {
+  if (decodeRepoWorkspace(workspace)) return caps?.repo_workspaces === true;
+  return workspaceCapable(caps?.workspaces, workspace);
+}
+
 export class FleetService {
   public routing: RoutingService;
   public resources: ResourceManagement;
@@ -392,6 +507,23 @@ export class FleetService {
   // The cursor is a value in the ORDER BY key (updated_at, id), never a
   // row position, so concurrent inserts, removals and wraps stay exact.
   private reofferCursors = new Map<string, [string, string]>();
+  // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
+  private linkRevisions = new Map<string, string>();
+  private candidateCache = new Map<string, { revision: string; at: number; value: any[] }>();
+  private pollMaintenanceAt = 0;
+  private maintenanceDirty = true;
+
+  /** Run `query(placeholders)` over `ids` in bounded chunks: reads only matching rows. */
+  private byChunks(ids: string[], query: (marks: string) => string, ...lead: any[]): any[] {
+    const out: any[] = [];
+    const size = Math.min(50, 100 - lead.length);
+    if (size < 1) throw new Error('sql_binding_budget');
+    for (let i = 0; i < ids.length; i += size) {
+      const chunk = ids.slice(i, i + size);
+      out.push(...this.sql.exec(query(chunk.map(() => '?').join(',')), ...lead, ...chunk).toArray());
+    }
+    return out;
+  }
 
   /** Synchronous operation scope: nested routing/reserve/plan calls share work,
    * never capacity snapshots. No await may cross this scope. */
@@ -405,6 +537,7 @@ export class FleetService {
     return this.withMaintenance(() => {
       if (this.maintenance!.reconciled) return;
       this.expireUnclaimedOffers();
+      this.expireSilentStarts();
       this.admission.reconcileOffers();
       reconcileAccountCapacity(this.sql, this.now());
       reconcileUnboundFleetSessions(this.sql, this.now());
@@ -452,6 +585,19 @@ export class FleetService {
     });
   }
 
+  /** A headless launch that never produced a bound native within SILENT_START_MS
+   * (claimed `starting`, or `running` receipt whose session is still unbound
+   * `offered`/`starting`) is failed with a diagnostic slug, its unbound session
+   * follows via reconcileUnboundFleetSessions, and the (machine, engine) pair
+   * is held so auto routing stops placing new work on the silent runtime. */
+  expireSilentStarts(): number {
+    return this.transaction(() => this.expireSilentStartsRows());
+  }
+
+  private expireSilentStartsRows(): number {
+    return expireSilentStartRows(this.sql, this.now());
+  }
+
   constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) {
     this.resources = new ResourceManagement(sql, now);
     this.routing = new RoutingService(sql, this, now, transaction);
@@ -466,9 +612,11 @@ export class FleetService {
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const holdColumns = this.sql.exec('PRAGMA table_info(fleet_memory_holds)').toArray().map((c: any) => c.name);
     if (!holdColumns.includes('evidence_json')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN evidence_json TEXT');
+    if (!holdColumns.includes('host_load_machine')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN host_load_machine TEXT');
+    if (!holdColumns.includes('host_load_factor')) this.sql.exec('ALTER TABLE fleet_memory_holds ADD COLUMN host_load_factor REAL');
     initResourceRequestProjection(this.sql, 'fleet_launches');
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
-    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key', 'runtime_json']) {
+    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key', 'runtime_json', 'worker_status']) {
       if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
@@ -477,10 +625,27 @@ export class FleetService {
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_expiry ON fleet_launches(state,created_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state ON fleet_launches(account,state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_account_phase ON fleet_sessions(account,phase)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_machine_phase ON fleet_sessions(machine_id,phase)');
+    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_recent ON fleet_launches(machine_id,finished_at) WHERE state = 'failed' AND mode = 'headless' AND verification_status = 'unverified'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native_state ON fleet_launches(machine_id,native_id,state)');
+    // Intake e8a22f4c: plan() and the choking watchdog look for these rare exit reasons on every poll;
+    // partial indexes keep both lookups independent of the machine's retained launch history.
+    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_model_unsupported ON fleet_launches(machine_id,engine,account) WHERE exit_reason = 'model_unsupported'");
+    // Preserve the established lookup identity and upgrade legacy definitions
+    // atomically to the exact terminal-state range used by choking admission.
+    const runtimeDDL = "CREATE INDEX fleet_launch_runtime_exit ON fleet_launches(machine_id,updated_at DESC) WHERE state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')";
+    const normalizeIndex = (ddl: string) => ddl.replace(/\s+/g, '').replace('IFNOTEXISTS', '');
+    this.transaction(() => {
+      const runtime: any = this.sql.exec("SELECT sql FROM sqlite_master WHERE type='index' AND name='fleet_launch_runtime_exit'").toArray()[0];
+      if (runtime && normalizeIndex(String(runtime.sql)) !== normalizeIndex(runtimeDDL))
+        this.sql.exec('DROP INDEX fleet_launch_runtime_exit');
+      this.sql.exec('DROP INDEX IF EXISTS fleet_queue_runtime_exit');
+      this.sql.exec(runtimeDDL.replace('CREATE INDEX ', 'CREATE INDEX IF NOT EXISTS '));
+    });
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_inflight_identity ON fleet_launches(machine_id,engine,account,profile) WHERE native_id IS NULL AND state IN ('starting','uncertain')");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_incarnation ON fleet_sessions(machine_id,tag,engine,account,profile,workspace,phase)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_route_account ON fleet_routes(account)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_queue_live_machines ON machines(last_checkin_at,id) WHERE drained=0 AND revoked_at IS NULL');
     this.sql.exec('CREATE INDEX IF NOT EXISTS routing_launch ON routing_jobs(launch_id)');
     const columns = this.sql.exec('PRAGMA table_info(fleet_sessions)').toArray().map((c: any) => c.name);
     if (!columns.includes('last_activity_at')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN last_activity_at TEXT');
@@ -489,80 +654,159 @@ export class FleetService {
     if (!columns.includes('progress_json')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN progress_json TEXT');
   }
 
-  public observationProvenance(account: any, route: any): { quota: any; subscriptionObservedAt: string | null } | null {
+  /**
+   * Unmetered engines (Antigravity/OpenCode Go expose no host quota API): a
+   * missing or failed reading is not an outage. Substitute a neutral
+   * run-verified observation unless the reading positively blocks the account
+   * (limit/cooldown). Engine health, credential and login holds still gate
+   * placement independently in plan()/claim.
+   */
+  public observationProvenance(account: any, route: any, snapshot?: FleetCapacitySnapshot): { quota: any; subscriptionObservedAt: string | null } | null {
+    const found = this.observationProvenanceRaw(account, route, snapshot);
+    if (!isUnmeteredProvider(account.provider)) return found;
+    const now = snapshot?.now ?? this.now();
+    if (found && (found.quota?.status === 'ok' || quotaPositivelyBlocked(found.quota, now))) return found;
+    const at = new Date(now).toISOString();
+    return { quota: unmeteredObservation(at), subscriptionObservedAt: at };
+  }
+
+  private observationProvenanceRaw(account: any, route: any, snapshot?: FleetCapacitySnapshot): { quota: any; subscriptionObservedAt: string | null } | null {
+    const now = snapshot?.now ?? this.now();
     const provider = canonicalQuotaProvider(account.provider);
     const label = canonicalAccountLabel(account.label);
     const legacyLabel = Object.entries(LEGACY_ACCOUNT_LABELS).find(([, c]) => c === label)?.[0] ?? label;
     const central: any = this.sql.exec('SELECT * FROM server_quota_snapshots WHERE (account = ? OR account = ?) AND (provider = ? OR provider = ?)', label, legacyLabel, provider, legacyRouteKeyFor(provider) ?? provider).toArray()[0];
-    if (central && fresh(central.captured_at, this.now(), QUOTA_STALE_MS - 1)) {
+    if (central && fresh(central.captured_at, now, QUOTA_STALE_MS - 1)) {
       const quota = parsed(central.quota_json);
-      if (!quota.observed_at || fresh(quota.observed_at, this.now(), QUOTA_STALE_MS - 1)) {
+      if (!quota.observed_at || fresh(quota.observed_at, now, QUOTA_STALE_MS - 1)) {
         return { quota, subscriptionObservedAt: central.captured_at };
       }
     }
     const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
     if (subscription) {
-      if (canonicalQuotaProvider(subscription.service) !== provider || !fresh(subscription.observed_at, this.now(), 1200000)) return null;
+      if (canonicalQuotaProvider(subscription.service) !== provider || !fresh(subscription.observed_at, now, 1200000)) return null;
       const quota = parsed(subscription.quota_json);
       const quotaObs = quota?.observed_at || subscription.observed_at;
-      return fresh(quotaObs, this.now(), 1200000) ? { quota: quota?.observed_at ? quota : { ...quota, observed_at: quotaObs }, subscriptionObservedAt: subscription.observed_at } : null;
+      return fresh(quotaObs, now, 1200000) ? { quota: quota?.observed_at ? quota : { ...quota, observed_at: quotaObs }, subscriptionObservedAt: subscription.observed_at } : null;
     }
     // A default CLI reading cannot describe a named profile or two accounts on one service.
     if (route.profile !== null && route.profile !== provider) return null;
-    const count = Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)', route.machine_id, provider, legacyRouteKeyFor(provider) ?? provider).one().n);
-    const snapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
-    if (count !== 1 || !snapshot || !fresh(snapshot.captured_at, this.now(), 1200000)) return null;
-    const quota = snapshotRouteForAccount(account.label, provider, parsed(snapshot.routes_json));
-    const obsTs = quota?.observed_at || snapshot.captured_at;
-    if (!quota || !fresh(obsTs, this.now(), 1200000)) return null;
+    const count = snapshot ? (snapshot.familyAccounts.get(capacityFamilyKey(route.machine_id, provider))?.size ?? 0)
+      : Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)', route.machine_id, provider, legacyRouteKeyFor(provider) ?? provider).one().n);
+    const hostSnapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
+    if (count !== 1 || !hostSnapshot || !fresh(hostSnapshot.captured_at, now, 1200000)) return null;
+    const quota = snapshotRouteForAccount(account.label, provider, parsed(hostSnapshot.routes_json));
+    const obsTs = quota?.observed_at || hostSnapshot.captured_at;
+    if (!quota || !fresh(obsTs, now, 1200000)) return null;
     const quotaWithTs = quota.observed_at ? quota : { ...quota, observed_at: obsTs };
-    return { quota: snapshot.status === 'ok' ? quotaWithTs : { ...quotaWithTs, status: 'unknown' }, subscriptionObservedAt: snapshot.captured_at };
+    return { quota: hostSnapshot.status === 'ok' ? quotaWithTs : { ...quotaWithTs, status: 'unknown' }, subscriptionObservedAt: hostSnapshot.captured_at };
   }
 
   private observation(account: any, route: any) {
     return this.observationProvenance(account, route)?.quota ?? null;
   }
 
+  /** One-row generation of every table the candidates read (written by StatusService triggers); null when absent. */
+  private candidateRevision(): string | null {
+    try { return String((this.sql.exec('SELECT revision FROM status_lifecycle_revision WHERE id=1').toArray()[0] as any)?.revision ?? '') || null; }
+    catch { return null; }
+  }
+
+  /** Intake e8a22f4c: every host polls this each few seconds and the query reads each live launch
+   * plus a fleet_sessions probe. Reuse the answer until a launch/session write moves the revision. */
   private reconciliationCandidates(machine: string) {
+    // fleet_catalog_seen is not covered by the revision triggers, so its freshness verdict is part of the key.
+    const at = this.now(), catalogFresh = freshCatalogs(this.sql, at).has(machine);
+    const revision = this.candidateRevision();
+    const key = revision ? `${revision}|${catalogFresh ? 1 : 0}` : null;
+    const hit = this.candidateCache.get(machine);
+    if (key && hit && hit.revision === key && at >= hit.at && at - hit.at < POLL_MAINTENANCE_MS) return hit.value;
+    const value = this.reconciliationCandidatesUncached(machine, catalogFresh);
+    if (key) this.candidateCache.set(machine, { revision: key, at, value });
+    return value;
+  }
+
+  private reconciliationCandidatesUncached(machine: string, catalogFresh: boolean) {
+    // Intake 0b87eb29: a claim Hub abandoned on the silent-start bound has no
+    // exit proof. Keep offering it to its owning host for a bounded window so
+    // a fenced no-start, recovered hub-results finish or late native start
+    // still lands instead of being lost behind the abandonment.
     // Hosts report their complete catalog before polling offers. Avoid one
     // redundant native retirement probe per fresh live workload each cycle;
     // stale, absent and ambiguous observations still need positive proof.
     const cutoff = new Date(this.now() - 180000).toISOString();
-    const catalogFresh = freshCatalogs(this.sql, this.now()).has(machine);
     // Fleet-only stores need no control table. Probe once, not once per row.
     const controlStore = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
     const bindingProjection = controlStore
       ? '(SELECT binding_json FROM session_control_sessions c WHERE c.fleet_launch_id=l.id AND c.machine_id=l.machine_id LIMIT 1)'
       : 'NULL';
-    return this.sql.exec(`SELECT l.id, l.workspace, ${jsonFields('l.request_json',['cwd'])} AS request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id, ${bindingProjection} AS binding_json
-      FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain')
-      AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
+    // One indexed branch per state: an OR across states made SQLite read the machine's whole launch history.
+    const columns = `l.id, l.workspace, ${jsonFields('l.request_json',['cwd'])} AS request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id, l.updated_at, ${bindingProjection} AS binding_json`;
+    const unobserved = `AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
         WHERE s.machine_id = l.machine_id AND s.native_id = l.native_id AND s.engine = l.engine
-        AND s.phase IN ('starting','running') AND (s.observed_at >= ? OR ?)))
-      ORDER BY l.updated_at LIMIT 100`, machine, cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
+        AND s.phase IN ('starting','running') AND (s.observed_at >= ? OR ?)))`;
+    return this.sql.exec(`SELECT * FROM (
+      SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain') ${unobserved}
+      UNION ALL
+      SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state = 'failed' AND l.mode = 'headless' AND l.exit_reason = ?
+        AND l.verification_status = 'unverified' AND l.finished_at > ? ${unobserved}
+    ) ORDER BY updated_at LIMIT 100`, machine, cutoff, catalogFresh ? 1 : 0,
+      machine, SILENT_START_REASON, new Date(this.now() - ABANDONED_RECOVERY_MS).toISOString(), cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
       const binding = controlStore ? parsed(r.binding_json) : null;
       return { id: r.id, workspace: r.workspace, cwd: parsed(r.request_json).cwd ?? null, diagnostic: parsed(r.launch_error_json), native_id: r.native_id, engine: r.engine, mode: r.mode, launcher_task_id: r.launcher_task_id, binding };
     });
   }
 
-  accountStatus(account: any) {
+  /** Live Hub sessions per canonical account (intake 93e7817b): one row per
+   * non-terminal session, attributed to the placed launch's account or, for
+   * adopted natives, the host-reported account. Read-only, display only:
+   * admission keeps its own reserved/observed accounting. */
+  liveSessionsByAccount(): Map<string, number> {
+    const out = new Map<string, number>();
+    try {
+      for (const r of this.sql.exec(`SELECT COALESCE(l.account, n.account) AS account, COUNT(*) AS n
+          FROM session_control_sessions s
+          LEFT JOIN fleet_launches l ON l.id = s.fleet_launch_id
+          LEFT JOIN fleet_sessions n ON s.fleet_launch_id IS NULL AND n.machine_id = s.machine_id
+            AND n.native_id = json_extract(CASE WHEN json_valid(s.binding_json) THEN s.binding_json ELSE '{}' END, '$.native_id')
+          WHERE s.state IN ('recorded','held','queued','offered','starting','running','uncertain')
+          GROUP BY COALESCE(l.account, n.account)`).toArray() as any[]) {
+        if (typeof r.account !== 'string' || !r.account) continue;
+        const key = canonicalAccountLabel(r.account);
+        out.set(key, (out.get(key) ?? 0) + Number(r.n));
+      }
+    } catch { /* session-control store is optional in isolated fleet installs */ }
+    return out;
+  }
+
+  /** Bounded read-only observations for autonomous queue budgets. */
+  queueCapacitySnapshot(now = this.now()): FleetCapacitySnapshot {
+    return readFleetCapacitySnapshot(this.sql, now, NATIVE_UNRESERVED);
+  }
+
+  accountStatus(account: any, snapshot?: FleetCapacitySnapshot) {
+    if (snapshot) return this.accountStatusWithinMaintenance(account, snapshot);
     return this.withMaintenance(() => this.accountStatusWithinMaintenance(account));
   }
 
-  private accountStatusWithinMaintenance(account: any) {
-    this.reconcileCapacity();
+  private accountStatusWithinMaintenance(account: any, snapshot?: FleetCapacitySnapshot) {
+    // Budget reads must never trigger global expiry/reconciliation scans.
+    // Canonical placement continues to own its normal maintenance path.
+    if (!snapshot) this.reconcileCapacity();
+    const now = snapshot?.now ?? this.now();
     // Canonical provider model: `codex-orin` is an account under provider
     // `codex`, never a separate provider. Stored rows keyed by old names
     // canonicalize here so grouping by provider shows both Codex accounts.
     const provider = canonicalQuotaProvider(account.provider);
-    const routes = this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
-    let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled; let healthy = false;
+    const routes = snapshot ? snapshot.routes.filter(r => r.account === account.label)
+      : this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
+    let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled; let healthy = false; let unmeteredOk = false;
     const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
     for (const route of routes) {
-      const prov = this.observationProvenance(account, route);
+      const prov = this.observationProvenance(account, route, snapshot);
       if (!prov) continue;
       observed++;
-      const adm = evaluateLaunchQuota({ provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: this.now(), reserves });
+      const adm = evaluateLaunchQuota({ provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: now, reserves });
       if (!adm.ok) {
         if (['limit_reached', 'cooldown_active'].includes(adm.reason)) blocked = true;
         else if (adm.reason === 'reserve') {
@@ -573,7 +817,8 @@ export class FleetService {
       if (adm.remaining !== null) {
         remaining = remaining === null ? adm.remaining : Math.min(remaining, adm.remaining);
         healthy = true;
-      } else unknown = true;
+      } else if (prov.quota?.details?.unmetered === true) { unmeteredOk = true; healthy = true; }
+      else unknown = true;
     }
     if (remaining !== null && remaining <= account.reserve_percent) blocked = true;
     // Capacity counts only live machines (Hetzner urgent live, legacy stale):
@@ -586,9 +831,9 @@ export class FleetService {
     const liveIds = new Set<string>();
     const liveEnginesByMachine = new Map<string, Set<string>>();
     try {
-      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines').toArray() as any[]) {
+      for (const m of (snapshot?.machines ?? this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines WHERE revoked_at IS NULL').toArray()) as any[]) {
         if (m.drained) continue;
-        if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000)) continue;
+        if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), now, 180000)) continue;
         liveIds.add(String(m.id));
         // Same advertised-engine rule as plan(): a route stays placeable only
         // while its machine's fresh capabilities still list the engine. A host
@@ -599,32 +844,36 @@ export class FleetService {
       }
     } catch { /* fail closed below when the live set is empty */ }
     const liveList = [...liveIds];
-    const staleCutoff = new Date(this.now() - 48 * 3600000).toISOString();
-    const idleCutoff = this.now() - this.resources.config().idle_minutes * 60000;
-    const catalogs = freshCatalogs(this.sql, this.now());
-    const isIdle = (row: any) => row.phase === 'running' && catalogs.has(String(row.machine_id))
+    const staleCutoff = new Date(now - 48 * 3600000).toISOString();
+    const idleCutoff = now - this.resources.config().idle_minutes * 60000;
+    const completeCatalogs = snapshot?.completeCatalogs ?? freshCompleteCatalogs(this.sql, now);
+    const isIdle = (row: any) => row.phase === 'running' && completeCatalogs.has(String(row.machine_id))
       && typeof row.last_activity_at === 'string' && Number.isFinite(Date.parse(row.last_activity_at))
       && Date.parse(row.last_activity_at) <= idleCutoff;
+    // A fresh complete census that no longer contains the exact native proves
+    // it does not consume physical concurrency. If an uncertain launch lost its
+    // launch native_id after binding, the exact session-control binding can
+    // still locate that historical native row. Keep launch/lifecycle rows
+    // unchanged: unobserved is not positive terminal proof.
+    const isUnobserved = (row: any) => unobservedReservationReleased(row, completeCatalogs);
     // Native activity, rather than a launch receipt's update timestamp,
     // determines whether a bound running session still occupies admission.
     // Stale catalogs, unknown native state/activity and in-flight starts
     // retain their reservations, even while independent heartbeats are fresh.
-    const reserved = liveList.length
-      ? (this.sql.exec(`SELECT l.state, l.machine_id, s.phase, s.last_activity_at FROM fleet_launches l
-          LEFT JOIN fleet_sessions s ON s.machine_id=l.machine_id AND s.native_id=l.native_id
-          WHERE l.account = ? AND l.state IN ${ACTIVE} AND l.machine_id IN (${liveList.map(() => '?').join(',')})
-          AND (l.state = 'running' OR l.updated_at > ?)`, account.label, ...liveList, staleCutoff).toArray() as any[])
-          .filter(row => row.state !== 'running' || !isIdle(row)).length
-      : 0;
-    const observedSessions = (() => {
-      if (!liveList.length) return 0;
-      const orphans = this.sql.exec(`SELECT s.machine_id, s.phase, s.last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND ${NATIVE_UNRESERVED}`, account.label, ...liveList).toArray() as any[];
-      let counted = 0;
-      for (const row of orphans) {
-        if (!isIdle(row)) counted++;
-      }
-      return counted;
-    })();
+    const reservations = snapshot ? snapshot.launches.filter(l => l.account === account.label &&
+      l.state !== 'queued' && (l.state === 'running' || l.updated_at > staleCutoff))
+      : this.byChunks(liveList, marks => `SELECT l.state,l.native_id,l.machine_id,s.phase,s.last_activity_at FROM fleet_launches l
+          ${reservationNativeJoinSql(this.sql)}
+          WHERE l.account=? AND (l.state='running' OR l.updated_at>?)
+          AND l.state IN ${ACTIVE} AND l.machine_id IN (${marks})`, account.label, staleCutoff);
+    const reserved = reservations.filter(row => row.state === 'running'
+      ? (!isIdle(row) && !isUnobserved(row))
+      : row.state === 'uncertain' ? !isUnobserved(row) : true).length;
+    const orphans = snapshot ? snapshot.natives.filter(n => n.account === account.label && n.unreserved)
+      : this.byChunks(liveList, marks => `SELECT s.machine_id,s.phase,s.last_activity_at
+          FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain')
+          AND s.machine_id IN (${marks}) AND ${NATIVE_UNRESERVED}`, account.label);
+    const observedSessions = orphans.filter(row => !isIdle(row)).length;
     const active = reserved + observedSessions;
     // Visibility breakdown (no accounting change): counted slots split into
     // launch reservations vs orphan observed sessions, alongside live native
@@ -632,13 +881,18 @@ export class FleetService {
     // capacity fixer owns the counting; this only projects it.
     let nativeLive: number | null = null;
     try {
-      const seen = freshCatalogs(this.sql, this.now());
-      if (liveList.length && liveList.every(id => seen.has(id))) nativeLive = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase = 'running' AND s.machine_id IN (${liveList.map(() => '?').join(',')})`, account.label, ...liveList).one().n);
+      const seen = completeCatalogs;
+      if (liveList.length && liveList.every(id => seen.has(id))) nativeLive = snapshot
+        ? snapshot.natives.filter(n => n.account === account.label && n.phase === 'running').length
+        : this.byChunks(liveList, marks => `SELECT COUNT(*) AS n FROM fleet_sessions s
+            WHERE s.account=? AND s.phase='running' AND s.machine_id IN (${marks})`, account.label)
+            .reduce((total, row) => total + Number(row.n), 0);
     } catch { nativeLive = null; }
     const availableSlots = Math.max(0, Number(account.max_concurrency) - active);
     const placeableMachines = new Set<string>();
     const placementReasons = new Set<string>();
     if (!routes.length) placementReasons.add('no_routes');
+    if (!account.enabled) placementReasons.add('account_disabled');
     if (!availableSlots) placementReasons.add('account_concurrency');
     let placeableRoutes = 0;
     for (const route of routes) {
@@ -647,8 +901,8 @@ export class FleetService {
         placeableMachines.add(String(route.machine_id));
       } else placementReasons.add(liveIds.has(String(route.machine_id)) ? 'engine_unavailable' : 'machine_unavailable');
     }
-    return { label: canonicalAccountLabel(account.label), provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: ['codex', 'zai'].includes(provider),
-      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || remaining === null || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
+    return { label: canonicalAccountLabel(account.label), provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: GOAL_PROVIDERS.has(provider),
+      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || (remaining === null && !unmeteredOk) || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
       // Counted vs live: active splits into launch reservations + orphan
       // observed sessions; native_live is the host-catalog verified live
       // process count for this account (includes launch-linked sessions).
@@ -783,13 +1037,13 @@ export class FleetService {
     } catch { /* alerting never breaks placement */ }
   }
 
-  plan(input: any) {
-    return this.withMaintenance(() => this.planWithinMaintenance(input));
+  plan(input: any, loadRefusal?: { machine: string; factor: number }) {
+    return this.withMaintenance(() => this.planWithinMaintenance(input, loadRefusal));
   }
 
-  private planWithinMaintenance(input: any):
+  private planWithinMaintenance(input: any, loadRefusal?: { machine: string; factor: number }):
     { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
-    { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any> } {
+    { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any>; hold_reason?: string; needs_machines?: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] } {
     if (input && (modelDisabledByPolicy(input.engine) || modelDisabledByPolicy(input.model) ||
         policy.models.some(m => [m.id, m.model].includes(input.engine) && modelDisabledByPolicy(m)))) return { error: 'model_disabled_by_policy' };
     if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project', 'needs']) ||
@@ -835,12 +1089,13 @@ export class FleetService {
     if (input.tier !== undefined) request.tier = input.tier;
     const needs: string[] = Array.isArray(input.needs) ? [...input.needs] : [];
     if (needs.length) request.needs = needs;
-    const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = [];
+    const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = []; const gateDegraded = new Set<number>();
     // Hub-held credential state (intake 5814e109 I5): an account whose Hub
     // credential the provider rejected is offered nowhere, and a host that
     // reported a generation rejected is not offered that account again until
     // Hub publishes a newer generation.
     const credentialInvalid = invalidLabels(this.sql); const credentialRejected = rejectedPairs(this.sql);
+
     this.reconcileCapacity();
     // Planning below is read-only after reconciliation. Drop the snapshot
     // before reserve/promotion writes so the next plan sees every commitment.
@@ -863,13 +1118,22 @@ export class FleetService {
     // capacity queueing for the engines the live fleet actually runs.
     const liveEngines = new Set<string>();
     try {
-      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines').toArray() as any[]) {
+      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines WHERE revoked_at IS NULL').toArray() as any[]) {
         if (m.drained) continue;
         if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000)) continue;
         const engines = parsed(m.capabilities)?.engines;
         if (Array.isArray(engines)) for (const e of engines) if (typeof e === 'string') liveEngines.add(e);
       }
     } catch { /* fail closed below: empty set keeps capability_unavailable */ }
+    const runnersByMachine = new Map<string, any>();
+    const routingRunners = (machineId: string) => {
+      if (!runnersByMachine.has(machineId)) {
+        let row: any = null;
+        try { row = this.sql.exec('SELECT runners_json, observed_at FROM routing_machines WHERE machine_id = ?', machineId).toArray()[0] ?? null; } catch { row = null; }
+        runnersByMachine.set(machineId, row);
+      }
+      return runnersByMachine.get(machineId);
+    };
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
       if (overrideModels.length) {
@@ -887,7 +1151,7 @@ export class FleetService {
           continue;
         }
       }
-      if (request.with_goal && !['codex', 'zcodex'].includes(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue; }
+      if (request.with_goal && !GOAL_ENGINES.has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue; }
       // A disabled execution engine holds all new candidate planning, whatever the account label.
       if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
       // Auth/permission holds are only cleared by a successful launch, which a
@@ -946,6 +1210,17 @@ export class FleetService {
       const hostCredentialRefusal = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.find((r: any) =>
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
         && r.reason === 'credential_rejected' && fresh(r.observed_at, this.now(), 300000));
+      // Host login probe (intake 06d2a0ac AC1/AC2): the host found no
+      // credential for this exact profile, so a session would sit at a
+      // sign-in screen. Never offer the route while that report is fresh.
+      // A dispatch refusal for the same reason holds the route until the
+      // host's next advertisement carries the probe (no re-offer loop).
+      const hostLoginRefusal = () => (Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.some((r: any) =>
+        r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
+        && r.reason === 'not_logged_in' && fresh(r.observed_at, this.now(), 300000)))
+        // Primary-key read of fleet_login_holds (one row per route), never launch history.
+        || this.sql.exec('SELECT 1 FROM fleet_login_holds WHERE machine_id = ? AND engine = ? AND account = ? AND profile = ? AND held_at_ms > ?',
+          route.machine_id, route.engine, route.account, route.profile ?? '', this.now() - ENGINE_HEALTH_RETRY_MS).toArray().length > 0;
       const routeProv = definition ? this.observationProvenance(definition, route) : null;
       const routeQuota = evaluateLaunchQuota({ provider: String(definition?.provider ?? ''), quota: routeProv?.quota ?? null,
         subscriptionObservedAt: routeProv?.subscriptionObservedAt ?? null, nowMs: this.now(),
@@ -979,30 +1254,46 @@ export class FleetService {
       };
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
+      else if (hb.fleet_routes_overflow !== undefined) reason = 'route_advertisement_overflow';
+      else if (Array.isArray(hb.fleet_routes) && !fresh(effectiveRoutesAt(route.machine_id, hb.fleet_routes_at), this.now(), 180000)) reason = 'route_advertisement_stale';
+      else if (!routeAdvertised(advertisedRoutes(Array.isArray(hb.fleet_routes) ? { ...hb, fleet_routes_at: effectiveRoutesAt(route.machine_id, hb.fleet_routes_at) } : hb,
+        routingRunners(route.machine_id), this.now()), route)) reason = 'route_not_advertised';
       else if (credentialInvalid.has(route.account)) reason = 'credential_invalid';
       else if (credentialRejected.has(route.machine_id + '\u0000' + route.account) || hostCredentialRefusal) reason = 'credential_rejected';
+      else if (hostLoginRefusal()) reason = 'not_logged_in';
       else if (gateRefusal) reason = gateRefusal.reason;
-      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, effectiveWorkspace) || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd))) {
+      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceReady(caps, effectiveWorkspace) || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd))) {
         const engineMissing = !Array.isArray(caps.engines) || !caps.engines.includes(route.engine);
         const modeMissing = !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode);
-        const workspaceMissing = !workspaceCapable(caps.workspaces, effectiveWorkspace)
+        const workspaceMissing = !workspaceReady(caps, effectiveWorkspace)
           || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd));
         // A route for an engine no live host advertises anymore is stale
         // registry debt, not a workspace/mode defect — but only when the live
         // fleet actually advertises engines. When nothing live advertises
         // anything (broken/empty registration), keep capability_unavailable.
         reason = (engineMissing && liveEngines.size > 0 && !liveEngines.has(route.engine)) ? 'engine_unavailable'
-          : !engineMissing && !modeMissing && workspaceMissing ? 'workspace_unavailable' : 'capability_unavailable';
+          : !engineMissing && !modeMissing && workspaceMissing ? 'workspace_unavailable'
+          : !engineMissing && modeMissing && !workspaceMissing ? 'mode_unavailable' : 'capability_unavailable';
       }
-      // Intake 4398ce2a (Alexey t1523u): the aggregate host gate and launcher
-      // telemetry are projections, not refusals. Missing, stale, failed or
-      // timed-out projections fail OPEN; per-route quota-gate refusals
-      // (fleet_route_rejections above) and real MemAvailable/PSI/OOM/disk
-      // signals below still hold. The host re-runs its real admission gate
-      // before every claim, and the claim requires a <30 s observation.
+      // Load remains advisory for fresh placement. A fenced host overload
+      // refusal supplies an internal, durable retry context; only that retry
+      // waits for this host's load to clear. Other eligible hosts may win.
+      else if (
+        loadRefusal !== undefined && loadRefusal.machine === route.machine_id &&
+        Number.isFinite(hb?.load?.[0]) && Number.isFinite(caps?.cpu_count) &&
+        caps.cpu_count > 0 && (
+          // Stored factors below the runaway default are legacy (1.5x) holds: never gate on them.
+          hb.load[0] > Math.max(loadRefusal.factor, HOST_LOAD_FACTOR) * caps.cpu_count
+          // Busy means measured CPU >= 98% averaged over >= 10s on a fresh sample, never load average.
+          || (() => {
+            const usage = sanitizeCpuUsage(hb.cpu_usage);
+            const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;
+            return usage?.busy_percent_window != null && age <= 180000 && age >= -30000 && usage.busy_percent_window >= CPU_SATURATED_PCT;
+          })())
+      ) reason = 'host_load_high';
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         memory().reserved_mb,
-        memory().requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
+        memory().requested_mb, this.resources.config(), hb.mem_total_mb)) reason = 'launcher_memory_reserve';
       // Missing mem/disk telemetry is not a choking signal: fail OPEN (intake
       // 4398ce2a, Alexey t1523u). Only a present, real reading below a floor holds.
       // Root-disk floor is configurable (resource_settings.disk_floor_gb, default
@@ -1013,11 +1304,29 @@ export class FleetService {
       else if (!account || account.status === 'blocked') reason = 'account_' + (account?.status || 'unmapped');
       else if (!routeQuota.ok) reason = 'quota_' + routeQuota.reason;
       else if (account.available_slots < 1) reason = 'account_concurrency';
-      if (reason) { evidence(); rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
+      if (reason) {
+        evidence();
+        rejected.push({
+          machine: route.machine_id, engine: route.engine, reason,
+          ...(reason.startsWith('route_') ? { account: route.account, profile: route.profile ?? null } : {}),
+          ...(reason === 'route_advertisement_overflow' ? { advertised_routes: hb.fleet_routes_overflow } : {}),
+          ...(reason === 'route_advertisement_stale' ? { advertised_at: effectiveRoutesAt(route.machine_id, hb.fleet_routes_at) } : {}),
+          ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}),
+          ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}),
+          ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}),
+          ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}),
+          ...(reason === 'host_load_high' ? { load1: hb.load[0], cpu_count: caps.cpu_count, load_limit: Math.max(loadRefusal!.factor, HOST_LOAD_FACTOR) * caps.cpu_count, cpu_busy_window: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window ?? null } : {}),
+          ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}),
+        });
+        continue;
+      }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
-      const model = policy.models.find(m => !modelDisabledByPolicy(m) && members.includes(m.id) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
+      const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) && (anyTier || members.includes(m.id)) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
+      // An engine named without a tier (e.g. antigravity, whose models sit in deep/review only)
+      // falls back to that engine's models in any tier instead of the default tier alone.
+      const model = pick(false) ?? (input.tier == null && request.engine && !overrideModels.length ? pick(true) : undefined);
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       // Host adapter refusals are scoped to the exact route, mode and model
       // within the engine health retry window so transient historical launch
@@ -1039,16 +1348,40 @@ export class FleetService {
       const urgency = ownPools.length ? Math.max(...ownPools.map(p => resetUrgency(netHeadroom(p.headroom_percentage, p.hard_floor_percent),
         (p.reset_at_ms - this.now()) / 3600000))) : 1;
       const tbm_weight = request.mode === 'interactive' ? 1 : tbm.pacing * tbm.banked * (tbm.efficiency ?? 1) * urgency;
-      const score = ((routeQuota.remaining ?? 5) / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) * tbm_weight;
+      // Unmetered engines carry no percentage; rank them at the policy's neutral
+      // headroom. Load already placed on the same provider family divides the
+      // score so unspecified starts spread by headroom instead of stacking on
+      // the single highest-percentage family.
+      const headroomPercent = routeQuota.remaining ?? (isUnmeteredProvider(family) ? (policy.rules as any).unmetered_headroom_percent : 5);
+      const familyLoad = [...accounts.values()].filter(a => a.provider === family).reduce((n, a) => n + a.active, 0);
+      const score = (headroomPercent / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) / (1 + familyLoad) * tbm_weight;
       // Windows hosts are overflow for work that does not ask for Windows:
       // agent tooling assumes Linux, so they win only when every Linux route
       // is held (loaded, capped or quota-limited). Pinned and os:windows
       // requests are unaffected (intake a3227276 AC3).
       const overflow = overflowMachine(machine, needs);
+      // A failed probe has no credential verdict. Prefer an admitted sibling,
+      // while retaining hard refusals for rejected or stale credentials.
+      if (gateProjection && !gateRefusal) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, ...(routeQuota.reason !== 'eligible' || (gateProjection && !gateRefusal) ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: model, score, ...(routeQuota.reason !== 'eligible' || (gateProjection && !gateRefusal) ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
     }
-    candidates.sort((a, b) => Number(!!a.overflow) - Number(!!b.overflow) || b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
+    // Intake 06d2a0ac AC1: an account with no quota verdict at all (status
+    // unknown: never observed, or only "unknown"/unavailable reports) is
+    // never auto-placed while the fleet holds verdicts for other accounts.
+    // Only a fleet-wide probe outage (no account known) keeps the fail-open
+    // projection rule (intake 4398ce2a); an explicit --account pin is the
+    // operator's override.
+    const degraded = new Set(Array.from(gateDegraded, i => candidates[i]));
+    // A disabled account reports blocked but carries no quota verdict.
+    if (!request.account && [...accounts.values()].some(a => a.enabled && a.status !== 'unknown')) {
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        if (accounts.get(candidates[i].account)?.status !== 'unknown') continue;
+        rejected.push({ machine: candidates[i].machine, engine: candidates[i].engine, reason: 'account_unknown' });
+        candidates.splice(i, 1);
+      }
+    }
+    candidates.sort((a, b) => Number(!!a.overflow) - Number(!!b.overflow) || Number(degraded.has(a)) - Number(degraded.has(b)) || b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
     // The stored intent carries the winner's normalized workspace: a bare
     // label that resolved under the selected host's root is persisted and
     // offered as the absolute path the host accepts. Labels that were
@@ -1056,11 +1389,51 @@ export class FleetService {
     if (candidates[0] && typeof candidates[0].workspace === 'string' && candidates[0].workspace !== request.workspace) {
       request.workspace = candidates[0].workspace;
     }
-    const codexSelector = input.engine === 'codex' || overrideModels.some(m => m.provider === 'codex');
-    if (!candidates.length && codexSelector && !input.account && rejected.some(r =>
-      r.reason.startsWith('codex_quota_gate_') || ['account_blocked', 'account_unknown', 'engine_auth_expired', 'credential_invalid', 'credential_rejected'].includes(r.reason))) {
-      const fallback: any = this.plan({ ...input, engine: undefined, tier: input.tier ?? taskTier({ model: overrideModels[0]?.id }) });
-      if (!fallback.error) return { ...fallback, request: { ...fallback.request, engine: request.engine }, rejected: [...rejected, ...fallback.rejected], fallback_from: input.engine };
+    // Every matching account and machine for an explicit engine has already
+    // been considered above. Replanning without `engine` here could silently
+    // offer a different engine while persisting the original requested engine.
+    // Intake dcac7cd4 AC1: rejected[] names only machines that have routes,
+    // so a needs-carrying start held while no host advertising those needs is
+    // online AND routed (the Windows request whose Windows host has no route
+    // advertisement) reads as a broken auto-restart. When the hold is really
+    // a missing routed host, say so at the top level and name every enrolled
+    // machine whose labels satisfy the needs with its online/route state.
+    // Bounded to 64 machines; never changes placement math.
+    if (needs.length && !candidates.length) {
+      try {
+        const machines = this.sql.exec('SELECT id, hostname, os, arch, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL ORDER BY id LIMIT 256').toArray() as any[];
+        const satisfying: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] = [];
+        for (const m of machines) {
+          const labels = new Set<string>();
+          try {
+            const rn: any = this.sql.exec('SELECT needs_json, observed_at FROM routing_machines WHERE machine_id = ?', m.id).toArray()[0];
+            if (rn && fresh(rn.observed_at, this.now(), 180000)) {
+              const advertised = JSON.parse(rn.needs_json);
+              if (Array.isArray(advertised)) for (const n of advertised) if (typeof n === 'string') labels.add(n);
+            }
+          } catch { /* operator routing needs are optional */ }
+          if (typeof m.os === 'string' && m.os.trim()) labels.add('os:' + m.os.trim().toLowerCase());
+          const archRaw = typeof m.arch === 'string' ? m.arch.trim().toLowerCase() : '';
+          if (archRaw) labels.add('arch:' + archRaw);
+          if (!needs.every(n => labels.has(n))) continue;
+          const routes = this.sql.exec('SELECT engine, account, profile FROM fleet_routes WHERE machine_id = ? ORDER BY engine, account LIMIT 64', m.id).toArray() as any[];
+          satisfying.push({
+            machine: m.id,
+            hostname: typeof m.hostname === 'string' ? m.hostname : null,
+            online: !m.drained && fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000),
+            routed: routes.length > 0,
+            routes: routes.slice(0, 8).map(r => ({ engine: r.engine, account: r.account, ...(r.profile ? { profile: r.profile } : {}) })),
+            last_checkin_at: typeof m.last_checkin_at === 'string' ? m.last_checkin_at : null,
+          });
+          if (satisfying.length >= 64) break;
+        }
+        // Only when no satisfying host is online AND routed: otherwise the
+        // per-route rejected[] entries already name the real blocker.
+        if (!satisfying.some(m => m.online && m.routed)) {
+          return { request, selected: candidates[0] || null, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine),
+            hold_reason: 'no_routed_host_matches_needs', needs_machines: satisfying };
+        }
+      } catch { /* diagnosis is best-effort: never break placement */ }
     }
     return { request, selected: candidates[0] || null, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine) };
     });
@@ -1157,8 +1530,15 @@ export class FleetService {
         for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project', 'needs']) {
           if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
         }
+        // These columns survive updates to the currently displayed hold reason.
+        // A primary-key lookup keeps each host-polled drain slice bounded.
+        const memoryHold: any = this.sql.exec('SELECT since, refused, host_load_machine, host_load_factor FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
+        const loadRefusal = memoryHold?.host_load_machine ? {
+          machine: String(memoryHold.host_load_machine),
+          factor: Number.isFinite(memoryHold.host_load_factor) && memoryHold.host_load_factor >= 0.5 && memoryHold.host_load_factor <= 8 ? memoryHold.host_load_factor : HOST_LOAD_FACTOR,
+        } : undefined;
         let plan: any;
-        try { plan = this.plan(input); } catch { continue; }
+        try { plan = this.plan(input, loadRefusal); } catch { continue; }
         if (!plan || (plan as any).error) continue;
         if (!plan.selected) {
           const rejected = plan.rejected || [];
@@ -1171,7 +1551,6 @@ export class FleetService {
           }
           continue;
         }
-        const memoryHold: any = this.sql.exec('SELECT since, refused FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
         // Keep known disk evidence sticky if a later plan reports another
         // temporary hold. A generic heartbeat cannot clear that refusal.
         const diskHeld = parsed(row.launch_error_json)?.reason === 'launcher_disk_reserve';
@@ -1301,7 +1680,11 @@ export class FleetService {
           return result({ id, state: 'queued', queued: true, queue_position: this.queuePosition(id), rejected: plan.rejected, access: admitted.access.mode }, 202);
         }
         try { this.recordPlacementRejection(actor, plan.rejected); } catch { /* alerting never breaks placement */ }
-        return result({ error: 'no_eligible_route', rejected: plan.rejected, access: parsed.access.mode }, 409);
+        // Intake dcac7cd4 AC1: a needs hold with no routed matching host
+        // carries the top-level reason plus the satisfying-machine states.
+        return result({ error: 'no_eligible_route', rejected: plan.rejected,
+          ...(plan.hold_reason ? { hold_reason: plan.hold_reason, needs_machines: plan.needs_machines } : {}),
+          access: parsed.access.mode }, 409);
       }
       const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
       this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
@@ -1314,6 +1697,7 @@ export class FleetService {
   async handle(request: Request, auth: Auth): Promise<Response> {
     if (auth.error) return auth.error;
     const path = new URL(request.url).pathname; const caller = auth.caller;
+    if (marksMaintenanceDirty(request.method, path)) this.maintenanceDirty = true;
     if (path === '/api/fleet/tasks' || path.startsWith('/api/fleet/tasks/') || path.startsWith('/api/fleet/routing/')) return this.routing.handle(request, auth);
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
@@ -1397,19 +1781,20 @@ export class FleetService {
       // alias resolve to the canonical host for display and liveness.
       let machineAliases: Record<string, string> = {};
       try {
-        const aliasRows = this.sql.exec('SELECT id, hostname, drained, last_checkin_at FROM machines').toArray() as any[];
+        const aliasRows = this.sql.exec('SELECT id, hostname, drained, last_checkin_at FROM machines WHERE revoked_at IS NULL').toArray() as any[];
         const resolution = resolveMachineAliases(aliasRows.map((m: any) => {
           const persisted = typeof m.last_checkin_at === 'string' ? Date.parse(m.last_checkin_at) : NaN;
           return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(persisted) ? persisted : null };
         }));
         machineAliases = Object.fromEntries(resolution.aliasOf.entries());
       } catch { machineAliases = {}; }
-      const machines = this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray().map((m: any) => {
+      const machines = this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL ORDER BY id').toArray().map((m: any) => {
         const canonical = machineAliases[String(m.id)] ?? null;
         return { ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at), alias_of: canonical, canonical_id: canonical ?? String(m.id) };
       });
       const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
-      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = parsed(this.sql.exec('SELECT capabilities FROM machines WHERE id = ?', r.machine_id).toArray()[0]?.capabilities); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
+      const liveSessions = this.liveSessionsByAccount();
+      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => { const s = this.accountStatus(a); return { ...s, sessions: liveSessions.get(s.label) ?? 0 }; }), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = parsed(this.sql.exec('SELECT capabilities FROM machines WHERE id = ?', r.machine_id).toArray()[0]?.capabilities); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
         machines, machine_aliases: machineAliases,
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions,
@@ -1419,6 +1804,26 @@ export class FleetService {
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
           harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() })),
         launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
+    }
+    const revokeMatch = /^\/api\/fleet\/machines\/([A-Za-z0-9_-]{1,64})\/revoke$/.exec(path);
+    if (revokeMatch && request.method === 'POST') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      const reason = typeof data?.reason === 'string' ? data.reason.trim() : '';
+      if (!object(data, ['confirm', 'reason']) || data.confirm !== true || !reason || reason.length > 500) return response({ error: 'confirm_and_reason_required' }, 400);
+      const machineId = revokeMatch[1];
+      return this.transaction(() => {
+        const m: any = this.sql.exec('SELECT id, credential_id, revoked_at FROM machines WHERE id = ?', machineId).toArray()[0];
+        if (!m) return response({ error: 'unknown_machine' }, 404);
+        if (m.revoked_at) return response({ status: 'already_revoked', machine_id: machineId, revoked_at: m.revoked_at });
+        const at = new Date(this.now()).toISOString(); const actor = String(caller.actor ?? 'admin');
+        const families = this.sql.exec('SELECT DISTINCT family_id FROM credentials WHERE kind = ? AND (machine_id = ? OR id = ?) AND family_id IS NOT NULL', 'host', machineId, m.credential_id ?? '').toArray().map((r: any) => r.family_id);
+        let revoked = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE kind = ? AND revoked_at IS NULL AND (machine_id = ? OR id = ?)', at, 'host', machineId, m.credential_id ?? '').rowsWritten;
+        for (const f of families) revoked += this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', at, f).rowsWritten;
+        this.sql.exec('UPDATE machines SET revoked_at = ?, revoked_reason = ?, revoked_by = ?, drained = 1 WHERE id = ?', at, reason, actor, machineId);
+        this.sql.exec('INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)', actor, 'machine_revoke', 'machine', machineId, JSON.stringify({ reason, credentials_revoked: revoked }), at);
+        return response({ status: 'revoked', machine_id: machineId, revoked_at: at, revoked_by: actor, reason, credentials_revoked: revoked });
+      });
     }
     if (path === '/api/fleet/claim-policy' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
@@ -1465,6 +1870,77 @@ export class FleetService {
         }
         for (const a of updates) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=?, reserve_percent=? WHERE label=?', a.max, a.reserve, a.label);
         return response({status: 'configured', updated_accounts: updates.length});
+      });
+    }
+    // `hub limits`: per-engine/per-account caps with live usage, and a live,
+    // persisted cap set (fleet_accounts is the admission source of truth).
+    if (path === '/api/fleet/limits' && request.method === 'GET') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const routes = this.sql.exec('SELECT account, engine FROM fleet_routes ORDER BY engine').toArray() as any[];
+      const liveSessions = this.liveSessionsByAccount();
+      const accounts = dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(row => {
+        const s = this.accountStatus(row);
+        return { account: s.label, provider: s.provider, engines: [...new Set(routes.filter(r => canonicalAccountLabel(String(r.account)) === s.label).map(r => String(r.engine)))],
+          max_concurrency: Number(s.max_concurrency), active: s.active, reserved: s.reserved, observed_sessions: s.observed_sessions,
+          native_live: s.native_live, sessions: liveSessions.get(s.label) ?? 0, available_slots: s.available_slots, placeable_slots: s.placeable_slots, enabled: s.enabled, status: s.status };
+      });
+      const engines = new Map<string, { engine: string; accounts: string[]; max_concurrency: number; active: number }>();
+      for (const a of accounts) {
+        const e = engines.get(a.provider) ?? { engine: a.provider, accounts: [], max_concurrency: 0, active: 0 };
+        e.accounts.push(a.account); e.max_concurrency += a.max_concurrency; e.active += Number(a.active) || 0;
+        engines.set(a.provider, e);
+      }
+      return response({ engines: [...engines.values()].sort((x, y) => x.engine.localeCompare(y.engine)), accounts });
+    }
+    if (path === '/api/fleet/limits' && request.method === 'PATCH') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      if (!object(data, ['target', 'max_concurrency', 'allow_lower']) || !label(data.target) ||
+          !Number.isInteger(data.max_concurrency) || data.max_concurrency < LIMIT_MIN || data.max_concurrency > LIMIT_MAX ||
+          (data.allow_lower !== undefined && typeof data.allow_lower !== 'boolean'))
+        return response({ error: 'invalid_limit' }, 400);
+      return this.transaction(() => {
+        const rows = this.sql.exec('SELECT label, provider, max_concurrency FROM fleet_accounts ORDER BY label').toArray() as any[];
+        const routes = this.sql.exec('SELECT account, engine FROM fleet_routes').toArray() as any[];
+        const resolved = resolveLimitTarget(data.target, rows, routes);
+        if (!resolved.rows.length) return response({ error: 'unknown_limit_target' }, 404);
+        const plan = planLimitSet(resolved.kind, resolved.rows, data.max_concurrency, data.allow_lower === true);
+        if (plan.error) return response({ error: plan.error, changes: plan.changes }, 409);
+        const changed = plan.changes.filter(c => c.to !== c.from);
+        for (const u of limitRowUpdates(resolved.rows, plan.changes)) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=? WHERE label=?', u.to, u.label);
+        if (changed.length) try {
+          this.sql.exec('INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)', String(caller.actor ?? 'admin'),
+            'fleet_limits_set', 'fleet_account', data.target, JSON.stringify(changed.map(c => ({ account: c.account, from: c.from, to: c.to }))), new Date(this.now()).toISOString());
+        } catch { /* audit is best-effort; fleet_accounts stays authoritative */ }
+        return response({ status: 'configured', target: data.target, kind: resolved.kind, max_concurrency: data.max_concurrency,
+          allow_lower: data.allow_lower === true, changes: plan.changes });
+      });
+    }
+    // Reversible per-account routing switch (intake 06d2a0ac AC3): a
+    // disabled account keeps its registry row, routes, credentials and
+    // history, but accountStatus() reports it blocked so plan() never offers
+    // it. Re-enabling restores placement; nothing is deleted.
+    const accountToggle = /^\/api\/fleet\/accounts\/([^/]+)$/.exec(path);
+    if (accountToggle && request.method === 'PATCH') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      let target = '';
+      try { target = decodeURIComponent(accountToggle[1]); } catch { target = ''; }
+      if (!label(target) || !object(data, ['enabled', 'reason']) || typeof data.enabled !== 'boolean' ||
+          (data.reason !== undefined && (typeof data.reason !== 'string' || data.reason.length > 200 || /[\x00-\x1f\x7f]/.test(data.reason))))
+        return response({ error: 'invalid_account_toggle' }, 400);
+      return this.transaction(() => {
+        const row: any = this.sql.exec('SELECT label, enabled FROM fleet_accounts WHERE label = ?', target).toArray()[0];
+        if (!row) return response({ error: 'unknown_account' }, 404);
+        const from = !!row.enabled;
+        if (from !== data.enabled) {
+          this.sql.exec('UPDATE fleet_accounts SET enabled = ? WHERE label = ?', Number(data.enabled), target);
+          try {
+            this.sql.exec('INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)', String(caller.actor ?? 'admin'),
+              data.enabled ? 'fleet_account_enabled' : 'fleet_account_disabled', 'fleet_account', target, JSON.stringify({ from, to: data.enabled, reason: data.reason ?? null }), new Date(this.now()).toISOString());
+          } catch { /* audit is best-effort; fleet_accounts stays authoritative */ }
+        }
+        return response({ status: data.enabled ? 'enabled' : 'disabled', account: target, changed: from !== data.enabled });
       });
     }
     if (path === '/api/fleet/accounts' && request.method === 'PUT') {
@@ -1553,10 +2029,17 @@ export class FleetService {
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       return this.withMaintenance(() => this.transaction(() => {
-        this.routing.dispatchNow();
-        this.reconcileCapacity();
-        // One re-plan per host poll; durable cursors preserve backlog progress.
-        try { this.drainCapacityQueue(1); } catch { /* best-effort */ };
+        // Intake e8a22f4c: capacity maintenance is queue-driven. Any fleet write marks it
+        // dirty; otherwise polls repeat it at most every POLL_MAINTENANCE_MS, because every
+        // host polls offers every few seconds and the sweeps scale with live launches.
+        const polledAt = this.now();
+        if (this.maintenanceDirty || polledAt - this.pollMaintenanceAt >= POLL_MAINTENANCE_MS || polledAt < this.pollMaintenanceAt) {
+          this.pollMaintenanceAt = polledAt; this.maintenanceDirty = false;
+          this.routing.dispatchNow();
+          this.reconcileCapacity();
+          // One re-plan per host poll; durable cursors preserve backlog progress.
+          try { this.drainCapacityQueue(1); } catch { /* best-effort */ };
+        }
         const valid: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
@@ -1619,7 +2102,7 @@ export class FleetService {
             return { ...(scopedWorkers.has(String(row.id)) ? { worker_credential_required: true } : {}),
               // AC1 lock identity (additive; unknown keys are ignored by hosts).
               ...(link ? { hub_session_id: link.hub_session_id, ...(link.intake_task_id ? { intake_task_id: link.intake_task_id } : {}) } : {}),
-              ...this.resources.cpuStart(String(row.id)), resource_choking: choking, resource_management: this.resources.config(),
+              ...this.resources.cpuStart(String(row.id)), resource_choking: choking, resource_management: this.resources.configFor(caller.machineId!),
               memory_estimate_mb: this.resources.estimate(request.project || String(row.workspace), String(row.engine), request.task_kind || 'goal'),
               selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile,
               mode: row.mode, workspace: row.workspace, cwd: request.cwd ?? null, prompt: row.prompt,
@@ -1627,7 +2110,7 @@ export class FleetService {
               ...(row.state !== 'offered' ? { state: row.state, claim_key: row.claim_key ?? null } : {}) };
           });
         });
-        return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!) });
+        return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!), engine_epoch: engineEpoch(this.sql) });
       }),1);
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {
@@ -1636,7 +2119,14 @@ export class FleetService {
       // mutation limit even with fewer than 100 sessions. Preserve the 500
       // row and field limits below; allow their maximum serialized footprint.
       const data = await body(request, 3 * 1024 * 1024);
-      if (!object(data, ['sessions']) || !Array.isArray(data.sessions) || data.sessions.length > 500) return response({ error: 'invalid_sessions' }, 400);
+      if (!object(data, ['sessions', 'census_complete']) || !Array.isArray(data.sessions) || data.sessions.length > 500 ||
+          (data.census_complete !== undefined && typeof data.census_complete !== 'boolean')) return response({ error: 'invalid_sessions' }, 400);
+      // Older hosts do not send the completeness bit. A sub-cap legacy report
+      // is known to be untruncated; a report at the cap fails closed because
+      // it may have omitted live native rows.
+      const censusComplete = data.census_complete === undefined
+        ? data.sessions.length < 500
+        : data.census_complete;
       const ids = new Set();
       for (const s of data.sessions) {
         if (!object(s, ['native_id', 'tag', 'engine', 'model', 'parent_id', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit', 'progress', 'tokens']) ||
@@ -1644,11 +2134,12 @@ export class FleetService {
             (s.parent_id !== undefined && s.parent_id !== null && (typeof s.parent_id !== 'string' || !/^[a-zA-Z0-9-]{1,160}$/.test(s.parent_id))) ||
             (s.tokens !== undefined && (!object(s.tokens, ['input_tokens', 'output_tokens']) ||
               !['input_tokens', 'output_tokens'].every(k => Number.isInteger(s.tokens[k]) && s.tokens[k] >= 0 && s.tokens[k] <= 1e12))) ||
-            (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup', 'terminal_error', 'goal_status', 'sampled_at']) ||
+            (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup', 'terminal_error', 'goal_status', 'sampled_at', 'last_cpu_at']) ||
               (s.progress.sampled_at !== undefined && (typeof s.progress.sampled_at !== 'string' || !fresh(s.progress.sampled_at, this.now() + 60000, 366 * 86400000))) ||
-              (s.progress.goal_status !== undefined && !['blocked', 'paused', 'stalled', 'active', 'complete'].includes(s.progress.goal_status)) ||
-              (s.progress.terminal_error !== undefined && (s.progress.terminal_error !== 'codex_reconnect_failed' || s.engine !== 'codex' || s.progress.headless !== false)) ||
+              (s.progress.goal_status !== undefined && !GOAL_STATUSES.includes(s.progress.goal_status)) ||
+              (s.progress.terminal_error !== undefined && (!((s.progress.terminal_error === 'codex_reconnect_failed' && s.engine === 'codex') || (['zcodex_agent_exited', 'zcodex_reconnect_failed'].includes(s.progress.terminal_error) && s.engine === 'zcodex')) || s.progress.headless !== false)) ||
               typeof s.progress.last_progress_at !== 'string' || !fresh(s.progress.last_progress_at, this.now() + 60000, 366 * 86400000) ||
+              (s.progress.last_cpu_at !== undefined && (typeof s.progress.last_cpu_at !== 'string' || !fresh(s.progress.last_cpu_at, this.now() + 60000, 366 * 86400000))) ||
               typeof s.progress.headless !== 'boolean' || ![true, false, null].includes(s.progress.agent_alive) ||
               typeof s.progress.orphaned !== 'boolean' || !['none', 'reaped', 'uncertain'].includes(s.progress.cleanup))) ||
             (s.last_activity_at !== undefined && s.last_activity_at !== null && (typeof s.last_activity_at !== 'string' || !fresh(s.last_activity_at, this.now() + 60000, 366 * 86400000))) ||
@@ -1658,20 +2149,35 @@ export class FleetService {
         ids.add(s.native_id);
       }
       return this.transaction(() => {
+        // Record the newest completeness verdict before reconciliation or
+        // queue draining can inspect capacity. A change of verdict is applied
+        // immediately; unchanged reports retain the existing 60 s write cap.
+        const censusNow = this.now();
+        const censusObservedAt = new Date(censusNow).toISOString();
+        this.sql.exec(`INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES (?, ?, ?)
+          ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at, complete=excluded.complete
+          WHERE fleet_catalog_census.complete != excluded.complete OR fleet_catalog_census.observed_at <= ?`,
+          caller.machineId!, censusObservedAt, censusComplete ? 1 : 0, new Date(censusNow - 60000).toISOString());
         // Write only rows that changed: hosts report every minute and Durable Object row writes
         // are metered. observed_at therefore means "last changed"; host freshness comes from heartbeats.
         const fields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'progress_json'];
-        const existing = new Map((this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ?', caller.machineId!).toArray() as any[]).map(r => [r.native_id, r]));
+        // Intake e8a22f4c: read only the reported rows (PK lookups) and the live-phase rows
+        // that may have vanished, never the retained history of the machine.
+        const reportedIds: string[] = data.sessions.map((s: any) => s.native_id);
+        const existing = new Map<string, any>();
+        for (const r of this.byChunks(reportedIds, (marks) => `SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id IN (${marks})`, caller.machineId!)) existing.set(r.native_id, r);
+        const reportedSet = new Set(reportedIds);
+        const liveUnreported = (this.sql.exec("SELECT native_id FROM fleet_sessions WHERE machine_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!).toArray() as any[])
+          .map(r => String(r.native_id)).filter(id => !reportedSet.has(id));
 
         // Stopped same-incarnation native sessions cannot resurrect from late live-catalog snapshots:
         // do not insert or resurrect in fleet_sessions or adoptObservedNativeSessions if already canonically stopped for the same incarnation.
         const stoppedSessions = new Map<string, number | null>();
         try {
-          const stoppedRows = this.sql.exec(
-            "SELECT id, binding_json FROM session_control_sessions WHERE machine_id = ? AND state = 'stopped'",
-            caller.machineId!
-          ).toArray() as any[];
-          for (const r of stoppedRows) {
+          // Primary-key lookups only: with machine_id/state in the WHERE the planner prefers the
+          // (machine_id,state) index and reads the machine's whole stopped history per chunk.
+          for (const r of this.byChunks(reportedIds, (marks) => `SELECT id, machine_id, state, binding_json FROM session_control_sessions WHERE id IN (${marks})`)) {
+            if (r.machine_id !== caller.machineId || r.state !== 'stopped') continue;
             try {
               const b = JSON.parse(r.binding_json || '{}');
               stoppedSessions.set(r.id, b.native_created_at_ms ?? null);
@@ -1683,6 +2189,8 @@ export class FleetService {
 
         let written = 0;
         const cleanSessions: any[] = [];
+        const changedSessions: any[] = [];
+        const seen = new Set<string>();
         for (const s of data.sessions) {
           if (s.tokens) recordSessionTokens(this.sql, { session_id: `${caller.machineId}:${s.native_id}`,
             native_id: s.native_id, tag: s.tag, engine: s.engine, account: s.account, ...s.tokens }, this.now());
@@ -1697,16 +2205,21 @@ export class FleetService {
             s.phase = 'uncertain';
           }
           cleanSessions.push(s);
-          const prior = existing.get(s.native_id); existing.delete(s.native_id);
+          const prior = existing.get(s.native_id); seen.add(s.native_id);
           const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null, progress_json: s.progress ? JSON.stringify(s.progress) : null };
           if (prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
+          changedSessions.push(s);
           this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms, progress_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, row.cwd, s.profile, s.account, row.last_activity_at, row.created_at_ms, row.progress_json);
           written++;
         }
         // Preserve historical observations. A missing catalog row is not exit
         // proof, but an orphan no longer observed is not a live workload.
-        for (const gone of existing.keys()) {
-          this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!, gone); written++;
+        // A reported row skipped as already-stopped is not "seen" and falls through here, as before.
+        const gone = censusComplete
+          ? [...liveUnreported, ...reportedIds.filter(id => existing.has(id) && !seen.has(id))]
+          : [];
+        for (const id of gone) {
+          this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!, id); written++;
         }
         // Exact positive terminal evidence releases physical concurrency even
         // if a headless launch journal was lost. Absence is never exit proof.
@@ -1715,14 +2228,19 @@ export class FleetService {
         // busy host reports hundreds of exited rows, and a per-row scan made
         // the PUT exceed the host's 10 s timeout (intake c206f556).
         let managedByNative: Map<string, any[]> | null = null;
-        for (const native of cleanSessions) {
+        // Only rows that changed in this census can newly prove an exit; unchanged
+        // terminal rows were settled when they changed, and reconcileAccountCapacity
+        // below settles late-bound launches from the stored fleet_sessions rows.
+        for (const native of changedSessions) {
           if (!['exited', 'dead'].includes(native.phase) || !native.created_at_ms) continue;
           // Deleted cwd/workspace is a capacity projection above, not positive
           // native exit evidence. It must never settle a launch reservation.
           if (native.workspace.endsWith(' (deleted)') || native.cwd?.endsWith(' (deleted)')) continue;
           if (!managedByNative) {
             managedByNative = new Map();
-            for (const session of this.sql.exec("SELECT id, fleet_launch_id, binding_json, engine FROM session_control_sessions WHERE machine_id = ? AND fleet_launch_id IS NOT NULL AND binding_json IS NOT NULL", caller.machineId!).toArray() as any[]) {
+            const exitedIds = changedSessions.filter(n => ['exited', 'dead'].includes(n.phase) && n.created_at_ms).map(n => n.native_id as string);
+            for (const session of this.byChunks(exitedIds, (marks) => `SELECT id, fleet_launch_id, binding_json, engine FROM session_control_sessions WHERE machine_id = ? AND fleet_launch_id IS NOT NULL AND binding_json IS NOT NULL
+              AND (CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text' THEN json_extract(binding_json, '$.native_id') END END) IN (${marks})`, caller.machineId!)) {
               const nativeId = parsed(session.binding_json).native_id;
               if (typeof nativeId !== 'string') continue;
               managedByNative.set(nativeId, [...(managedByNative.get(nativeId) ?? []), session]);
@@ -1739,7 +2257,14 @@ export class FleetService {
             this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ? AND state IN ('starting','running','uncertain')", at, session.id);
           }
         }
-        adoptObservedNativeSessions(this.sql, caller.machineId!, cleanSessions, this.now());
+        // Adoption and late-link work is per changed native; the link pass over every
+        // reported native reruns only when the intake linkage revision moved.
+        let revision = '';
+        try { revision = String((this.sql.exec('SELECT revision FROM session_observation_intake_meta WHERE id=1').toArray()[0] as any)?.revision ?? ''); } catch { /* table not created yet */ }
+        const revisionMoved = !revision || this.linkRevisions.get(caller.machineId!) !== revision;
+        this.linkRevisions.set(caller.machineId!, revision);
+        adoptObservedNativeSessions(this.sql, caller.machineId!, changedSessions, this.now(), undefined, revisionMoved ? cleanSessions : changedSessions);
+        if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
         // A refreshed catalog can free machine_capacity: promote waiters.
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }
@@ -1842,6 +2367,12 @@ export class FleetService {
             this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ? AND machine_id = ? AND reason = 'admission_unconfigured'", nowIso, data.engine, targetMachine);
             return response({ status: 'configuration_probed', engine: data.engine, machine_id: targetMachine });
           }
+          if (data.reason === 'zcodex_probe_passed') {
+            // Only a real zcodex exec probe on the host retires the session-failure hold.
+            if (!targetMachine || data.engine !== 'zcodex') return response({ error: 'machine_required' }, 400);
+            this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ? AND machine_id = ? AND reason = 'zcodex_session_failed'", nowIso, data.engine, targetMachine);
+            return response({ status: 'zcodex_probed', engine: data.engine, machine_id: targetMachine });
+          }
           if (data.reason === 'device_auth_verified') {
             if (!targetMachine || data.engine !== 'opencode') return response({ error: 'machine_required' }, 400);
             this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ? AND machine_id = ? AND reason = 'engine_auth_expired'", nowIso, data.engine, targetMachine);
@@ -1896,15 +2427,22 @@ export class FleetService {
         // excludes this (machine, account) until a newer generation exists (I5).
         if (row.account && (data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected')) recordCredentialRejection(this.sql, row.machine_id, row.account, data.reason, this.now());
         if (match[2] === 'reject') {
-          if (!object(data, ['reason', 'diagnostic']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
+          if (!object(data, ['reason', 'diagnostic', 'host_load_factor', 'claim_key']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
+          const claimRefusal = data.claim_key !== undefined;
+          if (claimRefusal && (typeof data.claim_key !== 'string' || !CLAIM_KEY.test(data.claim_key) || data.reason !== 'codex_quota_gate_codex_reserve_required')) return response({ error: 'invalid_rejection' }, 400);
+          if (data.host_load_factor !== undefined && (data.reason !== 'host_load_high' || typeof data.host_load_factor !== 'number' || !Number.isFinite(data.host_load_factor) || data.host_load_factor < 0.5 || data.host_load_factor > 8)) return response({ error: 'invalid_rejection' }, 400);
+          const loadFactor = data.host_load_factor ?? HOST_LOAD_FACTOR;
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
-          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable']) || !claimFieldsValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
+          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable', 'gate_reason', 'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s']) || !claimFieldsValid(diagnostic) || !gateReasonValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
               diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
               typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
               !sanitizeCommandFields(diagnostic)) return response({ error: 'invalid_rejection' }, 400);
-          // Only an unclaimed offer proves that no start was authorized. The
-          // transaction fences a racing claim; never reject possibly-live work.
-          if (row.state !== 'offered' || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);
+          // The owning host may abandon its exact effect-free pending claim.
+          // It fences native start in its journal before invoking an engine;
+          // uncertain/native-start records must never use this protocol.
+          const ownedPending = claimRefusal && row.state === 'starting' && row.claim_key === data.claim_key;
+          if (claimRefusal && !ownedPending) return response({ error: 'claim_key_mismatch' }, 409);
+          if ((!claimRefusal && row.state !== 'offered') || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);
           if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
           this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), row.id);
           const at = new Date(this.now()).toISOString();
@@ -1913,19 +2451,27 @@ export class FleetService {
             // Retain the same intent; next offer repeats every admission/authority gate.
             return response({ id: row.id, state: 'held', reason: data.reason, diagnostic, retryable: true });
           }
-          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
+          if (claimRefusal || data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected' || data.reason === 'not_logged_in' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking','host_load_high'].includes(data.reason)) {
+            if (data.reason === 'not_logged_in') {
+              this.sql.exec('INSERT OR REPLACE INTO fleet_login_holds (machine_id, engine, account, profile, held_at_ms) VALUES (?, ?, ?, ?, ?)', row.machine_id, row.engine, row.account, row.profile ?? '', this.now());
+            }
             if (data.reason === 'engine_auth_expired') {
               this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
             }
             // The fenced pre-claim refusal proves no native start. Retain the
             // failed attempt as route evidence and use a new launcher identity.
             const id = crypto.randomUUID();
-            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason, ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason) ? {cpu:this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id)} : {}) }];
+            const loadMachine: any = data.reason === 'host_load_high' ? this.sql.exec('SELECT last_heartbeat, capabilities FROM machines WHERE id = ?', row.machine_id).toArray()[0] : null;
+            const loadHeartbeat = parsed(loadMachine?.last_heartbeat) || {};
+            const loadCores = parsed(loadMachine?.capabilities)?.cpu_count;
+            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason,
+              ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason) ? {cpu:this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id)} : {}),
+              ...(data.reason === 'host_load_high' ? { load1: loadHeartbeat.load?.[0] ?? null, cpu_count: loadCores ?? null, load_limit: Number.isFinite(loadCores) ? Math.max(loadFactor, HOST_LOAD_FACTOR) * loadCores : null } : {}) }];
             this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ?", 'model-retry-' + row.id, data.reason, at, at, row.id);
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
-            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json) VALUES (?, ?, ?)', id, at, JSON.stringify(rejected));
+            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, host_load_machine, host_load_factor) VALUES (?, ?, ?, ?, ?)', id, at, JSON.stringify(rejected), data.reason === 'host_load_high' ? row.machine_id : null, data.reason === 'host_load_high' ? loadFactor : null);
             if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
-              this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, state = 'queued', updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held')", id, at, row.id);
+              this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, state = 'queued', updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held','starting')", id, at, row.id);
             }
             this.drainCapacityQueue();
             const next: any = this.sql.exec('SELECT state FROM fleet_launches WHERE id = ?', id).one();
@@ -2098,7 +2644,17 @@ export class FleetService {
           }
         }
         if (noStart && row.state === 'failed' && row.exit_reason === data.reason && row.launcher_task_id === data.launcher_task_id) return response({ id: row.id, state: row.state, replay: true });
-        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts', 'runtime'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
+        // Intake 0b87eb29: Hub abandoned this claim on the silent-start bound
+        // without any exit proof. The owning host's later exact receipt (a
+        // fenced no-start, a recovered completion with its hub-results report,
+        // or a late native start) supersedes the abandonment, so a real
+        // winning start is tracked again and a real finish is recorded.
+        const abandoned = abandonedLaunch(row) &&
+          ['running', 'failed', 'exited'].includes(data.state) &&
+          (!row.native_id || data.native_id === undefined || data.native_id === row.native_id) &&
+          (!row.launcher_task_id || data.launcher_task_id === undefined || data.launcher_task_id === row.launcher_task_id) &&
+          !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length;
+        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts', 'runtime'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || (!['starting', 'running', 'uncertain'].includes(row.state) && !abandoned)) return response({ error: 'invalid_transition' }, 409);
         if (['exited', 'failed'].includes(data.state) && this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
         if (['exited', 'failed'].includes(data.state) && data.confirmed_exit !== true) return response({ error: 'confirmed_exit_required' }, 409);
         if (data.state === 'running' && (typeof data.native_id !== 'string' || data.native_id.length < 1 || data.native_id.length > 160 || (row.mode === 'headless' && !label(data.launcher_task_id)))) return response({ error: 'native_receipt_required' }, 409);
@@ -2113,8 +2669,30 @@ export class FleetService {
           typeof (a as any).text !== 'string' || (a as any).text.length > 1024))) return response({ error: 'invalid_finish_report' }, 400);
         if (!['failed', 'exited'].includes(data.state) && (data.report_status !== undefined || data.report !== undefined || data.artifacts !== undefined)) return response({ error: 'invalid_finish_report' }, 400);
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
+        if (abandoned) {
+          // Drop the abandonment's synthetic verdict; the host receipt below
+          // (diagnostic, no-start proof, finish report) now owns the outcome.
+          this.sql.exec("UPDATE fleet_launches SET verification_status = NULL, exit_reason = NULL, launch_error_json = NULL, finished_at = NULL WHERE id = ?", row.id);
+          if (data.state !== 'failed') {
+            // The runtime was not silent after all: lift only its own hold.
+            this.sql.exec("DELETE FROM fleet_engine_health WHERE engine = ? AND machine_id = ? AND reason = ?", row.engine, row.machine_id, SILENT_START_REASON);
+          }
+          if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+            const at = new Date(this.now()).toISOString();
+            // Only the abandonment's own unbound terminal verdict is revised.
+            // An operator cancellation stays a cancellation; a late native
+            // start behind it is surfaced instead of silently stranded.
+            const next = data.state === 'running' ? 'starting' : data.state === 'exited' ? 'stopped' : 'failed';
+            this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state = 'failed'", next, at, row.id);
+            if (data.state === 'running' && this.sql.exec("SELECT id FROM session_control_sessions WHERE fleet_launch_id = ? AND state = 'cancelled'", row.id).toArray().length) {
+              const alerts = new LivenessService(this.sql); alerts.init();
+              alerts.setAlert('launch', row.id, { state: 'late_native_start', detail: JSON.stringify({ machine: row.machine_id, native_id: data.native_id ?? null, message: 'A native session started after its abandoned launch was cancelled; it is tracked as running until the host reports exit.' }) });
+            }
+          }
+        }
         if (runtime) this.sql.exec('UPDATE fleet_launches SET runtime_json = ? WHERE id = ?', JSON.stringify(runtime), row.id);
         if (diagnostic) this.sql.exec("UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?", JSON.stringify(diagnostic), diagnostic.reason, row.id);
+        if (data.state === 'running') promoteStartedOffers(this.sql, this.now(), { launchId: row.id });
         if (noStart) this.sql.exec("UPDATE fleet_launches SET exit_reason = ?, verification_status = 'not_started', finished_at = ? WHERE id = ?", data.reason, new Date(this.now()).toISOString(), row.id);
         if (diagnostic?.reason === 'engine_tool_permission_refused' && row.mode === 'headless') {
           this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at, diagnostics_json) VALUES (?, ?, 'unavailable', ?, ?, ?)", row.engine, row.machine_id, diagnostic.reason, new Date(this.now()).toISOString(), JSON.stringify(diagnostic));
@@ -2318,6 +2896,16 @@ export class FleetService {
         a === null || typeof a !== 'object' || Array.isArray(a) ||
         typeof (a as any).label !== 'string' || (a as any).label.length > 120 ||
         typeof (a as any).text !== 'string' || (a as any).text.length > 1024))) return;
+      // Intake 17e774f8: keep the worker's own outcome on the launch so the
+      // session view can tell a reported completion from a bare stop. Only an
+      // accepted exit whose runtime proves a clean completion, with a
+      // non-empty worker report, counts; the first value is immutable and the
+      // view re-checks the current runtime (src/worker-outcome.ts).
+      if (data.state === 'exited' && data.confirmed_exit === true && WORKER_STATUSES.includes(data.report_status) &&
+          typeof data.report === 'string' && data.report.trim() && cleanReportedExit(data.runtime)) {
+        this.sql.exec("UPDATE fleet_launches SET worker_status = ? WHERE id = ? AND state = 'exited' AND worker_status IS NULL",
+          data.report_status, launchId);
+      }
       if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length === 0) return;
       if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'intake_tasks'").toArray().length === 0) return;
       const session: any = this.sql.exec('SELECT id, request_json FROM session_control_sessions WHERE fleet_launch_id = ?', launchId).toArray()[0];

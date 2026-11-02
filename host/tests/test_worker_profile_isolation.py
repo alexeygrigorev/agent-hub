@@ -119,6 +119,11 @@ def test_suite_rejects_profile_write_outside_its_temp_tree(tmp_path):
         '    private_fs.atomic_write(Path(' + repr(str(profile)) + "), b'{}', 32768)\n")
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('APLEXER_', 'HUB_', 'AGENT_HUB_'))}
+    # The heavy-test slot marker is not a profile selector. Keep it only when
+    # this run really holds a slot, or the child pytest would request the
+    # shared cap again (nested) and time out.
+    if os.environ.get('AGENT_HUB_HEAVY_TEST_HELD') == '1':
+        env['AGENT_HUB_HEAVY_TEST_HELD'] = '1'
     env.update(TMPDIR=str(allowed), HOME=str(allowed),
                APLEXER_TAG='hub-' + OFFER, APLEXER_WORKSPACE=str(tmp_path / 'simulated-live'),
                APLEXER_FUTURE_SELECTOR='synthetic-test-only', HUB_WORKER_CONFIG_FILE=str(profile),

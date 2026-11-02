@@ -27,6 +27,17 @@ only the current run's new temporary directory on normal exit, failure, INT or
 TERM. Other runs and pre-existing scratch remain untouched. SIGKILL or host
 failure can leave temporary files; inspect those separately before cleanup.
 
+The heavy-test admission wrapper bounds an ordinary holder to 30 minutes and a
+`--priority final` holder to two hours. Final full-gate runs can therefore
+progress through the documented 75–90 minute suite without losing their slot;
+both holder kinds remain bounded, and `--run-timeout` or
+`AGENT_HUB_HEAVY_TEST_RUN_TIMEOUT_S` can set an explicit 1–86400 second limit.
+On wrapper SIGINT/SIGTERM or timeout, the wrapper signals only the dedicated
+child process group and keeps the group leader unreaped until escalation is
+complete, preventing a reused process-group ID from being signalled. The slot
+remains locked by the wrapper or inherited child descriptors until that group
+has exited.
+
 The uv cache uses the original HOME/XDG cache location, or explicit
 `UV_CACHE_DIR`, even while tests use a disposable HOME. This avoids downloading
 a new cache into each disposable home. Vitest uses `npx --no-install` so a
@@ -63,6 +74,14 @@ small CPU quota and increase wall-clock tails. Explicit caller pool settings
 are preserved; other Node options are kept. These defaults apply only to the
 Vitest command. Console timing reports remain visible for passing tests too.
 No file is excluded, no sample is retried and the 100 ms threshold is unchanged.
+
+When `scripts/test-affected-local.sh` prints a capacity HOLD, retry its
+self-admitting lane directly with
+`scripts/capped-test-retry.sh -- scripts/test-affected-local.sh`. This uses one
+slot per attempt and inherits `AGENT_HUB_HEAVY_TEST_PRIORITY` when set. Never
+nest the affected runner in `capped-test-run.sh` or `heavy-test-admission.py`,
+and never clear `AGENT_HUB_HEAVY_TEST_HELD` in a child shell to bypass its
+nested-admission guard.
 
 For bounded verification on a shared Linux host:
 

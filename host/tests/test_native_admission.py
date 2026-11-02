@@ -55,6 +55,24 @@ class NativeAdmissionTest(unittest.TestCase):
                 self.assertEqual(result['model'], model['model'])
                 self.assertEqual(configured_selection(model, engine, service), model)
 
+    def test_native_zcodex_policy_entry_admits_shared_zai_8d006dc3(self):
+        # Hub offers the native ZCode route with the engine=zcodex policy entry;
+        # it was unmatchable, the probe swallowed model_unsupported and dispatch
+        # failed before native bind as admission_refused (ZCode probe 4bce1985).
+        native = next(m for m in policy_models() if m['provider'] == 'zai' and m['engine'] == 'zcodex')
+        self.assertEqual(configured_selection(native, 'zcodex', 'zai'), native)
+        payload = dict(account='shared-zai', engine='zcodex', profile=None, mode='headless', selection=native)
+        result = admission.probe(payload, 'zai', 'shared-zai', 'zcodex', hub(ALLOW))
+        self.assertTrue(result['launch_allowed'])
+        self.assertTrue(result['model_supported'])
+        self.assertEqual((result['model'], result['effort']), (native['model'], native['effort']))
+        # The widening is zai-only: a zcodex entry never satisfies a codex engine route,
+        # and a tampered selection (wrong effort) is still refused.
+        with self.assertRaises(ValueError):
+            configured_selection(native, 'codex', 'codex')
+        with self.assertRaises(ValueError):
+            configured_selection(dict(native, effort='max'), 'zcodex', 'zai')
+
     def test_grok_model_family_denied_across_providers_and_modes(self):
         for value in ('grok', 'grok-4-7', 'opencode-go/grok-4.7', 'xai/GROK', 'muse/gRoK'):
             for provider, engine in (('grok', 'grok'), ('go', 'opencode'), ('zai', 'zcodex')):

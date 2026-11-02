@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -303,6 +305,24 @@ def _bound_native_response(proc, args):
     return proc
 
 
+def ensure_runtime_bin_on_path() -> None:
+    """Windows venv layout: <root>/venv/Scripts/python.exe, <root>/bin/aplexer.exe.
+
+    The scheduled task / aplexer shell may not carry the installer's PATH, so
+    the native CLI would be found nowhere. Prepend the sibling bin directory.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        candidate = Path(sys.executable).resolve().parent.parent.parent / "bin"
+    except OSError:
+        return
+    if (candidate / "aplexer.exe").is_file():
+        parts = os.environ.get("PATH", "").split(os.pathsep)
+        if str(candidate) not in parts:
+            os.environ["PATH"] = os.pathsep.join([str(candidate), *parts])
+
+
 def run_native(
     executable: str,
     args: list[str],
@@ -320,6 +340,7 @@ def run_native(
     if "--pane" in args or "--no-ack" in args or "--enter" in args:
         raise SessionControlError("--pane/--no-ack/--enter transports are forbidden")
     from .aplexer_client import client_call
+    ensure_runtime_bin_on_path()
     native = client_call(executable, args, env=env)
     if native is not None:
         return _bound_native_response(native, args)
@@ -341,7 +362,9 @@ def run_native(
             # evidence intentionally minimal: no stdout/stderr exfiltration
         ) from exc
     except OSError as exc:
-        raise SessionControlError(f"Native executable failed: {type(exc).__name__}") from exc
+        raise SessionControlError(
+            f"Native executable failed: {type(exc).__name__}"
+            f" (resolved={'yes' if shutil.which(executable) else 'no'})") from exc
     return _bound_native_response(proc, args)
 
 
@@ -664,7 +687,8 @@ def deliver_recorded(
                     state="transported",
                     native_id=envelope_id,
                     reason=detail or f"native deliver guard reports {status_lower}; processing NOT proven",
-                    evidence={"status": status_lower, "detail": detail},
+                    evidence={"status": status_lower, "detail": detail,
+                              "recipient_created_at_ms": observed.created_at_ms},
                 )
             if status_lower in ("not-ready", "busy", "draft", "menu", "unknown"):
                 # rc0 not-ready is not transported: readiness gate refused.
@@ -754,6 +778,29 @@ def reconcile_delivery_from_log(
                 return "recorded"
     except (SessionControlError, SessionUncertain):
         return None
+    return None
+
+
+def verify_delivery_from_log(executable, target, envelope_id, command_id, digest):
+    """Read-only recovery of a pane-submitted original envelope; inbox alone is not proof."""
+    try:
+        observed = qualify_target(executable, target, live_only=False)
+        if type(observed.created_at_ms) is not int or observed.created_at_ms <= 0:
+            return None
+        for env in fetch_message_log(executable, target.workspace):
+            if env.get("id") != envelope_id or env.get("delivery") != "pane":
+                continue
+            recipient = env.get("to") or {}
+            correlation = (env.get("data") or {}).get("hub_session_control") or {}
+            if (env.get("workspace") == target.workspace
+                    and recipient.get("session_id") == target.session_id
+                    and recipient.get("tag") == target.tag
+                    and correlation.get("correlation_id") == command_id
+                    and correlation.get("body_digest") == digest
+                    and body_digest(str(env.get("body", ""))) == digest):
+                return {"status": "already-submitted", "recipient_created_at_ms": observed.created_at_ms}
+    except (SessionControlError, SessionUncertain, TypeError, AttributeError):
+        pass
     return None
 
 
@@ -1247,7 +1294,8 @@ def stop_session(
               and _stop_workspace_matches(s.workspace, target.workspace)]
     if not before:
         from .retired_native import verify_native_retirement
-        is_retired, tombstone, reason = verify_native_retirement(executable, target)
+        is_retired, tombstone, reason = verify_native_retirement(
+            executable, target, allow_nested_workspace=True)
         if is_retired and isinstance(tombstone, dict):
             return StopResult(
                 state="stopped",

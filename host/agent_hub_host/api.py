@@ -20,7 +20,10 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 USER_AGENT = "agent-hub-host/1"
 
 def _get_opener():
-    opener = urllib.request.build_opener(NoRedirectHandler())
+    # Never route Hub traffic through HTTP(S)_PROXY from the user environment: a
+    # dead engine proxy (codex-vpn on 127.0.0.1:8899) made every check-in fail with
+    # WinError 10061 and Hub showed the host offline for 70+ minutes (2026-11-02).
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirectHandler())
     opener.addheaders = [("User-Agent", USER_AGENT)]
     return opener
 
@@ -84,6 +87,50 @@ def replay_keyed(call, transient, *, delays=None, sleep=None, notify=None):
             (sleep or time.sleep)(delay)
 
 
+# Connectivity guard: when every Hub call fails at the transport level for this
+# long, say once which local setting is the likely suspect. A dead engine proxy
+# (2026-11-02 desktop) otherwise looks exactly like an offline machine.
+HUB_UNREACHABLE_LOG_AFTER_S = 120.0
+HUB_UNREACHABLE_RELOG_S = 600.0
+_hub_outage = {'since': None, 'logged_at': None, 'failures': 0}
+
+
+def hub_unreachable_suspect(error) -> str:
+    reason = getattr(error, 'reason', error)
+    if isinstance(reason, socket.gaierror):
+        return 'DNS resolution failed: check the host DNS/network'
+    proxies = [n for n in ('HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy') if os.environ.get(n)]
+    if getattr(reason, 'errno', None) in (10061, 111) or isinstance(reason, ConnectionRefusedError):
+        hint = 'connection refused'
+        if proxies:
+            hint += '; env proxy set (%s) but Hub calls bypass it, check a local proxy/VPN or firewall' % ','.join(proxies)
+        return hint + ': check a local firewall or an intercepting proxy/VPN'
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return 'timeouts: check the network path, VPN or clock'
+    return 'transport error %s' % type(reason).__name__
+
+
+def _note_hub_success():
+    _hub_outage.update(since=None, logged_at=None, failures=0)
+
+
+def _note_hub_failure(error, *, now=None, emit=None):
+    now = time.monotonic() if now is None else now
+    out = _hub_outage
+    out['failures'] += 1
+    if out['since'] is None:
+        out['since'] = now
+    if now - out['since'] < HUB_UNREACHABLE_LOG_AFTER_S:
+        return False
+    if out['logged_at'] is not None and now - out['logged_at'] < HUB_UNREACHABLE_RELOG_S:
+        return False
+    out['logged_at'] = now
+    line = json.dumps({'event': 'hub_unreachable', 'for_s': int(now - out['since']), 'failures': out['failures'],
+                       'suspect': hub_unreachable_suspect(error)})
+    (emit or (lambda l: print(l, flush=True)))(line)
+    return True
+
+
 def safe_http_json(req: urllib.request.Request, timeout: float = 10.0, *, _token_exchange=None):
     if _token_exchange is not None:
         _token_exchange.begin(req)
@@ -102,8 +149,13 @@ def safe_http_json(req: urllib.request.Request, timeout: float = 10.0, *, _token
             data = json.loads(body.decode("utf-8"))
             if _token_exchange is not None:
                 _token_exchange.record(data)
+            _note_hub_success()
             return data
     except urllib.error.HTTPError as e:
+        _note_hub_success()  # the Hub answered
+        raise
+    except (urllib.error.URLError, OSError) as e:
+        _note_hub_failure(e)
         raise
 
 from . import auth, system, config, gate
@@ -277,35 +329,12 @@ def get_heartbeat_payload(clock=None, running_jobs=None) -> dict:
     else:
         jobs_list = []
 
-    mem_avail_mb = 0
-    mem_total_mb = None
-    if platform.system() == "Windows":
-        import ctypes
-        class MEMORYSTATUSEX(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        stat = MEMORYSTATUSEX()
-        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-            mem_avail_mb = stat.ullAvailPhys // (1024 * 1024)
-            try:
-                mem_total_mb = stat.ullTotalPhys // (1024 * 1024)
-            except Exception:
-                mem_total_mb = None
-    else:
-        try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        mem_avail_mb = int(line.split()[1]) // 1024
-                    elif line.startswith("MemTotal:"):
-                        try:
-                            mem_total_mb = int(line.split()[1]) // 1024
-                        except (ValueError, IndexError):
-                            pass
-        except Exception:
-            pass
-        if not isinstance(mem_total_mb, int) or mem_total_mb <= 0:
-            mem_total_mb = None
+    # Intake 63a9ee3a: an unreadable host reports null, never 0 — Hub reads
+    # a finite 0 as a real empty host and refuses with launcher_memory_reserve.
+    from .host_memory import read_host_memory
+    reading = read_host_memory()
+    mem_avail_mb = reading["available_bytes"] // (1024 * 1024) if reading else None
+    mem_total_mb = reading["total_bytes"] // (1024 * 1024) if reading else None
     from .cpu_resources import sample_cpu_usage
     cpu_usage = sample_cpu_usage()
     payload: dict = {

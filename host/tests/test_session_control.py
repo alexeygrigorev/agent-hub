@@ -270,7 +270,7 @@ class TestSessionControlCli(unittest.TestCase):
         args = self.parse('stop', 's1', '--key', 'k3', '--timeout', '2')
         with patch.object(session_control, 'request', return_value={'command_id':'c9','state':'recorded'}), \
                 patch.object(session_control, 'wait_for_command', side_effect=ValueError('Command wait timed out')):
-            with self.assertRaisesRegex(ValueError, 'stop_host_unreachable; command c9'):
+            with self.assertRaisesRegex(ValueError, 'stop_pending; command c9'):
                 session_control.execute(args)
 
     def test_lost_response_keeps_key_for_safe_retry(self):
@@ -614,6 +614,25 @@ class TestSessionControlCli(unittest.TestCase):
             session_control.execute(args)
         payload = transport.call_args.args[2]
         self.assertEqual(payload['intake_task_id'], 'task-url-1234')
+
+    def test_start_intake_worktree_flags(self):
+        # afab8367: a successor start replaces a live predecessor; Hub plans the
+        # fresh sibling worktree, so a named cwd is refused client-side.
+        args = self.parse('start', '--workspace', 'demo', '--intake-task-id', 'task-1',
+                          '--intake-worktree', 'successor', '--key', 'k-succ')
+        with patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(args)
+        self.assertEqual(transport.call_args.args[2]['intake_worktree'], 'successor')
+        self.assertNotIn('cwd', transport.call_args.args[2])
+        args = self.parse('start', '--workspace', 'demo', '--intake-task-id', 'task-1',
+                          '--intake-worktree', 'detached', '--key', 'k-det')
+        with patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(args)
+        self.assertEqual(transport.call_args.args[2]['intake_worktree'], 'detached')
+        args = self.parse('start', '--workspace', 'demo', '--intake-task-id', 'task-1',
+                          '--intake-worktree', 'successor', '--cwd', 'sub/dir', '--key', 'k-bad')
+        with self.assertRaisesRegex(ValueError, 'drop --cwd'):
+            session_control.execute(args)
 
     def test_commands_rendering_shows_waiting_in_inbox_and_reason(self):
         raw = {

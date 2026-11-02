@@ -41,7 +41,7 @@ const testConfig = JSON.parse(await readFile(resolve(root, 'test/wrangler.conver
 assert.equal(testConfig.durable_objects.bindings.length, 1);
 assert.equal(testConfig.durable_objects.bindings[0].name, 'HUB');
 assert.equal(testConfig.durable_objects.bindings[0].class_name, 'Hub');
-const bundled = await build({ entryPoints: [resolve(root, 'test', testConfig.main)], bundle: true, write: false, format: 'esm', platform: 'browser', external: ['cloudflare:workers'] });
+const bundled = await build({ entryPoints: [resolve(root, 'test', testConfig.main)], bundle: true, write: false, format: 'esm', platform: 'browser', external:['cloudflare:workers','node:async_hooks'] });
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2' };
 const mf = new Miniflare(convertV4MiniflareOptions({
   host: '127.0.0.1', port: 0,

@@ -9,6 +9,7 @@ from . import intake
 
 BASE = '/api/repos'
 HUMAN = ('label', 'purpose', 'stack', 'key_folders', 'urls', 'aliases')
+EDITABLE = HUMAN + ('status', 'canonical')
 SCAN = ('dir', 'origin', 'org', 'default_branch', 'status', 'canonical', 'last_commit', 'workflows', 'github_url', 'flags')
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
 
@@ -192,7 +193,7 @@ def add_commands(sub):
     listing.add_argument('--flagged', action='store_true')
     show = commands.add_parser('show')
     show.add_argument('name')
-    edit = commands.add_parser('edit', help='Operator-only human fields; JSON object file')
+    edit = commands.add_parser('edit', help='Operator-only repository metadata; JSON object file')
     edit.add_argument('name')
     edit.add_argument('--file', required=True)
     for action in ('seed', 'refresh'):
@@ -210,7 +211,7 @@ def execute(args):
     if args.repos_cmd == 'show': return intake.request('GET', BASE + '/' + quote(args.name, safe=''))
     if args.repos_cmd == 'edit':
         payload = json.loads(intake.read_file(args.file))
-        if not isinstance(payload, dict) or set(payload) - set(HUMAN): raise ValueError('invalid_human_fields')
+        if not isinstance(payload, dict) or set(payload) - set(EDITABLE): raise ValueError('invalid_repo_fields')
         return intake.request('PATCH', BASE + '/' + quote(args.name, safe=''), payload)
     if args.repos_cmd == 'seed':
         repos = seed_map(intake.read_file(args.file, limit=131072), args.root, args.machine)

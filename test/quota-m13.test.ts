@@ -490,7 +490,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(planned.selected).toBeFalsy();
     const claimRes = await doFetch(new Request(`http://example.com/api/fleet/launches/${launch.id}/claim`, {
       method: 'POST', headers: authSub,
-      body: JSON.stringify({ gate_allowed: true, model: 'gpt-6.1-sol', observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
+      body: JSON.stringify({ gate_allowed: true, model: 'gpt-6-luna', observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
     }));
     expect(claimRes.status).toBe(409);
 
@@ -500,7 +500,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(planned2.selected).toBeTruthy();
     const claimRes2 = await doFetch(new Request(`http://example.com/api/fleet/launches/${launch.id}/claim`, {
       method: 'POST', headers: authSub,
-      body: JSON.stringify({ gate_allowed: true, model: 'gpt-6.1-sol', observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
+      body: JSON.stringify({ gate_allowed: true, model: 'gpt-6-luna', observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
     }));
     expect(claimRes2.status).toBe(200);
     // Finish the launch so later registry writes are not held by an active launch.
@@ -589,7 +589,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(modelCandidates({ tier: 'daily' }, goRoute, goAd, quotaFor(80), t).length).toBeGreaterThan(0);
     // Codex has no reserve (intake 4f6cf562): 10% is offered, depletion and
     // unavailable sibling windows warn while known depletion offers no model.
-    const codexAd = [{ engine: 'codex', profile: null, model: 'gpt-6.1-sol', effort: 'high', account: 'm13-c' }];
+    const codexAd = [{ engine: 'codex', profile: null, model: 'gpt-6.1-sol', effort: 'medium', account: 'm13-c' }];
     const codexRoute = { provider: 'codex', engine: 'codex', profile: null, account: 'm13-c' };
     const codexInput = { tier: 'daily', preferred_runner: 'codex' };
     expect(modelCandidates(codexInput, codexRoute, codexAd, quotaFor(10), t).length).toBeGreaterThan(0);
@@ -678,7 +678,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(seededCheck).toMatchObject({ actor: 'human:admin-quota-m13', request_key: 'm13-grok-pre', state: 'offered' });
     const claimRes = await doFetch(new Request(`http://example.com/api/fleet/launches/${offerId}/claim`, {
       method: 'POST', headers: authSub,
-      body: JSON.stringify({ gate_allowed: true, model: 'gpt-6.1-sol', observed_at: isoNow(), account: 'm13-grok-main', profile_supported: true }),
+      body: JSON.stringify({ gate_allowed: true, model: 'gpt-6-luna', observed_at: isoNow(), account: 'm13-grok-main', profile_supported: true }),
     }));
     expect(claimRes.status).toBe(409);
     expect(((await claimRes.json()) as any).error).toBe('model_disabled_by_policy');

@@ -137,6 +137,27 @@ describe('scheduled reset alerts and operator fallback', () => {
       expect(h.sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='banked_reset_expiry' AND resolved_at IS NULL").toArray()).toHaveLength(0);
     });
   });
+  it('keeps known deadlines when an ok-status probe reports an empty list with a reset-credits error', async () => {
+    // Intake 7bf6f6ee AC2/AC3: ok + [] + banked_resets_error is explicit
+    // unknown (sub-probe failure), never a redeemed grant. The grant stays
+    // active and no false "consumed" wipe happens.
+    await inDO(stub(), async (h: any) => {
+      setup(h);
+      let now = NOW;
+      const service = () => new BankedResets(h.sql, h.livenessService, () => now);
+      const save = (q: any) => h.sql.exec('INSERT OR REPLACE INTO server_quota_snapshots VALUES (?,?,?,?)', 'shared-codex','codex',new Date(now).toISOString(),JSON.stringify(q));
+      save(quota([grant()]));
+      expect(service().run().filter(a => a.subject_kind === 'banked_reset_expiry')).toHaveLength(1);
+      now += HOUR;
+      save({ status: 'ok', details: { banked_resets: [], banked_resets_error: 'quota_unreachable' } });
+      service().run();
+      expect(h.sql.exec('SELECT id FROM banked_reset_grants WHERE active=1').toArray()).toHaveLength(1);
+      now += HOUR;
+      save(quota([]));
+      service().run();
+      expect(h.sql.exec('SELECT id FROM banked_reset_grants WHERE active=1').toArray()).toHaveLength(0);
+    });
+  });
   it('uses account-specific subscription probes for alternate Codex homes', async () => {
     await inDO(stub(), async (h: any) => {
       setup(h);

@@ -27,7 +27,9 @@ class WorktreeSuccessorTests(unittest.TestCase):
 
     def transfer(self, fact=None, intake='intake-test'):
         def request(method, path):
-            self.assertEqual((method, path), ('GET', '/api/sessions/worktree-guards'))
+            self.assertEqual(method, 'GET')
+            self.assertEqual(path.split('?')[0], '/api/sessions/worktree-guards')
+            self.assertIn('session_id=', path)  # bounded lookup, never the whole ledger
             return {'sessions': [self.fact if fact is None else fact]}
         return guard.protect_successor_worktree(request, 'git', self.tree, self.new, intake)
 
@@ -46,7 +48,9 @@ class WorktreeSuccessorTests(unittest.TestCase):
         self.assertEqual(entry['reason'], guard.lock_reason(self.new, 'intake-test'))
         self.assertNotEqual(_run(['git', 'worktree', 'remove', self.tree], self.repo).returncode, 0)
         self.assertFalse(guard.release_session_lock('git', self.tree, self.old, terminal=True, intake_state='done'))
-        self.assertFalse(guard.release_session_lock('git', self.tree, self.new, terminal=True, intake_state='open'))
+        self.assertTrue(guard.release_session_lock('git', self.tree, self.new, terminal=True, intake_state='open'))
+        self.assertFalse(guard.is_locked('git', self.tree))
+        self.assertTrue(guard.ensure_locked('git', self.tree, self.new, 'intake-test'))
         self.assertTrue(guard.release_session_lock('git', self.tree, self.new, terminal=True, intake_state='done'))
 
     def test_live_unknown_foreign_or_unlinked_owner_remains_locked(self):
@@ -107,7 +111,7 @@ class WorktreeSuccessorTests(unittest.TestCase):
         self.assertTrue(dispatcher._lock_session_worktree(offer, self.tree))
         # Two fresh guards lookups per attempt: the canonical stopped-lock
         # reuse check first, then the same-intake successor transfer.
-        self.assertEqual([r for r in requests if r[1] == '/api/sessions/worktree-guards'],
+        self.assertEqual([(r[0], r[1].split('?')[0]) for r in requests if r[1].startswith('/api/sessions/worktree-guards')],
                          [('GET', '/api/sessions/worktree-guards')] * 4)
         entry = guard.find_entry(guard.list_entries('git', self.tree), self.tree)
         self.assertEqual(entry['reason'], guard.lock_reason(self.new, 'intake-test'))

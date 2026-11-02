@@ -32,6 +32,21 @@ class StopReceiptTests(unittest.TestCase):
                 wait_command=Mock(return_value={'state':'failed','ack':{'reason':'stop_host_unreachable'}}),request=request)
         request.assert_not_called()
 
+    def test_wait_timeout_is_pending_not_host_unreachable(self):
+        # Intake 1c8d915e: a short CLI wait must not claim the host is unreachable.
+        from agent_hub_host.session_stop import wait_for_confirmed_stop
+        from agent_hub_host.session_control import SessionHTTPError, SessionTransportError
+        from unittest.mock import Mock
+        cases = [(ValueError('Command wait timed out'), 'stop_pending'),
+                 (SessionTransportError('connection reset'), 'stop_hub_unreachable'),
+                 (SessionHTTPError(404, code='not_found'), 'not_found')]
+        for error, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(ValueError, '^' + reason + '; command stop-1; stop not yet confirmed') as raised:
+                    wait_for_confirmed_stop('short-id', 'stop-1', 10, 1,
+                        wait_command=Mock(side_effect=error), request=Mock())
+                self.assertNotIn('stop_host_unreachable', str(raised.exception))
+
     def test_exact_stop_receipt_and_terminal_state_are_both_required(self):
         from agent_hub_host.session_stop import wait_for_confirmed_stop
         from unittest.mock import Mock

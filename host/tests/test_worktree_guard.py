@@ -63,9 +63,9 @@ class TestLockReason(unittest.TestCase):
 class TestGates(unittest.TestCase):
     def test_can_unlock_matrix(self):
         self.assertTrue(guard.can_unlock(True, "none"))
+        self.assertTrue(guard.can_unlock(True, "open"))
         self.assertTrue(guard.can_unlock(True, "done"))
         self.assertTrue(guard.can_unlock(True, "archived"))
-        self.assertFalse(guard.can_unlock(True, "open"))
         self.assertFalse(guard.can_unlock(True, "bogus"))
         self.assertFalse(guard.can_unlock(True, None))
         self.assertFalse(guard.can_unlock(False, "done"))
@@ -112,7 +112,7 @@ class TestGitLock(unittest.TestCase):
             self.assertTrue(guard.release_session_lock("git", path, "b" * 32,
                                                       terminal=True, intake_state="done"))
 
-    def test_release_preserves_manual_other_session_and_open_intake_locks(self):
+    def test_release_preserves_manual_other_session_but_releases_terminal_open_intake_lock(self):
         with tempfile.TemporaryDirectory() as tmp:
             origin = _make_repo(tmp)
             path = _add_worktree(origin, tmp)
@@ -123,7 +123,13 @@ class TestGitLock(unittest.TestCase):
                 self.assertTrue(guard.is_locked("git", path))
                 self.assertTrue(guard.unlock_worktree("git", path))
             self.assertTrue(guard.ensure_locked("git", path, sid, "intake-9"))
-            self.assertFalse(guard.release_session_lock("git", path, sid, terminal=True, intake_state="open"))
+            self.assertFalse(guard.release_session_lock("git", path, sid, terminal=True,
+                                                        intake_state="open", intake_id=None))
+            self.assertTrue(guard.is_locked("git", path))
+            self.assertTrue(guard.release_session_lock("git", path, sid, terminal=True,
+                                                        intake_state="open", intake_id="intake-9"))
+            self.assertFalse(guard.is_locked("git", path))
+            self.assertTrue(guard.ensure_locked("git", path, sid, "intake-9"))
             self.assertFalse(guard.release_session_lock("git", path, sid, terminal=False, intake_state="done"))
             self.assertTrue(guard.release_session_lock("git", path, sid, terminal=True, intake_state="done"))
             self.assertFalse(guard.is_locked("git", path))
@@ -147,8 +153,12 @@ class TestGitLock(unittest.TestCase):
             self.assertTrue(guard.protect_bound_worktree("git", sub, sid, "intake-1"))
             self.assertFalse(guard.protect_bound_worktree("git", sub, "f" * 32, None))
             self.assertTrue(guard.is_locked("git", path))
-            self.assertFalse(guard.release_session_lock("git", sub, sid, terminal=True, intake_state="open"))
-            self.assertTrue(guard.release_session_lock("git", sub, sid, terminal=True, intake_state="done"))
+            self.assertTrue(guard.release_session_lock("git", sub, sid, terminal=True,
+                                                       intake_state="open", intake_id="intake-1"))
+            self.assertFalse(guard.is_locked("git", path))
+            self.assertTrue(guard.protect_bound_worktree("git", sub, sid, "intake-1"))
+            self.assertTrue(guard.release_session_lock("git", sub, sid, terminal=True,
+                                                       intake_state="done", intake_id="intake-1"))
             self.assertFalse(guard.is_locked("git", path))
 
     def test_unregistered_path_unknown(self):
@@ -473,16 +483,51 @@ class LifecycleReconciliationTests(unittest.TestCase):
         expected = dict(workspace='/tree', repository={'common_dir': '/repo/.git'})
         with patch.object(guard, 'expected_repository', return_value=expected), \
              patch.object(guard, 'repository_identity', return_value=expected['repository']), \
-             patch.object(guard, 'release_session_lock', side_effect=[False, True]) as release:
+             patch.object(guard, 'release_session_lock', side_effect=[False, True, False]) as release:
             request = lambda *args: {'sessions': [fact]}
             self.assertEqual(guard.reconcile_terminal_locks(request), 0)
-            release.assert_not_called()
+            release.assert_called_once()
             fact['linked_intake_open'] = False
-            self.assertEqual(guard.reconcile_terminal_locks(request), 0)
             self.assertEqual(guard.reconcile_terminal_locks(request), 1)
+            self.assertEqual(guard.reconcile_terminal_locks(request), 0)
             fact['protected'] = True
             self.assertEqual(guard.reconcile_terminal_locks(request), 0)
-            self.assertEqual(release.call_count, 2)
+            self.assertEqual(release.call_count, 3)
+
+    def test_bounded_worker_pages_terminal_sessions_with_a_cursor(self):
+        guard._reconcile_cursor = None
+        fact = dict(session_id='11111111', terminal=True, native_terminal=True, linked_intake_open=False,
+                    protected=False, tag='hub-22222222')
+        expected = dict(workspace='/tree', repository={'common_dir': '/repo/.git'})
+        paths = []
+        pages = {None: ('c1', [fact]), 'c1': (None, [fact])}
+        def request(method, path):
+            paths.append(path)
+            query = dict(p.split('=', 1) for p in path.split('?', 1)[1].split('&'))
+            nxt, sessions = pages[query.get('cursor')]
+            return {'sessions': sessions, 'next_cursor': nxt}
+        with patch.object(guard, 'expected_repository', return_value=expected), \
+             patch.object(guard, 'repository_identity', return_value=expected['repository']), \
+             patch.object(guard, 'release_session_lock', return_value=True):
+            self.assertEqual(guard.reconcile_terminal_locks(request), 1)
+            self.assertEqual(guard.reconcile_terminal_locks(request), 1)
+            self.assertEqual(guard.reconcile_terminal_locks(request), 1)
+        self.assertEqual([p.split('?', 1)[1] for p in paths], ['limit=100', 'limit=100&cursor=c1', 'limit=100'])
+        self.assertNotIn('cursor', paths[0])
+        self.assertIn('cursor=c1', paths[1])
+        self.assertNotIn('cursor', paths[2])  # wrapped after the last page
+        guard._reconcile_cursor = None
+
+    def test_cursor_does_not_advance_when_the_deadline_cuts_a_page(self):
+        guard._reconcile_cursor = None
+        fact = dict(session_id='11111111', terminal=True, native_terminal=True, linked_intake_open=False, protected=False)
+        request = lambda method, path: {'sessions': [fact, fact], 'next_cursor': 'c9'}
+        with patch.object(guard.time, 'monotonic', side_effect=[0, 100, 100, 100]):
+            guard.reconcile_terminal_locks(request)
+        self.assertIsNone(guard._reconcile_cursor)
+        guard.reconcile_terminal_locks(request)
+        self.assertEqual(guard._reconcile_cursor, 'c9')
+        guard._reconcile_cursor = None
 
     def test_adoption_does_not_invent_original_repository(self):
         row = dict(workspace='/tree', tag='hub-22222222')
@@ -517,17 +562,131 @@ class RealTerminalLockReconciliationTests(unittest.TestCase):
             launch, sid = 'a' * 32, 'b' * 32
             self.assertTrue(guard.remember_repository(launch, tree))
             self.assertTrue(guard.protect_bound_worktree('git', tree, sid, 'proof-intake'))
-            fact = dict(session_id=sid, tag='task-hub-' + launch, terminal=True,
+            fact = dict(session_id=sid, intake_task_id='proof-intake', tag='task-hub-' + launch, terminal=True,
                         native_terminal=True, linked_intake_open=True, protected=False)
             request = lambda *args: {'sessions': [fact]}
-            self.assertEqual(guard.reconcile_terminal_locks(request), 0)
-            self.assertTrue(guard.is_locked('git', tree))
-            fact['linked_intake_open'] = False
             self.assertEqual(guard.reconcile_terminal_locks(request), 1)
+            self.assertFalse(guard.is_locked('git', tree))
+            fact['linked_intake_open'] = False
+            self.assertEqual(guard.reconcile_terminal_locks(request), 0)
             self.assertFalse(guard.is_locked('git', tree))
             self.assertTrue(guard.lock_worktree('git', tree, 'manual protection'))
             self.assertEqual(guard.reconcile_terminal_locks(request), 0)
             self.assertTrue(guard.is_locked('git', tree))
+
+
+class TerminalLockRepairTests(unittest.TestCase):
+    def test_dry_run_lists_exact_open_intake_owner_without_writing_then_apply_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            repo = _make_repo(tmp)
+            tree = _add_worktree(repo, tmp)
+            launch, sid = 'a' * 32, 'b' * 32
+            self.assertTrue(guard.remember_repository(launch, tree))
+            self.assertTrue(guard.protect_bound_worktree('git', tree, sid, 'proof-intake'))
+            fact = dict(session_id=sid, intake_task_id='proof-intake', tag='task-hub-' + launch,
+                        terminal=True, native_terminal=True, linked_intake_open=True,
+                        human_owned=False, protected=False, lock_release_permitted=True)
+            request = lambda *args: {'sessions': [fact]}
+            identity_before = sorted(os.listdir(guard.identity_directory()))
+
+            preview = guard.repair_terminal_locks(request)
+            self.assertEqual(preview['mode'], 'dry-run')
+            self.assertTrue(preview['complete'])
+            self.assertEqual(preview['candidate_count'], 1)
+            self.assertEqual(preview['candidates'], [{
+                'session_id': sid, 'intake_id': 'proof-intake', 'path': tree,
+                'reason': guard.lock_reason(sid, 'proof-intake')
+            }])
+            self.assertTrue(guard.is_locked('git', tree))
+            self.assertEqual(sorted(os.listdir(guard.identity_directory())), identity_before)
+
+            fact['intake_task_id'] = None
+            mismatched = guard.repair_terminal_locks(request)
+            self.assertEqual(mismatched['candidate_count'], 0)
+            self.assertTrue(guard.is_locked('git', tree))
+            fact['intake_task_id'] = 'proof-intake'
+
+            applied = guard.repair_terminal_locks(request, apply=True)
+            self.assertEqual(applied['released_count'], 1)
+            self.assertFalse(guard.is_locked('git', tree))
+            repeated = guard.repair_terminal_locks(request, apply=True)
+            self.assertEqual(repeated['candidate_count'], 0)
+            self.assertEqual(repeated['released_count'], 0)
+
+    def test_repair_time_budget_is_hard_across_git_calls(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+            repo = _make_repo(tmp)
+            tree = _add_worktree(repo, tmp)
+            launch, sid = 'a' * 32, 'b' * 32
+            self.assertTrue(guard.remember_repository(launch, tree))
+            self.assertTrue(guard.protect_bound_worktree('git', tree, sid, 'proof-intake'))
+            fact = dict(session_id=sid, intake_task_id='proof-intake', tag='task-hub-' + launch,
+                        terminal=True, native_terminal=True, linked_intake_open=True,
+                        human_owned=False, protected=False, lock_release_permitted=True)
+            request = lambda *args: {'sessions': [fact]}
+            clock = [1000.0]
+            seen = []
+
+            def slow_git(argv, cwd, timeout):
+                seen.append(timeout)
+                clock[0] += timeout  # each git call consumes its entire allowed timeout
+                raise TimeoutError('slow git')
+
+            real = guard._default_runner
+            with patch.object(guard.time, 'monotonic', lambda: clock[0]), \
+                    patch.object(guard, '_default_runner', slow_git):
+                for apply in (False, True):
+                    clock[0], seen[:] = 1000.0, []
+                    report = guard.repair_terminal_locks(request, apply=apply)
+                    self.assertFalse(report['complete'])
+                    self.assertEqual(report['released_count'], 0)
+                    self.assertLessEqual(clock[0] - 1000.0, guard.REPAIR_TIMEOUT_S)
+                    self.assertTrue(all(t <= guard.REPAIR_TIMEOUT_S for t in seen))
+            self.assertTrue(guard.is_locked('git', tree))
+
+            # Budget consumed by the Hub request itself: no git work, incomplete.
+            def slow_request(*args):
+                clock[0] += guard.REPAIR_TIMEOUT_S + 1
+                return {'sessions': [fact]}
+            with patch.object(guard.time, 'monotonic', lambda: clock[0]):
+                report = guard.repair_terminal_locks(slow_request, apply=True)
+            self.assertFalse(report['complete'])
+            self.assertEqual(report['released_count'], 0)
+            self.assertTrue(guard.is_locked('git', tree))
+
+    def test_repair_preserves_live_and_human_protected_session_locks(self):
+        cases = [
+            {'terminal': False, 'protected': False, 'lock_release_permitted': True, 'human_owned': False},
+            {'terminal': True, 'protected': True, 'lock_release_permitted': True, 'human_owned': False},
+            {'terminal': True, 'protected': False, 'lock_release_permitted': True, 'human_owned': True},
+            {'terminal': True, 'protected': False, 'lock_release_permitted': True, 'human_owned': None},
+        ]
+        for proof in cases:
+            with self.subTest(proof=proof), tempfile.TemporaryDirectory() as tmp, \
+                    patch.dict(os.environ, {'HUB_WORKTREE_IDENTITY_DIR': tmp + '/identity'}):
+                repo = _make_repo(tmp)
+                tree = _add_worktree(repo, tmp)
+                launch, sid = 'a' * 32, 'b' * 32
+                self.assertTrue(guard.remember_repository(launch, tree))
+                self.assertTrue(guard.protect_bound_worktree('git', tree, sid, 'proof-intake'))
+                fact = dict(session_id=sid, intake_task_id='proof-intake', tag='task-hub-' + launch,
+                            native_terminal=True, linked_intake_open=True, **proof)
+                report = guard.repair_terminal_locks(lambda *args: {'sessions': [fact]}, apply=True)
+                self.assertTrue(report['complete'])
+                self.assertEqual(report['candidate_count'], 0)
+                self.assertEqual(report['released_count'], 0)
+                self.assertTrue(guard.is_locked('git', tree))
+
+    def test_incomplete_scan_never_applies_partial_candidates(self):
+        request = lambda *args: {'sessions': [{}], 'next_cursor': 'more'}
+        candidate = {'session_id': 'b' * 32, 'intake_id': 'intake',
+                     'path': '/tree', 'reason': 'hub-session ' + 'b' * 32 + ' intake intake'}
+        with patch.object(guard, '_terminal_lock_candidate', return_value=candidate), \
+                patch.object(guard, 'release_session_lock') as release:
+            report = guard.repair_terminal_locks(request, apply=True, limit=1)
+        self.assertFalse(report['complete'])
+        self.assertEqual(report['candidate_count'], 1)
+        release.assert_not_called()
 
 
 class MissingAdoptionTests(unittest.TestCase):
@@ -563,12 +722,11 @@ class ExplicitOperatorAdoptionTests(unittest.TestCase):
             self.assertTrue(guard.is_locked('git', tree))
             self.assertNotEqual(_run(['git', '-C', repo, 'worktree', 'remove', tree], tmp).returncode, 0)
             self.assertEqual(guard.protect_operator_adoption(row, intent), receipt)
-            fact = dict(native, session_id=sid, native_created_at_ms=1234, terminal=True,
+            fact = dict(native, session_id=sid, intake_task_id='proof-intake',
+                        native_created_at_ms=1234, terminal=True,
                         native_terminal=True, linked_intake_open=True, protected=True,
                         lock_release_permitted=True)
             request = lambda *args: {'sessions': [fact]}
-            self.assertEqual(guard.reconcile_terminal_locks(request), 0)
-            fact['linked_intake_open'] = False
             self.assertEqual(guard.reconcile_terminal_locks(request), 1)
             self.assertFalse(guard.is_locked('git', tree))
 

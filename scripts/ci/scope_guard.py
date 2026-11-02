@@ -126,6 +126,13 @@ def hits(product, patch, repo_name=''):
         if comment(path, line):
             continue
         for token, pattern in patterns.items():
+            candidate = line
+            if product == 'hub' and token == 'pocketshell-package':
+                # aplexer is Hub's required native runtime, published under
+                # this GitHub organization. Match other packages on the same
+                # line normally; similarly named repositories remain blocked.
+                candidate = re.sub(r'https://github\.com/PocketShell-io/aplexer(?:\.git)?(?=[/\s\x22\x27?#]|$)',
+                                   'https://github.com/native-runtime', line, flags=re.I)
             if product == 'pocketshell':
                 # Actual link builders may emit navigation URLs, never runtime calls.
                 if token == 'hub-runtime' and re.search(r'(?i)(?:^|/)(?:link[-_]?builders?|links)(?:\.[\w]+)?$', path) and not re.search(r'\b(?:fetch|request|axios|connect)\s*\(', line):
@@ -133,7 +140,7 @@ def hits(product, patch, repo_name=''):
                 # Network/terminal routing belongs to PocketShell, model routing does not.
                 if token == 'routing' and re.search(r'(?i)\b(?:ssh|tcp|udp|network|tunnel|port|terminal)\b', line) and not re.search(r'(?i)\b(?:model|account|quota|fleet|agent)\b', line):
                     continue
-            if re.search(pattern, line):
+            if re.search(pattern, candidate):
                 found.append((path, lineno, token))
     return found
 

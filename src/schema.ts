@@ -60,7 +60,10 @@ CREATE TABLE IF NOT EXISTS machines (
   last_heartbeat JSON,
   drained INTEGER NOT NULL DEFAULT 0,
   notes TEXT,
-  approval_seq INTEGER -- R5 R2 current enrollment authority for this machine, NULL is pre-migration legacy
+  approval_seq INTEGER, -- R5 R2 current enrollment authority for this machine, NULL is pre-migration legacy
+  revoked_at TEXT, -- hard revoke (intake 298e50f9): hidden from every view, credentials dead
+  revoked_reason TEXT,
+  revoked_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS login_states (
@@ -223,5 +226,8 @@ CREATE TABLE IF NOT EXISTS claims (
   session_state TEXT,
   native_claim_id TEXT
 );
+
+CREATE INDEX IF NOT EXISTS messages_expires_at ON messages(expires_at);
+CREATE INDEX IF NOT EXISTS claims_expires_at ON claims(expires_at);
 `;
 

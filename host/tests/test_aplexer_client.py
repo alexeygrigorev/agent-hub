@@ -66,7 +66,7 @@ def test_cpu_limited_start_uses_real_cli_not_client():
     `aplexer.Client` intercepts any future path that lets CPU flags through.
     """
     cpu_argv = ['start', '--workspace', '/own', '--tag', 't',
-                '--engine', 'shell', '--memory', '1500M', '--pids', '256',
+                '--engine', 'shell', '--memory', '6144M', '--pids', '256',
                 '--cpu-quota-us', '100000', '--cpu-period-us', '100000',
                 '--json']
     with patch('aplexer.Client', side_effect=AssertionError('Client must not receive CPU flags')):
@@ -74,7 +74,7 @@ def test_cpu_limited_start_uses_real_cli_not_client():
     # Discrimination: the same argv WITHOUT the CPU flags is accepted by the
     # client path, proving the refusal above is caused by the CPU flags alone.
     plain_argv = ['start', '--workspace', '/own', '--tag', 't',
-                  '--engine', 'shell', '--memory', '1500M', '--pids', '256',
+                  '--engine', 'shell', '--memory', '6144M', '--pids', '256',
                   '--json']
     client = Mock()
     client.start.return_value.raw = {'id': 'new-id'}

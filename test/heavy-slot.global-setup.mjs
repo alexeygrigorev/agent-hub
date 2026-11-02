@@ -16,8 +16,18 @@ export default async function setup() {
   const wrapper = fileURLToPath(new URL('../scripts/capped-test-run.sh', import.meta.url));
   const holder = spawn('bash', [wrapper, '--', 'bash', '-c', 'echo heavy-slot-held; read -r _'],
     { stdio: ['pipe', 'pipe', 'inherit'] });
-  const acquired = await new Promise((resolve, reject) => {
-    holder.stdout.on('data', (chunk) => { if (String(chunk).includes('heavy-slot-held')) resolve(true); });
+  let acquired = false;
+  let released = false;
+  holder.on('exit', (code, signal) => {
+    if (acquired && !released) {
+      console.error(`vitest: heavy-test slot holder exited unexpectedly (${code ?? signal}); stopping this test process`);
+      process.kill(process.pid, 'SIGTERM');
+    }
+  });
+  const gotSlot = await new Promise((resolve, reject) => {
+    holder.stdout.on('data', (chunk) => {
+      if (String(chunk).includes('heavy-slot-held')) { acquired = true; resolve(true); }
+    });
     holder.on('error', () => resolve(false));
     holder.on('exit', (code) => {
       // 3 = no slot within the wait budget: refuse to pile onto the host.
@@ -25,8 +35,8 @@ export default async function setup() {
       resolve(false); // wrapper/env problem (exit 2): fail open, as before this cap existed
     });
   });
-  if (!acquired) return;
+  if (!gotSlot) return;
   holder.stdout.resume();
   process.env.AGENT_HUB_HEAVY_TEST_HELD = '1'; // nested runners reuse this slot
-  return () => { holder.stdin.end(); };
+  return () => { released = true; holder.stdin.end(); };
 }

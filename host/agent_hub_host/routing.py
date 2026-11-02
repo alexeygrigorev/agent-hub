@@ -22,7 +22,14 @@ def add_commands(sub):
     submit.add_argument('--runner', dest='preferred_runner')
     submit.add_argument('--machine', dest='preferred_machine')
     submit.add_argument('--key', help='Reuse this idempotency key for safe retries')
+    sub.add_parser('device-pending', help='List pending host/agent device approvals (admin)')
     sub.add_parser('routing-machines', help='List capability advertisements, model routes and host health')
+    goal = sub.add_parser('host-goal', help='Operator: set or inspect durable host bring-up state')
+    goal.add_argument('--machine', required=True)
+    goal.add_argument('--sha', help='Desired full main release SHA (omit to inspect)')
+    goal.add_argument('--engine', action='append', default=[], help='Managed engine bundle label (repeatable)')
+    goal.add_argument('--workspace', help='Workspace advertised by this host for verification sessions')
+    goal.add_argument('--retry', action='store_true', help='Start a new verification generation after fixing a failed attempt')
     policy = sub.add_parser('model-policy', help='Show routing policy or save Grok preference (global policy keeps routing disabled)')
     policy.add_argument('provider', nargs='?', choices=['grok'])
     policy.add_argument('action', nargs='?', choices=['set'])
@@ -30,6 +37,11 @@ def add_commands(sub):
     policy.add_argument('--reason')
     policy.add_argument('--json', action='store_true')
     release = sub.add_parser('host-release', help='Operator: pin the exact main commit a checkout-installed host updates itself to')
+    release.add_argument('--machine', required=True, help='Machine id')
+    target = release.add_mutually_exclusive_group(required=True)
+    target.add_argument('--sha', help='Full 40-hex commit on origin/main')
+    target.add_argument('--clear', action='store_true', help='Remove the pin; the host stays on its current commit')
+    release = sub.add_parser('launcher-release', help='Operator: pin the exact main commit a checkout-installed launcher updates itself to')
     release.add_argument('--machine', required=True, help='Machine id')
     target = release.add_mutually_exclusive_group(required=True)
     target.add_argument('--sha', help='Full 40-hex commit on origin/main')
@@ -62,6 +74,20 @@ def read_text(path):
 
 
 def execute(args):
+    if args.cmd == 'host-goal':
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.machine):
+            raise ValueError('Invalid machine id')
+        path = '/api/fleet/routing/host-goal/' + quote(args.machine, safe='')
+        if args.sha is None:
+            if args.engine or args.workspace or args.retry:
+                raise ValueError('Setting a goal requires --sha, --engine and --workspace')
+            return bus._do_request('GET', path)
+        if not re.fullmatch(r'[0-9a-fA-F]{40}', args.sha) or not args.engine or not args.workspace:
+            raise ValueError('Setting a goal requires full --sha, --engine and --workspace')
+        payload = {'sha': args.sha.lower(), 'engines': args.engine, 'workspace': args.workspace}
+        if args.retry:
+            payload['retry'] = True
+        return bus._do_request('PUT', path, payload)
     if args.cmd == 'submit':
         payload = {'needs': [n.strip() for n in args.needs.split(',') if n.strip()], 'workspace': args.workspace,
                    'idempotency_key': args.key or str(uuid.uuid4())}
@@ -89,14 +115,16 @@ def execute(args):
         return bus._do_request('GET', path)
     if args.cmd == 'model-policy' and (args.action or args.mode or args.reason):
         raise ValueError('Use model-policy grok set MODE --reason TEXT')
+    if args.cmd == 'device-pending':
+        return bus._do_request('GET', '/api/device/pending')
     if args.cmd in ('routing-machines', 'model-policy'):
         return bus._do_request('GET', '/api/fleet/routing/' + ('machines' if args.cmd == 'routing-machines' else 'policy'))
-    if args.cmd == 'host-release':
+    if args.cmd in ('host-release', 'launcher-release'):
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.machine):
             raise ValueError('Invalid machine id')
         if args.sha is not None and not re.fullmatch(r'[0-9a-fA-F]{40}', args.sha):
             raise ValueError('A full 40-hex commit is required')
-        return bus._do_request('PUT', '/api/fleet/routing/host-release/' + quote(args.machine, safe=''),
+        return bus._do_request('PUT', '/api/fleet/routing/' + args.cmd + '/' + quote(args.machine, safe=''),
                                {'sha': None if args.clear else args.sha.lower()})
     if args.cmd == 'jobs':
         return bus._do_request('GET', '/api/fleet/tasks')

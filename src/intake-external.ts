@@ -20,6 +20,10 @@ export function externalSessionInCensus(link: Obj, rows: Obj[], catalogs: Map<st
   const row = matches[0];
   const fresh = catalogs.has(row.machine_id);
   const terminal = nativeTerminalError(row) || ['exited', 'stopped', 'failed'].includes(row.phase);
-  return { ...row, live: fresh && !terminal && !['unknown', 'unobserved'].includes(row.phase),
+  const unknownPhase = ['unknown', 'unobserved'].includes(row.phase);
+  return { ...row, live: fresh && !terminal && !unknownPhase,
+    // A known, nonterminal native with a stale/missing census may simply be
+    // awaiting the next host report. Callers can safely ask the operator to retry.
+    retryable: !fresh && !terminal && !unknownPhase,
     liveness: !fresh || ['unknown', 'unobserved'].includes(row.phase) ? 'unknown' : terminal ? 'terminal' : 'live' };
 }

@@ -43,5 +43,19 @@ async function refresh() {
     logins.append(section);
   }
   status.textContent='Connected. Machines reconcile on their next heartbeat.';
+  try {
+    const versions = await call('/api/engines/versions');
+    const vSection = el('section'); vSection.append(el('h2', 'Engine versions'));
+    for (const [engine, pin] of Object.entries(versions.desired || {})) {
+      vSection.append(el('p', `${engine}: desired ${pin.version}, latest ${pin.latest}`));
+    }
+    for (const row of versions.reports || []) {
+      vSection.append(el('p', `${row.machine_id} ${row.engine}: installed ${row.installed || '?'} (latest ${row.latest || '?'}, last ${row.result || '?'})`));
+    }
+    for (const r of versions.rollouts || []) {
+      vSection.append(el('p', `rollout ${r.engine} ${r.target_version} via ${r.canary_machine}: ${r.state}`));
+    }
+    document.querySelector('.engine-page').append(vSection);
+  } catch { /* versions are best-effort beside the account list */ }
 }
 (async () => {try {const me=await call('/auth/me'); csrf=me.csrf_token; await refresh(); setInterval(() => refresh().catch(() => {status.textContent='Refresh failed.';}),5000);} catch {status.textContent='Sign in as a Hub administrator to manage accounts.';}})();

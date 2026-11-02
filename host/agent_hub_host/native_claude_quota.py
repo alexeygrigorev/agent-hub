@@ -9,9 +9,12 @@ tokens lacking user:profile scope, it fails closed cleanly and honestly.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+from email.utils import parsedate_to_datetime
 import json
 import math
 from pathlib import Path
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +25,14 @@ USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 COUNT_TOKENS_URL = 'https://api.anthropic.com/v1/messages/count_tokens'
 MAX_BODY = 131072
 DEFAULT_MODEL = 'claude-sonnet-4-6'
+# The usage endpoint rate-limits a token after a handful of rapid reads, and
+# every managed launch probes twice (launcher plan + run). One successful
+# reading is shared per token across processes so a launch burst does not
+# turn into 429s and a missing quota source (intake 798f0f8c).
+USAGE_CACHE_FILE = 'claude-usage-cache.json'
+USAGE_REUSE_S = 60
+USAGE_RATE_LIMITED_REUSE_S = 1800
+_clock = time.time
 
 
 def resolve_api_model(selected_model):
@@ -155,10 +166,16 @@ def _parse_usage_payload(data, now, selected_model=None):
     """
     five_hour = data.get('five_hour')
     seven_day = data.get('seven_day')
-    if not isinstance(five_hour, dict) or not isinstance(seven_day, dict):
+    # An explicit null five_hour means no 5-hour session window is active
+    # (nothing used since the last reset); treat it like the inactive window
+    # below. A missing or non-dict value, or any bad seven_day, still fails closed.
+    if 'five_hour' not in data or not isinstance(seven_day, dict) or (five_hour is not None and not isinstance(five_hour, dict)):
         raise ProbeError('native_claude_malformed_windows')
 
-    win_5h = _parse_window(five_hour, now, required_reset=False)
+    if five_hour is None:
+        win_5h = {'percent_remaining': 100.0, 'reset_at': None, 'inactive': True}
+    else:
+        win_5h = _parse_window(five_hour, now, required_reset=False)
     win_7d = _parse_window(seven_day, now, required_reset=True)
 
     windows = {
@@ -291,7 +308,99 @@ def _extract_selected_model(bundle, model=None):
     return None
 
 
-def probe(bundle, dest, opener=None, now=None, model=None, requested_model=None):
+def _usage_cache_path(dest):
+    return Path(dest) / USAGE_CACHE_FILE if dest else None
+
+
+def _token_key(token):
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+def _cached_usage(dest, token, max_age_s, now, selected_model):
+    """Re-parse a recent successful usage reading for this exact token, or None."""
+    path = _usage_cache_path(dest)
+    if path is None:
+        return None
+    try:
+        entry = _json_bytes(private_fs.read_bytes(str(path), MAX_BODY + 4096, private=True))
+        age = _clock() - float(entry['at'])
+        if entry.get('token') != _token_key(token) or not 0 <= age <= max_age_s or not isinstance(entry.get('usage'), dict):
+            return None
+        # Parsed against the current time: a reset that has since passed fails closed.
+        return _parse_usage_payload(entry['usage'], now, selected_model)
+    except Exception:
+        return None
+
+
+def _store_usage(dest, token, data):
+    path = _usage_cache_path(dest)
+    if path is None:
+        return
+    try:
+        raw = json.dumps({'at': _clock(), 'token': _token_key(token), 'usage': data}).encode('utf-8')
+        private_fs.atomic_write(path, raw, MAX_BODY + 4096)
+    except Exception:
+        pass
+
+
+def _backoff_path(dest, token):
+    # Same managed-account directory is passed by fleet and launcher. Never use
+    # HOME here: the launcher deliberately replaces HOME with the engine home.
+    return Path(dest) / ('claude-usage-backoff-' + _token_key(token) + '.json') if dest else None
+
+
+def _read_backoff(dest, token):
+    path = _backoff_path(dest, token)
+    try:
+        entry = _json_bytes(private_fs.read_bytes(str(path), 4096, private=True))
+        at, until = float(entry['at']), float(entry['until'])
+        failures = entry['failures']
+        if (entry.get('token') != _token_key(token) or not math.isfinite(at)
+                or not math.isfinite(until) or at > _clock() or until < at
+                or isinstance(failures, bool) or not isinstance(failures, int)
+                or not 0 <= failures <= 32):
+            return None
+        return entry
+    except Exception:
+        return None
+
+
+def _write_backoff(dest, token, entry):
+    path = _backoff_path(dest, token)
+    if path is not None:
+        private_fs.atomic_write(path, json.dumps(entry).encode(), 4096)
+
+
+def _record_rate_limit(dest, token, headers):
+    prior = _read_backoff(dest, token) or {}
+    failures = min(32, prior.get('failures', 0) + 1)
+    at = _clock()
+    delay = min(3600, 120 * 2 ** (failures - 1))
+    retry = headers.get('Retry-After') if headers else None
+    if retry is not None:
+        try:
+            seconds = float(retry)
+        except (ValueError, TypeError):
+            try:
+                stamp = parsedate_to_datetime(str(retry))
+                seconds = stamp.timestamp() - at if stamp.tzinfo else 0
+            except (ValueError, TypeError, OverflowError):
+                seconds = 0
+        if math.isfinite(seconds):
+            delay = max(delay, seconds)
+    _write_backoff(dest, token, {'token': _token_key(token), 'at': at,
+                               'until': at + delay, 'failures': failures})
+
+
+def _rate_limited_result(dest, token, now, selected_model):
+    cached = _cached_usage(dest, token, USAGE_RATE_LIMITED_REUSE_S, now, selected_model)
+    if cached is not None and all(w['percent_remaining'] > 0 for w in cached['claude']['windows'].values()):
+        return cached
+    return {'claude': {'status': 'unknown', 'error': 'native_claude_rate_limited',
+                       'details': {'limit_reached': True, 'managed': True}, 'windows': {}}}
+
+
+def _probe(bundle, dest, opener=None, now=None, model=None, requested_model=None):
     """Probe authoritative managed Claude quota for a portable token bundle."""
     now = now or dt.datetime.now(dt.timezone.utc)
     selected_model = _extract_selected_model(bundle, requested_model or model)
@@ -319,10 +428,20 @@ def probe(bundle, dest, opener=None, now=None, model=None, requested_model=None)
         },
         method='GET',
     )
+    backoff = _read_backoff(dest, token)
+    if backoff and backoff['until'] > _clock():
+        return _rate_limited_result(dest, token, now, selected_model)
+    cached = _cached_usage(dest, token, USAGE_REUSE_S, now, selected_model)
+    if cached is not None:
+        return cached
     try:
         with opener.open(req_usage, timeout=15) as resp:
             data = _json_bytes(resp.read(MAX_BODY + 1))
-            return _parse_usage_payload(data, now, selected_model)
+            result = _parse_usage_payload(data, now, selected_model)
+            _store_usage(dest, token, data)
+            _write_backoff(dest, token, {'token': _token_key(token), 'at': _clock(),
+                                         'until': _clock(), 'failures': 0})
+            return result
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             return {
@@ -338,14 +457,13 @@ def probe(bundle, dest, opener=None, now=None, model=None, requested_model=None)
             # Probe count_tokens preflight for native unified subscription headers.
             pass
         elif exc.code == 429:
-            return {
-                'claude': {
-                    'status': 'unknown',
-                    'error': 'native_claude_rate_limited',
-                    'details': {'limit_reached': True, 'managed': True},
-                    'windows': {},
-                }
-            }
+            try:
+                _record_rate_limit(dest, token, exc.headers)
+            except Exception:
+                # A storage refusal must never turn a provider refusal into admission.
+                return {'claude': {'status': 'unknown', 'error': 'native_claude_rate_limited',
+                                   'details': {'limit_reached': True, 'managed': True}, 'windows': {}}}
+            return _rate_limited_result(dest, token, now, selected_model)
         else:
             return {
                 'claude': {
@@ -414,7 +532,11 @@ def probe(bundle, dest, opener=None, now=None, model=None, requested_model=None)
         elif exc.code == 403:
             err = 'native_claude_scope_inference_only'
         elif exc.code == 429:
-            err = 'native_claude_rate_limited'
+            try:
+                _record_rate_limit(dest, token, exc.headers)
+            except Exception:
+                pass
+            return _rate_limited_result(dest, token, now, selected_model)
         else:
             err = f'native_claude_http_{exc.code}'
         return {
@@ -443,3 +565,25 @@ def probe(bundle, dest, opener=None, now=None, model=None, requested_model=None)
                 'windows': {},
             }
         }
+
+
+def probe(bundle, dest, opener=None, now=None, model=None, requested_model=None):
+    """Serialize reads for an exact token across fleet and launcher processes.
+
+    A contender never waits on a network request or starts another one. It may
+    use only the same bounded safe fallback as a provider rate-limit refusal.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    selected_model = _extract_selected_model(bundle, requested_model or model)
+    try:
+        token = _extract_token(bundle, dest)
+    except ProbeError:
+        return _probe(bundle, dest, opener, now, model, requested_model)
+    if not dest:
+        return _probe(bundle, dest, opener, now, model, requested_model)
+    lock = Path(dest) / ('claude-usage-' + _token_key(token) + '.lock')
+    try:
+        with private_fs.exclusive_lock(lock):
+            return _probe(bundle, dest, opener, now, model, requested_model)
+    except OSError:
+        return _rate_limited_result(dest, token, now, selected_model)

@@ -43,7 +43,7 @@ const sql = {exec(query, ...args) {
   const rows = stmt.columns().length ? stmt.all(...args) : (stmt.run(...args), []);
   return Object.assign(rows, {toArray:()=>rows});
 }};
-sql.exec('CREATE TABLE machines(id TEXT,name TEXT,hostname TEXT,drained INTEGER,last_checkin_at TEXT)');
+sql.exec('CREATE TABLE machines(id TEXT,name TEXT,hostname TEXT,drained INTEGER,last_checkin_at TEXT,revoked_at TEXT)');
 let receiptClock=end;
 const nativeHistory = new HostHistoryService(sql, {}, () => receiptClock);
 nativeHistory.init();

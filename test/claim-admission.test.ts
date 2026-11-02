@@ -158,7 +158,7 @@ describe('fleet edit admission', () => {
   it('revalidates at native start, holds running work after expiry, and does not free capacity', () => fleetFixture(async (f, sql, bus) => {
     const claim = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000, now);
     const offered: any = await (await f.handle(req('/api/fleet/launches', intent({ machine: 'hetzner', access: { mode: 'edit', claim_id: claim.id, scopes: ['src/a.ts'] } })), holder)).json();
-    const start = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: at(), account: 'shared-codex', profile_supported: true };
+    const start = { gate_allowed: true, model: 'gpt-6-luna', observed_at: at(), account: 'shared-codex', profile_supported: true };
     sql.exec('UPDATE claims SET released_at = ? WHERE id = ?', now, claim.id);
     expect((await f.handle(req('/api/fleet/launches/' + offered.id + '/claim', start), host())).status).toBe(409);
     expect(sql.exec('SELECT state, verification_status FROM fleet_launches WHERE id = ?', offered.id).one()).toEqual({ state: 'failed', verification_status: 'not_started' });
@@ -238,7 +238,7 @@ describe('routing edit admission and unchanged legacy routing', () => {
 });
 
 const editAccess = (id: string, scope = 'src/a.ts') => ({ mode: 'edit', claim_id: id, scopes: [scope] });
-const nativeStart = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: at(), account: 'shared-codex', profile_supported: true };
+const nativeStart = { gate_allowed: true, model: 'gpt-6-luna', observed_at: at(), account: 'shared-codex', profile_supported: true };
 
 describe('retained authority and replacement claims', () => {
   it('requires configured resource mapping, a genuine credential and bus authority', () => fleetFixture(async (f, sql, bus) => {

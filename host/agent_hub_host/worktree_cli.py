@@ -1,8 +1,9 @@
-"""`hub worktree`: intake-owned git worktrees (list, refresh, remove, register).
+"""`hub worktree`: intake-owned worktree status, removal, and lock repair.
 
 The Hub records each intake's worktrees and queues `status`/`remove` commands
-for the owning host agent (docs/INTAKE-WORKTREES.md). This client only talks
-to the Hub user endpoints; it never touches a worktree on disk itself.
+for the owning host agent (docs/INTAKE-WORKTREES.md). `repair-locks` is a
+host-only command using fresh Hub terminal facts and this host's Git registry;
+its default mode is a read-only listing.
 """
 import re
 import sys
@@ -50,6 +51,12 @@ def add_commands(sub):
     register.add_argument('--path', required=True, help='Absolute worktree path on that host')
     register.add_argument('--branch')
     register.add_argument('--session', help='Hub session id that used the worktree')
+    repair = commands.add_parser('repair-locks', help='List terminal Hub-session locks (read-only by default)')
+    repair_modes = repair.add_mutually_exclusive_group()
+    repair_modes.add_argument('--dry-run', dest='apply', action='store_false', help='List exact terminal-owner locks without changing Git (default)')
+    repair_modes.add_argument('--apply', dest='apply', action='store_true', help='Release only listed lock owners that pass fresh Hub and Git checks')
+    repair.set_defaults(apply=False)
+    repair.add_argument('--limit', type=int, default=1000, help='Maximum terminal Hub facts to scan (1..1000)')
     for command in (refresh, remove):
         command.add_argument('--wait', action='store_true', help='Poll the queued command(s) until done/failed')
         command.add_argument('--timeout', type=int, default=DEFAULT_TIMEOUT, help=f'--wait bound in seconds (default {DEFAULT_TIMEOUT})')
@@ -165,6 +172,16 @@ def execute(args):
     command = args.worktree_cmd
     if command == 'list':
         return intake.request('GET', task_path(args.intake) + '/worktrees')
+    if command == 'repair-locks':
+        from . import bus
+        from .worktree_guard import repair_terminal_locks
+        try:
+            report = repair_terminal_locks(bus._do_request, apply=args.apply, limit=args.limit)
+        except ValueError as exc:
+            raise intake.IntakeInputError(str(exc)) from None
+        if not report['complete']:
+            raise WaitIncomplete('Worktree lock repair did not finish within its scan/time bound; review the report and rerun.', report)
+        return report
     key = args.key or 'wt-' + uuid.uuid4().hex
     intake.valid_key(key)
     payload = {'key': key}

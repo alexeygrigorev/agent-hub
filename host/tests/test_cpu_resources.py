@@ -2,6 +2,41 @@ import unittest
 from agent_hub_host.cpu_resources import cpu_delta, update_cpu_distribution, read_cpu_stat, sample_cpu_usage
 
 
+class WindowedCpuTests(unittest.TestCase):
+    def snap(self, busy, idle):
+        return {"ticks": [busy, 0, 0, idle, 0, 0, 0, 0], "cores": 4}
+
+    def test_window_needs_a_snapshot_at_least_10_seconds_old(self):
+        from collections import deque
+        from agent_hub_host.cpu_resources import windowed_cpu
+        history = deque()
+        first = windowed_cpu(100.0, self.snap(0, 0), history)
+        self.assertIsNone(first["busy_percent_window"])
+        short = windowed_cpu(105.0, self.snap(50, 0), history)
+        self.assertIsNone(short["busy_percent_window"])
+        full = windowed_cpu(111.0, self.snap(100, 0), history)
+        self.assertEqual(full["busy_percent_window"], 100)
+        self.assertAlmostEqual(full["window_s"], 11.0)
+        self.assertAlmostEqual(full["busy_cores_window"], 4.0)
+
+    def test_window_history_is_bounded(self):
+        from collections import deque
+        from agent_hub_host.cpu_resources import windowed_cpu, WINDOW_KEEP_S
+        history = deque()
+        for t in range(0, 400, 10):
+            windowed_cpu(float(t), self.snap(t, t), history)
+        self.assertLessEqual(history[-1][0] - history[0][0], WINDOW_KEEP_S)
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows only")
+    def test_windows_system_times_are_measured(self):
+        stat = read_cpu_stat()
+        self.assertIsNotNone(stat)
+        self.assertGreaterEqual(stat["cores"], 1)
+        result = sample_cpu_usage()
+        self.assertIsNotNone(result["busy_percent"])
+        self.assertLessEqual(result["busy_cores"], result["cores"])
+
+
 class CpuResourcesTests(unittest.TestCase):
     def test_cross_repository_wire_fixture(self):
         import json

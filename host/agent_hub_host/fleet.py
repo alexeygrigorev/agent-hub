@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import closing
 import json
 import math
 import os
 from pathlib import Path
 import re
 import stat
+import sys
 import uuid
 import subprocess
 import threading
@@ -16,7 +18,7 @@ from typing import Any, Optional
 
 from . import bus
 from .session_rules import SESSION_PREAMBLE, compose_prompt
-from .retired_native import verify_native_retirement
+from .retired_native import launch_workspace_targets, verify_native_retirement, verify_retirement_in_targets
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 # Control characters the Hub server rejects in finish-report text
@@ -43,6 +45,20 @@ def _terminal_fleet_state(reconciled_state, has_result, diagnostic_reason=None):
     if not has_result:
         return 'failed'
     return 'exited'
+
+
+def _clean_native_success(report, evidence):
+    """A receipt-less launcher failure is superseded only by clean completion.
+
+    Intake 17e774f8: the worker's done report plus a native exit code of
+    exactly 0 and no signal. Missing exit evidence, any nonzero code (137)
+    or signal (9) keeps the launch failed; the report is still forwarded.
+    """
+    return (isinstance(report, dict) and report.get('report_status') == 'done'
+            and isinstance(evidence, dict) and type(evidence.get('exit_code')) is int
+            and evidence['exit_code'] == 0
+            and (evidence.get('exit_signal') is None
+                 or (type(evidence.get('exit_signal')) is int and evidence['exit_signal'] == 0)))
 
 
 def _sanitize_launcher_slug(text, limit=64):
@@ -78,7 +94,13 @@ WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 # subprocess for flags outside its allowlist).
 # Windows hosts (Tabo) must NOT receive Linux cgroup flags: aplexer on
 # Windows contains workloads with Job Objects and reports containment_empty.
-WORKER_MEMORY = "1500M"
+# MemoryMax is a crash-containment CEILING, not the admission estimate (placement uses ledger p50/p90 and host_sizing.WORKER_MB).
+# 1500M OOM-killed codex and workerd (vitest/playwright in the session scope) on RMTHZ with 31 GiB free.
+WORKER_MEMORY = "6144M"
+# zcodex = Rust TUI (~200 MB) + Node zcode core (300-460 MB, re-spawned on every
+# stream retry) + the agent's own toolchain; 1500M OOM-killed the core
+# mid-turn (intake de6f2139). Other engines keep the default cap.
+ENGINE_WORKER_MEMORY = {"zcodex": "6144M"}
 WORKER_PIDS = "256"
 WORKER_CPU_QUOTA_US = "100000"
 WORKER_CPU_PERIOD_US = "100000"
@@ -98,11 +120,11 @@ def is_windows_host() -> bool:
         return False
 
 
-def worker_resource_argv() -> list[str]:
+def worker_resource_argv(engine: str | None = None) -> list[str]:
     """Linux cgroup flags for `aplexer start`, empty on Windows (Job Objects)."""
     if is_windows_host():
         return []
-    return ["--memory", WORKER_MEMORY, "--pids", WORKER_PIDS,
+    return ["--memory", ENGINE_WORKER_MEMORY.get(engine, WORKER_MEMORY), "--pids", WORKER_PIDS,
             "--cpu-quota-us", WORKER_CPU_QUOTA_US, "--cpu-period-us", WORKER_CPU_PERIOD_US]
 
 # Advertisement-only cache for qualified role profiles (intake eff9a5ce AC1:
@@ -152,7 +174,9 @@ OFFERS_LOCK_NAME = "fleet-offers.lock"
 # plus a slow Hub can exceed that, so the gate is re-run before claiming when
 # the first observation is older than this.
 CLAIM_ADMISSION_REFRESH_S = 15.0
-# Bounded offer concurrency (settings "dispatch_concurrency", 1..10).
+# Engines whose native CLI starts from a '/goal ...' prompt (src/fleet.ts GOAL_ENGINES).
+GOAL_ENGINES = frozenset({'codex', 'zcodex', 'claude'})
+# Bounded offer concurrency (settings "dispatch_concurrency", 1..13).
 # Intake eff9a5ce burst fix: serial dispatch (30-60 s per offer) made a
 # 10-launch burst take 5+ minutes. The earlier admission_refused failures with
 # 3 parallel starts came from N concurrent admission-gate subprocesses (quota
@@ -160,18 +184,41 @@ CLAIM_ADMISSION_REFRESH_S = 15.0
 # a short-lived shared result (ADMISSION_SHARE_S), so parallel dispatch no
 # longer multiplies gate runs. Host pressure is enforced by the launcher and
 # Hub placement on real choking signals (PSI, MemAvailable, OOM), never here.
-DISPATCH_CONCURRENCY = 10
-DISPATCH_CONCURRENCY_MAX = 10
+# Intake 2a944c3f: per-pass cap on launcher reconcile runs and the pause for a
+# launch whose retirement proof was refused, so wedged rows cannot starve others.
+RECONCILE_LAUNCHER_BATCH = 16
+RECONCILE_BACKOFF_S = 120.0
+DISPATCH_CONCURRENCY = 13
+DISPATCH_CONCURRENCY_MAX = 13
 # An allowed gate observation is shared by concurrent dispatches for the same
 # account/engine/profile/mode/selection for this long. Well inside the Hub's
 # 30 s claim freshness and CLAIM_ADMISSION_REFRESH_S, so a shared observation
 # never forces a stale claim. Refusals are never shared.
 ADMISSION_SHARE_S = 8.0
+# Extra wait for output readers after a clean local-command exit; bounded so
+# a gate stays inside the 30 s admission window (intake ad8aa931).
+READER_GRACE_S = 10.0
+# Launcher plan rejection for a managed route without trusted quota evidence.
+QUOTA_SOURCE_REJECTION = 'quota source'
 # GET /api/fleet/offers transport retries (timeouts while the Hub is slow).
 # A failed offers read is never a launch failure: the offers simply stay
 # offered for the next tick.
 OFFERS_FETCH_ATTEMPTS = 3
 OFFERS_FETCH_BACKOFF_S = 1.0
+
+
+def _emit_stage_timing(offer_id, stages) -> None:
+    """One bounded event per claimed offer: seconds spent in each pre-claim stage.
+
+    Intake e1ed7abe: offered->running latency was unattributable without it.
+    Fixed stage names and numbers only; no paths, argv or credentials.
+    """
+    try:
+        out = {name: round(at - stages[i][1], 3) for i, (name, at) in enumerate(stages[1:])}
+        print(json.dumps({'event': 'offer_dispatch_stages', 'offer_id': offer_id,
+                          'total_s': round(stages[-1][1] - stages[0][1], 3), 'stages_s': out}), flush=True)
+    except Exception:
+        pass
 
 
 def dispatch_concurrency(settings) -> int:
@@ -323,6 +370,11 @@ def _path_under_root(path: Path, root: Path) -> bool:
 
 def _workspace_roots(settings) -> list[str]:
     roots: list[str] = list(settings.get("workspace_roots") or [])
+    # Repo-identity checkouts live under the host work root (intake 8028bb06).
+    from . import repo_workspace
+    work = repo_workspace.work_root(settings)
+    if work.is_dir() and absolute_workspace_ok(str(work)):
+        roots.append(str(work))
     ws = settings.get("workspaces") or {}
     for item, value in ws.items():
         for candidate in (item, value):
@@ -441,6 +493,9 @@ def resolve_workspace_path(settings, name: str) -> Path:
     ws = settings.get("workspaces") or {}
     if name in ws:
         return Path(ws[name]).resolve(strict=True)
+    from . import repo_workspace
+    if repo_workspace.decode(name):
+        return repo_workspace.resolve_existing(settings, name)
     if not isinstance(name, str) or not absolute_workspace_ok(name):
         raise ValueError("Local account/profile/workspace is not configured")
     path = Path(name)
@@ -530,6 +585,22 @@ def normalize_git_identity(conf) -> dict[str, str]:
     return res
 
 
+# Routes one heartbeat may advertise; must equal MAX_ADVERTISED_ROUTES in
+# src/registry.ts. Matches Hub's per-machine subscription limit (128).
+MAX_ADVERTISED_ROUTES = 128
+# Re-post an unchanged route advertisement this often; Hub holds every route
+# of a host whose last advertisement is older than 180 s.
+ROUTE_ADVERTISEMENT_REFRESH_S = 60
+
+
+def resolve_max_agents(value):
+    """Advertised concurrency: explicit int, or 'auto' sized from CPU/RAM (intake 88ff6766)."""
+    if value == 'auto':
+        from .host_sizing import auto_max_agents
+        return auto_max_agents()
+    return value
+
+
 def load_settings(path=None):
     """Explicit non-secret machine configuration, including several accounts per service."""
     default_path = path is None
@@ -540,11 +611,21 @@ def load_settings(path=None):
         if path.stat().st_size > 65536:
             raise ValueError("Subscription configuration exceeds 64 KiB")
         data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity", "opencode_auth"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity", "opencode_auth", "host_load_factor"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
     if 'opencode_auth' in data:
         from .opencode_auth import validate
         validate(data['opencode_auth'])
+    elif default_path:
+        # Hub-provisioned default (central store device login); an explicit
+        # opencode_auth above always wins (intake 5814e109 AC3).
+        try:
+            from . import provisioning
+            from .opencode_auth import validate
+            default_cfg = json.loads(provisioning.opencode_device_default_path().read_text(encoding='utf-8'))
+            data['opencode_auth'] = validate(default_cfg)
+        except (OSError, ValueError, TypeError, ImportError):
+            pass
     git_conf = data.get("git") if "git" in data else data.get("git_identity")
     if git_conf is not None:
         validate_git_identity_config(git_conf)
@@ -578,6 +659,12 @@ def load_settings(path=None):
         raise ValueError("Invalid subscriptions list")
     seen = set()
     for sub in subs:
+        # '{host_python}' resolves to the running host interpreter so configs
+        # never pin a release venv path that breaks on host upgrade.
+        if isinstance(sub, dict):
+            for key in ("quota_argv", "admission_argv", "startup_argv"):
+                if isinstance(sub.get(key), list):
+                    sub[key] = [sys.executable if x == "{host_python}" else x for x in sub[key]]
         if not isinstance(sub, dict) or set(sub) - {"service", "account_label", "plan", "engine", "profile", "quota_argv", "admission_argv", "launcher_provider", "launcher_model", "launcher_effort", "startup_argv", "native_start_argv"}:
             raise ValueError("Subscription accepts metadata and local command references only")
         if "native_start_argv" in sub:
@@ -628,9 +715,12 @@ def load_settings(path=None):
     needs = data.get('capabilities', [])
     if not isinstance(needs, list) or len(needs) > 64 or any(not isinstance(n, str) or not re.fullmatch(r'[a-z0-9][a-z0-9:_-]{0,95}', n) for n in needs) or len(set(needs)) != len(needs):
         raise ValueError('Invalid task capabilities')
-    maximum = data.get('max_agents', 1)
-    if type(maximum) is not int or not 1 <= maximum <= 100:
+    maximum = data.get('max_agents', 'auto')
+    # 'auto' stays raw here so settings written back keep it; it is resolved
+    # from CPU/RAM only when advertised (intake 88ff6766).
+    if maximum != 'auto' and (type(maximum) is not int or not 1 <= maximum <= 100):
         raise ValueError('Invalid machine concurrency')
+    data['max_agents'] = maximum
     # A relabel lists ONE side: the local label or its canonical alias, never
     # both. Two subscriptions canonicalizing to the same (engine, profile,
     # account) identity would make _route() ambiguous, so fail fast here.
@@ -663,11 +753,14 @@ def load_settings(path=None):
     return data
 
 
-def run_json(argv, *, payload=None, cwd=None, timeout=30):
-    """No shell; typed failures carry bounded redacted evidence, never argv."""
+def run_json(argv, *, payload=None, cwd=None, timeout=30, env=None):
+    """No shell; typed failures carry bounded redacted evidence, never argv.
+
+    env: an explicit child environment (launcher subprocesses only, see
+    launcher_env); None inherits the host environment as before."""
     from .launch_diagnostics import LocalCommandError
     from .aplexer_client import client_call
-    native = client_call(argv[0], argv[1:]) if payload is None else None
+    native = client_call(argv[0], argv[1:]) if payload is None and env is None else None
     if native is not None:
         if native.returncode:
             raise LocalCommandError(native.stdout + '\n' + native.stderr,
@@ -678,7 +771,7 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
             raise RuntimeError("Native client response exceeds bound; reconcile effects")
         return json.loads(native.stdout)
     import threading
-    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env)
     overflow = threading.Event()
     stdout = bytearray()
     stderr = bytearray()
@@ -723,6 +816,12 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
                                     command=argv[0], exit_code=proc.returncode,
                                     stdout=bytes(stdout), stderr=bytes(stderr))
         for thread in threads: thread.join(timeout=1)
+        if proc.returncode == 0 and not overflow.is_set():
+            # A clean exit can outrun the readers on a CPU/GIL-starved Windows
+            # controller: give them a bounded grace before a completed gate is
+            # reported as a failed command (DESKTOP-FP4OP26 abe6bf8d, intake ad8aa931).
+            grace = time.monotonic() + READER_GRACE_S
+            for thread in threads: thread.join(timeout=max(0, grace - time.monotonic()))
         if proc.returncode != 0 or overflow.is_set() or any(t.is_alive() for t in threads):
             raise LocalCommandError(bytes(stdout + b'\n' + stderr).decode('utf-8', 'replace'),
                                     command=argv[0], exit_code=proc.returncode,
@@ -854,7 +953,7 @@ def _is_quota_cli(argv):
     return name in ("quse", "quse.exe") or any(str(a) in ("quse", "quse.cli") for a in argv[1:3])
 
 
-def collect_subscriptions(settings, runner=run_json):
+def collect_subscriptions(settings, runner=run_json, antigravity_probe=None):
     """Probe default accounts once per service. Alternate accounts require explicit wrappers."""
     subscriptions = settings["subscriptions"]
     counts = {service: sum(s["service"] == service for s in subscriptions) for service in SERVICES}
@@ -863,10 +962,22 @@ def collect_subscriptions(settings, runner=run_json):
         service = sub["service"]
         raw = {}
         profile = sub.get("profile")
-        # Quota is Hub's (intake 5814e109 I4): the host runs no quota CLI. An
-        # explicitly configured non-quse adapter argv is still honoured.
+        # Hub-managed quota is read centrally. Host-home Antigravity accounts
+        # use its official, read-only /usage command after account_registry has
+        # verified the account-specific credential; no login flow is started.
         command = sub.get("quota_argv")
-        if command and not _is_quota_cli(command):
+        if service == "gemini" and sub.get("engine") == "antigravity":
+            try:
+                if antigravity_probe is None:
+                    from . import account_registry, native_antigravity_quota
+                    # CLI only: never the Antigravity desktop app / editor launcher.
+                    binary = account_registry._find_binary(("agy",))
+                    raw = native_antigravity_quota.probe(binary, Path.home()) if binary else {}
+                else:
+                    raw = antigravity_probe()
+            except Exception:
+                pass
+        elif command and not _is_quota_cli(command):
             try:
                 raw = runner(command)
             except Exception:
@@ -1125,6 +1236,7 @@ class Dispatcher:
         self.journal_dir = journal_dir or settings.get("journal_dir")
         self._imported_sessions_cursor: Optional[str] = None
         self._active_launches: dict[str, dict[str, Any]] = {}
+        self._reconcile_backoff: dict[str, float] = {}
         self._role_jobs_cache: Optional[tuple] = None
         # Intake 488b860e: offers already faulted once this process (fault flag
         # is once-per-offer; the synchronous same-key retry must run clean).
@@ -1144,6 +1256,11 @@ class Dispatcher:
         self._dispatching_guard = threading.Lock()
         self._bindings_lock = threading.Lock()
         self._catalog_report_lock = threading.Lock()
+        # Intake 6cbb862a: telemetry and check-in threads both post the route
+        # advertisement; snapshot, send and cache update are serialized.
+        self._route_advertisement_lock = threading.Lock()
+        self._route_advertisement_seq = 0
+        self._route_advertisement_posted = None
         self._catalog_enrichment = {}
         self._catalog_sampled_at = 0.0
         self._catalog_raw = None
@@ -1644,6 +1761,60 @@ class Dispatcher:
         self.request('POST', '/api/fleet/launches/' + offer_id + '/result', payload)
         return {'id': offer_id, **payload, 'reason': diagnostic['reason']}
 
+    def _settle_retired_dispatch(self, *, offer_id, task_id, workspace, target_cwd, target,
+                                 offer, sub, launched_at_ts, log_offsets, record, failure):
+        """Intake 17e774f8: a retired native after a receipt-less launcher exit.
+
+        The maintained launcher can exit 1 with empty pipes when the engine
+        finishes before any first action validates (Windows headless Claude,
+        b99fab81) although the worker completed and wrote its result. Native
+        retirement alone neither proves success nor releases the launcher's
+        reservation, so bind the exact native in the ordinary headless shape
+        and let reconcile_launches settle it: launcher release confirmed,
+        exited only for a clean native exit with a done report, failed (with
+        any worker report forwarded) otherwise. Unconfirmed release keeps the
+        reservation and reports uncertain; reconciliation finishes it later.
+        """
+        # Only this launch's own native may settle it: a foreign or stale
+        # start file must never qualify an unrelated retirement.
+        try:
+            started_ms = int(launched_at_ts * 1000) if type(launched_at_ts) in (int, float) else None
+            same = (target.tag == 'task-' + task_id
+                    and target.workspace in {str(Path(w).resolve(strict=True)) for w in (workspace, target_cwd)}
+                    and isinstance(offer.get('engine'), str) and target.engine == offer['engine']
+                    and type(target.created_at_ms) is int and started_ms is not None
+                    and started_ms - 60_000 <= target.created_at_ms <= int(time.time() * 1000) + 60_000)
+        except (OSError, ValueError, TypeError):
+            same = False
+        if not same:
+            return None
+        native_id = str(target.session_id)
+        record.update(state='running', settled=False, native_id=native_id, tag=target.tag,
+                      engine=target.engine, incarnation=target.created_at_ms,
+                      account=sub.get('account_label'), profile=offer.get('profile') or sub.get('profile'),
+                      launched_at_ts=launched_at_ts if type(launched_at_ts) in (int, float) else time.time(),
+                      log_offsets=log_offsets, retired_dispatch=True, dispatch_failure=failure,
+                      result_path=str(Path(workspace) / '.local' / 'hub-results' / (offer_id + '.json')))
+        record.pop('reason', None)
+        record.pop('diagnostic', None)
+        self._persist_launch_record(record)
+        self._active_launches[offer_id] = record
+        self.reconcile_launches([offer_id], terminal_only=True)
+        current = self._active_launches.get(offer_id) or record
+        if current.get('settled') is True and current.get('state') in ('exited', 'failed'):
+            return {'id': offer_id, 'state': current['state'], 'native_id': native_id,
+                    'launcher_task_id': task_id, 'recovered_receipt': True,
+                    **({'diagnostic': failure} if current['state'] == 'failed' else {})}
+        if not isinstance(current.get('terminal_payload'), dict):
+            # Nothing terminal was sent: expose the bound native as uncertain.
+            # A pending terminal payload is replayed by reconciliation instead.
+            self.request('POST', '/api/fleet/launches/' + offer_id + '/result',
+                         {'state': 'uncertain', 'native_id': native_id,
+                          'launcher_task_id': task_id, 'diagnostic': failure})
+        return {'id': offer_id, 'state': 'uncertain', 'native_id': native_id,
+                'launcher_task_id': task_id, 'reason': failure['reason'],
+                'diagnostic': failure, 'pending_release': True}
+
     def _recover_live_native_after_lost_receipt(self, *, offer_id, task_id, workspace, target,
                                                 start_engine, retire_detail, sub, offer,
                                                 launched_at_ts, log_offsets):
@@ -1708,6 +1879,9 @@ class Dispatcher:
         has_launcher = all(launcher.get(k) for k in ["argv", "root", "config_dir"])
 
         from .terminal_reports import guarded_records
+        from . import retired_native
+        pass_catalog = {}
+        launcher_runs = 0
         for offer_id, record in guarded_records(self, offer_ids):
             if record.get("settled") is True:
                 from .late_reports import deliver, cleanup
@@ -1748,16 +1922,24 @@ class Dispatcher:
             if not isinstance(engine, str) or not engine:
                 continue
 
-            try:
-                target = NativeTarget(
-                    session_id=record["native_id"],
-                    tag=record["tag"],
-                    workspace=record["workspace"],
-                    created_at_ms=incarnation,
-                    engine=engine,
-                ).validated()
-            except (SessionControlError, KeyError, ValueError, TypeError):
+            # The launcher binds the native session to the engine cwd, which
+            # differs from the workspace root for `--cwd` launches (intake
+            # 2a944c3f); a tombstone only matches its own exact workspace.
+            targets = []
+            for ws in launch_workspace_targets(record):
+                try:
+                    targets.append(NativeTarget(
+                        session_id=record["native_id"],
+                        tag=record["tag"],
+                        workspace=ws,
+                        created_at_ms=incarnation,
+                        engine=engine,
+                    ).validated())
+                except (SessionControlError, KeyError, ValueError, TypeError):
+                    continue
+            if not targets:
                 continue
+            target = targets[0]
 
             if (not terminal_only and not record.get('health_stop_confirmed')
                     and not record.get('routing_task_id')) and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused'):
@@ -1767,16 +1949,56 @@ class Dispatcher:
                     continue
 
             # 2. Positive retirement verification
-            try:
-                is_retired, tombstone, detail = verify_native_retirement(native, target, state_dir=state_dir)
-            except Exception:
-                continue
+            # Bounded: at most one live census per kind per pass (shared by
+            # every launch and candidate workspace) and a capped number of
+            # launcher runs; a launch whose launcher release is refused backs
+            # off for a while.
+            if "sessions" not in pass_catalog:
+                try:
+                    pass_catalog["sessions"] = retired_native.list_sessions(native, include_exited=True)
+                except Exception:
+                    pass_catalog["sessions"] = None
+            is_retired, found, tombstone, detail = False, None, None, "live_catalog_unavailable"
+            # A failed census is retried (through the verifier) by one launch
+            # per pass only, never by every launch.
+            if pass_catalog["sessions"] is not None:
+                is_retired, found, tombstone, detail = verify_retirement_in_targets(
+                    native, targets, state_dir=state_dir, sessions=pass_catalog["sessions"],
+                    verify=verify_native_retirement)
+            elif not pass_catalog.get("census_retried"):
+                pass_catalog["census_retried"] = True
+                try:
+                    is_retired, tombstone, detail = verify_native_retirement(native, targets[0], state_dir=state_dir)
+                    found = targets[0] if is_retired else None
+                except Exception:
+                    pass
+            if found is not None:
+                target = found
 
             if not is_retired:
-                from .terminal_reports import retained_terminal_exit
-                is_retired, tombstone, detail = retained_terminal_exit(self, target, record)
+                from .terminal_reports import retained_terminal_exit, native_catalog
+                if "rows" not in pass_catalog:
+                    pass_catalog["rows"] = native_catalog(self)
+                for candidate in targets:
+                    is_retired, tombstone, detail = retained_terminal_exit(
+                        self, candidate, record, rows=pass_catalog["rows"])
+                    if is_retired:
+                        target = candidate
+                        break
+                    if detail != 'retained_identity_unavailable':
+                        break
             if not is_retired:
                 continue
+            # Qualified native exit evidence survives catalog auto-retirement.
+            # Publish route health before launcher backoff/batch limits delay settlement.
+            try:
+                from .zcodex_health import observe_verified_terminal
+                observe_verified_terminal(self, record, target, tombstone or {})
+            except Exception:
+                pass  # health publication must not block terminal settlement
+            if time.time() < self._reconcile_backoff.get(offer_id, 0) or launcher_runs >= RECONCILE_LAUNCHER_BATCH:
+                continue
+            launcher_runs += 1
 
             # 3. Maintained Launcher reconcile
             if not has_launcher:
@@ -1786,7 +2008,7 @@ class Dispatcher:
             task_id = record["task_id"]
             reconcile_argv = prefix + ["reconcile", "--id", task_id, "--json"]
             try:
-                reconcile_out = self.runner(reconcile_argv, cwd=launcher["root"])
+                reconcile_out = self._launcher_run(reconcile_argv, cwd=launcher["root"])
             except Exception:
                 continue
 
@@ -1797,9 +2019,26 @@ class Dispatcher:
             resources_reserved = reconcile_out.get("resources_reserved")
 
             # Require confirmed physical release of the same native execution.
+            # A retired dispatch (intake 17e774f8) may hold no launcher
+            # binding when no first action validated: a missing (never a
+            # different) launcher native_id is accepted for it only.
+            launcher_native = reconcile_out.get("native_id")
+            # A `--cwd` launch whose launcher binding failed on the workspace
+            # mismatch (launcher_command_failed, before 1883b769) has no
+            # binding either; the retirement of the host-bound native was
+            # proven above, so a missing (never a different) native_id is
+            # accepted for it too.
+            unbound_ok = (launcher_native is None and reconcile_out.get("task_id") == record["task_id"]
+                          and (record.get("retired_dispatch") is True
+                               or (reconciled_state == "failed"
+                                   and record.get("target_cwd") not in (None, record.get("workspace")))))
             if (resources_reserved is not False
-                    or reconcile_out.get("native_id") != record["native_id"]
+                    or (launcher_native != record["native_id"] and not unbound_ok)
                     or reconciled_state not in ("completed-awaiting-review", "accepted", "failed")):
+                if resources_reserved is False:
+                    # Released but not this launch's own proof: do not re-run
+                    # the launcher every pass. Unconfirmed release retries.
+                    self._reconcile_backoff[offer_id] = time.time() + RECONCILE_BACKOFF_S
                 continue
 
             # 4. Own-host Fleet terminal result
@@ -1827,12 +2066,19 @@ class Dispatcher:
                 if acknowledge(self, record, cached, cached.get('runtime', {}).get('outcome') == 'reported'):
                     reconciled.append({'id': offer_id, 'state': 'exited', 'reconciled': True})
                 continue
-            fleet_state = cached['state'] if cached else _terminal_fleet_state(
-                reconciled_state, bool(_peeked),
-                (record.get('diagnostic') or {}).get('reason')
-                if isinstance(record.get('diagnostic'), dict) else None)
             from .exit_evidence import terminal_evidence, bound_finish_fields
             evidence = dict(cached['runtime']) if cached and isinstance(cached.get('runtime'), dict) else terminal_evidence(record, tombstone or {}, state_dir=state_dir)
+            if cached:
+                fleet_state = cached['state']
+            elif record.get('retired_dispatch') is True:
+                # The launcher's own state is failed (no first action); only a
+                # clean native completion with a done report supersedes it.
+                fleet_state = 'exited' if _clean_native_success(_peeked, evidence) else 'failed'
+            else:
+                fleet_state = _terminal_fleet_state(
+                    reconciled_state, bool(_peeked),
+                    (record.get('diagnostic') or {}).get('reason')
+                    if isinstance(record.get('diagnostic'), dict) else None)
             evidence['outcome'] = ('reported' if _peeked else
                 'failed-with-partial-work' if evidence['observed_commits'] or evidence['dirty_paths'] or evidence['log_tail'] else
                 'failed-without-report')
@@ -1906,6 +2152,9 @@ class Dispatcher:
                 result_payload['diagnostic'] = record['dispatch_diagnostic']
             elif record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
                 result_payload['diagnostic'] = record['diagnostic']
+            elif (fleet_state == 'failed' and record.get('retired_dispatch') is True
+                    and isinstance(record.get('dispatch_failure'), dict)):
+                result_payload['diagnostic'] = record['dispatch_failure']
             # AC a19cac9e: missing result JSON now forces failed above, so
             # every exit-without-result carries exit code/signal/wall-time/
             # tail here. Exited-with-result receipts keep no failure
@@ -2317,12 +2566,63 @@ class Dispatcher:
 
         return sorted(qualified)
 
+    def route_advertisement(self):
+        """Every distinct (engine, account, profile) route _route() accepts.
+
+        Hub offers only these while the advertisement is fresh, so a route the
+        host dropped (e.g. a failed managed install) holds with
+        route_not_advertised instead of failing dispatch_route_unconfigured on
+        the host (intake 6cbb862a). Never truncated.
+        """
+        routes, seen = [], set()
+        for s in self.settings['subscriptions']:
+            route = (s.get('engine', s['service']), s['account_label'], s.get('profile'))
+            if route not in seen:
+                seen.add(route)
+                routes.append({'engine': route[0], 'account': route[1], 'profile': route[2]})
+        return routes
+
+    def post_route_advertisement(self):
+        """POST the complete route list (or an explicit overflow) before a heartbeat.
+
+        Sent separately from the heartbeat so its size never competes with
+        telemetry for Hub's 32 KiB body limit: the heartbeat body is exactly
+        what it was without advertisement, and the route body is bounded by
+        MAX_ADVERTISED_ROUTES label tuples. Posted whenever the list changes
+        and at least every ROUTE_ADVERTISEMENT_REFRESH_S (Hub treats a list
+        older than 180 s as stale and holds every route). A failed post
+        raises, so the caller skips that heartbeat (and its offers) exactly
+        as if the heartbeat itself had failed.
+
+        Concurrent producers (telemetry and check-in threads) are fenced: the
+        lock serializes snapshot, send and cache update, and every post carries
+        a strictly increasing seq (wall-clock microseconds, so it also orders
+        posts across restarts) that Hub requires to exceed the stored one, so a
+        delayed older request can never replace newer route state.
+        """
+        with self._route_advertisement_lock:
+            routes = self.route_advertisement()
+            body = {'fleet_routes': routes} if len(routes) <= MAX_ADVERTISED_ROUTES else {'fleet_routes_overflow': len(routes)}
+            key = json.dumps(body, sort_keys=True)
+            last = self._route_advertisement_posted
+            now = time.monotonic()
+            if last and last[0] == key and now - last[1] < ROUTE_ADVERTISEMENT_REFRESH_S:
+                return body
+            if 'fleet_routes_overflow' in body:
+                print(json.dumps({'event': 'fleet_routes_overflow', 'routes': len(routes)}), flush=True)
+            seq = max(time.time_ns() // 1000, self._route_advertisement_seq + 1)
+            self._route_advertisement_seq = seq
+            self._route_advertisement_posted = None  # an unacknowledged post never suppresses the next one
+            self.request('POST', '/api/host/routes', {**body, 'seq': seq})
+            self._route_advertisement_posted = (key, now)
+            return body
+
     def goal_routes(self):
         """Advertise executable local routes, independent of quota admission."""
         return [{'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
                  'profile': sub.get('profile')}
                 for sub in self.settings['subscriptions']
-                if sub.get('engine', sub['service']) in {'codex', 'zcodex'}
+                if sub.get('engine', sub['service']) in GOAL_ENGINES
                 and sub.get('admission_argv')
                 and (sub['account_label'] in self._managed_labels or
                      (isinstance(sub.get('startup_argv'), list) and sub['startup_argv']
@@ -2335,7 +2635,10 @@ class Dispatcher:
         if len(matches) != 1:
             raise ValueError("Local account/profile/workspace is not configured")
         # Validates map membership or workspace_roots / worktrees identity paths.
-        resolve_workspace_path(self.settings, offer.get("workspace"))
+        # A repo-identity workspace is cloned by this host at dispatch (after the claim).
+        from . import repo_workspace
+        if not repo_workspace.decode(offer.get("workspace")):
+            resolve_workspace_path(self.settings, offer.get("workspace"))
         sub = dict(matches[0])
         if offer.get('mode') == 'headless' and sub.get('launcher_provider') == 'claude' and not sub.get('profile'):
             raise ValueError('model_unsupported: Claude headless route requires managed profile')
@@ -2389,7 +2692,7 @@ class Dispatcher:
         if not db.is_file() or db.is_symlink():
             return
         try:
-            with sqlite3.connect(str(db), timeout=5) as conn:
+            with closing(sqlite3.connect(str(db), timeout=5)) as conn, conn:
                 row = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
                 if not row or row[0] != "queued":
                     return
@@ -2400,14 +2703,26 @@ class Dispatcher:
         except Exception:
             return
 
+    def _launcher_run(self, argv, **kwargs):
+        """Run a launcher command with AGENT_HUB_HOST_PATH in its own env only.
+
+        The production runner receives an explicit environment copy carrying
+        this host's validated package path (Hub intake 86254a30 AC6); an
+        injected runner that declares accepts_env gets it too. Other injected
+        runners are called exactly as before."""
+        if self.runner is run_json or getattr(self.runner, "accepts_env", False) is True:
+            from .launcher_env import launcher_environment
+            return self.runner(argv, env=launcher_environment(), **kwargs)
+        return self.runner(argv, **kwargs)
+
     def _submit_launcher_task(self, prefix, launcher, task_id, submit_argv):
         try:
-            return self.runner(submit_argv, cwd=launcher["root"])
+            return self._launcher_run(submit_argv, cwd=launcher["root"])
         except (TimeoutError, subprocess.TimeoutExpired):
             raise  # Submission may have landed; retry its original key next cycle.
         except RuntimeError:
             self._drop_queued_launcher_task(launcher, task_id)
-            return self.runner(submit_argv, cwd=launcher["root"])
+            return self._launcher_run(submit_argv, cwd=launcher["root"])
 
     def _admission_gate(self, sub, admission_payload):
         """Single-flight, briefly shared admission gate run per route.
@@ -2439,26 +2754,46 @@ class Dispatcher:
     def _dispatch_admission(self, sub, admission_payload, selection, offer):
         """Run the local admission gate; return its fresh observed_at."""
         from .model_contract import canonical_account_label
+        from .dispatch_diagnostics import AdmissionRefusedError
+        gate_started = time.monotonic()
         gate = self._admission_gate(sub, admission_payload)
+        gate_duration_s = time.monotonic() - gate_started
         if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or canonical_account_label(gate.get("account_label")) != canonical_account_label(sub["account_label"]):
             gate_reason = gate.get("reason") if isinstance(gate.get("reason"), str) else ""
             # Preserve host-side gate slugs (intake 59a6f44a AC3/AC4): a managed
             # Codex quota-gate refusal must surface as codex_quota_gate_* in
             # rejected[]/launch_error, never a silent stopped/session_not_bound.
+            if gate_reason == "not_logged_in":
+                raise ValueError("not_logged_in: the engine profile has no credential on this host")
             if gate_reason.startswith("codex_quota_gate_"):
                 slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in gate_reason)[:64]
                 raise ValueError(slug + ": managed Codex quota gate refused launch before execution")
-            raise ValueError("Fresh admission refused")
+            if not gate_reason:
+                gate_reason = ("account_label_mismatch" if gate.get("launch_allowed") is True and gate.get("profile_supported") is True
+                               else "profile_unsupported" if gate.get("launch_allowed") is True else "gate_refused")
+            raise AdmissionRefusedError("Fresh admission refused", gate_reason)
         if (offer.get('task_id') or (selection and sub.get("account_label") in self._managed_labels)) and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
-            raise ValueError('Selected model/effort requires verified admission')
+            raise AdmissionRefusedError('Selected model/effort requires verified admission', 'model_unverified')
         at = gate.get("observed_at")
+        timing = {"gate_duration_s": round(gate_duration_s, 3)}
+        try:
+            server_at = dt.datetime.fromisoformat(gate["server_observed_at"].replace("Z", "+00:00"))
+            # This is an end-of-gate offset sample, including response transit
+            # and post-stamp work, not an exact synchronized-clock measurement.
+            timing["host_minus_hub_s"] = round((dt.datetime.now(dt.timezone.utc) - server_at).total_seconds(), 3)
+        except (KeyError, TypeError, ValueError):
+            pass
+        for key in ("host_minus_hub_s", "gate_post_stamp_s"):
+            if type(gate.get(key)) in (int, float):
+                timing[key] = gate[key]
         try:
             observed = dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
             age = (dt.datetime.now(dt.timezone.utc) - observed).total_seconds()
-            if not 0 <= age <= 30:
+            timing["admission_age_s"] = round(age, 3)
+            if not -5 <= age <= 30 or gate_duration_s > 30:
                 raise ValueError()
         except Exception:
-            raise ValueError("Fresh admission timestamp required") from None
+            raise AdmissionRefusedError("Fresh admission timestamp required", "admission_timestamp_stale", timing=timing) from None
         return at
 
     def _pending_claim_key(self, offer_id):
@@ -2645,13 +2980,15 @@ class Dispatcher:
     def dispatch(self, offer):
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
             raise ValueError('Goal work is interactive only')
-        # Intake 0689ce9c AC2: live host load gates every new launch before
-        # any admission subprocess, claim or native start. Test processes
-        # spawned INSIDE sessions are invisible to launcher admission and
-        # server placement (both deliberately choking-only), so the 1-minute
-        # load average is checked here: above factor x cores the launch is
-        # held (queued, retried next cycle). Nothing running is touched.
+        # Intake 0689ce9c: live host load gates every new launch before any
+        # admission subprocess, claim or native start. Test processes spawned
+        # INSIDE sessions are invisible to launcher admission; this 1-minute
+        # load check refuses new starts above factor x cores. For an unclaimed
+        # non-task offer, _dispatch_one refreshes the heartbeat before sending
+        # host_load_high so Hub keeps its retry queued until load clears.
+        # Nothing already running is touched.
         from .host_load import check_live_load
+        stages = [('start', time.monotonic())]
         check_live_load(self.settings)
         sub = self._route(offer)
         device_auth = self.settings.get('opencode_auth') if sub.get('launcher_provider') == 'opencode' else None
@@ -2676,6 +3013,7 @@ class Dispatcher:
         # a relabel (_route already pinned canonical identity above).
         admission_payload["account"] = sub["account_label"]
         at = self._preclaim_check(offer_id, self._dispatch_admission, sub, admission_payload, selection, offer)
+        stages.append(('admission', time.monotonic()))
         mode = offer.get("mode")
         # The offer workspace is a configured identifier — a legacy label or
         # an explicitly allowed absolute path — never a free-form path: it is
@@ -2683,9 +3021,15 @@ class Dispatcher:
         # validated above. A literal offer string must never become a
         # filesystem path on its own (label "demo" is not ./demo, and an
         # unconfigured "/abs/path" is refused before any claim or effect).
-        workspace = resolve_workspace_path(self.settings, offer["workspace"])
+        from . import repo_workspace
+        if repo_workspace.decode(offer["workspace"]):
+            # Repo identity (intake 8028bb06): this host clones its own fresh work tree.
+            workspace = repo_workspace.ensure_repo_workspace(self.settings, offer["workspace"])
+        else:
+            workspace = resolve_workspace_path(self.settings, offer["workspace"])
         offer_workspace = workspace
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"), self.settings)
+        stages.append(('workspace', time.monotonic()))
         native = self.settings.get("aplexer_bin", "aplexer")
         if mode == "interactive":
             if selection:
@@ -2702,15 +3046,15 @@ class Dispatcher:
                 if support.get('supported') is not True or support.get('provider') != sub['launcher_provider'] or support.get('model') != selection['model']:
                     raise ValueError('model_unsupported: maintained adapter refused requested model')
             with_goal = offer.get('with_goal') is True
-            if with_goal and (offer.get('engine') not in {'codex', 'zcodex'} or not isinstance(offer.get('prompt'), str) or not offer['prompt'].strip()):
-                raise ValueError('Interactive goal requires a Codex-family engine and goal text')
+            if with_goal and (offer.get('engine') not in GOAL_ENGINES or not isinstance(offer.get('prompt'), str) or not offer['prompt'].strip()):
+                raise ValueError('Interactive goal requires a goal-capable engine and goal text')
             if offer.get("prompt") and not with_goal:
                 raise ValueError("Interactive task injection is unsupported; start an empty native session")
             # Intake 4b161918: Hub-planned intake worktree (fail-open), after local refusals.
             from .intake_worktree import launch_cwd
             target_cwd, wt_note, intake_wt = launch_cwd(self.request, offer, workspace, target_cwd)
             self._lock_session_worktree(offer, target_cwd)
-            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"]] + worker_resource_argv() + ["--json"]
+            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"]] + worker_resource_argv(offer["engine"]) + ["--json"]
             if offer.get("profile"):
                 argv += ["--profile", offer["profile"]]
             if target_cwd != workspace:
@@ -2725,6 +3069,9 @@ class Dispatcher:
                 argv += ["--env", f"GIT_AUTHOR_NAME={git_name}", "--env", f"GIT_COMMITTER_NAME={git_name}"]
             if git_email:
                 argv += ["--env", f"GIT_AUTHOR_EMAIL={git_email}", "--env", f"GIT_COMMITTER_EMAIL={git_email}"]
+            from . import git_noninteractive
+            for _k, _v in git_noninteractive.session_env_pairs():
+                argv += ["--env", f"{_k}={_v}"]
             if selection and not sub.get("startup_argv") and sub.get("account_label") not in self._managed_labels:
                 argv += ["--model", selection["model"]]
             if with_goal or sub.get("startup_argv") or (selection and sub.get("account_label") in self._managed_labels):
@@ -2770,6 +3117,7 @@ class Dispatcher:
             # Refuse before creating a maintained-launcher task or acquiring
             # execution authority: a foreign lock must leave no reservation.
             self._lock_session_worktree(offer, target_cwd)
+            stages.append(('worktree', time.monotonic()))
             task_id = "hub-" + offer_id
             goal = wt_note + compose_prompt(offer["prompt"]) + "\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers."
             curr = workspace
@@ -2827,7 +3175,7 @@ class Dispatcher:
                 cpu_estimate = offer.get("expected_cpu_cores")
                 if type(cpu_estimate) in (int, float) and math.isfinite(cpu_estimate) and 0 <= cpu_estimate <= 65536:
                     payload["expected_cpu_cores"] = cpu_estimate
-                    if offer.get("expected_cpu_source") in ("repo_kind", "repo", "global", "default"):
+                    if offer.get("expected_cpu_source") in ("project_engine_model", "repo_kind", "repo", "global", "default"):
                         payload["expected_cpu_source"] = offer["expected_cpu_source"]
                 policy = offer.get("resource_management")
                 from .cpu_resources import sanitize_resource_choking
@@ -2838,7 +3186,7 @@ class Dispatcher:
                 if isinstance(policy, dict) and policy:
                     bounded = {k: policy[k] for k in (
                         "memory_floor_mb", "ramp_reserve_default_mb", "estimate_percentile",
-                        "estimate_multiplier", "ramp_seconds", "cpu_load_factor",
+                        "estimate_multiplier", "estimate_cap_mb", "memory_floor_pct", "ramp_seconds", "cpu_load_factor",
                         "cpu_target_utilization", "cpu_default_cores", "cpu_estimate_multiplier", "cpu_psi_hard_cap_pct", "cpu_psi_full_hard_cap_pct", "memory_psi_full_hard_cap_pct", "choking_cooldown_seconds",
                         "watchdog_interval_s", "idle_minutes", "rss_flag_gb") if k in policy}
                     if bounded:
@@ -2853,7 +3201,8 @@ class Dispatcher:
                 payload["managed_dir"] = str(provisioning.root())
             submit_argv = prefix + ["submit", "--id", task_id, "--key", task_id, "--paths", str(result_path), "--payload", json.dumps(payload), "--json"]
             self._preclaim_check(offer_id, self._submit_launcher_task, prefix, launcher, task_id, submit_argv)
-            plan = self._preclaim_check(offer_id, self.runner, prefix + ["plan", "--id", task_id], cwd=launcher["root"])
+            plan = self._preclaim_check(offer_id, self._launcher_run, prefix + ["plan", "--id", task_id], cwd=launcher["root"])
+            stages.append(('submit_plan', time.monotonic()))
             eligible = plan.get("eligible", [])
             # Real maintained-plan contract (verified live against the
             # maintained CLI dry-run): entries carry provider/model/task_fit
@@ -2884,7 +3233,12 @@ class Dispatcher:
                         sub.get("account_label"),
                         canonical_account_label(sub.get("account_label")),
                     } - {None, ""}
-                    if any(k in rejections for k in keys):
+                    matched = [str(rejections[k]) for k in keys if k in rejections]
+                    if matched:
+                        # Name the launcher's missing quota evidence (fixed slug;
+                        # the free-form launcher text is never forwarded).
+                        if any(QUOTA_SOURCE_REJECTION in r for r in matched):
+                            raise ValueError("admission_quota_unverified: maintained launcher has no trusted quota observation")
                         raise ValueError("Fresh admission refused")
                 raise ValueError("model_unsupported: maintained launcher plan refused requested model")
             # OpenCode, Antigravity, ZAI, Gemini, and named-profile Codex use the maintained native backend:
@@ -2923,6 +3277,8 @@ class Dispatcher:
         check_live_load(self.settings)
         claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
         self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, offer_workspace)
+        stages.append(('claim', time.monotonic()))
+        _emit_stage_timing(offer_id, stages)
         from .launch_diagnostics import capture_log_offsets
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()
@@ -2974,7 +3330,10 @@ class Dispatcher:
                 if mode == 'headless':
                     fence['task_id'] = task_id
                 self._persist_launch_record(fence)
-            receipt = self.runner(argv, cwd=cwd, timeout=120)
+            # Headless starts are launcher `run` commands; interactive starts are
+            # native aplexer and never receive the launcher-only host path.
+            receipt = (self._launcher_run(argv, cwd=cwd, timeout=120) if mode == "headless"
+                       else self.runner(argv, cwd=cwd, timeout=120))
             if mode == "interactive":
                 native_id = receipt.get("id")
                 if selection:
@@ -3087,6 +3446,14 @@ class Dispatcher:
             l_at = locals().get("launched_at_ts")
             failure = exception_diagnostic(exc, "dispatch_headless" if mode == "headless" else "dispatch_interactive",
                                            engine=engine_name, cwd=t_cwd, task_id=t_id, launched_at=l_at, start_offsets=l_offsets)
+            if mode == "headless" and t_id and failure.get("reason") == "launcher_command_failed":
+                # Intake 17e774f8: an empty-pipe launcher exit still saved its
+                # cause in this launch's own record; keep it, sanitized.
+                try:
+                    from .launch_diagnostics import launcher_record_cause
+                    failure = launcher_record_cause(failure, workspace, t_id, l_at)
+                except Exception:
+                    pass
             if mode == "headless" and not offer.get("task_id") and t_id:
                 try:
                     health = self._check_headless_health(offer_id, t_id, workspace, engine_name)
@@ -3123,17 +3490,35 @@ class Dispatcher:
                                 cand_engine = s_data.get("engine") or offer.get("engine")
                                 cand_inc = s_data.get("created_at_ms") or s_data.get("incarnation")
                                 if cand_id and cand_inc:
-                                    target = NativeTarget(
+                                    # The native is bound to the engine cwd for `--cwd`
+                                    # launches; the start file names the workspace root.
+                                    cand_targets = [NativeTarget(
                                         session_id=cand_id,
                                         tag=cand_tag,
-                                        workspace=str(Path(cand_ws).resolve(strict=True)),
+                                        workspace=str(Path(w).resolve(strict=True)),
                                         created_at_ms=cand_inc,
                                         engine=cand_engine,
-                                    ).validated()
-                                    is_retired, tomb, retire_detail = verify_native_retirement(native, target, state_dir=self.settings.get("aplexer_state_dir"))
-                                    if is_retired:
+                                    ).validated() for w in dict.fromkeys([str(target_cwd), cand_ws])]
+                                    target = cand_targets[0]
+                                    is_retired, found, tomb, retire_detail = verify_retirement_in_targets(
+                                        native, cand_targets, state_dir=self.settings.get("aplexer_state_dir"),
+                                        verify=verify_native_retirement)
+                                    if found is not None:
+                                        target = found
+                                    if is_retired and failure.get("reason") != "launcher_command_failed":
+                                        # Diagnosed model/auth/permission failures keep their policy.
                                         proven_dead = True
                                         native_session_id = cand_id
+                                    elif is_retired:
+                                        settled = self._settle_retired_dispatch(
+                                            offer_id=offer_id, task_id=task_id, workspace=workspace,
+                                            target_cwd=target_cwd, target=target, offer=offer,
+                                            sub=sub if isinstance(locals().get("sub"), dict) else {},
+                                            launched_at_ts=l_at, log_offsets=l_offsets,
+                                            record=record, failure=failure)
+                                        if settled is not None:
+                                            return settled
+                                        # Foreign/stale start identity: keep uncertain.
                                     else:
                                         recovered = self._recover_live_native_after_lost_receipt(
                                             offer_id=offer_id, task_id=task_id, workspace=workspace,
@@ -3306,7 +3691,21 @@ class Dispatcher:
 
     def _report_subscriptions(self):
         from .quota_snapshot import parse_iso_utc, STALE_AGE_THRESHOLD
-        reports = collect_subscriptions(self.settings, self.runner)
+        from .native_admission import routing_rules
+        # Hub maps a subscription report all-or-nothing: one entry without a
+        # route for this machine 400s the whole batch (unmapped). A provider
+        # disabled by routing policy (Grok) is never routed, so a lingering
+        # operator entry for it hid every other quota observation on
+        # DESKTOP-FP4OP26 (intake 8d006dc3). Disabled providers are neither
+        # probed nor reported; re-enabling the provider re-includes them.
+        disabled = set(routing_rules().get('disabled_providers', []))
+        subscriptions = self.settings.get('subscriptions', [])
+        skipped = sorted(s.get('account_label') for s in subscriptions if s.get('service') in disabled)
+        if skipped:
+            print(json.dumps({'event': 'fleet_subscription_skipped', 'reason': 'provider_disabled',
+                              'accounts': skipped}), flush=True)
+        settings = dict(self.settings, subscriptions=[s for s in subscriptions if s.get('service') not in disabled])
+        reports = collect_subscriptions(settings, self.runner)
         now = dt.datetime.now(dt.timezone.utc)
         downgraded = []
         for sub in reports:
@@ -3396,7 +3795,7 @@ class Dispatcher:
                 if (row.get('id') == record.get('native_id')
                         and row.get('created_at_ms') == record.get('incarnation')
                         and row.get('tag') == record.get('tag')
-                        and row.get('workspace') == record.get('workspace')
+                        and row.get('workspace') in launch_workspace_targets(record)
                         and row.get('engine') == record.get('engine')
                         and isinstance(row.get('exit'), dict)):
                     exit_info = row['exit']
@@ -3417,6 +3816,11 @@ class Dispatcher:
                             persist_observation(self, record)
         catalog = bounded_catalog(rows)
         progress = self._session_progress.sample(catalog, active_launches)
+        try:
+            from .zcodex_health import monitor_for
+            monitor_for(self).observe(catalog, progress)
+        except Exception:
+            pass  # health projection never blocks the catalog report
         enriched = session_metadata(catalog, self.settings, progress)
         with self._catalog_report_lock:
             # Enrichment is never authoritative for identity or lifecycle.
@@ -3437,10 +3841,11 @@ class Dispatcher:
             'account', 'created_at_ms', 'phase', 'confirmed_exit'))
 
     def report_native_bindings(self):
-        """Report a complete fresh census without reading transcripts or tokens.
+        """Report a bounded fresh census and its completeness verdict.
 
-        The server still verifies the catalog before accepting a binding. A
-        separate short lock orders complete reports, independent of sampling.
+        The server still verifies the catalog before accepting a binding. The
+        completeness flag is true only when no omitted row is potentially
+        live. A separate short lock orders reports, independent of sampling.
         """
         with self._catalog_report_lock:
             return self._report_native_bindings()
@@ -3449,12 +3854,28 @@ class Dispatcher:
         started = time.monotonic()
         raw = self.runner([self.settings.get('aplexer_bin', 'aplexer'), 'list', '--all', '--json'])
         census_done = time.monotonic()
-        metadata = session_metadata(bounded_catalog(raw), self.settings, collect_tokens=False)
+        if isinstance(raw, list):
+            raw_rows = raw
+            valid_envelope = True
+        elif isinstance(raw, dict) and isinstance(raw.get('sessions'), list):
+            raw_rows = raw['sessions']
+            valid_envelope = True
+        else:
+            raw_rows = []
+            valid_envelope = False
+        # Keep this full normalized list for the completeness verdict and
+        # binding lookups; only the wire catalog is bounded to Hub's 500 rows.
+        catalog = bounded_catalog(raw_rows)
+        from .account_capacity import confirmed_empty
+        from .catalog_completeness import census_is_complete
+        census_complete = valid_envelope and census_is_complete(
+            raw_rows, catalog, limit=CATALOG_LIMIT, confirmed_exit=confirmed_empty)
+        metadata = session_metadata(catalog, self.settings, collect_tokens=False)
         for row in metadata:
             row.update(self._catalog_enrichment.get(self._catalog_identity(row), {}))
         metadata_done = time.monotonic()
         from .catalog_transport import report_catalog
-        report_catalog(self.request, metadata)
+        report_catalog(self.request, metadata, census_complete=census_complete)
         put_done = time.monotonic()
         # Reconcile Fleet-owned starts into exact Hub session bindings after
         # reporting the observed native catalog. Retry is read-before-write.
@@ -3467,7 +3888,8 @@ class Dispatcher:
                 raise
             pending = []
         pending_done = time.monotonic()
-        rows = raw if isinstance(raw, list) else raw.get("sessions", [])
+        rows = raw_rows
+        skipped = []
         for session in pending:
             if not isinstance(session, dict):
                 continue
@@ -3476,14 +3898,23 @@ class Dispatcher:
                 continue
             from .worktree_guard import protect_adoption
             if not protect_adoption(row, session, request=self.request):
+                # Intake 1c8d915e: a held worktree lock kept a running native
+                # unbound (row stuck offered) with no trace. Report it.
+                skipped.append({'session': str(session.get('id', ''))[:8], 'reason': 'worktree_lock_held'})
                 continue
             try:
                 self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
-            except ValueError:
+            except ValueError as exc:
                 # A refused binding (e.g. server fleet_tag_mismatch for a
                 # launcher-backend tag before the server seam lands) must not
                 # kill the cycle; the entry stays pending for next cycle.
+                code, status = getattr(exc, 'hub_error', None), getattr(exc, 'http_status', None)
+                reason = (code if isinstance(code, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}', code)
+                          else 'binding_http_%d' % status if type(status) is int else 'binding_refused')
+                skipped.append({'session': str(session.get('id', ''))[:8], 'reason': reason})
                 continue
+        if skipped:
+            print(json.dumps({'event': 'bindings_skipped', 'skipped': skipped[:20]}), flush=True)
         print(json.dumps({'event': 'bindings_report_phases', 'sessions': len(metadata),
                           'pending': len(pending), 'phases_s': {
                               'census': round(census_done - started, 3),
@@ -3561,7 +3992,7 @@ class Dispatcher:
                     stale=(not alive) or held_s > self._cycle_lock_stale_s())
         return info
 
-    def _refresh_checkin(self, hb) -> None:
+    def _refresh_checkin(self, hb) -> bool:
         """Best-effort checkin refresh between serial dispatches.
 
         A multi-offer batch dispatches serially and each dispatch can take a
@@ -3576,6 +4007,7 @@ class Dispatcher:
         # Intake 4398ce2a: never re-post an old cycle snapshot — it overwrote
         # fresher telemetry (cpu_usage/observed_at) from the fast telemetry
         # tick. Sample a fresh base heartbeat and keep the latest projections.
+        sample_fresh = True
         try:
             from . import api
             fresh_hb = api.get_heartbeat_payload()
@@ -3585,10 +4017,52 @@ class Dispatcher:
                     fresh_hb[key] = latest[key]
         except Exception:
             fresh_hb = hb
+            sample_fresh = False
         try:
+            self.post_route_advertisement()
             self.request('POST', '/api/host/poll', fresh_hb)
+            return sample_fresh
         except Exception:
-            pass
+            return False
+
+    def _reject_pending_reserve_claim(self, offer, diagnostic):
+        """Abandon only this host's durable, pre-native pending attempt.
+
+        Dispatch holds the per-offer cross-process lock. The journal guard
+        additionally fences terminal delivery and rechecks the durable state;
+        a native-start fence or an absent journal can never release a claim.
+        """
+        if (offer.get('task_id') or
+                diagnostic.get('reason') != 'codex_quota_gate_codex_reserve_required'):
+            return None
+        from .terminal_reports import launch_guard, read_record
+        try:
+            with launch_guard(self, offer.get('id')):
+                record = read_record(self, offer.get('id'))
+                key = self._pending_claim_key(offer.get('id'))
+                if (not record or record.get('state') != 'claim_pending' or
+                        record.get('settled') is True or key is None or
+                        any(record.get(k) for k in ('native_id', 'native_session_id',
+                                                    'task_id', 'incarnation', 'tag'))):
+                    return None
+                receipt = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject',
+                                       {'reason': diagnostic['reason'],
+                                        'diagnostic': diagnostic, 'claim_key': key})
+                if (not isinstance(receipt, dict) or not isinstance(receipt.get('id'), str) or
+                        receipt['id'] == offer['id'] or
+                        receipt.get('state') not in {'queued', 'offered'} or
+                        not isinstance(receipt.get('queued'), bool) or
+                        receipt['queued'] != (receipt['state'] == 'queued') or
+                        not isinstance(receipt.get('rejected'), list)):
+                    return None
+                record.update(state='dispatch_refused', settled=True,
+                              reason=diagnostic['reason'], diagnostic=diagnostic)
+                self._persist_launch_record(record)
+                return receipt
+        except Exception:
+            # A transport error, old Hub or racing state change is not proof
+            # of release. Retain the exact pending key for another cycle.
+            return None
 
     def _dispatch_one(self, offer, results) -> None:
         """Dispatch a single fleet offer, appending exactly one outcome row.
@@ -3608,6 +4082,20 @@ class Dispatcher:
             if server_key is not None:
                 pending = self._pending_claim_key(offer.get('id'))
                 if not (isinstance(server_key, str) and CLAIM_KEY_RE.fullmatch(server_key) and pending == server_key):
+                    if (pending is not None and offer.get('state') == 'starting' and
+                            isinstance(server_key, str) and CLAIM_KEY_RE.fullmatch(server_key)):
+                        from .terminal_reports import launch_guard, read_record
+                        try:
+                            with launch_guard(self, offer.get('id')):
+                                record = read_record(self, offer.get('id'))
+                                if (record and record.get('state') == 'claim_pending' and
+                                        record.get('claim_key') == pending and record.get('settled') is not True and
+                                        not any(record.get(k) for k in ('native_id', 'native_session_id', 'task_id', 'incarnation', 'tag'))):
+                                    record.update(state='superseded', settled=True,
+                                                  reason='claim_superseded', superseded_by_hub_claim=True)
+                                    self._persist_launch_record(record)
+                        except Exception:
+                            pass  # Preserve uncertain ownership if evidence cannot be persisted.
                     results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'already_claimed'})
                     return
             outcome = self.dispatch(offer)
@@ -3660,28 +4148,88 @@ class Dispatcher:
             from .dispatch_diagnostics import classify
             workspace_available = True
             try:
-                resolve_workspace_path(self.settings, offer.get('workspace'))
+                from . import repo_workspace
+                if not repo_workspace.decode(offer.get('workspace')):
+                    resolve_workspace_path(self.settings, offer.get('workspace'))
             except (ValueError, OSError):
                 workspace_available = False
             diagnostic = classify(exc, workspace_available=workspace_available)
             reason = diagnostic['reason']
             if reason == 'host_overload':
-                # Intake 0689ce9c AC2: an overloaded host holds the offer
-                # (stays queued, retried next cycle). A /reject POST would
-                # terminally fail non-task offers, and nothing running may
-                # be touched, so the launch is only parked locally.
+                # Intake 0689ce9c: only an unclaimed non-task offer can be
+                # rejected. A pending claim may already own a native start,
+                # and routed task offers require their task-report path.
                 print(json.dumps({'event': 'dispatch_host_overload',
                                   'offer_id': offer.get('id'),
                                   'diagnostic': diagnostic}), flush=True)
-                # Load holds preserve any earlier ambiguous claim and its retry key.
+                pending_key = self._pending_claim_key(offer.get('id'))
+                if pending_key is not None or offer.get('task_id'):
+                    # Never reject an ambiguous claim or a routed task offer.
+                    if pending_key is not None:
+                        self._persist_launch_record({'offer_id': offer.get('id'),
+                            'state': 'claim_pending', 'claim_key': pending_key,
+                            'reason': reason, 'diagnostic': diagnostic, 'settled': False})
+                    results.append({'id': offer.get('id'), 'state': 'held',
+                                    'reason': reason, 'diagnostic': diagnostic})
+                    return
+
+                # Publish the same fresh load sample the local 1.5x-core
+                # guard used before rejecting. Hub drains the retry inside
+                # /reject, so it must see this heartbeat before choosing a
+                # host or the new queued intent could be immediately re-offered.
+                if not self._refresh_checkin(getattr(self, '_last_hb', None)):
+                    results.append({'id': offer.get('id'), 'state': 'held',
+                                    'reason': reason, 'diagnostic': diagnostic,
+                                    'stage': 'heartbeat_refresh'})
+                    return
+
+                from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
+                hub_reason = 'host_load_high'
+                hub_diagnostic = {
+                    'reason': hub_reason,
+                    'message': _DISPATCH_MESSAGES[hub_reason],
+                    'stage': 'dispatch_route',
+                    'error_type': 'ValueError',
+                }
+                record = {'offer_id': offer.get('id'), 'state': 'dispatch_refused',
+                          'reason': hub_reason, 'diagnostic': hub_diagnostic,
+                          'settled': False}
+                self._persist_launch_record(record)
+                try:
+                    from .host_load import load_factor
+                    rejected = self.request(
+                        'POST', '/api/fleet/launches/' + offer['id'] + '/reject',
+                        {'reason': hub_reason, 'diagnostic': hub_diagnostic,
+                         'host_load_factor': load_factor(self.settings)})
+                    if (not isinstance(rejected, dict) or
+                            not isinstance(rejected.get('id'), str) or
+                            rejected['id'] == offer.get('id') or
+                            rejected.get('state') not in {'queued', 'offered'} or
+                            not isinstance(rejected.get('queued'), bool) or
+                            rejected.get('queued') != (rejected['state'] == 'queued') or
+                            not isinstance(rejected.get('rejected'), list)):
+                        raise ValueError('invalid_host_load_requeue_receipt')
+                    record['settled'] = True
+                    self._persist_launch_record(record)
+                    results.append(rejected)
+                    return
+                except Exception as reject_exc:
+                    # No valid retry receipt means the old offer is not proven
+                    # settled. A racing claim or transport failure stays visible.
+                    err = (type(reject_exc).__name__ or 'Error')[:64]
                 results.append({'id': offer.get('id'), 'state': 'held',
-                                'reason': reason, 'diagnostic': diagnostic})
+                                'reason': reason, 'stage': 'dispatch_route',
+                                'error': err, 'diagnostic': diagnostic})
                 return
             if reason == 'dispatch_claim_refused':
                 print(json.dumps({'event': 'dispatch_claim_refused', 'offer_id': offer.get('id'),
                                   'diagnostic': diagnostic}), flush=True)
             pending_key = self._pending_claim_key(offer.get('id'))
             if pending_key is not None:
+                receipt = self._reject_pending_reserve_claim(offer, diagnostic)
+                if receipt is not None:
+                    results.append(receipt)
+                    return
                 # This is an already-ambiguous claim attempt, not an
                 # unclaimed offer. Admission can recover on a later cycle;
                 # retain its key and capacity, never attempt an unclaimed
@@ -3699,7 +4247,16 @@ class Dispatcher:
             self._persist_launch_record(record)
             if not offer.get('task_id'):
                 try:
-                    rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
+                    try:
+                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
+                    except Exception as reject_exc:
+                        # A Hub older than gate_reason (intake bf0863c4)
+                        # answers 400 invalid_rejection; settle without it.
+                        if 'gate_reason' not in diagnostic or '400' not in str(reject_exc):
+                            raise
+                        diagnostic = {k: v for k, v in diagnostic.items() if k != 'gate_reason'}
+                        record['diagnostic'] = diagnostic
+                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
                     record['settled'] = rejected.get('retryable') is not True
                     self._persist_launch_record(record)
                     results.append(rejected)
@@ -3712,6 +4269,31 @@ class Dispatcher:
             results.append({"id": offer.get("id"), "state": "held",
                             "reason": reason, "stage": "dispatch_route",
                             "error": err, "diagnostic": diagnostic})
+
+    def _merge_native_subscriptions(self):
+        """Advertise catalog host-home accounts whose CLI and login exist here (intake 608a2f9a)."""
+        previous = getattr(self, '_native_labels', set())
+        base = [s for s in self.settings['subscriptions'] if s['account_label'] not in previous]
+        try:
+            from .account_registry import native_credential_present, native_subscriptions, policy_accounts
+            from .model_contract import canonical_account_label
+            catalog = {account['account']: account for account in policy_accounts()}
+            # shared-gemini is the Antigravity host-home account. Remove a
+            # catalog-derived route when this host has no Antigravity token;
+            # Gemini CLI's separate oauth_creds.json is not that credential.
+            base = [sub for sub in base if not (
+                (account := catalog.get(canonical_account_label(sub.get('account_label'))))
+                and account.get('provider') == 'gemini'
+                and account.get('harness') == 'antigravity'
+                and account.get('credential', {}).get('mode') == 'host-home'
+                and not native_credential_present(account)
+            )]
+            native = native_subscriptions({'subscriptions': base})
+        except Exception as exc:
+            print(json.dumps({'event': 'native_subscriptions_skipped', 'error': type(exc).__name__}), flush=True)
+            native = [s for s in self.settings['subscriptions'] if s['account_label'] in previous]
+        self.settings['subscriptions'] = base + native
+        self._native_labels = {s['account_label'] for s in native}
 
     def once(self):
         # AC1: per-phase timings, published as a fleet_cycle_phases event.
@@ -3736,6 +4318,7 @@ class Dispatcher:
         managed = provisioning.managed_subscriptions()
         self.settings['subscriptions'] = [s for s in self.settings['subscriptions'] if s['account_label'] not in self._managed_labels] + managed
         self._managed_labels = {s['account_label'] for s in managed}
+        self._merge_native_subscriptions()
         _mark('provisioning')
         # AC2: exactly one of the 60s timer loop and the 20s session-host
         # loop owns offers per cycle. The loser skips with a receipt instead
@@ -3792,32 +4375,34 @@ class Dispatcher:
                 allowed |= admitted
                 if admitted:
                     admitted_engines.add(sub.get('engine', sub['service']))
-                elif gate.get('reason') in ('credential_rejected', 'credential_invalid'):
-                    # Hub's own credential verdict for this account (any engine).
+                elif gate.get('reason') in ('credential_rejected', 'credential_invalid', 'not_logged_in'):
+                    # Hub's own credential verdict for this account (any engine),
+                    # or the local login probe found no credential (06d2a0ac).
                     for mode in caps['fleet_modes']:
                         caps['fleet_route_rejections'].append({
                             'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
                             'profile': sub.get('profile'), 'mode': mode,
-                            'reason': 'credential_rejected', 'observed_at': utcnow()})
+                            'reason': 'not_logged_in' if gate.get('reason') == 'not_logged_in' else 'credential_rejected',
+                            'observed_at': utcnow()})
                 elif sub.get('service') == 'codex':
                     reason = gate.get('reason', '')
-                    # Only a Hub quota verdict is a refusal; anything else
-                    # (Hub unreachable, local profile repair) carries no
-                    # credential verdict and stays fail-open server-side.
-                    if not re.fullmatch(r'codex_quota_gate_[a-z0-9_]{1,64}', reason):
-                        reason = 'codex_quota_gate_quota_check_failed'
-                    for mode in caps['fleet_modes']:
-                        caps['fleet_route_rejections'].append({
-                            'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
-                            'profile': sub.get('profile'), 'mode': mode,
-                            'reason': reason, 'observed_at': utcnow()})
+                    # Publish only a specific Hub quota verdict. A generic
+                    # admission response (or quota_check_failed, which means
+                    # the probe itself crashed) says nothing about this
+                    # account's credentials and must not become a route
+                    # refusal. The Worker intentionally fails open for that
+                    # diagnostic; dispatch rechecks admission before launch.
+                    if re.fullmatch(r'codex_quota_gate_[a-z0-9_]{1,64}', reason) \
+                            and reason != 'codex_quota_gate_quota_check_failed':
+                        for mode in caps['fleet_modes']:
+                            caps['fleet_route_rejections'].append({
+                                'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
+                                'profile': sub.get('profile'), 'mode': mode,
+                                'reason': reason, 'observed_at': utcnow()})
             except Exception:
-                if sub.get('service') == 'codex':
-                    for mode in caps['fleet_modes']:
-                        caps['fleet_route_rejections'].append({
-                            'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
-                            'profile': sub.get('profile'), 'mode': mode,
-                            'reason': 'codex_quota_gate_quota_check_failed', 'observed_at': utcnow()})
+                # Probe errors have no quota verdict. Do not turn transport or
+                # decoding failures into account-specific refusals.
+                continue
         return allowed, admitted_engines
 
     def _offers_lock_path(self):
@@ -3874,6 +4459,7 @@ class Dispatcher:
             {'launch_allowed': allowed,
              'reason': 'fleet local admission' if allowed else 'fleet admission unavailable',
              'at': utcnow()}, self.settings)
+        self.post_route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         self._last_hb = hb
         return hb
@@ -3887,8 +4473,15 @@ class Dispatcher:
         """
         if 'capabilities' not in self.settings or 'max_agents' not in self.settings:
             return None
-        return {'needs': self.settings['capabilities'],
-                'max_agents': self.settings['max_agents'],
+        from .system import get_arch
+        # Operator settings can outlive the interpreter/OS architecture.
+        # The native detection used by registration owns the arch label too.
+        needs = [n for n in self.settings['capabilities'] if not n.startswith('arch:')]
+        arch = get_arch()
+        if arch != 'unknown' and any(n.startswith('arch:') for n in self.settings['capabilities']):
+            needs.append('arch:' + arch)
+        return {'needs': needs,
+                'max_agents': resolve_max_agents(self.settings['max_agents']),
                 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'),
                              'account': s['account_label'], 'model': s['launcher_model'],
                              'effort': s.get('launcher_effort')}
@@ -3920,6 +4513,7 @@ class Dispatcher:
         for key in ('gate', 'launcher_resources'):
             if key in latest:
                 hb[key] = latest[key]
+        self.post_route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         caps = self.capabilities_put_payload()
         if caps is not None:
@@ -4048,6 +4642,7 @@ class Dispatcher:
                     workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count())
         caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
         caps['launcher_resources'] = bool(self.settings.get('launcher'))
+        caps['repo_workspaces'] = True  # intake 8028bb06: clones repo-identity workspaces itself
         caps['fleet_goal_routes'] = self.goal_routes()
         # The maintained launcher admits Claude headless work only through a
         # managed profile. Its global model-support list alone does not prove
@@ -4104,6 +4699,7 @@ class Dispatcher:
                               'error': _sanitized_transport_error(exc)}), flush=True)
         _mark('register')
         hb['gate'] = allowed_gate
+        self.post_route_advertisement()
         self.request('POST', '/api/host/poll', hb)
         _mark('heartbeat')
         for engine in sorted(admitted_engines):

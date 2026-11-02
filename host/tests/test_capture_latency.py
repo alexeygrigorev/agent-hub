@@ -55,10 +55,11 @@ class CaptureLatency(unittest.TestCase):
                 self.assertNotIn('https', str(error.exception))
 
     def test_transport_failure_names_command_and_reason(self):
+        # A failed Hub poll says nothing about the session host (intake 93ff852f).
         with patch.object(sc, 'request', return_value={'command_id': 'command-fixture'}), \
              patch.object(sc, 'wait_for_command', side_effect=sc.SessionTransportError('private transport data')), \
              contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaisesRegex(sc.SessionInputError, 'host_unreachable; command command-fixture'):
+            with self.assertRaisesRegex(sc.SessionInputError, 'hub_unreachable; command command-fixture'):
                 sc.execute(capture_args())
 
     def test_invalid_wait_flags_refuse_before_enqueue(self):

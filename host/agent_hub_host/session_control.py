@@ -31,6 +31,10 @@ WAIT_DEFAULT_TIMEOUT = 300.0
 WAIT_MAX_TIMEOUT = 600.0
 WAIT_MIN_INTERVAL = 1.0
 CAPTURE_TIMEOUT = 30.0
+# A capture sent while the session is still offered/starting waits this long for its native
+# binding (Hub target: offered -> bound under 60 s) before it is enqueued; the ack wait
+# then gets its own full --timeout.
+BIND_WAIT_TIMEOUT = 90.0
 _request_deadline = contextvars.ContextVar('session_request_deadline', default=None)
 # Terminal command states: only these confirm an outcome. `transported` alone
 # is fetch/PTY bytes, never processing proof; waiting never treats it as done.
@@ -44,9 +48,13 @@ MAX_ERROR_RESPONSE = 10 * 1024 * 1024
 
 
 class SessionHTTPError(ValueError):
-    def __init__(self, status, code='request_failed', message=None):
+    def __init__(self, status, code='request_failed', message=None, pending=False, state=None):
         self.status = status
         self.code = code
+        # Hub answers a capture/send on a session that has no native binding yet
+        # with pending=true (intake e1ed7abe): early, retryable, not a failure.
+        self.pending = pending
+        self.state = state
         super().__init__(message or f'Session HTTP request failed with status {status} ({code})')
 
 
@@ -118,6 +126,8 @@ def http_error(exc, key=None):
     field = None
     detail = None
     reason = None
+    pending = False
+    pending_state = None
     routes = ''
     held_info = ''
     provider_guidance = ''
@@ -171,6 +181,11 @@ def http_error(exc, key=None):
             r = data.get('reason')
             if isinstance(r, str) and SAFE_ERROR.match(r):
                 reason = r
+            if code == 'session_not_bound' and data.get('pending') is True:
+                pending = True
+                st = data.get('state')
+                if isinstance(st, str) and SAFE_ERROR.match(st):
+                    pending_state = st
     except Exception:
         name = ''
 
@@ -183,6 +198,8 @@ def http_error(exc, key=None):
         parts.append(concurrency_guidance)
     if held_info:
         parts.append(held_info)
+    if pending:
+        parts.append(f'; session is {pending_state or "starting"} and not yet bound; retry shortly')
     if reason:
         parts.append(f'; reason: {reason}')
     if field:
@@ -192,7 +209,7 @@ def http_error(exc, key=None):
     full_message = ''.join(parts)
     if key and f'reconcile with --key {key}' not in full_message:
         full_message += f' (reconcile with --key {key} via show/commands)'
-    return SessionHTTPError(exc.code, code=code, message=full_message)
+    return SessionHTTPError(exc.code, code=code, message=full_message, pending=pending, state=pending_state)
 
 
 def request(method, path, payload=None):
@@ -437,6 +454,64 @@ def wait_for_command(session_id, command_id, timeout, interval):
                      'Command wait')
 
 
+PING_PROMPT_LIMIT = 8000
+
+
+def add_ping_arguments(node, name, required_id):
+    if required_id:
+        node.add_argument('id', help='Session id or friendly name')
+    else:
+        node.add_argument('id', nargs='?', default=None, help='Session id or name (default: this session from HUB_SESSION_ID or aplexer whoami)')
+    if name in ('create', 'set'):
+        node.add_argument('--every', required=True, help='Interval, e.g. 15m, 1h (min 1m, max 7d)')
+        src = node.add_mutually_exclusive_group(required=True)
+        src.add_argument('--prompt', default=None, help='Message delivered each tick (max 8 KiB)')
+        src.add_argument('--body-file', default=None, help='UTF-8 prompt file, or - for stdin')
+    if name in ('disable', 'clear'):
+        node.add_argument('--reason', default=None, help='Why the ping is cleared (recorded)')
+    node.add_argument('--json', action='store_true')
+
+
+def current_session_ref():
+    for key in ('HUB_SESSION_ID', 'AGENT_HUB_SESSION_ID'):
+        value = os.environ.get(key, '').strip()
+        if value:
+            return value
+    try:
+        import subprocess as _sp
+        out = _sp.run(['aplexer', 'whoami', '--json'], capture_output=True, text=True, timeout=15, check=True).stdout
+        value = json.loads(out).get('id')
+        if isinstance(value, str) and value:
+            return value
+    except Exception:
+        pass
+    raise SessionInputError('Cannot determine this session; pass the session id or set HUB_SESSION_ID')
+
+
+def execute_ping(args):
+    import re as _re
+    ref = getattr(args, 'id', None) or current_session_ref()
+    if not isinstance(ref, str) or not _re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}', ref):
+        raise ValueError('Invalid session id or name')
+    action = args.ping_cmd
+    base = '/api/sessions/' + ref
+    if action in ('create', 'set'):
+        if getattr(args, 'prompt', None) is not None:
+            text = read_prompt_text(args.prompt, limit=MAX_BRIEF, max_chars=MAX_BRIEF_CHARS, field='Prompt')
+        else:
+            text = read_file(args.body_file, limit=MAX_BRIEF, field='Body file')
+        if not text or not text.strip() or len(text) > PING_PROMPT_LIMIT:
+            raise SessionInputError('Prompt must be 1-8000 characters')
+        seconds = duration_seconds(args.every)
+        if seconds < 60 or seconds > 7 * 86400:
+            raise SessionInputError('--every must be between 1m and 7d')
+        return request('POST', base + '/ping', {'every_seconds': seconds, 'prompt': text})
+    if action in ('disable', 'clear'):
+        payload = {'reason': args.reason} if getattr(args, 'reason', None) else {}
+        return request('POST', base + '/ping-clear', payload)
+    return request('GET', base + '/pings')
+
+
 def duration_seconds(value):
     match = re.fullmatch(r'([1-9][0-9]*)([smhd])', str(value))
     if not match:
@@ -463,9 +538,13 @@ def add_commands(sub):
     listing.add_argument('--limit', type=int, default=50)
     listing.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     listing.add_argument('--tree', action='store_true', help='Display session lineage tree')
+    count = commands.add_parser('count', help='Count live sessions (running/queued/stalled) grouped by host, engine and/or account')
+    count.add_argument('--by', default='host,engine,account',
+                       help='Comma-separated grouping: any of host,engine,account (default host,engine,account)')
+    count.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     tree = commands.add_parser('tree', help='Display session lineage tree')
     tree.add_argument('--json', action='store_true', help='Output machine-readable JSON')
-    link = commands.add_parser('link', help='Link a session to an intake (operator only)')
+    link = commands.add_parser('link', help='Link a session to an intake (operator only; works while it runs and after it ended, from the retained session record; repeats are idempotent, a different existing linkage is refused)')
     link.add_argument('session')
     link.add_argument('--intake-task-id', required=True)
     link.add_argument('--key')
@@ -475,17 +554,21 @@ def add_commands(sub):
     start.add_argument('--machine')
     start.add_argument('--needs', action='append', default=None,
                        help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64); eligible machines must satisfy all needs, else held with rejected[] reason needs_unmet')
-    start.add_argument('--workspace', required=True)
+    start.add_argument('--workspace', default=None, help='Configured workspace label or absolute path on the target host (omit with --repo)')
+    start.add_argument('--repo', default=None, help='Repository owner/name; the placed host (any OS) clones its own fresh work tree from origin/main, so no host path is needed')
     start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
     start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier for policy routing')
     start.add_argument('--cwd')
+    start.add_argument('--intake-worktree', dest='intake_worktree', choices=['detached', 'successor'], default=None,
+                       help='detached: keep the intake link but never resume, create or lock its worktree (79458f2d). '
+                            'successor: replacement of a live predecessor; Hub plans a fresh sibling worktree and a named --cwd is refused (afab8367)')
     start.add_argument('--name', default=None,
                        help='Friendly session name (stored, shown in list/show; exact-match alias, never identity)')
     start.add_argument('--parent', default=None,
                        help='Parent session id recording lineage')
     start.add_argument('--intake-task-id', dest='intake_task_id', default=None,
                        help='Linked intake task id (API field intake_task_id); refused when that task has empty acceptance criteria.')
-    start.add_argument('--with-goal', action='store_true', help='Start interactive /goal work on a Codex-family engine (for sessions expecting follow-ups); requires --prompt or --brief-file; refuses --headless')
+    start.add_argument('--with-goal', action='store_true', help='Start interactive /goal work on a goal-capable engine (Codex-family or Claude) (for sessions expecting follow-ups); requires --prompt or --brief-file; refuses --headless')
     start.add_argument('--headless', action='store_true', help='Explicitly start in one-shot headless mode (no input channel; follow-ups must use codex exec resume)')
     mode = start.add_mutually_exclusive_group()
     mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
@@ -499,7 +582,8 @@ def add_commands(sub):
     override.add_argument('--machine')
     override.add_argument('--needs', action='append', default=None,
                           help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64)')
-    override.add_argument('--workspace', required=True)
+    override.add_argument('--workspace', default=None)
+    override.add_argument('--repo', default=None, help='Repository owner/name (host clones its own work tree)')
     override.add_argument('--tier', choices=TIERS)
     override.add_argument('--cwd')
     override.add_argument('--name', default=None, help='Friendly session name')
@@ -516,9 +600,11 @@ def add_commands(sub):
     send = commands.add_parser('send', help='Enqueue one prompt delivery on a bound session')
     send.add_argument('id')
     body_src = send.add_mutually_exclusive_group(required=True)
+    body_src.add_argument('--prompt-id', help='Library prompt id, slug or slug@version (rendered by Hub; see --var)')
     body_src.add_argument('--body-file', help='UTF-8 prompt file, or - for stdin (max 16 KiB)')
     body_src.add_argument('--prompt', default=None,
                           help='Inline UTF-8 prompt text (max 16 KiB; same boundaries as --body-file)')
+    send.add_argument('--var', action='append', metavar='KEY=VALUE', help='Variable for {{var.KEY}} in a --prompt-id prompt (repeatable)')
     send.add_argument('--require-ready', dest='require_ready', action='store_true',
                       help='Refuse send immediately if target session has no recent reported state')
     send.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
@@ -555,6 +641,21 @@ def add_commands(sub):
     wake_src = wake.add_mutually_exclusive_group(required=True)
     wake_src.add_argument('--body-file', help='UTF-8 prompt file, or - for stdin (max 8 KiB)')
     wake_src.add_argument('--prompt', default=None, help='Inline UTF-8 prompt text (max 8 KiB)')
+    ping = commands.add_parser('ping', help='External /loop: Hub delivers a message to a live session every interval (any engine); the session or owner clears it')
+    ping_cmds = ping.add_subparsers(dest='ping_cmd', required=True)
+    for name, helptext in (('create', 'Create or replace the recurring ping of a session'),
+                           ('disable', 'Clear the recurring ping (the session itself may do this when its goal is reached)'),
+                           ('show', 'Show the active ping, history and delivery failures')):
+        node = ping_cmds.add_parser(name, help=helptext)
+        add_ping_arguments(node, name, required_id=True)
+    loop = sub.add_parser('loop', help='Alias of sessions ping for the current session: set/clear/show a recurring Hub ping')
+    loop_cmds = loop.add_subparsers(dest='ping_cmd', required=True)
+    for name, helptext in (('set', 'Ping this session (or the given one) every interval'),
+                           ('clear', 'Clear the ping; run from inside the session when the goal is reached'),
+                           ('show', 'Show the ping state')):
+        node = loop_cmds.add_parser(name, help=helptext)
+        add_ping_arguments(node, name, required_id=False)
+        node.set_defaults(sessions_cmd='ping')
     warnings = commands.add_parser('warnings', help='Current unsnoozed long-running warnings with output tails')
     warnings.add_argument('--threshold')
     warnings.add_argument('--json', action='store_true')
@@ -650,6 +751,24 @@ def match_session_state(entry: dict, wanted: str) -> bool:
     return entry_state == wanted
 
 
+def wait_until_bound(session_id, interval, timeout=BIND_WAIT_TIMEOUT):
+    """Poll a pending session until it is running (bound); False when the budget runs out."""
+    from urllib.parse import quote
+    end = time.monotonic() + timeout
+    while True:
+        row = request('GET', '/api/sessions/' + quote(session_id, safe=''))
+        if isinstance(row, dict):
+            state = row.get('state')
+            if state == 'running':
+                return True
+            if state not in ('queued', 'held', 'offered', 'starting', 'uncertain'):
+                return False  # terminal or unknown: no bind is coming
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(interval, remaining))
+
+
 def execute(args):
     # Capture's budget covers enqueue, every paginated HTTP request and sleep.
     # A context-local deadline cannot affect concurrent host receiver requests.
@@ -740,6 +859,10 @@ def _execute(args):
         if getattr(args, 'export', False):
             return request('GET', '/api/sessions/audit/export?limit=%d' % max(1, min(20000, int(getattr(args, 'limit', None) or 5000))))
         return request('GET', '/api/sessions/audit?last=%d' % max(1, min(50, int(getattr(args, 'last', None) or 5))))
+    if cmd == 'count':
+        from urllib.parse import quote
+        by = normalize_breakdown_dims(getattr(args, 'by', None))
+        return request('GET', '/api/sessions?view=breakdown&by=' + quote(','.join(by), safe=','))
     if cmd == 'tree' or (cmd == 'list' and getattr(args, 'tree', False)):
         return request('GET', '/api/sessions/tree')
     if cmd == 'list':
@@ -780,6 +903,8 @@ def _execute(args):
     if cmd == 'ack':
         payload = {'snooze': duration_seconds(args.snooze)} if args.snooze else {}
         return request('POST', threshold_path(args, '/api/sessions/' + args.id + '/ack'), payload)
+    if cmd == 'ping':
+        return execute_ping(args)
     if cmd == 'wake':
         import uuid as _uuid
         import re as _re
@@ -835,11 +960,24 @@ def _execute(args):
             if not reason or not reason.strip():
                 raise ValueError('Engine override requires an explanation why this specific model/engine must be chosen (use --reason). Casual use should prefer auto/policy without --engine.')
         key = getattr(args, 'key', None) or str(uuid.uuid4())
-        payload = {'key': key, 'workspace': args.workspace}
+        repo = getattr(args, 'repo', None)
+        if bool(repo) == bool(getattr(args, 'workspace', None)):
+            raise ValueError('Give exactly one of --workspace or --repo')
+        payload = {'key': key}
+        if repo:
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', repo):
+                raise ValueError('--repo must be owner/name')
+            payload['repo'] = repo
+        else:
+            payload['workspace'] = args.workspace
         for field in ('engine', 'machine', 'tier', 'cwd'):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        if getattr(args, 'intake_worktree', None):
+            if payload.get('cwd'):
+                raise ValueError('--intake-worktree successor keeps Hub in charge of the cwd; drop --cwd (a detached start never names one either)')
+            payload['intake_worktree'] = args.intake_worktree
         needs = getattr(args, 'needs', None)
         if needs:
             if not isinstance(needs, list) or len(needs) > 64 or any(
@@ -905,7 +1043,14 @@ def _execute(args):
         if cmd == 'send':
             if getattr(args, 'prompt', None) is not None and getattr(args, 'body_file', None):
                 raise SessionInputError('Cannot specify both --body-file and --prompt')
-            if getattr(args, 'prompt', None) is not None:
+            if getattr(args, 'prompt_id', None):
+                from .prompt_schedules import parse_vars
+                rendered = request('POST', '/api/prompts/' + __import__("urllib.parse").parse.quote(args.prompt_id, safe='@') + '/render',
+                                   {'vars': parse_vars(getattr(args, 'var', None)) or {}})
+                body = rendered.get('text') or ''
+                if not body.strip():
+                    raise SessionInputError('Prompt rendered empty')
+            elif getattr(args, 'prompt', None) is not None:
                 body = read_prompt_text(args.prompt, limit=MAX_BODY, field='Prompt')
             elif getattr(args, 'body_file', None):
                 body = read_file(args.body_file, limit=MAX_BODY, field='Body file')
@@ -923,7 +1068,27 @@ def _execute(args):
         else:
             payload = {'key': key}
         try:
-            enqueue = lambda: request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
+            def enqueue():
+                try:
+                    return request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
+                except SessionHTTPError as exc:
+                    if cmd != 'capture' or not exc.pending or timeout is None:
+                        raise
+                    # Early capture: wait for the native binding instead of failing with
+                    # a bare 409, then give the acknowledgement its full budget.
+                    print(f'Session {args.id} is {exc.state or "starting"}: waiting up to {BIND_WAIT_TIMEOUT:g}s for its native binding',
+                          file=sys.stderr, flush=True)
+                    outer = _request_deadline.get()
+                    bind_token = _request_deadline.set(time.monotonic() + BIND_WAIT_TIMEOUT + 10)
+                    try:
+                        bound = wait_until_bound(args.id, min(interval, 2.0))
+                    finally:
+                        _request_deadline.reset(bind_token)
+                    if not bound:
+                        raise SessionInputError(f'session_not_bound; session {args.id} did not reach running within {BIND_WAIT_TIMEOUT:g}s; retry later') from None
+                    if outer is not None:
+                        _request_deadline.set(time.monotonic() + timeout)
+                    return request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
             # Capture is diagnostic and stays single-shot; keyed mutations
             # replay, never past the caller's wait budget.
             queued = (api.replay_keyed(enqueue, hub_unavailable, delays=replay_delays(), notify=replay_notice)
@@ -960,7 +1125,7 @@ def _execute(args):
                 except ValueError as exc:
                     if cmd != 'capture':
                         raise
-                    reason = 'host_unreachable' if isinstance(exc, SessionTransportError) and time.monotonic() < _request_deadline.get() else 'capture_not_acked'
+                    reason = 'hub_unreachable' if isinstance(exc, SessionTransportError) and time.monotonic() < _request_deadline.get() else 'capture_not_acked'
                     raise SessionInputError(f'{reason}; command {command_id}; inspect commands before retrying with the same key') from None
                 if cmd == 'capture':
                     entry = queued['command_wait']
@@ -1020,13 +1185,64 @@ def format_duration(seconds):
     return f'{seconds // 3600}h{seconds % 3600 // 60:02d}m{seconds % 60:02d}s'
 
 
+BREAKDOWN_DIMS = ('host', 'engine', 'account')
+
+
+def normalize_breakdown_dims(value):
+    """Validate `--by host,engine,account` (order kept, duplicates dropped)."""
+    if value is None or not str(value).strip():
+        return list(BREAKDOWN_DIMS)
+    dims = []
+    for part in str(value).split(','):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part not in BREAKDOWN_DIMS:
+            raise SessionInputError('--by accepts only host, engine and account (comma-separated)')
+        if part not in dims:
+            dims.append(part)
+    if not dims:
+        raise SessionInputError('--by needs at least one of host, engine, account')
+    return dims
+
+
+def render_breakdown(result):
+    """Text table for `hub sessions count`: one row per group plus totals."""
+    if not isinstance(result, dict):
+        return str(result)
+    dims = [d for d in (result.get('by') or BREAKDOWN_DIMS) if d in BREAKDOWN_DIMS]
+    totals = result.get('totals') or {}
+    rows = []
+    for r in result.get('rows') or []:
+        cells = []
+        for d in dims:
+            value = r.get(d) or '-'
+            if d == 'host':
+                label = r.get('host_label') or value
+                aliases = [a.get('label') or a.get('id') for a in (r.get('host_aliases') or []) if isinstance(a, dict)]
+                value = label + (' (aka ' + ','.join(aliases) + ')' if aliases else '')
+            cells.append(str(value))
+        cells += [str(r.get('running', 0)), str(r.get('queued', 0)), str(r.get('stalled', 0)), str(r.get('total', 0))]
+        rows.append(cells)
+    headers = [d.upper() for d in dims] + ['RUNNING', 'QUEUED', 'STALLED', 'TOTAL']
+    footer = ['TOTAL'] + [''] * (len(dims) - 1) + [str(totals.get(k, 0)) for k in ('running', 'queued', 'stalled', 'total')]
+    widths = [max(len(str(x[i])) for x in [headers, footer] + rows) for i in range(len(headers))]
+    line = lambda cells: '  '.join(str(c).ljust(widths[i]) for i, c in enumerate(cells)).rstrip()
+    out = [line(headers), '  '.join('-' * w for w in widths)]
+    out += [line(r) for r in rows]
+    out += ['  '.join('-' * w for w in widths), line(footer)]
+    if result.get('truncated'):
+        out.append('note: truncated at %s live sessions' % result.get('scanned'))
+    return '\n'.join(out)
+
+
 def render_table(sessions):
     """Render a compact table for `hub sessions list` with columns:
-    TYPE, NAME, ENGINE, MODEL, STATE, WORKSPACE, UPDATED and runtime warnings.
+    TYPE, NAME, HOST, ENGINE, ACCOUNT, MODEL, EFFORT, STATE, WORKSPACE, UPDATED and runtime warnings.
     """
     if not sessions:
         return 'No sessions found.'
-    headers = ['TYPE', 'NAME', 'ENGINE', 'MODEL', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
+    headers = ['TYPE', 'NAME', 'HOST', 'ENGINE', 'ACCOUNT', 'MODEL', 'EFFORT', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
     rows = []
     for s in sessions:
         stype = s.get('session_type') or ('aplexer' if s.get('mode') == 'interactive' else 'headless')
@@ -1041,7 +1257,9 @@ def render_table(sessions):
             state = 'idle'
         ws = s.get('workspace') or '-'
         upd = (s.get('updated_at') or '')[:19].replace('T', ' ')
-        rows.append([stype, name, engine, s.get('model_id') or s.get('model') or '-', state, ws, upd, str(s.get('long_running', False)).lower(),
+        host = s.get('machine') or '-'
+        account = s.get('account') or '-'
+        rows.append([stype, name, host, engine, account, s.get('model_id') or s.get('model') or '-', s.get('effort') or '-', state, ws, upd, str(s.get('long_running', False)).lower(),
                      format_duration(s.get('runtime')), format_duration(s.get('idle_for')), s.get('activity_state', '-')])
 
     widths = [len(h) for h in headers]
@@ -1132,9 +1350,14 @@ def render_output(args, result):
     cmd = getattr(args, 'sessions_cmd', None)
     if cmd == 'tree' or (cmd == 'list' and getattr(args, 'tree', False)):
         return render_tree(result)
+    if cmd == 'count':
+        return render_breakdown(result)
     if cmd == 'list':
         sessions = result.get('sessions', []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
-        return render_table(sessions)
+        text = render_table(sessions)
+        if isinstance(result, dict) and 'active_count' in result:
+            text += f"\nActive sessions: {result['active_count']}"
+        return text
     if cmd == 'warnings':
         lines = []
         for row in result.get('warnings', []):

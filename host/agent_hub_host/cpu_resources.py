@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import os
+from collections import deque
 from .host_oom import read_host_oom_delta
 from pathlib import Path
 import time
@@ -59,8 +61,32 @@ def sanitize_cpu_admission(value):
     return dict(value)
 
 
+def read_windows_cpu_stat():
+    """GetSystemTimes mapped onto the /proc/stat tick layout (user, nice, system, idle, ...).
+
+    Kernel time includes idle time, so system = kernel - idle. Returns None
+    when the API is unavailable; callers then report CPU as unknown.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        idle, kernel, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+        if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        value = lambda ft: (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+        i, k, u = value(idle), value(kernel), value(user)
+        cores = os.cpu_count() or 0
+        if cores < 1 or k < i:
+            return None
+        return {"ticks": [u, 0, k - i, i, 0, 0, 0, 0], "cores": cores}
+    except Exception:
+        return None
+
+
 def read_cpu_stat(proc_root="/proc"):
     """Exclude idle and iowait; guest counters are already included in user/nice."""
+    if os.name == "nt" and proc_root == "/proc":
+        return read_windows_cpu_stat()
     try:
         lines = (Path(proc_root) / "stat").read_text().splitlines()
         fields = [int(n) for n in lines[0].split()[1:9]]
@@ -112,6 +138,33 @@ def cpu_delta(before, after):
     return {"busy_percent": busy / total * 100, "busy_cores": busy / total * after["cores"], "cores": after["cores"]}
 
 
+WINDOW_MIN_S = 10.0
+WINDOW_KEEP_S = 120.0
+_window = deque()  # (monotonic_s, cpu stat) snapshots, bounded by age
+
+
+def windowed_cpu(now_s, snapshot, history=None):
+    """Average busy CPU over the newest earlier snapshot at least 10s old.
+
+    Returns {busy_percent_window, busy_cores_window, window_s} with None values
+    until a snapshot at least WINDOW_MIN_S old exists (unknown, never zero).
+    """
+    history = _window if history is None else history
+    chosen = None
+    for at, snap in history:
+        if now_s - at >= WINDOW_MIN_S:
+            chosen = (at, snap)  # history is oldest-first: keep the newest old-enough one
+    result = cpu_delta(chosen[1], snapshot) if chosen and snapshot else None
+    if snapshot:
+        history.append((now_s, snapshot))
+    while history and now_s - history[0][0] > WINDOW_KEEP_S:
+        history.popleft()
+    if result is None:
+        return {"busy_percent_window": None, "busy_cores_window": None, "window_s": None}
+    return {"busy_percent_window": result["busy_percent"], "busy_cores_window": result["busy_cores"],
+            "window_s": now_s - chosen[0]}
+
+
 def sample_cpu_usage(proc_root="/proc", interval_s=0.2, sleep=time.sleep, monotonic=time.monotonic, clock=time.time):
     before = read_cpu_stat(proc_root)
     started = monotonic()
@@ -119,11 +172,13 @@ def sample_cpu_usage(proc_root="/proc", interval_s=0.2, sleep=time.sleep, monoto
     after = read_cpu_stat(proc_root)
     elapsed = monotonic() - started
     result = cpu_delta(before, after)
+    # Test doubles supply exactly two clock readings; reuse them.
+    window = windowed_cpu(started + elapsed, after, _window if proc_root == "/proc" else deque())
     if result is None:
         result = {"busy_percent": None, "busy_cores": None, "cores": (after or before or {}).get("cores")}
     if not _number(elapsed) or elapsed <= 0:
         elapsed = None
-    return {**result, "psi_avg10": read_cpu_psi(proc_root),
+    return {**result, **window, "psi_avg10": read_cpu_psi(proc_root),
             "psi_full_avg10": read_cpu_psi(proc_root, category="full"),
             "memory_psi_full_avg10": read_cpu_psi(proc_root, resource="memory", category="full"),
             "io_psi_full_avg10": read_cpu_psi(proc_root, resource="io", category="full"),

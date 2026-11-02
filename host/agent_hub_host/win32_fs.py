@@ -16,8 +16,12 @@ TRUSTED_DIRECTORY_SIDS = ('S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')
 BOOL = C.c_int
 FULL = 0x1f01ff
 READ_CONTROL = 0x20000
+WRITE_DAC = 0x40000
 REPARSE = 0x400
 DIRECTORY = 0x10
+SE_FILE_OBJECT = 1
+DACL_SECURITY_INFORMATION = 0x4
+PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 
 
 class FileInfo(C.Structure):
@@ -62,7 +66,11 @@ class API:
         bind(adv, 'ConvertSidToStringSidW', [PTR, C.POINTER(PTR)])
         bind(adv, 'ConvertStringSecurityDescriptorToSecurityDescriptorW', [C.c_wchar_p, U32, C.POINTER(PTR), PTR])
         bind(adv, 'GetSecurityInfo', [PTR, U32, U32, C.POINTER(PTR), PTR, C.POINTER(PTR), PTR, C.POINTER(PTR)], U32)
+        bind(adv, 'SetSecurityInfo', [PTR, U32, U32, PTR, PTR, PTR, PTR], U32)
+        bind(adv, 'GetSecurityDescriptorDacl', [PTR, C.POINTER(BOOL), C.POINTER(PTR), C.POINTER(BOOL)])
         bind(adv, 'GetSecurityDescriptorControl', [PTR, C.POINTER(U16), C.POINTER(U32)])
+        bind(adv, 'GetSecurityDescriptorDacl', [PTR, C.POINTER(BOOL), C.POINTER(PTR), C.POINTER(BOOL)])
+        bind(adv, 'SetSecurityInfo', [PTR, U32, U32, PTR, PTR, PTR, PTR], U32)
         bind(adv, 'GetAce', [PTR, U32, C.POINTER(PTR)])
         bind(adv, 'EqualSid', [PTR, PTR])
         bind(adv, 'ConvertStringSidToSidW', [C.c_wchar_p, C.POINTER(PTR)])
@@ -147,6 +155,33 @@ class API:
             if sd:
                 self.LocalFree(sd)
 
+    def restrict(self, handle, directory=False):
+        """Windows analogue of fchmod 0700/0600 on an object the user already owns.
+
+        Replaces the DACL with the protected owner-only descriptor used for
+        objects we create. Refuses objects owned by anyone else. Inheritable
+        ACEs propagate to existing children (SetSecurityInfo semantics).
+        """
+        owner, sd = PTR(), PTR()
+        error = self.GetSecurityInfo(handle, 1, 1, C.byref(owner), None, None, None, C.byref(sd))
+        if error:
+            raise OSError(error, 'Cannot verify owner')
+        try:
+            if not owner or not self.EqualSid(owner, self.user_sid):
+                raise PermissionError('Refusing to restrict an object owned by another principal')
+        finally:
+            if sd:
+                self.LocalFree(sd)
+        with self.security(directory=directory) as sa:
+            present, dacl, defaulted = BOOL(), PTR(), BOOL()
+            self.check(self.GetSecurityDescriptorDacl(sa.descriptor, C.byref(present), C.byref(dacl), C.byref(defaulted)))
+            if not present.value or not dacl:
+                raise PermissionError('Owner-only DACL unavailable')
+            # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+            error = self.SetSecurityInfo(handle, 1, 0x4 | 0x80000000, None, None, dacl, None)
+            if error:
+                raise OSError(error, 'Cannot restrict ACL')
+
     def info(self, handle, directory=False):
         info = FileInfo()
         self.check(self.GetFileInformationByHandle(handle, C.byref(info)))
@@ -207,8 +242,14 @@ def local_path(path):
 
 
 @contextmanager
-def parent(path, *, create=False, private=True, native=False):
+def parent(path, *, create=False, private=True, native=False, owned=False):
+    """Pin every ancestor of path. owned=True restricts the user-owned leaf
+    directory to the protected owner-only DACL before any ACL proof, exactly as
+    POSIX callers fchmod(0o700) a directory they own (e.g. %APPDATA%\aplexer
+    created by an MSYS/Cygwin tool with a POSIX-mapped ACL)."""
     root, parts = local_path(path)
+    if owned and len(parts) < 2:
+        raise PermissionError('Refusing to restrict a drive root')
     a = api()
     with ExitStack() as stack:
         current = root
@@ -216,7 +257,8 @@ def parent(path, *, create=False, private=True, native=False):
         handle = a.open(current, 0, directory=True)
         stack.callback(a.CloseHandle, handle)
         handles.append(handle)
-        for component in parts[:-1]:
+        leaf = len(parts) - 2
+        for index, component in enumerate(parts[:-1]):
             current = ntpath.join(current, component)
             if create:
                 with a.security(directory=True) as sa:
@@ -224,9 +266,11 @@ def parent(path, *, create=False, private=True, native=False):
                         error = C.get_last_error()
                         if error != 183:  # ERROR_ALREADY_EXISTS; still verify opened object
                             raise C.WinError(error)
-            handle = a.open(current, 0, directory=True)
+            handle = a.open(current, WRITE_DAC if owned and index == leaf else 0, directory=True)
             stack.callback(a.CloseHandle, handle)
             handles.append(handle)
+        if owned:
+            a.restrict(handle, directory=True)
         if native:
             # Native Rust files may inherit their sole owner ACE. Verify the
             # complete owner-only suffix back to a protected directory while
@@ -239,6 +283,81 @@ def parent(path, *, create=False, private=True, native=False):
         if private:
             a.private(handle, directory=True)
         yield handle
+
+
+def repair_private_tree(root, *, max_entries=1024, max_depth=8):
+    """Re-protect an existing owner-owned directory tree; protected entries
+    are left untouched. Returns the number of re-protected entries.
+
+    An older journal directory may predate CPython's os.mkdir(mode=0o700)
+    protected-DACL behavior and inherit ambient ancestors' ACEs; every
+    private_fs operation on it then fails closed forever because applying a
+    new protected parent DACL never rewrites children's inherited entries.
+    Each entry is therefore re-protected from its own pinned WRITE_DAC handle
+    and re-verified in place. Bounded; every failure is an error (never a
+    silent partial repair). Non-owner entries refuse the repair: another
+    principal's tree is not ours to fix.
+    """
+    local_path(root)
+    a = api()
+    repaired, visited = 0, 0
+
+    def bound():
+        nonlocal visited
+        visited += 1
+        if visited > max_entries:
+            raise PermissionError('Private repair exceeded entry bound')
+
+    def repair_entry(path, directory):
+        nonlocal repaired
+        handle = a.open(path, READ_CONTROL | WRITE_DAC, directory=directory)
+        try:
+            try:
+                a.private(handle, directory=directory)
+                return  # already protected: nothing to rewrite
+            except PermissionError:
+                pass
+            owner = PTR()
+            error = a.GetSecurityInfo(handle, SE_FILE_OBJECT, 1, C.byref(owner),
+                                      None, None, None, None)
+            if error:
+                raise OSError(error, 'Cannot verify private ACL')
+            if not owner or not a.EqualSid(owner, a.user_sid):
+                raise PermissionError('Private repair requires owner access')
+            with a.security(directory=directory) as sa:
+                dacl, present, defaulted = PTR(), BOOL(), BOOL()
+                a.check(a.GetSecurityDescriptorDacl(
+                    sa.descriptor, C.byref(present), C.byref(dacl), C.byref(defaulted)))
+                if not present.value or not dacl.value:
+                    raise PermissionError('Security descriptor lacks a private DACL')
+                error = a.SetSecurityInfo(handle, SE_FILE_OBJECT,
+                                          DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                          None, None, dacl, None)
+                if error:
+                    raise OSError(error, 'Cannot apply private DACL')
+            a.private(handle, directory=directory)  # final proof, raises
+            repaired += 1
+        finally:
+            a.CloseHandle(handle)
+
+    def walk(path, depth):
+        if depth > max_depth:
+            raise PermissionError('Private repair exceeded depth bound')
+        bound()
+        repair_entry(path, True)
+        with os.scandir(path) as entries:
+            for entry in entries:
+                bound()
+                child = ntpath.join(str(path), entry.name)
+                if entry.is_dir(follow_symlinks=False):
+                    walk(child, depth + 1)
+                elif entry.is_file(follow_symlinks=False):
+                    repair_entry(child, False)
+                else:
+                    raise PermissionError('Refusing repair of non-regular journal entry')
+
+    walk(root, 0)
+    return repaired
 
 
 def open_file(path, flags, *, private=True):
@@ -258,6 +377,20 @@ def open_file(path, flags, *, private=True):
         a.CloseHandle(handle)
         raise
     return fd  # CRT fd now owns the handle
+
+
+def restrict_file(path):
+    """fchmod(0o600) analogue for an existing user-owned regular file.
+
+    The caller holds pinned ancestors (parent()). Reparse points, directories
+    and multiply linked files are refused by API.open/info. Missing files raise
+    FileNotFoundError."""
+    a = api()
+    handle = a.open(path, WRITE_DAC)
+    try:
+        a.restrict(handle)
+    finally:
+        a.CloseHandle(handle)
 
 
 def replace(source, target):

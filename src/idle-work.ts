@@ -3,6 +3,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { SessionControlService } from './session_control';
 import { IntakeService } from './intake';
+import { IntakeWorktrees } from './intake-worktrees';
 import { nativeObservationFresh } from './session_stall';
 import { linkedIntake, hasOpenWork, parseObject } from './intake-session';
 
@@ -40,7 +41,11 @@ export class IdleWorkService {
     if (this.busy) return;
     this.busy = true;
     try {
-      for (const item of this.sessions.attention()) {
+      // One attention census per tick (intake 8081a05a): it also decides
+      // which episodes stay active below, instead of recomputing it. A session
+      // that recovers during this loop is marked inactive on the next census.
+      const attention = this.sessions.attention();
+      for (const item of attention) {
         try {
         const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', item.session_id).toArray()[0];
         const task = row && linkedIntake(this.sql, row);
@@ -102,13 +107,25 @@ export class IdleWorkService {
             continue;
           }
           this.sql.exec('UPDATE session_idle_episodes SET replacement_key=? WHERE session_id=?', key, row.id);
+          // Intake afab8367: the predecessor is live by design (it stops only
+          // after the replacement runs), so its worktree lock can never move
+          // and a same-worktree replacement is refused as
+          // dispatch_worktree_refused. The replacement requests a fresh
+          // sibling worktree instead; the held tree's uncommitted state is
+          // reported on the intake, never copied or force-taken.
+          try {
+            const trees = new IntakeWorktrees(this.sql);
+            const linked = trees.bySession(row.id);
+            if (linked && linked.taskId === task.id)
+              for (const id of linked.worktreeIds) trees.enqueue(task.id, 'status', id, 'hub:service:idle-work');
+          } catch { /* registry may be absent; the replacement note still reports the tree */ }
           const result = await this.command('', { key, intake_task_id: task.id, workspace: binding.workspace,
-            ...(request.cwd ? { cwd: request.cwd } : {}), ...(request.access ? { access: request.access } : {}),
-            parent_id: row.id, mode: 'interactive', with_goal: true,
-            brief: `Replace stalled session ${row.id} for intake ${task.id}. Read hub intake show ${task.id}. Complete all open acceptance criteria:\n${ac}\nKeep intake OPEN. Append DONE only with accepted evidence. Preserve other sessions and the existing workspace.` });
+            ...(request.access ? { access: request.access } : {}),
+            parent_id: row.id, mode: 'interactive', with_goal: true, intake_worktree: 'successor',
+            brief: `Replace stalled session ${row.id} for intake ${task.id}. Read hub intake show ${task.id}. Complete all open acceptance criteria:\n${ac}\nKeep intake OPEN. Append DONE only with accepted evidence. Hub starts you in a fresh sibling worktree prepared for this replacement; never enter, commit in or unlock the previous session's workspace - its uncommitted state stays there and is reported on the intake. Preserve other sessions and the existing workspace.` });
           if (result.body?.id) this.tx(() => {
             this.sql.exec('UPDATE session_idle_episodes SET replacement_id=? WHERE session_id=?', result.body.id, row.id);
-            if (!this.note(task, 'idle-replacement:' + episode.episode, `Replacement ${result.body.id} submitted for ${row.id}; lineage parent=${row.id}. Old session stays until replacement is running.`)) throw new Error('idle_lineage_note_failed');
+            if (!this.note(task, 'idle-replacement:' + episode.episode, `Replacement ${result.body.id} submitted for ${row.id}; lineage parent=${row.id}. Old session stays until replacement is running. The replacement starts in its own fresh worktree (intake_worktree=successor) because the predecessor is live and its lock must not move; the predecessor's workspace stays locked and untouched, and its uncommitted state is reported via the worktree status command (hub worktree list ${task.id}).`)) throw new Error('idle_lineage_note_failed');
           });
           continue;
         }
@@ -124,7 +141,7 @@ export class IdleWorkService {
           // Recover pre-upgrade attempts too: their command may be durable even
           // when the response was lost before command_id reached the episode.
           const prior: any = this.sql.exec("SELECT payload_json FROM session_control_commands WHERE session_id=? AND actor='hub:service:idle-work' AND request_key=?", row.id, n.key).toArray()[0];
-          n.body = parseObject(prior?.payload_json).body ?? `${request.with_goal || item.goal_status ? '/goal resume\n' : ''}Resume intake ${task.id}. Open acceptance criteria:\n${ac}\nLast intake note:\n${lastNote}\nRead current intake, acknowledge this message, then continue authorized work.`;
+          n.body = parseObject(prior?.payload_json).body ?? `${(request.with_goal || item.goal_status) && item.goal_status !== 'unregistered' ? '/goal resume\n' : ''}Resume intake ${task.id}. Open acceptance criteria:\n${ac}\nLast intake note:\n${lastNote}\nRead current intake, acknowledge this message, then continue authorized work.`;
         }
         this.sql.exec('UPDATE session_idle_episodes SET nudges_json=?,last_nudge_at=? WHERE session_id=?', JSON.stringify(nudges), n.at, row.id);
         const result = await this.command('/' + row.id + '/send', { key: n.key, body: n.body });
@@ -134,7 +151,7 @@ export class IdleWorkService {
         }
         } catch { console.warn('idle_work_session_failed', item.session_id); }
       }
-      const active = new Set(this.sessions.attention().map(s => s.session_id));
+      const active = new Set(attention.map(s => s.session_id));
       for (const e of this.sql.exec('SELECT session_id FROM session_idle_episodes WHERE active=1').toArray() as any[]) {
         if (!active.has(e.session_id)) this.sql.exec('UPDATE session_idle_episodes SET active=0 WHERE session_id=?', e.session_id);
       }

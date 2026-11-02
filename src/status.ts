@@ -214,6 +214,13 @@ export class StatusService {
    * visibility into other actors' monitoring details. No second check loop.
    * Surfaced as needs_attention plus the stale history group (AC2). */
   private sessionAttention: () => Obj[] = () => [];
+  /** Ask ledger counts (intake 55c10deb); operator status only. */
+  private askSummary: (() => Obj) | null = null;
+  setAskSummary(fn: () => Obj): void { this.askSummary = fn; }
+  private asksDto(admin: boolean): Obj {
+    if (!admin || !this.askSummary) return {};
+    try { return { asks: this.askSummary() }; } catch { return {}; }
+  }
   setSessionAttention(provider: () => Obj[]) { this.sessionAttention = provider; }
 
   private attentionGroups(admin: boolean, measured: Obj[], intakeWarn: Obj | null = null): Obj {
@@ -484,7 +491,7 @@ export class StatusService {
   }
 
   private buildItems(p: Obj, tasks: Obj[], hostFilter: string | null, sinceMs: number | null, now: number, nowIso: string): { items: Obj[]; machines: Map<string, Obj>; missingHosts: string[]; expectedOffline: string[]; sessionCoverage: string; reportsCollected: boolean; probesCollected: boolean } {
-    const machines = new Map(this.rows('SELECT id, hostname, last_checkin_at, drained FROM machines').map(m => [m.id, m]));
+    const machines = new Map(this.rows('SELECT id, hostname, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL').map(m => [m.id, m]));
     const aliases = this.machineAliases(machines);
     const sessionIds = new Set<string>();
     for (const task of tasks) for (const event of task.history ?? []) {
@@ -518,6 +525,7 @@ export class StatusService {
   private coverageDto(missingHosts: string[], expectedOffline: string[], sessionCoverage: string, now: number): Obj {
     const offlineWindowActive = expectedOfflineWindowActive(now);
     return { sessions: sessionCoverage, missing_hosts: missingHosts, expected_offline: expectedOffline,
+      hosts: this.rows('SELECT id,hostname,last_checkin_at,drained FROM machines WHERE revoked_at IS NULL ORDER BY id').map(m => ({ ...m, last_checkin_at: effectiveCheckin(String(m.id), m.last_checkin_at) ?? null })),
       expected_offline_until: offlineWindowActive ? EXPECTED_OFFLINE_UNTIL : null,
       expected_offline_reason: offlineWindowActive && expectedOffline.length ? EXPECTED_OFFLINE_REASON : null,
       reason: missingHosts.length ? 'one_or_more_hosts_stale_or_unreachable' : expectedOffline.length ? 'all_unexpected_hosts_fresh_expected_offline_excluded' : 'all_known_hosts_fresh' };
@@ -709,6 +717,7 @@ export class StatusService {
           open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p, summaries),
           open_intake_warn_threshold: 100,
           ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
+          ...this.asksDto(!!(p as any).admin),
           ...this.attentionGroups(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next, total, limit },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
@@ -818,6 +827,7 @@ export class StatusService {
           open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p, summaries),
           open_intake_warn_threshold: 100,
           ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
+          ...this.asksDto(!!(p as any).admin),
           ...this.attentionGroups(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next: null, total: tasks.length, limit: tasks.length },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),

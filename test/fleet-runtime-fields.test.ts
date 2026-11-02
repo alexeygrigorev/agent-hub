@@ -33,7 +33,7 @@ describe('runtime diagnostic fields (intake a19cac9e AC1)', () => {
       { label: 'shared-codex', provider: 'codex', max_concurrency: 1, reserve_percent: 15, enabled: true },
     ], routes: [{ machine_id: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null }] }, 'PUT'), admin);
     const l: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
-    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6-luna', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     const path = '/launches/' + l.id + '/result';
     const receipt = { state: 'failed', native_id: 'native-runtime', launcher_task_id: 'hub-' + l.id, confirmed_exit: true };
     await s.handle(request(path, { state: 'running', native_id: receipt.native_id, launcher_task_id: receipt.launcher_task_id }), host('hetzner'));
@@ -47,7 +47,7 @@ describe('runtime diagnostic fields (intake a19cac9e AC1)', () => {
       { label: 'shared-codex', provider: 'codex', max_concurrency: 1, reserve_percent: 15, enabled: true },
     ], routes: [{ machine_id: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null }] }, 'PUT'), admin);
     const l: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
-    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6-luna', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     const path = '/launches/' + l.id + '/result';
     const receipt = { state: 'failed', native_id: 'native-runtime', launcher_task_id: 'hub-' + l.id, confirmed_exit: true };
     await s.handle(request(path, { state: 'running', native_id: receipt.native_id, launcher_task_id: receipt.launcher_task_id }), host('hetzner'));
@@ -61,7 +61,7 @@ describe('runtime diagnostic fields (intake a19cac9e AC1)', () => {
       { label: 'shared-codex', provider: 'codex', max_concurrency: 1, reserve_percent: 15, enabled: true },
     ], routes: [{ machine_id: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null }] }, 'PUT'), admin);
     const l: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
-    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6-luna', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     const path = '/launches/' + l.id + '/result';
     const receipt = { state: 'failed', native_id: 'native-children', launcher_task_id: 'hub-' + l.id, confirmed_exit: true };
     await s.handle(request(path, { state: 'running', native_id: receipt.native_id, launcher_task_id: receipt.launcher_task_id }), host('hetzner'));

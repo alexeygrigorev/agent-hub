@@ -136,7 +136,8 @@ def render_text(data):
         harness = pool.get("harness") or pool.get("engines") or []
         harness_text = ", ".join(h for h in harness if isinstance(h, str)) if isinstance(harness, list) else "unknown"
         lines.append("%s/%s/%s: %s (%s left, observed %s by %s)" % (
-            harness_text or "unknown", pool.get("provider", "?"), pool.get("account", "?"), pool.get("state", "unknown"),
+            harness_text or "unknown", pool.get("provider", "?"), pool.get("account", "?"),
+            pool.get("state", "unknown") + (" [DISABLED: excluded from routing]" if pool.get("routing") == "disabled" else ""),
             left, pool.get("observed_at") or "never",
             ", ".join(pool.get("observed_by_hosts") or []) or "no host"))
     coverage = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}

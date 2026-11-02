@@ -81,6 +81,62 @@ load never reaches the PUT at all (startup raises, reloads keep last good).
 
 ## Checkout-installed hosts: Hub-pinned self-update
 
+Linux immutable releases built with the desired-state update kit also consume
+the Hub pin automatically. They build from Git objects in `AGENT_HUB_SOURCE_REPO`
+(default `~/git/agent-hub`) using `build-host-release.py --source-repo`, verify
+the new tree, and switch the user unit through the normal restart marker. The
+source checkout and its dependencies are left intact. The kit is bundled and
+hashed in the release manifest. The managed final drop-in is
+`zz~~hub-desired-release.conf`; later conflicting overrides are refused.
+Status retains the running SHA during `updating`/`updated` and changes to the
+new SHA only when the new release reports `current`.
+
+### Operator switches and legacy overrides
+
+For a running release that predates the migration kit, build a verified release
+containing this fix, then run **that new release's switcher**, not the old running
+release's script. During an approved maintenance window:
+
+```sh
+python3 <new-release-dir>/scripts/switch-host-release.py \
+  --release <new-release-dir> \
+  --template <active-legacy-drop-in> \
+  --dropin <unit-drop-in-dir>/zz~~hub-desired-release.conf --restart
+systemctl --user show agent-hub-session-host.service --property=ExecStart --value
+```
+
+The switcher and desired-state updater share the same managed filename and
+ownership marker. They refuse an unmarked existing destination. Do not add
+more tildes to override precedence. The switcher inspects both systemd's
+DropInPaths and files on disk before mutation, so the bootstrap works even
+when the old running host cannot migrate its own overrides.
+
+Both paths recognize legacy `zz~<7-to-40-hex-sha>-switch-release.conf`
+names (including repeated tildes) only for regular, user-owned files in the
+unit's user drop-in directory, referencing a single manifested release whose
+SHA matches the filename. They preserve these as `.conf.disabled` before
+reloading the unit; foreign later overrides cause refusal.
+
+The updater holds `.hub-release-migration.lock` in the unit drop-in directory
+through fetch, build and activation; the switcher inherits that lock or acquires
+it for a manual invocation. Contending migrations refuse with
+`release_migration_busy`; retry after the other migration finishes. Source
+identity and content are revalidated after the build and before retirement.
+Existing backups, including ones appearing during build, cause refusal without
+replacing them. Linux `renameat2(RENAME_NOREPLACE)` also prevents a backup
+appearing at the final rename from being overwritten. Unsupported rename
+operations fail closed. Operators editing drop-ins should use the same lock
+with `flock`, and never edit them while a migration holds it.
+
+Before each retirement the switcher fsyncs a source/backup record to
+`<releases-dir>/.host-release-switch-journal.jsonl`. For rollback, inspect this
+private journal and the preserved overrides, restore a recorded backup only
+when its source name is absent, then reload user units and restart during an
+approved maintenance window. No override is deleted. After bootstrap, verify
+the next Hub pin reaches `host_release.state=current` and the unit's ExecStart
+references that same SHA. Build success and an active service alone do not
+prove live acceptance.
+
 Hosts that run the session host straight from a git checkout and have no
 inbound channel (Tabo: Windows, no ssh) take releases from the Hub instead
 of from an operator at the keyboard (intake a3227276):
@@ -93,8 +149,8 @@ hub host-release --machine cBynxGDoKVPoGpGWxvCTvg --clear   # stop pinning
 
 The Hub stores only the target SHA. Every 120 s the session host
 (`host/agent_hub_host/self_update.py`) reads its own pin and, when it differs
-from `HEAD`, requires: the checkout's own `.git` (release trees report
-`unsupported`), branch `main`, no tracked changes (untracked files are kept),
+from `HEAD`, requires: the checkout's own `.git` (Linux release trees use the
+bundled update kit above), branch `main`, no tracked changes (untracked files are kept),
 the SHA reachable from a fresh `origin/main`, and a fast-forward of `HEAD`.
 Anything else reports `refused` with the reason and changes nothing. It
 then fast-forwards, runs `python -m pip install -e .` in the service

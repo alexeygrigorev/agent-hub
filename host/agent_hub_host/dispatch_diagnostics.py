@@ -1,7 +1,7 @@
 """Fixed pre-start reasons plus bounded, redacted typed command evidence."""
 MESSAGES = {
-    'dispatch_worktree_refused': 'The worktree could not be protected before native start.',
-    'host_overload': 'Host 1-minute load is above the configured multiple of core count; new launches stay queued.',
+    'host_overload': 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
+    'host_load_high': 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
     'dispatch_worktree_refused': 'The worktree could not be protected before native start.',
     'cpu_headroom': 'Host CPU usage plus expected session demand exceeds the CPU target.',
     'cpu_pressure': 'Host CPU pressure exceeds the safety cap.',
@@ -14,7 +14,7 @@ MESSAGES = {
     'goal_startup_unconfigured': 'This account has no trusted interactive goal startup command.',
     'dispatch_startup_invalid': 'The configured trusted startup command is invalid.',
     'dispatch_cwd_invalid': 'The requested working directory is not confined to the workspace.',
-    'dispatch_goal_invalid': 'Goal work requires an interactive Codex-family route and nonempty text.',
+    'dispatch_goal_invalid': 'Goal work requires an interactive goal-capable (Codex-family or Claude) route and nonempty text.',
     'dispatch_prompt_unsupported': 'Interactive prompt injection requires an explicit goal start.',
     'dispatch_offer_invalid': 'The offered launch or task identifier is invalid.',
     'dispatch_capability_unavailable': 'The required task capabilities are unavailable on this host.',
@@ -25,7 +25,9 @@ MESSAGES = {
     'model_unsupported': 'The selected model or effort is unsupported by this local route.',
     'admission_unconfigured': 'This local route has no maintained fresh admission adapter.',
     'admission_refused': 'Fresh admission refused this account or could not verify its timestamp and model.',
+    'admission_quota_unverified': 'The maintained launcher could not read a trusted quota observation for this managed account (probe unavailable or rate-limited).',
     'engine_auth_expired': 'The engine authentication is unavailable or expired.',
+    'not_logged_in': 'The engine profile on this host is not logged in (no credential).',
     'codex_quota_gate_quota_unavailable': 'The managed Codex account quota gate refused launch before execution.',
     'codex_quota_gate_codex_reserve_required': 'The managed Codex account is below the configured weekly reserve.',
     'codex_quota_gate_stale_window_evidence': 'The managed Codex quota evidence is stale.',
@@ -40,7 +42,7 @@ EXACT = {
     'Goal startup requires a trusted local command': 'goal_startup_unconfigured',
     'Invalid trusted startup argv': 'dispatch_startup_invalid',
     'Goal work is interactive only': 'dispatch_goal_invalid',
-    'Interactive goal requires a Codex-family engine and goal text': 'dispatch_goal_invalid',
+    'Interactive goal requires a goal-capable engine and goal text': 'dispatch_goal_invalid',
     'Interactive task injection is unsupported; start an empty native session': 'dispatch_prompt_unsupported',
     'Invalid offer id': 'dispatch_offer_invalid', 'Invalid task id': 'dispatch_offer_invalid',
     'Required capabilities are no longer available locally': 'dispatch_capability_unavailable',
@@ -50,7 +52,46 @@ EXACT = {
     'Fresh admission refused': 'admission_refused',
     'Fresh admission timestamp required': 'admission_refused',
     'Selected model/effort requires verified admission': 'admission_refused',
+    # Intake ad8aa931: fixed pre-start refusals that read as a bare
+    # dispatch_internal_error on DESKTOP-FP4OP26 (35cf62ff, 8151fb8f).
+    'Selected model/effort is not configured locally': 'model_unsupported',
+    'Maintained launcher route is not configured': 'dispatch_route_unconfigured',
+    'Invalid provider profile': 'dispatch_route_unconfigured',
+    'Headless provider profile is not qualified': 'dispatch_route_unconfigured',
+    'Unsupported launch mode': 'dispatch_offer_invalid',
+    'workspace path exists and is not a git checkout': 'workspace_unavailable',
 }
+# Refusals whose text carries a variable tail (provider name, git stderr);
+# only the fixed slug leaves the host, never the tail.
+PREFIXES = (
+    ('Launcher provider ', 'dispatch_route_unconfigured'),
+    ('repo clone failed: ', 'workspace_unavailable'),
+    ('git fetch failed: ', 'workspace_unavailable'),
+    ('git checkout failed: ', 'workspace_unavailable'),
+)
+
+# Fixed admission-gate causes carried as gate_reason on admission_refused, so
+# a refused host is diagnosable remotely; any other gate text maps to
+# gate_refused and is never forwarded.
+GATE_REASONS = frozenset({
+    'local_bundle_missing', 'local_lock_unavailable', 'local_profile_missing',
+    'profile_mismatch', 'account_mismatch', 'model_mismatch', 'hub_unreachable',
+    'profile_not_installed', 'account_unmapped', 'credential_invalid',
+    'credential_rejected', 'quota_exhausted', 'profile_unsupported',
+    'account_label_mismatch', 'admission_timestamp_stale', 'model_unverified',
+    'gate_refused', 'not_logged_in',
+})
+
+
+class AdmissionRefusedError(ValueError):
+    """admission_refused with a fixed gate_reason slug."""
+    def __init__(self, message, gate_reason, *, timing=None):
+        super().__init__(message)
+        self.gate_reason = gate_reason if gate_reason in GATE_REASONS else 'gate_refused'
+        import math
+        self.timing = {k: round(v, 3) for k, v in (timing or {}).items()
+                       if k in {'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s'}
+                       and type(v) in (int, float) and math.isfinite(v) and abs(v) <= 86400}
 
 
 def classify(exc, *, workspace_available=True):
@@ -67,7 +108,9 @@ def classify(exc, *, workspace_available=True):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'engine_auth_expired', 'host_overload', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            if reason == 'dispatch_internal_error':
+                reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
         if value.startswith('HTTP request failed with status '):
             reason = 'dispatch_claim_refused'
     elif isinstance(exc, (RuntimeError, OSError)):
@@ -76,6 +119,9 @@ def classify(exc, *, workspace_available=True):
         reason = 'workspace_unavailable'
     value = {'reason': reason, 'message': MESSAGES[reason], 'stage': 'dispatch_route',
             'error_type': type(exc).__name__ if type(exc).__name__.isalpha() and len(type(exc).__name__) <= 64 else 'Error'}
+    if isinstance(exc, AdmissionRefusedError) and reason == 'admission_refused':
+        value['gate_reason'] = exc.gate_reason
+        value.update(exc.timing)
     from .launch_diagnostics import LocalCommandError
     if isinstance(exc, LocalCommandError):
         value.update(exc.command_diagnostic)
@@ -86,7 +132,7 @@ def classify(exc, *, workspace_available=True):
 
 # Fixed protocol enums only: token-shaped arbitrary strings can still be secrets.
 HTTP_SLUGS = frozenset({
-    'fresh_admission_required', 'account_capacity', 'account_concurrency',
+    'fresh_admission_required', 'account_capacity', 'account_concurrency', 'host_load_high',
     'machine_capacity', 'account_unavailable', 'provider_disabled',
     'quota_unavailable', 'no_quota_evidence', 'quota_unknown', 'quota_stale',
     'quota_exhausted', 'reserve_required', 'limit_reached', 'stale_window_evidence',

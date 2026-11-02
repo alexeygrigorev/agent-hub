@@ -5,6 +5,32 @@ import { getSession, allowedCallbackUrls, verifyCsrf } from "./auth/session";
 import { syncTbmFromHostSnapshot, syncTbmFromServerAccounts } from "./tbm-ingestion";
 import { resolveMachineAliases } from "./machine-alias";
 import { isPlainObject, parseUtcIso, readBoundedJsonBody } from "./strict-json";
+import routingPolicy from "../config/model-routing.json";
+
+/**
+ * Providers whose engines expose no usable quota API on the host (Antigravity
+ * /Gemini and OpenCode Go). A probe failure there is the absence of a meter,
+ * never evidence the engine is down: the real-run health holds, credential
+ * holds and positive exhaustion (limit_reached/cooldown) remain the only
+ * reasons to withhold placement (intake 3d1f8702).
+ */
+export function isUnmeteredProvider(provider: unknown): boolean {
+  const list: string[] = (routingPolicy.rules as any).unmetered_providers ?? [];
+  return typeof provider === "string" && list.includes(canonicalQuotaProvider(provider));
+}
+
+/** Observation Hub synthesizes for an unmetered provider; carries no percentage. */
+export function unmeteredObservation(observedAt: string): Record<string, any> {
+  return { status: "ok", error: null, observed_at: observedAt,
+    details: { limit_reached: false, unmetered: true, source: "hub-unmetered-engine" }, windows: {} };
+}
+
+/** True when a reading carries positive exhaustion/backoff evidence. */
+export function quotaPositivelyBlocked(quota: any, nowMs: number): boolean {
+  if (quota?.details?.limit_reached === true) return true;
+  const until = Date.parse(quota?.details?.cooldown_until);
+  return Number.isFinite(until) && until > nowMs;
+}
 
 export const QUOTA_MAX_BODY_BYTES = 32_768;
 export const QUOTA_STALE_MS = 1_200_000; // 1200 seconds (20 minutes) conservative boundary
@@ -309,6 +335,9 @@ const OPTIONAL_DETAILS_KEYS = new Set<string>([
   "profile",
   "cooldown_until",
   "banked_resets",
+  // Reset-credits sub-probe failure marker (intake 7bf6f6ee): explicit
+  // unknown that must survive to banked consumers, never a silent empty list.
+  "banked_resets_error",
 ]);
 
 const FORBIDDEN_PROTO_KEYS = new Set<string>([
@@ -350,6 +379,8 @@ export interface QuotaRouteDetailsDTO {
   /** Known provider backoff deadline (UTC ISO). Active holds block admission even when quota looks fine. */
   cooldown_until?: string | null;
   banked_resets?: { expires_at: string; available: boolean; label: string }[];
+  /** Reset-credits sub-probe failure: banked list is unknown, not empty. Opaque short reason, never provider output. */
+  banked_resets_error?: string | null;
 }
 
 export interface QuotaRouteDTO {
@@ -887,6 +918,13 @@ export function validateQuotaSnapshotPayload(
           sanitizedDetails.banked_resets.push({ expires_at: expiry.iso, available: grant.available, label: grant.label });
         }
       }
+      if (detailsVal.banked_resets_error !== undefined && detailsVal.banked_resets_error !== null) {
+        if (typeof detailsVal.banked_resets_error !== 'string' || detailsVal.banked_resets_error.length === 0 ||
+            detailsVal.banked_resets_error.length > 256) {
+          return { ok: false, status: 400, error: 'invalid_banked_resets_error' };
+        }
+        sanitizedDetails.banked_resets_error = detailsVal.banked_resets_error;
+      }
     }
 
     sanitizedRoutes[provider] = {
@@ -1332,7 +1370,7 @@ export class QuotaStore {
     // registration can never show as a missing machine.
     let aliasOf = new Map<string, string>();
     try {
-      const aliasRows = this.sql.exec("SELECT id, hostname, drained, last_checkin_at FROM machines").toArray() as any[];
+      const aliasRows = this.sql.exec("SELECT id, hostname, drained, last_checkin_at FROM machines WHERE revoked_at IS NULL").toArray() as any[];
       aliasOf = resolveMachineAliases(aliasRows.map((m: any) => {
         const seen = typeof m.last_checkin_at === 'string' ? Date.parse(m.last_checkin_at) : NaN;
         return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(seen) ? seen : null };
@@ -1340,7 +1378,7 @@ export class QuotaStore {
     } catch { aliasOf = new Map(); }
     // A filter naming an alias reads the canonical machine it resolves to.
     const effectiveHostId = filters.host_id && aliasOf.has(filters.host_id) ? aliasOf.get(filters.host_id)! : filters.host_id;
-    const machines = (this.sql.exec("SELECT id FROM machines ORDER BY id").toArray() as any[])
+    const machines = (this.sql.exec("SELECT id FROM machines WHERE revoked_at IS NULL ORDER BY id").toArray() as any[])
       .map((m: any) => m.id)
       .filter((id: string) => !aliasOf.has(id) && (!effectiveHostId || id === effectiveHostId));
 
@@ -1503,6 +1541,25 @@ export class QuotaStore {
       } else if (hasStale) {
         state = "stale";
       }
+      // Unmetered engines (no quota API): a failed/absent probe is not an outage.
+      // Fresh when a routed machine is live and its engine has no health hold;
+      // percentage stays unknown. Positive exhaustion keeps its own state.
+      if (["unavailable", "unknown", "stale"].includes(state) && Number(account.enabled) !== 0 && isUnmeteredProvider(account.provider) &&
+          !freshObs.some((o) => quotaPositivelyBlocked(o.quota, nowMs))) {
+        const liveRoute = routes.find((r) => {
+          const m: any = this.sql.exec("SELECT last_checkin_at, drained FROM machines WHERE id = ? AND revoked_at IS NULL", r.machine_id).toArray()[0];
+          if (!m || m.drained || !isFreshTs(m.last_checkin_at, nowMs, 180_000)) return false;
+          const held = this.sql.exec("SELECT 1 FROM fleet_engine_health WHERE engine = ? AND status = 'unavailable' AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL) LIMIT 1", r.engine, r.machine_id).toArray().length;
+          return !held;
+        });
+        if (liveRoute) {
+          state = "fresh";
+          remaining = null;
+          observedAt = new Date(nowMs).toISOString();
+          source = "unmetered-engine";
+          freshObs.splice(0, freshObs.length, { machine: liveRoute.machine_id, quota: unmeteredObservation(observedAt), kind: "unmetered" });
+        }
+      }
       const routeEngines = routes.length ? [...new Set(routes.map((r) => r.engine))].sort() : [canonicalQuotaProvider(account.provider)];
       // Display the first healthy observation when one exists so a broken
       // sibling probe never masks known windows (e.g. 7d 80% with 5h absent).
@@ -1510,7 +1567,9 @@ export class QuotaStore {
       pools.push({
         provider: canonicalQuotaProvider(account.provider),
         account: canonicalAccountLabel(account.label),
-
+        // Operator-disabled (intake 06d2a0ac AC3): excluded from routing,
+        // reversible; the quota row stays visible.
+        ...(Number(account.enabled) === 0 ? { routing: "disabled" } : {}),
         state,
         source,
         windows: displayObs?.quota.windows || {},
@@ -1534,7 +1593,37 @@ export class QuotaStore {
     }
 
     const hosts: Record<string, any>[] = [];
-    const coverage = { machines_total: machines.length, fresh: [] as string[], stale: [] as string[], missing: [] as string[] };
+    const coverage = { machines_total: machines.length, fresh: [] as string[], stale: [] as string[], missing: [] as string[],
+      // Machines counted fresh through their own per-account route reports
+      // (no fresh host-wide quse snapshot); see routeReportCoverage below.
+      route_reports: [] as string[] };
+    const coverageAccounts = new Set(accounts.map((a: any) => a.label));
+    const accountFiltered = Boolean(filters.provider || filters.account);
+    // A machine's own fleet subscription reports (one per routed account,
+    // posted every fleet cycle) are quota reports for exactly the accounts
+    // it can serve. A host without a host-wide quse snapshot (e.g. the
+    // Windows tablet serving only managed Codex bundles) is still a covered
+    // machine when every account routed to it has a fresh report from it;
+    // some-but-not-all is stale, none is missing.
+    const routeReportCoverage = (machineId: string): { routed: number; reported: number } => {
+      const routed = [...new Set(allRoutes
+        .filter((r) => r.machine_id === machineId && (!filters.engine || r.engine === filters.engine) &&
+          (!accountFiltered || coverageAccounts.has(r.account)))
+        .map((r) => r.account as string))];
+      let reported = 0;
+      for (const account of routed) {
+        const sub: any = this.sql
+          .exec("SELECT observed_at, quota_json FROM fleet_subscriptions WHERE machine_id = ? AND account = ?", machineId, account)
+          .toArray()[0];
+        if (!sub || !isFreshTs(sub.observed_at, nowMs, QUOTA_STALE_MS)) continue;
+        let quota: any = null;
+        try { quota = JSON.parse(sub.quota_json); } catch { quota = null; }
+        if (!quota || typeof quota !== "object") continue;
+        if (quota.observed_at !== undefined && quota.observed_at !== null && !isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS)) continue;
+        reported += 1;
+      }
+      return { routed: routed.length, reported };
+    };
     for (const machineId of machines) {
       const snap = this.getSnapshot(machineId, nowMs);
       const body = snap.body as Record<string, any>;
@@ -1560,8 +1649,14 @@ export class QuotaStore {
         });
       hosts.push({ host_id: machineId, snapshot: body, subscriptions: subs });
       if (snap.status === 200 && body.status === "ok") coverage.fresh.push(machineId);
-      else if (snap.status === 404) coverage.missing.push(machineId);
-      else coverage.stale.push(machineId);
+      else {
+        const { routed, reported } = routeReportCoverage(machineId);
+        if (routed > 0 && reported === routed) {
+          coverage.fresh.push(machineId);
+          coverage.route_reports.push(machineId);
+        } else if (snap.status === 404 && reported === 0) coverage.missing.push(machineId);
+        else coverage.stale.push(machineId);
+      }
     }
 
     return {
@@ -1582,12 +1677,66 @@ export class QuotaStore {
           engines: { zcodex: "codex" },
           accounts: { ...LEGACY_ACCOUNT_LABELS },
         },
-        account_coverage: { total: pools.length,
-          fresh: pools.filter(p => p.state === "fresh" || p.state === "exhausted").map(p => p.account),
-          stale: pools.filter(p => p.state === "stale").map(p => p.account),
-          unavailable: pools.filter(p => p.state === "unavailable" || p.state === "unknown").map(p => p.account) },
+        // Operator-disabled/retired accounts are out of routing: their rows stay
+        // visible but never count as an unavailable-quota bug.
+        account_coverage: { total: pools.filter(p => p.routing !== "disabled").length,
+          fresh: pools.filter(p => p.routing !== "disabled" && (p.state === "fresh" || p.state === "exhausted")).map(p => p.account),
+          stale: pools.filter(p => p.routing !== "disabled" && p.state === "stale").map(p => p.account),
+          unavailable: pools.filter(p => p.routing !== "disabled" && (p.state === "unavailable" || p.state === "unknown")).map(p => p.account) },
       },
     };
+  }
+
+  /**
+   * Sanitized engine verification for worker-scoped sessions (intake
+   * f28929eb): one read-only row per fleet route with exactly five string
+   * fields — engine, account label, host, health, quota state. Quota state
+   * reuses the fleet-view pool evidence (already free of credentials);
+   * health mirrors placement admission over fleet_engine_health. No operator
+   * surfaces (bundles, logins, credential metadata) and no nulls for known
+   * fields.
+   */
+  public getWorkerEnginesView(nowMs: number = this.now()): Record<string, any> {
+    const { body } = this.getFleetView({ host_id: null, provider: null, engine: null, account: null }, nowMs);
+    const poolState = new Map<string, string>();
+    const poolProviderByLabel = new Map<string, string>();
+    for (const pool of body.pools as Record<string, any>[]) {
+      const account = String(pool.account);
+      poolState.set(account + "\u0000" + String(pool.provider), String(pool.state));
+      if (!poolProviderByLabel.has(account)) poolProviderByLabel.set(account, String(pool.provider));
+    }
+    const registry = new Map<string, { enabled: number; provider: string }>();
+    for (const a of dedupeAccountsByCanonical(this.sql.exec("SELECT * FROM fleet_accounts ORDER BY label").toArray() as any[])) {
+      registry.set(canonicalAccountLabel(a.label), { enabled: Number(a.enabled) === 0 ? 0 : 1, provider: canonicalQuotaProvider(a.provider) });
+    }
+    const health = new Map<string, string>();
+    for (const h of this.sql.exec("SELECT engine, machine_id, status FROM fleet_engine_health").toArray() as any[]) {
+      health.set(String(h.machine_id ?? '') + "\u0000" + String(h.engine), String(h.status));
+    }
+    const engines: Record<string, string>[] = [];
+    for (const r of this.sql.exec("SELECT machine_id, engine, account FROM fleet_routes ORDER BY engine, account, machine_id").toArray() as any[]) {
+      const account = canonicalAccountLabel(String(r.account));
+      const registered = registry.get(account);
+      const provider = registered ? registered.provider : poolProviderByLabel.get(account) ?? "";
+      const state = poolState.get(account + "\u0000" + provider);
+      const specific = health.get(String(r.machine_id) + "\u0000" + String(r.engine));
+      const engineWide = health.get("\u0000" + String(r.engine));
+      engines.push({
+        engine: String(r.engine),
+        account,
+        host: String(r.machine_id),
+        health: specific === "unavailable" || engineWide === "unavailable" ? "unavailable"
+          : specific === "ok" || engineWide === "ok" ? "ok" : "unverified",
+        quota_state: registered?.enabled === 0 ? "disabled"
+          : state === "fresh" ? "ok"
+          : state === "exhausted" ? "exhausted"
+          : state === "unavailable" ? "unavailable"
+          : state === "stale" ? "stale"
+          : state === "unknown" ? "unknown"
+          : "unmapped",
+      });
+    }
+    return { schema_version: "1.0", observed_at: new Date(nowMs).toISOString(), engines };
   }
 
   /** Central account observations: no machine identity or host enrollment involved. */

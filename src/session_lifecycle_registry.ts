@@ -1,4 +1,5 @@
 import { jsonFields } from './sql-json-projection';
+import { backfillOnce } from './sql-probes';
 import { intakeHasDoneEvidence } from './intake';
 /** M15c live durable lifecycle registry (server authority).
  *
@@ -144,9 +145,9 @@ export function initLifecycleRequestProjection(sql: SqlStorage): void {
     DELETE FROM lifecycle_request_projection WHERE id=OLD.id; ${put} END`);
   sql.exec(`CREATE TRIGGER IF NOT EXISTS lifecycle_request_delete AFTER DELETE ON session_control_sessions BEGIN
     DELETE FROM lifecycle_request_projection WHERE id=OLD.id; END`);
-  sql.exec(`INSERT INTO lifecycle_request_projection SELECT c.id,
+  backfillOnce(sql, 'lifecycle_request_projection', () => sql.exec(`INSERT INTO lifecycle_request_projection SELECT c.id,
     ${jsonFields('c.request_json',['provenance','workspace','cwd'])},${brief('c.request_json')}
-    FROM session_control_sessions c WHERE NOT EXISTS(SELECT 1 FROM lifecycle_request_projection p WHERE p.id=c.id)`);
+    FROM session_control_sessions c WHERE NOT EXISTS(SELECT 1 FROM lifecycle_request_projection p WHERE p.id=c.id)`));
 }
 
 /** Canonical identity union. Only sessions with a native identity
@@ -407,14 +408,22 @@ function checkObservationPayload(input: any): { ok: true; stored: Record<string,
 /** Build trusted classifier inputs from canonical joins + stored
  * observations. Owner/provenance/human/engine/task linkage always come
  * from canonical rows; observations supply host-verified flags only. */
-export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>): { inputs: SessionInput[]; refs: Map<string, LifecycleRefs> } {
+export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>, options: { taskLinks?: boolean } = {}): { inputs: SessionInput[]; refs: Map<string, LifecycleRefs> } {
   const bases = joinedBases(sql, sessionIds);
   const observations = observationsByKey(sql, sessionIds ? bases.map(base=>base.key) : undefined);
-  const taskLinks = taskLinkIndex(sql);
+  // Callers that read only protection/ownership refs (worktree-guards) skip the
+  // full intake_task_projection scan; task_refs/report_refs are then empty.
+  const taskLinks = options.taskLinks === false ? () => ({ task_refs: [], report_refs: [] }) : taskLinkIndex(sql);
   const protectedSessions = new Set<string>();
   let protectionKnown = true;
   try {
-    for (const row of sql.exec('SELECT session_id FROM session_control_protections').toArray() as any[]) protectedSessions.add(row.session_id);
+    if (sessionIds) {
+      const all = [...sessionIds];
+      for (let i = 0; i < all.length; i += 1000) {
+        for (const row of sql.exec('SELECT session_id FROM session_control_protections WHERE session_id IN (SELECT value FROM json_each(?))',
+          JSON.stringify(all.slice(i, i + 1000))).toArray() as any[]) protectedSessions.add(row.session_id);
+      }
+    } else for (const row of sql.exec('SELECT session_id FROM session_control_protections').toArray() as any[]) protectedSessions.add(row.session_id);
   } catch { protectionKnown = false; }
   const inputs: SessionInput[] = [];
   const refs = new Map<string, LifecycleRefs>();

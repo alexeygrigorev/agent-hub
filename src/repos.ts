@@ -1,9 +1,11 @@
 /** Private repository registry. Human fields are insert-only during discovery. */
 import { boundedText } from './mcp';
+import { decodeRepoWorkspace } from './fleet';
 import type { SqlStorage } from '@cloudflare/workers-types';
 
 type Auth = { caller?: { kind?: string; isAdmin?: boolean; machineId?: string }; scopes?: string[]; error?: Response };
 const human = ['label', 'purpose', 'stack', 'key_folders', 'urls', 'aliases'] as const;
+const operatorFields = [...human, 'status', 'canonical'] as const;
 const machineFields = ['dir', 'origin', 'org', 'default_branch', 'status', 'canonical', 'last_commit', 'workflows', 'github_url', 'flags'] as const;
 const nameOk = (v: any) => typeof v === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(v);
 const textOk = (v: any) => typeof v === 'string' && v.length <= 4096 && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(v);
@@ -71,7 +73,8 @@ export class RepoRegistry {
   }
   /** Resolve before Fleet placement, pinning the owning host and keeping Fleet/host confinement. */
   prepareLaunch(input: any): { input?: any; error?: any } {
-    if (typeof input.workspace !== 'string' || pathOk(input.workspace)) return { input };
+    // Repo-identity workspaces (intake 8028bb06) are resolved by each host, not by this registry.
+    if (typeof input.workspace !== 'string' || pathOk(input.workspace) || decodeRepoWorkspace(input.workspace)) return { input };
     const rows = this.all();
     // Empty installations preserve configured legacy workspaces until seeded.
     if (!rows.length) return { input };
@@ -153,11 +156,38 @@ export class RepoRegistry {
       });
     }
     if (request.method === 'PATCH' && path.startsWith('/api/repos/')) {
-      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(k => !(human as readonly string[]).includes(k)) || human.some(k => body[k] !== undefined && (k === 'aliases' ? !Array.isArray(body[k]) || body[k].length > 32 || body[k].some((a: any) => !textOk(a) || a.length > 128 || !a.trim()) : !textOk(body[k])))) return json({ error: 'invalid_human_fields' }, 400);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(k => !(operatorFields as readonly string[]).includes(k)) || human.some(k => body[k] !== undefined && (k === 'aliases' ? !Array.isArray(body[k]) || body[k].length > 32 || body[k].some((a: any) => !textOk(a) || a.length > 128 || !a.trim()) : !textOk(body[k])))) return json({ error: 'invalid_repo_fields' }, 400);
+      if (body.status !== undefined && !['active', 'archived', 'duplicate'].includes(body.status)) return json({ error: 'invalid_status' }, 400);
+      if (body.canonical !== undefined && body.canonical !== null && !nameOk(body.canonical)) return json({ error: 'invalid_canonical' }, 400);
       return this.txn(() => {
-        const repo = this.get(decodeURIComponent(path.slice('/api/repos/'.length)));
+        let name: string;
+        try { name = decodeURIComponent(path.slice('/api/repos/'.length)); } catch { return json({ error: 'invalid_repo' }, 400); }
+        const repo = this.get(name);
         if (!repo) return json({ error: 'repo_not_found' }, 404);
-        this.save({ ...repo, ...body });
+        const next = { ...repo, ...body };
+        if (next.status === 'duplicate') {
+          const canonicalName = body.canonical === undefined ? repo.canonical : body.canonical;
+          if (!nameOk(canonicalName) || canonicalName === repo.name) return json({ error: 'invalid_canonical' }, 400);
+          const canonical = this.named(canonicalName);
+          if (!canonical) return json({ error: 'canonical_repo_missing' }, 400);
+          if (canonical.status !== 'active') return json({ error: 'canonical_repo_not_active' }, 400);
+          // An active target is terminal, so it cannot point back to this entry.
+          // Keep an explicit walk as a guard if status semantics change later.
+          const visited = new Set<string>([repo.name]);
+          let cursor: any = canonical;
+          while (cursor?.status === 'duplicate') {
+            if (visited.has(cursor.name)) return json({ error: 'duplicate_cycle' }, 400);
+            visited.add(cursor.name);
+            cursor = this.named(cursor.canonical);
+          }
+          if (!cursor || cursor.status !== 'active') return json({ error: 'canonical_repo_not_active' }, 400);
+          next.canonical = canonicalName;
+        } else {
+          if (body.canonical !== undefined && body.canonical !== null) return json({ error: 'canonical_requires_duplicate' }, 400);
+          // Canonical links have no meaning once a repository is active/archived.
+          next.canonical = null;
+        }
+        this.save(next);
         return json({ repo: this.get(repo.name) });
       });
     }
