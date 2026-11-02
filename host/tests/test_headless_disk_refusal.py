@@ -35,6 +35,20 @@ class HeadlessDiskRefusalTests(unittest.TestCase):
             self.assertEqual(diagnostic(bad)['reason'], 'launcher_command_failed')
             self.assertNotIn('private-value', json.dumps(diagnostic(bad)))
 
+    def test_absolute_disk_floor_grammar_is_classified(self):
+        raw = 'ValueError: cwd filesystem free < disk floor + required disk (41875931136 B)'
+        self.assertEqual(diagnostic(raw)['reason'], 'launcher_disk_reserve')
+
+    def test_disk_floor_is_min_of_absolute_and_five_percent(self):
+        from agent_hub_host.launcher_recovery import _launcher_disk_floor_mb
+        from unittest.mock import patch
+        usage = type('U', (), {'total': 100 * 1024 ** 3})()
+        with patch('shutil.disk_usage', return_value=usage):
+            self.assertEqual(_launcher_disk_floor_mb(['/x']), 5120)
+        usage = type('U', (), {'total': 2000 * 1024 ** 3})()
+        with patch('shutil.disk_usage', return_value=usage), patch.dict('os.environ', {'AGENT_DISK_FLOOR_GB': '12'}):
+            self.assertEqual(_launcher_disk_floor_mb(['/x']), 12288)
+
     def test_existing_resource_scan_projects_only_bounded_disk_evidence(self):
         runner = Mock(return_value={'active_mem_mb': 0, 'active_disk_mb': 19456,
                                    'breakdown': [{'task_id': 'hub-existing', 'private': 'withheld'}]})
@@ -42,7 +56,8 @@ class HeadlessDiskRefusalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             result = reconcile_resources(config, runner, workspace_paths=[root], workspace_aliases={"demo": root})
         self.assertEqual(result['active_disk_mb'], 19456)
-        self.assertEqual(result['disk_floor_mb'], 20480)
+        self.assertLessEqual(result['disk_floor_mb'], 15360)
+        self.assertEqual(result['active_disk_cap_mb'], 8192)
         self.assertEqual(result['next_disk_mb'], 512)
         self.assertEqual(result['disk_task_ids'], ['hub-existing'])
         self.assertEqual(result['disk_aliases'], {'demo': root})
