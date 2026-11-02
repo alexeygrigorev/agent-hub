@@ -30,6 +30,11 @@ const reply = (body: unknown, status = 200) => Response.json(body, { status, hea
 const object = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
 const text = (v: unknown, max = MAX_FIELD): v is string => typeof v === 'string' && v.length > 0 && v.length <= max && !v.includes('\0');
 const isKind = (v: string): v is HostCredentialKind => (HOST_CREDENTIAL_KINDS as readonly string[]).includes(v);
+/** Who wrote a credential, for the admin overview only; bounded, never secret material. */
+const actorSlug = (caller: any): string => {
+  const a = caller?.actor;
+  return typeof a === 'string' && /^[A-Za-z0-9_: .@-]{1,100}$/.test(a) ? a : (caller?.isAdmin === true ? 'admin' : 'unknown');
+};
 
 /** The exact payload a kind accepts; anything else is refused whole. */
 export function validPayload(kind: HostCredentialKind, value: unknown): value is Payload {
@@ -176,7 +181,7 @@ export class HostCredentialService {
     const written = this.tx(() => {
       if (Number(this.row(kind)?.generation ?? 0) + 1 !== generation) return false;
       this.sql.exec('INSERT OR REPLACE INTO host_credentials VALUES (?,?,?,?,?,?)', kind, generation, cipher, JSON.stringify(meta),
-        caller.isAdmin ? 'admin' : 'unknown', this.now());
+        actorSlug(caller), this.now());
       // A new generation must reach every host promptly.
       this.sql.exec('UPDATE host_credential_status SET resync_requested_at=?', this.now());
       return true;
