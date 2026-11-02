@@ -1,17 +1,16 @@
-import { reservationNativeJoinSql, unobservedReservationReleased } from './fleet-capacity-snapshot';
+import { reservationNativeJoinSql, reservationHoldsCapacity, INFLIGHT_LAUNCH_ID_SQL } from './fleet-capacity-snapshot';
 
 export const ACTIVE_LAUNCH_STATES_SQL = "('offered','starting','running','uncertain')";
 
 export type ReservedLaunchContext = {
   live_ids: string[];
-  stale_cutoff: string;
-  idle_cutoff_ms: number;
+  reservation_cutoff: string;
   complete_catalogs: Map<string, number>;
 };
 
 /** Cutoffs and catalogs without the live-machine set: the pure eligibility
- * part shared by accountStatus (snapshot branch) and the bounded page. */
-export type ReservedLaunchEligibility = Pick<ReservedLaunchContext, 'stale_cutoff' | 'idle_cutoff_ms' | 'complete_catalogs'>;
+ * part shared by accountStatus and the bounded page. */
+export type ReservedLaunchEligibility = Pick<ReservedLaunchContext, 'reservation_cutoff' | 'complete_catalogs'>;
 
 export type ReservedLaunchCursor = { state: string; id: string } | null;
 
@@ -30,29 +29,22 @@ export function encodeReservedLaunchCursor(cursor: ReservedLaunchCursor): string
   return cursor ? `${cursor.state}:${cursor.id}` : null;
 }
 
-function isIdle(row: any, eligibility: ReservedLaunchEligibility): boolean {
-  return row.phase === 'running' && eligibility.complete_catalogs.has(String(row.machine_id))
-    && typeof row.last_activity_at === 'string' && Number.isFinite(Date.parse(row.last_activity_at))
-    && Date.parse(row.last_activity_at) <= eligibility.idle_cutoff_ms;
-}
-
-/** The single reserved-eligibility predicate: state freshness plus the
- * catalog-backed idle/unobserved releases. accountStatus (both the snapshot
- * and the query branch via reservedLaunchPage) counts reservations with it. */
-export function isEligibleReservedLaunch(row: any, eligibility: ReservedLaunchEligibility): boolean {
-  if (!['offered', 'starting', 'running', 'uncertain'].includes(row.state)) return false;
-  if (row.state !== 'running' && !(row.updated_at > eligibility.stale_cutoff)) return false;
-  if (row.state === 'running') {
-    return !isIdle(row, eligibility) && !unobservedReservationReleased(row, eligibility.complete_catalogs);
-  }
-  if (row.state === 'uncertain') return !unobservedReservationReleased(row, eligibility.complete_catalogs);
-  return true;
+/** The single reserved-eligibility predicate: observed-live natives release,
+ * reservations hold only within TTL and release early on a fresh complete
+ * census. accountStatus (snapshot and query branches) and reservedLaunchPage
+ * count with it. */
+export function isEligibleReservedLaunch(
+  row: any,
+  eligibility: ReservedLaunchEligibility,
+  inFlightMatchedIds?: ReadonlySet<string>,
+): boolean {
+  return reservationHoldsCapacity(row, eligibility.complete_catalogs, eligibility.reservation_cutoff, inFlightMatchedIds);
 }
 
 /**
  * Shared accounting query for accountStatus and the operator's row-level read.
- * It selects at most 100 launch rows, with the same active/live/stale and
- * catalog-backed idle/unobserved predicate used for reserved capacity.
+ * It selects at most 100 launch rows, with the same TTL/live/census predicate
+ * used for reserved capacity (reservationHoldsCapacity).
  */
 export function reservedLaunchPage(
   sql: any,
@@ -76,18 +68,30 @@ export function reservedLaunchPage(
   const hubSessionIdSql = hasControlStore
     ? `(SELECT h.id FROM session_control_sessions h WHERE h.fleet_launch_id=l.id ORDER BY h.updated_at DESC LIMIT 1)`
     : 'NULL';
+  // In-flight starts (matching live natives via tag/workspace) do not hold a
+  // second slot: resolve them once per page with the same bounded probe that
+  // accountStatus uses, so the diagnostic agrees exactly with reserved.
+  let inFlightMatchedIds: Set<string> | undefined;
+  try {
+    const natives = sql.exec(`SELECT s.machine_id,s.native_id,s.phase,s.last_activity_at,${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id
+      FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain')
+      AND s.machine_id IN (${context.live_ids.map(() => '?').join(',')})`, account, ...context.live_ids).toArray() as any[];
+    inFlightMatchedIds = new Set(
+      natives.map(n => n.inflight_launch_id).filter((id: unknown): id is string => typeof id === 'string' && id.length > 0),
+    );
+  } catch { inFlightMatchedIds = undefined; }
   const whereCursor = cursor ? 'AND (l.state > ? OR (l.state = ? AND l.id > ?))' : '';
   const cursorBindings = cursor ? [cursor.state, cursor.state, cursor.id] : [];
-  const rawRows = sql.exec(`SELECT l.id, l.machine_id, l.state, l.native_id, l.created_at, l.updated_at,
-      ${hubSessionIdSql} AS hub_session_id, s.phase, s.last_activity_at, s.created_at_ms
+  const rawRows = sql.exec(`SELECT l.id, l.account, l.machine_id, l.state, l.native_id, l.created_at, l.updated_at,
+      ${hubSessionIdSql} AS hub_session_id, s.phase, s.last_activity_at, s.created_at_ms, s.account AS native_account
     FROM fleet_launches l${launchIndexHint}
     ${reservationNativeJoinSql(sql)}
     WHERE l.account = ? AND l.state IN ${ACTIVE_LAUNCH_STATES_SQL}
       AND EXISTS (SELECT 1 FROM json_each(?) live WHERE live.value=l.machine_id)
-      AND (l.state = 'running' OR l.updated_at > ?) ${whereCursor}
-    ORDER BY l.state, l.id LIMIT ?`, account, JSON.stringify(context.live_ids), context.stale_cutoff,
+      AND l.updated_at > ? ${whereCursor}
+    ORDER BY l.state, l.id LIMIT ?`, account, JSON.stringify(context.live_ids), context.reservation_cutoff,
     ...cursorBindings, limit).toArray() as any[];
-  const rows = rawRows.filter(row => isEligibleReservedLaunch(row, context))
+  const rows = rawRows.filter(row => isEligibleReservedLaunch(row, context, inFlightMatchedIds))
     .map(row => ({
       id: String(row.id),
       machine: String(row.machine_id),

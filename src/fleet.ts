@@ -20,7 +20,7 @@ import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { SILENT_START_MS, SILENT_START_REASON, ABANDONED_RECOVERY_MS, abandonedLaunch, expireSilentStartRows } from './silent-start';
 import { reconcileAccountCapacity } from './account_capacity';
-import { ACTIVE_LAUNCH_STATES_SQL, countReservedLaunches, parseReservedLaunchCursor, reservedLaunchPage, type ReservedLaunchContext } from './account-reserved-launches';
+import { ACTIVE_LAUNCH_STATES_SQL, isEligibleReservedLaunch, parseReservedLaunchCursor, reservedLaunchPage, type ReservedLaunchContext } from './account-reserved-launches';
 import { readAccountCapacityHistory } from './account-capacity-history';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
@@ -825,10 +825,12 @@ export class FleetService {
     // The launch↔session native join (with its bounded LIMIT 2 uniqueness
     // probe) lives only in reservationNativeJoinSql; every reserved-accounting
     // read reuses it instead of carrying SQL fragments through this context.
+    // The cutoff is the shared reservation TTL (not the legacy 48h stale
+    // window): accountStatus and the diagnostic page count with the same
+    // isEligibleReservedLaunch predicate.
     return {
       live_ids: liveIds,
-      stale_cutoff: new Date(nowMs - 48 * 3600000).toISOString(),
-      idle_cutoff_ms: nowMs - this.resources.config().idle_minutes * 60000,
+      reservation_cutoff: new Date(nowMs - RESERVATION_TTL_MS).toISOString(),
       complete_catalogs: catalogs ?? freshCompleteCatalogs(this.sql, nowMs),
     };
   }
@@ -923,7 +925,12 @@ export class FleetService {
     const inFlightMatchedIds = new Set(
       natives.map(n => n.inflight_launch_id).filter((id): id is string => typeof id === 'string' && id.length > 0),
     );
-    const reserved = reservations.filter(row => reservationHoldsCapacity(row, completeCatalogs, reservationCutoff, inFlightMatchedIds)).length;
+    // Single shared predicate (reviewer findings a/b/c): both the snapshot
+    // and the query branch count with isEligibleReservedLaunch, which wraps
+    // reservationHoldsCapacity over the same reservationNativeJoinSql rows
+    // the diagnostic page uses. No COUNT-over-controls SQL lives here.
+    const eligibility = { reservation_cutoff: reservationCutoff, complete_catalogs: completeCatalogs };
+    const reserved = reservations.filter(row => isEligibleReservedLaunch(row, eligibility, inFlightMatchedIds)).length;
     const observedSessions = natives.filter(row => !isIdle(row)).length;
     const active = reserved + observedSessions;
     // Visibility breakdown (no accounting change): counted slots split into
