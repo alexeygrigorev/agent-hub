@@ -104,7 +104,7 @@ describe('quota probe failure placement (b3749cbb)', () => {
       expect(service.accountStatus(sql.exec("SELECT * FROM fleet_accounts LIMIT 1").one()).remaining_percent).toBeNull();
     });
   });
-  it('falls back from exhausted Codex to a fresh engine in the same tier and reports every rejected engine', async () => {
+  it('holds an explicit Codex start when every Codex account is rejected', async () => {
     await fixture([], (service, sql) => {
       sql.exec("UPDATE fleet_subscriptions SET quota_json = ?", JSON.stringify({status: 'ok', observed_at: iso(), details: {limit_reached: true}, windows: {}}));
       sql.exec("INSERT INTO fleet_accounts VALUES ('shared-go','go',10,0,1)");
@@ -113,18 +113,20 @@ describe('quota probe failure placement (b3749cbb)', () => {
       const caps = JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id='host'").one().capabilities);
       sql.exec("UPDATE machines SET capabilities=?", JSON.stringify({...caps, workspaces: ['/srv/repos'], engines: ['codex','opencode']}));
       const plan = service.plan({ workspace: 'demo', mode: 'interactive', engine: 'codex', tier: 'daily', prompt: 'test' });
-      expect(plan.selected?.engine).toBe('opencode');
-      expect(plan.selected?.selection.id).toBe('muse');
-      expect(plan.request?.workspace).toBe('/srv/repos/demo');
+      expect(plan.selected).toBeNull();
+      expect(plan.candidates?.some((route: any) => route.engine !== 'codex')).toBe(false);
       expect(plan.request?.engine).toBe('codex');
       expect(plan.rejected).toContainEqual(expect.objectContaining({engine: 'codex', reason: 'account_blocked'}));
+      const defaultStart = service.plan({ workspace: 'demo', mode: 'interactive', tier: 'daily', prompt: 'test' });
+      expect(defaultStart.selected?.engine).toBe('opencode');
+      expect(defaultStart.selected?.selection.id).toBe('muse');
       // Deep tier cannot silently degrade to a daily model.
       const deep = service.plan({workspace: 'demo', mode: 'interactive', engine: 'astra', tier: 'deep', prompt: 'test'});
       expect(deep.selected).toBeNull();
       expect(deep.rejected).toContainEqual(expect.objectContaining({engine: 'opencode', reason: 'tier_unavailable'}));
     });
   });
-  it('falls back a Codex goal to a fresh same-tier zcodex goal route', async () => {
+  it('holds an explicit Codex goal when only a zcodex goal route remains', async () => {
     await fixture([], (service, sql) => {
       sql.exec("UPDATE fleet_subscriptions SET quota_json=?", JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:true},windows:{}}));
       sql.exec("INSERT INTO fleet_accounts VALUES ('shared-zai','zai',10,0,1)");
@@ -136,8 +138,10 @@ describe('quota probe failure placement (b3749cbb)', () => {
         {engine:'codex',account:'codex-orin',profile:'hub-codex-orin'},
         {engine:'zcodex',account:'shared-zai',profile:null}]}));
       const plan=service.plan({workspace:'demo',mode:'interactive',with_goal:true,engine:'codex',tier:'daily',prompt:'work'});
-      expect(plan.selected?.engine).toBe('zcodex');
-      expect(plan.selected?.selection.provider).toBe('zai');
+      expect(plan.selected).toBeNull();
+      expect(plan.candidates?.some((route: any) => route.engine === 'zcodex')).toBe(false);
+      expect(plan.request?.engine).toBe('codex');
+      expect(plan.rejected).toContainEqual(expect.objectContaining({engine: 'codex', reason: 'account_blocked'}));
       expect(plan.request?.with_goal).toBe(true);
     });
   });
