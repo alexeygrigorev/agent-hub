@@ -20,6 +20,8 @@ class SelectTests(unittest.TestCase):
             'src/mcp-tools.ts': '', 'src/mcp.ts': '', 'src/mcp-usage.ts': '',
             'src/mcp-oauth.ts': '', 'src/conversation-hub.ts': '', 'src/worker.ts': '',
             'src/ui-pages.ts': '',
+            'host/agent_hub_host/cli.py': '', 'host/agent_hub_host/worktree_cli.py': '',
+            'scripts/mcp-cli-inventory.py': '', 'test/mcp-cli-commands.json': '{}',
             'host/tests/test_jobs.py': 'from agent_hub_host import jobs',
             'host/tests/test_misc.py': 'import agent_hub_host.jobs as j',
             'host/tests/test_unrelated.py': 'import os',
@@ -69,6 +71,16 @@ class SelectTests(unittest.TestCase):
         for path in sorted(m.MCP_FILES):
             with self.subTest(path=path):
                 self.assertEqual(m.select([path], self.root)['vitest'], ['test/mcp.test.ts'])
+
+    def test_cli_mcp_parity_changes_select_both_parity_suites(self):
+        for path in [
+            'host/agent_hub_host/cli.py', 'host/agent_hub_host/worktree_cli.py',
+            'scripts/mcp-cli-inventory.py', 'test/mcp-cli-commands.json', 'src/mcp-tools.ts',
+        ]:
+            with self.subTest(path=path):
+                plan = m.select([path], self.root)
+                self.assertIn('test/mcp.test.ts', plan['vitest'])
+                self.assertIn('test/test_mcp_parity.py', plan['pytest'])
 
 
 if __name__ == '__main__':
