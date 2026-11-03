@@ -1,43 +1,38 @@
 # Install a Hub session host
 
-Fresh native Windows enrollment is still being verified on a real desktop. The macOS runtime can't enforce Hub's required resource limits, so its controller won't start.
+Run the command for your OS in your ordinary user account. The installer uses
+per-user paths and does not request administrator access, `sudo`, or a GitHub
+login.
 
-Run one command in your ordinary user account. You don't need an administrator terminal.
-
-On Windows, including ARM64, use PowerShell:
+**Windows PowerShell**
 
 ```powershell
 irm https://hub.dtcdev.click/host/install.ps1 | iex
 ```
 
-On Windows, you'll find the installation in `%LOCALAPPDATA%\Programs\agent-hub`. Your logon task runs the controller with limited privileges.
-
-On Linux or macOS, including ARM64:
+**Linux or macOS**
 
 ```bash
 curl -fsSL https://hub.dtcdev.click/host/install.sh | sh
 ```
 
-On Linux and macOS, you'll find the installation in `~/.local/share/agent-hub`. On Linux, we run the controller through your systemd user service. On macOS, we use your LaunchAgent.
+The installer downloads its runtime packages, configures the host and displays
+one Hub device URL and code. Approve that request in your browser. The approval
+covers the host credential and requests repository-read scope; repositories
+are cloneable when the Hub operator has enabled the repository policy. No
+separate GitHub login is used. ARM64 is detected automatically, with
+x64-compatible runtimes used where a native package is unavailable.
 
-Approve the displayed Hub device code in your browser. That approval enrolls the machine and requests access to the repositories your Hub operator has approved. You don't need a separate GitHub login on the host.
+The installation is repeatable: rerun the same command after an interruption
+to resume setup. Existing credentials and repository work are preserved. The
+installer ends with JSON containing the machine ID, service type, elevation
+prompt count and repository-access state. `repository_access: configured`
+means approved repositories can be cloned; `not_configured` means the Hub
+operator must enable repository access; `declined` or `forbidden` means access
+was not granted; `unavailable` means retry after a temporary outage.
 
-We install Python, Node and Git in your account, then add aplexer to manage sessions. We include `quse` for quota reporting.
-
-Your engine commands include Claude Code, Codex and OpenCode. We also install Gemini CLI, Grok and Antigravity. On Windows we supply Git Bash so Claude can run without another install.
-
-On Windows the host keeps itself current: when Hub serves a new `hub.pyz`, the host schedules a one-off task for your account that reruns the same install command (no admin, at most one attempt per release every six hours). Each update builds a new release beside the old one; older releases stay until you remove them. `hub host-release` pins do not apply to these immutable package installs (they report `unsupported immutable_platform_unsupported`); see [HOST-RELEASE.md](HOST-RELEASE.md#windows-package-installs-immutable-release-trees-supported-update-path) for the exact supported path.
-
-We also install the pinned Agent Quota Launcher in `launcher-releases/<commit>`, so the host accepts headless (`--prompt`) sessions as well as interactive ones. A launcher you configured yourself is never replaced. Over an ssh logon the user PATH can't always be saved; installation still completes, and the services carry their own PATH.
-
-We select Claude with Opus when no default exists, preserving your later choices on repairs. Your host then receives the engine accounts configured centrally in Hub. Account delivery and a successful model session are separate from installing an executable.
-
-The installer targets Linux with glibc 2.28 or newer, macOS 11 or newer, and Windows 10/11 on x64 and ARM64. macOS uses the matching aplexer binary and client from release `0.1.22`. Linux and Windows use `0.1.23`. ZCode/ZAI installation across these platforms remains unfinished.
-
-Keep your user session active so its controller can report availability. Open a new terminal to pick up the saved engine commands on PATH. Windows PowerShell also receives the updated PATH when installation finishes.
-
-The final JSON reports your machine ID, controller type and repository-access configuration. `not_configured` means your Hub operator must enable repository access; `declined` or `forbidden` means access wasn't granted; `unavailable` means you can retry after a temporary outage. These repository states still allow controller installation. Installation doesn't create accounts, keys or paid resources.
-
-If a download or installation step fails, rerun the same command. We preserve existing host credentials and repository work. Windows repairs use separate runtime releases and ask the owned controller to exit before switching the logon task. After a reboot or crash, a changed boot identity or exact native exit proof allows recovery, with the old receipt archived. Unknown state preserves the evidence and reports `controller/needs-attention.json`; restore native status access and retry. Abandoned stop requests expire. Fresh, rerun and reboot behavior still need native Windows transcripts. Look in `controller.log` inside the installation directory if the controller doesn't start. The installer refuses launchers in temporary storage or changes to another user profile. Test in a disposable profile or VM; Linux service tests need a real systemd user manager and cgroup delegation.
-
-Earlier local test controllers without the cooperative lease must be deliberately stopped before upgrading; the installer preserves a running controller it cannot prove it owns. Those versions were never publicly shipped.
+The Windows controller runs as a per-user logon task. Linux uses a systemd
+user service. Keep your user session active so the controller can report
+availability. macOS installs per-user files, but its controller currently does
+not start because required resource limits cannot be enforced there. Fresh
+Windows-profile end-to-end verification is still pending.
