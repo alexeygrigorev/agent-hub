@@ -1,4 +1,6 @@
 node_modules/
+# The symlink form created by scripts/local-dependencies.py in fresh checkouts.
+node_modules
 dist/
 .wrangler/
 .dev.vars

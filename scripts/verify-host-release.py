@@ -21,6 +21,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MANIFEST_TEMPLATE = REPO / "scripts" / "host-release-manifest.json"
+sys.path.insert(0, str(REPO / "scripts"))
+from host_release_modes import verify_tree
 
 SMOKE = (
     "import sys;"
@@ -83,6 +85,10 @@ def main(argv):
     release = Path(argv[1])
     if not release.is_dir():
         return fail("release dir is missing")
+    try:
+        verify_tree(release)
+    except (OSError, ValueError):
+        return fail("release contains group/world-writable or unsupported entries")
     manifest_file = release / "release-manifest.json"
     if not manifest_file.is_file():
         return fail("release-manifest.json is missing (not built by build-host-release.py)")

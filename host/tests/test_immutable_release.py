@@ -2,6 +2,7 @@ import json
 import importlib.util
 import os
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -111,6 +112,26 @@ class ImmutableReleaseTest(unittest.TestCase):
         self.assertEqual(self.template.read_text(), self.text)
         self.assertFalse((self.unit_dir / update.DROPIN).exists())
 
+    def test_launcher_repoint_refuses_writable_built_release_and_keeps_dropin(self):
+        original = self.run_command
+        switch_script = Path(__file__).resolve().parents[2] / 'scripts' / 'switch-host-release.py'
+
+        def run(argv, **kwargs):
+            if len(argv) > 1 and argv[1].endswith('switch-host-release.py'):
+                kwargs.pop('umask', None)
+                return subprocess.run([sys.executable, str(switch_script), *argv[2:]], **kwargs)
+            result = original(argv, **kwargs)
+            if len(argv) > 1 and argv[1].endswith('build-host-release.py'):
+                writable = self.root.parent.joinpath(self.target, 'writable')
+                writable.write_text('unsafe release')
+                writable.chmod(0o664)
+            return result
+
+        with patch.object(self, 'run_command', side_effect=run):
+            self.assertEqual(self.apply(), ('failed', 'release_switch_failed', self.before))
+        self.assertEqual(self.template.read_text(), self.text)
+        self.assertFalse((self.unit_dir / update.DROPIN).exists())
+
     def test_never_overwrites_an_unmanaged_destination(self):
         destination = self.unit_dir / update.DROPIN
         destination.write_text('another owner\n')
@@ -213,6 +234,9 @@ class ImmutableReleaseTest(unittest.TestCase):
         self.assertEqual(self.template.read_text(), self.text)
 
     def manual_switch(self):
+        target_release = self.root.parent / self.target
+        target_release.mkdir(parents=True, exist_ok=True)
+        target_release.chmod(0o755)
         spec = importlib.util.spec_from_file_location('switch_release',
             Path(__file__).resolve().parents[2] / 'scripts' / 'switch-host-release.py')
         switch = importlib.util.module_from_spec(spec)
@@ -263,6 +287,9 @@ class ImmutableReleaseTest(unittest.TestCase):
         self.assertFalse((self.unit_dir / update.DROPIN).exists())
 
     def test_manual_switch_uses_managed_marker_and_rejects_legacy_destination(self):
+        target_release = self.root.parent / self.target
+        target_release.mkdir(parents=True, exist_ok=True)
+        target_release.chmod(0o755)
         spec = importlib.util.spec_from_file_location('switch_release',
             Path(__file__).resolve().parents[2] / 'scripts' / 'switch-host-release.py')
         switch = importlib.util.module_from_spec(spec)
