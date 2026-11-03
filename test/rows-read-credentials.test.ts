@@ -18,11 +18,25 @@ const STALE_AGENTS = 300, DEAD_CREDS = 2000;
 /** Wrap sql so every cursor is kept; rowsRead is final once consumed. */
 function tracked(sql: any) {
   const calls: string[] = [];
+  const cursors: { q: string; cursor: any }[] = [];
   const proxy = new Proxy(sql, { get(t: any, p: string) {
-    if (p === 'exec') return (q: string, ...b: any[]) => { calls.push(String(q).replace(/\s+/g, ' ')); return t.exec(q, ...b); };
+    if (p === 'exec') return (q: string, ...b: any[]) => {
+      const qq = String(q).replace(/\s+/g, ' ');
+      calls.push(qq);
+      const cursor = t.exec(q, ...b);
+      cursors.push({ q: qq, cursor });
+      return cursor;
+    };
     const v = t[p]; return typeof v === 'function' ? v.bind(t) : v;
   } });
-  return { proxy, calls };
+  /** Rows read by statements issued since `from` (a prior `mark()`). */
+  const report = (from = 0) => {
+    let total = 0;
+    for (const { cursor } of cursors.slice(from)) total += Number(cursor.rowsRead) || 0;
+    return total;
+  };
+  const mark = () => cursors.length;
+  return { proxy, calls, report, mark };
 }
 
 function seed(sql: any) {
@@ -122,12 +136,14 @@ describe('write-driven credential sweeps', () => {
     expect(read(hub, "SELECT revoked_at FROM credentials WHERE id = 'c-stopped'").rows[0].revoked_at).not.toBeNull();
     const sweeped = t.calls.filter(q => /agents a LEFT JOIN/i.test(q));
     expect(sweeped.length).toBeGreaterThan(0);
-    const from = t.calls.length;
+    const from = t.mark();
     const second = poll();
     expect(second.map(s => s.session_id).sort()).toEqual(['s1', 's2']);
     // No sweep statement re-ran: identical exec calls would still be recorded
     // by the tracker even on a memo hit, so absence proves the gate skipped it.
     expect(t.calls.slice(from).filter(q => /agents a LEFT JOIN/i.test(q))).toEqual([]);
+    // And the repeat poll read zero rows (memoized zero-read cursors).
+    expect(t.report(from)).toBe(0);
   }));
 
   it('ending a session re-arms the sweep and drops it from the poll', () => withHub(async hub => {
@@ -154,10 +170,12 @@ describe('write-driven credential sweeps', () => {
     expect(first.sessions.map((s: any) => s.session_id)).toEqual(['s-needy']);
     // The backstop revoked the ended native session's family on the first poll.
     expect(read(hub, "SELECT revoked_at FROM credentials WHERE id = 'c-fn-dead'").rows[0].revoked_at).not.toBeNull();
-    const from = t.calls.length;
+    const from = t.mark();
     const second: any = await list().json();
     expect(second.sessions).toEqual(first.sessions);
     expect(t.calls.slice(from).filter(q => /FROM worker_access w LEFT JOIN/i.test(q))).toEqual([]);
+    // The repeat list read zero rows (memoized zero-read cursors).
+    expect(t.report(from)).toBe(0);
     // Ending the sessions re-arms the sweep, revokes the covered family, and
     // drops the needy session from the poll.
     hub.sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id IN ('s-needy','s-covered')");
