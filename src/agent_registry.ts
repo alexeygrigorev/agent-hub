@@ -48,9 +48,15 @@ export function migrateAgentRegistry(sql: SqlStorage, transaction: <T>(fn: () =>
 export function bindAgentCredentials(sql: SqlStorage, transaction: <T>(fn: () => T) => T): void {
   transaction(() => {
     const valid = registryRowSql('a.');
+    // Intake e8a22f4c: the identity match must stay sargable. A CASE over the
+    // stored columns defeats the tag/project indexes and scans the whole
+    // registry on every message insert (~8 rows/agent, ~9k rows/insert live).
+    // Branch on the colon in the *sought* value instead: both branches match a
+    // stored column (or indexed expression) against a per-row constant.
     const binding = (raw: string, created?: string) => `COALESCE((SELECT CASE WHEN COALESCE(a.project,'') = '' THEN a.tag ELSE a.project || ':' || a.tag END
       FROM agents a WHERE ${valid} AND
-      (CASE WHEN instr(${raw},':') = 0 THEN a.tag ELSE a.project || ':' || a.tag END) = ${raw}
+      ((instr(${raw},':') = 0 AND COALESCE(a.project,'') = '' AND a.tag = ${raw})
+        OR (instr(${raw},':') > 0 AND COALESCE(a.project,'') = substr(${raw},1,instr(${raw},':')-1) AND a.tag = substr(${raw},instr(${raw},':')+1)))
       AND (instr(${raw},':') > 0 OR (SELECT COUNT(*) FROM agents WHERE tag = ${raw}) = 1)
       ${created ? `AND julianday(a.registered_at) <= julianday(${created})` : ''}
       LIMIT 1), '')`;
@@ -69,7 +75,11 @@ export function bindAgentCredentials(sql: SqlStorage, transaction: <T>(fn: () =>
       }
     }
     const canonical = (raw: string) => `COALESCE(NULLIF(${binding(raw)},''), ${raw})`;
-    sql.exec(`CREATE TRIGGER IF NOT EXISTS messages_bind_agents AFTER INSERT ON messages BEGIN
+    // Intake e8a22f4c: the trigger body is sargable now; drop the pre-index
+    // definition once so live deployments pick it up (IF NOT EXISTS would
+    // keep scanning the registry on every message insert).
+    sql.exec('DROP TRIGGER IF EXISTS messages_bind_agents');
+    sql.exec(`CREATE TRIGGER messages_bind_agents AFTER INSERT ON messages BEGIN
       UPDATE messages SET from_actor = ${canonical('NEW.from_actor')}, to_actor = ${canonical('NEW.to_actor')},
         registry_unbound_from = CASE WHEN instr(NEW.from_actor,':') = 0 AND ${registryNameSql('NEW.from_actor')} AND ${binding('NEW.from_actor')} = '' THEN 1 ELSE NEW.registry_unbound_from END,
         registry_unbound_to = CASE WHEN instr(NEW.to_actor,':') = 0 AND ${registryNameSql('NEW.to_actor')} AND ${binding('NEW.to_actor')} = '' THEN 1 ELSE NEW.registry_unbound_to END
