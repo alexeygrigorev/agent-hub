@@ -20,6 +20,7 @@ import { taskTier, policy, modelDisabledByPolicy, heavyModelEffortAllowed, deepM
 import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
+import { reconcileInteractiveLaunchCatalog } from './launch-start-settlement';
 import { runHeldReconciler } from './intake-recovery';
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
@@ -3029,6 +3030,7 @@ export class FleetService {
         this.linkRevisions.set(caller.machineId!, revision);
         adoptObservedNativeSessions(this.sql, caller.machineId!, linkChangedSessions, this.now(), undefined,
           revisionMoved ? cleanSessions : linkChangedSessions);
+        reconcileInteractiveLaunchCatalog(this.sql, caller.machineId!, this.now(), censusComplete);
         if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
         reconcileVerifiedNoStarts(this.sql, this.now());

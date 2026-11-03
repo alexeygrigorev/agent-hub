@@ -56,9 +56,9 @@ function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', nati
 
 function reportFleetSession(sql: any, machine: string, nativeId: string, tag: string, workspace: string, phase = 'running') {
   const at = new Date().toISOString();
-  sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at)
-    VALUES (?, ?, ?, 'claude', ?, NULL, ?, ?, NULL, NULL, 'fixture-acct', NULL)`,
-    machine, nativeId, tag, phase, at, workspace);
+  sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms)
+    VALUES (?, ?, ?, 'claude', ?, NULL, ?, ?, NULL, NULL, 'fixture-acct', NULL, ?)`,
+    machine, nativeId, tag, phase, at, workspace, NATIVE_CREATED);
 }
 
 async function startAndBind(s: SessionControlService, sql: any, key: string) {
@@ -68,6 +68,10 @@ async function startAndBind(s: SessionControlService, sql: any, key: string) {
   const launchId = data.fleet_launch_id || 'launch-1';
   ensureFleetLaunch(sql, launchId, data.machine || 'hetzner');
   reportFleetSession(sql, data.machine || 'hetzner', NATIVE_ID, canonTag(launchId), NATIVE_WS);
+  const censusAt = new Date().toISOString();
+  sql.exec(`INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES (?, ?, 1)
+    ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at, complete=1`,
+    data.machine || 'hetzner', censusAt);
   const bres = await s.handle(request(`/api/sessions/${data.id}/binding`, { native: { ...bound(canonTag(launchId)), evidence: 'fixture' } }), host(data.machine || 'hetzner'));
   const bdata = await bres.json() as any;
   expect(bres.status, JSON.stringify(bdata)).toBe(200);
@@ -149,7 +153,7 @@ describe('session scheduled wakes', () => {
     });
   });
 
-  it.each(['offered', 'starting', 'uncertain'])('retries a due wake during %s and delivers after startup', async (phase) => {
+  it.each(['offered', 'starting', 'uncertain'])('reconciles a live binding and queues a due wake from %s', async (phase) => {
       await fixture(async (s, sql) => {
         const sess = await startAndBind(s, sql, 'wake-startup-' + phase);
         const result: any = await (await s.handle(request(`/api/sessions/${sess.id}/wake`,
@@ -157,9 +161,7 @@ describe('session scheduled wakes', () => {
         sql.exec('UPDATE session_control_sessions SET state=? WHERE id=?', phase, sess.id);
         sql.exec('UPDATE session_control_wakes SET wake_at_ms=? WHERE id=?', Date.now(), result.wake_id);
         expect(s.processDueWakes()).toMatchObject({ delivered: 0, missed: 0 });
-        expect(sql.exec('SELECT state FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0].state).toBe('pending');
-        sql.exec("UPDATE session_control_sessions SET state='running' WHERE id=?", sess.id);
-        expect(s.processDueWakes()).toMatchObject({ delivered: 0, missed: 0 });
+        expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?', sess.id).toArray()[0].state).toBe('running');
         expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0])
           .toMatchObject({ state: 'queued', delivered_at: null });
       });
