@@ -1,5 +1,6 @@
 """Real-journal relay regressions; no native process, network or credentials."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,29 +12,45 @@ class Utf8RelayTests(unittest.TestCase):
     def relay_case(self, body, expected):
         with tempfile.TemporaryDirectory() as tmp:
             journal = str(Path(tmp) / 'msg-owned.json')
+            native_id = '11111111-1111-4111-8111-111111111111'
+            hub_session_id = '22222222-2222-4222-8222-222222222222'
+            workspace = str(Path(tmp) / 'workspace')
+            auth_dir = Path(workspace) / '.local' / 'hub-session-auth'
+            auth_dir.mkdir(parents=True, mode=0o700)
+            profile_path = auth_dir / (native_id + '.json')
+            profile_path.write_text(json.dumps({
+                'base_url': 'https://hub.example', 'client_kind': 'agent',
+                'actor': 'session:' + hub_session_id, 'hub_session_id': hub_session_id,
+                'access_token': 'test-session-access', 'refresh_token': 'test-session-refresh'}))
+            os.chmod(profile_path, 0o600)
             rec = {'state': 'delivered', 'envelope_id': 'native-envelope',
-                   'sender_workspace': 'sender-workspace', 'hub_session_id': 'owned-session',
+                   'sender_workspace': 'sender-workspace', 'hub_session_id': hub_session_id,
                    'from_actor': 'agent:developer', 'created_ms': 1000,
-                   'target': {'session_id': 'owned-native'}, 'message_id': 'hub-message'}
+                   'target': {'session_id': native_id, 'workspace': workspace}, 'message_id': 'hub-message'}
             sm._write_journal(journal, rec)
-            env = {'id': 'native-reply', 'from': {'session_id': 'owned-native'},
+            env = {'id': 'native-reply', 'from': {'session_id': native_id},
                    'reply_to': 'native-envelope', 'body': body}
             sends = []
             def request(method, path, payload):
-                self.assertEqual((method, path), ('POST', '/api/bus/send'))
+                self.fail('native reply relay must use the session credential request')
+            def session_request(profile, method, path, payload):
+                self.assertEqual(profile['actor'], 'session:' + hub_session_id)
+                self.assertEqual((method, path), ('POST', '/api/bus/reply'))
                 self.assertLessEqual(len(payload['body'].encode('utf-8')), 16384)
                 self.assertEqual(payload['body'], expected)
-                self.assertEqual(payload['from_actor'], 'session:owned-session')
                 self.assertEqual(payload['to_actor'], 'agent:developer')
                 self.assertEqual(payload['reply_to'], 'hub-message')
+                self.assertNotIn('from_actor', payload)
                 sends.append(payload)
                 return {'id': 'hub-reply'}
             with patch.object(sm, 'fetch_message_log', return_value=[env]):
-                first = sm.relay_replies(journal_dir=tmp, executable='unused', request=request, now_ms=1000)
+                first = sm.relay_replies(journal_dir=tmp, executable='unused', request=request,
+                                         now_ms=1000, session_request=session_request)
                 self.assertEqual(first, [{'message_id': 'hub-message', 'reply_id': 'hub-reply'}])
-                self.assertEqual(sm.relay_replies(journal_dir=tmp, executable='unused', request=request, now_ms=1000), [])
+                self.assertEqual(sm.relay_replies(journal_dir=tmp, executable='unused', request=request,
+                                                  now_ms=1000, session_request=session_request), [])
             self.assertEqual(len(sends), 1)
-            self.assertEqual(sends[0]['idempotency_key'], 'native-native-reply')
+            self.assertEqual(sends[0]['idempotency_key'], 'native:native-reply')
             self.assertEqual(json.loads(Path(journal).read_text())['relayed'], ['native-reply'])
 
     def test_short_unicode_unchanged(self):

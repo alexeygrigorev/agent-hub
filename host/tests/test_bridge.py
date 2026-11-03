@@ -1820,6 +1820,25 @@ class TestBridgePollCursor(unittest.TestCase):
         self.assertEqual(self.forward_calls, ["m002"])
         self.assertEqual((summary["acked_skipped"], summary["already_forwarded"], summary["forwarded"]), (1, 2, []))
 
+    def test_hub_session_messages_are_settled_without_bridge_injection(self):
+        sid = "22222222-2222-4222-8222-222222222222"
+        msg = {"id": "hub-session-message", "to_actor": "session:" + sid, "to_session_id": sid,
+               "from_actor": "agent:developer", "kind": "note",
+               "body": "deliver through session-commands", "created_at": 1001}
+        summary = self._poll(_FakeInbox([msg]))
+        self.assertEqual(summary.get("hub_session_skipped"), 1)
+        self.assertEqual(self.forward_calls, [])
+        self.assertEqual(self.bridge.pending_inbox("projA:agent-1"), {})
+        self.assertNotIn(msg["id"], self.bridge.receipts.get("hub_to_native", {}))
+
+    def test_direct_forward_rejects_hub_session_destination(self):
+        msg = {"id": "hub-session-message", "to_actor": "agent:former-name",
+               "to_session_id": "22222222-2222-4222-8222-222222222222", "body": "message"}
+        with patch("subprocess.run") as run:
+            with self.assertRaisesRegex(BridgeCapabilityGap, "session-commands"):
+                self.bridge.forward_hub_to_native(msg, native_tag="agent-1")
+            run.assert_not_called()
+
     def test_window_exhaustion_is_an_error_and_the_next_cycle_continues_from_the_cursor(self):
         inbox = _FakeInbox(self._messages(13))
         first = self._poll(inbox, limit=1, max_pages=10)

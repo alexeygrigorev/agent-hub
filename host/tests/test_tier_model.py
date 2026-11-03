@@ -142,23 +142,35 @@ def test_interactive_unsupported_adapter_refused_before_claim(tmp_path):
 
 def test_claude_routes_are_sonnet_medium_never_haiku():
     config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
-    claude = [m for m in config['models'] if m['engine'] == 'claude']
-    assert [(m['model'], m['effort']) for m in claude] == [('opus', 'medium'), ('sonnet', 'medium')]
+    claude = [m for m in config['models']
+              if m.get('provider') == 'claude' or m.get('engine') == 'claude'
+              or 'claude' in (m['id'] + ' ' + m['model']).lower()]
+    assert [(m['model'], m['effort']) for m in claude] == [('sonnet', 'medium')]
+    assert all(m['id'] == 'sonnet' and m['model'] == 'sonnet' for m in claude)
+    assert not [m for m in config['models'] if 'haiku' in (m['id'] + ' ' + m['model']).lower()]
     for ids in config['tiers'].values():
         assert not [i for i in ids if 'haiku' in i]
-    assert 'opus' in config['tiers']['deep']
+        assert not [i for i in ids if i == 'opus']
+    for model_id in (config['rules'].get('auto_start_models', [])
+                     + config['rules'].get('fallback_models', [])):
+        assert 'haiku' not in model_id.lower()
+        model = next((m for m in config['models'] if m['id'] == model_id), None)
+        if model and (model.get('provider') == 'claude' or model.get('engine') == 'claude'
+                      or 'claude' in (model['id'] + ' ' + model['model']).lower()):
+            assert (model['id'], model['model'], model['effort']) == ('sonnet', 'sonnet', 'medium')
+    assert 'opus' not in {m['id'] for m in config['models']}
     assert 'opus' not in config['tiers']['daily']
 
 
 def test_bundle_effort_policy_8852ba59():
-    """Intake 8852ba59 AC3: sol/astra/argon/opus default to medium, never high for sol/astra."""
+    """Intake 8852ba59 AC3: sol/astra/argon default to medium, never high for sol/astra."""
     config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
     by_id = {m['id']: m for m in config['models']}
     assert by_id['sol']['effort'] == 'medium'
     assert by_id['astra']['effort'] == 'medium'
     assert by_id['argon']['effort'] == 'medium'
     assert by_id['argon-gemini']['effort'] == 'medium'
-    assert by_id['opus']['effort'] == 'medium'
+    assert 'opus' not in by_id
     assert by_id['luna']['effort'] == 'max'
     for mid in ('sol', 'astra'):
         assert by_id[mid]['effort'] != 'high'

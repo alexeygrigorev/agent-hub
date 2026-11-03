@@ -18,7 +18,8 @@ class SharedDataopsCredentialTests(unittest.TestCase):
             return p.engine_environment({'provider': 'codex'}, Path(root) / 'home', Path(root)), shared
 
     def test_points_sessions_at_the_shared_directory_when_provisioned(self):
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('DATAOPS_CONFIG_DIR', None)
             env, shared = self.env(root, True)
             self.assertEqual(env['DATAOPS_CONFIG_DIR'], str(shared))
 

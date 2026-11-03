@@ -35,7 +35,8 @@
  * only expires as `stop_not_claimed` when the host was reachable at expiry.
  *
  * A CHANNEL PROOF is any later command on the host that reached
- * claimed/acked/refused/uncertain: the claim direction demonstrably worked.
+ * claimed/acked/refused/uncertain, or a terminal failed row whose persisted
+ * host ack contains the matching claim token: the claim direction worked.
  * A proof newer than a stuck command supersedes it (AC2 automatic recovery),
  * and exhausted claim retries (`claim_expired_retry_exhausted`) are not
  * evidence at all because claims happened.
@@ -82,7 +83,7 @@ export type CommandChannelHealth = {
 /** Partial indexes keep every evidence scan inside a finite age window; the
  * pending index also satisfies the stuck scan's created_at order (no sort). */
 const COMMAND_CHANNEL_SCHEMA = `
-CREATE INDEX IF NOT EXISTS session_control_commands_proof_created ON session_control_commands(created_at) WHERE state IN ('claimed','acked','refused','uncertain');
+CREATE INDEX IF NOT EXISTS session_control_commands_proof_created_v2 ON session_control_commands(created_at) WHERE state IN ('claimed','acked','refused','uncertain','failed');
 CREATE INDEX IF NOT EXISTS session_control_commands_failed_stops ON session_control_commands(created_at) WHERE kind = 'stop' AND state = 'failed';
 CREATE INDEX IF NOT EXISTS session_control_commands_pending_created ON session_control_commands(created_at) WHERE state IN ('recorded','transported');
 `;
@@ -99,14 +100,15 @@ const ISO = '';
 /** States that are only reachable through a successful claim: channel proof.
  * Inlined as SQL literals (never bound parameters): the partial-index scan
  * requires SQLite to prove the index WHERE clause at planning time. */
-const PROOF_STATES_SQL = "('claimed','acked','refused','uncertain')";
+const PROOF_STATES_SQL = "('claimed','acked','refused','uncertain','failed')";
 
 /** The exact evidence queries, exported for EXPLAIN QUERY PLAN tests (review
  * cc84ca6f finding 3): each must stay index-bounded as history grows. */
 export const COMMAND_CHANNEL_PLAN_SQL = {
-  proof: `SELECT MAX(c.created_at) AS p FROM session_control_commands c INDEXED BY session_control_commands_proof_created
+  proof: `SELECT MAX(c.created_at) AS p FROM session_control_commands c INDEXED BY session_control_commands_proof_created_v2
      CROSS JOIN session_control_sessions s ON s.id = c.session_id
-     WHERE c.state IN ${PROOF_STATES_SQL} AND c.created_at >= ? AND s.machine_id = ?`,
+     WHERE c.state IN ${PROOF_STATES_SQL} AND (c.state != 'failed' OR json_extract(c.ack_json, '$.claim_token') = c.claim_token)
+       AND c.created_at >= ? AND s.machine_id = ?`,
   stuck: `SELECT c.id, c.kind, c.created_at, c.poll_at FROM session_control_commands c INDEXED BY session_control_commands_pending_created
      CROSS JOIN session_control_sessions s ON s.id = c.session_id
      WHERE c.state IN ('recorded','transported') AND s.machine_id = ?

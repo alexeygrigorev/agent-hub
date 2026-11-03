@@ -3,9 +3,10 @@ import argparse
 import io
 import json
 import os
+import sys
 import unittest
 from unittest.mock import patch
-from agent_hub_host import session_control
+from agent_hub_host import cli, session_control
 
 
 def parser():
@@ -107,6 +108,18 @@ class TestSessionControlCli(unittest.TestCase):
         with patch.object(session_control, 'request', return_value={'commands': []}) as transport:
             session_control.execute(self.parse('commands', 's'))
         self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/s/commands'))
+
+    def test_sessions_show_cli_displays_routed_model_and_effort(self):
+        row = {'id': 'session-fixture', 'state': 'running', 'engine': 'claude',
+               'model_id': 'sonnet', 'model': 'sonnet', 'effort': 'medium'}
+        output = io.StringIO()
+        with patch.object(session_control, 'request', return_value=row), \
+                patch.object(sys, 'argv', ['hub', 'sessions', 'show', row['id']]), \
+                patch('sys.stdout', output):
+            cli.main()
+        rendered = json.loads(output.getvalue())
+        self.assertEqual((rendered['model_id'], rendered['model'], rendered['effort']),
+                         ('sonnet', 'sonnet', 'medium'))
 
     def test_start_headless_brief_and_interactive_empty(self):
         with patch.object(session_control, 'read_file', return_value='synthetic goal'), \

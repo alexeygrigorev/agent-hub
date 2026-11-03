@@ -1582,6 +1582,8 @@ export class FleetService {
         (tier === 'deep' || overrideModels.length > 0 || Boolean(request.engine));
       const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) && (m.id !== 'astra' || allowAstra) &&
         (autoStartPool || deepModelAllowedForTier(m, tier, explicitlyRequestedDeep)) &&
+        // Claude is pinned to Sonnet/medium at selection time; caller effort
+        // overrides cannot turn a Claude offer into an unsupported launch.
         heavyModelEffortAllowed(m, input.effort ?? m.effort) &&
         (anyTier || members.includes(m.id)) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
       // Explicit model selectors and native engines may cross tiers only

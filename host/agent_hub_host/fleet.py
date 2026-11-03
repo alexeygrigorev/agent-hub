@@ -149,6 +149,33 @@ def build_native_start_argv(native, workspace, tag, engine, *, profile=None, cwd
         argv += ["--cwd", str(cwd)]
     return argv
 
+
+def claude_route_argv(argv, model, effort):
+    """Replace stale Claude model/effort flags with the selected Hub route."""
+    args = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '-p':
+            args.append(arg)
+            i += 1
+            if i < len(argv):
+                args.append(argv[i])
+                i += 1
+        elif arg == '--print':
+            args.append(arg)
+            i += 1
+        elif arg in ('--model', '-m', '--effort'):
+            i += 2
+        elif arg.startswith('--model=') or arg.startswith('--effort='):
+            i += 1
+        else:
+            args.append(arg)
+            i += 1
+    route_args = ['--model', model, '--effort', effort]
+    prompt_index = next((i for i, arg in enumerate(args) if arg in ('-p', '--print')), len(args))
+    return args[:prompt_index] + route_args + args[prompt_index:]
+
 # Advertisement-only cache for qualified role profiles (intake eff9a5ce AC1:
 # derivation costs ~7 s per cycle on DEFLf4 and only feeds registration).
 ROLE_JOBS_CACHE_TTL_S = 120.0
@@ -3457,7 +3484,14 @@ class Dispatcher:
             for _k, _v in git_noninteractive.session_env_pairs():
                 argv += ["--env", f"{_k}={_v}"]
             if selection and not sub.get("startup_argv") and sub.get("account_label") not in self._managed_labels:
-                argv += ["--model", selection["model"]]
+                if sub.get('launcher_provider') == 'claude':
+                    # aplexer exposes --model but not --effort. Use its
+                    # command override so both selected route settings reach
+                    # the real Claude process.
+                    argv += ["--", "claude", "--model", selection["model"],
+                             "--effort", selection["effort"]]
+                else:
+                    argv += ["--model", selection["model"]]
             if with_goal or sub.get("startup_argv") or (selection and sub.get("account_label") in self._managed_labels):
                 launch = sub.get('startup_argv')
                 if (with_goal or selection) and sub.get('account_label') in self._managed_labels:
@@ -3468,9 +3502,20 @@ class Dispatcher:
                 if not isinstance(launch, list) or not launch or any(not isinstance(a, str) or "\0" in a for a in launch):
                     raise ValueError("Invalid trusted startup argv")
                 if selection:
-                    from .model_contract import replace_model_args
-                    launch = replace_model_args(launch, selection["model"])
-                    if sub.get('launcher_provider') == 'codex':
+                    provider = sub.get('launcher_provider')
+                    if provider == 'claude':
+                        if sub.get('account_label') in self._managed_labels:
+                            from .model_contract import replace_model_args
+                            launch = replace_model_args(launch, selection['model'])
+                            # Consumed by provisioning.execute, which forces
+                            # the policy model and effort after bundle defaults.
+                            launch += ['--hub-session-effort=' + selection['effort']]
+                        else:
+                            launch = claude_route_argv(launch, selection['model'], selection['effort'])
+                    else:
+                        from .model_contract import replace_model_args
+                        launch = replace_model_args(launch, selection["model"])
+                    if provider == 'codex':
                         if sub.get('account_label') in self._managed_labels:
                             launch += ['--hub-session-effort=' + selection['effort']]
                         else:

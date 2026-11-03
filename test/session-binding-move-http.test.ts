@@ -115,7 +115,7 @@ describe('host-authenticated workspace binding repair', () => {
     const reoffered = await s.handle(request('/api/session-commands/offers'), host);
     expect((await reoffered.json() as any).offers).toContainEqual(expect.objectContaining({ command_id: commandId, generation: 2 }));
   }));
-  it('accepts wakes for the session after workspace binding repair and targets the moved worktree', async () => fixture(async (s) => {
+  it('accepts wakes after binding repair and marks delivered only after a native inbox receipt', async () => fixture(async (s, sql) => {
     expect((await repair(s)).status).toBe(200);
     const wakeRes = await s.handle(request(`/api/sessions/${sessionId}/wake`, {
       key: 'wake-after-move',
@@ -126,11 +126,12 @@ describe('host-authenticated workspace binding repair', () => {
     const wakeBody = await wakeRes.json() as any;
     expect(wakeBody).toMatchObject({
       session_id: sessionId,
-      wake_state: 'delivered',
+      wake_state: 'queued',
       binding: expect.objectContaining({ workspace, generation: 2 }),
     });
     const offered = await s.handle(request('/api/session-commands/offers'), host);
-    expect((await offered.json() as any).offers).toContainEqual(expect.objectContaining({
+    const offer = (await offered.json() as any).offers.find((candidate: any) => candidate.command_id === wakeBody.command_id);
+    expect(offer).toMatchObject({
       command_id: wakeBody.command_id,
       kind: 'send',
       generation: 2,
@@ -141,7 +142,21 @@ describe('host-authenticated workspace binding repair', () => {
         generation: 2,
         native_created_at_ms: created,
       }),
-    }));
+    });
+    const attemptId = '55555555-5555-4555-8555-555555555555';
+    const claimResponse = await s.handle(request(`/api/session-commands/${wakeBody.command_id}/claim`, {
+      correlation: offer.correlation,
+      attempt_id: attemptId,
+    }), host);
+    expect(claimResponse.status).toBe(200);
+    const claim = await claimResponse.json() as any;
+    const receipt = await s.handle(request(`/api/session-commands/${wakeBody.command_id}/status`, {
+      claim_token: claim.claim_token,
+      status: 'waiting in inbox for recipient',
+    }), host);
+    expect(receipt.status, await receipt.clone().text()).toBe(200);
+    expect(sql.exec('SELECT state, delivered_at FROM session_control_wakes WHERE id=?', wakeBody.wake_id).one())
+      .toMatchObject({ state: 'delivered', delivered_at: expect.any(String) });
   }));
   it('preserves existing execution custody instead of rebinding underneath it', async () => fixture(async (s, sql) => {
     seedCommand(sql);
