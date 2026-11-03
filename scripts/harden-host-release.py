@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from host_release_modes import DEFAULT_RELEASES_ROOT, harden_tree, validate_installed_release
+from host_release_modes import harden_tree, validate_installed_release
 
 
 def main():
@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--release", required=True)
     args = parser.parse_args()
     try:
-        release = validate_installed_release(args.release, DEFAULT_RELEASES_ROOT)
+        release = validate_installed_release(args.release)
         changed = harden_tree(release)
     except (OSError, ValueError) as exc:
         raise SystemExit("harden-host-release: REFUSED: " + str(exc))
