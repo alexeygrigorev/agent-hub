@@ -67,6 +67,8 @@ import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validate
 import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
 import { sampleAccountCapacityHistory } from './account-capacity-history';
+import { handleUiSearch } from './ui-search';
+import { advanceIntakeExport } from './intake-export';
 
 const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
 const METER_FLUSH_INTERVAL_MS = 5 * 60_000;
@@ -812,6 +814,15 @@ export class Hub extends DurableObject {
       const hours = Number(url.searchParams.get('hours') || 24);
       const report = rowsReadReport(this.sql, Date.now(), Number.isFinite(hours) ? hours : 24, this.meter.snapshot());
       return Response.json({ ...report, statements: this.meter.statementTop(Math.min(100, Number(url.searchParams.get('statements')) || 30)), target_per_day: ROWS_READ_TARGET_PER_DAY, alert_per_day: rowsReadAlertThreshold(this.env), meter_started_at: new Date(this.meter.startedAt).toISOString() });
+    }
+
+    // Cross-entity UI search exposes only bounded, display-safe projections to operators.
+    if (path === '/api/ui-search') {
+      const auth = await this.sessionControlAuth(request);
+      if (auth.error) return auth.error;
+      const isOperator = auth.caller?.isAdmin === true && auth.caller.kind === 'human';
+      return handleUiSearch(request, this.sql, isOperator,
+        () => this.ctx.storage.transactionSync(() => advanceIntakeExport(this.sql)));
     }
 
     try {

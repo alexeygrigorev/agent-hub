@@ -134,6 +134,7 @@ export default {
       '/', '/index.html',
       '/inbox', '/inbox.html', '/inbox.js', '/inbox.css',
       '/fleet', '/fleet.html', '/fleet.js', '/fleet.css',
+      '/hub-shell.js', '/hub-shell.css', '/hub-search.js',
       '/engines', '/engines.html', '/engines.js', '/engines.css',
       '/webhooks', '/webhooks.html', '/webhooks.js', '/webhooks.css',
       '/prompts', '/prompts.html', '/prompts.js', '/prompts.css',
