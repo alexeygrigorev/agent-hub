@@ -36,8 +36,11 @@ if name=='a':
         if s.get('start_error'): sys.exit(1)
         s['sessions'].append(dict(id='new',tag='orchestrator-main',workspace=str(p/'git/agent-hub-wt-orchestrator-run/ops/orchestrator'),phase='running',worker_alive=True,worker_pid=os.getppid(),workload_pid=os.getppid()))
         save()
-    elif cmd=='capture': print('❯')
-    elif cmd=='send': sys.exit(s.get('send_error',0))
+    elif cmd=='capture': print(s.get('capture_prompt', '❯'))
+    elif cmd=='send':
+        if s.get('capture_prompt'):
+            s['capture_prompt']='❯'; save()
+        sys.exit(s.get('send_error',0))
 elif name=='systemd-run':
     import subprocess
     # Proof timers (--on-active) are only recorded; scope launches run their command.
@@ -122,6 +125,21 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertIn('recovery path 1 started', result.stdout)
         self.assertTrue((self.state / 'proof_due').exists())
         self.assertNotIn('already running', result.stdout)
+
+    def test_permissions_prompt_uses_hex_without_raw(self):
+        self.data['capture_prompt'] = 'Yes, I accept Bypass Permissions mode\nNo, exit'
+        result = self.run_ctl('start')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('a send new --hex 32', self.calls())
+        self.assertIn('a send new --hex 0d', self.calls())
+        self.assertNotIn('--raw --hex', self.calls())
+
+    def test_trust_prompt_uses_hex_without_raw(self):
+        self.data['capture_prompt'] = 'Do you trust this folder? Yes, proceed'
+        result = self.run_ctl('start')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('a send new --hex 0d', self.calls())
+        self.assertNotIn('--raw --hex', self.calls())
 
     def test_falls_back_to_fresh_hub_routed_engine_without_claude(self):
         self.data['quota'] = {'pools': [
