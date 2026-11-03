@@ -109,11 +109,7 @@ jobs:
           UV_THREADPOOL_SIZE: "1"
           GOMAXPROCS: "1"
           NODE_OPTIONS: "--v8-pool-size=1"
-        run: |
-          for attempt in $(seq 1 20); do
-            echo "session-messaging-m1 repetition ${attempt}/20"
-            npx --no-install vitest run test/session-messaging-m1.test.ts --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept
-          done
+        run: bash scripts/ci/repeat-session-messaging-m1.sh
 
       - name: Standalone browser and static checks
         env:
