@@ -12,6 +12,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "public/**"
+      - "ops/**"
       - "scripts/**"
       - "wrangler.jsonc"
       - "package.json"
@@ -30,6 +31,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "public/**"
+      - "ops/**"
       - "scripts/**"
       - "wrangler.jsonc"
       - "package.json"
@@ -95,6 +97,13 @@ jobs:
         run: |
           python3 scripts/ci/validate-workflow.py
           python3 scripts/ci/test_ci.py
+
+      - name: Ops watchdog targeted tests
+        env:
+          TMPDIR: ${{ github.workspace }}/.local/tmp
+        run: |
+          mkdir -p .local/tmp
+          bash scripts/with-temp-home.sh -- bash ops/tests/session-ctl.test.sh
 
       - name: Worker discovery tests (Vitest)
         env:
