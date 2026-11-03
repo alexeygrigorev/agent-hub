@@ -1290,7 +1290,7 @@ export class SessionControlService {
           };
           launchError = { reason, message: messages[reason] || 'The launch failed without a structured diagnostic; inspect the host launcher receipt.', stage: started ? 'runtime' : 'dispatch_route' };
         }
-        if (row.state === 'queued' || row.state === 'held') {
+        if (row.state === 'queued' || row.state === 'held' || row.state === 'offered') {
           const hold: any = this.sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', row.fleet_launch_id).toArray()[0];
           memoryRejected = hold ? parsed(hold.rejected_json, []) : [];
         }
