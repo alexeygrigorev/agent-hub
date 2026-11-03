@@ -51,6 +51,11 @@ on:
         required: false
         type: boolean
         default: false
+      verify_credentials_only:
+        description: "Read-only Cloudflare credential check; no tests or deployment"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -60,8 +65,23 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  credential-preflight:
+    if: github.event_name == 'workflow_dispatch' && inputs.verify_credentials_only == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify Cloudflare credentials without deploying
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 scripts/ci/cloudflare_preflight.py
+
   test:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    if: "!contains(github.event.head_commit.message, '[skip ci]') && !(github.event_name == 'workflow_dispatch' && inputs.verify_credentials_only == true)"
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -161,6 +181,7 @@ jobs:
       always() &&
       (needs.test.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.skip_tests == true)) &&
       github.ref == 'refs/heads/main' &&
+      inputs.verify_credentials_only != true &&
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -175,6 +196,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify Cloudflare credentials before uploads
+        if: inputs.dry_run != true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 scripts/ci/cloudflare_preflight.py
 
       - name: Build Hub CLI zipapp & manifest
         run: |

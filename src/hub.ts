@@ -72,6 +72,8 @@ import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validate
 import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, rowsWrittenAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
 import { sampleAccountCapacityHistory } from './account-capacity-history';
+import { RowBudget, RowBudgetExceeded } from './row-budget';
+import { backfillOnce } from './sql-probes';
 import { WriteWatch } from './write-watch';
 import { ObservedCatalog } from './observed-catalog';
 
@@ -143,35 +145,37 @@ export class Hub extends DurableObject {
   sql: SqlStorage;
   env: Env;
   jwksCache: JwksCache = new JwksCache();
-  public intakeService: IntakeService;
-  private workerAccess: WorkerAccess;
-  public intakeWatchdog: IntakeWatchdog;
-  public opsLiveness: OpsLiveness;
-  public intakeTriage: IntakeTriage;
-  public intakeVerifier: IntakeVerifier;
-  public askLedger: AskLedger;
-  public sessionAudit: SessionAuditService;
-  public busService: BusService;
-  public jobsService: JobsService;
-  public quotaStore: QuotaStore;
-  public statusService: StatusService;
-  public metricsStore: MetricsStore;
-  public fleetService: FleetService;
-  public repoRegistry: RepoRegistry;
-  public provisioningService: ProvisioningService;
-  public sessionControlService: SessionControlService;
-  public livenessService: LivenessService;
-  public checksService: ChecksService;
-  public monitoringService: MonitoringService;
-  public backupService: BackupService;
-  public hostHistoryService: HostHistoryService;
-  public webhookService: WebhookService;
-  public promptLibrary: PromptLibraryService;
-  public sessionSchedules: SessionSchedulesService;
-  public launchSchedules: LaunchSchedulesService;
-  public driverService: DriverService;
+  public intakeService!: IntakeService;
+  private workerAccess!: WorkerAccess;
+  public intakeWatchdog!: IntakeWatchdog;
+  public opsLiveness!: OpsLiveness;
+  public intakeTriage!: IntakeTriage;
+  public intakeVerifier!: IntakeVerifier;
+  public askLedger!: AskLedger;
+  public sessionAudit!: SessionAuditService;
+  public busService!: BusService;
+  public jobsService!: JobsService;
+  public quotaStore!: QuotaStore;
+  public statusService!: StatusService;
+  public metricsStore!: MetricsStore;
+  public fleetService!: FleetService;
+  public repoRegistry!: RepoRegistry;
+  public provisioningService!: ProvisioningService;
+  public sessionControlService!: SessionControlService;
+  public livenessService!: LivenessService;
+  public checksService!: ChecksService;
+  public monitoringService!: MonitoringService;
+  public backupService!: BackupService;
+  public hostHistoryService!: HostHistoryService;
+  public webhookService!: WebhookService;
+  public promptLibrary!: PromptLibraryService;
+  public sessionSchedules!: SessionSchedulesService;
+  public launchSchedules!: LaunchSchedulesService;
+  public driverService!: DriverService;
 
-  private idleWork: IdleWorkService;
+  private idleWork!: IdleWorkService;
+  readonly rowBudget: RowBudget;
+  private initializationComplete = false;
   readonly meter = new RowsMeter();
   readonly writes = new WriteWatch();
   /** Write-through fleet_sessions catalog shared by resources and liveness. */
@@ -199,13 +203,15 @@ export class Hub extends DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
+    this.rowBudget = new RowBudget(ctx.storage);
+    this.rowBudget.guardStorage(ctx.storage);
     // DO rows-read meter (intake 8081a05a): every cursor is attributed to
     // the current alarm step / route scope and flushed once per alarm.
     // The write watch observes the same statements so write-through caches
     // can stamp freshness without a SQL probe (intake 8081a05a/e8a22f4c).
     // Meter the outer wrapper so cache hits still count as route/alarm cursor
     // calls (with rowsRead=0); the inner write watch owns SQL invalidation.
-    this.sql = this.meter.wrap(this.writes.wrap(ctx.storage.sql));
+    this.sql = this.meter.wrap(this.writes.wrap(this.rowBudget.wrap(ctx.storage.sql)));
     this.observedCatalog = new ObservedCatalog(this.sql, this.writes);
     // Cache generations advance for SQL writes, including those later rolled
     // back. Observe the native transaction boundary so aborted SQL/memory
@@ -224,6 +230,12 @@ export class Hub extends DurableObject {
         value: trackedTransactionSync,
       });
     }
+    // All initialization SQL is prepaid durably before it runs. Exhaustion
+    // leaves this object serving 503 without re-entering expensive migrations.
+    ctx.blockConcurrencyWhile(() => this.budgeted(async () => undefined, undefined));
+  }
+
+  private initializeServices(env: Env) {
     this.meter.runSync('init:schema', () => {
       this.initDb();
       for (const stmt of ROWS_STATS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
@@ -654,7 +666,6 @@ export class Hub extends DurableObject {
     this.jobsService = new JobsService(this.sql, this.ctx, {
       busService: busForJobs,
       enableAlarms: true,
-      alarmDeadline: () => this.hostHistoryService.nextSampleAt(),
       env: this.env,
     });
     this.jobsService.setBusService(busForJobs);
@@ -672,6 +683,34 @@ export class Hub extends DurableObject {
 
     this.quotaStore = new QuotaStore(this.sql, this.ctx, this.env);
   }
+
+  /** Every native event passes through this gate, including WebSocket events.
+   * No SQL alert/meter flush is permitted after exhaustion: the budget logs
+   * once, and deleting the alarm prevents runtime/background retry storms. */
+  private async budgeted<T>(fn: () => Promise<T>, exhausted: T): Promise<T> {
+    try {
+      if (!this.initializationComplete) {
+        await this.rowBudget.begin(true);
+        this.initializeServices(this.env);
+        this.initializationComplete = true;
+      }
+      await this.rowBudget.begin();
+      const result = await fn();
+      if (this.rowBudget.status().stopped) {
+        await this.ctx.storage.deleteAlarm();
+        return exhausted;
+      }
+      return result;
+    } catch (error) {
+      if (!(error instanceof RowBudgetExceeded) && !this.rowBudget.status().stopped) throw error;
+      await this.ctx.storage.deleteAlarm();
+      return exhausted;
+    } finally {
+      try { await this.rowBudget.finish(); }
+      catch { console.error('do_daily_row_budget_checkpoint_failed'); await this.ctx.storage.deleteAlarm(); }
+    }
+  }
+
 
   private ensureColumns(table: string, columns: { [col: string]: string }) {
     const existing = new Set<string>();
@@ -841,7 +880,7 @@ export class Hub extends DurableObject {
     const hasAt = auditInfo.some(c => c.name.toLowerCase() === 'at');
     const hasTs = auditInfo.some(c => c.name.toLowerCase() === 'ts');
     if (hasAt && hasTs) {
-      this.sql.exec("UPDATE audit SET at = ts WHERE at IS NULL AND ts IS NOT NULL");
+      backfillOnce(this.sql, 'audit_timestamp_upgrade', () => this.sql.exec("UPDATE audit SET at = ts WHERE at IS NULL AND ts IS NOT NULL"));
     }
 
     this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
@@ -852,8 +891,10 @@ export class Hub extends DurableObject {
   async fetch(request: Request): Promise<Response> {
     let scope = 'route:?';
     try { scope = 'route:' + normalizeRoute(request.method, new URL(request.url).pathname); } catch {}
-    try { return await this.meter.run(scope, () => this.routeFetch(request)); }
-    finally { this.maybeFlushRowsMeter(); }
+    return this.budgeted(async () => {
+      try { return await this.meter.run(scope, () => this.routeFetch(request)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, Response.json({ error: 'do_daily_row_budget_exceeded' }, { status: 503, headers: { 'Retry-After': '3600' } }));
   }
 
   private lastMeterFlush = 0;
@@ -2628,13 +2669,18 @@ export class Hub extends DurableObject {
 
   /** Central refresh + direct provider quota for Hub-held engine credentials. */
   async maintainCredentials() {
-    try { return await this.provisioningService.maintainCredentials(); }
-    catch { console.warn('credential_maintenance_failed'); return []; }
-    finally { await this.flushCredentialAlerts().catch(() => console.warn('credential_alert_failed')); }
+    return this.budgeted(async () => {
+      try { return await this.provisioningService.maintainCredentials(); }
+      catch { console.warn('credential_maintenance_failed'); return []; }
+      finally { if (!this.rowBudget.status().stopped) await this.flushCredentialAlerts().catch(() => console.warn('credential_alert_failed')); }
+    }, []);
   }
 
   async runChecks(only?: string) {
-    try { return await this.meter.run('rpc:runChecks', () => this.runChecksMetered(only)); } finally { this.maybeFlushRowsMeter(); }
+    return this.budgeted(async () => {
+      try { return await this.meter.run('rpc:runChecks', () => this.runChecksMetered(only)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, []);
   }
 
   private async runChecksMetered(only?: string) {
@@ -2744,8 +2790,11 @@ export class Hub extends DurableObject {
     return results;
   }
 
-  async scheduledTick(slotOverride?: string, source = 'scheduled') {
-    try { return await this.meter.run('tick:' + source, () => this.scheduledTickMetered(slotOverride, source)); } finally { this.maybeFlushRowsMeter(); }
+  async scheduledTick(slotOverride?: string, source = 'scheduled'): Promise<any> {
+    return this.budgeted<any>(async () => {
+      try { return await this.meter.run('tick:' + source, () => this.scheduledTickMetered(slotOverride, source)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, { status: 'stopped', reason: 'do_daily_row_budget_exceeded' });
   }
 
   private async scheduledTickMetered(slotOverride?: string, source = 'scheduled') {
@@ -2849,7 +2898,9 @@ export class Hub extends DurableObject {
   }
 
   async sampleHostHistory() {
-    try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
+    return this.budgeted(async () => {
+      try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
+    }, undefined);
   }
 
   /** Durable cadence survives hibernation. Alarm plus the existing five-minute cron own the tick. */
@@ -2874,6 +2925,10 @@ export class Hub extends DurableObject {
   }
 
   async alarm() {
+    return this.budgeted(() => this.alarmMetered(), undefined);
+  }
+
+  private async alarmMetered() {
     // Every step is metered (intake 8081a05a); totals flush once per alarm.
     const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('alarm:' + step, fn);
     const nowMs = Date.now();
@@ -2937,7 +2992,10 @@ export class Hub extends DurableObject {
       next = next === null ? retentionWake : Math.min(next, retentionWake);
       if (rearmCount === 31) console.warn(JSON.stringify({ event: 'bus_retention_rearm_capped', consecutive: rearmCount }));
     }
-    if (next !== null) await this.ctx.storage.setAlarm(Math.max(now + 1, next));
+    // A due wake may be blocked on host binding or admission. Its unchanged
+    // past deadline must not form a 1ms self-invocation loop. Concrete work
+    // retries at most once per 15 seconds; retention has its separate cap.
+    if (next !== null) await this.ctx.storage.setAlarm(Math.max(now + (pending ? 1000 : 15000), next));
     else await this.ctx.storage.deleteAlarm();
   }
 
@@ -5122,15 +5180,24 @@ export class Hub extends DurableObject {
     return null;
   }
 
-  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    try { return this.meter.runSync('ws:message', () => handleWebSocketMessageRegistry(ws, message, this.sql)); } finally { this.maybeFlushRowsMeter(); }
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    return this.budgeted(async () => {
+      try { this.meter.runSync('ws:message', () => handleWebSocketMessageRegistry(ws, message, this.sql)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, undefined);
   }
 
-  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
-    try { return this.meter.runSync('ws:close', () => handleWebSocketCloseRegistry(ws, this.sql)); } finally { this.maybeFlushRowsMeter(); }
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    return this.budgeted(async () => {
+      try { this.meter.runSync('ws:close', () => handleWebSocketCloseRegistry(ws, this.sql)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, undefined);
   }
 
-  webSocketError(ws: WebSocket, error: any) {
-    try { return this.meter.runSync('ws:error', () => handleWebSocketCloseRegistry(ws, this.sql)); } finally { this.maybeFlushRowsMeter(); }
+  async webSocketError(ws: WebSocket, error: any) {
+    return this.budgeted(async () => {
+      try { this.meter.runSync('ws:error', () => handleWebSocketCloseRegistry(ws, this.sql)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, undefined);
   }
 }

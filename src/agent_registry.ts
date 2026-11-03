@@ -34,7 +34,9 @@ export function migrateAgentRegistry(sql: SqlStorage, transaction: <T>(fn: () =>
     if (!(sql.exec('PRAGMA table_info(agents)').toArray() as any[]).some(c => c.name === 'project')) {
       throw new Error('unsupported_agents_schema');
     }
-    if (sql.exec("SELECT 1 FROM agents a WHERE COALESCE(a.project,'') = '' AND (SELECT COUNT(*) FROM agents b WHERE b.tag = a.tag) > 1 LIMIT 1").toArray().length) {
+    sql.exec('CREATE INDEX IF NOT EXISTS idx_agents_tag_lookup ON agents(tag)');
+    sql.exec("CREATE INDEX IF NOT EXISTS idx_agents_projectless_tag ON agents(tag) WHERE COALESCE(project,'')=''");
+    if (sql.exec("SELECT 1 FROM agents a INDEXED BY idx_agents_projectless_tag WHERE COALESCE(a.project,'') = '' AND EXISTS (SELECT 1 FROM agents b WHERE b.tag = a.tag AND b.rowid <> a.rowid LIMIT 1) LIMIT 1").toArray().length) {
       throw new Error('ambiguous_legacy_registry');
     }
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_project_tag_unique ON agents(COALESCE(project, ''), tag)");

@@ -24,7 +24,7 @@ RETRY_SLEEP_SECONDS = (10, 20)
 # Checked before transient patterns: a fatal marker ends the run immediately
 # even when a transient pattern also matches somewhere in the output.
 FATAL_PATTERNS = (
-    ('authentication', r'\[code: 10000\]|authentication error|invalid api token|not authorized|unauthorized logins? are not allowed|you must be logged in'),
+    ('authentication', r'\[code: (?:10000|9109)\]|authentication error|invalid (?:api|access) token|not authorized|unauthorized logins? are not allowed|you must be logged in'),
     ('config', r'could not (?:read|find|parse) config|invalid config|config validation failed|unrecognized setting'),
     ('build', r'build failed|no entry-?point (?:found|specified)|module not found|\[ERROR\] Could not resolve'),
 )

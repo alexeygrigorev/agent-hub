@@ -74,6 +74,10 @@ export class OpsLiveness {
     const cols = (this.sql.exec('PRAGMA table_info(ops_liveness)').toArray() as any[]).map(c => c.name);
     if (!cols.includes('first_seen_at')) this.sql.exec('ALTER TABLE ops_liveness ADD COLUMN first_seen_at INTEGER');
     this.sql.exec("CREATE INDEX IF NOT EXISTS ops_intake_created ON intake_task_projection(json_extract(data,'$.created_at'))");
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_intake_open_ac ON intake_task_projection(id)
+      WHERE json_extract(data,'$.status') IN ('open','in_progress')
+      AND json_extract(data,'$.archived_at') IS NULL
+      AND length(trim(coalesce(json_extract(data,'$.acceptance_criteria'),'')))>0`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS ops_intake_closed_time ON intake_audit(captured_at,task_id) WHERE kind IN ('close','cancel')");
     this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_intake_native_started ON session_control_sessions(
       json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_created_at_ms'))`);
@@ -145,10 +149,9 @@ export class OpsLiveness {
    * idle process is not work. `last_work_at` is the newest such evidence (including recent
    * session ends), so the idle clock starts at the last useful work, not at detection. */
   backlog(now = this.now()): { open_with_ac: number; active_sessions: number; last_work_at: number | null } {
-    const open = this.rows(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM intake_task_projection
-      WHERE json_extract(data,'$.status') IN ('open','in_progress','blocked','pending_approval') AND json_extract(data,'$.archived_at') IS NULL
-      AND json_extract(data,'$.status') IN ('open','in_progress')
-      AND length(trim(coalesce(json_extract(data,'$.acceptance_criteria'),'')))>0 LIMIT 1001)`)[0]?.n ?? 0;
+    const open = this.rows(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM intake_task_projection INDEXED BY ops_intake_open_ac
+      WHERE json_extract(data,'$.status') IN ('open','in_progress') AND json_extract(data,'$.archived_at') IS NULL
+      AND length(trim(coalesce(json_extract(data,'$.acceptance_criteria'),'')))>0 ORDER BY id LIMIT 1001)`)[0]?.n ?? 0;
     const candidates = this.rows(`SELECT s.state, s.updated_at, s.machine_id,
         CASE WHEN json_valid(s.binding_json) THEN json_extract(s.binding_json,'$.native_id') END AS native_id
       FROM session_control_sessions s JOIN intake_task_projection p ON p.id=${requestIntake}

@@ -1,0 +1,285 @@
+import type { SqlStorage } from '@cloudflare/workers-types';
+
+/** A prepaid, durable circuit breaker. This ledger deliberately uses KV outside
+ * application SQL transactions: rolling back SQL must never refund billed work.
+ * Reservations survive eviction; unused credit is lost on a crash, not reissued.
+ * Cloudflare exposes row counters after executing SQL, so the first statement
+ * that exceeds credit can overshoot. Queries must ALSO be bounded and indexed.
+ * The breaker prevents any subsequent SQL, even if an application catches it.
+ */
+export const DAILY_ROW_LIMITS = Object.freeze({ read: 1_000_000, written: 20_000 });
+const DAY_MS = 86_400_000;
+const LEDGER_KEY = 'cf_daily_row_budget_v1';
+const DEFAULT_CHUNK = Object.freeze({ read: 50_000, written: 1_000 });
+
+type Counts = { read: number; written: number };
+type Ledger = Counts & { day: number; stopped: boolean };
+type Store = { get<T>(key: string): Promise<T | undefined>; put<T>(key: string, value: T): Promise<void> };
+
+export class RowBudgetExceeded extends Error {
+  readonly code = 'do_daily_row_budget_exceeded';
+  constructor(readonly detail: string) { super('do_daily_row_budget_exceeded: ' + detail); this.name = 'RowBudgetExceeded'; }
+}
+
+export class RowBudget {
+  private ledger: Ledger | undefined;
+  private credit: Counts = { read: 0, written: 0 };
+  private debt: Counts = { read: 0, written: 0 };
+  private stopped = true;
+  private dirty = false;
+  private queue: Promise<void> = Promise.resolve();
+  private loggedDay = -1;
+  private readonly limits: Counts;
+  private readonly chunk: Counts;
+  private readonly storage: Store;
+  private emergencyAlarmDeleted = false;
+
+  constructor(storage: Store, private now: () => number = Date.now,
+    limits: Counts = DAILY_ROW_LIMITS, chunk: Counts = DEFAULT_CHUNK) {
+    // Capture native ledger calls before installing KV guards on the object.
+    this.storage = { get: storage.get.bind(storage), put: storage.put.bind(storage) };
+    // Even configuration mistakes cannot raise the production hard ceiling.
+    const safe = (value: number, ceiling: number) => Number.isSafeInteger(value) && value > 0 ? Math.min(value, ceiling) : 0;
+    this.limits = { read: safe(limits.read, DAILY_ROW_LIMITS.read), written: safe(limits.written, DAILY_ROW_LIMITS.written) };
+    this.chunk = { read: safe(chunk.read, this.limits.read), written: safe(chunk.written, this.limits.written) };
+  }
+
+  private day() { return Math.floor(this.now() / DAY_MS); }
+  private valid(value: unknown): value is Ledger {
+    const v = value as Ledger;
+    return !!v && Number.isSafeInteger(v.day) && Number.isSafeInteger(v.read) && v.read >= 0 &&
+      Number.isSafeInteger(v.written) && v.written >= 0 && typeof v.stopped === 'boolean';
+  }
+  private exclusive(fn: () => Promise<void>): Promise<void> {
+    const task = this.queue.then(fn);
+    this.queue = task.catch(() => {});
+    return task;
+  }
+  private trip(detail: string): never {
+    this.stopped = true;
+    if (this.loggedDay !== this.day()) {
+      this.loggedDay = this.day();
+      console.error(JSON.stringify({ event: 'do_daily_row_budget_exceeded', day: this.day(), detail,
+        reserved: this.ledger, limit: this.limits }));
+    }
+    throw new RowBudgetExceeded(detail);
+  }
+
+  /** MUST run before constructor initialization and each request/RPC/alarm.
+   * Cached credit makes normal preflight zero-I/O. Reservations are serialized,
+   * while overlapping events spend the same synchronous credit atomically. */
+  begin(bootstrap = false): Promise<void> {
+    return this.exclusive(async () => {
+      const day = this.day();
+      if (!this.ledger) {
+        const stored = await this.storage.get<Ledger>(LEDGER_KEY);
+        if (stored !== undefined && !this.valid(stored)) this.trip('invalid durable ledger');
+        this.ledger = stored ?? { day, read: 0, written: 0, stopped: false };
+        // KV lookup itself consumes a row; persist it with the next reservation.
+        this.debt.read++;
+      }
+      if (day < this.ledger.day) this.trip('clock moved behind durable ledger');
+      if (day > this.ledger.day) {
+        this.ledger = { day, read: 0, written: 0, stopped: false };
+        this.credit = { read: 0, written: 0 };
+        this.debt = { read: 0, written: 0 };
+        this.stopped = false;
+        this.emergencyAlarmDeleted = false;
+      }
+      if (this.ledger.stopped) this.trip('durable daily allowance exhausted');
+      if (!this.limits.read || !this.limits.written || !this.chunk.read || !this.chunk.written) this.trip('invalid budget configuration');
+      if (!this.stopped && this.credit.read > this.chunk.read / 4 && this.credit.written > this.chunk.written / 4 && !this.dirty) return;
+      await this.checkpoint(true, bootstrap);
+      if (this.ledger.stopped || this.credit.read <= 0 || this.credit.written <= 0) this.trip('daily allowance exhausted');
+      this.stopped = false;
+    });
+  }
+
+  /** Persist overdraw outside the caller's SQL transaction. Normal completion
+   * performs no I/O. Always await this in the event's finally block. */
+  finish(): Promise<void> {
+    return this.exclusive(async () => {
+      if (this.dirty && this.ledger) await this.checkpoint(false);
+    });
+  }
+
+  private async checkpoint(refill: boolean, bootstrap = false): Promise<void> {
+    const old = this.ledger!;
+    const ledger: Ledger = { ...old, read: old.read + this.debt.read, written: old.written + this.debt.written + 1 };
+    const add = { read: 0, written: 0 };
+    const chunk = bootstrap ? { read: Math.max(this.chunk.read, Math.min(250_000, this.limits.read)), written: Math.max(this.chunk.written, Math.min(5_000, this.limits.written)) } : this.chunk;
+    if (refill) {
+      add.read = Math.max(0, Math.min(chunk.read - this.credit.read, this.limits.read - ledger.read));
+      add.written = Math.max(0, Math.min(chunk.written - this.credit.written, this.limits.written - ledger.written));
+    }
+    ledger.read += add.read;
+    ledger.written += add.written;
+    ledger.stopped = ledger.stopped || ledger.read >= this.limits.read || ledger.written >= this.limits.written ||
+      (refill && (this.credit.read + add.read <= 0 || this.credit.written + add.written <= 0));
+    // Fail closed across a failed write. Never hand out credit until durable.
+    this.stopped = true;
+    await this.storage.put(LEDGER_KEY, ledger);
+    this.ledger = ledger;
+    this.credit.read += add.read;
+    this.credit.written += add.written;
+    this.debt = { read: 0, written: 0 };
+    this.dirty = false;
+  }
+
+  /** No storage access: safe to inspect after the breaker trips. */
+  status() {
+    return { stopped: this.stopped, day: this.ledger?.day ?? this.day(),
+      reserved: this.ledger ? { read: this.ledger.read, written: this.ledger.written } : null,
+      available: { ...this.credit }, limit: { ...this.limits } };
+  }
+
+  private assertAllowed() {
+    if (!this.ledger || this.day() !== this.ledger.day || this.stopped) this.trip('preflight required or credit exhausted');
+  }
+  private consume(read: number, written: number) {
+    const charge = (key: keyof Counts, amount: number) => {
+      if (!Number.isFinite(amount) || amount < 0) this.trip('invalid SQL row counters');
+      const paid = Math.min(this.credit[key], amount);
+      this.credit[key] -= paid;
+      const overdraw = amount - paid;
+      if (overdraw > 0) { this.debt[key] += overdraw; this.dirty = true; }
+    };
+    charge('read', read);
+    charge('written', written);
+    if (this.credit.read <= 0 || this.credit.written <= 0 || this.dirty) this.trip('statement exhausted prepaid credit');
+  }
+
+  /** Install alongside the SQL wrapper. SQLite-backed KV and alarm updates
+   * are billable too; callers must not be able to bypass the SQL breaker by
+   * repeatedly setting alarms or writing KV. Ledger calls retain native binds. */
+  guardStorage(storage: any): void {
+    const budget = this;
+    const units = (value: any, key = ''): number => {
+      let bytes: number;
+      if (value instanceof ArrayBuffer) bytes = value.byteLength;
+      else if (ArrayBuffer.isView(value)) bytes = value.byteLength;
+      else {
+        try {
+          const encoded = JSON.stringify(value);
+          if (encoded === undefined) return budget.trip('unmeasurable KV value');
+          bytes = new TextEncoder().encode(encoded).length * 2;
+        } catch { return budget.trip('unmeasurable KV value'); }
+      }
+      // Include serialized key/record framing and conservatively round each key.
+      return Math.max(1, Math.ceil((bytes + key.length * 2 + 128) / 4096));
+    };
+    const keys = (input: any): string[] => typeof input === 'string' ? [input] : Array.isArray(input) && input.every(v => typeof v === 'string') ? input : budget.trip('unbounded KV keys');
+    const charge = (read: number, written: number) => { budget.assertAllowed(); budget.consume(read, written); };
+    const install = (name: string, fn: (native: (...args: any[]) => any, args: any[]) => any) => {
+      if (typeof storage[name] !== 'function') return;
+      const native = storage[name].bind(storage);
+      Object.defineProperty(storage, name, { configurable: true, writable: true, value: (...args: any[]) => fn(native, args) });
+    };
+    install('get', async (native, args) => {
+      const requested = keys(args[0]);
+      charge(requested.length, 0);
+      const value = await native(...args);
+      let extra = 0;
+      if (value instanceof Map) { for (const [key, item] of value) extra += units(item, String(key)) - 1; }
+      else if (value !== undefined) extra += units(value, requested[0]) - 1;
+      if (extra) charge(extra, 0);
+      return value;
+    });
+    install('put', (native, args) => {
+      let count = 0;
+      if (typeof args[0] === 'string') count = units(args[1], args[0]);
+      else if (args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
+        for (const [key, value] of Object.entries(args[0])) count += units(value, key);
+      } else budget.trip('unmeasurable KV put');
+      charge(0, Math.max(1, count));
+      return native(...args);
+    });
+    install('delete', (native, args) => { charge(0, Math.max(1, keys(args[0]).length)); return native(...args); });
+    install('list', async (native, args) => {
+      const limit = args[0]?.limit;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) budget.trip('KV list requires bounded limit');
+      // Charge maximum result size before issuing the query, not just returned
+      // rows afterwards. Large values are charged additionally below.
+      charge(limit, 0);
+      const result = await native(...args);
+      let extra = 0;
+      for (const [key, value] of result) extra += units(value, String(key)) - 1;
+      if (extra) charge(extra, 0);
+      return result;
+    });
+    install('getAlarm', (native, args) => { charge(1, 0); return native(...args); });
+    install('setAlarm', (native, args) => { charge(0, 1); return native(...args); });
+    install('deleteAlarm', (native, args) => {
+      if (budget.stopped) {
+        if (budget.emergencyAlarmDeleted) return Promise.resolve();
+        budget.emergencyAlarmDeleted = true;
+        budget.debt.written++;
+        budget.dirty = !!budget.ledger;
+        return native(...args);
+      }
+      charge(0, 1);
+      return native(...args);
+    });
+    // Bulk deletion cannot be bounded from its API result and is unnecessary
+    // for Hub operation. In particular it cannot erase the budget ledger.
+    install('deleteAll', () => budget.trip('bulk storage deletion forbidden'));
+  }
+
+  wrap(sql: SqlStorage): SqlStorage {
+    const budget = this;
+    return new Proxy(sql as any, {
+      get(target, prop) {
+        if (prop !== 'exec') {
+          const value = target[prop];
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+        return (query: string, ...bindings: any[]) => {
+          budget.assertAllowed();
+          let cursor: any;
+          try { cursor = target.exec(query, ...bindings); }
+          catch (error) {
+            // These schema compilation failures execute no row work. Older
+            // migrations intentionally catch them while adding existing columns.
+            const message = String((error as any)?.message ?? error);
+            if (/^(?:SQLITE_ERROR:\s*)?(?:duplicate column name:|table \S+ already exists|index \S+ already exists)/i.test(message)) throw error;
+            // The runtime returned no cursor and therefore no trustworthy row
+            // counters. Persist a daily stop; retries cannot hide this work.
+            budget.ledger!.stopped = true;
+            budget.dirty = true;
+            budget.trip('SQL execution failed without measurable row counters');
+          }
+          let lastRead = 0, lastWritten = 0;
+          const charge = () => {
+            const read = Number(cursor.rowsRead), written = Number(cursor.rowsWritten);
+            const deltaRead = read - lastRead, deltaWritten = written - lastWritten;
+            lastRead = read; lastWritten = written;
+            budget.consume(deltaRead, deltaWritten);
+          };
+          charge();
+          // Charge every next(), including raw() and Symbol.iterator. toArray()
+          // must drain incrementally rather than bypassing the per-next guard.
+          const iterator = (source: any): any => ({
+            next(...args: any[]) { budget.assertAllowed(); const value = source.next(...args); charge(); return value; },
+            [Symbol.iterator]() { return this; },
+          });
+          return new Proxy(cursor, {
+            get(c, key) {
+              if (key === Symbol.iterator) return () => iterator(c[Symbol.iterator]());
+              if (key === 'raw') return (...args: any[]) => iterator(c.raw(...args));
+              if (key === 'next') return (...args: any[]) => { budget.assertAllowed(); const value = c.next(...args); charge(); return value; };
+              if (key === 'toArray') return () => Array.from(iterator(c[Symbol.iterator]()));
+              if (key === 'one') return () => {
+                const rows = iterator(c[Symbol.iterator]());
+                const first = rows.next();
+                if (first.done || !rows.next().done) throw new Error('Expected exactly one result from SQL query');
+                return first.value;
+              };
+              const value = c[key];
+              return typeof value === 'function' ? value.bind(c) : value;
+            },
+          });
+        };
+      },
+    }) as SqlStorage;
+  }
+}

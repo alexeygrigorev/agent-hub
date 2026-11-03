@@ -8,10 +8,11 @@ import { dedupeAccountsByCanonical } from './quota';
 import { resolveMachineAliases } from './machine-alias';
 import { isValidMachineId } from './machine-id';
 import { effectiveCheckin } from './registry';
-import { freshCatalogs } from './catalog-freshness';
 import type { WriteWatch } from './write-watch';
 
 const MINUTE = 60000, DAY = 86400000;
+export const HISTORY_SCAN_LIMIT = 128;
+export const HISTORY_COMPACT_WINDOWS = 8;
 export const HISTORY_RETENTION_MS = 32 * DAY;
 /** Quota freshness gate mirrors QUOTA_STALE_MS (20 minutes). Quota collection
  * runs every 600 s host-side; a snapshot older than this is stale and must
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS resource_history_entities (
  last_seen_ms INTEGER NOT NULL,PRIMARY KEY(kind,entity,machine_id)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS resource_history_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS resource_history_entities_seen ON resource_history_entities(last_seen_ms);
 CREATE TABLE IF NOT EXISTS token_hours_posted (
   entity TEXT NOT NULL, hour_ms INTEGER NOT NULL,
   input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
@@ -48,10 +50,9 @@ export class HostHistoryService {
   private packet(raw: string): Observation[] { const p = json(raw); return Array.isArray(p) ? p : []; }
   private writes: WriteWatch | null = null;
   private lastSampleStamp: string | null = null;
-  private lastSampleAt = 0;
   constructor(private sql: SqlStorage, private fleet: FleetService, private now = Date.now, writes?: WriteWatch) {
     this.writes = writes ?? null;
-    if (writes) writes.trackAll(['host_health_observations','disk_observations','fleet_accounts','fleet_launches','fleet_sessions_meta','machines','session_resource_usage','resource_resident_samples']);
+    if (writes) writes.trackAll(['host_health_observations','disk_observations','fleet_accounts','fleet_launches','fleet_sessions_meta','machines','session_resource_usage','resource_resident_samples','usage_quota_history','server_quota_snapshots','fleet_subscriptions']);
   }
   init() { initUsageStore(this.sql); for (const s of HOST_HISTORY_SCHEMA.split(';')) if (s.trim()) this.sql.exec(s); }
   /** One real observation per minute; retries and backfill cannot overwrite newer evidence. */
@@ -62,7 +63,7 @@ export class HostHistoryService {
     for (const [key, value] of Object.entries(values)) safe[key] = numeric(value);
     if (!Object.keys(safe).length) return;
     const known = this.rows('SELECT last_seen_ms FROM resource_history_entities WHERE kind=? AND entity=? AND machine_id=?', kind, entity, machine)[0];
-    if (!known && Number(this.rows('SELECT COUNT(*) AS n FROM resource_history_entities')[0].n) >= 512) {
+    if (!known && Number(this.rows('SELECT COUNT(*) AS n FROM (SELECT 1 FROM resource_history_entities LIMIT 512)')[0].n) >= 512) {
       this.sql.exec("INSERT OR IGNORE INTO resource_history_meta VALUES('dimension_limit',?)", this.now());
       return;
     }
@@ -167,14 +168,35 @@ export class HostHistoryService {
   backfill() {
     if (this.rows("SELECT value FROM resource_history_meta WHERE key='backfill_v1'").length) return;
     const cutoff = this.now() - HISTORY_RETENTION_MS;
-    for (const row of this.rows('SELECT machine_id,observed_at_ms,payload_json FROM disk_observations WHERE machine_id IN (SELECT id FROM machines) AND observed_at_ms >= ? ORDER BY observed_at_ms LIMIT 1000', cutoff)) this.disk(row);
-    for (const row of this.rows('SELECT machine_id,observed_at_ms,payload_json FROM host_health_observations WHERE machine_id IN (SELECT id FROM machines) LIMIT 128')) this.host(row);
+    const machines = this.rows('SELECT id FROM machines ORDER BY id LIMIT ?', HISTORY_SCAN_LIMIT + 1);
+    if (machines.length > HISTORY_SCAN_LIMIT) this.flag('backfill_truncated');
+    for (const machine of machines.slice(0, HISTORY_SCAN_LIMIT)) {
+      const disks = this.rows(`SELECT machine_id,observed_at_ms,payload_json FROM disk_observations INDEXED BY idx_disk_obs_machine
+        WHERE machine_id=? AND observed_at_ms>=? ORDER BY observed_at_ms LIMIT ?`, machine.id, cutoff, HISTORY_SCAN_LIMIT + 1);
+      if (disks.length > HISTORY_SCAN_LIMIT) this.flag('backfill_truncated');
+      for (const row of disks.slice(0, HISTORY_SCAN_LIMIT)) this.disk(row);
+      const host = this.rows('SELECT machine_id,observed_at_ms,payload_json FROM host_health_observations WHERE machine_id=?', machine.id)[0];
+      if (host) this.host(host);
+    }
     // Existing lifecycle rows establish failure timestamps without guessing when
     // a queued/starting session actually began running. Bucket counts are events.
-    for (const row of this.rows(`SELECT machine_id,CAST(CAST(strftime('%s',updated_at) AS INTEGER)/60 AS INTEGER)*60000 AS at,COUNT(*) AS n
-      FROM fleet_launches WHERE state='failed' AND updated_at >= ? GROUP BY machine_id,at ORDER BY at`, new Date(cutoff).toISOString())) {
-      if (row.at !== null) this.record('failures', 'fleet', String(row.machine_id || ''), Number(row.at), { failed_events: Number(row.n) }, 'fleet_launches');
+    // Read a bounded raw time-index range before filtering/grouping. LIMIT
+    // outside GROUP BY would still visit every historical launch. An overflow
+    // is explicitly unknown, never a prefix presented as an exact event count.
+    const launches = this.rows(`SELECT machine_id,state,updated_at FROM fleet_launches INDEXED BY fleet_launch_updated
+      WHERE updated_at>=? ORDER BY updated_at LIMIT ?`, new Date(cutoff).toISOString(), HISTORY_SCAN_LIMIT + 1);
+    const overflow = launches.length > HISTORY_SCAN_LIMIT;
+    if (overflow) this.flag('backfill_truncated');
+    const events = new Map<string, { machine: string; at: number; count: number }>();
+    for (const row of launches.slice(0, HISTORY_SCAN_LIMIT)) {
+      const at = Math.floor(Date.parse(row.updated_at) / MINUTE) * MINUTE;
+      if (row.state !== 'failed' || !Number.isFinite(at)) continue;
+      const machine = String(row.machine_id || ''), key = JSON.stringify([machine, at]);
+      const previous = events.get(key);
+      events.set(key, { machine, at, count: (previous?.count ?? 0) + 1 });
     }
+    for (const event of events.values()) this.record('failures', 'fleet', event.machine, event.at,
+      { failed_events: overflow ? null : event.count }, 'fleet_launches_bounded_backfill');
     for (const row of this.rows('SELECT machine_id,account,observed_at,quota_json FROM fleet_subscriptions LIMIT 4096')) {
       const p = json(row.quota_json);
       const values = Object.values(p.windows || {}).map((w: any) => numeric(w.percent_remaining)).filter((v): v is number => v !== null);
@@ -196,20 +218,24 @@ export class HostHistoryService {
    */
   sample() {
     const now = this.now();
-    // Change-driven sampling: a quiet fleet repeats the whole census for no
-    // new data points. Sample when any source table was written, or at most
-    // every 5 minutes as the series ceiling (quota refreshes land within it).
+    // Source-driven sampling: unchanged evidence cannot create a new sample.
+    // Quota journals are dependencies too, so new quota samples invalidate
+    // the stamp without a timer-driven full census of an idle fleet.
     if (this.writes) {
-      const stamp = this.writes.stamp('host_health_observations','disk_observations','fleet_accounts','fleet_launches','fleet_sessions_meta','machines','session_resource_usage','resource_resident_samples');
-      if (stamp === this.lastSampleStamp && now - this.lastSampleAt < 300000) return;
-      this.lastSampleStamp = stamp; this.lastSampleAt = now;
+      const stamp = this.writes.stamp('host_health_observations','disk_observations','fleet_accounts','fleet_launches','fleet_sessions_meta','machines','session_resource_usage','resource_resident_samples','usage_quota_history','server_quota_snapshots','fleet_subscriptions');
+      if (stamp === this.lastSampleStamp) return;
+      this.lastSampleStamp = stamp;
     }
     this.backfill();
     const last = this.rows("SELECT value FROM resource_history_meta WHERE key='sample'")[0]?.value;
     if (typeof last === 'number' && now - last < MINUTE) return;
-    for (const row of this.rows('SELECT machine_id,observed_at_ms,payload_json FROM host_health_observations WHERE machine_id IN (SELECT id FROM machines) LIMIT 128')) this.host(row);
-    for (const row of this.rows(`SELECT d.machine_id,d.observed_at_ms,d.payload_json FROM disk_observations d
-      WHERE d.machine_id IN (SELECT id FROM machines) AND d.observed_at_ms=(SELECT MAX(n.observed_at_ms) FROM disk_observations n WHERE n.machine_id=d.machine_id) LIMIT 128`)) this.disk(row);
+    for (const machine of this.rows('SELECT id FROM machines ORDER BY id LIMIT 128')) {
+      const host = this.rows('SELECT machine_id,observed_at_ms,payload_json FROM host_health_observations WHERE machine_id=?', machine.id)[0];
+      if (host) this.host(host);
+      const row = this.rows(`SELECT machine_id,observed_at_ms,payload_json FROM disk_observations
+        INDEXED BY idx_disk_obs_machine WHERE machine_id=? ORDER BY observed_at_ms DESC LIMIT 1`, machine.id)[0];
+      if (row) this.disk(row);
+    }
     for (const h of this.fleet.hostResources()) {
       // Reuse the memory owner's complete reservation, including pending
       // offers. A stale heartbeat must not masquerade as fresh headroom.
@@ -231,12 +257,10 @@ export class HostHistoryService {
     // tick (at most once a minute; quota collection refreshes every 600 s,
     // so live series always hold points at least every 15 minutes).
     this.quotaWindows(now);
-    for (const row of this.rows(`SELECT ids.machine_id,
-      (SELECT COUNT(*) FROM fleet_launches f WHERE f.machine_id=ids.machine_id AND f.state='queued') AS queued,
-      (SELECT COUNT(*) FROM fleet_launches f WHERE f.machine_id=ids.machine_id AND f.state='failed') AS failed
-      FROM (SELECT id AS machine_id FROM machines UNION SELECT DISTINCT machine_id FROM fleet_launches) ids LIMIT 129`)) {
-      this.record('sessions', 'fleet', String(row.machine_id || ''), now,
-        { running: row.machine_id ? this.nativeRunning(row.machine_id, now) : null, queued: Number(row.queued), failed: Number(row.failed) }, 'fleet_catalog_and_launches_census_v2');
+    for (const machine of this.historyMachines()) {
+      this.record('sessions', 'fleet', machine, now,
+        { running: machine ? this.nativeRunning(machine, now) : null,
+          queued: this.launchCount(machine, 'queued'), failed: this.launchCount(machine, 'failed') }, 'fleet_catalog_and_launches_census_v2');
     }
     this.flush();
     this.sql.exec("INSERT OR REPLACE INTO resource_history_meta VALUES('sample',?)", now);
@@ -247,9 +271,43 @@ export class HostHistoryService {
     const host = this.rows('SELECT last_checkin_at FROM machines WHERE id=?', machine)[0];
     const at = Date.parse(effectiveCheckin(machine, host?.last_checkin_at) || '');
     if (!Number.isFinite(at) || now - at > 180000 || at > now + MINUTE) return null;
-    if (!freshCatalogs(this.sql, now).has(machine)) return null;
-    const count = this.rows("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id=? AND phase='running'", machine)[0];
-    return Number(count.n);
+    const catalog = Date.parse(this.rows('SELECT observed_at FROM fleet_catalog_seen WHERE machine_id=?', machine)[0]?.observed_at || '');
+    if (!Number.isFinite(catalog) || now - catalog > 180000 || catalog > now + MINUTE) return null;
+    const rows = this.rows(`SELECT 1 FROM fleet_sessions INDEXED BY fleet_session_machine_phase
+      WHERE machine_id=? AND phase='running' LIMIT ?`, machine, HISTORY_SCAN_LIMIT + 1);
+    return this.boundedCount(rows);
+  }
+  private flag(key: string) {
+    this.sql.exec('INSERT OR IGNORE INTO resource_history_meta VALUES(?,?)', key, this.now());
+  }
+  private boundedCount(rows: any[]): number | null {
+    if (rows.length > HISTORY_SCAN_LIMIT) { this.flag('sample_truncated'); return null; }
+    return rows.length;
+  }
+  private launchCount(machine: string, state: string): number | null {
+    const rows = this.rows(`SELECT 1 FROM fleet_launches INDEXED BY fleet_launch_machine_state
+      WHERE machine_id=? AND state=? LIMIT ?`, machine, state, HISTORY_SCAN_LIMIT + 1);
+    return this.boundedCount(rows);
+  }
+  /** Seek distinct launch hosts instead of scanning every duplicate index key.
+   * Orphan launch hosts remain represented, capped with an explicit flag. */
+  private historyMachines(): string[] {
+    const registry = this.rows('SELECT id FROM machines ORDER BY id LIMIT ?', HISTORY_SCAN_LIMIT + 1);
+    const ids = new Set(registry.slice(0, HISTORY_SCAN_LIMIT).map(row => String(row.id)));
+    if (registry.length > HISTORY_SCAN_LIMIT) this.flag('sample_truncated');
+    let previous = '';
+    const blank = this.rows("SELECT 1 FROM fleet_launches INDEXED BY fleet_launch_machine_state WHERE machine_id='' LIMIT 1");
+    if (blank.length) ids.add('');
+    for (let i = 0; i <= HISTORY_SCAN_LIMIT; i++) {
+      const row = this.rows(`SELECT machine_id FROM fleet_launches INDEXED BY fleet_launch_machine_state
+        WHERE machine_id>? ORDER BY machine_id LIMIT 1`, previous)[0];
+      if (!row) break;
+      if (i === HISTORY_SCAN_LIMIT || (!ids.has(row.machine_id) && ids.size >= HISTORY_SCAN_LIMIT)) {
+        this.flag('sample_truncated'); break;
+      }
+      previous = String(row.machine_id); ids.add(previous);
+    }
+    return [...ids].slice(0, HISTORY_SCAN_LIMIT);
   }
   nextSampleAt(): number {
     const last = Number(this.rows("SELECT value FROM resource_history_meta WHERE key='sample'")[0]?.value);
@@ -258,24 +316,44 @@ export class HostHistoryService {
   compact() {
     this.flush();
     const now = this.now();
-    this.sql.exec('DELETE FROM resource_history WHERE bucket_ms < ?', now - HISTORY_RETENTION_MS);
-    this.sql.exec('DELETE FROM resource_history_entities WHERE last_seen_ms < ?', now - HISTORY_RETENTION_MS);
-    // Merge real per-dimension observations before dropping redundant packets.
-    // Keep each dimension's latest source timestamp; never invent an average.
+    // Expiry is batched even if this DO wakes after months of downtime.
+    this.sql.exec(`DELETE FROM resource_history WHERE bucket_ms IN
+      (SELECT bucket_ms FROM resource_history WHERE bucket_ms<? ORDER BY bucket_ms LIMIT ?)`, now - HISTORY_RETENTION_MS, HISTORY_SCAN_LIMIT);
+    this.sql.exec(`DELETE FROM resource_history_entities WHERE (kind,entity,machine_id) IN
+      (SELECT kind,entity,machine_id FROM resource_history_entities INDEXED BY resource_history_entities_seen
+       WHERE last_seen_ms<? ORDER BY last_seen_ms LIMIT ?)`, now - HISTORY_RETENTION_MS, HISTORY_SCAN_LIMIT);
+    // Each invocation processes at most eight hourly / sixteen 5m windows.
+    // The 5m tier can compact 80 minutes per hourly call, above its arrival
+    // rate of 60 minute packets, so a busy history does not grow forever.
+    // PK seeks skip
+    // empty time spans; a window contains at most 60 minute-keyed packets.
+    // The durable cursor prevents rescanning all compacted history hourly.
     for (const [age, step] of [[7 * DAY, 3600000], [2 * DAY, 5 * MINUTE]]) {
-      const groups = this.rows(`SELECT CAST(bucket_ms / ? AS INTEGER) AS slot,COUNT(*) AS n FROM resource_history WHERE bucket_ms < ? GROUP BY slot HAVING COUNT(*)>1`, step, now-age);
-      for (const group of groups) {
-        const start=Number(group.slot)*step;
-        const rows=this.rows('SELECT bucket_ms,payload_json FROM resource_history WHERE bucket_ms>=? AND bucket_ms<? ORDER BY bucket_ms',start,start+step);
-        const merged=new Map<string,Observation>();
-        for (const row of rows) for (const o of this.packet(row.payload_json)) {
-          const key=this.identity(o), previous=merged.get(key);
-          if (!previous || o.at>previous.at) merged.set(key,o);
+      const key = 'compact_cursor_' + step;
+      let after = Number(this.rows('SELECT value FROM resource_history_meta WHERE key=?', key)[0]?.value ?? -1);
+      const windows = step === 5 * MINUTE ? HISTORY_COMPACT_WINDOWS * 2 : HISTORY_COMPACT_WINDOWS;
+      for (let i = 0; i < windows; i++) {
+        const first = this.rows('SELECT bucket_ms FROM resource_history WHERE bucket_ms>? AND bucket_ms<? ORDER BY bucket_ms LIMIT 1', after, now - age)[0];
+        if (!first) {
+          // Revisit previously processed windows on the next hourly call:
+          // delayed source observations can arrive with an old timestamp.
+          after = -1; break;
         }
-        const keep=Number(rows.at(-1)!.bucket_ms);
-        this.sql.exec('UPDATE resource_history SET payload_json=? WHERE bucket_ms=?',JSON.stringify([...merged.values()]),keep);
-        this.sql.exec('DELETE FROM resource_history WHERE bucket_ms>=? AND bucket_ms<? AND bucket_ms<>?',start,start+step,keep);
+        const start = Math.floor(Number(first.bucket_ms) / step) * step;
+        const rows = this.rows('SELECT bucket_ms,payload_json FROM resource_history WHERE bucket_ms>=? AND bucket_ms<? ORDER BY bucket_ms LIMIT 61', start, start + step);
+        const merged = new Map<string, Observation>();
+        for (const row of rows) for (const o of this.packet(row.payload_json)) {
+          const id = this.identity(o), previous = merged.get(id);
+          if (!previous || o.at > previous.at) merged.set(id, o);
+        }
+        const keep = Number(rows.at(-1)!.bucket_ms);
+        if (rows.length > 1) {
+          this.sql.exec('UPDATE resource_history SET payload_json=? WHERE bucket_ms=?', JSON.stringify([...merged.values()]), keep);
+          this.sql.exec('DELETE FROM resource_history WHERE bucket_ms>=? AND bucket_ms<? AND bucket_ms<>?', start, start + step, keep);
+        }
+        after = start + step - 1;
       }
+      this.sql.exec('INSERT OR REPLACE INTO resource_history_meta VALUES(?,?)', key, after);
     }
     this.cache.clear();
   }
@@ -329,7 +407,8 @@ export class HostHistoryService {
         }
       }
     }
-    const data={truncated,dimension_limit:this.rows("SELECT value FROM resource_history_meta WHERE key='dimension_limit'").length>0,
+    const sampleTruncated = this.rows("SELECT key FROM resource_history_meta WHERE key IN ('sample_truncated','backfill_truncated')");
+    const data={truncated:truncated || sampleTruncated.length>0,sample_truncated:sampleTruncated.some(r=>r.key==='sample_truncated'),backfill_truncated:sampleTruncated.some(r=>r.key==='backfill_truncated'),dimension_limit:this.rows("SELECT value FROM resource_history_meta WHERE key='dimension_limit'").length>0,
       machines:machines.map(m=>({id:m.id,name:m.name,alias_of:aliases.get(m.id)||null})),machine_aliases:Object.fromEntries(aliases),
       range,start:new Date(start).toISOString(),end:new Date(now).toISOString(),step_ms:step,retention_days:32,
       earliest_observation:earliest===null ? null : new Date(earliest).toISOString(),coverage:'observations_only',

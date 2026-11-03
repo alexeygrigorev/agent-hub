@@ -1,3 +1,4 @@
+import { backfillOnce } from './sql-probes';
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
 import { bindingMoveAllowed } from './session-binding-move';
@@ -105,6 +106,7 @@ CREATE INDEX IF NOT EXISTS session_control_machine_created_state ON session_cont
 CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sessions(machine_id, state, created_at);
 CREATE INDEX IF NOT EXISTS session_control_native_binding ON session_control_sessions(machine_id,
   json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id'));
+CREATE INDEX IF NOT EXISTS session_control_running_id ON session_control_sessions(id) WHERE state='running';
 CREATE INDEX IF NOT EXISTS session_control_live_created ON session_control_sessions(created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_live_actor_created ON session_control_sessions(actor, created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
@@ -472,20 +474,21 @@ export class SessionControlService {
     // command. Reclassify unacknowledged rows without a host inbox receipt so
     // they continue through the queued-receipt path instead of preserving a
     // false delivery timestamp across upgrade.
-    this.sql.exec(`UPDATE session_control_wakes SET state='queued', delivered_at=NULL, updated_at=?
-      WHERE state='delivered' AND acked_at IS NULL AND command_id IN (
-        SELECT id FROM session_control_commands
-        WHERE state!='acked' AND COALESCE(host_status,'') NOT IN
-          ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`, this.at());
-    // The old delivered_at recorded Hub enqueue time. For rows with a native
-    // receipt, restart the acknowledgement window from the receipt-bearing
-    // command update; only touch rows whose old timestamp still equals enqueue.
-    this.sql.exec(`UPDATE session_control_wakes SET delivered_at = (
-        SELECT updated_at FROM session_control_commands WHERE id = session_control_wakes.command_id)
-      WHERE state='delivered' AND acked_at IS NULL AND delivered_at = (
-        SELECT created_at FROM session_control_commands WHERE id = session_control_wakes.command_id)
-      AND command_id IN (SELECT id FROM session_control_commands
-        WHERE COALESCE(host_status,'') IN ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`);
+    this.transaction(() => backfillOnce(this.sql, 'wake_native_receipt_v2', () => {
+      this.sql.exec(`UPDATE session_control_wakes SET state='queued', delivered_at=NULL, updated_at=?
+        WHERE state='delivered' AND acked_at IS NULL AND EXISTS (
+          SELECT 1 FROM session_control_commands WHERE id=session_control_wakes.command_id
+          AND state!='acked' AND COALESCE(host_status,'') NOT IN
+            ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`, this.at());
+      // Seek each wake's command by primary key. The previous IN subqueries
+      // materialized the entire command history on every DO cold start.
+      this.sql.exec(`UPDATE session_control_wakes SET delivered_at = (
+          SELECT updated_at FROM session_control_commands WHERE id=session_control_wakes.command_id)
+        WHERE state='delivered' AND acked_at IS NULL AND delivered_at = (
+          SELECT created_at FROM session_control_commands WHERE id=session_control_wakes.command_id)
+        AND EXISTS (SELECT 1 FROM session_control_commands WHERE id=session_control_wakes.command_id
+          AND COALESCE(host_status,'') IN ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`);
+    }));
     // M15c lifecycle: additive observations/decisions tables. Server-owned
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
@@ -495,14 +498,12 @@ export class SessionControlService {
     // Repair this day's pre-fix starts from canonical requests, once per id.
     // Run each repair atomically; historical manual links are left untouched.
     const hasIntake = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_tasks'").toArray().length;
-    if (hasIntake) {
+    if (hasIntake) this.transaction(() => backfillOnce(this.sql, 'session_intake_links_t2609u', () => {
       const today = this.at().slice(0, 10);
+      this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_created ON session_control_sessions(created_at,id)');
       const sessions = this.sql.exec("SELECT * FROM session_control_sessions WHERE created_at >= ? AND json_extract(request_json, '$.intake_task_id') IS NOT NULL ORDER BY created_at,id", today).toArray();
-      for (const row of sessions) {
-        try { this.transaction(() => recordIntakeSessionLink(this.sql, row, this.now())); }
-        catch { console.warn('intake_session_link_backfill_pending'); }
-      }
-    }
+      for (const row of sessions) recordIntakeSessionLink(this.sql, row, this.now());
+    }));
   }
 
   private at() { return new Date(this.now()).toISOString(); }
@@ -913,7 +914,7 @@ export class SessionControlService {
         ORDER BY wake_at_ms, created_at, id LIMIT 1)+600000
       UNION ALL SELECT CAST((julianday((SELECT delivered_at FROM session_control_wakes
         WHERE state='delivered' AND delivered_at IS NOT NULL ORDER BY delivered_at, id LIMIT 1))-2440587.5)*86400000 AS INTEGER)+600000
-      UNION ALL SELECT next_at_ms AS deadline FROM session_control_pings WHERE state='active')`).toArray()[0];
+      UNION ALL SELECT (SELECT next_at_ms FROM session_control_pings WHERE state='active' ORDER BY next_at_ms LIMIT 1))`).toArray()[0];
     return typeof row?.deadline === 'number' ? row.deadline : null;
   }
 
@@ -1178,18 +1179,36 @@ export class SessionControlService {
     return { delivered, acked, missed };
   }
 
-  attention(): any[] {
+  /** Cron recovery pages through live sessions; the dashboard can still ask
+   * for the full current attention view explicitly. The cursor is owned by
+   * the caller so restarts do not repeatedly inspect the same first page. */
+  attentionPage(limit = 50, after = ''): { items: any[]; evaluated: string[]; next: string } {
+    const size = Math.max(1, Math.min(50, Math.floor(limit)));
+    const rows = this.sql.exec(`SELECT id FROM session_control_sessions INDEXED BY session_control_running_id
+      WHERE state='running' AND id>? ORDER BY id LIMIT ?`, after, size + 1).toArray() as any[];
+    const ids = rows.slice(0, size).map(row => String(row.id));
+    return { items: this.attention(ids), evaluated: ids, next: rows.length > size ? ids[ids.length - 1] : '' };
+  }
+
+  attention(sessionIds?: string[]): any[] {
     const now = this.now(), result: any[] = [];
     const episodes = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray().length;
     // Point lookups per running session instead of reading every retained stall.
     const savedStall = (machine: unknown, native: unknown) => machine != null && native != null &&
       this.sql.exec('SELECT 1 FROM session_stalls WHERE machine_id=? AND native_id=? LIMIT 1', machine, native).toArray().length > 0;
-    const missed = new Set((this.sql.exec("SELECT DISTINCT session_id FROM session_control_wakes WHERE state='missed'").toArray() as any[]).map(r=>r.session_id));
-    const natives = new Map((this.sql.exec(`SELECT f.* FROM session_control_sessions s LEFT JOIN fleet_sessions f
-      ON f.machine_id=s.machine_id AND f.native_id=json_extract(s.binding_json,'$.native_id') WHERE s.state='running'`).toArray() as any[])
-      .map(r=>[JSON.stringify([r.machine_id,r.native_id]),r]));
+    const missed = new Set(sessionIds
+      ? sessionIds.filter(id => this.sql.exec("SELECT 1 FROM session_control_wakes WHERE session_id=? AND state='missed' LIMIT 1", id).toArray().length)
+      : (this.sql.exec("SELECT DISTINCT session_id FROM session_control_wakes WHERE state='missed'").toArray() as any[]).map(r => r.session_id));
+    const selected = sessionIds ? sessionIds.flatMap(id => this.sql.exec("SELECT id,machine_id,binding_json,mode,engine,state,created_at,updated_at FROM session_control_sessions WHERE id=? AND state='running'", id).toArray() as any[])
+      : this.sql.exec("SELECT id,machine_id,binding_json,mode,engine,state,created_at,updated_at FROM session_control_sessions WHERE state='running'").toArray() as any[];
+    const nativeRows = sessionIds ? selected.flatMap(row => {
+      const binding = parsed(row.binding_json, {});
+      return binding.native_id ? this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray() as any[] : [];
+    }) : this.sql.exec(`SELECT f.* FROM session_control_sessions s LEFT JOIN fleet_sessions f
+      ON f.machine_id=s.machine_id AND f.native_id=json_extract(s.binding_json,'$.native_id') WHERE s.state='running'`).toArray() as any[];
+    const natives = new Map(nativeRows.map(r => [JSON.stringify([r.machine_id, r.native_id]), r]));
     const freshness: NativeObservationCache = new Map();
-    for (const row of this.sql.exec("SELECT id,machine_id,binding_json,mode,engine,state,created_at,updated_at FROM session_control_sessions WHERE state='running'").toArray() as any[]) {
+    for (const row of selected) {
       const binding = parsed(row.binding_json, {});
       const nativeKey = JSON.stringify([row.machine_id,binding.native_id]);
       const observed: any = natives.get(nativeKey);
@@ -1222,7 +1241,9 @@ export class SessionControlService {
         title: state + ': ' + row.id, detail: `${state}; intake_id=${intakeId || '(unlinked)'}; idle_for=${idleFor}s; last_activity_at=${lastActivity}; last_nudge=${lastNudge || 'none'}` });
     }
     try {
-      for (const p of this.sql.exec("SELECT * FROM session_control_pings WHERE state='active' AND last_error IS NOT NULL").toArray() as any[]) {
+      const failedPings = sessionIds ? sessionIds.flatMap(id => this.sql.exec("SELECT * FROM session_control_pings WHERE session_id=? AND state='active' AND last_error IS NOT NULL", id).toArray() as any[])
+        : this.sql.exec("SELECT * FROM session_control_pings WHERE state='active' AND last_error IS NOT NULL").toArray() as any[];
+      for (const p of failedPings) {
         result.push({ session_id: p.session_id, intake_id: p.intake_task_id, state: 'ping_failed', severity: 'warn', source: 'session_ping',
           subject: 'session:' + p.session_id, title: 'ping_failed: ' + p.session_id,
           detail: `ping ${p.id} last delivery failed (${p.last_error}); failures=${p.failure_count}; clear with hub loop clear` });

@@ -60,6 +60,20 @@ function sha256Sync(input: string): string {
   return base64url(out);
 }
 
+/** Same epoch-seconds/epoch-milliseconds/ISO formats as parseExpiryMs.
+ * Stored as an expression index so alarm work seeks deadlines, rather than
+ * parsing every retained job on every invocation. */
+export function expiryMsSql(column: string): string {
+  return `(CASE WHEN CAST(${column} AS TEXT) NOT GLOB '*[^0-9.]*' AND CAST(${column} AS REAL)>0
+    THEN CASE WHEN CAST(${column} AS REAL)<100000000000 THEN CAST(${column} AS REAL)*1000 ELSE CAST(${column} AS REAL) END
+    ELSE ROUND((julianday(${column})-2440587.5)*86400000) END)`;
+}
+const OFFER_MS = expiryMsSql('offer_expires_at');
+const LEASE_MS = `COALESCE(${expiryMsSql('expires_at')},0)`;
+const ACQUIRED_MS = expiryMsSql('acquired_at');
+const DEADLINE_MS = expiryMsSql('deadline_at');
+const ALARM_BATCH = 100;
+
 export const JOBS_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
@@ -105,6 +119,13 @@ CREATE TABLE IF NOT EXISTS leases (
   released_at TEXT,
   release_reason TEXT
 );
+
+CREATE INDEX IF NOT EXISTS jobs_offered_due_ms ON jobs(${OFFER_MS}) WHERE status='offered';
+CREATE INDEX IF NOT EXISTS jobs_root_offered_due_ms ON jobs(${OFFER_MS}) WHERE status='offered' AND kind='root-run';
+CREATE INDEX IF NOT EXISTS jobs_nonroot_offered_due_ms ON jobs(${OFFER_MS}) WHERE status='offered' AND kind<>'root-run';
+CREATE INDEX IF NOT EXISTS jobs_root_offered_deadline_ms ON jobs(${DEADLINE_MS}) WHERE kind='root-run' AND status='offered';
+CREATE INDEX IF NOT EXISTS leases_active_due_ms ON leases(${LEASE_MS}) WHERE holder_job_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS leases_active_acquired_ms ON leases(${ACQUIRED_MS}) WHERE holder_job_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS offers (
   job_id TEXT,
@@ -451,7 +472,9 @@ export class JobsService {
     const alarmTime = Number.isFinite(observer) ? Math.min(jobAlarmTime || Infinity, observer!) : jobAlarmTime;
     if (alarmTime && this.deps?.enableAlarms && typeof this.ctx?.storage?.setAlarm === 'function') {
       try {
-        this.ctx.storage.setAlarm(alarmTime);
+        // A blocked past-due job cannot turn request-side scheduling into a
+        // tight loop either. Catch async storage rejection as well as throws.
+        Promise.resolve(this.ctx.storage.setAlarm(Math.max(this.now().getTime() + 15000, alarmTime))).catch(() => {});
       } catch {}
     }
   }
@@ -499,35 +522,29 @@ export class JobsService {
   }
 
   getAlarmTime(): number | null {
-    const now = this.now();
-    const nowMs = now.getTime();
     const nextTimes: number[] = [];
 
-    // 1. Pending offers
-    const offers = this.sql.exec("SELECT offer_expires_at FROM jobs WHERE status = 'offered' AND offer_expires_at IS NOT NULL").toArray();
-    for (const o of offers) {
-      const t = parseExpiryMs(o.offer_expires_at as string);
-      if (t !== null && t > nowMs) nextTimes.push(t);
+    // Each branch reads its first index entry, independent of history size.
+    const first = (query: string, ...bindings: any[]) => {
+      const row: any = this.sql.exec(query, ...bindings).toArray()[0];
+      if (typeof row?.due === 'number' && Number.isFinite(row.due)) nextTimes.push(Math.max(1, row.due));
+    };
+    if (isRootSchedulingEnabled(this.sql)) {
+      first(`SELECT ${OFFER_MS} AS due FROM jobs WHERE status='offered' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+    } else {
+      // Disabled root offers are frozen until their hard deadline. A stale
+      // offer timeout must not wake the DO repeatedly while frozen.
+      first(`SELECT ${OFFER_MS} AS due FROM jobs WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+      first(`SELECT ${DEADLINE_MS} AS due FROM jobs WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
     }
-
-    // 2. Active leases
-    const leases = this.sql.exec("SELECT expires_at FROM leases WHERE holder_job_id IS NOT NULL AND expires_at IS NOT NULL").toArray();
-    for (const l of leases) {
-      const t = parseExpiryMs(l.expires_at as string);
-      if (t !== null && t > nowMs) nextTimes.push(t);
-    }
-
-    // 3. Claims awaiting start timeout (5m from acquired_at) - ONLY if job is claimed and NOT YET started
-    const claimed = this.sql.exec(
-      "SELECT leases.acquired_at FROM leases JOIN jobs ON leases.holder_job_id = jobs.id WHERE jobs.status = 'claimed' AND jobs.started_at IS NULL AND leases.acquired_at IS NOT NULL"
-    ).toArray();
-    for (const c of claimed) {
-      const acq = parseExpiryMs(c.acquired_at as string);
-      if (acq !== null) {
-        const deadline = acq + 5 * 60000;
-        if (deadline > nowMs) nextTimes.push(deadline);
-      }
-    }
+    first(`SELECT ${LEASE_MS} AS due FROM leases WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
+    // At most ALARM_BATCH active claims per pass; the acquisition index
+    // avoids joining retained terminal jobs or inactive leases.
+    const claimed = this.sql.exec(`SELECT ${ACQUIRED_MS} AS due FROM leases
+      WHERE holder_job_id IS NOT NULL AND ${ACQUIRED_MS} IS NOT NULL
+      AND EXISTS (SELECT 1 FROM jobs WHERE id=leases.holder_job_id AND status='claimed' AND started_at IS NULL)
+      ORDER BY ${ACQUIRED_MS} LIMIT 1`).toArray() as any[];
+    for (const claim of claimed) if (typeof claim.due === 'number') nextTimes.push(claim.due + 5 * 60000);
 
     if (nextTimes.length === 0) return null;
     nextTimes.sort((a, b) => a - b);
@@ -541,8 +558,10 @@ export class JobsService {
 
       this.ctx.storage.transactionSync(() => {
         // 1. Expire offers (root-run)
-        const offeredJobs = this.sql.exec("SELECT * FROM jobs WHERE kind = 'root-run' AND status = 'offered' AND offer_expires_at IS NOT NULL").toArray();
         const rootSchedulingEnabled = isRootSchedulingEnabled(this.sql);
+        const offeredJobs = rootSchedulingEnabled
+          ? this.sql.exec(`SELECT * FROM jobs WHERE kind='root-run' AND status='offered' AND ${OFFER_MS}<=? ORDER BY ${OFFER_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray()
+          : this.sql.exec(`SELECT * FROM jobs WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS}<=? ORDER BY ${DEADLINE_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray();
         for (const job of offeredJobs) {
           // Root scheduling flag: while disabled, root-run offers are frozen (no expiry,
           // no re-offer); only a job whose deadline has passed is closed.
@@ -558,7 +577,8 @@ export class JobsService {
         }
 
         // 2. Expire leases (hard deadline or missed renew)
-        const activeLeases = this.sql.exec("SELECT * FROM leases WHERE holder_job_id IS NOT NULL").toArray();
+        const activeLeases = this.sql.exec(`SELECT * FROM leases WHERE holder_job_id IS NOT NULL
+          AND ${LEASE_MS}<=? ORDER BY ${LEASE_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray();
         for (const lease of activeLeases) {
           if (isLeaseExpired(lease.expires_at as any, nowMs)) {
             if (lease.name === 'root') {
@@ -580,7 +600,9 @@ export class JobsService {
 
         // 3. Claims awaiting first action (5 mins)
         const noStartLeases = this.sql.exec(
-          "SELECT leases.* FROM leases JOIN jobs ON leases.holder_job_id = jobs.id WHERE jobs.started_at IS NULL AND jobs.status = 'claimed'"
+          `SELECT leases.* FROM leases WHERE holder_job_id IS NOT NULL AND ${ACQUIRED_MS}<=?
+          AND EXISTS (SELECT 1 FROM jobs WHERE id=leases.holder_job_id AND started_at IS NULL AND status='claimed')
+          ORDER BY ${ACQUIRED_MS} LIMIT ?`, nowMs - 5 * 60000, ALARM_BATCH
         ).toArray();
         for (const lease of noStartLeases) {
           const acq = parseExpiryMs(lease.acquired_at as string);

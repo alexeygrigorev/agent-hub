@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS session_deliveries (
   UNIQUE(source_id, delivery_key)
 );
 CREATE INDEX IF NOT EXISTS session_deliveries_due ON session_deliveries(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS session_deliveries_queued_order ON session_deliveries(status, updated_at);
+CREATE INDEX IF NOT EXISTS session_deliveries_active_source ON session_deliveries(status, source, source_id);
 CREATE INDEX IF NOT EXISTS session_deliveries_recent ON session_deliveries(source_id, created_at);
 `;
 
@@ -683,10 +685,14 @@ export class WebhookService {
     this.pumping = true;
     let nextDue: number | undefined;
     try {
+      let passes = 0;
       do {
         this.pumpAgain = false;
         nextDue = await this.pumpOnce();
-      } while (this.pumpAgain);
+        passes++;
+      } while (this.pumpAgain && passes < 2);
+      // Sustained ingest cannot keep a single alarm alive indefinitely.
+      if (this.pumpAgain) nextDue = Math.min(nextDue ?? Infinity, this.now() + 15000);
     } finally {
       this.pumping = false;
     }
@@ -794,21 +800,25 @@ export class WebhookService {
     // 3b. Scheduled deliveries whose schedule was deleted or paused never
     // pile up behind a down session.
     for (const delivery of (this.sql.exec(
-      `SELECT d.id FROM session_deliveries d LEFT JOIN session_schedules s ON s.id = d.source_id
-       WHERE d.status IN ('pending','queued') AND d.source = 'schedule' AND (s.id IS NULL OR s.enabled = 0) LIMIT ?`, this.maxBatch).toArray() as any[])) {
+      `SELECT d.id FROM (SELECT id,source_id FROM (SELECT id,source_id FROM session_deliveries
+        WHERE status='pending' AND source='schedule' LIMIT ?)
+        UNION ALL SELECT id,source_id FROM (SELECT id,source_id FROM session_deliveries WHERE status='queued' AND source='schedule' LIMIT ?)) d
+       LEFT JOIN session_schedules s ON s.id = d.source_id WHERE s.id IS NULL OR s.enabled=0`, this.maxBatch, this.maxBatch).toArray() as any[])) {
       this.txn(() => this.transition(delivery.id, { status: 'failed', last_error: 'schedule_removed', next_attempt_at: null }, ['pending', 'queued']));
     }
     // 3. Pending/queued deliveries whose route was deleted: fail them honestly.
     for (const delivery of (this.sql.exec(
-      `SELECT d.id, d.target_label FROM session_deliveries d LEFT JOIN webhook_routes r ON r.id = d.source_id
-       WHERE d.status IN ('pending','queued') AND d.source = 'webhook' AND r.id IS NULL LIMIT ?`, this.maxBatch).toArray() as any[])) {
+      `SELECT d.id,d.target_label FROM (SELECT id,source_id,target_label FROM (SELECT id,source_id,target_label FROM session_deliveries
+        WHERE status='pending' AND source='webhook' LIMIT ?)
+        UNION ALL SELECT id,source_id,target_label FROM (SELECT id,source_id,target_label FROM session_deliveries WHERE status='queued' AND source='webhook' LIMIT ?)) d
+       LEFT JOIN webhook_routes r ON r.id=d.source_id WHERE r.id IS NULL`, this.maxBatch, this.maxBatch).toArray() as any[])) {
       this.txn(() => this.transition(delivery.id, { status: 'failed', last_error: 'route_deleted', next_attempt_at: null }, ['pending', 'queued']));
     }
 
     const next: any = this.sql.exec(
-      "SELECT MIN(next_attempt_at) AS due FROM session_deliveries WHERE status = 'pending'").toArray()[0];
-    if (next?.due) {
-      const dueMs = Date.parse(next.due);
+      "SELECT next_attempt_at AS due FROM session_deliveries WHERE status='pending' ORDER BY next_attempt_at LIMIT 1").toArray()[0];
+    if (next) {
+      const dueMs = next.due === null ? nowMs : Date.parse(next.due);
       if (Number.isFinite(dueMs)) nextDue = Math.max(nowMs, dueMs);
     }
     return nextDue;

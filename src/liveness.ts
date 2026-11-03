@@ -417,7 +417,9 @@ export class LivenessService {
 
   prune(keepDays = 30) {
     const cutoff = new Date(this.now() - keepDays * 86400000).toISOString();
-    this.sql.exec('DELETE FROM liveness_alerts WHERE resolved_at IS NOT NULL AND resolved_at < ?', cutoff);
+    this.sql.exec(`DELETE FROM liveness_alerts WHERE id IN (
+      SELECT id FROM liveness_alerts WHERE resolved_at IS NOT NULL AND resolved_at < ?
+      ORDER BY resolved_at LIMIT 100)`, cutoff);
   }
 }
 

@@ -22,6 +22,8 @@ export class IdleWorkService {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS session_idle_episodes(session_id TEXT PRIMARY KEY,
       episode TEXT NOT NULL, detected_at INTEGER NOT NULL, active INTEGER NOT NULL,
       nudges_json TEXT NOT NULL, last_nudge_at INTEGER, replacement_key TEXT, replacement_id TEXT, binding_identity TEXT)`);
+    this.sql.exec('CREATE INDEX IF NOT EXISTS session_idle_episodes_active ON session_idle_episodes(active,session_id)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS session_idle_work_state(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
     const cols = this.sql.exec('PRAGMA table_info(session_idle_episodes)').toArray() as any[];
     if (!cols.some(c => c.name === 'binding_identity')) this.sql.exec('ALTER TABLE session_idle_episodes ADD COLUMN binding_identity TEXT');
   }
@@ -44,7 +46,10 @@ export class IdleWorkService {
       // One attention census per tick (intake 8081a05a): it also decides
       // which episodes stay active below, instead of recomputing it. A session
       // that recovers during this loop is marked inactive on the next census.
-      const attention = this.sessions.attention();
+      const previous = String(this.sql.exec("SELECT value FROM session_idle_work_state WHERE key='session'").toArray()[0]?.value ?? '');
+      const page = typeof this.sessions.attentionPage === 'function' ? this.sessions.attentionPage(50, previous) : null;
+      const attention = page ? page.items : this.sessions.attention();
+      if (page && page.next !== previous) this.sql.exec("INSERT INTO session_idle_work_state VALUES('session',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", page.next);
       for (const item of attention) {
         try {
         const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', item.session_id).toArray()[0];
@@ -152,8 +157,24 @@ export class IdleWorkService {
         } catch { console.warn('idle_work_session_failed', item.session_id); }
       }
       const active = new Set(attention.map(s => s.session_id));
-      for (const e of this.sql.exec('SELECT session_id FROM session_idle_episodes WHERE active=1').toArray() as any[]) {
-        if (!active.has(e.session_id)) this.sql.exec('UPDATE session_idle_episodes SET active=0 WHERE session_id=?', e.session_id);
+      if (page) {
+        // Only evaluated sessions can be marked recovered; absence from a
+        // partial census says nothing about the rest of the fleet.
+        for (const id of page.evaluated) if (!active.has(id))
+          this.sql.exec('UPDATE session_idle_episodes SET active=0 WHERE session_id=? AND active=1', id);
+        const previousEpisode = String(this.sql.exec("SELECT value FROM session_idle_work_state WHERE key='episode'").toArray()[0]?.value ?? '');
+        const episodes = this.sql.exec('SELECT session_id FROM session_idle_episodes WHERE active=1 AND session_id>? ORDER BY session_id LIMIT 51', previousEpisode).toArray() as any[];
+        const window = episodes.slice(0, 50);
+        for (const e of window) {
+          const session: any = this.sql.exec('SELECT state FROM session_control_sessions WHERE id=?', e.session_id).toArray()[0];
+          if (!session || session.state !== 'running') this.sql.exec('UPDATE session_idle_episodes SET active=0 WHERE session_id=?', e.session_id);
+        }
+        const nextEpisode = episodes.length > 50 ? String(window[window.length - 1].session_id) : '';
+        if (nextEpisode !== previousEpisode) this.sql.exec("INSERT INTO session_idle_work_state VALUES('episode',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", nextEpisode);
+      } else {
+        // Compatibility for injected session services used by focused tests.
+        for (const e of this.sql.exec('SELECT session_id FROM session_idle_episodes WHERE active=1').toArray() as any[])
+          if (!active.has(e.session_id)) this.sql.exec('UPDATE session_idle_episodes SET active=0 WHERE session_id=?', e.session_id);
       }
     } finally { this.busy = false; }
   }
