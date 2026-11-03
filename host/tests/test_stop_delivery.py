@@ -128,7 +128,7 @@ class LiveDeletedWorkspaceStopTests(unittest.TestCase):
                                       engine='shell', phase='running', created_at_ms=100,
                                       worker_pid=12345, workload_pid=12346,
                                       containment_empty=True)
-            with patch.object(ns, 'list_sessions', return_value=[before]), \
+            with patch.object(ns, '_targeted_status', return_value=before), \
                  patch.object(ns, '_pid_dead', return_value=True), \
                  patch.object(ns, 'run_native', side_effect=AssertionError('already-dead session must not be killed')):
                 result = ns.stop_session('aplexer', target)
@@ -149,7 +149,7 @@ class LiveDeletedWorkspaceStopTests(unittest.TestCase):
                                      engine='shell', phase='exited', created_at_ms=100,
                                      worker_pid=12345, workload_pid=12346,
                                      containment_empty=False)
-            with patch.object(ns, 'list_sessions', side_effect=[[before], [after]]), \
+            with patch.object(ns, '_targeted_status', side_effect=[before, after]), \
                  patch.object(ns, '_pid_dead', return_value=True), \
                  patch.object(ns, 'run_native', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as run:
                 with self.assertRaises(ns.SessionUncertain):
@@ -167,7 +167,7 @@ class LiveDeletedWorkspaceStopTests(unittest.TestCase):
             before = ns.NativeSession(target.session_id, target.tag, target.workspace+' (deleted)',
                                       engine='shell', phase='running', created_at_ms=100)
             after = replace(before, phase='exited', containment_empty=True)
-            with patch.object(ns, 'list_sessions', side_effect=[[before],[after]]), \
+            with patch.object(ns, '_targeted_status', side_effect=[before, after]), \
                  patch.object(ns, 'run_native', return_value=subprocess.CompletedProcess([],0,'{}','')) as run, \
                  patch.object(ns, '_confirm_workload_exit', return_value=(True,'verified empty')):
                 result = ns.stop_session('aplexer',target)
@@ -190,7 +190,7 @@ class LiveDeletedWorkspaceStopTests(unittest.TestCase):
             before = ns.NativeSession(target.session_id, target.tag, target.workspace,
                                       engine='shell', phase='running', created_at_ms=100)
             after = replace(before, phase='exited', containment_empty=True)
-            with patch.object(ns, 'list_sessions', side_effect=[[before], [after]]), \
+            with patch.object(ns, '_targeted_status', side_effect=[before, after]), \
                  patch.object(ns, 'run_native', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as run, \
                  patch.object(ns, '_confirm_workload_exit', return_value=(True, 'verified empty')):
                 result = ns.stop_session('aplexer', target)
@@ -207,4 +207,5 @@ class LiveDeletedWorkspaceStopTests(unittest.TestCase):
             with patch.object(ns,'list_sessions',return_value=[row]), patch.object(ns,'run_native') as run:
                 with self.assertRaisesRegex(ns.SessionControlError,'generation mismatch'):
                     ns.stop_session('aplexer',target)
-            run.assert_not_called()
+            for call in run.call_args_list:
+                self.assertNotIn('kill', call.args[1])

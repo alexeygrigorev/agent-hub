@@ -239,6 +239,12 @@ it('bounds status and host query work with retained production-scale history', a
         `active-${i}`,`active-${i}`,at,account,at);
       if (i<36) h.sql.exec("UPDATE fleet_launches SET state='running',native_id=?,account=? WHERE id=?",`active-${i}`,account,sessionId(40000+i));
     }
+    // The 200 synthetic actives above are scan-cost scaffolding for the
+    // orphan correlation, not a real 200-session host: lift the per-host
+    // live-session cap here so this perf test keeps measuring the intended
+    // account-concurrency path (the cap itself is covered in cpu-headroom tests).
+    h.sql.exec("INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+      JSON.stringify({host_max_sessions:500}));
     const fixturePlan:any = new FleetService(h.sql,(cb)=>h.ctx.storage.transactionSync(cb)).plan({workspace:'demo',prompt:'Synthetic',machine:'claim-host'});
     expect(fixturePlan.rejected.length===7 && fixturePlan.rejected.every((r:any)=>r.reason==='account_concurrency')).toBe(true);
     for (let i = 0; i < 200; i++) {

@@ -1638,7 +1638,7 @@ export class FleetService {
           ...(reason === 'memory_pressure' && refusalOnRoute?.trigger === 'swap_pressure' ? { host_load: { trigger: 'swap_pressure', swap_used_pct: hb.swap_used_percent, swap_limit_pct: refusalOnRoute.limit } } : {}),
           ...(reason === 'cpu_pressure' && refusalOnRoute?.trigger === 'cpu_busy' ? { host_load: { trigger: 'cpu_busy', cpu_busy_pct: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window, cpu_window_s: sanitizeCpuUsage(hb.cpu_usage)?.window_s } } : {}),
           ...(reason === 'cpu_pressure' && refusalOnRoute?.trigger === 'cpu_psi_full' ? { host_load: { trigger: 'cpu_psi_full', cpu_psi_full_pct: sanitizeCpuUsage(hb.cpu_usage)?.psi_full_avg10, cpu_psi_full_limit_pct: refusalOnRoute.limit } } : {}),
-          ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) && !((reason === 'memory_pressure' && ['mem_available','swap_pressure'].includes(refusalOnRoute?.trigger || '')) || (reason === 'cpu_pressure' && ['cpu_busy','cpu_psi_full'].includes(refusalOnRoute?.trigger || ''))) ? {cpu:cpu()} : {}),
+          ...(['cpu_headroom','cpu_pressure','memory_pressure','machine_capacity','host_oom','host_runtime_choking'].includes(reason) && !((reason === 'memory_pressure' && ['mem_available','swap_pressure'].includes(refusalOnRoute?.trigger || '')) || (reason === 'cpu_pressure' && ['cpu_busy','cpu_psi_full'].includes(refusalOnRoute?.trigger || ''))) ? {cpu:cpu()} : {}),
         });
         continue;
       }
