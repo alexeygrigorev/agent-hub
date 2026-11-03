@@ -51,7 +51,12 @@ for line in sys.stdin:
         print(int(t)); sys.exit(0)
 sys.exit(1)' "$1" "$2"
 }
-failures() { local n=0; read -r n < "$STATE/restart_failures" 2>/dev/null || n=0; [[ "$n" =~ ^[0-9]+$ ]] || n=0; echo "$n"; }
+failures() {
+  local n=0
+  if [ -r "$STATE/restart_failures" ]; then read -r n < "$STATE/restart_failures" || n=0; fi
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  echo "$n"
+}
 
 # Hub-side liveness (src/ops-liveness.ts) watches these reports independently of this
 # script and of the session; a failed report never changes the local decision.
