@@ -82,6 +82,56 @@ describe('strict indexed background queue', () => {
     vi.restoreAllMocks();
   }));
 
+  it('exhausting one per-job deadline cannot hide another or resurrect on restart seeding', () => withHub(async (hub,state) => {
+    const raw=state.storage.sql,now=Date.now(),at=new Date(now).toISOString();
+    for(let i=0;i<2000;i++)raw.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor)
+      VALUES(?,'writer-run',?,'{}','expired',?,?,'test')`,'retained-'+i,'retained-'+i,at,at);
+    for(const [id,offset] of [['failing',2000],['following',1000]] as const)raw.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,offer_expires_at,actor)
+      VALUES(?,'writer-run',?,'{}','offered',?,?,?,'test')`,id,id,at,at,new Date(now-offset).toISOString());
+    const offerProbe=raw.exec("SELECT id FROM jobs INDEXED BY jobs_offered WHERE status='offered' ORDER BY offer_expires_at LIMIT 129");
+    expect(offerProbe.toArray()).toHaveLength(2);expect(offerProbe.rowsRead).toBeLessThan(8);
+    raw.exec("UPDATE hub_background_work SET attempts=3 WHERE id='job-deadline:failing'");
+    await hub.alarm(); // quarantine only the repeatedly failing entity
+    expect(raw.exec("SELECT status FROM jobs WHERE id='failing'").one().status).toBe('offered');
+    await hub.alarm();
+    expect(raw.exec("SELECT status FROM jobs WHERE id='following'").one().status).toBe('expired');
+    expect(raw.exec("SELECT id FROM hub_background_work WHERE kind='job-deadline'").toArray()).toEqual([]);
+    hub.backgroundWork.initEntityProducers(); // restoration is once-only, not a retry loop
+    expect(raw.exec("SELECT id FROM hub_background_work WHERE kind='job-deadline'").toArray()).toEqual([]);
+    raw.exec("UPDATE jobs SET offer_expires_at=? WHERE id='failing'",new Date(now+60000).toISOString());
+    expect(raw.exec("SELECT id FROM hub_background_work WHERE id='job-deadline:failing'").toArray()).toHaveLength(1);
+  }));
+
+  it('cold restoration does not resurrect an exhausted wake without a new source mutation', () => withHub(async (hub,state) => {
+    const raw=state.storage.sql,now=Date.now(),at=new Date(now).toISOString();
+    raw.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
+      VALUES('wake-owner','test','wake-owner','{}','host','codex','interactive','offered',?,?)`,at,at);
+    raw.exec(`INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at)
+      VALUES('failed-wake','wake-owner','test','failed-wake',?,?,'resume','pending',?,?)`,now-1000,at,at,at);
+    raw.exec("UPDATE hub_background_work SET attempts=3 WHERE id='session-wake:failed-wake'");
+    await hub.alarm();hub.backgroundWork.initEntityProducers();
+    expect(raw.exec("SELECT id FROM hub_background_work WHERE id='session-wake:failed-wake'").toArray()).toEqual([]);
+    raw.exec("UPDATE session_control_wakes SET wake_at_ms=? WHERE id='failed-wake'",now+60000);
+    expect(raw.exec("SELECT id FROM hub_background_work WHERE id='session-wake:failed-wake'").toArray()).toHaveLength(1);
+  }));
+
+  it('known job and lease producers maintain claim deadlines and frozen root offers', () => withHub((hub,state) => {
+    const raw=state.storage.sql,now=Date.now(),at=new Date(now).toISOString(),future=new Date(now+600000).toISOString(),past=new Date(now-600000).toISOString();
+    raw.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,offer_expires_at,actor)
+      VALUES('root-timer','root-run','root-timer','{}','offered',?,?,?,'test')`,at,future,past);
+    const due=()=>raw.exec("SELECT due_ms FROM hub_background_work WHERE id='job-deadline:root-timer'").one().due_ms;
+    expect(due()).toBe(Date.parse(future));
+    raw.exec('UPDATE root_scheduling SET enabled=1 WHERE id=1');expect(due()).toBe(Date.parse(past));
+    raw.exec('UPDATE root_scheduling SET enabled=0 WHERE id=1');expect(due()).toBe(Date.parse(future));
+    raw.exec("UPDATE jobs SET status='claimed',lease_epoch=1 WHERE id='root-timer'");
+    raw.exec("UPDATE leases SET epoch=1,holder_job_id='root-timer',expires_at=?,acquired_at=? WHERE name='root'",future,past);
+    expect(due()).toBe(Date.parse(past)+300000);
+    const changed=raw.exec("UPDATE jobs SET status='running',started_at=? WHERE id='root-timer'",at);changed.toArray();
+    expect(changed.rowsRead).toBeLessThan(100);expect(due()).toBe(Date.parse(future));
+    raw.exec("UPDATE jobs SET status='done' WHERE id='root-timer'");
+    expect(raw.exec("SELECT id FROM hub_background_work WHERE id='job-deadline:root-timer'").toArray()).toEqual([]);
+  }));
+
   it('root slot selects a single ready host and never calls registry or machine censuses', () => withHub((hub,state) => {
     const now=Math.floor(Date.now()/1800000)*1800000+60000,at=new Date(now).toISOString(),slot=new Date(now-60000).toISOString();
     hub.sql.exec('UPDATE root_scheduling SET enabled=1 WHERE id=1');

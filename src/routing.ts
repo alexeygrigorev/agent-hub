@@ -55,7 +55,7 @@ export class RoutingService {
     // exact GitHub main commit a machine should run; the host fast-forwards
     // its own clean checkout to it and reports the outcome. The Hub never
     // ships code, only the target SHA, which the host verifies is on main.
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS host_release_targets (machine_id TEXT PRIMARY KEY, sha TEXT, set_by TEXT, set_at TEXT, current_sha TEXT, state TEXT, error TEXT, reported_at TEXT)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS host_release_targets (machine_id TEXT PRIMARY KEY, sha TEXT, set_by TEXT, set_at TEXT, current_sha TEXT, state TEXT, error TEXT, reported_at TEXT, autostart_state TEXT, autostart_error TEXT)`);
     if (!this.sql.exec('PRAGMA table_info(host_release_targets)').toArray().some((c: any) => c.name === 'autostart_state')) this.sql.exec('ALTER TABLE host_release_targets ADD COLUMN autostart_state TEXT');
     if (!this.sql.exec('PRAGMA table_info(host_release_targets)').toArray().some((c: any) => c.name === 'autostart_error')) this.sql.exec('ALTER TABLE host_release_targets ADD COLUMN autostart_error TEXT');
     new HostGoals(this.sql, this.fleet, this.now).init();

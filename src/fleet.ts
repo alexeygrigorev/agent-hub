@@ -61,8 +61,8 @@ CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
 CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
-CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id TEXT NOT NULL, tag TEXT NOT NULL, engine TEXT, phase TEXT NOT NULL, agent_state TEXT, observed_at TEXT NOT NULL, workspace TEXT NOT NULL, profile TEXT, account TEXT, last_activity_at TEXT, cwd TEXT, PRIMARY KEY(machine_id, native_id));
-CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, runtime_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
+CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id TEXT NOT NULL, tag TEXT NOT NULL, engine TEXT, phase TEXT NOT NULL, agent_state TEXT, observed_at TEXT NOT NULL, workspace TEXT NOT NULL, profile TEXT, account TEXT, last_activity_at TEXT, cwd TEXT, created_at_ms INTEGER, progress_json TEXT, PRIMARY KEY(machine_id, native_id));
+CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, runtime_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, verification_status TEXT, exit_reason TEXT, finished_at TEXT, launch_error_json TEXT, model_selection_json TEXT, retried_launch_id TEXT, claim_key TEXT, worker_status TEXT, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS fleet_engine_health (engine TEXT NOT NULL, machine_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL, diagnostics_json TEXT, PRIMARY KEY(engine, machine_id));
 CREATE TABLE IF NOT EXISTS operator_notices (notice_key TEXT PRIMARY KEY, engine TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_login_holds (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT NOT NULL DEFAULT '', held_at_ms INTEGER NOT NULL, PRIMARY KEY(machine_id, engine, account, profile));
@@ -612,9 +612,10 @@ export class FleetService {
   private maintenance: { reconciled: boolean; drained: boolean; queueLimit:number } | null = null;
   // Intake 488b860e: rotation point for re-offered effect-free starting
   // launches, so no row starves behind others regardless of age order.
-  // The cursor is a value in the ORDER BY key (updated_at, id), never a
-  // row position, so concurrent inserts, removals and wraps stay exact.
-  private reofferCursors = new Map<string, [string, string]>();
+  // The cursor is the indexed immutable rowid, never a result offset.
+  // Concurrent inserts, removals and wraparound remain fair.
+  private reofferCursors = new Map<string,number>();
+  private offeredCursors = new Map<string,number>();
   /** All-clear offers answers per machine, keyed by the fleet write stamp. */
   private emptyOffers = new Map<string, { stamp: string; at: number; value: any }>();
   // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
@@ -2370,12 +2371,13 @@ export class FleetService {
     if (path === '/api/fleet/resources' || path.startsWith('/api/fleet/resources/')) {
       const suffix = path.slice('/api/fleet/resources'.length);
       if (request.method === 'GET') {
+        try {
         if (caller.kind === 'agent' && auth.scopes?.includes(WORKER_SCOPE)) {
           const worker = workerAccessContext(this.sql, caller.tokenId);
           if (!worker || worker.actor !== caller.actor || !['', '/sessions'].includes(suffix)) return response({error:'forbidden'},403);
           const own = (row: any) => row.session_id === worker.session_id ||
             (typeof worker.native_binding?.native_id === 'string' && row.machine_id === worker.machine_id && row.native_id === worker.native_binding.native_id);
-          if (suffix === '/sessions') return response({sessions:this.resources.usage(Object.fromEntries(new URL(request.url).searchParams)).filter(own)});
+          if (suffix === '/sessions') return response({sessions:this.resources.usage(Object.fromEntries(new URL(request.url).searchParams)).filter(own),observation:this.resources.usageObservation()});
           const overview = this.resources.overview();
           // Host headroom and aggregate usage are sanitized fleet data; session
           // paths, native identities and receipts stay within this launch.
@@ -2390,9 +2392,14 @@ export class FleetService {
         }
         if (!admin) return response({error:'forbidden'},403);
         if (!suffix) return response(this.resources.overview());
-        if (suffix === '/sessions') return response({sessions:this.resources.usage(Object.fromEntries(new URL(request.url).searchParams))});
+        if (suffix === '/sessions') return response({sessions:this.resources.usage(Object.fromEntries(new URL(request.url).searchParams)),observation:this.resources.usageObservation()});
         if (suffix === '/reaps') return response({reaps:this.resources.reaps()});
         if (suffix === '/throttles') return response({throttles:this.resources.throttles()});
+        } catch(error) {
+          if(error instanceof ResourceObservationLimit)return response({error:error.message,observation_pending:true},503);
+          if(error instanceof Error && error.message==='invalid_resource_cursor')return response({error:error.message},400);
+          throw error;
+        }
       }
       if (suffix === '/config' && request.method === 'PUT' && admin) {
         try { const data=await body(request); return response({config:this.resources.configure(data)}); }
@@ -2478,10 +2485,17 @@ export class FleetService {
         }
       } catch { /* harness reads as unknown below */ }
       }
-      const controlIds = new Map<string, string>();
-      if (want('launches')) {      try {
-        for (const row of this.sql.exec('SELECT id, fleet_launch_id FROM session_control_sessions WHERE fleet_launch_id IN (SELECT id FROM fleet_launches ORDER BY created_at DESC LIMIT 200)').toArray() as any[]) controlIds.set(row.fleet_launch_id, row.id);
-      } catch { /* optional session-control store */ }
+      const launchBefore=fleetParams.get('launches_cursor');
+      if(launchBefore!==null && (!/^\d{1,16}$/.test(launchBefore)||!Number.isSafeInteger(Number(launchBefore))))return response({error:'invalid_launches_cursor'},400);
+      const launchSource=want('launches')?(launchBefore
+        ?this.sql.exec('SELECT rowid AS page_rowid,* FROM fleet_launches WHERE rowid<? ORDER BY rowid DESC LIMIT 201',Number(launchBefore))
+        :this.sql.exec('SELECT rowid AS page_rowid,* FROM fleet_launches ORDER BY rowid DESC LIMIT 201')).toArray() as any[]:[];
+      const launchPage=launchSource.slice(0,200);
+      const controlIds=new Map<string,string>();let launchLinksLimited=false;
+      for(const launch of launchPage) {
+        const controls=this.sql.exec('SELECT id FROM session_control_sessions INDEXED BY session_control_fleet_lookup WHERE fleet_launch_id=? LIMIT 2',launch.id).toArray();
+        if(controls.length===1)controlIds.set(String(launch.id),String(controls[0].id));
+        if(controls.length>1)launchLinksLimited=true;
       }
       // Machine aliasing (mark, never delete): records sharing a normalized
       // hostname resolve to the live canonical host; sessions on a stale
@@ -2548,11 +2562,16 @@ export class FleetService {
         out.sessions_truncated = sessionsTruncated;
       }
       if (want('host_resources')) out.host_resources = this.hostResources();
-      if (want('resource_management')) out.resource_management = this.resources.overview();
+      if (want('resource_management')) {try{out.resource_management = this.resources.overview();}
+        catch(error){if(error instanceof ResourceObservationLimit)return response({error:error.message,observation_pending:true},503);throw error;}}
       if (want('placement')) out.placement = this.placementOverview();
       if (want('subscriptions')) out.subscriptions = this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
           harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() }));
-      if (want('launches')) out.launches = this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: ['queued','offered','failed'].includes(row.state) ? this.launchRejections(row) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, decision_score: selection?.decision_score ?? null, decision_reason: selection?.decision_reason ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; });
+      if (want('launches')) {out.launches = launchPage.map((row: any) => { const { page_rowid,request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: ['queued','offered','failed'].includes(row.state) ? this.launchRejections(row) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, decision_score: selection?.decision_score ?? null, decision_reason: selection?.decision_reason ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; });
+        out.launches_order='insertion_desc';out.launches_truncated=launchSource.length>200;
+        out.launches_cursor=launchSource.length>200?String(launchPage[launchPage.length-1].page_rowid):null;
+        out.launch_links_observation_limited=launchLinksLimited;
+      }
       return response(out);
     }
     const revokeMatch = /^\/api\/fleet\/machines\/([A-Za-z0-9_-]{1,64})\/revoke$/.exec(path);
@@ -2839,35 +2858,42 @@ export class FleetService {
           const cached = this.emptyOffers.get(caller.machineId!);
           if (cached && cached.stamp === offersStamp && polledAt >= cached.at && polledAt - cached.at < POLL_MAINTENANCE_MS) return response(cached.value);
         }
-        const valid: any[] = [];
-        for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
-          if (this.admission.retireInvalidOffer(row)) continue;
-          valid.push(row);
-          if (valid.length === 20) break;
+        const valid:any[]=[];
+        // The deployed machine/state index ends in rowid. Page its raw
+        // candidates BEFORE native-proof or admission filtering; filtering a
+        // whole starting history before LIMIT used to scan every old attempt.
+        const page=(state:string,cursors:Map<string,number>)=>{
+          const after=cursors.get(caller.machineId!)??0;
+          let rows=this.sql.exec(`SELECT rowid AS poll_rowid,* FROM fleet_launches INDEXED BY fleet_launch_machine_state
+            WHERE machine_id=? AND state=? AND rowid>? ORDER BY rowid LIMIT 65`,caller.machineId!,state,after).toArray() as any[];
+          if(!rows.length && after)rows=this.sql.exec(`SELECT rowid AS poll_rowid,* FROM fleet_launches INDEXED BY fleet_launch_machine_state
+            WHERE machine_id=? AND state=? AND rowid<=? ORDER BY rowid LIMIT 65`,caller.machineId!,state,after).toArray() as any[];
+          return {rows:rows.slice(0,64),more:rows.length>64};
+        };
+        const offeredPage=page('offered',this.offeredCursors);
+        let offeredConsumed=0;
+        for(const row of offeredPage.rows) {
+          offeredConsumed++;this.offeredCursors.set(caller.machineId!,Number(row.poll_rowid));
+          if(this.admission.retireInvalidOffer(row))continue;
+          valid.push(row);if(valid.length===20)break;
         }
-        // Intake 488b860e follow-up: an all-attempts claim timeout can land
-        // late server-side (state starting, attempt key stored, no native
-        // effect). Offered-only polling would never resurface it, so the
-        // same host could never replay the claim. Re-offer effect-free
-        // starting launches to the owning host with their stored key; the
-        // host resumes only on a journal key match, so a sibling loop's
-        // claim is never stolen. Rotation (not age order) guarantees no row
-        // starves: the retry window is the cycle right after the timeout,
-        // and a flood of newer rows or stale foreign rows can never pin a
-        // resumable launch out of the bounded window forever. The cursor is
-        // a value in the ORDER BY key with a wrap query, so rows past any
-        // fetch bound and rows inserted behind the cursor are still reached.
-        const resumeBase = "FROM fleet_launches WHERE machine_id = ? AND state = 'starting' AND native_id IS NULL AND launcher_task_id IS NULL";
-        const [cat, cid] = this.reofferCursors.get(caller.machineId!) ?? ['', ''];
-        const resumeRows = this.sql.exec(`SELECT * ${resumeBase} AND (updated_at > ? OR (updated_at = ? AND id > ?)) ORDER BY updated_at, id LIMIT 100`, caller.machineId!, cat, cat, cid).toArray() as any[];
-        if (resumeRows.length < 100) {
-          resumeRows.push(...this.sql.exec(`SELECT * ${resumeBase} AND NOT (updated_at > ? OR (updated_at = ? AND id > ?)) ORDER BY updated_at, id LIMIT ?`, caller.machineId!, cat, cat, cid, 100 - resumeRows.length).toArray() as any[]);
+        const resumePage=page('starting',this.reofferCursors);
+        const resumeRows:any[]=[];let resumeConsumed=0;
+        for(const row of resumePage.rows) {
+          resumeConsumed++;this.reofferCursors.set(caller.machineId!,Number(row.poll_rowid));
+          // A real native/process receipt can NEVER be offered as an
+          // effect-free retry. The original host still proves its claim key.
+          if(row.native_id!==null || row.launcher_task_id!==null)continue;
+          resumeRows.push(row);valid.push(row);if(valid.length===30)break;
         }
-        for (const row of resumeRows) {
-          valid.push(row);
-          this.reofferCursors.set(caller.machineId!, [row.updated_at, row.id]);
-          if (valid.length === 30) break;
-        }
+        const offeredPending=offeredPage.more || offeredConsumed<offeredPage.rows.length;
+        const resumePending=resumePage.more || resumeConsumed<resumePage.rows.length;
+        if(!offeredPending)this.offeredCursors.delete(caller.machineId!);
+        if(!resumePending)this.reofferCursors.delete(caller.machineId!);
+        // Preserve oldest waiting first within the bounded registration
+        // window; source cursor progress remains independent of host effects.
+        valid.sort((a,b)=>Number(a.state!=='offered')-Number(b.state!=='offered') ||
+          String(a.state==='offered'?a.created_at:a.updated_at).localeCompare(String(b.state==='offered'?b.created_at:b.updated_at)) || String(a.id).localeCompare(String(b.id)));
         const sessionTable = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
         const scopedWorkers = sessionTable && valid.length ? new Set(this.sql.exec(
           `SELECT fleet_launch_id FROM session_control_sessions WHERE fleet_launch_id IN (${valid.map(() => '?').join(',')}) AND json_extract(request_json,'$.intake_task_id') IS NOT NULL`,
@@ -2918,10 +2944,12 @@ export class FleetService {
               ...(row.state !== 'offered' ? { state: row.state, claim_key: row.claim_key ?? null } : {}) };
           });
         });
-        const body = { offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!), engine_epoch: engineEpoch(this.sql) };
+        const body = { offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!), engine_epoch: engineEpoch(this.sql),
+          observation_scope:'raw_state_page',observation_pending:offeredPending||resumePending,
+          offer_cursor:this.offeredCursors.get(caller.machineId!)??null,resume_cursor:this.reofferCursors.get(caller.machineId!)??null };
         // Only the all-clear answer is reusable: with offers present the poll
         // itself drives claim/resume rotation, so every answer is fresh.
-        if (offersStamp !== undefined && valid.length === 0 && resumeRows.length === 0) {
+        if (offersStamp !== undefined && valid.length === 0 && resumeRows.length === 0 && !offeredPending && !resumePending) {
           if (this.emptyOffers.size >= 8) this.emptyOffers.clear();
           this.emptyOffers.set(caller.machineId!, { stamp: this.writes!.stamp('fleet_launches','machines','fleet_accounts','fleet_routes','engine_epoch',
             'status_lifecycle_revision','fleet_catalog_seen','session_control_sessions'), at: polledAt, value: body });

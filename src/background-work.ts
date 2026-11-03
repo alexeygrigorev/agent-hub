@@ -1,3 +1,4 @@
+import { initJobBackgroundProducers } from './background-job-producers';
 import type { SqlStorage } from '@cloudflare/workers-types';
 
 export const BACKGROUND_QUEUE_CAPACITY = 128;
@@ -24,6 +25,7 @@ export class BackgroundWorkQueue {
     this.sql.exec('CREATE INDEX IF NOT EXISTS hub_background_due ON hub_background_work(due_ms,id)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS hub_background_count(id INTEGER PRIMARY KEY CHECK(id=1),pending INTEGER NOT NULL)');
     this.sql.exec('INSERT OR IGNORE INTO hub_background_count VALUES(1,0)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS hub_background_entity_seed(id INTEGER PRIMARY KEY CHECK(id=1),done INTEGER NOT NULL)');
     // Source-domain triggers may enqueue known IDs directly; count updates
     // remain atomic and constant work for those producers too.
     this.sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_background_capacity BEFORE INSERT ON hub_background_work
@@ -36,6 +38,7 @@ export class BackgroundWorkQueue {
   /** Install after source schemas exist. Producers address NEW.id only;
    * they cannot enumerate a fleet or turn a cron into maintenance work. */
   initEntityProducers(): void {
+    this.tx(() => initJobBackgroundProducers(this.sql,intent => this.enqueue(intent)));
     const epoch = (value: string) => `ROUND((julianday(${value})-2440587.5)*86400000)`;
     const install = (table: string, key: string, kind: BackgroundKind, active: string, due: string, entity = 'NEW.id') => {
       for (const event of ['INSERT','UPDATE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_background_${key}_${event.toLowerCase()}
@@ -56,6 +59,8 @@ export class BackgroundWorkQueue {
     const deliveryDue = `COALESCE(${epoch('NEW.next_attempt_at')},${epoch("'now'")})`;
     install('session_deliveries','delivery','webhook-delivery',"NEW.status IN ('pending','queued')",deliveryDue);
 
+    this.tx(() => {
+    if(this.sql.exec('SELECT done FROM hub_background_entity_seed WHERE id=1').toArray()[0]?.done)return;
     // Existing active work is real queued work, not retained history. Refuse
     // an incomplete restoration instead of silently dropping the 129th item.
     const intents = new Map<string, BackgroundIntent>();
@@ -83,6 +88,8 @@ export class BackgroundWorkQueue {
     const count=Number(this.sql.exec('SELECT pending FROM hub_background_count WHERE id=1').toArray()[0]?.pending);
     if(!Number.isSafeInteger(count)||count<0||count+additional>BACKGROUND_QUEUE_CAPACITY)throw new BackgroundQueueFull();
     for(const intent of intents.values())this.enqueue(intent);
+    this.sql.exec('INSERT OR REPLACE INTO hub_background_entity_seed VALUES(1,1)');
+    });
   }
 
   private validTime(value: number): void {

@@ -83,7 +83,7 @@ export class IntakeTriage {
     private watchdog: Pick<IntakeWatchdog, 'project'>, private tx: <T>(fn: () => T) => T,
     private hooks: TriageHooks = {}, private now = Date.now) {}
   init() {
-    this.sql.exec('CREATE TABLE IF NOT EXISTS intake_triage_meta(id INTEGER PRIMARY KEY CHECK(id=1),last_tick INTEGER,last_source TEXT,last_result TEXT)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS intake_triage_meta(id INTEGER PRIMARY KEY CHECK(id=1),last_tick INTEGER,last_source TEXT,last_result TEXT,last_session TEXT,last_alert TEXT,task_cursor TEXT NOT NULL DEFAULT \'\',request_cursor TEXT NOT NULL DEFAULT \'\')');
     this.sql.exec('INSERT OR IGNORE INTO intake_triage_meta(id) VALUES(1)');
     const cols = new Set(this.rows('PRAGMA table_info(intake_triage_meta)').map(row => row.name));
     for (const [name, def] of [['last_session','TEXT'],['last_alert','TEXT'],['task_cursor',"TEXT NOT NULL DEFAULT ''"],['request_cursor',"TEXT NOT NULL DEFAULT ''"]])

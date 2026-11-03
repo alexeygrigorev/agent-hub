@@ -183,3 +183,49 @@ describe('resource hotpaths ignore retained terminal history',()=>{
     expect(meter.snapshot()['alias-overflow'].rows_read).toBeLessThan(300);
   }));
 });
+
+describe('bounded offer and dashboard source windows',()=>{
+  it('pages past native-proven starting rows without scanning the whole population or reoffering positive effects',()=>fixture(async({f,raw,meter,iso}:any)=>{
+    raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2100)
+      INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+      SELECT 'started-'||i,'test','human','test','started-'||i,'{}','host','opencode','go','headless','/repo','test','starting','proof-'||i,?,? FROM n`,iso(),iso());
+    raw.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,claim_key,created_at,updated_at)
+      VALUES('late-retry','test','human','test','late-retry','{}','host','opencode','go','headless','/repo','test','starting','same-host-key',?,?)`,iso(),iso());
+    // Freeze unrelated periodic queue planning; this test measures the host
+    // candidate page, reconciliation and enrichment against retained rows.
+    (f as any).maintenanceDirty=false;(f as any).pollMaintenanceAt=Date.parse(iso());
+    let found=false;
+    for(let i=0;i<34;i++) {
+      const response=await meter.run('offer-page-'+i,()=>f.handle(new Request('https://hub.test/api/fleet/offers'),{caller:{kind:'host',machineId:'host',actor:'machine:host'},scopes:['host']}));
+      expect(response.status).toBe(200);
+      const body:any=await response.json();
+      for(const offer of body.offers){expect(offer.id).toBe('late-retry');expect(offer.claim_key).toBe('same-host-key');found=true;}
+      expect(meter.snapshot()['offer-page-'+i].rows_read).toBeLessThan(1000);
+    }
+    expect(found).toBe(true);
+  }));
+
+  it('returns dashboard insertion pages with a continuation instead of sorting all retained launches',()=>fixture(async({f,raw,meter,iso}:any)=>{
+    raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<21000)
+      INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+      SELECT 'dashboard-'||i,'test','human','test','dashboard-'||i,'{}','host','opencode','go','headless','/repo','test','exited',?,? FROM n`,iso(),iso());
+    const admin={caller:{kind:'human',actor:'test',isAdmin:true},scopes:['admin']};
+    const first=await meter.run('dashboard-first',()=>f.handle(new Request('https://hub.test/api/fleet?sections=launches'),admin));
+    expect(first.status).toBe(200);const page:any=await first.json();
+    expect(page.launches).toHaveLength(200);expect(page.launches_truncated).toBe(true);expect(page.launches_order).toBe('insertion_desc');
+    expect(meter.snapshot()['dashboard-first'].rows_read).toBeLessThan(500);
+    const next=await meter.run('dashboard-next',()=>f.handle(new Request('https://hub.test/api/fleet?sections=launches&launches_cursor='+page.launches_cursor),admin));
+    const second:any=await next.json();const firstIds=new Set(page.launches.map((row:any)=>row.id));
+    expect(second.launches).toHaveLength(200);expect(second.launches.some((row:any)=>firstIds.has(row.id))).toBe(false);
+    expect(meter.snapshot()['dashboard-next'].rows_read).toBeLessThan(500);
+  }));
+
+  it('bounds sparse CPU history before the measurement filter and refuses unknown defaults',()=>fixture(({r,raw,meter,iso}:any)=>{
+    raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2100)
+      INSERT INTO session_resource_usage(session_id,machine_id,native_id,started_at,finished_at,state,observed_at)
+      SELECT 'sparse-'||i,'history','sparse-'||i,?,?,'exited',? FROM n`,iso(),iso(),iso());
+    const view=meter.runSync('sparse-cpu',()=>r.cpuHeadroom('host'));
+    expect(view).toMatchObject({admitted:false,reason:'cpu_history_observation_limited',expected_cpu_source:'default_observation_limited'});
+    expect(meter.snapshot()['sparse-cpu'].rows_read).toBeLessThan(1600);
+  }));
+});

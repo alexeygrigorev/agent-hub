@@ -165,7 +165,7 @@ export class IntakeWatchdog {
     this.sql.exec('INSERT OR IGNORE INTO intake_watchdog_meta(id) VALUES(1)');
     this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_restart_queue(task_id TEXT PRIMARY KEY, state TEXT NOT NULL,
       reason TEXT NOT NULL, request_key TEXT, request_json TEXT, session_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-      next_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+      next_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, held_since INTEGER)`);
     const cols = (this.sql.exec('PRAGMA table_info(intake_restart_queue)').toArray() as any[]).map(c => c.name);
     if (!cols.includes('held_since')) this.sql.exec('ALTER TABLE intake_restart_queue ADD COLUMN held_since INTEGER');
     // Existing in-flight holds enter the TTL clock at their last update.
@@ -176,7 +176,7 @@ export class IntakeWatchdog {
     this.sql.exec("CREATE INDEX IF NOT EXISTS intake_queue_due ON intake_restart_queue(next_at,task_id) WHERE state='queued'");
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_due_cursor(id INTEGER PRIMARY KEY CHECK(id=1),next_at INTEGER NOT NULL,task_id TEXT NOT NULL)');
     this.sql.exec("INSERT OR IGNORE INTO intake_queue_due_cursor VALUES(1,-1,'')");
-    this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_cursor(id INTEGER PRIMARY KEY CHECK(id=1),after_id TEXT NOT NULL,forgotten_seen INTEGER NOT NULL DEFAULT 0)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS intake_queue_cursor(id INTEGER PRIMARY KEY CHECK(id=1),after_id TEXT NOT NULL,forgotten_seen INTEGER NOT NULL DEFAULT 0,sweep_after TEXT)');
     this.sql.exec("INSERT OR IGNORE INTO intake_queue_cursor(id,after_id) VALUES(1,'')");
     const cursorCols = (this.sql.exec('PRAGMA table_info(intake_queue_cursor)').toArray() as any[]).map(c => c.name);
     if (!cursorCols.includes('sweep_after')) this.sql.exec('ALTER TABLE intake_queue_cursor ADD COLUMN sweep_after TEXT');

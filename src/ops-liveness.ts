@@ -64,7 +64,7 @@ export class OpsLiveness {
 
   init() {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ops_liveness(role TEXT PRIMARY KEY, tick_at INTEGER, tick_summary TEXT,
-      watchdog_at INTEGER, watchdog_state TEXT, recovery_failures INTEGER NOT NULL DEFAULT 0, detail TEXT, updated_at INTEGER NOT NULL)`);
+      watchdog_at INTEGER, watchdog_state TEXT, recovery_failures INTEGER NOT NULL DEFAULT 0, detail TEXT, updated_at INTEGER NOT NULL, first_seen_at INTEGER)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ops_backlog_idle(id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL,
       resolved_at INTEGER, open_with_ac INTEGER NOT NULL, reason_json TEXT NOT NULL, kicks INTEGER NOT NULL DEFAULT 0,
       failed_kicks INTEGER NOT NULL DEFAULT 0, last_kick_at INTEGER, last_kick_json TEXT)`);

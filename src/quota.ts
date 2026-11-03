@@ -218,7 +218,8 @@ CREATE TABLE IF NOT EXISTS tbm_quota_pools (
     kill_switch_active INTEGER NOT NULL DEFAULT 0,
     kill_switch_reason TEXT,
     kill_switch_updated_at TEXT,
-    last_updated_ms INTEGER NOT NULL
+    last_updated_ms INTEGER NOT NULL,
+    quota_unit TEXT NOT NULL DEFAULT 'tokens'
 );
 CREATE TABLE IF NOT EXISTS tbm_banked_tranches (
     tranche_id TEXT PRIMARY KEY,
@@ -233,7 +234,9 @@ CREATE TABLE IF NOT EXISTS tbm_banked_tranches (
     banked_burn_rate_tpm REAL NOT NULL DEFAULT 0.0,
     target_banked_burn_rate_tpm REAL NOT NULL DEFAULT 0.0,
     expired_unused_tokens INTEGER NOT NULL DEFAULT 0,
-    updated_at_ms INTEGER NOT NULL
+    updated_at_ms INTEGER NOT NULL,
+    quantity_known INTEGER NOT NULL DEFAULT 1,
+    account TEXT
 );
 CREATE TABLE IF NOT EXISTS tbm_reward_events (
     event_id TEXT PRIMARY KEY,
@@ -249,7 +252,13 @@ CREATE TABLE IF NOT EXISTS tbm_reward_events (
     waste_at_reset_penalty REAL NOT NULL,
     banked_waste_penalty REAL NOT NULL,
     net_reward REAL NOT NULL,
-    token_efficiency_eta REAL NOT NULL
+    token_efficiency_eta REAL NOT NULL,
+    tokens_known INTEGER NOT NULL DEFAULT 0,
+    efficiency_known INTEGER NOT NULL DEFAULT 0,
+    tokens_burned INTEGER,
+    work_units REAL,
+    session_id TEXT,
+    event_kind TEXT NOT NULL DEFAULT 'session'
 );
 CREATE TABLE IF NOT EXISTS tbm_metrics_rollup (
     rollup_id TEXT PRIMARY KEY,
@@ -272,7 +281,9 @@ CREATE TABLE IF NOT EXISTS tbm_metrics_rollup (
     no_eligible_route_rate REAL NOT NULL,
     avg_time_to_outcome_seconds REAL NOT NULL,
     banked_tokens_burned INTEGER NOT NULL DEFAULT 0,
-    banked_tokens_expired_unused INTEGER NOT NULL DEFAULT 0
+    banked_tokens_expired_unused INTEGER NOT NULL DEFAULT 0,
+    tokens_known INTEGER NOT NULL DEFAULT 0,
+    efficiency_known INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pool_provider ON tbm_quota_pools(provider);
 CREATE INDEX IF NOT EXISTS idx_banked_edf ON tbm_banked_tranches(status, expires_at_ms ASC);

@@ -627,52 +627,78 @@ export class BusService {
    * (or its host bridge). An admin reading someone else's inbox does not mark anything.
    * Filters (§11): unread hides read messages; thread narrows to one thread id.
    */
-  inbox(caller: CallerContext, actor: string, limit: number = 50, cursor?: string, filters?: { unread?: boolean; thread?: string }): any[] {
+  private inboxOffsets = new Map<string, any[]>();
+
+  inbox(caller: CallerContext, actor: string, limit = 50, cursor?: string, filters?: { unread?: boolean; thread?: string }): any[] {
+    return this.inboxPage(caller,actor,limit,cursor,filters).rows;
+  }
+
+  inboxPage(caller: CallerContext, actor: string, limit = 50, cursor?: string, filters?: { unread?: boolean; thread?: string }): {rows:any[];next:string|null;truncated:boolean} {
+    const now=Date.now();
     this.prepareActorRoles([caller.actor,actor]);
-    const now = Date.now();
-    if (isRootRoleAddress(actor)) {
-      throw new Error(ROOT_AUTHORITY_ERROR);
+    if(isRootRoleAddress(actor))throw new Error(ROOT_AUTHORITY_ERROR);
+    if(!this.isAuthorizedForActor(caller,actor,now))throw new Error('unauthorized');
+    limit=Math.min(100,Math.max(1,limit));
+    const aliases=this.recipientAliases(actor);
+    if(!aliases.length || aliases.length>4)throw new Error('unauthorized');
+    const key=JSON.stringify([aliases,!!caller.isAdmin,!!filters?.unread,filters?.thread??null]);
+    const empty=()=>aliases.map(()=>[0,0,'']);
+    let offsets=cursor?empty():structuredClone(this.inboxOffsets.get(key)??empty());
+    if(cursor?.startsWith('ib1:')) {
+      try {
+        const parsed=JSON.parse(atob(cursor.slice(4)));
+        if(!Array.isArray(parsed)||parsed.length!==aliases.length||parsed.some(p=>!Array.isArray(p)||p.length!==3||
+          !Number.isSafeInteger(p[0])||p[0]<0||!Number.isSafeInteger(p[1])||p[1]<0||typeof p[2]!=='string'||p[2].length>128))throw new Error();
+        offsets=parsed;
+      } catch {throw new Error('invalid_cursor');}
+    } else if(cursor) {
+      if(this.hooks && /^\d+$/.test(cursor)) {
+        const seq=Number(cursor);if(!Number.isSafeInteger(seq))throw new Error('invalid_cursor');
+        offsets=aliases.map(()=>[0,seq,'']);
+      } else {
+        const row:any=this.sql.exec('SELECT rowid AS source_rowid,to_actor,recipient_seq FROM messages WHERE id=?',cursor).toArray()[0];
+        if(!row||!aliases.includes(row.to_actor))throw new Error('invalid_cursor');
+        offsets=aliases.map(alias=>this.hooks?[alias===row.to_actor&&row.recipient_seq==null?row.source_rowid:0,row.recipient_seq??0,'']:[0,0,cursor]);
+      }
     }
-
-    if (!this.isAuthorizedForActor(caller, actor, now)) throw new Error("unauthorized");
-
-    if (limit > 100) limit = 100;
-    if (limit < 1) limit = 1;
-
-    const aliases = this.recipientAliases(actor);
-    if (aliases.length === 0) throw new Error("unauthorized");
-
-    return this.runInTxn(() => {
-      let query = `SELECT * FROM messages WHERE to_actor IN (${aliases.map(() => '?').join(',')}) AND expires_at > ?${caller.isAdmin ? '' : ' AND registry_unbound_to = 0'}`;
-      const params: any[] = [...aliases, now];
-      if (filters?.unread) {
-        query += ' AND read_at IS NULL';
-      }
-      if (filters?.thread) {
-        query += ' AND thread_id = ?';
-        params.push(filters.thread);
-      }
-      if (cursor) {
-        if (this.hooks) {
-          const legacy = /^\d+$/.test(cursor) ? null : this.sql.exec('SELECT recipient_seq FROM messages WHERE id = ? AND to_actor IN (' + aliases.map(() => '?').join(',') + ')', cursor, ...aliases).toArray()[0];
-          if (legacy && legacy.recipient_seq == null) {
-            query += ' AND ((recipient_seq IS NULL AND id > ?) OR recipient_seq IS NOT NULL)';
-            params.push(cursor);
-          } else {
-            const seq = /^\d+$/.test(cursor) ? Number(cursor) : Number(legacy?.recipient_seq);
-            if (!Number.isSafeInteger(seq) || seq < 0) throw new Error('invalid_cursor');
-            query += ' AND recipient_seq > ?';
-            params.push(seq);
-          }
-        } else {
-          query += ' AND id > ?';
-          params.push(cursor);
+    const streams:{alias:number;kind:0|1|2;rows:any[];more:boolean}[]=[];
+    for(let i=0;i<aliases.length;i++) {
+      if(this.hooks) {
+        for(const kind of [0,1] as const) {
+          const raw=(kind===0
+            ? this.sql.exec('SELECT rowid AS inbox_rowid,* FROM messages WHERE to_actor=? AND recipient_seq IS NULL AND rowid>? ORDER BY rowid LIMIT ?',aliases[i],offsets[i][0],limit+1)
+            : this.sql.exec('SELECT rowid AS inbox_rowid,* FROM messages WHERE to_actor=? AND recipient_seq>? ORDER BY recipient_seq LIMIT ?',aliases[i],offsets[i][1],limit+1)).toArray() as any[];
+          streams.push({alias:i,kind,rows:raw.slice(0,limit),more:raw.length>limit});
         }
+      } else if(i===0) {
+        const raw=this.sql.exec('SELECT rowid AS inbox_rowid,* FROM messages WHERE id>? ORDER BY id LIMIT ?',offsets[0][2],limit+1).toArray() as any[];
+        streams.push({alias:0,kind:2,rows:raw.slice(0,limit),more:raw.length>limit});
       }
-      query += this.hooks ? ' ORDER BY recipient_seq ASC, id ASC LIMIT ?' : ' ORDER BY id ASC LIMIT ?';
-      params.push(limit);
-
-      const rows = this.sql.exec(query, ...params).toArray() as any[];
+    }
+    const eligible=(row:any)=>aliases.includes(row.to_actor) && row.expires_at>now && (caller.isAdmin||row.registry_unbound_to===0) &&
+      (!filters?.unread||row.read_at==null) && (!filters?.thread||row.thread_id===filters.thread);
+    const all=streams.flatMap(stream=>stream.rows).filter(eligible).sort((a,b)=>
+      this.hooks?(a.recipient_seq??-1)-(b.recipient_seq??-1)||String(a.id).localeCompare(String(b.id)):String(a.id).localeCompare(String(b.id)));
+    const rows=all.slice(0,limit), selected=new Set(rows.map(row=>row.id));
+    const next=structuredClone(offsets),resume=structuredClone(offsets);
+    let truncated=streams.some(stream=>stream.more)||all.length>limit;
+    for(const stream of streams) {
+      let firstEligible=false;
+      for(const row of stream.rows) {
+        const ok=eligible(row),position=stream.kind===0?row.inbox_rowid:stream.kind===1?row.recipient_seq:row.id;
+        if(!firstEligible&&!ok)resume[stream.alias][stream.kind]=position;
+        if(ok)firstEligible=true;
+        if(ok&&!selected.has(row.id)){truncated=true;break;}
+        next[stream.alias][stream.kind]=position;
+      }
+    }
+    // Only monotonically ineligible prefixes (read/expired/wrong thread/unbound)
+    // advance a cursor-less poll. Undelivered eligible rows remain repeatable.
+    if(!cursor) {
+      if(this.inboxOffsets.size>=512)this.inboxOffsets.delete(this.inboxOffsets.keys().next().value!);
+      this.inboxOffsets.set(key,resume);
+    }
+    return this.runInTxn(()=> {
       if (this.isRecipientPrincipal(caller, actor, now)) {
         if (caller.tokenId) {
           this.sql.exec(`INSERT INTO bus_reader_activity(recipient, credential_id, last_read_at) VALUES (?, ?, ?)
@@ -686,7 +712,7 @@ export class BusService {
           this.hooks?.onStage?.(row.id, 'delivered', caller.actor ?? null, caller.machineId ?? null, now);
         }
       }
-      return rows;
+      return {rows,next:truncated?'ib1:'+btoa(JSON.stringify(next)):null,truncated};
     });
   }
 
@@ -1086,6 +1112,7 @@ export class BusService {
     rows: any[]; next: string | null; truncated: boolean; order: 'id_desc'; scanned: number;
   } {
     const now = Date.now();
+    if(caller?.isRevoked)throw new Error('unauthorized');
     if (before && (before.length > 128 || /[\u0000-\u001f]/.test(before))) throw new Error('invalid_cursor');
     limit = Math.min(100,Math.max(1,Number.isSafeInteger(limit)?limit:100));
     let allowed: Set<string> | null = null;

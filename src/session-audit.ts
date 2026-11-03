@@ -255,7 +255,7 @@ export class SessionAuditService {
       session_id TEXT, machine_id TEXT, native_id TEXT, intake TEXT, engine TEXT, mode TEXT,
       idle_s INTEGER, rule TEXT NOT NULL, action TEXT NOT NULL, detail TEXT,
       action_key TEXT, outcome TEXT, outcome_at TEXT,
-      features_json TEXT NOT NULL, screen_tail TEXT)`);
+      features_json TEXT NOT NULL, screen_tail TEXT, dispatched INTEGER NOT NULL DEFAULT 1)`);
     try { this.sql.exec('ALTER TABLE session_audit_decisions ADD COLUMN dispatched INTEGER NOT NULL DEFAULT 1'); } catch { /* column exists */ }
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_audit_decisions_session ON session_audit_decisions(session_id, at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_audit_decisions_run ON session_audit_decisions(run_id)');

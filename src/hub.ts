@@ -239,7 +239,6 @@ export class Hub extends DurableObject {
   }
 
   private backgroundWork!: BackgroundWorkQueue;
-  private backgroundJobsStamp: string | null = null;
   private backgroundRootStamp: string | null = null;
   private backgroundAlarmStamp: string | null = null;
 
@@ -3013,7 +3012,6 @@ export class Hub extends DurableObject {
         this.backgroundWork.complete(work);
         if (work.kind === 'root-slot' && isRootSchedulingEnabled(this.sql)) this.enqueueRootSlot(Date.parse(entity)+1800000);
       } else this.backgroundWork.reschedule(work,due);
-      if (work.kind === 'job-deadline') this.backgroundJobsStamp = null;
     } catch (error) {
       if (error instanceof RowBudgetExceeded) throw error;
       console.error(JSON.stringify({event:'background_work_failed',kind:work.kind,id:work.id}));
@@ -3022,23 +3020,16 @@ export class Hub extends DurableObject {
     await this.armBackgroundQueue();
   }
 
-  /** The sole job head is refreshed only after job/lease state changes.
-   * Per-entity wake and delivery producers are transactional SQL triggers. */
+  /** Root policy changes schedule/cancel one explicit slot. Entity producers
+   * address known IDs transactionally; no shared deadline census is needed. */
   private async refreshBackgroundJobs() {
-    const stamp = this.writes.stamp('jobs','leases','job_claim_deadlines','root_scheduling');
-    const rootStamp = this.writes.stamp('root_scheduling');
-    if (rootStamp !== this.backgroundRootStamp) {
-      if (isRootSchedulingEnabled(this.sql)) {
-        const now=Date.now(), slot=Math.floor(now/1800000)*1800000;
-        this.enqueueRootSlot(now-slot<1500000 ? slot : slot+1800000);
-      } else this.backgroundWork.cancel('root-slot');
-      this.backgroundRootStamp=rootStamp;
-    }
-    if (stamp === this.backgroundJobsStamp) return;
-    const head = this.jobsService.nextBackgroundWork();
-    if (head) this.backgroundWork.enqueue({id:'head:job-deadline',kind:'job-deadline',dueAt:head.dueAt,payload:{entity_id:head.id}});
-    else this.backgroundWork.cancel('head:job-deadline');
-    this.backgroundJobsStamp = this.writes.stamp('jobs','leases','job_claim_deadlines','root_scheduling');
+    const stamp=this.writes.stamp('root_scheduling');
+    if(stamp===this.backgroundRootStamp)return;
+    if(isRootSchedulingEnabled(this.sql)) {
+      const now=Date.now(),slot=Math.floor(now/1800000)*1800000;
+      this.enqueueRootSlot(now-slot<1500000?slot:slot+1800000);
+    } else this.backgroundWork.cancel('root-slot');
+    this.backgroundRootStamp=stamp;
     await this.armBackgroundQueue();
   }
 
@@ -3711,13 +3702,14 @@ export class Hub extends DurableObject {
       }
 
       const cursor = url.searchParams.get('cursor') || url.searchParams.get('before') || undefined;
-      if (cursor && cursor.length > 128) return Response.json({ error: 'invalid_cursor' }, { status: 400 });
+      if (cursor && cursor.length > 1024) return Response.json({ error: 'invalid_cursor' }, { status: 400 });
 
       try {
         const deadline = Date.now() + waitMs;
         for (;;) {
-          const messages = this.busService.inbox(inboxCaller, actor!, limit, cursor, { unread, thread });
-          if (messages.length > 0 || Date.now() >= deadline) return Response.json(messages);
+          const page = this.busService.inboxPage(inboxCaller,actor!,limit,cursor,{unread,thread});
+          if(page.rows.length>0||page.truncated||Date.now()>=deadline) return Response.json(page.rows,{headers:{
+            'X-Hub-Inbox-Truncated':String(page.truncated),...(page.next?{'X-Hub-Inbox-Cursor':page.next}:{})}});
           await new Promise(resolve => setTimeout(resolve, 1000));
         }
       } catch (e: any) {
@@ -4137,7 +4129,7 @@ export class Hub extends DurableObject {
         const notice = unmappedWorkspace
           ? 'no claim policy maps this workspace to a Hub project — claims are not scoped to it; pass ?project= explicitly or configure fleet claim policy'
           : activeClaims.length === 0 && messages.length === 0
-            ? 'no active work declarations or recent bus activity in scope'
+            ? (historyPage.truncated?'Message history is paged; continue with message_cursor to inspect older activity.':'no active work declarations or recent bus activity in scope')
             : `${activeClaims.length} active work declaration${activeClaims.length === 1 ? '' : 's'}, ` +
               `${messages.length} recent bus message${messages.length === 1 ? '' : 's'} in scope — ` +
               'someone may already be on this; read the rows before starting overlapping work';

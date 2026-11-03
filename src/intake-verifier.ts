@@ -91,7 +91,7 @@ export class IntakeVerifier {
   constructor(private sql: SqlStorage, private intake: { statusAuthorizedTasks(p: Obj): Obj[]; watchdogTasks?(after: string, limit: number): Obj[]; statusTaskById?(p: Obj, id: string): Obj | undefined },
     private tx: <T>(fn: () => T) => T, private hooks: VerifierHooks = {}, private now = Date.now) {}
   init() {
-    this.sql.exec('CREATE TABLE IF NOT EXISTS intake_verifier_meta(id INTEGER PRIMARY KEY CHECK(id=1),enabled_at INTEGER NOT NULL,last_tick INTEGER,last_result TEXT)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS intake_verifier_meta(id INTEGER PRIMARY KEY CHECK(id=1),enabled_at INTEGER NOT NULL,last_tick INTEGER,last_result TEXT,task_cursor TEXT NOT NULL DEFAULT \'\')');
     const cols = new Set(this.rows('PRAGMA table_info(intake_verifier_meta)').map(row => row.name));
     if (!cols.has('task_cursor')) this.sql.exec("ALTER TABLE intake_verifier_meta ADD COLUMN task_cursor TEXT NOT NULL DEFAULT ''");
     this.sql.exec('INSERT OR IGNORE INTO intake_verifier_meta(id,enabled_at) VALUES(1,?)', this.now());
