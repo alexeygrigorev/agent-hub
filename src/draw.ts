@@ -4,7 +4,7 @@
  * A plain `hub sessions start` names no engine/model, so placement must not
  * deterministically stack every start on the single highest-scoring engine
  * (Codex luna). Instead the winner is drawn at random with weight
- * proportional to each eligible candidate's remaining quota headroom.
+ * proportional to each eligible candidate's composite decision score.
  *
  * Randomness is always injected as `rand: () => number`: production passes
  * `Math.random`, tests pass `mulberry32(seed)`. Pinned requests (engine or
@@ -24,9 +24,9 @@ export function mulberry32(seed: number): () => number {
 }
 
 /**
- * Split a plan into draw-eligible candidates and normalized headroom probabilities.
- * Overflow, degraded and depleted routes are excluded; positive finite remaining
- * quota percentages determine each candidate's share of the draw.
+ * Split a plan into draw-eligible candidates and normalized decision-score
+ * probabilities. Overflow, degraded and depleted routes are excluded; positive
+ * finite computeEngineDecision scores determine each candidate's share.
  */
 export function autoStartDrawDistribution<T extends Record<string, any>>(candidates: T[]): {
   eligible: T[];
@@ -38,10 +38,10 @@ export function autoStartDrawDistribution<T extends Record<string, any>>(candida
   const weights: number[] = [];
   for (const candidate of candidates) {
     if (candidate.overflow || candidate.degraded || candidate.decision?.factors?.depleted) continue;
-    const remainingPct = candidate.decision?.factors?.remaining_pct;
-    if (typeof remainingPct !== 'number' || !Number.isFinite(remainingPct) || remainingPct <= 0) continue;
+    const decisionScore = candidate.decision?.score;
+    if (typeof decisionScore !== 'number' || !Number.isFinite(decisionScore) || decisionScore <= 0) continue;
     eligible.push(candidate);
-    weights.push(remainingPct);
+    weights.push(decisionScore);
   }
   const total = weights.reduce((sum, weight) => sum + weight, 0);
   const probabilities = new Map<T, number>();
