@@ -226,11 +226,23 @@ describe('scoped durable worker access',()=>{
    expect([403,404]).toContain((await call(path,undefined,worker.access_token)).status);
  }));
 
- it.each(['headless','interactive'])('%s reads project intakes and appends only authorized notes/report/blocker, never decisions or close',(mode)=>setup(async({task,other,worker,call}:any)=>{
+ it.each(['headless','interactive'])('%s reads project intakes and appends only authorized notes/report/blocker, never decisions or close',(mode)=>setup(async({stub,task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const outside=uuid();
+  await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',outside,JSON.stringify({id:outside,project:'other-project',status:'open',version:1,created_at:Date.now(),updated_at:Date.now(),title:'outside',history:[]})));
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task+'/history')).status).toBe(200);
   expect((await api('/api/intake/tasks/'+other)).status).toBe(200); // same-project reads are permitted
+  const detailStats=await api('/api/intake/tasks/'+task+'/stats');
+  expect(detailStats.status,await detailStats.clone().text()).toBe(200);
+  expect((await detailStats.json() as any).stats.id).toBe(task);
+  expect((await api('/api/intake/tasks/'+outside+'/stats')).status).toBe(403);
+  const table=await api('/api/intake/stats?window=all&sort=attempt_count');
+  expect(table.status,await table.clone().text()).toBe(200);
+  const visibleStats:any=await table.json();
+  expect(visibleStats.items.map((row:any)=>row.id).sort()).toEqual([task,other].sort());
+  expect((await api('/api/intake/tasks/'+task+'/stats',{})).status).toBe(403);
+  expect((await api('/api/intake/stats',{})).status).toBe(403);
   expect((await api('/api/intake/tasks')).status).toBe(403);
   let version=1;
   for(const kind of ['note','report','blocker']) {

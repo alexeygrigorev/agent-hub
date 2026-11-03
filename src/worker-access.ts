@@ -169,7 +169,7 @@ export function workerCreatedTargets(sql: SqlStorage, sessionId: string | null |
   return new Set(sql.exec('SELECT task_id FROM worker_created_intakes WHERE session_id=? ORDER BY task_id LIMIT ?', sessionId, WORKER_CREATE_LIMIT)
     .toArray().map((r: any) => r.task_id as string));
 }
-const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context|\/depend|\/blocker|\/decompose)?$/;
+const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context|\/depend|\/blocker|\/decompose|\/stats)?$/;
 /** Intake 08658ee8 AC3: unique short-id prefixes (>= 8 chars, like sessions)
  * resolve to the full task id for the worker's own, created and linked intakes.
  * Triage requests stay exact-id (intake d8d509d2), so the caller passes the raw
@@ -213,6 +213,8 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
   }
   // Filing a follow-up intake; the intake service records provenance and caps volume.
   if (path === '/api/intake/tasks') return request.method === 'POST';
+  // The handler limits this read-only aggregate to tasks visible under the worker grant.
+  if (path === '/api/intake/stats') return request.method === 'GET';
   // Only the release handler opens: it rechecks the exact claim owner under
   // the effect transaction. This grants no claim listing or creation scope.
   if (/^\/api\/bus\/claims\/[^/]+\/release$/.test(path)) return request.method === 'POST';
