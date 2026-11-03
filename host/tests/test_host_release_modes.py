@@ -57,7 +57,12 @@ class HostReleaseModesTest(unittest.TestCase):
             release = root / ("a" * 40)
             release.mkdir(parents=True)
             (release / "release-manifest.json").write_text(json.dumps({"release_rev": "a" * 40}))
-            self.assertEqual(modes.validate_installed_release(release, root), release.resolve())
+            orch_root = Path(temp) / "host-releases-orch"
+            orch_release = orch_root / ("c" * 40)
+            orch_release.mkdir(parents=True)
+            (orch_release / "release-manifest.json").write_text(json.dumps({"release_rev": "c" * 40}))
+            self.assertEqual(modes.validate_installed_release(release, (root, orch_root)), release.resolve())
+            self.assertEqual(modes.validate_installed_release(orch_release, (root, orch_root)), orch_release.resolve())
 
             outside = Path(temp) / "unrelated"
             outside.mkdir()
