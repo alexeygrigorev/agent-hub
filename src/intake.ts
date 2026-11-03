@@ -2278,14 +2278,24 @@ export class IntakeService {
     project: string;
     title: string;
     text: string;
+    acceptanceCriteria?: string | null;
     currentState?: string | null;
     nextStep?: string | null;
+    sourceType?: string;
     sourceRef?: string;
+    sourceTimestamp?: string | null;
+    intakeKey?: string;
     actor?: string;
     now?: number;
-  }): { ok: true; taskId: string } | { ok: false; error: string } {
+  }): { ok: true; taskId: string; deduplicated?: boolean } | { ok: false; error: string } {
     return this.tx(() => {
       const now = input.now ?? Date.now();
+      const key = input.intakeKey ? str(input.intakeKey, 160) : null;
+      const receiptId = key ? 'service:intake:' + key : null;
+      if (receiptId) {
+        const prev = this.get('receipts', receiptId);
+        if (prev?.taskId && this.get('tasks', prev.taskId)) return { ok: true, taskId: prev.taskId, deduplicated: true };
+      }
       try {
         this.prune(now);
         // t1038u: task row count is soft; only aggregate byte budget refuses create.
@@ -2294,7 +2304,8 @@ export class IntakeService {
         return { ok: false, error: e?.code || 'capacity_exceeded' };
       }
       const taskId = crypto.randomUUID();
-      const flag = classifyScope(input.project, str(input.title, 256), str(input.text, 8192), null);
+      const ac = input.acceptanceCriteria == null ? null : acNullable(input.acceptanceCriteria);
+      const flag = classifyScope(input.project, str(input.title, 256), str(input.text, 8192), ac);
       const task: Obj = {
         id: taskId,
         project: input.project,
@@ -2307,7 +2318,7 @@ export class IntakeService {
         next_step: input.nextStep ?? null,
         owner: null,
         uncertainty: null,
-        acceptance_criteria: null,
+        acceptance_criteria: ac,
         scope: { policy_version: SCOPE_POLICY_VERSION, flag: flag.flag, matched_terms: flag.matched_terms },
         history: [
           {
@@ -2316,8 +2327,13 @@ export class IntakeService {
             actor: input.actor || 'hub:service:system',
             captured_at: now,
             text: str(input.text, 8192),
-            source: { type: 'unknown', reference: nullable(input.sourceRef, 2048), timestamp: new Date(now).toISOString() },
+            source: {
+              type: input.sourceType || 'unknown',
+              reference: nullable(input.sourceRef, 2048),
+              timestamp: input.sourceTimestamp !== undefined ? input.sourceTimestamp : new Date(now).toISOString(),
+            },
             authority: 'operator_record',
+            ...(key ? { intake_key: key } : {}),
           },
         ],
       };
@@ -2326,6 +2342,7 @@ export class IntakeService {
       try { this.capacity(encoded(task) + new TextEncoder().encode(task.id).byteLength); }
       catch (e: any) { return { ok: false, error: e.code || 'storage_capacity' }; }
       this.put('tasks', task);
+      if (receiptId) this.put('receipts', { id: receiptId, taskId, captured_at: now });
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
       return { ok: true, taskId };
     });
@@ -2339,19 +2356,27 @@ export class IntakeService {
     status?: string;
     currentState?: string | null;
     nextStep?: string | null;
+    acceptanceCriteria?: string | null;
     event?: {
       kind: string;
       text: string;
       actor?: string;
+      sourceType?: string;
       sourceRef?: string;
+      sourceTimestamp?: string | null;
+      intakeKey?: string;
       authority?: string;
     };
     now?: number;
-  }): { ok: true; task: Obj } | { ok: false; error: string } {
+  }): { ok: true; task: Obj; deduplicated?: boolean } | { ok: false; error: string } {
     return this.tx(() => {
       const task = this.get('tasks', taskId);
       if (!task) return { ok: false, error: 'not_found' };
       const now = input.now ?? Date.now();
+      const eventKey = input.event?.intakeKey ? str(input.event.intakeKey, 160) : null;
+      if (eventKey && (task.history || []).some((e: Obj) => e?.intake_key === eventKey)) {
+        return { ok: true, task, deduplicated: true };
+      }
       const priorBytes = !task.archived_at && OPEN.includes(task.status) ? encoded(task) : 0;
 
       if (input.status) {
@@ -2365,16 +2390,24 @@ export class IntakeService {
       if (input.nextStep !== undefined) {
         task.next_step = input.nextStep !== null ? str(input.nextStep, 8192) : null;
       }
+      if (input.acceptanceCriteria !== undefined) {
+        task.acceptance_criteria = input.acceptanceCriteria !== null ? acNullable(input.acceptanceCriteria) : null;
+      }
 
       if (input.event) {
-        const newEvent = {
+        const newEvent: Obj = {
           id: crypto.randomUUID(),
           kind: input.event.kind,
           actor: input.event.actor || 'hub:service:system',
           captured_at: now,
           text: str(input.event.text, 8192),
-          source: { type: 'unknown', reference: nullable(input.event.sourceRef, 2048), timestamp: new Date(now).toISOString() },
+          source: {
+            type: input.event.sourceType || 'unknown',
+            reference: nullable(input.event.sourceRef, 2048),
+            timestamp: input.event.sourceTimestamp !== undefined ? input.event.sourceTimestamp : new Date(now).toISOString(),
+          },
           authority: input.event.authority || 'operator_record',
+          ...(eventKey ? { intake_key: eventKey } : {}),
         };
 
         task.history = task.history || [];

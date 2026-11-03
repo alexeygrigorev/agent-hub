@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
-from . import auth, config, fleet, self_update, session_control, session_messages
+from . import auth, config, fleet, replica_watcher, self_update, session_control, session_messages
 from .dispatch_diagnostics import MESSAGES as DISPATCH_MESSAGES
 from .disk_monitor import DiskMonitor
 from .host_health_monitor import HostHealthMonitor
@@ -990,6 +990,11 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             release_thread = maybe_start_named_thread(
                 None, lambda *args: self_update.loop(*args, launcher_settings=lambda: dispatcher.settings, log=_log),
                 (lambda *a: dispatcher.request(*a), release_stop), 'host-release')
+            # Intake 290b935a: token-free ask ledger feed from local Grok Bot
+            # transcript replicas; disabled where the replica dir is absent.
+            maybe_start_named_thread(
+                None, replica_watcher.loop,
+                (lambda *a: dispatcher.request(*a), stop, str(journal), cfg['machine_id']), 'replica-watcher')
             while not stop.is_set() and (cycles is None or count < cycles):
                 if release_stop.is_set():
                     (journal / RELEASE_RESTART_MARKER).write_text('restart\n', encoding='utf-8')

@@ -79,7 +79,14 @@ async function refresh() {
       return card;
     }));
     const s = await get('/api/asks/summary');
+    const rec = s.meta?.reconcile || {};
+    const recNodes = [];
+    if (rec.last_run) {
+      const r = rec.last_run;
+      recNodes.push(node('p', `Latest reconcile (${when(r.ran_at)}): cursor ${r.from_cursor}..${r.to_cursor}, scanned ${r.scanned_messages} msg(s), found ${r.found_asks} ask(s) → created ${r.created} [${(r.created_ids || []).map(id => id.slice(0, 8)).join(', ') || 'none'}], appended ${r.appended} [${(r.appended_ids || []).map(id => id.slice(0, 8)).join(', ') || 'none'}], mapped ${r.mapped}`));
+    }
     sourcesEl.replaceChildren(
+      ...recNodes,
       ...s.sources.map(x => node('p', `${x.source} on ${x.machine_id}: last ingest ${when(x.last_ingest_at)}${x.alerted ? ' — SILENT (alerted)' : ''}`)),
       ...s.gaps.filter(g => !g.resolved_at).map(g => node('p', `Unrecorded ${g.scope === '*' ? 'all agents' : g.scope}: t${g.from_seq}–t${g.to_seq} (${g.kind})`)));
   } catch (e) { status.textContent = e.message; }
