@@ -1,6 +1,8 @@
 """Permission checks for immutable Agent Hub host release trees."""
 
+import json
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -65,9 +67,17 @@ def validate_installed_release(release, releases_root=DEFAULT_RELEASES_ROOT):
     target = release.resolve(strict=True)
     if target.parent != root or not target.is_dir():
         raise ValueError("release must be a direct child of the configured releases root")
+    if not re.fullmatch(r"[0-9a-f]{40}", target.name):
+        raise ValueError("release directory name must be a full lowercase commit SHA")
     manifest = target / "release-manifest.json"
     if manifest.is_symlink() or not manifest.is_file():
         raise ValueError("release-manifest.json is required")
     if not stat.S_ISREG(manifest.stat(follow_symlinks=False).st_mode):
         raise ValueError("release-manifest.json must be a regular file")
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("release-manifest.json must be valid JSON") from exc
+    if not isinstance(data, dict) or data.get("release_rev") != target.name:
+        raise ValueError("release manifest SHA must match its directory name")
     return target
