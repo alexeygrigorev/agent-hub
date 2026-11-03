@@ -42,24 +42,31 @@ describe('private repo registry', () => {
       });
     const target = 'runtime-target-' + crypto.randomUUID();
     const copy = 'runtime-copy-' + crypto.randomUUID();
-    const seeded = await call('/seed', 'POST', { repos: [
-      repo({ name: target, aliases: [] }), repo({ name: copy, aliases: [] }),
-    ] });
-    expect(seeded.status, await seeded.clone().text()).toBe(200);
-    const update = { status: 'duplicate', canonical: target };
-    expect((await call('/' + copy, 'PATCH', update, false)).status).toBe(401);
-    const patched = await call('/' + copy, 'PATCH', update);
-    expect(patched.status, await patched.clone().text()).toBe(200);
-    expect(await patched.json()).toMatchObject({ repo: { name: copy, ...update } });
-    const refreshed = await call('/refresh', 'POST', { repos: [{
-      name: copy, machine: 'hetzner', dir: '/srv/git/copy', status: 'active', canonical: null,
-    }] });
-    expect(refreshed.status, await refreshed.clone().text()).toBe(200);
-    const shown = await call('/' + copy);
-    expect(await shown.json()).toMatchObject({ repo: { name: copy, ...update }, canonical: target });
-    const invalid = await call('/' + copy, 'PATCH', { status: 'duplicate', canonical: copy });
-    expect(invalid.status).toBe(400);
-    expect(await invalid.json()).toEqual({ error: 'invalid_canonical' });
+    try {
+      const seeded = await call('/seed', 'POST', { repos: [
+        repo({ name: target, aliases: [] }), repo({ name: copy, aliases: [] }),
+      ] });
+      expect(seeded.status, await seeded.clone().text()).toBe(200);
+      const update = { status: 'duplicate', canonical: target };
+      expect((await call('/' + copy, 'PATCH', update, false)).status).toBe(401);
+      const patched = await call('/' + copy, 'PATCH', update);
+      expect(patched.status, await patched.clone().text()).toBe(200);
+      expect(await patched.json()).toMatchObject({ repo: { name: copy, ...update } });
+      const refreshed = await call('/refresh', 'POST', { repos: [{
+        name: copy, machine: 'hetzner', dir: '/srv/git/copy', status: 'active', canonical: null,
+      }] });
+      expect(refreshed.status, await refreshed.clone().text()).toBe(200);
+      const shown = await call('/' + copy);
+      expect(await shown.json()).toMatchObject({ repo: { name: copy, ...update }, canonical: target });
+      const invalid = await call('/' + copy, 'PATCH', { status: 'duplicate', canonical: copy });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toEqual({ error: 'invalid_canonical' });
+    } finally {
+      const stub = binding.HUB.get(binding.HUB.idFromName('hub'));
+      await runInDurableObject(stub, (hub: Hub) => {
+        hub.sql.exec('DELETE FROM repo_registry WHERE name IN (?, ?)', target, copy);
+      });
+    }
   });
   it('proves PATCH API readiness using a missing repo without writing', async () => {
     const binding = env as unknown as Env;
