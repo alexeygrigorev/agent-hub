@@ -1713,7 +1713,7 @@ describe('multi-host repository placement', () => {
     await configure(service);
     bindRepos(service, sql);
     catalog(sql);
-    const reserved = service.reserve(intent({workspace:'repo-demo'}), admin);
+    const reserved = service.reserve(intent({workspace:'repo-demo',machine:'hetzner'}), admin);
     expect(reserved.status).toBe(201);
     const intake = crypto.randomUUID();
     sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,created_at,updated_at)
@@ -1785,7 +1785,17 @@ describe('multi-host repository placement', () => {
     const row:any = sql.exec('SELECT capabilities FROM machines WHERE id=?', 'hetzner').one();
     sql.exec('UPDATE machines SET capabilities=? WHERE id=?', JSON.stringify({...JSON.parse(row.capabilities),
       workspaces:['/srv/repos','/srv/trees'], repo_worktree_root:'/srv/trees'}), 'hetzner');
-    const input = intent({workspace:'repo-demo', access:{mode:'read'}});
+    const input = intent({workspace:'repo-demo', machine:'hetzner', access:{mode:'read'}});
+    // The replayed reserve re-plans before matching the idempotency key, so
+    // the pinned host needs a free slot for the replay to normalize alike.
+    const roomy = { accounts: [
+      { label: 'shared-codex', provider: 'codex', max_concurrency: 5, reserve_percent: 15, enabled: true },
+      { label: 'desktop-codex', provider: 'codex', max_concurrency: 5, reserve_percent: 15, enabled: true },
+    ], routes: [
+      { machine_id: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null },
+      { machine_id: 'win35', engine: 'codex', account: 'desktop-codex', profile: null },
+    ] };
+    expect((await service.handle(request('/accounts', roomy, 'PUT'), admin)).status).toBe(200);
     const first = service.reserve(input, admin);
     expect(first.status).toBe(201);
     const stored:any = sql.exec('SELECT workspace,request_json FROM fleet_launches WHERE id=?', first.value.id).one();
