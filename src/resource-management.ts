@@ -21,8 +21,7 @@ export const NEXT_SLOT_MB = defaults.ramp_reserve_default_mb;
 // window is already counted in the host's MemAvailable, and the host re-runs
 // its own memory gate before every claim.
 export const IN_FLIGHT_RESERVE_SECONDS = 600;
-/** A host is memory-full only below this MemAvailable (Alexey t2362u-t2363u); CPU-full is >=98% busy over >=10s (CPU_SATURATED_PCT). */
-export const MEMORY_FULL_MB = 6144;
+/** CPU-full is >=98% busy over >=10s (CPU_SATURATED_PCT). Memory fullness uses the configured, host-scaled floor below. */
 export const CPU_LOAD_FACTOR = defaults.cpu_load_factor;
 export type ResourceConfig = typeof defaults;
 const parse = (s: any): any => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
@@ -911,18 +910,24 @@ export class ResourceManagement {
    * typical tasks fit by the ledger's own p90 estimates. Never derived from load average. */
   capacity(m: any, hb: any, caps: any, cpu: any) {
     const memAvail = finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null;
+    const config = this.config();
+    // Keep the displayed fullness verdict and task estimate on the same
+    // per-host policy used by admission (3% of RAM, bounded to 512 MiB–2 GiB).
+    // A fixed 6 GiB threshold marked healthy 32 GiB hosts full despite the
+    // host and launch paths correctly reporting an approximately 1 GiB floor.
+    const memoryFloorMb = effectiveFloorMb(config, hb.mem_total_mb);
     const cores = Number.isSafeInteger(caps.cpu_count) && caps.cpu_count > 0 ? caps.cpu_count : null;
     const busy = finite(cpu.current_cpu_cores) ? cpu.current_cpu_cores : null;
     const reasons: string[] = [];
     if (cpu.cpu_saturated === true) reasons.push('cpu_busy_over_'+CPU_SATURATED_PCT+'pct_10s');
-    if (memAvail !== null && memAvail < MEMORY_FULL_MB) reasons.push('mem_available_below_'+MEMORY_FULL_MB+'mb');
+    if (memAvail !== null && memAvail < memoryFloorMb) reasons.push('mem_available_below_'+memoryFloorMb+'mb');
     const perTaskCpu = this.cpuEstimate(null, null).expected_cpu_cores;
     const rows = this.sql.exec('SELECT COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500').toArray() as any[];
-    const p90 = percentile(rows.map(r => Number(r.peak_rss_mb)), this.config().estimate_percentile);
-    const perTaskMem = Math.ceil(Math.min(this.config().estimate_cap_mb, Math.max(64, p90 === null ? this.config().ramp_reserve_default_mb : p90 * this.config().estimate_multiplier)));
+    const p90 = percentile(rows.map(r => Number(r.peak_rss_mb)), config.estimate_percentile);
+    const perTaskMem = Math.ceil(Math.min(config.estimate_cap_mb, Math.max(64, p90 === null ? config.ramp_reserve_default_mb : p90 * config.estimate_multiplier)));
     const freeCores = cores !== null && busy !== null ? Math.max(0, cores - busy) : null;
     const byCpu = freeCores !== null && perTaskCpu > 0 ? Math.floor(freeCores / perTaskCpu) : null;
-    const byMem = memAvail !== null ? Math.max(0, Math.floor((memAvail - MEMORY_FULL_MB) / perTaskMem)) : null;
+    const byMem = memAvail !== null ? Math.max(0, Math.floor((memAvail - memoryFloorMb) / perTaskMem)) : null;
     const known = [byCpu, byMem].filter((v): v is number => v !== null);
     return { machine_id: String(m.id), cores, cpu_busy_cores: busy, cpu_busy_percent: finite(cpu.current_cpu_cores) && cores ? Math.round(cpu.current_cpu_cores / cores * 1000) / 10 : null,
       cpu_busy_percent_10s: cpu.busy_percent_window ?? null, cpu_window_s: cpu.window_s ?? null, free_cores: freeCores,

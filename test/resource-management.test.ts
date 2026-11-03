@@ -542,7 +542,7 @@ describe('resource management',()=>{
   expect(r.cpuEstimate('other','review','codex','unseen').expected_cpu_source).toBe('global');
  }));
 
- it('reports per-machine headroom: full only when CPU>=98% over 10s or MemAvailable<6G, never from load',async()=>fixture(async(r,sql)=>{
+ it('reports per-machine headroom: full only when CPU>=98% over 10s or MemAvailable is below its host-scaled floor, never from load',async()=>fixture(async(r,sql)=>{
   const hb=(extra:any)=>sql.exec("UPDATE machines SET capabilities=?,last_heartbeat=? WHERE id='host'",JSON.stringify({cpu_count:8}),
    JSON.stringify({mem_avail_mb:20000,mem_total_mb:32000,load:[90,90,90],cpu_usage:{busy_percent:50,busy_cores:4,cores:8,interval_s:.2,observed_at:iso(),busy_percent_window:50,window_s:30},...extra}));
   const cap=()=>r.overview().hosts.find((h:any)=>h.machine_id==='host')!.capacity;
@@ -551,7 +551,9 @@ describe('resource management',()=>{
   expect(cap().extra_tasks).toBeGreaterThan(0);
   hb({cpu_usage:{busy_percent:99,busy_cores:7.92,cores:8,interval_s:.2,observed_at:iso(),busy_percent_window:99,window_s:30}});
   expect(cap()).toMatchObject({full:true,full_reasons:['cpu_busy_over_98pct_10s'],extra_tasks:0});
-  hb({mem_avail_mb:5000});
-  expect(cap()).toMatchObject({full:true,full_reasons:['mem_available_below_6144mb']});
+  hb({mem_avail_mb:3504,mem_total_mb:32768});
+  expect(cap()).toMatchObject({full:false,full_reasons:[]});
+  hb({mem_avail_mb:900,mem_total_mb:32768});
+  expect(cap()).toMatchObject({full:true,full_reasons:['mem_available_below_983mb']});
  }));
 });
