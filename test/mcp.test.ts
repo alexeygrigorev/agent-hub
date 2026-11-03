@@ -504,7 +504,7 @@ describe('OAuth discovery, DCR, consent, PKCE and credential lifecycle', () => {
     try { expect((await redeem(second)).status).toBe(400); }
     finally { await inHub(h => h.sql.exec('UPDATE users SET email=? WHERE sub=?', 'admin@fake.local', sub)); }
   });
-  it('rotates refresh tokens with client binding and revokes the entire family', async () => {
+  it('rotates refresh tokens with client binding and replays the same human successor within grace', async () => {
     const g = await grant(); const t: any = await (await redeem(g)).json();
     const refresh = { client_id: g.client.client_id, resource: origin + '/mcp', grant_type: 'refresh_token', refresh_token: t.refresh_token };
     expect((await form('/oauth/token', { ...refresh, client_id: (await register()).client_id })).status).toBe(400);
@@ -512,8 +512,11 @@ describe('OAuth discovery, DCR, consent, PKCE and credential lifecycle', () => {
     expect(direct.status).toBe(400);
     const r = await form('/oauth/token', refresh); expect(r.status).toBe(200);
     const rotated: any = await r.json(); expect(rotated.access_token).not.toBe(t.access_token);
-    expect((await form('/oauth/token', refresh)).status).toBe(400);
-    expect((await rpc('ping', undefined, rotated.access_token)).status).toBe(401);
+    const replay = await form('/oauth/token', refresh); expect(replay.status).toBe(200);
+    const replayed: any = await replay.json();
+    expect(replayed.access_token).toBe(rotated.access_token);
+    expect(replayed.refresh_token).toBe(rotated.refresh_token);
+    expect((await rpc('ping', undefined, rotated.access_token)).status).toBe(200);
     const fresh: any = await (await redeem(await grant(g.client))).json();
     expect((await form('/oauth/revoke', { client_id: g.client.client_id, token: fresh.refresh_token })).status).toBe(200);
     expect((await rpc('ping', undefined, fresh.access_token)).status).toBe(401);
