@@ -123,6 +123,27 @@ export class LivenessService {
     let sessionRows: any[] = [];
     try { sessionRows = this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray() as any[]; } catch { sessionRows = []; }
     const catalogSeen = freshCatalogs(this.sql, now);
+    const refusedStops = new Map<string, string>();
+    try {
+      const rows = this.sql.exec(`SELECT s.machine_id, json_extract(s.binding_json, '$.native_id') AS native_id,
+          c.state, c.ack_json FROM session_control_sessions s JOIN session_control_commands c ON c.session_id = s.id
+        WHERE c.kind = 'stop' ORDER BY c.updated_at DESC, c.id DESC`).toArray() as any[];
+      for (const row of rows) {
+        if (typeof row.machine_id !== 'string' || typeof row.native_id !== 'string') continue;
+        const key = row.machine_id + '/' + row.native_id;
+        if (refusedStops.has(key)) continue;
+        // The first command is the latest one. A later successful or pending
+        // stop supersedes historical refusal evidence for the alert detail.
+        refusedStops.set(key, '');
+        if (row.state !== 'refused') continue;
+        let reason = 'host refused stop';
+        try {
+          const ack = JSON.parse(row.ack_json ?? 'null');
+          if (typeof ack?.reason === 'string' && ack.reason) reason = ack.reason.slice(0, 128);
+        } catch { /* keep a useful refusal label even for legacy receipts */ }
+        refusedStops.set(key, reason);
+      }
+    } catch { /* installations without session control tables have no stop receipts */ }
     for (const s of projectAliasSessions(sessionRows, aliasOf, now, catalogSeen)) {
       reported.add(s.machine_id + '/' + s.native_id);
       // A late catalog may already report under the canonical id while older
@@ -142,6 +163,8 @@ export class LivenessService {
       else if (s.phase !== 'running') { state = ['starting','exiting','uncertain','broken'].includes(s.phase) ? s.phase : 'unknown'; detail = `phase ${s.phase}`; }
       else if (s.agent_state === 'working') { state = 'working'; detail = activity === null ? 'working' : `active ${activity}s ago`; }
       else { state = s.agent_state ? 'idle' : 'running'; detail = `${s.agent_state || 'no agent state'}${activity === null ? '' : `, active ${activity}s ago`}`; }
+      const stopRefusal = state === 'stalled' ? refusedStops.get(s.machine_id + '/' + s.native_id) || undefined : undefined;
+      if (stopRefusal) detail += `; stop refused (${stopRefusal})`;
       if (alias) detail += ` (same host ${hostnames.get(String(s.machine_id)) ?? 'unknown'}; reporting via ${label(resolved)})`;
       subjects.push({ kind: 'session', id: `${label(resolved)}/${s.tag}`, state, detail: `${detail} (${s.engine || 'shell'} in ${s.workspace})`, machine_id: s.machine_id, resolved_machine_id: resolved, alias_of: alias, canonical_id: resolved, age_s: activity });
     }

@@ -67,6 +67,13 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
+for arg in "$@"; do
+  if [ "$(basename -- "$arg")" = "capped-test-run.sh" ]; then
+    echo "capped-test-retry: refusing nested scripts/capped-test-run.sh; this would deadlock on the same heavy-test admission slot" >&2
+    exit 2
+  fi
+done
+
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/heavy-phase-status.sh
 . "${SCRIPTS_DIR}/heavy-phase-status.sh"

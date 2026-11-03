@@ -69,6 +69,29 @@ describe('stalled running sessions', () => {
     }
     expect(sql.exec('SELECT * FROM session_control_commands').toArray()).toEqual([]);
   }));
+  it('includes a refused stop in the stalled session alert detail', async () => fixture(async (s, live, sql, clock) => {
+    sql.exec('UPDATE fleet_sessions SET tag = ?, workspace = ?, agent_state = ?, observed_at = ?, last_activity_at = ? WHERE machine_id = ? AND native_id = ?',
+      'stalled-stop', '/repo', 'idle', new Date(clock.now - 30000).toISOString(),
+      new Date(clock.now - 4000000).toISOString(), 'test-host', id);
+    const stop = await s.handle(new Request(`https://hub.test/api/sessions/${id}/stop`, {
+      method: 'POST', body: JSON.stringify({ key: 'refused-stop' }),
+    }), admin);
+    expect(stop.status).toBe(201);
+    const commandId = sql.exec('SELECT id FROM session_control_commands WHERE session_id = ?', id).one().id;
+    sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?',
+      'refused', JSON.stringify({ outcome: 'refused', reason: 'target_not_in_native_catalog' }),
+      new Date(clock.now).toISOString(), commandId);
+
+    const subject = live.evaluate().subjects.find(item => item.kind === 'session' && item.id === 'test-host/stalled-stop');
+    expect(subject?.state).toBe('stalled');
+    expect(subject?.detail).toContain('stop refused (target_not_in_native_catalog)');
+    const [alert] = live.reconcileAlerts(live.evaluate().subjects);
+    expect(alert.detail).toContain('stop refused (target_not_in_native_catalog)');
+    sql.exec("UPDATE session_control_commands SET state = 'acked', ack_json = ?, updated_at = ? WHERE id = ?",
+      JSON.stringify({ outcome: 'delivered', confirmed_exit: true }), new Date(clock.now + 1).toISOString(), commandId);
+    expect(live.evaluate().subjects.find(item => item.kind === 'session' && item.id === 'test-host/stalled-stop')?.detail)
+      .not.toContain('stop refused');
+  }));
   it('round trips bounded host progress and rejects arbitrary process or file payloads', async () => fixture(async (s, live, sql, clock) => {
     const fleet = new FleetService(sql, cb => cb(), () => clock.now); fleet.init();
     const row = { native_id: id, tag: 'test', workspace: '/test', engine: 'codex', phase: 'running', agent_state: 'idle', profile: null, account: null,
