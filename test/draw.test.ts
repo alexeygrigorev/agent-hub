@@ -3,34 +3,35 @@ import { autoStartDrawDistribution, mulberry32, weightedDrawIndex } from '../src
 import { drawAutoStart } from '../src/fleet';
 
 describe('weighted auto-start distribution', () => {
-  it('weights candidates by the composite routing score, not raw remaining quota', () => {
+  it('weights candidates by remaining quota headroom', () => {
     const highHeadroom = { decision: { score: 2, factors: { remaining_pct: 90, burn_factor: 0.05 } } };
     const highScore = { decision: { score: 6, factors: { remaining_pct: 10, burn_factor: 1 } } };
     const { eligible, weights, total, probabilities } = autoStartDrawDistribution([highHeadroom, highScore]);
 
     expect(eligible).toEqual([highHeadroom, highScore]);
-    expect(weights).toEqual([2, 6]);
-    expect(total).toBe(8);
-    expect(probabilities.get(highHeadroom)).toBe(0.25);
-    expect(probabilities.get(highScore)).toBe(0.75);
-    expect(eligible[weightedDrawIndex(weights, () => 0.5)]).toBe(highScore);
+    expect(weights).toEqual([90, 10]);
+    expect(total).toBe(100);
+    expect(probabilities.get(highHeadroom)).toBe(0.9);
+    expect(probabilities.get(highScore)).toBe(0.1);
+    expect(eligible[weightedDrawIndex(weights, () => 0.5)]).toBe(highHeadroom);
   });
 
-  it('excludes overflow, degraded, depleted and candidates without a positive score', () => {
+  it('excludes overflow, degraded, depleted and candidates without positive headroom', () => {
     const overflow = { overflow: true, decision: { score: 3, factors: { remaining_pct: 100 } } };
     const degraded = { degraded: true, decision: { score: 3, factors: { remaining_pct: 100 } } };
     const depleted = { decision: { score: 3, factors: { remaining_pct: 100, depleted: true } } };
-    const missingScore = { decision: { factors: { remaining_pct: 100, depleted: false } } };
-    const zeroScore = { decision: { score: 0, factors: { remaining_pct: 100, depleted: false } } };
+    const missingHeadroom = { decision: { score: 0.8, factors: { depleted: false } } };
+    const zeroHeadroom = { decision: { score: 0.9, factors: { remaining_pct: 0, depleted: false } } };
     const eligibleCandidate = { decision: { score: 0.4, factors: { remaining_pct: 40, depleted: false } } };
     const distribution = autoStartDrawDistribution([
-      overflow, degraded, depleted, missingScore, zeroScore, eligibleCandidate,
+      overflow, degraded, depleted, missingHeadroom, zeroHeadroom, eligibleCandidate,
     ]);
 
     expect(distribution.eligible).toEqual([eligibleCandidate]);
     expect(distribution.probabilities.get(eligibleCandidate)).toBe(1);
     expect(distribution.probabilities.has(overflow)).toBe(false);
-    expect(distribution.probabilities.has(missingScore)).toBe(false);
+    expect(distribution.probabilities.has(missingHeadroom)).toBe(false);
+    expect(distribution.probabilities.has(zeroHeadroom)).toBe(false);
   });
 
   it('keeps the weighted distribution stable for a seeded stream', () => {
@@ -43,7 +44,7 @@ describe('weighted auto-start distribution', () => {
     expect(preferred).toBeLessThanOrEqual(800);
   });
 
-  it('draws by composite score, records probability, and leaves pins deterministic', () => {
+  it('draws by quota headroom, records probability, and leaves pins deterministic', () => {
     const top: any = {
       decision: { score: 6, reason: 'auto: codex/shared-codex', factors: { remaining_pct: 10 } },
       decision_reason: 'auto: codex/shared-codex',
@@ -59,21 +60,21 @@ describe('weighted auto-start distribution', () => {
 
     const selected = drawAutoStart(candidates, {}, [], {}, () => 0.5);
 
-    expect(selected).toBe(top);
-    expect(top.draw_probability).toBe(0.75);
-    expect(scoreWinner.draw_probability).toBe(0.25);
+    expect(selected).toBe(scoreWinner);
+    expect(top.draw_probability).toBe(0.1);
+    expect(scoreWinner.draw_probability).toBe(0.9);
     expect(overflow.draw_probability).toBe(0);
-    expect(top.decision.reason).toContain('draw_probability=0.750000');
-    expect(top.selection.decision_reason).toContain('draw_probability=0.750000');
-    expect(top.selection.decision.reason).toContain('draw_probability=0.750000');
+    expect(scoreWinner.decision.reason).toContain('draw_probability=0.900000');
+    expect(scoreWinner.selection.decision_reason).toContain('draw_probability=0.900000');
+    expect(scoreWinner.selection.decision.reason).toContain('draw_probability=0.900000');
 
     expect(drawAutoStart(candidates, { engine: 'codex' }, [], {}, () => 0.99)).toBe(top);
     expect(drawAutoStart(candidates, {}, [], { tier: 'deep' }, () => 0.99)).toBe(top);
     expect(drawAutoStart(candidates, {}, [], {})).toBe(top);
   });
 
-  it('uses the sole eligible route when the top candidate has no positive score', () => {
-    const blocked: any = { decision: { score: 0, factors: { remaining_pct: 50 } } };
+  it('uses the sole eligible route when the top candidate has no headroom', () => {
+    const blocked: any = { decision: { score: 6, factors: { remaining_pct: 0 } } };
     const only: any = { decision: { score: 0.5, reason: 'auto: claude/shared', factors: { remaining_pct: 50 } } };
 
     expect(drawAutoStart([blocked, only], {}, [], {}, () => 0.75)).toBe(only);
