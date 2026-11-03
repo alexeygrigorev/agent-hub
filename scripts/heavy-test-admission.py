@@ -16,6 +16,11 @@ import sys
 import time
 from datetime import datetime, timezone
 
+try:
+    import pwd
+except ImportError:  # pragma: no cover - this script is Unix-only today
+    pwd = None
+
 # Priority classes, lowest privilege first (intake 1293b560 AC3).
 # 'final' is a pre-push verification lane: it jumps queued normal tickets
 # younger than NORMAL_AGE_S. 'release' is the orchestrator-main
@@ -99,10 +104,19 @@ ADMISSION_PROTOCOL_VERSION = 1
 
 
 def active_release_roots():
-    roots = {
-        Path.home() / '.local/share/agent-hub/host-releases',
-        Path.home() / '.local/share/agent-hub/host-releases-orch',
-    }
+    # Managed engines and disposable test homes can override HOME; the service
+    # release is rooted at the Unix account home from the passwd database.
+    roots = set()
+    if pwd is not None:
+        try:
+            account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        except (KeyError, OSError, AttributeError):
+            account_home = None
+        if account_home is not None and account_home.is_absolute():
+            roots.update((
+                account_home / '.local/share/agent-hub/host-releases',
+                account_home / '.local/share/agent-hub/host-releases-orch',
+            ))
     configured = os.environ.get('AGENT_HUB_HOST_RELEASES_DIR')
     if configured:
         roots.add(Path(configured).expanduser())
