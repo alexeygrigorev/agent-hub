@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from agent_hub_host import fleet, intake_worktree as iw
-import test_intake_worktree as fixtures
+from host.tests import test_intake_worktree as fixtures
 
 _git = fixtures._git
 
