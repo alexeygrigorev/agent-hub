@@ -18,12 +18,57 @@ beforeEach(async () => {
     isAdmin: true, csrfToken: 'tbm-csrf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
   await inDO(stub(), (h: any) => {
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
-    h.sql.exec('DELETE FROM tbm_quota_pools');
     h.sql.exec('DELETE FROM tbm_banked_tranches');
+    h.sql.exec('DELETE FROM tbm_quota_pools');
   });
 });
 
 describe('TBM public REST composition', () => {
+  it('exposes per-pool 24h/7d catalog values and keeps unsupported observations unknown with a reason', async () => {
+    const now = Date.now();
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("DELETE FROM tbm_reward_events WHERE event_id = 'session:one'");
+      h.sql.exec("DELETE FROM tbm_session_tokens WHERE session_id = 'one'");
+      h.sql.exec("DELETE FROM session_control_sessions WHERE id = 'one'");
+      h.sql.exec(`INSERT INTO tbm_quota_pools
+        (pool_id, provider, account, total_capacity_tokens, remaining_tokens, headroom_percentage,
+         reset_at_ms, last_updated_ms, capacity_known, quota_unit)
+        VALUES ('go:metrics:5h', 'go', 'metrics', 1000000, 700000, 70, ?, ?, 1, 'tokens')`, now + 3600000, now);
+      h.sql.exec(`INSERT INTO tbm_reward_events
+        (event_id, timestamp_ms, pool_id, intake_task_id, active_mode, swarm_concurrency,
+         useful_work_reward, pacing_error_penalty, floor_breach_penalty, engine_mix_penalty,
+         waste_at_reset_penalty, banked_waste_penalty, net_reward, token_efficiency_eta,
+         tokens_known, efficiency_known, tokens_burned, session_id, event_kind, work_units)
+        VALUES ('session:one', ?, 'go:metrics:5h', 'intake-one', 'high', 1,
+         2, 0, 0, 0, 0, 0, 2, 20, 1, 1, 100000, 'one', 'session', 2)`, now - 1000);
+      h.sql.exec(`INSERT INTO tbm_session_tokens (session_id, engine, total_tokens, observed_at_ms)
+        VALUES ('one', 'opencode', 100000, ?)`, now - 1000);
+      h.sql.exec(`INSERT INTO session_control_sessions
+        (id, actor, request_key, request_json, engine, mode, state, created_at, updated_at)
+        VALUES ('one', 'test', 'one', '{}', 'opencode', 'headless', 'stopped', ?, ?)`,
+        new Date(now - 60000).toISOString(), new Date(now - 1000).toISOString());
+      h.sql.exec(`INSERT INTO tbm_banked_tranches
+        (tranche_id, pool_id, provider, allocated_tokens, remaining_tokens, granted_at_ms,
+         expires_at_ms, status, banked_burn_rate_tpm, target_banked_burn_rate_tpm,
+         expired_unused_tokens, updated_at_ms, quantity_known)
+        VALUES ('tranche-one', 'go:metrics:5h', 'go', 500, 300, ?, ?, 'active', 50, 0, 0, ?, 1)`, now - 1000, now + 7200000, now);
+    });
+    const response = await call('metrics');
+    expect(response.status).toBe(200);
+    const data: any = await response.json();
+    for (const window of ['24h', '7d']) {
+      const pool = data.windows[window].pools.find((p: any) => p.pool_id === 'go:metrics:5h');
+      expect(pool).toBeTruthy();
+      expect(pool.metrics.useful_work_per_tokens.value).toBe(20);
+      expect(pool.metrics.engine_mix.value).toEqual({ free: 1, paid: 0, grok: 0 });
+      expect(pool.metrics.banked_remaining.value).toBe(300);
+      expect(pool.metrics.banked_burn_rate.value).toBe(50);
+      expect(pool.metrics.time_to_expiry.value).toBeGreaterThan(0);
+      expect(pool.metrics.burn_rate_vs_pacing_target.value).toBeNull();
+      expect(pool.metrics.burn_rate_vs_pacing_target.reason).toContain('No historical pacing samples');
+    }
+  });
+
   it('scheduled controller persists state and real ingestion triggers floors', async () => {
     const now = Date.now();
     const response = await call('server', { captured_at: new Date(now - 1000).toISOString(), accounts: [{

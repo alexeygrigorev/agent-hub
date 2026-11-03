@@ -1,5 +1,6 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { loadProviderPacing } from './pacing';
+import { getTbmMetrics } from './tbm-metrics';
 import { handleResetCreditEvidence } from './reset-credit-evidence';
 
 const reply = (data: unknown, status = 200) => Response.json(data, {
@@ -22,6 +23,10 @@ export async function handleTbmApi(request: Request, sql: SqlStorage, now = Date
     return reply({ as_of, pools, last_tick_ms: tick?.last_tick_ms ?? null,
       controller: sql.exec('SELECT * FROM tbm_controller_state ORDER BY pool_id').toArray(),
       routing_factors: Object.fromEntries(loadProviderPacing(sql, now)) });
+  }
+  if (path === '/api/quota/metrics') {
+    if (request.method !== 'GET') return reply({ error: 'method_not_allowed' }, 405);
+    return reply(getTbmMetrics(sql, now));
   }
   if (path === '/api/quota/banked') {
     return reply({ as_of, tranches: sql.exec('SELECT * FROM tbm_banked_tranches ORDER BY expires_at_ms, tranche_id LIMIT 1000').toArray() });

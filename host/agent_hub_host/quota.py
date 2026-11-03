@@ -27,8 +27,8 @@ def add_commands(sub):
     parser.add_argument("--account", default=None, help="Limit to one account label")
     parser.add_argument("--admin-token-file", default=None, help="Use an existing private Hub operator token for this read")
     parser.add_argument("--json", action="store_true", help="Emit raw JSON instead of text")
-    parser.add_argument("tbm", nargs="?", default=None, choices=["history", "pacing", "banked", "kill-switch"],
-                        help="TBM view: pacing, banked, or kill-switch (fleet filters do not apply)")
+    parser.add_argument("tbm", nargs="?", default=None, choices=["history", "pacing", "metrics", "banked", "kill-switch"],
+                        help="TBM view: pacing, metrics, banked, or kill-switch (fleet filters do not apply)")
     parser.add_argument("kill_action", nargs="?", default=None, choices=["on", "off"],
                         help="kill-switch write: on|off (read when omitted)")
     parser.add_argument("--reason", default=None, help="Reason for kill-switch on|off")
@@ -94,6 +94,10 @@ def execute(args):
         if getattr(args, key, None) is not None:
             raise ValueError("Invalid quota arguments: filters do not apply to '%s'" % tbm_view)
     from . import tbm as tbm_cli
+    if tbm_view == "metrics":
+        if getattr(args, "kill_action", None) is not None or getattr(args, "reason", None) is not None:
+            raise ValueError("Invalid quota arguments")
+        return tbm_cli.get_metrics()
     if tbm_view == "pacing":
         if getattr(args, "kill_action", None) is not None or getattr(args, "reason", None) is not None:
             raise ValueError("Invalid quota arguments")
@@ -117,6 +121,9 @@ def render_text(data):
     """Human-readable usage table; unknown stays unknown, never zero."""
     if not isinstance(data, dict):
         raise ValueError("Invalid quota payload")
+    if isinstance(data.get('windows'), dict):
+        from . import tbm as tbm_cli
+        return tbm_cli.render_metrics_text(data)
     if isinstance(data.get('series'), list):
         return '\n'.join('%s / %s / %s: %s known points' % (row.get('kind'), row.get('entity'), row.get('metric'), sum(isinstance(p.get('value'), (int, float)) for p in row.get('points', []))) for row in data['series']) or 'No usage history in this range.'
     lines = []
