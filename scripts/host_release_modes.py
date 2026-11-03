@@ -7,7 +7,10 @@ import stat
 from pathlib import Path
 
 GO_WRITE = 0o022
-DEFAULT_RELEASES_ROOT = Path("/home/alexey/.local/share/agent-hub/host-releases")
+DEFAULT_RELEASES_ROOTS = (
+    Path("/home/alexey/.local/share/agent-hub/host-releases"),
+    Path("/home/alexey/.local/share/agent-hub/host-releases-orch"),
+)
 
 
 def _entries(root):
@@ -57,16 +60,18 @@ def harden_tree(root):
     return changed
 
 
-def validate_installed_release(release, releases_root=DEFAULT_RELEASES_ROOT):
+def validate_installed_release(release, releases_roots=DEFAULT_RELEASES_ROOTS):
     """Confine hardening to one real, manifest-bearing installed release."""
     release = Path(release)
-    root = Path(releases_root)
-    if root.is_symlink() or release.is_symlink():
-        raise ValueError("release and releases root must not be symlinks")
-    root = root.resolve(strict=True)
+    if isinstance(releases_roots, (str, Path)):
+        releases_roots = (releases_roots,)
+    roots = tuple(Path(root) for root in releases_roots)
+    if release.is_symlink() or any(root.is_symlink() for root in roots):
+        raise ValueError("release and releases roots must not be symlinks")
+    roots = tuple(root.resolve(strict=True) for root in roots)
     target = release.resolve(strict=True)
-    if target.parent != root or not target.is_dir():
-        raise ValueError("release must be a direct child of the configured releases root")
+    if target.parent not in roots or not target.is_dir():
+        raise ValueError("release must be a direct child of a managed releases root")
     if not re.fullmatch(r"[0-9a-f]{40}", target.name):
         raise ValueError("release directory name must be a full lowercase commit SHA")
     manifest = target / "release-manifest.json"
