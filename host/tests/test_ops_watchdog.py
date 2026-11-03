@@ -24,7 +24,7 @@ if name=='a':
         if s.get('census_error'): sys.exit(1)
         print(json.dumps(s['sessions']))
     elif cmd=='engines':
-        print(json.dumps([{'name': 'gemini'}, {'name': 'antigravity'}, {'name': 'grok'}, {'name': 'opencode'}, {'name': 'zcodex'}]))
+        print(json.dumps(s.get('engines', [{'name': 'gemini'}, {'name': 'antigravity'}, {'name': 'grok'}, {'name': 'opencode'}, {'name': 'zcodex'}])))
     elif cmd=='status': print(json.dumps(next(x for x in s['sessions'] if x['id']==args[1])))
     elif cmd=='kill':
         if s.get('kill_ok'):
@@ -44,13 +44,14 @@ elif name=='systemd-run':
     sys.exit(subprocess.call(args[args.index('--')+1:]) if '--' in args else 0)
 elif name=='hub':
     if args and args[0]=='quota':
-        print(json.dumps({'pools': [
+        default={'pools': [
             {'provider': 'gemini', 'harness': ['gemini', 'antigravity'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
             {'provider': 'go', 'harness': ['opencode'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
             {'provider': 'grok', 'harness': ['grok'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
             {'provider': 'zai', 'harness': ['zcodex'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
-        ]}))
-        sys.exit(0)
+        ]}
+        print(json.dumps(s.get('quota',default)))
+        sys.exit(s.get('quota_error',0))
     sys.exit(s.get('hub_error',0))
 elif name=='git':
     if 'rev-parse' in args:
@@ -79,8 +80,16 @@ class OpsWatchdogTest(unittest.TestCase):
         self.ticks = self.home / 'tmp/agent-reports/orchestrator-ticks.jsonl'
         self.ticks.parent.mkdir(parents=True)
         self.ticks.write_text('{}\n')  # fresh tick log: the orchestrator is progressing
-        self.data = {'sessions': []}
+        self.data = {
+            'sessions': [],
+            'engines': [{'name': 'gemini'}, {'name': 'opencode'}],
+            'quota': {'pools': [
+                {'provider': 'gemini', 'harness': ['gemini'], 'state': 'fresh', 'remaining_percent': 100},
+                {'provider': 'go', 'harness': ['opencode'], 'state': 'fresh', 'remaining_percent': 80},
+            ]},
+        }
         self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)+':'+os.environ['PATH'], 'LOOP_INTERVAL': 'off', 'MIN_RESTART_GAP': '0', 'OPS_LOCK_DIR': str(self.home)}
+        self.env.update({'ORCH_ENGINE': 'gemini', 'ORCH_FALLBACK_ENGINE': 'opencode'})
 
     def session(self, alive=False, pid=2147483647):
         return dict(id='old', tag='orchestrator-main', workspace=str(self.workspace), phase='running', worker_alive=alive, worker_pid=pid, workload_pid=pid)
@@ -113,6 +122,17 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertIn('recovery path 1 started', result.stdout)
         self.assertTrue((self.state / 'proof_due').exists())
         self.assertNotIn('already running', result.stdout)
+
+    def test_falls_back_to_fresh_hub_routed_engine_without_claude(self):
+        self.data['quota'] = {'pools': [
+            {'provider': 'gemini', 'harness': ['gemini'], 'state': 'fresh', 'remaining_percent': 0},
+            {'provider': 'go', 'harness': ['opencode'], 'state': 'fresh', 'remaining_percent': 80},
+        ]}
+        result = self.run_ctl('start')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('--engine opencode', self.starts()[-1])
+        self.assertNotIn('--engine claude', self.starts()[-1])
+        self.assertNotIn('--engine sonnet', self.starts()[-1])
 
     def test_surviving_workload_blocks_forget_and_launch(self):
         self.data['sessions'] = [self.session(pid=os.getpid())]
