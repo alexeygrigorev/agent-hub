@@ -225,6 +225,7 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
     const depleted = { engine: 'claude', decision: { score: 100, factors: { remaining_pct: 99, depleted: true } } };
     expect(drawAutoStart([healthy, depleted], {}, [], {}, () => 0.9999)).toBe(healthy);
     expect((depleted as any).draw_probability).toBe(0);
+    expect(drawAutoStart([depleted], {}, [], {}, () => 0.9999)).toBeNull();
   });
 
   it('spreads fully unpinned starts weighted by headroom with no fixed order', async () => {
