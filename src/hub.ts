@@ -1,3 +1,5 @@
+import { initRootIncumbentProjection, advanceRootIncumbentProjection } from './root-incumbent';
+import { BackgroundWorkQueue } from './background-work';
 import { jobCredentialAllowed } from './auth/job-credential';
 import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, pollSessionCredentials, mintSessionCredential, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
@@ -30,7 +32,7 @@ import { isHumanCredentialAllowed as isHumanCredentialAllowedFn, validateHumanCr
 
 import { randomString, sha256, generateUserCode, base64url } from './auth/crypto';
 import { deriveHumanRefreshSuccessor, generateTokenPair, verifyBearerScope } from './auth/token';
-import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
+import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat, effectiveHeartbeatAt } from './registry';
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import {
   formatNativeActor,
@@ -236,11 +238,19 @@ export class Hub extends DurableObject {
     ctx.blockConcurrencyWhile(() => this.budgeted(async () => undefined, undefined));
   }
 
+  private backgroundWork!: BackgroundWorkQueue;
+  private backgroundJobsStamp: string | null = null;
+  private backgroundRootStamp: string | null = null;
+  private backgroundAlarmStamp: string | null = null;
+
   private initializeServices(env: Env) {
     this.meter.runSync('init:schema', () => {
       this.initDb();
       for (const stmt of ROWS_STATS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     });
+
+    this.backgroundWork = new BackgroundWorkQueue(this.sql, fn => this.ctx.storage.transactionSync(fn));
+    this.backgroundWork.init();
 
     const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
     // M12b intake assignment (narrow seam, owned by platform-intake-live):
@@ -433,7 +443,8 @@ export class Hub extends DurableObject {
       sessionState: id => (this.sql.exec('SELECT state FROM session_control_sessions WHERE id=?', id).toArray()[0] as any)?.state ?? null,
       hostFresh: machineId => {
         const m = this.sql.exec('SELECT last_checkin_at FROM machines WHERE id=?', machineId).toArray()[0] as any;
-        return !!m?.last_checkin_at && Date.now() - Date.parse(m.last_checkin_at) < 15 * 60000;
+        const at = effectiveHeartbeatAt(this.sql,machineId,m?.last_checkin_at);
+        return !!at && Date.now() - Date.parse(at) < 15 * 60000;
       },
     });
     this.askLedger.init();
@@ -684,6 +695,8 @@ export class Hub extends DurableObject {
 
     this.quotaStore = new QuotaStore(this.sql, this.ctx, this.env);
     this.afterInitializeServices(env);
+    this.backgroundWork.initEntityProducers();
+    this.ctx.storage.transactionSync(() => initRootIncumbentProjection(this.sql));
   }
 
   /** Extension initialization runs inside the same prepaid constructor gate. */
@@ -731,6 +744,10 @@ export class Hub extends DurableObject {
       }
       await this.rowBudget.begin();
       const result = await fn();
+      if (this.budgetActiveEvents === 1 && !this.rowBudget.status().stopped) {
+        await this.refreshBackgroundJobs();
+        await this.armBackgroundQueue();
+      }
       if (this.rowBudget.status().stopped) {
         await this.ctx.storage.deleteAlarm();
         return exhausted;
@@ -1129,6 +1146,10 @@ export class Hub extends DurableObject {
         if (!body || body.type !== 'heartbeat') return Response.json({ error: 'malformed_json' }, { status: 400 });
 
         updateHeartbeat(cred.machine_id, body, this.sql);
+        if (isRootSchedulingEnabled(this.sql)) {
+          this.ctx.storage.transactionSync(() => advanceRootIncumbentProjection(this.sql));
+          this.jobsService.markRootReady(cred.machine_id);
+        }
 
         const nowIso = new Date().toISOString();
         const { rows,truncated } = this.jobsService.offeredForHost(cred.machine_id);
@@ -2832,6 +2853,7 @@ export class Hub extends DurableObject {
   }
 
   private async scheduledTickMetered(slotOverride?: string, source = 'scheduled') {
+    if (source !== 'manual') { await this.alarmMetered(); return { status: 'queue_processed' }; }
     const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('tick:' + step, fn);
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
     // 1. Bus retention cleanup
@@ -2966,33 +2988,81 @@ export class Hub extends DurableObject {
     return this.budgeted(() => this.alarmMetered(), undefined);
   }
 
+  /** Process exactly one explicit queue item. Empty queue never re-arms. */
   private async alarmMetered() {
-    // Every step is metered (intake 8081a05a); totals flush once per alarm.
-    const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('alarm:' + step, fn);
-    const nowMs = Date.now();
-    const retentionPending = await this.ctx.storage.get('bus_retention_pending') === true;
-    const cleanup = retentionPending
-      ? await m('bus_retention', () => this.busService.retentionCleanup(nowMs, 100))
-      : { hasMore: false };
-    let nextAlarm = await m('jobs_alarms', () => this.jobsService.processAlarms());
-    // Webhook delivery pump (intake 19ec91c2): pending redeliveries pull the
-    // next alarm forward so a returning session is served without waiting
-    // for the full cadence.
-    let webhookNext: number | undefined;
-    try {
-      webhookNext = await m('webhooks', () => this.webhookService.pump());
-      if (webhookNext !== undefined) {
-        const current = nextAlarm ?? undefined;
-        nextAlarm = current === undefined ? webhookNext : Math.min(current, webhookNext);
+    const work = this.backgroundWork.takeDue();
+    if (!work) { await this.armBackgroundQueue(true,false); return; }
+    if (work.exhausted) {
+      console.error(JSON.stringify({event:'background_work_attempts_exhausted',kind:work.kind,id:work.id}));
+      if(work.kind==='root-slot' && isRootSchedulingEnabled(this.sql) && typeof work.payload.entity_id==='string') {
+        const slot=Date.parse(work.payload.entity_id);
+        if(Number.isFinite(slot)) this.enqueueRootSlot(Math.max(slot+1800000,Math.ceil(Date.now()/1800000)*1800000));
       }
-    } catch { console.warn('webhook_delivery_pump_failed'); }
+      await this.armBackgroundQueue();
+      return;
+    }
     try {
-      await m('due_wakes', () => this.ctx.storage.transactionSync(() => {
-        try { (this.sessionControlService as any).processDueWakes?.(); } catch {}
-      }));
-    } catch {}
-    try { await this.flushRowsMeter(); } catch { console.warn('rows_meter_flush_failed'); }
-    await this.scheduleDueAlarm([nextAlarm, this.jobsService.getAlarmTime(), webhookNext, this.nextWakeTimeSafe()], retentionPending ? cleanup.hasMore : undefined);
+      const entity = work.payload.entity_id;
+      if (typeof entity !== 'string') throw new Error('background_entity_missing');
+      let due: number | null;
+      if (work.kind === 'job-deadline') due = this.jobsService.processBackground(entity);
+      else if (work.kind === 'session-wake') due = this.sessionControlService.processBackground(entity);
+      else if (work.kind === 'webhook-delivery') due = await this.webhookService.processBackground(entity);
+      else due = await this.processRootSlotWork(entity);
+      if (due === null) {
+        this.backgroundWork.complete(work);
+        if (work.kind === 'root-slot' && isRootSchedulingEnabled(this.sql)) this.enqueueRootSlot(Date.parse(entity)+1800000);
+      } else this.backgroundWork.reschedule(work,due);
+      if (work.kind === 'job-deadline') this.backgroundJobsStamp = null;
+    } catch (error) {
+      if (error instanceof RowBudgetExceeded) throw error;
+      console.error(JSON.stringify({event:'background_work_failed',kind:work.kind,id:work.id}));
+      this.backgroundWork.reschedule(work,Date.now()+60000,true);
+    }
+    await this.armBackgroundQueue();
+  }
+
+  /** The sole job head is refreshed only after job/lease state changes.
+   * Per-entity wake and delivery producers are transactional SQL triggers. */
+  private async refreshBackgroundJobs() {
+    const stamp = this.writes.stamp('jobs','leases','job_claim_deadlines','root_scheduling');
+    const rootStamp = this.writes.stamp('root_scheduling');
+    if (rootStamp !== this.backgroundRootStamp) {
+      if (isRootSchedulingEnabled(this.sql)) {
+        const now=Date.now(), slot=Math.floor(now/1800000)*1800000;
+        this.enqueueRootSlot(now-slot<1500000 ? slot : slot+1800000);
+      } else this.backgroundWork.cancel('root-slot');
+      this.backgroundRootStamp=rootStamp;
+    }
+    if (stamp === this.backgroundJobsStamp) return;
+    const head = this.jobsService.nextBackgroundWork();
+    if (head) this.backgroundWork.enqueue({id:'head:job-deadline',kind:'job-deadline',dueAt:head.dueAt,payload:{entity_id:head.id}});
+    else this.backgroundWork.cancel('head:job-deadline');
+    this.backgroundJobsStamp = this.writes.stamp('jobs','leases','job_claim_deadlines','root_scheduling');
+    await this.armBackgroundQueue();
+  }
+
+  private async armBackgroundQueue(force = false, clearEmpty = true) {
+    const stamp = this.writes.stamp('hub_background_work');
+    if (!force && stamp === this.backgroundAlarmStamp) return;
+    const next = this.backgroundWork.nextAt();
+    this.backgroundAlarmStamp = stamp;
+    if (next === null) {
+      if (clearEmpty && await this.ctx.storage.getAlarm() !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const target = Math.max(Date.now()+15000,next);
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > target || current <= Date.now()) await this.ctx.storage.setAlarm(target);
+  }
+
+  private enqueueRootSlot(slot: number) {
+    if (!Number.isFinite(slot)) throw new Error('invalid_root_slot');
+    this.backgroundWork.enqueue({id:'root-slot',kind:'root-slot',dueAt:slot,payload:{entity_id:new Date(slot).toISOString()}});
+  }
+
+  private async processRootSlotWork(slot: string): Promise<number | null> {
+    return this.jobsService.processRootSlotBackground(slot);
   }
 
   private idleWorkAt = 0;
@@ -3005,36 +3075,10 @@ export class Hub extends DurableObject {
    * use 1s re-arms at most 30 times across DO restarts, then back off to 60s.
    * An omitted retention result preserves the durable backlog state; callers
    * that did not run cleanup (for example a webhook ingest) cannot clear it. */
-  private async scheduleDueAlarm(nextTimes: Array<number | null | undefined>, retentionHasMore?: boolean) {
-    const now = Date.now();
-    const current = await this.ctx.storage.getAlarm();
-    const due = nextTimes.map(Number).filter(value => Number.isFinite(value) && value > 0);
-    let pending = await this.ctx.storage.get('bus_retention_pending') === true;
-    let rearmCount = Number(await this.ctx.storage.get('bus_retention_fast_rearms')) || 0;
-    if (retentionHasMore === true) {
-      pending = true;
-      rearmCount++;
-      await this.ctx.storage.put('bus_retention_pending', true);
-      await this.ctx.storage.put('bus_retention_fast_rearms', rearmCount);
-    } else if (retentionHasMore === false) {
-      pending = false;
-      rearmCount = 0;
-      await this.ctx.storage.put('bus_retention_pending', false);
-      await this.ctx.storage.put('bus_retention_fast_rearms', 0);
-    }
-    let next: number | null = null;
-    const candidates = [...due, ...(current !== null && current > now ? [current] : [])];
-    if (candidates.length) next = Math.min(...candidates);
-    if (pending) {
-      const retentionWake = now + (rearmCount > 30 ? 60000 : 1000);
-      next = next === null ? retentionWake : Math.min(next, retentionWake);
-      if (rearmCount === 31) console.warn(JSON.stringify({ event: 'bus_retention_rearm_capped', consecutive: rearmCount }));
-    }
-    // A due wake may be blocked on host binding or admission. Its unchanged
-    // past deadline must not form a 1ms self-invocation loop. Concrete work
-    // retries at most once per 15 seconds; retention has its separate cap.
-    if (next !== null) await this.ctx.storage.setAlarm(Math.max(now + (pending ? 1000 : 15000), next));
-    else await this.ctx.storage.deleteAlarm();
+  private async scheduleDueAlarm(_nextTimes: Array<number | null | undefined>, _retentionHasMore?: boolean) {
+    // Legacy callers may request a wake, but only explicit durable work can arm it.
+    await this.refreshBackgroundJobs();
+    await this.armBackgroundQueue();
   }
 
   /** Idle recovery acts on 30-minute nudge delays, so a census at most every
@@ -3402,6 +3446,8 @@ export class Hub extends DurableObject {
       try {
         return Response.json(this.busService.getBusActors(auth.caller!));
       } catch (e: any) {
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
+        if (e.message === 'invalid_cursor') return Response.json({error:e.message},{status:400});
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
@@ -3421,8 +3467,12 @@ export class Hub extends DurableObject {
         return Response.json({ error: 'invalid_actor' }, { status: 400 });
       }
       try {
-        return Response.json(this.busService.getBusMessages(auth.caller!, actor));
+        const page=this.busService.getBusMessagesPage(auth.caller!,actor,url.searchParams.get('cursor'));
+        return Response.json(page.rows,{headers:{'X-Hub-History-Order':page.order,
+          'X-Hub-History-Truncated':String(page.truncated),...(page.next?{'X-Hub-History-Cursor':page.next}:{})}});
       } catch (e: any) {
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
+        if (e.message === 'invalid_cursor') return Response.json({error:e.message},{status:400});
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
@@ -3501,6 +3551,7 @@ export class Hub extends DurableObject {
         return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
       } catch (e: any) {
         if (['invalid_ref', 'invalid_delivery', 'invalid_deliver_by'].includes(e.message)) return Response.json({ error: e.message }, { status: 400 });
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
         if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
         if (e.message === 'from_actor_mismatch' || e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
@@ -3583,6 +3634,7 @@ export class Hub extends DurableObject {
         return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
       } catch (e: any) {
         if (['invalid_ref', 'invalid_delivery', 'invalid_deliver_by'].includes(e.message)) return Response.json({ error: e.message }, { status: 400 });
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
         if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
         if (e.message === 'from_actor_mismatch' || e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
@@ -3669,6 +3721,7 @@ export class Hub extends DurableObject {
           await new Promise(resolve => setTimeout(resolve, 1000));
         }
       } catch (e: any) {
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
         if (e.message === 'invalid_cursor') return Response.json({ error: 'invalid_cursor' }, { status: 400 });
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
@@ -4061,7 +4114,8 @@ export class Hub extends DurableObject {
           stale: typeof c.expires_at === 'number' ? c.expires_at <= nowMs : false,
         }));
         const messageActor = actor || holder || undefined;
-        const scopedMessages = this.busService.getBusMessages(auth.caller!, messageActor);
+        const historyPage = this.busService.getBusMessagesPage(auth.caller!,messageActor,url.searchParams.get('message_cursor'));
+        const scopedMessages = historyPage.rows;
         // Bridged native work.* envelopes are addressed to project:<project>
         // (no Hub agents row exists for them), so the scoped inbox query
         // above cannot match them: merge them explicitly whenever the scope
@@ -4070,8 +4124,8 @@ export class Hub extends DurableObject {
         if (effectiveProject && !unmappedWorkspace) {
           try {
             const nativeRows = this.sql.exec(
-              'SELECT * FROM messages WHERE to_actor = ? AND expires_at > ? ORDER BY created_at DESC LIMIT ?',
-              `project:${effectiveProject}`, nowMs, limit,
+              'SELECT * FROM (SELECT * FROM messages WHERE to_actor=? ORDER BY recipient_seq DESC LIMIT ?) WHERE expires_at>?',
+              `project:${effectiveProject}`, limit, nowMs,
             ).toArray() as any[];
             const seen = new Set(scopedMessages.map((r: any) => r.id));
             messages = [...scopedMessages, ...nativeRows.filter((r: any) => !seen.has(r.id))]
@@ -4093,9 +4147,12 @@ export class Hub extends DurableObject {
           claim_policy: claimPolicy,
           claims,
           recent_messages: messages,
+          message_history: {next:historyPage.next,truncated:historyPage.truncated,order:historyPage.order},
           notice,
         });
       } catch (e: any) {
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
+        if (e.message === 'invalid_cursor') return Response.json({error:e.message},{status:400});
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }

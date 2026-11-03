@@ -5,7 +5,13 @@ import type { Hub } from '../src/hub';
 import { expiryMsSql } from '../src/jobs';
 
 const withHub = (fn: (hub: Hub, state: DurableObjectState) => Promise<void>) =>
-  runInDurableObject((env as any).HUB.get((env as any).HUB.idFromName('cf-loop-' + crypto.randomUUID())), fn);
+  runInDurableObject((env as any).HUB.get((env as any).HUB.idFromName('cf-loop-' + crypto.randomUUID())), async (hub: Hub,state: DurableObjectState) => {
+    // These cost fixtures isolate entity processing; the fresh-database root
+    // default is unrelated to the production-disabled root schedule.
+    hub.sql.exec('UPDATE root_scheduling SET enabled=0 WHERE id=1');
+    (hub as any).backgroundWork?.cancel('root-slot');
+    await fn(hub,state);
+  });
 
 const plan = (hub: Hub, q: string, ...args: any[]) => (hub.sql.exec('EXPLAIN QUERY PLAN ' + q, ...args).toArray() as any[])
   .map(row => String(row.detail)).join('\n');
@@ -45,13 +51,18 @@ describe('CF runaway alarm regression', () => {
 
   it('does not re-arm an empty Hub, and overdue blocked work cannot re-arm at 1ms', () => withHub(async (hub, state) => {
     const schedule = (hub as any).scheduleDueAlarm.bind(hub);
+    hub.sql.exec('UPDATE root_scheduling SET enabled=0 WHERE id=1');
+    (hub as any).backgroundWork.cancel('root-slot');
+    await (hub as any).refreshBackgroundJobs();
     await state.storage.deleteAlarm();
     await schedule([], false);
     expect(await state.storage.getAlarm()).toBe(null);
     const before = Date.now();
-    await schedule([before - 60000]);
+    (hub as any).backgroundWork.enqueue({id:'blocked-test',kind:'job-deadline',dueAt:before-60000,payload:{entity_id:'blocked-test'}});
+    await schedule([]);
     expect((await state.storage.getAlarm())!).toBeGreaterThanOrEqual(before + 15000);
     await state.storage.deleteAlarm();
+    (hub as any).backgroundWork.cancel('blocked-test');
     await schedule([]);
     expect(await state.storage.getAlarm()).toBe(null);
   }));
@@ -138,7 +149,7 @@ describe('CF runaway alarm regression', () => {
     expect(raw.exec("SELECT status FROM jobs WHERE id='claim-last'").toArray()[0].status).toBe('failed');
     expect(raw.exec('SELECT lease_name FROM job_claim_deadlines').toArray()).toHaveLength(0);
     expect(plan(hub, 'SELECT due_ms FROM job_claim_deadlines ORDER BY due_ms,lease_name LIMIT 1')).toContain('job_claim_deadlines_due');
-    expect(plan(hub, "UPDATE credentials SET revoked_at=? WHERE subject=? AND kind='job' AND revoked_at IS NULL", at, 'claim-last')).toContain('credentials_job_subject_live');
+    expect(plan(hub, "UPDATE credentials SET revoked_at=? WHERE token_hash=? AND subject=? AND kind='job' AND revoked_at IS NULL", at,'hash','claim-last')).toContain('token_hash=?');
     // Reproduce an upgrade with pre-existing leases, including the claim
     // after all running rows. Migration pages must progress, not starve it.
     raw.exec("UPDATE jobs SET status='claimed',finished_at=NULL WHERE id='claim-last'");
@@ -172,6 +183,10 @@ describe('CF runaway alarm regression', () => {
 
   it('uses deployed wake indexes without sorting a large equal-time queue', () => withHub(async (hub, state) => {
     const raw = state.storage.sql, now = Date.now(), at = new Date(now).toISOString(), future = new Date(now + 3600000).toISOString();
+    // Historical manual-sweep fixture predates the new 128-intent admission
+    // policy; no producer can create this population in normal operation.
+    for(const name of ['hub_background_wake_insert','hub_background_wake_update','hub_background_wake_delete'])raw.exec('DROP TRIGGER IF EXISTS '+name);
+    raw.exec('DROP TRIGGER hub_background_wake_insert');
     raw.exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<3000)
       INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at)
       SELECT 'queued-'||i,'no-session','test','queued-'||i,?,?,'resume','queued',?,? FROM n`, now + 3600000, future, at, at);

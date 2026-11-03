@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS webhook_routes (
   enabled INTEGER NOT NULL DEFAULT 1,
   created_by TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  prompt_id TEXT,
+  prompt_vars TEXT
 );
 CREATE TABLE IF NOT EXISTS webhook_rate_buckets (
   webhook_id TEXT NOT NULL,
@@ -699,17 +701,29 @@ export class WebhookService {
     return nextDue;
   }
 
+  nextBackgroundWork(): { id: string; dueAt: number } | null {
+    const pending: any=this.sql.exec("SELECT id,next_attempt_at FROM session_deliveries WHERE status='pending' ORDER BY next_attempt_at LIMIT 1").toArray()[0];
+    const queued: any=this.sql.exec("SELECT id,next_attempt_at FROM session_deliveries WHERE status='queued' ORDER BY next_attempt_at LIMIT 1").toArray()[0];
+    const heads: {id:string;dueAt:number}[]=[];
+    if(pending)heads.push({id:pending.id,dueAt:pending.next_attempt_at===null?this.now():Date.parse(pending.next_attempt_at)});
+    if(queued)heads.push({id:queued.id,dueAt:queued.next_attempt_at===null?this.now():Date.parse(queued.next_attempt_at)});
+    return heads.filter(row=>Number.isFinite(row.dueAt)).sort((a,b)=>a.dueAt-b.dueAt)[0]??null;
+  }
+  async processBackground(id: string): Promise<number | null> {
+    return (await this.pumpOnce(id))??null;
+  }
+
   /** One bounded pass over the durable queue. Every mutation is a small
    * transaction on idempotent keys, gated on the row's current status so a
    * stale snapshot can never move a delivery backwards. Returns the next due
    * time (epoch ms) for the alarm. */
-  private async pumpOnce(): Promise<number | undefined> {
+  private async pumpOnce(deliveryId?: string): Promise<number | undefined> {
     const nowMs = this.now();
     let nextDue: number | undefined;
 
     // 1. Queued deliveries: follow the send command's ack ledger.
-    const queued = this.sql.exec(
-      "SELECT * FROM session_deliveries WHERE status = 'queued' ORDER BY updated_at LIMIT ?", this.maxBatch).toArray() as any[];
+    const queued = (deliveryId ? this.sql.exec("SELECT * FROM session_deliveries WHERE id=? AND status='queued'", deliveryId)
+      : this.sql.exec("SELECT * FROM session_deliveries WHERE status = 'queued' ORDER BY updated_at LIMIT ?", this.maxBatch)).toArray() as any[];
     for (const delivery of queued) {
       const command: any = delivery.command_id
         ? this.sql.exec('SELECT state, ack_json FROM session_control_commands WHERE id = ?', delivery.command_id).toArray()[0]
@@ -738,9 +752,9 @@ export class WebhookService {
     }
 
     // 2. Pending deliveries due now: resolve target and enqueue a send command.
-    const due = this.sql.exec(
-      `SELECT * FROM session_deliveries WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-       ORDER BY next_attempt_at LIMIT ?`, this.at(), this.maxBatch).toArray() as any[];
+    const due = (deliveryId ? this.sql.exec("SELECT * FROM session_deliveries WHERE id=? AND status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)", deliveryId,this.at())
+      : this.sql.exec(`SELECT * FROM session_deliveries WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       ORDER BY next_attempt_at LIMIT ?`, this.at(), this.maxBatch)).toArray() as any[];
     for (const delivery of due) {
       if (delivery.source === 'driver') {
         const driver: any = this.sql.exec('SELECT phase FROM hub_drivers WHERE id = ?', delivery.source_id).toArray()[0];
@@ -795,6 +809,20 @@ export class WebhookService {
         continue;
       }
       this.retryOrFailed(delivery, error);
+    }
+
+    if (deliveryId) {
+      const delivery: any=this.sql.exec('SELECT status,next_attempt_at FROM session_deliveries WHERE id=?',deliveryId).toArray()[0];
+      if (delivery?.status==='queued') {
+        const retry=nowMs+60000;
+        this.sql.exec("UPDATE session_deliveries SET next_attempt_at=? WHERE id=? AND status='queued'",new Date(retry).toISOString(),deliveryId);
+        return retry;
+      }
+      if (delivery?.status==='pending') {
+        const due=delivery.next_attempt_at===null?nowMs:Date.parse(delivery.next_attempt_at);
+        return Number.isFinite(due)?due:nowMs+60000;
+      }
+      return undefined;
     }
 
     // 3b. Scheduled deliveries whose schedule was deleted or paused never

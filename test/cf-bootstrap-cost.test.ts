@@ -11,5 +11,10 @@ it('initializes an empty exported Hub within the strict combined daily budget', 
     expect(hub.rowBudget.status().stopped).toBe(false);
     expect(hub.conversationsService).toBeDefined();
     expect(hub.jobsService).toBeDefined();
+    // These migration columns belong in modern CREATE definitions. SQLite
+    // ADD COLUMN re-reads the full catalog even when its source table is empty.
+    const unnecessary=hub.meter.statementTop(4096).filter((row:any)=>
+      /^ALTER TABLE (?:session_control_sessions|session_control_commands|webhook_routes|messages|credentials|jobs|machines|claims) ADD COLUMN\b/i.test(row.sql));
+    expect(unnecessary).toEqual([]);
   });
 });

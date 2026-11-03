@@ -94,8 +94,8 @@ CREATE INDEX IF NOT EXISTS session_control_wake_alerts_session ON session_contro
 `;
 
 export const SESSION_CONTROL_SCHEMA = ADOPTION_SCHEMA + `
-CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, parent_id TEXT, parent_source TEXT, session_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
-CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(session_id, actor, request_key));
+CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, parent_id TEXT, parent_source TEXT, session_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, owner_token_id TEXT, owner_family TEXT, host_family TEXT, hold_json TEXT, UNIQUE(actor, request_key));
+CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, owner_token_id TEXT, owner_family TEXT, holder_machine TEXT, claim_token TEXT, claim_expires_at TEXT, holder_attempt TEXT, attempts INTEGER DEFAULT 0, host_status TEXT, host_reason TEXT, not_before TEXT, recipient_seq INTEGER, UNIQUE(session_id, actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_cancellations (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_protections (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_held_cursor (id INTEGER PRIMARY KEY CHECK(id=1), created_at TEXT NOT NULL, session_id TEXT NOT NULL);
@@ -901,6 +901,41 @@ export class SessionControlService {
     return { ok: true, ms, iso: new Date(ms).toISOString() };
   }
 
+  nextBackgroundWork(): { id: string; dueAt: number } | null {
+    const heads: {id:string;dueAt:number}[] = [];
+    const pending: any = this.sql.exec("SELECT id,wake_at_ms FROM session_control_wakes WHERE state='pending' ORDER BY wake_at_ms,created_at,id LIMIT 1").toArray()[0];
+    if (pending) heads.push({id:pending.id,dueAt:pending.wake_at_ms});
+    const queued: any = this.sql.exec("SELECT id,wake_at_ms FROM session_control_wakes WHERE state='queued' ORDER BY wake_at_ms,created_at,id LIMIT 1").toArray()[0];
+    if (queued) heads.push({id:queued.id,dueAt:queued.wake_at_ms+WAKE_ACK_TIMEOUT_MS});
+    const delivered: any = this.sql.exec("SELECT id,wake_at_ms,delivered_at FROM session_control_wakes WHERE state='delivered' ORDER BY delivered_at,id LIMIT 1").toArray()[0];
+    if (delivered) {
+      const at=Date.parse(delivered.delivered_at);
+      heads.push({id:delivered.id,dueAt:(Number.isFinite(at)?at:delivered.wake_at_ms)+WAKE_ACK_TIMEOUT_MS});
+    }
+    const ping: any = this.sql.exec("SELECT id,next_at_ms FROM session_control_pings WHERE state='active' ORDER BY next_at_ms LIMIT 1").toArray()[0];
+    if (ping) heads.push({id:'ping:'+ping.id,dueAt:ping.next_at_ms});
+    return heads.sort((a,b)=>a.dueAt-b.dueAt)[0] ?? null;
+  }
+
+  processBackground(id: string): number | null {
+    if (id.startsWith('ping:')) {
+      const pingId=id.slice(5);
+      this.processPings(pingId);
+      const ping: any=this.sql.exec("SELECT next_at_ms FROM session_control_pings WHERE id=? AND state='active'",pingId).toArray()[0];
+      return typeof ping?.next_at_ms==='number'?ping.next_at_ms:null;
+    }
+    this.processDueWakes(id);
+    const row: any=this.sql.exec('SELECT state,wake_at_ms,delivered_at FROM session_control_wakes WHERE id=?',id).toArray()[0];
+    if (!row) return null;
+    if (row.state==='pending') return row.wake_at_ms>this.now()?row.wake_at_ms:Math.min(this.now()+15000,row.wake_at_ms+WAKE_ACK_TIMEOUT_MS);
+    if (row.state==='queued') return row.wake_at_ms+WAKE_ACK_TIMEOUT_MS;
+    if (row.state==='delivered') {
+      const at=Date.parse(row.delivered_at);
+      return (Number.isFinite(at)?at:row.wake_at_ms)+WAKE_ACK_TIMEOUT_MS;
+    }
+    return null;
+  }
+
   public nextWakeTime(): number | null {
     // Seek the earliest row of each indexed queue; never aggregate retained
     // outstanding history or apply julianday to every delivery. Keep the
@@ -941,11 +976,12 @@ export class SessionControlService {
   /** Sweep external pings: reconcile the last delivery, end pings of finished
    * sessions, deliver due ticks through the normal send command path and
    * coalesce ticks while the session still has an unfinished command. */
-  public processPings(): { delivered: number; skipped: number; failed: number; ended: number } {
+  public processPings(pingId?: string): { delivered: number; skipped: number; failed: number; ended: number } {
     const out = { delivered: 0, skipped: 0, failed: 0, ended: 0 };
     const nowMs = this.now(), at = this.at();
     let pings: any[] = [];
-    try { pings = this.sql.exec("SELECT * FROM session_control_pings WHERE state = 'active' ORDER BY next_at_ms ASC, id ASC LIMIT 200").toArray() as any[]; } catch { return out; }
+    try { pings = (pingId ? this.sql.exec("SELECT * FROM session_control_pings WHERE id=? AND state='active'", pingId)
+      : this.sql.exec("SELECT * FROM session_control_pings WHERE state = 'active' ORDER BY next_at_ms ASC, id ASC LIMIT 200")).toArray() as any[]; } catch { return out; }
     for (const ping of pings) {
       try {
         const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', ping.session_id).toArray()[0];
@@ -1029,15 +1065,14 @@ export class SessionControlService {
   /** Durable wake sweep: deliver due wakes through the verified send path and
    * expire unacked deliveries. Survives Worker/host restarts (DO SQLite).
    * Called opportunistically on session reads and from the Hub tick/alarm. */
-  public processDueWakes(): { delivered: number; acked: number; missed: number } {
+  public processDueWakes(wakeId?: string): { delivered: number; acked: number; missed: number } {
     let delivered = 0, acked = 0, missed = 0;
     const nowMs = this.now();
     const at = this.at();
     let due: any[] = [];
     try {
-      due = this.sql.exec(
-        "SELECT * FROM session_control_wakes WHERE state = 'pending' AND wake_at_ms <= ? ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 100",
-        nowMs).toArray() as any[];
+      due = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='pending' AND wake_at_ms<=?", wakeId, nowMs)
+        : this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'pending' AND wake_at_ms <= ? ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 100", nowMs)).toArray() as any[];
     } catch { due = []; }
     for (const wake of due) {
       try {
@@ -1091,7 +1126,8 @@ export class SessionControlService {
     // written to the native recipient inbox. Queue transport alone does not
     // satisfy this receipt.
     let queued: any[] = [];
-    try { queued = this.sql.exec("SELECT * FROM session_control_wakes INDEXED BY session_control_wakes_resolution_order WHERE state = 'queued' ORDER BY updated_at, rowid LIMIT 100").toArray() as any[]; }
+    try { queued = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='queued'", wakeId)
+      : this.sql.exec("SELECT * FROM session_control_wakes INDEXED BY session_control_wakes_resolution_order WHERE state = 'queued' ORDER BY updated_at, rowid LIMIT 100")).toArray() as any[]; }
     catch { queued = []; }
     for (const wake of queued) {
       try {
@@ -1121,7 +1157,8 @@ export class SessionControlService {
     // Ack reconciliation + 10-minute missed-wake expiry.
     let awaiting: any[] = [];
     try {
-      awaiting = this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'delivered' ORDER BY delivered_at ASC, id ASC LIMIT 100").toArray() as any[];
+      awaiting = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='delivered'", wakeId)
+        : this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'delivered' ORDER BY delivered_at ASC, id ASC LIMIT 100")).toArray() as any[];
     } catch { awaiting = []; }
     for (const wake of awaiting) {
       try {
@@ -1160,7 +1197,8 @@ export class SessionControlService {
         }
       } catch { /* next */ }
     }
-    const unresolved = this.sql.exec("SELECT * FROM session_control_wakes WHERE state='missed' ORDER BY updated_at LIMIT 100").toArray() as any[];
+    const unresolved = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='missed'", wakeId)
+      : this.sql.exec("SELECT * FROM session_control_wakes WHERE state='missed' ORDER BY updated_at LIMIT 100")).toArray() as any[];
     for (const wake of unresolved) {
       const cmd: any = wake.command_id && this.sql.exec('SELECT state FROM session_control_commands WHERE id=?', wake.command_id).toArray()[0];
       const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', wake.session_id).toArray()[0];
@@ -1173,7 +1211,7 @@ export class SessionControlService {
         this.sql.exec("UPDATE session_control_wakes SET state='resolved',updated_at=? WHERE id=?", at, wake.id);
       }
     }
-    try { this.processPings(); } catch { /* ping sweep never breaks wakes */ }
+    if (!wakeId) try { this.processPings(); } catch { /* ping sweep never breaks wakes */ }
     return { delivered, acked, missed };
   }
 

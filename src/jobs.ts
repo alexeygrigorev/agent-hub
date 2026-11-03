@@ -1,3 +1,5 @@
+import { externalRootBlocks } from './root-incumbent';
+import { effectiveHost } from './registry';
 import { registryNameSql } from './agent_registry';
 import { sha256, base64url } from './auth/crypto';
 import { getSession } from './auth/session';
@@ -363,7 +365,10 @@ export class JobsService {
       if (trimmed) this.sql.exec(trimmed);
     }
 
-    this.sql.exec("CREATE INDEX IF NOT EXISTS credentials_job_subject_live ON credentials(subject) WHERE kind='job' AND revoked_at IS NULL");
+    this.sql.exec('CREATE TABLE IF NOT EXISTS root_background_ready(slot_ms INTEGER NOT NULL,host_id TEXT NOT NULL,rank TEXT NOT NULL,PRIMARY KEY(slot_ms,host_id))');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS root_background_rank ON root_background_ready(slot_ms,rank,host_id)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS root_background_hosts(host_id TEXT PRIMARY KEY,last_slot_ms INTEGER NOT NULL)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS root_background_slots(slot_ms INTEGER PRIMARY KEY,invalid_attempts INTEGER NOT NULL DEFAULT 0)');
     this.initClaimDeadlines();
 
     const agentCols = ['engine TEXT', 'session_id TEXT', 'workspace TEXT', 'state TEXT', 'health_state TEXT', 'detail TEXT', 'lasthealth TEXT', 'health_at TEXT', 'last_seen_at TEXT'];
@@ -630,6 +635,147 @@ export class JobsService {
     return nextTimes[0];
   }
 
+  /** Hosts publish readiness only for their known identity and current/next
+   * slot. Stable random ranks provide a lottery without a background census. */
+  markRootReady(hostId: string): void {
+    if(!isRootSchedulingEnabled(this.sql))return;
+    const now=this.now().getTime(),slot=Math.floor(now/1800000)*1800000;
+    const host: any=effectiveHost(this.sql,this.sql.exec('SELECT * FROM machines WHERE id=?',hostId).toArray()[0]);
+    if(!host || host.drained || !this.checkHostRootRunCapability(host))return;
+    const checkin=parseExpiryMs(host.last_checkin_at);
+    let heartbeat:any;try{heartbeat=JSON.parse(host.last_heartbeat || '{}');}catch{return;}
+    if(checkin===null || now-checkin<0 || now-checkin>180000 || heartbeat?.gate?.launch_allowed!==true)return;
+    this.ctx.storage.transactionSync(()=>{
+      const prior:any=this.sql.exec('SELECT last_slot_ms FROM root_background_hosts WHERE host_id=?',hostId).toArray()[0];
+      if(prior?.last_slot_ms===slot)return;
+      if(typeof prior?.last_slot_ms==='number')for(const old of [prior.last_slot_ms,prior.last_slot_ms+1800000])
+        if(old<slot)this.sql.exec('DELETE FROM root_background_ready WHERE slot_ms=? AND host_id=?',old,hostId);
+      for(const when of [slot,slot+1800000])this.sql.exec('INSERT OR IGNORE INTO root_background_ready VALUES(?,?,?)',when,hostId,crypto.randomUUID());
+      this.sql.exec('INSERT INTO root_background_hosts VALUES(?,?) ON CONFLICT(host_id) DO UPDATE SET last_slot_ms=excluded.last_slot_ms',hostId,slot);
+    });
+  }
+
+  nextRootSlotWork(): {slot:string;dueAt:number} | null {
+    if(!isRootSchedulingEnabled(this.sql))return null;
+    const dueAt=(Math.floor(this.now().getTime()/1800000)+1)*1800000;
+    return {slot:new Date(dueAt).toISOString(),dueAt};
+  }
+
+  processRootSlotBackground(slot: string): number | null {
+    if(!isRootSchedulingEnabled(this.sql))return null;
+    const when=Date.parse(slot),now=this.now().getTime();
+    if(!Number.isFinite(when)||when%1800000!==0)throw new Error('invalid_root_slot');
+    if(when>now)return when;
+    if(now>=when+1500000)return null;
+    const external=externalRootBlocks(this.sql,now);
+    if(external===null)return Math.min(now+60000,when+1500000);
+    if(external) { this.tickRootSlotForHost(slot,''); return null; }
+    const candidate:any=this.sql.exec('SELECT host_id FROM root_background_ready INDEXED BY root_background_rank WHERE slot_ms=? ORDER BY rank,host_id LIMIT 1',when).toArray()[0];
+    if(!candidate)return Math.min(now+60000,when+1500000);
+    const attempts=Number(this.sql.exec('SELECT invalid_attempts FROM root_background_slots WHERE slot_ms=?',when).toArray()[0]?.invalid_attempts ?? 0);
+    if(attempts>=16)return null;
+    const result=this.tickRootSlotForHost(slot,String(candidate.host_id));
+    if(result.status!=='retry')return null;
+    this.sql.exec('DELETE FROM root_background_ready WHERE slot_ms=? AND host_id=?',when,candidate.host_id);
+    this.sql.exec('INSERT INTO root_background_slots VALUES(?,1) ON CONFLICT(slot_ms) DO UPDATE SET invalid_attempts=invalid_attempts+1',when);
+    return Math.min(now+15000,when+1500000);
+  }
+
+  /** Targeted root offer. The caller owns appointed external-root custody;
+   * this path never guesses it by scanning the agent registry. */
+  tickRootSlotForHost(slot: string, hostId: string): {status:'offered'|'skip'|'retry'|'disabled'|'late'} {
+    return this.withClockSnapshot(now=>this.ctx.storage.transactionSync(()=>{
+      if(!isRootSchedulingEnabled(this.sql))return {status:'disabled'};
+      const when=Date.parse(slot),nowMs=now.getTime(),key='root-run:'+slot;
+      if(!Number.isFinite(when)||when%1800000!==0||when>nowMs||nowMs>=when+1500000)return {status:'late'};
+      const existing:any=this.sql.exec('SELECT id,status FROM jobs WHERE idempotency_key=?',key).toArray()[0];
+      if(existing)return {status:existing.status==='offered'?'offered':'skip'};
+      if(externalRootBlocks(this.sql,nowMs)!==false) {
+        this.sql.exec("INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,outcome_summary) VALUES(?,'root-run',?,'{}','skip',?,?,'system','skip: appointed root custody active or unknown')",this.generateId(),key,slot,new Date(when+1500000).toISOString());
+        return {status:'skip'};
+      }
+      const lease:any=this.sql.exec("SELECT * FROM leases WHERE name='root'").toArray()[0];
+      if(lease?.holder_job_id) {
+        const holder:any=this.sql.exec('SELECT status,deadline_at,started_at,created_at FROM jobs WHERE id=?',lease.holder_job_id).toArray()[0];
+        const started=parseExpiryMs(holder?.started_at)??parseExpiryMs(holder?.created_at);
+        const hardstop=Math.min(parseExpiryMs(holder?.deadline_at)??Infinity,started===null?Infinity:started+1500000);
+        // Unknown or still authoritative custody never authorizes a second root.
+        if(!holder || (['claimed','running'].includes(holder.status) && (!isLeaseExpired(lease.expires_at,nowMs)||nowMs<hardstop+120000))) {
+          this.sql.exec("INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,outcome_summary) VALUES(?,'root-run',?,'{}','skip',?,?,'system','skip: root custody active or unknown')",this.generateId(),key,slot,new Date(when+1500000).toISOString());
+          return {status:'skip'};
+        }
+      }
+      const host:any=effectiveHost(this.sql,this.sql.exec('SELECT * FROM machines WHERE id=?',hostId).toArray()[0]);
+      if(!host || host.drained || !this.checkHostRootRunCapability(host))return {status:'retry'};
+      const checkin=parseExpiryMs(host.last_checkin_at);let heartbeat:any;
+      try{heartbeat=JSON.parse(host.last_heartbeat||'{}');}catch{return {status:'retry'};}
+      if(checkin===null||nowMs-checkin<0||nowMs-checkin>180000||heartbeat?.gate?.launch_allowed!==true)return {status:'retry'};
+      if(this.rootHostsPolicy?.length && !this.rootHostsPolicy.some(value=>[host.id,host.name,host.hostname].includes(value)))return {status:'retry'};
+      const id=this.generateId(),expiry=Math.min(nowMs+120000,when+1500000);
+      this.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_machine_id,offer_expires_at,offer_attempts)
+        VALUES(?,'root-run',?,'{}','offered',?,?,'system',?,?,?,?)`,id,key,slot,new Date(when+1500000).toISOString(),hostId,hostId,new Date(expiry).toISOString(),JSON.stringify([hostId]));
+      this.addHealthEvent('job',id,'offered','root slot offered to ready host',now.toISOString());
+      return {status:'offered'};
+    }));
+  }
+
+  /** Physical revocation follows the job's current opaque token through
+   * the deployed UNIQUE token_hash key. Generic authorization additionally
+   * fences every legacy token against current job state/hash/lease epoch. */
+  private revokeCurrentCredential(jobId: string, at: string): void {
+    const job: any = this.sql.exec('SELECT claim_token_hash FROM jobs WHERE id=?', jobId).toArray()[0];
+    if (typeof job?.claim_token_hash==='string' && job.claim_token_hash)
+      this.sql.exec("UPDATE credentials SET revoked_at=? WHERE token_hash=? AND subject=? AND kind='job' AND revoked_at IS NULL", at,job.claim_token_hash,jobId);
+  }
+
+  /** Queue adapter: only fixed index-head seeks, never a maintenance pass. */
+  nextBackgroundWork(): { id: string; dueAt: number } | null {
+    const heads: {id:string;dueAt:number}[] = [];
+    const add = (query: string) => {
+      const row: any = this.sql.exec(query).toArray()[0];
+      if (typeof row?.id==='string' && typeof row.due==='number' && Number.isFinite(row.due)) heads.push({id:row.id,dueAt:Math.max(1,row.due)});
+    };
+    if (isRootSchedulingEnabled(this.sql)) add(`SELECT id,${OFFER_MS} AS due FROM jobs WHERE status='offered' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+    else {
+      add(`SELECT id,${OFFER_MS} AS due FROM jobs INDEXED BY jobs_nonroot_offered_due_ms WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+      add(`SELECT id,${DEADLINE_MS} AS due FROM jobs INDEXED BY jobs_root_offered_deadline_ms WHERE status='offered' AND kind='root-run' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
+    }
+    add(`SELECT holder_job_id AS id,${LEASE_MS} AS due FROM leases WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
+    add('SELECT job_id AS id,due_ms AS due FROM job_claim_deadlines ORDER BY due_ms,lease_name LIMIT 1');
+    return heads.sort((a,b)=>a.dueAt-b.dueAt)[0] ?? null;
+  }
+
+  /** Process one named job. Re-offering expired root jobs remains an explicit
+   * slot action: the deadline consumer must never enumerate candidate hosts. */
+  processBackground(id: string): number | null {
+    return this.withClockSnapshot(now => this.ctx.storage.transactionSync(() => {
+      const job: any = this.sql.exec('SELECT * FROM jobs WHERE id=?', id).toArray()[0];
+      if (!job) return null;
+      const nowMs = now.getTime(), at = now.toISOString();
+      if (job.status==='offered') {
+        const due = job.kind==='root-run' && !isRootSchedulingEnabled(this.sql) ? parseExpiryMs(job.deadline_at) : parseExpiryMs(job.offer_expires_at);
+        if (due===null) return null;
+        if (due>nowMs) return due;
+        this.sql.exec("UPDATE jobs SET status='expired',finished_at=?,outcome_summary='offer expired' WHERE id=? AND status='offered'", at,id);
+        this.addHealthEvent('job',id,'failed','offer expired',at);
+        return null;
+      }
+      if (!['claimed','running'].includes(job.status)) return null;
+      const leaseName = job.role_name || 'root';
+      const lease: any = this.sql.exec('SELECT * FROM leases WHERE name=?', leaseName).toArray()[0];
+      if (!lease || lease.holder_job_id!==id || lease.epoch!==job.lease_epoch) return null;
+      const expiry = parseExpiryMs(lease.expires_at), firstAction = job.status==='claimed' && !job.started_at ? parseExpiryMs(lease.acquired_at) : null;
+      const claimDue = firstAction===null ? null : firstAction+300000;
+      const failure = expiry===null || expiry<=nowMs ? 'lease expired' : claimDue!==null && claimDue<=nowMs ? 'no first action' : null;
+      if (!failure) return Math.min(expiry!,claimDue ?? Infinity);
+      this.sql.exec('UPDATE jobs SET status=?,finished_at=?,outcome_summary=? WHERE id=?',failure==='lease expired'?'expired':'failed',at,failure,id);
+      this.revokeCurrentCredential(id,at);
+      this.sql.exec('UPDATE leases SET holder_job_id=NULL,holder_host_id=NULL,holder_machine_id=NULL,expires_at=NULL,released_at=?,release_reason=? WHERE name=? AND holder_job_id=? AND epoch=?',at,failure,leaseName,id,job.lease_epoch);
+      this.addHealthEvent('job',id,'failed',failure,at);
+      return null;
+    }));
+  }
+
   processAlarms(): number | null {
     return this.withClockSnapshot((now) => {
       const nowMs = now.getTime();
@@ -682,7 +828,7 @@ export class JobsService {
             const jobId = lease.holder_job_id as string;
             this.sql.exec("UPDATE jobs SET status = 'expired', finished_at = ?, outcome_summary = ? WHERE id = ?", nowIso, 'lease expired', jobId);
             this.addHealthEvent('job', jobId, 'failed', 'lease expired', nowIso);
-            this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+            this.revokeCurrentCredential(jobId, nowIso);
             this.sql.exec(
               "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ?",
               nowIso, 'lease expired', lease.name as string
@@ -700,7 +846,7 @@ export class JobsService {
             const jobId = lease.holder_job_id as string;
             this.sql.exec("UPDATE jobs SET status = 'failed', finished_at = ?, outcome_summary = ? WHERE id = ?", nowIso, 'no first action', jobId);
             this.addHealthEvent('job', jobId, 'failed', 'no first action', nowIso);
-            this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+            this.revokeCurrentCredential(jobId, nowIso);
             this.sql.exec(
               "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ?",
               nowIso, 'no first action', lease.name as string
@@ -771,7 +917,7 @@ export class JobsService {
   }
 
   private getCandidates(now: Date, excludeIds: string[], slotKeyOrDate?: string | Date): Machine[] {
-    const machines = this.sql.exec("SELECT * FROM machines WHERE revoked_at IS NULL").toArray() as unknown as Machine[];
+    const machines = (this.sql.exec("SELECT * FROM machines WHERE revoked_at IS NULL").toArray() as unknown as Machine[]).map(m=>effectiveHost(this.sql,m));
     const candidates: Machine[] = [];
     const nowMs = now.getTime();
 
@@ -1068,7 +1214,7 @@ export class JobsService {
         }
 
         // Server revalidate current machine checkin/drain/capability/heartbeat gate in same SQL transaction
-        const host = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+        const host = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any);
         if (!host) {
           result = { error: 'gate_failed', reason: 'host_not_found' }; return;
         }
@@ -1166,10 +1312,7 @@ export class JobsService {
             "UPDATE jobs SET status = 'fenced', finished_at = ?, outcome_summary = ? WHERE id = ? AND status IN ('claimed', 'running', 'offered')",
             nowIso, `fenced: superseded by takeover epoch ${newEpoch}`, oldJobId
           );
-          this.sql.exec(
-            "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
-            nowIso, oldJobId
-          );
+          this.revokeCurrentCredential(oldJobId, nowIso);
           this.addHealthEvent('job', oldJobId, 'fenced', `superseded by takeover epoch ${newEpoch}`, nowIso);
         }
 
@@ -1406,7 +1549,7 @@ export class JobsService {
         }
 
         // Update credential expiry
-        this.sql.exec("UPDATE credentials SET expires_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", newExpiresIso, jobId);
+        this.sql.exec("UPDATE credentials SET expires_at=? WHERE token_hash=? AND subject=? AND kind='job' AND revoked_at IS NULL", newExpiresIso, job.claim_token_hash, jobId);
       });
 
       this.scheduleAlarm();
@@ -1507,7 +1650,7 @@ export class JobsService {
         if (job.role_name) this.sql.exec('UPDATE jobs SET role_finish=? WHERE id=?', canonical({ status, summary: safeSummary, evidenceRefs }), jobId);
 
         // Invalidate/revoke job credential
-        if (!job.role_name) this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+        if (!job.role_name) this.revokeCurrentCredential(jobId, nowIso);
 
         this.addHealthEvent('job', jobId, status, safeSummary, nowIso);
 
@@ -1577,7 +1720,7 @@ export class JobsService {
           return { error: 'unauthorized_or_stale', status_code: 403 };
         }
         const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id=?', callerTokenId).toArray()[0];
-        const machine: any = this.sql.exec('SELECT * FROM machines WHERE id=?', callerHostId).toArray()[0];
+        const machine: any = effectiveHost(this.sql,this.sql.exec('SELECT * FROM machines WHERE id=?', callerHostId).toArray()[0]);
         let scopes: any;
         try { scopes = JSON.parse(cred?.scopes); } catch { scopes = null; }
         if (!cred || cred.kind !== 'host' || cred.revoked_at || !(Date.parse(cred.expires_at) > nowMs) ||
@@ -2011,7 +2154,7 @@ export class JobsService {
     let machineTransportKnown = false;
 
     if (hostId) {
-      const machine = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+      const machine = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any);
       if (machine) {
         let hb = null;
         try { hb = machine.last_heartbeat ? JSON.parse(machine.last_heartbeat) : null; } catch {}
@@ -2056,7 +2199,7 @@ export class JobsService {
 
     if (regAgent) {
       const regHostId = regAgent.machine_id;
-      const regMachine = regHostId ? this.sql.exec("SELECT * FROM machines WHERE id = ?", regHostId).toArray()[0] as any : null;
+      const regMachine = regHostId ? effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", regHostId).toArray()[0] as any) : null;
       let regMachineFresh = false;
       let regMachineKnown = false;
       if (regMachine && regMachine.last_checkin_at) {
@@ -2413,7 +2556,7 @@ export class JobsService {
         }
 
         // 5. Validate candidate host eligibility
-        const candidateMachine = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+        const candidateMachine = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any);
         if (!candidateMachine) {
           result = { error: 'host_not_found', reason: `candidate host ${hostId} not registered in machines` };
           return;
@@ -2492,10 +2635,7 @@ export class JobsService {
             "UPDATE jobs SET status = 'fenced', finished_at = ?, outcome_summary = ? WHERE id = ? AND status IN ('claimed', 'running', 'offered')",
             nowIso, `fenced: superseded by takeover epoch ${newEpoch} on host ${hostId}`, oldJobId
           );
-          this.sql.exec(
-            "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
-            nowIso, oldJobId
-          );
+          this.revokeCurrentCredential(oldJobId, nowIso);
           this.addHealthEvent('job', oldJobId, 'fenced', `superseded by takeover epoch ${newEpoch}`, nowIso);
         }
 
@@ -2925,7 +3065,7 @@ export class JobsService {
           const p = action.payload || {};
           let toActor = p.to_actor;
           if (!toActor && typeof p.to === 'string' && p.to) {
-            const mRow = this.sql.exec("SELECT 1 FROM machines WHERE id = ?", p.to).toArray()[0];
+            const mRow = effectiveHost(this.sql,this.sql.exec("SELECT 1 FROM machines WHERE id = ?", p.to).toArray()[0]);
             toActor = mRow ? `machine:${p.to}` : p.to;
           }
           const msgKind = p.kind || (p.type === 'directive' ? 'note' : p.type);
@@ -2979,7 +3119,7 @@ export class JobsService {
             validRecipient = res.length > 0;
           } else if (toActor.startsWith('machine:')) {
             const mId = toActor.substring(8);
-            const mRow = this.sql.exec("SELECT * FROM machines WHERE id = ? AND COALESCE(drained, 0) = 0", mId).toArray()[0] as any;
+            const mRow = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ? AND COALESCE(drained, 0) = 0", mId).toArray()[0] as any);
             validRecipient = Boolean(mRow && (!mRow.state || mRow.state !== 'drained'));
           } else if (toActor.includes(':')) {
             const [project, tag] = toActor.split(':');
@@ -3126,10 +3266,7 @@ export class JobsService {
             nowIso, p.new_status, p.target_job_id
           );
           // Revoke target job credentials
-          this.sql.exec(
-            "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
-            nowIso, p.target_job_id
-          );
+          this.revokeCurrentCredential(p.target_job_id, nowIso);
           this.addHealthEvent('job', p.target_job_id, p.new_status, `transitioned by root epoch ${epoch}`, nowIso);
           effectResult = { target_job_id: p.target_job_id, previous_status: targetJob.status, new_status: p.new_status };
         }
@@ -3191,7 +3328,7 @@ export class JobsService {
       let res: any = { success: false };
       this.ctx.storage.transactionSync(() => {
         // 1. Authenticate caller host exists
-        const host = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+        const host = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any);
         if (!host) {
           res = { success: false, error: 'host_not_found' };
           return;

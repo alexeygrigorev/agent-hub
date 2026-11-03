@@ -21,6 +21,8 @@ describe('retained intake and alert bootstrap uses deployed indexes',()=>{
   for(let i=0;i<80;i++)raw.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)','page-summary-'+String(i).padStart(3,'0'),JSON.stringify({id:'page-summary-'+i,status:'done',history:[]}));
   raw.exec("INSERT INTO intake_status_summary(id,title) VALUES('orphan-summary','orphan')");
   const o=observe(raw);initIntakeSummary(o.sql);
+  expect(o.calls.some(c=>/FROM intake_tasks/.test(c.query))).toBe(false);
+  advanceIntakeSummary(o.sql);
   expect(reads(o.calls)).toBeLessThan(200);
   expect(raw.exec('SELECT phase FROM intake_summary_migration WHERE id=1').one().phase).toBe(0);
   raw.exec("UPDATE intake_tasks SET data=json_set(data,'$.title','concurrent') WHERE id='page-summary-000'");

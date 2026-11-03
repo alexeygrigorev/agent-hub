@@ -20,9 +20,8 @@ export function initIntakeSummary(sql: SqlStorage) {
   sql.exec('CREATE TABLE IF NOT EXISTS intake_summary_migration(id INTEGER PRIMARY KEY CHECK(id=1),after_id TEXT,phase INTEGER NOT NULL)');
   sql.exec('INSERT OR IGNORE INTO intake_summary_migration VALUES(1,NULL,?)',proven?2:0);
   for(const op of ['INSERT','UPDATE','DELETE'] as const) sql.exec(trigger(op));
-  advanceIntakeSummary(sql);
 }
-/** Caller wraps page+cursor in a transaction. No periodic background scan. */
+/** Explicit request only; caller wraps page+cursor in a transaction. Construction and alarms never advance. */
 export function advanceIntakeSummary(sql: SqlStorage): boolean {
   const state = sql.exec('SELECT after_id,phase FROM intake_summary_migration WHERE id=1').one() as {after_id:string|null;phase:number};
   if(state.phase===2)return true;
@@ -37,4 +36,9 @@ export function advanceIntakeSummary(sql: SqlStorage): boolean {
   const done=rows.length<25;
   sql.exec('UPDATE intake_summary_migration SET after_id=?,phase=? WHERE id=1',rows.at(-1)?.id??state.after_id,done?2:1);
   return done;
+}
+
+/** Singleton readiness; never reads a retained source or advances its cursor. */
+export function intakeSummaryReady(sql:SqlStorage):boolean {
+  return Number((sql.exec('SELECT phase FROM intake_summary_migration WHERE id=1').toArray()[0] as any)?.phase)===2;
 }

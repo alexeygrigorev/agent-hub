@@ -688,6 +688,8 @@ export class StatusService {
         const code = (auth.error as Response).status || 401;
         return json({ error: 'unauthorized_or_forbidden' }, code);
       }
+      this.intake.statusPrincipal(auth);
+      this.intake.advanceStatusSummary();
       return this.tx(() => {
         const p = this.intake.statusPrincipal(auth);
         const params = new URL(request.url).searchParams;
@@ -757,6 +759,8 @@ export class StatusService {
         body = text.trim() === '' ? {} : JSON.parse(text);
       } catch { fail('malformed_json'); }
       if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) fail('invalid_body');
+      this.intake.statusPrincipal(auth);
+      this.intake.advanceStatusSummary();
       return this.tx(() => {
         const p = this.intake.statusPrincipal(auth);
         const params = new URL(request.url).searchParams;

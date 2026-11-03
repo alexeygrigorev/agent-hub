@@ -1,4 +1,4 @@
-import { initIntakeSummary, advanceIntakeSummary } from './intake-summary';
+import { initIntakeSummary, advanceIntakeSummary, intakeSummaryReady } from './intake-summary';
 /** Durable private intake. Payload text is data, never execution or operator authority. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { CallerContext } from './bus';
@@ -2267,11 +2267,16 @@ export class IntakeService {
     const task = this.get('tasks', id);
     return task && this.allowed(p, task) ? task : undefined;
   }
+  /** Explicit request bootstrap, outside any surrounding transaction which
+   * may reject the eventual partial observation. At most two 25-row pages. */
+  advanceStatusSummary(): boolean {
+    return this.tx(() => advanceIntakeSummary(this.sql) || advanceIntakeSummary(this.sql));
+  }
   statusTaskSummaries(p: Obj): Obj[] {
     // Bounded read from the write-maintained summary (intake 3bd2521a): never
     // parse every projected task body per status call. NULL summaries of
     // absent source fields become absent keys, matching the parsed-body shape.
-    if (!this.tx(() => advanceIntakeSummary(this.sql))) throw new IntakeError('intake_summary_migrating',503);
+    if (!intakeSummaryReady(this.sql)) throw new IntakeError('intake_summary_migrating',503);
     const rows = this.sql.exec('SELECT id,project,status,title,updated_at,created_at,archived_at,version FROM intake_status_summary ORDER BY id LIMIT 2001').toArray();
     if (rows.length > 2000) throw new IntakeError('intake_summary_observation_incomplete',503);
     return rows.map(statusSummaryRow).filter(t => this.allowed(p,t));
