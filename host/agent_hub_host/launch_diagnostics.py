@@ -34,7 +34,13 @@ REFUSALS = {
     'No valid routes available': ('launcher_admission_refused', 'Fresh launcher admission found no valid provider route.'),
     'Configured Codex launch wrapper unavailable': ('launcher_codex_wrapper_unavailable', 'The configured protected Codex wrapper is unavailable.'),
     'Maintained launcher plan refused': ('launcher_plan_refused', 'The maintained launcher plan refused the selected route.'),
+    "Provider 'antigravity' is not supported for managed headless execution": ('launcher_model_unsupported', 'The requested provider is not supported for managed headless execution by the host launcher.'),
+    'Cannot resolve trusted Agent Hub host path for managed profile execution': ('launcher_host_path_unavailable', 'The trusted Agent Hub host path could not be resolved for managed profile execution.'),
     'Native Codex receipt mismatch': ('launcher_receipt_mismatch', 'The native Codex receipt did not match the launch.'),
+    'Native ZCodex receipt mismatch': ('launcher_receipt_mismatch', 'The native ZCodex receipt did not match the launch.'),
+    'Native Gemini receipt mismatch': ('launcher_receipt_mismatch', 'The native Gemini receipt did not match the launch.'),
+    'Native profile receipt mismatch': ('launcher_receipt_mismatch', 'The native launch receipt profile did not match the requested profile.'),
+    'Native account receipt mismatch': ('launcher_receipt_mismatch', 'The native launch receipt account did not match the requested account.'),
     'Native receipt mismatch': ('launcher_receipt_mismatch', 'The native launch receipt did not match the requested session.'),
     'Native cwd mismatch': ('launcher_cwd_mismatch', 'The native session working directory did not match the requested cwd.'),
     'Native profile receipt mismatch': ('native_profile_mismatch', 'The native profile receipt did not match the configured route.'),
@@ -602,9 +608,14 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         # Accept only its complete numeric grammar, never arbitrary exception text.
         # Intake 63a9ee3a: newer launchers append the numeric
         # available/reserved/required/floor breakdown.
-        if re.fullmatch(r'host MemAvailable below [0-9]{1,7}MiB floor after reservation \(launcher_memory_reserve\)'
-                        r'(?:: available_mb=[0-9]{1,9} reserved_mb=[0-9]{1,9} required_mb=[0-9]{1,9} floor_mb=[0-9]{1,7})?', candidate):
+        if re.fullmatch(r'host MemAvailable below [1-9][0-9]{0,8}MiB floor after reservation \(launcher_memory_reserve\)'
+                        r'(?:: available_mb=[0-9]{1,9} reserved_mb=[0-9]{1,9} required_mb=[0-9]{1,9} floor_mb=[1-9][0-9]{0,8})?', candidate):
             reason, message = REFUSALS['launcher_memory_reserve']
+            surfaced_tail = error_type + ': ' + candidate
+            refusal_found = True
+            break
+        if re.fullmatch(r"(?:Launcher )?[Pp]rovider '[A-Za-z0-9][A-Za-z0-9._-]{0,31}' is not supported for (?:managed )?headless execution", candidate):
+            reason, message = REFUSALS["Provider 'antigravity' is not supported for managed headless execution"]
             surfaced_tail = error_type + ': ' + candidate
             refusal_found = True
             break
