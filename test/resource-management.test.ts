@@ -76,12 +76,18 @@ describe('resource management',()=>{
    return sql.exec(query,...args);
   }};
   const reporter=new ResourceManagement(boundedSql,()=>now);
+  reporter.initCatalogCache();
   reporter.report('host',{samples:[],reaps:[]});
   // An unrelated source revision must not restart an in-progress terminal sweep.
   sql.exec("UPDATE session_control_sessions SET updated_at=? WHERE id='session'",iso(-1));
   reporter.report('host',{samples:[],reaps:[]});
   expect(ledgerReads).toBeLessThanOrEqual(4);
-  expect(ledgerWrites).toBe(0);
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    VALUES('aaa-late','admin','aaa-late','{}','host','opencode','headless','exited',?, ?, ?)` ,
+    JSON.stringify({native_id:'aaa-late-native',tag:'aaa-late-tag',workspace:'/repo',native_created_at_ms:now-600000}),iso(-600000),iso());
+  reporter.report('host',{samples:[],reaps:[]});
+  expect(ledgerWrites).toBe(1);
+  expect(sql.exec("SELECT session_id FROM session_resource_usage WHERE session_id='aaa-late'").toArray()).toHaveLength(1);
   expect(sql.exec("SELECT state FROM session_resource_usage WHERE session_id='session'").one().state).toBe('exited');
  }));
  it('excludes negative, fractional and unsafe token counts consistently from period totals',async()=>fixture(async(r,sql)=>{

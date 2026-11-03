@@ -522,22 +522,25 @@ export class ResourceManagement {
    * catalog revision. Explicit confirmed exits still use finishObserved(). */
   private terminalSamples(machine: string, sessions: Map<string,any>, sampled: Set<string>, limit: number) {
     if(limit<=0 || !this.catalogRevision) return [];
-    const current=this.sql.exec('SELECT revision,cursor_session_id,complete FROM resource_terminal_reconcile WHERE machine_id=?',machine).toArray()[0] as any;
+    const current=this.sql.exec('SELECT revision,cursor_key,complete FROM resource_terminal_reconcile WHERE machine_id=?',machine).toArray()[0] as any;
     if(current?.revision===this.catalogRevision && current.complete===1) return [];
-    // Keep an in-progress cursor when unrelated source rows advance the shared
-    // catalog revision; terminal rows are ordered by their finish timestamp so
-    // newly finished sessions continue after the cursor instead of restarting
-    // this sweep from page one.
-    const cursor=current?.cursor_key as string|null ?? null;
+    // Preserve progress through unrelated catalog changes while a sweep is in
+    // flight. At its end, restart if the source revision moved so late or
+    // backdated bindings before the cursor are picked up on the next pass.
+    const cursor=current?.complete===1 && current.revision!==this.catalogRevision
+      ? null : (current?.cursor_key as string|null ?? null);
+    const scanRevision=current?.complete===1 && current.revision!==this.catalogRevision
+      ? this.catalogRevision : (current?.revision ?? this.catalogRevision);
     const candidates=[...new Map([...sessions.values()].filter(s=>TERMINAL.has(s.state) && s.finished_at)
       .map(s=>[s.native_id,s])).values()]
-      .map(s=>({...s,terminalCursorKey:String(s.finished_at)+'\n'+s.session_id}))
-      .filter(s=>!s.aliases.some((id:string)=>sampled.has(id)) && (!cursor || s.terminalCursorKey>cursor))
-      .sort((a,b)=>a.terminalCursorKey<b.terminalCursorKey?-1:a.terminalCursorKey>b.terminalCursorKey?1:0);
+      .filter(s=>!s.aliases.some((id:string)=>sampled.has(id)) && (!cursor || s.session_id>cursor))
+      .sort((a,b)=>a.session_id<b.session_id?-1:a.session_id>b.session_id?1:0);
     const window=candidates.slice(0,Math.min(200,limit));
     if(!window.length) {
-      this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_key,complete) VALUES(?,?,?,1)
-        ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,complete=1`,machine,this.catalogRevision,cursor);
+      const changed=scanRevision!==this.catalogRevision;
+      this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_key,complete) VALUES(?,?,NULL,?)
+        ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,cursor_key=NULL,complete=excluded.complete`,
+        machine,changed?this.catalogRevision:scanRevision,changed?0:1);
       return [];
     }
     const finished=new Set<string>();
@@ -545,11 +548,12 @@ export class ResourceManagement {
       const batch=window.slice(i,i+99);
       for(const row of this.sql.exec('SELECT native_id FROM session_resource_usage WHERE machine_id=? AND finished_at IS NOT NULL AND native_id IN ('+batch.map(()=>'?').join(',')+')',machine,...batch.map(s=>s.native_id)).toArray()) finished.add(String(row.native_id));
     }
-    const last=window[window.length-1].terminalCursorKey;
+    const last=window[window.length-1].session_id;
     const hasMore=candidates.length>window.length;
+    const changedAtEnd=!hasMore && scanRevision!==this.catalogRevision;
     this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_key,complete) VALUES(?,?,?,?)
       ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,cursor_key=excluded.cursor_key,complete=excluded.complete`,
-      machine,this.catalogRevision,last,hasMore?0:1);
+      machine,changedAtEnd?this.catalogRevision:scanRevision,hasMore?last:null,hasMore||changedAtEnd?0:1);
     const at=new Date(this.now()).toISOString();
     return window.filter(s=>!finished.has(s.native_id)).map(s=>({session_id:s.session_id,native_id:s.native_id,observed_at:at}));
   }
