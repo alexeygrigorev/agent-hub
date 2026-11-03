@@ -560,14 +560,16 @@ def add_commands(sub):
     link.add_argument('--key')
     start = commands.add_parser('start', help='Record a start intent using auto/policy routing (default). Casual use should prefer auto/policy.')
     start.add_argument('--engine', help='Engine override (operators only; requires --reason explaining why)')
-    start.add_argument('--reason', default=None, help='Explanation why this specific model/engine must be chosen (required when --engine is specified)')
+    start.add_argument('--reason', default=None,
+                       help='Explanation for an explicit deep-tier or engine choice (required with --tier deep or --engine)')
     start.add_argument('--machine')
     start.add_argument('--needs', action='append', default=None,
                        help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64); eligible machines must satisfy all needs, else held with rejected[] reason needs_unmet')
     start.add_argument('--workspace', default=None, help='Configured workspace label or absolute path on the target host (omit with --repo)')
     start.add_argument('--repo', default=None, help='Repository owner/name; the placed host (any OS) clones its own fresh work tree from origin/main, so no host path is needed')
     start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
-    start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier for policy routing')
+    start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier; --tier deep requires --reason')
+    start.add_argument('--effort', choices=['low', 'medium', 'high', 'max'], help='Per-session model reasoning effort')
     start.add_argument('--cwd')
     start.add_argument('--intake-worktree', dest='intake_worktree', choices=['detached', 'successor'], default=None,
                        help='detached: keep the intake link but never resume, create or lock its worktree (79458f2d). '
@@ -980,6 +982,12 @@ def _execute(args):
         elif cmd == 'start' and engine:
             if not reason or not reason.strip():
                 raise ValueError('Engine override requires an explanation why this specific model/engine must be chosen (use --reason). Casual use should prefer auto/policy without --engine.')
+        elif cmd == 'start' and getattr(args, 'tier', None) == 'deep':
+            if not reason or not reason.strip():
+                raise ValueError(
+                    'Explicit deep-tier starts require an explanation why deep reasoning is needed '
+                    '(use --reason). Casual use should prefer auto/policy without --tier deep.'
+                )
         key = getattr(args, 'key', None) or str(uuid.uuid4())
         repo = getattr(args, 'repo', None)
         if bool(repo) == bool(getattr(args, 'workspace', None)):
@@ -995,6 +1003,8 @@ def _execute(args):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        if getattr(args, 'effort', None) is not None:
+            payload['effort'] = args.effort
         if getattr(args, 'intake_worktree', None):
             if payload.get('cwd'):
                 raise ValueError('--intake-worktree successor keeps Hub in charge of the cwd; drop --cwd (a detached start never names one either)')

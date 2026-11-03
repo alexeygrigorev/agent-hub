@@ -1334,7 +1334,7 @@ export class SessionControlService {
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
       ...sessionAccount(launchAccount, observed?.account),
-      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? request.model ?? null, effort: modelSelection?.effort ?? null,
+      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? request.model ?? null, effort: modelSelection?.effort ?? request.effort ?? null,
       decision_score: modelSelection?.decision_score ?? null, decision_reason: modelSelection?.decision_reason ?? null, decision: modelSelection?.decision ?? null,
       engine_override_reason: request.engine_override_reason ?? modelSelection?.decision?.override_reason ?? null,
       expected_cpu_cores:expectedCpu?.expected_cpu_cores ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_cores ?? null,
@@ -2361,13 +2361,14 @@ export class SessionControlService {
       // null / blank intake_task_id means "missing" so the TBM gate can return
       // intake_task_id_required instead of a generic invalid_session_request.
       if (input.intake_task_id === null || input.intake_task_id === '') delete input.intake_task_id;
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo'])) {
-        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo']);
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo'])) {
+        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo']);
         const field = input && typeof input === 'object' && !Array.isArray(input)
           ? Object.keys(input).find(k => !allowed.has(k)) : undefined;
         return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
       }
       if (input.task_kind !== undefined && !['implement','review','ask','goal'].includes(input.task_kind)) return response({error:'invalid_session_request',field:'task_kind',detail:'invalid_task_kind'},400);
+      if (input.effort !== undefined && !['low', 'medium', 'high', 'max'].includes(input.effort)) return response({ error: 'invalid_session_request', field: 'effort', detail: 'invalid_effort' }, 400);
       // Intake 79458f2d: a detached start (hourly triage, post-DONE verifier) is
       // linked to an intake for accounting only. It never resumes, creates or
       // locks that intake's worktree, so it may not name a worktree path itself.
@@ -2535,7 +2536,9 @@ export class SessionControlService {
         const sessionType = mode === 'interactive' ? 'aplexer' : 'headless';
         const canonical = JSON.stringify({
           ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
+          ...(input.effort !== undefined ? {effort:input.effort} : {}),
           engine: input.engine ?? null, engine_override_reason: (input as any).engine_override_reason ?? null,
+          tier: input.tier ?? null,
           machine: input.machine ?? null,
           ...(input.needs !== undefined ? {needs: input.needs} : {}),
           workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
@@ -2554,6 +2557,7 @@ export class SessionControlService {
           if (!Object.prototype.hasOwnProperty.call(priorInput, 'parent_id')) priorInput.parent_id = null;
           if (!Object.prototype.hasOwnProperty.call(priorInput, 'intake_task_id')) priorInput.intake_task_id = null;
           if (!Object.prototype.hasOwnProperty.call(priorInput, 'engine_override_reason')) priorInput.engine_override_reason = null;
+          if (!Object.prototype.hasOwnProperty.call(priorInput, 'tier')) priorInput.tier = null;
           // Order-insensitive idempotency: legacy rows may carry the same
           // fields in a different key order (e.g. backfilled defaults).
           const norm = (o: any) => JSON.stringify(o, Object.keys(o).sort());
@@ -2579,6 +2583,10 @@ export class SessionControlService {
         // replay/retry; a different reason under the same key is a 409 above.
         if (!prior && input.engine !== undefined && (typeof input.engine_override_reason !== 'string' || !input.engine_override_reason.trim())) {
           return response({ error: 'engine_reason_required', field: 'engine_override_reason', detail: 'Engine override requires an explanation why this specific model/engine must be chosen (use engine_override_reason). Casual use should prefer auto/policy without engine.' }, 400);
+        }
+        if (taskTier({ tier: input.tier }) === 'deep' &&
+            (typeof input.engine_override_reason !== 'string' || !input.engine_override_reason.trim())) {
+          return response({ error: 'deep_tier_reason_required', field: 'engine_override_reason', detail: 'Explicit deep-tier starts require an explanation why deep reasoning is needed (use engine_override_reason). Casual use should prefer auto/policy without tier=deep.' }, 400);
         }
         // Start gate (server-side, before any Fleet placement or session row):
         // a start linked to an intake task requires non-empty acceptance
@@ -2713,6 +2721,7 @@ export class SessionControlService {
       // eligible route becomes an honest held session.
       const reserved = this.hooks.reserve({
         ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
+        ...(input.effort !== undefined ? {effort:input.effort} : {}),
         ...(input.intake_task_id ? {project:parsed(this.sql.exec('SELECT data FROM intake_tasks WHERE id=?',input.intake_task_id).toArray()[0]?.data,{}).project} : {}),
         mode, machine: input.machine ?? worktreeMachine, engine: input.engine, tier: input.tier,
         ...(input.engine_override_reason ? { engine_override_reason: input.engine_override_reason } : {}),

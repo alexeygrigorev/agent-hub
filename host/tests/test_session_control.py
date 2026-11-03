@@ -515,6 +515,22 @@ class TestSessionControlCli(unittest.TestCase):
             session_control.execute(args)
         self.assertIn('Engine override requires an explanation', str(ctx.exception))
 
+    def test_start_deep_tier_reason_required_and_forwarded(self):
+        for reason_args in ([], ['--reason', '   ']):
+            args = self.parse('start', '--workspace', 'demo', '--tier', 'deep', *reason_args, '--key', 'k')
+            with self.assertRaises(ValueError) as ctx:
+                session_control.execute(args)
+            self.assertIn('Explicit deep-tier starts require an explanation', str(ctx.exception))
+
+        with patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(self.parse(
+                'start', '--workspace', 'demo', '--tier', 'deep', '--reason',
+                'This task needs deeper reasoning', '--key', 'k',
+            ))
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['tier'], 'deep')
+        self.assertEqual(payload['engine_override_reason'], 'This task needs deeper reasoning')
+
     def test_dedicated_override_requires_engine_and_reason(self):
         with self.assertRaises(SystemExit):
             self.parse('override', '--workspace', 'demo', '--reason', 'some reason')

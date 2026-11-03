@@ -2549,14 +2549,17 @@ def refresh_launch_credential(label, b, home, dest, request=None):
 
 
 def managed_codex_effort_args(bundle, extra_argv):
-    """Enforce policy defaults at the native boundary, below explicit argv."""
+    """Apply the Hub effort after bundle defaults and before explicit caller argv."""
     if bundle['provider'] != 'codex':
         return []
-    args = bundle['args'] + extra_argv
+    marker = '--hub-session-effort='
+    session_efforts = [arg[len(marker):] for arg in extra_argv if arg.startswith(marker)]
+    if len(set(session_efforts)) > 1 or any(e not in ('low', 'medium', 'high', 'max') for e in session_efforts):
+        raise ValueError('invalid Hub session effort')
+    args = [arg for arg in extra_argv if not arg.startswith(marker)]
     if args in (["--version"], ["-v"], ["--help"], ["-h"]):
         return []
-    # Caller and bundle overrides are authoritative. Config files are not:
-    # older managed homes may still contain high/xhigh for the same model.
+    # Explicit caller config is last in the final argv and must remain authoritative.
     for i, arg in enumerate(args):
         if arg == '--':
             break
@@ -2571,13 +2574,18 @@ def managed_codex_effort_args(bundle, extra_argv):
             return []
         if arg == '--effort' or arg.startswith('--effort='):
             return []
-    from .model_contract import native_model, policy_models
-    model = native_model(extra_argv) or native_model(bundle['args']) or launcher_metadata('codex', bundle)['launcher_model']
-    efforts = {m['effort'] for m in policy_models()
-               if m['provider'] == 'codex' and m['model'] == model}
-    if len(efforts) != 1:
-        return []
-    effort = efforts.pop()
+    if session_efforts:
+        effort = session_efforts[0]
+    else:
+        from .model_contract import native_model, policy_models
+        model = native_model(args) or native_model(bundle['args']) or launcher_metadata('codex', bundle)['launcher_model']
+        efforts = {m['effort'] for m in policy_models()
+                   if m['provider'] == 'codex' and m['model'] == model}
+        if len(efforts) != 1:
+            return []
+        effort = efforts.pop()
+    # Hub calls the highest tier "max"; Codex's native spelling is "xhigh".
+    effort = {'max': 'xhigh'}.get(effort, effort)
     return ['-c', 'model_reasoning_effort=' + json.dumps(effort)] if effort else []
 
 
@@ -2678,7 +2686,11 @@ def execute():
                         bypass_flags = ['--dangerously-skip-permissions']
             from .codex_interactive import isolated_argv
             effort_args = managed_codex_effort_args(b, extra_argv)
-            argv = command + isolated_argv(b['provider'], effort_args + b['args'] + bypass_flags + extra_argv)
+            # This adapter-only marker is consumed above and must never reach Codex.
+            extra_argv = [arg for arg in extra_argv if not arg.startswith('--hub-session-effort=')]
+            # Bundle args carry startup defaults. Place Hub policy/session effort
+            # after them, with explicit caller argv last so it can override policy.
+            argv = command + isolated_argv(b['provider'], b['args'] + bypass_flags + effort_args + extra_argv)
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
         if not is_diagnostic:
             allowed, reason = hub_launch_gate(label)
