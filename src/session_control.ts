@@ -91,6 +91,7 @@ CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sess
 CREATE INDEX IF NOT EXISTS session_control_live_created ON session_control_sessions(created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_live_actor_created ON session_control_sessions(actor, created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
+CREATE INDEX IF NOT EXISTS session_control_unbound_live_launch ON session_control_sessions(fleet_launch_id) WHERE binding_json IS NULL AND fleet_launch_id IS NOT NULL AND state IN ('queued','held','offered','starting','running','uncertain');
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
 CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL, generation INTEGER NOT NULL, intake_id TEXT NOT NULL, PRIMARY KEY(subject, generation, intake_id));
@@ -4509,7 +4510,8 @@ export function reconcileUnboundFleetSessions(sql: SqlStorage, nowMs: number): v
   if (sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('fleet_launches','session_control_sessions')").toArray().length !== 2) return;
   const rows = sql.exec(`SELECT s.id, f.state FROM session_control_sessions s
     JOIN fleet_launches f ON f.id = s.fleet_launch_id
-    WHERE s.binding_json IS NULL AND s.state IN ('queued','held','offered','starting','running','uncertain')
+    WHERE s.binding_json IS NULL AND s.fleet_launch_id IS NOT NULL
+    AND s.state IN ('queued','held','offered','starting','running','uncertain')
     AND f.state IN ('failed','exited','expired','cancelled') LIMIT 100`).toArray() as any[];
   for (const row of rows) {
     const nextState = row.state === 'exited' ? 'stopped' : row.state === 'expired' ? 'failed' : row.state;
