@@ -31,6 +31,7 @@ import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { computeEngineDecision, fallbackModelIds, isDesktopCodexExcluded, isHealthyAlternative, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
 import { burnFactor, burnForecast, type BurnForecast } from './burn';
+import { autoStartDrawDistribution, weightedDrawIndex } from './draw';
 import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
 import { WORKER_SCOPE, workerAccessContext } from './worker-access';
 import { GOAL_STATUSES } from './intake-session';
@@ -124,6 +125,38 @@ function matchesModelRoute(model: any, route: any, family: unknown): boolean {
     (model.engine === route.engine || (nativeZai && model.engine === 'codex' && model.profile === 'zcodex')) &&
     (model.profile === route.profile || route.profile === 'hub-' + route.account ||
       (model.profile === null && route.profile !== null) || (nativeZai && model.profile === 'zcodex'));
+}
+/**
+ * Intake 9647e6d5: a fully unpinned auto-start (no engine pin, no model
+ * override, no tier and no account — a plain `hub sessions start`) draws its
+ * winner at random, weighted by remaining quota headroom, instead of
+ * always stacking on the top score (Codex luna). Machine and needs pins only choose
+ * where the work lands, so they keep the draw; any engine/model/tier/account
+ * constraint, previews, and callers without a random source keep the
+ * deterministic top-score pick. `overrideModels` mirrors plan()'s pin
+ * detection: a model id passed as the engine still counts as pinned.
+ */
+export function drawAutoStart(candidates: any[], request: any, overrideModels: any[], input: any, rand?: () => number): any | null {
+  if (!candidates.length) return null;
+  const distribution = autoStartDrawDistribution(candidates);
+  for (const candidate of candidates) {
+    candidate.draw_probability = distribution.probabilities.get(candidate) ?? 0;
+  }
+  const pinned = Boolean(request?.engine) || overrideModels.length > 0 ||
+    input?.tier != null || input?.account != null;
+  if (!rand || pinned || !distribution.eligible.length || distribution.total <= 0) return candidates[0];
+  const drawn = distribution.eligible[weightedDrawIndex(distribution.weights, rand)];
+  const probability = distribution.probabilities.get(drawn) ?? 0;
+  const drawReason = `${drawn.decision_reason ?? drawn.decision?.reason ?? 'decision'}; draw_probability=${probability.toFixed(6)}`;
+  drawn.decision_reason = drawReason;
+  if (drawn.decision && typeof drawn.decision === 'object') drawn.decision = { ...drawn.decision, reason: drawReason };
+  if (drawn.selection && typeof drawn.selection === 'object') {
+    drawn.selection = { ...drawn.selection, decision_reason: drawReason };
+    if (drawn.selection.decision && typeof drawn.selection.decision === 'object') {
+      drawn.selection.decision = { ...drawn.selection.decision, reason: drawReason };
+    }
+  }
+  return drawn;
 }
 /** Engines whose providers the canonical model policy disables. New grok sessions hold here. */
 function disabledEngines(): Set<string> {
@@ -1098,11 +1131,11 @@ export class FleetService {
     } catch { /* alerting never breaks placement */ }
   }
 
-  plan(input: any, loadRefusal?: { machine: string; factor: number; trigger?: string; limit?: number }) {
-    return this.withMaintenance(() => this.planWithinMaintenance(input, loadRefusal));
+  plan(input: any, loadRefusal?: { machine: string; factor: number; trigger?: string; limit?: number }, rand?: () => number) {
+    return this.withMaintenance(() => this.planWithinMaintenance(input, loadRefusal, rand));
   }
 
-  private planWithinMaintenance(input: any, loadRefusal?: { machine: string; factor: number; trigger?: string; limit?: number }):
+  private planWithinMaintenance(input: any, loadRefusal?: { machine: string; factor: number; trigger?: string; limit?: number }, rand?: () => number):
     { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
     { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any>; hold_reason?: string; needs_machines?: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] } {
     if (input && (modelDisabledByPolicy(input.engine) || modelDisabledByPolicy(input.model) ||
@@ -1500,7 +1533,7 @@ export class FleetService {
       // while retaining hard refusals for rejected or stale credentials.
       if (isDegraded) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, burn, burn_weight, decision_score: score, decision_reason: decision.reason, decision, ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, burn, burn_weight, decision_score: score, decision_reason: decision.reason, decision, ...(isDegraded ? { degraded: true } : {}), ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
       registerRedo(candidates[candidates.length - 1]);
     }
     // Intake 06d2a0ac AC1: an account with no quota verdict at all (status
@@ -1541,12 +1574,16 @@ export class FleetService {
       || a.engine.localeCompare(b.engine)
       || String(a.account ?? '').localeCompare(String(b.account ?? ''))
     );
+    // Intake 9647e6d5: a fully unpinned auto-start draws weighted by remaining quota headroom,
+    // never stacking on the top score. Any pin, previews and sourceless
+    // callers keep candidates[0].
+    const selected = drawAutoStart(candidates, request, overrideModels, input, rand);
     // The stored intent carries the winner's normalized workspace: a bare
     // label that resolved under the selected host's root is persisted and
     // offered as the absolute path the host accepts. Labels that were
     // already capable keep their exact legacy meaning (host map keys).
-    if (candidates[0] && typeof candidates[0].workspace === 'string' && candidates[0].workspace !== request.workspace) {
-      request.workspace = candidates[0].workspace;
+    if (selected && typeof selected.workspace === 'string' && selected.workspace !== request.workspace) {
+      request.workspace = selected.workspace;
     }
     // Every matching account and machine for an explicit engine has already
     // been considered above. Replanning without `engine` here could silently
@@ -1589,12 +1626,12 @@ export class FleetService {
         // Only when no satisfying host is online AND routed: otherwise the
         // per-route rejected[] entries already name the real blocker.
         if (!satisfying.some(m => m.online && m.routed)) {
-          return { request, selected: candidates[0] || null, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine),
+          return { request, selected, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine),
             hold_reason: 'no_routed_host_matches_needs', needs_machines: satisfying };
         }
       } catch { /* diagnosis is best-effort: never break placement */ }
     }
-    return { request, selected: candidates[0] || null, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine) };
+    return { request, selected, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine) };
     });
   }
 
@@ -1699,7 +1736,9 @@ export class FleetService {
           limit: Number.isFinite(memoryHold.host_load_limit) ? memoryHold.host_load_limit : undefined,
         } : undefined;
         let plan: any;
-        try { plan = this.plan(input, loadRefusal); } catch { continue; }
+        // Intake 9647e6d5: promotions of unpinned queued intents draw by the
+        // remaining quota headroom, like fresh auto-starts.
+        try { plan = this.plan(input, loadRefusal, Math.random); } catch { continue; }
         if (!plan || (plan as any).error) continue;
         if (!plan.selected) {
           const rejected = plan.rejected || [];
@@ -1838,7 +1877,9 @@ export class FleetService {
       // Give the retained waitlist a bounded turn before a new reservation;
       // within each circular slice, older rows are considered first.
       try { this.drainCapacityQueue(); } catch { /* best-effort */ }
-      const plan = this.plan(input);
+      // Intake 9647e6d5: real (non-preview) auto-starts draw by final decision
+      // score; previews, recommend and rebalance stay deterministic.
+      const plan = this.plan(input, undefined, preview ? undefined : Math.random);
       if ('error' in plan) return result(plan, plan.error === 'model_disabled_by_policy' ? 409 : 400);
       const parsed = this.admission.parseDeclaration(input?.access);
       if ('error' in parsed) return result({ error: parsed.error }, 400);
@@ -1983,6 +2024,7 @@ export class FleetService {
         decision_score: c.decision_score ?? c.score ?? null,
         decision_reason: c.decision_reason ?? c.selection?.decision_reason ?? null,
         decision: c.decision ?? c.selection?.decision ?? null,
+        draw_probability: c.draw_probability ?? 0,
       });
       return response({
         tier: taskTier({ tier: params.tier }) || policy.default_tier,
