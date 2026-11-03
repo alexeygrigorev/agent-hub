@@ -360,12 +360,14 @@ class FleetTests(unittest.TestCase):
             d = fleet.Dispatcher(settings(Path(tmp)), lambda *a: {}, runner)
             self.assertEqual(d.dispatch(offer())['state'], 'uncertain')
 
-    def test_interactive_readiness_seed_only_for_empty_starts_and_never_breaks_launch(self):
+    def test_interactive_readiness_seed_for_empty_and_codex_goal_starts_and_never_breaks_launch(self):
         # Intake 2fdcaef5: a fresh empty prompt has no harness state, so
         # aplexer message deliver refuses every queued envelope; the host
-        # seeds the truthful 'waiting' report. Goal starts type their own
-        # prompt (hook events fire) and must not seed. A failed seed never
-        # fails the launch.
+        # seeds the truthful 'waiting' report. Codex goal starts begin as
+        # empty TUI starts (intake f7829632: /goal is submitted through the
+        # composer after readiness), so they seed exactly like empty starts.
+        # Claude goals still travel as initial-prompt argv (hook events fire)
+        # and must not seed. A failed seed never fails the launch.
         with tempfile.TemporaryDirectory() as tmp:
             calls = []
             def runner(argv, **kw):
@@ -384,8 +386,13 @@ class FleetTests(unittest.TestCase):
             cfg_goal['subscriptions'][0]['startup_argv'] = ['codex']
             d_goal = fleet.Dispatcher(cfg_goal, lambda *a: {}, runner)
             calls.clear()
-            self.assertEqual(d_goal.dispatch(offer(with_goal=True, prompt='pursue the goal'))['state'], 'running')
-            self.assertFalse([c for c in calls if c[0][-1:] == ['waiting']])
+            with patch('agent_hub_host.goal_registration.register_goal',
+                       return_value={'status': 'active', 'thread_id': 'thread-1'}) as reg:
+                self.assertEqual(d_goal.dispatch(offer(with_goal=True, prompt='pursue the goal'))['state'], 'running')
+            self.assertEqual(reg.call_count, 1)
+            seeds = [c for c in calls if c[0][-1:] == ['waiting']]
+            self.assertEqual([c[0] for c in seeds], [['aplexer', 'state-report', 'waiting']])
+            self.assertEqual(seeds[0][1].get('env', {}).get('APLEXER_SESSION_ID'), 'native-session')
 
     def test_headless_uses_maintained_launcher_and_requires_account_aware_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
