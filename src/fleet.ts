@@ -1253,6 +1253,7 @@ export class FleetService {
     // registry even when a caller supplies context. Paths in request JSON are
     // never authority to provision an unregistered repository.
     const { repo_context: _suppliedRepoContext, ...logicalInput } = input;
+    input = logicalInput;
     if (this.repos) {
       const resolved = this.repos(logicalInput);
       if (resolved.error) return { error: resolved.error.error };
@@ -1744,7 +1745,7 @@ export class FleetService {
       // while retaining hard refusals for rejected or stale credentials.
       if (isDegraded) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, burn, burn_weight, decision_score: score, decision_reason: decision.reason, decision, ...(isDegraded ? { degraded: true } : {}), ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, repo_provision: repoProvision, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, burn, burn_weight, decision_score: score, decision_reason: decision.reason, decision, ...(isDegraded ? { degraded: true } : {}), ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, repo_provision: repoProvision, checkout_factor: checkoutFactor, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
       registerRedo(candidates[candidates.length - 1]);
     }
     // Intake 06d2a0ac AC1: an account with no quota verdict at all (status
@@ -1771,8 +1772,9 @@ export class FleetService {
       const redo = redecide.get(c);
       if (!redo || !fallbackIds.has(c.selection?.id)) continue;
       const d = redo(healthyAlternative);
-      c.score = c.decision_score = d.score; c.decision_reason = d.reason; c.decision = d;
-      c.selection = { ...c.selection, decision_score: d.score, decision_reason: d.reason, decision: d };
+      const factored = (typeof c.checkout_factor === 'number' ? c.checkout_factor : 1) * d.score;
+      c.score = c.decision_score = factored; c.decision_reason = d.reason; c.decision = d;
+      c.selection = { ...c.selection, decision_score: factored, decision_reason: d.reason, decision: d };
     }
     candidates.sort((a, b) =>
       Number(!!a.overflow) - Number(!!b.overflow)
