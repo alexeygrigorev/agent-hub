@@ -99,12 +99,57 @@ class TestIntakeCli(unittest.TestCase):
         with patch.object(intake, 'request', side_effect=[too_large, dict(last, items=[{'id': 'a'}, {'id': 'b'}])]) as transport:
             self.assertEqual(intake.list_all({'limit': 100})['total'], 2)
             self.assertIn('limit=50', transport.call_args.args[1])
-        for limit, failure in [(1, too_large), (100, intake.IntakeTransportError('connection interrupted')),
-                               (100, intake.StaleSnapshot('Snapshot changed'))]:
+        for limit, failure, expected, calls in [
+            (1, too_large, intake.IntakeResponseTooLarge, 1),
+            (100, intake.IntakeTransportError('connection interrupted'), intake.IntakeTransportError, 1),
+            # A stale pinned listing (410 expiry mapped to StaleSnapshot) retries
+            # the whole walk from page one, then surfaces IntakeInputError.
+            (100, intake.StaleSnapshot('Snapshot changed'), intake.IntakeInputError, 3),
+        ]:
             with patch.object(intake, 'request', side_effect=failure) as transport:
-                with self.assertRaises(type(failure)):
+                with self.assertRaises(expected):
                     intake.list_all({'limit': limit})
-                self.assertEqual(transport.call_count, 1)
+                self.assertEqual(transport.call_count, calls)
+
+    def test_list_all_follows_pinned_token_and_survives_churn(self):
+        from urllib.parse import parse_qs, urlparse
+        first = {'items': [{'id': 'a'}], 'next': 'a', 'snapshot_version': 7,
+                 'authorization_valid_until': 12345, 'total': 1, 'effective_limit': 1,
+                 'list_token': '11111111-1111-4111-8111-111111111111'}
+        # The server pins one id; a concurrent create bumps the revision but
+        # the token walk ignores it and completes the pinned set.
+        last = dict(first, items=[{'id': 'b'}], next=None, snapshot_version=8)
+        with patch.object(intake, 'request', side_effect=[first, last]) as transport:
+            result = intake.list_all({'limit': 1, 'all': 'true'})
+        self.assertEqual([t['id'] for t in result['items']], ['a', 'b'])
+        self.assertEqual(result['total'], 2)
+        first_query = parse_qs(urlparse(transport.call_args_list[0].args[1]).query)
+        self.assertEqual(first_query.get('list_token'), ['new'])
+        second_query = parse_qs(urlparse(transport.call_args_list[1].args[1]).query)
+        self.assertEqual(second_query.get('list_token'), ['11111111-1111-4111-8111-111111111111'])
+        self.assertEqual(second_query.get('after'), ['a'])
+        self.assertNotIn('revision', second_query)
+
+    def test_list_all_restarts_once_on_expired_token(self):
+        first = {'items': [{'id': 'a'}], 'next': 'a', 'snapshot_version': 7,
+                 'authorization_valid_until': None, 'total': 2, 'effective_limit': 1,
+                 'list_token': '22222222-2222-4222-8222-222222222222'}
+        expired = intake.StaleSnapshot('Listing snapshot expired')
+        done = dict(first, items=[{'id': 'a'}, {'id': 'b'}], next=None,
+                    list_token='33333333-3333-4333-8333-333333333333')
+        with patch.object(intake, 'request', side_effect=[first, expired, done]) as transport:
+            result = intake.list_all({'limit': 1, 'all': 'true'})
+        # The expired walk is discarded; the restart returns the full set once.
+        self.assertEqual([t['id'] for t in result['items']], ['a', 'b'])
+        self.assertEqual(transport.call_count, 3)
+
+    def test_list_search_filter_is_sent_as_q(self):
+        with patch.object(intake, 'request', return_value={'items': [], 'next': None, 'total': 0}) as transport:
+            code, out, error = self.run_cli('intake', 'list', '--search', 'login bug')
+        self.assertEqual(code, 0, error)
+        self.assertIn('q=login+bug', transport.call_args.args[1])
+        self.assertEqual(self.run_cli('intake', 'list', '--search', '   ')[0], 1)
+        transport.assert_called_once()
 
     def test_response_cap_failure_is_typed_without_increasing_transport_cap(self):
         with patch.object(intake.config, 'load_config', return_value={'base_url': 'https://fixture.invalid'}), \

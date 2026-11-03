@@ -120,6 +120,9 @@ def close_gate_refusal(body):
 def http_error(exc, method, payload):
     if exc.code == 409 and method == 'GET':
         return StaleSnapshot('Snapshot changed')
+    if exc.code == 410 and method == 'GET':
+        # Pinned listing token expired or was evicted; the walk restarts from page one.
+        return StaleSnapshot('Listing snapshot expired')
     # Never echo arbitrary error bodies, tokens, URLs or terminal controls.
     # The server only emits lowercase snake_case slugs; surface the exact
     # slug so auth/grant/capacity/field detail survives, collapse the rest.
@@ -151,6 +154,8 @@ def http_error(exc, method, payload):
                 detail += f'; max {limit} UTF-8 bytes'
     if code in ('invalid_limit', 'limit_out_of_range'):
         detail += '; limit must be a positive integer; min 1, max 100 (larger values clamp)'
+    if code == 'invalid_search':
+        detail += '; search must be 1-128 characters'
     if code == 'done_evidence_required':
         detail += '; append a DONE note with commit SHA or deploy run URL, Live check: command/URL, and Result: output before closing'
     if code == 'cancel_reason_required':
@@ -248,6 +253,7 @@ def add_commands(sub):
     listing = commands.add_parser('list', help='List one page, or all matching tasks with --all')
     listing.add_argument('--status', default=None)
     listing.add_argument('--project')
+    listing.add_argument('--search', help='Server-side dedup filter: case-insensitive substring over title, project, original text and context (max 128 chars)')
     listing.add_argument('--after')
     listing.add_argument('--revision', type=int)
     listing.add_argument('--authorization-valid-until', type=int)
@@ -409,31 +415,65 @@ def handoff(project=None, page_size=25):
 
 
 def list_all(params):
+    """Follow all pages of one pinned listing. The server pins the matching id
+    set behind list_token, so pages survive intake create/close churn; on the
+    rare expiry (410) the whole walk restarts, bounded like the handoff loop.
+    Servers without a token fall back to the revision-pinned walk."""
     if 'after' in params:
         raise IntakeInputError('--all cannot be combined with --after')
+    for _ in range(3):
+        try:
+            return _list_all_once(params)
+        except StaleSnapshot:
+            continue
+    raise IntakeInputError('Snapshot kept changing; retry the command')
+
+
+def _request_page(page_params, params):
+    """One GET with the oversized-response retry from the revision walk."""
+    while True:
+        try:
+            return request('GET', BASE + '/tasks?' + urlencode(page_params))
+        except IntakeResponseTooLarge:
+            current = min(page_params.get('limit', 25), 100)
+            if current <= 1:
+                raise
+            page_params['limit'] = max(1, current // 2)
+            params['limit'] = page_params['limit']
+
+
+def _list_all_once(params):
     items, seen, cursors = [], set(), set()
     first = None
+    token = None
+    after = None
     reduced = False
     for _ in range(10001):
-        while True:
-            try:
-                page = request('GET', BASE + '/tasks?' + urlencode(params))
-                break
-            except IntakeResponseTooLarge:
-                # Retry only an oversized GET, with the same cursor/revision.
-                # The limit strictly decreases, so there are at most 7 such
-                # reductions across the entire export; transport/auth/stale
-                # failures keep their existing fail-closed behavior.
-                current = min(params.get('limit', 25), 100)
-                if current <= 1:
-                    raise
-                params['limit'] = max(1, current // 2)
-                reduced = True
+        page_params = dict(params)
+        if token is not None:
+            page_params['list_token'] = token
+        elif first is None:
+            page_params['list_token'] = 'new'
+        if after:
+            page_params['after'] = after
+            if first.get('authorization_valid_until') is not None:
+                page_params['authorization_valid_until'] = first['authorization_valid_until']
+            if token is None:
+                # Tokenless fallback: the classic revision-pinned page walk.
+                page_params['revision'] = first['snapshot_version']
+        if 'limit' not in page_params:
+            page_params['limit'] = 100
+            params['limit'] = 100
+        before_limit = page_params.get('limit')
+        page = _request_page(page_params, params)
+        if page_params.get('limit') != before_limit:
+            reduced = True
         if first is None:
             first = page
-        elif (page['snapshot_version'] != first['snapshot_version'] or
-              page.get('authorization_valid_until') != first.get('authorization_valid_until') or
-              page['total'] != first['total']):
+            token = page.get('list_token')
+        elif token is None and (page['snapshot_version'] != first['snapshot_version'] or
+                                page.get('authorization_valid_until') != first.get('authorization_valid_until') or
+                                page['total'] != first['total']):
             raise StaleSnapshot('Snapshot changed')
         for task in page['items']:
             if task['id'] in seen:
@@ -442,18 +482,15 @@ def list_all(params):
             items.append(task)
         after = page['next']
         if not after:
-            if len(items) != first['total']:
+            if token is None and len(items) != first['total']:
                 raise IntakeInputError('Incomplete snapshot; retry the command')
             result = dict(first, items=items, next=None, total=len(items))
             if reduced:
-                result.update(effective_limit=page.get('effective_limit', min(params.get('limit', 25), 100)), page_size_reduced=True)
+                result.update(effective_limit=page.get('effective_limit', min(params.get('limit', 100), 100)), page_size_reduced=True)
             return result
         if after in cursors or not page['items']:
             raise IntakeInputError('Invalid snapshot cursor; retry the command')
         cursors.add(after)
-        params.update(after=after, revision=first['snapshot_version'])
-        if first.get('authorization_valid_until') is not None:
-            params['authorization_valid_until'] = first['authorization_valid_until']
     raise IntakeInputError('Snapshot page bound exceeded')
 
 
@@ -497,6 +534,13 @@ def execute(args):
         params = {'limit': args.limit if args.limit is not None else (100 if args.all else 25)}
         if args.status is not None:
             params['status'] = args.status
+        if args.search is not None:
+            search = args.search.strip()
+            if not search:
+                raise IntakeInputError('--search must be a non-empty filter (1-128 characters)')
+            if len(search) > 128:
+                raise IntakeInputError('--search exceeds 128 characters')
+            params['q'] = search
         if args.archived:
             params['archived'] = 'true'
         elif args.all:

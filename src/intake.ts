@@ -64,6 +64,26 @@ export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, 
   // has a separate 256 MiB planning budget below the Free plan's 1 GB/DO.
   grants: 256, rules: 128, receipts: 8192, totalBytes: 128 * 1024 * 1024, page: 100 };
 export const INTAKE_RETAINED_WARN_BYTES = 256 * 1024 * 1024;
+/** Pinned listing sessions (intake 08658ee8 AC1): 15 minutes covers a slow
+ * walk over every open intake; concurrent sessions are bounded and the
+ * oldest is evicted first. Token use is bound to the creating caller. */
+const LISTING_LIMITS = { ttlMs: 15 * 60_000, concurrent: 16 };
+type Listing = { token: string; ids: string[]; rules: Obj[]; revision: number; created: number; expires: number; actor: string | null; admin: boolean };
+/** Intake 08658ee8 AC2: server-side dedup search. Case-insensitive substring
+ * over title, project, the original intake text and the bounded context fields. */
+function searchQuery(url: URL): string | null {
+  const raw = url.searchParams.get('q');
+  if (raw === null) return null;
+  const q = raw.trim().toLowerCase();
+  if (!q) return null;
+  if (q.length > 128) throw new IntakeError('invalid_search', 400, 'q');
+  return q;
+}
+function matchesQuery(task: Obj, q: string): boolean {
+  const intake = (task.history ?? []).find((e: Obj) => e.kind === 'intake');
+  return [task.title, task.project, intake?.text, task.current_state, task.next_step]
+    .some((value: any) => typeof value === 'string' && value.toLowerCase().includes(q));
+}
 const HOT_TASKS = "json_extract(data,'$.archived_at') IS NULL AND json_extract(data,'$.status') NOT IN ('done','cancelled')";
 const ROW_BYTES = 'length(CAST(data AS BLOB))+length(CAST(id AS BLOB))';
 /** SQL aggregates avoid loading retained response snapshots into Worker memory. */
@@ -820,7 +840,7 @@ export class IntakeService {
       worktrees: this.worktrees.list(task.id), close_gate: this.worktrees.gate(task.id), merge_state: this.mergeGate.get(task.id) };
   }
   private view(task: Obj, p: Obj): Obj { return { ...this.taskView(task, p), operator_rules: this.rules([task]), data_notice: DATA_NOTICE }; }
-  private page(url: URL, items: Obj[], revision: number): Obj {
+  private pageLimit(url: URL): number {
     const rawLimit = url.searchParams.get('limit');
     let limit = 25;
     if (rawLimit !== null) {
@@ -829,6 +849,10 @@ export class IntakeService {
       if (requested < 1n) throw new IntakeError('limit_out_of_range', 400, 'limit');
       limit = Number(requested > BigInt(INTAKE_LIMITS.page) ? BigInt(INTAKE_LIMITS.page) : requested);
     }
+    return limit;
+  }
+  private page(url: URL, items: Obj[], revision: number): Obj {
+    const limit = this.pageLimit(url);
     const after = url.searchParams.get('after');
     if (after) credentialId(after);
     if (after && !url.searchParams.has('revision')) fail('revision_required');
@@ -837,11 +861,60 @@ export class IntakeService {
     const page = remaining.slice(0, limit);
     return { snapshot_version: revision, effective_limit: limit, items: page, next: remaining.length > limit ? page[page.length - 1].id : null, total: items.length };
   }
+  /** Intake 08658ee8 AC1: a listing token pins the matching id set (and operator
+   * rules) so paging through hundreds of intakes survives create/close churn
+   * instead of dying on the first stale_snapshot. Only ids are pinned — bounded
+   * memory — and each page re-checks authorization live. In-memory on the single
+   * Hub DO; a DO restart expires tokens and clients restart once on 410. */
+  private listings = new Map<string, Listing>();
+  private pruneListings(now = Date.now()) {
+    for (const [token, listing] of this.listings) if (listing.expires <= now) this.listings.delete(token);
+  }
+  private openListing(tasks: string[], rules: Obj[], revision: number, p: Obj): Listing {
+    this.pruneListings();
+    while (this.listings.size >= LISTING_LIMITS.concurrent) {
+      const oldest = [...this.listings.entries()].sort((a, b) => a[1].created - b[1].created)[0];
+      this.listings.delete(oldest[0]);
+    }
+    const now = Date.now();
+    const listing: Listing = { token: crypto.randomUUID(), ids: tasks, rules, revision, created: now, expires: now + LISTING_LIMITS.ttlMs, actor: typeof p.actor === 'string' ? p.actor : null, admin: !!p.admin };
+    this.listings.set(listing.token, listing);
+    return listing;
+  }
+  private listing(token: string, p: Obj): Listing {
+    this.pruneListings();
+    const listing = this.listings.get(token);
+    if (!listing || listing.expires <= Date.now() || listing.actor !== (typeof p.actor === 'string' ? p.actor : null) || listing.admin !== !!p.admin)
+      fail('list_token_expired', 410);
+    return listing!;
+  }
+  /** Serve one page from a pinned listing. Rows may have drifted, been archived
+   * or lost authorization since the pin; they are projected live and skipped
+   * when unauthorized or gone, while cursor positions ride the pinned ids. */
+  private pinnedPage(url: URL, listing: Listing, p: Obj): Obj {
+    const limit = this.pageLimit(url);
+    const after = url.searchParams.get('after');
+    if (after) credentialId(after);
+    const remaining = listing.ids.filter(id => !after || id > after);
+    const window = remaining.slice(0, limit);
+    const byId = new Map<string, Obj>();
+    for (let i = 0; i < window.length; i += 50) {
+      const chunk = window.slice(i, i + 50);
+      for (const row of this.sql.exec(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
+        const task = JSON.parse(row.data); byId.set(task.id, task);
+      }
+    }
+    const page = window.map(id => byId.get(id)).filter((t): t is Obj => !!t && this.allowed(p, t));
+    return { snapshot_version: listing.revision, effective_limit: limit, items: page,
+      next: remaining.length > limit ? window[window.length - 1] : null, total: listing.ids.length };
+  }
   /** Full records are hydrated only after bounded metadata page selection. */
   private exportPage(url: URL, p: Obj, revision: number): Obj {
     if (url.searchParams.has('authorization_valid_until') && Number(url.searchParams.get('authorization_valid_until')) !== (p.valid_until ?? null)) fail('stale_snapshot', 409);
     if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');
-    const page = this.page(url, [], revision); // shared limit/cursor/revision validation
+    const q = searchQuery(url);
+    const rawToken = url.searchParams.get('list_token');
+    if (rawToken !== null && rawToken !== 'new' && !/^[0-9a-f-]{36}$/.test(rawToken)) fail('invalid_list_token', 400);
     const status = url.searchParams.get('status'); const archived = url.searchParams.get('archived'); const all = url.searchParams.get('all');
     if (archived && archived !== 'true') fail('invalid_archived');
     if (all && all !== 'true') fail('invalid_all');
@@ -855,13 +928,84 @@ export class IntakeService {
     const filter: IntakeExportFilter = { project: url.searchParams.get('project'),
       statuses: openSet ? OPEN : status && status !== 'all' ? [status] : defaultOpen ? OPEN : null,
       archived: archived === 'true' ? 1 : defaultOpen ? 0 : null };
+    const rulesFor = (): Obj[] => this.rows('rules').filter(rule => rule.project === null ||
+      (typeof rule.project === 'string' && (filter.project === null || rule.project === filter.project) && intakeExportCounts(this.sql, p, rule.project).some(r => intakeExportMatches(r, filter))));
+    const warnFor = () => this.intakeOpenWarning(p);
+    // Intake 08658ee8 AC1: a pinned token walk skips the revision check, so
+    // create/close churn mid-walk cannot expire the cursor. Ids are pinned
+    // (bounded); bodies and authorization are re-read live per page.
+    if (rawToken !== null && rawToken !== 'new') {
+      const pinned = this.listing(rawToken, p);
+      const result = this.pinnedPage(url, pinned, p);
+      const warn = warnFor();
+      return { ...result, authorization_valid_until: p.valid_until ?? null,
+        items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: pinned.rules, data_notice: DATA_NOTICE,
+        authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
+        completeness: 'The list_token pins the matching id set and operator rules; pages stay valid while intakes are created or closed, and item bodies are read live. Restart once on list_token_expired (410).',
+        list_token: pinned.token, list_expires_at: pinned.expires,
+        ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
+        open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+        ...(warn ? { intake_open_warning: warn } : {}) };
+    }
+    // Full matching id set for a new pin or an explicit text search. Export
+    // ids keep the walk bounded; text matching hydrates bodies only when q is
+    // present (explicit dedup search, never the default list path).
+    const fullIds = (): string[] => {
+      const ids = intakeExportPageIds(this.sql, p, filter, null, INTAKE_LIMITS.tasks + 1).slice(0, INTAKE_LIMITS.tasks);
+      if (!q) return ids;
+      const out: string[] = [];
+      for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        const byId = new Map<string, Obj>();
+        for (const row of this.sql.exec(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
+          const t = JSON.parse(row.data); byId.set(t.id, t);
+        }
+        for (const id of chunk) { const t = byId.get(id); if (t && matchesQuery(t, q)) out.push(id); }
+      }
+      return out;
+    };
+    if (rawToken === 'new') {
+      const ids = fullIds();
+      const pinned = this.openListing(ids, rulesFor(), revision, p);
+      const result = this.pinnedPage(url, pinned, p);
+      const warn = warnFor();
+      return { ...result, authorization_valid_until: p.valid_until ?? null,
+        items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: pinned.rules, data_notice: DATA_NOTICE,
+        authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
+        completeness: 'The list_token pins the matching id set and operator rules; pages stay valid while intakes are created or closed, and item bodies are read live. Restart once on list_token_expired (410).',
+        list_token: pinned.token, list_expires_at: pinned.expires,
+        ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
+        open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+        ...(warn ? { intake_open_warning: warn } : {}) };
+    }
+    if (q) {
+      // Revision-pinned search page (single-shot dedup without a token).
+      // For a churn-proof walk, start with list_token=new instead.
+      const ids = fullIds();
+      const tasks: Obj[] = [];
+      for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        for (const row of this.sql.exec(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
+          const t = JSON.parse(row.data); if (this.allowed(p, t)) tasks.push(t);
+        }
+      }
+      tasks.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      const result = this.page(url, tasks, revision);
+      const warn = warnFor();
+      return { ...result, authorization_valid_until: p.valid_until ?? null, items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: rulesFor(), data_notice: DATA_NOTICE,
+        authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
+        completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot. For a churn-proof walk use list_token=new.',
+        ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
+        open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+        ...(warn ? { intake_open_warning: warn } : {}) };
+    }
+    const page = this.page(url, [], revision); // shared limit/cursor/revision validation
     const total = intakeExportCounts(this.sql, p, filter.project).filter(r => intakeExportMatches(r, filter)).reduce((n, r) => n + Number(r.n), 0);
     const candidates = intakeExportPageIds(this.sql, p, filter, url.searchParams.get('after'), page.effective_limit + 1);
     const items = candidates.slice(0, page.effective_limit).map(id => this.taskView(this.get('tasks', id)!, p));
     // Rules are capped at 128; check only their exact project counter keys.
-    const rules = this.rows('rules').filter(rule => rule.project === null ||
-      (typeof rule.project === 'string' && (filter.project === null || rule.project === filter.project) && intakeExportCounts(this.sql, p, rule.project).some(r => intakeExportMatches(r, filter))));
-    const warn = this.intakeOpenWarning(p);
+    const rules = rulesFor();
+    const warn = warnFor();
     return { ...page, total, items, next: candidates.length > page.effective_limit ? items[items.length-1].id : null,
       authorization_valid_until: p.valid_until ?? null, operator_rules: rules, data_notice: DATA_NOTICE,
       authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',

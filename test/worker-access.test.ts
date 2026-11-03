@@ -514,4 +514,22 @@ describe('scoped durable worker access',()=>{
   expect((await api('/api/intake/tasks/'+cont)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
  }));
+ it('resolves own and created intakes by unique short-id prefix (08658ee8 AC3)',()=>setup(async({task,other,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const code=async(r:Response)=>((await r.json()) as any).error;
+  // Own intake by 8-char prefix reads like the full id.
+  for(const sfx of ['','/history','/links','/context']) expect((await api('/api/intake/tasks/'+task.slice(0,8)+sfx)).status).toBe(200);
+  // A worker-created intake is reachable by prefix too.
+  const src={type:'unknown',reference:'test'};
+  const made=await api('/api/intake/tasks',{key:uuid(),project:'dataops',title:'prefix follow-up',text:'prefix body',source:src});
+  expect(made.status,await made.clone().text()).toBe(200);
+  const created:any=(await made.json() as any).task;
+  expect((await api('/api/intake/tasks/'+created.id.slice(0,8))).status).toBe(200);
+  // Another intake's prefix stays forbidden with the cross-intake code.
+  const cross=await api('/api/intake/tasks/'+other.slice(0,8));
+  expect(cross.status).toBe(403);expect(await code(cross)).toBe('cross_intake_forbidden');
+  // Unknown prefixes stay forbidden, never a 404 oracle.
+  const unknown=await api('/api/intake/tasks/00000000');
+  expect(unknown.status).toBe(403);expect(await code(unknown)).toBe('cross_intake_forbidden');
+ }));
 });
