@@ -1365,6 +1365,23 @@ def _stop_workspace_matches(observed: str, expected: str) -> bool:
             and canonicalize_workspace(observed.removesuffix(' (deleted)')) == expected)
 
 
+def _stop_workspace_matches_nested(observed: str, expected: str) -> bool:
+    """Allow stop-only matching when the native workspace is inside the bound workspace.
+
+    The caller still requires the exact native UUID, tag, incarnation and
+    engine, and uses the observed path for the kill command. General target
+    qualification stays exact so this does not widen send/capture authority.
+    """
+    if _stop_workspace_matches(observed, expected):
+        return True
+    try:
+        observed_path = Path(canonicalize_workspace(observed))
+        expected_path = Path(expected)
+        return observed_path != expected_path and observed_path.is_relative_to(expected_path)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def stop_session(
     executable: str,
     target: NativeTarget,
@@ -1393,7 +1410,7 @@ def stop_session(
     before = [s for s in _fresh_list(executable)
               if s.session_id.lower() == target.session_id.lower()
               and s.tag == target.tag
-              and _stop_workspace_matches(s.workspace, target.workspace)]
+              and _stop_workspace_matches_nested(s.workspace, target.workspace)]
     if not before:
         from .retired_native import verify_native_retirement
         is_retired, tombstone, reason = verify_native_retirement(
@@ -1407,6 +1424,8 @@ def stop_session(
                 ),
             )
         raise SessionControlError("Target not in native catalog (tag reuse or absent; %s); refusing" % reason)
+    if len(before) != 1:
+        raise SessionControlError("Target has multiple matching native catalog rows; refusing")
     if target.created_at_ms is not None and before[0].created_at_ms != target.created_at_ms:
         raise SessionControlError("Native generation mismatch before kill; refusing")
     if target.engine is not None and before[0].engine != target.engine:
@@ -1439,7 +1458,11 @@ def stop_session(
     remaining = [s for s in _fresh_list(executable)
                    if s.session_id.lower() == target.session_id.lower()
                    and s.tag == target.tag
-                   and _stop_workspace_matches(s.workspace, target.workspace)]
+                   and _stop_workspace_matches_nested(s.workspace, target.workspace)]
+    if len(remaining) > 1:
+        raise _uncertain_with_oracle(
+            "Multiple matching native catalog rows after kill; exit unproven",
+            oracle, {**attempt, "killed": True, "result": "ambiguous_catalog"})
     if not remaining:
         # Kill reported success AND the exact bound UUID/tag/workspace record is
         # gone. Absence WITHOUT our kill proof (forget/prune) is never exit
