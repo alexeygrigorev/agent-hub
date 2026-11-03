@@ -1395,6 +1395,11 @@ class CpuThrottleTests(unittest.TestCase):
             out["cpu_identity"] = previous["cpu_identity"]
         return out
 
+    def test_cpu_max_uses_the_configured_period_for_quota(self):
+        self.assertEqual(rm._cpu_max_for_cap(2.0), "200000 100000")
+        self.assertEqual(rm._cpu_max_for_cap(1.5), "150000 100000")
+        self.assertEqual(rm._cpu_max_for_cap(0.25), "25000 100000")
+
     def test_throttle_applies_after_sustained_over_cap_and_reports(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = str(Path(tmp) / "journal")
@@ -1412,9 +1417,10 @@ class CpuThrottleTests(unittest.TestCase):
             self.assertEqual(len(receipts), 1)
             self.assertEqual(receipts[0]["action"], "throttled")
             self.assertEqual(receipts[0]["session_id"], self.SESSION)
-            self.assertEqual(receipts[0]["cpu_max"], "2000000 100000")
+            self.assertEqual(receipts[0]["cpu_max"], "200000 100000")
             self.assertEqual(receipts[0]["prior_cpu_max"], "max 100000")
-            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+            self.assertEqual(receipts[0]["reason"], "sustained_over_cap")
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "200000 100000")
             self.assertTrue(out2.get("ok"))
 
     def test_throttle_lifts_when_usage_drops(self):
@@ -1424,15 +1430,56 @@ class CpuThrottleTests(unittest.TestCase):
             cg = self._cgroup(tmp)
             self._cycle(10_000_000, self._sample(cg, 100.0), journal)
             self._cycle(10_031_000, self._sample(cg, 199.0), journal)
-            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "200000 100000")
             idle = self._sample(cg, 199.5)
             out3, calls3 = self._cycle(10_062_000, idle, journal)
             receipts = [t for p in calls3["reports"] for t in p.get("throttles", [])]
             self.assertEqual(len(receipts), 1)
             self.assertEqual(receipts[0]["action"], "released")
             self.assertEqual(receipts[0]["outcome"], "restored")
+            self.assertEqual(receipts[0]["reason"], "usage_below_cap")
             self.assertEqual(receipts[0]["cpu_max"], "max 100000")
             self.assertEqual((cg / "cpu.max").read_text().strip(), "max 100000")
+
+    def test_failed_restore_keeps_active_state_and_retries(self):
+        entry = self._entry()
+        measured = {"cgroup_path": "/synthetic/aplexer-workload.scope"}
+        peak = {
+            "current_cpu_cores": 0.1,
+            "cpu_throttle": {
+                "cap_cores": 2.0,
+                "sustain_s": 300,
+                "prior_cpu_max": "max 100000",
+                "cpu_max": "200000 100000",
+                "cgroup": measured["cgroup_path"],
+            },
+        }
+        config = rm.default_config()
+        with patch.object(rm, "_read_cpu_max", return_value="200000 100000"), \
+             patch.object(rm, "_write_cpu_max", return_value=False) as failed_write:
+            failed = rm.evaluate_cpu_throttle(config, entry, measured, peak, 10_000,
+                                               "2026-11-02T00:00:10Z")
+            # A transient failure stays latched even if usage rises back above
+            # the release threshold before the next watchdog heartbeat.
+            peak["current_cpu_cores"] = 2.0
+            repeated = rm.evaluate_cpu_throttle(config, entry, measured, peak, 20_000,
+                                                 "2026-11-02T00:00:20Z")
+        self.assertEqual(failed[0]["outcome"], "unverified")
+        self.assertEqual(failed[0]["reason"], "usage_below_cap")
+        self.assertEqual(repeated, [])  # Report the failure once; retry the write.
+        self.assertEqual(failed_write.call_count, 2)
+        self.assertIn("cpu_throttle", peak)
+        self.assertTrue(peak["cpu_throttle_restore_failure_reported"])
+
+        with patch.object(rm, "_read_cpu_max", return_value="200000 100000"), \
+             patch.object(rm, "_write_cpu_max", return_value=True):
+            restored = rm.evaluate_cpu_throttle(config, entry, measured, peak, 30_000,
+                                                 "2026-11-02T00:00:30Z")
+        self.assertEqual(restored[0]["outcome"], "restored")
+        self.assertEqual(restored[0]["reason"], "usage_below_cap")
+        self.assertEqual(restored[0]["cpu_max"], "max 100000")
+        self.assertNotIn("cpu_throttle", peak)
+        self.assertNotIn("cpu_throttle_restore_failure_reported", peak)
 
     def test_throttle_persists_at_cap_without_flapping(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1447,7 +1494,7 @@ class CpuThrottleTests(unittest.TestCase):
             _, calls = self._cycle(10_062_000, at_cap, journal)
             receipts = [t for p in calls["reports"] for t in p.get("throttles", [])]
             self.assertEqual(receipts, [])
-            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "200000 100000")
 
     def test_throttle_never_applies_to_keep_or_unreadable_cpu_max(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1485,7 +1532,7 @@ class CpuThrottleTests(unittest.TestCase):
             cg = self._cgroup(tmp)
             self._cycle(10_000_000, self._sample(cg, 100.0), journal)
             self._cycle(10_031_000, self._sample(cg, 199.0), journal)
-            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "200000 100000")
             # Protection gained while pinned at the throttled ceiling: the
             # cap is lifted at once, not held until usage drops.
             protected = self._entry(keep=True)
@@ -1504,7 +1551,7 @@ class CpuThrottleTests(unittest.TestCase):
             cg = self._cgroup(tmp)
             self._cycle(10_000_000, self._sample(cg, 100.0), journal)
             self._cycle(10_031_000, self._sample(cg, 199.0), journal)
-            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "200000 100000")
             terminal = self._entry(state="failed")
             done = self._sample(cg, 199.2)
             _, calls = self._cycle(10_062_000, done, journal, entries=[terminal])
