@@ -156,3 +156,40 @@ describe('recommend endpoint', () => {
     });
   });
 });
+
+describe('route circuit breaker (intake 0e1b61c9)', () => {
+  const rejectedFor = (p: any, machine: string) =>
+    (p.rejected ?? []).some((r: any) => r.machine === machine && r.reason === 'route_quarantined');
+
+  it('skips a route whose last 3 launches in 10 minutes all died at the launcher, and only that route', async () => {
+    await withFleet('breaker-', (fleet, hub) => {
+      for (let i = 0; i < 3; i++) launch(hub, { machine: 'hetzner', account: 'acct-a', state: 'failed', exit_reason: 'launcher_command_failed' });
+      for (let i = 0; i < 2; i++) launch(hub, { machine: 'laptop', account: 'acct-a', state: 'failed', exit_reason: 'launcher_command_failed' });
+      const p = plan(fleet);
+      expect(find(p, 'hetzner', 'acct-a')).toBeUndefined();
+      expect(find(p, 'laptop', 'acct-a')).toBeDefined(); // only 2 failures
+      expect(find(p, 'hetzner', 'acct-b')).toBeDefined();
+      expect(rejectedFor(p, 'hetzner')).toBe(true);
+    });
+  });
+
+  it('re-opens after the window, and a later success resets it', async () => {
+    await withFleet('breaker-reopen-', (fleet, hub) => {
+      for (let i = 0; i < 3; i++) launch(hub, { machine: 'hetzner', account: 'acct-a', state: 'failed', exit_reason: 'launcher_command_failed', ageMs: 11 * 60_000 });
+      expect(find(plan(fleet), 'hetzner', 'acct-a')).toBeDefined();
+    });
+    await withFleet('breaker-reset-', (fleet, hub) => {
+      for (let i = 0; i < 3; i++) launch(hub, { machine: 'hetzner', account: 'acct-a', state: 'failed', exit_reason: 'launcher_command_failed', ageMs: 5 * 60_000 });
+      launch(hub, { machine: 'hetzner', account: 'acct-a', state: 'running', ageMs: 1000 });
+      expect(find(plan(fleet), 'hetzner', 'acct-a')).toBeDefined();
+    });
+  });
+
+  it('an operator pinning account and machine can still probe a quarantined route', async () => {
+    await withFleet('breaker-pin-', (fleet, hub) => {
+      for (let i = 0; i < 3; i++) launch(hub, { machine: 'hetzner', account: 'acct-a', state: 'failed', exit_reason: 'launcher_command_failed' });
+      const p = fleet.plan({ mode: 'headless', workspace: 'agent-hub', prompt: 'x', account: 'acct-a', machine: 'hetzner' }) as any;
+      expect(find(p, 'hetzner', 'acct-a')).toBeDefined();
+    });
+  });
+});
