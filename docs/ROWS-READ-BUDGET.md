@@ -83,3 +83,4 @@ path unchanged (probes, adoption, reconciles, drain). The intake linkage
 revision is deliberately not part of the key: it moves on every fleet-wide
 intake write while adoption is idempotent and reruns on the next changed
 census (credential/liveness paths read links live).
+(Quiet census: unchanged polls cost only the two capped freshness upserts.)
