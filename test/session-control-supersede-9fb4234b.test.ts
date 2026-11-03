@@ -38,12 +38,13 @@ async function fixture(fn: (service: SessionControlService, sql: any) => Promise
   });
 }
 
-async function createHeld(service: SessionControlService, sql: any, intakeId: string): Promise<any> {
+async function createHeld(service: SessionControlService, sql: any, intakeId: string, extra: Record<string, unknown> = {}): Promise<any> {
   sql.exec('INSERT OR REPLACE INTO intake_tasks (id, data) VALUES (?, ?)', intakeId, JSON.stringify({
     id: intakeId, project: 'demo', status: 'open', acceptance_criteria: 'Verify held placement recovery.', history: [],
   }));
   const response = await service.handle(request('/api/sessions', {
     key: crypto.randomUUID(), workspace: 'demo', mode: 'interactive', intake_task_id: intakeId,
+    ...extra,
   }), admin);
   const data = await response.json() as any;
   expect(response.status, JSON.stringify(data)).toBe(409);
@@ -107,6 +108,54 @@ describe('held-session intake supersession', () => {
         updated_at: staleAt,
       });
       insertIntakeLinks(sql, intakeId, held.id, shellId);
+
+      const shown = await (await service.handle(request('/api/sessions/' + held.id, undefined, 'GET'), admin)).json() as any;
+      expect(shown.state).toBe('held');
+      expect(shown.reason).toBe('cpu_pressure');
+      expect(shown.superseded_by).toBeUndefined();
+    });
+  });
+
+  it('uses a fresh complete census to keep an unchanged live observed-native session eligible', async () => {
+    await fixture(async (service, sql) => {
+      const intakeId = crypto.randomUUID();
+      const held = await createHeld(service, sql, intakeId);
+      const heldCreated = Date.parse(sql.exec('SELECT created_at FROM session_control_sessions WHERE id=?', held.id).toArray()[0].created_at);
+      const nativeId = crypto.randomUUID();
+      const shellId = crypto.randomUUID();
+      const createdAt = new Date(heldCreated + 1000).toISOString();
+      const unchangedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      sql.exec('CREATE TABLE IF NOT EXISTS fleet_catalog_census (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, complete INTEGER NOT NULL)');
+      sql.exec('INSERT OR REPLACE INTO fleet_catalog_census (machine_id,observed_at,complete) VALUES (?,?,1)', 'observed-host', new Date().toISOString());
+      sql.exec(`INSERT OR REPLACE INTO fleet_sessions
+        (machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,created_at_ms)
+        VALUES (?,?,?,'shell','running','idle',?,'demo',12345)`,
+        'observed-host', nativeId, 'rr-fresh', unchangedAt);
+      insertLiveLinkedSession(sql, shellId, createdAt, {
+        engine: 'shell', machine_id: 'observed-host', updated_at: unchangedAt,
+        request: { provenance: 'observed_native', observation_only: true },
+        binding: { native_id: nativeId, native_created_at_ms: 12345, tag: 'rr-fresh', workspace: 'demo',
+          provenance: 'observed_native', observed_at: unchangedAt },
+      });
+      insertIntakeLinks(sql, intakeId, held.id, shellId);
+
+      const shown = await (await service.handle(request('/api/sessions/' + held.id, undefined, 'GET'), admin)).json() as any;
+      expect(shown.state).toBe('cancelled');
+      expect(shown.reason).toBe('superseded_by_newer_session');
+      expect(shown.superseded_by).toBe(shellId);
+    });
+  });
+
+  it('does not let an unlinked recovery sibling supersede the held start', async () => {
+    await fixture(async (service, sql) => {
+      const intakeId = crypto.randomUUID();
+      const held = await createHeld(service, sql, intakeId, { engine_override_reason: 'Intake recovery after provider failure' });
+      const heldCreated = Date.parse(sql.exec('SELECT created_at FROM session_control_sessions WHERE id=?', held.id).toArray()[0].created_at);
+      const siblingId = crypto.randomUUID();
+      insertLiveLinkedSession(sql, siblingId, new Date(heldCreated + 1000).toISOString(), {
+        request: { intake_task_id: intakeId, engine_override_reason: 'Intake recovery after provider failure' },
+      });
+      insertIntakeLinks(sql, intakeId, held.id, []);
 
       const shown = await (await service.handle(request('/api/sessions/' + held.id, undefined, 'GET'), admin)).json() as any;
       expect(shown.state).toBe('held');
