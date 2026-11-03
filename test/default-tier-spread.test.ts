@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
-import { policy } from '../src/model-routing';
+import { isDeepModel, policy } from '../src/model-routing';
 import { freshCpu } from './cpu-fixture';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';

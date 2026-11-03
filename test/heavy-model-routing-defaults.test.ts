@@ -60,10 +60,8 @@ describe('heavy model routing defaults', () => {
       const model = models.get(id);
       if (model) expect(model.effort, id).toBe('medium');
     }
-    // Opus is intentionally not configured: Claude routes remain Sonnet-only.
-    // If a heavy selector is added later, the policy-wide loop below enforces
-    // the same medium-effort default.
-    expect(models.has('opus')).toBe(false);
+    // Opus is configured for deep/review only and must remain medium effort.
+    expect(models.get('opus')?.effort).toBe('medium');
     expect(isHeavyModel('gemini-4-argon-high')).toBe(true);
     expect(heavyModelEffortAllowed('gemini-4-argon-high', 'high')).toBe(false);
     expect(isDeepModel('gemini-4-argon-medium')).toBe(true);
