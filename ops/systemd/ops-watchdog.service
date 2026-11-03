@@ -1,5 +1,5 @@
 [Unit]
-Description=Restart dead or tick-stalled orchestrator-main / oncall-engineer and prove each restart (no scheduling)
+Description=Restart dead orchestrator-main / oncall-engineer sessions (no scheduling)
 
 [Service]
 Type=oneshot

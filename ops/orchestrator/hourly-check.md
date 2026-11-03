@@ -7,9 +7,11 @@ Alexey standing order t1756u (corrected t1760u): the orchestrator owns execution
 - (c) Finished work gets a DONE note with proof; never close or delete intakes.
 - (d) NEEDS_ALEXEY is only for prod/GitHub environment approvals, secrets, deletions, or Alexey's own 2FA. Never approve prod gates.
 
-Cadence: every 15 min via Hub scheduled pings once Hub schedules exist; until then, `/loop 1h` is a stopgap. Keep `LOOP_INTERVAL` in `ops/lib/session-ctl.sh` unchanged.
+Cadence: `/loop 1h` inside Claude is the scheduler stopgap. Hub scheduled prompts will replace it when available (AC15). Keep `LOOP_INTERVAL` in `ops/lib/session-ctl.sh` unchanged.
 
 Run each scheduled ping (or hourly `/loop` stopgap tick). Be brief; use `HUB_CONFIG_FILE=$HOME/.config/agent-hub/cli.json` (`host.json` does not exist on Hetzner). Human `hub auth login` on Hetzner was done 2026-10-27 22:17 (orin@datatalks.club), so `hub quota` / `hub engines` work with cli.json.
+
+**RMTHZ launch cap:** start at most 3 new fixer sessions in any rolling 60-minute window. Before each start, require the Hub admission gate, fresh quota for the selected engine, `bash .agents/skills/hub-sessions/hostload.sh` reporting `verdict=free`, at least 10 GiB `MemAvailable`, and the configured disk floor. If any gate holds or the 3-start cap is reached, keep the intake queued and record the exact reason and next action. Never kill another session to make room.
 
 0. Setup: `~/.local/share/agent-hub-ops/session-ctl.sh orchestrator skills-sync` (pull bot-skills; relink). If `~/tmp/agent-reports/orchestrator/handoff.md` is newer than your session start, read it first. Drain `inbox/` (see CLAUDE.md duty 9). Check remaining context (<15% => handoff-restart per CLAUDE.md).
 1. Load/memory: `uptime`, `free -g`. Respect live resource gates. If capacity blocks a launch, start permitted recovery in this tick and track the blocked fix and next action.

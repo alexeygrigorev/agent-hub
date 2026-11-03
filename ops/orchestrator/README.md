@@ -1,6 +1,6 @@
 # orchestrator-main and oncall-engineer: runbook
 
-Two interactive Claude Code sessions (engine `sonnet`) on Hetzner replace Grok Bot's recurring routines. Contract: Hub intake `67847fde-a00a-4689-8460-fbad45599f99` (AC1-AC14).
+Two interactive Claude Code sessions (engine `sonnet`) on Hetzner replace Grok Bot's recurring routines. Contract: Hub intake `67847fde-a00a-4689-8460-fbad45599f99` (AC1-AC15).
 
 | | orchestrator-main | oncall-engineer |
 |---|---|---|
@@ -25,28 +25,19 @@ ops/orchestrator/start.sh        # or: ops/oncall/start.sh
 It (1) fetches origin/main and creates/refreshes the run worktree (detached at origin/main), (2) syncs skills (below), (3) `a start --workspace <run dir> --cwd <run dir>/ops/<role> --tag <tag> --engine sonnet`, (4) accepts the bypass/trust prompts, (5) issues the loop command.
 
 ## /loop command
-Claude Code syntax (checked from the `loop` skill and live in the pane): `/loop <interval> <prompt>`. Issued by the start script:
+Checked in the installed Claude Code `/help` on 2026-11-03: `/loop` runs a prompt or slash command on a recurring interval (the command list shows `/loop 5m /foo…`). The start script issues it at the intended one-hour cadence. The current sessions still show their earlier `/loop 15m` and are paused by Claude's weekly limit; their first successful hourly iteration remains pending a quota-safe run:
 ```
 /loop 1h Run the orchestrator check: follow <run dir>/ops/orchestrator/hourly-check.md in this repo, starting with step 0 (skills sync, handoff, inbox).
 ```
 (same with `oncall`). The exact line used last is in `<reports>/state/loop_command`.
 
 ## Skills (AC14)
-Source: clone of `alexeygrigorev/bot-skills` at `~/git/bot-skills-ops` (note: `~/git/bot-skills` is not a git repo on Hetzner). `session-ctl.sh <role> skills-sync` runs `git pull --ff-only` and symlinks every `<skill>/SKILL.md` directory into `<run dir>/.claude/skills/` (project skills, auto-discovered by Claude Code; the dir is git-excluded in the run worktree). It runs on every start/restart (so restarts come back with the same skills) and as step 0 of each loop iteration. Both CLAUDE.md files list the skills to read and follow. If a pull fails the last checkout is used and logged.
+Source: the consolidated `alexeygrigorev/bots-management` repository at `~/git/bots-management-ops` (the former `bot-skills` repository was consolidated on 2026-10-30). `session-ctl.sh <role> skills-sync` runs `git pull --ff-only` and symlinks every `<skill>/SKILL.md` directory into `<run dir>/.claude/skills/` (project skills, auto-discovered by Claude Code; the dir is git-excluded in the run worktree). It runs on every start/restart (so restarts come back with the same skills) and as step 0 of each loop iteration. Both CLAUDE.md files list the skills to read and follow. If a pull fails the last checkout is used and logged.
 
-## Scheduler and watchdog (AC4; idle bound intake 500fd60b)
-**`/loop` inside the interactive session is the scheduler.** There is no external cron that re-prompts or does work. `ops-watchdog.timer` (user, every 10 min) -> `ops-watchdog.service` -> `flock -n` + `timeout 900` + `nice -n 10` + `ionice -c3` -> `watchdog.sh` -> `session-ctl.sh <role> check`.
+## Scheduler and watchdog (AC4)
+**Claude Code's in-session `/loop` is the scheduler.** There is no external cron that re-prompts, checks ticks, or decides whether useful work happened. The only external timer is `ops-watchdog.timer` (user, every 15 minutes). Its one-shot service checks the native aplexer worker and restarts a session only when that process is confirmed dead or missing. A live process is left alone even if a report or tick file is stale. A restart reads the handoff, syncs skills, starts a Sonnet session, and reissues `/loop`.
 
-For the orchestrator a live process is not enough. `check`:
-- restarts when the session is dead, or when it is alive but `~/tmp/agent-reports/orchestrator-ticks.jsonl` has not changed for 30 min (`MAX_TICK_AGE`). Every OK run arms a 1s-accurate transient deadline timer for the moment the newest tick turns 30 min old. That timer runs this role's check directly under a per-role lock, so detection waits neither for the 10-min timer nor for the oncall check;
-- proves every restart: the new session must append a tick within 10 min of the recorded start (`PROOF_WINDOW`). A transient timer re-runs the watchdog right after the deadline. Inside the window it neither restarts again nor reports OK. Proof reads the tick history: only a tick inside the window counts, and a late first tick starts path 2;
-- if the proof fails, it starts recovery path 2: a new session on `ORCH_FALLBACK_ENGINE` (default `sonnet`) with a fresh handoff, again with a 10-min proof. Paths then alternate;
-- counts consecutive failed recoveries (failed restart or failed proof). Only at 2 does it alert: `NEEDS_ALEXEY.md`, the oncall inbox, and Hub (below). A proven recovery resets the count;
-- reports each run to Hub: `hub ops heartbeat --kind watchdog --state <ok|recovering|proof_pending|proof_failed|...> --recovery-failures N --tick-at <tick log time>`. A failed report never changes the local decision.
-
-Hub-side check (`src/ops-liveness.ts`, minute alarm; `hub ops status`): it works without this watchdog and without the session. It alerts only after automatic recovery failed twice: the watchdog reports 2 consecutive failures, or the watchdog has been silent for two 30-min windows. Its backlog check counts open intakes with AC against intake sessions starting or running. After 30 min with none, Hub records why it was idle and starts the oldest ready intake through canonical admission, at most once per 30 min. Two starts in a row that produce no working session raise an alert. `HUB_OPS_LIVENESS=false` disables it, and `HUB_BACKLOG_IDLE_KICK=false` disables only the start. Details: `docs/ORCHESTRATOR-LIVENESS.md`.
-
-The oncall role keeps the dead-process check. Restarts outside recovery are rate limited (10 min). The unit sets `APLEXER_LAUNCH_SYSTEM_SCOPE=system` so sessions it starts do not die with the oneshot unit's cgroup. Manual run: `systemctl --user start ops-watchdog.service`; logs: `journalctl --user -u ops-watchdog.service`; `systemctl --user list-timers ops-watchdog.timer`.
+The service uses `flock -n`, `timeout 900`, `nice -n 10`, and `ionice -c3`. It does not create transient timers or send periodic prompts. Inspect the timer with `systemctl --user list-timers ops-watchdog.timer`; run one check with `systemctl --user start ops-watchdog.service`; inspect its result with `systemctl --user status ops-watchdog.service` and `journalctl --user -u ops-watchdog.service`.
 
 ## Restart / handoff (AC3)
 - Context under 15%: the session writes `handoff.md` and runs `session-ctl.sh <role> handoff-restart` (detached; kills itself and starts a fresh one, which reads the handoff in step 0).
@@ -63,7 +54,7 @@ oncall-send "text"                                                            # 
 `*-send` first appends `inbox/<UTC ts>-<pid>.md` (atomic, fsynced, never lost), then types a one-line `[INBOX id] …` into the pane via `a send --enter`, and prints `INBOX=saved <path>` plus `DELIVERY=delivered|not-delivered`. Exit 0 delivered, 2 saved only (the session drains the inbox each loop and after the restart), 1 not saved. The session moves handled files to `inbox/processed/`. Set `SENDER=alexey` to label the source.
 
 ## Mail access (alert triage)
-This host cannot read `dev@dtcdev.click` or any alert mailbox: only `msmtp` (send-only) is installed; there is no IMAP client, Maildir, mbsync/fetchmail config, and no Gmail API reader. Missing: a read-only mailbox path (IMAP read credentials or Gmail API read scope for dev@dtcdev.click / the alert label) provisioned for a non-secret-printing fetcher by Alexey. Until then alerts arrive via `oncall-send` (Grok Bot forwards dev@ mail) and, later, the Hub webhook->session routing intake. Credential files were deliberately not read.
+This host cannot read `dev@dtcdev.click` or any alert mailbox: only `msmtp` (send-only) is installed; there is no IMAP client, Maildir, mbsync/fetchmail config, and no Gmail API reader. Missing: a read-only mailbox path (IMAP read credentials or Gmail API read scope for dev@dtcdev.click / the alert label) provisioned for a non-secret-printing fetcher by Alexey. The Hub `dev-mailbox` webhook is enabled for `oncall-engineer`; until delivery from the live mailbox source is verified alongside Grok's existing wake, alerts still arrive via `oncall-send` (Grok Bot forwards dev@ mail). Credential files were deliberately not read.
 
 ## Moving to another host
 Pick a host with the Hub-validated resource floors, `a`, `claude`, `hub`, `gh` logged in and the repo clone `~/git/agent-hub`. Run `ops/install.sh`, copy `~/tmp/agent-reports/{orchestrator,oncall}` (handoff + inbox), stop the old sessions (`session-ctl.sh <role> status`, `a kill <id>`; ask Alexey first), run `start.sh` on the new host, point Grok Bot's `orch-send`/`oncall-send` at the new host (ssh wrapper). Disable the timer on the old host: `systemctl --user disable --now ops-watchdog.timer`.
@@ -71,21 +62,16 @@ Pick a host with the Hub-validated resource floors, `a`, `claude`, `hub`, `gh` l
 ## Playbook: Grok Bot limits running out (AC13)
 Also a bot-skills skill: `grok-limits-playbook`.
 
-> **Scheduler = Hub schedules (intake 19ec91c2 AC8-AC10; see [docs/PROMPT-SCHEDULES.md](../../docs/PROMPT-SCHEDULES.md)).** Library prompts `orchestrator-hourly` / `oncall-triage` + `hub schedules create --name <role>-hourly --session <label> --cron '0 * * * *' --prompt-id <slug>`; manage with `hub prompts|schedules`. Run the watchdog units with `LOOP_INTERVAL=off` so `session-ctl.sh` issues no `/loop`. The stopgap text below is historical.
-
-> **Hub driver (intake 1035ad06):** the replacement orchestrator is one managed interactive session, started with `hub driver start --engine codex --workspace agent-hub`; inspect it with `hub driver status`. The start command also queues the standing order and creates the 15-minute session prompt schedule through `/api/session-schedules`. This is distinct from `hub schedule`, which starts a fresh session on each tick. Keep `orchestrator-main` and its watchdog until its owner verifies two consecutive useful driver cycles, acknowledges the handoff, and retires the old in-session cron. See [Hub driver migration](../../docs/DRIVER.md#orchestrator-migration).
-
-> **/loop is a STOPGAP (AC15).** The ops sessions must be engine-agnostic; `/loop` exists only in Claude Code. Hub scheduled prompts (`hub schedules create --session <label> --cron "0 * * * *" --prompt-file <f>`, intake 19ec91c2 AC8, built in a separate session) replace it. Switch when that lands: (1) create one schedule per session (`orchestrator-main`, `oncall-engineer`) whose prompt file is the existing `hourly-check.md`; (2) verify one scheduled prompt arrives and `latest.md` updates; (3) set `LOOP_INTERVAL=off` in the watchdog unit environment (`session-ctl.sh` then skips the `/loop` send) and cancel the in-session loop (`/loop` cancel or restart the session); (4) the watchdog stays, restarts re-attach to the same schedule by session label. The briefs and `hourly-check.md` are already scheduler-neutral, and the engine (`ORCH_ENGINE`) can then be any engine.
-1. **Signs**: Grok usage near the weekly budget (65% at mid-week on 2026-10-27), or Grok routines failing/refusing for quota.
-2. **Cut order** (cheapest to lose first): hourly Hub report -> pending research follow-ups -> Codex quota check -> open-intake drain -> dev mailbox wake (last, until the Hub webhook exists). Grok keeps only: forwarding Alexey's messages and alerts, relaying `NEEDS_ALEXEY.md`.
-3. **Scheduler note**: Hub schedules (`hub schedules list`, engine-agnostic, durable queue) drive both sessions; `/loop` is retired once `LOOP_INTERVAL=off` is set (see above).
-3. **Where each goes**: drain, Codex quota, Hub report, research follow-ups -> orchestrator-main. Alert/outage triage (dev@ mail, Coolify, Contabo-deadman, CloudWatch, CI) -> oncall-engineer.
-4. **Talk to them directly**: attach commands above; `orch-send` / `oncall-send` from a shell on Hetzner; Hub UI (hub.dtcdev.click) sessions list -> open the session.
-5. **Webhook**: the Hub webhook->session routing (separate intake) replaces the Dapier->Grok mailbox wake: alerts land as messages in oncall-engineer without Grok.
-6. **Restore** after limits reset: re-enable the Grok routines in reverse order, keep the forwarders, verify `latest.md` of both sessions is fresh and `NEEDS_ALEXEY.md` is being relayed; drop any duplicated duties from the Grok side.
+1. **Signs**: Grok usage near its weekly budget (65% at mid-week on 2026-10-27), or Grok routines failing/refusing for quota.
+2. **Cut order** (cheapest to lose first): hourly Hub report -> pending research follow-ups -> Codex quota check -> open-intake drain -> dev mailbox wake. Keep the mailbox wake until the live Hub webhook source and delivery to both sessions have passed a dual-delivery check. Grok keeps only forwarding and relaying `NEEDS_ALEXEY.md`.
+3. **Where work goes**: `orchestrator-main` handles Hub health/placement, stuck sessions, load/memory, Codex quota, intake drain, research follow-ups, and receives every Alexey message and every alert through `orch-send`. `oncall-engineer` triages alerts (dev@ mail, Coolify, Contabo-deadman, CloudWatch, CI); forward dev@ infrastructure alerts to it with `oncall-send` as well. Developer forwards those items and does not investigate them.
+4. **Talk to them directly**: attach with the commands above; send `orch-send` / `oncall-send` from a shell on Hetzner; or use the Hub UI (`hub.dtcdev.click`, Sessions).
+5. **Webhook transition**: the authenticated Hub webhook route is in place and targets `oncall-engineer` (see [docs/WEBHOOKS.md](../docs/WEBHOOKS.md)); the live mailbox source and dual delivery to both sessions are not verified. Keep the Dapier-to-Grok wake and forward dev@ alerts to both sessions until that check passes. Afterward, the Hub webhook can replace the mailbox wake.
+6. **Scheduler**: Claude Code `/loop 1h` is the current scheduler stopgap. Hub scheduled prompts (`hub schedules create --session <label> --cron '0 * * * *' --prompt-file <f>`, intake 19ec91c2 AC8) are the engine-agnostic target. Create and verify a schedule for each session, then set `LOOP_INTERVAL=off` and cancel/restart the in-session loops. The external `ops-watchdog.timer` remains a 15-minute dead-process check and never re-prompts live sessions.
+7. **Restore** after limits reset: re-enable paused Grok routines in reverse cut order, keep the forwarders, verify both `latest.md` reports are fresh and `NEEDS_ALEXEY.md` is relayed, then remove only duties confirmed to be duplicated. A separate Hub driver migration is documented in [Hub driver migration](../../docs/DRIVER.md#orchestrator-migration); use its handoff criteria if that path is selected.
 
 ## Hub webhooks (dev@ route target)
 The Hub now exposes authenticated webhook endpoints that deliver payloads into a target session (intake `19ec91c2`): routes, delivery status and audit live at hub.dtcdev.click `/webhooks.html`, CLI `hub webhooks create|list|delete|test`. The dev@ mailbox route targets **oncall-engineer** (not orchestrator-main); see [docs/WEBHOOKS.md](../docs/WEBHOOKS.md) for auth (token/HMAC), rate limits, size caps and the test command. Dapier's live webhook is only repointed once the old Grok Bot wake keeps working (dual-deliver); deleting the old webhook needs Alexey.
 
 ## Rules
-Standing rules live in each CLAUDE.md (AC6). Cost: both sessions run engine `sonnet` (`ORCH_ENGINE` overrides, don't).
+Standing rules live in each CLAUDE.md (AC6). Cost: both sessions and recovery sessions always run engine `sonnet`; the launcher does not accept model overrides.
