@@ -215,6 +215,32 @@ class FleetTests(unittest.TestCase):
         text = json.dumps(report)
         self.assertNotIn('MUST_NOT_LEAK', text); self.assertNotIn('private@example', text)
 
+    def test_antigravity_explicit_quota_argv_precedes_native_usage_probe(self):
+        cfg = settings(Path('/repo'))
+        cfg['subscriptions'][0].update(service='gemini', engine='antigravity', quota_argv=['/opt/quota-adapter', '--json'])
+        raw = {'gemini': {'status': 'ok', 'details': {'limit_reached': False},
+                          'windows': {'5h': {'present': True, 'percent_remaining': 61,
+                                             'reset_at': '2030-01-02T17:00:00Z'}}}}
+        runner = MagicMock(return_value=raw)
+        native_probe = MagicMock(return_value={'gemini': {'status': 'ok'}})
+
+        reports = fleet.collect_subscriptions(cfg, runner, antigravity_probe=native_probe)
+
+        runner.assert_called_once_with(['/opt/quota-adapter', '--json'])
+        native_probe.assert_not_called()
+        self.assertEqual(reports[0]['quota']['windows']['5h']['percent_remaining'], 61)
+
+    def test_antigravity_native_probe_is_not_reused_for_managed_or_multiple_gemini_accounts(self):
+        default = {'service': 'gemini', 'account_label': 'shared-gemini', 'engine': 'antigravity', 'profile': None}
+        managed = {'service': 'gemini', 'account_label': 'hub-antigravity', 'engine': 'antigravity', 'profile': 'hub-hub-antigravity'}
+        native_probe = MagicMock(return_value={'gemini': {'status': 'ok'}})
+
+        managed_only = fleet.collect_subscriptions({'subscriptions': [managed]}, antigravity_probe=native_probe)
+        two_accounts = fleet.collect_subscriptions({'subscriptions': [default, managed]}, antigravity_probe=native_probe)
+
+        native_probe.assert_not_called()
+        self.assertTrue(all(report['quota']['status'] == 'unknown' for report in managed_only + two_accounts))
+
     def test_probe_failure_and_malformed_route_remain_unknown(self):
         cfg = settings(Path('/repo'))
         def runner(_): raise RuntimeError('MUST_NOT_LEAK')

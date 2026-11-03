@@ -15,7 +15,7 @@ import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type Ad
 import { effectiveCheckin, effectiveRoutesAt } from './registry';
 import { commandChannelHealth } from './command-channel';
 import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
-import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
+import { isUnmeteredProvider, quotaHasWindowEvidence, quotaPositivelyBlocked, quotaWindowPercent, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
 import { runHeldReconciler } from './intake-recovery';
@@ -766,9 +766,37 @@ export class FleetService {
     const found = this.observationProvenanceRaw(account, route, snapshot);
     if (!isUnmeteredProvider(account.provider)) return found;
     const now = snapshot?.now ?? this.now();
-    if (found && (found.quota?.status === 'ok' || quotaPositivelyBlocked(found.quota, now))) return found;
+    if (found && (found.quota?.status === 'ok' || quotaPositivelyBlocked(found.quota, now) || quotaHasWindowEvidence(found.quota))) return found;
+    if (!this.canSynthesizeUnmetered(account, route, snapshot, now)) return found;
     const at = new Date(now).toISOString();
     return { quota: unmeteredObservation(at), subscriptionObservedAt: at };
+  }
+
+  private canSynthesizeUnmetered(account: any, route: any, snapshot: FleetCapacitySnapshot | undefined, now: number): boolean {
+    if (!account.enabled) return false;
+    let machine: any = snapshot?.machines.find((m: any) => m.id === route.machine_id);
+    if (!machine) {
+      machine = this.sql.exec('SELECT id, last_checkin_at, drained, capabilities, last_heartbeat FROM machines WHERE id = ? AND revoked_at IS NULL', route.machine_id).toArray()[0];
+    }
+    if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), now, 180000)) return false;
+    const caps = parsed(machine.capabilities);
+    if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine)) return false;
+    const health: any = this.sql.exec("SELECT reason, updated_at FROM fleet_engine_health WHERE engine = ? AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL) AND status = 'unavailable'",
+      route.engine, route.machine_id).toArray().find((h: any) => !(RETRIABLE_ENGINE_HOLDS.has(h.reason) && now - Date.parse(h.updated_at) >= ENGINE_HEALTH_RETRY_MS));
+    if (health) return false;
+    if (invalidLabels(this.sql).has(account.label) || rejectedPairs(this.sql).has(route.machine_id + '\u0000' + account.label)) return false;
+    const rejected = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.some((r: any) =>
+      r.engine === route.engine && r.account === account.label && (r.profile ?? null) === (route.profile ?? null) &&
+      ['credential_rejected', 'not_logged_in'].includes(r.reason) && fresh(r.observed_at, now, 300000));
+    if (rejected || this.sql.exec('SELECT 1 FROM fleet_login_holds WHERE machine_id = ? AND engine = ? AND account = ? AND profile = ? AND held_at_ms > ?',
+      route.machine_id, route.engine, account.label, route.profile ?? '', now - ENGINE_HEALTH_RETRY_MS).toArray().length) return false;
+    const heartbeat = parsed(machine.last_heartbeat);
+    let runners: any = null;
+    try { runners = this.sql.exec('SELECT runners_json, observed_at FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0] ?? null; } catch { runners = null; }
+    const hb = Array.isArray(heartbeat.fleet_routes)
+      ? { ...heartbeat, fleet_routes_at: effectiveRoutesAt(route.machine_id, heartbeat.fleet_routes_at) }
+      : heartbeat;
+    return routeAdvertised(advertisedRoutes(hb, runners, now), route);
   }
 
   private observationProvenanceRaw(account: any, route: any, snapshot?: FleetCapacitySnapshot): { quota: any; subscriptionObservedAt: string | null } | null {
@@ -776,31 +804,43 @@ export class FleetService {
     const provider = canonicalQuotaProvider(account.provider);
     const label = canonicalAccountLabel(account.label);
     const legacyLabel = Object.entries(LEGACY_ACCOUNT_LABELS).find(([, c]) => c === label)?.[0] ?? label;
+    const candidates: { quota: any; subscriptionObservedAt: string | null }[] = [];
     const central: any = this.sql.exec('SELECT * FROM server_quota_snapshots WHERE (account = ? OR account = ?) AND (provider = ? OR provider = ?)', label, legacyLabel, provider, legacyRouteKeyFor(provider) ?? provider).toArray()[0];
     if (central && fresh(central.captured_at, now, QUOTA_STALE_MS - 1)) {
       const quota = parsed(central.quota_json);
       if (!quota.observed_at || fresh(quota.observed_at, now, QUOTA_STALE_MS - 1)) {
-        return { quota, subscriptionObservedAt: central.captured_at };
+        candidates.push({ quota, subscriptionObservedAt: central.captured_at });
       }
     }
     const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
     if (subscription) {
-      if (canonicalQuotaProvider(subscription.service) !== provider || !fresh(subscription.observed_at, now, 1200000)) return null;
-      const quota = parsed(subscription.quota_json);
-      const quotaObs = quota?.observed_at || subscription.observed_at;
-      return fresh(quotaObs, now, 1200000) ? { quota: quota?.observed_at ? quota : { ...quota, observed_at: quotaObs }, subscriptionObservedAt: subscription.observed_at } : null;
+      if (canonicalQuotaProvider(subscription.service) === provider && fresh(subscription.observed_at, now, 1200000)) {
+        const quota = parsed(subscription.quota_json);
+        const quotaObs = quota?.observed_at || subscription.observed_at;
+        if (fresh(quotaObs, now, 1200000)) candidates.push({ quota: quota?.observed_at ? quota : { ...quota, observed_at: quotaObs }, subscriptionObservedAt: subscription.observed_at });
+      }
     }
     // A default CLI reading cannot describe a named profile or two accounts on one service.
-    if (route.profile !== null && route.profile !== provider) return null;
-    const count = snapshot ? (snapshot.familyAccounts.get(capacityFamilyKey(route.machine_id, provider))?.size ?? 0)
-      : Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)', route.machine_id, provider, legacyRouteKeyFor(provider) ?? provider).one().n);
-    const hostSnapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
-    if (count !== 1 || !hostSnapshot || !fresh(hostSnapshot.captured_at, now, 1200000)) return null;
-    const quota = snapshotRouteForAccount(account.label, provider, parsed(hostSnapshot.routes_json));
-    const obsTs = quota?.observed_at || hostSnapshot.captured_at;
-    if (!quota || !fresh(obsTs, now, 1200000)) return null;
-    const quotaWithTs = quota.observed_at ? quota : { ...quota, observed_at: obsTs };
-    return { quota: hostSnapshot.status === 'ok' ? quotaWithTs : { ...quotaWithTs, status: 'unknown' }, subscriptionObservedAt: hostSnapshot.captured_at };
+    if (route.profile === null || route.profile === provider) {
+      const count = snapshot ? (snapshot.familyAccounts.get(capacityFamilyKey(route.machine_id, provider))?.size ?? 0)
+        : Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)', route.machine_id, provider, legacyRouteKeyFor(provider) ?? provider).one().n);
+      const hostSnapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
+      if (count === 1 && hostSnapshot && fresh(hostSnapshot.captured_at, now, 1200000)) {
+        const quota = snapshotRouteForAccount(account.label, provider, parsed(hostSnapshot.routes_json));
+        const obsTs = quota?.observed_at || hostSnapshot.captured_at;
+        if (quota && fresh(obsTs, now, 1200000)) {
+          const quotaWithTs = quota.observed_at ? quota : { ...quota, observed_at: obsTs };
+          candidates.push({ quota: hostSnapshot.status === 'ok' ? quotaWithTs : { ...quotaWithTs, status: 'unknown' }, subscriptionObservedAt: hostSnapshot.captured_at });
+        }
+      }
+    }
+    const rank = (quota: any) => quotaPositivelyBlocked(quota, now) ? 3
+      : quotaHasWindowEvidence(quota) ? 2
+      : quota?.status === 'ok' && quota.details?.stale !== true ? 1 : 0;
+    candidates.sort((a, b) => rank(b.quota) - rank(a.quota) ||
+      (quotaWindowPercent(a.quota) ?? 101) - (quotaWindowPercent(b.quota) ?? 101) ||
+      Date.parse(b.subscriptionObservedAt ?? '') - Date.parse(a.subscriptionObservedAt ?? ''));
+    return candidates[0] ?? null;
   }
 
   private observation(account: any, route: any) {
@@ -1234,6 +1274,10 @@ export class FleetService {
     return this.resources.withReadSnapshot(() => {
     const accounts = new Map<any,ReturnType<FleetService['accountStatus']>>();
     const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, a]));
+    const capacitySnapshot = this.queueCapacitySnapshot();
+    for (const definition of definitions.values()) {
+      accounts.set(definition.label, this.accountStatus(definition, capacitySnapshot));
+    }
     // Route alternatives within this synchronous read-only plan share the
     // same host commitments. Never retain these values across a reservation.
     const memoryByRoute=new Map<string,ReturnType<ResourceManagement['headroom']>>();
@@ -1575,7 +1619,8 @@ export class FleetService {
       // headroom. Load already placed on the same provider family divides the
       // score so unspecified starts spread by headroom instead of stacking on
       // the single highest-percentage family.
-      const headroomPercent = routeQuota.remaining ?? (isUnmeteredProvider(family) ? (policy.rules as any).unmetered_headroom_percent : 5);
+      const headroomPercent = routeQuota.remaining ?? account?.remaining_percent ??
+        (isUnmeteredProvider(family) ? (policy.rules as any).unmetered_headroom_percent : 5);
       const familyLoad = [...accounts.values()].filter(a => a.provider === family).reduce((n, a) => n + a.active, 0);
       const observedLoad = Number.isFinite(hb?.load?.[0]) && Number.isFinite(caps?.cpu_count) && caps.cpu_count > 0
         ? hb.load[0] / caps.cpu_count : 0;
@@ -1642,7 +1687,9 @@ export class FleetService {
     // operator's override.
     const degraded = new Set(Array.from(gateDegraded, i => candidates[i]));
     // A disabled account reports blocked but carries no quota verdict.
-    if (!request.account && [...accounts.values()].some(a => a.enabled && a.status !== 'unknown')) {
+    const knownAccount = (a: any) => a.enabled && a.status !== 'unknown' &&
+      (!isUnmeteredProvider(a.provider) || a.status === 'blocked' || a.remaining_percent !== null);
+    if (!request.account && [...accounts.values()].some(knownAccount)) {
       for (let i = candidates.length - 1; i >= 0; i--) {
         if (accounts.get(candidates[i].account)?.status !== 'unknown') continue;
         rejected.push({ machine: candidates[i].machine, engine: candidates[i].engine, reason: 'account_unknown' });

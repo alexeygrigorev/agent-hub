@@ -1128,7 +1128,16 @@ def collect_subscriptions(settings, runner=run_json, antigravity_probe=None):
         # use its official, read-only /usage command after account_registry has
         # verified the account-specific credential; no login flow is started.
         command = sub.get("quota_argv")
-        if service == "gemini" and sub.get("engine") == "antigravity":
+        # Explicit per-account wrappers are authoritative, including for
+        # Antigravity. The native /usage CLI can address only the single
+        # default-profile account in Path.home(); never reuse that reading for
+        # a named managed profile or another Gemini subscription.
+        if command and not _is_quota_cli(command):
+            try:
+                raw = runner(command)
+            except Exception:
+                pass
+        elif service == "gemini" and sub.get("engine") == "antigravity" and profile is None and counts[service] == 1:
             try:
                 if antigravity_probe is None:
                     from . import account_registry, native_antigravity_quota
@@ -1137,11 +1146,6 @@ def collect_subscriptions(settings, runner=run_json, antigravity_probe=None):
                     raw = native_antigravity_quota.probe(binary, Path.home()) if binary else {}
                 else:
                     raw = antigravity_probe()
-            except Exception:
-                pass
-        elif command and not _is_quota_cli(command):
-            try:
-                raw = runner(command)
             except Exception:
                 pass
         plan = sub.get("plan")
