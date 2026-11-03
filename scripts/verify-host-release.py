@@ -48,6 +48,31 @@ def fail(message):
     return 1
 
 
+def release_template(release):
+    """The manifest template a release is verified against (intake hubfail-t2596u).
+
+    A release carries its own template at scripts/host-release-manifest.json;
+    it always matches the release manifest version. The runner's template is
+    only a fallback for trees predating it. Returns (template, source) where
+    source is 'release' or 'runner'; (None, None) when neither is readable.
+    """
+    own = release / "scripts" / "host-release-manifest.json"
+    if own.is_file() and not own.is_symlink():
+        try:
+            parsed = json.loads(own.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                return parsed, "release"
+        except Exception:
+            pass
+    try:
+        parsed = json.loads(MANIFEST_TEMPLATE.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            return parsed, "runner"
+    except Exception:
+        pass
+    return None, None
+
+
 def tree_hashes(release, tree):
     """sha256 of every source file under a manifest tree (bounded).
 
@@ -96,9 +121,8 @@ def main(argv):
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
     except Exception:
         return fail("release-manifest.json is unreadable")
-    try:
-        template = json.loads(MANIFEST_TEMPLATE.read_text(encoding="utf-8"))
-    except Exception:
+    template, _source = release_template(release)
+    if template is None:
         return fail("repo manifest template is unreadable")
     if manifest.get("manifest_version") != template.get("version"):
         return fail("manifest version mismatch")

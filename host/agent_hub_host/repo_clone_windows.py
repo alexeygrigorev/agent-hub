@@ -84,10 +84,35 @@ def checkout_lock(path, *, timeout=30):
 
 
 def _run(argv, *, timeout):
+    """Run a clone command, capturing bounded output for failure diagnosis.
+
+    Output is redacted by output_tail before anything leaves the host, so a
+    clone failure carries the real stderr into launch_error and the journal
+    (intake hubfail-t2596u) instead of a bare exit code.
+    """
+    from .command_diagnostics import output_tail
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        return process.wait(timeout=timeout)
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except BaseException:
+            # taskkill targets only our own process tree, including Git helpers.
+            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15, check=False)
+            try:
+                out, err = process.communicate(timeout=15)
+            except BaseException:
+                out, err = b'', b''
+            tail = output_tail((err or b'') + b'\n' + (out or b''))
+            raise ValueError('repo_clone_failed: clone timed out' + (': ' + tail if tail else '')) from None
+        if process.returncode != 0:
+            tail = output_tail((err or b'') + b'\n' + (out or b''))
+            raise ValueError('repo_clone_failed: ' + (tail if tail else 'clone exited %d without output' % process.returncode))
+        return 0
+    except ValueError:
+        raise
     except BaseException:
         # taskkill targets only our own process tree, including Git helpers.
         subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
@@ -162,9 +187,9 @@ def clone(settings, repo, origin, target_dir, *, disk_floor_gb, auth_ok, verify_
             if clone_filter:
                 argv.append('--filter=' + clone_filter)
             if _run(argv, timeout=config.get('clone_timeout_sec', 300)) != 0:
-                raise ValueError('repo_clone_failed')
+                raise ValueError('repo_clone_failed: clone exited without output')
             if not _plain(staging) or not (staging / '.git').is_dir() or not _plain(staging / '.git'):
-                raise ValueError('repo_clone_failed')
+                raise ValueError('repo_clone_failed: clone published no usable checkout')
             verify_origin(staging, origin)
             if target.exists() or target.is_symlink():
                 raise ValueError('repo_checkout_missing')
@@ -174,6 +199,6 @@ def clone(settings, repo, origin, target_dir, *, disk_floor_gb, auth_ok, verify_
                 on_created(target)
             return target
         except (OSError, subprocess.SubprocessError) as exc:
-            raise ValueError('repo_clone_failed') from exc
+            raise ValueError('repo_clone_failed: clone command failed to run') from exc
         finally:
             _remove_staging(staging)

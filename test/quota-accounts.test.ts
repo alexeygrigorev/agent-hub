@@ -210,4 +210,29 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
       expect(status.remaining_percent).toBe(80);
     });
   });
+
+  it('an unavailable pool names its evidence gap instead of a bare score', async () => {
+    // Intake hubfail-t2596u: shared-claude/codex/zai-central read unavailable
+    // when the Hub has no server snapshot and every host probe is unknown.
+    const e = env as unknown as Env;
+    await runInDurableObject(e.HUB.get(e.HUB.idFromName(crypto.randomUUID())), async (hub: Hub) => {
+      const now = Date.now();
+      hub.fleetService.init();
+      const store = new QuotaStore(hub.sql, undefined, {} as any, () => now);
+      const at = ts(-1000);
+      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-claude','claude',1,10,1)");
+      hub.sql.exec("INSERT INTO fleet_routes VALUES ('m1','claude','shared-claude',NULL)");
+      hub.sql.exec("INSERT INTO fleet_routes VALUES ('m2','claude','shared-claude',NULL)");
+      const unknown = { status: 'unknown', observed_at: at, details: { limit_reached: null }, windows: {} };
+      hub.sql.exec('INSERT INTO fleet_subscriptions VALUES (?,?,?,?,?,?)', 'm1', 'shared-claude', 'claude', null, at, JSON.stringify(unknown));
+      hub.sql.exec('INSERT INTO fleet_subscriptions VALUES (?,?,?,?,?,?)', 'm2', 'shared-claude', 'claude', null, at, JSON.stringify(unknown));
+      const body = store.getFleetView({ host_id: null, provider: null, engine: null, account: null }, now).body as any;
+      const pool = body.pools.find((p: any) => p.account === 'shared-claude');
+      expect(pool.state).toBe('unavailable');
+      expect(pool.windows).toEqual({});
+      expect(pool.decision_reason).toContain('claude/shared-claude unavailable:');
+      expect(pool.decision_reason).toContain('no server snapshot');
+      expect(pool.decision_reason).toContain('subscription probe unknown from 2 host(s)');
+    });
+  });
 });

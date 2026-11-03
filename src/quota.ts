@@ -1558,6 +1558,7 @@ export class QuotaStore {
         } else hasStale = true;
       }
       let state = "unknown";
+      let unavailableWhy: string | null = null;
       let remaining: number | null = null;
       let observedAt: string | null = null;
       let collectorVersion: string | null = null;
@@ -1573,6 +1574,18 @@ export class QuotaStore {
           const healthy = freshObs.filter((o) => !observationUnavailable(o.quota));
           if (!healthy.length) {
             state = "unavailable";
+            // Intake hubfail-t2596u: an unavailable pool must name its
+            // evidence gap instead of a bare score. Subscription probes for
+            // quse-backed managed accounts are unknown by design (the host
+            // runs quse once for the host-wide snapshot, not per
+            // subscription); a named profile or multi-account family cannot
+            // fall back to a snapshot route that does not resolve to it.
+            const subReporters = [...new Set(freshObs.filter((o) => o.kind === "subscription").map((o) => o.machine))].sort();
+            const snapReporters = [...new Set(freshObs.filter((o) => o.kind === "snapshot").map((o) => o.machine))].sort();
+            const gap: string[] = [central ? "server snapshot stale" : "no server snapshot"];
+            gap.push(subReporters.length ? `subscription probe unknown from ${subReporters.length} host(s)` : "no subscription probe");
+            gap.push(snapReporters.length ? `host snapshot error from ${snapReporters.length} host(s)` : "no resolving host snapshot route (named profile or multi-account guard)");
+            unavailableWhy = gap.join("; ");
           } else {
             for (const o of healthy) {
               const m = windowMinPercent(o.quota);
@@ -1627,6 +1640,8 @@ export class QuotaStore {
         ? `disabled: ${canonProv}/${canonAcct}`
         : state === "exhausted"
         ? `excluded: ${canonProv}/${canonAcct} quota_exhausted`
+        : state === "unavailable" && unavailableWhy
+        ? `${canonProv}/${canonAcct} unavailable: ${unavailableWhy} [score=${decisionScore.toFixed(4)}]`
         : `${canonProv}/${canonAcct} score=${decisionScore.toFixed(4)} [rem=${remaining !== null ? `${Math.round(remaining)}%` : 'unmetered'} win=${burn.windows_summary} ratio=${burn.ratio !== null ? burn.ratio.toFixed(2) : 'unmetered'} status=${effBurnStatus} burn=${burn.factor.toFixed(2)}x pref=${pref.toFixed(2)}x]`;
       pools.push({
         provider: canonProv,

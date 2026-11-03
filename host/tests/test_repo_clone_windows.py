@@ -173,13 +173,27 @@ class WindowsCloneTests(unittest.TestCase):
         import subprocess
         from unittest.mock import Mock
         process = Mock(pid=123)
-        process.wait.side_effect = [subprocess.TimeoutExpired('gh', 1), 1]
+        process.communicate.side_effect = [subprocess.TimeoutExpired('gh', 1), (b'', b'')]
         with patch.object(clone_fs.subprocess, 'Popen', return_value=process), \
                 patch.object(clone_fs.subprocess, 'run') as taskkill:
-            with self.assertRaises(subprocess.TimeoutExpired):
+            with self.assertRaisesRegex(ValueError, '^repo_clone_failed: clone timed out'):
                 clone_fs._run(['gh','repo','clone','org/demo'], timeout=1)
             self.assertEqual(taskkill.call_args.args[0], ['taskkill','/PID','123','/T','/F'])
-            self.assertEqual(process.wait.call_count, 2)
+            self.assertEqual(process.communicate.call_count, 2)
+
+    def test_failed_command_carries_redacted_stderr(self):
+        from unittest.mock import Mock
+        process = Mock(pid=123)
+        process.communicate.return_value = (b'', b'fatal: unable to access token=hidden-secret')
+        process.returncode = 128
+        with patch.object(clone_fs.subprocess, 'Popen', return_value=process):
+            with self.assertRaisesRegex(ValueError, '^repo_clone_failed: '):
+                clone_fs._run(['gh','repo','clone','org/demo'], timeout=1)
+            try:
+                clone_fs._run(['gh','repo','clone','org/demo'], timeout=1)
+            except ValueError as exc:
+                self.assertIn('unable to access', str(exc))
+                self.assertNotIn('hidden-secret', str(exc))
 
     def test_readonly_git_object_cleanup_retries_and_preserves_origin_reason(self):
         import os

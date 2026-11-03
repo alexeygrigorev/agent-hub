@@ -691,24 +691,46 @@ def verify_repo_origin(checkout: Path, origin_url: str) -> None:
 
 
 def _run_repo_clone_command(argv, *, timeout):
-    """Bound gh and its Git/credential-helper descendants as one owned group."""
+    """Bound gh and its Git/credential-helper descendants as one owned group.
+
+    Output is captured (bounded) so a clone failure carries the real
+    sanitized stderr into launch_error and the journal (intake
+    hubfail-t2596u), never a bare exit code. Secrets are redacted by
+    output_tail before anything leaves the host.
+    """
     import signal
+    from .command_diagnostics import output_tail
     try:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     except OSError as exc:
-        raise ValueError('repo_clone_failed') from exc
+        raise ValueError('repo_clone_failed: launcher could not start clone command') from exc
     try:
-        return subprocess.CompletedProcess(argv, process.wait(timeout=timeout))
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            out, err = process.communicate()
+            tail = output_tail((err or b'') + b'\n' + (out or b''))
+            raise ValueError('repo_clone_failed: clone timed out' + (': ' + tail if tail else '')) from None
+        result = subprocess.CompletedProcess(argv, process.returncode, out, err)
+        if process.returncode != 0:
+            tail = output_tail((err or b'') + b'\n' + (out or b''))
+            result.stderr_tail = tail  # type: ignore[attr-defined]
+            result.stdout_tail = output_tail(out or b'')  # type: ignore[attr-defined]
+        return result
     except BaseException as exc:
+        if isinstance(exc, ValueError):
+            raise
         # Kill the whole owned group before the caller removes staging data.
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         process.wait()
-        if isinstance(exc, subprocess.TimeoutExpired):
-            raise ValueError('repo_clone_failed') from exc
         raise
 
 
@@ -783,7 +805,8 @@ def guarded_repo_clone(settings, repo: str, origin_url: str, target_dir: str,
                     _GH_AUTH_CACHE = None
                 if not gh_auth_ok():
                     raise ValueError('host_gh_auth_unavailable')
-                raise ValueError('repo_clone_failed')
+                tail = getattr(result, 'stderr_tail', '') or ''
+                raise ValueError('repo_clone_failed: ' + (tail if tail else 'clone exited %d without output' % (result.returncode,)))
             # flock serializes Hub writers; refuse any external writer's destination.
             if target.exists() or target.is_symlink():
                 raise ValueError('repo_clone_target_exists')
@@ -4362,10 +4385,13 @@ class Dispatcher:
                                                launched_at=l_at, start_offsets=l_offsets)
             if mode == "headless" and t_id and failure.get("reason") == "launcher_command_failed":
                 # Intake 17e774f8: an empty-pipe launcher exit still saved its
-                # cause in this launch's own record; keep it, sanitized.
+                # cause in this launch's own record; keep it, sanitized. The
+                # intake-worktree target cwd may hold the record when it
+                # differs from the offer workspace (intake hubfail-t2596u).
                 try:
                     from .launch_diagnostics import launcher_record_cause
-                    failure = launcher_record_cause(failure, workspace, t_id, l_at)
+                    extra = [t_cwd] if str(t_cwd) != str(workspace) else []
+                    failure = launcher_record_cause(failure, workspace, t_id, l_at, extra_dirs=extra)
                 except Exception:
                     pass
             if mode == "headless" and t_id:

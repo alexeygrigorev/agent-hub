@@ -13,6 +13,7 @@ MESSAGES = {
     'repo_clone_auth_failed': 'The host could not authenticate to GitHub while cloning the requested repository.',
     'repo_not_found': 'The repository origin was not found during host cloning.',
     'repo_clone_failed': 'The host could not clone the requested repository.',
+    'repo_proxy_unreachable': 'The host proxy required for GitHub cloning is unreachable.',
     'repo_checkout_missing': 'The requested repository checkout is unavailable on this host.',
     'repo_origin_missing': 'The repository has no cloneable GitHub origin.',
     'host_gh_auth_unavailable': 'The host GitHub CLI authentication is unavailable.',
@@ -156,7 +157,7 @@ def classify(exc, *, workspace_available=True, value_error_fallback=None):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'repo_clone_failed','repo_checkout_missing','repo_origin_missing','host_gh_auth_unavailable','host_disk_warn_no_clone','host_disk_critical','model_unsupported', 'model_unverified', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'repo_clone_failed','repo_proxy_unreachable','repo_checkout_missing','repo_origin_missing','host_gh_auth_unavailable','host_disk_warn_no_clone','host_disk_critical','model_unsupported', 'model_unverified', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
             if reason == 'dispatch_internal_error':
                 reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
             if reason == 'dispatch_internal_error':
@@ -174,6 +175,19 @@ def classify(exc, *, workspace_available=True, value_error_fallback=None):
         reason = 'workspace_unavailable'
     value = {'reason': reason, 'message': MESSAGES[reason], 'stage': 'dispatch_route',
             'error_type': type(exc).__name__ if type(exc).__name__.isalpha() and len(type(exc).__name__) <= 64 else 'Error'}
+    if isinstance(exc, ValueError) and reason in {'repo_clone_failed', 'repo_proxy_unreachable',
+                                                  'repo_clone_auth_failed', 'repo_not_found',
+                                                  'host_gh_auth_unavailable'}:
+        # Intake hubfail-t2596u: the real git/gh/proxy stderr must reach
+        # launch_error and the journal, never a bare refusal. The suffix is a
+        # single bounded line, redacted like all command evidence; the repo
+        # slug in the prefix is the requested repository, never a secret.
+        text = str(exc)
+        if ':' in text:
+            from .command_diagnostics import output_tail
+            tail = output_tail(text.split(':', 1)[1].strip())
+            if tail:
+                value['tail'] = tail
     if reason == 'dispatch_worktree_refused' and lock_owner:
         value.update(lock_owner=lock_owner[0], lock_owner_state=lock_owner[1],
                      recovery='hub sessions stop ' + lock_owner[0])

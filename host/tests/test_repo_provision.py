@@ -32,7 +32,7 @@ class RepoProvisionTests(unittest.TestCase):
                 return process
             try:
                 with patch.object(fleet.subprocess, 'Popen', side_effect=spawn):
-                    with self.assertRaisesRegex(ValueError, '^repo_clone_failed$'):
+                    with self.assertRaisesRegex(ValueError, '^repo_clone_failed: clone timed out'):
                         fleet._run_repo_clone_command([sys.executable, '-c', parent, str(marker)], timeout=2)
                 self.assertTrue(marker.exists(), 'child must start before the timeout')
                 self.assertIsNotNone(processes[0].returncode)
@@ -56,15 +56,23 @@ class RepoProvisionTests(unittest.TestCase):
                         pass
                     process.wait(timeout=3)
 
-    def test_clone_command_suppresses_output_and_maps_spawn_failure(self):
-        process = SimpleNamespace(wait=lambda **kwargs: 0)
+    def test_clone_command_captures_bounded_output_and_maps_spawn_failure(self):
+        process = SimpleNamespace(communicate=lambda timeout=None: (b'out', b'err'), returncode=0)
         with patch.object(fleet.subprocess, 'Popen', return_value=process) as spawn:
             self.assertEqual(fleet._run_repo_clone_command(['gh', 'repo', 'clone'], timeout=1).returncode, 0)
             spawn.assert_called_once_with(['gh', 'repo', 'clone'], stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         with patch.object(fleet.subprocess, 'Popen', side_effect=OSError('private command error')):
-            with self.assertRaisesRegex(ValueError, '^repo_clone_failed$'):
+            with self.assertRaisesRegex(ValueError, '^repo_clone_failed: launcher could not start clone command'):
                 fleet._run_repo_clone_command(['gh'], timeout=1)
+
+    def test_clone_failure_carries_redacted_stderr_not_secrets(self):
+        process = SimpleNamespace(communicate=lambda timeout=None: (b'', b'fatal: unable to access token=hidden-secret'), returncode=128)
+        with patch.object(fleet.subprocess, 'Popen', return_value=process):
+            result = fleet._run_repo_clone_command(['gh', 'repo', 'clone'], timeout=1)
+            self.assertEqual(result.returncode, 128)
+            self.assertIn('unable to access', result.stderr_tail)
+            self.assertNotIn('hidden-secret', result.stderr_tail)
 
     def test_layout_uses_first_writable_explicit_root_and_honors_disabled_cloning(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -345,11 +353,11 @@ class RepoProvisionTests(unittest.TestCase):
             def timeout(argv, **kwargs):
                 staging.mkdir()
                 (staging/'partial').write_text('partial')
-                raise ValueError('repo_clone_failed')
+                raise ValueError('repo_clone_failed: clone timed out')
             with patch.object(fleet, 'gh_auth_ok', return_value=True), patch.object(
                     fleet, '_run_repo_clone_command', side_effect=timeout), patch.object(fleet.os, 'statvfs', return_value=SimpleNamespace(
                     f_blocks=1000, f_bfree=900, f_bavail=900, f_frsize=1024**3)):
-                with self.assertRaisesRegex(ValueError, '^repo_clone_failed$'):
+                with self.assertRaisesRegex(ValueError, '^repo_clone_failed'):
                     fleet.guarded_repo_clone({'workspace_roots':[str(root)]}, 'demo', 'org/demo', str(target), disk_floor_gb=15)
             self.assertFalse(staging.exists())
             self.assertFalse(target.exists())

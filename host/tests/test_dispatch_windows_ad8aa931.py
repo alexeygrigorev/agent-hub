@@ -32,7 +32,7 @@ class TestNamedPreStartRefusals(unittest.TestCase):
         self.assertEqual(self.reason('Unsupported launch mode'), 'dispatch_offer_invalid')
         self.assertEqual(self.reason('workspace path exists and is not a git checkout'), 'workspace_unavailable')
 
-    def test_variable_tails_map_by_prefix_and_are_never_forwarded(self):
+    def test_variable_tails_map_by_prefix_and_carry_only_redacted_tails(self):
         cases = {"Launcher provider 'x' is not supported for headless execution": 'dispatch_route_unconfigured',
                  'repo clone failed: fatal: could not read Username for https://github.com': 'workspace_unavailable',
                  'repo_clone_auth_failed: owner/name: fatal: could not read Username for https://github.com': 'repo_clone_auth_failed',
@@ -43,7 +43,18 @@ class TestNamedPreStartRefusals(unittest.TestCase):
         for message, slug in cases.items():
             diag = classify(ValueError(message))
             self.assertEqual(diag['reason'], slug, message)
-            self.assertNotIn('Username', json.dumps(diag))
+            dumped = json.dumps(diag)
+            # No credential-shaped material ever crosses the boundary, even
+            # though the bounded git stderr tail now does (intake hubfail-t2596u).
+            for shape in ('token=', 'ghp_', 'sk-', '-----BEGIN', 'Traceback (most recent call last)'):
+                self.assertNotIn(shape, dumped, message)
+            tail = diag.get('tail', '')
+            self.assertTrue(len(tail) <= 512, message)
+            self.assertNotIn('\n', tail, message)
+        # The renamed proxy refusal keeps the dead proxy address for routing.
+        proxy = classify(ValueError('repo_proxy_unreachable: DataTalksClub/website: proxy 127.0.0.1:8899 unreachable (ConnectionRefusedError)'))
+        self.assertEqual(proxy['reason'], 'repo_proxy_unreachable')
+        self.assertIn('127.0.0.1:8899', proxy.get('tail', ''))
 
     def test_claude_headless_value_errors_have_named_reasons(self):
         cases = {
