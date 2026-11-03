@@ -796,7 +796,6 @@ async function refreshSessionDetail(sessionId) {
     } else if (sessionData.state === 'running' && csrf && !cmds.some(c => c.kind === 'capture') && !autoCapturedSessions.has(sessionData.id)) {
       autoCapturedSessions.add(sessionData.id);
       requestCapture('tail', true);
->>>>>>> 9be592e2 (perf(hub): bound intake lists/audit, fleet N+1, liveness page, poll guards (intake 94186660))
     }
   } catch (err) {
     if (actionStatus) actionStatus.textContent = `Could not load session details: ${err.message || 'error'}`;
