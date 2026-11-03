@@ -17,6 +17,11 @@ import hashlib
 import json
 import subprocess
 import sys
+# A release is verified by its own script, so this import must never write
+# bytecode into the tree under inspection (intake hubfail-t2596u): under a
+# permissive umask the __pycache__ directory would be group-writable and the
+# subsequent permission check would fail its own artifact.
+sys.dont_write_bytecode = True
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
