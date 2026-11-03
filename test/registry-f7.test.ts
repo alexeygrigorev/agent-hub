@@ -244,7 +244,15 @@ describe('F7 credential/message binding upgrade through SELF', () => {
   }
   it('preserves old credential/message fields and serves two projects after binding upgrade', async () => {
     const {token,before} = await installOldFixture();
-    await runInDurableObject(stub() as any, (hub: Hub,state) => { new Hub(state,bindings); });
+    await runInDurableObject(stub() as any, (hub: Hub,state) => {
+      new Hub(state,bindings);
+      // The test harness retains this original Hub object while constructing a
+      // second startup instance over the same storage. Invalidate its memoized
+      // projections for tables changed by the migration, as a real restart
+      // would create a fresh in-memory cache.
+      hub.writes.bump('credentials');
+      hub.writes.bump('messages');
+    });
     expect((await rows('SELECT * FROM agents'))[0]).toEqual(before.agent);
     const migrated = (await rows('SELECT * FROM credentials'))[0];
     expect(migrated.registry_actor).toBe('oldA:old-worker'); delete migrated.registry_actor;
