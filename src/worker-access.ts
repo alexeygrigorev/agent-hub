@@ -244,6 +244,9 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
     const child: any = sql.exec('SELECT actor,parent_id FROM session_control_sessions WHERE id=?',session[1]).toArray()[0];
     return !!child && child.actor === worker.actor && child.parent_id === worker.session_id;
   }
+  // Work claims: the route handler confines them to this intake's project and
+  // the worker's own holder (src/worker-claims.ts, intake 6022786b).
+  if (workerClaimRoute(path, request.method)) return true;
   return false;
 }
 
@@ -412,4 +415,10 @@ export class WorkerAccess {
         worker_launch_id:id,base_url:new URL(request.url).origin,worker_expires_at:expires});
     });
   }
+}
+
+/** Claim routes a worker may reach; src/worker-claims.ts confines them further. */
+export function workerClaimRoute(path: string, method: string): boolean {
+  if (path === '/api/bus/claims') return method === 'GET' || method === 'POST';
+  return method === 'POST' && /^\/api\/bus\/claims\/[^/]+\/release$/.test(path);
 }
