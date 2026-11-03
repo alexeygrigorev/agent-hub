@@ -49,10 +49,11 @@ describe('default tier policy', () => {
     // Intake 9647e6d5: an unpinned auto-start must never resolve Antigravity
     // to gemini-4-argon-high. Both Antigravity-family legs run at medium.
     expect(byId.get('argon')).toMatchObject({ model: 'gemini-4-argon-medium', effort: 'medium' });
-    expect(byId.get('argon-gemini')).toMatchObject({ model: 'gemini-2.5-pro', effort: 'medium' });
+    expect(byId.get('argon-gemini')).toMatchObject({ model: 'gemini-4-argon-medium', effort: 'medium' });
     const daily = policy.tiers.daily as string[];
     expect(daily).not.toContain('haiku');
     expect(daily).not.toContain('astra');
+    expect(policy.rules.auto_start_models).toEqual(['sonnet', 'argon', 'glm-flash-zcodex', 'muse', 'luna']);
     for (const id of daily) {
       const m = byId.get(id);
       expect(m.model, id).not.toBe('gemini-4-argon-high');
@@ -290,12 +291,13 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
       // separate depleted-route test proves below-floor routes get no draw.
       sub('shared-claude', 'claude', metered(iso(), 35, now));
       sub('zai-central', 'zai', metered(iso(), 31, now));
-      // The probes for the unmetered engines fail on the host, as observed live.
-      sub('hub-antigravity', 'gemini', broken(iso()));
+      // Antigravity has measured quota headroom for the weighted draw.
+      // Go has no host quota probe and remains placeable as unmetered.
+      sub('hub-antigravity', 'gemini', metered(iso(), 45, now));
       sub('shared-go', 'go', broken(iso()));
 
       // Without a random source the fully unpinned start stays deterministic.
-      const top = fleet.plan({ mode: 'headless', workspace: 'demo', prompt: 'deterministic' });
+      const top = fleet.plan({ mode: 'headless', workspace: 'demo', prompt: 'deterministic' }, undefined, () => 0);
       expect(top.selected, JSON.stringify(top.rejected)).toBeTruthy();
       expect(top.candidates!.length).toBe(5);
       expect(top.selected).toBe(top.candidates![0]);
