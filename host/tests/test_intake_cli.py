@@ -1,8 +1,12 @@
 """Archive paging uses the same authorized intake transport and bounded inputs."""
 import io
 import json
+import statistics
+import sys
+import time
 import unittest
 from unittest.mock import patch
+from agent_hub_host import __main__ as entrypoint
 from agent_hub_host import cli, intake
 
 class TestArchiveCli(unittest.TestCase):
@@ -50,6 +54,51 @@ class TestArchiveCli(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     cli.main()
                 request.assert_not_called()
+
+    def test_summary_local_dispatch_overhead_under_10ms(self):
+        """Measure local parse/dispatch/JSON work; HTTP and process startup are excluded."""
+        payload = {
+            'counts': {'total': 1000, 'open': 120, 'active': 45, 'done': 835},
+            'recent': [{'id': f'task-{i}', 'status': 'active', 'updated_at': i,
+                        'title': f'task {i}', 'current_state': 'working'} for i in range(5)],
+            'as_of': 1234567890,
+        }
+        elapsed = []
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['hub', 'intake', 'summary']), \
+                patch('sys.stdout', output), \
+                patch.object(intake, 'request', return_value=payload) as request:
+            for _ in range(50):
+                output.seek(0)
+                output.truncate(0)
+                started = time.perf_counter()
+                entrypoint.main()
+                elapsed.append(time.perf_counter() - started)
+        self.assertEqual(request.call_args.args, ('GET', '/api/intake/summary?'))
+        self.assertEqual(json.loads(output.getvalue()), payload)
+        self.assertLess(statistics.median(elapsed), 0.010)
+
+    def test_https_get_json_decompresses_gzip_and_reuses_keepalive_pool(self):
+        import gzip
+        from unittest.mock import MagicMock
+        compressed = gzip.compress(b'{"items": [{"id": "task-1"}], "next": null, "total": 1}')
+        fake_res = MagicMock()
+        fake_res.status = 200
+        fake_res.headers = {'Content-Type': 'application/json', 'Content-Encoding': 'gzip'}
+        fake_res.read.return_value = compressed
+        fake_res.will_close = False
+        fake_res.isclosed.return_value = True
+        fake_conn = MagicMock()
+        fake_conn.sock = object()
+        fake_conn.getresponse.return_value = fake_res
+        intake._https_conn_pool.clear()
+        intake._https_conn_pool[('localhost', 8443)] = fake_conn
+        try:
+            data = intake._https_get_json('https://localhost:8443', '/api/intake/tasks?limit=100', 'token-1')
+            self.assertEqual(data, {'items': [{'id': 'task-1'}], 'next': None, 'total': 1})
+            self.assertIs(intake._https_conn_pool.get(('localhost', 8443)), fake_conn)
+        finally:
+            intake._https_conn_pool.clear()
 
 
 class TestQueuePriorityCli(unittest.TestCase):

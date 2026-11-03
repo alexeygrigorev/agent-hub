@@ -172,7 +172,8 @@ describe('private durable intake HTTP/SQLite', () => {
       const page = (service as any).read(new URL('https://hub.test/api/intake/tasks?all=true&limit=25'), p);
       expect(page.total).toBe(1083); expect(page.items).toHaveLength(25);
       expect(page.items[0].payload_data.history[0].text).toHaveLength(8192);
-      expect(queries.filter(q => /SELECT data FROM intake_tasks/.test(q))).toHaveLength(25);
+      expect(queries.filter(q => /SELECT data FROM intake_tasks/.test(q))).toHaveLength(1);
+      expect(queries.length).toBeLessThanOrEqual(20);
       expect(queries.some(q => /SELECT data FROM intake_tasks ORDER/.test(q))).toBe(false);
       expect(page.intake_open_warning).toMatchObject({ open_count: 542, items_total: 542, item_limit: 128, items_truncated: true });
       expect(page.intake_open_warning.items).toHaveLength(128);
