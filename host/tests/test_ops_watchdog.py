@@ -20,7 +20,9 @@ with (p/'calls').open('a') as out: out.write(name+' '+ ' '.join(args)+'\n')
 def save(): f.write_text(json.dumps(s))
 if name=='a':
     cmd=args[0]
-    if cmd=='list':
+    if cmd=='engines':
+        print(json.dumps([{'name': engine} for engine in ('gemini', 'antigravity', 'grok', 'opencode', 'zcodex', 'codex', 'claude')]))
+    elif cmd=='list':
         if s.get('census_error'): sys.exit(1)
         print(json.dumps(s['sessions']))
     elif cmd=='status': print(json.dumps(next(x for x in s['sessions'] if x['id']==args[1])))
@@ -41,7 +43,15 @@ elif name=='systemd-run':
     # Proof timers (--on-active) are only recorded; scope launches run their command.
     sys.exit(subprocess.call(args[args.index('--')+1:]) if '--' in args else 0)
 elif name=='hub':
-    sys.exit(s.get('hub_error',0))
+    if args[:2] == ['quota', '--json']:
+        print(json.dumps({'pools': [
+            {'provider': 'gemini', 'state': 'fresh', 'remaining_percent': 44, 'harness': ['gemini', 'antigravity']},
+            {'provider': 'go', 'state': 'fresh', 'remaining_percent': 36, 'harness': ['opencode']},
+            {'provider': 'grok', 'state': 'fresh', 'remaining_percent': 32, 'harness': ['grok']},
+            {'provider': 'zai', 'state': 'fresh', 'remaining_percent': 50, 'harness': ['zcodex']},
+        ]}))
+    else:
+        sys.exit(s.get('hub_error',0))
 elif name=='git':
     if 'rev-parse' in args:
         print(str(p/'exclude') if '--git-path' in args else 'abcdef')
@@ -183,7 +193,8 @@ class OpsWatchdogTest(unittest.TestCase):
         import calendar
         start = int((self.state / 'last_start').read_text()) - 1200
         (self.state / 'last_start').write_text(str(start))
-        (self.state / 'proof_due').write_text(f'{start + 600} 1\n')
+        _, path, *engine = (self.state / 'proof_due').read_text().split()
+        (self.state / 'proof_due').write_text(f"{start + 600} {path} {' '.join(engine)}\n")
         shifted = []
         for line in self.ticks.read_text().splitlines():
             entry = json.loads(line)
@@ -194,8 +205,8 @@ class OpsWatchdogTest(unittest.TestCase):
 
     def due_now(self):
         due = self.state / 'proof_due'
-        _, path = due.read_text().split()
-        due.write_text(f'{int(time.time()) - 1} {path}\n')
+        _, path, *engine = due.read_text().split()
+        due.write_text(f"{int(time.time()) - 1} {path} {' '.join(engine)}\n")
 
     def timer_delays(self, kind):
         out = []
@@ -217,7 +228,7 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl()
         self.assertIn('recovery proof FAILED (path 1)', result.stdout)
         self.assertIn('recovery path 2 started', result.stdout)
-        self.assertIn('--engine sonnet', self.starts()[-1])
+        self.assertIn('--engine opencode', self.starts()[-1])
         self.assertEqual((self.state / 'restart_failures').read_text().strip(), '1')
 
     def test_on_time_tick_in_history_proves_even_after_a_later_tick(self):
@@ -319,12 +330,12 @@ class OpsWatchdogTest(unittest.TestCase):
         self.data['sessions'] = [self.session()]
         self.data['kill_ok'] = True
         self.run_ctl()
-        self.assertIn('--engine opus', self.starts()[-1])
+        self.assertIn('--engine gemini', self.starts()[-1])
         self.due_now()
         result = self.run_ctl()
         self.assertIn('recovery proof FAILED (path 1)', result.stdout)
         self.assertIn('recovery path 2 started', result.stdout)
-        self.assertIn('--engine sonnet', self.starts()[-1])
+        self.assertIn('--engine opencode', self.starts()[-1])
         needs = self.home / 'tmp/agent-reports/orchestrator/NEEDS_ALEXEY.md'
         self.assertFalse(needs.exists())  # one failed recovery is not an alert
         self.assertIn('--state proof_failed --recovery-failures 1', self.calls())
@@ -333,7 +344,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertIn('recovery proof FAILED (path 2)', result.stdout)
         self.assertIn('automatic recovery failed 2 consecutive times', needs.read_text())
         self.assertIn('--recovery-failures 2', self.calls())
-        self.assertIn('--engine opus', self.starts()[-1])  # keeps recovering after the alert
+        self.assertIn('--engine gemini', self.starts()[-1])  # keeps recovering after the alert
         self.assertEqual(len(self.starts()), 3)
 
     def test_session_dying_inside_proof_window_fails_proof_immediately(self):
