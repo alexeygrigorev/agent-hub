@@ -76,8 +76,11 @@ describe('Hub MCP protocol and parity', () => {
     // priority + promote (intake 68145244) adds intake_promote and priority
     // wording on intake_create/intake_update (+430 bytes): 50500 -> 51500.
     // Intake dependency tools add depend/blocker/decompose routes (~1.5 KB):
-    // 51500 -> 53000.
-    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(53000);
+    // 51500 -> 53000; intake description deduplication (intake 1e0bc141)
+    // reclaims 1.6 KB, tightening the complete-surface ceiling to 52000
+    // including the JSON-RPC envelope.
+    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(52000);
+    expect(new TextEncoder().encode(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools } })).length).toBeLessThanOrEqual(52000);
     for (const route of MCP_ROUTES) {
       const tool = tools.find(tool => tool.name === route.name)!;
       const readOnly = route.method === 'GET' || route.name === 'sessions_capture';
@@ -120,6 +123,8 @@ describe('Hub MCP protocol and parity', () => {
 
     expect(legacyTools().map(tool => tool.name)).toEqual([...LEGACY_MCP_TOOL_NAMES]);
     expect(LEGACY_MCP_TOOL_NAMES).toHaveLength(87);
+    expect(new TextEncoder().encode(JSON.stringify({ tools: legacyTools() })).length).toBeLessThanOrEqual(45000);
+    expect(new TextEncoder().encode(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools: legacyTools() } })).length).toBeLessThanOrEqual(45000);
     expect(Object.keys(LEGACY_MCP_ALIASES)).toHaveLength(87);
     expect(new Set([...Object.keys(LEGACY_MCP_ALIASES), ...Object.keys(EXTENDED_MCP_ALIASES)])).toEqual(new Set(MCP_ROUTES.map(route => route.name)));
   });
