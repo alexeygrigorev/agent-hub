@@ -2,7 +2,8 @@
 
 aplexer prunes a finished session's record and history within seconds, so a
 controller child that dies at startup used to leave no stderr evidence at
-all (intake 4d33b30d). These tests run the real wrapper in a subprocess.
+all (intake 4d33b30d). Most tests run the wrapper in a subprocess; the invalid
+inherited-handle case calls it in-process to simulate failed OS descriptors.
 """
 import os
 import subprocess
