@@ -1,5 +1,5 @@
 import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
-import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
+import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, pollSessionCredentials, mintSessionCredential, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
 import { handleNamedAgentRequest } from './named-agents';
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
@@ -177,6 +177,24 @@ export class Hub extends DurableObject {
   /** Write-through fleet_sessions catalog shared by resources and liveness. */
   readonly observedCatalog: ObservedCatalog;
   private rowsAlertCheckedHour = -1;
+  /** Last write stamp served by each credential backstop sweep (intake
+   * e8a22f4c): the sweeps re-run only after a write to the tables they read,
+   * never on every host poll. Cold start sweeps once (no stamp yet). */
+  private credentialSweepStamps = new Map<string, string>();
+  /** Non-null when a source table changed since this sweep last ran. The
+   * caller runs the sweep, then records the post-sweep stamp with
+   * credentialSweepDone, so a sweep that revokes (and bumps generations
+   * itself) still converges immediately instead of re-running once. */
+  credentialSweepChanged(key: string, ...tables: string[]): string | null {
+    const stamp = this.writes.stamp(...tables);
+    return this.credentialSweepStamps.get(key) === stamp ? null : stamp;
+  }
+  /** Record the current write stamp after a sweep ran (inside the same
+   * synchronous transaction, so no write slips between the sweep and the
+   * stamp). A throwing sweep never reaches this, so the next poll retries. */
+  credentialSweepDone(key: string, ...tables: string[]): void {
+    this.credentialSweepStamps.set(key, this.writes.stamp(...tables));
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -254,7 +272,8 @@ export class Hub extends DurableObject {
     });
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, this.writes, this.observedCatalog);
     this.fleetService.init();
-    this.workerAccess = new WorkerAccess(this.sql, fn => this.ctx.storage.transactionSync(fn), caller => this.sessionControlService.hostObservationAllowed(caller.machineId, caller));
+    this.workerAccess = new WorkerAccess(this.sql, fn => this.ctx.storage.transactionSync(fn), caller => this.sessionControlService.hostObservationAllowed(caller.machineId, caller),
+      { changed: (key, ...tables) => this.credentialSweepChanged(key, ...tables), done: (key, ...tables) => this.credentialSweepDone(key, ...tables) });
     this.workerAccess.init();
     this.repoRegistry = new RepoRegistry(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.repoRegistry.init();
@@ -1187,8 +1206,11 @@ export class Hub extends DurableObject {
         const now = Date.now();
         if (path === '/api/session-messaging/credentials' && request.method === 'GET') {
           return this.ctx.storage.transactionSync(() => {
-            revokeEndedSessionCredentials(this.sql, now);
-            return Response.json({ sessions: sessionsNeedingCredentials(this.sql, caller.machineId, now) });
+            const tables = ['agents', 'session_control_sessions', 'credentials'];
+            const changed = this.credentialSweepChanged('messaging-credential', ...tables);
+            const sessions = pollSessionCredentials(this.sql, caller.machineId, now, changed !== null);
+            if (changed !== null) this.credentialSweepDone('messaging-credential', ...tables);
+            return Response.json({ sessions });
           });
         }
         // Spec path (AC1): POST /api/sessions/:id/messaging-credential. The

@@ -90,3 +90,49 @@ remainder is per-intent volume and needs admission-side quarantine).
 - `recordSessionTokens`: active-phase token upserts persist at most once per
   60s per session (`TOKEN_PERSIST_COOLDOWN_MS`); terminal phases always
   persist so the final count is never lost.
+
+## Periodic job budget (design targets, intake e8a22f4c)
+
+Design principle (AC1/AC3): steady-state polls read zero rows. Repeat
+identical reads hit memoized zero-read cursors (WriteWatch) or are skipped
+entirely by a write-stamp gate; only genuine fleet events (writes) cause
+re-reads, bounded per run by the test pins below. Rows/day therefore scales
+with fleet events, not with clocks. The DO alarm is a one-shot for due work
+(`deleteAlarm()` when idle), not a polling tick.
+
+Worst-case mechanical bounds (test pins x maximum runs/day) exceed the
+guideline under pathological continuous-due-work; the expected column is the
+quiet-fleet steady state the tests pin (repeat poll == 0 rows).
+
+| Job | Trigger | Worst case / run (test) | Expected / day, quiet fleet |
+| --- | --- | --- | --- |
+| `alarm:idle_work` | due wakes only, internally at most every 5 min | `SESSIONS*25` (first census) | 0 (gate skips; memo serves repeats) |
+| `alarm:bus_retention` | retention backlog only | 40 rows | 0 (skipped when no backlog) |
+| `alarm:expire_messages` | due expiries only | 20 rows | 0 (indexed due scan, empty) |
+| `alarm:jobs_alarms` | due jobs only | 100 rows | ~0 (no due alarms) |
+| `alarm:webhooks` | pending deliveries only | 50 rows | 0 (empty pump) |
+| `meter:flush` + hourly budget check | every 5 min flush; check once per hour | 1 upsert/row per active scope | ~300 rows (ring upserts) + 2 small reads/hour |
+| 5-min cron ticks (watchdog, liveness, host/capacity history, tbm, audit, triage, schedules) | cron; each step internally write-gated or index-bounded | `SESSIONS*40` audit; 40 retention; indexed branches elsewhere | ~0 steady state (caches/memo); bounded re-reads on real events |
+| `GET /api/fleet/offers` (per host, every few s) | host poll | 400 idle / 60 repeat | 0 repeat (stamp cache); re-read on launch/session writes only |
+| `PUT /api/fleet/sessions` (per host, ~60 s) | host census | `CENSUS*4` repeat; 0 writes on volatile-only progress | 0 repeat; writes only on semantic change |
+| `GET /api/session-messaging/credentials` (per host, 120 s) | host poll | sweep <= ~300 first run, then 0; list indexed + memoized | 0 repeat (stamp gate skips sweep, memo serves list) |
+| `GET /api/session-intake/credentials` (per host, 120 s) | host poll | repeat 0; first run indexed (credentials_family) | 0 repeat; re-sweep only after session/credential writes |
+| `GET /api/fleet/resources/watchdog`, `POST .../report` | host poll | revision-cached catalog; re-read on authority writes only | 0 repeat (test: repeat poll reads zero) |
+| `GET /api/sessions` CPU estimates | dashboard/admin poll | <=500 recent rows per rebuild; shared cross-request cache | 0 repeat; rebuild on resource/CPU/RSS/config writes only |
+
+Quiet-fleet design total: low hundreds of rows/day (meter ring + hourly
+checks + first-reads after genuine events), inside the ~5,000/day guideline;
+the 20,000/day alert (`GET /api/metrics/rows-read`, `do_rows_read_budget`
+liveness alert, deduped to one notification per open alert + hourly refresh)
+stays silent at these levels. Noisy-fleet cost is proportional to real
+placements, launches, credential mints and session transitions, not to poll
+or tick rates.
+
+Live baseline 2026-11-03 (intake note, pre-deploy of the census/estimate
+fixes): meter 24h ~5.58B reads/day + ~17.0M writes/day; GraphQL Nov 2: 2.88B
+reads, 16.4M writes. The remaining gap after this branch deploys is measured
+with `GET /api/metrics/rows-read?hours=24&statements=30` (>=1h post-deploy
+window) plus the Cloudflare GraphQL rowsRead/rowsWritten series; until the
+live total is under the alert line the budget alert keeps firing as an
+over_budget liveness alert (single notification, hourly refresh, no paging
+storm) rather than a per-hour page.
