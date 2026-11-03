@@ -1619,9 +1619,7 @@ def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, exp
     monkeypatch.setattr(sys, 'argv', args + ['task'])
     p.execute()
     overrides = [arg for arg in calls[0] if arg.startswith('model_reasoning_effort=')]
-    assert overrides[-1] == 'model_reasoning_effort="' + expected + '"'
-    if not explicit:
-        assert overrides[0] == 'model_reasoning_effort="high"'
+    assert overrides == ['model_reasoning_effort="' + expected + '"']
 
 
 def test_managed_claude_execution_argv_forces_sonnet_medium(tmp_path, monkeypatch):
