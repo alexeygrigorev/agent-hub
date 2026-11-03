@@ -6,7 +6,7 @@ import { createSessionCookie } from '../src/auth/session';
 
 describe('private fleet assets', () => {
   it('protects every dashboard asset and does not trust an arbitrary cookie', async () => {
-    for (const path of ['/', '/fleet.html', '/fleet.js', '/fleet.css']) {
+    for (const path of ['/', '/fleet.html', '/fleet.js', '/fleet.css', '/machines', '/machines.html', '/machines.js', '/machines.css', '/quota', '/quota.html', '/quota.js', '/quota.css', '/settings', '/settings.html', '/settings.js', '/settings.css']) {
       const r = await doFetch(new Request('https://hub.test' + path, { headers: { Cookie: 'hub_session=fake' } }));
       expect(r.status).toBe(303); expect(r.headers.get('Location')).toBe('/auth/login');
     }
