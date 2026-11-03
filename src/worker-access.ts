@@ -333,11 +333,25 @@ export function revokeEndedNativeWorkerCredentials(sql: SqlStorage, now: number)
      WHERE w.launch_id = w.session_id AND (s.id IS NULL OR s.state <> 'running'))`, new Date(now).toISOString());
 }
 
+/** Write-stamp gate for the ended-session backstop sweeps (intake e8a22f4c).
+ * `changed` is non-null when a source table was written since the sweep last
+ * ran; the caller runs the sweep, then `done` records the post-sweep stamp
+ * in the same synchronous transaction. */
+export type CredentialSweepGate = {
+  changed: (key: string, ...tables: string[]) => string | null;
+  done: (key: string, ...tables: string[]) => void;
+};
+
 export class WorkerAccess {
-  constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private hostAllowed: (caller: CallerContext) => boolean) {}
+  constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private hostAllowed: (caller: CallerContext) => boolean,
+    private sweep?: CredentialSweepGate) {}
   init() {
     this.sql.exec(WORKER_ACCESS_SCHEMA);
     this.sql.exec('CREATE INDEX IF NOT EXISTS worker_access_session_family ON worker_access(session_id,family_id)');
+    // The per-session live-credential existence join probes one credential
+    // family per session; without this index it scans the whole credential
+    // history on every host poll (intake e8a22f4c).
+    this.sql.exec('CREATE INDEX IF NOT EXISTS credentials_family ON credentials(family_id)');
     this.sql.exec(DRIVER_ACCESS_SCHEMA); this.sql.exec(WORKER_CREATED_SCHEMA); this.sql.exec(WORKER_CREATED_INDEX);
   }
   releaseClaim(caller: CallerContext, target: string): Response {
@@ -364,12 +378,18 @@ export class WorkerAccess {
       return Response.json({ status: 'ok' });
     });
   }
-  /** Host lists running native sessions that need an intake credential. */
+  /** Host lists running native sessions that need an intake credential. The
+   * ended-session revoke sweep is a backstop (transitions revoke directly);
+   * it runs only after a write to the tables it reads, never on every poll. */
   listNative(caller: CallerContext | undefined, scopes: string[] | undefined): Response {
     if (caller?.kind !== 'host' || !caller.machineId || !scopes?.includes('host') || !this.hostAllowed(caller)) return Response.json({ error: 'forbidden' }, { status: 403 });
     return this.tx(() => {
-      revokeEndedNativeWorkerCredentials(this.sql, Date.now());
-      return Response.json({ sessions: nativeSessionsNeedingIntakeCredential(this.sql, caller.machineId!) }, { headers: { 'Cache-Control': 'no-store' } });
+      const tables = ['worker_access', 'session_control_sessions', 'credentials'];
+      const changed = this.sweep ? this.sweep.changed('native-credential', ...tables) : 'run';
+      if (changed !== null) revokeEndedNativeWorkerCredentials(this.sql, Date.now());
+      const sessions = nativeSessionsNeedingIntakeCredential(this.sql, caller.machineId!);
+      if (changed !== null && this.sweep) this.sweep.done('native-credential', ...tables);
+      return Response.json({ sessions }, { headers: { 'Cache-Control': 'no-store' } });
     });
   }
   /** Mint the intake-scoped credential of a running native session. Authority is

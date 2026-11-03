@@ -84,6 +84,8 @@ export function initSessionMessaging(sql: SqlStorage): void {
   sql.exec('CREATE INDEX IF NOT EXISTS message_events_at ON message_events(at)');
   // Session credential lookups go by registry_actor; never scan credentials.
   sql.exec('CREATE INDEX IF NOT EXISTS credentials_registry_actor ON credentials(registry_actor)');
+  // The credential poll lists agent identities per machine; never scan agents (intake e8a22f4c).
+  sql.exec('CREATE INDEX IF NOT EXISTS idx_agents_project_machine ON agents(project, machine_id)');
   const commandCols = new Set(sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_commands'").toArray().length
     ? sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)) : []);
   if (commandCols.size && !commandCols.has('not_before')) sql.exec('ALTER TABLE session_control_commands ADD COLUMN not_before TEXT');
@@ -417,6 +419,16 @@ export function sessionsNeedingCredentials(sql: SqlStorage, machineId: string, n
     if (out.length >= 10) break;
   }
   return out;
+}
+
+/** Host poll for sessions needing a messaging credential (intake e8a22f4c):
+ * the ended-session revoke sweep is a backstop (transitions revoke
+ * directly), so it runs only when `sweep` is true — the caller passes false
+ * while no source table was written since the last sweep. Returns the
+ * sessions still missing a live credential. */
+export function pollSessionCredentials(sql: SqlStorage, machineId: string, now: number, sweep = true): { session_id: string; native_id: string; tag: string; workspace: string }[] {
+  if (sweep) revokeEndedSessionCredentials(sql, now);
+  return sessionsNeedingCredentials(sql, machineId, now);
 }
 
 /** Mint the session's own bus-only credential for its bound host: actor
