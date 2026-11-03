@@ -13,6 +13,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin, effectiveRoutesAt } from './registry';
+import { commandChannelHealth } from './command-channel';
 import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
 import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
@@ -267,7 +268,7 @@ function gateReasonValid(d: any): boolean {
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
 // tier exclusion or a recorded route refusal); it never frees up, so it must not
 // turn a capacity wait into a hard 409.
-const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'not_logged_in', 'desktop_codex_excluded']);
+const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'not_logged_in', 'desktop_codex_excluded', 'command_channel_unreachable']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
@@ -1233,6 +1234,7 @@ export class FleetService {
     const memoryByRoute=new Map<string,ReturnType<ResourceManagement['headroom']>>();
     const cpuByMachine=new Map<string,ReturnType<ResourceManagement['cpuHeadroom']>>();
     const diskByWorkspace=new Map<string,ReturnType<FleetService['diskHeadroom']>>();
+    const commandChannelByMachine = new Map<string, ReturnType<typeof commandChannelHealth>>();
     // Rejection-time host telemetry (MemAvailable + PSI cpu/memory/io full),
     // captured from the same heartbeat that drove the refusal and persisted
     // with the rejected entry. Status warnings show these values, never a
@@ -1312,6 +1314,11 @@ export class FleetService {
         continue;
       }
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
+      let commandChannel = commandChannelByMachine.get(route.machine_id);
+      if (!commandChannel) {
+        commandChannel = commandChannelHealth(this.sql, machine, this.now());
+        commandChannelByMachine.set(route.machine_id, commandChannel);
+      }
       const definition=definitions.get(route.account);
       if(definition && !accounts.has(route.account)) accounts.set(route.account,this.accountStatus(definition));
       const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(machine?.last_heartbeat);
@@ -1402,6 +1409,7 @@ export class FleetService {
       };
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
+      else if (commandChannel.state === 'unreachable') reason = commandChannel.reason ?? 'command_channel_unreachable';
       else if (isDesktopCodexExcluded(machine, route, canonicalQuotaProvider(definitions.get(route.account)?.provider as string))) reason = 'desktop_codex_excluded';
       else if (hb.fleet_routes_overflow !== undefined) reason = 'route_advertisement_overflow';
       else if (Array.isArray(hb.fleet_routes) && !fresh(effectiveRoutesAt(route.machine_id, hb.fleet_routes_at), this.now(), 180000)) reason = 'route_advertisement_stale';

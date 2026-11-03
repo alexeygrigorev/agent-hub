@@ -42,6 +42,7 @@ import { ProvisioningService } from './provisioning';
 import { hostRepositoryAccess } from './host-repo-access';
 import { hostRepositoryAuthorizer } from './host-repo-authority';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
+import { watchCommandChannels, ensureCommandChannelSchema } from './command-channel';
 import { HostGoals } from './host-goals';
 import { BankedResets } from './banked-resets';
 import { ChecksService, validateCheck, type ActionDeps } from './checks';
@@ -245,6 +246,8 @@ export class Hub extends DurableObject {
     });
     this.sessionControlService.init();
     initSessionMessaging(this.sql); // not_before on the just-created commands table
+    // Command-channel partial indexes (intake 3aa850b4) once the commands table exists.
+    ensureCommandChannelSchema(this.sql);
     // Inbound webhooks -> session delivery (intake 19ec91c2): the queue
     // resolves targets at delivery time and reuses session-control send
     // commands; HMAC route keys are wrapped with the session secret and the
@@ -2399,6 +2402,9 @@ export class Hub extends DurableObject {
       catch { console.warn('launch_schedule_tick_failed'); }
     }
     for (const alert of await m('watch_hosts', () => this.livenessService.watchHosts())) await this.notifyAlert(alert);
+    // Per-host command-channel health (intake 3aa850b4): open/resolve
+    // command_channel needs_attention alerts next to host check-in watching.
+    for (const alert of await m('watch_command_channels', () => watchCommandChannels(this.sql, this.livenessService, Date.now()))) await this.notifyAlert(alert);
     await m('host_goals', () => new HostGoals(this.sql, this.fleetService).reconcile());
     await m('tbm', () => this.runTbmTick());
     // A10 (290b935a/55c10deb): the 5-min slot starts the ask reconciler when new asks wait.
