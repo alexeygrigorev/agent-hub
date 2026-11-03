@@ -244,6 +244,12 @@ function acNullable(value: any): string | null {
   if (typeof value !== 'string' || new TextEncoder().encode(value).length > AC_MAX) throw new IntakeError('invalid_field', 400, 'acceptance_criteria', AC_MAX);
   return value;
 }
+/** Queue priority (intake 68145244): high | normal | low, default normal. */
+const INTAKE_PRIORITIES = ['high', 'normal', 'low'];
+function priorityValue(value: any): string {
+  if (!INTAKE_PRIORITIES.includes(value)) throw new IntakeError('invalid_field', 400, 'priority');
+  return value;
+}
 /** Server-trusted start gate: non-empty (non-whitespace) acceptance criteria. */
 function hasAcceptanceCriteria(task: Obj): boolean {
   return typeof task.acceptance_criteria === 'string' && task.acceptance_criteria.trim().length > 0;
@@ -1447,11 +1453,12 @@ export class IntakeService {
   private write(path: string, b: Obj, p: Obj): Obj {
     const now = Date.now();
     if (path === '/tasks') {
-      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria', 'verification']);
+      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria', 'verification', 'priority']);
       const project = identifier(b.project);
       const task: Obj = { id: crypto.randomUUID(), project, title: str(b.title, 256, 'title'), status: 'open', version: 1,
         created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null,
         acceptance_criteria: acNullable(b.acceptance_criteria), history: [],
+        priority: b.priority === undefined ? 'normal' : priorityValue(b.priority), promoted_at: null,
         ...(b.verification !== undefined ? { verification: verificationMode(b.verification) } : {}) };
       if (p.worker) {
         // Intake 34d0271b: a worker may file follow-up intakes in any project.
@@ -1518,7 +1525,7 @@ export class IntakeService {
       this.pushHistory(task, [{ kind: 'merge_evidence', state: merge.state, head: merge.head, problems: merge.problems, deploy: merge.deploy?.state ?? null }], p.actor, now, b.key);
       return { task_id: task.id, merge_state: merge, gate: this.mergeGate.check(task.id) };
     }
-    const match = /^\/tasks\/([A-Za-z0-9._:-]+)(\/(?:events|continue))?$/.exec(path);
+    const match = /^\/tasks\/([A-Za-z0-9._:-]+)(\/(?:events|continue|promote))?$/.exec(path);
     if (!match) fail('not_found', 404);
     const task = this.get('tasks', match[1]); if (!task || !this.allowed(p, task, true)) fail('not_found', 404);
     this.expected(b, task.version);
@@ -1530,6 +1537,14 @@ export class IntakeService {
       if (this.continuation(task) !== 'ready') fail('continuation_not_ready', 409);
       this.transition(task, 'in_progress', p.actor, now);
       task.history.push({ id: crypto.randomUUID(), kind: 'continuation', actor: p.actor, captured_at: now, evidence: 'recorded_active_not_started', authority: 'untrusted_task_data' });
+    } else if (match[2] === '/promote') {
+      // Promote (intake 68145244): stamp promoted_at; the autonomous queue
+      // picks promoted intakes first, newest promotion first, ahead of every
+      // priority. Re-promoting re-stamps the time, moving the intake back to
+      // the front. A promotion also overrides a retry backoff at dispatch.
+      keys(b, ['key', 'expected_version']);
+      task.promoted_at = now;
+      task.history.push({ id: crypto.randomUUID(), kind: 'update', changes: { promoted_at: now }, actor: p.actor, captured_at: now, authority: 'untrusted_task_data' });
     } else if (match[2]) {
       keys(b, ['key', 'expected_version', 'event', 'note', 'text']);
       // Keep the original event envelope and the documented MCP note shorthand
@@ -1546,7 +1561,7 @@ export class IntakeService {
         task.scope = scopeHint(task, (task.scope.basis_version ?? 1) + 1);
       }
     } else {
-      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by', 'force', 'outcome']);
+      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by', 'force', 'outcome', 'priority']);
       // AC5 triage reviewers only fill missing AC; enforced at effect time so an
       // exact retry of a successful fill replays its receipt instead.
       if (p.worker && 'acceptance_criteria' in b && hasAcceptanceCriteria(task)) fail('forbidden', 403);
@@ -1561,16 +1576,17 @@ export class IntakeService {
       }
       if ('force' in b && typeof b.force !== 'boolean') throw new IntakeError('invalid_field', 400, 'force');
       if (b.force === true && (b.status !== 'done' || typeof b.reason !== 'string' || !b.reason.trim())) fail('force_reason_required');
-      if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification'].some(k => k in b)) fail('empty_update');
+      if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'priority'].some(k => k in b)) fail('empty_update');
       const changes: Obj = {};
       const previousStatus = task.status;
       if (b.status === 'done' && ['title', 'project', 'acceptance_criteria'].some(k => k in b && b[k] !== task[k])) fail('done_evidence_required', 409);
       if ('status' in b) this.transition(task, b.status, p.actor, now, b.reason === undefined ? undefined : str(b.reason, 8192), b.superseded_by, b.force === true, unverified);
-      for (const field of ['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']) if (field in b) {
+      for (const field of ['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority']) if (field in b) {
         if (field === 'status' && !STATUSES.includes(b[field])) fail('invalid_status');
         const previous = field === 'status' ? previousStatus : task[field];
         task[field] = field === 'project' ? identifier(b[field]) : field === 'status' ? b[field]
           : field === 'acceptance_criteria' ? acNullable(b[field])
+          : field === 'priority' ? priorityValue(b[field])
           : nullable(b[field], field === 'title' ? 256 : 8192);
         if (previous !== task[field]) changes[field] = task[field];
       }

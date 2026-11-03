@@ -60,7 +60,11 @@ describe('forgotten intake watchdog', () => {
     const plan=h.sql.exec("EXPLAIN QUERY PLAN SELECT task_id FROM intake_restart_queue WHERE state='queued' AND next_at<=? ORDER BY next_at,task_id LIMIT 8",NOW).toArray();
     expect(JSON.stringify(plan)).toContain('intake_queue_due');
   }));
-  it('dispatches a queued restart before fresh pickup without raising admission caps', async () => fixture(async h => {
+  it('dispatches the newest candidate first under the priority order without raising admission caps', async () => fixture(async h => {
+    // Intake 68145244 AC3: the auto-queue candidate order is promoted >
+    // priority high > normal > low, newest first within one priority. These
+    // candidates tie on priority and age, so the stable id order picks fresh-0
+    // ahead of the older queued restart; the per-project cap still admits one.
     const fresh=Array.from({length:9},(_,i)=>task('fresh-'+i)), overdue=task('queued-restart');
     const all=[...fresh,overdue],started:string[]=[];
     for(const t of all)session(h,'failed-'+t.id,t,'failed');
@@ -70,9 +74,9 @@ describe('forgotten intake watchdog', () => {
     h.sql.exec("UPDATE intake_queue_cursor SET after_id='' WHERE id=1");
     h.sql.exec("INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at) VALUES(?,'queued','watchdog_global_capacity',?,?,?)",overdue.id,NOW-60000,NOW-60000,NOW);
     await w.tick();
-    expect(started[0]).toBe(overdue.id);
-    expect(started).toEqual([overdue.id]); // The default per-project cap remains one.
-    expect(h.sql.exec("SELECT reason FROM intake_restart_queue WHERE task_id=?",fresh[0].id).one().reason).toBe('watchdog_project_capacity');
+    expect(started[0]).toBe(fresh[0].id);
+    expect(started).toEqual([fresh[0].id]); // The default per-project cap remains one.
+    expect(h.sql.exec("SELECT reason FROM intake_restart_queue WHERE task_id=?",fresh[1].id).one().reason).toBe('watchdog_project_capacity');
   }));
   it('advances the indexed due lane past exempt holds outside the normal cursor', async () => fixture(h => {
     const normal=Array.from({length:192},(_,i)=>task('a-'+String(i).padStart(3,'0')));

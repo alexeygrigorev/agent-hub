@@ -1662,3 +1662,30 @@ describe('operator close without evidence (d8d509d2 AC9)', () => {
     expect(events.map((e: any) => e.kind)).not.toContain('close');
   });
 });
+
+describe('intake queue priority and promote (68145244)', () => {
+  it('defaults priority to normal, stores an explicit priority and refuses unknown values', async () => {
+    const created = await create();
+    expect(created.task).toMatchObject({ priority: 'normal', promoted_at: null });
+    const high = await ok('/tasks', { key: 'create-prio-' + ++seq, project: 'demo', title: 'High priority', text: 'x', source, priority: 'high' });
+    expect(high.task).toMatchObject({ priority: 'high', promoted_at: null });
+    const bad = await call('/tasks', { key: 'create-prio-bad-' + ++seq, project: 'demo', title: 'Bad', text: 'x', source, priority: 'urgent' });
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ error: 'invalid_field' });
+  });
+
+  it('updates priority through CAS and promote stamps promoted_at with an update event', async () => {
+    const { task } = await create();
+    const updated = await ok('/tasks/' + task.id, { key: 'update-prio-' + ++seq, expected_version: task.version, priority: 'low' });
+    expect(updated.task).toMatchObject({ priority: 'low', promoted_at: null });
+    expect(updated.task.payload_data.history.at(-1)).toMatchObject({ kind: 'update', changes: { priority: 'low' } });
+    const conflict = await call('/tasks/' + task.id + '/promote', { key: 'promo-conflict-' + ++seq, expected_version: task.version });
+    expect(conflict.status).toBe(409);
+    const before = Date.now();
+    const promoted = await ok('/tasks/' + task.id + '/promote', { key: 'promo-' + ++seq, expected_version: updated.task.version });
+    expect(promoted.task.promoted_at).toBeGreaterThanOrEqual(before);
+    expect(promoted.task.payload_data.history.at(-1)).toMatchObject({ kind: 'update', changes: { promoted_at: promoted.task.promoted_at } });
+    const again = await ok('/tasks/' + task.id + '/promote', { key: 'promo-again-' + ++seq, expected_version: promoted.task.version });
+    expect(again.task.promoted_at).toBeGreaterThan(promoted.task.promoted_at);
+  });
+});

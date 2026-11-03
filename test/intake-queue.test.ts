@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom as parseQueuePolicy, WATCHDOG_INTERVAL, QUEUE_STALL_MS, QUEUE_RETRY_LIMIT, QUEUE_RETRY_MAX_MS, QUEUE_HOLD_TTL_MS, QUEUE_SWEEP_LIMIT } from '../src/intake-watchdog';
+import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom as parseQueuePolicy, queueCandidateOrder, WATCHDOG_INTERVAL, QUEUE_STALL_MS, QUEUE_RETRY_LIMIT, QUEUE_RETRY_MAX_MS, QUEUE_HOLD_TTL_MS, QUEUE_SWEEP_LIMIT } from '../src/intake-watchdog';
 // Existing dispatch/recovery cases explicitly opt in; production-default tests use the base class.
 const queuePolicyFrom = (settings: Record<string, unknown> = {}) => parseQueuePolicy({HUB_INTAKE_QUEUE_ENABLED:'true',HUB_INTAKE_QUEUE_PROJECTS:'*',...settings});
 class IntakeWatchdog extends BaseIntakeWatchdog {
@@ -373,5 +373,63 @@ describe('autonomous intake queue',()=>{
     now+=WATCHDOG_INTERVAL;await w.tick();
     expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id='zz-done-000'").one().n).toBe(0);
     expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id LIKE 'aa-young-%'").one().n).toBe(130);
+  }));
+});
+
+describe('queue priority and promotion (intake 68145244)',()=>{
+  const prio=(id:string,priority:string,age=1000,extra:any={})=>({...task(id),priority,created_at:NOW-age,...extra});
+  it('comparator: promoted first (newest promotion), then high>normal>low, newest within one priority',()=>{
+    const order=[prio('promo-old','low',9000,{promoted_at:NOW-9000}),prio('normal-new','normal',100),
+      prio('promo-new','normal',200,{promoted_at:NOW-1000}),prio('low-old','low',200),
+      prio('high','high',3000),prio('normal-old','normal',5000)].sort(queueCandidateOrder).map(t=>t.id);
+    expect(order).toEqual(['promo-new','promo-old','high','normal-new','normal-old','low-old']);
+  });
+  it('comparator: missing or unknown priority reads as normal; ties break by id',()=>{
+    const order=[{id:'b',created_at:NOW},{id:'a',created_at:NOW},{id:'c',created_at:NOW,priority:'urgent'},
+      {id:'d',created_at:NOW}].sort(queueCandidateOrder).map(t=>t.id);
+    expect(order).toEqual(['a','b','c','d']);
+  });
+  it('auto-queue starts promoted first, then priority, newest within a priority',()=>fixture(async h=>{
+    const promo=prio('promo','low',9000,{promoted_at:NOW-1000}),high=prio('high-start','high',3000),
+      normalNew=prio('normal-new','normal',1000),normalOld=prio('normal-old','normal',5000),low=prio('low-start','low',200);
+    const tasks=[normalOld,low,promo,high,normalNew];const started:string[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>tasks} as any,(f:any)=>f(),{
+      policy:()=>queuePolicyFrom({HUB_INTAKE_QUEUE_MAX_INFLIGHT:'8',HUB_INTAKE_QUEUE_MAX_PER_PROJECT:'8'}),
+      start:async input=>{started.push(input.intake_task_id);return {status:202,body:{}}}
+    },()=>NOW);w.init();await w.tick();
+    expect(started).toEqual(['promo','high-start','normal-new','normal-old','low-start']);
+  }));
+  it('a promoted intake overrides a retry backoff and is the next started',()=>fixture(async h=>{
+    const backoff=task('backoff'),promoted={...task('jump'),promoted_at:NOW-1};
+    for(const id of ['backoff','jump'])h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,next_at,updated_at)
+      VALUES(?,'queued','watchdog_project_capacity',?,?)`,id,NOW+600000,NOW);
+    const started:string[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[backoff,promoted]} as any,(f:any)=>f(),{
+      start:async input=>{started.push(input.intake_task_id);return {status:202,body:{}}}
+    },()=>NOW);w.init();await w.tick();
+    expect(started).toEqual(['jump']);
+    expect(w.queue([backoff,promoted]).find(r=>r.id==='backoff')?.state).toBe('queued');
+  }));
+  it('visible queue positions run promoted > priority > newest',()=>fixture(async h=>{
+    const promoted=prio('pos-promo','low',9000,{promoted_at:NOW-100}),high=prio('pos-high','high',3000),
+      normal=prio('pos-normal','normal',300);
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[]} as any,(f:any)=>f(),{},()=>NOW);w.init();
+    const rows=w.queue([normal,high,promoted]);
+    expect(rows.find(r=>r.id==='pos-promo')).toMatchObject({queue_position:1,priority:'low'});
+    expect(rows.find(r=>r.id==='pos-high')?.queue_position).toBe(2);
+    expect(rows.find(r=>r.id==='pos-normal')?.queue_position).toBe(3);
+  }));
+  it('idle kick starts the promoted intake ahead of older backlog',()=>fixture(async h=>{
+    h.sql.exec('UPDATE machines SET capabilities=? WHERE id=?',JSON.stringify({workspaces:['demo','proof']}),'queue-host');
+    const old={...task('kick-old'),project:'proof'},promoted={...prio('kick-promo','low',9000,{promoted_at:NOW-50}),project:'proof'};
+    const started:string[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[old,promoted]} as any,(f:any)=>f(),{
+      policy:()=>queuePolicyFrom({HUB_INTAKE_QUEUE_PROJECTS:'proof'}),
+      start:async input=>{started.push(input.intake_task_id);session(h,promoted,'kick-session','queued');
+        return {status:202,body:{id:'kick-session',state:'queued'}}}
+    },()=>NOW);w.init();
+    const result=await w.idleKick();
+    expect(started).toEqual(['kick-promo']);
+    expect(result.task_id).toBe('kick-promo');
   }));
 });

@@ -73,6 +73,7 @@
   "intake list",
   "intake merge-check",
   "intake merge-state",
+  "intake promote",
   "intake revoke",
   "intake rules",
   "intake show",
