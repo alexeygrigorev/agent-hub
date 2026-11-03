@@ -2,7 +2,8 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { runInDurableObject } from 'cloudflare:test';
 import { doFetch, defaultEnv, createHelpers, loginAndGetState } from './m1-focus-setup';
 import { Hub } from '../src/hub';
-import { QuotaStore, QUOTA_STALE_MS, QUOTA_MAX_BODY_BYTES } from '../src/quota';
+import { FleetService } from '../src/fleet';
+import { QuotaStore, QUOTA_STALE_MS, QUOTA_MAX_BODY_BYTES, quotaHasWindowEvidence, quotaPositivelyBlocked } from '../src/quota';
 import { sha256 } from '../src/auth/crypto';
 
 // Offline test fixtures only: no live API calls, no real tokens, no subprocess execution.
@@ -252,6 +253,48 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
 
   afterAll(() => {
     globalThis.fetch = originalFetch;
+  });
+
+  it('does not treat stale or unavailable windows as quota evidence', () => {
+    const stale = { status: 'unknown', details: { stale: true },
+      windows: { weekly: { present: true, percent_remaining: 0 } } };
+    const unavailable = { status: 'error', details: {},
+      windows: { weekly: { present: true, percent_remaining: 0, error: 'unavailable' } } };
+    expect(quotaHasWindowEvidence(stale)).toBe(false);
+    expect(quotaPositivelyBlocked(stale, Date.now())).toBe(false);
+    expect(quotaHasWindowEvidence(unavailable)).toBe(false);
+    expect(quotaPositivelyBlocked(unavailable, Date.now())).toBe(false);
+  });
+
+  it('keeps fresh host window exhaustion when the central quota row is an error', async () => {
+    const isolated = defaultEnv.HUB.get(defaultEnv.HUB.idFromName('quota-provenance-' + crypto.randomUUID()));
+    await runInDurableObject(isolated, async (hub: Hub, state: DurableObjectState) => {
+      const now = Date.now();
+      const at = (delta = 0) => new Date(now + delta).toISOString();
+      const fleet = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now);
+      fleet.init();
+      const quotas = new QuotaStore(hub.sql, state, defaultEnv as any, () => now);
+      const hostId = 'quota-provenance-host';
+      hub.sql.exec(`INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities)
+        VALUES (?,?,?,?,?,?,?,?)`, hostId, hostId, hostId, at(), at(), JSON.stringify({}), 0, JSON.stringify({ engines: ['antigravity'] }));
+      hub.sql.exec('INSERT INTO fleet_accounts (label,provider,max_concurrency,reserve_percent,enabled) VALUES (?,?,?,?,?)', 'hub-antigravity', 'gemini', 1, 0, 1);
+      hub.sql.exec('INSERT INTO fleet_routes (machine_id,engine,account,profile) VALUES (?,?,?,NULL)', hostId, 'antigravity', 'hub-antigravity');
+      const hostQuota = { status: 'unknown', observed_at: at(-1000), details: { limit_reached: false },
+        windows: { weekly: { present: true, percent_remaining: 0, reset_at: at(86400000), rolling: false } } };
+      hub.sql.exec('INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)',
+        hostId, 'hub-antigravity', 'gemini', null, at(-1000), JSON.stringify(hostQuota));
+      const centralError = { status: 'error', observed_at: at(-1000), details: {},
+        windows: { weekly: { present: false, percent_remaining: null, reset_at: null, error: 'unavailable' } } };
+      hub.sql.exec('INSERT INTO server_quota_snapshots (account,provider,captured_at,quota_json) VALUES (?,?,?,?)',
+        'hub-antigravity', 'gemini', at(-1000), JSON.stringify(centralError));
+
+      const view = quotas.getFleetView({ host_id: null, provider: 'gemini', engine: null, account: null }, now);
+      const pool = view.body.pools.find((row: any) => row.account === 'hub-antigravity');
+      expect(view.status).toBe(200);
+      expect(pool.state).toBe('exhausted');
+      expect(pool.windows.weekly.percent_remaining).toBe(0);
+      expect(pool.source).toBe('machine-fallback');
+    });
   });
 
   it('register returns the credential-bound machine_id for already paired hosts and never another host id', async () => {

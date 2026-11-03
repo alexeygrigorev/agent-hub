@@ -30,7 +30,16 @@ export function unmeteredObservation(observedAt: string): Record<string, any> {
 export function quotaPositivelyBlocked(quota: any, nowMs: number): boolean {
   if (quota?.details?.limit_reached === true) return true;
   const until = Date.parse(quota?.details?.cooldown_until);
-  return Number.isFinite(until) && until > nowMs;
+  return (Number.isFinite(until) && until > nowMs) || windowMinPercent(quota) === 0;
+}
+
+/** A valid quota window is useful even when a sibling window made status unknown. */
+export function quotaHasWindowEvidence(quota: any): boolean {
+  return windowMinPercent(quota) !== null;
+}
+
+export function quotaWindowPercent(quota: any): number | null {
+  return windowMinPercent(quota);
 }
 
 export const QUOTA_MAX_BODY_BYTES = 32_768;
@@ -506,6 +515,7 @@ function isFreshTs(value: unknown, nowMs: number, ttlMs: number): boolean {
 }
 
 function windowMinPercent(quota: any): number | null {
+  if (quota?.details?.stale === true) return null;
   let remaining: number | null = null;
   for (const w of Object.values((quota && quota.windows) || {}) as any[]) {
     if (w === null || typeof w !== "object" || w.present !== true || w.error === "unavailable") continue;
@@ -1513,9 +1523,10 @@ export class QuotaStore {
         }
       }
 
-      const hasHealthyObservation = freshObs.some((o) => !observationUnavailable(o.quota));
-      const hasPositiveHold = freshObs.some((o) => o.quota.details?.limit_reached === true || windowMinPercent(o.quota) === 0 ||
-        (typeof o.quota.details?.cooldown_until === "string" && Date.parse(o.quota.details.cooldown_until) > nowMs));
+      const observationHasWindow = (o: { quota: any }) => quotaHasWindowEvidence(o.quota);
+      const observationHasHeadroom = (o: { quota: any }) => !observationUnavailable(o.quota) || observationHasWindow(o);
+      const hasHealthyObservation = freshObs.some(observationHasHeadroom);
+      const hasPositiveHold = freshObs.some((o) => quotaPositivelyBlocked(o.quota, nowMs));
       if (!hasHealthyObservation && !hasPositiveHold) {
         const snapshotSources = new Set(freshObs.filter((o) => o.kind === "snapshot").map((o) => o.machine));
         for (const machineId of machines) {
@@ -1543,8 +1554,28 @@ export class QuotaStore {
         try { quota = JSON.parse(central.quota_json); } catch { /* unavailable */ }
         if (quota && isFreshTs(central.captured_at, nowMs, QUOTA_STALE_MS) &&
             (!quota.observed_at || isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS))) {
-          freshObs.splice(0, freshObs.length, { machine: "hub-server", quota, kind: "server" });
-          source = "server";
+          const evidenceRank = (value: any) => quotaPositivelyBlocked(value, nowMs) ? 3
+            : quotaHasWindowEvidence(value) ? 2
+            : !observationUnavailable(value) ? 1 : 0;
+          const centralRank = evidenceRank(quota);
+          const hostBestRank = freshObs.reduce((best, o) => Math.max(best, evidenceRank(o.quota)), 0);
+          const hostBestPercent = freshObs.filter((o) => evidenceRank(o.quota) === hostBestRank)
+            .map((o) => windowMinPercent(o.quota)).filter((n): n is number => n !== null)
+            .reduce<number | null>((min, n) => min === null ? n : Math.min(min, n), null);
+          const centralPercent = windowMinPercent(quota);
+          const useCentral = centralRank > hostBestRank || centralRank === hostBestRank && (
+            centralRank === 3 || centralRank === 1 || centralRank === 0 ||
+            (centralPercent !== null && (hostBestPercent === null || centralPercent <= hostBestPercent))
+          );
+          // A fresh central error row is a probe failure, not a reason to erase
+          // a host's usable window or positive exhaustion evidence. Prefer
+          // the lowest valid window when both sources have measurements.
+          if (useCentral) {
+            freshObs.splice(0, freshObs.length, { machine: "hub-server", quota, kind: "server" });
+            source = "server";
+          } else {
+            hasStale = true;
+          }
         } else hasStale = true;
       }
       let state = "unknown";
@@ -1553,14 +1584,14 @@ export class QuotaStore {
       let collectorVersion: string | null = null;
       if (freshObs.length) {
         state = "fresh";
-        if (freshObs.some((o) => o.quota.details?.limit_reached === true)) {
+        if (freshObs.some((o) => quotaPositivelyBlocked(o.quota, nowMs))) {
           state = "exhausted";
         } else {
           // One broken host probe must not hold the whole pool when another
           // host reports healthy evidence: a known 7d window with a missing
           // short window stays placeable. Fail closed only when NO healthy
           // observation remains (genuine window errors still fail that host).
-          const healthy = freshObs.filter((o) => !observationUnavailable(o.quota));
+          const healthy = freshObs.filter(observationHasHeadroom);
           if (!healthy.length) {
             state = "unavailable";
           } else {
@@ -1570,8 +1601,8 @@ export class QuotaStore {
             }
           }
         }
-        const healthyForTs = freshObs.some((o) => !observationUnavailable(o.quota))
-          ? freshObs.filter((o) => !observationUnavailable(o.quota)) : freshObs;
+        const healthyForTs = freshObs.some(observationHasHeadroom)
+          ? freshObs.filter(observationHasHeadroom) : freshObs;
         const times = healthyForTs.map((o) => o.quota.observed_at).filter((t: unknown) => typeof t === "string") as string[];
         if (times.length) observedAt = times.sort().pop()!;
         const cv = healthyForTs.map((o) => o.quota.collector_version).find((v: unknown) => typeof v === "string");
@@ -1583,7 +1614,8 @@ export class QuotaStore {
       // Fresh when a routed machine is live and its engine has no health hold;
       // percentage stays unknown. Positive exhaustion keeps its own state.
       if (["unavailable", "unknown", "stale"].includes(state) && Number(account.enabled) !== 0 && isUnmeteredProvider(account.provider) &&
-          !freshObs.some((o) => quotaPositivelyBlocked(o.quota, nowMs))) {
+          !freshObs.some((o) => quotaPositivelyBlocked(o.quota, nowMs)) &&
+          !freshObs.some((o) => quotaHasWindowEvidence(o.quota))) {
         const liveRoute = routes.find((r) => {
           const m: any = this.sql.exec("SELECT last_checkin_at, drained FROM machines WHERE id = ? AND revoked_at IS NULL", r.machine_id).toArray()[0];
           if (!m || m.drained || !isFreshTs(m.last_checkin_at, nowMs, 180_000)) return false;
