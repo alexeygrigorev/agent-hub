@@ -155,6 +155,7 @@ export class ChecksService {
    * have transactional idempotency and a retained receipt in ConversationsService. */
   async runDue(deps: ActionDeps, only?: string): Promise<any[]> {
     const results: any[] = [];
+    let insertedRun = false;
     const names = (this.sql.exec('SELECT name FROM hub_checks WHERE enabled = 1 OR name = ? ORDER BY name', only ?? '').toArray()).map(r => String(r.name));
     for (const name of names) {
       if (only && name !== only) continue;
@@ -232,11 +233,19 @@ export class ChecksService {
       // Unknown dispatch is never healthy, but its original evaluation stays frozen
       // in the slot so reconciliation can recover the first-payload receipt.
       const reported: CheckResult = retry ? { status: 'error', detail: 'conversation dispatch unresolved; ' + result.detail } : result;
-      this.sql.exec('UPDATE hub_checks SET last_status = ?, last_detail = ? WHERE name = ?', reported.status, reported.detail.slice(0, 1000), name);
-      this.sql.exec('INSERT INTO hub_check_runs (name, at, status, detail, action) VALUES (?, ?, ?, ?, ?)', name, at, reported.status, reported.detail.slice(0, 1000), action);
+      // Intake e8a22f4c: a due check whose verdict is identical to the stored
+      // one rewrites nothing and appends no run row; the slot state machine
+      // above already fenced the lease. History grows only on change.
+      const detail1000 = reported.detail.slice(0, 1000);
+      if (row.last_status !== reported.status || (row.last_detail ?? '') !== detail1000) {
+        this.sql.exec('UPDATE hub_checks SET last_status = ?, last_detail = ? WHERE name = ?', reported.status, detail1000, name);
+        this.sql.exec('INSERT INTO hub_check_runs (name, at, status, detail, action) VALUES (?, ?, ?, ?, ?)', name, at, reported.status, detail1000, action);
+        insertedRun = true;
+      }
       results.push({ name, ...reported, action });
     }
-    this.sql.exec('DELETE FROM hub_check_runs WHERE id <= (SELECT id FROM hub_check_runs ORDER BY id DESC LIMIT 1 OFFSET 1000)');
+    // The retained-run trim runs only when this pass appended history.
+    if (insertedRun) this.sql.exec('DELETE FROM hub_check_runs WHERE id <= (SELECT id FROM hub_check_runs ORDER BY id DESC LIMIT 1 OFFSET 1000)');
     return results;
   }
 

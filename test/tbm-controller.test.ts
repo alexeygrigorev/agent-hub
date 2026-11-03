@@ -19,6 +19,7 @@ import {
   recordSessionOutcomeReward,
   recordSessionTokens,
   tickTbm,
+  TOKEN_PERSIST_COOLDOWN_MS,
 } from '../src/tbm-controller';
 
 const inDO: any = runInDurableObject;
@@ -658,5 +659,21 @@ it('reports total accepted work while measuring efficiency only on the known-cos
     expect(row.useful_work_units).toBe(20);
     expect(row.total_tokens_burned).toBe(100000);
     expect(row.token_efficiency_eta).toBe(100);
+  });
+});
+
+it('cools down active-phase token persists but always persists terminal counts', async () => {
+  await inDO(stub('token-cooldown'), (h: any) => {
+    const sql = h.sql;
+    // Intake e8a22f4c: censuses repeat token counts every ~10s; persisting
+    // each one is the bulk of the census write rate.
+    recordSessionTokens(sql, { session_id: 'cool', total_tokens: 1000 }, NOW);
+    expect(sql.exec("SELECT total_tokens FROM tbm_session_tokens WHERE session_id='cool'").one().total_tokens).toBe(1000);
+    recordSessionTokens(sql, { session_id: 'cool', total_tokens: 2000 }, NOW + 10_000);
+    expect(sql.exec("SELECT total_tokens FROM tbm_session_tokens WHERE session_id='cool'").one().total_tokens).toBe(1000);
+    recordSessionTokens(sql, { session_id: 'cool', total_tokens: 3000 }, NOW + TOKEN_PERSIST_COOLDOWN_MS);
+    expect(sql.exec("SELECT total_tokens FROM tbm_session_tokens WHERE session_id='cool'").one().total_tokens).toBe(3000);
+    recordSessionTokens(sql, { session_id: 'cool', total_tokens: 4000, terminal: true }, NOW + TOKEN_PERSIST_COOLDOWN_MS + 10_000);
+    expect(sql.exec("SELECT total_tokens FROM tbm_session_tokens WHERE session_id='cool'").one().total_tokens).toBe(4000);
   });
 });

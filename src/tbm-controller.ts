@@ -187,7 +187,16 @@ export interface SessionTokensInput {
   output_tokens?: number | null;
   total_tokens?: number | null;
   observed_at_ms?: number;
+  /**
+   * Set for terminal native phases (exited/dead). Active-phase reports persist
+   * at most once per TOKEN_PERSIST_COOLDOWN_MS; terminal reports always
+   * persist so the final count is never lost to the cooldown.
+   */
+  terminal?: boolean | null;
 }
+
+/** Active-phase token reports persist at most once per minute per session. Censuses arrive every ~10s; TBM pacing reads on a 5-minute cadence. */
+export const TOKEN_PERSIST_COOLDOWN_MS = 60_000;
 
 /** Record or update measured native token usage for a session and upgrade any pending reward row. */
 export function recordSessionTokens(sql: SqlStorage, input: SessionTokensInput, nowMs = Date.now()): void {
@@ -206,6 +215,12 @@ export function recordSessionTokens(sql: SqlStorage, input: SessionTokensInput, 
       && (!input.native_id || prior.native_id === input.native_id)
       && (!input.tag || prior.tag === input.tag) && (!input.engine || prior.engine === input.engine)
       && (!input.account || prior.account === input.account)) return;
+  // Intake e8a22f4c: host censuses repeat unchanged-or-slightly-changed token
+  // counts every ~10s; persisting each one is the bulk of the census write
+  // rate. Active phases persist at most once per cooldown window; the next
+  // window picks up the latest counts, and terminal phases always persist.
+  if (!input.terminal && prior && prior.observed_at_ms !== null && prior.observed_at_ms !== undefined
+      && atMs - Number(prior.observed_at_ms) < TOKEN_PERSIST_COOLDOWN_MS) return;
   ensureTbmControllerSchema(sql);
   sql.exec(
     `INSERT INTO tbm_session_tokens (session_id, native_id, tag, engine, account, input_tokens, output_tokens, total_tokens, observed_at_ms)

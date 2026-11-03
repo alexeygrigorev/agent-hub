@@ -3015,7 +3015,8 @@ export class FleetService {
         const seen = new Set<string>();
         for (const s of data.sessions) {
           if (s.tokens) recordSessionTokens(this.sql, { session_id: `${caller.machineId}:${s.native_id}`,
-            native_id: s.native_id, tag: s.tag, engine: s.engine, account: s.account, ...s.tokens }, this.now());
+            native_id: s.native_id, tag: s.tag, engine: s.engine, account: s.account, ...s.tokens,
+            terminal: s.phase === 'exited' || s.phase === 'dead' }, this.now());
           const staleRecoverable = staleReconciledStopped.has(s.native_id) && (s.phase === 'starting' || s.phase === 'running');
           if (stoppedSessions.has(s.native_id) && !staleRecoverable) {
             const stoppedCreated = stoppedSessions.get(s.native_id);
@@ -3135,9 +3136,16 @@ export class FleetService {
         this.linkRevisions.set(caller.machineId!, revision);
         adoptObservedNativeSessions(this.sql, caller.machineId!, linkChangedSessions, this.now(), undefined,
           revisionMoved ? cleanSessions : linkChangedSessions);
-        if (changedSessions.length || gone.length) this.maintenanceDirty = true;
-        reconcileAccountCapacity(this.sql, this.now());
-        reconcileVerifiedNoStarts(this.sql, this.now());
+        // Intake e8a22f4c: only new/changed/vanished rows can present new
+        // positive terminal evidence. An unchanged census re-scans the same
+        // retained history on every host poll, so the fleet-wide reconciles
+        // run only when this census changed something; other hosts' changed
+        // censuses and the manual /reconcile endpoint still settle promptly.
+        if (changedSessions.length || gone.length) {
+          this.maintenanceDirty = true;
+          reconcileAccountCapacity(this.sql, this.now());
+          reconcileVerifiedNoStarts(this.sql, this.now());
+        }
         // A refreshed catalog can free machine_capacity: promote waiters.
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }
         // unchanged rows retain last-change timestamps; the complete census

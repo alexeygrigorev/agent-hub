@@ -30,7 +30,9 @@ function tracked(sql: any) {
     return { total, top: [...by].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${n} ${k}`) };
   };
   const mark = () => calls.length;
-  return { proxy, report, mark };
+  /** Raw SQL issued since `from` (a prior `mark()`), for asserting a hot path skips a scan. */
+  const queries = (from = 0) => calls.slice(from).map(({ q }) => q.replace(/\s+/g, ' '));
+  return { proxy, report, mark, queries };
 }
 
 function seed(sql: any) {
@@ -194,4 +196,26 @@ it('PUT /api/fleet/sessions skips rewrites when only volatile progress timestamp
   // Semantic change still writes.
   const third = await put([{ ...sess(iso(-500))[0], phase: 'exited', confirmed_exit: true }]);
   expect(third.written).toBeGreaterThan(0);
+}));
+
+it('PUT /api/fleet/sessions skips the fleet-wide terminal reconciles when nothing changed (intake e8a22f4c)', withFleet(async (s, t) => {
+  const sessions = Array.from({ length: 50 }, (_, i) => ({
+    native_id: uuid(3, i), tag: 'hub-' + uuid(1, i), engine: 'codex', phase: i < 5 ? 'running' : 'exited', confirmed_exit: i >= 5, agent_state: null,
+    workspace: '/w', cwd: '/w', profile: null, account: null, last_activity_at: null, created_at_ms: now - 1000 - i }));
+  const put = async () => {
+    const r = await s.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions }) }), host);
+    expect(r.status).toBe(200);
+    return r.json() as Promise<any>;
+  };
+  const reconcile = (qs: string[]) => qs.filter(q =>
+    /FROM fleet_launches l JOIN fleet_sessions n/.test(q) || /WHERE l\.mode='headless'/.test(q));
+  await put();
+  const from = t.mark();
+  expect((await put()).written).toBe(0);
+  expect(reconcile(t.queries(from))).toEqual([]);
+  // A real change still reconciles fleet-wide terminal evidence.
+  const changed = sessions.map((row, i) => (i === 0 ? { ...row, phase: 'exited', confirmed_exit: true } : row));
+  const r = await s.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions: changed }) }), host);
+  expect(r.status).toBe(200);
+  expect(reconcile(t.queries(from)).length).toBeGreaterThan(0);
 }));

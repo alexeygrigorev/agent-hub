@@ -129,7 +129,24 @@ describe('running checks', () => {
     const second = await checks.runDue(deps);
     expect(second[0].action).toBe('alert already open');
     expect(deps.log).toHaveLength(1);
-    expect(checks.runs().length).toBe(2);
+    // Intake e8a22f4c: an identical verdict appends no run row and rewrites
+    // no check row; history grows only when the verdict changes.
+    expect(checks.runs().length).toBe(1);
+  }));
+
+  it('skips check-row writes and run history when the verdict is identical', () => fixture(async (checks, deps, clock, sql) => {
+    checks.replace([row({ name: 'steady', kind: 'quota', interval_s: 300, params: { min_percent: 20 } })]);
+    await checks.runDue(deps);
+    const before = (sql.exec('SELECT last_status, last_detail, last_run_at FROM hub_checks WHERE name = ?', 'steady').toArray()[0] as any);
+    expect(checks.runs()).toHaveLength(1);
+    clock.t += 300000;
+    clock.t += 300000;
+    const again = await checks.runDue(deps);
+    expect(again.map(r => [r.name, r.status])).toEqual([['steady', 'fail']]);
+    expect(checks.runs()).toHaveLength(1);
+    const after = (sql.exec('SELECT last_status, last_detail, last_run_at FROM hub_checks WHERE name = ?', 'steady').toArray()[0] as any);
+    expect(after.last_status).toBe(before.last_status);
+    expect(after.last_detail).toBe(before.last_detail);
   }));
 
   it('resolves a check alert when the check passes again', () => fixture(async (checks, deps, clock) => {
