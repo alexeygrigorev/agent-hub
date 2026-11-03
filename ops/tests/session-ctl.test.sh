@@ -18,6 +18,7 @@ export FAKE_QUOTA="$fake/quota.json"
 export FAKE_KILLED="$fake/killed.log"
 export FAKE_START_ENGINE="$fake/start-engine"
 export FAKE_SEND_LOG="$fake/send.log"
+unset ORCH_ENGINE ORCH_FALLBACK_ENGINE
 
 cat > "$bin/a" <<'APLEXER'
 #!/usr/bin/env bash
@@ -182,6 +183,28 @@ printf '%s 1\n' "$(( $(date +%s)-1 ))" > "$state/proof_due"
 if output="$(run_ctl orchestrator check 2>&1)"; then :; fi
 assert_contains "$output" 'recovery path 2'
 [[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
+
+# A failed recovery excludes the engine that actually started, even when quota
+# forced it away from the preferred primary route.
+write_quota <<'JSON'
+{"pools":[{"provider":"go","state":"fresh","remaining_percent":36,"harness":["opencode"]}]}
+JSON
+write_live orchestrator 'normal ready prompt'
+state="$HOME/tmp/agent-reports/orchestrator/state"
+rm -f "$state/proof_due"
+printf '%s\n' "$(( $(date +%s)-3600 ))" > "$state/last_start"
+output="$(run_ctl orchestrator check 2>&1)"
+assert_contains "$output" 'recovery path 1 started on opencode'
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+state="$HOME/tmp/agent-reports/orchestrator/state"
+read -r due path attempted_engine < "$state/proof_due"
+[[ "$attempted_engine" == opencode ]]
+printf '%s %s %s\n' "$(( $(date +%s)-1 ))" "$path" "$attempted_engine" > "$state/proof_due"
+write_default_quota
+output="$(run_ctl orchestrator check 2>&1)" || true
+assert_contains "$output" 'recovery path 2 started on gemini'
+[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
 assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
 
 # Claude-only, Codex-only, stale and exhausted quota are not sufficient recovery evidence.

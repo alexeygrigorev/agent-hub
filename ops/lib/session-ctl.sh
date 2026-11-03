@@ -89,10 +89,11 @@ arm_timer() {  # $1 = kind (deadline|proof), $2 = seconds from now
 # start (last_start is written before launch and prompt readiness, so the wait counts).
 arm_proof() {  # $1 = recovery path (1 = restart, 2 = new session on the fallback engine)
   [ "$ROLE" = orchestrator ] || return 0
-  local started due; started=$(cat "$STATE/last_start" 2>/dev/null || date +%s); due=$((started + PROOF_WINDOW))
-  echo "$due $1" > "$STATE/proof_due"
+  local started due engine="${2:-$ENGINE}"
+  started=$(cat "$STATE/last_start" 2>/dev/null || date +%s); due=$((started + PROOF_WINDOW))
+  echo "$due $1 $engine" > "$STATE/proof_due"
   arm_timer proof "$((due - $(date +%s) + 1))"
-  log "recovery path $1 started; proof due: fresh tick within ${PROOF_WINDOW}s"
+  log "recovery path $1 started on $engine; proof due: fresh tick within ${PROOF_WINDOW}s"
 }
 
 # List failures are errors, never evidence that no session exists.
@@ -355,11 +356,17 @@ restart_failed() {  # $1 = Hub report state
 
 # Start recovery path $1 and arm its proof. Path 2 is a different new session: the
 # fallback engine plus a fresh handoff, for a session that starts but never ticks.
-recover() {  # $1 = path, $2 = reason
-  local path="$1" reason="$2" saved="$ENGINE" saved_exclude="$ENGINE_EXCLUDE" saved_selected="$ENGINE_SELECTED" rc=0
-  if [ "$path" = 2 ]; then ENGINE="$FALLBACK_ENGINE"; ENGINE_EXCLUDE="$saved"; else ENGINE_EXCLUDE=""; fi
+recover() {  # $1 = path, $2 = reason, $3 = engine whose proof failed (optional)
+  local path="$1" reason="$2" failed_engine="${3:-}" saved="$ENGINE" saved_exclude="$ENGINE_EXCLUDE" saved_selected="$ENGINE_SELECTED" rc=0
+  if [ "$path" = 2 ]; then
+    ENGINE="$FALLBACK_ENGINE"
+    # Older proof records contain only due + path; preserve their preference-based exclusion.
+    ENGINE_EXCLUDE="${failed_engine:-$saved}"
+  else
+    ENGINE_EXCLUDE="$failed_engine"
+  fi
   ENGINE_SELECTED=0
-  if FORCE=1 restart "$reason (recovery path $path, engine $ENGINE)"; then arm_proof "$path"; hub_report recovering
+  if FORCE=1 restart "$reason (recovery path $path, engine $ENGINE)"; then arm_proof "$path" "$ENGINE"; hub_report recovering
   else rc=1; fi
   ENGINE="$saved"; ENGINE_EXCLUDE="$saved_exclude"; ENGINE_SELECTED="$saved_selected"
   [ "$rc" = 0 ] || restart_failed restart_failed
@@ -369,7 +376,7 @@ recover() {  # $1 = path, $2 = reason
 # 1 after handling a failed proof (next recovery path started).
 check_proof() {
   [ -f "$STATE/proof_due" ] || return 0
-  local due path now ls_ts first; read -r due path < "$STATE/proof_due"; now=$(date +%s)
+  local due path failed_engine now ls_ts first; read -r due path failed_engine < "$STATE/proof_due"; now=$(date +%s)
   ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
   if first=$(tick_in_window "$ls_ts" "${due:-0}"); then
     rm -f "$STATE/proof_due"; echo 0 > "$STATE/restart_failures"
@@ -383,7 +390,7 @@ check_proof() {
   log "recovery proof FAILED (path ${path:-1}): no tick within ${PROOF_WINDOW}s after start${id:+ (session $id alive)}"
   restart_failed proof_failed
   local next=2; [ "${path:-1}" = 2 ] && next=1
-  recover "$next" "no tick within ${PROOF_WINDOW}s after recovery path ${path:-1}" || true
+  recover "$next" "no tick within ${PROOF_WINDOW}s after recovery path ${path:-1}" "$failed_engine" || true
   return 1
 }
 
