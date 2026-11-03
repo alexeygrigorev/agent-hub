@@ -39,6 +39,7 @@ import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
 import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { ProvisioningService } from './provisioning';
+import { HostCredentialService } from './host-credentials';
 import { hostRepositoryAccess } from './host-repo-access';
 import { hostRepositoryAuthorizer } from './host-repo-authority';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
@@ -152,6 +153,7 @@ export class Hub extends DurableObject {
   public fleetService: FleetService;
   public repoRegistry: RepoRegistry;
   public provisioningService: ProvisioningService;
+  public hostCredentialService: HostCredentialService;
   public sessionControlService: SessionControlService;
   public livenessService: LivenessService;
   public checksService: ChecksService;
@@ -312,6 +314,9 @@ export class Hub extends DurableObject {
     this.provisioningService = new ProvisioningService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env, this.fleetService,
       (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller));
     this.provisioningService.init();
+    this.hostCredentialService = new HostCredentialService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env,
+      (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller));
+    this.hostCredentialService.init();
     new HostGoals(this.sql, this.fleetService).init();
     // Hub-owned credentials (intake 5814e109): a provider rejection opens one
     // alert per account; the next successful provider read resolves it.
@@ -1032,6 +1037,9 @@ export class Hub extends DurableObject {
       }
       if (path === '/api/engines/recommend') {
         return this.fleetService.handle(request, await this.sessionControlAuth(request));
+      }
+      if (path === '/api/host-credentials' || path.startsWith('/api/host-credentials/')) {
+        return this.hostCredentialService.handle(request, await this.authenticateBusRequest(request));
       }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
         const url = new URL(request.url);
