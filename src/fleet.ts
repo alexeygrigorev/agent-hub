@@ -2955,7 +2955,38 @@ export class FleetService {
           cleanSessions.push(s);
           const prior = existing.get(s.native_id); seen.add(s.native_id);
           const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null, progress_json: s.progress ? JSON.stringify(s.progress) : null };
-          if (!staleRecoverable && prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
+          const stableProgress = (v: any): string | null => {
+            if (v === null || v === undefined) return null;
+            if (typeof v !== 'string') {
+              try {
+                const o: any = typeof v === 'object' ? v : JSON.parse(String(v));
+                if (!o || typeof o !== 'object') return String(v);
+                const { sampled_at: _sa, last_progress_at: _lpa, last_cpu_at: _lca, ...rest } = o;
+                return JSON.stringify(rest);
+              } catch { return String(v); }
+            }
+            try {
+              const o: any = JSON.parse(v);
+              if (!o || typeof o !== 'object') return v;
+              const { sampled_at: _sa, last_progress_at: _lpa, last_cpu_at: _lca, ...rest } = o;
+              return JSON.stringify(rest);
+            } catch { return v; }
+          };
+          const rowStable = { ...row, progress_json: stableProgress(row.progress_json) };
+          const priorStable = prior ? { ...prior, progress_json: stableProgress(prior.progress_json) } : null;
+          if (!staleRecoverable && prior && priorStable && fields.every(f => ((priorStable as any)[f] ?? null) === ((rowStable as any)[f] ?? null))) {
+            // Volatile progress timestamps alone must not rewrite the row every minute:
+            // touch observed_at at most every 5 min to keep the 10-min liveness window.
+            try {
+              const prevObs = prior.observed_at ? Date.parse(prior.observed_at) : 0;
+              if (this.now() - prevObs >= 5 * 60 * 1000) {
+                this.sql.exec('UPDATE fleet_sessions SET observed_at = ? WHERE machine_id = ? AND native_id = ?', new Date(this.now()).toISOString(), caller.machineId!, s.native_id);
+                written++;
+                observedRows.push({ machine_id: caller.machineId!, native_id: s.native_id, tag: s.tag, engine: s.engine, phase: s.phase, agent_state: s.agent_state, observed_at: new Date(this.now()).toISOString(), workspace: s.workspace, cwd: row.cwd, profile: s.profile, account: s.account, last_activity_at: row.last_activity_at });
+              }
+            } catch {}
+            continue;
+          }
           changedSessions.push(s);
           // Activity/progress refreshes do not change the launch-to-session
           // relationship. Keep them on the write-through catalog path without

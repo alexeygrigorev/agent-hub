@@ -170,3 +170,28 @@ it('only writes that can change capacity or the queue mark fleet maintenance dir
   for (const [m, p] of [['POST', '/api/fleet/launches'], ['POST', `/api/fleet/launches/${uuid(1, 1)}/claim`], ['POST', `/api/fleet/launches/${uuid(1, 1)}/result`],
     ['POST', '/api/fleet/tasks'], ['POST', '/api/fleet/tasks/abc/result'], ['PATCH', '/api/fleet/accounts'], ['POST', '/api/fleet/reconcile']]) expect(dirty(m, p), `${m} ${p}`).toBe(true);
 });
+
+it('PUT /api/fleet/sessions skips rewrites when only volatile progress timestamps change (intake e8a22f4c)', withFleet(async (s, _t, hub) => {
+  const prog = (sampled: string) => ({
+    last_progress_at: iso(-60000), headless: false, agent_alive: true,
+    orphaned: false, cleanup: 'none', sampled_at: sampled,
+  });
+  const sess = (sampled: string) => [{
+    native_id: uuid(3, 9001), tag: 'hub-' + uuid(1, 9001), engine: 'codex', phase: 'running',
+    confirmed_exit: false, agent_state: null, workspace: '/w', cwd: '/w', profile: null,
+    account: null, last_activity_at: null, created_at_ms: now - 1000, progress: prog(sampled),
+  }];
+  const put = async (sessions: any[]) => {
+    const r = await s.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions }) }), host);
+    expect(r.status).toBe(200);
+    return r.json() as Promise<any>;
+  };
+  const first = await put(sess(iso(-2000)));
+  expect(first.written).toBeGreaterThan(0);
+  // Same semantic state, only sampled_at moved (host reports every minute): no full rewrite.
+  const second = await put(sess(iso(-1000)));
+  expect(second.written).toBe(0);
+  // Semantic change still writes.
+  const third = await put([{ ...sess(iso(-500))[0], phase: 'exited', confirmed_exit: true }]);
+  expect(third.written).toBeGreaterThan(0);
+}));
