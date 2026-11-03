@@ -261,8 +261,16 @@ class DiskMonitor:
         exists_fn: Optional[Callable[[str], bool]] = None,
         time_fn: Optional[Callable[[], float]] = None,
         monotonic_fn: Optional[Callable[[], float]] = None,
+        janitor: Any = None,
     ):
         self.config_path = resolve_config_path(config_path)
+        # Disk floor janitor (intake fcc31e56): trusted config next to this one;
+        # a missing disk-janitor.json means disabled. ``janitor=False`` opts out.
+        if janitor is None and config_path:
+            from .disk_janitor import CONFIG_FILENAME as JANITOR_CONFIG, DiskJanitor, hub_request_from_host_config
+            janitor = DiskJanitor(os.path.join(os.path.dirname(self.config_path), JANITOR_CONFIG),
+                                  hub_request=hub_request_from_host_config())
+        self.janitor = janitor or None
         self._config_override = dict(config) if isinstance(config, dict) else None
         self._machine_id_override = machine_id
         self._min_interval_override = min_interval_s
@@ -457,6 +465,13 @@ class DiskMonitor:
             }
             if primary_mount:
                 fs_entry["primary_mount"] = primary_mount
+            if is_primary and self.janitor is not None:
+                try:
+                    floor = self.janitor.floor_report(mount)
+                except Exception:
+                    floor = None
+                if floor:
+                    fs_entry["floor"] = floor
             if top_consumers:
                 fs_entry["top_consumers"] = top_consumers
                 fs_entry["top_consumers_truncated"] = top_consumers_truncated
@@ -499,6 +514,10 @@ class DiskMonitor:
             }
 
         self.last_collect_monotonic = now_mono
+
+        if self.janitor is not None:
+            # Single-inflight background pass; never blocks this observation.
+            self.janitor.maybe_start()
 
         try:
             payload, errors = self.collect(cfg)
