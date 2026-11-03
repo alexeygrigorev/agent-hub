@@ -99,14 +99,18 @@ class TestCICD(unittest.TestCase):
         for test in ('test/test_no_reset_apply.py', 'host/tests/test_codex_reset_credit.py',
                      'host/tests/test_reset_credit_workflow.py'):
             self.assertEqual(workflow.count(test), 1, test)
-        # Vitest discovery is unfiltered: the guard file must exist and no vitest
-        # invocation may narrow discovery with an explicit .test.ts file list.
+        # Full Vitest discovery is mandatory even when an early targeted lane
+        # catches cost-safety failures before the larger suite starts.
         self.assertTrue((REPO_ROOT / 'test/reset-credit-evidence.test.ts').is_file(),
                         'test/reset-credit-evidence.test.ts')
         vitest_lines = [ln for ln in workflow.splitlines() if 'vitest run' in ln]
         self.assertTrue(vitest_lines, 'deploy.yml runs vitest discovery')
-        for ln in vitest_lines:
-            self.assertIsNone(re.search(r'\btest/[\w./-]+\.test\.ts', ln), ln)
+        full_step = workflow.split('- name: Worker discovery tests (Vitest)', 1)[1].split('\n      - ', 1)[0]
+        full_invocations = [ln for ln in full_step.splitlines() if 'vitest run' in ln]
+        self.assertEqual(len(full_invocations), 1, 'full discovery step remains mandatory')
+        self.assertIsNone(re.search(r'\btest/[\w./-]+\.test\.ts', full_invocations[0]), full_invocations[0])
+        self.assertNotIn('--exclude', full_invocations[0])
+        self.assertNotIn('--testNamePattern', full_invocations[0])
 
     def test_validate_workflows_passes(self):
         """Verify current repository workflows pass static validation."""
