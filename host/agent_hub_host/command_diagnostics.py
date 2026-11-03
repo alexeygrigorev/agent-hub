@@ -5,6 +5,32 @@ TAIL_LIMIT = 512
 WINDOW_LIMIT = 8 * 1024 * 1024  # Matches run_json's largest bounded capture.
 
 
+_FINAL_EXCEPTION = re.compile(
+    r'[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Exit|Timeout|Interrupt|Locked): [^\r\n]{1,200}')
+_PATH = re.compile(r'(?:[A-Za-z]:)?[\\/][^\s\'"]+')
+
+
+def _traceback_summary(value):
+    """Withhold the traceback body but keep its final `ExcType: message` line.
+
+    The body can echo source, locals and private paths. The last line names the
+    failure (for example `OperationalError: database is locked`), so it is
+    redacted, stripped of filesystem paths and bounded."""
+    marker = '[traceback output withheld]'
+    lines = [ln.strip() for ln in value.splitlines() if ln.strip()]
+    last = lines[-1] if lines else ''
+    if not _FINAL_EXCEPTION.fullmatch(last):
+        return marker
+    try:
+        from .log_redaction import redact_log
+        last = redact_log(last, max_chars=400)
+    except Exception:
+        return marker
+    last = _PATH.sub('<path>', last)
+    last = ''.join(c if 32 <= ord(c) < 127 else ' ' for c in last)
+    return marker + ' ' + last[:240]
+
+
 def output_tail(value):
     if isinstance(value, bytes):
         value = value.decode('utf-8', 'replace')
@@ -18,7 +44,7 @@ def output_tail(value):
     # Token redaction cannot make those safe; the structured error classification
     # still retains the recognized exception type and safe failure summary.
     if 'Traceback (most recent call last):' in value:
-        return '[traceback output withheld]'
+        return _traceback_summary(value)
     try:
         from .log_redaction import redact_log
         value = re.sub(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)',
