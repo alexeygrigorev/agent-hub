@@ -16,7 +16,19 @@ CPU_LOAD_RULE = (
     "with a CPU cap (for example systemd-run --user --scope -p CPUQuota=200%) "
     "and a bounded duration, and every spawned load process must be cleaned up."
 )
-SESSION_PREAMBLE = "Hub session rules:\n" + AWS_MAIN_TEMP_RULE + "\n" + CPU_LOAD_RULE
+BLOCKER_RULE = (
+    "Never silently stop when blocked. Report through `hub intake blocker <original-id> "
+    "--title <follow-up> --text <diagnosis> --acceptance-criteria <verifiable-AC> --key <stable-key>`. "
+    "This creates and links a prerequisite and blocks the original; finish the follow-up, then "
+    "the Hub scheduler resumes the original. Use hub intake depend <id> --on <prerequisite-id> "
+    "for an existing blocker, or hub intake decompose <id> --key <stable-key> for a deep-tier "
+    "decomposition into child intakes with AC. Your short-lived session credential authorizes "
+    "intake creation and notes in the linked project; never print or copy tokens. "
+    "Append a DONE note only after all AC have evidence, including commit/deploy reference, "
+    "Live check: command and Result: output. Never close or delete intakes. "
+    "A session ending without DONE evidence or a linked blocker intake is flagged by Hub."
+)
+SESSION_PREAMBLE = "Hub session rules:\n" + AWS_MAIN_TEMP_RULE + "\n" + CPU_LOAD_RULE + "\n" + BLOCKER_RULE
 
 CAPACITY_RETRY_RULE = (
     "On a host capacity-gate refusal for a heavy step (capped-test-run exit 3 with "

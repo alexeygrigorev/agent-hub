@@ -229,6 +229,24 @@ def add_commands(sub):
     commands = root.add_subparsers(dest='intake_cmd', required=True)
     from . import intake_stats
     intake_stats.options(commands.add_parser('stats', help='Timing and attempts for one intake'), individual=True)
+    depend = commands.add_parser('depend', help='Add a prerequisite; original work waits until it is DONE')
+    depend.add_argument('id')
+    depend.add_argument('--on', required=True)
+    depend.add_argument('--remove', action='store_true')
+    depend.add_argument('--key')
+    depend.add_argument('--version', type=int)
+    blocker = commands.add_parser('blocker', help='Create a follow-up with AC, link it and block the original atomically')
+    blocker.add_argument('id')
+    blocker.add_argument('--title', required=True)
+    blocker.add_argument('--text', required=True)
+    blocker.add_argument('--acceptance-criteria', required=True)
+    blocker.add_argument('--key', required=True)
+    blocker.add_argument('--version', type=int)
+    decompose = commands.add_parser('decompose', help='Queue a deep-tier agent to create child intakes and dependencies')
+    decompose.add_argument('id')
+    decompose.add_argument('--workspace')
+    decompose.add_argument('--key', required=True)
+    decompose.add_argument('--version', type=int)
     forgotten = commands.add_parser('forgotten', help='Open intakes forgotten by live sessions; includes queued restart reason')
     forgotten.add_argument('--project')
     queue = commands.add_parser('queue', help='Autonomous intake queue (promoted first, then priority high > normal > low, then newest created_at)')
@@ -323,6 +341,7 @@ def add_commands(sub):
     assign.add_argument('id')
     assign.add_argument('--version', type=int, required=True)
     assign.add_argument('--key', required=True)
+    assign.add_argument('--force', action='store_true', help='Operator only: start despite unresolved dependencies')
     assign.add_argument('--workspace', required=True, help='Configured workspace label on the selected host')
     assign.add_argument('--engine', help='Requested engine label (existing model tiers still decide placement; requires --reason)')
     assign.add_argument('--reason', default=None, help='Explanation why this specific model/engine must be chosen (required when --engine is specified)')
@@ -605,6 +624,20 @@ def execute(args):
         return request('POST' if args.payload_file else 'GET', BASE + '/' + command,
                        json_file(args.payload_file) if args.payload_file else None)
     path = BASE + '/tasks/' + safe_id(args.id)
+    if command in ('depend', 'blocker', 'decompose'):
+        key = args.key or (command + '-' + uuid.uuid4().hex)
+        valid_key(key)
+        version = args.version
+        if version is None:
+            version = request('GET', path)['task']['version']
+        payload = {'key': key, 'expected_version': version}
+        if command == 'depend':
+            payload.update(on=safe_id(args.on), remove=args.remove)
+        elif command == 'blocker':
+            payload.update(title=args.title, text=args.text, acceptance_criteria=args.acceptance_criteria)
+        elif args.workspace:
+            payload['workspace'] = args.workspace
+        return request('POST', path + '/' + command, payload)
     if command in ('show', 'history', 'links', 'context'):
         if command == 'history' and getattr(args, 'archived', False):
             limit, after = getattr(args, 'limit', 100), getattr(args, 'after', None)
@@ -636,6 +669,8 @@ def execute(args):
         return cas_update(path + '/promote', payload, args.version is None, key, read_path=path)
     if command == 'assign':
         session = {'workspace': args.workspace}
+        if getattr(args, 'force', False):
+            session['force'] = True
         for field in ('engine', 'tier', 'machine', 'cwd'):
             if getattr(args, field, None):
                 session[field] = getattr(args, field)
