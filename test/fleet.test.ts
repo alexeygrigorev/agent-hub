@@ -119,8 +119,8 @@ describe('generic accounts and launch placement', () => {
       expect(fleet.accounts.find((a: any) => a.label === label)).toMatchObject({ placeable_slots: 8, placement_reasons: [] });
     }
     const opusPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'opus', tier: 'deep' })), admin)).json() as any;
-    // The explicit Opus selector cannot resolve under the Sonnet-only Claude policy.
-    expect(opusPlan.selected).toBeNull();
+    // The explicit Opus selector resolves to the newly configured medium model.
+    expect(opusPlan.selected?.selection).toMatchObject({ id: 'opus', model: 'opus', effort: 'medium' });
     const glmPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'glm-flash', tier: 'daily' })), admin)).json() as any;
     expect(glmPlan.selected?.engine, JSON.stringify(glmPlan.rejected)).toBe('zcodex');
     expect(glmPlan.rejected).toEqual([]);
