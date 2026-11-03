@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { RoutingService, redact } from '../src/routing';
 import { FleetService } from '../src/fleet';
-import { modelCandidates, taskTier } from '../src/model-routing';
+import { isDeepModel, modelCandidates, policy, taskTier } from '../src/model-routing';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 const now = Date.now();
@@ -72,6 +72,56 @@ describe('capability task routing', () => {
     const b: any = await (await r.handle(req('/api/tasks', data), client())).json(); expect(a.id).toBe(b.id);
     expect((await r.handle(req('/api/tasks', { ...data, prompt: 'changed' }), client())).status).toBe(409);
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(1);
+  }));
+  it('requires a stated reason for deep-tier or explicit deep-model task requests', () => fixture(async (r, f, sql) => {
+    for (const data of [
+      input({ tier: 'deep' }),
+      input({ model: 'argon' }),
+      input({ model: 'gemini-4-argon-medium' }),
+      input({ tier: 'daily', model: 'argon' }),
+      input({ model: 'argon', engine_override_reason: '  \t' }),
+      ...(policy.models as any[]).filter(isDeepModel).map(model => input({ tier: 'daily', model: model.id })),
+    ]) {
+      const rejected = await r.handle(req('/api/tasks', data), client());
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ error: 'deep_tier_reason_required', field: 'engine_override_reason' });
+    }
+    expect(sql.exec('SELECT COUNT(*) AS n FROM routing_jobs').one().n).toBe(0);
+
+    for (const data of [
+      input({ tier: 'deep', access: { mode: 'read' } }),
+      input({ tier: 'smart', access: { mode: 'read' } }),
+      input({ engine: 'argon', access: { mode: 'read' } }),
+    ]) {
+      const rejected = f.reserve(data, admin);
+      expect(rejected.status).toBe(400);
+      expect(rejected.value).toMatchObject({ error: 'deep_tier_reason_required', field: 'engine_override_reason' });
+    }
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
+
+    const reason = 'Deep reasoning is needed to compare these alternatives.';
+    const data: any = input({ model: 'argon', engine_override_reason: reason });
+    const accepted = await r.handle(req('/api/tasks', data), client());
+    expect(accepted.status).toBe(201);
+    const job: any = await accepted.json();
+    expect(job.tier).toBe('deep');
+    const stored = JSON.parse(sql.exec('SELECT request_json FROM routing_jobs WHERE id = ?', job.id).one().request_json);
+    expect(stored).toMatchObject({ tier: 'deep', model: 'argon', engine_override_reason: reason });
+    expect((await r.handle(req('/api/tasks', data), client())).status).toBe(200);
+    expect((await r.handle(req('/api/tasks', { ...data, engine_override_reason: 'A different stated reason.' }), client())).status).toBe(409);
+
+    const dailyExplicit = input({ tier: 'daily', model: 'argon', engine_override_reason: reason });
+    const dailyAccepted = await r.handle(req('/api/tasks', dailyExplicit), client());
+    expect(dailyAccepted.status).toBe(201);
+    expect(await dailyAccepted.json()).toMatchObject({ tier: 'daily', selection: null });
+  }));
+  it('does not require a deep-reason override for a daily model shared with the deep tier', () => fixture(async r => {
+    expect(isDeepModel('sonnet')).toBe(false);
+    expect(isDeepModel('gemini-4-argon-medium')).toBe(true);
+    expect(taskTier({ tier: 'daily', model: 'sonnet' })).toBe('daily');
+    const response = await r.handle(req('/api/tasks', input({ tier: 'daily', model: 'sonnet' })), client());
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ tier: 'daily', selection: null });
   }));
   it('holds human waits and releases only on confirmed terminal results, redacting artifacts', () => fixture(async (r, f, sql) => {
     const job: any = await (await r.handle(req('/api/tasks', input()), client())).json();

@@ -100,11 +100,12 @@ describe('burn-aware model candidates', () => {
 
   it('routes Claude Sonnet at medium effort for deep and review work when it is expiring', () => {
     for (const tier of ['deep', 'review']) {
-      const [sonnet] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'sonnet', 'medium', 'claude-acct'), claude, NOW);
+      const [sonnet] = modelCandidates({ tier, ...(tier === 'deep' ? { engine_override_reason: 'This task explicitly requests deep reasoning.' } : {}) },
+        route('claude', 'claude'), ad('claude', 'sonnet', 'medium', 'claude-acct'), claude, NOW);
       expect(sonnet?.id).toBe('sonnet');
       expect(sonnet.effort).toBe('medium');
       expect(sonnet.factors.burn).toBeGreaterThan(3);
-      const [opus] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'opus', 'medium', 'claude-acct'), claude, NOW);
+      const [opus] = modelCandidates({ tier, engine_override_reason: 'This task explicitly requires the Opus route for deep reasoning.' }, route('claude', 'claude'), ad('claude', 'opus', 'medium', 'claude-acct'), claude, NOW);
       expect(opus?.id).toBe('opus');
       expect(opus.effort).toBe('medium');
       expect(opus.factors.burn).toBeGreaterThan(3);
@@ -117,7 +118,7 @@ describe('burn-aware model candidates', () => {
     const idle = q(weekly(90, 30)); // 10% used in 138h -> ~88% would expire
     expect(burnReleasesExplicitOnly(burnForecast(idle, NOW))).toBe(true);
     expect(modelCandidates({ tier: 'daily' }, route('codex', 'codex'), sol, idle, NOW)).toHaveLength(1);
-    expect(modelCandidates({ tier: 'deep' }, route('codex', 'codex'), astra, idle, NOW)).toHaveLength(1);
+    expect(modelCandidates({ tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning.' }, route('codex', 'codex'), astra, idle, NOW)).toHaveLength(1);
     expect(modelCandidates({ tier: 'quick' }, route('codex', 'codex'), ad('codex', 'gpt-6-luna', 'max', 'codex-acct'), idle, NOW)).toHaveLength(0);
     // Early-cycle synthetic quota stays explicit-only without a proven waste estimate.
     expect(modelCandidates({ tier: 'daily' }, route('codex', 'codex'), sol, codex, NOW)).toHaveLength(0);

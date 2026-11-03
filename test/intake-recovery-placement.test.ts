@@ -129,12 +129,10 @@ it('AC1: intake recovery skips engines that already failed for the intake, accou
   watchdog.init();
   await watchdog.tick();
 
-  // Canonical order is codex -> opencode -> zcodex -> antigravity.
-  // codex failed for intake, opencode is account_blocked, zcodex is zcodex_session_failed -> must place on antigravity!
-  expect(starts).toHaveLength(1);
-  expect(starts[0].status, JSON.stringify(starts[0])).toBe(201);
-  expect(starts[0].body).toMatchObject({ state: 'offered', engine: 'antigravity', mode: 'headless' });
-  expect(h.sql.exec("SELECT COUNT(*) AS n FROM session_control_sessions WHERE state = 'held'").one().n).toBe(0);
+  // Recovery must not escape daily eligibility by falling back to deep Argon.
+  // Keep the intake held for an operator decision when every daily route failed.
+  expect(starts).toHaveLength(0);
+  expect(h.sql.exec("SELECT COUNT(*) AS n FROM session_control_sessions WHERE engine = 'antigravity' AND request_json LIKE ?", `%${task.id}%`).one().n).toBe(0);
 
   // Now test when NO engine is eligible: antigravity also fails/quarantines for a second intake
   const taskAllDead = { id: crypto.randomUUID(), title: 'AC1 all engines ineligible', project: 'demo', status: 'open', version: 1, created_at: now - 3600000, updated_at: now,
