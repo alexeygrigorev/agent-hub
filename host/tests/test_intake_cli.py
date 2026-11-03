@@ -112,7 +112,7 @@ class TestMergeCheckCli(unittest.TestCase):
             cli.main()
         request.assert_called_once_with('GET', '/api/intake/tasks/fixture-task')
         collect.assert_called_once_with(str(Path('/repo').resolve()), [other_sha, new_sha], fetch=False,
-                                        include_head=True, preferred_deploy_sha=None)
+                                        include_head=True, preferred_deploy_sha=new_sha)
         self.assertTrue(json.loads(output.getvalue())['dry_run'])
 
     def test_newer_superseding_report_drops_stale_merge_state_shas(self):
@@ -138,7 +138,7 @@ class TestMergeCheckCli(unittest.TestCase):
                 patch('agent_hub_host.merge_evidence.collect', return_value={'commits': []}) as collect:
             cli.main()
         collect.assert_called_once_with(str(Path('/repo').resolve()), [new_sha], fetch=False,
-                                        include_head=True, preferred_deploy_sha=None)
+                                        include_head=True, preferred_deploy_sha=new_sha)
 
     def test_older_superseding_report_keeps_merge_state_shas_required(self):
         old_id = '11111111-1111-4111-8111-111111111111'
@@ -165,3 +165,80 @@ class TestMergeCheckCli(unittest.TestCase):
         collect.assert_called_once_with(str(Path('/repo').resolve()),
                                         [recorded_head, new_sha, recorded_commit], fetch=False,
                                         include_head=True, preferred_deploy_sha=recorded_head)
+
+    def test_private_clone_checkpoint_replaces_stored_head_and_is_preferred_deploy(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        old_sha, new_sha = 'a1' * 20, 'b2' * 20
+        shown = {'task': {
+            'id': 'fixture-task',
+            'payload_data': {'history': [
+                {'id': old_id, 'kind': 'report', 'reference': old_sha, 'captured_at': 100},
+                {'id': new_id, 'kind': 'report', 'reference': new_sha, 'captured_at': 301,
+                 'supersedes': [old_id]},
+            ]},
+            'merge_state': {'head': 'c3' * 20, 'commits': [{'sha': 'd4' * 20}],
+                            'activity_at': 500, 'evidence_at': 250},
+        }}
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'merge-check', 'fixture-task', '--dry-run']), \
+                patch('sys.stdout', output), \
+                patch.object(intake, 'request', return_value=shown), \
+                patch('agent_hub_host.merge_evidence.own_clone', return_value='/private/repo'), \
+                patch('agent_hub_host.merge_evidence.fetch_origin'), \
+                patch('agent_hub_host.merge_evidence.collect', return_value={'commits': []}) as collect:
+            cli.main()
+
+        collect.assert_called_once_with('/private/repo', [new_sha], fetch=False,
+                                        include_head=False, preferred_deploy_sha=new_sha)
+        evidence = json.loads(output.getvalue())['evidence']
+        self.assertEqual(evidence['head'], new_sha)
+
+    def test_private_clone_without_checkpoint_prefers_latest_active_report(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        old_sha, new_sha = 'a1' * 20, 'b2' * 20
+        shown = {'task': {'id': 'fixture-task', 'payload_data': {'history': [
+            {'id': old_id, 'kind': 'report', 'reference': old_sha},
+            {'id': new_id, 'kind': 'report', 'reference': new_sha,
+             'supersedes': [old_id]},
+        ]}}}
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'merge-check', 'fixture-task', '--dry-run']), \
+                patch('sys.stdout', output), \
+                patch.object(intake, 'request', return_value=shown), \
+                patch('agent_hub_host.merge_evidence.own_clone', return_value='/private/repo'), \
+                patch('agent_hub_host.merge_evidence.fetch_origin'), \
+                patch('agent_hub_host.merge_evidence.collect', return_value={'commits': []}) as collect:
+            cli.main()
+
+        collect.assert_called_once_with('/private/repo', [new_sha], fetch=False,
+                                        include_head=False, preferred_deploy_sha=new_sha)
+        self.assertNotIn('head', json.loads(output.getvalue())['evidence'])
+
+    def test_private_clone_after_checkpoint_keeps_persisted_head(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        current_sha = 'b2' * 20
+        shown = {'task': {
+            'id': 'fixture-task',
+            'payload_data': {'history': [
+                {'id': old_id, 'kind': 'report', 'reference': 'a1' * 20, 'captured_at': 100},
+                {'id': new_id, 'kind': 'report', 'reference': current_sha, 'captured_at': 301,
+                 'supersedes': [old_id]},
+            ]},
+            'merge_state': {'head': current_sha, 'commits': [{'sha': current_sha}],
+                            'activity_at': 500, 'evidence_at': 400},
+        }}
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'merge-check', 'fixture-task', '--dry-run']), \
+                patch('sys.stdout', output), \
+                patch.object(intake, 'request', return_value=shown), \
+                patch('agent_hub_host.merge_evidence.own_clone', return_value='/private/repo'), \
+                patch('agent_hub_host.merge_evidence.fetch_origin'), \
+                patch('agent_hub_host.merge_evidence.collect', return_value={'commits': []}) as collect:
+            cli.main()
+
+        collect.assert_called_once_with('/private/repo', [current_sha, current_sha], fetch=False,
+                                        include_head=False, preferred_deploy_sha=current_sha)
+        self.assertNotIn('head', json.loads(output.getvalue())['evidence'])
