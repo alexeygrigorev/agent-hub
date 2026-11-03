@@ -17,13 +17,14 @@ BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the ru
 SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bots-management-ops}"   # read-only clone of alexeygrigorev/bots-management (bot-skills is archived)
 SKILLS_REMOTE="${SKILLS_REMOTE:-alexeygrigorev/bots-management}"
 SKILLS_DIR="${SKILLS_DIR:-$SKILLS_REPO/.agents/skills}"   # skills live under .agents/skills
-if [ "$ROLE" = orchestrator ]; then ENGINE="${ORCH_ENGINE:-opus}"; LOOP_DEFAULT=15m; else ENGINE="${ORCH_ENGINE:-sonnet}"; LOOP_DEFAULT=1h; fi
+ENGINE=sonnet
+LOOP_DEFAULT=1h
 LOOP_INTERVAL="${LOOP_INTERVAL:-$LOOP_DEFAULT}"
 TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
 BRIEF="$HOME/tmp/briefs/orchestrator-main.md"
 MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
 PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produce a fresh tick within 10 min
-FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-sonnet}"        # second recovery path: new session, other engine
+FALLBACK_ENGINE=sonnet                                     # fixed cost configuration for recovery sessions
 STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "$STATE"
 log() { echo "[$(date -u +%FT%TZ)] $ROLE: $*"; }
 # fd 9 holds the per-role lock (role_lock). No child may inherit it: a detached aplexer worker,

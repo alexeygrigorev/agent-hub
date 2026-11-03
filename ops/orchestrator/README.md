@@ -1,6 +1,6 @@
 # orchestrator-main and oncall-engineer: runbook
 
-Two interactive Claude Code sessions (engine `sonnet`) on Hetzner replace Grok Bot's recurring routines. Contract: Hub intake `67847fde-a00a-4689-8460-fbad45599f99` (AC1-AC14).
+Two interactive Claude Code sessions (engine `sonnet`) on Hetzner replace Grok Bot's recurring routines. Contract: Hub intake `67847fde-a00a-4689-8460-fbad45599f99` (AC1-AC15).
 
 | | orchestrator-main | oncall-engineer |
 |---|---|---|
@@ -40,7 +40,7 @@ Source: clone of `alexeygrigorev/bot-skills` at `~/git/bot-skills-ops` (note: `~
 For the orchestrator a live process is not enough. `check`:
 - restarts when the session is dead, or when it is alive but `~/tmp/agent-reports/orchestrator-ticks.jsonl` has not changed for 30 min (`MAX_TICK_AGE`). Every OK run arms a 1s-accurate transient deadline timer for the moment the newest tick turns 30 min old. That timer runs this role's check directly under a per-role lock, so detection waits neither for the 10-min timer nor for the oncall check;
 - proves every restart: the new session must append a tick within 10 min of the recorded start (`PROOF_WINDOW`). A transient timer re-runs the watchdog right after the deadline. Inside the window it neither restarts again nor reports OK. Proof reads the tick history: only a tick inside the window counts, and a late first tick starts path 2;
-- if the proof fails, it starts recovery path 2: a new session on `ORCH_FALLBACK_ENGINE` (default `sonnet`) with a fresh handoff, again with a 10-min proof. Paths then alternate;
+- if the proof fails, it starts recovery path 2: a new Sonnet session with a fresh handoff, again with a 10-min proof. Paths then alternate;
 - counts consecutive failed recoveries (failed restart or failed proof). Only at 2 does it alert: `NEEDS_ALEXEY.md`, the oncall inbox, and Hub (below). A proven recovery resets the count;
 - reports each run to Hub: `hub ops heartbeat --kind watchdog --state <ok|recovering|proof_pending|proof_failed|...> --recovery-failures N --tick-at <tick log time>`. A failed report never changes the local decision.
 
@@ -63,7 +63,7 @@ oncall-send "text"                                                            # 
 `*-send` first appends `inbox/<UTC ts>-<pid>.md` (atomic, fsynced, never lost), then types a one-line `[INBOX id] …` into the pane via `a send --enter`, and prints `INBOX=saved <path>` plus `DELIVERY=delivered|not-delivered`. Exit 0 delivered, 2 saved only (the session drains the inbox each loop and after the restart), 1 not saved. The session moves handled files to `inbox/processed/`. Set `SENDER=alexey` to label the source.
 
 ## Mail access (alert triage)
-This host cannot read `dev@dtcdev.click` or any alert mailbox: only `msmtp` (send-only) is installed; there is no IMAP client, Maildir, mbsync/fetchmail config, and no Gmail API reader. Missing: a read-only mailbox path (IMAP read credentials or Gmail API read scope for dev@dtcdev.click / the alert label) provisioned for a non-secret-printing fetcher by Alexey. Until then alerts arrive via `oncall-send` (Grok Bot forwards dev@ mail) and, later, the Hub webhook->session routing intake. Credential files were deliberately not read.
+This host cannot read `dev@dtcdev.click` or any alert mailbox: only `msmtp` (send-only) is installed; there is no IMAP client, Maildir, mbsync/fetchmail config, and no Gmail API reader. Missing: a read-only mailbox path (IMAP read credentials or Gmail API read scope for dev@dtcdev.click / the alert label) provisioned for a non-secret-printing fetcher by Alexey. The Hub `dev-mailbox` webhook is enabled for `oncall-engineer`; until delivery from the live mailbox source is verified alongside Grok's existing wake, alerts still arrive via `oncall-send` (Grok Bot forwards dev@ mail). Credential files were deliberately not read.
 
 ## Moving to another host
 Pick a host with the Hub-validated resource floors, `a`, `claude`, `hub`, `gh` logged in and the repo clone `~/git/agent-hub`. Run `ops/install.sh`, copy `~/tmp/agent-reports/{orchestrator,oncall}` (handoff + inbox), stop the old sessions (`session-ctl.sh <role> status`, `a kill <id>`; ask Alexey first), run `start.sh` on the new host, point Grok Bot's `orch-send`/`oncall-send` at the new host (ssh wrapper). Disable the timer on the old host: `systemctl --user disable --now ops-watchdog.timer`.
@@ -77,7 +77,7 @@ Also a bot-skills skill: `grok-limits-playbook`.
 
 > **/loop is a STOPGAP (AC15).** The ops sessions must be engine-agnostic; `/loop` exists only in Claude Code. Hub scheduled prompts (`hub schedules create --session <label> --cron "0 * * * *" --prompt-file <f>`, intake 19ec91c2 AC8, built in a separate session) replace it. Switch when that lands: (1) create one schedule per session (`orchestrator-main`, `oncall-engineer`) whose prompt file is the existing `hourly-check.md`; (2) verify one scheduled prompt arrives and `latest.md` updates; (3) set `LOOP_INTERVAL=off` in the watchdog unit environment (`session-ctl.sh` then skips the `/loop` send) and cancel the in-session loop (`/loop` cancel or restart the session); (4) the watchdog stays, restarts re-attach to the same schedule by session label. The briefs and `hourly-check.md` are already scheduler-neutral, and the engine (`ORCH_ENGINE`) can then be any engine.
 1. **Signs**: Grok usage near the weekly budget (65% at mid-week on 2026-10-27), or Grok routines failing/refusing for quota.
-2. **Cut order** (cheapest to lose first): hourly Hub report -> pending research follow-ups -> Codex quota check -> open-intake drain -> dev mailbox wake (last, until the Hub webhook exists). Grok keeps only: forwarding Alexey's messages and alerts, relaying `NEEDS_ALEXEY.md`.
+2. **Cut order** (cheapest to lose first): hourly Hub report -> pending research follow-ups -> Codex quota check -> open-intake drain -> dev mailbox wake (last, until the Hub webhook has verified live-source delivery). Grok keeps only: forwarding Alexey's messages and alerts, relaying `NEEDS_ALEXEY.md`.
 3. **Scheduler note**: Hub schedules (`hub schedules list`, engine-agnostic, durable queue) drive both sessions; `/loop` is retired once `LOOP_INTERVAL=off` is set (see above).
 3. **Where each goes**: drain, Codex quota, Hub report, research follow-ups -> orchestrator-main. Alert/outage triage (dev@ mail, Coolify, Contabo-deadman, CloudWatch, CI) -> oncall-engineer.
 4. **Talk to them directly**: attach commands above; `orch-send` / `oncall-send` from a shell on Hetzner; Hub UI (hub.dtcdev.click) sessions list -> open the session.
@@ -88,4 +88,4 @@ Also a bot-skills skill: `grok-limits-playbook`.
 The Hub now exposes authenticated webhook endpoints that deliver payloads into a target session (intake `19ec91c2`): routes, delivery status and audit live at hub.dtcdev.click `/webhooks.html`, CLI `hub webhooks create|list|delete|test`. The dev@ mailbox route targets **oncall-engineer** (not orchestrator-main); see [docs/WEBHOOKS.md](../docs/WEBHOOKS.md) for auth (token/HMAC), rate limits, size caps and the test command. Dapier's live webhook is only repointed once the old Grok Bot wake keeps working (dual-deliver); deleting the old webhook needs Alexey.
 
 ## Rules
-Standing rules live in each CLAUDE.md (AC6). Cost: both sessions run engine `sonnet` (`ORCH_ENGINE` overrides, don't).
+Standing rules live in each CLAUDE.md (AC6). Cost: both sessions and recovery sessions always run engine `sonnet`; the launcher does not accept model overrides.
