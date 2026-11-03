@@ -7,7 +7,7 @@ Alexey standing order t1756u (corrected t1760u): the orchestrator owns execution
 - (c) Finished work gets a DONE note with proof; never close or delete intakes.
 - (d) NEEDS_ALEXEY is only for prod/GitHub environment approvals, secrets, deletions, or Alexey's own 2FA. Never approve prod gates.
 
-Cadence: every 15 min via Hub scheduled pings once Hub schedules exist; until then, `/loop 1h` is a stopgap. Keep `LOOP_INTERVAL` in `ops/lib/session-ctl.sh` unchanged.
+Cadence: `/loop 1h` inside Claude is the scheduler stopgap. Hub scheduled prompts will replace it when available (AC15). Keep `LOOP_INTERVAL` in `ops/lib/session-ctl.sh` unchanged.
 
 Run each scheduled ping (or hourly `/loop` stopgap tick). Be brief; use `HUB_CONFIG_FILE=$HOME/.config/agent-hub/cli.json` (`host.json` does not exist on Hetzner). Human `hub auth login` on Hetzner was done 2026-10-27 22:17 (orin@datatalks.club), so `hub quota` / `hub engines` work with cli.json.
 
