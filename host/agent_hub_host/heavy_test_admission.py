@@ -21,9 +21,13 @@ from datetime import datetime, timezone
 # final tickets, so main is never blocked behind worker test lanes. Only an
 # explicit --priority release / AGENT_HUB_HEAVY_TEST_PRIORITY=release takes
 # the release class; aging promotes a normal ticket to the final class only,
-# never to release. Older readers (before release existed) coerce an unknown
-# priority to 'normal' with a warning instead of failing the queue (see
-# Queue.load), so a release row degrades to normal instead of poisoning them.
+# never to release. Readers at or after 0a353095 coerce an unknown priority
+# to 'normal' with a warning instead of failing the queue (see Queue.load).
+# Readers before 0a353095 (including the d8740aac era) refuse that single
+# admission with a caught ValueError (exit 3, shared state untouched); the
+# foreign row disappears when its ticket is admitted (release admits first
+# at rank 0), so the effect is transient and self-clearing, never pool
+# poisoning. No worktree edit is needed on either side for this.
 PRIORITIES = ('normal', 'final', 'release')
 NORMAL_AGE_S = 1500
 try:  # test hook / host tuning; invalid values keep the default
@@ -33,14 +37,17 @@ try:  # test hook / host tuning; invalid values keep the default
 except Exception:
     pass
 # Slot sizing (intake 1293b560 AC2, supersedes the 167c6178 follow-up note).
-# The slot count is ONE host-level setting: the integer in the live
-# <heavy-test-dir>/slots file, re-read by every admission. An explicit
-# --slots flag still wins (operator/tests); AGENT_HUB_HEAVY_TEST_SLOTS is
-# only a fallback for private pools and tests when the file is absent, never
-# a per-process override of the live host setting. Old worktrees already read
-# the same file when the env var is unset, so unsetting the env (see
-# docs/HETZNER-OVERLOAD-0689CE9C.md and AGENTS.md) keeps old and new
-# checkouts on the same count with no code change on their side.
+# For readers at or after 9f5ea5f2 the slot count is ONE host-level setting:
+# the integer in the live <heavy-test-dir>/slots file, re-read by every
+# admission. An explicit --slots flag still wins (operator/tests);
+# AGENT_HUB_HEAVY_TEST_SLOTS is only a fallback for private pools and tests
+# when the file is absent, never a per-process override of the live host
+# setting. Readers before 9f5ea5f2 (including the d8740aac era) do not read
+# the file: with the env var unset they use their compiled default (2), so
+# until they rebase they contend for fewer shared slots than newer checkouts
+# (measured 2026-11-03 on RMTHZ: live file 4, zero processes export the env).
+# Never export the env per-process (see docs/HETZNER-OVERLOAD-0689CE9C.md
+# and AGENTS.md); the live file keeps current checkouts on one count.
 #
 # Sizing formula (measured 2026-11-02, RMTHZ: 12 cores, 62 GiB):
 #   load_budget = 1.5 * cores            (host 5-min load budget for tests)
