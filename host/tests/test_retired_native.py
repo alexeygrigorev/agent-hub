@@ -376,9 +376,9 @@ class TestStopAndCleanupEndToEnd(unittest.TestCase):
         if history_content is not None:
             (tdir / "history.bin").write_bytes(history_content)
 
-    @patch("agent_hub_host.native_sessions.list_sessions")
-    def test_stop_session_on_already_retired_is_no_kill(self, mock_list):
-        mock_list.return_value = []
+    @patch("agent_hub_host.native_sessions._targeted_status")
+    def test_stop_session_on_already_retired_is_no_kill(self, mock_status):
+        mock_status.return_value = None
         self._setup_retired_session(self.target)
 
         with patch.dict(os.environ, {"APLEXER_STATE_DIR": str(self.state_dir)}), \
@@ -388,9 +388,9 @@ class TestStopAndCleanupEndToEnd(unittest.TestCase):
         self.assertEqual(res.state, "stopped")
         self.assertIn("already confirmed retired: finished tombstone at 1792266525291", res.reason)
 
-    @patch("agent_hub_host.native_sessions.list_sessions")
-    def test_stop_session_tombstone_subdir_of_target_workspace_stops(self, mock_list):
-        mock_list.return_value = []
+    @patch("agent_hub_host.native_sessions._targeted_status")
+    def test_stop_session_tombstone_subdir_of_target_workspace_stops(self, mock_status):
+        mock_status.return_value = None
         sub = self.ws / "docs"
         sub.mkdir()
         self._setup_retired_session(make_target(str(sub), session_id=self.target.session_id,
@@ -403,9 +403,9 @@ class TestStopAndCleanupEndToEnd(unittest.TestCase):
 
     @patch("agent_hub_host.native_sessions._confirm_workload_exit", return_value=(True, "verified empty"))
     @patch("agent_hub_host.native_sessions.run_native")
-    @patch("agent_hub_host.native_sessions.list_sessions")
+    @patch("agent_hub_host.native_sessions._targeted_status")
     def test_stop_session_live_native_in_subdirectory_uses_observed_workspace(
-        self, mock_list, mock_run, _mock_confirm
+        self, mock_status, mock_run, _mock_confirm
     ):
         from dataclasses import replace
         sub = self.ws / "docs"
@@ -415,7 +415,7 @@ class TestStopAndCleanupEndToEnd(unittest.TestCase):
             phase="running", created_at_ms=self.target.created_at_ms,
         )
         after = replace(before, phase="exited", containment_empty=True)
-        mock_list.side_effect = [[before], [after]]
+        mock_status.side_effect = [before, after]
         mock_run.return_value = SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
         res = stop_session("aplexer", self.target)
@@ -424,22 +424,30 @@ class TestStopAndCleanupEndToEnd(unittest.TestCase):
         argv = mock_run.call_args.args[1]
         self.assertEqual(argv[argv.index("--workspace") + 1], str(sub))
 
-    @patch("agent_hub_host.native_sessions.list_sessions")
-    def test_stop_session_live_native_outside_bound_workspace_still_refuses(self, mock_list):
+    def test_stop_session_live_native_outside_bound_workspace_still_refuses(self):
+        import json as _json
+        import subprocess as _subprocess
         outside = self.tmp / "elsewhere"
         outside.mkdir()
-        row = NativeSession(
-            self.target.session_id, self.target.tag, str(outside), engine=self.target.engine,
-            phase="running", created_at_ms=self.target.created_at_ms,
-        )
-        mock_list.return_value = [row]
-        with patch("agent_hub_host.retired_native.list_sessions", return_value=[]):
+        status = {"id": self.target.session_id, "tag": self.target.tag,
+                  "workspace": str(outside), "engine": self.target.engine,
+                  "phase": "running", "created_at_ms": self.target.created_at_ms}
+        calls = []
+
+        def _fake_run(_executable, argv, **kwargs):
+            calls.append(list(argv))
+            return _subprocess.CompletedProcess(argv, 0, _json.dumps(status), "")
+
+        with patch("agent_hub_host.native_sessions.run_native", side_effect=_fake_run), \
+                patch("agent_hub_host.retired_native.list_sessions", return_value=[]):
             with self.assertRaises(SessionControlError):
                 stop_session("aplexer", self.target)
+        for argv in calls:
+            self.assertNotIn("kill", argv)
 
-    @patch("agent_hub_host.native_sessions.list_sessions")
-    def test_stop_session_unrelated_workspace_or_tag_still_refused(self, mock_list):
-        mock_list.return_value = []
+    @patch("agent_hub_host.native_sessions._targeted_status")
+    def test_stop_session_unrelated_workspace_or_tag_still_refused(self, mock_status):
+        mock_status.return_value = None
         other = self.tmp / "elsewhere"
         other.mkdir()
         self._setup_retired_session(make_target(str(other), session_id=self.target.session_id,

@@ -212,6 +212,11 @@ describe('bounded real Fleet autonomous capacity snapshot',()=>{
     }
   }));
   it('atomically upgrades the legacy runtime index while preserving its lookup identity and bounded reads',()=>fixture((s,sql,queries)=>{
+    // Isolate this index-upgrade test from the per-host live-session cap:
+    // the 400 running scale rows below are query-plan scaffolding, not a
+    // real 400-session host. The cap itself is covered in cpu-headroom tests.
+    // (The setting validates to [1,512]; the 400 scale rows fit under 500.)
+    s.resources.configure({host_max_sessions:500});
     sql.exec('DROP INDEX fleet_launch_runtime_exit');
     sql.exec("CREATE INDEX fleet_launch_runtime_exit ON fleet_launches(machine_id,updated_at) WHERE exit_reason IN ('engine_runtime_timeout','engine_signal_exit')");
     sql.exec("CREATE INDEX IF NOT EXISTS fleet_queue_runtime_exit ON fleet_launches(machine_id,updated_at DESC) WHERE state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')");

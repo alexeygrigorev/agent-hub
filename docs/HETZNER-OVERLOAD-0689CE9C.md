@@ -57,8 +57,11 @@ attempt as not started and durably retains the refusing host and its factor on
 the retry hold. Hub re-evaluates that retry live from the host's heartbeat:
 load above `cpu_load_factor` (default 2) x cores, measured CPU busy >= 98% over
 10 seconds, CPU-full PSI above its configured limit, MemAvailable below the
-host floor, or swap use above its configured limit (default 80%). The same
-signals gate fresh placement through `src/cpu-headroom.ts`; a refused route
+host floor, or swap use above its configured limit (default 80%). Hub
+placement holds fresh launches on swap pressure and on the per-host
+live-session cap through `src/cpu-headroom.ts` (load average itself stays
+advisory-only at placement per 6aadd6c9 CPU-headroom policy; the host-side
+2x-core load gate plus refusal propagation is the load enforcement); a refused route
 includes the measured trigger in placement diagnostics. Unreadable inputs fail
 open. The optional local `host_load_factor` setting (0.5-8, default 2) can
 override the Hub load factor; it is a valid `subscriptions.json` key (it was

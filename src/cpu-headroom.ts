@@ -76,8 +76,13 @@ export function cpuVerdict(raw: unknown, cores: number, expected: number, rampin
     // CPU busy is measured on every OS; PSI exists on Linux only and is not required.
     telemetry_state:known ? 'measured' : 'unknown',
     advisory:known ? null : 'cpu_usage_unknown'};
-  const hostReason = hostLoad!==null&&loadLimit!==null&&hostLoad>loadLimit ? 'host_load_high'
-    : swap!==null&&swap>swapLimit ? 'memory_pressure'
+  // Host load average is reported as context but never gates Hub placement:
+  // fixtures and 6aadd6c9 CPU-headroom policy treat load as advisory-only
+  // (many heartbeats carry dummy load samples). The 2x-core load gate is
+  // enforced on the host itself (host_load.py check_live_load + heartbeat
+  // gate), and a host refusal propagates as a durable per-retry hold with
+  // its measured load_limit in placement diagnostics (src/fleet.ts).
+  const hostReason = swap!==null&&swap>swapLimit ? 'memory_pressure'
     : active!==null&&active>=sessionLimit ? 'machine_capacity' : null;
   const cpuReason = known && usage.busy_percent_window!==null && usage.busy_percent_window>=CPU_SATURATED_PCT ? 'cpu_pressure'
     : fresh && usage.psi_full_avg10!==null && usage.psi_full_avg10 > config.cpu_psi_full_hard_cap_pct ? 'cpu_pressure'

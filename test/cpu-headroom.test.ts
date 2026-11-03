@@ -28,15 +28,16 @@ describe('heavy utilization without choking',()=>{
   expect(cpuVerdict(usage(1,{memory_psi_full_avg10:20}),12,2,0,cfg,now,32000).reason).toBe('memory_pressure');
   expect(cpuVerdict(usage(1,{host_oom_kills_delta:1}),12,2,0,cfg,now)).toMatchObject({reason:'host_oom',host_oom_kills_delta:1});
  });
- it('holds on fresh host load above N cores and reports the configured limit',()=>{
-  const host={load1:24.1,swap_used_percent:0,observed_at:new Date(now).toISOString(),active_sessions:2};
-  // Host admission state is the 10th argument now that the memory gate
-  // (memAvailableMb, memoryFloorMb, memObservedAt) owns positions 7-9.
+ it('reports fresh host load as context without gating Hub placement',()=>{
+  // Load average never gates Hub placement (host-side 2x-core gate in
+  // host_load.py enforces it; a host refusal propagates as a durable
+  // per-retry hold). The measurement stays visible in the verdict.
+  const host={load1:100,swap_used_percent:0,observed_at:new Date(now).toISOString(),active_sessions:2};
   expect(cpuVerdict(usage(),12,1,0,{...cfg,cpu_load_factor:2},now,undefined,undefined,undefined,host)).toMatchObject({
-   admitted:false,reason:'host_load_high',host_load1:24.1,host_load_limit:24,
+   admitted:true,reason:null,host_load1:100,host_load_limit:24,
   });
   expect(cpuVerdict(usage(),12,1,0,{...cfg,cpu_load_factor:2},now,undefined,undefined,undefined,{...host,load1:24})).toMatchObject({admitted:true,reason:null});
-  expect(cpuVerdict(usage(),12,1,0,{...cfg,cpu_load_factor:2},now,undefined,undefined,undefined,{...host,load1:100,observed_at:new Date(now-180001).toISOString()})).toMatchObject({admitted:true,reason:null});
+  expect(cpuVerdict(usage(),12,1,0,{...cfg,cpu_load_factor:2},now,undefined,undefined,undefined,{...host,load1:100,observed_at:new Date(now-180001).toISOString()})).toMatchObject({admitted:true,reason:null,host_load1:null});
  });
  it('holds on host swap pressure and reserves a bounded concurrent session slot',()=>{
   const host={load1:1,swap_used_percent:80.1,observed_at:new Date(now).toISOString(),active_sessions:0};

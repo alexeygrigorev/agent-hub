@@ -507,6 +507,14 @@ def _targeted_status(executable: str, target: NativeTarget) -> Optional[NativeSe
                 "processes", "containment_empty", "containment_cgroup", "workload_cgroup"):
         if key in detail and key not in raw:
             raw[key] = detail[key]
+    # A usable targeted read must carry the session identity and a phase.
+    # An empty `{}` (or any identity-less shape) is not a successful read:
+    # defaulting the UUID/phase from the request would fabricate the binding
+    # this path exists to prove. Treat it as unavailable (list fallback).
+    if "id" not in raw and "session_id" not in raw:
+        raise SessionUncertain("Targeted native status omitted the session identity; reconcile")
+    if "phase" not in raw and "state" not in raw:
+        raise SessionUncertain("Targeted native status omitted the session phase; reconcile")
     sid = raw.get("id", raw.get("session_id", target.session_id))
     if not isinstance(sid, str) or sid.lower() != target.session_id.lower():
         raise SessionControlError("Targeted native status UUID mismatch; refusing")
@@ -528,6 +536,40 @@ def _targeted_status(executable: str, target: NativeTarget) -> Optional[NativeSe
             raise SessionControlError("Native engine mismatch in targeted status; refusing")
         raw.setdefault("engine", target.engine)
     return project_session(raw)
+
+
+def _read_target(executable: str, target: NativeTarget) -> Optional[NativeSession]:
+    """Read one exact native identity for a stop: targeted status first.
+
+    Natives without a targeted ``status`` subcommand (older builds, minimal
+    fakes) fall back to a qualified catalog scan with the SAME binding rules
+    (exact UUID/tag, nested workspace, generation, engine). Identity refusals
+    (SessionControlError) never fall back: the catalog row they reject is
+    exactly what the fallback would return. Verification strictness is
+    identical on both paths; only the read cost differs.
+    """
+    try:
+        return _targeted_status(executable, target)
+    except SessionControlError:
+        raise
+    except Exception:
+        pass
+    rows = [s for s in _fresh_list(executable)
+            if s.session_id.lower() == target.session_id.lower()
+            and s.tag == target.tag]
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise SessionControlError("Target has multiple matching native catalog rows; refusing")
+    row = rows[0]
+    if not _stop_workspace_matches_nested(row.workspace, target.workspace):
+        raise SessionControlError("Target native status workspace mismatch; refusing")
+    if target.created_at_ms is not None and row.created_at_ms is not None \
+            and row.created_at_ms != target.created_at_ms:
+        raise SessionControlError("Native generation mismatch in catalog status; refusing")
+    if target.engine is not None and row.engine is not None and row.engine != target.engine:
+        raise SessionControlError("Native engine mismatch in catalog status; refusing")
+    return row
 
 
 def list_sessions(
@@ -1495,7 +1537,7 @@ def stop_session(
         raise SessionControlError("Signal must be HUP|TERM")
     if type(grace_ms) is not int or not 0 <= grace_ms <= 30000:
         raise SessionControlError("grace_ms must be 0..30000")
-    before = _targeted_status(executable, target)
+    before = _read_target(executable, target)
     if before is None:
         from .retired_native import verify_native_retirement
         is_retired, tombstone, reason = verify_native_retirement(
@@ -1539,8 +1581,8 @@ def stop_session(
             "Kill reported failure; target exit unproven — reconcile",
             oracle, {**attempt, "killed": False, "result": "kill_failed"})
     try:
-        remaining = _targeted_status(executable, target)
-    except (SessionControlError, SessionUncertain) as exc:
+        remaining = _read_target(executable, target)
+    except (SessionControlError, SessionUncertain, OSError) as exc:
         raise _uncertain_with_oracle(
             "Post-kill targeted status unavailable; reconcile",
             oracle, {**attempt, "killed": True, "result": "status_unavailable"}) from exc

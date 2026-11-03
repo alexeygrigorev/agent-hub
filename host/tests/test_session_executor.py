@@ -144,6 +144,8 @@ def main():
         print(json.dumps({"phase": hit[0]["phase"], "state": hit[0]["phase"],
                           "id": hit[0]["id"], "tag": hit[0]["tag"],
                           "workspace": hit[0]["workspace"],
+                          "engine": hit[0].get("engine"),
+                          "containment_empty": hit[0].get("containment_empty", False),
                           "created_at_ms": hit[0].get("created_at_ms")}))
     elif cmd == "kill":
         ws = opt(args, "--workspace"); tag = opt(args, "--tag")
