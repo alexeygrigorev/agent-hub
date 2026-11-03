@@ -421,7 +421,7 @@ export const WORKTREE_OWNER_CONTENDERS_SQL = `
   WHERE machine_id = ? AND id != ? AND (? IS NULL OR id != ?)
     AND ${contenderExpr('intake_task_id')} = ?
     AND state IN ('queued','held','offered','starting','running','uncertain')
-    AND (COALESCE(${contenderExpr('task_kind')},'') != 'review' OR ${contenderExpr('cwd')} IS NOT NULL)
+    AND (COALESCE(${contenderExpr('task_kind')},'') != 'review' OR COALESCE(${contenderExpr('cwd')},'') != '')
   LIMIT 2
 `;
 const NATIVE_AMOUNTS: Record<string, number> = { credits_remaining: 1e12, spend_used: 1e15, spend_limit: 1e15 };
@@ -2668,6 +2668,8 @@ export class FleetService {
                   ack.native?.tag === 'unbound' && ack.native?.workspace === '/');
           })) return true;
         } catch {}
+        // Intake 36c4cf38: same tuple check as confirmedStopRecorded in
+        // session_control.ts (guards layer); the two verdicts must agree.
         if (binding?.retirement && typeof binding.retirement === 'object' &&
             binding.retirement.native_id === binding.native_id &&
             binding.retirement.tag === binding.tag &&

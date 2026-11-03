@@ -348,7 +348,9 @@ def remove_worktree(path: str, branch: Optional[str] = None, *, live_check: Opti
     _, err = _git(runner, git_bin, ["worktree", "remove", path], main)
     if err:
         if entry.get("locked") and can_unlock_hub and entry.get("reason"):
-            _git(runner, git_bin, ["worktree", "lock", "--reason", str(entry["reason"]), path], main)
+            _, relock_err = _git(runner, git_bin, ["worktree", "lock", "--reason", str(entry["reason"]), path], main)
+            if relock_err:
+                return _result("error", "remove failed and re-lock failed: " + err, status)
         return _result("error", err, status)
     removed = not os.path.lexists(path)
     _, prune_err = _git(runner, git_bin, ["worktree", "prune"], main)

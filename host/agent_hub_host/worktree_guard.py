@@ -299,8 +299,8 @@ def ensure_locked(
                             return False
                         if _read_active_owner(path, reason, intake_id, git_bin, runner) != active:
                             return False
-                    _write_active_owner(path, session_id, intake_id, reason, git_bin, runner)
-                    return True
+                    # Fail closed when the fence record cannot be written.
+                    return _write_active_owner(path, session_id, intake_id, reason, git_bin, runner) is True
                 owner = parse_lock_reason(entry.get("reason"))
                 requested = parse_lock_reason(reason)
                 if not (owner and requested and requested[1] is not None
@@ -737,8 +737,8 @@ def protect_successor_worktree(request, git_bin, path, session_id, intake_id):
             if owner[0] == session_id:
                 if active is not None and active != session_id:
                     return False
-                _write_active_owner(root, session_id, intake_id, entry.get('reason'), git_bin)
-                return True
+                # Fail closed when the fence record cannot be written.
+                return _write_active_owner(root, session_id, intake_id, entry.get('reason'), git_bin) is True
             facts = guard_facts(request, session_id=','.join([owner[0], session_id]), intake_task_id=intake_id)
             matches = [f for f in facts if isinstance(f, dict) and f.get('session_id') == owner[0]]
             if len(matches) != 1:

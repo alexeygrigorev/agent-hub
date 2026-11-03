@@ -280,6 +280,25 @@ class RemoveTests(GitSandbox):
         self.assertTrue(removed["branch_deleted"])
         self.assertFalse(os.path.exists(locked))
 
+    def test_hub_lock_relock_failure_after_failed_remove_is_error(self):
+        task_id = "9d878e85-f022-4095-8726-25bf7e92da9b"
+        session_id = "795dd70f-6b42-489c-9bc2-168df4384ad1"
+        hub_reason = f"hub-session {session_id} intake {task_id}"
+        locked = self.add_worktree("repo-wt-hub-relock")
+        _git(self.repo, "worktree", "lock", "--reason", hub_reason, locked)
+
+        def runner(argv, cwd, timeout=iw.GIT_TIMEOUT):
+            if argv[1:3] == ["worktree", "remove"]:
+                raise RuntimeError("injected remove failure")
+            if argv[1:3] == ["worktree", "lock"]:
+                raise RuntimeError("injected re-lock failure")
+            return iw.default_runner(argv, cwd, timeout)
+
+        failed = self.remove(locked, "repo-wt-hub-relock", task_id=task_id,
+                             unlock_hub_lock=True, runner=runner)
+        self.assertEqual(failed["outcome"], "error", failed)
+        self.assertIn("re-lock failed", failed["reason"])
+
     def test_merge_unknown_refused(self):
         path = self.add_worktree("repo-wt-offline")
         _git(self.repo, "remote", "set-url", "origin", os.path.join(self.home, "missing.git"))

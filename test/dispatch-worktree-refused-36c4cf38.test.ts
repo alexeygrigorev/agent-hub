@@ -189,6 +189,18 @@ describe('worktree-owner terminal attestation and exclusive successor ownership 
     });
     expect((await read(s2.sessionId)).terminal).toBe(true);
 
+    // M1 (review): the guards layer must agree with worktree-owner for the
+    // retired imported session — terminal AND native_terminal with the bound
+    // tag — or host fallback paths would refuse what the primary admits.
+    const guardsS2 = await hostSessionControl(c, '/api/sessions/worktree-guards?session_id=' + s2.sessionId);
+    expect(guardsS2.status).toBe(200);
+    expect(guardsS2.body.sessions.find((s: any) => s.session_id === s2.sessionId)).toMatchObject({
+      session_id: s2.sessionId,
+      terminal: true,
+      native_terminal: true,
+      tag: 'manual-worker',
+    });
+
     // 4. Unbound uncertain session stopped via POST /api/sessions/:id/stop (launch_state='exited', native_id=NULL) -> terminal=true.
     const s3 = seedLaunch(c, { intake_task_id: intakeId }, {
       state: 'stopped', launchState: 'exited', binding: null,
@@ -244,9 +256,9 @@ describe('worktree-owner terminal attestation and exclusive successor ownership 
     expect((await read(succD.sessionId)).terminal).toBe(false);
     expect((await read(reviewExplicitCwd.sessionId)).terminal).toBe(false);
 
-    // Clean up reviewReadOnly reference check: stopping C admits D even while read-only review runs.
+    // Stopping C admits D even while the read-only review session runs: it
+    // never held the worktree lock, so it cannot fence the release.
     c.hub.sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", reviewExplicitCwd.sessionId);
-    expect(reviewReadOnly.sessionId).toBeTruthy();
     expect((await read(succD.sessionId)).terminal).toBe(true);
   }));
 });

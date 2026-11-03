@@ -4816,6 +4816,16 @@ export class SessionControlService {
             ack.native?.native_id === '00000000-0000-0000-0000-000000000000' &&
             ack.native?.tag === 'unbound' && ack.native?.workspace === '/');
     })) return true;
+    // Intake 36c4cf38: a host-recorded retirement marker is exit proof for
+    // the exact bound incarnation (same tuple check as the fleet
+    // worktree-owner endpoint): the retirement endpoint validated the full
+    // native triple, created_at_ms, engine, generation, cause and timestamps
+    // before persisting it, and the native row may already be pruned.
+    if (binding?.retirement && typeof binding.retirement === 'object' &&
+        binding.retirement.native_id === binding.native_id &&
+        binding.retirement.tag === binding.tag &&
+        binding.retirement.workspace === binding.workspace &&
+        binding.retirement.created_at_ms === binding.native_created_at_ms) return true;
     if (!binding || !session.fleet_launch_id) return false;
     const launch: any = this.sql.exec('SELECT state, verification_status, native_id FROM fleet_launches WHERE id=? AND machine_id=?', session.fleet_launch_id, session.machine_id).toArray()[0];
     return launch?.state === 'exited' && launch.verification_status === 'verified' && launch.native_id === binding.native_id;
