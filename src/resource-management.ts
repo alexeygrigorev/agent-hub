@@ -1,5 +1,7 @@
-import { worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
+import { worktreeIntakeProtected, worktreeIntakeSnapshot, type WorktreeSnapshotScope } from './worktree-intakes';
 import { openWorkPreventsIdleReap, type IdleReapCache } from './intake-session';
+import { WriteWatch, StampCache } from './write-watch';
+import { ObservedCatalog } from './observed-catalog';
 /** Live host admission and durable per-session usage; token usage joins by native identity. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import defaults from '../config/resource-management.json';
@@ -101,20 +103,42 @@ export function memoryVerdict(available: number, ramp: number, estimate: number,
 // re-parsing whole retained prompts per session. Invalid JSON passes through
 // unchanged and still parses as an empty request.
 const SLIM_REQUEST = `CASE WHEN json_valid(request_json) THEN json_object('intake_task_id', json_extract(request_json, '$.intake_task_id')) ELSE request_json END`;
-// Matches the session_control_native index expression (src/hub.ts).
-const NATIVE_KEY = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
-  THEN json_extract(binding_json, '$.native_id') END END`;
+// Matches session_control_native_binding exactly (src/session_control.ts).
+// The caller binds only native-id strings, so non-text JSON values cannot
+// match and need no per-row json_type guard in the indexed expression.
+const NATIVE_KEY = `json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END, '$.native_id')`;
 export class ResourceManagement {
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
-  private catalogRawRows=new Map<string,any[]>();
-  private catalogRawBytes=0;
+  private catalogRawRows=new Map<string,{rev:string|null;value:any[]}>();
   private catalogIntakes: ReturnType<typeof worktreeIntakeSnapshot> | null = null;
   private catalogCache = new Map<string, {revision:string;rows:ReturnType<ResourceManagement['buildCanonicalSessions']>;bytes:number}>();
+  /** Write-through freshness: exact stamps replace the per-call revision
+   * probe on hot paths; the trigger-maintained revision row stays as the
+   * fallback for callers constructed without a watch (isolated tests). */
+  private writes: WriteWatch | null;
+  private canonicalByMachine: StampCache<string, ReturnType<ResourceManagement['buildCanonicalSessions']>> | null = null;
+  /** Per-machine scoped intake snapshots; the unscoped snapshot read the
+   * whole projection table per rebuild. */
+  private intakeSnapshots: StampCache<string, ReturnType<typeof worktreeIntakeSnapshot>> | null = null;
+  /** Per-machine watchdog response (canonical + idle authority verdicts). */
+  private watchdogSessions: StampCache<string, ReturnType<ResourceManagement['sessionsUncached']>> | null = null;
+  private observed: ObservedCatalog | null;
+  constructor(private sql: SqlStorage, private now: () => number = Date.now, writes?: WriteWatch, observed?: ObservedCatalog) {
+    this.writes = writes ?? null;
+    this.observed = observed ?? null;
+    if (this.writes) {
+      this.canonicalByMachine = new StampCache(this.writes, key => this.canonicalStampTables(key === '' ? undefined : key));
+      this.intakeSnapshots = new StampCache(this.writes, key => this.intakeStampTables(), 16);
+      this.watchdogSessions = new StampCache(this.writes, key => [...this.canonicalStampTables(key), 'resource_settings', 'host_health_observations', 'session_idle_episodes', 'session_control_sessions']);
+      this.writes.trackAll(['session_control_sessions','fleet_launches','machines','intake_tasks','intake_task_projection','resource_request_projection','session_control_protections','resource_reaps','resource_settings','host_health_observations','session_idle_episodes']);
+    }
+  }
   /** Install after all canonical source schemas exist. SQLite triggers keep
    * protection/identity changes and their cache generations in one transaction. */
   initCatalogCache() {
-    this.catalogReady=false; this.catalogCache.clear(); this.catalogRawRows.clear(); this.catalogRawBytes=0; this.catalogStructureRevision=null; this.catalogIntakes=null;
+    this.catalogReady=false; this.catalogCache.clear(); this.catalogRawRows.clear(); this.catalogStructureRevision=null; this.catalogIntakes=null;
+    this.canonicalByMachine?.invalidate(); this.intakeSnapshots?.invalidate();
     // Every table read by worktreeIntakeSnapshot must bump structure_revision.
     // Its cached closure/DONE verdicts must never survive an authority write.
     const tables=['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','machines'];
@@ -136,7 +160,47 @@ export class ResourceManagement {
     }
     this.catalogReady=true;
   }
+  /** Canonical result depends on control/launch identity, intake linkage and
+   * protection/reap authority, plus observed METADATA (a census that changes
+   * tag/phase/engine bumps `fleet_sessions_meta` via noteCensus/notePhase).
+   * fleet_sessions activity itself overlays per read from the write-through
+   * catalog and must not invalidate anything. */
+  private canonicalStampTables(machine?: string): string[] {
+    void machine;
+    return ['session_control_sessions','fleet_launches','machines','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','fleet_sessions_meta'];
+  }
+  private intakeStampTables(): string[] {
+    return ['machines','session_control_sessions','fleet_launches','intake_tasks','intake_task_projection','resource_request_projection'];
+  }
+  /** Census PUT: patch the write-through catalog with the rows just written.
+   * metadataChanged marks rows whose identity fields (tag/engine/phase/...)
+   * changed, not only activity/progress refreshes. */
+  noteCensus(machine: string, rows: any[], metadataChanged: boolean): void {
+    this.observed?.note(machine, rows);
+    if (metadataChanged) this.writes?.bump('fleet_sessions_meta');
+  }
+  /** Watchdog/census phase flips (exited, unobserved). */
+  notePhase(machine: string, nativeId: string, phase: string, observedAt: string): void {
+    this.observed?.notePhase(machine, nativeId, phase, observedAt);
+    this.writes?.bump('fleet_sessions_meta');
+  }
+  /** Intake-linkage snapshot restricted to what this catalog rebuild can
+   * reference: the machine's bound sessions, their native aliases on every
+   * hostname sibling, and the projections linked to them. Unscoped (global
+   * overview) builds keep the full snapshot. */
+  private scopedIntakeSnapshot(
+    machine: string | undefined,
+    controlData: Map<string, {binding: any; req: any; launch: any; model: any}>,
+    launchData: Map<string, {req: any; model: any}>,
+  ): ReturnType<typeof worktreeIntakeSnapshot> {
+    if (!machine) return worktreeIntakeSnapshot(this.sql);
+    const sessionIds = [...controlData.keys()];
+    const nativeIds = [...new Set([...controlData.values()].map(d => d.binding.native_id).filter(v => typeof v === 'string' && v))];
+    const scope: WorktreeSnapshotScope = { sessionIds, nativeIds };
+    return worktreeIntakeSnapshot(this.sql, scope);
+  }
   private historyRevision: string | null = null;
+  private historyStamp: string | null = null;
   private memoryHistory = new Map<string | null, any[]>();
   private cpuHistory: any[] | null = null;
   private memoryEstimates = new Map<string, number>();
@@ -145,7 +209,6 @@ export class ResourceManagement {
   private readSnapshot: Map<string, any[]> | null = null;
   private snapshotNow: number | null = null;
   private cpuPendingSnapshot: Map<string, {id:string;remaining:number}[]> | null = null;
-  constructor(private sql: SqlStorage, private now: () => number = Date.now) {}
   init() {
     for (const statement of RESOURCE_SCHEMA.split(';')) if (statement.trim()) this.sql.exec(statement);
     for (const table of ['session_resource_usage', 'session_cpu_usage', 'resource_settings']) {
@@ -160,6 +223,18 @@ export class ResourceManagement {
   }
   private refreshHistory() {
     if (this.historyScope) return;
+    if (this.writes) {
+      // The shared DO write watch is the authoritative in-memory generation
+      // for the estimate inputs. Avoid the former revision-row SELECT on
+      // every admission/resource report; the trigger revision stays as the
+      // fallback for isolated constructors without WriteWatch.
+      const stamp = this.writes.stamp('session_resource_usage','session_cpu_usage','session_rss_median','resource_settings');
+      if (stamp === this.historyStamp) return;
+      this.historyStamp = stamp;
+      this.memoryHistory.clear(); this.cpuHistory = null;
+      this.memoryEstimates.clear(); this.cpuEstimates.clear();
+      return;
+    }
     // Random generations avoid reusing a cached revision after a transaction
     // rolls back and another writer subsequently advances the same counter.
     const revision = String(this.readRows('SELECT revision FROM resource_history_revision WHERE id=1')[0].revision);
@@ -196,6 +271,16 @@ export class ResourceManagement {
     return { ...config, memory_floor_mb: effectiveFloorMb(config, parse(m?.last_heartbeat).mem_total_mb) };
   }
   config(): ResourceConfig { return resourceConfig(parse(this.readRows('SELECT data FROM resource_settings WHERE id=1')[0]?.data)); }
+  /** Host-poll path for the resource config: stamp-checked, zero rows between writes. */
+  private cachedConfigValue: { stamp: string; value: ResourceConfig } | null = null;
+  cachedConfig(): ResourceConfig {
+    if (!this.writes) return this.config();
+    const stamp = this.writes.stamp('resource_settings');
+    if (this.cachedConfigValue?.stamp === stamp) return this.cachedConfigValue.value;
+    const value = this.config();
+    this.cachedConfigValue = { stamp, value };
+    return value;
+  }
   configure(value: any) {
     const config = resourceConfig(value);
     this.sql.exec('INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', JSON.stringify(config));
@@ -312,6 +397,20 @@ export class ResourceManagement {
     const verdict=cpuVerdict(parse(m?.last_heartbeat).cpu_usage,parse(m?.capabilities).cpu_count,0,0,config,now);
     return this.chokingState(machine,now,config,verdict.reason).resource_choking;
   }
+  /** Watchdog-poll path: the choking evidence window is time-based, so this
+   * cache adds a one-minute ceiling on top of the write stamp (a quiet host
+   * would otherwise serve an expired cooldown window forever). */
+  private chokingCache = new Map<string, {stamp: string; at: number; value: any}>();
+  cachedResourceChoking(machine: string) {
+    if (!this.writes) return this.resourceChoking(machine);
+    const stamp = this.writes.stamp('resource_choking_events','fleet_launches','host_health_observations','machines','resource_settings');
+    const now = this.now(); const hit = this.chokingCache.get(machine);
+    if (hit && hit.stamp === stamp && now - hit.at < 60_000) return hit.value;
+    const value = this.resourceChoking(machine);
+    if (this.chokingCache.size >= 8) this.chokingCache.clear();
+    this.chokingCache.set(machine, {stamp, at: now, value});
+    return value;
+  }
   private chokingState(machine: string, now: number, config: ResourceConfig, verdictReason: string | null) {
     const cooldown=new Date(now-config.choking_cooldown_seconds*1000).toISOString();
     const event:any=this.readRows(`SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? AND reason!='host_runtime_choking' ORDER BY observed_at DESC LIMIT 1`,machine,cooldown)[0];
@@ -372,15 +471,18 @@ export class ResourceManagement {
     // Native activity changes do not require rereading immutable control and
     // launch projections. These rows contain SQL scalars only; JSON is parsed
     // afresh below, and every structural/authority write invalidates them.
+    // Freshness stamp: write watch when present, else the trigger revision.
+    // Entries persist across rebuilds: an intake-only write reuses the JOINs.
+    const rawRev = this.writes ? this.writes.stamp('session_control_sessions','fleet_launches','machines') : this.catalogStructureRevision;
     const read=(query:string,...bindings:any[]):any[]=>{
       const key=JSON.stringify([query,bindings]);
       const prior=this.catalogRawRows.get(key);
-      if(this.catalogStructureRevision!==null && prior) return prior;
+      if(rawRev!==null && prior && prior.rev===rawRev) return prior.value;
       const value=this.sql.exec(query,...bindings).toArray();
       const bytes=value.reduce((n,row)=>n+256+Object.values(row).reduce<number>((sum,v)=>sum+(typeof v==='string'?v.length*2:8),0),0);
-      if(this.catalogStructureRevision!==null && value.length<=10000 && bytes<=2*1024*1024 && value.every(row=>Object.values(row).every(v=>v===null || typeof v!=='object'))) {
-        if(this.catalogRawRows.size>=4 || this.catalogRawBytes+bytes>4*1024*1024) {this.catalogRawRows.clear();this.catalogRawBytes=0;}
-        this.catalogRawRows.set(key,value);this.catalogRawBytes+=bytes;
+      if(rawRev!==null && value.length<=10000 && bytes<=2*1024*1024 && value.every(row=>Object.values(row).every(v=>v===null || typeof v!=='object'))) {
+        if(this.catalogRawRows.size>=4) this.catalogRawRows.clear();
+        this.catalogRawRows.set(key,{rev:rawRev,value});
       }
       return value;
     };
@@ -397,7 +499,9 @@ export class ResourceManagement {
     // Hydrate the complete alias set before selecting canonical sessions. Batch
     // catalog facts instead of re-reading full intake histories for every alias.
     const key = (...parts: any[]) => JSON.stringify(parts);
-    const observedByNative = new Map(this.sql.exec(`SELECT machine_id,native_id,tag,last_activity_at,created_at_ms,phase
+    // Write-through observed rows (census/reap paths patch the map; zero row
+    // reads on the hot path). Per-rebuild scan stays for the fallback mode.
+    const observedByNative = this.observed ? this.observed.byNative(machine) : new Map(this.sql.exec(`SELECT machine_id,native_id,tag,last_activity_at,created_at_ms,phase
       FROM fleet_sessions ${machine ? 'WHERE machine_id=?' : ''}`, ...(machine ? [machine] : [])).toArray()
       .map((r:any)=>[key(r.machine_id,r.native_id),r]));
     const protectedIds = new Set(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_protections'").toArray().length
@@ -425,10 +529,14 @@ export class ResourceManagement {
         FROM ${intakeTable} WHERE id IN (${ids.map(()=>'?').join(',')})`,...ids).toArray()) projects.set(row.id,row.project);
     }
     // Native census activity invalidates the canonical rows, but cannot change
-    // intake closure or binding aliases. Reuse those facts until a structural
-    // write changes the rollback-safe generation. Keep failures uncached.
-    const worktreeLinks = this.catalogIntakes ?? worktreeIntakeSnapshot(this.sql);
-    if (!this.catalogIntakes && this.catalogStructureRevision !== null && worktreeLinks.valid) {
+    // intake closure or binding aliases. The snapshot is machine-scoped (only
+    // the machine's sessions, their native aliases and linked projections) and
+    // stamp-cached; without a watch the unscoped snapshot is cached as before.
+    // Keep failures uncached.
+    const worktreeLinks = this.intakeSnapshots
+      ? this.intakeSnapshots.get(machine ?? '', () => this.scopedIntakeSnapshot(machine, controlData, launchData))
+      : (this.catalogIntakes ?? worktreeIntakeSnapshot(this.sql));
+    if (!this.intakeSnapshots && !this.catalogIntakes && this.catalogStructureRevision !== null && worktreeLinks.valid) {
       const entries = [...worktreeLinks.machines, ...worktreeLinks.projections, ...worktreeLinks.sessions];
       if (entries.length <= 10000 && entries.reduce((n, row) => n + 512 + JSON.stringify(row).length * 2, 0) <= 4 * 1024 * 1024) {
         this.catalogIntakes = worktreeLinks;
@@ -481,11 +589,24 @@ export class ResourceManagement {
   }
   private canonicalSessions(machine?: string) {
     // No time-based authority cache: metadata/authority writes change the
-    // durable random generation, including rollback and retry. Activity is live.
+    // durable random generation, including rollback and retry. With the
+    // write-through watch, the stamp check reads zero rows and is exactly as
+    // fresh as the database; otherwise the trigger-maintained revision row
+    // decides (and activity is still read live per call below).
+    if (this.canonicalByMachine) {
+      const rows = this.canonicalByMachine.get(machine ?? '', () => this.buildCanonicalSessions(machine));
+      // Activity overlays live from the write-through catalog: a census that
+      // only refreshes timestamps must not rebuild retained identity history.
+      const activity = this.observed ? this.observed.activity(machine) : null;
+      const keyOf = (row: any) => JSON.stringify([row.machine_id, row.native_id]);
+      // Callers cannot mutate a cached protection or alias list.
+      return rows.map(row=>({...row,aliases:[...row.aliases],
+        last_activity_at: activity ? (activity.get(keyOf(row)) ?? null) : row.last_activity_at}));
+    }
     const raw=this.catalogReady ? this.sql.exec('SELECT revision,structure_revision FROM resource_catalog_revision WHERE id=1').toArray()[0] : null;
     const revision=typeof raw?.revision==='string' && /^[a-f0-9]{32}$/.test(raw.revision) ? raw.revision : null;
     const structure=revision!==null && typeof raw?.structure_revision==='string' && /^[a-f0-9]{32}$/.test(raw.structure_revision) ? raw.structure_revision : null;
-    if(structure===null || structure!==this.catalogStructureRevision) {this.catalogRawRows.clear();this.catalogRawBytes=0;this.catalogIntakes=null;}
+    if(structure===null || structure!==this.catalogStructureRevision) {this.catalogRawRows.clear();this.catalogIntakes=null;}
     this.catalogStructureRevision=structure;
     if(revision===null) this.catalogCache.clear();
     const key=machine ?? ''; const cached=this.catalogCache.get(key);
@@ -597,6 +718,24 @@ export class ResourceManagement {
     } catch { return false; } // corrupt/missing authority is never reap permission
   }
   sessions(machine?: string) {
+    // The watchdog response is served per host poll (and per session-progress
+    // poll on the host); the canonical stamp plus the watchdog-only authority
+    // sources gate the whole computation. Exactly-as-fresh: any write to a
+    // source table changes the stamp and rebuilds. Activity timestamps are a
+    // write-through overlay so census-only progress remains fresh without
+    // rebuilding the much larger authority projection.
+    if (this.watchdogSessions && machine) {
+      const sessions = this.watchdogSessions.get(machine, () => this.sessionsUncached(machine));
+      if (!this.observed) return sessions;
+      const activity = this.observed.activity(machine);
+      return sessions.map(session => {
+        const lastActivity = activity.get(JSON.stringify([session.machine_id, session.native_id])) ?? null;
+        return lastActivity === session.last_activity_at ? session : { ...session, last_activity_at: lastActivity };
+      });
+    }
+    return this.sessionsUncached(machine);
+  }
+  private sessionsUncached(machine?: string) {
     const canonical = this.canonicalSessions(machine).slice(0,1000);
     let authority: (session: any) => any[] | null;
     try { authority = this.idleAuthority(canonical); } catch { authority = () => { throw new Error('idle_authority_unavailable'); }; }
@@ -645,21 +784,25 @@ export class ResourceManagement {
       if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
       const old:any=this.sql.exec('SELECT * FROM session_resource_usage WHERE machine_id=? AND native_id=?',machine,session.native_id).toArray()[0];
       const ledgerId=old?.session_id ?? session.session_id;
-      this.sql.exec('INSERT INTO session_resource_metadata VALUES(?,?) ON CONFLICT(session_id) DO UPDATE SET workspace=excluded.workspace',ledgerId,session.workspace);
-      if (session.fleet_launch_id && finite(sample.current_cpu_cores)) this.sql.exec('INSERT INTO resource_cpu_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET current_cpu_cores=excluded.current_cpu_cores,observed_at=excluded.observed_at WHERE excluded.observed_at>resource_cpu_samples.observed_at',session.fleet_launch_id,sample.current_cpu_cores,sample.observed_at);
+      this.sql.exec('INSERT INTO session_resource_metadata VALUES(?,?) ON CONFLICT(session_id) DO UPDATE SET workspace=excluded.workspace WHERE session_resource_metadata.workspace IS NOT excluded.workspace',ledgerId,session.workspace);
+      if (session.fleet_launch_id && finite(sample.current_cpu_cores)) this.sql.exec(`INSERT INTO resource_cpu_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET current_cpu_cores=excluded.current_cpu_cores,observed_at=excluded.observed_at
+        WHERE excluded.observed_at>resource_cpu_samples.observed_at AND (excluded.current_cpu_cores IS NOT resource_cpu_samples.current_cpu_cores OR substr(excluded.observed_at,1,16)>substr(resource_cpu_samples.observed_at,1,16))`,session.fleet_launch_id,sample.current_cpu_cores,sample.observed_at);
       if (finite(sample.p95_cpu_cores)) {
         const finalized=this.sql.exec('SELECT 1 FROM session_cpu_finalized WHERE session_id=?',ledgerId).toArray().length>0;
         const prior:any=this.sql.exec('SELECT observed_at FROM session_cpu_usage WHERE session_id=?',ledgerId).toArray()[0];
         // Live lifetime p95 can fall as real idle intervals accumulate. Freeze
         // only an actual terminal CPU report, never a memory-only final row.
         if (!finalized && (!prior || at>=Date.parse(prior.observed_at))) {
-          this.sql.exec('INSERT INTO session_cpu_usage VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p95_cpu_cores=excluded.p95_cpu_cores,observed_at=excluded.observed_at',ledgerId,sample.p95_cpu_cores,sample.observed_at);
+          this.sql.exec(`INSERT INTO session_cpu_usage VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p95_cpu_cores=excluded.p95_cpu_cores,observed_at=excluded.observed_at
+            WHERE excluded.observed_at>=session_cpu_usage.observed_at AND (excluded.p95_cpu_cores IS NOT session_cpu_usage.p95_cpu_cores OR substr(excluded.observed_at,1,16)>substr(session_cpu_usage.observed_at,1,16))`,ledgerId,sample.p95_cpu_cores,sample.observed_at);
           if (TERMINAL.has(session.state)) this.sql.exec('INSERT OR IGNORE INTO session_cpu_finalized VALUES(?,?)',ledgerId,sample.observed_at);
         }
       }
-      if (finite(sample.oom_kills) && Number.isInteger(sample.oom_kills) && sample.oom_kills>=0) this.sql.exec('INSERT INTO session_oom_kills VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET oom_kills=MAX(session_oom_kills.oom_kills,excluded.oom_kills),observed_at=excluded.observed_at',ledgerId,sample.oom_kills,sample.observed_at);
-      if (finite(sample.p50_rss_mb)) this.sql.exec('INSERT INTO session_rss_median VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p50_rss_mb=excluded.p50_rss_mb,observed_at=excluded.observed_at WHERE excluded.observed_at>=session_rss_median.observed_at',ledgerId,sample.p50_rss_mb,sample.observed_at);
-      if (session.fleet_launch_id && finite(sample.current_rss_mb)) this.sql.exec('INSERT INTO resource_resident_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET resident_mb=excluded.resident_mb,observed_at=excluded.observed_at WHERE excluded.observed_at>=resource_resident_samples.observed_at',session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
+      if (finite(sample.oom_kills) && Number.isInteger(sample.oom_kills) && sample.oom_kills>=0) this.sql.exec('INSERT INTO session_oom_kills VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET oom_kills=excluded.oom_kills,observed_at=excluded.observed_at WHERE excluded.oom_kills>session_oom_kills.oom_kills',ledgerId,sample.oom_kills,sample.observed_at);
+      if (finite(sample.p50_rss_mb)) this.sql.exec(`INSERT INTO session_rss_median VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p50_rss_mb=excluded.p50_rss_mb,observed_at=excluded.observed_at
+        WHERE excluded.observed_at>=session_rss_median.observed_at AND (excluded.p50_rss_mb IS NOT session_rss_median.p50_rss_mb OR substr(excluded.observed_at,1,16)>substr(session_rss_median.observed_at,1,16))`,ledgerId,sample.p50_rss_mb,sample.observed_at);
+      if (session.fleet_launch_id && finite(sample.current_rss_mb)) this.sql.exec(`INSERT INTO resource_resident_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET resident_mb=excluded.resident_mb,observed_at=excluded.observed_at
+        WHERE excluded.observed_at>=resource_resident_samples.observed_at AND (excluded.resident_mb IS NOT resource_resident_samples.resident_mb OR substr(excluded.observed_at,1,16)>substr(resource_resident_samples.observed_at,1,16))`,session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
       const max = (k:string) => finite(sample[k]) ? Math.max(old?.[k] ?? 0,sample[k]) : old?.[k] ?? null;
       const cpu=max('cpu_seconds'),runtime=max('runtime_s');
       this.sql.exec(`INSERT INTO session_resource_usage VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -668,7 +811,17 @@ export class ResourceManagement {
         started_at=CASE WHEN session_resource_usage.started_at='' THEN excluded.started_at ELSE session_resource_usage.started_at END,
         finished_at=excluded.finished_at,state=excluded.state,
         peak_rss_mb=excluded.peak_rss_mb,peak_pss_mb=excluded.peak_pss_mb,cpu_seconds=excluded.cpu_seconds,
-        runtime_s=excluded.runtime_s,avg_cpu_cores=excluded.avg_cpu_cores,observed_at=excluded.observed_at`,
+        runtime_s=excluded.runtime_s,avg_cpu_cores=excluded.avg_cpu_cores,observed_at=excluded.observed_at
+        WHERE session_resource_usage.fleet_launch_id IS NOT excluded.fleet_launch_id
+          OR session_resource_usage.intake_id IS NOT excluded.intake_id OR session_resource_usage.project IS NOT excluded.project
+          OR session_resource_usage.engine IS NOT excluded.engine OR session_resource_usage.model IS NOT excluded.model
+          OR session_resource_usage.tier IS NOT excluded.tier OR session_resource_usage.kind IS NOT excluded.kind
+          OR (session_resource_usage.started_at='' AND excluded.started_at<>'')
+          OR session_resource_usage.finished_at IS NOT excluded.finished_at OR session_resource_usage.state IS NOT excluded.state
+          OR session_resource_usage.peak_rss_mb IS NOT excluded.peak_rss_mb OR session_resource_usage.peak_pss_mb IS NOT excluded.peak_pss_mb
+          OR session_resource_usage.cpu_seconds IS NOT excluded.cpu_seconds OR session_resource_usage.runtime_s IS NOT excluded.runtime_s
+          OR session_resource_usage.avg_cpu_cores IS NOT excluded.avg_cpu_cores
+          OR substr(excluded.observed_at,1,16)>substr(session_resource_usage.observed_at,1,16)`,
         ledgerId,machine,session.native_id,session.fleet_launch_id,session.intake_id,session.project,session.engine,session.model,session.tier,session.kind,
         // Legacy storage requires text; an empty unknown is exposed as null,
         // never replaced with the time a launch entered the queue.
@@ -691,6 +844,7 @@ export class ResourceManagement {
       if (!TERMINAL.has(session.state)) this.sql.exec("UPDATE session_control_sessions SET state='stopped',updated_at=? WHERE id=?",reap.at,session.session_id);
       this.sql.exec("UPDATE fleet_launches SET state=CASE WHEN state IN ('exited','failed','stopped') THEN state ELSE 'failed' END,finished_at=COALESCE(finished_at,?),exit_reason=COALESCE(exit_reason,?),updated_at=? WHERE id=?",reap.at,'watchdog_'+reap.reason,reap.at,session.fleet_launch_id);
       this.sql.exec("UPDATE fleet_sessions SET phase='exited',observed_at=? WHERE machine_id=? AND native_id=?",reap.at,machine,session.native_id);
+      this.notePhase(machine,session.native_id,'exited',reap.at);
     }
     for (const throttle of value.throttles ?? []) {
       // Reversible CPU-throttle receipts (intake f31b678f): the host only

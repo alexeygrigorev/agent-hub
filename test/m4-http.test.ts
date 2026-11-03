@@ -114,7 +114,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     const id = (env as any).HUB.idFromName("hub");
     const stub = (env as any).HUB.get(id);
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      await seedTestDb(instance.ctx.storage.sql);
+      await seedTestDb(instance.sql);
     });
   });
 
@@ -137,13 +137,13 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     await (runInDurableObject as any)(stub, async (instance: any) => {
       const now = new Date().toISOString();
       const future = new Date(Date.now() + 600000).toISOString();
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at, claim_token_hash)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-alpha-1', 'root-run', 'root-run:test-alpha-1', JSON.stringify({ step: 'init' }), 'offered', now, future, 'role:root',
         'host-alpha', 'host-alpha', future, 'super-secret-token-hash-must-not-leak'
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at, claim_token_hash)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-beta-1', 'root-run', 'root-run:test-beta-1', JSON.stringify({ step: 'init' }), 'offered', now, future, 'role:root',
@@ -219,7 +219,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     await (runInDurableObject as any)(stub, async (instance: any) => {
       const now = new Date().toISOString();
       const future = new Date(Date.now() + 600000).toISOString();
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-fail-gate', 'root-run', 'root-run:fail-gate', JSON.stringify({}), 'offered', now, future, 'role:root',
@@ -249,8 +249,8 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
       const now = new Date().toISOString();
       const future = new Date(Date.now() + 600000).toISOString();
       // Ensure lease is unheld
-      instance.ctx.storage.sql.exec("UPDATE leases SET holder_job_id = NULL, expires_at = NULL WHERE name = 'root'");
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec("UPDATE leases SET holder_job_id = NULL, expires_at = NULL WHERE name = 'root'");
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-lifecycle-1', 'root-run', 'root-run:lifecycle-1', JSON.stringify({}), 'offered', now, future, 'role:root',
@@ -337,7 +337,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
 
     // Verify lease is released
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const lease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
+      const lease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
       expect(lease.holder_job_id).toBeNull();
     });
   });
@@ -349,7 +349,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     await (runInDurableObject as any)(stub, async (instance: any) => {
       const now = new Date().toISOString();
       const future = new Date(Date.now() + 600000).toISOString();
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-decline-1', 'root-run', 'root-run:decline-1', JSON.stringify({}), 'offered', now, future, 'role:root',
@@ -380,7 +380,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     await (runInDurableObject as any)(stub, async (instance: any) => {
       const now = new Date().toISOString();
       const future = new Date(Date.now() + 600000).toISOString();
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at, claim_token_hash)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-redaction-1', 'root-run', 'root-run:redaction-1', JSON.stringify({}), 'offered', now, future, 'role:root',
@@ -458,11 +458,11 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     const stub = (env as any).HUB.get(id);
     const future = new Date(Date.now() + 600000).toISOString();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         "UPDATE leases SET holder_job_id = 'job-verify-active', holder_host_id = 'host-alpha', holder_machine_id = 'host-alpha', epoch = epoch + 1, expires_at = ? WHERE name = 'root'",
         future
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         "INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, holder_machine_id, lease_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         'job-verify-active', 'root-run', 'root-run:verify-act', JSON.stringify({}), 'running', new Date().toISOString(), future, 'role:root', 'host-alpha', 'host-alpha', currentEpoch + 1
       );
@@ -538,7 +538,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     expect(tickData2.status).toBe('ok');
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const rows = instance.ctx.storage.sql.exec("SELECT id FROM jobs WHERE idempotency_key = ?", `root-run:${validSlot}`).toArray();
+      const rows = instance.sql.exec("SELECT id FROM jobs WHERE idempotency_key = ?", `root-run:${validSlot}`).toArray();
       expect(rows.length).toBe(1);
     });
   });
@@ -554,15 +554,15 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     const tokenPollBeta = await sha256('hubt_poll_beta');
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         'cred_poll_alpha', 'host', tokenPollAlpha, 'fam_pa', 'host-alpha', 'host-alpha', JSON.stringify(['host']), 'admin-1', now, future
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         'cred_poll_beta', 'host', tokenPollBeta, 'fam_pb', 'host-beta', 'host-beta', JSON.stringify(['host']), 'admin-1', now, future
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-poll-test', 'root-run', 'root-run:poll-1', JSON.stringify({}), 'offered', now, future, 'role:root',
@@ -601,16 +601,16 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     const future = new Date(Date.now() + 600000).toISOString();
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         "UPDATE leases SET holder_job_id = 'job-action-holder', holder_host_id = 'host-alpha', holder_machine_id = 'host-alpha', epoch = 42, expires_at = ? WHERE name = 'root'",
         future
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, holder_machine_id, lease_epoch, native_session)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-action-holder', 'root-run', 'root-run:act-hold', JSON.stringify({}), 'running', now, future, 'role:root', 'host-alpha', 'host-alpha', 42, 'session-act-42'
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-transition-target', 'sub-task', 'sub:1', JSON.stringify({}), 'pending', now, future, 'system'
@@ -641,7 +641,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
 
     // Verify message was stored in DB with from_actor = 'role:root'
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const msgs = instance.ctx.storage.sql.exec("SELECT * FROM messages WHERE from_actor = 'role:root' AND to_actor = 'machine:host-alpha'").toArray();
+      const msgs = instance.sql.exec("SELECT * FROM messages WHERE from_actor = 'role:root' AND to_actor = 'machine:host-alpha'").toArray();
       expect(msgs.length).toBeGreaterThan(0);
     });
 
@@ -667,7 +667,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
 
     // Verify target job was transitioned in DB
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const targetJob = instance.ctx.storage.sql.exec("SELECT * FROM jobs WHERE id = 'job-transition-target'").toArray()[0];
+      const targetJob = instance.sql.exec("SELECT * FROM jobs WHERE id = 'job-transition-target'").toArray()[0];
       expect(targetJob.status).toBe('succeeded');
       expect(targetJob.outcome_summary).toBe('sub-task successfully completed');
     });
@@ -736,10 +736,10 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     const future = new Date(Date.now() + 600000).toISOString();
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, epoch = 100, expires_at = NULL WHERE name = 'root'"
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-deny-native', 'root-run', 'root-run:deny-1', JSON.stringify({}), 'offered', now, future, 'role:root',

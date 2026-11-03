@@ -349,7 +349,7 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   const taskId = request.intake_task_id;
   if (typeof taskId !== 'string' || !taskId) return false;
   let rows: any[] = sql.exec('SELECT data FROM intake_tasks WHERE id=?', taskId).toArray();
-  if (!rows.length && taskId.length >= 6) rows = sql.exec("SELECT data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", taskId).toArray();
+  if (!rows.length && taskId.length >= 6) rows = sql.exec('SELECT data FROM intake_tasks WHERE id COLLATE NOCASE LIKE ? LIMIT 2', taskId + '%').toArray();
   if (rows.length !== 1) return false; // pruned, missing or ambiguous historical task
   const task = JSON.parse(rows[0].data);
   if (task.history.some((e: Obj) => e !== null && typeof e === 'object' && ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
@@ -468,6 +468,7 @@ export class IntakeService {
         this.sql.exec(`INSERT INTO intake_status_summary(id,project,status,title,updated_at,created_at,archived_at,version) SELECT id,${summaryValues('')} FROM intake_tasks WHERE true
           ON CONFLICT(id) DO UPDATE SET project=excluded.project,status=excluded.status,title=excluded.title,updated_at=excluded.updated_at,created_at=excluded.created_at,archived_at=excluded.archived_at,version=excluded.version`);
       }
+      this.sql.exec('CREATE INDEX IF NOT EXISTS intake_tasks_id_nocase ON intake_tasks(id COLLATE NOCASE)');
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_note_archive(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,seq INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(task_id,seq))');
       for (const op of ['UPDATE', 'DELETE']) this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_note_archive_no_' + op.toLowerCase() +
         ' BEFORE ' + op + " ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");

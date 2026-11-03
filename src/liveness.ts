@@ -9,6 +9,8 @@ import { accountCapacityAlerts, quotaProbeStaleAlerts } from './account_capacity
 import { resolveMachineAliases, aliasDetail, projectAliasSessions } from './machine-alias';
 import { freshCatalogs } from './catalog-freshness';
 import { classifySessionStall, initSessionStalls, orphanFailure, toolCallStallThreshold } from './session_stall';
+import { ObservedCatalog } from './observed-catalog';
+import { StampCache, WriteWatch } from './write-watch';
 
 export const LIVENESS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_heartbeats (actor TEXT PRIMARY KEY, machine_id TEXT, status TEXT NOT NULL, summary TEXT, at TEXT NOT NULL);
@@ -17,6 +19,8 @@ CREATE INDEX IF NOT EXISTS liveness_alerts_open ON liveness_alerts (subject_kind
 CREATE INDEX IF NOT EXISTS liveness_alerts_open_kind ON liveness_alerts (subject_kind) WHERE resolved_at IS NULL;
 CREATE INDEX IF NOT EXISTS liveness_alerts_resolved ON liveness_alerts (resolved_at) WHERE resolved_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS alert_backfill_suppressed (alert_id INTEGER PRIMARY KEY, suppressed_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS liveness_alerts_open_opened ON liveness_alerts (opened_at) WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS liveness_alerts_resolved_opened ON liveness_alerts (opened_at DESC) WHERE resolved_at IS NOT NULL;
 `;
 
 export type Thresholds = { machineStaleS: number; machineOfflineS: number; agentStallS: number; agentToolCallStallS: number; heartbeatStaleS: number; launchStuckS: number };
@@ -60,13 +64,38 @@ function ageSeconds(at: unknown, now: number): number | null {
 }
 
 export class LivenessService {
-  constructor(private sql: SqlStorage, private thresholds: Thresholds = DEFAULT_THRESHOLDS, private now: () => number = Date.now) {}
+  private observed: ObservedCatalog | null = null;
+  private writeWatch: WriteWatch | null = null;
+  private liveLaunches: StampCache<string, any[]> | null = null;
+  /** Write-through agent heartbeats: one upsert site, so the map IS the table. */
+  private heartbeatRows: Map<string, any> | null = null;
+  private heartbeatsLoaded = false;
+  constructor(private sql: SqlStorage, private thresholds: Thresholds = DEFAULT_THRESHOLDS, private now: () => number = Date.now, observed?: ObservedCatalog, writes?: WriteWatch) {
+    this.observed = observed ?? null;
+    this.writeWatch = writes ?? null;
+    if (writes) {
+      this.liveLaunches = new StampCache(writes, () => ['fleet_launches']);
+      writes.trackAll(['fleet_launches', 'agent_heartbeats']);
+    }
+  }
+
+  private ensureHeartbeats(): Map<string, any> {
+    if (!this.heartbeatsLoaded) {
+      this.heartbeatRows = new Map();
+      try {
+        for (const row of this.sql.exec('SELECT * FROM agent_heartbeats ORDER BY actor').toArray() as any[]) this.heartbeatRows!.set(String(row.actor), row);
+      } catch { /* table not created yet */ }
+      this.heartbeatsLoaded = true;
+    }
+    return this.heartbeatRows!;
+  }
 
   init() {
     initSessionStalls(this.sql);
     for (const stmt of LIVENESS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const columns = this.sql.exec('PRAGMA table_info(liveness_alerts)').toArray().map((c: any) => c.name);
     if (!columns.includes('delivered_to')) this.sql.exec("ALTER TABLE liveness_alerts ADD COLUMN delivered_to TEXT NOT NULL DEFAULT '[]'");
+    this.ensureHeartbeats();
   }
 
   machineState(machine: any, now = this.now(), label: string = machine.id): Subject {
@@ -121,8 +150,10 @@ export class LivenessService {
     const hostKnown = (id: string) => machines.get(canonical(id))?.state === 'online';
 
     const reported = new Set<string>();
+    // Write-through observed rows (census/reap patch the shared catalog);
+    // the full-table scan used to run on every dashboard/poll read.
     let sessionRows: any[] = [];
-    try { sessionRows = this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray() as any[]; } catch { sessionRows = []; }
+    try { sessionRows = this.observed ? this.observed.all() : (this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray() as any[]); } catch { sessionRows = []; }
     const catalogSeen = freshCatalogs(this.sql, now);
     const refusedStops = new Map<string, string>();
     try {
@@ -171,7 +202,11 @@ export class LivenessService {
     }
 
     let launchRows: any[] = [];
-    try { launchRows = this.sql.exec("SELECT id, machine_id, mode, state, native_id, updated_at, summary FROM fleet_launches WHERE state IN ('offered','starting','running','uncertain') ORDER BY created_at").toArray() as any[]; } catch { launchRows = []; }
+    try {
+      launchRows = this.liveLaunches
+        ? this.liveLaunches.get('', () => this.sql.exec("SELECT id, machine_id, mode, state, native_id, updated_at, summary FROM fleet_launches WHERE state IN ('offered','starting','running','uncertain') ORDER BY created_at").toArray() as any[])
+        : (this.sql.exec("SELECT id, machine_id, mode, state, native_id, updated_at, summary FROM fleet_launches WHERE state IN ('offered','starting','running','uncertain') ORDER BY created_at").toArray() as any[]);
+    } catch { launchRows = []; }
     for (const l of launchRows) {
       const age = ageSeconds(l.updated_at, now);
       const resolved = l.machine_id ? canonical(l.machine_id) : l.machine_id;
@@ -217,7 +252,7 @@ export class LivenessService {
     subjects.push(...accountCapacityAlerts(this.sql, now));
     subjects.push(...quotaProbeStaleAlerts(this.sql, now));
     subjects.push(...(this.pressureProjection?.() || []));
-    for (const h of this.sql.exec('SELECT * FROM agent_heartbeats ORDER BY actor').toArray() as any[]) {
+    for (const h of (this.heartbeatsLoaded ? [...this.ensureHeartbeats().values()].sort((a, b) => String(a.actor).localeCompare(String(b.actor))) : (this.sql.exec('SELECT * FROM agent_heartbeats ORDER BY actor').toArray() as any[]))) {
       const age = ageSeconds(h.at, now);
       const state = age === null || age > t.heartbeatStaleS ? 'stale' : h.status;
       subjects.push({ kind: 'agent', id: h.actor, state, detail: `${h.status}${h.summary ? ': ' + h.summary : ''}; last heartbeat ${age ?? 'unknown'}s ago`, machine_id: h.machine_id, age_s: age });
@@ -278,8 +313,12 @@ export class LivenessService {
     const status = input.status ?? 'working';
     if (typeof status !== 'string' || !STATUS.test(status) || ALERT_STATES.has(status)) return { error: 'invalid_status' };
     if (input.summary !== undefined && (typeof input.summary !== 'string' || input.summary.length > 240 || /[\x00-\x1f\x7f]/.test(input.summary))) return { error: 'invalid_summary' };
+    const at = new Date(this.now()).toISOString();
     this.sql.exec('INSERT INTO agent_heartbeats (actor, machine_id, status, summary, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(actor) DO UPDATE SET machine_id = excluded.machine_id, status = excluded.status, summary = excluded.summary, at = excluded.at',
-      actor, machineId, status, input.summary ?? null, new Date(this.now()).toISOString());
+      actor, machineId, status, input.summary ?? null, at);
+    // Write-through: the evaluate() scan reads this map, not the table.
+    const rows = this.ensureHeartbeats();
+    rows.set(String(actor), { actor, machine_id: machineId, status, summary: input.summary ?? null, at });
     return { ok: true };
   }
 
@@ -365,7 +404,15 @@ export class LivenessService {
 
   alerts(limit = 100, subject?: string) {
     if (subject !== undefined) return this.sql.exec('SELECT * FROM liveness_alerts WHERE subject = ? ORDER BY resolved_at IS NOT NULL, opened_at DESC LIMIT ?', subject, limit).toArray();
-    return this.sql.exec('SELECT * FROM liveness_alerts ORDER BY resolved_at IS NOT NULL, opened_at DESC LIMIT ?', limit).toArray();
+    // Two indexed partial-index branches instead of one expression sort over
+    // the whole (10k+ row) alert history. Each branch reads at most `limit`
+    // index entries; the true top-N interleaves both, merged in memory.
+    const open = this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NULL ORDER BY opened_at DESC LIMIT ?', limit).toArray() as any[];
+    const resolved = this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NOT NULL ORDER BY opened_at DESC LIMIT ?', limit).toArray() as any[];
+    return [...open, ...resolved].sort((a, b) =>
+      ((a.resolved_at !== null ? 1 : 0) - (b.resolved_at !== null ? 1 : 0))
+      || (String(b.opened_at).localeCompare(String(a.opened_at)))
+      || (Number(b.id) - Number(a.id))).slice(0, limit);
   }
 
   prune(keepDays = 30) {

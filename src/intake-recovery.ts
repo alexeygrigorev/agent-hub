@@ -20,7 +20,8 @@ export function recoveryProtected(sql: SqlStorage, session: { id: string; machin
   try { binding = JSON.parse(session.binding_json || 'null'); } catch { return false; }
   if (!session.machine_id || !binding?.native_id) return false;
   return sql.exec(`SELECT s.id FROM session_control_sessions s JOIN session_control_protections p ON p.session_id=s.id
-    WHERE s.machine_id=? AND json_extract(s.binding_json,'$.native_id')=? LIMIT 1`, session.machine_id,binding.native_id).toArray().length > 0;
+    WHERE s.machine_id=? AND json_extract(CASE WHEN json_valid(s.binding_json) THEN s.binding_json ELSE '{}' END,'$.native_id')=? LIMIT 1`,
+    session.machine_id,binding.native_id).toArray().length > 0;
 }
 
 /** Waiting belongs to the physical worker too, even through an unlinked alias. */

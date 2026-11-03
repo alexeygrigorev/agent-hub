@@ -72,6 +72,8 @@ import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validate
 import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
 import { sampleAccountCapacityHistory } from './account-capacity-history';
+import { WriteWatch } from './write-watch';
+import { ObservedCatalog } from './observed-catalog';
 
 const HUMAN_REFRESH_REPLAY_GRACE_MS = 30_000;
 const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
@@ -171,6 +173,9 @@ export class Hub extends DurableObject {
 
   private idleWork: IdleWorkService;
   readonly meter = new RowsMeter();
+  readonly writes = new WriteWatch();
+  /** Write-through fleet_sessions catalog shared by resources and liveness. */
+  readonly observedCatalog: ObservedCatalog;
   private rowsAlertCheckedHour = -1;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -178,7 +183,29 @@ export class Hub extends DurableObject {
     this.env = env;
     // DO rows-read meter (intake 8081a05a): every cursor is attributed to
     // the current alarm step / route scope and flushed once per alarm.
-    this.sql = this.meter.wrap(ctx.storage.sql);
+    // The write watch observes the same statements so write-through caches
+    // can stamp freshness without a SQL probe (intake 8081a05a/e8a22f4c).
+    // Meter the outer wrapper so cache hits still count as route/alarm cursor
+    // calls (with rowsRead=0); the inner write watch owns SQL invalidation.
+    this.sql = this.meter.wrap(this.writes.wrap(ctx.storage.sql));
+    this.observedCatalog = new ObservedCatalog(this.sql, this.writes);
+    // Cache generations advance for SQL writes, including those later rolled
+    // back. Observe the native transaction boundary so aborted SQL/memory
+    // snapshots cannot remain current or have their stamps reused.
+    const storage = this.ctx.storage as any;
+    const nativeTransactionSync = storage.transactionSync;
+    if (typeof nativeTransactionSync === 'function') {
+      const invokeTransactionSync = nativeTransactionSync.bind(storage);
+      const trackedTransactionSync = (fn: any) => this.writes.transaction(
+        () => invokeTransactionSync(fn),
+        () => this.observedCatalog.reset(),
+      );
+      Object.defineProperty(storage, 'transactionSync', {
+        configurable: true,
+        writable: true,
+        value: trackedTransactionSync,
+      });
+    }
     this.meter.runSync('init:schema', () => {
       this.initDb();
       for (const stmt of ROWS_STATS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
@@ -225,7 +252,7 @@ export class Hub extends DurableObject {
       },
       onOverride: (id, caller, sender, now) => messageEvent(this.sql, id, 'admin_override', caller.actor ?? null, caller.machineId ?? null, now, { from_actor: sender }),
     });
-    this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
+    this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, this.writes, this.observedCatalog);
     this.fleetService.init();
     this.workerAccess = new WorkerAccess(this.sql, fn => this.ctx.storage.transactionSync(fn), caller => this.sessionControlService.hostObservationAllowed(caller.machineId, caller));
     this.workerAccess.init();
@@ -349,7 +376,7 @@ export class Hub extends DurableObject {
         ? (machineId: unknown, caller: any) => sessionControl.hostObservationAllowed(machineId, caller)
         : undefined);
     }
-    this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
+    this.livenessService = new LivenessService(this.sql, thresholdsFrom(env), Date.now, this.observedCatalog, this.writes);
     this.livenessService.init();
     // Ask ledger (intake 55c10deb): Alexey's verbatim messages -> asks -> intake AC
     // lines. Its pass runs on the watchdog tick and its close gate sits beside
@@ -507,7 +534,7 @@ export class Hub extends DurableObject {
         setAlert: (kind, subject, problem) => this.livenessService.setAlert(kind, subject, problem),
         deliverAlert: alert => this.notifyAlert(alert),
       }),
-    }, Date.now, makeHeuristicDecider, this.env);
+    }, Date.now, makeHeuristicDecider, this.env, undefined, () => this.observedCatalog.rows());
     this.sessionAudit.init();
     this.livenessService.setPressureProjection(() => placementPressureSubjects(this.sql, Date.now()));
     this.checksService = new ChecksService(this.sql);
@@ -528,7 +555,7 @@ export class Hub extends DurableObject {
     // non-admin caller, so host/agent/job credentials get 403.
     this.backupService = new BackupService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env);
     this.backupService.init();
-    this.hostHistoryService = new HostHistoryService(this.sql, this.fleetService);
+    this.hostHistoryService = new HostHistoryService(this.sql, this.fleetService, Date.now, this.writes);
     this.hostHistoryService.init();
     this.statusService.setMonitoringService(this.monitoringService);
     this.statusService.initLifecycleCache();
@@ -668,6 +695,7 @@ export class Hub extends DurableObject {
         this.sql.exec(trimmed);
       }
     }
+    this.sql.exec('CREATE TABLE IF NOT EXISTS tbm_tick_state (id INTEGER PRIMARY KEY, last_tick_ms INTEGER NOT NULL, summary_json TEXT NOT NULL)');
 
     // 3. Ensure all M4 columns on existing tables (SPEC §6 and M3 migrations)
     this.ensureColumns('agents', {
@@ -878,10 +906,6 @@ export class Hub extends DurableObject {
       if (path === '/api/monitoring/history') {
         const auth = await this.authenticateBusRequest(request);
         const response = this.hostHistoryService.handle(request, auth);
-        if (response.ok) {
-          const alarm = await this.ctx.storage.getAlarm();
-          if (alarm === null || alarm > Date.now() + 60000) await this.ctx.storage.setAlarm(Date.now() + 60000);
-        }
         return response;
       }
       if (path === '/api/monitoring/tokens') {
@@ -1241,7 +1265,9 @@ export class Hub extends DurableObject {
         return this.webhookService.handle(request, await this.sessionControlAuth(request));
       }
       if (path === '/webhooks' || path.startsWith('/webhooks/')) {
-        return this.webhookService.handleIngest(request, path);
+        const result = await this.webhookService.handleIngest(request, path);
+        if (request.method === 'POST' && result.ok) await this.scheduleDueAlarm([Date.now() + 1]);
+        return result;
       }
       if (path === '/api/prompts' || path.startsWith('/api/prompts/')) {
         return this.promptLibrary.handle(request, await this.sessionControlAuth(request));
@@ -1995,9 +2021,7 @@ export class Hub extends DurableObject {
         // Caller body.now inert: strictly use internal server clock
         const now = Date.now();
         const cleanup = this.busService.retentionCleanup(now, 100);
-        if (cleanup.hasMore) {
-          await this.ctx.storage.setAlarm(Date.now() + 1000);
-        }
+        await this.scheduleDueAlarm([], cleanup.hasMore);
         const totalDeleted = (cleanup.messagesDeleted || 0) + (cleanup.claimsDeleted || 0);
         return Response.json({
           status: 'ok',
@@ -2604,6 +2628,34 @@ export class Hub extends DurableObject {
       }
       this.sql.exec("INSERT INTO hub_meta(key,value) VALUES ('alert_destination_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", destinationHash);
     }
+    let retentionHasMore = false;
+    let webhookNext: number | undefined;
+    // Periodic maintenance belongs to the existing five-minute cron. Alarms
+    // stay reserved for concrete due jobs, wakes, webhook retries and a
+    // bounded retention backlog instead of polling these scans every minute.
+    if (!only) {
+      try { await m('intake_watchdog', () => this.intakeWatchdog.tick('cron')); } catch { console.warn('intake_queue_tick_failed'); }
+      try { await m('ops_liveness', () => this.opsLiveness.tick()); } catch { console.warn('ops_liveness_tick_failed'); }
+      await m('expire_messages', () => this.ctx.storage.transactionSync(() => {
+        const nowMs = Date.now();
+        expireSessionMessages(this.sql, nowMs);
+        expireMessageEvents(this.sql, nowMs);
+      }));
+      try { await m('idle_work', () => this.idleWorkTick()); } catch { console.warn('idle_work_tick_failed'); }
+      try { await m('host_history', () => this.hostHistoryService.sample()); } catch { console.warn('resource_history_sampling_failed'); }
+      try {
+        await m('fleet_account_capacity_history', () => sampleAccountCapacityHistory(
+          this.sql,
+          Date.now(),
+          () => dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[])
+            .map(account => this.fleetService.cachedAccountStatus(account)),
+        ));
+      } catch { console.warn('fleet_account_capacity_history_sample_failed'); }
+      try {
+        const cleanup = await m('bus_retention', () => this.busService.retentionCleanup(Date.now(), 100));
+        retentionHasMore = cleanup.hasMore;
+      } catch { console.warn('bus_retention_failed'); }
+    }
     // Cron launch schedules (intake a839dfb6): due ticks create intakes and
     // enqueue sessions through the canonical admission path. Runs on both
     // crons (every 5 minutes); a manual single-check run never fires them.
@@ -2612,6 +2664,8 @@ export class Hub extends DurableObject {
       catch { console.warn('session_schedule_tick_failed'); }
       try { await m('launch_schedules', () => this.launchSchedules.tick('cron')); }
       catch { console.warn('launch_schedule_tick_failed'); }
+      try { webhookNext = await m('webhooks', () => this.webhookService.pump()); }
+      catch { console.warn('webhook_delivery_pump_failed'); }
     }
     for (const alert of await m('watch_hosts', () => this.livenessService.watchHosts())) await this.notifyAlert(alert);
     // Per-host command-channel health (intake 3aa850b4): open/resolve
@@ -2657,6 +2711,9 @@ export class Hub extends DurableObject {
     }, only));
     // Retry alerts whose delivery failed or had no target yet, at most every 15 minutes each.
     for (const alert of this.livenessService.undelivered(900)) await this.notifyAlert(alert);
+    try { await m('rows_meter_flush', () => this.flushRowsMeter()); }
+    catch { console.warn('rows_meter_flush_failed'); }
+    if (!only) await this.scheduleDueAlarm([this.jobsService.getAlarmTime(), webhookNext, this.nextWakeTimeSafe()], retentionHasMore);
     return results;
   }
 
@@ -2758,32 +2815,29 @@ export class Hub extends DurableObject {
       });
     } catch {}
 
-    // 4. Schedule next alarm with bounded free usage guard
-    if (cleanup.hasMore) {
-      await this.ctx.storage.setAlarm(Date.now() + 1000);
-    } else {
-      const nextTime = nextAlarm || this.jobsService.getAlarmTime();
-      if (nextTime) {
-        try {
-          await this.ctx.storage.setAlarm(Math.max(Date.now(), Math.min(nextTime, Date.now() + 60000)));
-        } catch {}
-      }
-    }
+    // Schedule only concrete due work; periodic maintenance runs on cron.
+    await this.scheduleDueAlarm([nextAlarm, this.jobsService.getAlarmTime(), this.nextWakeTimeSafe()], cleanup.hasMore);
 
     return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit, intake_triage: intakeTriage, intake_verifier: intakeVerifier, merge_gate: mergeGate };
   }
 
   async sampleHostHistory() {
     try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
-    const alarm = await this.ctx.storage.getAlarm();
-    if (alarm === null || alarm > Date.now() + 60000) await this.ctx.storage.setAlarm(Date.now() + 60000);
   }
 
   /** Durable cadence survives hibernation. Alarm plus the existing five-minute cron own the tick. */
+  private tbmStamp: string | null = null;
   runTbmTick(nowMs = Date.now()) {
-    this.sql.exec('CREATE TABLE IF NOT EXISTS tbm_tick_state (id INTEGER PRIMARY KEY, last_tick_ms INTEGER NOT NULL, summary_json TEXT NOT NULL)');
     const previous: any = this.sql.exec('SELECT last_tick_ms FROM tbm_tick_state WHERE id=1').toArray()[0];
     if (previous && nowMs - previous.last_tick_ms < 240000) return;
+    // Change-driven ceiling: with no quota/session/outcome writes since the
+    // last tick there is nothing new to reward or roll up (rows-read budget).
+    if (this.writes) {
+      const stamp = this.writes.stamp('tbm_session_tokens','tbm_quota_pools','tbm_reward_events','tbm_pool_resets','tbm_banked_tranches','tbm_controller_state',
+        'fleet_sessions_meta','session_resource_usage','session_control_sessions','fleet_launches','usage_quota_history','server_quota_snapshots','fleet_subscriptions');
+      if (stamp === this.tbmStamp && previous && nowMs - previous.last_tick_ms < 900000) return;
+      this.tbmStamp = stamp;
+    }
     return this.ctx.storage.transactionSync(() => {
       syncStoredTbmSnapshots(this.sql, nowMs);
       const summary = tickTbm(this.sql, nowMs);
@@ -2795,33 +2849,18 @@ export class Hub extends DurableObject {
   async alarm() {
     // Every step is metered (intake 8081a05a); totals flush once per alarm.
     const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('alarm:' + step, fn);
-    try { await m('intake_watchdog', () => this.intakeWatchdog.tick('alarm')); } catch { console.warn('intake_queue_tick_failed'); }
-    try { await m('ops_liveness', () => this.opsLiveness.tick()); } catch { console.warn('ops_liveness_tick_failed'); }
-    const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
-    await m('expire_messages', () => this.ctx.storage.transactionSync(() => {
-      expireSessionMessages(this.sql, now.getTime());
-      expireMessageEvents(this.sql, now.getTime());
-    }));
-    await m('tbm', () => this.runTbmTick(now.getTime()));
-    // Reuse the existing minute alarm so configured idle delays do not wait
-    // for a root slot. Durable episode/command keys fence duplicate delivery.
-    try { await m('idle_work', () => this.idleWorkTick()); } catch { console.warn('idle_work_tick_failed'); }
-    try { await m('host_history', () => this.hostHistoryService.sample()); } catch { console.warn('resource_history_sampling_failed'); }
-    try {
-      await m('fleet_account_capacity_history', () => sampleAccountCapacityHistory(
-        this.sql,
-        now.getTime(),
-        () => dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[])
-          .map(account => this.fleetService.accountStatus(account)),
-      ));
-    } catch { console.warn('fleet_account_capacity_history_sample_failed'); }
-    const cleanup = await m('bus_retention', () => this.busService.retentionCleanup(now.getTime(), 100));
+    const nowMs = Date.now();
+    const retentionPending = await this.ctx.storage.get('bus_retention_pending') === true;
+    const cleanup = retentionPending
+      ? await m('bus_retention', () => this.busService.retentionCleanup(nowMs, 100))
+      : { hasMore: false };
     let nextAlarm = await m('jobs_alarms', () => this.jobsService.processAlarms());
     // Webhook delivery pump (intake 19ec91c2): pending redeliveries pull the
     // next alarm forward so a returning session is served without waiting
     // for the full cadence.
+    let webhookNext: number | undefined;
     try {
-      const webhookNext = await m('webhooks', () => this.webhookService.pump());
+      webhookNext = await m('webhooks', () => this.webhookService.pump());
       if (webhookNext !== undefined) {
         const current = nextAlarm ?? undefined;
         nextAlarm = current === undefined ? webhookNext : Math.min(current, webhookNext);
@@ -2833,22 +2872,47 @@ export class Hub extends DurableObject {
       }));
     } catch {}
     try { await this.flushRowsMeter(); } catch { console.warn('rows_meter_flush_failed'); }
-
-    // A backlog drains fast, but a stuck hasMore must never pin the DO to a
-    // 1s alarm forever: at most 30 consecutive 1s re-arms, then the minute cadence.
-    this.fastRearms = cleanup.hasMore ? this.fastRearms + 1 : 0;
-    if (cleanup.hasMore && this.fastRearms <= 30) {
-      await this.ctx.storage.setAlarm(Date.now() + 1000);
-    } else {
-      if (cleanup.hasMore) console.warn(JSON.stringify({ event: 'bus_retention_rearm_capped', consecutive: this.fastRearms }));
-      try {
-        await this.ctx.storage.setAlarm(Math.max(Date.now(), Math.min(nextAlarm || Infinity, Date.now() + 60000)));
-      } catch {}
-    }
+    await this.scheduleDueAlarm([nextAlarm, this.jobsService.getAlarmTime(), webhookNext, this.nextWakeTimeSafe()], retentionPending ? cleanup.hasMore : undefined);
   }
 
-  private fastRearms = 0;
   private idleWorkAt = 0;
+
+  private nextWakeTimeSafe(): number | null {
+    try { return this.sessionControlService.nextWakeTime(); } catch { return null; }
+  }
+
+  /** The alarm is a one-shot for due work. Bus-retention continuations may
+   * use 1s re-arms at most 30 times across DO restarts, then back off to 60s.
+   * An omitted retention result preserves the durable backlog state; callers
+   * that did not run cleanup (for example a webhook ingest) cannot clear it. */
+  private async scheduleDueAlarm(nextTimes: Array<number | null | undefined>, retentionHasMore?: boolean) {
+    const now = Date.now();
+    const current = await this.ctx.storage.getAlarm();
+    const due = nextTimes.map(Number).filter(value => Number.isFinite(value) && value > 0);
+    let pending = await this.ctx.storage.get('bus_retention_pending') === true;
+    let rearmCount = Number(await this.ctx.storage.get('bus_retention_fast_rearms')) || 0;
+    if (retentionHasMore === true) {
+      pending = true;
+      rearmCount++;
+      await this.ctx.storage.put('bus_retention_pending', true);
+      await this.ctx.storage.put('bus_retention_fast_rearms', rearmCount);
+    } else if (retentionHasMore === false) {
+      pending = false;
+      rearmCount = 0;
+      await this.ctx.storage.put('bus_retention_pending', false);
+      await this.ctx.storage.put('bus_retention_fast_rearms', 0);
+    }
+    let next: number | null = null;
+    const candidates = [...due, ...(current !== null && current > now ? [current] : [])];
+    if (candidates.length) next = Math.min(...candidates);
+    if (pending) {
+      const retentionWake = now + (rearmCount > 30 ? 60000 : 1000);
+      next = next === null ? retentionWake : Math.min(next, retentionWake);
+      if (rearmCount === 31) console.warn(JSON.stringify({ event: 'bus_retention_rearm_capped', consecutive: rearmCount }));
+    }
+    if (next !== null) await this.ctx.storage.setAlarm(Math.max(now + 1, next));
+    else await this.ctx.storage.deleteAlarm();
+  }
 
   /** Idle recovery acts on 30-minute nudge delays, so a census at most every
    * 5 minutes is enough; the minute alarm used to rerun it (intake 8081a05a).
@@ -2856,8 +2920,11 @@ export class Hub extends DurableObject {
    * once, and HUB_IDLE_OPEN_AC_NUDGE_MINUTES below 5 acts within ~5 minutes. */
   private async idleWorkTick() {
     const now = Date.now();
-    if (now - this.idleWorkAt < IDLE_WORK_INTERVAL_MS) return;
+    const durableLast = Number(await this.ctx.storage.get('idle_work_last_tick')) || 0;
+    const last = Math.max(this.idleWorkAt, durableLast);
+    if (now - last < IDLE_WORK_INTERVAL_MS) return;
     this.idleWorkAt = now;
+    await this.ctx.storage.put('idle_work_last_tick', now);
     await this.idleWork.tick();
   }
 
@@ -3169,10 +3236,6 @@ export class Hub extends DurableObject {
 
   private async handleBusRoutes(request: Request, path: string): Promise<Response | null> {
     const result = await this.dispatchBusRoutes(request, path);
-    if (result?.ok && request.method === 'POST' && ['/api/bus/send', '/api/bus/reply'].includes(path)) {
-      const alarm = await this.ctx.storage.getAlarm();
-      if (alarm === null || alarm > Date.now() + 60000) await this.ctx.storage.setAlarm(Date.now() + 60000);
-    }
     if (result && result.status === 403) {
       const auth = await this.authenticateBusRequest(request);
       // Unknown/invalid credentials have no authenticated audit principal.

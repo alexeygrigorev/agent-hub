@@ -34,8 +34,10 @@ describe('TBM public REST composition', () => {
     }] });
     expect(response.status).toBe(200);
     await inDO(stub(), async (h: any) => {
-      h.sql.exec('DROP TABLE IF EXISTS tbm_tick_state');
-      await h.alarm();
+      h.sql.exec('DELETE FROM tbm_tick_state');
+      // TBM rollups are driven by the existing five-minute checks cadence;
+      // alarms now only service concrete due work.
+      await h.runChecks('tbm');
       const state: any = h.sql.exec("SELECT * FROM tbm_controller_state WHERE pool_id='go:staged-low:5h'").one();
       expect(state.last_at_ms).toBeGreaterThanOrEqual(now);
       const pool = loadPools(h.sql).find(p => p.account === 'staged-low')!;

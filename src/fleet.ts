@@ -1,4 +1,6 @@
 import { engineEpoch } from './engine-epoch';
+import { WriteWatch } from './write-watch';
+import { ObservedCatalog } from './observed-catalog';
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { GOAL_ENGINES, GOAL_PROVIDERS } from './goal-engines';
 import { observationModel } from './session-observation';
@@ -577,12 +579,16 @@ export class FleetService {
   public routing: RoutingService;
   public resources: ResourceManagement;
   public admission: ClaimAdmission;
+  private transaction: <T>(fn: () => T) => T;
+  private observedCatalog: ObservedCatalog | null;
   private maintenance: { reconciled: boolean; drained: boolean; queueLimit:number } | null = null;
   // Intake 488b860e: rotation point for re-offered effect-free starting
   // launches, so no row starves behind others regardless of age order.
   // The cursor is a value in the ORDER BY key (updated_at, id), never a
   // row position, so concurrent inserts, removals and wraps stay exact.
   private reofferCursors = new Map<string, [string, string]>();
+  /** All-clear offers answers per machine, keyed by the fleet write stamp. */
+  private emptyOffers = new Map<string, { stamp: string; at: number; value: any }>();
   // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
   private linkRevisions = new Map<string, string>();
   private candidateCache = new Map<string, { revision: string; at: number; value: any[] }>();
@@ -687,10 +693,18 @@ export class FleetService {
     return expireSilentStartRows(this.sql, this.now());
   }
 
-  constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) {
-    this.resources = new ResourceManagement(sql, now);
-    this.routing = new RoutingService(sql, this, now, transaction);
-    this.admission = new ClaimAdmission(sql, transaction, now);
+  constructor(private sql: SqlStorage, transaction: <T>(fn: () => T) => T, private now: () => number = Date.now, private writes?: WriteWatch, observed?: ObservedCatalog) {
+    this.observedCatalog = observed ?? null;
+    // Write-through session rows can be patched before the enclosing SQL
+    // transaction returns. If any later statement aborts the transaction,
+    // drop the cache so the next read reloads the committed state.
+    this.transaction = fn => {
+      try { return transaction(fn); }
+      catch (error) { this.observedCatalog?.reset(); throw error; }
+    };
+    this.resources = new ResourceManagement(sql, now, writes, observed);
+    this.routing = new RoutingService(sql, this, now, this.transaction);
+    this.admission = new ClaimAdmission(sql, this.transaction, now);
   }
   init() {
     this.resources.init();
@@ -918,6 +932,26 @@ export class FleetService {
       }
     } catch { /* fail closed below when the live set is empty */ }
     return { ids, engines };
+  }
+
+  /** Admission-probe path (~1.8M calls/day): the full account status runs a
+   * capacity sweep per call. Cache the verdict on the fleet write stamp with
+   * a 30 s ceiling - admission already tolerates 30 s-stale observations, and
+   * quota refreshes arrive on a minutes cadence. */
+  private admissionStatus = new Map<string, { stamp: string; at: number; value: any }>();
+  cachedAccountStatus(account: any) {
+    const stamp = this.writes?.stamp('fleet_accounts','fleet_routes','machines','fleet_launches','session_control_sessions',
+      'fleet_sessions','fleet_sessions_meta','fleet_catalog_seen','fleet_catalog_census','fleet_subscriptions',
+      'server_quota_snapshots','host_quota_snapshots','resource_settings') ?? null;
+    const now = this.now();
+    const hit = stamp !== null ? this.admissionStatus.get(String(account.label)) : undefined;
+    if (hit && hit.stamp === stamp && now - hit.at < 30_000) return hit.value;
+    const value = this.accountStatus(account);
+    if (stamp !== null) {
+      if (this.admissionStatus.size >= 32) this.admissionStatus.clear();
+      this.admissionStatus.set(String(account.label), { stamp, at: now, value });
+    }
+    return value;
   }
 
   private accountStatusWithinMaintenance(account: any, snapshot?: FleetCapacitySnapshot) {
@@ -2269,7 +2303,7 @@ export class FleetService {
         }
         if (suffix === '/watchdog') {
           if (!host) return response({error:'forbidden'},403);
-          return response({config:this.resources.config(), sessions:this.resources.sessions(caller.machineId!), choking:this.resources.resourceChoking(caller.machineId!)});
+          return response({config:this.resources.cachedConfig(), sessions:this.resources.sessions(caller.machineId!), choking:this.resources.cachedResourceChoking(caller.machineId!)});
         }
         if (!admin) return response({error:'forbidden'},403);
         if (!suffix) return response(this.resources.overview());
@@ -2641,6 +2675,16 @@ export class FleetService {
           try { this.drainCapacityQueue(1); } catch { /* best-effort */ };
         }
         try { runHeldReconciler(this.sql); } catch { /* best-effort */ }
+        // The all-clear answer is served from memory: an offered/starting row
+        // for this machine can only appear through a fleet_launches write,
+        // which moves the stamp. Zero row reads per poll while quiet
+        // (intake 8081a05a/e8a22f4c; ~20M polls/day).
+        const offersStamp = this.writes?.stamp('fleet_launches','machines','fleet_accounts','fleet_routes','engine_epoch',
+          'status_lifecycle_revision','fleet_catalog_seen','session_control_sessions');
+        if (offersStamp !== undefined) {
+          const cached = this.emptyOffers.get(caller.machineId!);
+          if (cached && cached.stamp === offersStamp && polledAt >= cached.at && polledAt - cached.at < POLL_MAINTENANCE_MS) return response(cached.value);
+        }
         const valid: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
@@ -2719,7 +2763,15 @@ export class FleetService {
               ...(row.state !== 'offered' ? { state: row.state, claim_key: row.claim_key ?? null } : {}) };
           });
         });
-        return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!), engine_epoch: engineEpoch(this.sql) });
+        const body = { offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!), engine_epoch: engineEpoch(this.sql) };
+        // Only the all-clear answer is reusable: with offers present the poll
+        // itself drives claim/resume rotation, so every answer is fresh.
+        if (offersStamp !== undefined && valid.length === 0 && resumeRows.length === 0) {
+          if (this.emptyOffers.size >= 8) this.emptyOffers.clear();
+          this.emptyOffers.set(caller.machineId!, { stamp: this.writes!.stamp('fleet_launches','machines','fleet_accounts','fleet_routes','engine_epoch',
+            'status_lifecycle_revision','fleet_catalog_seen','session_control_sessions'), at: polledAt, value: body });
+        }
+        return response(body);
       }),1);
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {
@@ -2805,6 +2857,10 @@ export class FleetService {
         let written = 0;
         const cleanSessions: any[] = [];
         const changedSessions: any[] = [];
+        const linkChangedSessions: any[] = [];
+        const observedRows: any[] = [];
+        const unobservedIds: string[] = [];
+        let metadataChanged = false;
         const seen = new Set<string>();
         for (const s of data.sessions) {
           if (s.tokens) recordSessionTokens(this.sql, { session_id: `${caller.machineId}:${s.native_id}`,
@@ -2825,7 +2881,18 @@ export class FleetService {
           const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null, progress_json: s.progress ? JSON.stringify(s.progress) : null };
           if (!staleRecoverable && prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
           changedSessions.push(s);
-          this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms, progress_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, row.cwd, s.profile, s.account, row.last_activity_at, row.created_at_ms, row.progress_json);
+          // Activity/progress refreshes do not change the launch-to-session
+          // relationship. Keep them on the write-through catalog path without
+          // repeating per-native adoption and linkage probes on every census.
+          const linkFields = ['tag', 'engine', 'phase', 'workspace', 'created_at_ms'];
+          if (!prior || linkFields.some(f => (prior[f] ?? null) !== (row[f] ?? null))) linkChangedSessions.push(s);
+          if (!metadataChanged) {
+            const metaFields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account'];
+            metadataChanged = !prior || metaFields.some(f => (prior[f] ?? null) !== (row[f] ?? null));
+          }
+          const observedAt = new Date(this.now()).toISOString();
+          this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms, progress_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, observedAt, s.workspace, row.cwd, s.profile, s.account, row.last_activity_at, row.created_at_ms, row.progress_json);
+          observedRows.push({ machine_id: caller.machineId!, native_id: s.native_id, tag: s.tag, engine: s.engine, phase: s.phase, agent_state: s.agent_state, observed_at: observedAt, workspace: s.workspace, cwd: row.cwd, profile: s.profile, account: s.account, last_activity_at: row.last_activity_at, created_at_ms: row.created_at_ms, progress_json: row.progress_json });
           written++;
         }
         // Preserve historical observations. A missing catalog row is not exit
@@ -2836,7 +2903,12 @@ export class FleetService {
           : [];
         for (const id of gone) {
           this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!, id); written++;
+          unobservedIds.push(id);
         }
+        // Write-through the observed catalog so watchdog/liveness reads stay
+        // at zero rows between real changes (intake 8081a05a/e8a22f4c).
+        if (observedRows.length) this.resources.noteCensus(caller.machineId!, observedRows, metadataChanged);
+        for (const id of unobservedIds) this.resources.notePhase(caller.machineId!, id, 'unobserved', new Date(this.now()).toISOString());
         // Exact positive terminal evidence releases physical concurrency even
         // if a headless launch journal was lost. Absence is never exit proof.
         // Routed jobs retain their separate task-result contract.
@@ -2879,7 +2951,8 @@ export class FleetService {
         try { revision = String((this.sql.exec('SELECT revision FROM session_observation_intake_meta WHERE id=1').toArray()[0] as any)?.revision ?? ''); } catch { /* table not created yet */ }
         const revisionMoved = !revision || this.linkRevisions.get(caller.machineId!) !== revision;
         this.linkRevisions.set(caller.machineId!, revision);
-        adoptObservedNativeSessions(this.sql, caller.machineId!, changedSessions, this.now(), undefined, revisionMoved ? cleanSessions : changedSessions);
+        adoptObservedNativeSessions(this.sql, caller.machineId!, linkChangedSessions, this.now(), undefined,
+          revisionMoved ? cleanSessions : linkChangedSessions);
         if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
         reconcileVerifiedNoStarts(this.sql, this.now());

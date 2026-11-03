@@ -161,7 +161,7 @@ describe('Root scheduling flag: auth and body validation', () => {
   it('default is enabled and readback requires an admin session (bearer and non-admin rejected)', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      await seedBase(instance.ctx.storage.sql);
+      await seedBase(instance.sql);
       const sessionCookie = await createSessionCookie(instance.env, {
         sub: 'admin-1', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test-token',
         exp: Math.floor(Date.now() / 1000) + 3600
@@ -210,7 +210,7 @@ describe('Root scheduling flag: auth and body validation', () => {
   it('PUT requires session CSRF and a strict {"enabled": boolean} body', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      await seedBase(instance.ctx.storage.sql);
+      await seedBase(instance.sql);
       const sessionCookie = await createSessionCookie(instance.env, {
         sub: 'admin-1', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test-token',
         exp: Math.floor(Date.now() / 1000) + 3600
@@ -272,7 +272,7 @@ describe('Root scheduling flag: scheduler and claim gating', () => {
   it('disabled tick creates no root-run job and no offers; re-enable resumes the same slot (fixed clock)', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       await seedBase(sql);
       const sessionCookie = await adminCookie(instance.env);
 
@@ -316,7 +316,7 @@ describe('Root scheduling flag: scheduler and claim gating', () => {
   it('tick slot-age boundary is decided by the injected clock, not the wall clock', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       await seedBase(sql);
       setRootScheduling(sql, false, FIXED_NOW.toISOString());
 
@@ -341,8 +341,8 @@ describe('Root scheduling flag: scheduler and claim gating', () => {
   it('disable refuses new claims of offered root-run jobs; enable restores claiming', async () => {
     const stub = await getStub();
     const sessionCookie = await (runInDurableObject as any)(stub, async (instance: any) => {
-      await seedBase(instance.ctx.storage.sql);
-      await seedOfferedRootJob(instance.ctx.storage.sql, 'job-dis-1', 'host-alpha', 'root-run:dis-1');
+      await seedBase(instance.sql);
+      await seedOfferedRootJob(instance.sql, 'job-dis-1', 'host-alpha', 'root-run:dis-1');
       return await createSessionCookie(instance.env, {
         sub: 'admin-1', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test-token',
         exp: Math.floor(Date.now() / 1000) + 3600
@@ -359,7 +359,7 @@ describe('Root scheduling flag: scheduler and claim gating', () => {
     expect(claimData.error).toBe('conflict');
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const lease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+      const lease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
       expect(lease.holder_job_id).toBeNull();
       expect(lease.epoch).toBe(0);
     });
@@ -378,8 +378,8 @@ describe('Root scheduling flag: scheduler and claim gating', () => {
   it('START transitions are gated while disabled; a running root keeps renewing and finishing', async () => {
     const stub = await getStub();
     const sessionCookie = await (runInDurableObject as any)(stub, async (instance: any) => {
-      await seedBase(instance.ctx.storage.sql);
-      await seedOfferedRootJob(instance.ctx.storage.sql, 'job-gate-1', 'host-alpha', 'root-run:gate-1');
+      await seedBase(instance.sql);
+      await seedOfferedRootJob(instance.sql, 'job-gate-1', 'host-alpha', 'root-run:gate-1');
       return await createSessionCookie(instance.env, {
         sub: 'admin-1', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test-token',
         exp: Math.floor(Date.now() / 1000) + 3600
@@ -431,7 +431,7 @@ describe('Root scheduling flag: scheduler and claim gating', () => {
     expect(finishRes.status).toBe(200);
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       const job = sql.exec("SELECT status FROM jobs WHERE id = 'job-gate-1'").toArray()[0] as any;
       expect(job.status).toBe('succeeded');
       const lease = sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
@@ -444,7 +444,7 @@ describe('Root scheduling flag: idempotence, durability, races', () => {
   it('repeated stop/start is idempotent and durable across DO restart', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      await seedBase(instance.ctx.storage.sql);
+      await seedBase(instance.sql);
       const sessionCookie = await createSessionCookie(instance.env, {
         sub: 'admin-1', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test-token',
         exp: Math.floor(Date.now() / 1000) + 3600
@@ -474,7 +474,7 @@ describe('Root scheduling flag: idempotence, durability, races', () => {
       expect(e2Data.updated_at).toBe(e1Data.updated_at);
 
       // Exactly one state row
-      const rows = instance.ctx.storage.sql.exec('SELECT id FROM root_scheduling').toArray();
+      const rows = instance.sql.exec('SELECT id FROM root_scheduling').toArray();
       expect(rows.length).toBe(1);
 
       // Disable again for the restart check
@@ -488,8 +488,8 @@ describe('Root scheduling flag: idempotence, durability, races', () => {
       expect(((await res.json()) as any).enabled).toBe(false);
 
       // A fresh JobsService also honors the persisted flag
-      await seedOfferedRootJob(instance.ctx.storage.sql, 'job-after-restart', 'host-alpha', 'root-run:after-restart');
-      const svc = new JobsService(instance.ctx.storage.sql, instance.ctx);
+      await seedOfferedRootJob(instance.sql, 'job-after-restart', 'host-alpha', 'root-run:after-restart');
+      const svc = new JobsService(instance.sql, instance.ctx);
       const claim = await svc.claimJob('job-after-restart', 'host-alpha', true);
       expect(claim.error).toBe('conflict');
       expect(claim.reason).toBe('root_scheduling_disabled');
@@ -499,9 +499,9 @@ describe('Root scheduling flag: idempotence, durability, races', () => {
   it('two-host claim race: exactly one winner when enabled; both refused when disabled', async () => {
     const stub = await getStub();
     const sessionCookie = await (runInDurableObject as any)(stub, async (instance: any) => {
-      await seedBase(instance.ctx.storage.sql);
-      await seedOfferedRootJob(instance.ctx.storage.sql, 'job-race-a', 'host-alpha', 'root-run:race-a');
-      await seedOfferedRootJob(instance.ctx.storage.sql, 'job-race-b', 'host-beta', 'root-run:race-b');
+      await seedBase(instance.sql);
+      await seedOfferedRootJob(instance.sql, 'job-race-a', 'host-alpha', 'root-run:race-a');
+      await seedOfferedRootJob(instance.sql, 'job-race-b', 'host-beta', 'root-run:race-b');
       return await createSessionCookie(instance.env, {
         sub: 'admin-1', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test-token',
         exp: Math.floor(Date.now() / 1000) + 3600
@@ -517,14 +517,14 @@ describe('Root scheduling flag: idempotence, durability, races', () => {
     expect(statuses).toEqual([200, 409]);
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const lease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+      const lease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
       expect(lease.epoch).toBe(1);
       expect(['job-race-a', 'job-race-b']).toContain(lease.holder_job_id);
     });
 
     // Disabled: release the lease, offer two fresh jobs, both claims refused, epoch untouched
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       sql.exec("UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, holder_actor = NULL, expires_at = NULL, released_at = ? WHERE name = 'root'", new Date().toISOString());
       setRootScheduling(sql, false, new Date().toISOString());
       await seedOfferedRootJob(sql, 'job-race-a2', 'host-alpha', 'root-run:race-a2');
@@ -539,7 +539,7 @@ describe('Root scheduling flag: idempotence, durability, races', () => {
     expect(resB2.status).toBe(409);
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       const lease = sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
       expect(lease.epoch).toBe(1);
       expect(lease.holder_job_id).toBeNull();
@@ -553,7 +553,7 @@ describe('Root scheduling flag: idempotence, durability, races', () => {
   it('takeover claim path is refused while disabled and works when enabled', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       await seedBase(sql);
       await seedOfferedRootJob(sql, 'job-take-1', 'host-alpha', 'root-run:take-1');
 
@@ -571,7 +571,7 @@ describe('Root scheduling flag: idempotence, durability, races', () => {
   it('module unit: idempotent set, missing row falls back to enabled', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       await seedBase(sql);
 
       expect(isRootSchedulingEnabled(sql)).toBe(true);
@@ -630,7 +630,7 @@ describe('Root scheduling flag: host read interface', () => {
   it('GET with a verified host bearer returns enabled/updated_at/server_time (UTC) and tracks admin changes', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       await seedBase(sql);
       await seedHostBearers(sql);
       const sessionCookie = await adminCookie(instance.env);
@@ -673,7 +673,7 @@ describe('Root scheduling flag: host read interface', () => {
   it('GET denies unknown, stale, wrong-kind, wrong-scope, admin-scoped and machine-less bearer tokens', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       await seedBase(sql);
       await seedHostBearers(sql);
 
@@ -708,7 +708,7 @@ describe('Root scheduling flag: host read interface', () => {
   it('PUT with a host bearer is rejected and changes nothing', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       await seedBase(sql);
       await seedHostBearers(sql);
       const before = getRootScheduling(sql);
@@ -733,7 +733,7 @@ describe('Root scheduling flag: deadline expiry and offer visibility', () => {
     it(`re-enable after a long pause leaves no ghost offer (${mode})`, async () => {
       const stub = await getStub();
       await (runInDurableObject as any)(stub, async (instance: any) => {
-        const sql = instance.ctx.storage.sql;
+        const sql = instance.sql;
         await seedBase(sql);
         const sessionCookie = await adminCookie(instance.env);
 
@@ -807,7 +807,7 @@ describe('Root scheduling flag: deadline expiry and offer visibility', () => {
   it('decline of a past-deadline root-run offer closes the job instead of re-offering', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       await seedBase(sql);
       await seedOfferedRootJob(sql, 'job-decl-live', 'host-alpha', 'root-run:decl-live');
       await seedOfferedRootJob(sql, 'job-decl-past', 'host-alpha', 'root-run:decl-past');
@@ -829,7 +829,7 @@ describe('Root scheduling flag: deadline expiry and offer visibility', () => {
   it('root-run offers are hidden from host offer lists while disabled and listed again after enable', async () => {
     const stub = await getStub();
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const sql = instance.ctx.storage.sql;
+      const sql = instance.sql;
       await seedBase(sql);
       await seedHostBearers(sql);
       await seedOfferedRootJob(sql, 'job-vis-1', 'host-alpha', 'root-run:vis-1');

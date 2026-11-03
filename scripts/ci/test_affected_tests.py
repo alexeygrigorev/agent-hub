@@ -14,8 +14,10 @@ class SelectTests(unittest.TestCase):
         self.addCleanup(self.dir.cleanup)
         self.root = Path(self.dir.name)
         for rel, text in {
-            'src/quota.ts': '', 'host/agent_hub_host/jobs.py': '',
+            'src/quota.ts': '', 'src/fleet.ts': '',
+            'host/agent_hub_host/jobs.py': '', 'host/agent_hub_host/fleet.py': '',
             'test/quota.test.ts': "import '../src/quota'", 'test/other.test.ts': 'nothing',
+            'test/source_import.test.ts': "import { list } from '../src/fleet'",
             'test/mcp.test.ts': 'MCP integration test',
             'src/mcp-tools.ts': '', 'src/mcp.ts': '', 'src/mcp-usage.ts': '',
             'src/mcp-oauth.ts': '', 'src/conversation-hub.ts': '', 'src/worker.ts': '',
@@ -25,6 +27,8 @@ class SelectTests(unittest.TestCase):
             'host/tests/test_jobs.py': 'from agent_hub_host import jobs',
             'host/tests/test_misc.py': 'import agent_hub_host.jobs as j',
             'host/tests/test_unrelated.py': 'import os',
+            'host/tests/test_python_fleet_import.py': 'from agent_hub_host import fleet',
+            'host/tests/test_source_path_contract.py': "assert 'src/fleet.ts' in source",
             'host/tests/test_machine_binding.py': '',
             'host/tests/test_release_completeness.py': '',
             'host/tests/test_bootstrap_control.py': '',
@@ -40,6 +44,22 @@ class SelectTests(unittest.TestCase):
         self.assertEqual(plan['pytest'], [])
         self.assertTrue(plan['typecheck'])
         self.assertEqual(plan['broad'], [])
+
+    def test_typescript_change_does_not_select_python_module_with_same_basename(self):
+        plan = m.select(['src/fleet.ts'], self.root)
+        self.assertEqual(plan['vitest'], ['test/source_import.test.ts'])
+        self.assertEqual(plan['pytest'], ['host/tests/test_source_path_contract.py'])
+
+    def test_python_change_does_not_select_typescript_module_with_same_basename(self):
+        plan = m.select(['host/agent_hub_host/fleet.py'], self.root)
+        self.assertEqual(plan['vitest'], [])
+        self.assertEqual(plan['pytest'], sorted([
+            'host/tests/test_python_fleet_import.py',
+            'host/tests/test_machine_binding.py',
+            'host/tests/test_release_completeness.py',
+            'host/tests/test_bootstrap_control.py',
+            'test/test_mcp_parity.py',
+        ]))
 
     def test_host_change_selects_canary_regressions_in_addition_to_importers(self):
         plan = m.select(['host/agent_hub_host/jobs.py'], self.root)

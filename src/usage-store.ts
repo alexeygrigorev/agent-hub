@@ -2,12 +2,17 @@
  * store; their chart/pacing tables are projections, never separate collectors. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 export const USAGE_RETENTION_MS = 32 * 86400000;
+const initialized = new WeakSet<object>();
 export function initUsageStore(sql: SqlStorage) {
+  const identity = sql as object;
+  if (initialized.has(identity)) return;
   sql.exec(`CREATE TABLE IF NOT EXISTS usage_quota_history (
     account TEXT NOT NULL, engine TEXT NOT NULL, provider TEXT NOT NULL,
     observed_at_ms INTEGER NOT NULL, quota_json TEXT NOT NULL,
     PRIMARY KEY(account,engine,provider,observed_at_ms))`);
   sql.exec('CREATE INDEX IF NOT EXISTS usage_quota_history_time ON usage_quota_history(observed_at_ms)');
+  sql.exec('CREATE INDEX IF NOT EXISTS usage_quota_history_account_provider_time ON usage_quota_history(account,provider,observed_at_ms)');
+  initialized.add(identity);
 }
 export function recordUsageQuota(sql: SqlStorage, account: string, provider: string, quota: any, at: number) {
   initUsageStore(sql);

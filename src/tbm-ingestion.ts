@@ -150,6 +150,6 @@ export function syncStoredTbmSnapshots(sql: SqlStorage, now: number): void {
     try { quota = JSON.parse(row.quota_json); } catch { continue; }
     recordUsageQuota(sql,canonicalAccountLabel(row.account),canonicalQuotaProvider(row.provider),quota,at);
   }
-  const history:any[]=sql.exec('SELECT account,provider,observed_at_ms,quota_json FROM usage_quota_history WHERE observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms',now-15*60000,now).toArray();
+  const history:any[]=sql.exec('SELECT account,provider,observed_at_ms,quota_json FROM usage_quota_history WHERE observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms LIMIT 4096',now-15*60000,now).toArray();
   for(const row of history) syncTbmFromServerAccounts(sql,[{account:row.account,provider:row.provider,quota:JSON.parse(row.quota_json)}],row.observed_at_ms);
 }
