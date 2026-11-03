@@ -51,12 +51,14 @@ export function bindAgentCredentials(sql: SqlStorage, transaction: <T>(fn: () =>
     // Intake e8a22f4c: the identity match must stay sargable. A CASE over the
     // stored columns defeats the tag/project indexes and scans the whole
     // registry on every message insert (~8 rows/agent, ~9k rows/insert live).
-    // Branch on the colon in the *sought* value instead: both branches match a
-    // stored column (or indexed expression) against a per-row constant.
+    // Branch on the colon in the *sought* value instead: both branches match
+    // bare stored columns against per-row constants, so the tag and
+    // project/tag indexes apply. Semantics match the old CASE exactly,
+    // including the projectless-collision guard below.
     const binding = (raw: string, created?: string) => `COALESCE((SELECT CASE WHEN COALESCE(a.project,'') = '' THEN a.tag ELSE a.project || ':' || a.tag END
       FROM agents a WHERE ${valid} AND
-      ((instr(${raw},':') = 0 AND COALESCE(a.project,'') = '' AND a.tag = ${raw})
-        OR (instr(${raw},':') > 0 AND COALESCE(a.project,'') = substr(${raw},1,instr(${raw},':')-1) AND a.tag = substr(${raw},instr(${raw},':')+1)))
+      ((instr(${raw},':') = 0 AND a.tag = ${raw})
+        OR (instr(${raw},':') > 0 AND a.project = substr(${raw},1,instr(${raw},':')-1) AND a.tag = substr(${raw},instr(${raw},':')+1)))
       AND (instr(${raw},':') > 0 OR (SELECT COUNT(*) FROM agents WHERE tag = ${raw}) = 1)
       ${created ? `AND julianday(a.registered_at) <= julianday(${created})` : ''}
       LIMIT 1), '')`;
