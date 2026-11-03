@@ -1664,3 +1664,151 @@ def test_antigravity_home_is_seeded_past_theme_and_data_sharing_prompts(tmp_path
     other = tmp_path / 'other'
     p.provision_managed_home(dict(b, provider='codex'), other, tmp_path)
     assert not (other / p.ANTIGRAVITY_ONBOARDING).exists()
+
+def test_admission_reports_host_identity_missing_when_host_json_absent_or_unauthenticated_9104edb4(tmp_path, monkeypatch, capsys):
+    """Intake 9104edb4 AC4: missing/unauthenticated host.json or human HUB_CONFIG_FILE yields host_identity_missing."""
+    from agent_hub_host import config, dispatch_diagnostics, fleet, native_admission
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    cfg_dir = tmp_path / 'config'
+    cfg_dir.mkdir(mode=0o700)
+    missing_host = cfg_dir / 'host.json'
+    monkeypatch.setattr(config, 'get_config_path', lambda: missing_host)
+    monkeypatch.setattr(config, 'get_host_config_path', lambda: missing_host)
+    monkeypatch.delenv('HUB_CONFIG_FILE', raising=False)
+    monkeypatch.setattr(sys, 'argv', ['admission', 'hub-claude'])
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+
+    # 1. Missing host.json -> host_identity_missing
+    p.admission()
+    out = json.loads(capsys.readouterr().out)
+    assert out['launch_allowed'] is False
+    assert out['profile_supported'] is False
+    assert out['account_label'] == 'hub-claude'
+    assert out['reason'] == 'host_identity_missing'
+
+    # 2. Present host.json without access_token -> host_identity_missing
+    config._save_to(missing_host, {'base_url': 'https://hub.example', 'client_kind': 'host'})
+    p.admission()
+    out = json.loads(capsys.readouterr().out)
+    assert out['launch_allowed'] is False
+    assert out['reason'] == 'host_identity_missing'
+
+    # 3. Human profile in single-file override mode -> host_identity_missing
+    human_cli = cfg_dir / 'cli.json'
+    config._save_to(human_cli, {
+        'base_url': 'https://hub.example',
+        'access_token': 'fixture-human-token',
+        'client_kind': 'human',
+    }, human_flow=True)
+    monkeypatch.setenv('HUB_CONFIG_FILE', str(human_cli))
+    monkeypatch.setattr(config, 'get_config_path', lambda: human_cli)
+    monkeypatch.setattr(config, 'get_host_config_path', lambda: human_cli)
+    p.admission()
+    out = json.loads(capsys.readouterr().out)
+    assert out['launch_allowed'] is False
+    assert out['reason'] == 'host_identity_missing'
+
+    # 4. native_admission.probe also reports host_identity_missing
+    monkeypatch.delenv('HUB_CONFIG_FILE', raising=False)
+    monkeypatch.setattr(config, 'get_config_path', lambda: cfg_dir / 'absent-host.json')
+    monkeypatch.setattr(config, 'get_host_config_path', lambda: cfg_dir / 'absent-host.json')
+    probe_out = native_admission.probe(
+        {'account': 'shared-claude', 'engine': 'claude', 'profile': None, 'mode': 'headless'},
+        'claude', 'shared-claude', 'claude',
+    )
+    assert probe_out['launch_allowed'] is False
+    assert probe_out['reason'] == 'host_identity_missing'
+
+    # 5. Fleet _dispatch_admission + dispatch_diagnostics classify as host_identity_missing, not admission_refused
+    dispatcher = fleet.Dispatcher.__new__(fleet.Dispatcher)
+    dispatcher._admission_guard = fleet.threading.Lock()
+    dispatcher._admission_locks = {}
+    dispatcher._admission_shared = {}
+    dispatcher._managed_labels = {'hub-claude'}
+    dispatcher.runner = lambda argv, payload=None: dict(out)
+    with pytest.raises(ValueError) as exc_info:
+        dispatcher._dispatch_admission(
+            {'account_label': 'hub-claude', 'admission_argv': ['admission', 'hub-claude']},
+            {'account': 'hub-claude', 'engine': 'claude', 'profile': 'hub-hub-claude', 'mode': 'headless'},
+            None,
+            {},
+        )
+    assert str(exc_info.value).startswith('host_identity_missing:')
+    classified = dispatch_diagnostics.classify(exc_info.value)
+    assert classified['reason'] == 'host_identity_missing'
+    assert classified['reason'] != 'admission_refused'
+    fleet_ts = (Path(__file__).resolve().parents[2] / 'src/fleet.ts').read_text(encoding='utf-8')
+    assert '"host_identity_missing": ' + json.dumps(classified['message']) in fleet_ts
+
+
+def test_admission_partial_sonnet_selection_and_model_mismatch_diagnostic(tmp_path, monkeypatch, capsys):
+    """A policy-defined partial Claude selection resolves and model mismatch stays explicit."""
+    import io
+    from agent_hub_host import dispatch_diagnostics, fleet
+
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(parents=True, mode=0o700)
+    bundle_dir = root_dir / 'hub-claude-rev1'
+    bundle_dir.mkdir(parents=True, mode=0o700)
+    bundle = {
+        'label': 'hub-claude',
+        'provider': 'claude',
+        'revision': 'rev1',
+        'version': '2.1.304',
+        'args': [],
+        'credential_generation': 6,
+    }
+    p.write_json(bundle_dir / 'bundle.json', bundle)
+    p.write_json(root_dir / 'state.json', [{'label': 'hub-claude', 'revision': 'rev1'}])
+    prof = tmp_path / 'profiles.toml'
+    prof.write_text('[profiles.hub-hub-claude]\nengine = "claude"\n', encoding='utf-8')
+
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    monkeypatch.setattr(p, 'profile_path', lambda: prof)
+    monkeypatch.setattr(p, 'host_request', lambda method, path, body=None: {
+        'launch_allowed': True,
+        'profile_supported': True,
+        'account_label': 'hub-claude',
+        'credential_generation': 6,
+        'observed_at': '2026-10-30T09:00:00Z',
+    })
+    monkeypatch.setattr(sys, 'argv', ['admission', 'hub-claude'])
+
+    # Partial selection {'model': 'sonnet'} without 'id' or 'engine' resolves to the current policy effort.
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps({'selection': {'model': 'sonnet'}})))
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: False)
+    p.admission()
+    out_sonnet = json.loads(capsys.readouterr().out)
+    assert out_sonnet['launch_allowed'] is True
+    assert out_sonnet['model_supported'] is True
+    assert out_sonnet['model'] == 'sonnet'
+    assert out_sonnet['effort'] == 'medium'
+
+    # Unsupported model returns reason='model_mismatch' and fleet surfaces model_unsupported (not admission_refused)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps({'selection': {'model': 'nonexistent-model'}})))
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: False)
+    p.admission()
+    out_bad = json.loads(capsys.readouterr().out)
+    assert out_bad['launch_allowed'] is False
+    assert out_bad['model_supported'] is False
+    assert out_bad['reason'] == 'model_mismatch'
+
+    dispatcher = fleet.Dispatcher.__new__(fleet.Dispatcher)
+    dispatcher._admission_guard = fleet.threading.Lock()
+    dispatcher._admission_locks = {}
+    dispatcher._admission_shared = {}
+    dispatcher._managed_labels = {'hub-claude'}
+    dispatcher.runner = lambda argv, payload=None: dict(out_bad)
+    with pytest.raises(ValueError) as exc_info:
+        dispatcher._dispatch_admission(
+            {'account_label': 'hub-claude', 'admission_argv': ['admission', 'hub-claude']},
+            {'account': 'hub-claude', 'engine': 'claude', 'profile': 'hub-hub-claude', 'mode': 'headless'},
+            {'id': 'nonexistent-model', 'model': 'nonexistent-model', 'effort': 'high'},
+            {},
+        )
+    assert str(exc_info.value).startswith('model_unsupported:')
+    classified = dispatch_diagnostics.classify(exc_info.value)
+    assert classified['reason'] == 'model_unsupported'
+    assert classified['reason'] != 'admission_refused'

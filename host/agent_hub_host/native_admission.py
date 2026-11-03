@@ -46,7 +46,11 @@ def probe(payload, service, account, engine, request=None):
             return result
         selection = payload.get('selection')
         if selection is not None:
-            model = configured_selection(selection, engine, service)
+            try:
+                model = configured_selection(selection, engine, service)
+            except ValueError:
+                result['reason'] = 'model_unsupported'
+                return result
             result.update(model_supported=True, model=model['model'], effort=model['effort'])
         verdict = request('POST', '/api/engines/admission', {'label': account, 'native': True})
         if not isinstance(verdict, dict) or verdict.get('account_label') != account:
@@ -57,9 +61,11 @@ def probe(payload, service, account, engine, request=None):
             result['reason'] = str(verdict['reason'])[:64]
         if verdict.get('quota_warning'):
             result['quota_warning'] = str(verdict['quota_warning'])[:64]
-    except Exception:
+    except Exception as exc:
+        from .provisioning import HostIdentityMissingError
+        if isinstance(exc, HostIdentityMissingError):
+            result['reason'] = 'host_identity_missing'
         # Exceptions may contain provider or Hub response bodies. Emit fixed booleans.
-        pass
     return result
 
 

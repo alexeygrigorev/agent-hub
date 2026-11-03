@@ -35,6 +35,25 @@ _GUARD_NAMES = (GUARD_HOME_ENV, GUARD_USER_HOME_ENV, GUARD_XDG_ENV, GUARD_APPDAT
 _guarded_environment: tuple[tuple[str, str], ...] = ()
 
 
+def _capture_initial_environment() -> tuple[tuple[str, str], ...]:
+    items = [(GUARD_HOME_ENV, os.path.expanduser("~"))]
+    if os.name == "posix":
+        import pwd
+        items.append((GUARD_USER_HOME_ENV, pwd.getpwuid(os.getuid()).pw_dir))
+    elif os.environ.get("USERPROFILE"):
+        items.append((GUARD_USER_HOME_ENV, os.environ["USERPROFILE"]))
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        items.append((GUARD_XDG_ENV, xdg))
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        items.append((GUARD_APPDATA_ENV, appdata))
+    return tuple(items)
+
+
+_INITIAL_ENVIRONMENT: tuple[tuple[str, str], ...] = _capture_initial_environment()
+
+
 def _remember_guard_environment():
     global _guarded_environment
     if not _guarded_environment and os.environ.get(GUARD_HOME_ENV):
@@ -45,7 +64,11 @@ def _remember_guard_environment():
 
 def guard_environment() -> dict[str, str]:
     """Original guard roots, retained even when a test replaces its environment."""
-    return dict(_guarded_environment)
+    if _guarded_environment:
+        return dict(_guarded_environment)
+    if under_test_runner():
+        return dict(_INITIAL_ENVIRONMENT)
+    return {}
 
 # Ambient connection/credential selectors: any of these left over from the
 # launching session would make config resolution leave the isolated home.
@@ -60,7 +83,14 @@ _CLEARED = (
 
 def under_test_runner() -> bool:
     """True when a test runner is active in this interpreter."""
-    return any(name in sys.modules for name in ("unittest", "pytest", "_pytest"))
+    if any(name in sys.modules for name in ("unittest", "pytest", "_pytest")):
+        return True
+    main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+    if isinstance(main_file, str) and main_file:
+        base = os.path.basename(main_file)
+        if base.startswith("test_") or base.endswith("_test.py"):
+            return True
+    return False
 
 
 def isolate():

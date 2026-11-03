@@ -231,5 +231,227 @@ class TestUpdateConfigSingleProfile(unittest.TestCase):
         self.assertFalse(self.host_json.exists())
 
 
+class TestRealHomeHostJsonFailClosed(unittest.TestCase):
+    """Intake 9104edb4 AC4: a host test run with the real HOME fails closed before touching host.json."""
+
+    def test_late_test_runner_import_with_real_home_fails_closed_before_touching_host_json(self):
+        script = r'''
+import json, os, sys
+from pathlib import Path
+home = Path(sys.argv[1])
+host = home / '.config/agent-hub/host.json'
+before = host.read_bytes()
+# Import agent_hub_host.config BEFORE unittest with the real HOME.
+from agent_hub_host import config
+import unittest
+actions = {
+    'get_host_config_path': config.get_host_config_path,
+    'load_host_config': config.load_host_config,
+    'save_host_config': lambda: config.save_host_config({'client_kind': 'host', 'access_token': 'fixture-clobber'}),
+    'save_config': lambda: config.save_config({'client_kind': 'host', 'access_token': 'fixture-clobber'}),
+    'update_config': lambda: config.update_config(access_token='fixture-clobber'),
+    'clear_config': config.clear_config,
+}
+blocked = {}
+for name, fn in actions.items():
+    try:
+        fn()
+    except config.ConfigPermissionError:
+        blocked[name] = True
+    else:
+        blocked[name] = False
+print(json.dumps({
+    'blocked': blocked,
+    'unchanged': host.exists() and host.read_bytes() == before,
+}))
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            home = base / "real-home"
+            profiles = home / ".config" / "agent-hub"
+            profiles.mkdir(parents=True, mode=0o700)
+            host_path = profiles / "host.json"
+            host_path.write_text(json.dumps({
+                "client_kind": "host",
+                "access_token": "canary-host-token",
+                "base_url": "https://hub.example",
+            }))
+            host_path.chmod(0o600)
+            scratch = base / "tmp"
+            scratch.mkdir()
+            env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
+            env.update(
+                HOME=str(home),
+                XDG_CONFIG_HOME=str(home / ".config"),
+                APPDATA=str(home / ".config"),
+                TMPDIR=str(scratch),
+                PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(home)],
+                env=env, text=True, capture_output=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(all(data["blocked"].values()), data["blocked"])
+            self.assertTrue(data["unchanged"])
+
+    def test_direct_test_script_importing_config_before_unittest_isolates_and_guards_host_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            home = base / "real-home"
+            profiles = home / ".config" / "agent-hub"
+            profiles.mkdir(parents=True, mode=0o700)
+            host_path = profiles / "host.json"
+            host_path.write_text(json.dumps({
+                "client_kind": "host",
+                "access_token": "canary-host-token",
+                "base_url": "https://hub.example",
+            }))
+            host_path.chmod(0o600)
+            before = host_path.read_bytes()
+            scratch = base / "tmp"
+            scratch.mkdir()
+            test_script = scratch / "test_direct_real_home.py"
+            test_script.write_text(
+                "from agent_hub_host import config\n"
+                "import json, os, sys, unittest\n"
+                "from pathlib import Path\n"
+                "real_home = Path(sys.argv[1])\n"
+                "real_host = real_home / '.config/agent-hub/host.json'\n"
+                "isolated = Path(os.environ['HOME']).resolve() != real_home.resolve()\n"
+                "os.environ['HOME'] = str(real_home)\n"
+                "os.environ['XDG_CONFIG_HOME'] = str(real_home / '.config')\n"
+                "blocked = False\n"
+                "try:\n"
+                "    config.clear_config()\n"
+                "except config.ConfigPermissionError:\n"
+                "    blocked = True\n"
+                "print(json.dumps({'isolated': isolated, 'blocked': blocked}))\n",
+                encoding="utf-8",
+            )
+            env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
+            env.update(
+                HOME=str(home),
+                XDG_CONFIG_HOME=str(home / ".config"),
+                APPDATA=str(home / ".config"),
+                TMPDIR=str(scratch),
+                PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+            )
+            result = subprocess.run(
+                [sys.executable, str(test_script), str(home)],
+                env=env, text=True, capture_output=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["isolated"])
+            self.assertTrue(data["blocked"])
+            self.assertTrue(host_path.exists())
+            self.assertEqual(host_path.read_bytes(), before)
+
+    def test_managed_admission_reports_host_identity_missing_instead_of_generic_admission_refused(self):
+        import io
+        from agent_hub_host import dispatch_diagnostics, fleet, native_admission, provisioning
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root_dir = base / "managed"
+            root_dir.mkdir(mode=0o700)
+            cfg_dir = base / "config"
+            cfg_dir.mkdir(mode=0o700)
+            missing_host = cfg_dir / "host.json"
+            with patch.object(provisioning, "root", return_value=root_dir), \
+                 patch.object(config, "get_config_path", return_value=missing_host), \
+                 patch.object(config, "get_host_config_path", return_value=missing_host), \
+                 patch.dict(os.environ, {}, clear=False), \
+                 patch.object(sys, "argv", ["admission", "hub-claude"]), \
+                 patch.object(sys.stdin, "isatty", return_value=True):
+                os.environ.pop("HUB_CONFIG_FILE", None)
+                buf = io.StringIO()
+                with patch.object(sys, "stdout", buf):
+                    provisioning.admission()
+                out = json.loads(buf.getvalue())
+                self.assertFalse(out["launch_allowed"])
+                self.assertFalse(out["profile_supported"])
+                self.assertEqual(out["account_label"], "hub-claude")
+                self.assertEqual(out["reason"], "host_identity_missing")
+
+                probe_out = native_admission.probe(
+                    {"account": "shared-claude", "engine": "claude", "profile": None, "mode": "headless"},
+                    "claude", "shared-claude", "claude",
+                )
+                self.assertFalse(probe_out["launch_allowed"])
+                self.assertEqual(probe_out["reason"], "host_identity_missing")
+
+                dispatcher = fleet.Dispatcher.__new__(fleet.Dispatcher)
+                dispatcher._admission_guard = fleet.threading.Lock()
+                dispatcher._admission_locks = {}
+                dispatcher._admission_shared = {}
+                dispatcher._managed_labels = {"hub-claude"}
+                dispatcher.runner = lambda argv, payload=None: dict(out)
+                with self.assertRaises(ValueError) as ctx:
+                    dispatcher._dispatch_admission(
+                        {"account_label": "hub-claude", "admission_argv": ["admission", "hub-claude"]},
+                        {"account": "hub-claude", "engine": "claude", "profile": "hub-hub-claude", "mode": "headless"},
+                        None,
+                        {},
+                    )
+                self.assertTrue(str(ctx.exception).startswith("host_identity_missing:"))
+                classified = dispatch_diagnostics.classify(ctx.exception)
+                self.assertEqual(classified["reason"], "host_identity_missing")
+                self.assertNotEqual(classified["reason"], "admission_refused")
+                fleet_ts = (Path(__file__).resolve().parents[2] / "src" / "fleet.ts").read_text(encoding="utf-8")
+                self.assertIn('"host_identity_missing": ' + json.dumps(classified["message"]), fleet_ts)
+
+                dispatcher.runner = lambda argv, payload=None: {
+                    "launch_allowed": False,
+                    "profile_supported": True,
+                    "account_label": "hub-claude",
+                    "model_supported": False,
+                    "reason": "model_mismatch",
+                }
+                with self.assertRaises(ValueError) as mismatch_ctx:
+                    dispatcher._dispatch_admission(
+                        {"account_label": "hub-claude", "admission_argv": ["admission", "hub-claude"]},
+                        {"account": "hub-claude", "engine": "claude", "profile": "hub-hub-claude", "mode": "headless"},
+                        {"id": "bad", "model": "bad", "effort": "high"},
+                        {},
+                    )
+                self.assertTrue(str(mismatch_ctx.exception).startswith("model_unsupported:"))
+                mismatch_classified = dispatch_diagnostics.classify(mismatch_ctx.exception)
+                self.assertEqual(mismatch_classified["reason"], "model_unsupported")
+                self.assertNotEqual(mismatch_classified["reason"], "admission_refused")
+
+                bundle_dir = root_dir / "hub-claude-rev1"
+                bundle_dir.mkdir(parents=True, mode=0o700)
+                provisioning.write_json(bundle_dir / "bundle.json", {
+                    "label": "hub-claude",
+                    "provider": "claude",
+                    "revision": "rev1",
+                    "version": "2.1.304",
+                    "args": [],
+                    "credential_generation": 6,
+                })
+                provisioning.write_json(root_dir / "state.json", [{"label": "hub-claude", "revision": "rev1"}])
+                prof = base / "profiles.toml"
+                prof.write_text('[profiles.hub-hub-claude]\nengine = "claude"\n', encoding="utf-8")
+                with patch.object(provisioning, "profile_path", return_value=prof), \
+                     patch.object(provisioning, "host_request", return_value={
+                         "launch_allowed": True,
+                         "profile_supported": True,
+                         "account_label": "hub-claude",
+                         "credential_generation": 6,
+                         "observed_at": "2026-10-30T09:00:00Z",
+                     }), \
+                     patch.object(sys, "stdin", io.StringIO(json.dumps({"selection": {"model": "sonnet"}}))):
+                    buf_sonnet = io.StringIO()
+                    with patch.object(sys, "stdout", buf_sonnet):
+                        provisioning.admission()
+                    out_sonnet = json.loads(buf_sonnet.getvalue())
+                    self.assertTrue(out_sonnet["launch_allowed"])
+                    self.assertTrue(out_sonnet["model_supported"])
+                    self.assertEqual(out_sonnet["model"], "sonnet")
+                    self.assertEqual(out_sonnet["effort"], "medium")
+
+
 if __name__ == "__main__":
     unittest.main()
