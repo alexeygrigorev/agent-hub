@@ -6,6 +6,18 @@ from unittest.mock import patch
 from agent_hub_host import cli, intake
 
 class TestArchiveCli(unittest.TestCase):
+    def test_ready_fields_listing_sends_only_requested_metadata_fields(self):
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'list', '--status', 'open', '--ready',
+                                '--fields', 'id,project,title,status,updated_at']), \
+             patch('sys.stdout', output), patch.object(intake, 'request', return_value={'items': []}) as request:
+            cli.main()
+        from urllib.parse import parse_qs, urlparse
+        self.assertEqual(parse_qs(urlparse(request.call_args.args[1]).query), {
+            'limit': ['25'], 'status': ['open'], 'ready': ['true'],
+            'fields': ['id,project,title,status,updated_at'],
+        })
+
     def test_archived_history_cursor_and_limit(self):
         output = io.StringIO()
         with patch('sys.argv', ['hub', 'intake', 'history', 'fixture-task', '--archived', '--after', '7', '--limit', '2']), patch('sys.stdout', output), patch.object(intake, 'request', return_value={'items': [], 'next_after': None}) as request:

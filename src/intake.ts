@@ -78,6 +78,8 @@ function hotBytes(sql: SqlStorage): number {
 export const OPEN_INTAKE_WARN_THRESHOLD = 100; // t1038u-deploy-marker
 const OPEN = ['open', 'in_progress', 'blocked', 'pending_approval'];
 const STATUSES = [...OPEN, 'done', 'cancelled'];
+const INTAKE_LIST_FIELDS = new Set(['id', 'project', 'title', 'status', 'version', 'created_at', 'updated_at',
+  'last_event_kind', 'last_event_at', 'last_session_id']);
 export const INTAKE_EVENT_KINDS = ['intake', 'note', 'decision', 'followup', 'blocker', 'pending_approval', 'scope_decision',
   'link', 'session', 'report', 'commit', 'rule_reference', 'resolution', 'approval_decision',
   'owner_acceptance', 'first_action', 'work_action', 'independent_review', 'accepted_outcome',
@@ -225,6 +227,44 @@ function str(value: any, max = 8192, field?: string): string {
 function identifier(value: any): string {
   if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) fail('invalid_identifier');
   return value;
+}
+function intakeListFields(url: URL): string[] | null {
+  const values = url.searchParams.getAll('fields');
+  if (!values.length) return null;
+  const fields = values[0].split(',').map(field => field.trim());
+  if (values.length !== 1 || !fields.length || fields.length > INTAKE_LIST_FIELDS.size ||
+      fields.some(field => !INTAKE_LIST_FIELDS.has(field)) || new Set(fields).size !== fields.length) {
+    fail('invalid_fields');
+  }
+  return fields;
+}
+function intakeReadyFilter(url: URL): boolean {
+  const values = url.searchParams.getAll('ready');
+  if (!values.length) return false;
+  if (values.length !== 1 || (values[0] !== 'true' && values[0] !== 'false')) fail('invalid_ready');
+  return values[0] === 'true';
+}
+function projectIntakeListFields(data: Obj, fields: string[]): Obj {
+  return Object.fromEntries(fields.map(field => [field, Object.hasOwn(data, field) ? data[field] : null]));
+}
+function intakeListRecord(task: Obj, fields: string[]): Obj {
+  const view = task.payload_data ? task : null;
+  if (!view) return projectIntakeListFields(task, fields);
+  const history = Array.isArray(view.payload_data.history) ? view.payload_data.history : [];
+  let lastSessionId: string | null = null;
+  for (const event of history) if (event.kind === 'link' && typeof event.hub_session_id === 'string') lastSessionId = event.hub_session_id;
+  return projectIntakeListFields({
+    ...view,
+    title: view.payload_data.title,
+    last_event_kind: history.length ? history[history.length - 1].kind ?? null : null,
+    last_event_at: history.length ? history[history.length - 1].captured_at ?? null : null,
+    last_session_id: lastSessionId,
+  }, fields);
+}
+function intakeFieldsOnlyPage(page: Obj, fields: string[], p: Obj, items = page.items): Obj {
+  return { snapshot_version: page.snapshot_version, effective_limit: page.effective_limit, total: page.total,
+    next: page.next, items, authorization_valid_until: p.valid_until ?? null,
+    authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only', fields };
 }
 function credentialId(value: any): string {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-][A-Za-z0-9._:-]{0,127}$/.test(value)) fail('invalid_identifier');
@@ -837,27 +877,38 @@ export class IntakeService {
     if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');
     const page = this.page(url, [], revision); // shared limit/cursor/revision validation
     const status = url.searchParams.get('status'); const archived = url.searchParams.get('archived'); const all = url.searchParams.get('all');
+    const fields = intakeListFields(url);
+    const ready = intakeReadyFilter(url);
+    if (ready) fail('invalid_ready');
     if (archived && archived !== 'true') fail('invalid_archived');
     if (all && all !== 'true') fail('invalid_all');
     if (status && status !== 'all' && !STATUSES.includes(status)) fail('invalid_status');
     const defaultOpen = archived !== 'true' && all !== 'true' && status !== 'all' && !['done','cancelled'].includes(status ?? '');
     const filter: IntakeExportFilter = { project: url.searchParams.get('project'),
-      statuses: status && status !== 'all' ? [status] : defaultOpen ? OPEN : null,
+      statuses: status === 'open' ? OPEN : status && status !== 'all' ? [status] : defaultOpen ? OPEN : null,
       archived: archived === 'true' ? 1 : defaultOpen ? 0 : null };
     const total = intakeExportCounts(this.sql, p, filter.project).filter(r => intakeExportMatches(r, filter)).reduce((n, r) => n + Number(r.n), 0);
     const candidates = intakeExportPageIds(this.sql, p, filter, url.searchParams.get('after'), page.effective_limit + 1);
-    const items = candidates.slice(0, page.effective_limit).map(id => this.taskView(this.get('tasks', id)!, p));
+    const selectedIds = candidates.slice(0, page.effective_limit);
+    const items = fields
+      ? selectedIds.map(id => {
+        const row = this.sql.exec('SELECT data FROM intake_export WHERE id=?', id).toArray()[0] as Obj | undefined;
+        if (!row) fail('stale_snapshot', 409);
+        return projectIntakeListFields(JSON.parse(row.data), fields);
+      })
+      : selectedIds.map(id => this.taskView(this.get('tasks', id)!, p));
     // Rules are capped at 128; check only their exact project counter keys.
     const rules = this.rows('rules').filter(rule => rule.project === null ||
       (typeof rule.project === 'string' && (filter.project === null || rule.project === filter.project) && intakeExportCounts(this.sql, p, rule.project).some(r => intakeExportMatches(r, filter))));
     const warn = this.intakeOpenWarning(p);
-    return { ...page, total, items, next: candidates.length > page.effective_limit ? items[items.length-1].id : null,
+    const result = { ...page, total, items, next: candidates.length > page.effective_limit ? selectedIds[selectedIds.length - 1] : null,
       authorization_valid_until: p.valid_until ?? null, operator_rules: rules, data_notice: DATA_NOTICE,
       authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
       completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.',
       ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
       open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
       ...(warn ? { intake_open_warning: warn } : {}) };
+    return fields ? intakeFieldsOnlyPage(result, fields, p, items) : result;
   }
   private exportSummary(url: URL, p: Obj, revision: number): Obj {
     // Counts include every authorized task, including retained terminal/archive rows.
@@ -1007,7 +1058,9 @@ export class IntakeService {
       return this.page(url, visible.map(e => ({ ...e, id: String(Number.MAX_SAFE_INTEGER - e.seq).padStart(20, '0') })).sort((a, b) => a.id.localeCompare(b.id)), revision);
     }
     if (path === '/summary') return this.exportSummary(url, p, revision);
-    if (path === '/tasks' && url.searchParams.get('status') !== 'open') return this.exportPage(url, p, revision);
+    const fields = path === '/tasks' ? intakeListFields(url) : null;
+    const ready = path === '/tasks' ? intakeReadyFilter(url) : false;
+    if (path === '/tasks' && !ready && (fields !== null || url.searchParams.get('status') !== 'open')) return this.exportPage(url, p, revision);
     if (path === '/tasks' || path === '/handoff') {
       if (url.searchParams.has('authorization_valid_until') && Number(url.searchParams.get('authorization_valid_until')) !== (p.valid_until ?? null)) fail('stale_snapshot', 409);
       if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');
@@ -1024,9 +1077,12 @@ export class IntakeService {
       if (status && status !== 'all' && status !== 'open' && !STATUSES.includes(status)) fail('invalid_status');
       if (path === '/handoff' || status === 'open') tasks = tasks.filter(t => OPEN.includes(t.status) || this.unresolved(t).length > 0 || this.continuation(t) === 'uncertain');
       else if (status && status !== 'all') tasks = tasks.filter(t => t.status === status);
+      if (ready) tasks = tasks.filter(t => this.continuation(t) === 'ready');
       const result = this.page(url, tasks, revision);
       const warn = this.intakeOpenWarning(p);
-      return { ...result, authorization_valid_until: p.valid_until ?? null, items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: this.rules(tasks),
+      const items = result.items.map((t: Obj) => this.taskView(t, p));
+      if (fields) return intakeFieldsOnlyPage(result, fields, p, items.map((task: Obj) => intakeListRecord(task, fields)));
+      return { ...result, authorization_valid_until: p.valid_until ?? null, items, operator_rules: this.rules(tasks),
         data_notice: DATA_NOTICE, authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
         completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.',
         ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}),

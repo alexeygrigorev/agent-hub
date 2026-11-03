@@ -32,7 +32,8 @@ class TestIntakeCli(unittest.TestCase):
                  'authorization_valid_until': 12345, 'total': 2, 'effective_limit': 1}
         last = dict(first, items=[{'id': 'b'}], next=None)
         with patch.object(intake, 'request', side_effect=[first, last]) as transport:
-            code, out, error = self.run_cli('intake', 'list', '--all', '--limit', '1', '--project', 'demo')
+            code, out, error = self.run_cli('intake', 'list', '--all', '--limit', '1', '--project', 'demo',
+                                            '--status', 'open', '--ready', '--fields', 'id,project,title,status,updated_at')
         self.assertEqual(code, 0, error)
         result = json.loads(out)
         self.assertEqual([t['id'] for t in result['items']], ['a', 'b'])
@@ -40,7 +41,8 @@ class TestIntakeCli(unittest.TestCase):
         self.assertIsNone(result['next'])
         from urllib.parse import urlparse, parse_qs
         query = parse_qs(urlparse(transport.call_args_list[1].args[1]).query)
-        self.assertEqual(query, {'all': ['true'], 'project': ['demo'], 'limit': ['1'],
+        self.assertEqual(query, {'all': ['true'], 'project': ['demo'], 'limit': ['1'], 'status': ['open'],
+                                'ready': ['true'], 'fields': ['id,project,title,status,updated_at'],
                                 'after': ['a'], 'revision': ['7'], 'authorization_valid_until': ['12345']})
 
     def test_summary_is_one_history_free_request(self):
