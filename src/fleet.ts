@@ -2411,19 +2411,27 @@ export class FleetService {
         // Worktree-guard (AC1): the host locks the session worktree on start
         // with reason "hub-session <id> intake <intake-id|none>". The offer
         // carries both ids so the host never invents them.
-        const hubLinks = new Map<string, { hub_session_id: string; intake_task_id: string | null }>();
+        const hubLinks = new Map<string, { hub_session_id: string; intake_task_id: string | null; driver?: boolean }>();
         if (sessionTable && valid.length) {
           try {
             for (const row of this.sql.exec(
-              `SELECT id, fleet_launch_id, request_json FROM session_control_sessions WHERE fleet_launch_id IN (${valid.map(() => '?').join(',')})`,
+              `SELECT id, fleet_launch_id, request_key, request_json FROM session_control_sessions WHERE fleet_launch_id IN (${valid.map(() => '?').join(',')})`,
               ...valid.map(row => String(row.id))).toArray() as any[]) {
-              if (!row.fleet_launch_id || hubLinks.has(String(row.fleet_launch_id))) continue;
+              const fid = row.fleet_launch_id ? String(row.fleet_launch_id) : '';
+              if (!fid) continue;
+              const isDriver = typeof row.request_key === 'string' && row.request_key.startsWith('driver-') &&
+                driverLaunchRegistered(this.sql, fid);
+              const prev = hubLinks.get(fid);
+              if (prev) {
+                if (isDriver) prev.driver = true;
+                continue;
+              }
               let intake: string | null = null;
               try {
                 const request = row.request_json ? JSON.parse(row.request_json) : {};
                 if (typeof request.intake_task_id === 'string' && request.intake_task_id) intake = request.intake_task_id;
               } catch { /* unparseable request: intake stays null */ }
-              hubLinks.set(String(row.fleet_launch_id), { hub_session_id: String(row.id), intake_task_id: intake });
+              hubLinks.set(fid, { hub_session_id: String(row.id), intake_task_id: intake, driver: isDriver });
             }
           } catch { /* additive enrichment is best-effort */ }
         }
@@ -2434,7 +2442,7 @@ export class FleetService {
           return valid.map(row => {
             const request = parsed(row.request_json);
             const link = hubLinks.get(String(row.id));
-            return { ...(scopedWorkers.has(String(row.id)) || driverLaunchRegistered(this.sql, String(row.id)) ? { worker_credential_required: true } : {}),
+            return { ...(scopedWorkers.has(String(row.id)) || link?.driver ? { worker_credential_required: true } : {}),
               // AC1 lock identity (additive; unknown keys are ignored by hosts).
               ...(link ? { hub_session_id: link.hub_session_id, ...(link.intake_task_id ? { intake_task_id: link.intake_task_id } : {}) } : {}),
               ...this.resources.cpuStart(String(row.id)), resource_choking: choking, resource_management: this.resources.configFor(caller.machineId!),

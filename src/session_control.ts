@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS session_worktree_episodes (subject TEXT PRIMARY KEY, active INTEGER NOT NULL, generation INTEGER NOT NULL, completed INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS fleet_catalog_seen_fresh ON fleet_catalog_seen(observed_at, machine_id);
 CREATE TABLE IF NOT EXISTS session_stale_reconciliations (session_id TEXT PRIMARY KEY, previous_state TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL);
 `;
 
@@ -158,13 +159,13 @@ const ACTIVE_HEARTBEAT_MS = 10 * 60 * 1000;
 function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
   const cutoff = new Date(nowMs - ACTIVE_HEARTBEAT_MS).toISOString();
   return {
-    sql: `(state IN ('queued','held','offered') OR (state IN ('starting','running','uncertain') AND EXISTS (
+    sql: `(state = 'queued' OR state = 'held' OR state = 'offered' OR ((state = 'starting' OR state = 'running' OR state = 'uncertain') AND EXISTS (
       SELECT 1 FROM fleet_sessions f WHERE f.machine_id = session_control_sessions.machine_id
       AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id')
-      AND f.phase NOT IN ('exited','dead','pruned','forgotten','unobserved')
-      AND (f.observed_at >= ? OR EXISTS (
-        SELECT 1 FROM fleet_catalog_seen c WHERE c.machine_id = f.machine_id AND c.observed_at >= ?
-      )))))`,
+      AND f.phase != 'exited' AND f.phase != 'dead' AND f.phase != 'pruned' AND f.phase != 'forgotten' AND f.phase != 'unobserved'
+      AND (f.observed_at >= ? OR instr(COALESCE((
+        SELECT '|' || group_concat(c.machine_id, '|') || '|' FROM fleet_catalog_seen c WHERE c.observed_at >= ?
+      ), ''), '|' || f.machine_id || '|') > 0))))`,
     params: [cutoff, cutoff],
   };
 }
