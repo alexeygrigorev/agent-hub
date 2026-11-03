@@ -3,8 +3,12 @@ import { runInDurableObject } from 'cloudflare:test';
 import { defaultEnv, doFetch } from './m1-focus-setup';
 import { createSessionCookie } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
-import { CLI_EXCLUSIONS, MCP_ROUTES, publicTools, toolRequest, dispatchToolRequest } from '../src/mcp-tools';
+import { MCP_ROUTES, publicTools, toolRequest, dispatchToolRequest } from '../src/mcp-tools';
 import { handleMcp } from '../src/mcp';
+import {
+  CLI_EXCLUSIONS, CORE_TOOL_NAMES, DEFAULT_TOOL_EXCLUSIONS, DOMAIN_TOOL_NAMES,
+  EXTENDED_MCP_ALIASES, LEGACY_MCP_ALIASES, LEGACY_MCP_TOOL_NAMES, canonicalNameForTool, curatedTools, legacyTools, resolveMcpCall,
+} from '../src/mcp-curation';
 import cliCommands from './mcp-cli-commands.json';
 
 const origin = 'http://example.com';
@@ -13,8 +17,8 @@ const csrf = 'mcp-csrf';
 const sub = 'mcp-admin';
 let cookie: string;
 async function inHub(fn: (h: any) => any) { return runInDurableObject(defaultEnv.HUB.get(defaultEnv.HUB.idFromName('hub')), fn); }
-function rpc(method: string, params?: any, auth = bearer, extra: Record<string, string> = {}) {
-  return doFetch(new Request(origin + '/mcp', { method: 'POST', headers: {
+function rpc(method: string, params?: any, auth = bearer, extra: Record<string, string> = {}, path = '/mcp') {
+  return doFetch(new Request(origin + path, { method: 'POST', headers: {
     Authorization: 'Bearer ' + auth, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...extra,
   }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, ...(params ? { params } : {}) }) }));
 }
@@ -93,10 +97,84 @@ describe('Hub MCP protocol and parity', () => {
       }
     }
   });
+  it('advertises the exact curated 25-tool default surface within both schema budgets', () => {
+    const tools = curatedTools();
+    expect(tools.map(tool => tool.name)).toEqual([...CORE_TOOL_NAMES, ...DOMAIN_TOOL_NAMES]);
+    const compact = JSON.stringify({ tools });
+    expect(new TextEncoder().encode(compact).length).toBeLessThanOrEqual(18000);
+    expect(tools).toHaveLength(25);
+
+    const toolByName = new Map(tools.map(tool => [tool.name, tool]));
+    for (const name of ['intake_governance', 'bus_read', 'conversations_read', 'fleet_read'])
+      expect(toolByName.get(name)?.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, openWorldHint: false });
+    for (const name of ['bus_write', 'conversations_write', 'ops_write'])
+      expect(toolByName.get(name)?.annotations).toEqual({ readOnlyHint: false, destructiveHint: true, openWorldHint: false });
+
+    expect(toolByName.get('intake_show')?.inputSchema.properties.query.properties.view.enum).toEqual(['history', 'links', 'context']);
+    expect(toolByName.get('sessions_list')?.inputSchema.properties.query.properties.view.enum).toEqual(['lifecycle', 'tree']);
+    for (const name of DEFAULT_TOOL_EXCLUSIONS) expect(toolByName.has(name)).toBe(false);
+    for (const name of DEFAULT_TOOL_EXCLUSIONS) {
+      const leaked = DOMAIN_TOOL_NAMES.some(domain => toolByName.get(domain)?.inputSchema.properties.action.enum.includes(name));
+      expect(leaked, `${name} must stay out of default action enums`).toBe(false);
+    }
+
+    expect(legacyTools().map(tool => tool.name)).toEqual([...LEGACY_MCP_TOOL_NAMES]);
+    expect(LEGACY_MCP_TOOL_NAMES).toHaveLength(87);
+    expect(Object.keys(LEGACY_MCP_ALIASES)).toHaveLength(87);
+    expect(new Set([...Object.keys(LEGACY_MCP_ALIASES), ...Object.keys(EXTENDED_MCP_ALIASES)])).toEqual(new Set(MCP_ROUTES.map(route => route.name)));
+  });
+  it('serves the 87 legacy schemas on explicit toolsets and routes compact actions through the legacy adapter', async () => {
+    for (const toolset of ['all', 'legacy']) {
+      const result: any = await (await rpc('tools/list', undefined, bearer, {}, `/mcp?toolsets=${toolset}`)).json();
+      expect(result.result.tools.map((tool: any) => tool.name)).toEqual([...LEGACY_MCP_TOOL_NAMES]);
+      expect(result.result.tools).toHaveLength(87);
+    }
+    expect(((await (await rpc('tools/list', undefined, bearer, {}, '/mcp?toolsets=invalid')).json()) as any).error.code).toBe(-32602);
+
+    for (const name of LEGACY_MCP_TOOL_NAMES) {
+      const route = MCP_ROUTES.find(item => item.name === name)!;
+      const args: Record<string, any> = Object.fromEntries([...route.path.matchAll(/\{(\w+)\}/g)].map(match => [match[1], match[1] === 'action' ? 'refresh' : 'fixture']));
+      if (route.method !== 'GET') args.payload = {};
+      const resolved = resolveMcpCall(name, args);
+      expect(LEGACY_MCP_ALIASES[name]).toBe(resolved.canonicalName);
+      const direct = toolRequest(origin, name, args, 'Bearer fixture');
+      const aliased = toolRequest(origin, resolved.routeName, resolved.args, 'Bearer fixture');
+      expect(aliased.method).toBe(direct.method);
+      expect(aliased.url).toBe(direct.url);
+      expect(aliased.headers.get('Authorization')).toBe(direct.headers.get('Authorization'));
+      expect(await aliased.clone().text()).toBe(await direct.clone().text());
+    }
+
+    expect(LEGACY_MCP_ALIASES.intake_history).toBe('intake_show');
+    expect(LEGACY_MCP_ALIASES.sessions_tree).toBe('sessions_list');
+    expect(canonicalNameForTool('conversations_read')).toBe('conversations_read');
+    expect(resolveMcpCall('conversations_read', { id: 'fixture', payload: {} })).toMatchObject({ canonicalName: 'conversations_write', usageKind: 'alias' });
+    expect(resolveMcpCall('conversations_write', { action: 'mark_read', id: 'fixture', payload: {} })).toMatchObject({ routeName: 'conversations_read', canonicalName: 'conversations_write', usageKind: 'canonical' });
+    expect(curatedTools().find(tool => tool.name === 'conversations_read')?.inputSchema.properties.action.enum).not.toContain('mark_read');
+
+    const alias = toolRequest(origin, 'worktree_write', { id: 'fixture', action: 'register', payload: { key: 'fixture' } }, 'Bearer fixture');
+    const compact = resolveMcpCall('ops_write', { action: 'worktree_write', id: 'fixture', subaction: 'register', payload: { key: 'fixture' } });
+    const canonical = toolRequest(origin, compact.routeName, compact.args, 'Bearer fixture');
+    expect(canonical.method).toBe(alias.method);
+    expect(canonical.url).toBe(alias.url);
+    expect(canonical.headers.get('Authorization')).toBe(alias.headers.get('Authorization'));
+    expect(await canonical.clone().text()).toBe(await alias.clone().text());
+
+    const history = resolveMcpCall('intake_show', { id: 'fixture', query: { view: 'history' } });
+    expect(history).toMatchObject({ routeName: 'intake_history', canonicalName: 'intake_show' });
+    expect(new URL(toolRequest(origin, history.routeName, history.args, 'Bearer fixture').url).pathname).toBe('/api/intake/tasks/fixture/history');
+    const tree = resolveMcpCall('sessions_list', { query: { view: 'tree' } });
+    expect(tree).toMatchObject({ routeName: 'sessions_tree', canonicalName: 'sessions_list' });
+    expect(new URL(toolRequest(origin, tree.routeName, tree.args, 'Bearer fixture').url).pathname).toBe('/api/sessions/tree');
+    expect(() => resolveMcpCall('intake_show', { id: 'fixture', query: { view: 'secret' } })).toThrow('invalid_view');
+    expect(() => resolveMcpCall('bus_read', { action: 'bus_send' })).toThrow('invalid_action');
+  });
   it('annotates sessions_capture as a read-only, non-destructive queued read', async () => {
     // Capture only queues a sanitized read of the native screen; it never types
     // into or stops the session, unlike its send/stop siblings on the same route shape.
     const listed: any = await (await rpc('tools/list')).json();
+    expect(listed.result.tools.map((tool: any) => tool.name)).toEqual([...CORE_TOOL_NAMES, ...DOMAIN_TOOL_NAMES]);
+    expect(listed.result.tools).toHaveLength(25);
     const byName = (name: string) => listed.result.tools.find((t: any) => t.name === name);
     expect(byName('sessions_capture').annotations).toEqual({ readOnlyHint: true, destructiveHint: false, openWorldHint: false });
     for (const name of ['sessions_send', 'sessions_stop'])
@@ -104,9 +182,11 @@ describe('Hub MCP protocol and parity', () => {
     expect(byName('sessions_capture').annotations).not.toHaveProperty('idempotentHint');
   });
   it('counts authenticated list/call attempts in bounded buckets without payloads', async () => {
-    await inHub(h => h.sql.exec('DELETE FROM mcp_tool_usage'));
+    await inHub(h => h.sql.exec('DELETE FROM mcp_tool_usage_30d'));
     await rpc('tools/list');
     await rpc('tools/call', { name: 'status' });
+    await rpc('tools/call', { name: 'sessions_tree' });
+    await rpc('tools/call', { name: 'sessions_list', arguments: { query: { view: 'tree' } } });
     await rpc('tools/call', { name: 'secret-unrecognized-tool', arguments: { payload: { secret: bearer } } });
     await rpc('tools/list', undefined, 'invalid-bearer');
     const response = await doFetch(new Request(origin + '/api/status', { headers: { Authorization: 'Bearer ' + bearer } }));
@@ -114,6 +194,8 @@ describe('Hub MCP protocol and parity', () => {
     expect(data.mcp_tool_usage).toEqual(expect.arrayContaining([
       expect.objectContaining({ tool_name: 'tools/list', caller_kind: 'human', calls: 1 }),
       expect.objectContaining({ tool_name: 'status', caller_kind: 'human', calls: 1 }),
+      expect.objectContaining({ tool_name: 'sessions_tree', canonical_tool_name: 'sessions_list', usage_kind: 'alias', caller_kind: 'human' }),
+      expect.objectContaining({ tool_name: 'sessions_list', canonical_tool_name: 'sessions_list', usage_kind: 'canonical', caller_kind: 'human' }),
       expect.objectContaining({ tool_name: 'unknown', caller_kind: 'human', calls: 1 }),
     ]));
     expect(JSON.stringify(data.mcp_tool_usage)).not.toContain(bearer);
@@ -124,12 +206,23 @@ describe('Hub MCP protocol and parity', () => {
       expect(rows.filter((row: any) => row.caller_kind === 'other')).toEqual([
         expect.objectContaining({ tool_name: 'unknown', calls: 500 }),
       ]);
-      h.sql.exec("UPDATE mcp_tool_usage SET calls=9007199254740991 WHERE tool_name='unknown' AND caller_kind='other'");
+      h.sql.exec("UPDATE mcp_tool_usage_30d SET calls=9007199254740991 WHERE tool_name='unknown' AND caller_kind='other'");
       h.mcpUsage.record('untrusted', 'untrusted');
       expect(h.mcpUsage.summary().find((row: any) => row.caller_kind === 'other').calls).toBe(9007199254740991);
     });
     const reread: any = await (await doFetch(new Request(origin + '/api/status', { headers: { Authorization: 'Bearer ' + bearer } }))).json();
     expect(reread.mcp_tool_usage.find((row: any) => row.tool_name === 'tools/list').calls).toBe(1);
+  });
+  it('retains only the rolling 30-day alias observation window', async () => {
+    await inHub(h => {
+      const now = Date.now();
+      h.sql.exec('DELETE FROM mcp_tool_usage_30d');
+      h.mcpUsage.record('sessions_tree', 'human', 'sessions_list', now - 31 * 86400000);
+      h.mcpUsage.record('sessions_tree', 'human', 'sessions_list', now - 5 * 86400000);
+      const rows = h.mcpUsage.summary(now);
+      expect(rows).toEqual([expect.objectContaining({ tool_name: 'sessions_tree', canonical_tool_name: 'sessions_list', usage_kind: 'alias' })]);
+      expect(h.sql.exec('SELECT COUNT(*) AS n FROM mcp_tool_usage_30d').toArray()[0].n).toBe(1);
+    });
   });
 
   it.each([5, "5", 26, 100, "100", "101", 1000])('accepts MCP limit %s and clamps above 100', async limit => {
@@ -225,7 +318,8 @@ describe('Hub MCP protocol and parity', () => {
       expect(await res.json()).toMatchObject({ error: { code: -32603 } });
     }
   });
-  it('sessions_start links its intake once through the canonical server path', async () => {    const invoke = async (name: string, args: any) => {
+  it('sessions_start links its intake once through the canonical server path', async () => {
+    const invoke = async (name: string, args: any) => {
       const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
       return JSON.parse(response.result.content[0].text);
     };
@@ -313,10 +407,13 @@ describe('Hub MCP protocol and parity', () => {
     const r = await doFetch(new Request(origin + '/mcp', { method: 'POST', headers: { Authorization: 'Bearer ' + bearer, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }, body: 'x'.repeat(32769) }));
     expect(r.status).toBe(413);
   });
-  it('marks every mutation destructive, especially send/stop', async () => {
+  it('marks every curated write domain destructive, especially send/stop', async () => {
     const result: any = await (await rpc('tools/list')).json();
-    expect(result.result.tools.length).toBe(MCP_ROUTES.length);
-    for (const name of ['sessions_send', 'sessions_stop', 'bus_send']) expect(result.result.tools.find((t: any) => t.name === name).annotations.destructiveHint).toBe(true);
+    expect(result.result.tools).toHaveLength(25);
+    for (const name of ['sessions_send', 'sessions_stop']) expect(result.result.tools.find((t: any) => t.name === name).annotations.destructiveHint).toBe(true);
+    for (const name of ['bus_write', 'conversations_write', 'ops_write'])
+      expect(result.result.tools.find((t: any) => t.name === name).annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(new Set(result.result.tools.map((t: any) => t.name)).size).toBe(25);
     expect(new Set(publicTools().map(t => t.name)).size).toBe(MCP_ROUTES.length);
   });
   it('covers EVERY actual CLI leaf, with a documented exclusion when local-only', () => {
