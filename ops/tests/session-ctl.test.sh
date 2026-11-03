@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
+fake="$HOME/session-ctl-fixture"
+bin="$fake/bin"
+mkdir -p "$bin" "$fake/skills/.agents/skills" "$fake/skills/.git" "$fake/locks"
+
+export PATH="$bin:$PATH"
+export BASE_REPO="$fake/base"
+export SKILLS_REPO="$fake/skills"
+export SKILLS_DIR="$fake/skills/.agents/skills"
+export OPS_LOCK_DIR="$fake/locks"
+export OPS_TIMERS=0 OPS_HUB_REPORT=0 MIN_RESTART_GAP=0 MAX_ONCALL_INBOX_AGE=1200
+export FAKE_SESSIONS="$fake/sessions.json"
+export FAKE_SCREEN="$fake/screen.txt"
+export FAKE_QUOTA="$fake/quota.json"
+export FAKE_KILLED="$fake/killed.log"
+export FAKE_START_ENGINE="$fake/start-engine"
+export FAKE_SEND_LOG="$fake/send.log"
+
+cat > "$bin/a" <<'APLEXER'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  engines)
+    printf '[{"name":"gemini"},{"name":"antigravity"},{"name":"grok"},{"name":"opencode"},{"name":"zcodex"},{"name":"codex"},{"name":"claude"}]\n'
+    ;;
+  list)
+    cat "$FAKE_SESSIONS"
+    ;;
+  capture)
+    cat "$FAKE_SCREEN"
+    ;;
+  kill)
+    printf '%s\n' "${2:-}" >> "$FAKE_KILLED"
+    printf '[]\n' > "$FAKE_SESSIONS"
+    ;;
+  start)
+    workspace=""; tag=""; engine=""
+    while (($#)); do
+      case "$1" in
+        --workspace) workspace="$2"; shift 2 ;;
+        --tag) tag="$2"; shift 2 ;;
+        --engine) engine="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf '%s\n' "$engine" > "$FAKE_START_ENGINE"
+    printf '[{"id":"new-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true}]\n' "$tag" "$workspace" "$tag" > "$FAKE_SESSIONS"
+    printf '❯\n' > "$FAKE_SCREEN"
+    ;;
+  send)
+    printf '%s\n' "$*" >> "$FAKE_SEND_LOG"
+    ;;
+  *)
+    echo "unexpected fake a command: $1" >&2
+    exit 2
+    ;;
+esac
+APLEXER
+
+cat > "$bin/hub" <<'HUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == quota && "${2:-}" == --json ]] || exit 2
+cat "$FAKE_QUOTA"
+HUB
+
+cat > "$bin/systemd-run" <<'SYSTEMD_RUN'
+#!/usr/bin/env bash
+set -euo pipefail
+while (($#)); do
+  if [[ "$1" == -- ]]; then
+    shift
+    exec "$@"
+  fi
+  shift
+done
+exit 2
+SYSTEMD_RUN
+
+cat > "$bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+dir=""
+if [[ "${1:-}" == -C ]]; then dir="$2"; shift 2; fi
+case "${1:-} ${2:-}" in
+  "worktree add")
+    target=""
+    for value in "$@"; do
+      [[ "$value" == "$HOME"/git/agent-hub-wt-*-run ]] && target="$value"
+    done
+    [[ -n "$target" ]] || exit 2
+    mkdir -p "$target/.git/info"
+    : > "$target/.git/info/exclude"
+    ;;
+  "rev-parse --git-path") printf '%s\n' "$dir/.git/info/exclude" ;;
+  "rev-parse --short") printf 'abc1234\n' ;;
+  *) : ;;
+esac
+GIT
+
+cat > "$bin/gh" <<'GH'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 2
+GH
+chmod +x "$bin/a" "$bin/hub" "$bin/systemd-run" "$bin/git" "$bin/gh"
+
+write_quota() {
+  cat > "$FAKE_QUOTA"
+}
+
+write_live() {
+  local role="$1" pane="$2" tag workspace sub
+  if [[ "$role" == orchestrator ]]; then tag=orchestrator-main; sub=orchestrator
+  else tag=oncall-engineer; sub=oncall; fi
+  workspace="$HOME/git/agent-hub-wt-${role}-run/ops/$sub"
+  mkdir -p "$workspace" "$HOME/tmp/agent-reports/$sub/inbox"
+  printf '[{"id":"old-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true}]\n' "$role" "$workspace" "$tag" > "$FAKE_SESSIONS"
+  printf '%s\n' "$pane" > "$FAKE_SCREEN"
+  : > "$FAKE_KILLED"
+  : > "$FAKE_SEND_LOG"
+  rm -f "$FAKE_START_ENGINE"
+}
+
+write_default_quota() {
+  write_quota <<'JSON'
+{"pools":[
+ {"provider":"gemini","state":"fresh","remaining_percent":44,"harness":["gemini","antigravity"]},
+ {"provider":"go","state":"fresh","remaining_percent":36,"harness":["opencode"]},
+ {"provider":"grok","state":"fresh","remaining_percent":32,"harness":["grok"]},
+ {"provider":"zai","state":"fresh","remaining_percent":50,"harness":["zcodex"]},
+ {"provider":"claude","state":"exhausted","remaining_percent":0,"harness":["claude","sonnet","opus","haiku"]}
+]}
+JSON
+}
+
+run_ctl() { "$repo/ops/lib/session-ctl.sh" "$@"; }
+assert_contains() { [[ "$1" == *"$2"* ]] || { echo "expected output to contain: $2" >&2; echo "$1" >&2; exit 1; }; }
+assert_not_contains() { [[ "$1" != *"$2"* ]] || { echo "unexpected output text: $2" >&2; echo "$1" >&2; exit 1; }; }
+
+# A recent inbox item remains healthy and does not cause a restart.
+write_default_quota
+write_live oncall 'normal ready prompt'
+printf 'recent alert\n' > "$HOME/tmp/agent-reports/oncall/inbox/recent.md"
+touch -d '10 minutes ago' "$HOME/tmp/agent-reports/oncall/inbox/recent.md"
+output="$(run_ctl oncall check 2>&1)"
+assert_contains "$output" 'OK session=old-oncall'
+[[ ! -e "$FAKE_START_ENGINE" ]]
+
+# A stale inbox item is a progress failure and selects a quota-backed engine.
+write_default_quota
+write_live oncall 'normal ready prompt'
+printf 'unprocessed alert\n' > "$HOME/tmp/agent-reports/oncall/inbox/old.md"
+touch -d '25 minutes ago' "$HOME/tmp/agent-reports/oncall/inbox/old.md"
+output="$(run_ctl oncall check 2>&1)"
+assert_contains "$output" 'STALLED session=old-oncall: oncall inbox'
+assert_not_contains "$output" 'OK session='
+[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+assert_contains "$(<"$FAKE_SEND_LOG")" 'Run the oncall check now:'
+assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
+
+# Both roles recover from limit screens, and exhausted Claude quota is never selected.
+for role in oncall orchestrator; do
+  write_default_quota
+  write_live "$role" 'You have hit your weekly limit - resets Nov 5'
+  output="$(run_ctl "$role" check 2>&1)"
+  assert_contains "$output" 'provider usage limit screen'
+  assert_not_contains "$output" 'OK session='
+  [[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+done
+
+# The second orchestrator recovery path defaults to OpenCode and avoids the failed route.
+write_default_quota
+write_live orchestrator 'normal ready prompt'
+state="$HOME/tmp/agent-reports/orchestrator/state"
+mkdir -p "$state"
+printf '%s\n' "$(( $(date +%s)-20 ))" > "$state/last_start"
+printf '%s 1\n' "$(( $(date +%s)-1 ))" > "$state/proof_due"
+if output="$(run_ctl orchestrator check 2>&1)"; then :; fi
+assert_contains "$output" 'recovery path 2'
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
+
+# Claude-only, Codex-only, stale and exhausted quota are not sufficient recovery evidence.
+cat > "$FAKE_QUOTA" <<'JSON'
+{"pools":[
+ {"provider":"claude","state":"fresh","remaining_percent":80,"harness":["claude","sonnet","opus","haiku"]},
+ {"provider":"codex","state":"fresh","remaining_percent":90,"harness":["codex"]},
+ {"provider":"gemini","state":"stale","remaining_percent":80,"harness":["gemini"]},
+ {"provider":"go","state":"exhausted","remaining_percent":0,"harness":["opencode"]}
+]}
+JSON
+write_live oncall 'usage limit'
+status=0
+output="$(run_ctl oncall check 2>&1)" || status=$?
+[[ "$status" -ne 0 ]]
+assert_contains "$output" 'no configured non-Claude engine has fresh Hub quota headroom'
+[[ ! -s "$FAKE_KILLED" ]]
+[[ ! -e "$FAKE_START_ENGINE" ]]
+
+echo 'session-ctl targeted tests passed'

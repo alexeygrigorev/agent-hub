@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Shared control for the two interactive Claude ops sessions.
+# Shared control for the two interactive ops sessions.
 #   session-ctl.sh <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync>
 # Watchdog (check) restarts a dead or tick-stalled session and proves every restart by a fresh
-# tick (intake 500fd60b); the in-session /loop is the scheduler.
+# tick (intake 500fd60b); Hub scheduled prompts provide the engine-neutral scheduler.
 # Needs: a (aplexer), git, gh, python3. Never prints secrets.
 set -uo pipefail
 
@@ -17,13 +17,15 @@ BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the ru
 SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bots-management-ops}"   # read-only clone of alexeygrigorev/bots-management (bot-skills is archived)
 SKILLS_REMOTE="${SKILLS_REMOTE:-alexeygrigorev/bots-management}"
 SKILLS_DIR="${SKILLS_DIR:-$SKILLS_REPO/.agents/skills}"   # skills live under .agents/skills
-if [ "$ROLE" = orchestrator ]; then ENGINE="${ORCH_ENGINE:-opus}"; LOOP_DEFAULT=15m; else ENGINE="${ORCH_ENGINE:-sonnet}"; LOOP_DEFAULT=1h; fi
-LOOP_INTERVAL="${LOOP_INTERVAL:-$LOOP_DEFAULT}"
+ENGINE="${ORCH_ENGINE:-gemini}"
 TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
 BRIEF="$HOME/tmp/briefs/orchestrator-main.md"
 MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
 PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produce a fresh tick within 10 min
-FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-sonnet}"        # second recovery path: new session, other engine
+FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-opencode}"      # second recovery path: new session, other engine
+MAX_ONCALL_INBOX_AGE="${MAX_ONCALL_INBOX_AGE:-1200}"
+ENGINE_EXCLUDE=""
+ENGINE_SELECTED=0
 STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "$STATE"
 log() { echo "[$(date -u +%FT%TZ)] $ROLE: $*"; }
 # fd 9 holds the per-role lock (role_lock). No child may inherit it: a detached aplexer worker,
@@ -165,10 +167,121 @@ prep_worktree() {
 
 screen() { a capture "$1" --screen --plain 2>/dev/null; }
 
+# Select only a configured non-Claude route whose Hub quota is fresh and above its
+# provider reserve. The allowlist intentionally excludes Codex model aliases so a
+# watchdog cannot pick sol/astra/argon with an unknown effort setting.
+quota_engine() {  # $1 preferred, $2 excluded route, $3 fallback preference
+  local quota engines
+  quota=$(HUB_CONFIG_FILE="${HUB_CONFIG_FILE:-$HOME/.config/agent-hub/cli.json}" T=30 t hub quota --json 2>/dev/null) || return 1
+  engines=$(T=15 t a engines --json 2>/dev/null) || return 1
+  printf '%s\n%s\n' "$quota" "$engines" | python3 -c '
+import json, math, sys
+
+preferred, excluded, fallback = sys.argv[1:4]
+raw = sys.stdin.read()
+decoder = json.JSONDecoder()
+try:
+    first = raw.lstrip()
+    quota, end = decoder.raw_decode(first)
+    engines_doc, _ = decoder.raw_decode(first[end:].lstrip())
+except Exception:
+    sys.exit(1)
+
+allowed = {"gemini": "gemini", "antigravity": "gemini", "grok": "grok",
+           "opencode": "go", "zcodex": "zai"}
+configured = set()
+def collect(value):
+    if isinstance(value, dict):
+        for key in ("name", "id", "engine"):
+            item = value.get(key)
+            if isinstance(item, str):
+                configured.add(item.lower())
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                collect(child)
+    elif isinstance(value, list):
+        for child in value:
+            collect(child)
+collect(engines_doc)
+
+pools = quota.get("pools", []) if isinstance(quota, dict) else []
+routes = {engine: [] for engine in allowed}
+for pool in pools if isinstance(pools, list) else []:
+    if not isinstance(pool, dict):
+        continue
+    harness = pool.get("harness") or pool.get("engines") or []
+    if not isinstance(harness, list):
+        continue
+    for value in harness:
+        if isinstance(value, str) and value.lower() in allowed:
+            engine = value.lower()
+            if pool.get("provider") == allowed[engine]:
+                routes[engine].append(pool)
+
+def has_headroom(engine, pool):
+    if pool.get("state") != "fresh" or pool.get("routing") == "disabled":
+        return False
+    if pool.get("limit_reached") is True:
+        return False
+    remaining = pool.get("remaining_percent")
+    if isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining):
+        return False
+    reserve = 5 if allowed[engine] == "grok" else 0
+    return remaining > reserve
+
+order = []
+for candidate in (preferred, fallback, "gemini", "antigravity", "opencode", "grok", "zcodex"):
+    candidate = candidate.strip().lower()
+    if candidate in allowed and candidate not in order:
+        order.append(candidate)
+for candidate in order:
+    if candidate == excluded.strip().lower() or candidate not in configured:
+        continue
+    matching = routes.get(candidate, [])
+    if matching and all(has_headroom(candidate, pool) for pool in matching):
+        print(candidate)
+        sys.exit(0)
+sys.exit(1)
+' "$1" "$2" "$3"
+}
+
+select_engine() {
+  [ "$ENGINE_SELECTED" = 1 ] && return 0
+  local selected
+  selected=$(quota_engine "$ENGINE" "$ENGINE_EXCLUDE" "$FALLBACK_ENGINE") || {
+    log "no configured non-Claude engine has fresh Hub quota headroom; recovery held"
+    return 1
+  }
+  [ "$selected" = "$ENGINE" ] || log "engine preference unavailable; Hub quota selected $selected"
+  ENGINE="$selected"
+  ENGINE_SELECTED=1
+}
+
+usage_limit_screen() {
+  local captured
+  captured=$(screen "$1") || return 1
+  grep -qiE 'hit your weekly limit|weekly[[:space:]]+limit|limit to reset|usage limit' <<<"$captured"
+}
+
+oldest_oncall_inbox_item() {
+  find "$REPORTS/inbox" -mindepth 1 -maxdepth 1 -type f -name '*.md' -printf '%T@\n' 2>/dev/null | sort -n | head -1 | cut -d. -f1
+}
+
+oncall_inbox_stalled() {
+  [ "$ROLE" = oncall ] || return 1
+  [[ "$MAX_ONCALL_INBOX_AGE" =~ ^[0-9]+$ ]] || return 1
+  local oldest now
+  oldest=$(oldest_oncall_inbox_item)
+  [[ "$oldest" =~ ^[0-9]+$ ]] || return 1
+  now=$(date +%s)
+  [ $((now-oldest)) -ge "$MAX_ONCALL_INBOX_AGE" ]
+}
+
 start() {
   local current
   current=$(find_session) || { log "session census failed"; return 1; }
   [ -n "$current" ] && { log "already running: $current"; return 0; }
+  select_engine || return 1
   # Clear stale names before launch; never leave orphan workloads behind.
   stop_old || return 1
   prep_worktree || return 1
@@ -186,12 +299,11 @@ start() {
     if grep -q -E '❯|> $|for shortcuts' <<<"$s"; then ready=1; break; fi
   done
   [ "$ready" = 1 ] || { log "prompt readiness failed: $id"; return 1; }
-  local prompt="/loop $LOOP_INTERVAL Run the $ROLE check: follow $RUNDIR/$SUB/hourly-check.md, starting with step 0 (skills sync, handoff, inbox)."
-  [ "$ROLE" = orchestrator ] && prompt="/loop $LOOP_INTERVAL Run the orchestrator tick: follow $BRIEF (durable brief) and $RUNDIR/$SUB/CLAUDE.md; append one line to $TICKS every tick."
-  if [ "${LOOP_INTERVAL}" = off ]; then log "LOOP_INTERVAL=off: scheduler is Hub scheduled prompts; no /loop issued"; return 0; fi
+  local prompt="Run the $ROLE check now: follow $RUNDIR/$SUB/hourly-check.md, starting with step 0 (skills sync, handoff, inbox). Hub scheduled prompts continue the recurring work for session tag $TAG."
+  [ "$ROLE" = orchestrator ] && prompt="Run the orchestrator tick now: follow $BRIEF (durable brief) and $RUNDIR/$SUB/CLAUDE.md; append one line to $TICKS. Hub scheduled prompts continue the recurring work for session tag $TAG."
   a send "$id" "$prompt" --enter >/dev/null; local rc=$?
   echo "$prompt" > "$STATE/loop_command"
-  log "loop issued (send rc=$rc): $prompt"
+  log "engine-neutral startup prompt sent (rc=$rc); Hub schedules provide recurring work"
   return "$rc"
 }
 
@@ -222,6 +334,7 @@ make_handoff() {  # $1 = reason; keeps a hand-written handoff.md if it is newer 
 restart() {  # $1 = reason
   local now last; now=$(date +%s); last=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
   if [ $((now-last)) -lt "$MIN_RESTART_GAP" ] && [ "${FORCE:-0}" != 1 ]; then log "restart suppressed: last start $((now-last))s ago"; return 1; fi
+  select_engine || return 1
   make_handoff "${1:-manual}"; stop_old || return 1; start
 }
 
@@ -243,11 +356,12 @@ restart_failed() {  # $1 = Hub report state
 # Start recovery path $1 and arm its proof. Path 2 is a different new session: the
 # fallback engine plus a fresh handoff, for a session that starts but never ticks.
 recover() {  # $1 = path, $2 = reason
-  local path="$1" reason="$2" saved="$ENGINE" rc=0
-  [ "$path" = 2 ] && ENGINE="$FALLBACK_ENGINE"
+  local path="$1" reason="$2" saved="$ENGINE" saved_exclude="$ENGINE_EXCLUDE" saved_selected="$ENGINE_SELECTED" rc=0
+  if [ "$path" = 2 ]; then ENGINE="$FALLBACK_ENGINE"; ENGINE_EXCLUDE="$saved"; else ENGINE_EXCLUDE=""; fi
+  ENGINE_SELECTED=0
   if FORCE=1 restart "$reason (recovery path $path, engine $ENGINE)"; then arm_proof "$path"; hub_report recovering
   else rc=1; fi
-  ENGINE="$saved"
+  ENGINE="$saved"; ENGINE_EXCLUDE="$saved_exclude"; ENGINE_SELECTED="$saved_selected"
   [ "$rc" = 0 ] || restart_failed restart_failed
 }
 
@@ -277,6 +391,15 @@ check() {
   mkdir -p "$HOME/tmp/agent-reports/orchestrator" "$HOME/tmp/agent-reports/oncall/inbox"
   local id
   id=$(find_session) || { log "session census failed"; restart_failed census_failed; return 1; }
+  if [ -n "$id" ] && usage_limit_screen "$id"; then
+    log "STALLED session=$id: provider usage limit screen"
+    recover 1 "provider usage limit screen"; return
+  fi
+  if [ -n "$id" ] && oncall_inbox_stalled; then
+    local oldest; oldest=$(oldest_oncall_inbox_item)
+    log "STALLED session=$id: oncall inbox has an unprocessed item aged $(( $(date +%s)-oldest ))s"
+    recover 1 "oncall inbox item older than ${MAX_ONCALL_INBOX_AGE}s"; return
+  fi
   if [ "$ROLE" = orchestrator ]; then
     check_proof; case $? in 1) return 1 ;; 2) return 0 ;; esac
     id=$(find_session) || { log "session census failed"; restart_failed census_failed; return 1; }
