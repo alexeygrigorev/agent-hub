@@ -1,14 +1,10 @@
-"""M12e session executor: durable intent + existing Fleet routing contract for start.
+"""M12e executor for durable server-claimed native session actions.
 
-Start path delegates to the existing :class:`agent_hub_host.fleet.Dispatcher`
-(same account/profile/workspace validation, same fresh admission gate, same
-claim/result reporting, same ``a start`` argv). This module adds only:
+Fleet owns offer dispatch and start. This module provides:
 
 - durable per-command intent journal with per-journal exclusive locks
   (``private_fs.exclusive_lock``; concurrent processes serialize per intent,
   contention reports ``uncertain`` instead of duplicating effects),
-- reconcile-before-retry (uncertain starts adopt the live native session, never
-  blind-retry into a duplicate),
 - custody + bounds checks shared with :mod:`agent_hub_host.native_sessions`,
 - inbox-only send / bounded capture / confirmed stop with idempotent intents,
 - :func:`handle_claimed_command`: the shared server-claimed receiver the head
@@ -17,13 +13,12 @@ claim/result reporting, same ``a start`` argv). This module adds only:
 
 R2 corrections (head-ordered): raw ``send --enter`` is retired (its working
 verdict is not ACK proof); ``transport="pty-guarded"`` now holds honestly.
-``start_from_offer`` stays a pure compat helper for the EXISTING Fleet consumer
-only — this module never polls Fleet offers and the claimed receiver rejects
-``start`` (Fleet already handles start once). No server routes, CLI verbs,
-services, or timers are installed here. The ``request`` callable is injected
-(fake in tests, real hub HTTP from the API worker's wiring). Server-side claim/
-ack field names follow the head-chosen interface (see ``docs/SESSION-HOST.md``
-and ``.local/session/HOST-R2-INTERFACE.md``).
+This module does not poll Fleet offers or implement start; the claimed receiver
+rejects ``start`` because Fleet owns it. No server routes, CLI verbs, services,
+or timers are installed here. The ``request`` callable is injected (fake in
+tests, real Hub HTTP from the API worker's wiring). Server-side claim/ack field
+names follow the head-chosen interface (see ``docs/SESSION-HOST.md`` and
+``.local/session/HOST-R2-INTERFACE.md``).
 """
 
 from __future__ import annotations
@@ -38,7 +33,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import private_fs
-from .fleet import Dispatcher
 from .native_bridge import NativeServiceBinding
 from .native_sessions import (
     MAX_BODY_BYTES,
@@ -426,174 +420,6 @@ def _ack_native_delivery(journal_file, prior, command_id, target, evidence, requ
         if submitted is not None:
             return submitted
     return {**updated, "ack": {"submitted": False, "payload": payload}}
-
-
-def _target_from_offer_result(offer: dict[str, Any], result: dict[str, Any],
-                               workspace_path: str) -> Optional[NativeTarget]:
-    native_id = result.get("native_id")
-    tag = "hub-" + str(offer.get("id", ""))
-    if not isinstance(native_id, str) or not native_id:
-        return None
-    try:
-        return NativeTarget(session_id=native_id, tag=tag, workspace=workspace_path).validated()
-    except SessionControlError:
-        return None
-
-
-def reconcile_native_target(executable: str, target: NativeTarget) -> dict[str, Any]:
-    """Reconcile one target against the live native catalog (read-only, no effect)."""
-    target = target.validated()
-    rows = [s for s in list_sessions(executable, include_exited=True)
-            if s.session_id.lower() == target.session_id.lower()]
-    if not rows:
-        return {"session_id": target.session_id, "known": False, "phase": "absent"}
-    row = rows[0]
-    return {
-        "session_id": row.session_id,
-        "known": True,
-        "phase": row.phase,
-        "tag": row.tag,
-        "workspace": row.workspace,
-        "tag_matches": row.tag == target.tag,
-        "workspace_matches": row.workspace == target.workspace,
-    }
-
-
-def start_from_offer(
-    settings: dict[str, Any],
-    offer: dict[str, Any],
-    *,
-    custody: CallerCustody,
-    runner: Callable,
-    request: Callable,
-    journal_dir: str,
-    executable: str = "aplexer",
-) -> dict[str, Any]:
-    """Start one session from a Fleet offer through the existing Dispatcher contract.
-
-    Pure compat helper for the EXISTING Fleet consumer path only: the caller passes
-    one already-authorized offer (server-side reservation flow). This function never
-    polls Fleet offers and the claimed-command receiver rejects ``start`` — Fleet
-    already handles start once, and no second consumer is added here.
-
-    Idempotent per ``(offer id, request_key)``: a repeated call with the same key
-    returns the journaled outcome (reconciled against live native state) without a
-    second native start. A conflicting payload raises (409-equivalent). An
-    ``uncertain`` journal is reconciled first; an adopted live session is reported
-    back through the existing ``.../result`` shape, never blind-retried. The
-    read-modify-write holds the per-offer exclusive lock across processes.
-    """
-    _check_custody(custody)
-    if not isinstance(settings, dict) or not isinstance(offer, dict):
-        raise SessionControlError("settings and offer are required")
-    offer_id = offer.get("id")
-    if not isinstance(offer_id, str) or not offer_id or len(offer_id) > 128:
-        raise SessionControlError("Offer id is required")
-    request_key = offer.get("request_key", offer_id)
-    if not isinstance(request_key, str) or not request_key:
-        raise SessionControlError("Request key is required")
-    workspace_label = offer.get("workspace")
-    workspaces = settings.get("workspaces", {})
-    if not isinstance(workspace_label, str) or workspace_label not in workspaces:
-        raise SessionControlError("Offer workspace is not configured locally")
-    workspace_path = str(workspaces[workspace_label])
-
-    journal_file = _journal_path(journal_dir, "offer-" + offer_id)
-    with _lock_held(journal_file):
-        prior = _read_journal(journal_file)
-        if prior is not None:
-            if prior.get("request_key") != request_key:
-                raise SessionControlError("Idempotency key conflict for offer (no partial mutation)")
-            return _reconcile_journal(
-                executable, prior, offer, workspace_path, request, journal_file,
-            )
-
-        dispatcher = Dispatcher(settings, request=request, runner=runner)
-        try:
-            result = dispatcher.dispatch(offer)
-        except SessionUncertain:
-            raise
-        except SessionControlError:
-            raise
-        except ValueError as exc:
-            # Admission/route refusal: held honestly, no native effect, journaled.
-            record = {"offer_id": offer_id, "request_key": request_key, "state": "held",
-                      "reason": str(exc)[:300], "native_id": None}
-            _write_journal(journal_file, record)
-            return {"id": offer_id, **record}
-        except Exception as exc:  # unexpected runner failure: uncertain, reconcile later
-            record = {"offer_id": offer_id, "request_key": request_key, "state": "uncertain",
-                      "reason": f"{type(exc).__name__}", "native_id": None}
-            _write_journal(journal_file, record)
-            raise SessionUncertain(record["reason"]) from exc
-
-        if not isinstance(result, dict):
-            raise SessionUncertain("Dispatcher returned no result; reconcile before retry")
-        record = {"offer_id": offer_id, "request_key": request_key,
-                  "state": str(result.get("state", "uncertain")),
-                  "reason": str(result.get("reason", ""))[:300],
-                  "native_id": result.get("native_id") if isinstance(result.get("native_id"), str) else None}
-        _write_journal(journal_file, record)
-        return {"id": offer_id, **record}
-
-
-def _reconcile_journal(
-    executable: str,
-    prior: dict[str, Any],
-    offer: dict[str, Any],
-    workspace_path: str,
-    request: Callable,
-    journal_file: str,
-) -> dict[str, Any]:
-    """Reconcile a journaled offer outcome against live native state (no blind retry)."""
-    state = prior.get("state")
-    native_id = prior.get("native_id")
-    offer_id = prior.get("offer_id")
-    if state == "uncertain" and not native_id:
-        # No receipt: adopt ONLY if the offer's unique tag resolves to exactly one
-        # live session in the workspace (hub-<offer> tags are unique by construction).
-        try:
-            rows = [s for s in list_sessions(executable, workspace=workspace_path)
-                    if s.tag == "hub-" + str(offer.get("id", "")) and s.phase not in
-                    ("exited", "dead", "forgotten", "pruned")]
-        except SessionControlError:
-            rows = []
-        if len(rows) == 1:
-            native_id = rows[0].session_id
-            prior = {**prior, "native_id": native_id}
-            _write_journal(journal_file, prior)
-        else:
-            return {"id": offer_id, **prior, "reconciled": "tag-ambiguous-still-uncertain"}
-    if state in ("running", "uncertain") and isinstance(native_id, str) and native_id:
-        try:
-            target = NativeTarget(
-                session_id=native_id, tag="hub-" + str(offer.get("id", "")),
-                workspace=workspace_path,
-            ).validated()
-        except SessionControlError:
-            return {"id": offer_id, **prior, "reconciled": "target-invalid"}
-        seen = reconcile_native_target(executable, target)
-        if seen["known"] and seen["phase"] not in ("exited", "dead", "forgotten", "pruned"):
-            if state == "uncertain":
-                # Protect the adopted checkout before publishing a running receipt.
-                from . import worktree_guard as adopt_guard
-                if not adopt_guard.protect_bound_worktree(
-                        "git", workspace_path, offer.get("hub_session_id"),
-                        offer.get("intake_task_id")):
-                    return {"id": offer_id, **prior, "reconciled": "worktree-lock-failed"}
-                if adopt_guard.bound_worktree_root(workspace_path) is not None and not adopt_guard.remember_repository(offer_id, workspace_path):
-                    return {"id": offer_id, **prior, "reconciled": "worktree-identity-failed"}
-                try:
-                    request("POST", "/api/fleet/launches/" + offer_id + "/result",
-                            {"state": "running", "native_id": native_id})
-                except Exception:
-                    pass
-                prior = {**prior, "state": "running", "adopted": True}
-                _write_journal(journal_file, prior)
-            return {"id": offer_id, **prior, "reconciled": "live-session-adopted"}
-        if state == "uncertain" and not seen["known"]:
-            return {"id": offer_id, **prior, "reconciled": "absent-uncertain-held"}
-    return {"id": offer_id, **prior, "reconciled": "journal-replay-no-effect"}
 
 
 def send_prompt(
@@ -1419,10 +1245,10 @@ def handle_claimed_command(
     flag (ordinary stops), leaves stop acks tree-free. Roots are confinement,
     never target authority.
 
-    ``start`` is explicitly REJECTED here: Fleet already handles start once
-    (see :func:`start_from_offer`); this receiver never reconsumes Fleet offers
-    or invokes start. ``GET .../offers`` is discovery/transport only and never
-    reaches this function without a granted claim.
+    ``start`` is explicitly REJECTED here because Fleet owns offer dispatch;
+    this receiver never polls Fleet offers or invokes start. ``GET .../offers``
+    is discovery/transport only and never reaches this function without a
+    granted claim.
 
     Exact result DTO: ``{"op", "command_id", "state", "native_id"?,
     "reply_envelope_id"?, "reason", "ack": {...submitted or to-submit...}}``.
@@ -2185,60 +2011,6 @@ def _run_claimed_effect(
             cleanup_roots=cleanup_roots, command_id=str(command["command_id"]),
             linked_intake_open=linked_intake_open)
     return outcome
-
-
-def handle_session_command(
-    command: dict[str, Any],
-    *,
-    custody: CallerCustody,
-    settings: Optional[dict[str, Any]] = None,
-    runner: Optional[Callable] = None,
-    request: Optional[Callable] = None,
-    journal_dir: Optional[str] = None,
-    executable: str = "aplexer",
-) -> dict[str, Any]:
-    """Compat command entry kept for local tests; mutating ops need a server claim.
-
-    Read-only ``list``/``status`` work as before. ``send``/``capture``/``stop``
-    require ``command["claim"]`` (server-issued single attempt) and delegate to
-    :func:`handle_claimed_command`. ``start`` stays Fleet-owned via
-    :func:`start_from_offer` and is rejected here. Nothing is installed anywhere.
-    """
-    _check_custody(custody)
-    if not isinstance(command, dict) or command.get("op") not in (
-        "list", "start", "send", "capture", "stop",
-    ):
-        raise SessionControlError("Unknown session command op")
-
-    def need(name: str) -> Any:
-        value = command.get(name)
-        if value is None:
-            raise SessionControlError(f"Command field required: {name}")
-        return value
-
-    op = command["op"]
-    if op == "list":
-        if settings is None:
-            raise SessionControlError("settings required for list projection")
-        workspace = command.get("workspace")
-        sessions = list_sessions(executable, workspace=workspace)
-        return {"op": "list", "sessions": [
-            {"session_id": s.session_id, "tag": s.tag, "workspace": s.workspace,
-             "engine": s.engine, "profile": s.profile, "phase": s.phase,
-             "agent_state": s.agent_state, "last_activity_ms": s.last_activity_ms}
-            for s in sessions[:200]]}
-    if op == "start":
-        raise SessionControlError("held: start is Fleet-owned; use start_from_offer via Fleet")
-    if journal_dir is None:
-        raise SessionControlError("journal_dir is required")
-    claim = command.get("claim")
-    if not isinstance(claim, dict):
-        raise SessionControlError("Server claim is required for send|capture|stop")
-    if "command_id" not in command or not isinstance(command.get("command_id"), str):
-        raise SessionControlError("Command id is required")
-    return handle_claimed_command(command, claim, custody=custody,
-                                  journal_dir=journal_dir, executable=executable,
-                                  request=request)
 
 
 def session_status(

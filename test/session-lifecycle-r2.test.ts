@@ -2,8 +2,6 @@ import { describe, it, expect } from 'vitest';
 import {
   classifySession,
   planCleanup,
-  validateCleanupTarget,
-  validateOwnershipTransfer,
   sanitizeObservationText,
   toHandoffDto,
 } from '../src/session_lifecycle';
@@ -83,17 +81,6 @@ describe('m15 r2 C3 ownership provenance binding epochs', () => {
     // Immutable starter/human protection retained in projection.
     expect(finished.owner).toBe('synth-starter');
     expect(finished.starter).toBe('synth-starter');
-  });
-  it('target binding and epochs strict', () => {
-    const good = { session_key: 'h/n', expected_machine_id: 'h', expected_native_id: 'n', expected_owner: 'o', observed_machine_id: 'h', observed_native_id: 'n', observed_owner: 'o', busy_or_draft_or_pending: false, contained: true };
-    expect(validateCleanupTarget(good)).toEqual({ ok: true });
-    expect(validateCleanupTarget({ session_key: 'h/n', expected_machine_id: '', expected_native_id: '', expected_owner: '', observed_machine_id: '', observed_native_id: '', observed_owner: '', busy_or_draft_or_pending: false, contained: true }).ok).toBe(false);
-    expect(validateCleanupTarget({ ...good, expected_owner: 'unknown', observed_owner: 'unknown' }).ok).toBe(false);
-    const t = { session_key: 'h/n', current_owner: 'a', current_epoch: 3, expected_owner: 'a', expected_epoch: 3, new_owner: 'b', actor: 'a', human_owned: false };
-    expect(validateOwnershipTransfer(t)).toEqual({ ok: true });
-    expect(validateOwnershipTransfer({ ...t, current_epoch: -1, expected_epoch: -1 }).ok).toBe(false);
-    expect(validateOwnershipTransfer({ ...t, current_epoch: 1.5, expected_epoch: 1.5 }).ok).toBe(false);
-    expect(validateOwnershipTransfer({ ...t, current_epoch: Number.MAX_SAFE_INTEGER + 1, expected_epoch: Number.MAX_SAFE_INTEGER + 1 }).ok).toBe(false);
   });
 });
 

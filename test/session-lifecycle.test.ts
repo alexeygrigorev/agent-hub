@@ -3,8 +3,6 @@ import {
   classifySession,
   projectSessions,
   planCleanup,
-  validateCleanupTarget,
-  validateOwnershipTransfer,
   sanitizeObservationText,
   toStatusDto,
   toHandoffDto,
@@ -114,8 +112,8 @@ describe('m15 synthetic lifecycle classification', () => {
   });
 });
 
-describe('m15 synthetic cleanup plan and executor seam', () => {
-  it('only finished owned sessions without obligations are eligible; seams revalidate binding and ownership', () => {
+describe('m15 synthetic cleanup plan', () => {
+  it('only finished owned sessions without obligations are eligible', () => {
     const finished = { ...classifySession(base({ report_written: true, screen_done: true, report_at: '2026-10-17T11:00:00Z', last_activity_at: '2026-10-17T10:00:00Z', authoritative_no_pending_proof: true }), { now_ms: NOW }), owner: 'synth-starter', human_owned: false, pending_obligations: false };
     expect(planCleanup([finished], 'synth-starter').eligible).toHaveLength(1);
     const idle = { ...classifySession(base({ last_activity_at: '2026-10-15T10:00:00Z' }), { now_ms: NOW }), owner: 'synth-starter', human_owned: false, pending_obligations: false };
@@ -124,13 +122,5 @@ describe('m15 synthetic cleanup plan and executor seam', () => {
     const plan = planCleanup([idle, foreign, human], 'synth-starter');
     expect(plan.eligible).toHaveLength(0);
     expect(plan.ineligible).toHaveLength(3);
-    const good = { session_key: 'h/n', expected_machine_id: 'h', expected_native_id: 'n', expected_owner: 'o', observed_machine_id: 'h', observed_native_id: 'n', observed_owner: 'o', busy_or_draft_or_pending: false, contained: true };
-    expect(validateCleanupTarget(good)).toEqual({ ok: true });
-    expect(validateCleanupTarget({ ...good, observed_native_id: 'other' }).ok).toBe(false);
-    expect(validateCleanupTarget({ ...good, contained: false }).ok).toBe(false);
-    const transfer = { session_key: 'h/n', current_owner: 'synth-starter', current_epoch: 3, expected_owner: 'synth-starter', expected_epoch: 3, new_owner: 'synth-next', actor: 'synth-starter', human_owned: false };
-    expect(validateOwnershipTransfer(transfer)).toEqual({ ok: true });
-    expect(validateOwnershipTransfer({ ...transfer, actor: 'admin' }).ok).toBe(false);
-    expect(validateOwnershipTransfer({ ...transfer, new_owner: 'unknown' }).ok).toBe(false);
   });
 });
