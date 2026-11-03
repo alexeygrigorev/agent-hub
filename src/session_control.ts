@@ -4979,9 +4979,15 @@ export function adoptObservedNativeSessions(
             provenance: 'fleet_launch', evidence: { source: 'fleet_launch', evidence: launchEvidence } };
           const request = parsed(row.request_json, {});
           if (request.provenance === 'observed_native') request.provenance = 'hub_launch_verified';
-          sql.exec(`UPDATE session_control_sessions SET fleet_launch_id=?, machine_id=?, engine=COALESCE(engine,?),
-            request_json=?, binding_json=?, state=?, updated_at=? WHERE id=?`, launch.id, machineId, s.engine ?? null,
-            JSON.stringify(request), JSON.stringify(binding), nextState, isoNow, row.id);
+          const requestJson = JSON.stringify(request);
+          const bindingJson = JSON.stringify(binding);
+          const engine = row.engine ?? s.engine ?? null;
+          if (row.fleet_launch_id !== launch.id || row.machine_id !== machineId || row.engine !== engine ||
+              row.request_json !== requestJson || row.binding_json !== bindingJson || row.state !== nextState) {
+            sql.exec(`UPDATE session_control_sessions SET fleet_launch_id=?, machine_id=?, engine=COALESCE(engine,?),
+              request_json=?, binding_json=?, state=?, updated_at=? WHERE id=?`, launch.id, machineId, s.engine ?? null,
+              requestJson, bindingJson, nextState, isoNow, row.id);
+          }
         }
         if (!launch.native_id) {
           sql.exec('UPDATE fleet_launches SET native_id=?, updated_at=? WHERE id=? AND machine_id=? AND native_id IS NULL',

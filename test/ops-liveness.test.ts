@@ -301,7 +301,7 @@ describe('ops liveness (intake 500fd60b)', () => {
     });
   });
 
-  it('serves heartbeat and status over HTTP for admins only, and the minute alarm evaluates it', async () => {
+  it('serves heartbeat and status over HTTP for admins only, and the five-minute check evaluates it', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('ops-liveness-http-' + crypto.randomUUID()));
     let cookie = '';
@@ -319,7 +319,7 @@ describe('ops liveness (intake 500fd60b)', () => {
     expect(status.status).toBe(200);
     expect((await status.json() as any).window_s).toBe(OPS_WINDOW_MS / 1000);
     await runInDurableObject(stub, async (hub: Hub) => {
-      await hub.alarm();
+      await hub.runChecks();
       expect(hub.sql.exec('SELECT last_eval FROM ops_liveness_meta WHERE id=1').one().last_eval).toEqual(expect.any(Number));
     });
   });
