@@ -286,6 +286,24 @@ describe('durable daily SQL row circuit breaker', () => {
     await expect(new RowBudget(store,()=>0).begin()).rejects.toThrow(RowBudgetExceeded);
   });
 
+  it('borrows unused prepaid directions for constructor work without raising the combined reservation', async () => {
+    const store=new MemoryStore(),budget=new RowBudget(store,()=>0);
+    await budget.begin(true);
+    const original=budget.status().reserved_total;
+    budget.wrap(nativeSql(0,0,5000) as any).exec('UPDATE bounded_constructor');
+    budget.wrap(nativeSql(1,10000,0) as any).exec('SELECT bounded_constructor').toArray();
+    expect(budget.status().stopped).toBe(false);
+    expect(budget.status().reserved_total).toBe(original);
+    expect(budget.status().available_total).toBe(4000);
+    await budget.releaseUnused();
+    const persisted=[...store.data.values()][0] as any;
+    expect(persisted.read).toBe(10001);
+    expect(persisted.written).toBe(5002);
+    expect(persisted.read+persisted.written).toBeLessThan(20000);
+    const restart=new RowBudget(store,()=>0);await restart.begin();
+    expect(restart.status().stopped).toBe(false);
+  });
+
   it('rebalances unused bootstrap credits in one refill write instead of denying a hot directional workload', async () => {
     const store = new MemoryStore();
     const budget = new RowBudget(store,()=>0);
@@ -308,6 +326,22 @@ describe('durable daily SQL row circuit breaker', () => {
 
 
 describe('native SQLite budget accounting', () => {
+  it('preflights a small real index using the same combined pool after write credit is borrowed', async () => {
+    const stub=(env as any).HUB.get((env as any).HUB.idFromName('cf-pooled-ddl-'+crypto.randomUUID()));
+    await (runInDurableObject as any)(stub,async(_hub:any,state:any)=>{
+      const raw=state.storage.sql;
+      raw.exec('CREATE TABLE pooled_ddl_source(id INTEGER PRIMARY KEY,value TEXT)');
+      raw.exec("INSERT INTO pooled_ddl_source VALUES(1,'a'),(2,'b')");
+      const budget=new RowBudget(new MemoryStore(),()=>0);await budget.begin(true);
+      budget.wrap(nativeSql(0,0,5000) as any).exec('UPDATE bounded_constructor');
+      expect(budget.status().available.written).toBe(0);
+      budget.wrap(raw).exec('CREATE INDEX pooled_ddl_value ON pooled_ddl_source(value)');
+      expect(budget.status().stopped).toBe(false);
+      await budget.finish();
+      expect(budget.status().reserved_total).toBeLessThan(20000);
+    });
+  });
+
   it('meters lazy native cursor reads before a caller can continue scanning', async () => {
     const stub = (env as any).HUB.get((env as any).HUB.idFromName('cf-native-budget-' + crypto.randomUUID()));
     await (runInDurableObject as any)(stub, async (_hub: any, state: any) => {

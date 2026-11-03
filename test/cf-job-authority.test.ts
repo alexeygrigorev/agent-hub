@@ -5,6 +5,15 @@ import { generateTokenPair, verifyBearerScope } from '../src/auth/token';
 import { RowsMeter } from '../src/rows-meter';
 
 describe('indexed credential authority and timestamp coalescing', () => {
+  it('refuses nonfinite numeric lease deadlines', () => {
+    const credential={kind:'job',subject:'j',token_hash:'h',machine_id:'m'};
+    for(const expires_at of [Infinity,-Infinity,NaN]) {
+      const sql={exec(query:string){return {toArray:()=>query.includes('FROM jobs')
+        ? [{id:'j',kind:'root-run',status:'running',claim_token_hash:'h',holder_machine_id:'m',lease_epoch:1}]
+        : [{holder_job_id:'j',epoch:1,expires_at}]};}};
+      expect(jobCredentialAllowed(sql,credential)).toBe(false);
+    }
+  });
   it('denies old job generations and released leases using two point lookups', async () => {
     const stub = (env as any).HUB.get((env as any).HUB.idFromName('job-authority-' + crypto.randomUUID()));
     await (runInDurableObject as any)(stub, async (_hub: any, state: any) => {
@@ -18,6 +27,15 @@ describe('indexed credential authority and timestamp coalescing', () => {
       expect(meter.snapshot().authority.rows_read).toBeLessThanOrEqual(4);
       expect(jobCredentialAllowed(sql, { ...cred, token_hash: 'old-hash' }, now)).toBe(false);
       expect(jobCredentialAllowed(sql, { ...cred, machine_id: 'other' }, now)).toBe(false);
+      for (const expiry of [new Date(now+60000).toISOString(), now+60000, Math.floor(now/1000)+60, String(now+60000)]) {
+        raw.exec("UPDATE leases SET expires_at=? WHERE name='root'", expiry);
+        expect(jobCredentialAllowed(sql, cred, now), String(expiry)).toBe(true);
+      }
+      for (const expiry of ['Infinity','NaN',0,-1, 200_000_000_000, new Date(now-60000).toISOString()]) {
+        raw.exec("UPDATE leases SET expires_at=? WHERE name='root'", expiry);
+        expect(jobCredentialAllowed(sql, cred, now), String(expiry)).toBe(false);
+      }
+      raw.exec("UPDATE leases SET expires_at=? WHERE name='root'",new Date(now+60000).toISOString());
       raw.exec("UPDATE leases SET epoch=8 WHERE name='root'");
       expect(jobCredentialAllowed(sql, cred, now)).toBe(false);
       raw.exec("UPDATE leases SET epoch=7 WHERE name='root'");

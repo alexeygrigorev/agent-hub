@@ -11,6 +11,7 @@ export function noteCatalogObservation(sql:SqlStorage,machine:string,now:number,
   hosts.set(machine,{at:now,complete,persistedAt:persist?now:old.persistedAt});
   return persist;
 }
+export function invalidateCatalogObservations(sql:object):void { liveCatalogs.delete(sql); }
 function overlay(sql:SqlStorage,rows:Map<string,number>,now:number,completeOnly:boolean):Map<string,number> {
   for(const [machine,live] of liveCatalogs.get(sql as object) ?? []) {
     rows.delete(machine);

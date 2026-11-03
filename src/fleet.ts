@@ -17,7 +17,7 @@ import { launcherDiskHeadroom } from './launcher-disk';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
-import { effectiveCheckin, effectiveRoutesAt } from './registry';
+import { effectiveCheckin, effectiveRoutesAt, effectiveHeartbeat } from './registry';
 import { commandChannelHealth } from './command-channel';
 import { taskTier, policy, modelDisabledByPolicy, heavyModelEffortAllowed, deepModelAllowedForTier } from './model-routing';
 import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
@@ -32,7 +32,7 @@ import { ACTIVE_LAUNCH_STATES_SQL, isEligibleReservedLaunch, parseReservedLaunch
 import { readAccountCapacityHistory } from './account-capacity-history';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
-import { freshCatalogs, freshCompleteCatalogs, noteCatalogObservation } from './catalog-freshness';
+import { freshCatalogs, freshCompleteCatalogs, noteCatalogObservation, invalidateCatalogObservations } from './catalog-freshness';
 import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, reservationHoldsCapacity, RESERVATION_TTL_MS, INFLIGHT_LAUNCH_ID_SQL, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
@@ -729,7 +729,7 @@ export class FleetService {
     // drop the cache so the next read reloads the committed state.
     this.transaction = fn => {
       try { return transaction(fn); }
-      catch (error) { this.observedCatalog?.reset(); throw error; }
+      catch (error) { this.observedCatalog?.reset(); this.resources?.invalidateLiveTelemetry(); invalidateCatalogObservations(this.sql); throw error; }
     };
     this.resources = new ResourceManagement(sql, now, writes, observed);
     this.routing = new RoutingService(sql, this, now, this.transaction);
@@ -1137,7 +1137,7 @@ export class FleetService {
       const id = String(m.id);
       if (machineFilter && id !== machineFilter) continue;
       let hb: any = {};
-      try { hb = JSON.parse(m.last_heartbeat || '{}'); } catch { hb = {}; }
+      try { hb = JSON.parse(effectiveHeartbeat(this.sql,m.id,m.last_heartbeat) || '{}'); } catch { hb = {}; }
       const memAvailMb = typeof hb.mem_avail_mb === 'number' && Number.isFinite(hb.mem_avail_mb) ? hb.mem_avail_mb : null;
       const launcher = hb.launcher_resources && typeof hb.launcher_resources === 'object' ? hb.launcher_resources : null;
       const reservedMb = launcher && typeof launcher.active_mem_mb === 'number' && Number.isFinite(launcher.active_mem_mb) && launcher.active_mem_mb >= 0 ? launcher.active_mem_mb : null;
@@ -1204,7 +1204,7 @@ export class FleetService {
           ? this.sql.exec(`SELECT id, last_heartbeat FROM machines WHERE id IN (${placeholders})`, ...machines.map((h) => h.machine_id)).toArray() as any[]
           : [];
         const parts = heartbeats.map((m) => {
-          const usage = sanitizeCpuUsage(parsed(m.last_heartbeat).cpu_usage);
+          const usage = sanitizeCpuUsage(parsed(effectiveHeartbeat(this.sql,m.id,m.last_heartbeat)).cpu_usage);
           return `${m.id}: psi_cpu_full=${usage?.psi_full_avg10 ?? 'unknown'}% psi_memory_full=${usage?.memory_psi_full_avg10 ?? 'unknown'}% psi_io_full=${usage?.io_psi_full_avg10 ?? 'unknown'}% observed_at=${usage?.observed_at ?? 'unknown'}`;
         });
         if (parts.length) psiNote = ' ' + parts.join('; ');
@@ -1421,7 +1421,7 @@ export class FleetService {
       }
       const definition=definitions.get(route.account);
       if(definition && !accounts.has(route.account)) accounts.set(route.account,this.accountStatus(definition));
-      const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(machine?.last_heartbeat);
+      const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(effectiveHeartbeat(this.sql,route.machine_id,machine?.last_heartbeat));
       // Label filter (Tabo intake AC4): requested needs must be satisfied by
       // the machine's advertised routing needs plus synthesized os:/arch:
       // labels from registration (os=Windows/Linux, arch=arm64/amd64).
@@ -1871,7 +1871,7 @@ export class FleetService {
 
   private diskHeadroom(machine: string, workspace?: string, excludeId?: string, cwd?: string) {
     const row: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machine).toArray()[0];
-    const hb = parsed(row?.last_heartbeat);
+    const hb = parsed(effectiveHeartbeat(this.sql,machine,row?.last_heartbeat));
     if (!fresh(hb.launcher_resources?.observed_at, this.now(), LAUNCHER_TELEMETRY_STALE_MS)) return null;
     const pending = this.sql.exec("SELECT id FROM fleet_launches WHERE machine_id = ? AND mode = 'headless' AND state IN ('offered','starting','running','uncertain')", machine).toArray()
       .map((r: any) => String(r.id)).filter(id => id !== excludeId);
@@ -2041,7 +2041,7 @@ export class FleetService {
         const diskOrigin: any = diskHeld ? this.sql.exec('SELECT l.machine_id FROM fleet_launches l JOIN fleet_memory_holds h ON h.launch_id=l.id WHERE h.retry_id=?', row.id).toArray()[0] : null;
         if (memoryHold?.refused && diskHeld && (!diskOrigin || diskOrigin.machine_id === plan.selected.machine)) {
           const machine: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', plan.selected.machine).toArray()[0];
-          const disk = parsed(machine?.last_heartbeat).launcher_resources;
+          const disk = parsed(effectiveHeartbeat(this.sql,plan.selected.machine,machine?.last_heartbeat)).launcher_resources;
           const verdict = this.diskHeadroom(plan.selected.machine, plan.request.workspace, undefined, plan.request.cwd);
           if (!disk || disk.observed_at <= memoryHold.since || !verdict?.admitted) continue;
         }
@@ -2966,7 +2966,7 @@ export class FleetService {
 
         // Record the newest completeness verdict before reconciliation or
         // queue draining can inspect capacity. A change of verdict is applied
-        // immediately; unchanged reports retain the existing 60 s write cap.
+        // immediately; unchanged reports retain the fifteen-minute durable write cap.
         const censusNow = this.now();
         const censusObservedAt = new Date(censusNow).toISOString();
         const persistCensus=noteCatalogObservation(this.sql,caller.machineId!,censusNow,censusComplete);
@@ -3148,7 +3148,7 @@ export class FleetService {
         // A refreshed catalog can free machine_capacity: promote waiters.
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }
         // unchanged rows retain last-change timestamps; the complete census
-        // has separate freshness evidence, bounded to one host write/minute.
+        // has separate freshness evidence, coalesced to a durable checkpoint every fifteen minutes.
         if(persistCensus)this.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at WHERE fleet_catalog_seen.observed_at <= ?', caller.machineId!, new Date(this.now()).toISOString(), new Date(this.now() - 900000).toISOString());
         return response({ status: 'reported', written });
       });
@@ -3349,7 +3349,7 @@ export class FleetService {
             const reportedHostLoad = diagnostic.host_load;
             const hasHostLoad = reportedHostLoad !== undefined;
             const loadMachine: any = (data.reason === 'host_load_high' || hasHostLoad) ? this.sql.exec('SELECT last_heartbeat, capabilities FROM machines WHERE id = ?', row.machine_id).toArray()[0] : null;
-            const loadHeartbeat = parsed(loadMachine?.last_heartbeat) || {};
+            const loadHeartbeat = parsed(effectiveHeartbeat(this.sql,row.machine_id,loadMachine?.last_heartbeat)) || {};
             const loadCores = parsed(loadMachine?.capabilities)?.cpu_count;
             const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason,
               ...(hasHostLoad ? { host_load: reportedHostLoad } : {}),

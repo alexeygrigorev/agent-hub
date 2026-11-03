@@ -1,3 +1,4 @@
+import { effectiveHost } from './registry';
 /** Private repository registry. Human fields are insert-only during discovery. */
 import { boundedText } from './mcp';
 import { decodeRepoWorkspace, encodeRepoWorkspace } from './fleet';
@@ -75,7 +76,7 @@ export class RepoRegistry {
     return candidate;
   }
   all(): any[] {
-    const machines = this.sql.exec('SELECT id,last_checkin_at,capabilities FROM machines').toArray();
+    const machines = this.sql.exec('SELECT id,last_checkin_at,capabilities FROM machines').toArray().map(m=>effectiveHost(this.sql,m));
     const online = new Set(machines
       .filter(m => { const age = this.now() - Date.parse(String(m.last_checkin_at)); return age >= 0 && age <= 180000; }).map(m => String(m.id)));
     return this.sql.exec('SELECT repo_id,data FROM repo_registry ORDER BY name').toArray().map(row => {

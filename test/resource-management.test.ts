@@ -215,8 +215,10 @@ describe('resource management',()=>{
   sql.exec('INSERT INTO resource_cpu_samples VALUES(?,?,?)','launch',1,iso());
   sql.exec('INSERT INTO resource_resident_samples VALUES(?,?,?)','launch',100,iso());
   r.withReadSnapshot(()=>{
-    expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(1);
-    expect(r.headroom('host').reserved_mb).toBe(412);
+    // Persisted measurements cannot restore advisory credit after a cold
+    // cache/rollback: a fresh binding-verified report is required.
+    expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(2);
+    expect(r.headroom('host').reserved_mb).toBe(512);
   });
   sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id='launch'");
   r.configure({memory_floor_mb:4096,memory_floor_pct:20});

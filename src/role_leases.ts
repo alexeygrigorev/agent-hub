@@ -1,3 +1,4 @@
+import { effectiveHost } from './registry';
 import type { SqlStorage } from '@cloudflare/workers-types';
 
 const NAME = /^[a-z][a-z0-9-]{0,47}$/;
@@ -48,7 +49,7 @@ export class RoleLeases {
   }
 
   host(hostId: string, credentialId: string, kind: string, now: number): any | null {
-    const host: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', hostId).toArray()[0];
+    const host: any = effectiveHost(this.sql,this.sql.exec('SELECT * FROM machines WHERE id = ?', hostId).toArray()[0] as any);
     const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', credentialId).toArray()[0];
     if (!host || !host.registered_at || host.credential_id !== credentialId || host.drained ||
         ['disabled', 'revoked', 'drained', 'dead'].includes(host.state) || !cred || cred.kind !== 'host' ||

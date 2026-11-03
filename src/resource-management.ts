@@ -1,3 +1,4 @@
+import { effectiveHeartbeat, effectiveHeartbeatAt } from './registry';
 import { worktreeIntakeProtected, worktreeIntakeSnapshot, type WorktreeSnapshotScope } from './worktree-intakes';
 import { openWorkPreventsIdleReap, type IdleReapCache } from './intake-session';
 import { WriteWatch, StampCache } from './write-watch';
@@ -118,6 +119,7 @@ export class ResourceManagement {
     const at=Date.parse(value.observed_at);
     return Number.isFinite(at)&&at>=now-180000&&at<=now+30000?value:null;
   }
+  invalidateLiveTelemetry():void { this.liveTelemetry.clear(); }
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
   private catalogRawRows=new Map<string,{rev:string|null;value:any[]}>();
@@ -287,7 +289,7 @@ export class ResourceManagement {
   configFor(machine: string): ResourceConfig {
     const config = this.config();
     const m: any = this.readRows('SELECT last_heartbeat FROM machines WHERE id=?', machine)[0];
-    return { ...config, memory_floor_mb: effectiveFloorMb(config, parse(m?.last_heartbeat).mem_total_mb) };
+    return { ...config, memory_floor_mb: effectiveFloorMb(config, parse(effectiveHeartbeat(this.sql,machine,m?.last_heartbeat)).mem_total_mb) };
   }
   config(): ResourceConfig { return resourceConfig(parse(this.readRows('SELECT data FROM resource_settings WHERE id=1')[0]?.data)); }
   /** Host-poll path for the resource config: stamp-checked, zero rows between writes. */
@@ -373,7 +375,7 @@ export class ResourceManagement {
   private hostAdmissionState(machine: string, heartbeat: any, observedAt: unknown, excludeLaunch?: string) {
     const load = Array.isArray(heartbeat?.load) ? heartbeat.load[0] : null;
     return {load1: load, swap_used_percent: heartbeat?.swap_used_percent,
-      observed_at: observedAt, active_sessions: this.hostSessionCount(machine, excludeLaunch)};
+      observed_at: effectiveHeartbeatAt(this.sql,machine,observedAt), active_sessions: this.hostSessionCount(machine, excludeLaunch)};
   }
   cpuHeadroom(machine: string, input: any = {}, excludeLaunch?: string) {
     return this.withHistory(() => this.cpuHeadroomFromHistory(machine, input, excludeLaunch));
@@ -381,18 +383,25 @@ export class ResourceManagement {
   private cpuHeadroomFromHistory(machine: string, input: any, excludeLaunch?: string) {
     const now = this.snapshotNow ?? this.now();
     const m:any=this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?',machine)[0];
-    const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
+    const hb=parse(effectiveHeartbeat(this.sql,machine,m?.last_heartbeat)),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
     const inFlightCutoff=new Date(now-IN_FLIGHT_RESERVE_SECONDS*1000).toISOString();
     const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal',input.engine ?? null,input.model ?? null);
-    // Expose the common state range to the machine/state index; the CASE below
-    // applies the running-ramp cutoff or the bounded in-flight window and is
-    // NULL (no reservation) for any other state, so the index filter stays
-    // an optimisation only.
-    const pending=this.readRows(`SELECT l.id,l.native_id,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,
-      c.current_cpu_cores,c.observed_at AS cpu_observed_at FROM fleet_launches l
-      LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_cpu_samples c ON c.launch_id=l.id WHERE machine_id=?
-      AND l.state IN ('offered','starting','running','uncertain')
-      AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),created_at)>=CASE WHEN state='running' THEN ? WHEN state IN ('offered','starting','uncertain') THEN ? END`,machine,cutoff,inFlightCutoff) as any[];
+    const candidates:any[]=[];
+    for(const state of ['offered','starting','running','uncertain']) {
+      const remaining=MEMORY_PENDING_SCAN_LIMIT+1-candidates.length;
+      if(remaining<=0)break;
+      candidates.push(...this.readRows(`SELECT l.id,l.native_id,l.state,l.created_at,
+        ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,p.started_at AS ramp_started_at
+        FROM fleet_launches l INDEXED BY fleet_launch_machine_state
+        LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_ramps p ON p.launch_id=l.id
+        WHERE l.machine_id=? AND l.state=? ORDER BY l.rowid LIMIT ?`,machine,state,remaining));
+    }
+    if(candidates.length>MEMORY_PENDING_SCAN_LIMIT)return {
+      ...cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,0,config,now),
+      admitted:false,reason:'resource_snapshot_overflow',snapshot_truncated:true,ramping_cpu_cores:null,
+      resource_choking:null,choking_observed_at:null,expected_cpu_source:estimate.expected_cpu_source,
+    };
+    const pending=candidates.filter(row=>(row.ramp_started_at ?? row.created_at)>=(row.state==='running'?cutoff:inFlightCutoff));
     const pendingKey=JSON.stringify([machine,cutoff,inFlightCutoff,now]);
     let commitments=this.cpuPendingSnapshot?.get(pendingKey);
     if (!commitments) {
@@ -403,8 +412,8 @@ export class ResourceManagement {
       // separate 30–60s polls. Fresh exact-binding measurements are advisory
       // ramp credit; they need not land inside the 200ms host /proc/stat sample.
         const live=this.freshLiveTelemetry(row.id,now,row.native_id);
-        const at=Date.parse(live?.observed_at ?? row.cpu_observed_at);
-        const current=live?.current_cpu_cores ?? row.current_cpu_cores;
+        const at=Date.parse(live?.observed_at);
+        const current=live?.current_cpu_cores;
         const credit=Number.isFinite(at)&&at>=now-180000&&at<=now+30000&&finite(current) ? current : 0;
         return {id:row.id,remaining:Math.max(0,committed-credit)};
       });
@@ -424,7 +433,7 @@ export class ResourceManagement {
   capacityCpuAdmitted(machine: string): boolean {
     const now = this.snapshotNow ?? this.now(), config = this.config();
     const m: any = this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?', machine)[0];
-    const heartbeat = parse(m?.last_heartbeat);
+    const heartbeat = parse(effectiveHeartbeat(this.sql,machine,m?.last_heartbeat));
     const verdict = cpuVerdict(heartbeat.cpu_usage, parse(m?.capabilities).cpu_count, 0, 0, config, now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null,
       this.hostAdmissionState(machine,heartbeat,m?.last_checkin_at));
     return this.chokingState(machine, now, config, verdict.reason).reason === null;
@@ -434,7 +443,7 @@ export class ResourceManagement {
     // reservation estimate across every pending request.
     const now=this.snapshotNow ?? this.now(),config=this.config();
     const m:any=this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?',machine)[0];
-    const heartbeat=parse(m?.last_heartbeat);
+    const heartbeat=parse(effectiveHeartbeat(this.sql,machine,m?.last_heartbeat));
     const verdict=cpuVerdict(heartbeat.cpu_usage,parse(m?.capabilities).cpu_count,0,0,config,now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null,
       this.hostAdmissionState(machine,heartbeat,m?.last_checkin_at));
     return this.chokingState(machine,now,config,verdict.reason).resource_choking;
@@ -480,7 +489,7 @@ export class ResourceManagement {
   private headroomFromHistory(machine: string, input: any, engine: string | null) {
     const now = this.snapshotNow ?? this.now();
     const machineRow: any = this.readRows('SELECT last_heartbeat FROM machines WHERE id=?', machine)[0];
-    const hb = parse(machineRow?.last_heartbeat); const config = this.config();
+    const hb = parse(effectiveHeartbeat(this.sql,machine,machineRow?.last_heartbeat)); const config = this.config();
     const cutoff = new Date(now - config.ramp_seconds * 1000).toISOString();
     const inFlightCutoff = new Date(now - IN_FLIGHT_RESERVE_SECONDS * 1000).toISOString();
     // Only launch ramps are additional commitments. Resident usage is already in MemAvailable.
@@ -511,7 +520,7 @@ export class ResourceManagement {
       const req = parse(row.request_json);
       const estimate = this.estimate(req.project || row.workspace, row.engine, req.task_kind || req.kind || 'goal');
       const live=this.freshLiveTelemetry(row.id,now,row.native_id);
-      const resident=live?.current_rss_mb ?? row.resident_mb;
+      const resident=live?.current_rss_mb;
       reserved += Math.max(0, estimate - (finite(resident) ? resident : 0));
     }
     return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
@@ -1027,7 +1036,7 @@ export class ResourceManagement {
         return {id:String(m.id),hostname:m.hostname,drained:m.drained,last_seen_ms:Number.isFinite(at)?at:null};})).aliasOf;
     } catch { aliasOf=new Map(); }
     const hosts=rows.filter((m:any)=>!aliasOf.has(String(m.id))).map((m:any)=>{
-      const hb=parse(m.last_heartbeat),caps=parse(m.capabilities),headroom=this.headroom(m.id),cpuView=this.cpuHeadroom(m.id);
+      const hb=parse(effectiveHeartbeat(this.sql,m.id,m.last_heartbeat)),caps=parse(m.capabilities),headroom=this.headroom(m.id),cpuView=this.cpuHeadroom(m.id);
       return {machine_id:m.id,aliases:[...aliasOf].filter(([,c])=>c===String(m.id)).map(([a])=>a).sort(),mem_total_mb:hb.mem_total_mb??null,
         mem_used_mb:finite(hb.mem_total_mb)&&finite(hb.mem_avail_mb)?hb.mem_total_mb-hb.mem_avail_mb:null,
         load5:hb.load?.[1]??null,cores:caps.cpu_count??null,...headroom,cpu:cpuView,capacity:this.capacity(m,hb,caps,cpuView),host_observed_at:m.last_checkin_at,

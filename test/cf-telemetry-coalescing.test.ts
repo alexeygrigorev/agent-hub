@@ -1,8 +1,9 @@
 import { describe,it,expect } from 'vitest';
 import { env,runInDurableObject } from 'cloudflare:test';
-import { ResourceManagement } from '../src/resource-management';
+import { FleetService } from '../src/fleet';
 import { RowsMeter } from '../src/rows-meter';
 import { WriteWatch } from '../src/write-watch';
+import { updateHeartbeat,effectiveHeartbeat,effectiveHost } from '../src/registry';
 import { noteCatalogObservation,freshCatalogs,freshCompleteCatalogs } from '../src/catalog-freshness';
 
 const fixture=(fn:(x:any)=>Promise<void>|void)=>(runInDurableObject as any)((env as any).HUB.get((env as any).HUB.idFromName('telemetry-'+crypto.randomUUID())),async(_h:any,state:any)=>{
@@ -15,9 +16,9 @@ const fixture=(fn:(x:any)=>Promise<void>|void)=>(runInDurableObject as any)((env
     VALUES('session','test','control',?,'launch','host','opencode','headless','running',?,?,?)`,JSON.stringify({intake_task_id:'task'}),JSON.stringify({native_id:'native',tag:'agent',workspace:'/repo'}),iso(),iso());
   raw.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace) VALUES('host','native','agent','opencode','running',?,'/repo')",iso());
   const meter=new RowsMeter(()=>now),watch=new WriteWatch(),sql=watch.wrap(meter.wrap(raw));
-  const r=new ResourceManagement(sql,()=>now,watch);r.initCatalogCache();
+  const f=new FleetService(sql,fn=>state.storage.transactionSync(fn),()=>now,watch),r=f.resources;r.initCatalogCache();
   const sample=(extra:any={})=>({session_id:'session',native_id:'native',current_rss_mb:200,peak_rss_mb:200,peak_pss_mb:210,current_cpu_cores:1,cpu_seconds:20,runtime_s:100,observed_at:iso(),...extra});
-  await fn({r,raw,sql,meter,sample,advance:(ms:number)=>{now+=ms;},iso});
+  await fn({f,r,raw,sql,meter,sample,advance:(ms:number)=>{now+=ms;},iso});
 });
 
 describe('live telemetry persistence coalescing',()=>{
@@ -82,3 +83,71 @@ describe('coalesced catalog freshness',()=>{
     expect(freshCompleteCatalogs(sql,now).get('host')).toBe(now);
   }));
 });
+
+
+describe('heartbeat coalescing with live admission overlays',()=>{
+  it('keeps the latest pressure and host freshness without persisting sampling noise',()=>fixture(({r,raw,sql,meter,advance,iso}:any)=>{
+    const heartbeat=(mem:number,swap:number)=>({type:'heartbeat',at:iso(),mem_avail_mb:mem,mem_total_mb:64000,swap_used_percent:swap,load:[1],gate:{launch_allowed:true,reason:'ok',at:iso()},launcher_resources:{active_mem_mb:1000,observed_at:iso()}});
+    const first=iso();updateHeartbeat('host',heartbeat(3000,0),sql,Date.parse(iso()));
+    advance(240000);
+    meter.runSync('heartbeat',()=>updateHeartbeat('host',heartbeat(500,85),sql,Date.parse(iso())));
+    expect(meter.snapshot().heartbeat.rows_written).toBe(0);
+    expect(meter.snapshot().heartbeat.rows_read).toBe(0);
+    const durable=raw.exec("SELECT * FROM machines WHERE id='host'").one();
+    expect(durable.last_checkin_at).toBe(first);
+    expect(JSON.parse(effectiveHeartbeat(sql,'host',durable.last_heartbeat)!)).toMatchObject({mem_avail_mb:500,swap_used_percent:85});
+    expect(effectiveHost(sql,durable).last_checkin_at).toBe(iso());
+    expect(r.headroom('host').mem_available_mb).toBe(500);
+    expect(r.capacityCpuAdmitted('host')).toBe(false);
+    const restarted={};
+    expect(effectiveHost(restarted,durable).last_checkin_at).toBe(first);
+    advance(660000);
+    meter.runSync('heartbeat-due',()=>updateHeartbeat('host',heartbeat(500,85),sql,Date.parse(iso())));
+    expect(meter.snapshot()['heartbeat-due'].rows_written).toBeGreaterThan(0);
+  }));
+
+  it('persists a real gate/control transition immediately inside the coalescing interval',()=>fixture(({raw,sql,meter,advance,iso}:any)=>{
+    const hb=(allowed:boolean)=>({type:'heartbeat',at:iso(),gate:{launch_allowed:allowed,reason:allowed?'ok':'operator_hold',at:iso()}});
+    updateHeartbeat('host',hb(true),sql,Date.parse(iso()));advance(1000);
+    meter.runSync('control',()=>updateHeartbeat('host',hb(false),sql,Date.parse(iso())));
+    expect(meter.snapshot().control.rows_written).toBeGreaterThan(0);
+    expect(JSON.parse(raw.exec("SELECT last_heartbeat FROM machines WHERE id='host'").one().last_heartbeat).gate.launch_allowed).toBe(false);
+  }));
+});
+
+
+describe('advisory telemetry and completeness transaction fences',()=>{
+  it('drops admission credit after eviction and does not reuse an old-native measurement',()=>fixture(({r,raw,sql,sample}:any)=>{
+    r.report('host',{samples:[sample()],reaps:[]});expect(r.headroom('host').reserved_mb).toBe(312);
+    r.invalidateLiveTelemetry();expect(r.headroom('host').reserved_mb).toBe(512);
+    expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(2);
+    r.report('host',{samples:[sample()],reaps:[]});
+    sql.exec("UPDATE fleet_launches SET native_id='replacement' WHERE id='launch'");
+    expect(r.headroom('host').reserved_mb).toBe(512);
+    expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(2);
+  }));
+
+  it('invalidates uncommitted telemetry and complete-census overlays after an SQL rollback',()=>fixture(({f,r,raw,sql,sample,iso}:any)=>{
+    r.report('host',{samples:[sample()],reaps:[]});
+    raw.exec("INSERT INTO fleet_catalog_census VALUES('host',?,0)",iso());
+    expect(()=>(f as any).transaction(()=>{
+      noteCatalogObservation(sql,'host',Date.parse(iso()),true);
+      sql.exec("UPDATE fleet_catalog_census SET complete=1 WHERE machine_id='host'");
+      r.report('host',{samples:[sample({current_rss_mb:500,current_cpu_cores:1.5})],reaps:[]});
+      throw new Error('rollback');
+    })).toThrow('rollback');
+    expect(freshCompleteCatalogs(sql,Date.parse(iso())).has('host')).toBe(false);
+    expect(r.headroom('host').reserved_mb).toBe(512);
+    expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(2);
+  }));
+});
+
+
+it('CPU admission refuses an oversized raw active prefix before retained history can be scanned',()=>fixture(({r,raw,meter,iso}:any)=>{
+  raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2100)
+    INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+    SELECT 'active-'||i,'test','human','test','active-'||i,'{}','host','opencode','go','headless','/repo','test','running',?,? FROM n`,iso(),iso());
+  const verdict=meter.runSync('cpu-prefix',()=>r.cpuHeadroom('host'));
+  expect(verdict).toMatchObject({admitted:false,reason:'resource_snapshot_overflow',snapshot_truncated:true,ramping_cpu_cores:null});
+  expect(meter.snapshot()['cpu-prefix'].rows_read).toBeLessThan(1000);
+}));

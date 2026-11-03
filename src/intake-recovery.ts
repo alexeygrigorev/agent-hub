@@ -1,3 +1,4 @@
+import { effectiveHost } from './registry';
 /** Recovery decisions never substitute a stall observation for native exit proof. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { GOAL_ENGINES } from './goal-engines';
@@ -318,7 +319,7 @@ export function evaluateRecoveryEngineEligibility(
       const routeCount = Number((sql.exec('SELECT COUNT(*) AS n FROM fleet_routes').one() as any)?.n || 0);
       if (routeCount > 0) {
         const nowMs = now();
-        const mRows = sql.exec('SELECT last_checkin_at, drained FROM machines WHERE revoked_at IS NULL LIMIT 64').toArray() as any[];
+        const mRows = sql.exec('SELECT id,last_checkin_at, drained FROM machines WHERE revoked_at IS NULL LIMIT 64').toArray().map(m=>effectiveHost(sql,m)) as any[];
         hasLiveFleet = mRows.some(m => !m.drained && typeof m.last_checkin_at === 'string' && Math.abs(nowMs - Date.parse(m.last_checkin_at)) <= 180000);
       }
     }

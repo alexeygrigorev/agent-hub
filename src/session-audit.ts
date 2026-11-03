@@ -1,3 +1,4 @@
+import { effectiveHeartbeat } from './registry';
 /** Idle-session audit (intake 27d1e27b): a Hub-scheduled pass every 30 minutes
  * over all live sessions (Hub-managed and observed aplexer natives). Each
  * session is scored on last output change, host CPU, git worktree state,
@@ -453,7 +454,7 @@ export class SessionAuditService {
     const catalogs = freshCatalogs(this.sql, now);
     const cpuByMachine = new Map<string, Obj>();
     for (const m of this.rows('SELECT id, last_heartbeat FROM machines')) {
-      const usage = sanitizeCpuUsage(parse(m.last_heartbeat).cpu_usage);
+      const usage = sanitizeCpuUsage(parse(effectiveHeartbeat(this.sql,m.id,m.last_heartbeat)).cpu_usage);
       if (usage) cpuByMachine.set(m.id, { busy_percent: usage.busy_percent, busy_cores: usage.busy_cores, cores: usage.cores, observed_at: usage.observed_at });
     }
     const worktrees = new Map<string, Obj>();

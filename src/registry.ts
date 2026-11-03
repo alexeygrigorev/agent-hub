@@ -100,13 +100,27 @@ function sanitizeHeartbeat(body: any) {
 
 const machineState = new Map<string, { lastSeenAt: number, lastPersistedAt: number, fingerprint: string, hb: any, routesAt?: number }>();
 
+const heartbeatObservations=new WeakMap<object,Map<string,{hb:any;at:number;persistedAt:number;fingerprint:string}>>();
+/** Telemetry remains current for admission without a write for every sample.
+ * The SQL handle scopes memory to one Durable Object. Cold objects use the
+ * durable observation, whose real timestamp still expires conservatively. */
+export function effectiveHeartbeat(sql:object,machine:string,persisted:unknown):string|null {
+  const current=heartbeatObservations.get(sql)?.get(machine);
+  return current ? JSON.stringify(current.hb) : typeof persisted==='string'?persisted:null;
+}
+export function effectiveHeartbeatAt(sql:object,machine:string,persisted:unknown):string|null {
+  const current=heartbeatObservations.get(sql)?.get(machine);
+  return current?new Date(current.at).toISOString():typeof persisted==='string'?persisted:null;
+}
+export function effectiveHost<T extends {id?:string;last_heartbeat?:unknown;last_checkin_at?:unknown}>(sql:object,row:T):T {
+  if(!row || !row.id)return row;
+  const current=heartbeatObservations.get(sql)?.get(row.id);
+  return current ? {...row,last_heartbeat:JSON.stringify(current.hb),last_checkin_at:new Date(current.at).toISOString()} : row;
+}
+
 function getFingerprint(hb: any): string {
   return JSON.stringify({
-    cpu_usage: hb.cpu_usage,
-    load: hb.load,
-    swap_used_percent: hb.swap_used_percent,
-    gate: hb.gate,
-    launcher_resources: hb.launcher_resources,
+    gate: hb.gate ? {launch_allowed:hb.gate.launch_allowed,reason:hb.gate.reason}:null,
     running_jobs: hb.running_jobs,
     sessions_summary: hb.sessions_summary,
     fleet_routes: hb.fleet_routes,
@@ -115,7 +129,7 @@ function getFingerprint(hb: any): string {
 }
 
 /**
- * Latest check-in time for a machine. Storage is written at most every five minutes for an
+ * Latest check-in time for a machine. Storage is written at most every fifteen minutes for an
  * unchanged heartbeat, so prefer the in-memory time this Durable Object saw when it is newer.
  */
 export function effectiveCheckin(machineId: string, persisted: unknown): string | null {
@@ -165,7 +179,7 @@ export function sanitizeRouteAdvertisement(body: any): RouteAdvertisement | null
  * forward. Returns null (stale) when seq does not exceed the stored one. */
 export function updateRouteAdvertisement(machineId: string, advert: RouteAdvertisement, sql: SqlStorage, now = Date.now()): string | null {
   let st = machineState.get(machineId);
-  let previous: any = st?.hb;
+  let previous: any = heartbeatObservations.get(sql as object)?.get(machineId)?.hb;
   if (!previous) {
     try { previous = JSON.parse(String((sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machineId).toArray()[0] as any)?.last_heartbeat ?? 'null')); } catch { previous = null; }
   }
@@ -180,6 +194,8 @@ export function updateRouteAdvertisement(machineId: string, advert: RouteAdverti
     machineState.set(machineId, st);
   }
   st.hb = hb;
+  const live=heartbeatObservations.get(sql as object)?.get(machineId);
+  if(live){live.hb=hb;live.fingerprint=getFingerprint(hb);}
   st.routesAt = now;
   st.fingerprint = getFingerprint(hb);
   sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(hb), machineId);
@@ -222,6 +238,9 @@ export function updateHeartbeatMemoryOnly(machineId: string) {
 export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStorage, now = Date.now()) {
   const hb = sanitizeHeartbeat(rawPayload);
   if (!hb) return;
+  let observations=heartbeatObservations.get(sql as object);
+  if(!observations)heartbeatObservations.set(sql as object,observations=new Map());
+  const priorObservation=observations.get(machineId);
 
   const cpu=hb.cpu_usage;
   if(cpu && cpu.host_oom_kills_delta>0 && now-Date.parse(cpu.observed_at)>=-30000 && now-Date.parse(cpu.observed_at)<=180000
@@ -234,7 +253,7 @@ export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStor
   // overflow forward with its original fleet_routes_at, so it ages out but
   // never looks newer than it is and is never erased by telemetry.
   {
-    let previous: any = st?.hb;
+    let previous: any = priorObservation?.hb;
     if (!previous) {
       try { previous = JSON.parse(String((sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machineId).toArray()[0] as any)?.last_heartbeat ?? 'null')); } catch { previous = null; }
     }
@@ -253,7 +272,9 @@ export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStor
   st.lastSeenAt = now;
   st.hb = hb;
 
-  if (fingerprint !== st.fingerprint || now - st.lastPersistedAt >= 300000) {
+  const persist=!priorObservation || fingerprint!==priorObservation.fingerprint || now-priorObservation.persistedAt>=900000;
+  observations.set(machineId,{hb,at:now,persistedAt:persist?now:priorObservation.persistedAt,fingerprint});
+  if (persist) {
     st.fingerprint = fingerprint;
     st.lastPersistedAt = now;
     sql.exec(

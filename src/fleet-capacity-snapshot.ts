@@ -1,6 +1,6 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { canonicalQuotaProvider } from './quota';
-import { effectiveCheckin } from './registry';
+import { effectiveHost } from './registry';
 
 type Row = Record<string, any>;
 export const CAPACITY_LIMITS = { hosts: 64, accounts: 128, routes: 256, launches: 256, natives: 256, engines: 16 };
@@ -111,10 +111,10 @@ export function readFleetCapacitySnapshot(sql: SqlStorage, now: number, unreserv
     return rows;
   };
   const machines = bounded(CAPACITY_MACHINES_SQL, CAPACITY_LIMITS.hosts,
-    // Unchanged heartbeats persist at least every five minutes. Include their
+    // Unchanged heartbeats persist every fifteen minutes. Include their
     // storage lag, then use the same effective in-memory check-in as Fleet.
-    new Date(now - 360000).toISOString(), new Date(now + 60000).toISOString())
-    .map((m): Row => ({ ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at) }))
+    new Date(now - 960000).toISOString(), new Date(now + 60000).toISOString())
+    .map((m): Row => effectiveHost(sql,m))
     .filter(m => { const at = Date.parse(m.last_checkin_at || ''); return Number.isFinite(at) && at <= now + 60000 && now - at <= 180000; });
   const definitions = bounded('SELECT * FROM fleet_accounts ORDER BY label LIMIT 129', CAPACITY_LIMITS.accounts);
   const keyed = (keys: string[], limit: number, query: (marks: string, remaining: number) => string, ...fixed: any[]) => {

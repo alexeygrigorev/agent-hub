@@ -142,7 +142,9 @@ export class RowBudget {
     if (this.loggedDay !== this.day()) {
       this.loggedDay = this.day();
       console.error(JSON.stringify({ event: 'do_daily_row_budget_exceeded', day: this.day(), detail,
-        reserved: this.ledger, limit: this.limits, limit_total: this.combinedLimit }));
+        reserved: this.ledger, available: this.credit, debt: this.debt,
+        spent: this.ledger ? {read:this.ledger.read-this.credit.read+this.debt.read,written:this.ledger.written-this.credit.written+this.debt.written}:null,
+        limit: this.limits, limit_total: this.combinedLimit }));
     }
     throw new RowBudgetExceeded(detail);
   }
@@ -273,11 +275,21 @@ export class RowBudget {
     if (!this.ledger || this.day() !== this.ledger.day || this.stopped) this.trip('preflight required or credit exhausted');
   }
   private consume(read: number, written: number) {
+    const fungible = this.limits.read >= this.combinedLimit && this.limits.written >= this.combinedLimit;
     const charge = (key: keyof Counts, amount: number) => {
       if (!Number.isFinite(amount) || amount < 0) {
         if (this.ledger) this.ledger.stopped = true;
         this.dirty = true;
         this.trip('invalid SQL row counters');
+      }
+      if (fungible && amount > this.credit[key]) {
+        const other = key === 'read' ? 'written' : 'read';
+        const transfer = Math.min(amount-this.credit[key],this.credit[other]);
+        // A reservation pays for combined rows, regardless of direction. Move
+        // only UNUSED credit and its reservation label; total prepaid cost is
+        // invariant, including on a crash before the next durable checkpoint.
+        this.credit[other] -= transfer; this.credit[key] += transfer;
+        this.ledger![other] -= transfer; this.ledger![key] += transfer;
       }
       const paid = Math.min(this.credit[key], amount);
       this.credit[key] -= paid;
@@ -286,7 +298,8 @@ export class RowBudget {
     };
     charge('read', read);
     charge('written', written);
-    if (this.credit.read <= 0 || this.credit.written <= 0 || this.dirty) this.trip('statement exhausted prepaid credit');
+    if ((fungible ? this.credit.read+this.credit.written <= 0 : this.credit.read <= 0 || this.credit.written <= 0) || this.dirty)
+      this.trip('statement exhausted prepaid credit');
   }
 
   /** Install alongside the SQL wrapper. SQLite-backed KV and alarm updates
@@ -386,11 +399,17 @@ export class RowBudget {
       // Keep source probe + build within current prepaid credit, allowing
       // conservative schema overhead. This does not preempt arbitrary SQL:
       // it bounds the particular full-source operation before native exec.
-      const cap = build.predicate
-        ? Math.min(INDEX_PARTIAL_READ_SOURCE_LIMIT,Math.floor((this.credit.read-128)/4))
-        : Math.min(INDEX_BUILD_SOURCE_LIMIT, Math.floor((this.credit.read - 64) / 3), Math.floor(this.credit.written - 16));
+      const fungible = this.limits.read >= this.combinedLimit && this.limits.written >= this.combinedLimit;
+      const pooledCap = Math.floor((this.credit.read+this.credit.written-128)/4);
+      // Probe + predicate probe + native read + index write consume the SAME
+      // pool. Divide it once, never allocate the whole pool to both directions.
+      const cap = fungible
+        ? Math.min(build.predicate ? INDEX_PARTIAL_READ_SOURCE_LIMIT : INDEX_BUILD_SOURCE_LIMIT,pooledCap)
+        : build.predicate
+          ? Math.min(INDEX_PARTIAL_READ_SOURCE_LIMIT,Math.floor((this.credit.read-128)/4))
+          : Math.min(INDEX_BUILD_SOURCE_LIMIT, Math.floor((this.credit.read - 64) / 3), Math.floor(this.credit.written - 16));
       if (cap < 0) deny('insufficient prepaid credit for index migration');
-      const partialWriteCap=Math.min(INDEX_BUILD_SOURCE_LIMIT,Math.floor(this.credit.written-16));
+      const partialWriteCap=Math.min(INDEX_BUILD_SOURCE_LIMIT,fungible ? pooledCap : Math.floor(this.credit.written-16));
       if(build.predicate && partialWriteCap<0) deny('insufficient prepaid write credit for partial index migration');
       const table = '"main"."' + build.table.replaceAll('"', '""') + '"';
       const source = sql.exec(`SELECT 1 FROM ${table} NOT INDEXED LIMIT ?`, cap + 1).toArray();
