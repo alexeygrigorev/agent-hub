@@ -122,10 +122,14 @@ function memoSafe(query: string): boolean {
   // These table-valued functions are pure over their SQL arguments. Other
   // FROM/JOIN functions can expose mutable or connection-local state, so do
   // not memoize them without an explicit dependency contract.
+  // `pragma_table_list(name)` (the meter's rewrite of sqlite_master existence
+  // probes, intake e8a22f4c) is pure over the schema: every DDL statement
+  // bumps the schema generation that versions every memo stamp, so a cached
+  // probe answer stays exact until the schema itself changes.
   const tableFunctions = /\b(?:FROM|JOIN)\s+(?:(?:main|temp)\s*\.\s*)?(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z_][A-Za-z0-9_$]*))\s*\(/gi;
   for (let match = tableFunctions.exec(query); match; match = tableFunctions.exec(query)) {
     const name = tableName(match);
-    if (name !== 'json_each' && name !== 'json_tree') return false;
+    if (name !== 'json_each' && name !== 'json_tree' && name !== 'pragma_table_list') return false;
   }
   return true;
 }
