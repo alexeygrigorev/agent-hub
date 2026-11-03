@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
 import type { Hub } from '../src/hub';
@@ -16,35 +16,40 @@ const weekly = (pct: number, hoursLeft: number) => ({ status: 'ok', observed_at:
   windows: { '7d': { present: true, percent_remaining: pct, reset_at: iso(hoursLeft * H) } } });
 
 async function fixture(check: (fleet: FleetService, sql: any, setQuota: (claude: any, codex: any) => void) => Promise<void>) {
-  const bindings = env as unknown as Env;
-  const stub = bindings.HUB.get(bindings.HUB.idFromName('burn-placement-' + crypto.randomUUID()));
-  await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    const fleet = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
-    fleet.init();
-    const sql = hub.sql;
-    const heartbeat = { mem_avail_mb: 37000, disk_free_gb: 80, load: [1, 1, 1], cpu_usage: freshCpu(iso(), 8, 1) };
-    sql.exec('INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities) VALUES (?,?,?,?,?,?,?,?)',
-      'host', 'host', 'host', iso(), iso(), JSON.stringify(heartbeat), 0,
-      JSON.stringify({ engines: ['claude', 'codex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
-    sql.exec('INSERT INTO routing_machines (machine_id,needs_json,max_agents,runners_json,observed_at) VALUES (?,?,?,?,?)', 'host', '[]', 4, '[]', iso());
-    const setQuota = (claude: any, codex: any) => {
-      sql.exec('DELETE FROM host_quota_snapshots');
-      sql.exec('INSERT INTO host_quota_snapshots (host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json) VALUES (?,?,?,?,?,?,?,?,?)',
-        'host', '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify({ claude, codex }));
-    };
-    const configured = await fleet.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify({
-      accounts: [
-        { label: 'shared-claude', provider: 'claude', max_concurrency: 100, reserve_percent: 0, enabled: true },
-        { label: 'shared-codex', provider: 'codex', max_concurrency: 100, reserve_percent: 0, enabled: true },
-      ],
-      routes: [
-        { machine_id: 'host', engine: 'claude', account: 'shared-claude', profile: null },
-        { machine_id: 'host', engine: 'codex', account: 'shared-codex', profile: null },
-      ],
-    }) }), admin);
-    expect(configured.status).toBe(200);
-    await check(fleet, sql, setQuota);
-  });
+  const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+  try {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('burn-placement-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+      const fleet = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
+      fleet.init();
+      const sql = hub.sql;
+      const heartbeat = { mem_avail_mb: 37000, disk_free_gb: 80, load: [1, 1, 1], cpu_usage: freshCpu(iso(), 8, 1) };
+      sql.exec('INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities) VALUES (?,?,?,?,?,?,?,?)',
+        'host', 'host', 'host', iso(), iso(), JSON.stringify(heartbeat), 0,
+        JSON.stringify({ engines: ['claude', 'codex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
+      sql.exec('INSERT INTO routing_machines (machine_id,needs_json,max_agents,runners_json,observed_at) VALUES (?,?,?,?,?)', 'host', '[]', 4, '[]', iso());
+      const setQuota = (claude: any, codex: any) => {
+        sql.exec('DELETE FROM host_quota_snapshots');
+        sql.exec('INSERT INTO host_quota_snapshots (host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json) VALUES (?,?,?,?,?,?,?,?,?)',
+          'host', '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify({ claude, codex }));
+      };
+      const configured = await fleet.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify({
+        accounts: [
+          { label: 'shared-claude', provider: 'claude', max_concurrency: 100, reserve_percent: 0, enabled: true },
+          { label: 'shared-codex', provider: 'codex', max_concurrency: 100, reserve_percent: 0, enabled: true },
+        ],
+        routes: [
+          { machine_id: 'host', engine: 'claude', account: 'shared-claude', profile: null },
+          { machine_id: 'host', engine: 'codex', account: 'shared-codex', profile: null },
+        ],
+      }) }), admin);
+      expect(configured.status).toBe(200);
+      await check(fleet, sql, setQuota);
+    });
+  } finally {
+    random.mockRestore();
+  }
 }
 
 const rebalance = async (fleet: FleetService, apply: boolean) =>
@@ -60,8 +65,8 @@ describe('burn-aware fleet placement', () => {
     expect(plan.selected.burn.waste_alert).toBe(true);
     const codex = plan.candidates!.find((c: any) => c.account === 'shared-codex');
     expect(plan.selected.score).toBeGreaterThan(2 * codex.score);
-    // Deep work takes Claude Opus for the same reason.
-    expect(fleet.plan(intent({ tier: 'deep' })).selected).toMatchObject({ account: 'shared-claude', selection: expect.objectContaining({ id: 'opus' }) });
+    // Deep work takes Claude Sonnet at medium effort for the same reason.
+    expect(fleet.plan(intent({ tier: 'deep' })).selected).toMatchObject({ account: 'shared-claude', selection: expect.objectContaining({ id: 'sonnet', effort: 'medium' }) });
     // Account status exposes the forecast for the dashboard and alert.
     const status = fleet.accountStatus({ label: 'shared-claude', provider: 'claude', max_concurrency: 100, reserve_percent: 0, enabled: 1 });
     expect(status.burn_forecast).toMatchObject({ window: '7d', waste_alert: true });

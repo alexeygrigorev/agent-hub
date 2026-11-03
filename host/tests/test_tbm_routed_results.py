@@ -26,6 +26,14 @@ class RoutedResultsTests(unittest.TestCase):
         managed = patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[])
         managed.start()
         self.addCleanup(managed.stop)
+        # Hermetic: the temp workspace may sit inside a linked git worktree (push-main TMPDIR
+        # under .local/tmp), which would otherwise trigger the real worktree lock guard.
+        unbound = patch('agent_hub_host.worktree_guard.bound_worktree_root', return_value=None)
+        unbound.start()
+        self.addCleanup(unbound.stop)
+        protected = patch('agent_hub_host.worktree_guard.protect_bound_worktree', return_value=True)
+        protected.start()
+        self.addCleanup(protected.stop)
         self.request = Mock(return_value={'id': JOB, 'launch_id': OFFER, 'status': 'done'})
         self.runner = Mock(return_value={'state': 'completed-awaiting-review',
                                         'native_id': NATIVE, 'resources_reserved': False})

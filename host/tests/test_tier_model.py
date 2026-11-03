@@ -15,7 +15,7 @@ from agent_hub_host.session_control import render_table
     ('antigravity', 'antigravity', 'argon'), ('codex', 'codex', 'astra'),
     ('codex', 'zai', 'glm-flash'),
     ('codex', 'codex', 'sol'), ('codex', 'codex', 'luna'),
-    ('claude', 'claude', 'opus'), ('claude', 'claude', 'sonnet'),
+    ('claude', 'claude', 'sonnet'),
 ])
 @pytest.mark.parametrize('mode', ['headless', 'interactive'])
 def test_model_survives_default_subscription(engine, provider, model_id, mode):
@@ -128,11 +128,10 @@ def test_interactive_unsupported_adapter_refused_before_claim(tmp_path):
 
 def test_claude_routes_are_sonnet_medium_never_haiku():
     config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
-    assert 'haiku' not in json.dumps(config).lower()
-    claude = [m for m in config['models'] if m['engine'] == 'claude' and m['id'] != 'opus']
+    claude = [m for m in config['models'] if m['engine'] == 'claude']
     assert [(m['model'], m['effort']) for m in claude] == [('sonnet', 'medium')]
     for ids in config['tiers'].values():
-        assert not [i for i in ids if 'haiku' in i]
+        assert not [i for i in ids if 'haiku' in i or i == 'opus']
 
 
 def test_sessions_table_shows_model_and_effort():
@@ -140,3 +139,34 @@ def test_sessions_table_shows_model_and_effort():
     header = out.splitlines()[0].split()
     row = out.splitlines()[2].split()
     assert 'EFFORT' in header and 'sonnet' in row and 'medium' in row
+
+
+def test_managed_claude_admission_defaults_to_sonnet_medium_and_rejects_other_models(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    quse = fake_bin / 'quse'
+    quse.write_text("#!/bin/sh\nprintf '%s\\n' '{\"claude\":{\"status\":\"ok\",\"details\":{\"limit_reached\":false},\"windows\":{\"weekly\":{\"percent_remaining\":80}}}}'\n")
+    quse.chmod(0o755)
+    script = Path(__file__).resolve().parents[2] / 'scripts' / 'claude-admission.py'
+
+    def run(selection_marker):
+        payload = {} if selection_marker is ... else {'selection': selection_marker}
+        env = dict(os.environ, PATH=str(fake_bin) + os.pathsep + os.environ.get('PATH', ''))
+        result = subprocess.run([sys.executable, str(script)], input=json.dumps(payload), text=True,
+                                capture_output=True, env=env, check=True)
+        return json.loads(result.stdout)
+
+    default = run(...)
+    assert default['launch_allowed'] is True
+    assert (default['model'], default['effort']) == ('sonnet', 'medium')
+    selected = run({'model': 'sonnet', 'effort': 'medium'})
+    assert selected['launch_allowed'] is True
+    assert (selected['model'], selected['effort']) == ('sonnet', 'medium')
+    for model, effort in [('haiku', None), ('opus', 'high'), ('sonnet', 'high')]:
+        rejected = run({'model': model, 'effort': effort})
+        assert rejected['launch_allowed'] is False
+        assert rejected['model_supported'] is False

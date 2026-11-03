@@ -82,6 +82,16 @@ describe('default tier placement', () => {
       expect(fleet.accountStatus(hub.sql.exec("SELECT * FROM fleet_accounts WHERE label='hub-antigravity'").one())).toMatchObject({ status: 'ok' });
       expect(fleet.accountStatus(hub.sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-go'").one())).toMatchObject({ status: 'ok' });
 
+      const recommendRes = await fleet.handle(new Request('https://hub.test/api/fleet/recommend', {
+        method: 'POST',
+        body: JSON.stringify({ machine, mode: 'headless', workspace: 'demo', prompt: 'draw probabilities' }),
+      }), admin);
+      expect(recommendRes.status, await recommendRes.clone().text()).toBe(200);
+      const recommendBody: any = await recommendRes.json();
+      expect(recommendBody.selected.engine).toBe(recommendBody.candidates[0].engine);
+      expect(recommendBody.candidates.every((candidate: any) => Number.isFinite(candidate.draw_probability))).toBe(true);
+      expect(recommendBody.candidates.reduce((sum: number, candidate: any) => sum + candidate.draw_probability, 0)).toBeCloseTo(1, 6);
+
       const engines: string[] = [];
       for (let i = 0; i < 4; i++) {
         const prompt = 'start ' + i;

@@ -89,6 +89,7 @@ function coverageLabel(code) {
 
 function renderEmpty(reason) {
   HubMetricsCharts.clear(reason);
+  if (byId('metrics-coverage-summary')) byId('metrics-coverage-summary').textContent = 'Snapshot coverage · ' + reason;
   byId('coverage').replaceChildren(Object.assign(document.createElement('p'), { textContent: reason }));
   byId('buckets').replaceChildren(Object.assign(document.createElement('p'), { textContent: 'No 24h buckets.' }));
   byId('usage').replaceChildren(Object.assign(document.createElement('p'), { textContent: 'Usage unknown.' }));
@@ -103,6 +104,7 @@ function render(data) {
   HubMetricsCharts.render(data);
   const stale = data.stale === true || data.status === 'stale';
   const cov = data.coverage || {};
+  if (byId('metrics-coverage-summary')) byId('metrics-coverage-summary').textContent = `Snapshot coverage · outcomes ${coverageLabel(cov.accepted)} · usage ${coverageLabel(cov.usage)}${stale ? ' · stale' : ''}`;
   const gaps = Array.isArray(data.gaps) ? data.gaps.map(g => g && g.code).filter(Boolean) : [];
   byId('coverage').replaceChildren(table(
     ['Surface', 'Coverage', 'Window'],
@@ -323,6 +325,7 @@ async function refresh() {
     if (myRefresh !== refreshGeneration) return;
     csrf = me.csrf_token;
     HubHostCharts.refresh(api);
+    syncHistoryRange();
     if (window.HubUsageHistory) HubUsageHistory.refresh(api);
     for (const id of ['account-name', 'menu-name', 'menu-email']) byId(id).textContent = me.email;
     document.querySelector('.dk-avatar__initials').textContent = me.email.slice(0, 1).toUpperCase();
@@ -433,4 +436,48 @@ if (signOut) signOut.addEventListener('click', async () => {
     signOut.disabled = false;
   }
 });
+// One timeframe drives both history renderers; snapshots expose their fixed window.
+function syncHistoryRange() {
+  const shared = byId('metrics-range');
+  if (!shared) return;
+  const resource = document.querySelector('[aria-label="Resource history range"]');
+  if (resource && resource.value !== shared.value) {
+    resource.value = shared.value;
+    resource.dispatchEvent(new Event('change'));
+  }
+  const url = new URL(location.href);
+  url.searchParams.set('range', shared.value);
+  history.replaceState(null, '', url);
+  const longer = shared.value !== '24h';
+  byId('metrics-snapshot-limit').hidden = !longer;
+  byId('metrics-snapshot-content').hidden = longer;
+}
+function metricsRoute() {
+  const hash = location.hash.slice(1);
+  const routing = hash === 'routing-settings';
+  const usage = ['usage', 'usage-history', 'usage-token-history', 'tbm'].includes(hash);
+  const hosts = ['hosts', 'host-health'].includes(hash);
+  const view = usage ? 'usage' : hosts ? 'hosts' : 'outcomes';
+  byId('metrics-analysis').hidden = routing;
+  byId('routing-settings').hidden = !routing;
+  document.querySelectorAll('[data-metrics-panel]').forEach(panel => { panel.hidden = panel.dataset.metricsPanel !== view; });
+  document.querySelectorAll('[data-metrics-view]').forEach(button => {
+    const active = button.dataset.metricsView === view;
+    button.setAttribute('aria-pressed', String(active));
+    button.classList.toggle('dk-button--secondary', !active);
+  });
+  if (hash === 'tbm') byId('tbm').open = true;
+}
+if (byId('metrics-range')) {
+  const savedRange = new URLSearchParams(location.search).get('range');
+  if (['24h', '7d', '30d'].includes(savedRange)) byId('metrics-range').value = savedRange;
+  syncHistoryRange();
+  byId('metrics-range').addEventListener('change', syncHistoryRange);
+  document.querySelectorAll('[data-metrics-view]').forEach(button => button.addEventListener('click', () => {
+    history.replaceState(null, '', '#' + button.dataset.metricsView);
+    metricsRoute();
+  }));
+  addEventListener('hashchange', metricsRoute);
+  metricsRoute();
+}
 refresh();

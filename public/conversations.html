@@ -77,7 +77,7 @@
     <div class="dk-main__inner dk-fill conv-inner">
       <div class="dk-page-header" id="conv-page-header">
         <div class="dk-page-header__main">
-          <h1 class="dk-page-header__title">Conversations</h1>
+          <h1 class="dk-page-header__title">Messages</h1>
           <p class="dk-page-header__subtitle" id="conv-state" role="status">Loading…</p>
         </div>
         <div class="dk-page-header__actions">
@@ -85,11 +85,12 @@
         </div>
       </div>
 
+      <nav class="messages-nav" aria-label="Messages views"><a href="/inbox.html">Inbox</a><a href="/conversations.html" aria-current="page">Conversations</a></nav><p class="messages-purpose">Recent discussions with people and agents. Viewing a thread updates its read position.</p>
       <div class="dk-split conv-split" id="conv-split" data-view="list">
         <section class="dk-split__list" aria-labelledby="conv-list-title">
           <header class="dk-split__head">
             <h2 class="dk-split__title" id="conv-list-title">Conversations</h2>
-            <span class="dk-split__count dk-mono" id="conv-count"></span>
+            <label class="conv-sort-label">Order <select class="dk-select" id="conv-order" aria-label="Conversation order"><option value="unread">Unread first</option><option value="recent">Recent</option></select></label><span class="dk-split__count dk-mono" id="conv-count"></span>
           </header>
           <div class="dk-split__scroll" id="conv-list-scroll">
             <div class="conv-list-state" id="conv-list-state" hidden></div>

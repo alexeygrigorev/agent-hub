@@ -368,16 +368,18 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(recNoReason.status).toBe(400);
       expect(await recNoReason.json()).toMatchObject({ error: 'engine_reason_required' });
 
-      // 2. Unpinned session start picks antigravity and exposes decision_score & decision_reason in GET /api/sessions/:id
+      // 2. An unpinned start draws among eligible routes and records the draw
+      // probability in the session decision shown by GET /api/sessions/:id.
       const autoRes = await sessions.handle(new Request('https://hub.test/api/sessions', {
         method: 'POST',
         body: JSON.stringify({ key: 'auto-pick-1', mode: 'interactive', workspace: 'agent-hub' }),
       }), admin);
       expect(autoRes.status).toBe(201);
       const autoBody: any = await autoRes.json();
-      expect(autoBody.engine).toBe('antigravity');
+      expect(['claude', 'antigravity', 'opencode']).toContain(autoBody.engine);
       expect(typeof autoBody.decision_score).toBe('number');
-      expect(autoBody.decision_reason).toContain('auto: antigravity/hub-antigravity');
+      expect(autoBody.decision_reason).toContain(`auto: ${autoBody.engine}/`);
+      expect(autoBody.decision_reason).toContain('draw_probability=');
 
       const showRes = await sessions.handle(new Request(`https://hub.test/api/sessions/${autoBody.id}`), admin);
       expect(showRes.status).toBe(200);

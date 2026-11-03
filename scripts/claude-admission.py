@@ -25,13 +25,12 @@ except Exception:
     ok = False
 
 selection = r.get('selection')
-model = 'opus'
-effort = 'high'
-if selection is not None and isinstance(selection, dict):
-    req_model = selection.get('model')
-    if req_model in ('opus', 'sonnet', 'haiku', 'claude-opus', 'claude-sonnet', 'claude-haiku'):
-        model = req_model
-        effort = selection.get('effort')
+model = 'sonnet'
+effort = 'medium'
+if selection is not None:
+    if (isinstance(selection, dict) and selection.get('model') == 'sonnet'
+            and selection.get('effort') == 'medium'):
+        pass
     else:
         ok = False
 

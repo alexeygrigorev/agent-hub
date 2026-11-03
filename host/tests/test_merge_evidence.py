@@ -93,6 +93,19 @@ class MergeEvidenceTests(unittest.TestCase):
             'conclusion': 'success', 'deployed_sha': B,
         })
 
+    def test_cancelled_own_run_is_proven_by_descendant_deploy(self):
+        cancelled_then_deployed = FakeRunner(
+            in_main=[A, B], cherry='', ancestors={B: [A]},
+            runs=[
+                {'databaseId': 47, 'headSha': A, 'conclusion': 'cancelled', 'status': 'completed', 'url': 'cancelled-own'},
+                {'databaseId': 48, 'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'descendant'},
+            ],
+        )
+        self.assertEqual(me.deploy_state('/r', A, cancelled_then_deployed), {
+            'state': 'success', 'sha': A, 'run': 'descendant', 'run_id': '48',
+            'conclusion': 'success', 'deployed_sha': B,
+        })
+
     def test_gh_failure_is_unknown_never_success(self):
         class NoGh(FakeRunner):
             def __call__(self, argv, **kw):

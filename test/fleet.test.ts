@@ -1,6 +1,6 @@
 import policy from '../config/model-routing.json';
 import {freshCpu} from './cpu-fixture';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService, isCapacityOnlyHold, PLACEMENT_PRESSURE_REASONS } from '../src/fleet';
 import type { Hub } from '../src/hub';
@@ -118,11 +118,12 @@ describe('generic accounts and launch placement', () => {
     for (const [label] of entries) {
       expect(fleet.accounts.find((a: any) => a.label === label)).toMatchObject({ placeable_slots: 8, placement_reasons: [] });
     }
-    for (const [engine, tier, expected] of [['opus', 'deep', 'claude'], ['glm-flash', 'daily', 'zcodex']]) {
-      const plan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine, tier })), admin)).json() as any;
-      expect(plan.selected?.engine, JSON.stringify(plan.rejected)).toBe(expected);
-      expect(plan.rejected).toEqual([]);
-    }
+    const opusPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'opus', tier: 'deep' })), admin)).json() as any;
+    // The explicit Opus selector cannot resolve under the Sonnet-only Claude policy.
+    expect(opusPlan.selected).toBeNull();
+    const glmPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'glm-flash', tier: 'daily' })), admin)).json() as any;
+    expect(glmPlan.selected?.engine, JSON.stringify(glmPlan.rejected)).toBe('zcodex');
+    expect(glmPlan.rejected).toEqual([]);
     const grok = await (await s.handle(request('/plan', intent({ engine: 'grok', tier: 'daily' })), admin)).json() as any;
     expect(grok.error).toBe('model_disabled_by_policy');
     // Prefix siblings must never gain access when a root is added.
@@ -792,6 +793,9 @@ describe('generic accounts and launch placement', () => {
   ])('requeues only a load-refused retry: factor=$factor pinned=$pinned', async ({factor,pinned,sendFactor}) => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    // This retry test asserts the refusal flow, not random placement.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
     const launch: any = await (await s.handle(request('/launches', intent(pinned ? { machine: 'hetzner' } : {})), admin)).json();
     expect(launch.machine).toBe('hetzner');
     const sessionId = crypto.randomUUID();
@@ -845,6 +849,7 @@ describe('generic accounts and launch placement', () => {
     beat(8 * 3);
     expect(restarted.drainCapacityQueue().promoted).toBeGreaterThan(0);
     expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({state:'offered',machine_id:'hetzner'});
+    } finally { random.mockRestore(); }
   }));
   it('gates and clears a memory-triggered host refusal using the reported MemAvailable floor', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -1038,6 +1043,9 @@ describe('generic accounts and launch placement', () => {
   }));
   it.each([false, true])('keeps unsupported-model session alive with fallback or explicit hold (pinned=%s)', async pinned => fixture(async (s, sql) => {
     await configure(s);
+    // This fallback test asserts refusal handling, not random placement.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     const input = intent({ ...(pinned ? { machine: 'hetzner' } : {}), access: { mode: 'read' } });
     const launch: any = await (await s.handle(request('/launches', input), admin)).json();
@@ -1070,6 +1078,7 @@ describe('generic accounts and launch placement', () => {
       await s.handle(request('/launches/' + refusal.id + '/claim', { gate_allowed: true, model: 'gpt-6-luna', observed_at: iso(), account: 'desktop-codex', profile_supported: true }), host('win35'));
       expect((await s.handle(request('/launches/' + refusal.id + '/reject', { reason: 'model_unsupported' }), host('win35'))).status).toBe(409);
     }
+    } finally { random.mockRestore(); }
   }));
   it('excludes a host-advertised unsupported route only for its account and mode', async () => fixture(async (s, sql) => {
     await configure(s);

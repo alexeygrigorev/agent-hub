@@ -219,7 +219,18 @@
     const root = byId('tbm-kill');
     if (!root) return;
     root.replaceChildren();
+    if (typeof data?.active !== 'boolean') {
+      root.append(el('p', 'Kill-switch state unavailable. Refresh to retry.'));
+      const notice = byId('metrics-routing-notice');
+      if (notice) { notice.hidden = false; notice.textContent = 'Routing safety state unavailable. Open Settings → Routing or refresh to retry.'; }
+      return;
+    }
     const active = data.active === true;
+    const notice = byId('metrics-routing-notice');
+    if (notice) {
+      notice.hidden = !active;
+      notice.textContent = active ? `Autonomous burn paused by the fleet kill-switch${data.reason ? ': ' + data.reason : ''}. Open Settings → Routing to review.` : '';
+    }
     const status = el('p', '', active ? 'tbm-status-active' : 'tbm-status-idle');
     status.id = 'tbm-kill-status';
     status.textContent = active
@@ -318,27 +329,36 @@
       const me = await apiGet('/auth/me');
       csrf = me.csrf_token || null;
       const user = me.email || 'authenticated';
-      const [pacing, banked, kill] = await Promise.all([
-        apiGet('/api/quota/pacing').catch((e) => { throw e; }),
-        apiGet('/api/quota/banked').catch((e) => { throw e; }),
-        apiGet('/api/quota/kill-switch').catch((e) => { throw e; }),
+      const [pacing, banked, kill] = await Promise.allSettled([
+        apiGet('/api/quota/pacing'), apiGet('/api/quota/banked'), apiGet('/api/quota/kill-switch'),
       ]);
-      renderPacing(pacing, pacing.routing_factors);
-      renderBanked(banked);
-      renderKill(kill);
+      const expired = [pacing, banked, kill].find(result => result.status === 'rejected' && result.reason?.code === 'expired');
+      if (expired) throw expired.reason;
+      if (pacing.status === 'fulfilled') renderPacing(pacing.value, pacing.value.routing_factors);
+      else byId('tbm-pacing')?.replaceChildren(el('p', 'Burn pacing unavailable. Refresh to retry.'));
+      if (banked.status === 'fulfilled') renderBanked(banked.value);
+      else byId('tbm-banked')?.replaceChildren(el('p', 'Banked deadlines unavailable. Refresh to retry.'));
+      renderKill(kill.status === 'fulfilled' ? kill.value : null);
       await renderGrok();
-      if (status) status.textContent = `TBM · ${user} · as of ${pacing.as_of || banked.as_of || 'unknown'}`;
+      if (status) status.textContent = [pacing, banked, kill].some(result => result.status === 'rejected')
+        ? 'Burn pacing · partial: some sources unavailable.'
+        : `TBM · ${user} · as of ${pacing.value.as_of || banked.value.as_of || 'unknown'}`;
     } catch (e) {
       if (e && e.code === 'expired') { location.assign('/auth/login'); return; }
+      const notice = byId('metrics-routing-notice');
+      if (notice) { notice.hidden = false; notice.textContent = 'Routing safety state unavailable. Open Settings → Routing or refresh to retry.'; }
       if (status) status.textContent = e && e.code === 'access_denied' ? 'TBM · access denied.' : 'TBM data unavailable.';
-      if (e && e.code !== 'access_denied') renderEmpty('TBM data unavailable. Unknown is not zero.');
+      renderEmpty(e?.code === 'access_denied' ? 'Access denied.' : 'TBM data unavailable. Unknown is not zero.');
+      byId('tbm-grok')?.replaceChildren(el('p', e?.code === 'access_denied' ? 'Grok policy access denied.' : 'Grok policy unavailable.'));
     }
   }
 
   function init() {
     if (!byId('tbm-pacing') && !byId('tbm-banked') && !byId('tbm-kill')) return;
-    const btn = byId('tbm-refresh');
-    if (btn) btn.addEventListener('click', () => { btn.disabled = true; refresh().finally(() => { btn.disabled = false; }); });
+    for (const id of ['tbm-refresh', 'routing-refresh']) {
+      const btn = byId(id);
+      if (btn) btn.addEventListener('click', () => { btn.disabled = true; refresh().finally(() => { btn.disabled = false; }); });
+    }
     refresh();
   }
 

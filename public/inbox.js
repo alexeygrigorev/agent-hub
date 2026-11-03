@@ -5,7 +5,7 @@
 (function () {
   'use strict';
 
-  var state = { me: null, csrf: null, inboxes: [], actor: null, messages: [], selected: null, unreadOnly: false, timer: null };
+  var state = { me: null, csrf: null, inboxes: [], actor: null, messages: [], selected: null, unreadOnly: new URLSearchParams(location.search).get('unread') !== '0', timer: null };
 
   function byId(id) { return document.getElementById(id); }
   function esc(text) {
@@ -68,9 +68,11 @@
 
   function renderList() {
     var list = byId('inbox-list');
+    var scroll = list.scrollTop;
     var markRead = byId('inbox-mark-read');
     markRead.hidden = unreadCount() === 0;
-    if (!state.messages.length) {
+    var visibleMessages = state.unreadOnly ? state.messages.filter(function (m) { return !m.read_at; }) : state.messages;
+    if (!visibleMessages.length) {
       list.replaceChildren();
       var empty = document.createElement('p');
       empty.className = 'inbox-empty';
@@ -80,7 +82,7 @@
     }
     var seen = {};
     var frag = document.createDocumentFragment();
-    for (var msg of state.messages) {
+    for (var msg of visibleMessages) {
       if (seen[msg.id]) continue;
       seen[msg.id] = true;
       var row = document.createElement('button');
@@ -98,34 +100,44 @@
       frag.appendChild(row);
     }
     list.replaceChildren(frag);
+    list.scrollTop = scroll;
   }
 
   async function openMessage(id) {
+    var actor = state.actor;
     state.selected = id;
+    state.listScroll = byId('inbox-list').scrollTop;
     renderList();
     var section = byId('inbox-detail-section');
     section.hidden = false;
     if (window.matchMedia('(max-width: 720px)').matches) section.scrollIntoView({ behavior: 'smooth' });
     var detail = byId('inbox-detail');
+    byId('inbox-read-one').hidden = true;
+    byId('inbox-reply-form').hidden = true;
+    document.querySelector('.inbox-split').dataset.view = 'detail';
     detail.innerHTML = '<p class="inbox-empty">Loading…</p>';
     var msg;
-    try { msg = await api('/api/bus/messages/' + encodeURIComponent(id)); } catch (e) { detail.innerHTML = '<p class="inbox-empty">' + esc(e.message) + '</p>'; return; }
+    try { msg = await api('/api/bus/messages/' + encodeURIComponent(id)); } catch (e) { if (state.selected !== id || state.actor !== actor) return; detail.innerHTML = '<p class="inbox-empty">' + esc(e.message) + '</p>'; return; }
+    if (state.selected !== id || state.actor !== actor) return;
     var ref = null;
     try { ref = msg.ref_json ? JSON.parse(msg.ref_json) : null; } catch (e) { /* ignore */ }
     detail.innerHTML =
       '<div class="inbox-msg"><p class="inbox-msg__head"><strong>' + esc(msg.from_actor) + '</strong> → <strong>' + esc(msg.to_actor) + '</strong></p>' +
-      '<p class="inbox-msg__meta">state ' + esc(msg.state || 'accepted') + ' · ' + esc(when(msg.created_at)) +
+      '<details class="inbox-delivery"><summary>Delivery details</summary><p class="inbox-msg__meta">state ' + esc(msg.state || 'accepted') + ' · ' + esc(when(msg.created_at)) +
       (msg.deliver_by ? ' · deliver by ' + esc(when(msg.deliver_by)) : '') + '</p>' +
       (ref ? '<p class="inbox-msg__ref">ref: <code>' + esc(JSON.stringify(ref)) + '</code></p>' : '') +
-      '<pre class="inbox-msg__body">' + esc(msg.body) + '</pre></div>';
+      '</details><pre class="inbox-msg__body">' + esc(msg.body) + '</pre></div>';
     var form = byId('inbox-reply-form');
     form.hidden = false;
     byId('inbox-reply-label').textContent = 'Reply as ' + (state.actor || 'me');
     byId('inbox-reply-meta').textContent = 'thread ' + String(msg.thread_id || '').slice(0, 8) + ' · to ' + msg.from_actor;
     form.dataset.replyTo = msg.id;
     form.dataset.thread = msg.thread_id || '';
-    // Reading a message marks it read for the human's own inbox.
-    markMessagesRead([msg.id], true);
+    byId('inbox-read-one').hidden = !!msg.read_at;
+    byId('inbox-read-one').onclick = async function () {
+      await markMessagesRead([msg.id], false);
+      byId('inbox-read-one').hidden = state.messages.some(function (m) { return m.id === msg.id && m.read_at; });
+    };
   }
 
   async function markMessagesRead(ids, quiet) {
@@ -178,24 +190,32 @@
     renderActorSelect();
   }
 
+  var inboxGeneration = 0;
   async function loadMessages() {
-    if (!state.actor) return;
+    var generation = ++inboxGeneration;
+    var actor = state.actor;
+    if (!actor) { byId('inbox-list').textContent = 'No inbox identity available.'; setStatus('No inbox identity available.'); return; }
     var params = new URLSearchParams({ actor: state.actor, limit: '100' });
     if (state.unreadOnly) params.set('unread', '1');
-    var rows = await api('/api/bus/inbox?' + params.toString());
+    var rows;
+    try { rows = await api('/api/bus/inbox?' + params.toString()); }
+    catch (e) { if (generation !== inboxGeneration || actor !== state.actor) return; throw e; }
+    if (generation !== inboxGeneration || actor !== state.actor) return;
     state.messages = Array.isArray(rows) ? rows : rows.messages || [];
+    if (state.unreadOnly) state.messages = state.messages.filter(function (m) { return !m.read_at; });
     renderList();
     renderBadge();
     setStatus(state.actor + ' · ' + state.messages.length + ' message' + (state.messages.length === 1 ? '' : 's') + (unreadCount() ? ', ' + unreadCount() + ' unread' : ''));
   }
 
   async function refresh() {
-    try { await loadMessages(); } catch (e) { setStatus(e.message); }
+    try { await loadMessages(); } catch (e) { setStatus('Could not load inbox: ' + e.message); byId('inbox-list').textContent = 'Inbox unavailable. Refresh to retry.'; }
   }
 
   async function boot() {
+    byId('inbox-unread-only').checked = state.unreadOnly;
     var me;
-    try { me = await api('/auth/me'); } catch (e) { return; }
+    try { me = await api('/auth/me'); } catch (e) { setStatus('Could not load inbox: ' + e.message); return; }
     if (!me || !me.email) { globalThis.location.assign('/auth/login'); return; }
     state.me = me;
     state.csrf = me.csrf_token || null;
@@ -204,25 +224,29 @@
     try {
       await loadInboxes();
       await loadMessages();
-    } catch (e) { setStatus(e.message); }
+    } catch (e) { setStatus('Inbox unavailable: ' + e.message); byId('inbox-list').textContent = 'Could not load messages. Refresh to retry.'; }
     byId('inbox-refresh').addEventListener('click', refresh);
     byId('inbox-actor').addEventListener('change', async function (event) {
       state.actor = event.target.value;
       state.selected = null;
+      document.querySelector('.inbox-split').dataset.view = 'list';
       byId('inbox-detail-section').hidden = true;
       await refresh();
     });
     byId('inbox-unread-only').addEventListener('change', async function (event) {
       state.unreadOnly = event.target.checked;
+      var url = new URL(location.href); url.searchParams.set('unread', state.unreadOnly ? '1' : '0'); history.replaceState(null, '', url);
       await refresh();
     });
     byId('inbox-mark-read').addEventListener('click', function () {
       markMessagesRead(state.messages.filter(function (m) { return !m.read_at; }).map(function (m) { return m.id; }));
     });
     byId('inbox-close').addEventListener('click', function () {
+      document.querySelector('.inbox-split').dataset.view = 'list';
       byId('inbox-detail-section').hidden = true;
       state.selected = null;
       renderList();
+      byId('inbox-list').scrollTop = state.listScroll || 0;
     });
     byId('inbox-reply-form').addEventListener('submit', sendReply);
     state.timer = setInterval(refresh, 15000);
