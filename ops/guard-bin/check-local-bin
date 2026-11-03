@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Incident 504d662b AC3 alert guard: ~/.local/bin was wholesale-deleted once
+# (a `rm -rf "$HOME"` after a prefix-only HOME override). The PATH rm guard
+# blocks the known vector; this check catches any other vector. It only
+# READS: exit 0 iff the directory exists and every reference-backed critical
+# entry is present. watchdog.sh turns a failure into one alert per episode.
+#   BIN_WATCH_HOME  audit this home instead of the passwd home (tests only)
+set -u
+home=${BIN_WATCH_HOME:-}
+[ -n "$home" ] || home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+[ -n "$home" ] || home=${HOME:-}
+bin="$home/.local/bin"
+# Entries the user's systemd units, cron and session PATH actually invoke
+# (incident 504d662b AC2 inventory).
+critical="aplexer a hub uv pocketshell-link victoria-metrics"
+if [ ! -d "$bin" ]; then
+  echo "bin-watch: ALERT: $bin vanished (not a directory)"
+  exit 1
+fi
+missing=
+for t in $critical; do
+  [ -e "$bin/$t" -a -x "$bin/$t" ] || missing="$missing $t"
+done
+if [ -n "$missing" ]; then
+  echo "bin-watch: ALERT: $bin lost:$missing"
+  exit 1
+fi
+echo "bin-watch: ok: $bin has every critical entry"
