@@ -175,25 +175,24 @@ describe('scoped durable worker access',()=>{
   const ac=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
   expect(ac.status,await ac.clone().text()).toBe(200);
   const v=(await ac.json() as any).task.version;
-  // A lost reply retried with the same key replays the saved receipt; a new key may not overwrite.
+  // Moving the task out of the worker's project ends access, including receipt replay.
   const replay=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
-  expect(replay.status,await replay.clone().text()).toBe(200);
-  expect((await replay.json() as any).task.version).toBe(v);
+  expect(replay.status,await replay.clone().text()).toBe(403);
+  expect(await code(replay)).toBe('cross_intake_forbidden');
   expect((await api('/api/intake/tasks/'+blank,{key:'t-ac2',expected_version:v,acceptance_criteria:'second fill'})).status).toBe(403);
   for (const bad of [{key:'t-st',expected_version:v,status:'done'},{key:'t-ti',expected_version:v,title:'renamed'},
     {key:'t-mix',expected_version:v,project:'aws-infra',status:'cancelled',reason:'x'}])
    expect((await api('/api/intake/tasks/'+blank,bad)).status).toBe(403);
   expect((await api('/api/intake/tasks/'+blank+'/events',{key:'t-dec',expected_version:v,event:{kind:'decision',text:'x'}})).status).toBe(403);
   expect((await api('/api/intake/tasks/'+third,{key:'t-3',expected_version:1,project:'aws-infra'})).status).toBe(403);
-  // The verdict note itself revokes access immediately, without waiting for the hourly ledger update.
-  const note=await api('/api/intake/tasks/'+blank+'/events',{key:'t-note',expected_version:v,event:{kind:'note',text:'TRIAGE ACTUAL — backlog triage (hourly, Claude Opus)'}});
+  // A verdict note on an in-project triage item revokes access immediately.
+  const note=await api('/api/intake/tasks/'+later+'/events',{key:'t-note',expected_version:1,event:{kind:'note',text:'TRIAGE ACTUAL — backlog triage (hourly, Claude Opus)'}});
   expect(note.status,await note.clone().text()).toBe(200);
-  expect((await api('/api/intake/tasks/'+blank)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+later)).status).toBe(403);
   expect((await api('/api/intake/tasks/'+blank,{key:'t-after',expected_version:v+1,project:'relay'})).status).toBe(403);
-  expect((await api('/api/intake/tasks/'+later)).status).toBe(200);
   // A reviewer whose session ended keeps no batch access.
   await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE session_control_sessions SET state='exited' WHERE id=?",session));
-  expect((await api('/api/intake/tasks/'+later)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
  }));
  it('reads only shared usage dimensions without granting other monitoring or writes',()=>setup(async({stub,worker,call}:any)=>{
   await runInDurableObject<Hub, any>(stub,(h:any)=>{
@@ -545,7 +544,7 @@ describe('scoped durable worker access',()=>{
   expect((await parent.json() as any).task.blocked_by).toEqual([]);
   await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec(`INSERT INTO intake_decomposition_sessions(session_id,task_id,project,created_at,child_count)
    VALUES(?,?,?, ?,0)`,session,task,'agent-hub',Date.now()));
-  const child=await api('/api/intake/tasks',{key:'child-'+key,project:'agent-hub',title:'Build compiler package',text:'Add a compiler package.',
+  const child=await api('/api/intake/tasks',{key:'child-'+key,project:'agent-hub',title:'Build compiler package',text:'Add a compiler package.',source:{type:'unknown',reference:'test'},
    acceptance_criteria:'The package builds on the Hub worker host.'});
   expect(child.status,await child.clone().text()).toBe(200);
   expect((await child.json() as any).task.created_by).toMatchObject({hub_session_id:session,decomposition_child:true});
