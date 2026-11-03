@@ -1,9 +1,15 @@
-"""Submit Codex-family goals through the native TUI and verify the goal store.
+"""Register Codex-family goals through the native interactive TUI.
 
-Codex's interactive CLI treats a slash command passed as its initial prompt
-argument as ordinary model text. Start the TUI empty, deliver the command
-through aplexer's guarded message transport, then verify the exact rollout's
-thread_goals row before declaring the launch ready.
+Codex treats ``/goal`` passed as its initial prompt argument as ordinary model
+text. Start the TUI empty, submit the command once through Aplexer's guarded
+interactive-input path, and verify the exact rollout's ``thread_goals`` row
+before declaring the launch ready.
+
+The ``send --enter`` call is deliberately limited to this feature: goal
+registration is a native slash command, not Hub mailbox messaging. Aplexer
+uses Codex's bracketed-paste input for this multiline command. Its receipt must
+prove a ready composer, landed text, and submission. Ambiguous outcomes are
+never retried.
 """
 from __future__ import annotations
 
@@ -15,12 +21,13 @@ from .native_progress import GOAL_STATUSES, NativeTranscriptProgress, stored_goa
 
 
 GOAL_REGISTRATION_TIMEOUT_S = 60.0
-_DELIVERY_RETRY_STATUSES = frozenset({'not-ready', 'busy', 'draft', 'menu', 'unknown'})
-_DELIVERED_STATUSES = frozenset({'submitted', 'already-submitted', 'recipient-acked'})
+_TUI_READY_TIMEOUT_S = 25
+_TUI_SEND_TIMEOUT_S = 30.0
+_CONFIRMED_SEND_STATUSES = frozenset({'submitted', 'delivered_working'})
 
 
 class GoalRegistrationError(RuntimeError):
-    """The TUI command or its authoritative thread_goals receipt was not proven."""
+    """The native TUI or its authoritative thread_goals receipt was not proven."""
 
     reason = 'goal_registration_failed'
 
@@ -69,6 +76,25 @@ def _registered_goal(row: dict[str, Any], progress: Any) -> Optional[dict[str, s
     return None
 
 
+def _verified_delivery(receipt: Any, *, native_id: str, engine: str) -> bool:
+    if not isinstance(receipt, dict) or receipt.get('id') != native_id:
+        return False
+    delivery = receipt.get('delivery')
+    if not isinstance(delivery, dict):
+        return False
+    sends = delivery.get('sends')
+    enters = delivery.get('enter_presses')
+    return (
+        delivery.get('engine') == engine
+        and delivery.get('ready') is True
+        and delivery.get('landed') is True
+        and delivery.get('submitted') is True
+        and delivery.get('status') in _CONFIRMED_SEND_STATUSES
+        and type(sends) is int and sends == 1
+        and type(enters) is int and 1 <= enters <= 3
+    )
+
+
 def register_goal(
     executable: str,
     *,
@@ -84,11 +110,11 @@ def register_goal(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, str]:
-    """Deliver one ``/goal`` envelope and wait for its exact SQLite row.
+    """Submit one native ``/goal`` command and verify its exact SQLite row.
 
-    Readiness refusals retry the same durable envelope with capped exponential
-    backoff. An ambiguous send or delivery is never repeated. Store polling
-    reads only the rollout thread's goal row and shares the same 60 s deadline.
+    The ready-composer/send receipt and store lookup share one 60-second
+    deadline. There is exactly one text submission: unclear delivery, a
+    missing receipt, or a missing goal row fails closed rather than resending.
     """
     if (engine not in ('codex', 'zcodex') or not isinstance(goal_command, str)
             or not goal_command.startswith('/goal ') or not goal_command[6:].strip()
@@ -97,85 +123,75 @@ def register_goal(
 
     progress = progress or NativeTranscriptProgress()
     deadline = monotonic() + min(float(timeout_s), GOAL_REGISTRATION_TIMEOUT_S)
-    envelope_id = None
-    row = None
-    delivered = False
-    retry_delay = 0.25
 
-    def call(argv: list[str], **kwargs: Any) -> Any:
+    def call(argv: list[str], *, call_timeout: float = 3.0, **kwargs: Any) -> Any:
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise GoalRegistrationError()
-        # run_json otherwise routes catalog reads through its in-process
-        # aplexer client, which has no per-call timeout. An explicit child
-        # environment selects the CLI transport, where the remaining deadline
-        # is enforced by run_json. Message effects already use that CLI path.
-        return runner(argv, timeout=max(0.1, min(3.0, remaining)),
+        # run_json otherwise routes list through its in-process Aplexer client,
+        # which has no per-call timeout. An explicit child environment selects
+        # the CLI transport so each native operation stays inside the deadline.
+        return runner(argv, timeout=max(0.1, min(call_timeout, remaining)),
                       env=os.environ.copy(), **kwargs)
 
-    while monotonic() < deadline:
-        remaining = deadline - monotonic()
-        if row is None:
-            try:
-                row = _exact_row(
-                    call([executable, 'list', '--all', '--json']),
-                    native_id=native_id, tag=tag, workspace=workspace, engine=engine,
-                    expected_created_at_ms=expected_created_at_ms)
-            except GoalRegistrationError:
-                raise
-            except Exception:
-                row = None
-            if row is None:
-                sleep(min(retry_delay, max(0.0, remaining)))
-                retry_delay = min(3.0, retry_delay * 2)
-                continue
-
-        if envelope_id is None:
-            try:
-                receipt = call([
-                    executable, 'message', 'send', '--to', tag,
-                    '--workspace', workspace, '--kind', 'hub-session-goal', '--json', goal_command,
-                ], cwd=workspace)
-            except Exception as exc:
-                raise GoalRegistrationError() from exc
-            envelope_id = receipt.get('id') if isinstance(receipt, dict) else None
-            if not isinstance(envelope_id, str) or not envelope_id or len(envelope_id) > 128:
-                raise GoalRegistrationError()
-
-        if not delivered:
-            # Requalify the exact native tuple before every guarded TUI effect.
-            try:
-                current = _exact_row(
-                    call([executable, 'list', '--all', '--json']),
-                    native_id=native_id, tag=tag, workspace=workspace, engine=engine,
-                    expected_created_at_ms=expected_created_at_ms)
-                if current is None:
-                    raise GoalRegistrationError()
-                delivery = call([
-                    executable, 'message', 'deliver', '--workspace', workspace,
-                    '--json', envelope_id,
-                ], cwd=workspace)
-            except GoalRegistrationError:
-                raise
-            except Exception as exc:
-                raise GoalRegistrationError() from exc
-            status = delivery.get('status') if isinstance(delivery, dict) else None
-            if status in _DELIVERED_STATUSES:
-                delivered = True
-                retry_delay = 0.25
-            elif status in _DELIVERY_RETRY_STATUSES:
-                sleep(min(retry_delay, max(0.0, remaining)))
-                retry_delay = min(3.0, retry_delay * 2)
-                continue
-            else:
-                raise GoalRegistrationError()
-
+    retry_delay = 0.25
+    row = None
+    while row is None and monotonic() < deadline:
         try:
-            registered = _registered_goal(row, progress)
+            row = _exact_row(
+                call([executable, 'list', '--all', '--json']),
+                native_id=native_id, tag=tag, workspace=workspace, engine=engine,
+                expected_created_at_ms=expected_created_at_ms)
+        except GoalRegistrationError:
+            raise
+        except Exception:
+            row = None
+        if row is None:
+            sleep(min(retry_delay, max(0.0, deadline - monotonic())))
+            retry_delay = min(3.0, retry_delay * 2)
+    if row is None:
+        raise GoalRegistrationError()
+
+    # A thread can only belong to this just-started native id, and checking
+    # first avoids duplicate slash commands if a caller reconciles a prior run.
+    try:
+        registered = _registered_goal(row, progress)
+    except Exception:
+        registered = None
+    if registered:
+        return registered
+
+    # Requalify the exact session tuple immediately before the one TUI effect.
+    current = _exact_row(
+        call([executable, 'list', '--all', '--json']),
+        native_id=native_id, tag=tag, workspace=workspace, engine=engine,
+        expected_created_at_ms=expected_created_at_ms)
+    if current is None:
+        raise GoalRegistrationError()
+
+    try:
+        receipt = call([
+            executable, 'send', native_id, goal_command,
+            '--enter', '--json', '--wait-ack', '0', '--resends', '0',
+            '--ready-timeout', str(_TUI_READY_TIMEOUT_S),
+        ], call_timeout=_TUI_SEND_TIMEOUT_S, cwd=workspace)
+    except Exception as exc:
+        # The command may have reached the TUI. Its effects are ambiguous, so
+        # the caller fails/cleans up once; this helper never retries the send.
+        raise GoalRegistrationError() from exc
+    if not _verified_delivery(receipt, native_id=native_id, engine=engine):
+        raise GoalRegistrationError()
+
+    retry_delay = 0.25
+    while monotonic() < deadline:
+        try:
+            registered = _registered_goal(current, progress)
         except Exception:
             registered = None
         if registered:
             return registered
-        sleep(min(0.5, max(0.0, deadline - monotonic())))
+        remaining = deadline - monotonic()
+        if remaining > 0:
+            sleep(min(0.5, remaining))
 
     raise GoalRegistrationError()

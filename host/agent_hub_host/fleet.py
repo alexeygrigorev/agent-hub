@@ -3785,8 +3785,8 @@ class Dispatcher:
                 codex_goal = offer.get('with_goal') is True and offer.get('engine') in CODEX_GOAL_ENGINES
                 if codex_goal:
                     # Empty TUI starts do not fire a prompt hook. Seed the
-                    # documented empty-prompt state; aplexer's deliver guard
-                    # still independently checks the live screen before input.
+                    # documented empty-prompt state; goal_registration uses
+                    # aplexer's readiness receipt before accepting a TUI send.
                     self._seed_interactive_readiness(native, native_id, workspace)
                     from .goal_registration import register_goal
                     goal_command = launch_goal(wt_note, offer['prompt'], offer_id)

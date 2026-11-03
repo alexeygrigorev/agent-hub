@@ -805,15 +805,18 @@ support goals, while other engines report false. Existing disabled-provider,
 quota, resource and profile checks still apply.
 
 For Codex and ZCodex, the host starts the trusted local engine command without
-goal text, waits for the exact native session, sends `/goal …` through the
-guarded `aplexer message deliver` path, then reads that rollout's thread id in
-`<CODEX_HOME>/goals_<n>.sqlite` (`thread_goals`). It reports success only after
-the exact thread row appears, with a 60-second bound and no duplicate send on
-an ambiguous delivery. This covers unmanaged trusted-argv Codex and ZCodex
-starts as well as managed Codex starts. The intake reported that ZCodex goals
-had failed on every launch since 2026-10-27 and some Codex launches failed;
-both previously passed `/goal …` as initial-prompt argv text. Claude keeps its
-existing startup-argument path. Goal text never runs in a shell.
+goal text and waits for the exact native session. It submits `/goal …` once
+through Aplexer's readiness-checked, bracketed-paste TUI input path, then reads that
+rollout's thread id in `<CODEX_HOME>/goals_<n>.sqlite` (`thread_goals`). Success
+requires a receipt proving that the composer was ready, the exact command
+landed and was submitted, followed by the exact thread row within 60 seconds.
+Ambiguous delivery is never retried. This narrowly scoped TUI input call is
+for Codex's native slash command; it does not use Hub mailbox framing. The
+path covers unmanaged trusted-argv Codex and ZCodex starts as well as managed
+Codex starts. The intake reported that ZCodex goals had failed on every launch
+since 2026-10-27 and some Codex launches failed; both previously passed
+`/goal …` as initial-prompt argv text. Claude keeps its existing
+startup-argument path. Goal text never runs in a shell.
 
 If the exact goal row is not registered by the deadline, the host tries one
 qualified stop of that launch and reports `goal_registration_failed`. A

@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from pathlib import Path
+
 import pytest
 
 from agent_hub_host.goal_registration import GoalRegistrationError, register_goal
@@ -25,73 +26,96 @@ def fake_goal_store(tmp_path: Path, engine: str):
         'engine': engine, 'created_at_ms': 1793707200000,
         'history_path': str(sidecar / 'history.jsonl'),
     }
-    return row, goal_db
+    return row, goal_db, rollout
+
+
+def delivery_receipt(row, *, ready=True, landed=True, submitted=True):
+    return {
+        'id': row['id'],
+        'delivery': {
+            'engine': row['engine'], 'status': 'submitted', 'ready': ready,
+            'landed': landed, 'submitted': submitted, 'sends': 1, 'enter_presses': 1,
+        },
+    }
 
 
 @pytest.mark.parametrize('engine', ['codex', 'zcodex'])
-def test_register_goal_delivers_slash_command_and_reads_exact_fake_thread_store(tmp_path, engine):
-    row, goal_db = fake_goal_store(tmp_path, engine)
+def test_register_goal_submits_native_command_and_reads_exact_fake_thread_store(tmp_path, engine):
+    row, goal_db, rollout = fake_goal_store(tmp_path, engine)
     calls = []
+    sent = [False]
+    lookup_count = [0]
+
+    class DelayedStore:
+        def locate(self, _row):
+            lookup_count[0] += 1
+            # The exact thread row appears on the second post-send lookup.
+            if sent[0] and lookup_count[0] >= 3:
+                with sqlite3.connect(goal_db) as db:
+                    db.execute("INSERT OR IGNORE INTO thread_goals VALUES ('thread-123', 'goal-1', 'Fix it', 'active', NULL, 0, 0, 1, 2)")
+            return rollout
 
     def runner(argv, **kwargs):
         calls.append((argv, kwargs))
-        if argv[1:3] == ['message', 'send']:
-            return {'id': 'envelope-1'}
-        if argv[1:3] == ['message', 'deliver']:
-            with sqlite3.connect(goal_db) as db:
-                db.execute("INSERT INTO thread_goals VALUES ('thread-123', 'goal-1', 'Fix it', 'active', NULL, 0, 0, 1, 2)")
-            return {'status': 'submitted'}
-        return [row]
+        if argv[1] == 'list':
+            return [row]
+        if argv[1] == 'send':
+            sent[0] = True
+            return delivery_receipt(row)
+        raise AssertionError(f'unexpected native operation: {argv[1:3]}')
 
     verified = register_goal(
         'aplexer', native_id=row['id'], tag=row['tag'], workspace=row['workspace'],
         engine=engine, goal_command='/goal Fix the test', runner=runner,
+        progress=DelayedStore(),
     )
     assert verified == {'status': 'active', 'thread_id': 'thread-123'}
-    send = next(argv for argv, _ in calls if argv[1:3] == ['message', 'send'])
-    assert send[-1] == '/goal Fix the test'
-    assert send[send.index('--workspace') + 1] == row['workspace']
-    assert not any(argv[-1] == '/goal Fix the test' for argv, _ in calls if argv[1:3] != ['message', 'send'])
-    delivery = next(argv for argv, _ in calls if argv[1:3] == ['message', 'deliver'])
-    assert delivery[-1] == 'envelope-1'
+    send, kwargs = next((argv, kwargs) for argv, kwargs in calls if argv[1] == 'send')
+    assert send[2:4] == [row['id'], '/goal Fix the test']
+    assert '--enter' in send
+    assert '--raw' not in send
+    assert '--json' in send
+    assert send[send.index('--wait-ack') + 1] == '0'
+    assert send[send.index('--resends') + 1] == '0'
+    assert send[send.index('--ready-timeout') + 1] == '25'
+    assert kwargs['cwd'] == row['workspace']
+    assert kwargs['timeout'] <= 30
+    assert not any(argv[1] == 'message' for argv, _ in calls)
 
 
-def test_goal_not_ready_timeout_sends_once_and_does_not_retry_launch(tmp_path):
-    row, _goal_db = fake_goal_store(tmp_path, 'codex')
-    now = [0.0]
+def test_goal_tui_readiness_failure_is_loud_and_is_not_retried(tmp_path):
+    row, _goal_db, _rollout = fake_goal_store(tmp_path, 'codex')
     calls = []
 
     def runner(argv, **kwargs):
         calls.append(argv)
-        if argv[1:3] == ['message', 'send']:
-            return {'id': 'envelope-1'}
-        if argv[1:3] == ['message', 'deliver']:
-            return {'status': 'not-ready'}
-        return [row]
+        if argv[1] == 'list':
+            return [row]
+        if argv[1] == 'send':
+            return delivery_receipt(row, ready=False)
+        raise AssertionError(f'unexpected native operation: {argv[1:3]}')
 
     with pytest.raises(GoalRegistrationError, match='goal_registration_failed'):
         register_goal(
             'aplexer', native_id=row['id'], tag=row['tag'], workspace=row['workspace'],
             engine='codex', goal_command='/goal Fix the test', runner=runner,
-            timeout_s=2.0, progress=object(), monotonic=lambda: now[0],
-            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+            progress=type('NoStore', (), {'locate': lambda *_: None})(),
         )
-    assert sum(argv[1:3] == ['message', 'send'] for argv in calls) == 1
-    assert 1 <= sum(argv[1:3] == ['message', 'deliver'] for argv in calls) <= 5
+    assert sum(argv[1] == 'send' for argv in calls) == 1
 
 
-def test_goal_store_timeout_after_single_delivery_is_fail_loud(tmp_path):
-    row, _goal_db = fake_goal_store(tmp_path, 'zcodex')
+def test_goal_store_timeout_after_single_native_submission_is_fail_loud(tmp_path):
+    row, _goal_db, _rollout = fake_goal_store(tmp_path, 'zcodex')
     now = [0.0]
     calls = []
 
     def runner(argv, **kwargs):
         calls.append(argv)
-        if argv[1:3] == ['message', 'send']:
-            return {'id': 'envelope-1'}
-        if argv[1:3] == ['message', 'deliver']:
-            return {'status': 'submitted'}
-        return [row]
+        if argv[1] == 'list':
+            return [row]
+        if argv[1] == 'send':
+            return delivery_receipt(row)
+        raise AssertionError(f'unexpected native operation: {argv[1:3]}')
 
     with pytest.raises(GoalRegistrationError, match='goal_registration_failed'):
         register_goal(
@@ -100,8 +124,7 @@ def test_goal_store_timeout_after_single_delivery_is_fail_loud(tmp_path):
             timeout_s=1.5, progress=type('NoStore', (), {'locate': lambda *_: None})(),
             monotonic=lambda: now[0], sleep=lambda delay: now.__setitem__(0, now[0] + delay),
         )
-    assert sum(argv[1:3] == ['message', 'send'] for argv in calls) == 1
-    assert sum(argv[1:3] == ['message', 'deliver'] for argv in calls) == 1
+    assert sum(argv[1] == 'send' for argv in calls) == 1
 
 
 def test_engine_without_goal_support_is_refused_before_native_effect():
