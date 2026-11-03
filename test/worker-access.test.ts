@@ -178,7 +178,7 @@ describe('scoped durable worker access',()=>{
   // Moving the task out of the worker's project ends access, including receipt replay.
   const replay=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
   expect(replay.status,await replay.clone().text()).toBe(403);
-  expect(await code(replay)).toBe('cross_intake_forbidden');
+  expect(await replay.json()).toEqual({error:'cross_intake_forbidden'});
   expect((await api('/api/intake/tasks/'+blank,{key:'t-ac2',expected_version:v,acceptance_criteria:'second fill'})).status).toBe(403);
   for (const bad of [{key:'t-st',expected_version:v,status:'done'},{key:'t-ti',expected_version:v,title:'renamed'},
     {key:'t-mix',expected_version:v,project:'aws-infra',status:'cancelled',reason:'x'}])
