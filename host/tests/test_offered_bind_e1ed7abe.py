@@ -35,6 +35,9 @@ class OffersLoop(unittest.TestCase):
         self.assertEqual(session_host.run.__kwdefaults__['fleet_interval'], 120)
         self.assertEqual(session_host.session_messages.PROVISION_INTERVAL_S, 600.0)
 
+    def test_default_cadence_is_a_bounded_offers_poll(self):
+        self.assertLessEqual(fleet.OFFERS_POLL_S, 10.0)
+
     def test_polling_flag_covers_exactly_the_poll(self):
         stop, polling, seen = threading.Event(), threading.Event(), []
 

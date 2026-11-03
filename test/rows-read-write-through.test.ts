@@ -218,6 +218,17 @@ it('write watch stamps move exactly with the observed writes', () => {
   expect(w.stamp('machines')).not.toBe(before);
 });
 
+it('write listeners receive changed tables and trigger destinations', () => {
+  const watch = new WriteWatch();
+  const changes: string[][] = [];
+  const unsubscribe = watch.onWrite(tables => changes.push([...tables].sort()));
+  watch.note('CREATE TRIGGER source_updates_routing AFTER UPDATE ON route_source BEGIN UPDATE routing_jobs SET state = \'failed\' WHERE id = NEW.id; END');
+  watch.note('UPDATE route_source SET state = ? WHERE id = ?', 1);
+  watch.note('UPDATE route_source SET state = ? WHERE id = ?', 0);
+  unsubscribe();
+  expect(changes).toEqual([['route_source', 'routing_jobs']]);
+});
+
 it('memoizes complete stable SQL reads and invalidates them on direct and trigger writes', withFleet(async (s, t, watch) => {
   const sql = (s as any).sql;
   const firstCursor: any = sql.exec('SELECT name FROM machines WHERE id=?', 'h0');

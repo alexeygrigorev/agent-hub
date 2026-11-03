@@ -20,7 +20,7 @@ async function fixture(fn: (service: FleetService, sql: any) => Promise<void>) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-test-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now);
+    const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now, hub.writes);
     service.init(); const sql = hub.sql;
     for (const machine of ['hetzner', 'win35']) {
       sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));

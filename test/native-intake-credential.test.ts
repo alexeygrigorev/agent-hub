@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { sha256 } from '../src/auth/crypto';
+import { revokeEndedNativeWorkerCredentials } from '../src/worker-access';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -123,7 +124,8 @@ describe('native session intake credential', () => {
     expect((await api('/api/intake/tasks/' + task, undefined, next.access_token)).status).toBe(200);
 
     // ...and dies with it: stopped session => access and refresh fail.
-    await runInDurableObject<Hub, any>(stub, (h: any) => { h.sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", session); });
+    // Production stop paths bump updated_at; the watermarked sweep keys on it.
+    await runInDurableObject<Hub, any>(stub, (h: any) => { h.sql.exec("UPDATE session_control_sessions SET state='stopped', updated_at=? WHERE id=?", new Date().toISOString(), session); });
     expect((await api('/api/intake/tasks/' + task, undefined, next.access_token)).status).toBe(403);
     expect((await refresh(next.refresh_token)).status).toBe(400);
     // The sweep revokes the family explicitly.

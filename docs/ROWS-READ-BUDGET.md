@@ -123,7 +123,7 @@ probes too.
 | `tick:intake_verifier` | 5-min cron, DONE claims only | 603 rows on the 300-intake fixture; indexed open-task selection | 0 with no claims awaiting verification |
 | `tick:intake_triage` | hourly | 3,069 rows on the 300-intake fixture; indexed open-task selection | 0 with no forgotten intake candidates |
 | `GET /api/fleet/offers` (per host, 10 s) | host poll | 400 idle / 60 repeat | 0 repeat (stamp cache); re-read on launch/session writes only |
-| `PUT /api/fleet/sessions` (per host, 60 s) | host census | bounded primary-key lookups on change; unchanged census returns before SQL | 0 repeat; writes only on semantic change |
+| `PUT /api/fleet/sessions` (per host, 60 s) | host census | bounded primary-key lookups on change; write events invalidate settlement state | 0 repeat; reprocess after a relevant write |
 | `GET /api/session-messaging/credentials` (per host, 600 s) | host poll | sweep <= ~300 first run, then 0; list indexed + memoized | 0 repeat (stamp gate skips sweep, memo serves list) |
 | `GET /api/session-intake/credentials` (per host, 600 s) | host poll | repeat 0; first run indexed (credentials_family) | 0 repeat; re-sweep only after session/credential writes |
 | `GET /api/fleet/resources/watchdog`, `POST .../report` (report every 120 s) | host poll | revision-cached catalog; unchanged report returns before SQL | 0 repeat (test: repeat poll reads zero) |
@@ -161,3 +161,18 @@ window) plus the Cloudflare GraphQL rowsRead/rowsWritten series; until the
 live total is under the alert line the budget alert keeps firing as an
 over_budget liveness alert (single notification, hourly refresh, no paging
 storm) rather than a per-hour page.
+## Read cuts, round 2 (intake e8a22f4c)
+
+- `reconciliationCandidates`: each UNION branch now takes its oldest 100
+  (the global top-100 is always contained in the per-branch top-100s, so the
+  answer is identical) over the new
+  `fleet_launch_machine_state_updated(machine_id,state,updated_at)` index
+  instead of scanning the machine's whole live launch history per 2s poll.
+- Credentials: the candidate scan folds the credential-existence and link
+  probes into indexed EXISTS subqueries; the ended-credential sweep runs only
+  after a write to the tables it reads (write-stamp gate), never on every
+  host poll.
+- `launcher_memory_reserve` scan: new partial index
+  `fleet_launch_failed_reason(state,exit_reason,updated_at) WHERE state='failed'`.
+- Host polls (take effect as hosts update): offers 2s->10s, credential and
+  messaging provisioning 120s->600s.

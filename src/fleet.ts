@@ -99,6 +99,12 @@ export const ROUTE_FAILURE_NEUTRAL_REASONS = new Set(['launcher_offer_expired', 
   'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high', 'operator_stopped', 'stopped_by_operator', 'cancelled']);
 const ACTIVE = ACTIVE_LAUNCH_STATES_SQL;
 const LIVE_CATALOG_PHASES = new Set(['starting','running','broken','unknown','uncertain']);
+const CENSUS_SETTLEMENT_TABLES = new Set([
+  'fleet_accounts','fleet_launches','fleet_routes','fleet_sessions','fleet_subscriptions','host_quota_snapshots',
+  'intake_session_links','intake_task_projection','intake_tasks','resource_reaps','resource_request_projection',
+  'resource_settings','routing_jobs','session_control_protections','session_control_sessions',
+  'session_observation_intake_meta','session_stale_reconciliations',
+]);
 function stableJson(value: any): any {
   if (Array.isArray(value)) return value.map(stableJson);
   if (!value || typeof value !== 'object') return value;
@@ -620,6 +626,7 @@ function workspaceReady(caps: any, workspace: any): boolean {
   return workspaceCapable(caps?.workspaces, workspace);
 }
 
+
 export class FleetService {
   /** Registry resolver injected by hub.ts: rebuilds repo_context from the
    * canonical catalog even when a caller supplies forged placement context. */
@@ -637,14 +644,16 @@ export class FleetService {
   private reofferCursors = new Map<string, [string, string]>();
   /** All-clear offers answers per machine, keyed by the fleet write stamp. */
   private emptyOffers = new Map<string, { stamp: string; at: number; value: any }>();
-  /** Last semantic host catalog and live native set. Exact repeated polls
-   * return before SQL; the set is also the bounded vanished-session source. */
+  /** Last semantic host catalog and live native set. Repeats return before SQL
+   * unless a settlement-source write event dirtied the cache; the set is also
+   * the bounded vanished-session source. */
   private censusSnapshots = new Map<string, { fingerprint: string; live: Set<string> }>();
   // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
   private linkRevisions = new Map<string, string>();
   private candidateCache = new Map<string, { revision: string; at: number; value: any[] }>();
   private pollMaintenanceAt = 0;
   private maintenanceDirty = true;
+  private censusSettlementDirty = true;
 
   /** Run `query(placeholders)` over `ids` in bounded chunks: reads only matching rows. */
   private byChunks(ids: string[], query: (marks: string) => string, ...lead: any[]): any[] {
@@ -753,6 +762,14 @@ export class FleetService {
       try { return transaction(fn); }
       catch (error) { this.observedCatalog?.reset(); this.censusSnapshots.clear(); clearCatalogReports(this.sql); this.resources?.invalidateReports(); throw error; }
     };
+    this.writes?.onWrite(tables => {
+      if (tables.some(table => CENSUS_SETTLEMENT_TABLES.has(table))) {
+        this.maintenanceDirty = true;
+        this.censusSettlementDirty = true;
+      }
+      // Phase changes outside the census still alter the vanished-session set.
+      if (tables.includes('fleet_sessions')) this.censusSnapshots.clear();
+    });
     this.resources = new ResourceManagement(sql, now, writes, observed, machine => this.censusSnapshots.delete(machine));
     this.routing = new RoutingService(sql, this, now, this.transaction);
     this.admission = new ClaimAdmission(sql, this.transaction, now);
@@ -778,6 +795,9 @@ export class FleetService {
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_state ON fleet_launches(state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_machine_state ON fleet_launches(machine_id,state)');
+    // Intake e8a22f4c: reconciliation candidates take the oldest 100 per branch; the
+    // updated_at tail keeps each branch to an index prefix instead of the machine history.
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_machine_state_updated ON fleet_launches(machine_id,state,updated_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_expiry ON fleet_launches(state,created_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state ON fleet_launches(account,state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state_id ON fleet_launches(account,state,id)');
@@ -786,6 +806,9 @@ export class FleetService {
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_recent ON fleet_launches(machine_id,finished_at) WHERE state = 'failed' AND mode = 'headless' AND verification_status = 'unverified'");
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_account_failed_recent ON fleet_launches(account,updated_at DESC) WHERE state = 'failed'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native_state ON fleet_launches(machine_id,native_id,state)');
+    // Intake e8a22f4c: the launcher memory-reserve scan runs on the cron path;
+    // keep it off the retained failed-launch history.
+    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_reason ON fleet_launches(state,exit_reason,updated_at) WHERE state = 'failed'");
     // Intake e8a22f4c: plan() and the choking watchdog look for these rare exit reasons on every poll;
     // partial indexes keep both lookups independent of the machine's retained launch history.
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_model_unsupported ON fleet_launches(machine_id,engine,account) WHERE exit_reason = 'model_unsupported'");
@@ -916,11 +939,14 @@ export class FleetService {
     const unobserved = `AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
         WHERE s.machine_id = l.machine_id AND s.native_id = l.native_id AND s.engine = l.engine
         AND s.phase IN ('starting','running') AND (s.observed_at >= ? OR ?)))`;
+    // Intake e8a22f4c: bound each branch to the same top-100 the union
+    // keeps. A global top-100 is always contained in the per-branch top-100s,
+    // so the result is identical while deep launch histories stop scanning.
     return this.sql.exec(`SELECT * FROM (
-      SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain') ${unobserved}
+      SELECT * FROM (SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain') ${unobserved} ORDER BY updated_at ASC LIMIT 100)
       UNION ALL
-      SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state = 'failed' AND l.mode = 'headless' AND l.exit_reason = ?
-        AND l.verification_status = 'unverified' AND l.finished_at > ? ${unobserved}
+      SELECT * FROM (SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state = 'failed' AND l.mode = 'headless' AND l.exit_reason = ?
+        AND l.verification_status = 'unverified' AND l.finished_at > ? ${unobserved} ORDER BY updated_at ASC LIMIT 100)
     ) ORDER BY updated_at LIMIT 100`, machine, cutoff, catalogFresh ? 1 : 0,
       machine, SILENT_START_REASON, new Date(this.now() - ABANDONED_RECOVERY_MS).toISOString(), cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
       const binding = controlStore ? parsed(r.binding_json) : null;
@@ -2305,7 +2331,10 @@ export class FleetService {
   async handle(request: Request, auth: Auth): Promise<Response> {
     if (auth.error) return auth.error;
     const path = new URL(request.url).pathname; const caller = auth.caller;
-    if (marksMaintenanceDirty(request.method, path)) this.maintenanceDirty = true;
+    if (marksMaintenanceDirty(request.method, path)) {
+      this.maintenanceDirty = true;
+      this.censusSettlementDirty = true;
+    }
     if (path === '/api/fleet/tasks' || path.startsWith('/api/fleet/tasks/') || path.startsWith('/api/fleet/routing/')) return this.routing.handle(request, auth);
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
@@ -3005,7 +3034,7 @@ export class FleetService {
       const machineId = caller.machineId!;
       const fingerprint = censusFingerprint(data.sessions, censusComplete);
       const priorSnapshot = this.censusSnapshots.get(machineId);
-      if (priorSnapshot?.fingerprint === fingerprint && !this.maintenanceDirty) {
+      if (priorSnapshot?.fingerprint === fingerprint && !this.censusSettlementDirty) {
         this.observedCatalog?.refreshProgress(machineId, data.sessions.map((session: any) => ({
           native_id: session.native_id, progress_json: session.progress ? JSON.stringify(session.progress) : null,
         })));
@@ -3015,6 +3044,9 @@ export class FleetService {
       return this.transaction(() => {
         // These catalog rows are durable presence/completeness markers and
         // only change when a host first reports or the completeness verdict changes.
+        // Record the newest completeness verdict before reconciliation or
+        // queue draining can inspect capacity. A change of verdict is applied
+        // immediately; unchanged reports retain the existing 60 s write cap.
         const censusNow = this.now();
         const censusObservedAt = new Date(censusNow).toISOString();
         this.sql.exec(`INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES (?, ?, ?)
@@ -3216,6 +3248,7 @@ export class FleetService {
         // poll would otherwise repeat. Keep dirty only while a routed terminal
         // receipt is deliberately deferred behind its task result.
         this.maintenanceDirty = settlementDeferred;
+        this.censusSettlementDirty = settlementDeferred;
         // The marker is inserted once. Live report freshness never refreshes
         // this durable catalog row.
         this.sql.exec('INSERT OR IGNORE INTO fleet_catalog_seen VALUES (?,?)', machineId, censusObservedAt);
