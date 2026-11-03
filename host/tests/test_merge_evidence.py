@@ -229,6 +229,47 @@ class CommitExtractionTests(unittest.TestCase):
         ]
         self.assertEqual(me.explicit_commit_refs(history), [shipped_commit, current_head])
 
+    def test_explicit_mode_preserves_legacy_latest_report_checkpoint(self):
+        first_id = '11111111-1111-4111-8111-111111111111'
+        latest_id = '22222222-2222-4222-8222-222222222222'
+        current_id = '33333333-3333-4333-8333-333333333333'
+        history = [
+            {'id': first_id, 'kind': 'report', 'reference': 'a1' * 20},
+            {'kind': 'commit', 'reference': 'b2' * 20},
+            {'id': latest_id, 'kind': 'report', 'reference': 'c3' * 20},
+            {'id': current_id, 'kind': 'report', 'reference': 'd4' * 20,
+             'supersedes': [latest_id]},
+        ]
+        self.assertEqual(me.explicit_commit_refs(history), ['b2' * 20, 'd4' * 20])
+
+    def test_newer_valid_superseding_report_replaces_stale_merge_state_checkpoint(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': 'a1' * 20, 'captured_at': 50},
+            {'id': new_id, 'kind': 'report', 'reference': 'b2' * 20, 'captured_at': 301,
+             'supersedes': [old_id]},
+        ]
+        state = {'activity_at': 200, 'evidence_at': 250, 'head': 'c3' * 20}
+        self.assertTrue(me.superseding_report_is_newer_than_merge_state(history, state))
+        self.assertFalse(me.superseding_report_is_newer_than_merge_state(
+            history, {**state, 'activity_at': 301}))
+        self.assertFalse(me.superseding_report_is_newer_than_merge_state(
+            history, {**state, 'evidence_at': 302}))
+        self.assertFalse(me.superseding_report_is_newer_than_merge_state(
+            history, {'activity_at': 200}))
+
+    def test_malformed_superseding_report_cannot_replace_merge_state_checkpoint(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': 'a1' * 20},
+            {'id': new_id, 'kind': 'report', 'reference': 'b2' * 20, 'captured_at': 301,
+             'supersedes': ['missing-id']},
+        ]
+        self.assertFalse(me.superseding_report_is_newer_than_merge_state(
+            history, {'activity_at': 200, 'evidence_at': 250}))
+
     def test_collect_include_head_false_skips_head_and_cherry(self):
         runner = FakeRunner(in_main=[B], cherry='', runs=[{'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'u'}])
         out = me.collect('/r', [B], runner, fetch=False, include_head=False)

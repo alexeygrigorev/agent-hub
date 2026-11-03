@@ -605,6 +605,11 @@ def execute(args):
         recorded_head = str(state.get('head') or '').strip().lower()
         if not merge_evidence.SHA.match(recorded_head):
             recorded_head = ''
+        if merge_evidence.superseding_report_is_newer_than_merge_state(history, state):
+            # A newer explicit report marks a rebase checkpoint. Keeping the
+            # pre-rebase worktree head/commits would reintroduce stale SHAs.
+            recorded = []
+            recorded_head = ''
         try:
             repo = str(Path(args.repo).resolve()) if args.repo else merge_evidence.own_clone()
             candidates = merge_evidence.shas_from_text(text, exclude=(task.get('id'),) + tuple(e.get('hub_session_id') or e.get('id') for e in history if isinstance(e, dict)))
