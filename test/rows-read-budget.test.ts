@@ -159,6 +159,36 @@ describe('rows-read budget alert', () => {
   }));
 });
 
+describe('rows-written budget alert', () => {
+  it('opens the written-budget alert when the last full hour projects over budget', () => withHub(async hub => {
+    const hour = Math.floor(Date.now() / 3_600_000) - 1;
+    hub.sql.exec("INSERT INTO rows_read_stats(slot,scope,hour,calls,rows_read,rows_written,max_read) VALUES(?,?,?,1,100,?,0)", hour % 192, '__total__', hour, 100_000);
+    await hub.fetch(new Request('https://hub/api/metrics/rows-read')); // 401, but flushes the meter
+    await hub.alarm();
+    const open: any = hub.sql.exec("SELECT state, detail FROM liveness_alerts WHERE subject_kind='do_rows_written_budget' AND resolved_at IS NULL").toArray()[0];
+    expect(open?.state).toBe('over_budget');
+    expect(open.detail).toContain('2400000/day');
+  }));
+
+  it('resolves the written-budget alert once the projection drops under budget', () => withHub(async hub => {
+    hub.livenessService.setAlert('do_rows_written_budget', 'hub', { state: 'over_budget', detail: 'test' });
+    const hour = Math.floor(Date.now() / 3_600_000) - 1;
+    hub.sql.exec("INSERT INTO rows_read_stats(slot,scope,hour,calls,rows_read,rows_written,max_read) VALUES(?,?,?,1,100,?,0)", hour % 192, '__total__', hour, 10);
+    await hub.alarm();
+    expect(hub.sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='do_rows_written_budget' AND resolved_at IS NULL").toArray()).toHaveLength(0);
+  }));
+
+  it('attributes rows written to the statement behind a write', () => withHub(async hub => {
+    await hub.meter.run('probe:write', () => {
+      hub.sql.exec("INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at,state) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        'w1', 'a', 'b', 'note', 't', 'x', 'k', Date.now() - 1000, Date.now() + 86400000, 'accepted');
+    });
+    const top = hub.meter.statementTop(1500).filter(row => row.scope === 'probe:write' && /INTO messages/i.test(row.sql));
+    expect(top.length).toBeGreaterThan(0);
+    expect(top.every(row => row.rows_written >= 1)).toBe(true);
+  }));
+});
+
 describe('route normalization', () => {
   it('keeps meter scopes bounded', () => {
     expect(normalizeRoute('get', '/api/sessions/3f2a1b4c-1111-4111-8111-111111111111/send')).toBe('GET /api/sessions/:id/send');

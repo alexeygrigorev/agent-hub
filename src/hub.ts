@@ -70,7 +70,7 @@ import { HostHistoryService } from './host-history';
 import { HISTORY_RETENTION_MS } from './host-history';
 import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validateTokenPayload } from './token-history';
 import { placementPressureSubjects } from './host-pressure';
-import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
+import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, rowsWrittenAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
 import { sampleAccountCapacityHistory } from './account-capacity-history';
 import { WriteWatch } from './write-watch';
 import { ObservedCatalog } from './observed-catalog';
@@ -855,7 +855,7 @@ export class Hub extends DurableObject {
       if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
       const hours = Number(url.searchParams.get('hours') || 24);
       const report = rowsReadReport(this.sql, Date.now(), Number.isFinite(hours) ? hours : 24, this.meter.snapshot());
-      return Response.json({ ...report, statements: this.meter.statementTop(Math.min(100, Number(url.searchParams.get('statements')) || 30)), target_per_day: ROWS_READ_TARGET_PER_DAY, alert_per_day: rowsReadAlertThreshold(this.env), meter_started_at: new Date(this.meter.startedAt).toISOString() });
+      return Response.json({ ...report, statements: this.meter.statementTop(Math.min(100, Number(url.searchParams.get('statements')) || 30)), target_per_day: ROWS_READ_TARGET_PER_DAY, alert_per_day: rowsReadAlertThreshold(this.env), alert_writes_per_day: rowsWrittenAlertThreshold(this.env), meter_started_at: new Date(this.meter.startedAt).toISOString() });
     }
 
     try {
@@ -2943,17 +2943,29 @@ export class Hub extends DurableObject {
     }
     if (!checkDue) return;
     this.rowsAlertCheckedHour = hour;
-    const alert = this.meter.runSync('meter:alert', () => {
+    const alerts = this.meter.runSync('meter:alert', () => {
       const report = rowsReadReport(this.sql, Date.now(), 2);
+      const out: any[] = [];
       const projected = report.projected_rows_read_per_day;
-      if (projected === null) return null;
-      const limit = rowsReadAlertThreshold(this.env);
-      const top = report.scopes.slice(0, 3).map(s => `${s.scope}=${s.rows_read}`).join(', ');
-      return this.livenessService.setAlert('do_rows_read_budget', 'hub', projected > limit
-        ? { state: 'over_budget', detail: `DO rows read projected ${projected}/day (last full hour x24) > budget ${limit}/day; top: ${top}` }
-        : null);
+      if (projected !== null) {
+        const limit = rowsReadAlertThreshold(this.env);
+        const top = report.scopes.slice(0, 3).map(s => `${s.scope}=${s.rows_read}`).join(', ');
+        out.push(this.livenessService.setAlert('do_rows_read_budget', 'hub', projected > limit
+          ? { state: 'over_budget', detail: `DO rows read projected ${projected}/day (last full hour x24) > budget ${limit}/day; top: ${top}` }
+          : null));
+      }
+      const projectedWritten = report.projected_rows_written_per_day;
+      if (projectedWritten !== null) {
+        const writtenLimit = rowsWrittenAlertThreshold(this.env);
+        const topWritten = [...report.scopes].sort((a, b) => b.rows_written - a.rows_written).slice(0, 3)
+          .map(s => `${s.scope}=${s.rows_written}`).join(', ');
+        out.push(this.livenessService.setAlert('do_rows_written_budget', 'hub', projectedWritten > writtenLimit
+          ? { state: 'over_budget', detail: `DO rows written projected ${projectedWritten}/day (last full hour x24) > budget ${writtenLimit}/day; top: ${topWritten}` }
+          : null));
+      }
+      return out;
     });
-    if (alert) await this.notifyAlert(alert);
+    for (const alert of alerts) if (alert) await this.notifyAlert(alert);
   }
 
   /** M12e session control auth (narrow seam, owned by platform-session-api-r2):
