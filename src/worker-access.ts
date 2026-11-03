@@ -326,18 +326,12 @@ export function revokeNativeWorkerCredentials(sql: SqlStorage, sessionId: string
   sql.exec(`UPDATE credentials SET revoked_at = ? WHERE revoked_at IS NULL AND family_id IN
     (SELECT family_id FROM worker_access WHERE session_id = ? AND launch_id = session_id)`, new Date(now).toISOString(), sessionId);
 }
-/** Sweep backstop: revoke native intake credentials of sessions no longer running.
- * Intake e8a22f4c: hosts poll every few minutes and the unscoped sweep re-read
- * the whole worker_access history on every poll. `sinceMs` bounds the sweep to
- * sessions that ended after the watermark (plus deleted sessions, which carry
- * no timestamp); pass 0 (or omit) for a full sweep after restarts. Callers
- * advance the watermark to the sweep start so an ending racing the sweep is
- * picked up by the next pass, never skipped. */
-export function revokeEndedNativeWorkerCredentials(sql: SqlStorage, now: number, sinceMs = 0): void {
+/** Sweep backstop: revoke native intake credentials of sessions no longer running. */
+export function revokeEndedNativeWorkerCredentials(sql: SqlStorage, now: number): void {
   if (!sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_access'").toArray().length) return;
   sql.exec(`UPDATE credentials SET revoked_at = ? WHERE revoked_at IS NULL AND family_id IN
     (SELECT w.family_id FROM worker_access w LEFT JOIN session_control_sessions s ON s.id = w.session_id
-     WHERE w.launch_id = w.session_id AND (s.id IS NULL OR (s.state <> 'running' AND s.updated_at > ?)))`, new Date(now).toISOString(), new Date(sinceMs).toISOString());
+     WHERE w.launch_id = w.session_id AND (s.id IS NULL OR s.state <> 'running'))`, new Date(now).toISOString());
 }
 
 /** Write-stamp gate for the ended-session backstop sweeps (intake e8a22f4c).
