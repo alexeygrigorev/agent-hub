@@ -226,6 +226,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   repo_clone_auth_failed: 'The host could not authenticate to GitHub while cloning the requested repository.',
   repo_not_found: 'The repository origin was not found during host cloning.',
   repo_clone_failed: 'The host could not clone the requested repository.',
+  repo_proxy_unreachable: 'The host proxy required for GitHub cloning is unreachable.',
   repo_checkout_missing: 'The requested repository checkout is unavailable on this host.',
   repo_origin_missing: 'The repository has no cloneable GitHub origin.',
   host_gh_auth_unavailable: 'The host GitHub CLI authentication is unavailable.',

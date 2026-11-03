@@ -352,6 +352,24 @@ class LauncherRecordCauseTests(unittest.TestCase):
         self.assertIs(launcher_record_cause(self.failure, self.root, "../evil", self.at), self.failure)
         self.assertIs(launcher_record_cause(self.failure, self.root, TASK_ID, None), self.failure)
 
+    def test_fallback_workspace_supplies_cause_when_offer_workspace_lacks_record(self):
+        other = self.root / "target-cwd"
+        (other / ".local").mkdir(parents=True)
+        base = {"task_id": TASK_ID, "started_at_ts": self.at + 2, "reason": "intake worktree cause"}
+        (other / ".local" / f"launch-{TASK_ID}.json").write_text(json.dumps(base))
+        value = launcher_record_cause(self.failure, self.root, TASK_ID, self.at, extra_dirs=[str(other)])
+        self.assertIn("intake worktree cause", value["message"])
+
+    def test_empty_pipe_points_at_launch_record(self):
+        error = LocalCommandError('', command='python.exe', exit_code=1,
+                                  stdout=b'', stderr=b'', task_id=TASK_ID)
+        self.assertIn('without stdout or stderr', error.diagnostic['message'])
+        self.assertIn('launch-' + TASK_ID + '.json', error.diagnostic['message'])
+        self.assertEqual(error.diagnostic.get('launch_record'), 'launch-' + TASK_ID + '.json')
+        plain = LocalCommandError('', command='python.exe', exit_code=1, stdout=b'', stderr=b'')
+        self.assertNotIn('launch-', plain.diagnostic['message'])
+        self.assertNotIn('launch_record', plain.diagnostic)
+
     def test_linked_record_linked_local_and_oversize_are_refused(self):
         real = self.root / "real.json"
         real.write_text(json.dumps({"task_id": TASK_ID, "started_at_ts": self.at, "reason": "x"}))

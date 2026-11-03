@@ -1645,11 +1645,27 @@ export class QuotaStore {
         ? 0
         : Math.round((Math.max(0, effRem) / 100) * burn.factor * pref * 10000) / 10000;
       const effBurnStatus = state === "exhausted" ? "exhausted" : burn.burn_status;
+      // Intake fae60b8a: when no fixed probe code names the failure, name the
+      // evidence gap so `hub quota` shows why instead of a bare score.
+      // Subscription probes for quse-backed managed accounts are unknown by
+      // design (the host runs quse once for the host-wide snapshot, not per
+      // subscription); a named profile or multi-account family cannot fall
+      // back to a snapshot route that does not resolve to it.
+      const probe = probeSuffix(displayObs?.quota);
+      let gap = "";
+      if (state === "unavailable" && !probe) {
+        const subReporters = [...new Set(freshObs.filter((o) => o.kind === "subscription").map((o) => o.machine))].sort();
+        const snapReporters = [...new Set(freshObs.filter((o) => o.kind === "snapshot").map((o) => o.machine))].sort();
+        const parts: string[] = [central ? "server snapshot stale" : "no server snapshot"];
+        parts.push(subReporters.length ? `subscription probe unknown from ${subReporters.length} host(s)` : "no subscription probe");
+        parts.push(snapReporters.length ? `host snapshot error from ${snapReporters.length} host(s)` : "no resolving host snapshot route");
+        gap = ` gap=${parts.join("; ")}`;
+      }
       const decisionReason = disabled
         ? `disabled: ${canonProv}/${canonAcct}`
         : state === "exhausted"
         ? `excluded: ${canonProv}/${canonAcct} quota_exhausted`
-        : `${canonProv}/${canonAcct} score=${decisionScore.toFixed(4)} [rem=${remaining !== null ? `${Math.round(remaining)}%` : 'unmetered'} win=${burn.windows_summary} ratio=${burn.ratio !== null ? burn.ratio.toFixed(2) : 'unmetered'} status=${effBurnStatus} burn=${burn.factor.toFixed(2)}x pref=${pref.toFixed(2)}x]${probeSuffix(displayObs?.quota)}`;
+        : `${canonProv}/${canonAcct} score=${decisionScore.toFixed(4)} [rem=${remaining !== null ? `${Math.round(remaining)}%` : 'unmetered'} win=${burn.windows_summary} ratio=${burn.ratio !== null ? burn.ratio.toFixed(2) : 'unmetered'} status=${effBurnStatus} burn=${burn.factor.toFixed(2)}x pref=${pref.toFixed(2)}x]${probe}${gap}`;
       pools.push({
         provider: canonProv,
         account: canonAcct,

@@ -96,6 +96,18 @@ def ensure_repo_workspace(settings, label, *, home: Optional[str] = None,
     path.parent.mkdir(parents=True, exist_ok=True)
     slug = f"{owner}/{name}"
     gh = gh_bin if gh_bin is not None else git_noninteractive.find_gh()
+    # Preflight (intake hubfail-t2596u): a dead loopback proxy is the observed
+    # Hub failure mode (desktop HTTPS_PROXY with no listener). Name it as the
+    # reason instead of a bare clone failure; the message carries only a
+    # sanitized host:port, never credentials. gh auth is advisory here (public
+    # repos clone without it) and joins the failure tail below. A proxy
+    # bypassed for every needed GitHub host via NO_PROXY (the operator
+    # workaround for codex-vpn) is left alone; nothing here writes env.
+    wanted = ((git_noninteractive._GITHUB_SUFFIXES + git_noninteractive._GH_EXTRA_HOSTS)
+              if gh else git_noninteractive._GITHUB_SUFFIXES)
+    proxy_finding = git_noninteractive.dead_proxy_finding(hosts=wanted)
+    if proxy_finding is not None:
+        raise ValueError("repo_proxy_unreachable: " + slug + ": " + proxy_finding)
     proc = None
     if gh:
         proc = run([gh, "repo", "clone", slug, str(path)], None, CLONE_TIMEOUT)
@@ -103,11 +115,13 @@ def ensure_repo_workspace(settings, label, *, home: Optional[str] = None,
         proc = run([git_bin, "clone", "--quiet", f"https://github.com/{slug}.git", str(path)], None, CLONE_TIMEOUT)
     if proc.returncode != 0:
         detail = (proc.stderr or "") + (proc.stdout or "")
+        gh_finding = git_noninteractive.gh_auth_finding(gh_bin if gh_bin is not None else gh)
+        tail = _short(proc) + ("" if not gh_finding else "; " + gh_finding[:160])
         if git_noninteractive.is_repo_not_found(detail):
-            raise ValueError("repo_not_found: " + slug + ": " + _short(proc))
+            raise ValueError("repo_not_found: " + slug + ": " + tail)
         if git_noninteractive.is_auth_failure(detail):
-            raise ValueError(git_noninteractive.AUTH_FAILED + ": " + slug + ": " + _short(proc))
-        raise ValueError("repo_clone_failed: " + slug + ": " + _short(proc))
+            raise ValueError(git_noninteractive.AUTH_FAILED + ": " + slug + ": " + tail)
+        raise ValueError("repo_clone_failed: " + slug + ": " + tail)
     for argv in ([git_bin, "fetch", "--quiet", "origin", "main"],
                  [git_bin, "checkout", "--quiet", "-B", "wt-" + id8, "origin/main"]):
         proc = run(argv, str(path), GIT_TIMEOUT)

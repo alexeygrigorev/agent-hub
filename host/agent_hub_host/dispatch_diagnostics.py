@@ -15,6 +15,7 @@ MESSAGES = {
     'repo_clone_auth_failed': 'The host could not authenticate to GitHub while cloning the requested repository.',
     'repo_not_found': 'The repository origin was not found during host cloning.',
     'repo_clone_failed': 'The host could not clone the requested repository.',
+    'repo_proxy_unreachable': 'The host proxy required for GitHub cloning is unreachable.',
     'repo_checkout_missing': 'The requested repository checkout is unavailable on this host.',
     'repo_origin_missing': 'The repository has no cloneable GitHub origin.',
     'host_gh_auth_unavailable': 'The host GitHub CLI authentication is unavailable.',
@@ -176,7 +177,7 @@ def classify(exc, *, workspace_available=True, value_error_fallback=None):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'repo_clone_failed','repo_checkout_missing','repo_origin_missing','host_gh_auth_unavailable','host_disk_warn_no_clone','host_disk_critical','model_unsupported', 'model_unverified', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'repo_clone_failed','repo_proxy_unreachable','repo_checkout_missing','repo_origin_missing','host_gh_auth_unavailable','host_disk_warn_no_clone','host_disk_critical','model_unsupported', 'model_unverified', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
             if reason == 'dispatch_internal_error':
                 reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
             if reason == 'dispatch_internal_error':
@@ -190,13 +191,13 @@ def classify(exc, *, workspace_available=True, value_error_fallback=None):
             reason = value_error_fallback
     elif isinstance(exc, (RuntimeError, OSError)):
         reason = 'dispatch_local_command_failed'
-    if not workspace_available and reason not in {'repo_clone_failed', 'repo_origin_missing', 'host_gh_auth_unavailable', 'repo_checkout_missing', 'host_disk_warn_no_clone', 'host_disk_critical'} and not (isinstance(exc, ValueError) and str(exc) == 'repo_origin_mismatch'):
+    if not workspace_available and reason not in {'repo_clone_failed', 'repo_proxy_unreachable', 'repo_origin_missing', 'host_gh_auth_unavailable', 'repo_checkout_missing', 'host_disk_warn_no_clone', 'host_disk_critical'} and not (isinstance(exc, ValueError) and str(exc) == 'repo_origin_mismatch'):
         reason = 'workspace_unavailable'
     value = {'reason': reason, 'message': MESSAGES[reason], 'stage': 'dispatch_route',
             'error_type': type(exc).__name__ if type(exc).__name__.isalpha() and len(type(exc).__name__) <= 64 else 'Error'}
-    if reason == 'repo_clone_failed' and isinstance(exc, ValueError):
+    if reason in {'repo_clone_failed', 'repo_proxy_unreachable'} and isinstance(exc, ValueError):
         # Intake fae60b8a: the journal record must carry the real git
-        # stderr, never a bare slug. Only this reason keeps a tail;
+        # stderr, never a bare slug. Only clone/proxy refusals keep a tail;
         # auth/not-found refusals stay slug-only (ad8aa931), and the tail
         # is scrubbed, bounded and ASCII-only.
         scrubbed = _scrub_clone_tail(str(exc))

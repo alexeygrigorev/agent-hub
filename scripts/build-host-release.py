@@ -65,6 +65,19 @@ def write_pth(target):
     pth.chmod(0o644)
 
 
+def verifier_for(tree, default):
+    """The verifier script a release tree is checked with (intake hubfail-t2596u).
+
+    A tree's own verifier understands its own manifest; the runner's is only
+    a fallback for trees predating the shipped verifier. ``default`` is the
+    runner's own verifier path.
+    """
+    own = Path(tree) / "scripts" / "verify-host-release.py"
+    if own.is_file() and not own.is_symlink():
+        return own
+    return default
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rev", required=True, help="git revision to build from")
@@ -81,7 +94,7 @@ def main():
     target = releases / short
     if target.exists():
         print("build-host-release: target exists, verifying in place: " + short)
-        rc = subprocess.run([sys.executable, str(VERIFY), str(target)]).returncode
+        rc = subprocess.run([sys.executable, str(verifier_for(target, VERIFY)), str(target)]).returncode
         if rc != 0:
             raise SystemExit("build-host-release: existing release failed verification")
         write_pth(target)
@@ -163,7 +176,7 @@ def main():
         raise SystemExit("build-host-release: target appeared concurrently, aborting")
     # Written after the rename so the path points at the final release dir.
     write_pth(target)
-    rc = subprocess.run([sys.executable, str(VERIFY), str(target)]).returncode
+    rc = subprocess.run([sys.executable, str(verifier_for(target, VERIFY)), str(target)]).returncode
     if rc != 0:
         shutil.rmtree(target, ignore_errors=True)
         raise SystemExit("build-host-release: smoke check failed, release discarded")

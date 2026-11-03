@@ -540,7 +540,7 @@ def _sanitize_cli_error_line(line: str) -> str | None:
     return s[:220]
 
 
-def launcher_record_cause(failure, workspace, task_id, launched_at):
+def launcher_record_cause(failure, workspace, task_id, launched_at, extra_dirs=None):
     """Keep the launcher's own saved cause for an empty-pipe exit (intake 17e774f8).
 
     The maintained launcher can exit 1 with empty stdout/stderr on Windows
@@ -548,23 +548,36 @@ def launcher_record_cause(failure, workspace, task_id, launched_at):
     record counts: exact task_id, started_at_ts within this dispatch's
     window, no-follow bounded read with no linked .local. Text is redacted
     and path-free. Never native-exit or success evidence. Returns a new dict.
+
+    ``extra_dirs`` names fallback workspaces (e.g. the intake-worktree target
+    cwd when it differs from the offer workspace) searched after ``workspace``
+    (intake hubfail-t2596u).
     """
     if (not isinstance(failure, dict) or not isinstance(task_id, str)
             or not re.fullmatch(r'hub-[A-Za-z0-9][A-Za-z0-9_-]{0,127}', task_id)
             or type(launched_at) not in (int, float)):
         return failure
-    try:
-        from . import private_fs
-        from .command_diagnostics import output_tail
-        local = Path(workspace) / '.local'
-        if local.is_symlink() or not local.is_dir():
-            return failure
-        doc = json.loads(private_fs.read_bytes(str(local / ('launch-' + task_id + '.json')),
-                                               262144, private=False).decode('utf-8'))
+    candidates = [workspace]
+    if extra_dirs:
+        try:
+            candidates.extend(d for d in extra_dirs if d not in candidates)
+        except TypeError:
+            pass
+    for candidate in candidates:
+        try:
+            from . import private_fs
+            from .command_diagnostics import output_tail
+            local = Path(candidate) / '.local'
+            if local.is_symlink() or not local.is_dir():
+                continue
+            doc = json.loads(private_fs.read_bytes(str(local / ('launch-' + task_id + '.json')),
+                                                   262144, private=False).decode('utf-8'))
+        except (OSError, ValueError, TypeError, UnicodeDecodeError):
+            continue
         started = doc.get('started_at_ts') if isinstance(doc, dict) else None
         if (not isinstance(doc, dict) or doc.get('task_id') != task_id
                 or type(started) not in (int, float) or not launched_at - 5 <= started <= launched_at + 300):
-            return failure
+            continue
 
         def clean(value):
             text = output_tail(value)
@@ -581,13 +594,12 @@ def launcher_record_cause(failure, workspace, task_id, launched_at):
             found['tail'] = ('No first action was validated before native exit.' if doc['outcome'] == 'failed'
                              else 'No first action was validated before the launcher deadline.')
         if not found:
-            return failure
+            continue
         code = failure.get('exit_code')
         prefix = ('The launcher command failed with exit code %d: ' % code
                   if type(code) is int else 'The launcher command failed: ')
         return {**failure, **found, 'message': (prefix + found.get('tail', found.get('stderr_tail', '')))[:300]}
-    except (OSError, ValueError, TypeError, UnicodeDecodeError):
-        return failure
+    return failure
 
 
 def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='launcher_run', engine=None, cwd=None, task_id=None, launched_at=None, start_offsets=None):
@@ -728,6 +740,12 @@ class LocalCommandError(RuntimeError):
                 and type(exit_code) is int):
             self.diagnostic['message'] = ('The launcher returned exit code %d without stdout or stderr; '
                                           'no native receipt was captured.' % exit_code)
+            if isinstance(task_id, str) and re.fullmatch(r'hub-[A-Za-z0-9][A-Za-z0-9_-]{0,127}', task_id):
+                # Intake hubfail-t2596u: point at the per-launch record that
+                # carries the launcher-side cause instead of a bare exit code.
+                self.diagnostic['message'] += (' Check the host .local/launch-' + task_id +
+                                               '.json record for the launcher-side cause.')
+                self.diagnostic['launch_record'] = 'launch-' + task_id + '.json'
         if reconcile_effects:
             self.diagnostic['message'] = 'Native client operation failed; reconcile effects'
         super().__init__(self.diagnostic['message'])
