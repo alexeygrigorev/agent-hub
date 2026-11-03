@@ -862,29 +862,45 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30, env=None):
         return json.loads(native.stdout)
     import threading
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env)
-    overflow = threading.Event()
+    output_overflow = threading.Event()
+    reader_failed = threading.Event()
+    stdin_write_failed = threading.Event()
     stdout = bytearray()
     stderr = bytearray()
     def drain(stream, limit, target=None):
         size = 0
         try:
             while True:
-                chunk = stream.read(8192)
+                # BufferedReader.read(n) may wait for EOF on Windows when a
+                # short-lived native gate's child inherited the pipe handle.
+                # read1 returns the bytes already available, so a complete
+                # JSON receipt is visible even while EOF is delayed.
+                reader = getattr(stream, 'read1', stream.read)
+                chunk = reader(8192)
                 if not chunk: break
+                remaining = max(0, limit - size)
                 size += len(chunk)
+                if target is not None and remaining:
+                    target.extend(chunk[:remaining])
                 if size > limit:
-                    overflow.set(); break
-                if target is not None: target.extend(chunk)
+                    output_overflow.set(); break
         except Exception:
-            overflow.set()
+            reader_failed.set()
         finally:
             stream.close()
     def write():
         try:
             if payload is not None: proc.stdin.write(json.dumps(payload).encode('utf-8'))
-            proc.stdin.close()
         except Exception:
-            overflow.set()
+            # A child can exit 0 after it has already produced a complete
+            # receipt, racing this best-effort stdin close/write. Keep that
+            # fact separate from output overflow so valid output can win.
+            stdin_write_failed.set()
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                stdin_write_failed.set()
     # The native catalog includes containment and process metadata per session.
     # Keep provider probes small while allowing the bounded 500-session catalog.
     is_catalog = list(argv[-2:]) == ["list", "--json"] or list(argv[-3:]) == ["list", "--all", "--json"]
@@ -894,36 +910,55 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30, env=None):
                threading.Thread(target=write, daemon=True)]
     for thread in threads: thread.start()
     deadline = time.monotonic() + timeout
+    readers_timed_out = False
+    stdin_writer_timed_out = False
     try:
-        while proc.poll() is None and not overflow.is_set() and time.monotonic() < deadline:
-            overflow.wait(.02)
+        while (proc.poll() is None and not output_overflow.is_set()
+               and not reader_failed.is_set() and time.monotonic() < deadline):
+            output_overflow.wait(.02)
         if proc.poll() is None:
-            expired = time.monotonic() >= deadline and not overflow.is_set()
+            expired = time.monotonic() >= deadline and not output_overflow.is_set() and not reader_failed.is_set()
             proc.kill(); proc.wait(timeout=2)
             if expired:
                 raise LocalCommandTimeout('Local command timed out')
+            failure_kind = 'output_overflow' if output_overflow.is_set() else None
             raise LocalCommandError('Local command failed or exceeded resource limit',
                                     command=argv[0], exit_code=proc.returncode,
-                                    stdout=bytes(stdout), stderr=bytes(stderr))
-        for thread in threads: thread.join(timeout=1)
-        if proc.returncode == 0 and not overflow.is_set():
-            # A clean exit can outrun the readers on a CPU/GIL-starved Windows
-            # controller: give them a bounded grace before a completed gate is
-            # reported as a failed command (DESKTOP-FP4OP26 abe6bf8d, intake ad8aa931).
-            grace = time.monotonic() + READER_GRACE_S
-            for thread in threads: thread.join(timeout=max(0, grace - time.monotonic()))
-        if proc.returncode != 0 or overflow.is_set() or any(t.is_alive() for t in threads):
-            raise LocalCommandError(bytes(stdout + b'\n' + stderr).decode('utf-8', 'replace'),
-                                    command=argv[0], exit_code=proc.returncode,
-                                    stdout=bytes(stdout), stderr=bytes(stderr))
+                                    stdout=bytes(stdout), stderr=bytes(stderr),
+                                    failure_kind=failure_kind)
+        # A clean exit can outrun the readers on a CPU/GIL-starved Windows
+        # controller. Give readers one bounded grace, then trust a complete,
+        # parseable receipt even if an inherited handle delays EOF.
+        grace = time.monotonic() + READER_GRACE_S
+        for thread in threads:
+            thread.join(timeout=max(0, grace - time.monotonic()))
+        readers_timed_out = any(t.is_alive() for t in threads[:2])
+        stdin_writer_timed_out = threads[2].is_alive()
     finally:
         if proc.poll() is None: proc.kill(); proc.wait(timeout=2)
         # Each reader owns and closes its stream after EOF. Closing its raw descriptor here
         # races with BufferedReader cleanup and can close an unrelated later probe's descriptor.
         for thread in threads: thread.join(timeout=1)
+    failure_kind = None
+    if output_overflow.is_set():
+        failure_kind = 'output_overflow'
+    elif stdin_write_failed.is_set() or stdin_writer_timed_out:
+        failure_kind = 'stdin_write_failed'
+    elif readers_timed_out or any(t.is_alive() for t in threads[:2]):
+        failure_kind = 'reader_timeout'
+    if proc.returncode != 0 or output_overflow.is_set() or reader_failed.is_set():
+        raise LocalCommandError(bytes(stdout + b'\n' + stderr).decode('utf-8', 'replace'),
+                                command=argv[0], exit_code=proc.returncode,
+                                stdout=bytes(stdout), stderr=bytes(stderr),
+                                failure_kind=failure_kind)
     try:
         value = json.loads(stdout)
     except Exception:
+        if failure_kind is not None:
+            raise LocalCommandError(bytes(stdout + b'\n' + stderr).decode('utf-8', 'replace'),
+                                    command=argv[0], exit_code=proc.returncode,
+                                    stdout=bytes(stdout), stderr=bytes(stderr),
+                                    failure_kind=failure_kind)
         raise RuntimeError("Local command returned invalid JSON") from None
     if not isinstance(value, (dict, list)):
         raise RuntimeError("Local command returned invalid JSON shape")
@@ -3034,7 +3069,14 @@ class Dispatcher:
                 gate_reason = ("account_label_mismatch" if gate.get("launch_allowed") is True and gate.get("profile_supported") is True
                                else "profile_unsupported" if gate.get("launch_allowed") is True else "gate_refused")
             raise AdmissionRefusedError("Fresh admission refused", gate_reason)
-        if (offer.get('task_id') or (selection and sub.get("account_label") in self._managed_labels)) and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
+        requires_verified_selection = bool(
+            offer.get('task_id') or sub.get("account_label") in self._managed_labels
+        )
+        if requires_verified_selection and (
+                not isinstance(selection, dict)
+                or gate.get('model_supported') is not True
+                or gate.get('model') != selection.get('model')
+                or gate.get('effort') != selection.get('effort')):
             raise AdmissionRefusedError('Selected model/effort requires verified admission', 'model_unverified')
         at = gate.get("observed_at")
         timing = {"gate_duration_s": round(gate_duration_s, 3)}
@@ -3728,8 +3770,21 @@ class Dispatcher:
             t_cwd = locals().get("target_cwd") or locals().get("workspace")
             l_offsets = locals().get("log_offsets")
             l_at = locals().get("launched_at_ts")
-            failure = exception_diagnostic(exc, "dispatch_headless" if mode == "headless" else "dispatch_interactive",
-                                           engine=engine_name, cwd=t_cwd, task_id=t_id, launched_at=l_at, start_offsets=l_offsets)
+            stage = "dispatch_headless" if mode == "headless" else "dispatch_interactive"
+            failure = None
+            if isinstance(exc, ValueError):
+                from .dispatch_diagnostics import classify as classify_dispatch_error
+                candidate = classify_dispatch_error(
+                    exc,
+                    value_error_fallback=('dispatch_value_error'
+                                          if mode == 'headless' and engine_name == 'claude' else None))
+                if candidate.get('reason') != 'dispatch_internal_error':
+                    candidate['stage'] = stage
+                    failure = candidate
+            if failure is None:
+                failure = exception_diagnostic(exc, stage,
+                                               engine=engine_name, cwd=t_cwd, task_id=t_id,
+                                               launched_at=l_at, start_offsets=l_offsets)
             if mode == "headless" and t_id and failure.get("reason") == "launcher_command_failed":
                 # Intake 17e774f8: an empty-pipe launcher exit still saved its
                 # cause in this launch's own record; keep it, sanitized.
@@ -4454,7 +4509,12 @@ class Dispatcher:
                     resolve_workspace_path(self.settings, offer.get('workspace'))
             except (ValueError, OSError):
                 workspace_available = False
-            diagnostic = classify(exc, workspace_available=workspace_available)
+            diagnostic = classify(
+                exc,
+                workspace_available=workspace_available,
+                value_error_fallback=('dispatch_value_error'
+                                      if offer.get('mode') == 'headless'
+                                      and offer.get('engine') == 'claude' else None))
             reason = diagnostic['reason']
             if reason == 'host_overload':
                 load_status = getattr(exc, 'host_load_status', None)
