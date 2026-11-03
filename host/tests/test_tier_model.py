@@ -141,9 +141,11 @@ def test_interactive_unsupported_adapter_refused_before_claim(tmp_path):
 def test_claude_routes_are_sonnet_medium_never_haiku():
     config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
     claude = [m for m in config['models'] if m['engine'] == 'claude']
-    assert [(m['model'], m['effort']) for m in claude] == [('sonnet', 'medium')]
+    assert [(m['model'], m['effort']) for m in claude] == [('opus', 'medium'), ('sonnet', 'medium')]
     for ids in config['tiers'].values():
-        assert not [i for i in ids if 'haiku' in i or i == 'opus']
+        assert not [i for i in ids if 'haiku' in i]
+    assert 'opus' in config['tiers']['deep']
+    assert 'opus' not in config['tiers']['daily']
 
 
 def test_bundle_effort_policy_8852ba59():

@@ -65,8 +65,9 @@ describe('burn-aware fleet placement', () => {
     expect(plan.selected.burn.waste_alert).toBe(true);
     const codex = plan.candidates!.find((c: any) => c.account === 'shared-codex');
     expect(plan.selected.score).toBeGreaterThan(2 * codex.score);
-    // Deep work takes Claude Sonnet at medium effort for the same reason.
-    expect(fleet.plan(intent({ tier: 'deep' })).selected).toMatchObject({ account: 'shared-claude', selection: expect.objectContaining({ id: 'sonnet', effort: 'medium' }) });
+    // A reasoned deep request can use Opus, which remains at medium effort.
+    expect(fleet.plan(intent({ tier: 'deep', engine_override_reason: 'This task requires deep reasoning.' })).selected)
+      .toMatchObject({ account: 'shared-claude', selection: expect.objectContaining({ id: 'opus', effort: 'medium' }) });
     // Account status exposes the forecast for the dashboard and alert.
     const status = fleet.accountStatus({ label: 'shared-claude', provider: 'claude', max_concurrency: 100, reserve_percent: 0, enabled: 1 });
     expect(status.burn_forecast).toMatchObject({ window: '7d', waste_alert: true });

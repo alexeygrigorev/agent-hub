@@ -142,9 +142,10 @@ describe('burn-aware model candidates', () => {
     expect(modelCandidates({ tier: 'daily' }, r, a, stale, NOW)).toEqual([]);
   });
 
-  it.each([['gemini', 'gemini', 'gemini-4-argon-high', 'deep'], ['go', 'opencode', 'opencode-go/muse-spark-1.3-contributor', 'daily']])(
+  it.each([['gemini', 'gemini', 'gemini-4-argon-medium', 'deep'], ['go', 'opencode', 'opencode-go/muse-spark-1.3-contributor', 'daily']])(
     'scores expiring quota for %s', (provider, engine, model, tier) => {
-      const [candidate] = modelCandidates({ tier }, route(provider, engine), ad(engine, model, engine === 'opencode' ? null : 'medium', provider + '-acct'), q(weekly(95, 28)), NOW);
+      const [candidate] = modelCandidates({ tier, ...(tier === 'deep' ? { engine_override_reason: 'This task explicitly requires deep reasoning.' } : {}) },
+        route(provider, engine), ad(engine, model, engine === 'opencode' ? null : 'medium', provider + '-acct'), q(weekly(95, 28)), NOW);
       expect(candidate.factors.burn).toBeGreaterThan(3);
     });
 });

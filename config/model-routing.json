@@ -101,8 +101,6 @@
     ],
     "daily": [
       "muse",
-      "argon",
-      "argon-gemini",
       "glm-flash",
       "glm-flash-zcodex",
       "sonnet",
@@ -146,7 +144,7 @@
     },
     {
       "id": "argon",
-      "model": "gemini-4-argon-high",
+      "model": "gemini-4-argon-medium",
       "provider": "gemini",
       "engine": "antigravity",
       "profile": null,
@@ -226,7 +224,7 @@
     },
     {
       "id": "argon-gemini",
-      "model": "gemini-4-argon-high",
+      "model": "gemini-4-argon-medium",
       "provider": "gemini",
       "engine": "gemini",
       "profile": null,
