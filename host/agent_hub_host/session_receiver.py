@@ -473,15 +473,13 @@ def receive_once(
         except (SessionControlError, SessionUncertain) as exc:
             skipped.append({"command_id": command_id, "reason": str(exc)[:300]})
             continue
-        # Genuine sender qualification BEFORE the claim/effect: a host process
-        # without a bound native sender identity would emit an anonymous
-        # envelope recipients cannot reply to, so send offers are held
-        # honestly (no claim, no journal, no effect) instead. The authorized
-        # sender workspace is independent of the target workspace.
+        # A process without a bound sender identity cannot create a replyable
+        # native envelope. Hold it before claiming; this is not a command
+        # delivery failure and should not consume a server-side fence.
         if command.get("op") == "send":
             try:
                 qualify_sender_binding(executable, sender_workspace)
-            except (SessionControlError, SessionUncertain) as exc:
+            except (SessionControlError, SessionUncertain):
                 skipped.append({"command_id": command_id,
                                 "reason": "native_sender_unbound_reconcile"})
                 continue
@@ -491,11 +489,22 @@ def receive_once(
         except Exception as exc:
             # Lost claim reply: SAME attempt_id reconciles via replay on the
             # next cycle (server replays the token to the same attester).
-            skipped.append({"command_id": command_id,
-                            "reason": "claim_unresolved_%s_same_attempt_%s" % (type(exc).__name__, attempt_id)})
+            status = getattr(exc, "status", None)
+            code = getattr(exc, "code", None)
+            if type(status) is int and 400 <= status < 500 and isinstance(code, str) \
+                    and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+                skipped.append({"command_id": command_id, "attempt_id": attempt_id,
+                                "reason": "claim_refused:%s" % code})
+            else:
+                skipped.append({"command_id": command_id, "attempt_id": attempt_id,
+                                "reason": "claim_unresolved_%s_same_attempt" % type(exc).__name__})
             continue
         if not isinstance(server_claim, dict) or not server_claim.get("claim_token"):
-            skipped.append({"command_id": command_id, "reason": "claim_rejected_reconcile_via_commands"})
+            code = server_claim.get("error") if isinstance(server_claim, dict) else None
+            if not isinstance(code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+                code = "unknown"
+            skipped.append({"command_id": command_id, "attempt_id": attempt_id,
+                            "reason": "claim_refused:%s" % code})
             continue
         host_claim = claim_to_host_claim(server_claim, str(command_id))
         # Generation agreement: the granted claim must match the offered command.
@@ -514,8 +523,11 @@ def receive_once(
         except SessionControlError as exc:
             skipped.append({"command_id": command_id, "reason": str(exc)[:300]})
             continue
-        processed.append({"command_id": command_id, "op": command.get("op"),
+        processed.append({"command_id": command_id, "attempt_id": attempt_id,
+                          "op": command.get("op"),
                           "state": outcome.get("state"),
+                          **({"reason": str(outcome["reason"])[:300]}
+                             if isinstance(outcome.get("reason"), str) and outcome.get("reason") else {}),
                           "ack_submitted": bool((outcome.get("ack") or {}).get("submitted", False)),
                           "tree": ((outcome.get("ack") or {}).get("payload") or {}).get("tree"),
                           "replayed": bool(outcome.get("replayed", False))})

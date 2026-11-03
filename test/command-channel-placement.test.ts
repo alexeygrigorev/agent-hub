@@ -65,16 +65,17 @@ async function fixture(fn: (ctx: Ctx) => Promise<void>) {
 }
 
 /** A live session bound to the machine plus one direct command row. */
-function seedCommand(ctx: Ctx, opts: { id: string; kind?: string; state: string; createdDelta: number; sessionState?: string; notBeforeDelta?: number | null; ack?: object; pollAtDelta?: number | null }) {
+function seedCommand(ctx: Ctx, opts: { id: string; kind?: string; state: string; createdDelta: number; sessionState?: string; notBeforeDelta?: number | null; ack?: object; pollAtDelta?: number | null; claimToken?: boolean }) {
   const { sql, clock } = ctx;
   const iso = (delta = 0) => new Date(clock.now + delta).toISOString();
   sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
     VALUES (?, 'test', ?, '{}', ?, 'codex', 'headless', ?, NULL, ?, ?)`,
     'sess-' + opts.id, 'key-sess-' + opts.id, MACHINE, opts.sessionState ?? 'running', iso(-3600_000), iso(0));
-  sql.exec(`INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, not_before, poll_at, ack_json, created_at, updated_at)
-    VALUES (?, 'sess-${opts.id}', ?, 'test', ?, '{}', ?, 1, ?, ?, ?, ?, ?, ?)`,
+  sql.exec(`INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, claim_token, not_before, poll_at, ack_json, created_at, updated_at)
+    VALUES (?, 'sess-${opts.id}', ?, 'test', ?, '{}', ?, 1, ?, ?, ?, ?, ?, ?, ?)`,
     'cmd-' + opts.id, opts.kind ?? 'capture', 'key-' + opts.id, opts.state,
-    `cmd:${opts.id}:gen:1`, opts.notBeforeDelta == null ? null : iso(opts.notBeforeDelta),
+    `cmd:${opts.id}:gen:1`, opts.claimToken ? `token-${opts.id}` : null,
+    opts.notBeforeDelta == null ? null : iso(opts.notBeforeDelta),
     opts.pollAtDelta == null ? null : iso(opts.pollAtDelta),
     opts.ack === undefined ? null : JSON.stringify(opts.ack), iso(opts.createdDelta), iso(0));
 }
@@ -161,6 +162,15 @@ describe('command-channel health (intake 3aa850b4)', () => {
     expect(sql.exec("SELECT COUNT(*) AS n FROM liveness_alerts WHERE subject_kind = 'command_channel' AND resolved_at IS NOT NULL").one().n).toBe(1);
   }));
 
+  it('AC2: a failed command with a recorded claim token proves the host channel recovered', () => fixture(async ctx => {
+    seedCommand(ctx, { id: 'stuck-a', state: 'recorded', createdDelta: -20 * 60_000, pollAtDelta: -19 * 60_000 });
+    seedCommand(ctx, { id: 'stuck-b', state: 'transported', createdDelta: -18 * 60_000, pollAtDelta: -17 * 60_000 });
+    expect(health(ctx).state).toBe('unreachable');
+    seedCommand(ctx, { id: 'claimed-then-failed', state: 'failed', createdDelta: -60_000,
+      claimToken: true, ack: { outcome: 'failed', reason: 'Inbox refused' } });
+    expect(health(ctx).state).toBe('ok');
+  }));
+
   it('AC3: stale check-in (Hub transport failure) reads unknown, blocks only via machine_unavailable, alerts nothing', () => fixture(async ctx => {
     const { f, sql, clock } = ctx;
     seedCommand(ctx, { id: 'stuck3a', kind: 'capture', state: 'recorded', createdDelta: -11 * 60_000 });
@@ -211,7 +221,7 @@ describe('command-channel health (intake 3aa850b4)', () => {
     const iso = new Date(clock.now).toISOString();
     const planOf = (q: string, params: unknown[]) => (sql.exec('EXPLAIN QUERY PLAN ' + q, ...params).toArray() as any[]).map(r => String(r.detail));
     const proof = planOf(COMMAND_CHANNEL_PLAN_SQL.proof, [iso, MACHINE]);
-    expect(proof.some(d => d.includes('session_control_commands_proof_created')), proof.join(' | ')).toBe(true);
+    expect(proof.some(d => d.includes('session_control_commands_proof_created_v2')), proof.join(' | ')).toBe(true);
     const stuck = planOf(COMMAND_CHANNEL_PLAN_SQL.stuck, [MACHINE, iso, iso, '', iso]);
     expect(stuck.some(d => d.includes('session_control_commands_pending_created')), stuck.join(' | ')).toBe(true);
     expect(stuck.some(d => d.startsWith('SEARCH') && d.includes('created_at>?') && d.includes('created_at<?')), stuck.join(' | ')).toBe(true);

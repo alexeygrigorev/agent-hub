@@ -1584,7 +1584,8 @@ def handle_claimed_command(
                 pass
             ack_payload: dict[str, Any] = {
                 "correlation": _server_correlation(command_id, proved["generation"]),
-                "outcome": "refused" if state == "refused" else "uncertain",
+                "outcome": "failed" if state == "failed" else
+                    "refused" if state == "refused" else "uncertain",
                 "native": {"native_id": target.session_id,
                            "tag": target.tag, "workspace": target.workspace},
                 "reason": reason[:512],
@@ -1645,7 +1646,10 @@ def handle_claimed_command(
                 linked_intake_open=proved.get("linked_intake_open"))
         except SessionControlError as exc:
             # Read-only or pre-effect refusal (no mutation): durable refused.
-            return _durable_failure("refused", exc)
+            # A definite native inbox write failure is terminal for this
+            # generation-bound command, so a wake cannot remain queued forever.
+            state = "failed" if op == "send" and str(exc).startswith("Inbox refused:") else "refused"
+            return _durable_failure(state, exc)
         except SessionUncertain as exc:
             return _durable_failure("uncertain", exc)
         except Exception as exc:  # never strand attempted:true/state:null

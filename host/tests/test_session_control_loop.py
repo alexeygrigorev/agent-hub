@@ -118,6 +118,9 @@ def main():
             rows = load()
             hit = [r for r in rows if r["tag"] == to and r["workspace"] == ws]
             if not hit: sys.stderr.write("no session tagged\n"); sys.exit(1)
+            if os.environ.get("FAKE_SEND_FAIL") == "1":
+                # Definite native rejection before the envelope write.
+                sys.stderr.write("no session tagged\n"); sys.exit(1)
             # Genuine sender provenance (installed reply_target contract): the
             # sender resolves from the calling process's bound session in this
             # workspace; an unbound process emits an anonymous envelope that
@@ -376,6 +379,63 @@ def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env, monkeypatc
     assert payload["proof"]["reply_to_native_id"] == reply2["id"]
     assert payload["proof"]["sender_native_id"] == rec["id"]
     assert payload["proof"]["sender_created_at_ms"] == 1700000000000
+
+
+def test_definite_native_inbox_write_rejection_is_terminal_failed_ack(env, monkeypatch):
+    rec = seed(env)
+    target = NativeTarget(session_id=rec["id"], tag="agent1", workspace=env["work"],
+                          created_at_ms=1700000000000)
+    monkeypatch.setenv("FAKE_SEND_FAIL", "1")
+    cid = str(uuid.uuid4())
+    claim = {"command_id": cid, "claim_token": "tok-" + uuid.uuid4().hex + "zz",
+             "holder": "hetzner1", "generation": 1,
+             "expires_at_ms": int(time.time() * 1000) + 60000}
+    acked = {}
+    outcome = se.handle_claimed_command(
+        {"op": "send", "command_id": cid, "generation": 1,
+         "target": {"session_id": target.session_id, "tag": target.tag,
+                    "workspace": target.workspace, "created_at_ms": target.created_at_ms},
+         "body": "wake prompt", "await_ack": True},
+        claim, custody=custody(), journal_dir=env["journal"], executable=env["fake"],
+        request=lambda method, path, payload: acked.update(payload=payload) or {})
+    assert outcome["state"] == "failed"
+    assert outcome["reason"].startswith("Inbox refused:")
+    assert acked["payload"]["outcome"] == "failed"
+    assert acked["payload"]["reason"] == outcome["reason"]
+    assert not os.listdir(env["msgs"])
+
+
+def test_definite_claim_refusal_reports_server_reason_and_stable_attempt(env):
+    rec = seed(env)
+    target = NativeTarget(session_id=rec["id"], tag="agent1", workspace=env["work"],
+                          created_at_ms=1700000000000)
+    cid = str(uuid.uuid4())
+    offered = offer(cid, "send", target, payload={"body": "wake prompt"})
+    calls = []
+
+    class ClaimRefused(Exception):
+        status = 409
+        code = "claim_authority_changed"
+
+    def request(method, path, payload):
+        calls.append((method, path, payload))
+        if method == "GET":
+            return {"offers": [offered]}
+        if path.endswith("/claim"):
+            raise ClaimRefused("server response detail is not copied")
+        raise AssertionError("unexpected request: %s %s" % (method, path))
+
+    result = rc.receive_once(custody=custody(), journal_dir=env["journal"],
+                             executable=env["fake"], request=request,
+                             sender_workspace=env["work"])
+    claim_call = next(call for call in calls if call[1].endswith("/claim"))
+    journal_path = os.path.join(env["journal"], "recv-" + cid + ".json")
+    with open(journal_path, encoding="utf-8") as f:
+        journal = json.load(f)
+    assert claim_call[2]["attempt_id"] == journal["attempt_id"]
+    assert result["skipped"] == [{"command_id": cid, "attempt_id": journal["attempt_id"],
+                                  "reason": "claim_refused:claim_authority_changed"}]
+    assert not any(call[1].endswith("/ack") for call in calls)
 
 
 def test_handle_claimed_capture_and_stop_shapes(env):
