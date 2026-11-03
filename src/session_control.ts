@@ -7,6 +7,7 @@ import { LivenessService } from './liveness';
 import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
 import { linkedIntake, linkedTaskIds, hasOpenWork, nativeGoalStatus, sessionWakeState, openWorkPreventsIdleReap } from './intake-session';
 import { workerAccessContext, workerWakeAllowed } from './worker-access';
+import { DRIVER_SCOPE, driverAccessContext, driverRequestAllowed } from './driver-access';
 import { registeredRepoLabel } from './repos';
 import { decodeRepoWorkspace, encodeRepoWorkspace } from './fleet';
 import { initResourceRequestProjection } from './sql-json-projection';
@@ -512,6 +513,8 @@ export class SessionControlService {
     if (!cred || cred.revoked_at) return false;
     const expires = Date.parse(cred.expires_at);
     if (!Number.isFinite(expires) || expires <= this.now()) return false;
+    let scopes: any; try { scopes = JSON.parse(cred.scopes); } catch { return false; }
+    if (Array.isArray(scopes) && scopes.includes(DRIVER_SCOPE) && !driverAccessContext(this.sql, caller.tokenId, this.now())) return false;
     return credentialActor(this.sql, cred) !== null;
   }
 
@@ -542,18 +545,18 @@ export class SessionControlService {
   }
 
   private cancelOwnerLive(row: any, caller: Caller, operatorStop = false): boolean {
-    // Explicit human operators already may stop any bound session. Apply the
-    // same authority to a provably unstarted intent, without broadening the
-    // owner-only /cancel endpoint or trusting a collapsed browser actor.
-    if (operatorStop && caller.isAdmin === true && caller.kind === 'human') {
-      // The internal recovery service uses the same canonical stop/cancellation
-      // transaction as operators. HTTP authentication never issues this actor.
-      if (caller.actor === 'hub:service:intake-watchdog') return true;
-      if (typeof caller.actor === 'string' && caller.actor.startsWith('human:admin-token:')) return true;
+    // Explicit operator stop may cross ownership only for an authenticated
+    // human bearer. Revalidate that bearer after the streamed body, inside the
+    // cancellation transaction. Cookie admins without a stable human identity
+    // may stop their own actor's intent; /cancel remains owner-only.
+    if (operatorStop && caller.isAdmin === true) {
       if (caller.tokenId) {
+        if (caller.kind !== 'human') return false;
         const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
-        if (validateHumanCredentialRecord(this.sql, this.options.env, cred, this.now())?.actor === caller.actor) return true;
+        return validateHumanCredentialRecord(this.sql, this.options.env, cred, this.now())?.actor === caller.actor;
       }
+      return row.actor === actorName(caller) || caller.actor === 'hub:service:intake-watchdog' ||
+        (typeof caller.actor === 'string' && caller.actor.startsWith('human:'));
     }
     if (row.actor !== actorName(caller) || !this.ownerOk(row, caller)) return false;
     // Legacy admin bearers have a stable actor but no credentials-table row.
@@ -2139,6 +2142,11 @@ export class SessionControlService {
     const threshold = thresholdRaw === null ? 10800 : Number(thresholdRaw);
     if (!Number.isSafeInteger(threshold) || threshold <= 0 || threshold > 31536000) return response({ error: 'invalid_threshold' }, 400);
     const admin = caller.isAdmin === true;
+    const driverScoped = auth.scopes?.includes(DRIVER_SCOPE) === true;
+    if (driverScoped && !driverRequestAllowed(this.sql, request, caller.tokenId!, this.now())) {
+      return response({ error: 'driver_scope_forbidden' }, 403);
+    }
+    const observeAll = admin || driverScoped;
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
 
@@ -2399,6 +2407,8 @@ export class SessionControlService {
       if (mode === 'headless' && input.brief !== undefined && !input.brief.trim()) {
         return response({ error: 'invalid_session_request', field: 'brief', detail: 'empty_brief' }, 400);
       }
+      if (driverScoped && (typeof input.intake_task_id !== 'string' || mode !== 'headless' ||
+          input.engine !== undefined || input.machine !== undefined)) return response({ error: 'driver_scope_forbidden' }, 403);
       const worker = workerAccessContext(this.sql, caller.tokenId);
       if (worker) {
         const intake = input.intake_task_id;
@@ -2417,6 +2427,15 @@ export class SessionControlService {
       }
       const actor = caller.actor || caller.machineId || 'admin';
       try { return this.transaction(() => {
+        const driver = driverScoped ? driverAccessContext(this.sql, caller.tokenId, this.now()) : null;
+        if (driverScoped) {
+          if (!driver || typeof input.intake_task_id !== 'string' || mode !== 'headless' ||
+              input.engine !== undefined || input.machine !== undefined ||
+              (input.parent_id !== undefined && input.parent_id !== driver.session_id)) {
+            return response({ error: 'driver_scope_forbidden' }, 403);
+          }
+          input.parent_id = driver.session_id;
+        }
         const finish = (row: any, extra: any = {}, status = 200) => {
           recordIntakeSessionLink(this.sql, row, this.now(), extra.hold);
           if (worker && !extra.replay) recordWorkerChildStart(this.sql, row, worker.session_id, this.now());
@@ -2439,7 +2458,7 @@ export class SessionControlService {
           if (!parentRow) {
             return response({ error: 'parent_session_not_found' }, 404);
           }
-          if (!admin && !(worker && parentRow.id === worker.session_id) && !this.ownerOk(parentRow, caller)) {
+          if (!admin && !(worker && parentRow.id === worker.session_id) && !(driver && parentRow.id === driver.session_id) && !this.ownerOk(parentRow, caller)) {
             return response({ error: 'parent_forbidden' }, 403);
           }
           let curr = parentRow;
@@ -2762,7 +2781,7 @@ export class SessionControlService {
           if (value.length > 128) return null;
           return value;
         };
-        const scope = admin
+        const scope = observeAll
           ? { owner: scopeParam('owner'), host: scopeParam('host'), task: scopeParam('task') }
           : { owner: caller.actor ?? null, host: scopeParam('host'), task: scopeParam('task') };
         const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit')) || 50));
@@ -2777,10 +2796,10 @@ export class SessionControlService {
         if (!dims) return response({ error: 'invalid_breakdown', allowed: ['host', 'engine', 'account'] }, 400);
         const cap = 1000;
         const states = LIVE_STORED_STATES.map(() => '?').join(',');
-        const live = (admin
+        const live = (observeAll
           ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE state IN (${states}) ORDER BY created_at DESC, id DESC LIMIT ?`, ...LIVE_STORED_STATES, cap + 1).toArray()
           : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? AND state IN (${states}) ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...LIVE_STORED_STATES, cap + 1).toArray()
-        ).filter((r: any) => this.ownerOk(r, caller));
+        ).filter((r: any) => observeAll || this.ownerOk(r, caller));
         const scanned = live.slice(0, cap);
         return response(buildSessionBreakdown(this.sql, scanned.map(r => this.view(r)), dims,
           { now_ms: this.now(), scanned: scanned.length, truncated: live.length > cap }));
@@ -2790,22 +2809,22 @@ export class SessionControlService {
       const params: any[] = [];
       let cursorSql = this.cursorClause(cursor, params, true);
       const liveOnly = url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1';
-      const listFrom = liveOnly ? liveFrom(admin) : 'session_control_sessions';
+      const listFrom = liveOnly ? liveFrom(observeAll) : 'session_control_sessions';
       if (liveOnly) {
         const frag = activeSessionsSql(this.now());
         cursorSql += ` AND ${LIVE_STATES_SQL} AND ${frag.sql}`;
         params.push(...frag.params);
       }
-      const rows = (admin
+      const rows = (observeAll
         ? this.sql.exec(`SELECT * FROM ${listFrom} WHERE 1 = 1 ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...params, limit + 1).toArray()
         : this.sql.exec(`SELECT * FROM ${listFrom} WHERE actor = ? ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...params, limit + 1).toArray()
-      ).filter((r: any) => this.ownerOk(r, caller));
+      ).filter((r: any) => observeAll || this.ownerOk(r, caller));
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
       const countFrag = activeSessionsSql(this.now());
       // Capped count over the partial live index: bounded by ACTIVE_COUNT_CAP matches, never a base-table scan.
-      const countFrom = liveFrom(admin);
-      const activeCount = Number((admin
+      const countFrom = liveFrom(observeAll);
+      const activeCount = Number((observeAll
         ? this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, ...countFrag.params, ACTIVE_COUNT_CAP)
         : this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE actor = ? AND ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, caller.actor, ...countFrag.params, ACTIVE_COUNT_CAP)
       ).toArray()[0]?.n ?? 0);
@@ -3474,6 +3493,7 @@ export class SessionControlService {
       const scopedSelfRead = request.method === 'GET' && scopedWorker?.session_id === session?.id &&
         (!sub || ['commands','wakes','pings'].includes(sub));
       if (!session || !(this.ownerOk(session,caller) || scopedSelfRead ||
+          (driverScoped && !sub && request.method === 'GET') ||
           (['wake','ping','ping-clear'].includes(sub as string) && request.method === 'POST' && wakeOwnerOk(session)))) return response({ error: 'not_found' },404);
 
       // Polling a capacity-queued intent adopts any Fleet-side promotion, so

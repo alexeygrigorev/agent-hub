@@ -23,6 +23,9 @@ for (const [name, mode] of [['start_agent', 'headless'], ['start_session', 'inte
 }
 tool('sessions_link', 'POST', '/api/sessions/{id}/link', 'Link intake; scoped workers must match task, machine and workspace; idempotent.', ['sessions link']);
 tool('sessions_list', 'GET', '/api/sessions', 'List sessions; query view=lifecycle grouped, view=breakdown&by=host,engine,account counts; state, limit, cursor filter.', ['sessions', 'sessions list', 'sessions count']);
+tool('driver_status', 'GET', '/api/driver', 'Operator driver/session/schedule status, startup delivery and scheduled-ping receipts.', ['driver status']);
+for (const action of ['start', 'stop', 'restart']) tool(`driver_${action}`, 'POST', `/api/driver/${action}`,
+  'Operator only. Stable key; start/restart accept engine, host and workspace; start also accepts force. Start creates an interactive singleton and its 15-minute prompt schedule. Retry uncertain actions with the same key and payload.', [`driver ${action}`]);
 tool('sessions_tree', 'GET', '/api/sessions/tree', 'Session requester/parent tree.', ['sessions tree']);
 tool('sessions_start', 'POST', '/api/sessions', 'Queue durable session intent: workspace or registered repo owner/name, brief, name, mode=headless|interactive, parent_id, intake_task_id, key, with_goal. Omit engine for tier policy; explicit engine REQUIRES engine_override_reason. Non-interactive starts REQUIRE intake_task_id and nonempty AC. Scope flags never block starts. needs filters advertised machine labels; unmet needs hold with needs_unmet. Admission unchanged. Use interactive with_goal for follow-ups; headless uses native resume. Poll sessions_show/commands: queued or transported is not acknowledged execution.', ['sessions start', 'sessions override']);
 tool('sessions_show', 'GET', '/api/sessions/{id}', 'Session binding and observed state.', ['sessions show']);

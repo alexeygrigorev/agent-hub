@@ -9,6 +9,7 @@ type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
 import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, initSessionLinks, initLinkRefs, triageTargets, workerAccessContext, workerCreatedTargets, workerLinkedTargets } from './worker-access';
+import { DRIVER_SCOPE, driverAccessContext, driverIntakeMutationAllowed } from './driver-access';
 import { advanceIntakeExport, initIntakeExport, intakeExportCounts, intakeExportRecent, intakeExportPageIds, intakeExportMatches, type IntakeExportFilter } from './intake-export';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
@@ -650,6 +651,13 @@ export class IntakeService {
         grants: [{ scope: 'task', target: worker.task_id, access: 'write', expires_at: worker.expires_at },
           ...[...triage, ...created, ...linked].map(target => ({ scope: 'task', target, access: 'write', expires_at: worker.expires_at }))],
         valid_until: Math.min(Date.parse(c.expires_at), worker.expires_at) };
+    }
+    if (JSON.parse(c.scopes).includes(DRIVER_SCOPE)) {
+      const driver = driverAccessContext(this.sql, c.id);
+      if (!driver || driver.actor !== binding.actor) fail('forbidden', 403);
+      return { admin: false, driver: true, actor: binding.actor, identity: 'family:' + binding.family_id, caller,
+        grants: [{ scope: 'all', target: null, access: 'write', expires_at: driver.expires_at }],
+        valid_until: Math.min(Date.parse(c.expires_at), driver.expires_at) };
     }
     const grants = this.rows('grants').filter(g => !g.revoked_at && g.expires_at > Date.now() && canonical(g.binding) === canonical(binding));
     if (!grants.length) fail('forbidden', 403);
@@ -1628,6 +1636,7 @@ export class IntakeService {
     const fingerprint = canonical({ path: '/tasks/' + taskId + '/assign', payload: b });
     const pre: Obj = this.tx(() => {
       const p = this.principal(auth);
+      if (p.driver && !driverIntakeMutationAllowed('/tasks/' + taskId + '/assign', b)) fail('forbidden', 403);
       const task = this.get('tasks', taskId);
       if (!task || !this.allowed(p, task, true)) fail('not_found', 404);
       // Lost-response replay returns the original response even if the task
@@ -1978,6 +1987,7 @@ export class IntakeService {
         if (!payload) return json(this.read(url, p));
         identifier(payload.key);
         const path = url.pathname.slice('/api/intake'.length);
+        if (p.driver && !driverIntakeMutationAllowed(path, payload)) fail('forbidden', 403);
         // AC5 triage reviewers may also set AC/project on their requested intakes (never status).
         const triageUpdate = p.worker && p.triage?.has(/^\/tasks\/([^/]+)$/.exec(path)?.[1]) &&
           Object.keys(payload).every(k => ['key', 'expected_version', 'acceptance_criteria', 'project'].includes(k)) &&
