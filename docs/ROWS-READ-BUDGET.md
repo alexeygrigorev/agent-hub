@@ -70,3 +70,21 @@ freshness after writes, cold/warm observed-catalog reads, alarm backlog limits,
 and query plans for the new indexes. The required pre-push runner and CI must
 pass before this change is accepted. Live production readings remain necessary
 to establish that cold starts and residual routes stay below 5,000/day.
+
+## Write cuts (intake e8a22f4c, PR #2)
+
+Green product (DO rows written ~$1/M) ran 16.4M/day on Nov 2 (~$16/day).
+Top write scopes from the live meter: PUT /api/fleet/sessions 8.9M,
+POST /api/fleet/resources/report 3.1M, checks:run_due 2.1M,
+POST /api/fleet/launches/:id/reject 1.0M (3.25M calls, ~3.1M already
+write-free 409s; UNIQUE(actor, request_key) rules out double-mints, so the
+remainder is per-intent volume and needs admission-side quarantine).
+
+- `checks:run_due`: identical verdicts skip the `hub_checks` UPDATE and the
+  `hub_check_runs` INSERT; the 1000-row trim runs only when history grew.
+- Census PUT: the two fleet-wide terminal reconciles
+  (`reconcileAccountCapacity`, `reconcileVerifiedNoStarts`) run only when the
+  census changed or retired rows; unchanged polls skip them.
+- `recordSessionTokens`: active-phase token upserts persist at most once per
+  60s per session (`TOKEN_PERSIST_COOLDOWN_MS`); terminal phases always
+  persist so the final count is never lost.
