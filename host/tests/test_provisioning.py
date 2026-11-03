@@ -1504,7 +1504,16 @@ def _fake_windows_go_install(revision='33333333-3333-4333-8333-333333333333'):
                 files={}, env={}, args=['--model', 'opencode-go/muse-spark-1.3-contributor']), executable
 
 
-def test_windows_go_bundle_pins_managed_opencode_engine(monkeypatch):
+@pytest.fixture(autouse=False)
+def _launcher_stub(tmp_path, monkeypatch):
+    # 67ae673 no longer falls back to python.exe; CI Pythons may ship no distlib t64.exe stub.
+    stub = tmp_path / 't64.exe'
+    stub.write_bytes(b'MZ')
+    real = p._windows_exe_launcher
+    monkeypatch.setattr(p, '_windows_exe_launcher', lambda command, label, stub=stub: real(command, label, stub))
+
+
+def test_windows_go_bundle_pins_managed_opencode_engine(monkeypatch, _launcher_stub):
     # Intake 608a2f9a (B): aplexer's bare `opencode` resolves to the npm shim
     # on Windows (exit 127); the managed block pins the native binary and the
     # pin follows each installed revision.
@@ -1535,7 +1544,7 @@ def test_go_engine_is_the_2x_cli_that_can_import_the_central_device_login(tmp_pa
     assert p._go_engine_current(bundle, old_tree.parent.parent) is True
 
 
-def test_opencode_engine_pin_absent_off_windows_and_for_operator_tables(monkeypatch):
+def test_opencode_engine_pin_absent_off_windows_and_for_operator_tables(monkeypatch, _launcher_stub):
     bundle, executable = _fake_windows_go_install()
     p.profiles([bundle], is_windows=False)  # POSIX engines resolve natively, no pin
     assert '[engines.opencode]' not in p.profile_path().read_text()
