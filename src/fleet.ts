@@ -2677,6 +2677,9 @@ export class FleetService {
             binding.retirement.created_at_ms === binding.native_created_at_ms) return true;
         return Boolean(binding && row.launch_state === 'exited' && row.launch_verification === 'verified' && row.launch_native === binding.native_id);
       })();
+      // The unbound launch-less stopped clause has no guards-layer twin
+      // (intake 1c8d915e keeps guards fail-closed there): fallbacks refuse
+      // what this primary path admits, never the reverse.
       const launchTerminal = ['failed', 'exited', 'cancelled', 'expired', 'refused'].includes(row.launch_state) ||
         confirmedStop || (!row.fleet_launch_id && row.state === 'stopped');
       // All-launches spawned check: every same-request host attempt is

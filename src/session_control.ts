@@ -2515,7 +2515,13 @@ export class SessionControlService {
         // unstarted, however terminal its own launch row looks.
         const unplacedNoLink = (row as any).guard_unplaced_owner === true && !priorHostLaunch;
         const unstarted = !unplacedNoLink && !binding && !row.guard_launch_native && !priorAttemptSpawned &&
-          (['failed', 'exited', 'cancelled', 'expired', 'refused'].includes(row.guard_launch_state) || confirmedStop);
+          // Narrow launch list (intake 1c8d915e): an exited launch whose
+          // native id vanished may still have run a workload, so it is never
+          // "never started" here — exit proof comes from receipts, the
+          // retirement marker (via confirmedStop), or the routed-launch
+          // receipt. The wider fleet worktree-owner list may admit such an
+          // owner on the primary path; this layer stays fail-closed.
+          (['failed', 'refused'].includes(row.guard_launch_state) || confirmedStop);
         // Intake 1c8d915e: a finished headless native is retired from the
         // host catalog, so its census row can stop short of a terminal phase.
         // Fleet's own confirmed exit receipt for the exact native (the bound
