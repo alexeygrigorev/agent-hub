@@ -11,6 +11,8 @@ import { IntakeVerifier } from './intake-verifier';
 import { AskLedger } from './asks';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
 import { RepoRegistry } from './repos';
+// Work claims for renewable worker credentials (intake 6022786b).
+import { handleWorkerClaimRequest } from './worker-claims';
 import { hostReconcileFact, validReconcileNative } from './host-reconcile';
 import { IntakeService } from './intake';
 import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceReviewHuman, deviceResult } from './ui-pages';
@@ -3487,8 +3489,13 @@ export class Hub extends DurableObject {
     // POST & GET /api/bus/claims
     if (path === '/api/bus/claims') {
       if (request.method === 'POST') {
-        const auth = await this.authenticateBusRequest(request);
+        const auth = await this.sessionControlAuth(request);
         if (auth.error) return auth.error;
+        if (auth.scopes?.includes(WORKER_SCOPE)) {
+          const parsed = await this.parseSafeBusBody(request, new Set(['project', 'scope', 'holder', 'ttl_ms', 'lease_epoch']));
+          if (parsed.error) return parsed.error;
+          return handleWorkerClaimRequest(request, this.sql, this.busService, auth.caller!, parsed.data!);
+        }
         if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
           return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
         }
@@ -3534,8 +3541,9 @@ export class Hub extends DurableObject {
       }
 
       if (request.method === 'GET') {
-        const auth = await this.authenticateBusRequest(request);
+        const auth = await this.sessionControlAuth(request);
         if (auth.error) return auth.error;
+        if (auth.scopes?.includes(WORKER_SCOPE)) return handleWorkerClaimRequest(request, this.sql, this.busService, auth.caller!, {});
         if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
           return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
         }
@@ -3684,9 +3692,15 @@ export class Hub extends DurableObject {
     // POST /api/bus/claims/:target/release
     if (path.startsWith('/api/bus/claims/') && path.endsWith('/release')) {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
-      const auth = await this.authenticateBusRequest(request);
+      const auth = await this.sessionControlAuth(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin') && !auth.scopes?.includes(WORKER_SCOPE)) {
+      if (auth.scopes?.includes(WORKER_SCOPE)) {
+        const parsed = await this.parseSafeBusBody(request, new Set(['lease_epoch']), true);
+        if (parsed.error) return parsed.error;
+        return handleWorkerClaimRequest(request, this.sql, this.busService, auth.caller!, parsed.data!,
+          nativeTarget => this.workerAccess.releaseClaim(auth.caller!, nativeTarget));
+      }
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
@@ -3705,7 +3719,6 @@ export class Hub extends DurableObject {
       }
 
       try {
-        if (auth.scopes?.includes(WORKER_SCOPE)) return this.workerAccess.releaseClaim(auth.caller!, target);
         this.busService.releaseClaim(auth.caller!, target, Date.now(), leaseEpoch);
         return Response.json({ status: 'ok' });
       } catch (e: any) {

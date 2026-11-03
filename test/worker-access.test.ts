@@ -76,8 +76,17 @@ describe('scoped durable worker access',()=>{
    const res=await release(id);expect(res.status).toBe(403);expect(await res.json()).toEqual({error:'worker_claim_forbidden'});
   }
   expect((await release('agent-hub:src/'+peer)).status).toBe(403);
-  expect((await call('/api/bus/claims',undefined,worker.access_token)).status).toBe(403);
-  expect((await call('/api/bus/claims',{project:'agent-hub',scope:'x',holder:actor},worker.access_token)).status).toBe(403);
+  const listed=await call('/api/bus/claims',undefined,worker.access_token);
+  expect(listed.status).toBe(200);
+  const visible:any[]=await listed.json() as any[];
+  expect(visible.every(claim=>claim.project==='agent-hub')).toBe(true);
+  expect(visible.some(claim=>claim.id===wrongProject)).toBe(false);
+  const created=await call('/api/bus/claims',{project:'agent-hub',scope:'worker-created',holder:actor},worker.access_token);
+  expect(created.status,await created.clone().text()).toBe(200);
+  const createdId=(await created.json() as any).id;
+  expect((await call('/api/bus/claims',{project:'other-project',scope:'worker-created',holder:actor},worker.access_token)).status).toBe(403);
+  expect((await call('/api/bus/claims',{project:'agent-hub',scope:'foreign-holder',holder:'someone-else'},worker.access_token)).status).toBe(403);
+  expect((await release(createdId)).status).toBe(200);
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    for(const id of [own,bridged,byScope]) expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?',id).toArray()[0].released_at).toBeTruthy();
    for(const id of [peer,old,wrongWorkspace,wrongProject,wrongHost,samePrefix,legacy]) expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?',id).toArray()[0].released_at).toBeNull();
@@ -227,7 +236,10 @@ describe('scoped durable worker access',()=>{
   for(const kind of ['scope_decision','approval_decision','done_note','resolution']) expect((await api('/api/intake/tasks/'+task+'/events',{key:uuid(),expected_version:version,event:{kind,text:'forbidden'}})).status).toBe(403);
   expect((await api('/api/intake/tasks/'+task+'/close',{key:uuid(),expected_version:version})).status).toBe(403);
   expect((await api('/api/fleet/launches',{})).status).toBe(403);
-  expect((await api('/api/bus/claims')).status).toBe(403);
+  // Own-project work claims are allowed (test/worker-claims.test.ts); other bus routes are not.
+  expect((await api('/api/bus/claims')).status).toBe(200);
+  expect((await api('/api/bus/claims?project=dtc-website')).status).toBe(403);
+  expect((await api('/api/bus/activity')).status).toBe(403);
  }, mode));
  it.each(['headless','interactive'])('%s issuance refuses another host, a missing link, and an unbound running launch',(mode)=>setup(async({stub,id,call}:any)=>{
   const issue=()=>call('/api/fleet/launches/'+id+'/worker-credential',{});
