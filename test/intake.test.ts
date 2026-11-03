@@ -184,6 +184,13 @@ describe('private durable intake HTTP/SQLite', () => {
       expect(mixedPage.total).toBe(1083); expect(mixedPage.items.map((t: any) => t.id)).toEqual(page.items.map((t: any) => t.id));
       expect(JSON.stringify(plans)).not.toMatch(/MULTI-INDEX OR|TEMP B-TREE/);
 
+      queries.length = 0;
+      const compact = (service as any).read(new URL('https://hub.test/api/intake/tasks?status=open&limit=25&fields=id,project,title,status,updated_at'), p);
+      expect(compact.total).toBe(542); expect(compact.items).toHaveLength(25);
+      expect(Object.keys(compact.items[0])).toEqual(['id', 'project', 'title', 'status', 'updated_at']);
+      expect(new TextEncoder().encode(JSON.stringify(compact)).length).toBeLessThan(100_000);
+      expect(queries.filter(q => /SELECT data FROM intake_tasks/.test(q))).toHaveLength(0);
+
       for (const principal of [p, mixed]) for (const [query, expectedTotal] of [
         ['all=true', 1083], ['all=true&project=export-fixture', 1083],
         ['status=done', 541], ['archived=true', 541], ['status=done&archived=true', 541], ['', 542],
@@ -218,6 +225,33 @@ describe('private durable intake HTTP/SQLite', () => {
       expect(rollback).toBe('fixture rollback');
       expect((service as any).read(new URL('https://hub.test/api/intake/summary'), p).counts.blocked).toBe(0);
     });
+  });
+
+  it('returns lightweight intake fields and filters the ready refill without payload bodies', async () => {
+    const ready = (await create()).task;
+    await append(ready.id, ready.version, { kind: 'note', text: 'private-history-marker-' + 'x'.repeat(8000) });
+    const uncertain = (await create()).task;
+    await ok('/tasks/' + uncertain.id, { key: 'mark-uncertain-' + ++seq,
+      expected_version: uncertain.version, uncertainty: 'Needs clarification.' });
+
+    const fields = ['id', 'project', 'title', 'status', 'updated_at'];
+    const result = await ok('/tasks?status=open&ready=true&fields=' + fields.join(',') + '&limit=100');
+    expect(result.total).toBe(1);
+    expect(result.fields).toEqual(fields);
+    expect(result.items).toEqual([{ id: ready.id, project: 'demo', title: 'Synthetic task', status: 'open',
+      updated_at: expect.any(Number) }]);
+    expect(Object.keys(result.items[0])).toEqual(fields);
+    expect(result).not.toHaveProperty('operator_rules');
+    expect(JSON.stringify(result)).not.toContain('payload_data');
+    expect(JSON.stringify(result)).not.toContain('private-history-marker');
+    expect(new TextEncoder().encode(JSON.stringify(result)).length).toBeLessThan(100_000);
+
+    const invalidFields = await call('/tasks?fields=history');
+    expect(invalidFields.status).toBe(400);
+    expect(await invalidFields.json()).toMatchObject({ error: 'invalid_fields' });
+    const invalidReady = await call('/tasks?ready=yes');
+    expect(invalidReady.status).toBe(400);
+    expect(await invalidReady.json()).toMatchObject({ error: 'invalid_ready' });
   });
 
   it('keeps summary counts fresh across project/status/archive changes and overlapping grants', async () => {

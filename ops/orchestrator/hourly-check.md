@@ -16,7 +16,7 @@ Run each scheduled ping (or hourly `/loop` stopgap tick). Be brief; use `HUB_CON
 2. Hub: `hub sessions list`, `hub status`/`hub fleet` as available: held, no_eligible_route with rejected[], slots, host release SHA; CI red on main, deploy failed, launcher_command_failed and capture_not_acked. Run the hub-sessions hard gate before any fix.
 3. Stuck sessions: check running/offered/held/failed/stalled sessions and any with no activity >30 min: `hub sessions show <id>`; resume/restart or start a Hub intake with AC plus a fixer session in the same tick; dedupe only against a live session actively working the same root cause.
 4. Codex quota: `hub quota` (and `quse`). At shared-codex 0%: apply the earliest banked reset.
-5. Drain: `hub intake list --status open`: DONE notes for verified intakes; restart forgotten ones; start queued ones with AC subject to live resource and quota gates.
+5. Drain open tasks with `hub intake list --status open --fields id,project,title,status,updated_at`; fetch `hub intake show <id>` only for the selected task. For ready-task refill, use `hub intake list --status open --ready --fields id,project,title,status,updated_at`. Append DONE notes for verified intakes; restart forgotten ones; start queued ones with AC subject to live resource and quota gates.
 6. `~/tmp/pending-research-followups.md`: close OPEN rows whose reports landed.
 7. Alerts: anything in the inbox that is an alert: triage via alert-triage skill; real outage => `oncall-send` with a precise summary.
 8. Write `latest.md` (include UTC timestamp, session/intake ids), `NEEDS_ALEXEY.md` (empty if nothing), copy to `history/`.

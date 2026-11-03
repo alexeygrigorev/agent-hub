@@ -245,7 +245,9 @@ def add_commands(sub):
     create.add_argument('--key', required=True)
     listing = commands.add_parser('list', help='List one page, or all matching tasks with --all')
     listing.add_argument('--status', default=None)
+    listing.add_argument('--ready', action='store_true', help='Only include intakes whose continuation state is ready')
     listing.add_argument('--project')
+    listing.add_argument('--fields', help='Return only comma-separated lightweight list fields (history and payload bodies are omitted)')
     listing.add_argument('--after')
     listing.add_argument('--revision', type=int)
     listing.add_argument('--authorization-valid-until', type=int)
@@ -488,6 +490,10 @@ def execute(args):
         params = {'limit': args.limit if args.limit is not None else (100 if args.all else 25)}
         if args.status is not None:
             params['status'] = args.status
+        if args.ready:
+            params['ready'] = 'true'
+        if args.fields is not None:
+            params['fields'] = args.fields
         if args.archived:
             params['archived'] = 'true'
         elif args.all:

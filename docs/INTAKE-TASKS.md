@@ -59,6 +59,7 @@ dependency, global binary or local STATE file is needed.
 ```sh
 hub intake create --project example --title 'Review request' --text-file request.txt --key capture-001 --acceptance-criteria 'Review posted; two findings max'
 hub intake list --status open --project example --limit 100
+hub intake list --status open --ready --fields id,project,title,status,updated_at
 hub intake list --status open --all
 hub intake show TASK_ID
 hub intake history TASK_ID
@@ -79,6 +80,15 @@ string also works in REST/MCP). The default is 25; values above the maximum of
 100 clamp to 100. Responses include `effective_limit`. Non-integers return HTTP
 400 `invalid_limit`; zero and negative integers return `limit_out_of_range`, with
 `field: "limit"`, `min: 1` and `max: 100` in either error response.
+
+Use `--fields` for refill and discovery loops that need list metadata. The
+matching API query is `fields=id,project,title,status,updated_at`; it returns
+only the requested allowlisted fields per item and omits histories, payloads
+and operator rule bodies. `--ready` adds `ready=true` to the API and keeps only
+tasks whose continuation state is ready. Fetch `hub intake show <id>` only
+after selecting a task that needs its full context. Supported fields are `id`,
+`project`, `title`, `status`, `version`, `created_at`, `updated_at`,
+`last_event_kind`, `last_event_at` and `last_session_id`.
 
 `hub intake list --all` follows `next` internally, preserving filters and pinning
 `snapshot_version` as `revision` and the authorization expiry from the first page.
