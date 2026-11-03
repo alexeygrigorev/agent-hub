@@ -215,12 +215,18 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
     expect(s.plan(input).selected).toBeNull();
   }));
-  it('rejects high effort overrides for heavy model routes', async () => fixture(async s => {
+  it('never places a heavy model at high or max effort, including explicit per-session requests', async () => fixture(async s => {
     await configure(s);
     const reason = 'Deep reasoning is required for this explicit model request.';
-    for (const [engine, tier] of [['sol', 'daily'], ['astra', 'deep'], ['argon', 'deep'], ['argon-gemini', 'deep'], ['opus', 'deep']] as const) {
-      const plan = s.plan(intent({ engine, tier, effort: 'high', engine_override_reason: reason, access: { mode: 'read' } }));
-      expect(plan.selected, `${engine}: ${JSON.stringify(plan)}`).toBeNull();
+    const cases = [
+      ['sol', 'daily'], ['astra', 'deep'], ['argon', 'deep'], ['argon-gemini', 'deep'], ['opus', 'deep'],
+    ] as const;
+    for (const [engine, tier] of cases) {
+      for (const effort of ['high', 'max'] as const) {
+        const plan = s.plan(intent({ engine, tier, effort, engine_override_reason: reason, access: { mode: 'read' } }));
+        expect(plan.error, `${engine}/${effort}`).toBeUndefined();
+        expect(plan.selected, `${engine}/${effort}`).toBeNull();
+      }
     }
   }));
   it('persists quick-tier Luna and exposes the resolved model in session views', async () => fixture(async (s, sql) => {
@@ -264,6 +270,11 @@ describe('generic accounts and launch placement', () => {
       }
       expect(s.plan(intent({ engine: modelId, engine_override_reason: reason })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' } });
       expect(s.plan(intent({ tier: 'deep', engine, engine_override_reason: reason })).selected?.selection).toMatchObject({ id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' });
+      for (const effort of ['high', 'max'] as const) {
+        const blocked = s.plan(intent({ machine: 'hetzner', engine: modelId, effort, engine_override_reason: reason }));
+        expect(blocked.selected, `${engine}/${effort}`).toBeNull();
+        expect((blocked.rejected ?? []).some(item => item.reason === 'model_unsupported'), `${engine}/${effort}`).toBe(true);
+      }
     }
     const depletedQuota = { status: 'unknown', observed_at: iso(), details: { limit_reached: false },
       windows: { weekly: { present: true, percent_remaining: 0, reset_at: iso(86400000) } } };
