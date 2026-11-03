@@ -37,8 +37,11 @@ REFUSALS = {
     'Native Codex receipt mismatch': ('launcher_receipt_mismatch', 'The native Codex receipt did not match the launch.'),
     'Native receipt mismatch': ('launcher_receipt_mismatch', 'The native launch receipt did not match the requested session.'),
     'Native cwd mismatch': ('launcher_cwd_mismatch', 'The native session working directory did not match the requested cwd.'),
-    'Native lifecycle receipt is incomplete': ('launcher_receipt_incomplete', 'The native lifecycle receipt is incomplete.'),
-    'No confirmed native execution receipt': ('launcher_receipt_incomplete', 'The launcher exited without a confirmed native execution receipt.'),
+    'Native profile receipt mismatch': ('native_profile_mismatch', 'The native profile receipt did not match the configured route.'),
+    'Native account receipt mismatch': ('native_account_mismatch', 'The native account receipt did not match the configured route.'),
+    'Native lifecycle receipt is incomplete': ('native_lifecycle_incomplete', 'The native lifecycle receipt is incomplete.'),
+    'No confirmed native execution receipt': ('native_execution_unconfirmed', 'The launcher exited without a confirmed native execution receipt.'),
+    'Selected model/effort requires verified admission': ('model_unverified', 'The selected model and effort do not match fresh verified admission.'),
     'Managed profile removed': ('launcher_unknown_profile', 'The managed engine profile is not installed on this host.'),
     'Managed engine binary missing': ('launcher_binary_missing', 'The managed engine binary is missing on this host.'),
     'Packaged native engine binary missing': ('launcher_binary_missing', 'The packaged native engine binary is missing on this host.'),
@@ -698,11 +701,13 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
 
 
 class LocalCommandError(RuntimeError):
-    def __init__(self, raw='', *, exit_code=None, command=None, stdout=None, stderr='', reconcile_effects=False, engine=None, cwd=None, task_id=None, launched_at=None, start_offsets=None):
+    def __init__(self, raw='', *, exit_code=None, command=None, stdout=None, stderr='', reconcile_effects=False, engine=None, cwd=None, task_id=None, launched_at=None, start_offsets=None, failure_kind=None):
         from .command_diagnostics import command_details
         self.diagnostic = diagnostic(raw, exit_code=exit_code, engine=engine, cwd=cwd, task_id=task_id, launched_at=launched_at, start_offsets=start_offsets)
         # Raw exceptions are classification input, not captured command output.
         self.command_diagnostic = command_details(command, stdout, stderr)
+        if failure_kind in {'stdin_write_failed', 'reader_timeout', 'output_overflow'}:
+            self.command_diagnostic['failure_kind'] = failure_kind
         self.diagnostic.update(self.command_diagnostic)
         if (self.diagnostic.get('reason') == 'launcher_command_failed'
                 and isinstance(raw, (str, bytes)) and not raw.strip()

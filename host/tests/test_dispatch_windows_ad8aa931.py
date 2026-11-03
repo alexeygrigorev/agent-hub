@@ -1,10 +1,11 @@
-"""Pre-start refusals on DESKTOP-FP4OP26 are named and a clean gate exit is not a failure (intake ad8aa931).
+"""Windows Claude headless diagnostics and clean local-command exits (intake ad8aa931).
 
 Claude headless launches there failed as a bare dispatch_internal_error
 (35cf62ff, 8151fb8f) and as LocalCommandError on an exit-0 admission gate
 whose complete JSON was captured (abe6bf8d).
 """
 import json
+import io
 import sys
 import unittest
 from unittest.mock import patch
@@ -13,8 +14,7 @@ from agent_hub_host import fleet
 from agent_hub_host.dispatch_diagnostics import classify
 from agent_hub_host.launch_diagnostics import LocalCommandError
 
-# Prints the gate JSON and exits 0 while a child keeps the inherited stdout
-# open, the way a starved reader thread outlives the 1 s join.
+# Prints gate JSON and exits 0 while a child briefly retains inherited stdout.
 LINGER = ("import json, subprocess, sys\n"
           "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(%s)'])\n"
           "print(json.dumps({'launch_allowed': True}))\n")
@@ -45,18 +45,103 @@ class TestNamedPreStartRefusals(unittest.TestCase):
             self.assertEqual(diag['reason'], slug, message)
             self.assertNotIn('Username', json.dumps(diag))
 
+    def test_claude_headless_value_errors_have_named_reasons(self):
+        cases = {
+            'Native profile receipt mismatch': 'native_profile_mismatch',
+            'Native account receipt mismatch': 'native_account_mismatch',
+            'Native lifecycle receipt is incomplete': 'native_lifecycle_incomplete',
+            'No confirmed native execution receipt': 'native_execution_unconfirmed',
+            'Maintained launcher route is not configured': 'dispatch_route_unconfigured',
+            'Selected model/effort requires verified admission': 'model_unverified',
+            'Native receipt mismatch': 'native_receipt_mismatch',
+            'Native cwd mismatch': 'native_cwd_mismatch',
+            'Noncanonical native UUID': 'native_session_identity_invalid',
+            'Worker Hub credential could not be prepared': 'dispatch_credential_unavailable',
+            'Result path escapes workspace root': 'dispatch_result_path_invalid',
+            'Refuse symlinked ancestor directory: /private/worktree': 'dispatch_result_path_invalid',
+            'Invalid final report': 'dispatch_result_invalid',
+        }
+        for message, slug in cases.items():
+            with self.subTest(message=message):
+                diagnostic = classify(ValueError(message))
+                self.assertEqual(diagnostic['reason'], slug)
+                self.assertTrue(diagnostic['message'])
+
     def test_unknown_messages_stay_internal(self):
-        self.assertEqual(self.reason('Native lifecycle receipt is incomplete'), 'dispatch_internal_error')
+        self.assertEqual(self.reason('Unmapped Claude native check failed'), 'dispatch_internal_error')
         self.assertEqual(self.reason('repo clone failedX'), 'dispatch_internal_error')
+
+    def test_claude_headless_unknown_value_error_uses_fixed_fallback(self):
+        diagnostic = classify(
+            ValueError('Unmapped Claude native check failed'),
+            value_error_fallback='dispatch_value_error')
+        self.assertEqual(diagnostic['reason'], 'dispatch_value_error')
+        self.assertEqual(diagnostic['message'], 'A Claude headless dispatch validation check refused before native start.')
+        self.assertEqual(
+            classify(ValueError('Unmapped Claude native check failed'),
+                     value_error_fallback='arbitrary_detail')['reason'],
+            'dispatch_internal_error')
 
 
 class TestCleanExitReaderGrace(unittest.TestCase):
-    def test_clean_exit_with_slow_reader_returns_the_json(self):
-        self.assertEqual(fleet.run_json([sys.executable, '-c', LINGER % 2]), {'launch_allowed': True})
+    def test_clean_exit_returns_json(self):
+        self.assertEqual(fleet.run_json([sys.executable, '-c', "print('{\"launch_allowed\": true}')"]), {'launch_allowed': True})
 
-    def test_reader_held_past_the_grace_is_still_a_failure(self):
-        with patch.object(fleet, 'READER_GRACE_S', 0.5), self.assertRaises(LocalCommandError):
-            fleet.run_json([sys.executable, '-c', LINGER % 4])
+    def test_parseable_exit_zero_receipt_survives_an_inherited_pipe_handle(self):
+        with patch.object(fleet, 'READER_GRACE_S', 0.05):
+            self.assertEqual(fleet.run_json([sys.executable, '-c', LINGER % 0.2]), {'launch_allowed': True})
+
+    def test_incomplete_output_with_lingering_reader_is_named_reader_timeout(self):
+        code = ("import subprocess, sys\n"
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.2)'])\n"
+                "sys.stdout.write('{\\\"launch_allowed\\\":')\n"
+                "sys.stdout.flush()\n")
+        with patch.object(fleet, 'READER_GRACE_S', 0.02), self.assertRaises(LocalCommandError) as ctx:
+            fleet.run_json([sys.executable, '-c', code])
+        self.assertEqual(ctx.exception.command_diagnostic['failure_kind'], 'reader_timeout')
+        self.assertEqual(classify(ctx.exception)['failure_kind'], 'reader_timeout')
+
+    def test_output_limit_is_named_output_overflow(self):
+        with self.assertRaises(LocalCommandError) as ctx:
+            fleet.run_json([sys.executable, '-c', "import sys; sys.stdout.write('x' * 140000)"])
+        self.assertEqual(ctx.exception.command_diagnostic['failure_kind'], 'output_overflow')
+        self.assertEqual(classify(ctx.exception)['failure_kind'], 'output_overflow')
+
+    def test_stdin_exit_race_is_named_but_parseable_success_is_accepted(self):
+        class BrokenStdin:
+            def __init__(self):
+                self.closed = False
+            def write(self, _data):
+                raise BrokenPipeError('child exited before stdin write')
+            def close(self):
+                self.closed = True
+
+        class CompletedProcess:
+            def __init__(self, stdout):
+                self.stdin = BrokenStdin()
+                self.stdout = io.BytesIO(stdout)
+                self.stderr = io.BytesIO(b'')
+                self.returncode = 0
+            def poll(self):
+                return self.returncode
+            def wait(self, timeout=None):
+                return self.returncode
+            def kill(self):
+                self.returncode = -9
+
+        command = [sys.executable, '-c', 'pass']
+        completed = CompletedProcess(b'{"launch_allowed": true}')
+        with patch.object(fleet.subprocess, 'Popen', return_value=completed):
+            self.assertEqual(fleet.run_json(command, payload={'goal': 'test'}), {'launch_allowed': True})
+        self.assertTrue(completed.stdin.closed)
+
+        completed = CompletedProcess(b'not json')
+        with patch.object(fleet.subprocess, 'Popen', return_value=completed):
+            with self.assertRaises(LocalCommandError) as ctx:
+                fleet.run_json(command, payload={'goal': 'test'})
+        self.assertTrue(completed.stdin.closed)
+        self.assertEqual(ctx.exception.command_diagnostic['failure_kind'], 'stdin_write_failed')
+        self.assertEqual(classify(ctx.exception)['failure_kind'], 'stdin_write_failed')
 
     def test_nonzero_exit_gets_no_grace(self):
         with self.assertRaises(LocalCommandError) as ctx:

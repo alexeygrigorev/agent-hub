@@ -23,9 +23,21 @@ MESSAGES = {
     'dispatch_capability_unavailable': 'The required task capabilities are unavailable on this host.',
     'dispatch_local_command_failed': 'A local dispatch prerequisite command failed before native start.',
     'dispatch_internal_error': 'An unexpected host dispatch error occurred before native start.',
+    'dispatch_value_error': 'A Claude headless dispatch validation check refused before native start.',
+    'dispatch_result_path_invalid': 'The headless result path could not be safely contained in the workspace.',
+    'dispatch_result_invalid': 'The headless result did not match the expected report format.',
+    'dispatch_credential_unavailable': 'The host could not prepare the session credential before native start.',
     'dispatch_claim_refused': 'The Hub refused the dispatch claim before native start.',
     'claim_timeout': 'The launch claim timed out before a confirmed response; the launch is held for an idempotent same-host retry.',
     'model_unsupported': 'The selected model or effort is unsupported by this local route.',
+    'model_unverified': 'The selected model or effort does not match fresh verified admission.',
+    'native_profile_mismatch': 'The native execution receipt did not match the configured profile.',
+    'native_account_mismatch': 'The native execution receipt did not match the configured account.',
+    'native_lifecycle_incomplete': 'The native lifecycle receipt did not prove a running or completed session.',
+    'native_execution_unconfirmed': 'The launcher returned without a confirmed native execution receipt.',
+    'native_receipt_mismatch': 'The native execution receipt did not match the requested session.',
+    'native_cwd_mismatch': 'The native session working directory did not match the requested working directory.',
+    'native_session_identity_invalid': 'The native session identity was missing or malformed.',
     'admission_unconfigured': 'This local route has no maintained fresh admission adapter.',
     'admission_refused': 'Fresh admission refused this account or could not verify its timestamp and model.',
     'admission_quota_unverified': 'The maintained launcher could not read a trusted quota observation for this managed account (probe unavailable or rate-limited).',
@@ -54,7 +66,6 @@ EXACT = {
     'Offer cwd escapes the workspace root': 'dispatch_cwd_invalid',
     'Fresh admission refused': 'admission_refused',
     'Fresh admission timestamp required': 'admission_refused',
-    'Selected model/effort requires verified admission': 'admission_refused',
     # Intake ad8aa931: fixed pre-start refusals that read as a bare
     # dispatch_internal_error on DESKTOP-FP4OP26 (35cf62ff, 8151fb8f).
     'Selected model/effort is not configured locally': 'model_unsupported',
@@ -63,11 +74,38 @@ EXACT = {
     'Headless provider profile is not qualified': 'dispatch_route_unconfigured',
     'Unsupported launch mode': 'dispatch_offer_invalid',
     'workspace path exists and is not a git checkout': 'workspace_unavailable',
+    'Selected model/effort requires verified admission': 'model_unverified',
+    'Native profile receipt mismatch': 'native_profile_mismatch',
+    'Native account receipt mismatch': 'native_account_mismatch',
+    'Native lifecycle receipt is incomplete': 'native_lifecycle_incomplete',
+    'No confirmed native execution receipt': 'native_execution_unconfirmed',
+    'Native receipt mismatch': 'native_receipt_mismatch',
+    'Native cwd mismatch': 'native_cwd_mismatch',
+    'Native Codex receipt mismatch': 'native_receipt_mismatch',
+    'Native ZCodex receipt mismatch': 'native_receipt_mismatch',
+    'Native Gemini receipt mismatch': 'native_receipt_mismatch',
+    'Native Codex UUID required': 'native_session_identity_invalid',
+    'Native ZCodex UUID required': 'native_session_identity_invalid',
+    'Native Gemini UUID required': 'native_session_identity_invalid',
+    'Noncanonical native UUID': 'native_session_identity_invalid',
+    'Worker Hub credential could not be prepared': 'dispatch_credential_unavailable',
+    'Result path escapes workspace root': 'dispatch_result_path_invalid',
+    'Refuse linked ancestor directory': 'dispatch_result_path_invalid',
+    'Refuse linked result file': 'dispatch_result_path_invalid',
+    'Result path escapes workspace': 'dispatch_result_path_invalid',
+    'Invalid final report': 'dispatch_result_invalid',
 }
 # Refusals whose text carries a variable tail (provider name, git stderr);
 # only the fixed slug leaves the host, never the tail.
 PREFIXES = (
     ('Launcher provider ', 'dispatch_route_unconfigured'),
+    ('Native profile receipt mismatch', 'native_profile_mismatch'),
+    ('Native account receipt mismatch', 'native_account_mismatch'),
+    ('Native receipt mismatch', 'native_receipt_mismatch'),
+    ('Native cwd mismatch', 'native_cwd_mismatch'),
+    ('Refuse symlinked ancestor directory:', 'dispatch_result_path_invalid'),
+    ('Ancestor directory is not a regular directory:', 'dispatch_result_path_invalid'),
+    ('Refuse symlinked result leaf:', 'dispatch_result_path_invalid'),
     ('repo clone failed: ', 'workspace_unavailable'),
     ('git fetch failed: ', 'workspace_unavailable'),
     ('git checkout failed: ', 'workspace_unavailable'),
@@ -97,7 +135,7 @@ class AdmissionRefusedError(ValueError):
                        and type(v) in (int, float) and math.isfinite(v) and abs(v) <= 86400}
 
 
-def classify(exc, *, workspace_available=True):
+def classify(exc, *, workspace_available=True, value_error_fallback=None):
     if isinstance(exc, ClaimRefusedError):
         return dict(exc.diagnostic)
     reason = 'dispatch_internal_error'
@@ -112,7 +150,7 @@ def classify(exc, *, workspace_available=True):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'model_unsupported', 'model_unverified', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
             if reason == 'dispatch_internal_error':
                 reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
             if reason == 'dispatch_internal_error':
@@ -122,6 +160,8 @@ def classify(exc, *, workspace_available=True):
                     reason = 'dispatch_worktree_refused'
         if value.startswith('HTTP request failed with status '):
             reason = 'dispatch_claim_refused'
+        if reason == 'dispatch_internal_error' and value_error_fallback in MESSAGES:
+            reason = value_error_fallback
     elif isinstance(exc, (RuntimeError, OSError)):
         reason = 'dispatch_local_command_failed'
     if not workspace_available:
@@ -131,7 +171,10 @@ def classify(exc, *, workspace_available=True):
     if reason == 'dispatch_worktree_refused' and lock_owner:
         value.update(lock_owner=lock_owner[0], lock_owner_state=lock_owner[1],
                      recovery='hub sessions stop ' + lock_owner[0])
-    if isinstance(exc, AdmissionRefusedError) and reason == 'admission_refused':
+    if isinstance(exc, AdmissionRefusedError):
+        if exc.gate_reason == 'model_unverified':
+            value['reason'] = 'model_unverified'
+            value['message'] = MESSAGES['model_unverified']
         value['gate_reason'] = exc.gate_reason
         value.update(exc.timing)
     from .launch_diagnostics import LocalCommandError

@@ -48,6 +48,32 @@ class FleetTests(unittest.TestCase):
             request.assert_not_called()
             self.assertEqual(dispatcher._route(dict(req, mode='interactive'))['engine'], 'claude')
 
+    def test_claude_headless_effort_mismatch_is_model_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = settings(Path(tmp))
+            cfg['subscriptions'] = [{
+                'service': 'claude', 'engine': 'claude', 'account_label': 'managed-claude',
+                'profile': 'hub-managed-claude', 'launcher_provider': 'claude',
+                'launcher_model': 'sonnet', 'launcher_effort': 'high',
+                'admission_argv': ['maintained-gate'],
+            }]
+            def runner(argv, **_kwargs):
+                self.assertEqual(argv, ['maintained-gate'])
+                return {
+                    'launch_allowed': True, 'profile_supported': True,
+                    'account_label': 'managed-claude', 'model_supported': True,
+                    'model': 'sonnet', 'effort': 'medium', 'observed_at': fleet.utcnow(),
+                }
+            dispatcher = fleet.Dispatcher(cfg, lambda *_args: {}, runner)
+            with self.assertRaises(ValueError) as raised:
+                dispatcher._dispatch_admission(
+                    cfg['subscriptions'][0], {'engine': 'claude', 'account': 'managed-claude'},
+                    {'model': 'sonnet', 'effort': 'high'}, {'task_id': 'task-123'},
+                )
+            diagnostic = dispatch_diagnostics.classify(raised.exception)
+            self.assertEqual(diagnostic['reason'], 'model_unverified')
+            self.assertEqual(diagnostic['gate_reason'], 'model_unverified')
+
     def test_registration_advertises_native_claude_headless_refusal_only(self):
         cfg = settings(Path('/repo'))
         cfg['subscriptions'] += [
