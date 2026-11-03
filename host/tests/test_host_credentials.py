@@ -210,7 +210,9 @@ class HostCredentialsTest(unittest.TestCase):
             return {'status': 'recorded', 'resync': not runner.logged_in}
         # First poll: host already holds generation 1 (state), but gh was logged out outside Hub.
         hc._save_state({'generations': {'gh_token': 1}})
-        result = hc.sync(request, runner)
+        # A fresh process can start with monotonic uptime below the poll and
+        # status intervals; its first poll/report must still run.
+        result = hc.sync(request, runner, clock=lambda: 1.0)
         self.assertTrue(runner.logged_in)
         self.assertEqual(len([p for p in seen if 'sync' in p]), 2)
         self.assertEqual(result['status'], 'synced')

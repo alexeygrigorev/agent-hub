@@ -282,7 +282,7 @@ def sync(request=None, runner=subprocess.run, clock=time.monotonic, force=False,
     from . import provisioning
     request = request or provisioning.host_request
     now = clock()
-    if not force and now - _last['poll'] < POLL_S:
+    if not force and _last['poll'] > 0 and now - _last['poll'] < POLL_S:
         return {'status': 'skipped'}
     _last['poll'] = now
     state = _load_state()
@@ -329,7 +329,7 @@ def sync(request=None, runner=subprocess.run, clock=time.monotonic, force=False,
 
 def report_status(request, generations, *, identity_applied=False, runner=subprocess.run, clock=time.monotonic, force=False):
     now = clock()
-    if not force and now - _last['status'] < STATUS_REFRESH_S:
+    if not force and _last['status'] > 0 and now - _last['status'] < STATUS_REFRESH_S:
         return None
     body = {'gh': gh_status(runner), 'ssh': ssh_status(runner=runner), 'identity_applied': bool(identity_applied), 'generations': generations}
     if not any(k in generations for k in ('git_ssh_key',)):
