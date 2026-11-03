@@ -1,4 +1,5 @@
 import os
+import json
 import stat
 import subprocess
 import sys
@@ -55,12 +56,12 @@ class HostReleaseModesTest(unittest.TestCase):
             root = Path(temp) / "host-releases"
             release = root / ("a" * 40)
             release.mkdir(parents=True)
-            (release / "release-manifest.json").write_text("{}")
+            (release / "release-manifest.json").write_text(json.dumps({"release_rev": "a" * 40}))
             self.assertEqual(modes.validate_installed_release(release, root), release.resolve())
 
             outside = Path(temp) / "unrelated"
             outside.mkdir()
-            (outside / "release-manifest.json").write_text("{}")
+            (outside / "release-manifest.json").write_text(json.dumps({"release_rev": "b" * 40}))
             with self.assertRaisesRegex(ValueError, "direct child"):
                 modes.validate_installed_release(outside, root)
             alias = root / "alias"
