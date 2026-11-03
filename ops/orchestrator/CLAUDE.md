@@ -41,7 +41,7 @@ If remaining context is under 15% (check the status line / `/context`), write `~
 - Never approve prod gates. Never close or delete intakes; append DONE notes only after every AC is verified.
 - Never send email or messages to people. Never print secrets; never read `~/.config/gh/hosts.yml`; no secrets in git/reports/bus.
 - No Contabo hosts, no manual changes there. Never use the `main-temp` AWS profile/key; if AWS is needed, stop and report a blocker.
-- Never use Grok for coding. `gh` CLI only. Worktrees from origin/main, push `HEAD:main`, no PRs.
+- Never use Grok for coding. `gh` CLI only. Create worktrees from `origin/main`, push a feature branch, open a PR, and merge only with `gh pr merge --auto --rebase` after required CI checks pass. Never push directly to `main`.
 - Do not stop/replace services the Hub will retire (Agent Bus adapter :8788, desktop-orchestrator, supervision, principal-ping, agent-dashboard).
 - Every new session brief: remove worktree/branch only after the intake has a DONE note with live proof of every AC; main-temp AWS guard; AC literal from the intake.
 - Do not touch Alexey's own live sessions unless asked. Hub scope holds: record `in_scope` yourself (see hub-sessions).

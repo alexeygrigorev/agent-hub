@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Shared control for the two interactive Claude ops sessions.
 #   session-ctl.sh <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync>
-# Watchdog (check) restarts a dead or tick-stalled session and proves every restart by a fresh
-# tick (intake 500fd60b); the in-session /loop is the scheduler.
+# Watchdog (check) only restarts a dead session. The in-session /loop is the scheduler.
 # Needs: a (aplexer), git, gh, python3. Never prints secrets.
 set -uo pipefail
 
@@ -20,11 +19,7 @@ SKILLS_DIR="${SKILLS_DIR:-$SKILLS_REPO/.agents/skills}"   # skills live under .a
 ENGINE=sonnet
 LOOP_DEFAULT=1h
 LOOP_INTERVAL="${LOOP_INTERVAL:-$LOOP_DEFAULT}"
-TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
 BRIEF="$HOME/tmp/briefs/orchestrator-main.md"
-MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
-PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produce a fresh tick within 10 min
-FALLBACK_ENGINE=sonnet                                     # fixed cost configuration for recovery sessions
 STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "$STATE"
 log() { echo "[$(date -u +%FT%TZ)] $ROLE: $*"; }
 # fd 9 holds the per-role lock (role_lock). No child may inherit it: a detached aplexer worker,
@@ -33,68 +28,12 @@ t() { timeout "${T:-60}" "$@" 9>&-; }
 a() { command a "$@" 9>&-; }
 git() { command git "$@" 9>&-; }
 gh() { command gh "$@" 9>&-; }
-tick_mtime() { stat -c %Y "$TICKS" 2>/dev/null || echo 0; }
-# Proof needs the tick history, not the newest mtime: is any tick line's "ts" in (start, due]?
-tick_in_window() {  # $1 = start epoch, $2 = due epoch; prints the first in-window tick epoch
-  [ -r "$TICKS" ] || return 1
-  tail -n 2000 "$TICKS" | python3 -c '
-import json,sys,datetime
-lo,hi=int(sys.argv[1]),int(sys.argv[2])
-for line in sys.stdin:
-    try:
-        ts=json.loads(line)["ts"]
-        t=datetime.datetime.fromisoformat(ts.replace("Z","+00:00")).timestamp()
-    except Exception:
-        continue
-    if lo < t <= hi:
-        print(int(t)); sys.exit(0)
-sys.exit(1)' "$1" "$2"
-}
-failures() { local n=0; read -r n < "$STATE/restart_failures" 2>/dev/null || n=0; [[ "$n" =~ ^[0-9]+$ ]] || n=0; echo "$n"; }
-
-# Hub-side liveness (src/ops-liveness.ts) watches these reports independently of this
-# script and of the session; a failed report never changes the local decision.
-hub_report() {  # $1 = state
-  [ "$ROLE" = orchestrator ] || return 0
-  [ "${OPS_HUB_REPORT:-1}" = 1 ] || return 0
-  local tk; tk=$(tick_mtime)
-  local args=(ops heartbeat --role "$ROLE" --kind watchdog --state "$1" --recovery-failures "$(failures)")
-  [ "$tk" -gt 0 ] && args+=(--tick-at "$(date -u -d "@$tk" +%FT%TZ)")
-  T=30 t hub "${args[@]}" >/dev/null 2>&1 || log "hub ops report failed (state=$1)"
-}
-
-# Exact-time checks: the 10-min timer alone would bound detection at ~41 min. Each transient
-# timer runs this role's check directly, not watchdog.sh, so it never waits behind the other
-# role or the shared service lock. The per-role lock (role_lock) is held only by one
-# orchestrator check at a time, so a deadline waits at most for an in-flight check of the
-# same session (seconds; a minute or more only while a restart is already recovering it).
-SELF="$(readlink -f "$0")"
 LOCK_DIR="${OPS_LOCK_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"
 role_lock() {
   exec 9>"$LOCK_DIR/ops-ctl-$ROLE.lock" || return 1
   flock -w "${ROLE_LOCK_WAIT:-300}" 9 || { log "role lock busy for ${ROLE_LOCK_WAIT:-300}s; next timer retries"; return 1; }
 }
-arm_timer() {  # $1 = kind (deadline|proof), $2 = seconds from now
-  [ "${OPS_TIMERS:-1}" = 1 ] || return 0
-  local unit="ops-$1-$ROLE" delay="$2"; [ "$delay" -lt 1 ] && delay=1
-  systemctl --user stop "$unit-*.timer" >/dev/null 2>&1 || true
-  systemd-run --user --collect -q --on-active="$delay" --timer-property=AccuracySec=1s --unit "$unit-$(date +%s%N)" \
-    --setenv=PATH="$PATH" --setenv=HUB_CONFIG_FILE="${HUB_CONFIG_FILE:-}" --setenv=APLEXER_LAUNCH_SYSTEM_SCOPE=system \
-    /usr/bin/timeout 900 "$SELF" "$ROLE" check \
-    >/dev/null 2>&1 9>&- || log "$1 timer not armed; the 10-min timer will check"
-}
 
-# After a restart the new session must append a tick within PROOF_WINDOW of the recorded
-# start (last_start is written before launch and prompt readiness, so the wait counts).
-arm_proof() {  # $1 = recovery path (1 = restart, 2 = new session on the fallback engine)
-  [ "$ROLE" = orchestrator ] || return 0
-  local started due; started=$(cat "$STATE/last_start" 2>/dev/null || date +%s); due=$((started + PROOF_WINDOW))
-  echo "$due $1" > "$STATE/proof_due"
-  arm_timer proof "$((due - $(date +%s) + 1))"
-  log "recovery path $1 started; proof due: fresh tick within ${PROOF_WINDOW}s"
-}
-
-# List failures are errors, never evidence that no session exists.
 matching_sessions() {
   t a list --json | python3 -c '
 import json,sys
@@ -166,10 +105,61 @@ prep_worktree() {
 
 screen() { a capture "$1" --screen --plain 2>/dev/null; }
 
+quota_gate() {
+  T=45 t hub quota --provider claude --json 2>/dev/null | python3 -c '
+import json,sys
+try:
+    data=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not data.get("coverage",{}).get("fresh"):
+    sys.exit(1)
+for pool in data.get("pools",[]):
+    if not isinstance(pool,dict) or pool.get("provider") != "claude":
+        continue
+    remaining=pool.get("remaining_percent")
+    if (pool.get("depleted") is False and isinstance(remaining,(int,float))
+            and not isinstance(remaining,bool) and remaining > 0
+            and pool.get("state") not in {"unknown","stale","unavailable","exhausted"}):
+        sys.exit(0)
+sys.exit(1)'
+}
+
+launch_gate() {
+  quota_gate || { log "Claude quota gate unavailable or exhausted; refusing to start Sonnet (no credits)"; return 1; }
+  local hostload
+  hostload=$(bash "$SKILLS_DIR/hub-sessions/hostload.sh" 2>/dev/null) || { log "host capacity check unavailable; refusing launch"; return 1; }
+  [[ "$hostload" == *"verdict=free"* ]] || { log "host CPU capacity gate refused launch"; return 1; }
+  awk '$1 == "MemAvailable:" { found=1; if ($2 < 10485760) exit 1 } END { if (!found) exit 1 }' /proc/meminfo || {
+    log "MemAvailable is below 10 GiB or unavailable; refusing launch"; return 1;
+  }
+  python3 - "$BASE_REPO/config/resource-management.json" "$RUNDIR" <<'PY' || {
+import json,os,sys
+from pathlib import Path
+try:
+    config=json.load(open(sys.argv[1],encoding="utf-8"))
+    floor=config.get("disk_floor_gb")
+    if isinstance(floor,bool) or not isinstance(floor,int) or floor < 1:
+        raise ValueError("invalid disk floor")
+    probe=Path(sys.argv[2])
+    while not probe.exists() and probe != probe.parent:
+        probe=probe.parent
+    stat=os.statvfs(probe)
+    available=stat.f_bavail * stat.f_frsize
+    if available < floor * 1024**3:
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+    log "configured disk floor is missing, invalid, or not met; refusing launch"; return 1;
+  }
+}
+
 start() {
   local current
   current=$(find_session) || { log "session census failed"; return 1; }
-  [ -n "$current" ] && { log "already running: $current"; return 0; }
+  if [ -n "$current" ] && [ "${RESTART_FORCE:-0}" != 1 ]; then log "already running: $current"; return 0; fi
+  launch_gate || return 1
   # Clear stale names before launch; never leave orphan workloads behind.
   stop_old || return 1
   prep_worktree || return 1
@@ -220,102 +210,31 @@ make_handoff() {  # $1 = reason; keeps a hand-written handoff.md if it is newer 
   } > "$h"
 }
 
-restart() {  # $1 = reason
-  local now last; now=$(date +%s); last=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
-  if [ $((now-last)) -lt "$MIN_RESTART_GAP" ] && [ "${FORCE:-0}" != 1 ]; then log "restart suppressed: last start $((now-last))s ago"; return 1; fi
-  make_handoff "${1:-manual}"; stop_old || return 1; start
-}
-
-restart_failed() {  # $1 = Hub report state
-  local n; n=$(( $(failures) + 1 )); echo "$n" > "$STATE/restart_failures"
-  log "recovery FAILED ($n consecutive)"
-  if [ "$n" -ge 2 ]; then
-    local alert="ops-watchdog: $TAG automatic recovery failed $n consecutive times; inspect $STATE and journalctl --user -u ops-watchdog.service"
-    # Append: preserve unrelated human requests. Durable inbox works even while
-    # both sessions are dead; no unsolicited keystrokes into a busy agent pane.
-    printf '\n[%s] %s\n' "$(date -u +%FT%TZ)" "$alert" >> "$HOME/tmp/agent-reports/orchestrator/NEEDS_ALEXEY.md"
-    printf '%s\n' "$alert" > "$HOME/tmp/agent-reports/oncall/inbox/watchdog-$ROLE-$(date +%s)-$$.md"
-    log "ALERT: $alert"
-  fi
-  hub_report "${1:-restart_failed}"
-  return 1
-}
-
-# Start recovery path $1 and arm its proof. Path 2 is a different new session: the
-# fallback engine plus a fresh handoff, for a session that starts but never ticks.
-recover() {  # $1 = path, $2 = reason
-  local path="$1" reason="$2" saved="$ENGINE" rc=0
-  [ "$path" = 2 ] && ENGINE="$FALLBACK_ENGINE"
-  if FORCE=1 restart "$reason (recovery path $path, engine $ENGINE)"; then arm_proof "$path"; hub_report recovering
-  else rc=1; fi
-  ENGINE="$saved"
-  [ "$rc" = 0 ] || restart_failed restart_failed
-}
-
-# Returns 0 when no proof is pending or it just passed; 2 while still inside the window;
-# 1 after handling a failed proof (next recovery path started).
-check_proof() {
-  [ -f "$STATE/proof_due" ] || return 0
-  local due path now ls_ts first; read -r due path < "$STATE/proof_due"; now=$(date +%s)
-  ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
-  if first=$(tick_in_window "$ls_ts" "${due:-0}"); then
-    rm -f "$STATE/proof_due"; echo 0 > "$STATE/restart_failures"
-    log "recovery proven: fresh tick $((first-ls_ts))s after start (path ${path:-1})"; return 0
-  fi
-  local id; id=$(find_session) || id=""
-  if [ "$now" -le "${due:-0}" ] && [ -n "$id" ]; then log "recovery pending proof: session=$id, $((due-now))s left"; hub_report proof_pending; return 2; fi
-  # No tick inside the window (none, or only a late one): the recovery failed its proof
-  # and the next recovery path starts, as AC2 requires.
-  rm -f "$STATE/proof_due"
-  log "recovery proof FAILED (path ${path:-1}): no tick within ${PROOF_WINDOW}s after start${id:+ (session $id alive)}"
-  restart_failed proof_failed
-  local next=2; [ "${path:-1}" = 2 ] && next=1
-  recover "$next" "no tick within ${PROOF_WINDOW}s after recovery path ${path:-1}" || true
-  return 1
+restart() {  # $1 = reason; called only by an explicit handoff or dead-session check
+  make_handoff "${1:-manual}"; RESTART_FORCE=1 start
 }
 
 check() {
-  mkdir -p "$HOME/tmp/agent-reports/orchestrator" "$HOME/tmp/agent-reports/oncall/inbox"
   local id
-  id=$(find_session) || { log "session census failed"; restart_failed census_failed; return 1; }
-  if [ "$ROLE" = orchestrator ]; then
-    check_proof; case $? in 1) return 1 ;; 2) return 0 ;; esac
-    id=$(find_session) || { log "session census failed"; restart_failed census_failed; return 1; }
-  fi
-  if [ -n "$id" ] && [ "$ROLE" = orchestrator ]; then
-    # progress check: a live process is not proof of work; the tick log must be fresh
-    # (grace = MAX_TICK_AGE after a start)
-    local now ls_ts tk; now=$(date +%s); ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
-    tk=$(tick_mtime); [ "$tk" -lt "$ls_ts" ] && tk=$ls_ts
-    if [ $((now-tk)) -ge "$MAX_TICK_AGE" ]; then
-      log "STALLED session=$id: no tick for $((now-tk))s"
-      recover 1 "no tick for $((now-tk))s (stalled)"; return
-    fi
-    arm_timer deadline "$((tk + MAX_TICK_AGE - now))"
-  fi
+  id=$(find_session) || { log "session census failed; no recovery attempted"; return 1; }
   if [ -n "$id" ]; then
-    echo 0 > "$STATE/restart_failures"
-    log "OK session=$id"; hub_report ok; return 0
+    log "OK session=$id (live process; /loop owns cadence)"
+    return 0
   fi
-  log "DEAD (no live worker)"
-  if [ "$ROLE" = orchestrator ]; then recover 1 "session process dead/missing"; return; fi
-  if restart "session process dead/missing"; then
-    id=$(find_session) || id=""
-    if [ -n "$id" ]; then
-      echo 0 > "$STATE/restart_failures"
-      log "restarted session=$id"; return 0
-    fi
-  fi
-  restart_failed
+  log "DEAD (no live process); restarting from handoff"
+  restart "session process dead/missing" || { log "restart failed; see this service journal"; return 1; }
+  id=$(find_session) || { log "session census failed after restart"; return 1; }
+  [ -n "$id" ] || { log "restart completed without a verified live session"; return 1; }
+  log "restarted session=$id"
 }
 
 case "$CMD" in
   start) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; start ;;
   ensure|check) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; check ;;
   status) id=$(find_session); [ -n "$id" ] && { log "running $id"; echo "attach: a attach $id   (or: a open $TAG --workspace $RUNDIR)"; } || { log "not running"; exit 1; } ;;
-  restart) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; FORCE=1 restart "manual" ;;
+  restart) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; restart "manual" ;;
   handoff-restart)  # called BY the session itself after writing handoff.md; detaches so it survives the kill
-    FORCE=1 setsid nohup bash -c "sleep 5; '$0' $ROLE restart" >>"$STATE/restart.log" 2>&1 < /dev/null 9>&- & log "restart scheduled in 5s" ;;
+    setsid nohup bash -c "sleep 5; '$0' $ROLE restart" >>"$STATE/restart.log" 2>&1 < /dev/null 9>&- & log "restart scheduled in 5s" ;;
   skills-sync) skills_sync ;;
   *) echo "unknown command $CMD" >&2; exit 64 ;;
 esac

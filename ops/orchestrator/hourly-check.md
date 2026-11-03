@@ -11,6 +11,8 @@ Cadence: `/loop 1h` inside Claude is the scheduler stopgap. Hub scheduled prompt
 
 Run each scheduled ping (or hourly `/loop` stopgap tick). Be brief; use `HUB_CONFIG_FILE=$HOME/.config/agent-hub/cli.json` (`host.json` does not exist on Hetzner). Human `hub auth login` on Hetzner was done 2026-10-27 22:17 (orin@datatalks.club), so `hub quota` / `hub engines` work with cli.json.
 
+**RMTHZ launch cap:** start at most 3 new fixer sessions in any rolling 60-minute window. Before each start, require the Hub admission gate, fresh quota for the selected engine, `bash .agents/skills/hub-sessions/hostload.sh` reporting `verdict=free`, at least 10 GiB `MemAvailable`, and the configured disk floor. If any gate holds or the 3-start cap is reached, keep the intake queued and record the exact reason and next action. Never kill another session to make room.
+
 0. Setup: `~/.local/share/agent-hub-ops/session-ctl.sh orchestrator skills-sync` (pull bot-skills; relink). If `~/tmp/agent-reports/orchestrator/handoff.md` is newer than your session start, read it first. Drain `inbox/` (see CLAUDE.md duty 9). Check remaining context (<15% => handoff-restart per CLAUDE.md).
 1. Load/memory: `uptime`, `free -g`. Respect live resource gates. If capacity blocks a launch, start permitted recovery in this tick and track the blocked fix and next action.
 2. Hub: `hub sessions list`, `hub status`/`hub fleet` as available: held, no_eligible_route with rejected[], slots, host release SHA; CI red on main, deploy failed, launcher_command_failed and capture_not_acked. Run the hub-sessions hard gate before any fix.
