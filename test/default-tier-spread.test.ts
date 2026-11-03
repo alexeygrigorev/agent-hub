@@ -66,12 +66,10 @@ describe('default tier policy', () => {
     }
   });
 
-  it('does not list luna first and excludes haiku, sol-high and GLM on opencode', () => {
+  it('lists luna first and excludes haiku, sol-high and GLM on opencode', () => {
     const daily = policy.tiers.daily as string[];
     expect(policy.default_tier).toBe('daily');
-    expect(daily[0]).not.toBe('luna');
-    expect(daily.indexOf('luna')).toBeGreaterThan(daily.indexOf('sonnet'));
-    expect(daily.indexOf('luna')).toBeGreaterThan(daily.indexOf('muse'));
+    expect(daily[0]).toBe('luna');
     const byId = new Map((policy.models as any[]).map(m => [m.id, m]));
     for (const id of daily) {
       const m = byId.get(id);
