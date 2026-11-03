@@ -105,7 +105,7 @@ describe('burn-aware model candidates', () => {
       expect(sonnet?.id).toBe('sonnet');
       expect(sonnet.effort).toBe('medium');
       expect(sonnet.factors.burn).toBeGreaterThan(3);
-      const [opus] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'opus', 'medium', 'claude-acct'), claude, NOW);
+      const [opus] = modelCandidates({ tier, engine_override_reason: 'This task explicitly requires the Opus route for deep reasoning.' }, route('claude', 'claude'), ad('claude', 'opus', 'medium', 'claude-acct'), claude, NOW);
       expect(opus?.id).toBe('opus');
       expect(opus.effort).toBe('medium');
       expect(opus.factors.burn).toBeGreaterThan(3);
