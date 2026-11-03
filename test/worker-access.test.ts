@@ -531,7 +531,7 @@ describe('scoped durable worker access',()=>{
   for(const sfx of ['','/history','/links','/context']) expect((await api('/api/intake/tasks/'+task.slice(0,8)+sfx)).status).toBe(200);
   // A worker-created intake is reachable by prefix too.
   const src={type:'unknown',reference:'test'};
-  const made=await api('/api/intake/tasks',{key:uuid(),project:'dataops',title:'prefix follow-up',text:'prefix body',source:src});
+  const made=await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'prefix follow-up',text:'prefix body',source:src});
   expect(made.status,await made.clone().text()).toBe(200);
   const created:any=(await made.json() as any).task;
   expect((await api('/api/intake/tasks/'+created.id.slice(0,8))).status).toBe(200);
