@@ -18,6 +18,8 @@ import { resolve, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const assetRoot = resolve(process.env.AGENT_HUB_UI_ASSET_ROOT || resolve(root, 'public'));
+const screenshotOnly = process.env.AGENT_HUB_UI_SCREENSHOT_ONLY === '1';
 const outIdx = process.argv.indexOf('--out');
 const out = resolve(outIdx >= 0 && process.argv[outIdx + 1] ? process.argv[outIdx + 1] : resolve(root, '.local/phone-ui'));
 await mkdir(out, { recursive: true, mode: 0o700 });
@@ -35,7 +37,7 @@ const mf = new Miniflare(convertV4MiniflareOptions({
     name: 'phone-ui-local', script: bundle.outputFiles[0].text, modules: true, compatibilityDate: '2024-04-05', compatibilityFlags: ['nodejs_compat'],
     durableObjects: { HUB: { className: 'Hub', useSQLite: true } },
     bindings: { SESSION_SECRET: secret, HUB_ADMINS: 'admin@fake.local', LOCAL_FIXTURE_KEY: key, HUB_ADMIN_TOKEN_SHA256: createHash('sha256').update(adminToken).digest('hex'), AUTH_BASE_URL: 'https://auth.fake.local', AUTH_CALLBACK_URL: 'https://auth.fake.local/auth/callback', AUTH_CLIENT_ID: 'local-only' },
-    serviceBindings: { ASSETS: async r => { const f = resolve(root, 'public', '.' + new URL(r.url).pathname); assert.ok(f.startsWith(resolve(root, 'public') + '/')); try { return new Response(await readFile(f), { headers: { 'Content-Type': mime[extname(f)] || 'application/octet-stream' } }); } catch { return new Response(null, { status: 404 }); } } },
+    serviceBindings: { ASSETS: async r => { const f = resolve(assetRoot, '.' + new URL(r.url).pathname); assert.ok(f.startsWith(assetRoot + '/')); try { return new Response(await readFile(f), { headers: { 'Content-Type': mime[extname(f)] || 'application/octet-stream' } }); } catch { return new Response(null, { status: 404 }); } } },
   }],
 }));
 let browser;
@@ -102,6 +104,25 @@ try {
     checks.push(`Theme ${theme}: all 8 routes render at 390x844 with h1, no horizontal scroll, no secret leakage`);
   }
 
+  if (screenshotOnly) {
+    for (const [width, height, prefix] of [[390, 844, 'phone'], [1440, 900, 'desktop']]) {
+      await page.setViewportSize({ width, height });
+      await page.goto(base + '/auth/token');
+      await page.evaluate(() => localStorage.setItem('dakit-theme', 'dark'));
+      await cookie(human.cookie);
+      await page.goto(base + '/intake');
+      await page.locator('.intake-item').first().waitFor();
+      await capture(`${prefix}-intake-list-${width}`);
+      await page.locator('.intake-item').first().click();
+      await page.locator('#intake-detail-ac').waitFor();
+      await capture(`${prefix}-intake-detail-${width}`);
+      await page.goto(base + '/asks.html');
+      await page.getByRole('heading', { name: 'Ask ledger' }).waitFor();
+      await capture(`${prefix}-asks-${width}`);
+    }
+    checks.push('Authenticated baseline page captures completed');
+  } else {
+
   // Authenticated functional pass (dark, phone width).
   await page.setViewportSize({ width: 390, height: 844 });
   await page.evaluate(() => localStorage.setItem('dakit-theme', 'dark'));
@@ -113,15 +134,17 @@ try {
   await capture('phone-intake-statistics-table-390-dark');
   await page.locator('#intake-list').getByText('Phone list task alpha', { exact: false }).waitFor();
   // Filter narrows the list.
-  await page.getByLabel('Filter tasks').fill('approval task beta');
+  await page.getByLabel('Search this page').fill('approval task beta');
   await page.locator('#intake-list').getByText('Phone approval task beta', { exact: false }).waitFor();
   assert.equal(await page.locator('.intake-item').count(), 1);
-  await page.getByLabel('Filter tasks').fill('');
+  await page.getByLabel('Search this page').fill('');
   await capture('phone-intake-filter-390-dark');
   checks.push('Intake list filter narrows to the matching task at phone width');
 
   // Read-only open: the detail shows every AC2 element.
-  await page.locator('#intake-list').getByText('Phone list task alpha', { exact: false }).click();
+  await page.getByLabel('Search this page').fill('Phone list task alpha');
+  assert.equal(await page.locator('.intake-item').count(), 1, 'search includes title on the loaded page');
+  await page.locator('.intake-item').first().click();
   await page.waitForURL('**/intake/*');
   const detailUrl = page.url();
   assert.ok(/\/intake\/[A-Za-z0-9._:-]+$/.test(new URL(detailUrl).pathname), 'detail uses /intake/<id>');
@@ -133,6 +156,15 @@ try {
   assert.equal(await page.locator('#intake-stats-section').isVisible(), false);
   await capture('phone-intake-detail-390-dark');
   checks.push('Intake detail shows title, status, AC, history, linked sessions at phone width');
+
+  await page.getByRole('button', { name: 'Back to tasks' }).click();
+  await page.getByLabel('Search this page').waitFor();
+  assert.equal(new URL(page.url()).searchParams.get('q'), 'Phone list task alpha', 'back restores the filter in the URL');
+  assert.equal(await page.getByLabel('Search this page').inputValue(), 'Phone list task alpha');
+  assert.equal(await page.locator('.intake-item').count(), 1, 'back restores the filtered list');
+  await page.locator('.intake-item').first().click();
+  await page.getByText('AC: phone fixture must render.', { exact: false }).waitFor();
+  checks.push('Back to intake restores the page filter and list position');
 
   // Note action from the phone UI.
   await page.getByLabel('Add a note').fill('Phone note 1');
@@ -167,6 +199,25 @@ try {
   assert.equal(approved.task.control.version, pendingVersion + 1, 'approval advanced exactly one version (no session side effects)');
   checks.push('Intake approve resolves the pending obligation with no session side effects');
 
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(base + '/asks.html');
+  await page.getByRole('heading', { name: 'Ask ledger' }).waitFor();
+  assert.equal(await page.locator('#state').inputValue(), 'unresolved', 'Ask audit defaults to pending and unmapped work');
+  await capture('phone-asks-390-dark');
+  checks.push('Ask audit opens on unresolved mapping work at phone width');
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(base + '/intake');
+  await page.locator('.intake-item').first().waitFor();
+  await capture('desktop-intake-list-1440');
+  await page.locator('.intake-item').first().click();
+  await page.locator('#intake-detail-ac').waitFor();
+  await capture('desktop-intake-detail-1440');
+  await page.goto(base + '/asks.html');
+  await page.getByRole('heading', { name: 'Ask ledger' }).waitFor();
+  await capture('desktop-asks-1440');
+  checks.push('Intake list/detail and Ask audit render at desktop width');
+
   // Sessions page: capture/send controls exist with real ack states, never "accepted".
   // Live pass on a seeded running session: capture + send enqueue through the
   // real handler and surface their recorded states at phone width.
@@ -190,14 +241,16 @@ try {
 
   // Conversations page: composer (send) present at phone width, no accepted-delivery badge.
   await page.goto(base + '/conversations.html');
-  await page.locator('h1', { hasText: 'Conversations' }).waitFor();
+  await page.locator('h1', { hasText: 'Messages' }).waitFor();
   const convBody = await page.locator('#main-content').textContent();
   assert.ok(!/accepted/i.test(convBody.replace(/Accepted Outcome|accepted_outcome/gi, '')), 'conversations never show delivery as accepted');
   await capture('phone-conversations-390-dark');
   checks.push('Conversations usable at phone width; delivery never shown as accepted');
 
+  }
+
   assert.deepEqual(errors, []);
-  await writeFile(resolve(out, 'results.json'), JSON.stringify({ checks, screenshots: shots, apiMocks: false, pageErrors: 0, viewport: '390x844', themes: ['light', 'dark'] }, null, 2) + '\n');
+  await writeFile(resolve(out, 'results.json'), JSON.stringify({ checks, screenshots: shots, apiMocks: false, pageErrors: 0, viewport: '390x844', desktopViewport: '1440x900', themes: ['light', 'dark'] }, null, 2) + '\n');
   for (const c of checks) console.log('PASS ' + c);
   console.log(`PASS ${shots.length} phone screenshots; zero browser script errors`);
 } finally {

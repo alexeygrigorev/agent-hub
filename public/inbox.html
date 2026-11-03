@@ -6,6 +6,7 @@
 <title>Inbox · Agent Hub</title>
 <link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css">
 <link rel="stylesheet" href="/inbox.css">
+<script src="/auth.js"></script>
 <script src="/inbox.js"></script>
 </head>
 <body>
@@ -81,22 +82,23 @@
     <div class="dk-main__inner dk-fill inbox-inner">
       <div class="dk-page-header">
         <div class="dk-page-header__main">
-          <h1 class="dk-page-header__title">Inbox</h1>
+          <h1 class="dk-page-header__title">Messages</h1>
           <p class="dk-page-header__subtitle" id="inbox-state" role="status">Loading…</p>
         </div>
         <div class="dk-page-header__actions">
-          <select class="dk-select inbox-actor-select" id="inbox-actor" aria-label="Inbox identity"></select>
+          <details class="inbox-routing"><summary>Inbox identity</summary><select class="dk-select inbox-actor-select" id="inbox-actor" aria-label="Inbox identity"></select></details>
           <button class="dk-button dk-button--secondary" type="button" id="inbox-refresh">Refresh</button>
         </div>
       </div>
 
+      <nav class="messages-nav" aria-label="Messages views"><a href="/inbox.html" aria-current="page">Inbox</a><a href="/conversations.html">Conversations</a></nav><p class="messages-purpose">Direct requests and notifications. Opening a message leaves its read state unchanged.</p>
       <div class="dk-split inbox-split">
         <section class="dk-split__list" aria-labelledby="inbox-list-title">
           <header class="dk-split__head">
             <h2 class="dk-split__title" id="inbox-list-title">Messages</h2>
             <div class="inbox-list-tools">
-              <label class="inbox-check"><input type="checkbox" id="inbox-unread-only"> Unread</label>
-              <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="inbox-mark-read" hidden>Mark read</button>
+              <label class="inbox-check"><input type="checkbox" id="inbox-unread-only" checked> Unread</label>
+              <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="inbox-mark-read" hidden>Mark listed read</button>
             </div>
           </header>
           <div class="dk-split__body" id="inbox-list" role="listbox" aria-label="Messages"></div>
@@ -109,7 +111,7 @@
             </button>
           </header>
           <div class="dk-split__body inbox-detail-body">
-            <div id="inbox-detail"></div>
+            <div id="inbox-detail"></div><button class="dk-button dk-button--secondary" type="button" id="inbox-read-one" hidden>Mark this message read</button>
             <form id="inbox-reply-form" class="inbox-reply" hidden>
               <p class="inbox-reply__label" id="inbox-reply-label">Reply</p>
               <textarea class="dk-textarea" id="inbox-reply-body" rows="4" maxlength="16384" placeholder="Write a reply…" required></textarea>

@@ -5,6 +5,17 @@ try {
 } catch {}
 addEventListener('DOMContentLoaded', () => {
   document.querySelector('h1')?.focus();
+  const hubPages = new Set(['/', '/index.html', '/sessions', '/sessions.html', '/intake', '/intake.html',
+    '/fleet', '/fleet.html', '/quota.html', '/machines.html', '/settings.html', '/inbox', '/inbox.html',
+    '/conversations', '/conversations.html', '/metrics', '/metrics.html', '/schedules', '/schedules.html',
+    '/prompts.html', '/webhooks.html', '/engines.html', '/banked-resets.html', '/asks.html',
+    '/quota', '/machines', '/settings', '/prompts', '/webhooks', '/engines', '/banked-resets', '/asks']);
+  const intakeDetail = location.pathname.startsWith('/intake/') && location.pathname.length <= 385;
+  if (hubPages.has(location.pathname) || intakeDetail) {
+    import('/hub-shell.js').then(({ mountHubShell }) => mountHubShell()).catch(() => {
+      /* Existing page navigation remains available if the shared shell fails to load. */
+    });
+  }
   // Use the official code primitive with Hub's actual issuance alphabet.
   import('/vendor/dakit/device-code.js').then(({bindCodeInput,normalizeUserCode,describeUserCodeError}) => {
     for (const input of document.querySelectorAll('.dk-code-input')) {

@@ -3,6 +3,7 @@
 const byId = id => document.getElementById(id);
 let csrf = null;
 let selectedSchedule = null;
+let listScroll = 0;
 
 async function api(path, method = 'GET', data) {
   const headers = {};
@@ -30,6 +31,12 @@ async function api(path, method = 'GET', data) {
 function setStatus(text) {
   const el = byId('sc-status');
   if (el) el.textContent = text || '';
+}
+
+
+function cadenceLabel(cron, timezone) {
+  const readable = cron === '0 9 * * *' ? 'Daily at 09:00' : cron === '0 * * * *' ? 'Every hour' : `Cron: ${cron}`;
+  return `${readable} · ${timezone || 'timezone unknown'}`;
 }
 
 function cell(row, text, mono = false) {
@@ -66,19 +73,17 @@ async function loadSchedules() {
     body.textContent = '';
     if (!data.schedules.length) {
       const tr = document.createElement('tr');
-      cell(tr, 'No launch schedules yet', false).colSpan = 8;
+      cell(tr, 'No launch schedules yet', false).colSpan = 6;
       body.appendChild(tr);
       return;
     }
     for (const schedule of data.schedules) {
       const tr = document.createElement('tr');
-      cell(tr, schedule.name, true);
+      cell(tr, schedule.name);
       cell(tr, schedule.project, true);
-      cell(tr, schedule.cron, true);
-      cell(tr, schedule.tz);
-      cell(tr, schedule.overlap);
+      cell(tr, cadenceLabel(schedule.cron, schedule.tz));
       cell(tr, schedule.next_due_at || (schedule.enabled ? '—' : 'paused'));
-      cell(tr, schedule.enabled ? 'yes' : 'no');
+      cell(tr, schedule.enabled ? 'Enabled' : 'Paused');
       const actions = document.createElement('td');
       actions.appendChild(actionButton('Open', () => openSchedule(schedule.id)));
       actions.appendChild(document.createTextNode(' '));
@@ -93,21 +98,29 @@ async function loadSchedules() {
   } catch (err) {
     body.textContent = '';
     const tr = document.createElement('tr');
-    cell(tr, `Load failed: ${err.message}`).colSpan = 8;
+    cell(tr, `Load failed: ${err.message}`).colSpan = 6;
     body.appendChild(tr);
   }
 }
 
 async function openSchedule(id) {
+  if (document.querySelector('main').dataset.view !== 'detail') listScroll = window.scrollY;
+  document.querySelector('main').dataset.view = 'detail';
   selectedSchedule = id;
   byId('sc-detail').hidden = false;
+  if (matchMedia('(max-width:700px)').matches) byId('sc-detail').scrollIntoView({ block: 'start' });
+  byId('sc-detail-name').textContent = '';
+  byId('sc-runs-body').replaceChildren();
+  byId('sc-detail-summary').textContent = 'Loading schedule…';
   setStatus('Loading runs…');
   try {
     const [detail, runs] = await Promise.all([
       api(`/api/schedules/${encodeURIComponent(id)}`),
       api(`/api/schedules/${encodeURIComponent(id)}/runs?limit=50`),
     ]);
+    if (selectedSchedule !== id) return;
     byId('sc-detail-name').textContent = detail.name;
+    byId('sc-detail-summary').textContent = `${detail.project || 'Unknown project'} · ${detail.cron} · ${detail.tz} · ${detail.enabled ? 'Enabled' : 'Paused'}`;
     const body = byId('sc-runs-body');
     body.textContent = '';
     for (const run of runs.runs || detail.runs || []) {
@@ -129,6 +142,8 @@ async function openSchedule(id) {
     }
     setStatus('');
   } catch (err) {
+    if (selectedSchedule !== id) return;
+    byId('sc-detail-summary').textContent = `Detail failed: ${err.message}`;
     setStatus(`Detail failed: ${err.message}`);
   }
 }
@@ -192,6 +207,7 @@ async function createSchedule(event) {
 
 async function tickSchedule() {
   if (!selectedSchedule) return;
+  if (!confirm('Run this due tick now? It can start a new session.')) return;
   try {
     if (!csrf) csrf = (await api('/auth/me')).csrf_token || null;
     const result = await api(`/api/schedules/${encodeURIComponent(selectedSchedule)}/tick`, 'POST', {});
@@ -209,9 +225,28 @@ async function init() {
     await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual', headers: { 'X-CSRF-Token': csrf } });
     location.assign('/');
   });
+  byId('sc-close-detail').addEventListener('click', () => { selectedSchedule = null; byId('sc-detail').hidden = true; document.querySelector('main').dataset.view = 'list'; window.scrollTo(0, listScroll); });
+  byId('sc-cadence').addEventListener('change', event => {
+    const custom = event.target.value === 'custom';
+    byId('sc-cron-panel').open = custom;
+    if (!custom) byId('sc-cron').value = event.target.value;
+    else byId('sc-cron').focus();
+  });
   byId('sc-create-form').addEventListener('submit', createSchedule);
   byId('sc-tick').addEventListener('click', tickSchedule);
   await loadSchedules();
 }
 
 init();
+
+// Preserve column context when tables become one-column cards on phones.
+function labelSecondaryTables() {
+  document.querySelectorAll('main table').forEach(table => {
+    const labels = [...table.querySelectorAll('thead th')].map(th => th.textContent);
+    table.querySelectorAll('tbody tr').forEach(row => [...row.children].forEach((cell, index) => {
+      if (cell.colSpan === 1) cell.dataset.label = labels[index] || '';
+    }));
+  });
+}
+new MutationObserver(labelSecondaryTables).observe(document.querySelector('main'), { childList: true, subtree: true });
+labelSecondaryTables();

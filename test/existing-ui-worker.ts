@@ -8,10 +8,15 @@ export class Hub extends ProductionHub {
       // F7 phone pass: a stand-in running session row so the real capture/send
       // enqueue path (recorded ack states) can be driven from a phone-width
       // page. No host, placement or execution is involved.
+      // The row is live (recent fleet heartbeat) so the running-sessions
+      // landing lists it; the detail path works either way.
       const id = crypto.randomUUID();
+      const nativeId = 'phone-native-' + id.slice(0, 8);
       const now = new Date().toISOString();
       this.sql.exec('INSERT OR REPLACE INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,parent_id,parent_source,session_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-        id, 'human:ui-human', 'phone-fixture-' + id.slice(0, 8), JSON.stringify({ workspace: 'demo' }), null, 'ui-machine', 'codex', 'interactive', 'running', null, null, null, 'headless', now, now);
+        id, 'human:ui-human', 'phone-fixture-' + id.slice(0, 8), JSON.stringify({ workspace: 'demo' }), null, 'ui-machine', 'codex', 'interactive', 'running', JSON.stringify({ native_id: nativeId }), null, null, 'headless', now, now);
+      this.sql.exec('INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,last_activity_at) VALUES (?,?,?,?,?,?,?,?)',
+        'ui-machine', nativeId, 'phone-fixture', 'codex', 'running', now, 'demo', now);
       return id;
     }
     if (action === 'auth-off' || action === 'auth-on') { this.env = {...this.env,HUB_ADMIN_TOKEN_SHA256:action === 'auth-on' ? tokenHash : undefined}; return; }

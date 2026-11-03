@@ -55,7 +55,7 @@ async function refresh() {
     for (const r of versions.rollouts || []) {
       vSection.append(el('p', `rollout ${r.engine} ${r.target_version} via ${r.canary_machine}: ${r.state}`));
     }
-    document.querySelector('.engine-page').append(vSection);
+    document.getElementById('versions').replaceChildren(...vSection.childNodes);
   } catch { /* versions are best-effort beside the account list */ }
 }
-(async () => {try {const me=await call('/auth/me'); csrf=me.csrf_token; await refresh(); setInterval(() => refresh().catch(() => {status.textContent='Refresh failed.';}),5000);} catch {status.textContent='Sign in as a Hub administrator to manage accounts.';}})();
+(async () => {try {const me=await call('/auth/me'); csrf=me.csrf_token; await refresh(); setInterval(() => refresh().catch(() => {status.textContent='Account refresh failed; displayed data may be out of date.';}),30000);} catch {status.textContent='Sign in as a Hub administrator to manage accounts.';}})();

@@ -210,6 +210,7 @@
   async function load() {
     const current = ++generation;
     const note = root() ? root().querySelector('[data-usage-note]') : null;
+    if (note) note.textContent = `Loading ${range} usage history…`;
     try {
       const [history, tokens, quota, banked] = await Promise.all([
         fetchApi(`/api/monitoring/history?range=${range}`),
@@ -222,12 +223,15 @@
       engineAliases = quota?.canonical?.engines || {};
       accountLabels = Object.fromEntries((quota?.pools || []).map(p => [p.account,
         `${(p.harness || p.engines || []).join(', ') || 'unknown'}/${p.provider} ${p.account}`]));
-      if (note) note.textContent = statusLine(history);
+      if (note) note.textContent = statusLine(history) + (history.truncated || history.dimension_limit ? ' · partial: series limit reached' : '');
       drawCurrent(quota, banked);
       drawQuota(history, '');
       drawTokens(history, tokens && tokens.sources);
     } catch {
       if (current !== generation) return;
+      document.getElementById('usage-current')?.replaceChildren(el('p', 'Current usage unavailable; measurements unknown.'));
+      if (note) note.textContent = 'History unavailable. Refresh to retry.';
+      if (sourceRoot()) sourceRoot().replaceChildren();
       if (quotaRoot()) quotaRoot().replaceChildren(el('p', 'Quota history unavailable. Sign in or refresh to retry; measurements unknown.', 'metrics-chart-empty'));
       if (tokenRoot()) tokenRoot().replaceChildren(el('p', 'Token history unavailable. Sign in or refresh to retry; measurements unknown.', 'metrics-chart-empty'));
     }
@@ -241,13 +245,16 @@
         initialized = true;
         const controls = el('div', '', 'metrics-project-filter');
         const label = el('label', 'Usage history range ');
-        const select = el('select', '', 'dk-select');
-        select.setAttribute('aria-label', 'Usage history range');
-        for (const value of ['24h', '7d', '30d']) select.append(Object.assign(el('option', value), { value }));
-        select.value = range;
+        const shared = document.getElementById('metrics-range');
+        const select = shared || el('select', '', 'dk-select');
+        if (!shared) {
+          select.setAttribute('aria-label', 'Usage history range');
+          for (const value of ['24h', '7d', '30d']) select.append(Object.assign(el('option', value), { value }));
+          select.value = range;
+        }
+        range = select.value;
         select.addEventListener('change', () => { range = select.value; load(); });
-        label.append(select);
-        controls.append(label);
+        if (!shared) { label.append(select); controls.append(label); }
         const host = root();
         const note = el('p', '', 'metrics-chart-note');
         note.setAttribute('data-usage-note', '');
