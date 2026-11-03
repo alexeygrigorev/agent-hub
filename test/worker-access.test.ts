@@ -185,14 +185,19 @@ describe('scoped durable worker access',()=>{
    expect((await api('/api/intake/tasks/'+blank,bad)).status).toBe(403);
   expect((await api('/api/intake/tasks/'+blank+'/events',{key:'t-dec',expected_version:v,event:{kind:'decision',text:'x'}})).status).toBe(403);
   expect((await api('/api/intake/tasks/'+third,{key:'t-3',expected_version:1,project:'aws-infra'})).status).toBe(403);
-  // A verdict note on an in-project triage item revokes access immediately.
+  // A verdict note on an in-project triage item revokes triage write access immediately;
+  // project read access remains available for this worker's project.
   const note=await api('/api/intake/tasks/'+later+'/events',{key:'t-note',expected_version:1,event:{kind:'note',text:'TRIAGE ACTUAL — backlog triage (hourly, Claude Opus)'}});
   expect(note.status,await note.clone().text()).toBe(200);
-  expect((await api('/api/intake/tasks/'+later)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+later)).status).toBe(200);
+  const afterVerdict=await api('/api/intake/tasks/'+later+'/events',{key:'t-after-verdict',expected_version:2,event:{kind:'note',text:'triage scope ended'}});
+  expect(afterVerdict.status).toBe(403);
   expect((await api('/api/intake/tasks/'+blank,{key:'t-after',expected_version:v+1,project:'relay'})).status).toBe(403);
   // A reviewer whose session ended keeps no batch access.
   await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE session_control_sessions SET state='exited' WHERE id=?",session));
-  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(200); // project read survives the triage grant
+  const endedWrite=await api('/api/intake/tasks/'+other+'/events',{key:'t-ended',expected_version:1,event:{kind:'note',text:'triage scope ended'}});
+  expect(endedWrite.status).toBe(403);
  }));
  it('reads only shared usage dimensions without granting other monitoring or writes',()=>setup(async({stub,worker,call}:any)=>{
   await runInDurableObject<Hub, any>(stub,(h:any)=>{
