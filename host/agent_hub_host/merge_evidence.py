@@ -59,18 +59,35 @@ def existing_commits(repo: str, candidates: list, runner: Callable = subprocess.
 
 
 def explicit_commit_refs(history: list) -> list:
-    """Commit SHAs from explicit report/commit event fields (reference = sha).
+    """Return the latest report head plus every explicit commit event SHA.
 
-    Only ``report``/``commit`` entries whose ``reference`` is a 7-40 hex SHA
-    count. Note text, intake/session/launch ids and uuid fragments never count
-    here; free-text candidates go through ``shas_from_text`` + ``existing_commits``."""
-    refs = []
-    for entry in history or []:
+    A ``report`` reference records a branch-head checkpoint. Rebase replaces
+    that checkpoint, so older report references are audit history, not commits
+    that must also become reachable from main. A ``commit`` event is an
+    immutable deliverable reference and remains required cumulatively. Note
+    text, intake/session/launch ids and uuid fragments never count here;
+    free-text candidates go through ``shas_from_text`` + ``existing_commits``.
+    """
+    active: list[tuple[int, str]] = []
+    latest_report: tuple[int, str] | None = None
+    for index, entry in enumerate(history if isinstance(history, list) else []):
         if not isinstance(entry, dict) or entry.get('kind') not in ('report', 'commit'):
             continue
         ref = str(entry.get('reference') or '').strip()
-        if SHA.match(ref) and ref.lower() not in refs:
-            refs.append(ref.lower())
+        if not SHA.fullmatch(ref):
+            continue
+        normalized = ref.lower()
+        if entry.get('kind') == 'report':
+            latest_report = (index, normalized)
+        else:
+            active.append((index, normalized))
+
+    if latest_report is not None:
+        active.append(latest_report)
+    refs = []
+    for _, ref in sorted(active):
+        if ref not in refs:
+            refs.append(ref)
     return refs
 
 
