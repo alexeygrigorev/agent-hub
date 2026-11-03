@@ -69,6 +69,7 @@ export function queueCandidateOrder(a: Obj, b: Obj): number {
   if (ra !== rb) return ra - rb;
   return ms(b.created_at) - ms(a.created_at) || a.id.localeCompare(b.id);
 }
+export { queueCandidateOrder as intakeQueueOrder };
 const bindingNative = "json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id')";
 const DAY = 86400000;
 /** Admission holds an automatic restart may clear by moving to another
@@ -850,14 +851,14 @@ export class IntakeWatchdog {
         retry_limit: QUEUE_RETRY_LIMIT, next_at: q?.next_at ?? now, last_movement_at: at,
         stuck: !done && now - at >= QUEUE_STALL_MS, history, queue_position: null as number | null,
         completion_evidence: done ? 'reported_live_proof_not_independently_verified' : null };
-    }).sort((a,b) => Number(a.next_at > now) - Number(b.next_at > now) ||
-      (queueRows.get(a.id)?.updated_at ?? 0) - (queueRows.get(b.id)?.updated_at ?? 0) || a.id.localeCompare(b.id));
+    });
+    // Visible order and positions: due items lead (a promotion overrides a
+    // retry backoff), then the candidate order (promoted > priority > newest)
+    // so the queue reads as it will run.
+    const notDue = (item: Obj) => Number((queueRows.get(item.id)?.next_at ?? now) > now && !promotedAt(byId.get(item.id)!));
+    items.sort((a,b) => notDue(a) - notDue(b) || queueCandidateOrder(byId.get(a.id)!, byId.get(b.id)!));
     let position = 0;
-    // Visible positions: due items lead, then the candidate order
-    // (promoted > priority > newest) so the queue reads as it will run.
-    const dueFirst = (item: Obj) => Number((queueRows.get(item.id)?.next_at ?? now) > now);
-    for (const item of [...items].sort((a,b) => dueFirst(a) - dueFirst(b) ||
-      queueCandidateOrder(byId.get(a.id)!, byId.get(b.id)!)))
+    for (const item of items)
       if (item.state === 'queued' && !this.automationHold(byId.get(item.id)!, policy)) item.queue_position = ++position;
     return items;
   }

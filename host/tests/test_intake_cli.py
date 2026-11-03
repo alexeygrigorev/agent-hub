@@ -82,3 +82,10 @@ class TestQueuePriorityCli(unittest.TestCase):
         method, path, body = request.call_args.args
         self.assertEqual((method, path), ('POST', '/api/intake/tasks/fixture-task'))
         self.assertEqual(body['priority'], 'low')
+
+    def test_queue_lists_the_auto_queue(self):
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'queue', '--project', 'demo', '--limit', '10']), patch('sys.stdout', output), patch.object(intake, 'request', return_value={'items': [{'id': 'q-1', 'queue_position': 1}]}) as request:
+            cli.main()
+        request.assert_called_once_with('GET', '/api/intake/queue?project=demo&limit=10')
+        self.assertEqual(json.loads(output.getvalue())['items'][0]['id'], 'q-1')

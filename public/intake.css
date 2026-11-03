@@ -127,7 +127,7 @@
 }
 .intake-history-card__text { overflow-wrap: anywhere; min-width: 0; flex: 1; }
 .intake-approve-actions { display: flex; flex-wrap: wrap; gap: var(--dk-space-2); }
-.intake-note-form__foot, .session-send-form__foot { display: flex; justify-content: flex-end; }
+.intake-note-form__foot, .session-send-form__foot { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--dk-space-2); }
 
 /* Worktrees + close gate (intake 4b161918). */
 .intake-worktrees__head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--dk-space-2); }
