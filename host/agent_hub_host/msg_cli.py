@@ -3,7 +3,7 @@
 Identity, never taken from flags:
 - ``--profile NAME``: a named agent profile (``~/.config/agent-hub/NAME.json``,
   e.g. the Developer's ``agent:developer``) written by
-  ``hub msg agent-credential NAME --output FILE``;
+  ``hub agents create NAME``;
 - inside a Hub session: the session's own credential that the bound host
   provisions (``session:<hub-session-id>``), found via APLEXER_SESSION_ID;
 - otherwise the normal profile (HUB_CONFIG_FILE, human or host), which must
@@ -91,7 +91,7 @@ def resolve_identity(profile: str | None) -> tuple[str | None, str]:
     if profile:
         path, source = profile_path(profile), 'profile:' + profile
         if not path.is_file():
-            raise MsgError('No such profile; ask an operator for `hub msg agent-credential`')
+            raise MsgError('No such profile; ask an operator for `hub agents create`')
     elif os.environ.get('APLEXER_SESSION_ID') and os.environ.get('APLEXER_WORKSPACE') and not os.environ.get('HUB_CONFIG_FILE'):
         native = os.environ['APLEXER_SESSION_ID'].strip().lower()
         if re.fullmatch(r'[0-9a-f-]{36}', native):
@@ -113,10 +113,12 @@ def resolve_sender(args, actor: str | None = None) -> str:
     credential now that HUB_CONFIG_FILE points at it."""
     if actor is None:
         actor, _source = resolve_identity(getattr(args, 'profile', None))
-    sender = actor or getattr(args, 'from_actor', None)
+    acting_as = getattr(args, 'as_actor', None)
+    sender = acting_as or actor or getattr(args, 'from_actor', None)
     if not sender:
         raise MsgError('This profile has no messaging identity; pass --from')
-    if actor and getattr(args, 'from_actor', None) and args.from_actor != actor:
+    expected = acting_as or actor
+    if expected and getattr(args, 'from_actor', None) and args.from_actor != expected:
         raise MsgError('--from differs from this identity')
     return sender
 
@@ -189,6 +191,8 @@ def _body(args) -> str:
 def _send_payload(args, sender: str) -> dict:
     payload = {'from_actor': sender, 'to_actor': args.to, 'kind': getattr(args, 'kind', None) or 'note',
                'body': _body(args), 'idempotency_key': getattr(args, 'key', None) or str(uuid.uuid4())}
+    if getattr(args, 'as_actor', None):
+        payload['as'] = args.as_actor
     delivery = getattr(args, 'delivery', None)
     if delivery:
         payload['delivery'] = delivery
@@ -216,6 +220,7 @@ def add_commands(sub):
     send.add_argument('--body', default=None, help='Text, or - for stdin')
     send.add_argument('--body-file')
     send.add_argument('--from', dest='from_actor', help='Sender for default (human/host) profiles only')
+    send.add_argument('--as', dest='as_actor', help='Act as a delegated named agent, e.g. agent:oncall')
     mode = send.add_mutually_exclusive_group()
     mode.add_argument('--tui', action='store_const', const='tui', dest='delivery', help='Type into the session prompt')
     mode.add_argument('--inbox', action='store_const', const='inbox', dest='delivery', help='Native inbox only')
@@ -229,6 +234,7 @@ def add_commands(sub):
     reply.add_argument('--body', default=None, help='Text, or - for stdin')
     reply.add_argument('--body-file')
     reply.add_argument('--from', dest='from_actor')
+    reply.add_argument('--as', dest='as_actor', help='Act as a delegated named agent, e.g. agent:oncall')
     reply_mode = reply.add_mutually_exclusive_group()
     reply_mode.add_argument('--tui', action='store_const', const='tui', dest='delivery')
     reply_mode.add_argument('--inbox', action='store_const', const='inbox', dest='delivery')
@@ -254,15 +260,20 @@ def add_commands(sub):
     readdr = ms.add_parser('readdress', help='Operator: point an undelivered session message at a replacement session')
     readdr.add_argument('id')
     readdr.add_argument('--to', required=True, help='New session:<hub-session-id>')
-    delegate = ms.add_parser('agent-delegate', help='Operator: grant or revoke an MCP client\'s delegation for agent:<name>')
+    delegate = ms.add_parser('agent-delegate', help='Operator: grant or revoke delegated MCP credential families for agent:<name>')
     delegate.add_argument('name')
     delegate.add_argument('--client', help='MCP client id to grant (omit to list)')
     delegate.add_argument('--remove', action='store_true', help='Revoke instead of grant')
+    from . import agents_cli
+    agents_cli.add_commands(sub)
 
 
 def execute(args):
     from . import bus
     from .config import load_config
+    if getattr(args, 'msg_cmd', None) == 'agents':
+        from . import agents_cli
+        return agents_cli.execute(args)
     if args.msg_cmd == 'agent-credential':
         if not PROFILE_NAME.fullmatch(args.name):
             raise MsgError('Invalid agent name')
@@ -295,7 +306,10 @@ def execute(args):
         if args.msg_cmd == 'send':
             result = _request('POST', '/api/bus/send', _send_payload(args, sender), retries=True)
         else:
-            original = _request('GET', '/api/bus/messages/' + quote(args.id, safe=''))
+            original_path = '/api/bus/messages/' + quote(args.id, safe='')
+            if getattr(args, 'as_actor', None):
+                original_path += '?as=' + quote(args.as_actor, safe='')
+            original = _request('GET', original_path)
             to = original['from_actor'] if original.get('to_actor') == sender else original['to_actor']
             args.to = to
             # /api/bus/reply requires reply_to; the server derives the thread
@@ -369,7 +383,10 @@ def top_reply(args):
     key = getattr(args, 'idempotency_key', None) or str(uuid.uuid4())
     args.key = key
     if not getattr(args, 'to_actor', None):
-        original = _request('GET', '/api/bus/messages/' + quote(args.reply_to, safe=''))
+        original_path = '/api/bus/messages/' + quote(args.reply_to, safe='')
+        if getattr(args, 'as_actor', None):
+            original_path += '?as=' + quote(args.as_actor, safe='')
+        original = _request('GET', original_path)
         args.to_actor = original['from_actor'] if original.get('to_actor') == sender else original['to_actor']
         if getattr(args, 'to', None) is None:
             args.to = args.to_actor

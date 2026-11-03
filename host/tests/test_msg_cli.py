@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agent_hub_host import msg_cli, session_messages  # noqa: E402
+from agent_hub_host import cli, msg_cli, session_messages  # noqa: E402
 
 NATIVE = "33333333-3333-4333-8333-333333333333"
 HUB_SESSION = "22222222-2222-4222-8222-222222222222"
@@ -81,6 +81,10 @@ class MsgCliTest(unittest.TestCase):
             self.assertEqual(self.calls[-1][2]["to_actor"], "agent:developer")
             self.assertEqual(self.calls[-1][2]["reply_to"], "m1")
             self.assertEqual(reply["from"], "session:" + HUB_SESSION)
+            delegated = self.run_cli(["msg", "reply", "m1", "--body", "as oncall", "--as", "agent:oncall"])
+            self.assertEqual(delegated["from"], "agent:oncall")
+            self.assertEqual(self.calls[-1][2]["from_actor"], "agent:oncall")
+            self.assertEqual(self.calls[-1][2]["as"], "agent:oncall")
         # Without APLEXER_WORKSPACE the session file is not discovered.
         del os.environ["APLEXER_WORKSPACE"]
         os.environ.pop("HUB_CONFIG_FILE", None)
@@ -248,19 +252,34 @@ class MsgCliM5Test(unittest.TestCase):
         self.assertEqual(self.calls[-1][:2], ("POST", "/api/bus/messages/read"))
         self.assertEqual(self.calls[-1][2], {"ids": ["a", "b"]})
 
+    def test_root_profile_inbox_reads_the_named_agent_inbox(self):
+        with mock.patch.object(cli.sys, "argv", ["hub", "--profile", "developer", "inbox"]), \
+                mock.patch.object(msg_cli, "resolve_identity", return_value=("agent:developer", "profile:developer")) as identity, \
+                mock.patch.object(msg_cli, "_request", return_value=[]) as request, \
+                mock.patch("builtins.print"):
+            cli.main()
+        identity.assert_called_once_with("developer")
+        self.assertEqual(request.call_args.args[0], "GET")
+        self.assertIn("actor=agent%3Adeveloper", request.call_args.args[1])
+
     def test_top_level_send_resolves_profile_identity(self):
         self.write_profile()
         with mock.patch("agent_hub_host.bus._do_request", side_effect=self.fake_request):
-            args = argparse.Namespace(profile="developer", to_actor="human:me", body="hi", body_file=None, from_actor=None,
+            args = argparse.Namespace(profile="developer", to_actor="human:me", body="hi", body_file=None, from_actor=None, as_actor=None,
                                       kind=None, delivery=None, thread_id=None, thread=None, reply_to=None, lease_epoch=None,
                                       idempotency_key="k-top", ref=None, deliver_by=None)
             result = msg_cli.top_send(args)
-        self.assertEqual(result["from"], "agent:developer")
-        self.assertEqual(self.calls[-1][2]["from_actor"], "agent:developer")
-        # A --from that differs from the profile credential is refused (§11).
-        args.from_actor = "agent:impersonator"
-        with self.assertRaises(msg_cli.MsgError):
-            msg_cli.top_send(args)
+            self.assertEqual(result["from"], "agent:developer")
+            self.assertEqual(self.calls[-1][2]["from_actor"], "agent:developer")
+            args.as_actor = "agent:oncall"
+            delegated = msg_cli.top_send(args)
+            self.assertEqual(delegated["from"], "agent:oncall")
+            self.assertEqual(self.calls[-1][2]["from_actor"], "agent:oncall")
+            self.assertEqual(self.calls[-1][2]["as"], "agent:oncall")
+            # --from must agree with the acting identity, not the underlying credential.
+            args.from_actor = "agent:impersonator"
+            with self.assertRaises(msg_cli.MsgError):
+                msg_cli.top_send(args)
 
     def test_readdress_and_agent_delegate_requests(self):
         with mock.patch("agent_hub_host.bus._do_request", side_effect=self.fake_request):

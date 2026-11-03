@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService } from '../src/session_control';
 import { BusService } from '../src/bus';
-import { resolveRecipient, afterMessageInsert, renderTui, checkSendScoping, setMessageState } from '../src/session-messaging';
+import { resolveRecipient, afterMessageInsert, renderTui, checkSendScoping, setMessageState, updateNamedAgentDelegates } from '../src/session-messaging';
 import { sha256 } from '../src/auth/crypto';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
@@ -127,7 +127,7 @@ describe('cross-device session messaging', () => {
 });
 
 describe('named agent credential', () => {
-  it('mints an operator-only rotating agent:developer messaging credential that reads its own inbox', async () => {
+  it('mints an operator-only rotating agent:developer msg credential that reads its own inbox', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('named-agent-' + crypto.randomUUID()));
     const human = 'test-only-named-agent-admin';
@@ -144,7 +144,7 @@ describe('named agent credential', () => {
     const res = await call('/api/agents/named/developer/credential', human, {});
     expect(res.status).toBe(201);
     const cred: any = await res.json();
-    expect(cred).toMatchObject({ actor: 'agent:developer', scopes: ['bus:send', 'bus:read'] });
+    expect(cred).toMatchObject({ actor: 'agent:developer', scopes: ['msg:send', 'msg:read'] });
     expect((await inbox(cred.access_token)).status).toBe(200);
     // The agent identity cannot mint or rotate credentials itself.
     expect((await call('/api/agents/named/developer/credential', cred.access_token, {})).status).toBe(403);
@@ -394,36 +394,70 @@ describe('M5 client surface (intake 3bdf9715)', () => {
   }));
 });
 
-describe('M5 named-agent delegation (§9)', () => {
-  it('acts as a named agent only for granted MCP clients or the operator, and audits the send', () => fixture(async ({ bus, hub, sql }) => {
+describe('M6 named-agent delegation (§9)', () => {
+  it('checks the exact delegated credential family on message routes and audits on_behalf_of', () => fixture(async ({ bus, hub, sql }) => {
     const human = { kind: 'human', actor: 'human:alice', tokenId: 'mcp-cred-alice' } as any;
-    // No delegate grant yet: refused.
-    expect((hub as any).actingCallerFor(human, 'agent:developer').error?.status).toBe(403);
-    expect((hub as any).actingCallerFor(human, 'human:alice').delegated).toBe(false); // own actor passes through
-    expect((hub as any).actingCallerFor(human, 'session:nope').error?.status).toBe(400);
-    // Operator override is allowed without a grant; the acting view drops
-    // admin and any host authority before the bus checks run.
-    const admin = (hub as any).actingCallerFor({ kind: 'human', actor: 'admin', isAdmin: true } as any, 'agent:developer');
-    expect(admin.delegated).toBe(true);
-    expect(admin.caller).toMatchObject({ actor: 'agent:developer', isAdmin: false, machineId: undefined });
-    // A delegate grant binds one MCP client (the caller's credential family) to the agent.
+    const call = async (caller: any, path: string, method = 'POST', body?: any) => {
+      (hub as any).authenticateBusRequest = async () => ({ caller, scopes: ['msg:send', 'msg:read', 'admin'] });
+      return hub.fetch(new Request('https://hub.test' + path, {
+        method, headers: { 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }));
+    };
+    const send = { to_actor: 'agent:developer', kind: 'note', body: 'as developer', idempotency_key: 'd-1', as: 'agent:developer' };
+    expect((await call(human, '/api/bus/send', 'POST', send)).status).toBe(403); // no delegate grant yet
+    expect((await call({ kind: 'human', actor: 'admin', isAdmin: true }, '/api/bus/send', 'POST', send)).status).toBe(403);
+
+    // One credential family is delegated; sibling families from the same MCP client stay isolated.
     const at = new Date().toISOString();
-    sql.exec("INSERT INTO named_agent_delegates (agent, client, created_by, created_at) VALUES ('developer', 'test-client', 'admin', ?)", at);
+    const far = new Date(Date.now() + 86400000).toISOString();
+    sql.exec('CREATE TABLE IF NOT EXISTS mcp_grants (family TEXT PRIMARY KEY, client TEXT, resource TEXT, expires INTEGER)');
     sql.exec(`INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at)
-      VALUES ('mcp-cred-alice', 'human', 'hash-alice', 'fam-alice', 'alice@fake.local', 'human:alice', '["admin"]', 'a', ?, ?)`, at, at);
+      VALUES ('mcp-cred-alice', 'human', 'hash-alice', 'fam-alice', 'alice@fake.local', 'human:alice', '["admin"]', 'a', ?, ?)`, at, far);
+    sql.exec(`INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at)
+      VALUES ('mcp-cred-alice-sibling', 'human', 'hash-alice-sibling', 'fam-alice-sibling', 'alice@fake.local', 'human:alice', '["admin"]', 'a', ?, ?)`, at, far);
     sql.exec("INSERT INTO mcp_grants (family, client, resource, expires) VALUES ('fam-alice', 'test-client', 'https://hub.test/mcp', ?)", Date.now() + 3600000);
-    const granted = (hub as any).actingCallerFor(human, 'agent:developer');
-    expect(granted.error).toBeUndefined();
-    expect(granted.delegated).toBe(true);
-    // A delegated send is checked as the named agent and audited on_behalf_of.
-    const sent = bus.send(granted.caller, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'as developer', idempotencyKey: 'd-1' });
-    (hub as any).auditDelegatedSend(human, granted, sent.id);
+    sql.exec("INSERT INTO mcp_grants (family, client, resource, expires) VALUES ('fam-alice-sibling', 'test-client', 'https://hub.test/mcp', ?)", Date.now() + 3600000);
+    updateNamedAgentDelegates(sql, 'developer', ['fam-alice']);
+    expect((await call({ ...human, tokenId: 'mcp-cred-alice-sibling' }, '/api/bus/send', 'POST', { ...send, idempotency_key: 'd-sibling' })).status).toBe(403);
+
+    // The MCP-style HTTP route changes the sender to the named agent while
+    // preserving the credential-family owner in the metadata-only audit.
+    const sentResponse = await call(human, '/api/bus/send', 'POST', send);
+    expect(sentResponse.status).toBe(200);
+    const sent = await sentResponse.json() as any;
+    expect(sql.exec('SELECT from_actor, to_actor FROM messages WHERE id = ?', sent.id).one()).toEqual({
+      from_actor: 'agent:developer', to_actor: 'agent:developer',
+    });
     const audit: any = sql.exec("SELECT actor, detail_json FROM message_events WHERE message_id = ? AND event = 'delegated'", sent.id).one();
     expect(audit.actor).toBe('human:alice');
-    expect(audit.detail_json).toContain('test-client');
+    expect(JSON.parse(audit.detail_json)).toMatchObject({ on_behalf_of: 'human:alice', credential_family: 'fam-alice' });
+
+    const inbox = await call(human, '/api/bus/inbox?as=agent%3Adeveloper', 'GET');
+    expect(inbox.status).toBe(200);
+    expect((await inbox.json() as any[]).map(row => row.id)).toContain(sent.id);
+
+    sql.exec(`INSERT INTO users (sub, email, is_admin, first_seen_at, last_seen_at)
+      VALUES ('alice', 'alice@fake.local', 1, ?, ?)`, at, at);
+    const inbound = bus.send({ kind: 'human', actor: 'human:alice' } as any, {
+      senderActor: 'human:alice', toActor: 'agent:developer', kind: 'note', body: 'reply to this', idempotencyKey: 'd-inbound',
+    });
+    const replyResponse = await call(human, '/api/bus/reply', 'POST', {
+      reply_to: inbound.id, from_actor: 'agent:developer', to_actor: 'human:alice', kind: 'reply',
+      body: 'reply as developer', idempotency_key: 'd-reply', as: 'agent:developer',
+    });
+    expect(replyResponse.status).toBe(200);
+    const reply = await replyResponse.json() as any;
+    expect(reply.thread_id).toBe(inbound.threadId);
+    expect(sql.exec('SELECT from_actor, to_actor, thread_id FROM messages WHERE id = ?', reply.id).one()).toEqual({
+      from_actor: 'agent:developer', to_actor: 'human:alice', thread_id: inbound.threadId,
+    });
+    const replyAudit: any = sql.exec("SELECT actor, detail_json FROM message_events WHERE message_id = ? AND event = 'delegated'", reply.id).one();
+    expect(replyAudit.actor).toBe('human:alice');
+    expect(JSON.parse(replyAudit.detail_json)).toMatchObject({ on_behalf_of: 'human:alice', credential_family: 'fam-alice' });
+
     // Revoking the grant stops future delegation.
-    sql.exec("DELETE FROM named_agent_delegates WHERE agent = 'developer' AND client = 'test-client'");
-    expect((hub as any).actingCallerFor(human, 'agent:developer').error?.status).toBe(403);
+    updateNamedAgentDelegates(sql, 'developer', ['fam-alice'], true);
+    expect((await call(human, '/api/bus/send', 'POST', { ...send, idempotency_key: 'd-revoked' })).status).toBe(403);
   }));
 });
 
