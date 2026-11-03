@@ -94,9 +94,14 @@ def main():
         rows = load()
         hit = [r for r in rows if r["tag"] == tag and r["workspace"] == ws]
         if not hit: sys.stderr.write("no session\n"); sys.exit(1)
+        # Targeted-status fidelity: the real native DTO carries the stop-oracle
+        # receipts (containment_empty, engine) beside phase, and the hardened
+        # stop path verifies them instead of scanning the catalog.
         print(json.dumps({"phase": hit[0]["phase"], "state": hit[0]["phase"],
                           "id": hit[0]["id"], "tag": hit[0]["tag"],
                           "workspace": hit[0]["workspace"],
+                          "engine": hit[0].get("engine"),
+                          "containment_empty": hit[0].get("containment_empty", False),
                           "created_at_ms": hit[0].get("created_at_ms")}))
     elif cmd == "kill":
         ws = opt(args, "--workspace"); tag = opt(args, "--tag")
@@ -757,7 +762,7 @@ def test_receive_once_ordinary_stop_with_roots_leaves_tree_absent(env):
     assert "feat-n" in _git(["branch", "--list", "feat-n"], main).stdout
 
 
-def test_receive_once_unbound_stop_acks_delivered_confirmed_exit(env):
+def test_receive_once_unbound_stop_without_exact_native_stays_unverified(env):
     cid = str(uuid.uuid4())
     stop_offer = offer(cid, "stop", None, payload={})
     stop_offer["session_state"] = "uncertain"
@@ -779,7 +784,8 @@ def test_receive_once_unbound_stop_acks_delivered_confirmed_exit(env):
     result = rc.receive_once(custody=custody(), journal_dir=env["journal"],
                              executable=env["fake"], request=stub_request, limit=20)
     assert result["offers_seen"] == 1
-    assert result["processed"][0]["state"] == "stopped"
-    assert acked[0]["outcome"] == "delivered"
-    assert acked[0]["confirmed_exit"] is True
+    assert result["processed"] == []
+    assert any(row["reason"] == "unbound_stop_native_identity_missing_or_ambiguous"
+               for row in result["skipped"])
+    assert acked == []
 

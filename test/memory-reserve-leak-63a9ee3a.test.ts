@@ -16,7 +16,11 @@ const req=(extra={})=>({workspace:'demo',project:'repo',task_kind:'implement',pr
 async function fixture(fn:(f:FleetService,sql:any,launch:(id:string,state:string,ageMs:number,ramp?:boolean)=>void)=>Promise<void>) {
   const bindings=env as unknown as Env;
   await runInDurableObject(bindings.HUB.get(bindings.HUB.idFromName('memres-'+crypto.randomUUID())),async(h:Hub,state:DurableObjectState)=>{
-    const f=new FleetService(h.sql,cb=>state.storage.transactionSync(cb),()=>now);f.init();const sql=h.sql;
+    const f=new FleetService(h.sql,cb=>state.storage.transactionSync(cb),()=>now);f.init();
+    // These fixtures model reservation accounting; the explicit concurrent
+    // session cap has its own placement regression test.
+    f.resources.configure({host_max_sessions:512});
+    const sql=h.sql;
     sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat,capabilities) VALUES(?,?,?,?,?,?,?)','host','host','host',iso(),iso(),
       JSON.stringify({mem_avail_mb:12000,disk_free_gb:80,load:[1,1,1],cpu_usage:freshCpu(iso(),12,1),gate:{launch_allowed:true,at:iso()}}),
       JSON.stringify({engines:['codex'],fleet_modes:['interactive','headless'],workspaces:['demo'],cpu_count:12}));

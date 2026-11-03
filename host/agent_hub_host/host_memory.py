@@ -39,6 +39,36 @@ def read_proc_meminfo(path: str = "/proc/meminfo", open_fn: Callable = open) -> 
     return _valid(values.get("MemTotal"), available, "proc_meminfo")
 
 
+def read_proc_swap_used_percent(path: str = "/proc/meminfo", open_fn: Callable = open) -> Optional[float]:
+    """Return swap use percent on Linux, or None when proc telemetry is absent."""
+    values: Dict[str, int] = {}
+    try:
+        with open_fn(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                key, sep, rest = line.partition(":")
+                parts = rest.split()
+                if sep and parts and key.strip() in ("SwapTotal", "SwapFree"):
+                    values[key.strip()] = int(parts[0]) * 1024
+    except (OSError, ValueError, TypeError):
+        return None
+    total, free = values.get("SwapTotal"), values.get("SwapFree")
+    if type(total) is not int or type(free) is not int or total < 0 or free < 0 or free > total:
+        return None
+    if total == 0:
+        return 0.0
+    return round((total - free) * 100.0 / total, 2)
+
+
+def read_host_swap_used_percent(*, system: Optional[str] = None,
+                                meminfo_path: str = "/proc/meminfo",
+                                open_fn: Callable = open) -> Optional[float]:
+    """Return measured host swap use where the OS exposes it; unknown otherwise."""
+    system = system or platform.system()
+    if system != "Linux":
+        return None
+    return read_proc_swap_used_percent(meminfo_path, open_fn)
+
+
 def read_windows_global_memory() -> Optional[Dict]:
     try:
         import ctypes

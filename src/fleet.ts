@@ -199,7 +199,6 @@ const CLAIM_REFUSAL_REJECTED = new Set(['fresh_admission_required', 'model_unsup
  * guards the 2026-10-28 incident (load 275-295 on 12 cores); real busyness is measured CPU/memory. */
 const HOST_LOAD_FACTOR = 6;
 /** Per-host load budget factor for automatic goal placement (1.5x cores; 18 on 12-core RMTHZ). */
-const GOAL_LOAD_FACTOR = 1.5;
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -409,13 +408,21 @@ function object(value: any, keys: string[]): boolean {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => keys.includes(k));
 }
 function validHostLoad(reason: string, value: any): boolean {
-  if (!object(value, ['trigger', 'mem_avail_mb', 'mem_floor_mb', 'cpu_busy_pct', 'cpu_window_s', 'load1', 'cores', 'factor'])) return false;
+  if (!object(value, ['trigger', 'mem_avail_mb', 'mem_floor_mb', 'cpu_busy_pct', 'cpu_window_s', 'cpu_psi_full_pct', 'cpu_psi_full_limit_pct', 'swap_used_pct', 'swap_limit_pct', 'load1', 'cores', 'factor'])) return false;
   if (value.trigger === 'mem_available') return reason === 'memory_pressure' &&
     Object.keys(value).length === 3 && Number.isFinite(value.mem_avail_mb) && value.mem_avail_mb >= 0 && value.mem_avail_mb <= 1e9 &&
     Number.isFinite(value.mem_floor_mb) && value.mem_floor_mb > 0 && value.mem_floor_mb <= 6144 && value.mem_avail_mb < value.mem_floor_mb;
   if (value.trigger === 'cpu_busy') return reason === 'cpu_pressure' &&
     Object.keys(value).length === 3 && Number.isFinite(value.cpu_busy_pct) && value.cpu_busy_pct >= CPU_SATURATED_PCT && value.cpu_busy_pct <= 100 &&
     Number.isFinite(value.cpu_window_s) && value.cpu_window_s >= 10 && value.cpu_window_s <= 3600;
+  if (value.trigger === 'cpu_psi_full') return reason === 'cpu_pressure' &&
+    Object.keys(value).length === 3 && Number.isFinite(value.cpu_psi_full_pct) && value.cpu_psi_full_pct >= 0 && value.cpu_psi_full_pct <= 100 &&
+    Number.isFinite(value.cpu_psi_full_limit_pct) && value.cpu_psi_full_limit_pct >= .1 && value.cpu_psi_full_limit_pct <= 100 &&
+    value.cpu_psi_full_pct > value.cpu_psi_full_limit_pct;
+  if (value.trigger === 'swap_pressure') return reason === 'memory_pressure' &&
+    Object.keys(value).length === 3 && Number.isFinite(value.swap_used_pct) && value.swap_used_pct >= 0 && value.swap_used_pct <= 100 &&
+    Number.isFinite(value.swap_limit_pct) && value.swap_limit_pct >= 1 && value.swap_limit_pct <= 100 &&
+    value.swap_used_pct > value.swap_limit_pct;
   if (value.trigger === 'load_runaway') return reason === 'host_load_high' &&
     Object.keys(value).length === 4 && Number.isFinite(value.load1) && value.load1 >= 0 && value.load1 <= 1e9 &&
     Number.isInteger(value.cores) && value.cores >= 1 && value.cores <= 4096 &&
@@ -1583,6 +1590,14 @@ export class FleetService {
           const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;
           return usage?.busy_percent_window != null && age <= 180000 && age >= -30000 && usage.busy_percent_window >= (loadRefusal.limit ?? CPU_SATURATED_PCT);
         }
+        if (trigger === 'cpu_psi_full') {
+          const usage = sanitizeCpuUsage(hb.cpu_usage);
+          const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;
+          return usage?.psi_full_avg10 != null && age <= 180000 && age >= -30000 && usage.psi_full_avg10 > (loadRefusal.limit ?? this.resources.config().cpu_psi_full_hard_cap_pct);
+        }
+        if (trigger === 'swap_pressure') {
+          return Number.isFinite(hb.swap_used_percent) && hb.swap_used_percent > (loadRefusal.limit ?? this.resources.config().swap_max_used_percent);
+        }
         const runaway = Number.isFinite(hb?.load?.[0]) && Number.isFinite(caps?.cpu_count) && caps.cpu_count > 0 &&
           hb.load[0] > (trigger === 'load_runaway' ? loadRefusal.factor : Math.max(loadRefusal.factor, HOST_LOAD_FACTOR)) * caps.cpu_count;
         if (trigger === 'load_runaway') return runaway;
@@ -1591,16 +1606,8 @@ export class FleetService {
         const usage = sanitizeCpuUsage(hb.cpu_usage);
         const age = usage ? this.now() - Date.parse(usage.observed_at) : NaN;
         return runaway || (usage?.busy_percent_window != null && age <= 180000 && age >= -30000 && usage.busy_percent_window >= CPU_SATURATED_PCT);
-      })()) reason = loadRefusal.trigger === 'mem_available' ? 'memory_pressure'
-        : loadRefusal.trigger === 'cpu_busy' ? 'cpu_pressure' : 'host_load_high';
-      // A goal placement has a per-host load budget, independent of account
-      // concurrency. When this host is over budget, continue checking other
-      // eligible machines so a busy host does not freeze the fleet-wide pool.
-      else if (
-        request.with_goal === true && Number.isFinite(hb?.load?.[0]) &&
-        Number.isFinite(caps?.cpu_count) && caps.cpu_count > 0 &&
-        hb.load[0] > GOAL_LOAD_FACTOR * caps.cpu_count
-      ) reason = 'host_load_high';
+      })()) reason = ['mem_available','swap_pressure'].includes(loadRefusal.trigger || '') ? 'memory_pressure'
+        : ['cpu_busy','cpu_psi_full'].includes(loadRefusal.trigger || '') ? 'cpu_pressure' : 'host_load_high';
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         memory().reserved_mb,
         memory().requested_mb, this.resources.config(), hb.mem_total_mb)) reason = 'launcher_memory_reserve';
@@ -1626,10 +1633,12 @@ export class FleetService {
           ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}),
           ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}),
           ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}),
-          ...(reason === 'host_load_high' ? { ...(Number.isFinite(hb?.load?.[0]) ? { load1: hb.load[0] } : {}), cpu_count: caps.cpu_count, load_limit: (refusalOnRoute ? (refusalOnRoute.trigger === 'load_runaway' ? refusalOnRoute.factor : Math.max(refusalOnRoute.factor, HOST_LOAD_FACTOR)) : GOAL_LOAD_FACTOR) * caps.cpu_count, cpu_busy_window: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window ?? null } : {}),
+          ...(reason === 'host_load_high' ? { ...(Number.isFinite(hb?.load?.[0]) ? { load1: hb.load[0] } : {}), cpu_count: caps.cpu_count, load_limit: (refusalOnRoute === undefined ? this.resources.config().cpu_load_factor : refusalOnRoute.trigger === 'load_runaway' ? refusalOnRoute.factor : Math.max(refusalOnRoute.factor, HOST_LOAD_FACTOR)) * caps.cpu_count, cpu_busy_window: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window ?? null } : {}),
           ...(reason === 'memory_pressure' && refusalOnRoute?.trigger === 'mem_available' ? { host_load: { trigger: 'mem_available', mem_avail_mb: hb.mem_avail_mb, mem_floor_mb: refusalOnRoute.limit } } : {}),
+          ...(reason === 'memory_pressure' && refusalOnRoute?.trigger === 'swap_pressure' ? { host_load: { trigger: 'swap_pressure', swap_used_pct: hb.swap_used_percent, swap_limit_pct: refusalOnRoute.limit } } : {}),
           ...(reason === 'cpu_pressure' && refusalOnRoute?.trigger === 'cpu_busy' ? { host_load: { trigger: 'cpu_busy', cpu_busy_pct: sanitizeCpuUsage(hb.cpu_usage)?.busy_percent_window, cpu_window_s: sanitizeCpuUsage(hb.cpu_usage)?.window_s } } : {}),
-          ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) && !((reason === 'memory_pressure' && refusalOnRoute?.trigger === 'mem_available') || (reason === 'cpu_pressure' && refusalOnRoute?.trigger === 'cpu_busy')) ? {cpu:cpu()} : {}),
+          ...(reason === 'cpu_pressure' && refusalOnRoute?.trigger === 'cpu_psi_full' ? { host_load: { trigger: 'cpu_psi_full', cpu_psi_full_pct: sanitizeCpuUsage(hb.cpu_usage)?.psi_full_avg10, cpu_psi_full_limit_pct: refusalOnRoute.limit } } : {}),
+          ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) && !((reason === 'memory_pressure' && ['mem_available','swap_pressure'].includes(refusalOnRoute?.trigger || '')) || (reason === 'cpu_pressure' && ['cpu_busy','cpu_psi_full'].includes(refusalOnRoute?.trigger || ''))) ? {cpu:cpu()} : {}),
         });
         continue;
       }
@@ -2015,7 +2024,7 @@ export class FleetService {
         const loadRefusal = memoryHold?.host_load_machine ? {
           machine: String(memoryHold.host_load_machine),
           factor: Number.isFinite(memoryHold.host_load_factor) && memoryHold.host_load_factor >= 0.5 && memoryHold.host_load_factor <= 8 ? memoryHold.host_load_factor : HOST_LOAD_FACTOR,
-          trigger: ['mem_available', 'cpu_busy', 'load_runaway'].includes(memoryHold.host_load_trigger) ? String(memoryHold.host_load_trigger) : 'legacy',
+          trigger: ['mem_available', 'cpu_busy', 'cpu_psi_full', 'swap_pressure', 'load_runaway'].includes(memoryHold.host_load_trigger) ? String(memoryHold.host_load_trigger) : 'legacy',
           limit: Number.isFinite(memoryHold.host_load_limit) ? memoryHold.host_load_limit : undefined,
         } : undefined;
         let plan: any;
@@ -3353,7 +3362,9 @@ export class FleetService {
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
             const hostLoadTrigger = hasHostLoad ? String(reportedHostLoad.trigger) : null;
             const hostLoadLimit = reportedHostLoad?.trigger === 'mem_available' ? reportedHostLoad.mem_floor_mb
-              : reportedHostLoad?.trigger === 'cpu_busy' ? reportedHostLoad.cpu_busy_pct : null;
+              : reportedHostLoad?.trigger === 'cpu_busy' ? reportedHostLoad.cpu_busy_pct
+              : reportedHostLoad?.trigger === 'cpu_psi_full' ? reportedHostLoad.cpu_psi_full_limit_pct
+              : reportedHostLoad?.trigger === 'swap_pressure' ? reportedHostLoad.swap_limit_pct : null;
             this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, host_load_machine, host_load_factor, host_load_trigger, host_load_limit) VALUES (?, ?, ?, ?, ?, ?, ?)',
               id, at, JSON.stringify(rejected), (hasHostLoad || data.reason === 'host_load_high') ? row.machine_id : null,
               data.reason === 'host_load_high' ? loadFactor : null, hostLoadTrigger, hostLoadLimit);

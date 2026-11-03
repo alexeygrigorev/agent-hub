@@ -336,16 +336,18 @@ def get_heartbeat_payload(clock=None, running_jobs=None) -> dict:
 
     # Intake 63a9ee3a: an unreadable host reports null, never 0 — Hub reads
     # a finite 0 as a real empty host and refuses with launcher_memory_reserve.
-    from .host_memory import read_host_memory
+    from .host_memory import read_host_memory, read_host_swap_used_percent
     reading = read_host_memory()
     mem_avail_mb = reading["available_bytes"] // (1024 * 1024) if reading else None
     mem_total_mb = reading["total_bytes"] // (1024 * 1024) if reading else None
+    swap_used_percent = read_host_swap_used_percent()
     from .cpu_resources import sample_cpu_usage
     cpu_usage = sample_cpu_usage()
     payload: dict = {
         "type": "heartbeat",
       "cpu_usage": cpu_usage,
         "mem_avail_mb": mem_avail_mb,
+        "swap_used_percent": swap_used_percent,
         "disk_free_gb": shutil.disk_usage("/").free // (1024**3),
         "load": os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0),
         "gate": gate.get_gate_status(clock),

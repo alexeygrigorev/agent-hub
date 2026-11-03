@@ -3843,9 +3843,9 @@ class Dispatcher:
         # unclaimed non-task offer, _dispatch_one refreshes the heartbeat
         # before sending the matching Hub refusal so its retry stays held.
         # Nothing already running is touched.
-        from .host_load import check_live_load
+        from .host_load import check_live_load, policy_settings
         stages = [('start', time.monotonic())]
-        check_live_load(self.settings)
+        check_live_load(policy_settings(self.settings, offer))
         sub = self._route(offer)
         checkout = offered_repo_checkout(self.settings, offer)
         if checkout is not None and offer['repo_provision']['mode'] == 'clone_on_demand':
@@ -4106,7 +4106,7 @@ class Dispatcher:
                     bounded = {k: policy[k] for k in (
                         "memory_floor_mb", "ramp_reserve_default_mb", "estimate_percentile",
                         "estimate_multiplier", "estimate_cap_mb", "memory_floor_pct", "ramp_seconds", "cpu_load_factor",
-                        "cpu_target_utilization", "cpu_default_cores", "cpu_estimate_multiplier", "cpu_psi_hard_cap_pct", "cpu_psi_full_hard_cap_pct", "memory_psi_full_hard_cap_pct", "choking_cooldown_seconds",
+                        "cpu_target_utilization", "cpu_default_cores", "cpu_estimate_multiplier", "cpu_psi_hard_cap_pct", "cpu_psi_full_hard_cap_pct", "memory_psi_full_hard_cap_pct", "swap_max_used_percent", "host_max_sessions", "choking_cooldown_seconds",
                         "watchdog_interval_s", "idle_minutes", "rss_flag_gb") if k in policy}
                     if bounded:
                         payload["resource_management"] = bounded
@@ -4193,7 +4193,8 @@ class Dispatcher:
         # uncertain native launch holding a dispatch reservation forever.
         self._lock_session_worktree(offer, target_cwd)
         # Re-sample after slow preparation, before any claim.
-        check_live_load(self.settings)
+        from .host_load import check_live_load, policy_settings
+        check_live_load(policy_settings(self.settings, offer))
         claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
         self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, offer_workspace)
         stages.append(('claim', time.monotonic()))
@@ -5172,7 +5173,7 @@ class Dispatcher:
                     'error_type': 'ValueError',
                 }
                 if (isinstance(load_status, dict) and
-                        load_status.get('trigger') in {'mem_available', 'cpu_busy', 'load_runaway'}):
+                        load_status.get('trigger') in {'mem_available', 'cpu_busy', 'cpu_psi_full', 'swap_pressure', 'load_runaway'}):
                     from .host_load import hub_refusal
                     hub_reason, host_load = hub_refusal(load_status)
                     from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
@@ -5201,8 +5202,8 @@ class Dispatcher:
                                     'reason': reason, 'diagnostic': hub_diagnostic})
                     return
 
-                # Publish the same fresh load sample the local 1.5x-core
-                # guard used before rejecting. Hub drains the retry inside
+                # Publish the same fresh load sample the configurable local
+                # host-load guard used before rejecting. Hub drains the retry inside
                 # /reject, so it must see this heartbeat before choosing a
                 # host or the new queued intent could be immediately re-offered.
                 if not self._refresh_checkin(getattr(self, '_last_hb', None)):

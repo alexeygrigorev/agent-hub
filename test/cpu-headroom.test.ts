@@ -28,6 +28,23 @@ describe('heavy utilization without choking',()=>{
   expect(cpuVerdict(usage(1,{memory_psi_full_avg10:20}),12,2,0,cfg,now,32000).reason).toBe('memory_pressure');
   expect(cpuVerdict(usage(1,{host_oom_kills_delta:1}),12,2,0,cfg,now)).toMatchObject({reason:'host_oom',host_oom_kills_delta:1});
  });
+ it('holds on fresh host load above N cores and reports the configured limit',()=>{
+  const host={load1:24.1,swap_used_percent:0,observed_at:new Date(now).toISOString(),active_sessions:2};
+  // Host admission state is the 10th argument now that the memory gate
+  // (memAvailableMb, memoryFloorMb, memObservedAt) owns positions 7-9.
+  expect(cpuVerdict(usage(),12,1,0,{...cfg,cpu_load_factor:2},now,undefined,undefined,undefined,host)).toMatchObject({
+   admitted:false,reason:'host_load_high',host_load1:24.1,host_load_limit:24,
+  });
+  expect(cpuVerdict(usage(),12,1,0,{...cfg,cpu_load_factor:2},now,undefined,undefined,undefined,{...host,load1:24})).toMatchObject({admitted:true,reason:null});
+  expect(cpuVerdict(usage(),12,1,0,{...cfg,cpu_load_factor:2},now,undefined,undefined,undefined,{...host,load1:100,observed_at:new Date(now-180001).toISOString()})).toMatchObject({admitted:true,reason:null});
+ });
+ it('holds on host swap pressure and reserves a bounded concurrent session slot',()=>{
+  const host={load1:1,swap_used_percent:80.1,observed_at:new Date(now).toISOString(),active_sessions:0};
+  expect(cpuVerdict(usage(),12,1,0,{...cfg,swap_max_used_percent:80},now,undefined,undefined,undefined,host)).toMatchObject({admitted:false,reason:'memory_pressure',swap_used_percent:80.1});
+  expect(cpuVerdict(usage(),12,1,0,{...cfg,host_max_sessions:2},now,undefined,undefined,undefined,{...host,swap_used_percent:0,active_sessions:2})).toMatchObject({
+   admitted:false,reason:'machine_capacity',host_session_count:2,host_max_sessions:2,
+  });
+ });
  it('never treats the unscoped legacy vmstat counter as host OOM',()=>{
   expect(cpuVerdict(usage(1,{oom_kills_delta:20}),12,2,0,cfg,now)).toMatchObject({admitted:true,reason:null});
   expect(cpuVerdict(usage(1,{oom_kills_delta:20,host_oom_kills_delta:0}),12,2,0,cfg,now).admitted).toBe(true);

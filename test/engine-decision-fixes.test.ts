@@ -21,6 +21,9 @@ async function withFleet(name: string, fn: (fleet: FleetService, hub: Hub) => Pr
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
     const fleet = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => NOW);
     fleet.init();
+    // This fixture tests placement scoring with synthetic active rows. The
+    // dedicated host-cap test covers the independent safety ceiling.
+    fleet.resources.configure({ host_max_sessions: 512 });
     for (const machine of ['hetzner', 'laptop']) {
       hub.sql.exec(
         'INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, 0, ?)',

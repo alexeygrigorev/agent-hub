@@ -31,6 +31,24 @@ class SessionHostTests(unittest.TestCase):
             args=execute.call_args.args[0]
             self.assertEqual(args.machine_id,'test-machine')
             self.assertEqual(args.sessions_cmd,'host-receive')
+            self.assertEqual(args.command_kind,'non_stop')
+
+    def test_urgent_stop_loop_uses_a_stop_only_receiver(self):
+        import threading
+        stop = threading.Event()
+        dispatcher = SimpleNamespace(settings={'aplexer_bin': 'aplexer'})
+        calls = []
+
+        def execute(args):
+            calls.append(args)
+            stop.set()
+
+        with patch.object(session_host.session_control, 'execute', side_effect=execute):
+            session_host.urgent_stop_loop(dispatcher, stop, 'test-machine', '/journal', '/repo', poll_s=0)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].command_kind, 'stop')
+        self.assertEqual(calls[0].machine_id, 'test-machine')
 
     def test_heavy_test_reaper_posts_a_sanitized_intake_note(self):
         from agent_hub_host import heavy_test_admission

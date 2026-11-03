@@ -15,7 +15,7 @@ async function fixture(fn:(f:FleetService,sql:any,beat:(busy:number,extra?:any)=
  const bindings=env as unknown as Env;
  await runInDurableObject(bindings.HUB.get(bindings.HUB.idFromName('cpu-'+crypto.randomUUID())),async(h:Hub,state:DurableObjectState)=>{
   const f=new FleetService(h.sql,cb=>state.storage.transactionSync(cb),()=>now);f.init();const sql=h.sql;
-  const beat=(busy:number,extra={})=>sql.exec('UPDATE machines SET last_heartbeat=? WHERE id=?',JSON.stringify({mem_avail_mb:32000,disk_free_gb:80,load:[100,100,100],cpu_usage:freshCpu(iso(),8,busy),gate:{launch_allowed:true,at:iso()},...extra}),'host');
+  const beat=(busy:number,extra={})=>sql.exec('UPDATE machines SET last_heartbeat=? WHERE id=?',JSON.stringify({mem_avail_mb:32000,disk_free_gb:80,load:[12,12,12],cpu_usage:freshCpu(iso(),8,busy),gate:{launch_allowed:true,at:iso()},...extra}),'host');
   sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities) VALUES(?,?,?,?,?,?)','host','host','host',iso(),iso(),JSON.stringify({engines:['codex'],fleet_modes:['interactive','headless'],workspaces:['demo'],cpu_count:8}));beat(0);
   const quota={status:'ok',observed_at:iso(),details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:iso(86400000)}}};
   sql.exec('INSERT INTO host_quota_snapshots(host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json) VALUES(?,?,?,?,?,?,?,?,?)','host','1.0',iso(),now,iso(),now,'ok',null,JSON.stringify({codex:quota}));

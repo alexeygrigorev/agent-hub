@@ -164,12 +164,14 @@ hard-coded constants.
 | `estimate_cap_mb` | 1024 | Ceiling for one session's measured estimate |
 | `estimate_multiplier` | 1.25 | measured estimate growth allowance |
 | `ramp_seconds` | 180 | additional reserve window after starting |
-| `cpu_load_factor` | 3.0 | Deprecated compatibility field; never gates CPU |
+| `cpu_load_factor` | 2.0 | Host launch hold when the 1-minute load exceeds this multiple of logical cores |
+| `swap_max_used_percent` | 80 | Host launch hold when measured swap use exceeds this percentage |
+| `host_max_sessions` | 24 | Maximum live or in-flight sessions per host; claims reserve a slot atomically |
 | `cpu_target_utilization` | 1.0 | Advisory utilization target; never a busy-only gate |
 | `cpu_default_cores` | 1.0 | Conservative no-history task estimate |
 | `cpu_estimate_multiplier` | 1.25 | Growth allowance over measured CPU p95 |
 | `cpu_psi_hard_cap_pct` | 50 | Deprecated compatibility field; PSI some is display-only |
-| `cpu_psi_full_hard_cap_pct` | 5 | CPU full PSI hard cap |
+| `cpu_psi_full_hard_cap_pct` | 5 | CPU full PSI hard cap at the host and Hub admission gates |
 | `memory_psi_full_hard_cap_pct` | 1 | Memory full PSI hard cap |
 | `choking_cooldown_seconds` | 300 | Recent OOM/runtime-failure hold |
 | `watchdog_interval_s` | 300–600 | watchdog |

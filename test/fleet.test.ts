@@ -439,7 +439,7 @@ describe('generic accounts and launch placement', () => {
   }));
   it('chooses by measured CPU and keeps unknown CPU advisory', async () => fixture(async (s, sql) => {
     await configure(s);
-    const hb = { mem_avail_mb: 32000, disk_free_gb: 80, load: [30], cpu_usage: freshCpu(iso(),8,7), gate: { launch_allowed: true, at: iso() } };
+    const hb = { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso(),8,7), gate: { launch_allowed: true, at: iso() } };
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
     expect((s.plan(intent()) as any).selected.machine).toBe('win35');
     delete (hb as any).cpu_usage;
@@ -813,7 +813,7 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', claimed.id).one().state).toBe('starting');
   }));
-  it('keeps fresh placement load advisory after upgrading legacy hold rows', async () => fixture(async (s, sql) => {
+  it('applies fresh host load admission after upgrading legacy hold rows', async () => fixture(async (s, sql) => {
     sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_machine');
     sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_factor');
     sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_trigger');
@@ -823,8 +823,12 @@ describe('generic accounts and launch placement', () => {
     expect(sql.exec("SELECT rejected_json, host_load_machine, host_load_factor, host_load_trigger, host_load_limit FROM fleet_memory_holds WHERE launch_id='legacy-hold'").one()).toMatchObject({rejected_json:'[]',host_load_machine:null,host_load_factor:null,host_load_trigger:null,host_load_limit:null});
     await configure(s);
     const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
-    heartbeat.load = [100, 100, 100];
-    sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    heartbeat.load = [17, 100, 100];
+    sql.exec('UPDATE machines SET last_heartbeat = ?, last_checkin_at = ? WHERE id = ?', JSON.stringify(heartbeat), iso(), 'hetzner');
+    expect(s.plan(intent({ machine: 'hetzner' })).selected).toBeNull();
+    expect(s.plan(intent({ machine: 'hetzner' })).rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'host_load_high', load_limit: 16 }));
+    heartbeat.load = [16, 100, 100];
+    sql.exec('UPDATE machines SET last_heartbeat = ?, last_checkin_at = ? WHERE id = ?', JSON.stringify(heartbeat), iso(), 'hetzner');
     expect(s.plan(intent({ machine: 'hetzner' })).selected?.machine).toBe('hetzner');
     expect(isCapacityOnlyHold([{reason:'host_load_high'}])).toBe(true);
     expect(PLACEMENT_PRESSURE_REASONS.has('host_load_high')).toBe(true);
@@ -835,6 +839,9 @@ describe('generic accounts and launch placement', () => {
     {factor:6,pinned:false,sendFactor:true},
   ])('requeues only a load-refused retry: factor=$factor pinned=$pinned', async ({factor,pinned,sendFactor}) => fixture(async (s, sql) => {
     await configure(s);
+    // Isolate the persisted host refusal threshold from central placement's
+    // configurable load policy, which defaults to 2x cores.
+    s.resources.configure({cpu_load_factor:3});
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     // This retry test asserts the refusal flow, not random placement.
     const random = vi.spyOn(Math, 'random').mockReturnValue(0);
@@ -930,6 +937,30 @@ describe('generic accounts and launch placement', () => {
     heartbeat.mem_avail_mb = 7168;
     heartbeat.at = iso();
     sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    expect(s.drainCapacityQueue().promoted).toBeGreaterThan(0);
+    expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({ state: 'offered', machine_id: 'hetzner' });
+  }));
+  it('persists swap pressure as a memory hold and promotes after swap recovers', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
+    heartbeat.load = [1, 1, 1]; heartbeat.swap_used_percent = 82; heartbeat.at = iso();
+    sql.exec('UPDATE machines SET last_heartbeat = ?, last_checkin_at = ? WHERE id = ?', JSON.stringify(heartbeat), iso(), 'hetzner');
+    const diagnostic = {
+      reason: 'memory_pressure', message: 'Host memory full pressure exceeds the safety cap.',
+      stage: 'dispatch_route', error_type: 'ValueError',
+      host_load: { trigger: 'swap_pressure', swap_used_pct: 82, swap_limit_pct: 80 },
+    };
+    const retry: any = await (await s.handle(request('/launches/' + launch.id + '/reject', {
+      reason: 'memory_pressure', diagnostic,
+    }), host('hetzner'))).json();
+    expect(retry).toMatchObject({ state: 'queued', queued: true });
+    expect(retry.rejected).toContainEqual(expect.objectContaining({ reason: 'memory_pressure', host_load: diagnostic.host_load }));
+    expect(sql.exec('SELECT host_load_trigger, host_load_limit FROM fleet_memory_holds WHERE launch_id = ?', retry.id).one()).toMatchObject({
+      host_load_trigger: 'swap_pressure', host_load_limit: 80,
+    });
+    heartbeat.swap_used_percent = 79;
+    sql.exec('UPDATE machines SET last_heartbeat = ?, last_checkin_at = ? WHERE id = ?', JSON.stringify(heartbeat), iso(), 'hetzner');
     expect(s.drainCapacityQueue().promoted).toBeGreaterThan(0);
     expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({ state: 'offered', machine_id: 'hetzner' });
   }));
@@ -1430,8 +1461,8 @@ describe('bare workspace labels resolve under advertised absolute roots', () => 
   }));
 });
 
-describe('goal placement respects per-host load budgets', () => {
-  it('moves an over-budget goal to another host while keeping account capacity fleet-wide', async () => fixture(async (s, sql) => {
+describe('host admission respects per-host load budgets', () => {
+  it('moves an over-budget launch to another host while keeping account capacity fleet-wide', async () => fixture(async (s, sql) => {
     await configure(s, true);
     const goalRoutes = [{ engine: 'codex', account: 'shared-codex', profile: null }];
     for (const machine of ['hetzner', 'win35']) {
@@ -1447,7 +1478,7 @@ describe('goal placement respects per-host load budgets', () => {
 
     const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep', engine_override_reason: 'This goal requires deep reasoning.' }));
     expect(plan.selected?.machine).toBe('win35');
-    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'host_load_high', load_limit: 12 }));
+    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'host_load_high', load_limit: 16 }));
     expect(s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).max_concurrency).toBe(1);
   }));
 

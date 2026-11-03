@@ -1,4 +1,4 @@
-/** CPU admission primitives. Load average is context only, never an admission input. */
+/** CPU and fresh host load admission primitives shared by placement and claims. */
 export interface CpuUsage {
   busy_percent: number | null; busy_cores: number | null; cores: number | null;
   busy_percent_window: number | null; window_s: number | null;
@@ -9,6 +9,7 @@ export interface CpuConfig {
   cpu_target_utilization: number; cpu_psi_hard_cap_pct: number;
   cpu_default_cores: number; cpu_estimate_multiplier: number;
   cpu_psi_full_hard_cap_pct: number; memory_psi_full_hard_cap_pct: number;
+  cpu_load_factor?: number; swap_max_used_percent?: number; host_max_sessions?: number;
 }
 /** A host is CPU-full only when measured busy CPU averaged over >=10s reaches this (Alexey t2362u-t2363u; never from load average). */
 export const CPU_SATURATED_PCT = 98;
@@ -46,12 +47,23 @@ export function sanitizeCpuUsage(value: any): CpuUsage | null {
     observed_at:value.observed_at,interval_s:finite(value.interval_s)&&value.interval_s>0&&value.interval_s<=180 ? value.interval_s : null};
 }
 export function cpuVerdict(raw: unknown, cores: number, expected: number, ramping: number, config: CpuConfig, now: number,
-  memAvailableMb: number | null = null, memoryFloorMb = MEMORY_PRESSURE_FLOOR_MB, memObservedAt: string | null = null) {
+  memAvailableMb: number | null = null, memoryFloorMb = MEMORY_PRESSURE_FLOOR_MB, memObservedAt: string | null = null,
+  host: {load1?: unknown; swap_used_percent?: unknown; observed_at?: unknown; active_sessions?: unknown} = {}) {
   const usage = sanitizeCpuUsage(raw);
   const fresh=usage&&now-Date.parse(usage.observed_at)<=180000&&now-Date.parse(usage.observed_at)>=-30000;
   const memoryAt = typeof memObservedAt === 'string' ? Date.parse(memObservedAt) : NaN;
   const freshMemory = Boolean(fresh) || (Number.isFinite(memoryAt) && now-memoryAt<=180000 && now-memoryAt>=-30000);
   const known=fresh&&usage.cores===cores&&usage.busy_cores!==null&&usage.interval_s!==null&&finite(expected)&&finite(ramping);
+  const hostAt=typeof host.observed_at==='string'?Date.parse(host.observed_at):NaN;
+  const hostFresh=Number.isFinite(hostAt)&&now-hostAt<=180000&&now-hostAt>=-30000;
+  const hostCores=Number.isSafeInteger(cores)&&cores>=1&&cores<=65536?cores:usage?.cores;
+  const hostLoad=hostFresh&&finite(host.load1)&&host.load1<=1e9?host.load1:null;
+  const loadFactor=finite(config.cpu_load_factor)?config.cpu_load_factor:2;
+  const loadLimit=hostCores!==null&&hostCores!==undefined?hostCores*loadFactor:null;
+  const swap=hostFresh&&finite(host.swap_used_percent)&&host.swap_used_percent<=100?host.swap_used_percent:null;
+  const swapLimit=finite(config.swap_max_used_percent)?config.swap_max_used_percent:80;
+  const active=Number.isSafeInteger(host.active_sessions)&&Number(host.active_sessions)>=0?Number(host.active_sessions):null;
+  const sessionLimit=Number.isSafeInteger(config.host_max_sessions)&&Number(config.host_max_sessions)>=1?Number(config.host_max_sessions):24;
   const numbers = {current_cpu_cores:known ? usage.busy_cores : null,expected_cpu_cores:expected,
     ramping_cpu_cores:ramping,limit_cpu_cores:cores * config.cpu_target_utilization,
     target_utilization:config.cpu_target_utilization,psi_avg10:usage?.psi_avg10 ?? null,
@@ -64,12 +76,18 @@ export function cpuVerdict(raw: unknown, cores: number, expected: number, rampin
     // CPU busy is measured on every OS; PSI exists on Linux only and is not required.
     telemetry_state:known ? 'measured' : 'unknown',
     advisory:known ? null : 'cpu_usage_unknown'};
-  const reason = known && usage.busy_percent_window!==null && usage.busy_percent_window>=CPU_SATURATED_PCT ? 'cpu_pressure'
+  const hostReason = hostLoad!==null&&loadLimit!==null&&hostLoad>loadLimit ? 'host_load_high'
+    : swap!==null&&swap>swapLimit ? 'memory_pressure'
+    : active!==null&&active>=sessionLimit ? 'machine_capacity' : null;
+  const cpuReason = known && usage.busy_percent_window!==null && usage.busy_percent_window>=CPU_SATURATED_PCT ? 'cpu_pressure'
     : fresh && usage.psi_full_avg10!==null && usage.psi_full_avg10 > config.cpu_psi_full_hard_cap_pct ? 'cpu_pressure'
     : freshMemory && finite(memAvailableMb) && memAvailableMb < memoryFloorMb ? 'memory_pressure'
     // PSI is a secondary signal: only a high 10-second full-stall average can
     // refuse a host when the primary MemAvailable reading is not low.
     : fresh && usage.memory_psi_full_avg10!==null && usage.memory_psi_full_avg10 >= Math.max(10, config.memory_psi_full_hard_cap_pct) ? 'memory_pressure'
     : fresh && (usage.host_oom_kills_delta ?? 0)>0 ? 'host_oom' : null;
-  return {...numbers,reason,admitted:reason === null};
+  const reason=hostReason??cpuReason;
+  return {...numbers,host_load1:hostLoad,host_load_limit:loadLimit,swap_used_percent:swap,
+    swap_max_used_percent:swapLimit,host_session_count:active,host_max_sessions:sessionLimit,
+    reason,admitted:reason === null};
 }
