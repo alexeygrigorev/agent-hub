@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import {freshFixtureBudgetDay} from './helpers/fixture-budget';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { doFetch, loginAndGetState, createHelpers, defaultEnv } from './m1-focus-setup';
 import { runInDurableObject } from 'cloudflare:test';
@@ -19,6 +20,7 @@ afterAll(() => {
 });
 
 describe('M1 Focus: JWKS', () => {
+  beforeEach(async()=>runInDurableObject(defaultEnv.HUB.get(defaultEnv.HUB.idFromName('hub')),async h=>freshFixtureBudgetDay(h)));
 
   it('JWKS: multiple unknownkids do not cause repeated refetch within cooldown', async () => {
     let fetchCount = 0;

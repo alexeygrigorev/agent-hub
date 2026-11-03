@@ -1,3 +1,4 @@
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom, WATCHDOG_INTERVAL, QUEUE_RETRY_BASE_MS, QUEUE_HOLD_TTL_MS, INTAKE_IDLE_GRACE } from '../src/intake-watchdog';
@@ -17,8 +18,10 @@ function task(id = 'synthetic-task', age = 3 * 3600000): any {
     status: 'open', acceptance_criteria: 'Synthetic criterion', history: [] };
 }
 async function fixture(fn: (h: any) => any) {
-  return inDO(stub(), async (h: any) => {
-    for (const table of ['intake_queue_due_cursor', 'intake_queue_admissions', 'intake_queue_movement', 'intake_restart_queue', 'intake_watchdog_meta', 'session_control_sessions', 'fleet_sessions', 'claims', 'fleet_catalog_seen']) h.sql.exec('DELETE FROM ' + table);
+  return inDO(stub(), async (h: any, state:any) => {
+    await advanceFixtureBudgetDay(h);
+    const seedSql=fixtureSql(h,state);
+    for (const table of ['intake_queue_due_cursor', 'intake_queue_admissions', 'intake_queue_movement', 'intake_restart_queue', 'intake_watchdog_meta', 'session_control_sessions', 'fleet_sessions', 'claims', 'fleet_catalog_seen']) seedSql.exec('DELETE FROM ' + table);
     return fn(h);
   });
 }

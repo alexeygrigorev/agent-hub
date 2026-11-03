@@ -12,7 +12,7 @@ it('refreshes a host credential and its binding despite extra trigger writes', a
     raw.exec('CREATE TABLE auth_cas_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,value TEXT)');
     raw.exec("CREATE TRIGGER auth_cas_credential AFTER UPDATE OF revoked_at ON credentials BEGIN INSERT INTO auth_cas_audit(value) VALUES('credential-a'),('credential-b'); END");
     raw.exec("CREATE TRIGGER auth_cas_machine AFTER UPDATE OF credential_id ON machines BEGIN INSERT INTO auth_cas_audit(value) VALUES('machine-a'),('machine-b'); END");
-    const response=await hub.fetch(new Request('https://hub.test/auth/token',{method:'POST',headers:{'Content-Type':'application/json'},
+    const response=await hub.fetch(new Request('https://hub.test/api/token/refresh',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({grant_type:'refresh_token',refresh_token:pair.refreshToken})}));
     expect(response.status).toBe(200);
     const body=await response.json();expect(body.access_token).toMatch(/^hubt_/);

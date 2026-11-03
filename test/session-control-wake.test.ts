@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import { describe, expect, it } from 'vitest';
 import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
@@ -35,28 +36,29 @@ async function fixture(fn: (s: SessionControlService, sql: any, hub: Hub, state:
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('session-wake-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: fake.hook, wakeMissed: (taskId, wakeId) => hub.intakeWatchdog.enqueueWakeRecovery(taskId, wakeId) }, {});
     service.init();
-    seedFixtureIntake(hub.sql);
+    seedFixtureIntake(fixtureStatements(hub.sql));
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
-    hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
+    fixtureStatements(hub.sql).exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
       VALUES ('host-cred-1', 'host', 'hash-host-cred-1', 'refresh-host-cred-1', 'host-family-1', 'test-host', 'hetzner', NULL, '["host"]', 'test', ?, ?)`, at, far);
-    hub.sql.exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
+    fixtureStatements(hub.sql).exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
     await fn(service, hub.sql, hub, state);
   });
 }
 
 function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', nativeId: string | null = NATIVE_ID, launchState = 'running') {
   const at = new Date().toISOString();
-  sql.exec(`INSERT OR REPLACE INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
+  fixtureStatements(sql).exec(`INSERT OR REPLACE INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
     VALUES (?, 'test-admin', 'human', NULL, 'fixture', ?, '{"workspace":"demo"}', ?, 'claude', 'fixture-acct', NULL, 'headless', 'demo', 'goal', ?, ?, NULL, ?, ?)`,
     launchId, 'fleet-' + launchId, machine, launchState, nativeId, at, at);
 }
 
 function reportFleetSession(sql: any, machine: string, nativeId: string, tag: string, workspace: string, phase = 'running') {
   const at = new Date().toISOString();
-  sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at)
+  fixtureStatements(sql).exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at)
     VALUES (?, ?, ?, 'claude', ?, NULL, ?, ?, NULL, NULL, 'fixture-acct', NULL)`,
     machine, nativeId, tag, phase, at, workspace);
 }
@@ -101,13 +103,13 @@ describe('session scheduled wakes', () => {
   it('does not let a null delivered timestamp hide the next alarm', async () => {
     await fixture(async (_s, sql, _hub, state) => {
       const at = new Date(Date.now() + 12345).toISOString();
-      sql.exec(`INSERT INTO session_control_wakes
+      fixtureStatements(sql).exec(`INSERT INTO session_control_wakes
         (id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at,delivered_at)
         VALUES('alarm-valid','gone','test','valid',0,?,'resume','delivered',?,?,?)`, at, at, at, at);
-      sql.exec(`INSERT INTO session_control_wakes
+      fixtureStatements(sql).exec(`INSERT INTO session_control_wakes
         (id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at,delivered_at)
         VALUES('alarm-null','gone','test','null',0,?,'resume','delivered',?,?,NULL)`, at, at, at);
-      const expected = sql.exec(`SELECT CAST((julianday(?) - 2440587.5) * 86400000 AS INTEGER) + 600000 AS deadline`, at).toArray()[0].deadline;
+      const expected = fixtureStatements(sql).exec(`SELECT CAST((julianday(?) - 2440587.5) * 86400000 AS INTEGER) + 600000 AS deadline`, at).toArray()[0].deadline;
       const service = new SessionControlService(sql, cb => state.storage.transactionSync(cb), () => Date.now(), {}, {});
       expect(service.nextWakeTime()).toBe(expected);
     });
@@ -116,13 +118,16 @@ describe('session scheduled wakes', () => {
   it('seeks indexed wake queues and caps each sweep with retained production history', async () => {
     await fixture(async (_s, sql, _hub, state) => {
       const now = Date.now(), at = new Date(now).toISOString();
+      // This benchmarks the legacy indexed sweep against pre-queue history.
+      // Production queue admission is separately tested at its strict128 cap.
+      for(const trigger of ['hub_background_wake_insert','hub_background_wake_update','hub_background_wake_delete'])fixtureStatements(sql).exec('DROP TRIGGER '+trigger);
       state.storage.transactionSync(() => {
-        for (let i = 0; i < 5000; i++) sql.exec(`INSERT INTO session_control_wakes
+        for (let i = 0; i < 5000; i++) fixtureStatements(sql).exec(`INSERT INTO session_control_wakes
           (id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at,delivered_at)
           VALUES(?,?,'test',?,?,?,'retained prompt',?,?,?,?)`,
           `history-${i}`, 'gone', `history-${i}`, now + 3600000, at,
           i % 2 ? 'acked' : 'resolved', at, at, at);
-        for (const phase of ['pending', 'delivered']) for (let i = 0; i < 101; i++) sql.exec(`INSERT INTO session_control_wakes
+        for (const phase of ['pending', 'delivered']) for (let i = 0; i < 101; i++) fixtureStatements(sql).exec(`INSERT INTO session_control_wakes
           (id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at,delivered_at)
           VALUES(?,?,'test',?,?,?,'resume',?,?,?,?)`,
           `${phase}-${i}`, 'gone', `${phase}-${i}`, now - 1000, at, phase, at, at, at);
@@ -136,13 +141,13 @@ describe('session scheduled wakes', () => {
       expect(service.nextWakeTime()).toBe(now - 1000);
       expect(service.processDueWakes()).toEqual({ delivered: 0, acked: 0, missed: 200 });
       for (const [phase, remaining] of [['pending', 1], ['queued', 0], ['delivered', 1]] as const) {
-        expect(sql.exec('SELECT COUNT(*) AS n FROM session_control_wakes WHERE state=?', phase).toArray()[0].n).toBe(remaining);
+        expect(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM session_control_wakes WHERE state=?', phase).toArray()[0].n).toBe(remaining);
       }
       // Inspect the actual service queries: LIMIT alone must not hide a full
       // retained-history sort. SQLite must seek each ordered queue by index.
       expect(reads).toHaveLength(5);
       for (const {query, bindings} of reads) {
-        const plan = sql.exec('EXPLAIN QUERY PLAN ' + query, ...bindings).toArray().map((r: any) => r.detail).join('\n');
+        const plan = fixtureStatements(sql).exec('EXPLAIN QUERY PLAN ' + query, ...bindings).toArray().map((r: any) => r.detail).join('\n');
         expect(plan).not.toMatch(/SCAN session_control_wakes|USE TEMP B-TREE/);
         expect(plan).toMatch(/SEARCH session_control_wakes USING/);
       }
@@ -154,13 +159,13 @@ describe('session scheduled wakes', () => {
         const sess = await startAndBind(s, sql, 'wake-startup-' + phase);
         const result: any = await (await s.handle(request(`/api/sessions/${sess.id}/wake`,
           { key: 'startup', at: new Date(Date.now() + 3600000).toISOString(), prompt: 'resume' }), admin)).json();
-        sql.exec('UPDATE session_control_sessions SET state=? WHERE id=?', phase, sess.id);
-        sql.exec('UPDATE session_control_wakes SET wake_at_ms=? WHERE id=?', Date.now(), result.wake_id);
+        fixtureStatements(sql).exec('UPDATE session_control_sessions SET state=? WHERE id=?', phase, sess.id);
+        fixtureStatements(sql).exec('UPDATE session_control_wakes SET wake_at_ms=? WHERE id=?', Date.now(), result.wake_id);
         expect(s.processDueWakes()).toMatchObject({ delivered: 0, missed: 0 });
-        expect(sql.exec('SELECT state FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0].state).toBe('pending');
-        sql.exec("UPDATE session_control_sessions SET state='running' WHERE id=?", sess.id);
+        expect(fixtureStatements(sql).exec('SELECT state FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0].state).toBe('pending');
+        fixtureStatements(sql).exec("UPDATE session_control_sessions SET state='running' WHERE id=?", sess.id);
         expect(s.processDueWakes()).toMatchObject({ delivered: 0, missed: 0 });
-        expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0])
+        expect(fixtureStatements(sql).exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0])
           .toMatchObject({ state: 'queued', delivered_at: null });
       });
   });
@@ -170,10 +175,10 @@ describe('session scheduled wakes', () => {
         const sess = await startAndBind(s, sql, 'wake-startup-expired-' + phase);
         const result: any = await (await s.handle(request(`/api/sessions/${sess.id}/wake`,
           { key: 'expired', at: new Date(Date.now() + 3600000).toISOString(), prompt: 'resume' }), admin)).json();
-        sql.exec('UPDATE session_control_sessions SET state=? WHERE id=?', phase, sess.id);
-        sql.exec('UPDATE session_control_wakes SET wake_at_ms=? WHERE id=?', Date.now() - 660000, result.wake_id);
+        fixtureStatements(sql).exec('UPDATE session_control_sessions SET state=? WHERE id=?', phase, sess.id);
+        fixtureStatements(sql).exec('UPDATE session_control_wakes SET wake_at_ms=? WHERE id=?', Date.now() - 660000, result.wake_id);
         expect(s.processDueWakes()).toMatchObject({ delivered: 0, missed: 1 });
-        expect(sql.exec('SELECT detail FROM session_control_wake_alerts WHERE wake_id=?', result.wake_id).toArray()[0].detail).toBe('wake_delivery_deadline_exceeded');
+        expect(fixtureStatements(sql).exec('SELECT detail FROM session_control_wake_alerts WHERE wake_id=?', result.wake_id).toArray()[0].detail).toBe('wake_delivery_deadline_exceeded');
       });
   });
 
@@ -191,11 +196,11 @@ describe('session scheduled wakes', () => {
       expect(show.stalled).toBe(false);
       const grouped: any = await (await s.handle(request('/api/sessions?view=lifecycle', undefined, 'GET'), admin)).json();
       expect(Object.values(grouped.groups).flat().find((v: any) => v.refs?.session_id === sess.id)).toMatchObject({ state: 'waiting_until', waiting_until: at });
-      const row = sql.exec('SELECT * FROM session_control_sessions WHERE id=?', sess.id).toArray()[0];
+      const row = fixtureStatements(sql).exec('SELECT * FROM session_control_sessions WHERE id=?', sess.id).toArray()[0];
       const taskId = JSON.parse(row.request_json).intake_task_id;
-      const task = JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id=?', taskId).toArray()[0].data);
+      const task = JSON.parse(fixtureStatements(sql).exec('SELECT data FROM intake_tasks WHERE id=?', taskId).toArray()[0].data);
       task.history.push({ kind: 'link', hub_session_id: sess.id });
-      sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(task), taskId);
+      fixtureStatements(sql).exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(task), taskId);
       const cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true,
         csrfToken: 'csrf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
       const response = await hub.fetch(new Request('https://hub.test/api/status', { headers: { Cookie: cookie } }));
@@ -214,6 +219,9 @@ describe('session scheduled wakes', () => {
         method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': 'csrf', 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, at, prompt: 'resume' }),
       }));
+      // Isolate wake scheduling from default-job/command fixture deadlines.
+      // The producer source remains intact; only this test's unrelated intents are removed.
+      fixtureStatements(sql).exec("DELETE FROM hub_background_work WHERE kind!='session-wake'");
       await state.storage.deleteAlarm();
       const due = Date.now() + 300000;
       const response = await post('alarm-one', new Date(due).toISOString());
@@ -240,7 +248,7 @@ describe('session scheduled wakes', () => {
       const replay = await (await later.handle(request(`/api/sessions/${sess.id}/wake`, input), admin)).json() as any;
       expect(replay.wake_id).toBe(now.wake_id);
       expect(replay.replay).toBe(true);
-      expect(sql.exec('SELECT id FROM session_control_wakes WHERE id=?', first.wake_id).toArray()).toHaveLength(1);
+      expect(fixtureStatements(sql).exec('SELECT id FROM session_control_wakes WHERE id=?', first.wake_id).toArray()).toHaveLength(1);
     });
   });
 
@@ -282,7 +290,7 @@ describe('session scheduled wakes', () => {
       }), host('hetzner'));
       expect(receipt.status).toBe(200);
       expect((s as any).processDueWakes().delivered).toBe(0);
-      expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wdata.wake_id).toArray()[0])
+      expect(fixtureStatements(sql).exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wdata.wake_id).toArray()[0])
         .toMatchObject({ state: 'delivered', delivered_at: expect.any(String) });
       const base = { correlation: offer.correlation, outcome: 'delivered', native: { native_id: NATIVE_ID, tag: 'hub-launch-1', workspace: NATIVE_WS }, claim_token: claim.claim_token };
       // Queue transport alone never proves the wake was acknowledged.
@@ -323,9 +331,9 @@ describe('session scheduled wakes', () => {
       }), host('hetzner'));
       expect(ack.status, JSON.stringify(await ack.json())).toBe(200);
       (s as any).processDueWakes();
-      expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
+      expect(fixtureStatements(sql).exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
         .toMatchObject({ state: 'missed', delivered_at: null });
-      expect(sql.exec('SELECT detail FROM session_control_wake_alerts WHERE wake_id=?', wake.wake_id).toArray()[0].detail)
+      expect(fixtureStatements(sql).exec('SELECT detail FROM session_control_wake_alerts WHERE wake_id=?', wake.wake_id).toArray()[0].detail)
         .toContain('wake_native_delivery_failed:Inbox refused: native write denied');
     });
   });
@@ -341,7 +349,7 @@ describe('session scheduled wakes', () => {
 
       await markNativeInboxReceipt(s, sess.id, 'delivered; awaiting recipient reply');
 
-      expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
+      expect(fixtureStatements(sql).exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
         .toMatchObject({ state: 'delivered', delivered_at: expect.any(String) });
       expect((s as any).processDueWakes().missed).toBe(0);
       const listing: any = await (await s.handle(request(`/api/sessions/${sess.id}/wakes`, undefined, 'GET'), admin)).json();
@@ -356,16 +364,17 @@ describe('session scheduled wakes', () => {
         key: 'upgrade-receipt-window', at: 'now', prompt: 'resume after upgrade',
       }), admin);
       const wake: any = await response.json();
-      const send = sql.exec('SELECT * FROM session_control_commands WHERE id=(SELECT command_id FROM session_control_wakes WHERE id=?)', wake.wake_id).toArray()[0];
+      const send = fixtureStatements(sql).exec('SELECT * FROM session_control_commands WHERE id=(SELECT command_id FROM session_control_wakes WHERE id=?)', wake.wake_id).toArray()[0];
       const oldEnqueueTime = send.created_at;
       const receiptTime = new Date(Date.now() + 1000).toISOString();
-      sql.exec("UPDATE session_control_commands SET host_status=?,updated_at=? WHERE id=?",
+      fixtureStatements(sql).exec("UPDATE session_control_commands SET host_status=?,updated_at=? WHERE id=?",
         'delivered; awaiting recipient reply', receiptTime, send.id);
-      sql.exec("UPDATE session_control_wakes SET state='delivered',delivered_at=? WHERE id=?", oldEnqueueTime, wake.wake_id);
+      fixtureStatements(sql).exec("UPDATE session_control_wakes SET state='delivered',delivered_at=? WHERE id=?", oldEnqueueTime, wake.wake_id);
 
+      fixtureStatements(sql).exec("DELETE FROM hub_init_stamps WHERE key='wake_native_receipt_v2'"); // recreate the pre-upgrade migration state
       s.init();
 
-      expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
+      expect(fixtureStatements(sql).exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
         .toMatchObject({ state: 'delivered', delivered_at: receiptTime });
     });
   });
@@ -379,18 +388,18 @@ describe('session scheduled wakes', () => {
       const unrelated: any = await (await s.handle(request(`/api/sessions/${sess.id}/send`, {
         key:'wake-'+wake.wake_id.slice(0,32), body:'unrelated prompt',
       }), admin)).json();
-      sql.exec('UPDATE session_control_wakes SET wake_at_ms=? WHERE id=?',Date.now()-1,wake.wake_id);
-      sql.exec(`CREATE TRIGGER reject_wake_delivery BEFORE UPDATE ON session_control_wakes
+      fixtureStatements(sql).exec('UPDATE session_control_wakes SET wake_at_ms=? WHERE id=?',Date.now()-1,wake.wake_id);
+      fixtureStatements(sql).exec(`CREATE TRIGGER reject_wake_delivery BEFORE UPDATE ON session_control_wakes
         WHEN NEW.state='queued' BEGIN SELECT RAISE(ABORT,'fixture rollback'); END`);
       expect(s.processDueWakes().delivered).toBe(0);
-      expect(sql.exec('SELECT id FROM session_control_commands').toArray()).toHaveLength(1);
-      sql.exec('DROP TRIGGER reject_wake_delivery');
+      expect(fixtureStatements(sql).exec('SELECT id FROM session_control_commands').toArray()).toHaveLength(1);
+      fixtureStatements(sql).exec('DROP TRIGGER reject_wake_delivery');
       expect(s.processDueWakes().delivered).toBe(0);
-      const stored = sql.exec('SELECT command_id FROM session_control_wakes WHERE id=?',wake.wake_id).toArray()[0];
+      const stored = fixtureStatements(sql).exec('SELECT command_id FROM session_control_wakes WHERE id=?',wake.wake_id).toArray()[0];
       expect(stored.command_id).not.toBe(unrelated.command_id);
-      expect(JSON.parse(sql.exec('SELECT payload_json FROM session_control_commands WHERE id=?',stored.command_id).toArray()[0].payload_json)).toEqual({body:'scheduled evidence'});
+      expect(JSON.parse(fixtureStatements(sql).exec('SELECT payload_json FROM session_control_commands WHERE id=?',stored.command_id).toArray()[0].payload_json)).toEqual({body:'scheduled evidence'});
       s.processDueWakes();
-      expect(sql.exec('SELECT id FROM session_control_commands').toArray()).toHaveLength(2);
+      expect(fixtureStatements(sql).exec('SELECT id FROM session_control_commands').toArray()).toHaveLength(2);
     });
   });
 
@@ -404,20 +413,20 @@ describe('session scheduled wakes', () => {
       await markNativeInboxReceipt(s, sess.id);
       // Backdate the native inbox receipt beyond the acknowledgement window.
       const past = new Date(Date.now() - 11 * 60_1000).toISOString();
-      sql.exec("UPDATE session_control_wakes SET delivered_at = ? WHERE id = ?", past, wdata.wake_id);
+      fixtureStatements(sql).exec("UPDATE session_control_wakes SET delivered_at = ? WHERE id = ?", past, wdata.wake_id);
       const sweep = (s as any).processDueWakes();
       expect(sweep.missed).toBeGreaterThanOrEqual(1);
-      const stored: any = sql.exec('SELECT state FROM session_control_wakes WHERE id = ?', wdata.wake_id).toArray()[0];
+      const stored: any = fixtureStatements(sql).exec('SELECT state FROM session_control_wakes WHERE id = ?', wdata.wake_id).toArray()[0];
       expect(stored.state).toBe('missed');
-      const alerts = sql.exec('SELECT * FROM session_control_wake_alerts WHERE wake_id = ?', wdata.wake_id).toArray();
+      const alerts = fixtureStatements(sql).exec('SELECT * FROM session_control_wake_alerts WHERE wake_id = ?', wdata.wake_id).toArray();
       expect(alerts.length).toBeGreaterThanOrEqual(1);
       const status: any = new StatusService(sql, cb => cb(), new IntakeService(sql, cb => cb()));
       expect(status.attentionGroups(true, []).needs_attention).toContainEqual(expect.objectContaining({ subject: 'missed_wake:' + wdata.wake_id }));
       expect(status.attentionGroups(false, []).needs_attention.some((a: any) => a.subject === 'missed_wake:' + wdata.wake_id)).toBe(false);
-      const intake = JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id=?', 'fixture-intake').toArray()[0].data);
+      const intake = JSON.parse(fixtureStatements(sql).exec('SELECT data FROM intake_tasks WHERE id=?', 'fixture-intake').toArray()[0].data);
       expect(intake.history.some((e: any) => e.actor === 'hub:service:wake' && e.text.includes('no ack within 10 min'))).toBe(true);
       (s as any).processDueWakes();
-      expect(sql.exec('SELECT id FROM session_control_wake_alerts WHERE wake_id=?', wdata.wake_id).toArray()).toHaveLength(1);
+      expect(fixtureStatements(sql).exec('SELECT id FROM session_control_wake_alerts WHERE wake_id=?', wdata.wake_id).toArray()).toHaveLength(1);
     });
   });
 
@@ -426,28 +435,28 @@ describe('session scheduled wakes', () => {
       const sess = await startAndBind(s, sql, 'wake-gone-after-delivery');
       const result: any = await (await s.handle(request(`/api/sessions/${sess.id}/wake`, { key: 'gone-after', at: 'now', prompt: 'resume' }), admin)).json();
       await markNativeInboxReceipt(s, sess.id);
-      expect(sql.exec('SELECT state FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0].state).toBe('delivered');
-      sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", sess.id);
+      expect(fixtureStatements(sql).exec('SELECT state FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0].state).toBe('delivered');
+      fixtureStatements(sql).exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", sess.id);
       const sweep = s.processDueWakes();
       expect(sweep.missed).toBe(1);
-      expect(sql.exec('SELECT reason FROM intake_restart_queue WHERE task_id=?', 'fixture-intake').toArray()[0].reason).toBe('missed_wake:' + result.wake_id);
-      const task = JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id=?', 'fixture-intake').toArray()[0].data);
+      expect(fixtureStatements(sql).exec('SELECT reason FROM intake_restart_queue WHERE task_id=?', 'fixture-intake').toArray()[0].reason).toBe('missed_wake:' + result.wake_id);
+      const task = JSON.parse(fixtureStatements(sql).exec('SELECT data FROM intake_tasks WHERE id=?', 'fixture-intake').toArray()[0].data);
       // A stale canonical stop cannot replace a still-running native owner.
       expect(hub.intakeWatchdog.project([task])[0].forgotten).toBe(false);
-      sql.exec('INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES(?,?)', 'hetzner', new Date().toISOString());
-      sql.exec("UPDATE fleet_sessions SET phase='exited',created_at_ms=? WHERE machine_id='hetzner' AND native_id=?", NATIVE_CREATED, NATIVE_ID);
+      fixtureStatements(sql).exec('INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES(?,?)', 'hetzner', new Date().toISOString());
+      fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase='exited',created_at_ms=? WHERE machine_id='hetzner' AND native_id=?", NATIVE_CREATED, NATIVE_ID);
       expect(hub.intakeWatchdog.project([task])[0]).toMatchObject({ forgotten:true, reason:'session_ended_without_done_or_blocker_intake' });
-      sql.exec('DELETE FROM fleet_catalog_seen');
+      fixtureStatements(sql).exec('DELETE FROM fleet_catalog_seen');
       expect(hub.intakeWatchdog.project([task])[0]).toMatchObject({ forgotten:false, state:'unknown' });
       const status: any = new StatusService(sql, cb => cb(), new IntakeService(sql, cb => cb()));
       expect(status.attentionGroups(true, []).needs_attention).toContainEqual(expect.objectContaining({ subject: 'missed_wake:' + result.wake_id }));
       // Existing proof validation owns command ack. A later verified ack clears
       // attention while preserving the historical missed-wake alert row.
-      sql.exec("UPDATE session_control_commands SET state='acked' WHERE id=?", result.command_id);
+      fixtureStatements(sql).exec("UPDATE session_control_commands SET state='acked' WHERE id=?", result.command_id);
       s.processDueWakes();
-      expect(sql.exec('SELECT state FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0].state).toBe('acked');
+      expect(fixtureStatements(sql).exec('SELECT state FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0].state).toBe('acked');
       expect(status.attentionGroups(true, []).needs_attention.some((a: any) => a.subject === 'missed_wake:' + result.wake_id)).toBe(false);
-      expect(sql.exec('SELECT id FROM session_control_wake_alerts WHERE wake_id=?', result.wake_id).toArray()).toHaveLength(1);
+      expect(fixtureStatements(sql).exec('SELECT id FROM session_control_wake_alerts WHERE wake_id=?', result.wake_id).toArray()).toHaveLength(1);
     });
   });
 
@@ -456,11 +465,11 @@ describe('session scheduled wakes', () => {
       const sess = await startAndBind(s, sql, 'wake-late-proof');
       const result: any = await (await s.handle(request(`/api/sessions/${sess.id}/wake`, { key:'late', at:'now', prompt:'resume' }), admin)).json();
       await markNativeInboxReceipt(s, sess.id);
-      sql.exec('UPDATE session_control_wakes SET delivered_at=? WHERE id=?',new Date(Date.now()-660000).toISOString(),result.wake_id);
-      sql.exec("UPDATE session_control_commands SET state='acked',updated_at=? WHERE id=?",new Date().toISOString(),result.command_id);
+      fixtureStatements(sql).exec('UPDATE session_control_wakes SET delivered_at=? WHERE id=?',new Date(Date.now()-660000).toISOString(),result.wake_id);
+      fixtureStatements(sql).exec("UPDATE session_control_commands SET state='acked',updated_at=? WHERE id=?",new Date().toISOString(),result.command_id);
       expect(s.processDueWakes()).toMatchObject({missed:1,acked:1});
-      expect(sql.exec('SELECT detail FROM session_control_wake_alerts WHERE wake_id=?',result.wake_id).toArray()[0].detail).toBe('wake_ack_after_10m');
-      expect(sql.exec('SELECT state FROM session_control_wakes WHERE id=?',result.wake_id).toArray()[0].state).toBe('acked');
+      expect(fixtureStatements(sql).exec('SELECT detail FROM session_control_wake_alerts WHERE wake_id=?',result.wake_id).toArray()[0].detail).toBe('wake_ack_after_10m');
+      expect(fixtureStatements(sql).exec('SELECT state FROM session_control_wakes WHERE id=?',result.wake_id).toArray()[0].state).toBe('acked');
     });
   });
 
@@ -471,9 +480,9 @@ describe('session scheduled wakes', () => {
       const wres = await s.handle(request(`/api/sessions/${sess.id}/wake`, { key: 'w5', at, prompt: 'later' }), admin);
       const wdata = await wres.json() as any;
       expect(wres.status).toBe(201);
-      sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", sess.id);
+      fixtureStatements(sql).exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", sess.id);
       // Force due.
-      sql.exec("UPDATE session_control_wakes SET wake_at_ms = ?, wake_at = ? WHERE id = ?", Date.now() - 1000, new Date().toISOString(), wdata.wake_id);
+      fixtureStatements(sql).exec("UPDATE session_control_wakes SET wake_at_ms = ?, wake_at = ? WHERE id = ?", Date.now() - 1000, new Date().toISOString(), wdata.wake_id);
       const sweep = (s as any).processDueWakes();
       expect(sweep.missed).toBeGreaterThanOrEqual(1);
     });

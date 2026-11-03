@@ -1,4 +1,8 @@
 const SAMPLE_INTERVAL_MS = 15 * 60_000;
+export const ACCOUNT_CAPACITY_HISTORY_OBSERVATION_LIMIT = 128;
+export class AccountCapacityHistoryObservationLimit extends Error {
+  constructor(){super('account_capacity_history_observation_limited');this.name='AccountCapacityHistoryObservationLimit';}
+}
 export const ACCOUNT_CAPACITY_HISTORY_MAX_ROWS = 4096;
 export const ACCOUNT_CAPACITY_HISTORY_MAX_TOTAL_ROWS = 32768;
 export const ACCOUNT_CAPACITY_HISTORY_MAX_WINDOW_MS = 31 * 24 * 60 * 60_000;
@@ -23,12 +27,17 @@ export function sampleAccountCapacityHistory(
   getAccounts: () => any[],
 ): number {
   initAccountCapacityHistory(sql);
-  const latest = sql.exec('SELECT MAX(observed_at_ms) AS observed_at_ms FROM fleet_account_capacity_history').one()?.observed_at_ms;
-  if (latest !== null && latest !== undefined && Number.isFinite(Number(latest)) && nowMs - Number(latest) < SAMPLE_INTERVAL_MS) return 0;
-
-  let recorded = 0;
-  let totalRows = Number(sql.exec('SELECT COUNT(*) AS n FROM fleet_account_capacity_history').one()?.n ?? 0);
-  for (const account of getAccounts()) {
+  // This legacy/manual sampler refuses an incomplete retained population.
+  // MAX(timestamp) across account-major storage and COUNT(*) both walk history.
+  const retained=sql.exec(`SELECT account,observed_at_ms FROM fleet_account_capacity_history
+    ORDER BY account,observed_at_ms LIMIT 129`).toArray() as any[];
+  if(retained.length>ACCOUNT_CAPACITY_HISTORY_OBSERVATION_LIMIT)throw new AccountCapacityHistoryObservationLimit();
+  const latest=retained.reduce((n,row)=>Math.max(n,Number(row.observed_at_ms)),Number.NEGATIVE_INFINITY);
+  if(Number.isFinite(latest) && nowMs-latest<SAMPLE_INTERVAL_MS)return 0;
+  const accounts=getAccounts();
+  if(accounts.length>ACCOUNT_CAPACITY_HISTORY_OBSERVATION_LIMIT)throw new AccountCapacityHistoryObservationLimit();
+  let recorded=0,totalRows=retained.length;
+  for (const account of accounts) {
     if (typeof account?.label !== 'string' || !account.label ||
         !Number.isInteger(account.active) || account.active < 0 ||
         !Number.isInteger(account.reserved) || account.reserved < 0 ||
@@ -36,12 +45,12 @@ export function sampleAccountCapacityHistory(
         (account.native_live !== null && account.native_live !== undefined &&
           (!Number.isInteger(account.native_live) || account.native_live < 0))) continue;
     if (totalRows >= ACCOUNT_CAPACITY_HISTORY_MAX_TOTAL_ROWS) break;
-    const accountRows = Number(sql.exec('SELECT COUNT(*) AS n FROM fleet_account_capacity_history WHERE account = ?', account.label).one()?.n ?? 0);
+    const accountRows=retained.filter(row=>row.account===account.label).length;
     if (accountRows >= ACCOUNT_CAPACITY_HISTORY_MAX_ROWS) continue;
     const inserted = sql.exec(`INSERT OR IGNORE INTO fleet_account_capacity_history
       (account, observed_at_ms, active, reserved, native_live, concurrency_limit)
-      VALUES (?, ?, ?, ?, ?, ?)`, account.label, nowMs, account.active, account.reserved,
-      account.native_live ?? null, account.max_concurrency).rowsWritten;
+      VALUES (?, ?, ?, ?, ?, ?) RETURNING account`, account.label, nowMs, account.active, account.reserved,
+      account.native_live ?? null, account.max_concurrency).toArray().length;
     const added = inserted > 0 ? 1 : 0;
     recorded += added;
     totalRows += added;
@@ -65,8 +74,8 @@ export function readAccountCapacityHistory(
   if (!exists) return { rows: [], next_cursor: null };
   const rows = sql.exec(`SELECT observed_at_ms, active, reserved, native_live, concurrency_limit
     FROM fleet_account_capacity_history
-    WHERE account = ? AND observed_at_ms >= ? AND observed_at_ms < ? AND (? IS NULL OR observed_at_ms > ?)
-    ORDER BY observed_at_ms LIMIT ?`, account, fromMs, toMs, afterMs, afterMs, limit).toArray() as any[];
+    WHERE account = ? AND observed_at_ms >= ? AND observed_at_ms < ?
+    ORDER BY observed_at_ms LIMIT ?`, account, afterMs===null?fromMs:Math.max(fromMs,afterMs+1), toMs, limit).toArray() as any[];
   const next = rows.length === limit ? Number(rows[rows.length - 1].observed_at_ms) : null;
   return {
     rows: rows.map(row => ({

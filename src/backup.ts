@@ -8,11 +8,11 @@ import type { SqlStorage } from '@cloudflare/workers-types';
  * which already enforces mixed-authority refusal, cookie CSRF and the narrow
  * operator-token fallback):
  *
- * - GET /api/backup/export — consistent JSON dump of EVERY user table rows
+ * - GET /api/backup/export — bounded consistent JSON dump of user table rows
  *   plus the full DDL schema (tables, indexes, triggers, views) inside one
  *   storage transaction, so the snapshot is internally consistent.
- * - GET /api/backup/status — table names + row counts only (cheap liveness
- *   proof for the restore drill without shipping the full dataset).
+ * - GET /api/backup/status — table names + bounded row counts (null if unknown;
+ *   never an unbounded retained-history census).
  *
  * Both require an admin caller (operator session, human credential or the
  * configured operator token) and are per-caller sliding-window rate-limited.
@@ -43,20 +43,23 @@ const STATUS_LIMIT_PER_HOUR = 120;
 // call is capped to CHUNK_MAX_ROWS rows.
 const CHUNK_LIMIT_PER_HOUR = 2000;
 const CHUNK_MAX_ROWS = 5000;
-const CHUNK_DEFAULT_ROWS = 500;
+const CHUNK_DEFAULT_ROWS = 128;
+const OBSERVATION_ROWS = 128;
+const METADATA_ROWS = 1024;
 
 // Backup export API version. Bump on any BackupService behavior change so
 // operators can tell which code a live (possibly long-lived) DO isolate is
 // actually executing: it is reported by /api/backup/status.
+// v6: bounded raw observations, nullable totals, 128-row chunks/offset ceiling.
 // v5 (intake e27e0f9d): keyset chunk cursor (?after=first|<rowid>) ordered by
 // rowid, ORDER BY rowid on offset reads, and status lists WITHOUT ROWID
 // tables (those keep stable PK-ordered offset paging).
-const BACKUP_API_VERSION = 5;
+const BACKUP_API_VERSION = 6;
 
 // DO memory is 128 MiB; materializing every table into JS objects peaks at
 // ~2-3x the JSON size. Fail closed well below that ceiling.
-const PER_TABLE_ROW_CAP = 200000;
-const TOTAL_ROW_CAP = 500000;
+const PER_TABLE_ROW_CAP = 1000;
+const TOTAL_ROW_CAP = 1000;
 
 // Ephemeral rate-limit state: never exported (would leak the caller/IP key).
 const EXCLUDED_FROM_EXPORT = new Set(['backup_rate']);
@@ -116,16 +119,21 @@ export class BackupService {
 
   /** User tables whose rows are exported (ephemeral state excluded). */
   private userTables(): { name: string; sql: string }[] {
-    return (this.sql.exec(
-      `SELECT name, sql FROM sqlite_master WHERE ${USER_TABLE_WHERE} ORDER BY name`
-    ).toArray() as any[]).filter(t => !EXCLUDED_FROM_EXPORT.has(String(t.name)));
+    const objects=this.metadataObjects();
+    return objects.filter(t=>t.type==='table' && !EXCLUDED_FROM_EXPORT.has(t.name)).map(t=>({name:t.name,sql:t.sql}));
+  }
+
+  private metadataObjects(): {name:string;sql:string;type:string}[] {
+    // Bound the raw schema prefix before platform/type filters and sorting.
+    const rows=this.sql.exec('SELECT name,sql,type FROM sqlite_master LIMIT ?',METADATA_ROWS+1).toArray() as any[];
+    if(rows.length>METADATA_ROWS)throw new ExportTooLarge('schema_observation_limited');
+    return rows.filter(t=>!String(t.name).startsWith('sqlite_')&&!String(t.name).startsWith('_cf_')&&t.sql!==null)
+      .sort((a,b)=>String(a.name).localeCompare(String(b.name)));
   }
 
   /** Full replayable DDL: tables + indexes + triggers + views (auto-indexes excluded). */
   private schemaObjects(): { name: string; sql: string }[] {
-    return (this.sql.exec(
-      `SELECT name, sql FROM sqlite_master WHERE ${SCHEMA_OBJECT_WHERE} ORDER BY name`
-    ).toArray() as any[]).filter(t => !EXCLUDED_FROM_EXPORT.has(String(t.name)));
+    return this.metadataObjects().filter(t=>!EXCLUDED_FROM_EXPORT.has(t.name));
   }
 
   /**
@@ -226,7 +234,8 @@ export class BackupService {
     next_after?: string | null;
     cursor: 'offset' | 'rowid';
     limit: number;
-    total: number;
+    total: number | null;
+    total_exact: boolean;
     ddl: string;
     rows: unknown[];
     value_markers: { bigint: number; blob: number; unreadable: number };
@@ -234,7 +243,8 @@ export class BackupService {
     return this.tx(() => {
       const names = new Set(this.userTables().map(t => String(t.name)));
       if (!names.has(table)) throw new ExportStageError('table', table);
-      const total = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM ${quoteIdent(table)}`).one() as any).n);
+      const observed=this.sql.exec(`SELECT 1 FROM ${quoteIdent(table)} LIMIT ?`,OBSERVATION_ROWS+1).toArray().length;
+      const total=observed<=OBSERVATION_ROWS?observed:null;
       if (!Number.isInteger(limit) || limit < 1 || limit > CHUNK_MAX_ROWS) {
         throw new ExportStageError('range', table);
       }
@@ -245,9 +255,10 @@ export class BackupService {
       if (keyset) {
         if (parseKeysetCursor(cursor.after) !== cursor.after) throw new ExportStageError('range', table);
         if (withoutRowid) throw new ExportStageError('keyset', table);
-      } else if (!Number.isInteger(cursor.offset) || cursor.offset < 0 || cursor.offset > total) {
+      } else if (!Number.isInteger(cursor.offset) || cursor.offset < 0 || cursor.offset > OBSERVATION_ROWS || (total!==null && cursor.offset > total)) {
         throw new ExportStageError('range', table);
       }
+      limit=Math.min(limit,OBSERVATION_ROWS);
       const q = quoteIdent(table);
       let rows: any[];
       try {
@@ -281,7 +292,7 @@ export class BackupService {
         : { cursor: 'offset' as const, offset: (cursor as { offset: number }).offset };
       return {
         exported_at: new Date().toISOString(), snapshot: 'hub-do-sqlite',
-        table, ...position, limit, total, ddl, rows: clean, value_markers: stats,
+        table, ...position, limit, total, total_exact:total!==null, ddl, rows: clean, value_markers: stats,
       };
     });
   }
@@ -381,10 +392,12 @@ export class BackupService {
     }
   }
 
-  private snapshot(): { exported_at: string; tables: string[]; row_counts: Record<string, number>; without_rowid: string[]; api_version: number } {
+  private snapshot(): { exported_at: string; tables: string[]; row_counts: Record<string, number|null>; counts_observation_limited: boolean; without_rowid: string[]; api_version: number } {
     return this.tx(() => {
       const names: string[] = [];
-      const counts: Record<string, number> = {};
+      const counts: Record<string, number|null> = {};
+      let remaining=TOTAL_ROW_CAP;
+      let limited=false;
       const withoutRowid: string[] = [];
       let tables: { name: string; sql: string }[];
       try {
@@ -397,12 +410,16 @@ export class BackupService {
         try {
           names.push(name);
           if (isWithoutRowid(String(t.sql || ''))) withoutRowid.push(name);
-          counts[name] = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`).one() as any).n);
+          const cap=Math.min(OBSERVATION_ROWS,remaining);
+          const observed=remaining>0?this.sql.exec(`SELECT 1 FROM ${quoteIdent(name)} LIMIT ?`,cap+1).toArray().length:1;
+          remaining=Math.max(0,remaining-observed);
+          counts[name]=observed<=cap?observed:null;
+          if(counts[name]===null)limited=true;
         } catch (err) {
           throw new ExportStageError('snapshot', name);
         }
       }
-      return { exported_at: new Date().toISOString(), tables: names, row_counts: counts, without_rowid: withoutRowid, api_version: BACKUP_API_VERSION };
+      return { exported_at: new Date().toISOString(), tables: names, row_counts: counts, counts_observation_limited:limited, without_rowid: withoutRowid, api_version: BACKUP_API_VERSION };
     });
   }
 
@@ -437,7 +454,7 @@ export class BackupService {
         const name = String(t.name);
         let rows: any[];
         try {
-          rows = this.sql.exec(`SELECT * FROM ${quoteIdent(name)}`).toArray() as any[];
+          rows = this.sql.exec(`SELECT * FROM ${quoteIdent(name)} LIMIT ?`,Math.min(PER_TABLE_ROW_CAP,TOTAL_ROW_CAP-total)+1).toArray() as any[];
         } catch (err) {
           throw new ExportStageError('export', name);
         }

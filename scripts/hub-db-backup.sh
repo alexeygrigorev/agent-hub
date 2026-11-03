@@ -26,13 +26,14 @@
 # where STAMP is Europe/Berlin %Y%m%dT%H%M%z.
 #
 # Export size is bounded server-side (per-table/total row caps, HTTP 413) and
-# each chunked read is capped (CHUNK_ROWS, endpoint enforces <= 5000);
+# each chunked read is capped (CHUNK_ROWS, client requests <= 128 rows);
 # this script treats any non-200 as a failed run and writes nothing.
 #
 # Chunk consistency (intake e27e0f9d): each chunk is internally consistent
 # (single server-side transaction). Rowid tables are paged with a keyset
 # cursor (?after=<rowid>, API v5+), so concurrent inserts/deletes can neither
-# skip nor duplicate rows; WITHOUT ROWID tables (and API v4 servers) use
+# shift unread rows; this is not a cross-table point-in-time snapshot.
+# WITHOUT ROWID tables (and API v4 servers) use
 # ordered offset paging. Every table is validated against ITS OWN read: the
 # assembled count must match the COUNT(*) the server reported in the table's
 # final chunk within max(10, 2%). A table that misses is re-read up to
@@ -103,12 +104,13 @@ STORAGEBOX_DIR="${STORAGEBOX_DIR:-/home/alexey/storagebox/backups/hub-do}"
 RETENTION_DAYS="${RETENTION_DAYS:-30}"
 LOCK_FILE="${LOCK_FILE:-/var/lib/hub-db-backup/hub-db-backup.lock}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-60}"
-CHUNK_ROWS="${CHUNK_ROWS:-500}"
+CHUNK_ROWS="${CHUNK_ROWS:-128}"
 TABLE_ATTEMPTS="${TABLE_ATTEMPTS:-3}"
 
 [[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || fail "RETENTION_DAYS must be an integer (got ${RETENTION_DAYS})"
 (( RETENTION_DAYS >= 30 )) || fail "RETENTION_DAYS=${RETENTION_DAYS} violates AC: retention >= 30 days"
 [[ "$CHUNK_ROWS" =~ ^[0-9]+$ ]] && (( CHUNK_ROWS >= 1 && CHUNK_ROWS <= 5000 )) || fail "CHUNK_ROWS must be an integer 1..5000 (got ${CHUNK_ROWS})"
+if (( CHUNK_ROWS > 128 )); then log "CHUNK_ROWS=${CHUNK_ROWS} clamped to bounded maximum 128"; CHUNK_ROWS=128; fi
 [[ "$TABLE_ATTEMPTS" =~ ^[0-9]+$ ]] && (( TABLE_ATTEMPTS >= 1 && TABLE_ATTEMPTS <= 10 )) || fail "TABLE_ATTEMPTS must be an integer 1..10 (got ${TABLE_ATTEMPTS})"
 # HUB_BASE_URL must be https (operator token bearer); localhost http is
 # allowed only for local drills via explicit opt-out.
@@ -179,6 +181,18 @@ api_get() {
 PRE_STATUS="${TMP_PARTS}/status-pre.json"
 CODE="$(api_get "/api/backup/status" "$PRE_STATUS")"
 [[ "$CODE" == "200" ]] || fail "status fetch failed HTTP ${CODE}"
+# API v6 counts are nullable bounded observations. A partial inventory cannot
+# verify a complete backup; stop BEFORE schema/data requests or storage writes.
+python3 - "$PRE_STATUS" <<'PY' || fail "bounded observation unavailable; export cannot verify"
+import json, sys
+body = json.load(open(sys.argv[1], encoding="utf-8"))
+tables, counts = body.get("tables"), body.get("row_counts")
+assert body.get("snapshot") == "hub-do-sqlite"
+assert isinstance(tables, list) and tables and isinstance(counts, dict)
+assert not body.get("counts_observation_limited", False)
+assert all(type(counts.get(table)) is int and counts[table] >= 0 for table in tables)
+PY
+
 
 # 2. Schema: full replayable DDL (tables, indexes, triggers, views).
 SCHEMA_JSON="${TMP_PARTS}/schema.json"
@@ -212,7 +226,7 @@ mkdir -p "$CHUNKS_DIR"
 # the caller re-raises with FAIL_REASON from the reason file.
 FETCH_REASON="${TMP_PARTS}/fetch-reason.txt"
 fetch_table() {
-  local table="$1" mode="$2" seq=0 rows=0 pos got next part query
+  local table="$1" mode="$2" seq=0 rows=0 pos got next effective part query
   fetch_fail() { printf '%s' "$*" > "$FETCH_REASON"; log "ERROR: $*" >&2; exit 1; }
   if [[ "$mode" == "rowid" ]]; then pos="$KEYSET_START"; else pos=0; fi
   while :; do
@@ -220,20 +234,24 @@ fetch_table() {
     if [[ "$mode" == "rowid" ]]; then query="after=${pos}"; else query="offset=${pos}"; fi
     CODE="$(api_get "/api/backup/export?table=${table}&${query}&limit=${CHUNK_ROWS}" "$part")"
     [[ "$CODE" == "200" ]] || fetch_fail "chunk fetch failed table=${table} ${query} HTTP ${CODE} (no body stored)"
-    # "<rows> <next_after|->" from the chunk.
-    read -r got next < <(python3 -c "
+    # Honor the SERVER'S effective limit; a smaller clamp is not EOF.
+    read -r got next effective < <(python3 -c "
 import json, sys
 b = json.load(open(sys.argv[1], encoding='utf-8'))
+rows, effective, total = b.get('rows'), b.get('limit'), b.get('total')
+assert isinstance(rows, list)
+assert type(effective) is int and 1 <= effective <= 128 and len(rows) <= effective
+assert type(total) is int and total >= 0 and b.get('total_exact', True) is True
 n = b.get('next_after')
-print(len(b.get('rows', [])), '-' if n is None else int(str(n)))" "$part" 2>/dev/null) || true
-    [[ "${got:-}" =~ ^[0-9]+$ ]] || fetch_fail "unparseable chunk table=${table} ${query}"
+print(len(rows), '-' if n is None else int(str(n)), effective)" "$part" 2>/dev/null) || true
+    [[ "${got:-}" =~ ^[0-9]+$ && "${effective:-}" =~ ^[0-9]+$ ]] || fetch_fail "bounded observation unavailable; export cannot verify table=${table} ${query}"
     # NOTE: plain assignments, not ((..)) arithmetic (which returns non-zero
     # for a zero result and would trip set -e on empty tables).
     rows=$((rows + got))
     seq=$((seq + 1))
     # Stop when the server returns fewer rows than requested (last page).
     # An exactly-full last page yields one more empty page; cap iterations.
-    if (( got < CHUNK_ROWS )); then break; fi
+    if (( got < effective )); then break; fi
     if [[ "$mode" == "rowid" ]]; then
       [[ "$next" =~ ^-?[0-9]+$ ]] || fetch_fail "keyset chunk without next_after table=${table}"
       if [[ "$pos" != "$KEYSET_START" ]] && ! (( next > pos )); then
@@ -259,7 +277,8 @@ seq, n, total = 0, 0, None
 while os.path.isfile(os.path.join(d, f"{table}.{seq}.json")):
     b = json.load(open(os.path.join(d, f"{table}.{seq}.json"), encoding="utf-8"))
     n += len(b.get("rows", []))
-    total = int(b.get("total"))
+    total = b.get("total")
+    assert type(total) is int and total >= 0 and b.get("total_exact", True) is True, "bounded observation unavailable; export cannot verify"
     seq += 1
 assert total is not None, f"no chunks table={table}"
 bound = max(10, int(total * 0.02))
@@ -312,6 +331,8 @@ for label, body in (("pre", pre), ("post", post)):
     assert body.get("snapshot") == "hub-do-sqlite", f"{label} snapshot marker mismatch"
     assert isinstance(body.get("tables"), list) and body["tables"], f"{label} tables missing"
     assert isinstance(body.get("row_counts"), dict), f"{label} row_counts missing"
+    assert not body.get("counts_observation_limited", False), "bounded observation unavailable; export cannot verify"
+    assert all(type(body["row_counts"].get(t)) is int and body["row_counts"][t] >= 0 for t in body["tables"]), "bounded observation unavailable; export cannot verify"
 schema = schema_body.get("schema")
 assert isinstance(schema, dict) and schema, "schema missing/empty"
 
@@ -338,7 +359,9 @@ for table in tables:
             assert body.get("after") == after, f"chunk keyset gap {part}"
         else:
             assert body.get("offset") == offset, f"chunk offset mismatch {part}"
-        final_totals[table] = int(body.get("total"))
+        total = body.get("total")
+        assert type(total) is int and total >= 0 and body.get("total_exact", True) is True, "bounded observation unavailable; export cannot verify"
+        final_totals[table] = total
         chunk_rows = body.get("rows")
         assert isinstance(chunk_rows, list), f"chunk rows not a list {part}"
         chunk_markers = body.get("value_markers", {})
@@ -388,6 +411,8 @@ for name in list(assembled) + list(schema):
 body = {
     "exported_at": post.get("exported_at"),
     "snapshot": "hub-do-sqlite",
+    "consistency": "independent_table_reads",
+    "verification": {"cross_table_snapshot": False, "count_tolerance_rows": 10, "count_tolerance_ratio": 0.02},
     "schema": schema,
     "row_counts": {t: len(r) for t, r in assembled.items()},
     "value_markers": markers,
@@ -410,7 +435,7 @@ gzip -c "$TMP_RAW" > "$TMP_GZ"
 chmod 600 "$TMP_GZ"
 SIZE="$(stat -c%s "$TMP_GZ" 2>/dev/null || stat -f%z "$TMP_GZ")"
 # Backstop against truncation: validation above already proves the assembled
-# document is complete (non-empty tables, required tables, counts match), so
+# document has the required tables and meets per-table count tolerances, so
 # the floor stays low enough for small-but-valid exports; integrity is
 # verified by test-decompressing.
 [[ "$SIZE" -gt 200 ]] || fail "export gzip suspiciously small (${SIZE}B)"
@@ -424,7 +449,7 @@ chmod 600 "$LOCAL_DEST"
 cp -- "$TMP_GZ" "$STORAGE_DEST" || fail "storagebox copy failed: ${STORAGE_DEST}"
 chmod 600 "$STORAGE_DEST"
 
-log "backup ok tables validated size=${SIZE}B local=${LOCAL_DEST} storagebox=${STORAGE_DEST}"
+log "backup ok independent table reads validated within count tolerance size=${SIZE}B local=${LOCAL_DEST} storagebox=${STORAGE_DEST}"
 
 # Retention: delete ONLY copies strictly older than RETENTION_DAYS whole days
 # (find -mtime +N matches files with age >= N+1 days, so +30 keeps a full

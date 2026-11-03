@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { restartFixtureHub, fixtureSql, freshFixtureBudgetDay } from './helpers/fixture-budget';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { env, SELF, runInDurableObject, createExecutionContext, waitOnExecutionContext, createScheduledController } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
@@ -10,6 +11,13 @@ import worker from '../src/worker';
 import type { Env } from '../src/env';
 const bindings = env as unknown as Env;
 const stub = () => bindings.HUB.get(bindings.HUB.idFromName('hub'));
+beforeEach(async()=>{await (runInDurableObject as any)(stub() as any,async(hub:any)=>freshFixtureBudgetDay(hub));});
+// Reproduce the actual pre-binding schema; modern fresh CREATE statements
+// already contain these columns and would skip the upgrade being tested.
+function legacyCredentialsSql(){return SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS credentials ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS device_pairings'))
+  .replace(/,\s*(?:--[^\n]*\n\s*)?registry_actor TEXT/,'');}
+function legacyMessagesSql(){return SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS claims ('))
+  .replace(/\n\s*registry_unbound_(?:from|to) INTEGER NOT NULL DEFAULT 0,/g,'');}
 const csrf = 'local-f7-csrf';
 async function admin(sub = 'local-owner', email = 'admin@fake.local') {
   return (await createSessionCookie(bindings, { sub, email, isAdmin: true, csrfToken: csrf, exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
@@ -23,7 +31,7 @@ async function req(path: string, method = 'GET', body?: any, auth?: string, csrf
 }
 async function rows(query: string, ...args: any[]) {
   let result: any[] = [];
-  await runInDurableObject(stub() as any, (hub: Hub) => { result = hub.sql.exec(query,...args).toArray(); });
+  await runInDurableObject(stub() as any, (hub: Hub) => { result = fixtureSql(hub).exec(query,...args).toArray(); });
   return result;
 }
 async function credential(actor: string, kind = 'agent', scopes = ['bus:send','bus:read'], extra: any = {}) {
@@ -201,16 +209,16 @@ describe('F7 actual Worker -> bound ConversationHub / existing authority', () =>
 
   it('preserves inherited bound RPC/cron/alarm and late-slot refusal deterministically', async () => {
     await runInDurableObject(stub() as any, (hub: Hub) => { hub.jobsService.setClock(()=>new Date('2026-10-17T12:01:00Z')); });
-    const tick = await (stub() as any).scheduledTick(); expect(tick.status).toBe('ok');
+    const tick = await (stub() as any).scheduledTick(); expect(tick.status).toBe('queue_processed');
     expect(Array.isArray(await (stub() as any).runChecks())).toBe(true);
     for (const cron of ['*/5 * * * *','*/30 * * * *']) {
       const ctx = createExecutionContext(); await worker.scheduled(createScheduledController({cron}) as unknown as ScheduledEvent,bindings,ctx); await waitOnExecutionContext(ctx);
     }
     await runInDurableObject(stub() as any, async (hub: Hub,state) => {
-      const base = new BaseHub(state,bindings); base.jobsService.setClock(()=>new Date('2026-10-17T13:26:00Z'));
       hub.jobsService.setClock(()=>new Date('2026-10-17T13:26:00Z'));
-      expect((await hub.scheduledTick()).status).toBe((await base.scheduledTick()).status);
-      expect((await hub.scheduledTick()).status).toBe('refused');
+      const baseResult=await BaseHub.prototype.scheduledTick.call(hub,undefined,'manual');
+      expect((await hub.scheduledTick(undefined,'manual')).status).toBe(baseResult.status);
+      expect(baseResult.status).toBe('refused');
       await hub.alarm(); hub.jobsService.setClock(()=>new Date());
     });
     expect((await req('/api/conversations-other')).status).toBe(404);
@@ -222,36 +230,30 @@ describe('F7 credential/message binding upgrade through SELF', () => {
     const token = 'hubt_local_old_database'; const hash = await sha256(token);
     let before: any;
     await runInDurableObject(stub() as any, (hub: Hub) => {
-      hub.sql.exec('DROP TRIGGER messages_bind_agents');
-      hub.sql.exec('DROP TABLE messages');
-      hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages ('), SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS claims (')));
-      hub.sql.exec('DROP TABLE agents');
-      hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS agents ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages')));
-      hub.sql.exec('DROP TABLE credentials');
-      hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS credentials ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS device_pairings')));
-      hub.sql.exec("INSERT INTO agents(tag,project,role,machine_id,registered_at,state,health_state,health_at,last_seen_at,updated_at) VALUES ('old-worker','oldA','implementer','local-old-machine','2020-01-01','unknown','unknown','2020-01-02','2020-01-03','2020-01-04')");
-      hub.sql.exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,credential_id) VALUES ('local-old-machine','local','local','2020-01-01','local-old-id')");
-      hub.sql.exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,machine_id,scopes,created_by_sub,created_at,expires_at) VALUES ('local-old-id','agent',?,'local-family','old-worker','old-worker','local-old-machine','["bus:send","bus:read"]','local-owner','2020-01-01',?)`,hash,new Date(Date.now()+3600000).toISOString());
-      hub.sql.exec("INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at) VALUES ('old-message','old-worker','old-worker','note','old-thread','local-private','old-key',?,?)",Date.now(),Date.now()+3600000);
-      if(collision) hub.sql.exec("INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at) VALUES ('collision-message','oldA:old-worker','old-worker','note','old-thread','local-private','old-key',?,?)",Date.now(),Date.now()+3600000);
+      fixtureSql(hub).exec('DROP TRIGGER messages_bind_agents');
+      fixtureSql(hub).exec('DROP TABLE messages');
+      fixtureSql(hub).exec(legacyMessagesSql());
+      fixtureSql(hub).exec('DROP TABLE agents');
+      fixtureSql(hub).exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS agents ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages')));
+      fixtureSql(hub).exec('DROP TABLE credentials');
+      fixtureSql(hub).exec(legacyCredentialsSql());
+      fixtureSql(hub).exec("INSERT INTO agents(tag,project,role,machine_id,registered_at,state,health_state,health_at,last_seen_at,updated_at) VALUES ('old-worker','oldA','implementer','local-old-machine','2020-01-01','unknown','unknown','2020-01-02','2020-01-03','2020-01-04')");
+      fixtureSql(hub).exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,credential_id) VALUES ('local-old-machine','local','local','2020-01-01','local-old-id')");
+      fixtureSql(hub).exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,machine_id,scopes,created_by_sub,created_at,expires_at) VALUES ('local-old-id','agent',?,'local-family','old-worker','old-worker','local-old-machine','["bus:send","bus:read"]','local-owner','2020-01-01',?)`,hash,new Date(Date.now()+3600000).toISOString());
+      fixtureSql(hub).exec("INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at) VALUES ('old-message','old-worker','old-worker','note','old-thread','local-private','old-key',?,?)",Date.now(),Date.now()+3600000);
+      if(collision) fixtureSql(hub).exec("INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at) VALUES ('collision-message','oldA:old-worker','old-worker','note','old-thread','local-private','old-key',?,?)",Date.now(),Date.now()+3600000);
       before = {
-        agent: hub.sql.exec('SELECT * FROM agents').toArray()[0],
-        credential: hub.sql.exec('SELECT * FROM credentials').toArray()[0],
-        message: hub.sql.exec('SELECT * FROM messages WHERE id = ?', 'old-message').toArray()[0],
+        agent: fixtureSql(hub).exec('SELECT * FROM agents').toArray()[0],
+        credential: fixtureSql(hub).exec('SELECT * FROM credentials').toArray()[0],
+        message: fixtureSql(hub).exec('SELECT * FROM messages WHERE id = ?', 'old-message').toArray()[0],
       };
     });
     return {token,before};
   }
   it('preserves old credential/message fields and serves two projects after binding upgrade', async () => {
     const {token,before} = await installOldFixture();
-    await runInDurableObject(stub() as any, (hub: Hub,state) => {
-      new Hub(state,bindings);
-      // The test harness retains this original Hub object while constructing a
-      // second startup instance over the same storage. Invalidate its memoized
-      // projections for tables changed by the migration, as a real restart
-      // would create a fresh in-memory cache.
-      hub.writes.bump('credentials');
-      hub.writes.bump('messages');
+    await runInDurableObject(stub() as any, async (hub: Hub,state) => {
+      await restartFixtureHub(hub,bindings);
     });
     expect((await rows('SELECT * FROM agents'))[0]).toEqual(before.agent);
     const migrated = (await rows('SELECT * FROM credentials'))[0];
@@ -269,24 +271,24 @@ describe('F7 credential/message binding upgrade through SELF', () => {
     expect(JSON.stringify(await (await req('/api/bus/messages','GET',undefined,other)).json())).not.toContain('old-message');
     const id = await conversation(token);
     expect((await req('/api/conversations/'+id,'GET',undefined,other)).status).toBe(403);
-    await runInDurableObject(stub() as any, (hub: Hub,state) => { new Hub(state,bindings); });
+    await runInDurableObject(stub() as any, async (hub: Hub,state) => { await restartFixtureHub(hub,bindings); });
     expect((await req('/api/conversations/'+id,'GET',undefined,token)).status).toBe(200);
   });
   it('rolls back a failed binding upgrade without changing current agent keys or old credential/message data', async () => {
     const {before} = await installOldFixture(true);
     await rows("CREATE TRIGGER fail_registry_binding BEFORE UPDATE ON credentials BEGIN SELECT RAISE(ABORT, 'injected_binding_failure'); END");
-    await runInDurableObject(stub() as any, (hub: Hub,state) => {
-      expect(()=>new Hub(state,bindings)).toThrow();
-      expect(hub.sql.exec('PRAGMA table_info(agents)').toArray().find((r:any)=>r.name==='tag')?.pk).toBe(0);
-      expect(hub.sql.exec('PRAGMA table_info(credentials)').toArray().some((r:any)=>r.name==='registry_actor')).toBe(false);
-      expect(hub.sql.exec('SELECT * FROM agents').toArray()[0]).toEqual(before.agent);
-      expect(hub.sql.exec('SELECT * FROM credentials').toArray()[0]).toEqual(before.credential);
-      expect(hub.sql.exec('SELECT * FROM messages WHERE id = ?', 'old-message').toArray()[0]).toEqual(before.message);
-      expect(hub.sql.exec('SELECT COUNT(*) as n FROM messages').toArray()[0]).toEqual({n:2});
-      hub.sql.exec("INSERT INTO agents(tag,project) VALUES ('still-usable','oldA')");
-      hub.sql.exec('DROP TRIGGER fail_registry_binding');
-      new Hub(state,bindings);
-      expect(hub.sql.exec('SELECT COUNT(*) as n FROM messages').toArray()[0]).toEqual({n:2});
+    await runInDurableObject(stub() as any, async (hub: Hub,state) => {
+      await expect(restartFixtureHub(hub,bindings)).rejects.toThrow();
+      expect(fixtureSql(hub).exec('PRAGMA table_info(agents)').toArray().find((r:any)=>r.name==='tag')?.pk).toBe(0);
+      expect(fixtureSql(hub).exec('PRAGMA table_info(credentials)').toArray().some((r:any)=>r.name==='registry_actor')).toBe(false);
+      expect(fixtureSql(hub).exec('SELECT * FROM agents').toArray()[0]).toEqual(before.agent);
+      expect(fixtureSql(hub).exec('SELECT * FROM credentials').toArray()[0]).toEqual(before.credential);
+      expect(fixtureSql(hub).exec('SELECT * FROM messages WHERE id = ?', 'old-message').toArray()[0]).toEqual(before.message);
+      expect(fixtureSql(hub).exec('SELECT COUNT(*) as n FROM messages').toArray()[0]).toEqual({n:2});
+      fixtureSql(hub).exec("INSERT INTO agents(tag,project) VALUES ('still-usable','oldA')");
+      fixtureSql(hub).exec('DROP TRIGGER fail_registry_binding');
+      await restartFixtureHub(hub,bindings);
+      expect(fixtureSql(hub).exec('SELECT COUNT(*) as n FROM messages').toArray()[0]).toEqual({n:2});
     });
   });
 });
@@ -294,15 +296,15 @@ describe('F7 credential/message binding upgrade through SELF', () => {
 describe('F7 migration on actual Durable Object SQLite', () => {
   it('preserves both same-tag project rows through full Hub startup without replacement inserts', async () => {
     const isolated = bindings.HUB.get(bindings.HUB.idFromName('m3-f7-'+crypto.randomUUID()));
-    await runInDurableObject(isolated as any, (hub: Hub,state) => {
-      hub.sql.exec('DROP TABLE agents');
-      for (const statement of BUS_SCHEMA_SQL.split(';')) if(statement.trim())hub.sql.exec(statement);
-      hub.sql.exec("INSERT INTO agents(tag,project,role,machine_id,registered_at) VALUES ('same-m3','m3A','implementer','local-A','2020-01-01')");
-      hub.sql.exec("INSERT INTO agents(tag,project,role,machine_id,registered_at) VALUES ('same-m3','m3B','reviewer','local-B','2020-01-02')");
-      const before = hub.sql.exec('SELECT tag,project,role,machine_id,registered_at FROM agents ORDER BY project').toArray();
-      new Hub(state,bindings);
-      expect(hub.sql.exec('SELECT tag,project,role,machine_id,registered_at FROM agents ORDER BY project').toArray()).toEqual(before);
-      expect(()=>hub.sql.exec("INSERT INTO agents(tag,project) VALUES ('same-m3','m3B')")).toThrow();
+    await runInDurableObject(isolated as any, async (hub: Hub,state) => {
+      fixtureSql(hub).exec('DROP TABLE agents');
+      for (const statement of BUS_SCHEMA_SQL.split(';')) if(statement.trim())fixtureSql(hub).exec(statement);
+      fixtureSql(hub).exec("INSERT INTO agents(tag,project,role,machine_id,registered_at) VALUES ('same-m3','m3A','implementer','local-A','2020-01-01')");
+      fixtureSql(hub).exec("INSERT INTO agents(tag,project,role,machine_id,registered_at) VALUES ('same-m3','m3B','reviewer','local-B','2020-01-02')");
+      const before = fixtureSql(hub).exec('SELECT tag,project,role,machine_id,registered_at FROM agents ORDER BY project').toArray();
+      await restartFixtureHub(hub,bindings);
+      expect(fixtureSql(hub).exec('SELECT tag,project,role,machine_id,registered_at FROM agents ORDER BY project').toArray()).toEqual(before);
+      expect(()=>fixtureSql(hub).exec("INSERT INTO agents(tag,project) VALUES ('same-m3','m3B')")).toThrow();
       expect(hub.busService.validateRecipient('same-m3')).toBe(false);
       expect(hub.busService.validateRecipient('m3A:same-m3')).toBe(true);
     });

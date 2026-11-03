@@ -497,9 +497,14 @@ export class ResourceManagement {
   private chokingState(machine: string, now: number, config: ResourceConfig, verdictReason: string | null) {
     const cooldown=new Date(now-config.choking_cooldown_seconds*1000).toISOString();
     const event:any=this.readRows(`SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? AND reason!='host_runtime_choking' ORDER BY observed_at DESC LIMIT 1`,machine,cooldown)[0];
-    const runtime:any=this.readRows(`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
-      AND state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')
-      ORDER BY updated_at DESC LIMIT 1`,machine,cooldown)[0];
+    // Bound the deployed time-index prefix before host/state/reason filters.
+    // Absence behind retained unrelated transitions is unknown, not clearance.
+    const runtimeRows=this.readRows(`SELECT machine_id,state,exit_reason,updated_at
+      FROM fleet_launches INDEXED BY fleet_launch_updated WHERE updated_at>=?
+      ORDER BY updated_at DESC LIMIT 129`,cooldown);
+    const runtime:any=runtimeRows.find(row=>row.machine_id===machine && ['failed','exited'].includes(row.state)
+      && ['engine_runtime_timeout','engine_signal_exit'].includes(row.exit_reason));
+    const runtimeLimited=!runtime && runtimeRows.length>128;
     let serviceChoking=false; let serviceAt:string|null=null;
     if(this.readRows("SELECT name FROM sqlite_master WHERE type='table' AND name='host_health_observations'").length) {
       const health:any=this.readRows('SELECT payload_json,observed_at FROM host_health_observations WHERE machine_id=? AND observed_at>=?',machine,cooldown)[0];
@@ -510,9 +515,9 @@ export class ResourceManagement {
       serviceChoking=(parse(health?.payload_json).services || []).some((s:any)=>
         s.worker==='broken' && ['service_crash','service_timeout'].includes(s.reason));
     }
-    const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdictReason);
+    const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdictReason || (runtimeLimited?'runtime_observation_limited':null));
     const chokingAt=event?.observed_at || runtime?.updated_at || (serviceChoking ? serviceAt : null);
-    return {reason,choking_observed_at:chokingAt,
+    return {reason,choking_observed_at:chokingAt,runtime_observation_limited:runtimeLimited,
       resource_choking:['host_oom','host_runtime_choking'].includes(reason)&&chokingAt ? {reason,observed_at:chokingAt} : null};
   }
   headroom(machine: string, input: any = {}, engine: string | null = null) {

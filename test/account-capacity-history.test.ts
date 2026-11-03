@@ -2,6 +2,7 @@ import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-s
 import { expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { ACCOUNT_CAPACITY_HISTORY_MAX_ROWS, readAccountCapacityHistory, sampleAccountCapacityHistory } from '../src/account-capacity-history';
+import { RowsMeter } from '../src/rows-meter';
 import { FleetService } from '../src/fleet';
 
 const inDO: any = runInDurableObject;
@@ -33,7 +34,7 @@ it('records bounded rolling account-capacity observations and reads a half-open 
   });
 });
 
-it('stops sampling at the per-account cap without deleting any Hub data', async () => {
+it('refuses an incomplete retained population without deleting any Hub data', async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName(crypto.randomUUID()));
   await inDO(stub, (hub: any) => {
     registerFixtureStatements(hub);
@@ -46,7 +47,9 @@ it('stops sampling at the per-account cap without deleting any Hub data', async 
         VALUES ('capped-account', ?, 1, 1, 1, 4)`, start + i * 15 * 60_000);
     }
     const statements: string[] = [];
-    const observedSql = new Proxy(sql, {
+    const meter=new RowsMeter();
+    const measured=meter.wrap(sql);
+    const observedSql = new Proxy(measured, {
       get(target, key) {
         if (key !== 'exec') return Reflect.get(target, key);
         return (query: string, ...bindings: any[]) => {
@@ -55,9 +58,10 @@ it('stops sampling at the per-account cap without deleting any Hub data', async 
         };
       },
     });
-    expect(sampleAccountCapacityHistory(observedSql, start + ACCOUNT_CAPACITY_HISTORY_MAX_ROWS * 15 * 60_000, () => [
+    expect(()=>meter.runSync('refused-sampler',()=>sampleAccountCapacityHistory(observedSql, start + ACCOUNT_CAPACITY_HISTORY_MAX_ROWS * 15 * 60_000, () => [
       { label: 'capped-account', active: 2, reserved: 2, native_live: 2, max_concurrency: 4 },
-    ])).toBe(0);
+    ]))).toThrow('account_capacity_history_observation_limited');
+    expect(meter.snapshot()['refused-sampler'].rows_read).toBeLessThan(400);
     expect(statements.some(query => /^\s*DELETE\b/i.test(query))).toBe(false);
     expect(Number(fixtureStatements(sql).exec("SELECT COUNT(*) AS n FROM fleet_account_capacity_history WHERE account='capped-account'").one().n))
       .toBe(ACCOUNT_CAPACITY_HISTORY_MAX_ROWS);

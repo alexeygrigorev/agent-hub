@@ -1,3 +1,4 @@
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { beforeEach, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { IntakeDependencies } from '../src/intake-dependencies';
@@ -22,10 +23,12 @@ async function create(project = 'demo') {
 beforeEach(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true,
     csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
-  await inDO(stub(), (h: any) => {
+  await inDO(stub(), async (h: any,state:any) => {
+    await advanceFixtureBudgetDay(h);
+    const seedSql=fixtureSql(h,state);
     const graph = new IntakeDependencies(h.sql); graph.init();
-    h.sql.exec('DELETE FROM intake_dependencies');
-    for (const id of ['dep-a', 'dep-b', 'dep-c']) h.sql.exec('INSERT OR REPLACE INTO intake_tasks VALUES(?,?)', id,
+    seedSql.exec('DELETE FROM intake_dependencies');
+    for (const id of ['dep-a', 'dep-b', 'dep-c']) seedSql.exec('INSERT OR REPLACE INTO intake_tasks VALUES(?,?)', id,
       JSON.stringify({ id, project: 'demo', title: id, status: 'open', history: [] }));
   });
 });

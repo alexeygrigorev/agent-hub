@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { restartFixtureHub, freshFixtureBudgetDay } from './helpers/fixture-budget';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { pinJobsClock } from './slot-clock';
 import { runInDurableObject } from 'cloudflare:test';
 import { doFetch, defaultEnv } from './m1-focus-setup';
@@ -7,6 +8,8 @@ import { sha256 } from '../src/auth/crypto';
 import { Hub } from '../src/hub';
 import { SCHEMA_SQL } from '../src/schema';
 import { BUS_SCHEMA_SQL } from '../src/bus';
+
+beforeEach(async()=>{const stub=defaultEnv.HUB.get(defaultEnv.HUB.idFromName('hub'));await (runInDurableObject as any)(stub,async(instance:any)=>freshFixtureBudgetDay(instance));});
 
 let savedFetch = globalThis.fetch;
 
@@ -752,16 +755,16 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     });
     await freezeJobsClock(isoStub, EARLY_T);
     await runInDurableObject(isoStub, async (instance: Hub) => {
-      const coldHub = new Hub((instance as any).ctx, instance.env);
+      const coldHub = await restartFixtureHub(instance);
       (coldHub as any).jobsService.setClock(() => new Date(EARLY_T));
       expect(
         countSql(coldHub.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
       ).toBe(150);
-      await coldHub.alarm();
+      await coldHub.scheduledTick(undefined,'manual');
       expect(
         countSql(coldHub.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
       ).toBe(50);
-      await coldHub.alarm();
+      await coldHub.scheduledTick(undefined,'manual');
       expect(
         countSql(coldHub.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
       ).toBe(0);

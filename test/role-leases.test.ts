@@ -1,3 +1,4 @@
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
@@ -14,22 +15,24 @@ let sequence = 0;
 async function fixture() {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('roles-' + ++sequence));
   const cookie = await inHub(stub, async (hub: any) => {
+    await advanceFixtureBudgetDay(hub);
+    const seedSql=fixtureSql(hub);
     hub._roleNow = BASE;
     hub.jobsService = new JobsService(hub.sql, hub.ctx, { now: () => new Date(hub._roleNow), enableAlarms: false });
     for (const id of ['host-a','host-b','foreign']) {
       const hash = await sha256('token-' + id);
-      hub.sql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,scopes,created_by_sub,created_at,expires_at) VALUES(?,'host',?,?,?,?,?,'test',?,?)",
+      seedSql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,scopes,created_by_sub,created_at,expires_at) VALUES(?,'host',?,?,?,?,?,'test',?,?)",
         'cred-' + id, hash, id, id, id, '["host"]', new Date(BASE).toISOString(), '2100-01-01T00:00:00Z');
-      hub.sql.exec('INSERT INTO machines(id,name,hostname,credential_id,registered_at,last_checkin_at,last_heartbeat,capabilities) VALUES(?,?,?,?,?,?,?,?)',
+      seedSql.exec('INSERT INTO machines(id,name,hostname,credential_id,registered_at,last_checkin_at,last_heartbeat,capabilities) VALUES(?,?,?,?,?,?,?,?)',
         id,id,id,'cred-' + id,new Date(BASE).toISOString(),new Date(BASE).toISOString(),'{"gate":{"launch_allowed":true}}','{"jobs":["writer-run"]}');
     }
     for (const kind of ['agent','job','routing-client']) {
-      hub.sql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,'test',?,?)",
+      seedSql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,'test',?,?)",
         kind,kind,await sha256('token-' + kind),kind,kind,kind === 'routing-client' ? 'routing-client:test' : 'ordinary',
         kind === 'routing-client' ? '["routing:submit"]' : '["host","admin","jobs:create"]',new Date(BASE).toISOString(),'2100-01-01T00:00:00Z');
     }
-    hub.sql.exec("UPDATE credentials SET approval_seq=1 WHERE kind='host'");
-    hub.sql.exec('UPDATE machines SET approval_seq=1');
+    seedSql.exec("UPDATE credentials SET approval_seq=1 WHERE kind='host'");
+    seedSql.exec('UPDATE machines SET approval_seq=1');
     return createSessionCookie(hub.env, { sub: 'admin', email: 'admin@fake.local', isAdmin: true, csrfToken: 'roles-csrf', exp: Math.floor(Date.now()/1000)+3600 });
   });
   const request = async (path: string, body?: any, token = 'token-host-a', method = body === undefined ? 'GET' : 'POST', session = false, csrf = true) => {

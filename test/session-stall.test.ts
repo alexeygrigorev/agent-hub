@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService } from '../src/session_control';
@@ -14,16 +15,17 @@ async function fixture(fn: (s: SessionControlService, live: LivenessService, sql
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('session-stall-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const clock = { now: start };
     const s = new SessionControlService(hub.sql, cb => state.storage.transactionSync(cb), () => clock.now);
     s.init();
     const live = new LivenessService(hub.sql, undefined, () => clock.now); live.init();
     const at = new Date(start).toISOString(), created = new Date(start - 11000000).toISOString();
-    hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at) VALUES ('test-host', 'test-host', 'test-host', ?, ?)", created, at);
-    hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+    fixtureStatements(hub.sql).exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at) VALUES ('test-host', 'test-host', 'test-host', ?, ?)", created, at);
+    fixtureStatements(hub.sql).exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
       VALUES (?, 'test-admin', 'test', '{}', 'test-host', 'codex', 'headless', 'running', ?, ?, ?)`, id,
       JSON.stringify({ native_id: id, tag: 'test', workspace: '/test', native_created_at_ms: start - 11000000 }), created, at);
-    hub.sql.exec(`INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, last_activity_at, created_at_ms)
+    fixtureStatements(hub.sql).exec(`INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, last_activity_at, created_at_ms)
       VALUES ('test-host', ?, 'test', 'codex', 'running', 'idle', ?, '/test', ?, ?)`, id, at, new Date(start - 1800000).toISOString(), start - 11000000);
     await fn(s, live, hub.sql, clock);
   });
@@ -31,7 +33,7 @@ async function fixture(fn: (s: SessionControlService, live: LivenessService, sql
 async function view(s: SessionControlService, path = '/' + id) {
   return await (await s.handle(new Request('https://hub.test/api/sessions' + path), admin)).json() as any;
 }
-function native(sql: any) { return sql.exec('SELECT * FROM fleet_sessions').toArray()[0]; }
+function native(sql: any) { return fixtureStatements(sql).exec('SELECT * FROM fleet_sessions').toArray()[0]; }
 
 describe('stalled running sessions', () => {
   it('reuses host clocks within a projection without sharing native fallback times', async () => fixture(async (_s, _live, sql) => {
@@ -46,7 +48,7 @@ describe('stalled running sessions', () => {
     const observed = { machine_id: 'test-host', observed_at: new Date(start - 3600000).toISOString() };
     expect(nativeObservationFresh(counted, observed, start, cache)).toBe(true);
     expect(reads).toBe(4);
-    sql.exec('UPDATE machines SET last_checkin_at = ? WHERE id = ?', new Date(start - 180001).toISOString(), 'test-host');
+    fixtureStatements(sql).exec('UPDATE machines SET last_checkin_at = ? WHERE id = ?', new Date(start - 180001).toISOString(), 'test-host');
     expect(nativeObservationFresh(counted, observed, start, new Map())).toBe(false);
   }));
 
@@ -56,7 +58,7 @@ describe('stalled running sessions', () => {
     for (let i = 0; i < 3; i++) {
       clock.now += 60000;
       const at = new Date(clock.now).toISOString();
-      sql.exec('UPDATE machines SET last_checkin_at = ?', at);
+      fixtureStatements(sql).exec('UPDATE machines SET last_checkin_at = ?', at);
       const response = await fleet.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions: [{
         native_id: id, tag: 'test', workspace: '/test', engine: 'codex', phase: 'running', agent_state: 'working', profile: null, account: null,
         created_at_ms: start - 11000000, last_activity_at: at,
@@ -67,18 +69,18 @@ describe('stalled running sessions', () => {
       expect((await view(s)).idle_for).toBeGreaterThan(1800);
       expect(live.evaluate().subjects.find(x => x.kind === 'session')?.state).toBe('stalled');
     }
-    expect(sql.exec('SELECT * FROM session_control_commands').toArray()).toEqual([]);
+    expect(fixtureStatements(sql).exec('SELECT * FROM session_control_commands').toArray()).toEqual([]);
   }));
   it('includes a refused stop in the stalled session alert detail', async () => fixture(async (s, live, sql, clock) => {
-    sql.exec('UPDATE fleet_sessions SET tag = ?, workspace = ?, agent_state = ?, observed_at = ?, last_activity_at = ? WHERE machine_id = ? AND native_id = ?',
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET tag = ?, workspace = ?, agent_state = ?, observed_at = ?, last_activity_at = ? WHERE machine_id = ? AND native_id = ?',
       'stalled-stop', '/repo', 'idle', new Date(clock.now - 30000).toISOString(),
       new Date(clock.now - 4000000).toISOString(), 'test-host', id);
     const stop = await s.handle(new Request(`https://hub.test/api/sessions/${id}/stop`, {
       method: 'POST', body: JSON.stringify({ key: 'refused-stop' }),
     }), admin);
     expect(stop.status).toBe(201);
-    const commandId = sql.exec('SELECT id FROM session_control_commands WHERE session_id = ?', id).one().id;
-    sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?',
+    const commandId = fixtureStatements(sql).exec('SELECT id FROM session_control_commands WHERE session_id = ?', id).one().id;
+    fixtureStatements(sql).exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?',
       'refused', JSON.stringify({ outcome: 'refused', reason: 'target_not_in_native_catalog' }),
       new Date(clock.now).toISOString(), commandId);
 
@@ -87,7 +89,7 @@ describe('stalled running sessions', () => {
     expect(subject?.detail).toContain('stop refused (target_not_in_native_catalog)');
     const [alert] = live.reconcileAlerts(live.evaluate().subjects);
     expect(alert.detail).toContain('stop refused (target_not_in_native_catalog)');
-    sql.exec("UPDATE session_control_commands SET state = 'acked', ack_json = ?, updated_at = ? WHERE id = ?",
+    fixtureStatements(sql).exec("UPDATE session_control_commands SET state = 'acked', ack_json = ?, updated_at = ? WHERE id = ?",
       JSON.stringify({ outcome: 'delivered', confirmed_exit: true }), new Date(clock.now + 1).toISOString(), commandId);
     expect(live.evaluate().subjects.find(item => item.kind === 'session' && item.id === 'test-host/stalled-stop')?.detail)
       .not.toContain('stop refused');
@@ -111,10 +113,10 @@ describe('stalled running sessions', () => {
     clock.now += 1;
     expect(await view(s)).toMatchObject({ state: 'stalled', stalled: true, lifecycle_state: 'running', stall_reason: 'no_native_progress', stall_threshold: 1800 });
     expect((await view(s, '')).sessions[0].state).toBe('stalled');
-    sql.exec("UPDATE session_control_sessions SET mode = 'interactive'");
+    fixtureStatements(sql).exec("UPDATE session_control_sessions SET mode = 'interactive'");
     expect((await view(s)).state).toBe('stalled');
-    expect(sql.exec('SELECT state FROM session_control_sessions').toArray()[0].state).toBe('running');
-    expect(sql.exec('SELECT * FROM session_control_commands').toArray()).toEqual([]);
+    expect(fixtureStatements(sql).exec('SELECT state FROM session_control_sessions').toArray()[0].state).toBe('running');
+    expect(fixtureStatements(sql).exec('SELECT * FROM session_control_commands').toArray()).toEqual([]);
     expect(live.evaluate().subjects.find(x => x.kind === 'session')?.state).toBe('stalled');
     expect(stallThreshold({ HUB_AGENT_STALL_S: '90' })).toBe(90);
     for (const value of ['NaN', '0', '-1', '604801']) expect(stallThreshold({ HUB_AGENT_STALL_S: value })).toBe(1800);
@@ -125,72 +127,72 @@ describe('stalled running sessions', () => {
     let subjects = live.evaluate().subjects;
     expect(live.reconcileAlerts(subjects)).toHaveLength(1);
     expect(live.reconcileAlerts(subjects)).toHaveLength(0);
-    sql.exec('UPDATE fleet_sessions SET last_activity_at = ?', new Date(clock.now).toISOString());
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET last_activity_at = ?', new Date(clock.now).toISOString());
     subjects = live.evaluate().subjects;
     expect(subjects.find(x => x.kind === 'session')?.state).toBe('stalled');
     expect(live.reconcileAlerts(subjects)).toHaveLength(0);
     clock.now += 60000;
-    sql.exec('UPDATE fleet_sessions SET last_activity_at = ?', new Date(clock.now).toISOString());
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET last_activity_at = ?', new Date(clock.now).toISOString());
     subjects = live.evaluate().subjects;
     expect(subjects.find(x => x.kind === 'session')?.state).toBe('idle');
     live.reconcileAlerts(subjects);
     expect(live.alerts()[0].resolved_at).not.toBeNull();
     clock.now += 1800001;
-    sql.exec('UPDATE machines SET last_checkin_at = ?', new Date(clock.now).toISOString());
+    fixtureStatements(sql).exec('UPDATE machines SET last_checkin_at = ?', new Date(clock.now).toISOString());
     expect(live.reconcileAlerts(live.evaluate().subjects)).toHaveLength(1);
   }));
 
   it('reports gone headless agents immediately even with recently active orphan children and uncertain native phase', async () => fixture(async (s, live, sql) => {
-    sql.exec("UPDATE fleet_sessions SET phase = 'uncertain', progress_json = ?", JSON.stringify({ headless: true, agent_alive: false, orphaned: true, cleanup: 'uncertain', last_progress_at: new Date(start).toISOString() }));
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase = 'uncertain', progress_json = ?", JSON.stringify({ headless: true, agent_alive: false, orphaned: true, cleanup: 'uncertain', last_progress_at: new Date(start).toISOString() }));
     expect(await view(s)).toMatchObject({ state: 'stalled', stall_reason: 'agent_exited_children_running' });
     expect(live.evaluate().subjects.find(x => x.kind === 'session')?.state).toBe('stalled');
-    expect(sql.exec('SELECT state FROM session_control_sessions').toArray()[0].state).toBe('running');
+    expect(fixtureStatements(sql).exec('SELECT state FROM session_control_sessions').toArray()[0].state).toBe('running');
     // Successful reaping retains a visible failure and one alert even when
     // it completes between scheduled liveness checks.
-    sql.exec("UPDATE fleet_sessions SET phase = 'exited', progress_json = ?", JSON.stringify({ headless: true, agent_alive: false, orphaned: true, cleanup: 'reaped', last_progress_at: new Date(start).toISOString() }));
-    sql.exec("UPDATE session_control_sessions SET state = 'stopped'");
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase = 'exited', progress_json = ?", JSON.stringify({ headless: true, agent_alive: false, orphaned: true, cleanup: 'reaped', last_progress_at: new Date(start).toISOString() }));
+    fixtureStatements(sql).exec("UPDATE session_control_sessions SET state = 'stopped'");
     expect(await view(s)).toMatchObject({ state: 'failed', lifecycle_state: 'stopped' });
     expect(live.reconcileAlerts(live.evaluate().subjects)).toHaveLength(1);
     expect(live.reconcileAlerts(live.evaluate().subjects)).toHaveLength(0);
   }));
 
   it('uses authoritative agent progress, ignores stale observations and resets on new incarnation or proven exit', async () => fixture(async (s, live, sql, clock) => {
-    sql.exec('UPDATE fleet_sessions SET progress_json = ?', JSON.stringify({ last_progress_at: new Date(start).toISOString() }));
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET progress_json = ?', JSON.stringify({ last_progress_at: new Date(start).toISOString() }));
     clock.now += 1;
     expect((await view(s)).state).toBe('running');
-    sql.exec('UPDATE fleet_sessions SET progress_json = NULL');
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET progress_json = NULL');
     expect((await view(s)).state).toBe('stalled');
     expect(classifySessionStall(sql, native(sql), clock.now, 1800, false).stalled).toBe(true);
-    sql.exec('UPDATE fleet_sessions SET created_at_ms = ?, last_activity_at = ?', clock.now, new Date(clock.now).toISOString());
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET created_at_ms = ?, last_activity_at = ?', clock.now, new Date(clock.now).toISOString());
     // Matching UUID alone cannot transfer new-incarnation activity to the
     // original Hub binding. Classifier itself resets for the new native.
     expect(classifySessionStall(sql, native(sql), clock.now).stalled).toBe(false);
-    sql.exec('UPDATE session_control_sessions SET binding_json = ?', JSON.stringify({ native_id: id, tag: 'test', workspace: '/test', native_created_at_ms: clock.now }));
+    fixtureStatements(sql).exec('UPDATE session_control_sessions SET binding_json = ?', JSON.stringify({ native_id: id, tag: 'test', workspace: '/test', native_created_at_ms: clock.now }));
     expect((await view(s)).state).toBe('running');
-    sql.exec("UPDATE fleet_sessions SET phase = 'exited'");
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase = 'exited'");
     expect(classifySessionStall(sql, native(sql), clock.now).stalled).toBe(false);
-    sql.exec("UPDATE fleet_sessions SET phase = 'running', last_activity_at = ?", new Date(start - 2000000).toISOString());
-    sql.exec('UPDATE machines SET last_checkin_at = ?', new Date(start - 900000).toISOString());
-    sql.exec('UPDATE fleet_sessions SET observed_at = ?', new Date(start - 900000).toISOString());
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase = 'running', last_activity_at = ?", new Date(start - 2000000).toISOString());
+    fixtureStatements(sql).exec('UPDATE machines SET last_checkin_at = ?', new Date(start - 900000).toISOString());
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET observed_at = ?', new Date(start - 900000).toISOString());
     expect((await view(s)).stalled).toBe(false);
   }));
 
   it('stalls missing/unobserved bindings on a fresh catalog without fabricating exit', async () => fixture(async (s, live, sql, clock) => {
     clock.now += 1;
-    sql.exec("UPDATE fleet_sessions SET phase = 'unobserved'");
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase = 'unobserved'");
     expect((await view(s)).state).toBe('stalled');
     expect(live.evaluate().subjects.find(x => x.kind === 'session')?.state).toBe('stalled');
-    sql.exec('DELETE FROM fleet_sessions');
+    fixtureStatements(sql).exec('DELETE FROM fleet_sessions');
     expect((await view(s)).state).toBe('stalled');
-    expect(sql.exec('SELECT state FROM session_control_sessions').toArray()[0].state).toBe('running');
+    expect(fixtureStatements(sql).exec('SELECT state FROM session_control_sessions').toArray()[0].state).toBe('running');
   }));
 
   it('reconciles the three-hour warning with mismatched native phases and preserves its snooze independently of stall alerts', async () => fixture(async (s, live, sql) => {
-    sql.exec("UPDATE fleet_sessions SET phase = 'uncertain'");
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase = 'uncertain'");
     expect(await view(s)).toMatchObject({ long_running: true, warning_active: true, runtime: 11000 });
     expect((await view(s, '/warnings')).warnings).toHaveLength(1);
-    sql.exec('UPDATE fleet_sessions SET phase = ?', 'running');
-    sql.exec('UPDATE fleet_sessions SET last_activity_at = ?', new Date(start - 2000000).toISOString());
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET phase = ?', 'running');
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET last_activity_at = ?', new Date(start - 2000000).toISOString());
     await s.handle(new Request('https://hub.test/api/sessions/' + id + '/ack', { method: 'POST', body: '{}' }), admin);
     expect(await view(s)).toMatchObject({ state: 'stalled', long_running: true, warning_active: false });
     expect(live.reconcileAlerts(live.evaluate().subjects)).toHaveLength(1);
@@ -199,7 +201,7 @@ describe('stalled running sessions', () => {
 
 describe('active tool calls (intake 167c6178)', () => {
   const idleFor = (sql: any, seconds: number, agentState: string, progress: any = null) => {
-    sql.exec('UPDATE fleet_sessions SET last_activity_at = ?, agent_state = ?, progress_json = ?',
+    fixtureStatements(sql).exec('UPDATE fleet_sessions SET last_activity_at = ?, agent_state = ?, progress_json = ?',
       new Date(start - seconds * 1000).toISOString(), agentState, progress && JSON.stringify(progress));
   };
   const live = (idle: number, cpuAgo: number) => ({ last_progress_at: new Date(start - idle * 1000).toISOString(), headless: true, agent_alive: true,

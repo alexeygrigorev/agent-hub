@@ -34,7 +34,10 @@ describe('retained intake and alert bootstrap uses deployed indexes',()=>{
   for(let i=0;i<80;i++)raw.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)','page-summary-'+String(i).padStart(3,'0'),JSON.stringify({id:'page-summary-'+i,status:'done',history:[]}));
   raw.exec("INSERT INTO intake_status_summary(id,title) VALUES('orphan-summary','orphan')");
   const o=observe(raw);initIntakeSummary(o.sql);
-  expect(o.calls.some(c=>/FROM intake_tasks/.test(c.query))).toBe(false);
+  const sourceHeads=o.calls.filter(c=>/FROM intake_tasks/.test(c.query));
+  expect(sourceHeads.map(c=>c.query)).toEqual(['SELECT id FROM intake_tasks ORDER BY id LIMIT 1']);
+  expect(reads(sourceHeads)).toBeLessThanOrEqual(2);
+  expect(raw.exec('SELECT phase FROM intake_summary_migration WHERE id=1').one().phase).toBe(0);
   advanceIntakeSummary(o.sql);
   expect(reads(boundedMetadata(o.calls))).toBeLessThan(200);
   const repeat=observe(raw);initIntakeSummary(repeat.sql);

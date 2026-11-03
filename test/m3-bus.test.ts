@@ -1,3 +1,4 @@
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Env } from '../src/env';
@@ -15,30 +16,32 @@ describe('M3 Bus Service & Schema Tests', () => {
   beforeEach(async () => {
     const id = defaultEnv.HUB.idFromName("hub");
     stub = defaultEnv.HUB.get(id);
-    await runInDurableObject(stub, async (instance: Hub) => {
+    await runInDurableObject(stub, async (instance: Hub, state:any) => {
+      await advanceFixtureBudgetDay(instance);
+      const seedSql=fixtureSql(instance,state);
       for (const statement of BUS_SCHEMA_SQL.split(';')) {
         const trimmed = statement.trim();
         if (trimmed) {
-          try { instance.sql.exec(trimmed); } catch (e) {}
+          try { seedSql.exec(trimmed); } catch (e) {}
         }
       }
 
-      instance.sql.exec('DELETE FROM messages');
-      instance.sql.exec('DELETE FROM claims');
-      try { instance.sql.exec('DELETE FROM agents'); } catch (e) {}
-      try { instance.sql.exec('DELETE FROM machines'); } catch (e) {}
-      try { instance.sql.exec('DELETE FROM credentials'); } catch (e) {}
+      seedSql.exec('DELETE FROM messages');
+      seedSql.exec('DELETE FROM claims');
+      try { seedSql.exec('DELETE FROM agents'); } catch (e) {}
+      try { seedSql.exec('DELETE FROM machines'); } catch (e) {}
+      try { seedSql.exec('DELETE FROM credentials'); } catch (e) {}
 
-      instance.sql.exec("CREATE TABLE IF NOT EXISTS machines (id TEXT PRIMARY KEY, name TEXT, hostname TEXT, registered_at TEXT)");
-      instance.sql.exec("CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, kind TEXT, token_hash TEXT UNIQUE, scopes JSON, family_id TEXT, subject TEXT, created_by_sub TEXT, created_at TEXT, expires_at TEXT, revoked_at TEXT, machine_id TEXT, actor TEXT, last_used_at TEXT)");
+      seedSql.exec("CREATE TABLE IF NOT EXISTS machines (id TEXT PRIMARY KEY, name TEXT, hostname TEXT, registered_at TEXT)");
+      seedSql.exec("CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, kind TEXT, token_hash TEXT UNIQUE, scopes JSON, family_id TEXT, subject TEXT, created_by_sub TEXT, created_at TEXT, expires_at TEXT, revoked_at TEXT, machine_id TEXT, actor TEXT, last_used_at TEXT)");
 
-      instance.sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('machine-A', 'Machine A', 'host-a', '2026-01-01T00:00:00Z')");
-      instance.sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('machine-B', 'Machine B', 'host-b', '2026-01-01T00:00:00Z')");
+      seedSql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('machine-A', 'Machine A', 'host-a', '2026-01-01T00:00:00Z')");
+      seedSql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('machine-B', 'Machine B', 'host-b', '2026-01-01T00:00:00Z')");
 
-      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-1', 'projA', 'worker', 'machine-A')");
-      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-1b', 'projA', 'worker', 'machine-A')");
-      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-2', 'projB', 'worker', 'machine-B')");
-      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('lead-1', 'projA', 'lead', 'machine-A')");
+      seedSql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-1', 'projA', 'worker', 'machine-A')");
+      seedSql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-1b', 'projA', 'worker', 'machine-A')");
+      seedSql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-2', 'projB', 'worker', 'machine-B')");
+      seedSql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('lead-1', 'projA', 'lead', 'machine-A')");
     });
   });
 
@@ -415,30 +418,32 @@ describe('M3 bus corrections: recipient ACK, addresses, aliases, expiry', () => 
   beforeEach(async () => {
     const id = defaultEnv.HUB.idFromName("hub");
     stub = defaultEnv.HUB.get(id);
-    await runInDurableObject(stub, async (instance: Hub) => {
+    await runInDurableObject(stub, async (instance: Hub, state:any) => {
+      await advanceFixtureBudgetDay(instance);
+      const seedSql=fixtureSql(instance,state);
       for (const schema of [SCHEMA_SQL, BUS_SCHEMA_SQL]) {
         for (const statement of schema.split(';')) {
           const trimmed = statement.trim();
           if (trimmed) {
-            try { instance.sql.exec(trimmed); } catch (e) {}
+            try { seedSql.exec(trimmed); } catch (e) {}
           }
         }
       }
       for (const table of ['messages', 'claims', 'agents', 'machines', 'credentials']) {
-        try { instance.sql.exec(`DELETE FROM ${table}`); } catch (e) {}
+        try { seedSql.exec(`DELETE FROM ${table}`); } catch (e) {}
       }
       const now = new Date().toISOString();
       for (const m of ['mach-A', 'mach-B']) {
-        instance.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', m, m, m, now);
+        seedSql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', m, m, m, now);
       }
-      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-1', 'projA', 'worker', 'mach-A')");
-      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-2', 'projB', 'worker', 'mach-B')");
-      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('principal-1', 'projA', 'principal', 'mach-A')");
-      await seedCred(instance.sql, 'c_host_a', 'tok_host_a', 'host', 'mach-A', null, ['host', 'bus:send', 'bus:read']);
-      await seedCred(instance.sql, 'c_host_b', 'tok_host_b', 'host', 'mach-B', null, ['host', 'bus:send', 'bus:read']);
-      await seedCred(instance.sql, 'c_w1', 'tok_w1', 'agent', 'mach-A', 'worker-1', ['bus:send', 'bus:read']);
-      await seedCred(instance.sql, 'c_w2q', 'tok_w2q', 'agent', 'mach-B', 'projB:worker-2', ['bus:send', 'bus:read']);
-      await seedCred(instance.sql, 'c_p1', 'tok_p1', 'agent', 'mach-A', 'principal-1', ['bus:send', 'bus:read']);
+      seedSql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-1', 'projA', 'worker', 'mach-A')");
+      seedSql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-2', 'projB', 'worker', 'mach-B')");
+      seedSql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('principal-1', 'projA', 'principal', 'mach-A')");
+      await seedCred(seedSql, 'c_host_a', 'tok_host_a', 'host', 'mach-A', null, ['host', 'bus:send', 'bus:read']);
+      await seedCred(seedSql, 'c_host_b', 'tok_host_b', 'host', 'mach-B', null, ['host', 'bus:send', 'bus:read']);
+      await seedCred(seedSql, 'c_w1', 'tok_w1', 'agent', 'mach-A', 'worker-1', ['bus:send', 'bus:read']);
+      await seedCred(seedSql, 'c_w2q', 'tok_w2q', 'agent', 'mach-B', 'projB:worker-2', ['bus:send', 'bus:read']);
+      await seedCred(seedSql, 'c_p1', 'tok_p1', 'agent', 'mach-A', 'principal-1', ['bus:send', 'bus:read']);
     });
   });
 

@@ -1,3 +1,4 @@
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { pinJobsClock } from './slot-clock';
 import { runInDurableObject, env } from 'cloudflare:test';
@@ -100,8 +101,9 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
   beforeEach(async () => {
     const id = (env as any).HUB.idFromName("hub");
     const stub = (env as any).HUB.get(id);
-    await (runInDurableObject as any)(stub, async (instance: any) => {
-      await resetAndSeedIntegrationDb(instance.sql);
+    await (runInDurableObject as any)(stub, async (instance: any, state:any) => {
+      await advanceFixtureBudgetDay(instance);
+      await resetAndSeedIntegrationDb(fixtureSql(instance,state));
     });
   });
 

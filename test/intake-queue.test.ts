@@ -1,3 +1,4 @@
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { IntakeWatchdog as BaseIntakeWatchdog, queuePolicyFrom as parseQueuePolicy, queueCandidateOrder, WATCHDOG_INTERVAL, QUEUE_STALL_MS, QUEUE_RETRY_LIMIT, QUEUE_RETRY_MAX_MS, QUEUE_HOLD_TTL_MS, QUEUE_SWEEP_LIMIT } from '../src/intake-watchdog';
@@ -14,10 +15,12 @@ const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('queue-tests
 const task = (id = 'queue-task'): any => ({ id, project:'demo', title:'Queue task', status:'open', version:1,
   created_at:NOW, updated_at:NOW, acceptance_criteria:'Verify the result', history:[] });
 async function fixture(fn: (h:any)=>any) {
-  return (runInDurableObject as any)(stub(), async (h:any) => {
-    for (const table of ['intake_queue_admissions','intake_queue_budget_meta','intake_queue_budget_alerts','intake_queue_digest','intake_queue_escalations','session_control_wakes','intake_queue_movement','intake_restart_queue','intake_watchdog_meta','session_control_sessions','fleet_sessions','claims','fleet_catalog_seen']) h.sql.exec('DELETE FROM '+table);
-    h.sql.exec("UPDATE intake_queue_cursor SET after_id='',forgotten_seen=0");
-    h.sql.exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,capabilities) VALUES('queue-host','queue-host','queue-host','2026-10-28T10:00:00Z',?)",JSON.stringify({workspaces:['demo']}));
+  return (runInDurableObject as any)(stub(), async (h:any, state:any) => {
+    await advanceFixtureBudgetDay(h);
+    const seedSql=fixtureSql(h,state);
+    for (const table of ['intake_queue_admissions','intake_queue_budget_meta','intake_queue_budget_alerts','intake_queue_digest','intake_queue_escalations','session_control_wakes','intake_queue_movement','intake_restart_queue','intake_watchdog_meta','session_control_sessions','fleet_sessions','claims','fleet_catalog_seen']) seedSql.exec('DELETE FROM '+table);
+    seedSql.exec("UPDATE intake_queue_cursor SET after_id='',forgotten_seen=0");
+    seedSql.exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,capabilities) VALUES('queue-host','queue-host','queue-host','2026-10-28T10:00:00Z',?)",JSON.stringify({workspaces:['demo']}));
     return fn(h);
   });
 }

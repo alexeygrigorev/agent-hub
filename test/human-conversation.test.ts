@@ -1,3 +1,4 @@
+import { restartFixtureHub } from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { Hub, BaseHub } from '../src/conversation-hub';
@@ -71,7 +72,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-human-google-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_inst: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_inst, bindings);
       const nowIso = new Date().toISOString();
 
       // Seed real users table row
@@ -218,7 +219,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-human-token-admin-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_inst: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_inst, bindings);
 
       // Seed valid token admin credential
       await insertHumanBearerCredential(hub.sql, {
@@ -261,7 +262,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
         ...bindings,
         HUB_ADMIN_TOKEN_SHA256: undefined,
       } as unknown as Env;
-      const unconfHub = new Hub(state, unconfiguredEnv);
+      const unconfHub = await restartFixtureHub(hub, unconfiguredEnv);
       const unconfRes = await unconfHub.fetch(
         new Request('https://hub.test/api/conversations/participants', {
           method: 'GET',
@@ -284,7 +285,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-human-refresh-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_inst: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_inst, bindings);
       const nowIso = new Date().toISOString();
 
       hub.sql.exec(
@@ -364,7 +365,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-human-fencing-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_inst: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_inst, bindings);
       const nowIso = new Date().toISOString();
 
       hub.sql.exec(
@@ -446,7 +447,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
         ...bindings,
         HUB_ADMINS: 'otheradmin@google.com', // alexey removed
       } as Env;
-      const nonAdminHub = new Hub(state, nonAdminEnv);
+      const nonAdminHub = await restartFixtureHub(hub, nonAdminEnv);
       const resUnallowlisted = await nonAdminHub.fetch(
         new Request('https://hub.test/api/conversations/participants', {
           method: 'GET',
@@ -469,7 +470,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-human-invalids-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_inst: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_inst, bindings);
       const nowIso = new Date().toISOString();
 
       hub.sql.exec(
@@ -589,7 +590,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-authority-sep-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_inst: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_inst, bindings);
       const nowIso = new Date().toISOString();
 
       hub.sql.exec(
@@ -690,7 +691,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-disjoint-kinds-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_inst: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_inst, bindings);
       const nowIso = new Date().toISOString();
 
       // Insert host credential
@@ -767,7 +768,7 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-human-links-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_inst: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_inst, bindings);
       const nowIso = new Date().toISOString();
 
       hub.sql.exec(

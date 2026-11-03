@@ -1,3 +1,4 @@
+import {fixtureSql} from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
@@ -716,7 +717,7 @@ describe('Disk Monitoring Service', () => {
     // Seed well above the former hard 256/512 refuse without approaching the safety-net ceiling.
     for (let i = 0; i < 520; i++) {
       const dummyId = `dummy-task-${i.toString().padStart(4, '0')}`;
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'INSERT INTO intake_tasks(id, data) VALUES(?, ?)',
         dummyId,
         JSON.stringify({ id: dummyId, project: 'demo', title: `Dummy ${i}`, status: 'open', version: 1, created_at: clock.t, updated_at: clock.t, history: [] }),
