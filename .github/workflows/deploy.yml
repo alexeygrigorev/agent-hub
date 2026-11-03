@@ -58,8 +58,26 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  release_slot:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Validate every deploy-relevant main push early, but keep the grant
+      # issued until the orchestrator dispatches the actual production deploy.
+      - name: Release slot check (orchestrator-issued, exact SHA)
+        run: python3 scripts/ci/release_slot_verify.py --check-only
+
   test:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    needs: release_slot
+    if: |
+      always() &&
+      (needs.release_slot.result == 'success' || needs.release_slot.result == 'skipped') &&
+      !contains(github.event.head_commit.message || '', '[skip ci]')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -159,6 +177,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # Orchestrator release slot gate (intake 2c87c231): the head commit must
+      # carry a Release-Slot trailer bound to a Hub-issued, single-use slot
+      # record for this exact SHA. Main pushes check it without consumption;
+      # a real dispatch consumes it atomically. Dry-runs check without burning
+      # a slot. Fails closed before any deploy.
+      - name: Release slot gate (orchestrator-issued, single-use, SHA-bound)
+        run: |
+          if [ "${{ inputs.dry_run == true }}" = "true" ]; then
+            python3 scripts/ci/release_slot_verify.py --check-only
+          else
+            python3 scripts/ci/release_slot_verify.py
+          fi
 
       - name: Scope boundary (all pushed commits)
         run: python3 scripts/ci/scope_guard.py

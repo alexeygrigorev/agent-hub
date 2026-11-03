@@ -7,6 +7,10 @@ on:
         description: "Exact Cloudflare Worker Version ID to restore at 100% (e.g. cf8aef89-43de-4732-a2aa-e34ce91a426d)"
         required: true
         type: string
+      release_slot:
+        description: "Orchestrator release slot id issued for this version (hub releases issue --target <version_id>)"
+        required: true
+        type: string
       message:
         description: "Reason / message for rollback deployment annotation"
         required: false
@@ -25,6 +29,15 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      # Same orchestrator release slot gate as the deploy workflow (intake
+      # 2c87c231 AC2): a rollback is a manual deploy, so dispatching it also
+      # consumes a single-use slot bound to the exact version id.
+      - name: Release slot gate (orchestrator-issued, single-use, version-bound)
+        env:
+          INPUT_RELEASE_SLOT: ${{ github.event.inputs.release_slot }}
+          INPUT_VERSION_ID: ${{ github.event.inputs.version_id }}
+        run: python3 scripts/ci/release_slot_verify.py --target "$INPUT_VERSION_ID" --slot "$INPUT_RELEASE_SLOT"
 
       - uses: actions/setup-node@v4
         with:

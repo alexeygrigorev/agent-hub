@@ -72,6 +72,17 @@ def validate_deploy_workflow(file_path: Path):
     if "contents: read" not in content:
         raise ValueError(f"Permissions must specify minimal 'contents: read' in {file_path}")
 
+    # Release gate (intake 2c87c231 AC1): deploys must consume an
+    # orchestrator-issued, single-use, SHA-bound release slot first.
+    if "release_slot_verify.py" not in content:
+        raise ValueError(f"Release slot gate step missing in {file_path}; deploys must verify an orchestrator release slot")
+    if "release_slot_verify.py --check-only" not in content:
+        raise ValueError(f"Main-push release slot check missing in {file_path}")
+    if "github.event_name == 'push'" not in content or "github.ref == 'refs/heads/main'" not in content:
+        raise ValueError(f"Main-push release slot check must be limited to main pushes in {file_path}")
+    if "github.event_name == 'workflow_dispatch'" not in content:
+        raise ValueError(f"Production deploy job must be workflow_dispatch gated in {file_path}")
+
     # Check timeouts
     if "timeout-minutes:" not in content:
         raise ValueError(f"Bounded timeout-minutes missing in {file_path}")
@@ -136,6 +147,11 @@ def validate_rollback_workflow(file_path: Path):
         raise ValueError(f"Permissions must specify minimal 'contents: read' in {file_path}")
     if "secrets.CLOUDFLARE_API_TOKEN" not in content or "secrets.CLOUDFLARE_ACCOUNT_ID" not in content:
         raise ValueError(f"Missing Cloudflare credentials in {file_path}")
+
+    # Release gate (intake 2c87c231 AC2): a manual rollback is a manual deploy
+    # and must consume a release slot bound to the exact version id.
+    if "release_slot:" not in content or "release_slot_verify.py" not in content or "--target \"$INPUT_VERSION_ID\" --slot \"$INPUT_RELEASE_SLOT\"" not in content:
+        raise ValueError(f"Release slot gate (release_slot input + verify step) missing in {file_path}")
 
     if HAS_YAML:
         data = yaml.safe_load(content)
