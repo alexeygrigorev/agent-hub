@@ -237,6 +237,14 @@ describe('F7 phone routes and intake pages', () => {
     expect(intakeJs).toContain('/sessions.html?session=${encodeURIComponent(sid)}');
     expect(intakeJs).toContain('last_remove');
     expect(intakeJs).toContain('checked_at');
+    // Priority (create + update) and promote-to-front controls in portal UI (efcfa907).
+    for (const id of ['intake-create-form', 'intake-create-priority', 'intake-priority-form', 'intake-priority-select', 'intake-priority-btn', 'intake-promote-btn']) {
+      expect(intakeHtml, id).toContain(`id="${id}"`);
+    }
+    expect(intakeJs).toContain('submitPriority');
+    expect(intakeJs).toContain('promoteIntake');
+    expect(intakeJs).toContain('submitCreate');
+    expect(intakeJs).toContain('/promote`');
   });
 
   it('worker maps every F7 clean URL to its bundle with no terminal/SSH routes', () => {

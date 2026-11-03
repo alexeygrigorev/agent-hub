@@ -231,6 +231,10 @@ def add_commands(sub):
     intake_stats.options(commands.add_parser('stats', help='Timing and attempts for one intake'), individual=True)
     forgotten = commands.add_parser('forgotten', help='Open intakes forgotten by live sessions; includes queued restart reason')
     forgotten.add_argument('--project')
+    queue = commands.add_parser('queue', help='Autonomous intake queue (promoted first, then priority high > normal > low, then newest created_at)')
+    queue.add_argument('--project')
+    queue.add_argument('--cursor')
+    queue.add_argument('--limit', type=int)
     create = commands.add_parser('create', help='Capture verbatim UTF-8 text from file/stdin; missing provenance stays unknown')
     create.add_argument('--project', required=True)
     create.add_argument('--title', required=True)
@@ -501,6 +505,9 @@ def execute(args):
     if command == 'forgotten':
         params = {'project': args.project} if args.project else {}
         return request('GET', BASE + '/forgotten' + ('?' + urlencode(params) if params else ''))
+    if command == 'queue':
+        params = {field: getattr(args, field) for field in ('project', 'cursor', 'limit') if getattr(args, field, None) is not None}
+        return request('GET', BASE + '/queue' + ('?' + urlencode(params) if params else ''))
     if command == 'create':
         valid_key(args.key)
         criteria = getattr(args, 'acceptance_criteria', None)

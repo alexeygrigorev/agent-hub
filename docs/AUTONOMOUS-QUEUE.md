@@ -23,7 +23,9 @@ secrets, deletions and 2FA; agents never approve production gates.
 `GET /api/intake/queue` is an authorized, paginated view of visible open intakes. A page returns at most 64 task records, with one additional record read to detect a next page; ordinal cursors reveal no unauthorized task IDs. Queue positions are relative to the authorized page, which the dashboard labels explicitly. The
 main dashboard shows queue positions, running work, recovery/escalation,
 last movement time and the most recent 32 movements per intake. Queue positions
-follow due-time eligibility within the displayed page. Dispatch uses a durable cursor across 64-intake batches so continuously arriving work cannot keep the same first IDs at the front. Offered and starting work stays queued until the replacement reaches canonical running state. Unproven launch or native receipts receive bounded read-only checks with backoff, then escalation; their age never authorizes a stop or replacement. Repeated
+follow readiness (due work before not-yet-due) and then intake queue order —
+promoted first (newest promotion first), then priority high > normal > low
+(default normal), then newest creation order — within the displayed page. Dispatch uses a durable cursor across 64-intake batches so continuously arriving work cannot keep the same first IDs at the front. Offered and starting work stays queued until the replacement reaches canonical running state. Unproven launch or native receipts receive bounded read-only checks with backoff, then escalation; their age never authorizes a stop or replacement. Repeated
 polls do not refresh movement time. Items unchanged for 30 minutes are
 highlighted. The existing forgotten-intake view remains available.
 
