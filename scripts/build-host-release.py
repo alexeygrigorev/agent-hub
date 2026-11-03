@@ -25,6 +25,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MANIFEST_TEMPLATE = REPO / "scripts" / "host-release-manifest.json"
+sys.path.insert(0, str(REPO / "scripts"))
+from host_release_modes import harden_tree, verify_tree
 VERIFY = REPO / "scripts" / "verify-host-release.py"
 DEFAULT_RELEASES = Path.home() / ".local" / "share" / "agent-hub" / "host-releases"
 
@@ -35,6 +37,8 @@ TRACKED_PATHS = [
     "scripts/metrics-dashboard-export.py",
     "scripts/host-release-manifest.json",
     "scripts/build-host-release.py",
+    "scripts/host_release_modes.py",
+    "scripts/harden-host-release.py",
     "scripts/verify-host-release.py",
     "scripts/switch-host-release.py",
     "pyproject.toml",
@@ -56,7 +60,9 @@ def write_pth(target):
     # Belt and braces next to the drop-in PYTHONPATH=<release>/host: an
     # offline .pth entry (no pip, no network) so the release venv always
     # resolves its own host package.
-    (site_dirs[0] / "agent_hub_host_release.pth").write_text(str(target / "host") + "\n", encoding="utf-8")
+    pth = site_dirs[0] / "agent_hub_host_release.pth"
+    pth.write_text(str(target / "host") + "\n", encoding="utf-8")
+    pth.chmod(0o644)
 
 
 def main():
@@ -144,6 +150,12 @@ def main():
     if vproc.returncode != 0:
         shutil.rmtree(staging, ignore_errors=True)
         raise SystemExit("build-host-release: venv creation failed")
+    try:
+        harden_tree(staging)
+        verify_tree(staging)
+    except (OSError, ValueError) as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise SystemExit("build-host-release: release permissions could not be hardened: " + str(exc))
     try:
         staging.rename(target)
     except OSError:
