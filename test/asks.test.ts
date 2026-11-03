@@ -33,8 +33,8 @@ const DONE = (extra: string) => `DONE\nevidence: agent-hub@0123456789abcdef push
 async function fixture(fn: (h: any, ledger: AskLedger, alerts: any[], clock: { now: number }) => any) {
   return inDO(stub(), async (h: any) => {
     for (const t of ['tasks', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    for (const t of ['ask_messages', 'asks', 'ask_agents', 'ask_gaps', 'ask_sources', 'liveness_alerts']) h.sql.exec('DELETE FROM ' + t);
-    h.sql.exec("UPDATE ask_meta SET gap_scope='agent',last_tick=NULL,last_result=NULL,daily_day=NULL WHERE id=1");
+    for (const t of ['ask_messages', 'asks', 'ask_agents', 'ask_gaps', 'ask_sources', 'ask_reconcile_runs', 'liveness_alerts']) h.sql.exec('DELETE FROM ' + t);
+    h.sql.exec("UPDATE ask_meta SET gap_scope='agent',last_tick=NULL,last_result=NULL,daily_day=NULL,reconcile_cursor=0,last_reconcile_run=NULL,last_reconcile_at=NULL WHERE id=1");
     const alerts: any[] = [];
     const clock = { now: Date.now() };
     const ledger = new AskLedger(h.sql, h.intakeService, (f: any) => f(), {
@@ -458,5 +458,122 @@ describe('Hub composition', () => {
     const res = await h.fetch(new Request('https://hub.test/api/asks'));
     expect(res.status).toBe(401);
     expect(h.askLedger.counts().messages).toBe(0);
+  }));
+});
+
+describe('daily incremental ask reconciliation (intake f530f981 AC2-AC4, AC6)', () => {
+  it('matches against open/done/archived intakes, auto-creates uncovered asks with verbatim words + Berlin ts + stable key, appends missing words on partial matches, and advances cursor incrementally', () => fixture(async (h, l, _alerts, clock) => {
+    const openTask = await intake(h, '1. Build fleet quota timeline chart with daily samples', 'Quota timeline chart');
+    const doneTask = await intake(h, '1. Export the usage report as CSV from /api/usage', 'CSV usage report');
+    await note(h, doneTask.id, DONE('AC1: met'));
+    expect((await close(h, doneTask.id)).status).toBe(200);
+    const archTask = await intake(h, '1. Configure host heartbeat liveness threshold', 'Host liveness threshold');
+    // Mark archTask as archived in storage + summary projection
+    const archData = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', archTask.id).toArray()[0].data);
+    archData.archived_at = clock.now;
+    h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(archData), archTask.id);
+    h.sql.exec('UPDATE intake_status_summary SET archived_at=? WHERE id=?', clock.now, archTask.id);
+
+    const recIntake = await intake(h, '1. Daily ask reconciler tracking intake');
+    l.settings({ reconcile_intake: recIntake.id });
+
+    const fixedTs = Date.UTC(2026, 9, 31, 14, 30, 0); // 2026-10-31 15:30:00 CET (Berlin)
+    ingest(l, 'dev', [
+      { msg_id: 't2001u', role: 'user', ts: fixedTs, text: 'Export the usage report as CSV from /api/usage' },
+      { msg_id: 't2002u', role: 'user', ts: fixedTs + 1000, text: 'Configure host heartbeat liveness threshold' },
+      { msg_id: 't2003u', role: 'user', ts: fixedTs + 2000, text: 'Build fleet quota timeline chart with daily samples and add dark mode toggle' },
+      { msg_id: 't2004u', role: 'user', ts: fixedTs + 3000, text: 'Automatically sync phone voice memos into the daily writer queue' },
+      { msg_id: 't2005a', role: 'assistant', ts: fixedTs + 4000, text: 'Working on it now' },
+    ]);
+
+    const run1 = await l.runReconcilePass(clock.now);
+    expect(run1).toMatchObject({
+      state: 'reconciled',
+      from_cursor: 0,
+      scanned_messages: 4,
+      found_asks: 4,
+      mapped: 2,
+      appended: 1,
+      created: 1,
+      appended_ids: [openTask.id],
+    });
+    expect(run1.created_ids).toHaveLength(1);
+    expect(run1.to_cursor).toBeGreaterThan(0);
+
+    // Verify newly created intake for uncovered ask t2004u (AC3)
+    const createdTask = h.intakeService.getTaskById(run1.created_ids[0]);
+    expect(createdTask.title).toContain('[Reconciled t2004u]');
+    expect(createdTask.title).toContain('Automatically sync phone voice memos into the daily writer queue');
+    expect(createdTask.acceptance_criteria).toContain('Automatically sync phone voice memos into the daily writer queue');
+    expect(createdTask.acceptance_criteria).toContain('2026-10-31 15:30:03');
+    expect(createdTask.history[0]).toMatchObject({
+      kind: 'intake',
+      intake_key: 'ask-reconcile-dev-t2004u-p0',
+      source: {
+        type: 'chat',
+        reference: expect.stringContaining('Developer/t2004u (2026-10-31 15:30:03 CET)'),
+      },
+    });
+    expect(createdTask.history[0].text).toContain('Automatically sync phone voice memos into the daily writer queue');
+
+    // Verify partial match appended missing words to openTask (AC3)
+    const updatedOpen = h.intakeService.getTaskById(openTask.id);
+    const partialNote = updatedOpen.history.find((e: any) => e.intake_key === 'ask-reconcile-dev-t2003u-p0-note');
+    expect(partialNote).toBeDefined();
+    expect(partialNote.text).toContain('missing words:');
+    expect(partialNote.text).toContain('dark');
+    expect(partialNote.text).toContain('toggle');
+    expect(partialNote.text).toContain('Build fleet quota timeline chart with daily samples and add dark mode toggle');
+
+    // Verify short report written to Hub summary and tracking intake (AC4)
+    const sum = l.summary();
+    expect(sum.meta.reconcile.cursor).toBe(run1.to_cursor);
+    expect(sum.meta.reconcile.last_run.id).toBe(run1.id);
+    expect(sum.meta.reconcile.runs).toHaveLength(1);
+    expect(sum.meta.reconcile.runs[0].report).toContain('RECONCILE REPORT');
+    const updatedRec = h.intakeService.getTaskById(recIntake.id);
+    expect(updatedRec.history.some((e: any) => e.kind === 'note' && String(e.text).includes('RECONCILE REPORT'))).toBe(true);
+
+    // Incremental cursor: next run with no new messages does no scan (AC4)
+    const run2 = await l.runReconcilePass(clock.now + 60000);
+    expect(run2).toMatchObject({
+      state: 'no_new_messages',
+      from_cursor: run1.to_cursor,
+      to_cursor: run1.to_cursor,
+      scanned_messages: 0,
+      found_asks: 0,
+    });
+
+    // Re-running from cursor 0 never duplicates intakes or notes due to stable keys (AC3)
+    const taskCountBefore = h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').toArray()[0].n;
+    const openHistoryLenBefore = h.intakeService.getTaskById(openTask.id).history.length;
+    const rerun = await l.runReconcilePass(clock.now + 120000, { cursor: 0 });
+    expect(rerun).toMatchObject({
+      state: 'reconciled',
+      scanned_messages: 4,
+      created: 0,
+      appended: 0,
+      mapped: 4,
+    });
+    expect(h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').toArray()[0].n).toBe(taskCountBefore);
+    expect(h.intakeService.getTaskById(openTask.id).history.length).toBe(openHistoryLenBefore);
+
+    // Incremental new message scans only the new message after cursor (AC4)
+    ingest(l, 'dev', [
+      { msg_id: 't2006u', role: 'user', ts: fixedTs + 5000, text: 'Add a one-click button to copy session ID in the sessions table' },
+    ]);
+    const postRes = await l.handle(new Request('https://hub.test/api/asks/reconcile', {
+      method: 'POST',
+      body: JSON.stringify({ run_pass: true }),
+    }), op);
+    expect(postRes.status).toBe(200);
+    const run3 = await postRes.json() as any;
+    expect(run3).toMatchObject({
+      state: 'reconciled',
+      from_cursor: run1.to_cursor,
+      scanned_messages: 1,
+      found_asks: 1,
+      created: 1,
+    });
   }));
 });
