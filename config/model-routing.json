@@ -140,7 +140,7 @@
       "provider": "codex",
       "engine": "codex",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "argon",
@@ -148,7 +148,15 @@
       "provider": "gemini",
       "engine": "antigravity",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
+    },
+    {
+      "id": "opus",
+      "model": "opus",
+      "provider": "claude",
+      "engine": "claude",
+      "profile": null,
+      "effort": "medium"
     },
     {
       "id": "luna",
@@ -220,7 +228,7 @@
       "provider": "gemini",
       "engine": "gemini",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "beam-free",

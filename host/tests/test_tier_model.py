@@ -134,6 +134,20 @@ def test_claude_routes_are_sonnet_medium_never_haiku():
         assert not [i for i in ids if 'haiku' in i or i == 'opus']
 
 
+def test_bundle_effort_policy_8852ba59():
+    """Intake 8852ba59 AC3: sol/astra/argon/opus default to medium, never high for sol/astra."""
+    config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
+    by_id = {m['id']: m for m in config['models']}
+    assert by_id['sol']['effort'] == 'medium'
+    assert by_id['astra']['effort'] == 'medium'
+    assert by_id['argon']['effort'] == 'medium'
+    assert by_id['argon-gemini']['effort'] == 'medium'
+    assert by_id['opus']['effort'] == 'medium'
+    assert by_id['luna']['effort'] == 'max'
+    for mid in ('sol', 'astra'):
+        assert by_id[mid]['effort'] != 'high'
+
+
 def test_sessions_table_shows_model_and_effort():
     out = render_table([{'id': 's1', 'engine': 'claude', 'model_id': 'sonnet', 'effort': 'medium', 'state': 'running'}])
     header = out.splitlines()[0].split()
