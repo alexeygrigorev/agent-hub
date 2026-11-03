@@ -32,6 +32,9 @@ const SLOW_STATEMENT_LOG_ROWS = 5_000;
 const statementLogRows = () => Number((globalThis as any).__ROWS_METER_STATEMENT_LOG) || SLOW_STATEMENT_LOG_ROWS;
 export const DEFAULT_ROWS_READ_ALERT_PER_DAY = 20_000;
 export const ROWS_READ_TARGET_PER_DAY = 5_000;
+/** Cloudflare bills DO storage writes ~$1/M; the Free plan includes 100k/day.
+ * Alert when the last full hour projects above the daily write budget. */
+export const DEFAULT_ROWS_WRITTEN_ALERT_PER_DAY = 100_000;
 
 export const ROWS_STATS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS rows_read_stats (
@@ -108,9 +111,9 @@ export class RowsMeter {
   private settle(scope: Scope) {
     let read = 0, written = 0;
     scope.cursors.forEach((c, i) => {
-      let r = 0;
-      try { r = Number(c.rowsRead) || 0; read += r; written += Number(c.rowsWritten) || 0; } catch {}
-      this.addStatement(scope.name, scope.queries[i], r);
+      let r = 0, w = 0;
+      try { r = Number(c.rowsRead) || 0; read += r; written += (w = Number(c.rowsWritten) || 0); } catch {}
+      this.addStatement(scope.name, scope.queries[i], r, w);
       // Name the statement behind a heavy read so the hot path is visible in logs.
       if (r >= statementLogRows()) console.warn(JSON.stringify({ event: 'do_rows_read_statement', scope: scope.name, rows_read: r, sql: String(scope.queries[i] ?? '').replace(/\s+/g, ' ').slice(0, 160) }));
     });
@@ -121,22 +124,22 @@ export class RowsMeter {
     this.add(scope.name, calls, read, written);
   }
 
-  /** In-memory rows read per (scope, normalized SQL), bounded; the live answer to "which statement". */
-  private statements = new Map<string, { scope: string; sql: string; calls: number; rows_read: number; max_read: number }>();
+  /** In-memory rows read/written per (scope, normalized SQL), bounded; the live answer to "which statement". */
+  private statements = new Map<string, { scope: string; sql: string; calls: number; rows_read: number; rows_written: number; max_read: number }>();
 
-  private addStatement(scope: string, query: string | undefined, read: number) {
+  private addStatement(scope: string, query: string | undefined, read: number, written: number) {
     const sql = String(query ?? '').replace(/\s+/g, ' ').replace(/\((?:\?,\s?)+\?\)/g, '(?...)').slice(0, 140);
     const key = scope + '\u0000' + sql;
     let t = this.statements.get(key);
     if (!t) {
       if (this.statements.size >= MAX_STATEMENTS) return;
-      t = { scope, sql, calls: 0, rows_read: 0, max_read: 0 };
+      t = { scope, sql, calls: 0, rows_read: 0, rows_written: 0, max_read: 0 };
       this.statements.set(key, t);
     }
-    t.calls++; t.rows_read += read; if (read > t.max_read) t.max_read = read;
+    t.calls++; t.rows_read += read; t.rows_written += written; if (read > t.max_read) t.max_read = read;
   }
 
-  /** Statements with the most rows read since this instance started. */
+  /** Statements with the most rows read since this instance started (rows_written included for the write budget). */
   statementTop(limit = 30) {
     this.settle(this.unscoped);
     return [...this.statements.values()].sort((a, b) => b.rows_read - a.rows_read).slice(0, limit).map(t => ({ ...t }));
@@ -199,28 +202,39 @@ export function rowsReadReport(sql: SqlStorage, nowMs: number, hours = 24, pendi
   const rows = sql.exec('SELECT scope, hour, calls, rows_read, rows_written, max_read FROM rows_read_stats WHERE hour > ? AND hour <= ? LIMIT 20000', current - h, current).toArray() as any[];
   const byScope = new Map<string, RowsTotals>();
   const hourly = new Map<number, number>();
+  const hourlyWritten = new Map<number, number>();
   for (const r of rows) {
-    if (r.scope === '__total__') { hourly.set(r.hour, (hourly.get(r.hour) ?? 0) + Number(r.rows_read)); continue; }
+    if (r.scope === '__total__') {
+      hourly.set(r.hour, (hourly.get(r.hour) ?? 0) + Number(r.rows_read));
+      hourlyWritten.set(r.hour, (hourlyWritten.get(r.hour) ?? 0) + Number(r.rows_written));
+      continue;
+    }
     const t = byScope.get(r.scope) ?? { calls: 0, rows_read: 0, rows_written: 0, max_read: 0 };
     t.calls += Number(r.calls); t.rows_read += Number(r.rows_read); t.rows_written += Number(r.rows_written); t.max_read = Math.max(t.max_read, Number(r.max_read));
     byScope.set(r.scope, t);
   }
-  let pendingRead = 0;
+  let pendingRead = 0, pendingWritten = 0;
   for (const [scope, p] of Object.entries(pending)) {
-    pendingRead += p.rows_read;
+    pendingRead += p.rows_read; pendingWritten += p.rows_written;
     const t = byScope.get(scope) ?? { calls: 0, rows_read: 0, rows_written: 0, max_read: 0 };
     t.calls += p.calls; t.rows_read += p.rows_read; t.rows_written += p.rows_written; t.max_read = Math.max(t.max_read, p.max_read);
     byScope.set(scope, t);
   }
   hourly.set(current, (hourly.get(current) ?? 0) + pendingRead);
+  hourlyWritten.set(current, (hourlyWritten.get(current) ?? 0) + pendingWritten);
   const total = [...hourly.values()].reduce((a, b) => a + b, 0);
+  const totalWritten = [...hourlyWritten.values()].reduce((a, b) => a + b, 0);
   const lastFull = hourly.get(current - 1) ?? null;
+  const lastFullWritten = hourlyWritten.get(current - 1) ?? null;
   const scopes = [...byScope].map(([scope, t]) => ({ scope, ...t })).sort((a, b) => b.rows_read - a.rows_read).slice(0, 100);
   return {
     window_hours: h,
     rows_read: total,
     projected_rows_read_per_day: lastFull === null ? null : lastFull * 24,
     last_full_hour_rows_read: lastFull,
+    rows_written: totalWritten,
+    projected_rows_written_per_day: lastFullWritten === null ? null : lastFullWritten * 24,
+    last_full_hour_rows_written: lastFullWritten,
     hourly: [...hourly].sort((a, b) => a[0] - b[0]).map(([hour, rows_read]) => ({ hour_start: new Date(hour * 3_600_000).toISOString(), rows_read })),
     scopes,
   };
@@ -229,4 +243,9 @@ export function rowsReadReport(sql: SqlStorage, nowMs: number, hours = 24, pendi
 export function rowsReadAlertThreshold(env: any): number {
   const raw = Number(env?.HUB_ROWS_READ_ALERT_PER_DAY);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_ROWS_READ_ALERT_PER_DAY;
+}
+
+export function rowsWrittenAlertThreshold(env: any): number {
+  const raw = Number(env?.HUB_ROWS_WRITTEN_ALERT_PER_DAY);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_ROWS_WRITTEN_ALERT_PER_DAY;
 }

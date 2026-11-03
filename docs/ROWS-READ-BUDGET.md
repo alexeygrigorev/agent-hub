@@ -1,8 +1,11 @@
 # Durable Object rows-read budget (intake 8081a05a)
 
 Target: low thousands of rows read per day (5,000/day); alert at 20,000/day.
+Writes (intake e8a22f4c, green Cloudflare product ~$1/M): target low tens of
+thousands/day, alert at 100,000/day (`HUB_ROWS_WRITTEN_ALERT_PER_DAY`).
 Live meter: `GET /api/metrics/rows-read?hours=24&statements=30` reports per-route,
-per-alarm-step and SQL-statement rows read/written.
+per-alarm-step and SQL-statement rows read AND written (per-statement writes
+tracked since the written-budget alert shipped).
 
 ## Pre-change evidence
 
