@@ -275,29 +275,32 @@ def check_no_live_use(realpath: str, live_paths: Any) -> None:
             raise SessionControlError("another live session uses this worktree; refusing")
 
 
-def verify_merged_fresh(git_bin: str, realpath: str, *, runner: Callable) -> str:
-    """Prove HEAD is entirely reachable from FRESH `origin/main`.
+def verify_merged_fresh(git_bin: str, realpath: str, *, runner: Callable, default_branch: str = "main") -> str:
+    """Prove HEAD is entirely reachable from FRESH `origin/{default_branch}`.
 
     Uses `ls-remote` (network read, no local mutation). Network/unknown fails
     closed to listed-only (SessionControlError, never deletion). Returns the
     fresh main SHA on success.
     """
-    proc = runner([git_bin, "ls-remote", "origin", "refs/heads/main"], realpath, GIT_TIMEOUT)
+    if not isinstance(default_branch, str) or not BRANCH.fullmatch(default_branch):
+        raise SessionControlError("invalid default branch; listed-only")
+    ref = "refs/heads/" + default_branch
+    proc = runner([git_bin, "ls-remote", "origin", ref], realpath, GIT_TIMEOUT)
     if proc.returncode != 0:
-        raise SessionControlError("remote_unavailable: origin/main unreachable; listed-only")
+        raise SessionControlError(f"remote_unavailable: origin/{default_branch} unreachable; listed-only")
     sha = ""
     for line in (proc.stdout or "").splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[1] == "refs/heads/main" and re.fullmatch(r"[0-9a-f]{40}", parts[0]):
+        if len(parts) >= 2 and parts[1] == ref and re.fullmatch(r"[0-9a-f]{40}", parts[0]):
             sha = parts[0]
             break
     if not sha:
-        raise SessionControlError("remote_unavailable: origin/main unknown; listed-only")
+        raise SessionControlError(f"remote_unavailable: origin/{default_branch} unknown; listed-only")
     ancestor = runner([git_bin, "merge-base", "--is-ancestor", "HEAD", sha], realpath, GIT_TIMEOUT)
     if ancestor.returncode == 0:
         return sha
     if ancestor.returncode == 1:
-        raise SessionControlError("unmerged commits: HEAD not reachable from fresh origin/main; listed-only")
+        raise SessionControlError(f"unmerged commits: HEAD not reachable from fresh origin/{default_branch}; listed-only")
     raise SessionControlError("ancestry_unknown: merge-base failed; listed-only")
 
 
@@ -323,6 +326,7 @@ def remove_owned_worktree(
     git_bin: str = "git",
     runner: Optional[Callable] = None,
     linked_intake_open: Optional[bool] = None,
+    default_branch: str = "main",
 ) -> dict[str, Any]:
     """Remove ONE owned dedicated worktree + branch after confirmed stop.
 
@@ -457,7 +461,7 @@ def remove_owned_worktree(
             common_dir = info["common_dir"]
             check_clean(git_bin, realpath, common_dir, runner=run)
             check_no_live_use(realpath, live_paths)
-            fresh_sha = verify_merged_fresh(git_bin, realpath, runner=run)
+            fresh_sha = verify_merged_fresh(git_bin, realpath, runner=run, default_branch=default_branch)
         except (SessionControlError, SessionUncertain) as exc:
             # Guard refusals are returned as data (never thrown): the observed
             # kept reason is journaled for audit and reported; nothing was

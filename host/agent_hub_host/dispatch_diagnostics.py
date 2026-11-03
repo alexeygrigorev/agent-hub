@@ -13,6 +13,11 @@ MESSAGES = {
     'repo_clone_auth_failed': 'The host could not authenticate to GitHub while cloning the requested repository.',
     'repo_not_found': 'The repository origin was not found during host cloning.',
     'repo_clone_failed': 'The host could not clone the requested repository.',
+    'repo_checkout_missing': 'The requested repository checkout is unavailable on this host.',
+    'repo_origin_missing': 'The repository has no cloneable GitHub origin.',
+    'host_gh_auth_unavailable': 'The host GitHub CLI authentication is unavailable.',
+    'host_disk_warn_no_clone': 'The host filesystem is under pressure; cloning is refused.',
+    'host_disk_critical': 'The host filesystem is critically full; provisioning is refused.',
     'dispatch_route_unconfigured': 'The offered account, engine and profile do not match a local route.',
     'goal_startup_unconfigured': 'This account has no trusted interactive goal startup command.',
     'dispatch_startup_invalid': 'The configured trusted startup command is invalid.',
@@ -49,6 +54,7 @@ MESSAGES = {
     'codex_quota_gate_quota_check_failed': 'The managed Codex quota check failed.',
 }
 EXACT = {
+    'repo_origin_mismatch': 'dispatch_cwd_invalid',
     'worktree_lock_failed: missing offer identity': 'dispatch_worktree_refused',
     'worktree_lock_failed: missing canonical session identity': 'dispatch_worktree_refused',
     'worktree_lock_failed: checkout could not be protected': 'dispatch_worktree_refused',
@@ -150,7 +156,7 @@ def classify(exc, *, workspace_available=True, value_error_fallback=None):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'model_unsupported', 'model_unverified', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'repo_clone_failed','repo_checkout_missing','repo_origin_missing','host_gh_auth_unavailable','host_disk_warn_no_clone','host_disk_critical','model_unsupported', 'model_unverified', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
             if reason == 'dispatch_internal_error':
                 reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
             if reason == 'dispatch_internal_error':
@@ -164,7 +170,7 @@ def classify(exc, *, workspace_available=True, value_error_fallback=None):
             reason = value_error_fallback
     elif isinstance(exc, (RuntimeError, OSError)):
         reason = 'dispatch_local_command_failed'
-    if not workspace_available:
+    if not workspace_available and reason not in {'repo_clone_failed', 'repo_origin_missing', 'host_gh_auth_unavailable', 'repo_checkout_missing', 'host_disk_warn_no_clone', 'host_disk_critical'} and not (isinstance(exc, ValueError) and str(exc) == 'repo_origin_mismatch'):
         reason = 'workspace_unavailable'
     value = {'reason': reason, 'message': MESSAGES[reason], 'stage': 'dispatch_route',
             'error_type': type(exc).__name__ if type(exc).__name__.isalpha() and len(type(exc).__name__) <= 64 else 'Error'}

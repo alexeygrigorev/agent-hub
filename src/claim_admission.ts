@@ -272,7 +272,14 @@ export function sameIntent(stored: string, canonical: string): boolean {
     const request = JSON.parse(stored);
     delete request.edit_authority;
     request.access ??= { mode: 'legacy_unspecified', claim_id: null, project: null, scopes: [] };
-    return JSON.stringify(request) === canonical;
+    const supplied = JSON.parse(canonical);
+    // Repository placement metadata is regenerated from the catalog on each
+    // plan. Logical workspace and user intent remain part of identity.
+    for (const value of [request, supplied]) {
+      delete value.repo_context;
+      delete value.repo_provision;
+    }
+    return JSON.stringify(request) === JSON.stringify(supplied);
   } catch { return false; }
 }
 

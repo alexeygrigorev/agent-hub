@@ -134,6 +134,8 @@ class TestWindowsProvisioningPortability(unittest.TestCase):
             p_json.write_text(json.dumps(cfg))
             loaded = fleet.load_settings(p_json)
             self.assertEqual(loaded['cleanup_roots'], [r'C:\worktrees\test', 'D:/worktrees/other'])
+            self.assertIsNone(fleet.repo_layout(loaded)['worktree_root'])
+            self.assertNotIn('repo_worktree_root', loaded)
 
     def test_locate_native_zcodex_windows(self):
         with tempfile.TemporaryDirectory() as tmp:

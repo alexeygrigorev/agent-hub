@@ -115,11 +115,8 @@ class WorkspaceRootsTests(unittest.TestCase):
 
     def test_load_settings_accepts_workspace_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "worktrees"
-            # absolute_workspace_ok requires [A-Za-z0-9._-] segments — tempfile
-            # paths may include other chars; use a sanitized path under /tmp
-            safe = Path("/tmp/hub-ws-root-test-roots")
-            safe.mkdir(exist_ok=True)
+            safe = Path(tmp).resolve() / "repos"
+            safe.mkdir()
             cfg = {
                 "version": 1,
                 "subscriptions": [],
@@ -130,6 +127,10 @@ class WorkspaceRootsTests(unittest.TestCase):
             p.write_text(json.dumps(cfg))
             loaded = fleet.load_settings(p)
             self.assertEqual(loaded["workspace_roots"], [str(safe)])
+            self.assertEqual(loaded.get('cleanup_roots', []), [])
+            self.assertEqual(fleet.repo_layout(loaded)['checkout_root'], safe)
+            self.assertIsNone(fleet.repo_layout(loaded)['worktree_root'])
+            self.assertFalse((safe / '.worktrees').exists())
 
 
 if __name__ == "__main__":

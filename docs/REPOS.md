@@ -1,7 +1,7 @@
 # Repository registry
 
 Hub keeps the private repository map in its SQLite Durable Object. Each entry
-has a unique name, label, aliases, owning machine, absolute directory, origin
+has a unique name, label, aliases, per-host checkout paths, origin
 (`org/repo`), org, purpose, stack, key folders, workflows, URLs, default branch,
 active/archived/duplicate status, canonical duplicate target, last commit SHA/date,
 and discovery flags. Repository paths and descriptions are private authenticated
@@ -56,15 +56,18 @@ hub repos edit dtc-website --file human-fields.json
 ```
 
 The edit file is a JSON object containing any of `label`, `aliases` (string array),
-`purpose`, `stack`, `key_folders`, `urls`, `status`, and `canonical`. For example,
+`purpose`, `stack`, `key_folders`, `urls`, `status`, `canonical`, or `allowed_machines`. The latter is a
+list of machine IDs; absent or `null` permits every enrolled host, and `[]`
+permits none. For example, `{"allowed_machines":["HOST_ID"]}` restricts both
+existing-checkout and clone routes. For example,
 `{"status":"duplicate","canonical":"dtc-website"}` marks an entry as a duplicate.
 The target must already exist and be active; self-links, missing/inactive targets,
 and duplicate cycles are rejected without changing the entry. Setting status to
 `active` or `archived` clears its canonical link. Edit/seed require an operator. A host can
-refresh only entries owned by its authenticated machine. Authorized host and
+refresh only checkout rows bound to its authenticated machine; another host may report the same repository. Authorized host and
 agent readers can list/show. API routes are `GET /api/repos`,
 `GET /api/repos/{name}`, `PATCH /api/repos/{name}`, `POST /api/repos/seed`,
-`POST /api/repos/refresh`; list filters are `org`, `status`, `flagged=true`.
+`POST /api/repos/refresh`; list filters are `org`, `status`, `flagged=true`, `host`, `missing_on`.
 Seed/refresh accept `{"repos": [...]}` in bounded batches. MCP tools `repos_list`,
 `repos_show`, `repos_edit` use the same routes and authorization.
 
@@ -125,8 +128,8 @@ refresh preservation, and a missing-row PATCH probe with no write.
 
 An exact repository name takes precedence over labels/aliases of other entries.
 A registered name, label or alias resolves to its canonical repository before
-Fleet placement, pins its owning machine and supplies the canonical absolute
-path. Duplicate chains resolve to the canonical entry; loops and missing targets
+Fleet placement. The logical name remains in the request until Fleet evaluates
+each host's checkout rows and chooses an executable absolute path. Duplicate chains resolve to the canonical entry; loops and missing targets
 are refused. Existing configured workspace labels and explicit absolute paths
 remain supported. Once seeded, unknown bare names return `unknown_workspace`
 with the nearest registry names. No filesystem name fallback is used for them.
@@ -138,3 +141,83 @@ origin, purpose, stack, key folders, workflows, URLs and default branch. The
 original session request remains the idempotency key input; metadata is appended
 to the execution brief. Empty interactive starts keep their empty-prompt contract.
 The summary is explicitly metadata, never executable instructions.
+
+
+## Multiple hosts
+
+The catalog now uses `repo_id` (lowercase GitHub `owner/repo`, or `local/name`)
+with a case-insensitively unique name. `repo_checkouts` stores each `(repo_id,
+host_id)` path, status, HEAD, branch, dirty counts, free bytes and observation
+history independently. Existing single-host rows migrate transactionally on
+initialization; human fields and duplicate links survive. Distinct legacy entries
+sharing an origin retain separate local identities during migration.
+
+GET list/show and the JSON CLI output include `checkouts`, `checkouts_by_host`, `hosts`,
+`present_online_count` and `no_present_online`. Checkout rows include both
+`host_id`/`path` and `machine_id`/`local_path`. The compatibility `machine` and
+`dir` fields represent a present checkout, preferring an online host. Present
+means a clone exists; online means a machine check-in within three minutes.
+The Fleet page's Repos section highlights zero present checkouts on online hosts.
+An enrolled host's explicitly advertised repo workspace also supplies checkout
+evidence when it has no scanned row. Windows drive paths are supported. A generic
+workspace root does not imply that every repository is checked out beneath it.
+`hub repos list --host HOST` filters present checkouts; `--missing-on HOST`
+finds repositories without one there.
+
+Refresh roots come from repeatable `--root` flags, then `repos.scan_roots` in
+`~/.config/agent-hub/subscriptions.json`, then `workspace_roots` (excluding roots
+named `worktrees` or `tmp`). Empty configuration fails with
+`no_configured_repo_roots` before any HTTP request. There is no implicit
+`~/git` fallback. The installed timer uses these settings without embedding a
+path. All roots are scanned before submitting results so one root cannot mark
+another root's checkouts missing. Git origin is reported as both `origin` and
+`origin_url` (GitHub owner/repo); null or empty origin/default branch observations
+never erase successful catalog metadata.
+
+## Placement and guarded provisioning
+
+Clone routes multiply the placement score by 0.85, giving existing checkouts a 15% preference at equal load. A host without one is
+eligible only when the catalog's `clone_policy` is `clone_on_demand` (the default), a GitHub
+`origin_url` is known, its cached `gh_authenticated` capability is true, and fresh disk
+state for the checkout mount is `ok`. Missing or unknown prerequisites remain
+visible as `repo_checkout_missing`, `repo_origin_missing`,
+`host_gh_auth_unavailable`, or `host_disk_warn_no_clone`. These reasons alone do
+not queue; they can accompany a valid host's transient capacity hold without
+turning its HTTP 202 queue result into a hard rejection.
+
+Cloning requires an explicit true `repo_clone_enabled` capability and a valid
+`repo_checkout_root`. The host chooses the first writable configured scan or
+workspace root, honors `repos.checkout_root` and `repos.clone_on_demand`, and
+does not infer clone permission from legacy workspace aliases. Fresh mount
+observations take precedence over a different filesystem's heartbeat warning.
+
+The host probes `gh auth status --hostname github.com` at most once every five
+minutes, retaining only a boolean and discarding output. Provisioning uses
+`gh repo clone` into a sibling `<target>.tmp.<pid>` directory under an explicit
+`workspace_roots` entry. A per-repository `.hub-clone-<name>.lock` serializes
+cloners. Fresh filesystem usage and free bytes are checked under the lock before
+cloning on checkout mounts; warning, critical inode or space pressure and
+insufficient free space refuse cold clones.
+Only a successful clone is published with `os.replace`. Existing targets, symlinks and pre-existing staging data are never overwritten.
+The invocation removes only its own new failed staging directory.
+Successful clones immediately refresh their authenticated host checkout row,
+including the cache marker and server-recorded last-use time. Ordinary scans
+retain that marker at the same path. No automatic cache eviction is enabled.
+
+`repos` accepts `scan_roots`, `checkout_root`, `worktree_root`, `clone_on_demand`,
+`clone_filter` (`blob:none` or null), `clone_timeout_sec` (1–900), and
+`max_cached_clones` (metadata for future cache management).
+
+POSIX clone effects require `flock`, `statvfs`, secure directory-open
+flags, and process-group cleanup. Windows cloning uses a persistent byte lock,
+a handle that refuses reparse points, and a fresh free-disk check. Windows hosts
+advertise no repository worktree root: enabling cloning does not enable POSIX
+worktree effects. Hosts without the required platform APIs advertise cloning
+disabled; existing checkout launches remain available. Stale unsupported requests
+fail with a typed refusal. Clone errors discard command output.
+
+Both repo names and registered raw checkout paths receive repository metadata in
+their launch prompt. A raw-path request retains its exact workspace; operator host restrictions still apply.
+
+The 0.85 cold-checkout score factor is a soft preference: at equal quota and
+load, an existing checkout wins, but healthier quota can select a cold host.

@@ -1,6 +1,8 @@
 """Private repository discovery. Uses git/gh argv only; never reads gh credentials."""
 import datetime as dt
 import json
+import os
+import shutil
 import re
 import subprocess
 from pathlib import Path
@@ -8,7 +10,8 @@ from urllib.parse import quote, urlencode
 from . import intake
 
 BASE = '/api/repos'
-HUMAN = ('label', 'purpose', 'stack', 'key_folders', 'urls', 'aliases')
+HUMAN = ('label', 'purpose', 'stack', 'key_folders', 'urls', 'aliases', 'allowed_machines')
+CHECKOUT = ('workspace_root', 'checkout_status', 'branch', 'dirty_counts', 'disk_free_bytes', 'origin_url', 'cloned_on_demand')
 EDITABLE = HUMAN + ('status', 'canonical', 'portable')  # portable: intake 178ec5bb
 SCAN = ('dir', 'origin', 'org', 'default_branch', 'status', 'canonical', 'last_commit', 'workflows', 'github_url', 'flags')
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
@@ -24,6 +27,26 @@ def command(argv, cwd=None):
 def origin_name(value):
     match = re.fullmatch(r'(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?', value)
     return match[1] if match else ''
+
+
+def scan_single(path, machine, *, default_branch='main', cloned_on_demand=False, runner=command):
+    """Report a completed checkout without scanning or changing sibling repos."""
+    path = Path(path)
+    if path.is_symlink() or path.resolve(strict=True) != path or not (path/'.git').is_dir() or (path/'.git').is_symlink():
+        raise ValueError('repo_checkout_missing')
+    origin = origin_name(runner(['git', '-C', str(path), 'remote', 'get-url', 'origin']))
+    if not origin:
+        raise ValueError('repo_origin_missing')
+    row = dict(name=path.name, machine=machine, dir=str(path), workspace_root=str(path.parent),
+               checkout_status='present', origin=origin, origin_url=origin, default_branch=default_branch,
+               flags=[], cloned_on_demand=bool(cloned_on_demand), disk_free_bytes=shutil.disk_usage(path).free)
+    try:
+        commit = runner(['git', '-C', str(path), 'log', '-1', '--format=%H%n%cI']).splitlines()
+        if len(commit) == 2:
+            row['last_commit'] = {'sha':commit[0], 'date':commit[1]}
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        pass  # Empty repositories have no HEAD; origin and checkout still exist.
+    return row
 
 
 def seed_map(text, root, machine):
@@ -117,7 +140,7 @@ def seed_map(text, root, machine):
         if (path / '.git').is_dir() and not path.is_symlink():
             try:
                 remote = origin_name(command(['git', '-C', str(path), 'remote', 'get-url', 'origin']))
-                if remote: repo.update(origin=remote, org=remote.split('/')[0])
+                if remote: repo.update(origin=remote, origin_url=remote, org=remote.split('/')[0])
             except (ValueError, OSError, subprocess.TimeoutExpired):
                 pass
     return list(repos.values())
@@ -126,7 +149,14 @@ def seed_map(text, root, machine):
 def scan(root, machine, existing, runner=command):
     root = Path(root).expanduser().resolve(strict=True)
     if not root.is_dir(): raise ValueError('invalid_repo_root')
-    known = {r['name']: r for r in existing if r['machine'] == machine}
+    known = {}
+    for r in existing:
+        if 'checkouts' in r:
+            checkout = next((c for c in r['checkouts'] if c.get('host_id', c.get('machine_id')) == machine), None)
+            if not checkout: continue
+            known[r['name']] = dict(r, machine=machine, dir=checkout.get('path', checkout.get('local_path')), flags=checkout.get('flags', []))
+        elif r.get('machine') == machine:
+            known[r['name']] = r
     discovered = []
     present = set()
     for path in sorted(root.iterdir()):
@@ -135,12 +165,12 @@ def scan(root, machine, existing, runner=command):
         old = known.get(path.name)
         flags = list(old.get('flags', [])) if old else ['NEW']
         flags = [f for f in flags if f not in ('MISSING', 'WORKTREE', 'GH_ERROR', 'GIT_ERROR')]
-        repo = dict(name=path.name, machine=machine, dir=str(path), status=old.get('status', 'active') if old else 'active', flags=flags)
+        repo = dict(name=path.name, machine=machine, dir=str(path), workspace_root=str(root), checkout_status='present', disk_free_bytes=shutil.disk_usage(path).free, status=old.get('status', 'active') if old else 'active', flags=flags)
         try:
             remote = origin_name(runner(['git', '-C', str(path), 'remote', 'get-url', 'origin']))
         except (ValueError, OSError, subprocess.TimeoutExpired):
             remote = old.get('origin', '') if old else ''
-        repo.update(origin=remote, org=remote.split('/')[0] if remote else (old.get('org', '') if old else ''))
+        repo.update(origin=remote, origin_url=remote, org=remote.split('/')[0] if remote else (old.get('org', '') if old else ''))
         # A missing old directory plus the same origin at a new directory is a move.
         if not old and remote:
             moved = [r for r in known.values() if r.get('origin') == remote and not (Path(r['dir']) / '.git').is_dir() and r['status'] != 'duplicate']
@@ -154,6 +184,15 @@ def scan(root, machine, existing, runner=command):
         except (ValueError, OSError, IndexError, subprocess.TimeoutExpired):
             repo['flags'].append('GIT_ERROR')
         repo['workflows'] = ', '.join(p.name for p in sorted((path / '.github' / 'workflows').glob('*')) if p.is_file() and p.suffix in ('.yml', '.yaml'))
+        try:
+            repo['branch'] = runner(['git', '-C', str(path), 'branch', '--show-current'])
+            lines = runner(['git', '-C', str(path), 'status', '--porcelain=v1', '--untracked-files=normal']).splitlines()
+            repo['dirty_counts'] = dict(staged=sum(len(x) > 1 and x[0] not in (' ', '?') for x in lines),
+                                        unstaged=sum(len(x) > 1 and x[1] not in (' ', '?') for x in lines),
+                                        untracked=sum(x.startswith('??') for x in lines))
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            repo['checkout_status'] = 'error'
+            if 'GIT_ERROR' not in repo['flags']: repo['flags'].append('GIT_ERROR')
         if remote:
             try:
                 view = json.loads(runner(['gh', 'repo', 'view', remote, '--json', 'defaultBranchRef,isArchived,url']))
@@ -165,13 +204,53 @@ def scan(root, machine, existing, runner=command):
         present.add(repo['name'])
         discovered.append(repo)
     for name, old in known.items():
-        if name in present: continue
+        if name in present or not old.get('dir') or Path(old['dir']).parent != root: continue
         flags = list(dict.fromkeys(old.get('flags', []) + ['MISSING']))
         if (Path(old['dir']) / '.git').is_file(): flags.append('WORKTREE')
         repo = {k: old[k] for k in ('name', 'machine', *SCAN) if k in old}
         repo['flags'] = list(dict.fromkeys(flags))
+        repo['workspace_root'] = str(root)
+        repo['checkout_status'] = 'worktree_only' if 'WORKTREE' in flags else 'missing'
         discovered.append(repo)
     return discovered
+
+
+def scan_roots(explicit=None, settings_path=None):
+    if explicit:
+        values = explicit if isinstance(explicit, list) else [explicit]
+    else:
+        path = Path(settings_path) if settings_path else Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'agent-hub' / 'subscriptions.json'
+        try:
+            settings = json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            settings = {}
+        if not isinstance(settings, dict): raise ValueError('invalid_repo_roots')
+        repos_config = settings.get('repos', {})
+        if not isinstance(repos_config, dict): raise ValueError('invalid_repo_roots')
+        if 'scan_roots' in repos_config:
+            values = repos_config['scan_roots']
+        else:
+            values = settings.get('workspace_roots', [])
+            if isinstance(values, list): values = [v for v in values if isinstance(v, str) and Path(v).name not in ('worktrees', 'tmp')]
+    if not isinstance(values, list) or any(not isinstance(v, str) or not v or not Path(v).expanduser().is_absolute() for v in values):
+        raise ValueError('invalid_repo_roots')
+    roots = list(dict.fromkeys(str(Path(v).expanduser().resolve(strict=True)) for v in values))
+    if not roots: raise ValueError('no_configured_repo_roots')
+    if any(not Path(v).is_dir() for v in roots): raise ValueError('invalid_repo_roots')
+    return roots
+
+
+def scan_all(roots, machine, existing, runner=command):
+    rows = {}
+    for root in roots:
+        for repo in scan(root, machine, existing, runner):
+            key = repo['name'].lower()
+            previous = rows.get(key)
+            if not previous or repo['checkout_status'] not in ('missing', 'worktree_only'):
+                if previous and previous['checkout_status'] == 'present' and repo['checkout_status'] == 'present' and previous['dir'] != repo['dir']:
+                    raise ValueError('multiple_repo_checkouts_on_host')
+                rows[key] = repo
+    return list(rows.values())
 
 
 def post_batches(path, repos):
@@ -189,6 +268,8 @@ def add_commands(sub):
     commands = sub.add_parser('repos', help='Private server-side repository registry').add_subparsers(dest='repos_cmd', required=True)
     listing = commands.add_parser('list')
     listing.add_argument('--org')
+    listing.add_argument('--host')
+    listing.add_argument('--missing-on')
     listing.add_argument('--status', choices=('active', 'archived', 'duplicate'))
     listing.add_argument('--flagged', action='store_true')
     show = commands.add_parser('show')
@@ -198,27 +279,35 @@ def add_commands(sub):
     edit.add_argument('--file', required=True)
     for action in ('seed', 'refresh'):
         cmd = commands.add_parser(action)
-        cmd.add_argument('--root', default=str(Path.home() / 'git'))
+        cmd.add_argument('--root', action='append')
         cmd.add_argument('--machine', required=True)
         if action == 'seed': cmd.add_argument('--file', required=True)
 
 
 def execute(args):
     if args.repos_cmd == 'list':
-        query = {k: getattr(args, k) for k in ('org', 'status') if getattr(args, k, None)}
+        query = {k: getattr(args, k) for k in ('org', 'status', 'host', 'missing_on') if getattr(args, k, None)}
         if args.flagged: query['flagged'] = 'true'
         return intake.request('GET', BASE + ('?' + urlencode(query) if query else ''))
     if args.repos_cmd == 'show': return intake.request('GET', BASE + '/' + quote(args.name, safe=''))
     if args.repos_cmd == 'edit':
         payload = json.loads(intake.read_file(args.file))
         if not isinstance(payload, dict) or set(payload) - set(EDITABLE): raise ValueError('invalid_repo_fields')
+        allowed = payload.get('allowed_machines')
+        if allowed is not None and (not isinstance(allowed, list) or len(allowed) > 256 or
+                any(not isinstance(host, str) or not NAME.fullmatch(host) for host in allowed) or
+                len(set(allowed)) != len(allowed)):
+            raise ValueError('invalid_repo_fields')
         return intake.request('PATCH', BASE + '/' + quote(args.name, safe=''), payload)
     if args.repos_cmd == 'seed':
-        repos = seed_map(intake.read_file(args.file, limit=131072), args.root, args.machine)
+        roots = scan_roots(args.root)
+        if len(roots) != 1: raise ValueError('seed_requires_one_root')
+        repos = seed_map(intake.read_file(args.file, limit=131072), roots[0], args.machine)
         post_batches(BASE + '/seed', repos)
         return dict(seeded=len(repos))
+    roots = scan_roots(args.root)
     existing = intake.request('GET', BASE)['repos']
-    repos = scan(args.root, args.machine, existing)
+    repos = scan_all(roots, args.machine, existing)
     post_batches(BASE + '/refresh', repos)
     return dict(at=dt.datetime.now(dt.timezone.utc).isoformat(), scanned=len(repos),
                 flagged=[dict(name=r['name'], flags=r['flags']) for r in repos if r['flags']])

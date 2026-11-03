@@ -226,7 +226,7 @@ Each host configures its local workspace and repository layout in `~/.config/age
 To guarantee **zero hardcoded `~/git` assumptions**:
 1. **`repos.scan_roots`**: Defaults to all entries in `workspace_roots` whose basename is not `worktrees` or `tmp`. If `workspace_roots` is empty or omitted and `--root` is not passed on the CLI, `hub repos refresh` fails closed with `no_configured_repo_roots` (never `Path.home() / 'git'`).
 2. **`repos.checkout_root`**: Defaults to `repos.scan_roots[0]` if non-empty, else `None`.
-3. **`repos.worktree_root`**: Defaults to `cleanup_roots[0]` if non-empty, else `<checkout_root>/.worktrees` when `checkout_root` is set. When `repos.worktree_root` is configured, `fleet.py` automatically includes it in `_workspace_roots(settings)` and `cleanup_roots` so host confinement and post-exit worktree cleanup work without duplicate config edits.
+3. **`repos.worktree_root`**: Defaults to `None`; worktrees require explicit nested configuration or the legacy `repo_worktree_root`. Cleanup roots never enable worktrees. When `repos.worktree_root` is configured, `fleet.py` automatically includes it in `_workspace_roots(settings)` and `cleanup_roots` so host confinement and post-exit worktree cleanup work without duplicate config edits.
 4. **`repos.clone_on_demand`**: Defaults to `true` when `checkout_root` is a valid existing local directory on the host, `false` otherwise.
 
 ### 4.2 Host Capability Advertisement (`POST /api/machines/register`)

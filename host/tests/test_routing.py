@@ -39,7 +39,7 @@ class RoutingClientTests(unittest.TestCase):
         runner = lambda *a, **kw: self.fail('must not invoke native command')
         with tempfile.TemporaryDirectory() as tmp:
             settings = {'subscriptions':[{'service':'zai','engine':'zcodex','profile':None,'account_label':'a','launcher_model':'glm-5.3-flash','launcher_effort':'high','admission_argv':['gate']}], 'workspaces':{'tasks':tmp}}
-            offer = {'task_id':'job','needs':[],'account':'a','engine':'zcodex','profile':None,'workspace':'tasks','selection':{'model':'glm-5.3','effort':'high'}}
+            offer = {'id':'offer-model-mismatch','task_id':'job','needs':[],'account':'a','engine':'zcodex','profile':None,'workspace':'tasks','selection':{'model':'glm-5.3','effort':'high'}}
             with self.assertRaisesRegex(ValueError, 'model_unsupported'):
                 fleet.Dispatcher(settings, request=runner, runner=runner).dispatch(offer)
 
