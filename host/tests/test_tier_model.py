@@ -75,6 +75,16 @@ def test_model_fail_closed_before_any_native_effect():
     assert native_model(['native', '--model', 'astra', '--model', 'sol']) is None
 
 
+def test_configured_model_accepts_per_session_effort_override():
+    from agent_hub_host.model_contract import configured_selection
+    selection = dict(id='astra', model='gpt-6-astra', effort='low')
+    assert configured_selection(selection, 'codex', 'codex')['effort'] == 'low'
+    with pytest.raises(ValueError, match='model_unsupported'):
+        configured_selection(dict(selection, effort='xhigh'), 'codex', 'codex')
+    with pytest.raises(ValueError, match='model_unsupported'):
+        configured_selection(dict(selection, effort='high'), 'codex', 'codex')
+
+
 def test_model_visible_in_list():
     assert 'astra' in render_table([dict(id='test', engine='codex', model_id='astra')])
 

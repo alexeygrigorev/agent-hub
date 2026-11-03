@@ -100,10 +100,13 @@ def configured_selection(selection, engine, provider):
     policy_engines = {engine, 'codex'} if family == 'zai' and engine == 'zcodex' else {engine}
     matches = [m for m in policy_models() if m['id'] == selection.get('id') and
                m['model'] == selection.get('model') and m['engine'] in policy_engines and
-               m['provider'] == family and m['effort'] == selection.get('effort')]
+               m['provider'] == family and
+               (selection.get('effort') == m['effort'] or
+                (selection.get('effort') in ('low', 'medium', 'high', 'max') and
+                 not (selection.get('id') in ('astra', 'sol') and selection.get('effort') == 'high')))]
     if not matches:
         raise ValueError('model_unsupported: model is not configured for this route')
-    return matches[0]
+    return dict(matches[0], effort=selection.get('effort'))
 
 
 def replace_model_args(argv, model):
