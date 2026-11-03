@@ -118,7 +118,7 @@ describe('generic accounts and launch placement', () => {
     for (const [label] of entries) {
       expect(fleet.accounts.find((a: any) => a.label === label)).toMatchObject({ placeable_slots: 8, placement_reasons: [] });
     }
-    const opusPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'opus', tier: 'deep' })), admin)).json() as any;
+    const opusPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'opus', tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning.' })), admin)).json() as any;
     // The explicit Opus selector resolves to the newly configured medium model.
     expect(opusPlan.selected?.selection).toMatchObject({ id: 'opus', model: 'opus', effort: 'medium' });
     const glmPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'glm-flash', tier: 'daily' })), admin)).json() as any;
@@ -164,23 +164,25 @@ describe('generic accounts and launch placement', () => {
     await s.handle(request('/accounts', data, 'PUT'), admin);
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
     await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
-    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected?.profile).toBe('secondary');
+    const deepReason = 'This task explicitly requires the deep-tier policy check.';
+    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep', engine_override_reason: deepReason })).selected?.profile).toBe('secondary');
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
-    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected).toBeNull();
-    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'tier_unavailable' });
+    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep', engine_override_reason: deepReason })).selected).toBeNull();
+    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep', engine_override_reason: deepReason })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'tier_unavailable' });
     // A centrally managed account profile replaces the adapter profile name.
     sql.exec("UPDATE fleet_routes SET profile='hub-shared-codex' WHERE machine_id='hetzner'");
     await s.handle(request('/subscriptions', { subscriptions: [{ service: 'zai', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
     for (const selector of [{}, { tier: 'daily' }, { engine: 'glm-flash' }]) {
       expect(s.plan(intent({ machine: 'hetzner', ...selector })).selected?.selection).toMatchObject({ id: 'glm-flash', model: 'glm-5.3-flash' });
     }
-    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected).toBeNull();
+    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep', engine_override_reason: deepReason })).selected).toBeNull();
 
   }));
   it('resolves Astra to live Codex accounts, preserving pins, tiers and replay', async () => fixture(async (s, sql) => {
     await configure(s);
     sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id = 'win35'", iso(-180001));
-    const input = intent({ engine: 'astra', tier: 'deep', access: { mode: 'read' } });
+    const reason = 'This task needs deeper reasoning for the explicit Astra choice.';
+    const input = intent({ engine: 'astra', tier: 'deep', engine_override_reason: reason, access: { mode: 'read' } });
     const plan = s.plan(input);
     expect(plan.selected).toMatchObject({ machine: 'hetzner', engine: 'codex', account: 'shared-codex' });
     expect(plan.request.engine).toBe('astra');
@@ -195,6 +197,8 @@ describe('generic accounts and launch placement', () => {
     expect(first.status).toBe(201);
     expect(first.value.engine).toBe('codex');
     expect(first.value.selection).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
+    expect(JSON.parse(sql.exec('SELECT request_json FROM fleet_launches WHERE id = ?', first.value.id).one().request_json))
+      .toMatchObject({ engine_override_reason: reason });
     const offers: any = await (await s.handle(request('/offers', undefined, 'GET'), host('hetzner'))).json();
     expect(offers.offers.find((o: any) => o.id === first.value.id)?.selection).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
     expect(s.reserve(input, admin).value).toMatchObject({ id: first.value.id, replay: true });
@@ -210,6 +214,14 @@ describe('generic accounts and launch placement', () => {
     expect(sql.exec('SELECT started_at FROM resource_ramps WHERE launch_id=?', first.value.id).one().started_at).toBe(iso());
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
     expect(s.plan(input).selected).toBeNull();
+  }));
+  it('rejects high effort overrides for heavy model routes', async () => fixture(async s => {
+    await configure(s);
+    const reason = 'Deep reasoning is required for this explicit model request.';
+    for (const [engine, tier] of [['sol', 'daily'], ['astra', 'deep'], ['argon', 'deep'], ['argon-gemini', 'deep'], ['opus', 'deep']] as const) {
+      const plan = s.plan(intent({ engine, tier, effort: 'high', engine_override_reason: reason, access: { mode: 'read' } }));
+      expect(plan.selected, `${engine}: ${JSON.stringify(plan)}`).toBeNull();
+    }
   }));
   it('persists quick-tier Luna and exposes the resolved model in session views', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -240,14 +252,27 @@ describe('generic accounts and launch placement', () => {
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
     // Duplicate model ids are forbidden: each engine alternative has its own
     // policy id (argon for antigravity, argon-gemini for gemini).
+    const reason = 'This task explicitly requires the selected Gemini deep model.';
     for (const [engine, modelId] of [['antigravity', 'argon'], ['gemini', 'argon-gemini']] as const) {
       sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
       sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
       await s.handle(request('/subscriptions', { subscriptions: [{ service: 'gemini', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
-      const reason = 'This task explicitly requires the selected Gemini deep model.';
+      if (engine === 'antigravity') {
+        const plain = s.plan(intent({ task_kind: 'implement', machine: 'hetzner' }));
+        expect(plain.selected, JSON.stringify(plain.rejected)).toBeNull();
+        expect((plain.rejected ?? []).some(item => item.reason === 'model_unsupported')).toBe(true);
+      }
       expect(s.plan(intent({ engine: modelId, engine_override_reason: reason })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' } });
       expect(s.plan(intent({ tier: 'deep', engine, engine_override_reason: reason })).selected?.selection).toMatchObject({ id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' });
     }
+    const depletedQuota = { status: 'unknown', observed_at: iso(), details: { limit_reached: false },
+      windows: { weekly: { present: true, percent_remaining: 0, reset_at: iso(86400000) } } };
+    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'gemini', account: 'shared-codex', plan: 'pro', quota: depletedQuota }] }, 'PUT'), host('hetzner'));
+    const geminiAccount: any = sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one();
+    expect(s.accountStatus(geminiAccount).status).toBe('blocked');
+    const depleted = s.plan(intent({ machine: 'hetzner' }));
+    expect(depleted.selected, JSON.stringify(depleted.rejected)).toBeNull();
+    expect((depleted.rejected ?? []).some(item => item.reason === 'account_blocked')).toBe(true);
   }));
   it('filters Grok models behind allowed aliases from automatic placement and old offer claims', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -318,7 +343,7 @@ describe('generic accounts and launch placement', () => {
   it('refuses Opus and Claude when no live route exists', async () => fixture(async (s, sql) => {
     await configure(s);
     for (const engine of ['opus', 'claude']) {
-      const result = s.reserve(intent({ engine, machine: 'hetzner', access: { mode: 'read' } }), admin);
+      const result = s.reserve(intent({ engine, engine_override_reason: 'This test explicitly checks unavailable routes.', machine: 'hetzner', access: { mode: 'read' } }), admin);
       expect(result.status).toBe(409);
       expect(result.value.error).toBe('no_eligible_route');
     }
@@ -1000,7 +1025,7 @@ describe('generic accounts and launch placement', () => {
     await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'desktop-codex', plan: 'pro', quota }] }, 'PUT'), host('win35'));
     const goalCaps = (routes: any[]) => ({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: routes });
     sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(goalCaps([{ engine: 'codex', account: 'shared-codex', profile: null }])), 'hetzner');
-    const goal = intent({ mode: 'interactive', with_goal: true, tier: 'deep' });
+    const goal = intent({ mode: 'interactive', with_goal: true, tier: 'deep', engine_override_reason: 'This interactive goal requires deep reasoning.' });
     const planned = s.plan(goal);
     expect(planned.selected?.machine, JSON.stringify(planned.rejected)).toBe('hetzner');
     expect(planned.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'goal_unsupported' });
@@ -1406,7 +1431,7 @@ describe('goal placement respects per-host load budgets', () => {
       windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } },
     } }] }, 'PUT'), host('hetzner'));
 
-    const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep' }));
+    const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep', engine_override_reason: 'This goal requires deep reasoning.' }));
     expect(plan.selected?.machine).toBe('win35');
     expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'host_load_high', load_limit: 12 }));
     expect(s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).max_concurrency).toBe(1);
@@ -1419,7 +1444,7 @@ describe('goal placement respects per-host load budgets', () => {
       sql.exec("UPDATE machines SET capabilities = ?, last_heartbeat = json_set(last_heartbeat, '$.load', json(?)) WHERE id = ?",
         JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: goalRoutes }), JSON.stringify([load]), machine);
     }
-    const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep' }));
+    const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep', engine_override_reason: 'This goal requires deep reasoning.' }));
     expect(plan.selected?.machine).toBe('win35');
   }));
 

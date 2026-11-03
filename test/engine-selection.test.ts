@@ -96,34 +96,25 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       sub('zai-central', 'zai', makeQuota(now, { pct7d: 31, hours7d: 100.8 }));
       sub('shared-codex', 'codex', makeQuota(now, { pct7d: 54, hours7d: 100.8 }));
 
-      const deepReason = 'This task explicitly requires deep reasoning.';
-      // Argon is deep-only (intake 8852ba59): compare claude vs antigravity
-      // on an explicit deep goal, where both engines are eligible.
-      const plan: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'implement task', tier: 'deep', engine_override_reason: deepReason });
+      const plan: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'implement task' });
       expect(plan.selected).toBeTruthy();
-      expect(plan.selected.engine).toBe('antigravity');
-      expect(plan.selected.account).toBe('hub-antigravity');
-      expect(plan.selected.decision_reason).toContain('auto: antigravity/hub-antigravity');
-      expect(plan.selected.decision_reason).toContain('rem=60%');
+      expect(plan.selected.engine).not.toBe('antigravity');
+      expect(plan.candidates.some((c: any) => c.engine === 'antigravity')).toBe(false);
 
       const claudeCand = plan.candidates.find((c: any) => c.engine === 'claude');
-      const agyCand = plan.candidates.find((c: any) => c.engine === 'antigravity');
       expect(claudeCand).toBeTruthy();
-      expect(agyCand.score).toBeGreaterThan(claudeCand.score * 10);
       expect(claudeCand.decision.factors.depleted).toBe(true);
-      expect(claudeCand.selection).toMatchObject({ effort: 'medium' });
-      expect(['sonnet', 'opus']).toContain(claudeCand.selection.id);
+      expect(claudeCand.selection).toMatchObject({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
       expect(plan.candidates.filter((c: any) => c.engine === 'claude').every((c: any) =>
-        (c.selection?.id === 'sonnet' || c.selection?.id === 'opus') && c.selection?.effort === 'medium')).toBe(true);
-      // Deep includes astra (codex burn-released for deep); haiku stays out.
-      expect(plan.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(true);
+        c.selection?.id === 'sonnet' && c.selection?.effort === 'medium')).toBe(true);
+      expect(plan.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(false);
       expect(plan.candidates.some((c: any) => /haiku/i.test(c.selection?.model ?? ''))).toBe(false);
 
       // Astra requires an explicit deep/review tier; even another tier that
       // contains it in policy must not turn routine placement into Astra.
       const ordinaryAsk: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'routine ask', tier: 'ask' });
       expect(ordinaryAsk.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(false);
-      const explicitDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'deep review', tier: 'deep' });
+      const explicitDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'deep review', tier: 'deep', engine_override_reason: 'This task requires deep reasoning for the review.' });
       expect(explicitDeep.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(true);
 
       // Luna is a config-driven fallback (rules.fallback_models): while a healthy
@@ -137,13 +128,9 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       updateSub('zai-central', 'zai', 40);
       updateSub('shared-codex', 'codex', 95);
       const withHealthy: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'ordinary start' });
-      // Argon is deep-only (intake 8852ba59): daily covers muse/sonnet/luna,
-      // while argon needs an explicit deep goal.
       for (const id of ['muse', 'sonnet', 'luna'])
         expect(withHealthy.candidates.some((c: any) => c.selection?.id === id), id).toBe(true);
-      expect(withHealthy.candidates.some((c: any) => c.selection?.id === 'argon'), 'argon-daily').toBe(false);
-      const withHealthyDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'ordinary deep start', tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning.' });
-      expect(withHealthyDeep.candidates.some((c: any) => c.selection?.id === 'argon'), 'argon-deep').toBe(true);
+      expect(withHealthy.candidates.some((c: any) => c.selection?.id === 'argon')).toBe(false);
       expect(withHealthy.candidates.some((c: any) =>
         c.engine === 'zcodex' && c.account === 'zai-central' && c.selection?.provider === 'zai')).toBe(true);
       const lunaHealthy = withHealthy.candidates.find((c: any) => c.selection?.id === 'luna');
@@ -168,12 +155,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(current.selected.engine).not.toBe('claude');
       expect(best((c: any) => c.engine === 'claude')).toBeLessThan(best((c: any) => c.engine === 'codex'));
       expect(best((c: any) => c.engine === 'claude')).toBeLessThan(best((c: any) => c.engine === 'opencode'));
-      // Argon is deep-only (intake 8852ba59): no antigravity candidate on the
-      // default daily goal; the deep goal keeps antigravity ahead of depleted claude.
-      expect(current.candidates.some((c: any) => c.engine === 'antigravity'), 'antigravity-daily').toBe(false);
-      const currentDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'current quota deep', tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning.' });
-      const bestDeep = (pred: (c: any) => boolean) => Math.max(...currentDeep.candidates.filter(pred).map((c: any) => c.score));
-      expect(bestDeep((c: any) => c.engine === 'claude')).toBeLessThan(bestDeep((c: any) => c.engine === 'antigravity'));
+      expect(current.candidates.some((c: any) => c.engine === 'antigravity')).toBe(false);
       expect(current.candidates.find((c: any) => c.engine === 'codex').decision.factors.fallback_factor).toBe((routingPolicy.rules as any).fallback_factor);
 
       // With no healthy non-fallback route left the fallback is not down-weighted
@@ -189,7 +171,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(noHealthy.selected.decision.factors.fallback_factor).toBe(1);
 
       // A model pin can cross tier membership, so luna + deep stays on Luna.
-      const lunaDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'pinned Luna', engine: 'luna', tier: 'deep' });
+      const lunaDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'pinned Luna', engine: 'luna', tier: 'deep', engine_override_reason: 'This task explicitly pins Luna for the deep-tier fallback check.' });
       expect(lunaDeep.selected?.selection).toMatchObject({ id: 'luna', model: 'gpt-6-luna', effort: 'max' });
       expect(lunaDeep.rejected.some((r: any) => r.reason === 'tier_unavailable')).toBe(false);
     });
@@ -469,8 +451,8 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
     const now = Date.parse('2026-11-02T17:15:00Z');
     const q = makeQuota(now, { pct7d: 50, hours7d: 84 });
     const d1 = computeEngineDecision({
-      machine: 'hetzner', engine: 'antigravity', account: 'hub-antigravity', profile: null, provider: 'gemini',
-      model: { id: 'argon', model: 'gemini-4-argon-medium' }, tier: 'daily', quota: q, headroomPercent: 50, nowMs: now,
+      machine: 'hetzner', engine: 'zcodex', account: 'shared-zai', profile: null, provider: 'zai',
+      model: { id: 'glm-flash', model: 'glm-5.3-flash' }, tier: 'daily', quota: q, headroomPercent: 50, nowMs: now,
       cpuLoad: 0, pendingLaunches: 0, familyLoad: 0, accountActive: 0, accountMaxConcurrency: 4, recentAccountFailures: 0,
       degraded: false, tbmWeight: 1,
     });
@@ -483,7 +465,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
     expect(d1.score).toBe(d2.score);
     const list = [
       { machine: 'hetzner', engine: 'opencode', account: 'shared-go', score: d2.score, decision: d2 },
-      { machine: 'hetzner', engine: 'antigravity', account: 'hub-antigravity', score: d1.score, decision: d1 },
+      { machine: 'hetzner', engine: 'zcodex', account: 'shared-zai', score: d1.score, decision: d1 },
     ];
     const comparator = (a: any, b: any) =>
       b.score - a.score
@@ -495,8 +477,8 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       || String(a.account ?? '').localeCompare(String(b.account ?? ''));
     const sorted1 = [...list].sort(comparator);
     const sorted2 = [...list].reverse().sort(comparator);
-    expect(sorted1.map(x => x.engine)).toEqual(['antigravity', 'opencode']);
-    expect(sorted2.map(x => x.engine)).toEqual(['antigravity', 'opencode']);
+    expect(sorted1.map(x => x.engine)).toEqual(['opencode', 'zcodex']);
+    expect(sorted2.map(x => x.engine)).toEqual(['opencode', 'zcodex']);
   });
 });
 
