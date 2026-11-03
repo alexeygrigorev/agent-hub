@@ -146,30 +146,24 @@ class ReleaseCompletenessTests(unittest.TestCase):
             (target / "host" / "agent_hub_host").mkdir(parents=True)
             init = target / "host" / "agent_hub_host" / "__init__.py"
             init.write_text("# pristine")
-            admission = target / "host" / "agent_hub_host" / "heavy_test_admission.py"
-            admission.write_text("ADMISSION_PROTOCOL_VERSION = 1\n")
             files = {}
-            for name, body in [
-                ("config/model-routing.json", "{}"),
-                ("scripts/session-host-supervisor.py", "#"),
-                ("scripts/metrics-dashboard-export.py", "#"),
-                ("scripts/build-host-release.py", "#"),
-                ("scripts/verify-host-release.py", "#"),
-                ("scripts/switch-host-release.py", "#"),
-                ("pyproject.toml", ""), ("uv.lock", ""),
-            ]:
+            manifest_template = json.loads(MANIFEST.read_text())
+            for name in manifest_template["files"]:
+                body = ("ADMISSION_PROTOCOL_VERSION = 1\n"
+                        if name == "host/agent_hub_host/heavy_test_admission.py" else "# stub\n")
                 dest = target / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(body)
                 files[name] = hashlib.sha256(body.encode()).hexdigest()
             files["host/agent_hub_host/__init__.py"] = hashlib.sha256(b"# pristine").hexdigest()
-            files["host/agent_hub_host/heavy_test_admission.py"] = hashlib.sha256(
-                b"ADMISSION_PROTOCOL_VERSION = 1\n").hexdigest()
             (target / "release-manifest.json").write_text(json.dumps({
-                "manifest_version": json.loads(MANIFEST.read_text())["version"],
+                "manifest_version": manifest_template["version"],
                 "release_rev": "0" * 40,
                 "files_sha256": files,
             }))
+            for path in target.rglob("*"):
+                path.chmod(0o755 if path.is_dir() else 0o644)
+            target.chmod(0o755)
             init.write_text("# tampered")
             proc = subprocess.run([sys.executable, str(VERIFY), str(target)],
                                   capture_output=True, text=True, timeout=60)
