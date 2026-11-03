@@ -252,11 +252,21 @@ DISPATCH_CONCURRENCY_MAX = 13
 # An allowed gate observation is shared by concurrent dispatches for the same
 # account/engine/profile/mode/selection for this long. Well inside the Hub's
 # 30 s claim freshness and CLAIM_ADMISSION_REFRESH_S, so a shared observation
-# never forces a stale claim. Refusals are never shared.
+# never forces a stale claim. Refusals are never shared. The window is
+# monotonic-only (intake 06728269): a wall-clock half would permanently
+# disable sharing on a host whose clock is skewed against the Hub, and the
+# shared verdict's freshness is enforced skew-free in _dispatch_admission.
 ADMISSION_SHARE_S = 8.0
 # Extra wait for output readers after a clean local-command exit; bounded so
 # a gate stays inside the 30 s admission window (intake ad8aa931).
 READER_GRACE_S = 10.0
+# Bounded clock-skew tolerance for the wall-clock sanity bound on the Hub
+# admission stamp (intake 06728269). Freshness itself is enforced skew-free
+# from gate measurements (see _admission_stamp_fresh); this symmetric bound
+# only filters garbage stamps, never a plausible skew. Host placement already
+# requires telemetry far fresher than this, so a clock beyond the bound fails
+# placement first; the bound never widens the 30 s verdict window.
+ADMISSION_CLOCK_SKEW_S = 120.0
 # Launcher plan rejection for a managed route without trusted quota evidence.
 QUOTA_SOURCE_REJECTION = 'quota source'
 # GET /api/fleet/offers transport retries (timeouts while the Hub is slow).
@@ -303,6 +313,74 @@ def _iso_age_s(value):
         return (dt.datetime.now(dt.timezone.utc) - observed).total_seconds()
     except Exception:
         return float("inf")
+
+
+def _admission_number(value):
+    """Bounded finite number or None; evidence is numeric and credential-free."""
+    if type(value) not in (int, float) or isinstance(value, bool):
+        return None
+    value = float(value)
+    return round(value, 3) if abs(value) <= 86400 else None
+
+
+def _admission_stamp_evidence(gate, wall_age, started_mono=None, finished_mono=None):
+    """Measured, credential-free evidence for an admission stamp verdict.
+
+    Intake 06728269: the Hub stamps observed_at on its own clock mid-gate;
+    a host wall clock skewed against the Hub shifts the wall age in both
+    directions (negative on a lagging clock, past 30 s on a leading clock),
+    which refused every dispatch on LAPTOP-PHA6TCNC. The real stamp age is
+    mirrored skew-free in host monotonic time: the stamp happened about
+    gate_post_stamp_s (measured inside the gate after the Hub verdict
+    arrived) before the gate subprocess finished, and both moments are
+    measured without the wall clock. The wall age stays recorded as
+    evidence and as a garbage-stamp sanity bound.
+    """
+    post_stamp = duration = offset = None
+    if isinstance(gate, dict):
+        post_stamp = _admission_number(gate.get('gate_post_stamp_s'))
+        offset = _admission_number(gate.get('gate_stamp_offset_s'))
+        meta = gate.get('_gate_meta')
+        if isinstance(meta, dict):
+            duration = _admission_number(meta.get('duration_s'))
+            if finished_mono is None:
+                finished_mono = meta.get('finished_mono')
+    measured = type(finished_mono) in (int, float) and not isinstance(finished_mono, bool)
+    if measured:
+        verdict_age = time.monotonic() - float(finished_mono) + (post_stamp or 0.0)
+    else:
+        # No measurement available (test fakes): fall back to the wall age,
+        # the pre-06728269 verdict.
+        verdict_age = wall_age
+    evidence = {'gate_stamp_age_s': _admission_number(wall_age), 'gate_duration_s': duration,
+                'gate_post_stamp_s': post_stamp, 'gate_stamp_offset_s': offset}
+    return verdict_age, {k: v for k, v in evidence.items() if v is not None}, measured
+
+
+def _admission_stamp_fresh(wall_age, verdict_age, *, measured=True, gate_duration=0.0):
+    """True when the Hub admission verdict is inside the 30 s verdict window.
+
+    The window itself is real elapsed time since the Hub stamp, measured
+    skew-free from the gate (verdict_age); the wall age is only a bounded
+    sanity filter against garbage stamps, never a widening of the window.
+    """
+    if measured:
+        return -ADMISSION_CLOCK_SKEW_S <= wall_age <= 30 + ADMISSION_CLOCK_SKEW_S and 0 <= verdict_age <= 30
+    # Older/fake gate clients that provide no monotonic receipt metadata keep
+    # the preexisting narrow wall-clock tolerance; they cannot claim the wide
+    # skew path without measurements.
+    return -5 <= wall_age <= 30 and gate_duration <= 30
+
+
+def _admission_refresh_due(at, since_mono):
+    """Whether the gate must re-run before claiming (CLAIM_ADMISSION_REFRESH_S).
+
+    The wall age of `at` is skew-blind on a host whose clock lags the Hub
+    (it stays negative and never triggers the refresh, intake 06728269), so
+    host monotonic time since the gate finished — real elapsed time —
+    triggers the re-run too.
+    """
+    return _iso_age_s(at) > CLAIM_ADMISSION_REFRESH_S or time.monotonic() - since_mono > CLAIM_ADMISSION_REFRESH_S
 
 
 def _sanitized_transport_error(exc, limit=160):
@@ -3620,12 +3698,20 @@ class Dispatcher:
             lock = self._admission_locks.setdefault(key, threading.Lock())
         with lock:
             shared = self._admission_shared.get(key)
-            if shared is not None and time.monotonic() - shared[0] <= ADMISSION_SHARE_S \
-                    and _iso_age_s(shared[1].get("observed_at", "")) <= ADMISSION_SHARE_S:
+            if shared is not None and time.monotonic() - shared[0] <= ADMISSION_SHARE_S:
                 return dict(shared[1])
+            started = time.monotonic()
             gate = self.runner(sub["admission_argv"], payload=admission_payload)
+            finished = time.monotonic()
+            # Skew-free freshness evidence for _dispatch_admission (intake
+            # 06728269): monotonic moments around the gate subprocess plus
+            # its measured duration. Kept on shared entries too, so a reused
+            # observation is judged by the original run's real finish.
+            if isinstance(gate, dict):
+                gate['_gate_meta'] = {'started_mono': started, 'finished_mono': finished,
+                                      'duration_s': round(finished - started, 3)}
             if isinstance(gate, dict) and gate.get("launch_allowed") is True:
-                self._admission_shared[key] = (time.monotonic(), dict(gate))
+                self._admission_shared[key] = (finished, dict(gate))
             else:
                 self._admission_shared.pop(key, None)
             return gate
@@ -3674,11 +3760,19 @@ class Dispatcher:
                 timing[key] = gate[key]
         try:
             observed = dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
-            age = (dt.datetime.now(dt.timezone.utc) - observed).total_seconds()
-            timing["admission_age_s"] = round(age, 3)
-            if not -5 <= age <= 30 or gate_duration_s > 30:
-                raise ValueError()
         except Exception:
+            raise AdmissionRefusedError("Fresh admission timestamp required", "admission_timestamp_stale", timing=timing) from None
+        wall_age = (dt.datetime.now(dt.timezone.utc) - observed).total_seconds()
+        timing['admission_age_s'] = round(wall_age, 3)
+        verdict_age, evidence, measured = _admission_stamp_evidence(gate, wall_age)
+        timing.update(evidence)
+        if not _admission_stamp_fresh(wall_age, verdict_age, measured=measured, gate_duration=gate_duration_s):
+            # Intake 06728269 (LAPTOP-PHA6TCNC): the old wall-only check
+            # (0 <= wall age <= 30, no skew tolerance) refused every dispatch
+            # on a host whose clock is skewed against the Hub, in either
+            # direction. The verdict window is now mirrored skew-free from
+            # the measured gate; the measured evidence is recorded on the
+            # refusal for remote diagnosis.
             raise AdmissionRefusedError("Fresh admission timestamp required", "admission_timestamp_stale", timing=timing) from None
         return at
 
@@ -3957,7 +4051,8 @@ class Dispatcher:
         # a relabel (_route already pinned canonical identity above).
         admission_payload["account"] = sub["account_label"]
         at = self._preclaim_check(offer_id, self._dispatch_admission, sub, admission_payload, selection, offer)
-        stages.append(('admission', time.monotonic()))
+        at_mono = time.monotonic()
+        stages.append(('admission', at_mono))
         mode = offer.get("mode")
         # The offer workspace is a configured identifier — a legacy label or
         # an explicitly allowed absolute path — never a free-form path: it is
@@ -4242,9 +4337,12 @@ class Dispatcher:
         # Claim with the offered (registry route) account: the server binds the
         # claim to the offered route, and _route plus the admission gate above
         # already verified canonical identity with the local subscription.
-        if _iso_age_s(at) > CLAIM_ADMISSION_REFRESH_S:
+        if _admission_refresh_due(at, at_mono):
             # Intake 4398ce2a: launcher submit/plan (and a slow Hub) can push
-            # the first observation past the Hub's 30 s claim freshness.
+            # the first observation past the Hub's 30 s claim freshness, so
+            # the gate re-runs once CLAIM_ADMISSION_REFRESH_S is exceeded.
+            # Intake 06728269: the wall age is skew-blind on a lagging host
+            # clock, so the monotonic co-trigger keeps the re-run real.
             at = self._preclaim_check(offer_id, self._dispatch_admission, sub, admission_payload, selection, offer)
         # Intake 488b860e: the key spans this host attempt (reused across
         # cycles while the claim stays unconfirmed). A timeout retries with
@@ -5442,10 +5540,17 @@ class Dispatcher:
             if not sub.get('admission_argv'):
                 continue
             try:
+                started = time.monotonic()
                 gate = self.runner(sub['admission_argv'], payload={'mode': 'interactive', 'engine': sub.get('engine', sub['service']), 'profile': sub.get('profile'), 'account': sub['account_label'], 'workspace': next(iter(self.settings.get('workspaces', {})), None)})
+                finished = time.monotonic()
                 at = dt.datetime.fromisoformat(gate['observed_at'].replace('Z', '+00:00'))
                 age = (dt.datetime.now(dt.timezone.utc) - at).total_seconds()
-                admitted = gate.get('launch_allowed') is True and gate.get('profile_supported') is True and gate.get('account_label') == sub['account_label'] and 0 <= age <= 30
+                # Skew-free freshness (intake 06728269): the wall age of a
+                # gate on a clock-skewed host is wrong in both directions, so
+                # the projection mirrors the dispatch verdict window instead
+                # of the wall clock. Dispatch re-checks the actual gate.
+                verdict_age, _, measured = _admission_stamp_evidence(gate, age, started, finished)
+                admitted = gate.get('launch_allowed') is True and gate.get('profile_supported') is True and gate.get('account_label') == sub['account_label'] and _admission_stamp_fresh(age, verdict_age, measured=measured)
                 allowed |= admitted
                 if admitted:
                     admitted_engines.add(sub.get('engine', sub['service']))

@@ -133,15 +133,39 @@ GATE_REASONS = frozenset({
 })
 
 
+# Measured, credential-free admission stamp evidence (intake 06728269):
+# wall age of the Hub stamp at the freshness check, the full measured gate
+# duration, the measured gate duration after the Hub stamp, and the
+# host-vs-Hub clock offset at stamp receipt. Numbers only, so a refusal is
+# diagnosable remotely without echoing any host path, argv or token.
+GATE_EVIDENCE_KEYS = ('gate_stamp_age_s', 'gate_duration_s', 'gate_post_stamp_s', 'gate_stamp_offset_s')
+
+
+def gate_evidence(values):
+    """Keep only bounded finite numbers under the fixed evidence keys."""
+    import math
+    if not isinstance(values, dict):
+        return None
+    kept = {}
+    for key in GATE_EVIDENCE_KEYS:
+        value = values.get(key)
+        if type(value) in (int, float) and math.isfinite(value) and abs(value) <= 86400:
+            kept[key] = round(float(value), 3)
+    return kept or None
+
+
 class AdmissionRefusedError(ValueError):
     """admission_refused with a fixed gate_reason slug."""
-    def __init__(self, message, gate_reason, *, timing=None):
+    def __init__(self, message, gate_reason, timing=None, evidence=None):
         super().__init__(message)
         self.gate_reason = gate_reason if gate_reason in GATE_REASONS else 'gate_refused'
         import math
-        self.timing = {k: round(v, 3) for k, v in (timing or {}).items()
-                       if k in {'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s'}
+        bounded_timing = {k: round(v, 3) for k, v in (timing or {}).items()
+                       if k in {'gate_duration_s', 'host_minus_hub_s', 'admission_age_s', 'gate_post_stamp_s',
+                                'gate_stamp_age_s', 'gate_stamp_offset_s'}
                        and type(v) in (int, float) and math.isfinite(v) and abs(v) <= 86400}
+        bounded_timing.update(gate_evidence(evidence) or {})
+        self.timing = bounded_timing
 
 
 # Bounded git-stderr evidence for repo_clone_failed journal records (intake
