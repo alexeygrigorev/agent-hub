@@ -100,7 +100,8 @@ describe('burn-aware model candidates', () => {
 
   it('routes Claude Sonnet at medium effort for deep and review work when it is expiring', () => {
     for (const tier of ['deep', 'review']) {
-      const [sonnet] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'sonnet', 'medium', 'claude-acct'), claude, NOW);
+      const [sonnet] = modelCandidates({ tier, ...(tier === 'deep' ? { engine_override_reason: 'This task explicitly requests deep reasoning.' } : {}) },
+        route('claude', 'claude'), ad('claude', 'sonnet', 'medium', 'claude-acct'), claude, NOW);
       expect(sonnet?.id).toBe('sonnet');
       expect(sonnet.effort).toBe('medium');
       expect(sonnet.factors.burn).toBeGreaterThan(3);
@@ -109,11 +110,11 @@ describe('burn-aware model candidates', () => {
 
   it('releases explicit-only Codex for daily/deep only while its weekly quota would expire unused', () => {
     const sol = ad('codex', 'gpt-6.1-sol', 'medium', 'codex-acct');
-    const astra = ad('codex', 'gpt-6-astra', 'high', 'codex-acct');
+    const astra = ad('codex', 'gpt-6-astra', 'medium', 'codex-acct');
     const idle = q(weekly(90, 30)); // 10% used in 138h -> ~88% would expire
     expect(burnReleasesExplicitOnly(burnForecast(idle, NOW))).toBe(true);
     expect(modelCandidates({ tier: 'daily' }, route('codex', 'codex'), sol, idle, NOW)).toHaveLength(1);
-    expect(modelCandidates({ tier: 'deep' }, route('codex', 'codex'), astra, idle, NOW)).toHaveLength(1);
+    expect(modelCandidates({ tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning.' }, route('codex', 'codex'), astra, idle, NOW)).toHaveLength(1);
     expect(modelCandidates({ tier: 'quick' }, route('codex', 'codex'), ad('codex', 'gpt-6-luna', 'max', 'codex-acct'), idle, NOW)).toHaveLength(0);
     // Early-cycle synthetic quota stays explicit-only without a proven waste estimate.
     expect(modelCandidates({ tier: 'daily' }, route('codex', 'codex'), sol, codex, NOW)).toHaveLength(0);
@@ -138,9 +139,10 @@ describe('burn-aware model candidates', () => {
     expect(modelCandidates({ tier: 'daily' }, r, a, stale, NOW)).toEqual([]);
   });
 
-  it.each([['gemini', 'gemini', 'gemini-4-argon-high', 'deep'], ['go', 'opencode', 'opencode-go/muse-spark-1.3-contributor', 'daily']])(
+  it.each([['gemini', 'gemini', 'gemini-4-argon-medium', 'deep'], ['go', 'opencode', 'opencode-go/muse-spark-1.3-contributor', 'daily']])(
     'scores expiring quota for %s', (provider, engine, model, tier) => {
-      const [candidate] = modelCandidates({ tier }, route(provider, engine), ad(engine, model, engine === 'opencode' ? null : 'high', provider + '-acct'), q(weekly(95, 28)), NOW);
+      const [candidate] = modelCandidates({ tier, ...(tier === 'deep' ? { engine_override_reason: 'This task explicitly requires deep reasoning.' } : {}) },
+        route(provider, engine), ad(engine, model, engine === 'opencode' ? null : 'medium', provider + '-acct'), q(weekly(95, 28)), NOW);
       expect(candidate.factors.burn).toBeGreaterThan(3);
     });
 });

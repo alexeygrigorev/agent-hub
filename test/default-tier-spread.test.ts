@@ -1,10 +1,10 @@
-// Intake 3d1f8702: unspecified starts must spread by quota headroom across engines
-// (Claude sonnet, Z.ai, OpenCode muse, Antigravity, Codex luna) instead of always
-// landing on Codex luna, and unmetered engines (no host quota API) must stay placeable.
+// Intake 3d1f8702: unspecified daily starts spread by quota headroom across
+// Claude, Z.ai, OpenCode and Codex. The configured Antigravity route remains in
+// the fixture to ensure its deep-only models cannot leak through the any-tier fallback.
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
-import { policy } from '../src/model-routing';
+import { isDeepModel, policy } from '../src/model-routing';
 import { freshCpu } from './cpu-fixture';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
@@ -92,6 +92,26 @@ describe('default tier placement', () => {
       expect(recommendBody.candidates.every((candidate: any) => Number.isFinite(candidate.draw_probability))).toBe(true);
       expect(recommendBody.candidates.reduce((sum: number, candidate: any) => sum + candidate.draw_probability, 0)).toBeCloseTo(1, 6);
 
+      // Naming Antigravity alone must not use the legacy any-tier fallback to
+      // escape the daily tier and place a deep model on a plain implement start.
+      const engineOnly = fleet.plan({ machine, mode: 'headless', workspace: 'demo', prompt: 'plain implement',
+        engine: 'antigravity', task_kind: 'implement' } as any);
+      expect(engineOnly.selected).toBeNull();
+      expect(engineOnly.rejected).toContainEqual({ machine, engine: 'antigravity', reason: 'model_unsupported' });
+      expect(isDeepModel(engineOnly.selected?.selection), JSON.stringify(engineOnly)).toBe(false);
+      const reasonedEngine = fleet.plan({ machine, mode: 'headless', workspace: 'demo', prompt: 'explicit deep implement',
+        engine: 'antigravity', engine_override_reason: 'This task requires deep reasoning on the requested Gemini route.',
+        task_kind: 'implement' } as any);
+      expect(reasonedEngine.selected?.selection, JSON.stringify(reasonedEngine)).toMatchObject({
+        id: 'argon', model: 'gemini-4-argon-medium', effort: 'medium',
+      });
+      const reasonedDailyEngine = fleet.plan({ machine, mode: 'headless', workspace: 'demo', prompt: 'explicit deep implement',
+        engine: 'antigravity', tier: 'daily', engine_override_reason: 'This task requires deep reasoning on the requested Gemini route.',
+        task_kind: 'implement' } as any);
+      expect(reasonedDailyEngine.selected?.selection, JSON.stringify(reasonedDailyEngine)).toMatchObject({
+        id: 'argon', model: 'gemini-4-argon-medium', effort: 'medium',
+      });
+
       const engines: string[] = [];
       for (let i = 0; i < 4; i++) {
         const prompt = 'start ' + i;
@@ -104,13 +124,12 @@ describe('default tier placement', () => {
       }
       expect(new Set(engines).size, engines.join(',')).toBeGreaterThanOrEqual(3);
       expect(engines.slice(0, 3).every(e => e === 'codex'), engines.join(',')).toBe(false);
-      expect(engines).toContain('antigravity');
       expect(engines).toContain('opencode');
       expect(engines).toContain('zcodex');
     });
   });
 
-  it('keeps healthy codex in the mix and starves depleted claude at the 2026-11-02 quota (claude 10, zai 8, muse 43, codex 45, antigravity 40)', async () => {
+  it('keeps healthy daily routes in the mix and starves depleted claude at the 2026-11-02 quota (claude 10, zai 8, muse 43, codex 45)', async () => {
     const now = Date.now();
     const iso = (d = 0) => new Date(now + d).toISOString();
     const bindings = env as unknown as Env;
@@ -160,7 +179,7 @@ describe('default tier placement', () => {
       }
       console.log('ENGINE_MIX ' + JSON.stringify(counts));
       expect(counts.codex ?? 0, JSON.stringify(counts)).toBeGreaterThanOrEqual(1);
-      expect(counts.claude ?? 0, JSON.stringify(counts)).toBeLessThanOrEqual(Math.min(counts.codex ?? 0, counts.antigravity ?? 0, counts.opencode ?? 0));
+      expect(counts.claude ?? 0, JSON.stringify(counts)).toBeLessThanOrEqual(Math.min(counts.codex ?? 0, counts.opencode ?? 0));
       expect(Object.keys(counts).length, JSON.stringify(counts)).toBeGreaterThanOrEqual(3);
     });
   });

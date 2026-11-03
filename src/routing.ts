@@ -1,7 +1,7 @@
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 /** Durable client task queue layered over the existing quota-aware fleet launcher. */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import { modelCandidates, taskTier, policy, modelDisabledByPolicy } from './model-routing';
+import { isDeepModel, modelCandidates, taskTier, policy, modelDisabledByPolicy } from './model-routing';
 import { readGrokPolicy, grokMode } from './grok-policy';
 import { evaluateLaunchQuota } from './quota_admission';
 import { canonicalQuotaProvider } from './quota';
@@ -191,7 +191,7 @@ export class RoutingService {
       candidates.sort((a, b) => b.priority - a.priority || b.score - a.score || a.machine.localeCompare(b.machine));
       if (!candidates.length) return;
       const c = candidates[0];
-      const reserved = this.fleet.reserve({ workspace: input.workspace, machine: c.machine, engine: c.model.id, tier: c.model.tier, account: c.account, prompt: c.prompt, ...(parsed.access.mode === 'edit' ? { approved_action: JSON.stringify(input.tasks) } : {}), idempotency_key: 'task-' + row.id, access: parsed.access }, { caller: principal, scopes: ['fleet:launch'] }, authority);
+      const reserved = this.fleet.reserve({ workspace: input.workspace, machine: c.machine, engine: c.model.id, tier: c.model.tier, account: c.account, prompt: c.prompt, ...(parsed.access.mode === 'edit' ? { approved_action: JSON.stringify(input.tasks) } : {}), ...(input.engine_override_reason ? { engine_override_reason: input.engine_override_reason } : {}), idempotency_key: 'task-' + row.id, access: parsed.access }, { caller: principal, scopes: ['fleet:launch'] }, authority);
       if (reserved.status < 300) this.sql.exec('UPDATE routing_jobs SET launch_id = ?, updated_at = ?, selection_json = ? WHERE id = ? AND launch_id IS NULL', reserved.value.id, this.at(), JSON.stringify(c.model), row.id);
     });
   }
@@ -328,9 +328,15 @@ export class RoutingService {
     if (path === '/api/tasks' && request.method === 'POST') {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);
       const input = await jsonBody(request);
-      if (!obj(input, ['prompt', 'approved_action', 'tasks', 'needs', 'preferred_runner', 'preferred_machine', 'workspace', 'idempotency_key', 'tier', 'model', 'difficulty', 'access']) || !label(input.idempotency_key) || !label(input.workspace ?? 'tasks') || (input.preferred_machine !== undefined && !label(input.preferred_machine)) || (input.preferred_runner !== undefined && !label(input.preferred_runner))) return reply({ error: 'invalid_task' }, 400);
+      if (!obj(input, ['prompt', 'approved_action', 'tasks', 'needs', 'preferred_runner', 'preferred_machine', 'workspace', 'idempotency_key', 'tier', 'model', 'difficulty', 'access', 'engine_override_reason']) || !label(input.idempotency_key) || !label(input.workspace ?? 'tasks') || (input.preferred_machine !== undefined && !label(input.preferred_machine)) || (input.preferred_runner !== undefined && !label(input.preferred_runner)) || (input.engine_override_reason !== undefined && (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500))) return reply({ error: 'invalid_task' }, 400);
       if (modelDisabledByPolicy(input.model) || policy.models.some(m => [m.id, m.model].includes(input.model) && modelDisabledByPolicy(m))) return reply({ error: 'model_disabled_by_policy' }, 409);
       if (!taskTier(input) || (input.model !== undefined && !policy.models.some(m => [m.id, m.model].includes(input.model)))) return reply({ error: 'invalid_tier_or_model' }, 400);
+      const deepModelRequested = input.model !== undefined && policy.models.some(m =>
+        [m.id, m.model].includes(input.model) && isDeepModel(m));
+      if ((taskTier(input) === 'deep' || deepModelRequested) &&
+          (typeof input.engine_override_reason !== 'string' || !input.engine_override_reason.trim())) {
+        return reply({ error: 'deep_tier_reason_required', field: 'engine_override_reason', detail: 'Explicit deep-tier or deep-model task requests require an explanation why deep reasoning is needed.' }, 400);
+      }
       const needs = input.needs ?? [];
       const tasks = input.tasks ?? [{ prompt: input.prompt, approved_action: input.approved_action }];
       if ((input.tasks !== undefined && (input.prompt !== undefined || input.approved_action !== undefined)) || !Array.isArray(needs) || needs.length > 64 || needs.some((n: any) => typeof n !== 'string' || !CAP.test(n)) || !Array.isArray(tasks) || !tasks.length || tasks.length > 16 || tasks.some((t: any) => !obj(t, ['prompt', 'approved_action']) || typeof t.prompt !== 'string' || !t.prompt.trim() || typeof t.approved_action !== 'string' || !t.approved_action.trim()) || JSON.stringify(tasks).length > 12000) return reply({ error: 'invalid_task' }, 400);
@@ -339,7 +345,9 @@ export class RoutingService {
       if (!admin && !routingClient && parsed.access.mode !== 'edit') return reply({ error: 'forbidden' }, 403);
       // Exact action/prompt is retained privately for execution, never included in list/get responses.
       const workspace = input.workspace || 'tasks';
-      const canonical = JSON.stringify({ workspace, tier: taskTier(input), model: input.model ?? null, needs: [...new Set(needs)].sort(), tasks, preferred_runner: input.preferred_runner ?? null, preferred_machine: input.preferred_machine ?? null, access: parsed.access });
+      const canonicalPayload: Record<string, any> = { workspace, tier: taskTier(input), model: input.model ?? null, needs: [...new Set(needs)].sort(), tasks, preferred_runner: input.preferred_runner ?? null, preferred_machine: input.preferred_machine ?? null, access: parsed.access };
+      if (input.engine_override_reason !== undefined) canonicalPayload.engine_override_reason = input.engine_override_reason;
+      const canonical = JSON.stringify(canonicalPayload);
       const inserted = this.transaction(() => {
         const prior: any = this.sql.exec('SELECT * FROM routing_jobs WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
         if (prior) return { prior };

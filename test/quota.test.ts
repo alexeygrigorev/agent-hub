@@ -2,11 +2,30 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { runInDurableObject } from 'cloudflare:test';
 import { doFetch, defaultEnv, createHelpers, loginAndGetState } from './m1-focus-setup';
 import { Hub } from '../src/hub';
-import { QuotaStore, QUOTA_STALE_MS, QUOTA_MAX_BODY_BYTES } from '../src/quota';
+import { QuotaStore, QUOTA_STALE_MS, QUOTA_MAX_BODY_BYTES, quotaPositivelyBlocked } from '../src/quota';
 import { sha256 } from '../src/auth/crypto';
 
 // Offline test fixtures only: no live API calls, no real tokens, no subprocess execution.
 const originalFetch = globalThis.fetch;
+
+describe('positive quota exhaustion evidence', () => {
+  it('preserves a depleted unmetered-provider window instead of synthesizing healthy quota', () => {
+    const exhausted = {
+      status: 'depleted',
+      details: { limit_reached: false },
+      windows: { weekly: { present: true, percent_remaining: 0 } },
+    };
+    expect(quotaPositivelyBlocked(exhausted, Date.now(), 'gemini')).toBe(true);
+    expect(quotaPositivelyBlocked({
+      ...exhausted,
+      windows: { weekly: { present: true, percent_remaining: 30 } },
+    }, Date.now(), 'gemini')).toBe(false);
+    expect(quotaPositivelyBlocked({
+      ...exhausted,
+      windows: { weekly: { present: false, percent_remaining: 0 } },
+    }, Date.now(), 'gemini')).toBe(false);
+  });
+});
 
 let stableHelpersPromise: Promise<any> | null = null;
 function getStableHelpers() {

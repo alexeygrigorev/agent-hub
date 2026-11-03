@@ -75,10 +75,10 @@ describe('managed Claude placement (798f0f8c)', () => {
         } })) }),
       }), { caller: { machineId: machine, actor: 'machine:' + machine, kind: 'host' }, scopes: ['host'] });
       expect(reported.status).toBe(200);
-      const intent = { engine: 'claude', tier: 'deep', machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' };
+      const intent = { engine: 'claude', tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning.', machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' };
       const plan = fleet.plan(intent);
       expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({
-        account: 'hub-claude', selection: { model: 'sonnet', effort: 'medium' },
+        account: 'hub-claude', selection: { model: 'opus', effort: 'medium' },
       });
       expect(plan.selected?.mode).toBeUndefined();
       expect(plan.request.mode).toBe('headless');
