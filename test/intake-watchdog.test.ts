@@ -381,6 +381,16 @@ describe('forgotten intake watchdog', () => {
     }},()=>now);w.init();await w.tick();now+=QUEUE_RETRY_BASE_MS;await w.tick();
     expect(inputs.map(i=>i.engine)).toEqual(['opencode','zcodex']);expect(inputs[0].key).not.toBe(inputs[1].key);
   }));
+  it('keeps a retry unpinned when the first policy-routed admission is refused', async () => fixture(async h => {
+    const t=task();let now=NOW;const inputs:any[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async input=>{
+      inputs.push(input);return {status:400,body:{error:'admission_refused'}};
+    }},()=>now);w.init();await w.tick();now+=QUEUE_RETRY_BASE_MS;await w.tick();
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]).not.toHaveProperty('engine');
+    expect(inputs[1]).not.toHaveProperty('engine');
+    expect(inputs[0].key).not.toBe(inputs[1].key);
+  }));
   it.each(['future-wake','different-incarnation'])('preserves %s instead of stopping it', async scenario => fixture(async h => {
     const t=task();const binding={native_id:'native',tag:'worker',workspace:'fixture',native_created_at_ms:NOW-3600000};
     session(h,'protected-native',t,'running',{machine:'fixture',binding});
