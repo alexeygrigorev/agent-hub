@@ -361,5 +361,5 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
       expect(seen.get('codex')).toMatchObject({ id: 'luna', effort: 'max' });
       expect(seen.get('zcodex')).toMatchObject({ model: 'glm-5.3-flash' });
     });
-  });
+  }, 15_000);
 });

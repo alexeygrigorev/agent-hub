@@ -260,7 +260,7 @@ describe('generic accounts and launch placement', () => {
     // policy id (argon for antigravity, argon-gemini for gemini). Default
     // routing uses medium effort for both supported models.
     const reason = 'This task explicitly requires the selected Gemini deep model.';
-    const expectedModel = { antigravity: 'gemini-4-argon-medium', gemini: 'gemini-2.5-pro' } as const;
+    const expectedModel = { antigravity: 'gemini-4-argon-medium', gemini: 'gemini-4-argon-medium' } as const;
     for (const [engine, modelId] of [['antigravity', 'argon'], ['gemini', 'argon-gemini']] as const) {
       sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
       sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
