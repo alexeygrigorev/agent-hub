@@ -589,4 +589,17 @@ describe('scoped durable worker access',()=>{
   expect(child.status,await child.clone().text()).toBe(200);
   expect((await child.json() as any).task.created_by).toMatchObject({hub_session_id:session,decomposition_child:true});
  }));
+ it('lets a worker record merge evidence only for its own intake, without allowing close',()=>setup(async({task,other,worker,call}:any)=>{
+  const sha='a'.repeat(40);
+  const evidence=(key:string)=>({key,head:sha,branch:'main',unmerged:0,commits:[{sha,in_main:true}],deploy:{state:'skipped'}});
+  const own=await call('/api/intake/tasks/'+task+'/merge-evidence',evidence('own-'+uuid()),worker.access_token);
+  expect(own.status,await own.clone().text()).toBe(200);
+  expect((await own.json() as any).merge_state).toMatchObject({task_id:task,state:'merged',head:sha,unmerged:0,deploy:{state:'skipped'},problems:[]});
+  const foreign=await call('/api/intake/tasks/'+other+'/merge-evidence',evidence('foreign-'+uuid()),worker.access_token);
+  expect(foreign.status).toBe(403);
+  expect((await foreign.json() as any).error).toBe('cross_intake_forbidden');
+  const close=await call('/api/intake/tasks/'+task+'/close',{key:uuid(),expected_version:1},worker.access_token);
+  expect(close.status).toBe(403);
+  expect((await close.json() as any).error).toBe('worker_scope_forbidden');
+ }));
 });

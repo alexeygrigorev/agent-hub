@@ -2562,7 +2562,7 @@ export class IntakeService {
           delete payload.note;
           delete payload.text;
         }
-        if (p.worker && /\/merge-evidence$/.test(path)) payload.event = undefined;
+        if (p.worker && /\/merge-evidence$/.test(path)) delete payload.event;
         if (p.worker && !triageUpdate && !workerCreate && !workerGraph && payload.event) payload.event = redactClaimData(payload.event);
         // Do not replay a private response after the caller loses its task/operator grant.
         if (path.startsWith('/rules') || path.startsWith('/grants')) this.operator(p);
