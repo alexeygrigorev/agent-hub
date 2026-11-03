@@ -24,6 +24,8 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'scripts'))
+from host_release_modes import verify_tree
 sys.path.insert(0, str(REPO / 'host'))
 from agent_hub_host.immutable_release import (legacy_switches, migration_lock,
     retire_switches, validate_switches, UpdateRefused)
@@ -115,6 +117,11 @@ def activate(args, dropin):
     if dropin.is_symlink() or (dropin.exists() and
             (not dropin.is_file() or not dropin.read_text(encoding='utf-8').startswith(MARKER))):
         raise SystemExit('switch-host-release: REFUSED: unmanaged destination')
+    release = Path(args.release).resolve()
+    try:
+        verify_tree(release)
+    except (OSError, ValueError):
+        raise SystemExit('switch-host-release: REFUSED: release contains group/world-writable or unsupported entries')
     template_text = Path(args.template).read_text(encoding='utf-8')
     old_dirs = sorted(set(m.group(0) for m in SHA.finditer(template_text)))
     if len(old_dirs) != 1:
@@ -125,7 +132,6 @@ def activate(args, dropin):
     # Include files not yet loaded by systemd as well as reported search paths.
     dropins = set(Path(p) for p in shlex.split(paths)) | set(dropin.parent.glob('*.conf'))
     legacy = legacy_switches(dropins, dropin.parent.resolve(), old_root)
-    release = Path(args.release).resolve()
     rc = subprocess.run([sys.executable, str(VERIFY), str(release)]).returncode
     if rc != 0:
         raise SystemExit("switch-host-release: REFUSED: release failed verification")
