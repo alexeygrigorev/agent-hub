@@ -7,8 +7,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import defaults from '../config/resource-management.json';
 import { IntakeService } from './intake';
 import { policy } from './model-routing';
-import { CPU_SATURATED_PCT } from './cpu-headroom';
-import { cpuVerdict } from './cpu-headroom';
+import { CPU_SATURATED_PCT, cpuVerdict } from './cpu-headroom';
 import { resolveMachineAliases } from './machine-alias';
 import { jsonFields, resourceRequest } from './sql-json-projection';
 export const MEMORY_FLOOR_MB = defaults.memory_floor_mb;
@@ -376,7 +375,7 @@ export class ResourceManagement {
     // Keep the original summation order, excluding only this exact launch.
     let remaining=0;
     for(const row of commitments) if(row.id!==excludeLaunch) remaining+=row.remaining;
-    const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,now);
+    const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,now,hb.mem_avail_mb,effectiveFloorMb(config,hb.mem_total_mb),hb.at ?? hb.launcher_resources?.observed_at ?? hb.gate?.at ?? null);
     const choking=this.chokingState(machine,now,config,verdict.reason);
     return {...verdict,...choking,admitted:choking.reason===null,expected_cpu_source:estimate.expected_cpu_source};
   }
@@ -386,7 +385,8 @@ export class ResourceManagement {
   capacityCpuAdmitted(machine: string): boolean {
     const now = this.snapshotNow ?? this.now(), config = this.config();
     const m: any = this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?', machine)[0];
-    const verdict = cpuVerdict(parse(m?.last_heartbeat).cpu_usage, parse(m?.capabilities).cpu_count, 0, 0, config, now);
+    const heartbeat = parse(m?.last_heartbeat);
+    const verdict = cpuVerdict(heartbeat.cpu_usage, parse(m?.capabilities).cpu_count, 0, 0, config, now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null);
     return this.chokingState(machine, now, config, verdict.reason).reason === null;
   }
   resourceChoking(machine: string) {
@@ -394,7 +394,8 @@ export class ResourceManagement {
     // reservation estimate across every pending request.
     const now=this.snapshotNow ?? this.now(),config=this.config();
     const m:any=this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine)[0];
-    const verdict=cpuVerdict(parse(m?.last_heartbeat).cpu_usage,parse(m?.capabilities).cpu_count,0,0,config,now);
+    const heartbeat=parse(m?.last_heartbeat);
+    const verdict=cpuVerdict(heartbeat.cpu_usage,parse(m?.capabilities).cpu_count,0,0,config,now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null);
     return this.chokingState(machine,now,config,verdict.reason).resource_choking;
   }
   /** Watchdog-poll path: the choking evidence window is time-based, so this

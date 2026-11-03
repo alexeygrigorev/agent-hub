@@ -108,8 +108,16 @@ describe('CPU predictive placement integration',()=>{
   beat(0,{cpu_usage:null});expect(f.resources.cpuHeadroom('host',req())).toMatchObject({admitted:true,telemetry_state:'unknown'});
   beat(0,{cpu_usage:{...freshCpu(iso()),psi_full_avg10:6}});expect(f.plan(req()).rejected![0].reason).toBe('cpu_pressure');
  }));
+ it('uses low MemAvailable as the memory-pressure gate and ignores a low PSI blip when RAM is available',()=>fixture(async(f,_sql,beat)=>{
+  beat(0,{mem_avail_mb:2047,cpu_usage:{...freshCpu(iso()),memory_psi_full_avg10:0.5}});
+  expect(f.resources.cpuHeadroom('host',req())).toMatchObject({admitted:false,reason:'memory_pressure'});
+  beat(0,{mem_avail_mb:2048,cpu_usage:{...freshCpu(iso()),memory_psi_full_avg10:0.5}});
+  expect(f.resources.cpuHeadroom('host',req())).toMatchObject({admitted:true,reason:null});
+  beat(0,{mem_avail_mb:2047,cpu_usage:null});
+  expect(f.resources.cpuHeadroom('host',req())).toMatchObject({admitted:false,reason:'memory_pressure'});
+ }));
  it('retains fresh OOM evidence through clear/unknown samples, then recovers after cooldown',()=>fixture(async(f,sql,beat)=>{
-  beat(8,{cpu_usage:{...freshCpu(iso(),8,8),memory_psi_full_avg10:2}});
+  beat(8,{cpu_usage:{...freshCpu(iso(),8,8),memory_psi_full_avg10:20}});
   expect(f.reserve(req(),admin).value.rejected[0].reason).toBe('memory_pressure');
   sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities,last_heartbeat) SELECT 'oom-host',name,hostname,registered_at,last_checkin_at,capabilities,last_heartbeat FROM machines WHERE id='host'");
   updateHeartbeat('oom-host',{type:'heartbeat',cpu_usage:{...freshCpu(iso()),host_oom_kills_delta:1}},sql);
