@@ -104,7 +104,9 @@ describe('default tier placement', () => {
       }
       expect(new Set(engines).size, engines.join(',')).toBeGreaterThanOrEqual(3);
       expect(engines.slice(0, 3).every(e => e === 'codex'), engines.join(',')).toBe(false);
-      expect(engines).toContain('antigravity');
+      // Argon is deep-only (intake 8852ba59): default daily placement spreads
+      // across the daily engines and must not place antigravity.
+      expect(engines).not.toContain('antigravity');
       expect(engines).toContain('opencode');
       expect(engines).toContain('zcodex');
     });
@@ -161,7 +163,11 @@ describe('default tier placement', () => {
       console.log('ENGINE_MIX ' + JSON.stringify(counts));
       expect(counts.codex ?? 0, JSON.stringify(counts)).toBeGreaterThanOrEqual(1);
       expect(counts.claude ?? 0, JSON.stringify(counts)).toBeLessThanOrEqual(Math.min(counts.codex ?? 0, counts.antigravity ?? 0, counts.opencode ?? 0));
-      expect(Object.keys(counts).length, JSON.stringify(counts)).toBeGreaterThanOrEqual(3);
+      // Argon is deep-only (intake 8852ba59), so the daily pool at these live
+      // quotas is opencode + codex (claude 10 and zai 8 depleted, antigravity
+      // out of daily): spread across the 2 healthy daily engines.
+      expect(Object.keys(counts).length, JSON.stringify(counts)).toBeGreaterThanOrEqual(2);
+      expect(counts.antigravity ?? 0, JSON.stringify(counts)).toBe(0);
     });
   });
 
