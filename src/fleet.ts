@@ -87,6 +87,10 @@ const PROVIDERS = new Set(['codex', 'codex-orin', 'claude', 'grok', 'gemini', 'z
 /** Window and cap of the per-route failure count in plan() and the failures that do not count. */
 export const ROUTE_FAILURE_WINDOW_MS = 30 * 60_000;
 export const ROUTE_FAILURE_CAP = 8;
+/** Route circuit breaker: the last N launches of an (account, machine) route inside the window all failed
+ *  `launcher_command_failed` (engine never started) -> skip the route; it re-opens when the window passes. */
+export const ROUTE_QUARANTINE_WINDOW_MS = 10 * 60_000;
+export const ROUTE_QUARANTINE_FAILURES = 3;
 export const ROUTE_FAILURE_NEUTRAL_REASONS = new Set(['launcher_offer_expired', 'model_unsupported', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency',
   'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high', 'operator_stopped', 'stopped_by_operator', 'cancelled']);
 const ACTIVE = ACTIVE_LAUNCH_STATES_SQL;
@@ -1283,6 +1287,21 @@ export class FleetService {
       }
       return recentFailuresByRoute.get(key)!;
     };
+    const quarantineByRoute = new Map<string, boolean>();
+    const routeQuarantined = (acct: string, machineId: string): boolean => {
+      const key = acct + ' ' + machineId;
+      if (!quarantineByRoute.has(key)) {
+        let q = false;
+        try {
+          const sinceIso = new Date(this.now() - ROUTE_QUARANTINE_WINDOW_MS).toISOString();
+          const recent = this.sql.exec(`SELECT state, exit_reason FROM fleet_launches WHERE account = ? AND machine_id = ? AND updated_at > ? ORDER BY updated_at DESC LIMIT ${ROUTE_QUARANTINE_FAILURES}`,
+            acct, machineId, sinceIso).toArray() as any[];
+          q = recent.length >= ROUTE_QUARANTINE_FAILURES && recent.every(r => r.state === 'failed' && r.exit_reason === 'launcher_command_failed');
+        } catch { q = false; }
+        quarantineByRoute.set(key, q);
+      }
+      return quarantineByRoute.get(key)!;
+    };
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
       if (overrideModels.length) {
@@ -1312,6 +1331,13 @@ export class FleetService {
         !(RETRIABLE_ENGINE_HOLDS.has(h.reason) && this.now() - Date.parse(h.updated_at) >= ENGINE_HEALTH_RETRY_MS));
       if (engineHealth && engineHealth.status === 'unavailable') {
         rejected.push({ machine: route.machine_id, engine: route.engine, reason: engineHealth.reason || 'engine_auth_expired' });
+        continue;
+      }
+      // Circuit breaker (intake 0e1b61c9): a route whose last launches all died at the
+      // launcher before the engine produced work is skipped until the window passes, then
+      // one probe is let through. An operator pinning account AND machine still probes it.
+      if (!(request.account && request.machine) && routeQuarantined(route.account, route.machine_id)) {
+        rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'route_quarantined' });
         continue;
       }
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];

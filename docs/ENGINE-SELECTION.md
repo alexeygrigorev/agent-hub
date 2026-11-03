@@ -1,10 +1,8 @@
-# Hub Engine Selection & Burn-Rate Decision Logic
 
-This document defines the deterministic decision function that Agent Hub uses to choose an engine, subscription account, profile, model, and host when launching a session (`FleetService.plan` / `evaluateEngineDecision`), as well as the policy governing callers that pin an engine (`--engine <engine> --reason <reason>`).
+## Route circuit breaker (intake 0e1b61c9)
 
-## 1. Guiding Principles (Alexey, 2026-11-02)
-
-- **Uniform burn-rate pacing across subscriptions:** Every subscription is paid for and should be burned to its limit uniformly before its reset window (`5h`, `7d`/weekly, or `monthly`), rather than burning one engine (`claude`) to zero while others sit idle:
+When the last 3 launches of an exact `(account, machine)` route inside 10 minutes all ended `failed` with `exit_reason = launcher_command_failed` (the engine never produced work), `plan()` rejects the route with `route_quarantined` instead of only down-weighting it (`ROUTE_QUARANTINE_FAILURES`, `ROUTE_QUARANTINE_WINDOW_MS` in `src/fleet.ts`). Any later launch that is not such a failure, or the window passing, re-opens the route, so one probe launch goes through. An operator pinning both account and machine can still probe the route.
+ `7d`/weekly, or `monthly`), rather than burning one engine (`claude`) to zero while others sit idle:
   - *«I'd rather have hub have a good decision logic for selecting the engine. have argon think about it and implement.»*
   - *«let's focus on using muse antigravity and zai and codex more than claude - we can clearly see that the usage is draining faster yet hub picks up claude for some reasons»*
   - *«I don't see the single muse»*
