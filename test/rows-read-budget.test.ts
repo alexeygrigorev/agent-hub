@@ -131,9 +131,11 @@ describe('per-step rows-read budgets', () => {
     expect(rows['tick:session_audit'] ?? 0).toBeLessThan(SESSIONS * 40);
     expect(rows['tick:bus_retention'] ?? 0).toBeLessThanOrEqual(40);
     const total = Object.values(rows).reduce((a, b) => a + b, 0);
-    // About 82 rows per running session with the 2x intake fixture; leave a
-    // small margin while keeping this below a scan of the large history tables.
-    expect(total).toBeLessThan(SESSIONS * 84);
+    // Bounding work (snapshot maps, one shared reservation predicate, LIMIT 2
+    // uniqueness probes) holds the full scheduled tick at ~10900 rows on the
+    // 150-session fixture (deterministic seed; late-half-hour slot refusals
+    // read ~34); restore the 12000 ceiling per intake b1d66970 AC2.
+    expect(total).toBeLessThan(SESSIONS * 80);
   }));
 });
 

@@ -1,8 +1,8 @@
-"""Installer release pins (2026-10-29).
+"""Installer release pins (2026-11-03).
 
 Node: https://nodejs.org/dist/v22.23.4/SHASUMS256.txt
-aplexer: PocketShell-io/aplexer v0.1.22/v0.1.23 SHA256SUMS.txt
-Python wheels: versioned pypi.org JSON metadata (URLs and SHA256).
+aplexer: official v0.1.22/v0.1.23/v0.1.24 SHA256SUMS.txt
+Other Python wheels: versioned pypi.org JSON metadata (URLs and SHA256).
 Antigravity: official per-platform updater manifests, pinned here for review.
 Grok package identity: https://docs.x.ai/build/enterprise
 Pins change with source review; the installer never trusts a mutable checksum
@@ -16,18 +16,37 @@ NODE_SHA256 = {'node-v22.23.4-darwin-arm64.tar.gz': 'c9e1dbc748b33ed2d14f4244519
  'node-v22.23.4-win-arm64.zip': 'a8b8cd79cbbb3062435f449591d98dd63730bbbf30ce2d7cc3a6376c236cb111',
  'node-v22.23.4-win-x64.zip': 'cbc74b5e0982c9dbb41525fd8fb5dcd32fbee237863f7829072f4639a1ce5f20'}
 
-APLEXER_SHA256 = {'0.1.22': {'aplexer-linux-amd64': 'cc8f79b9f34143cc1d38ba14410cf3bd8aab0a27b94fd3801f051b11b663de9c',
-            'aplexer-linux-arm64': 'fe4db9710bd3782d705e7601dcb17dd27642be0e2508a85ec87ecb308d9fdf29',
-            'aplexer-macos-amd64': 'b588bea800a36b642ee69a3701095d5d0512c1a7f8c41ad5fdd04d8e9d6939ca',
-            'aplexer-macos-arm64': '0d2a93df472949b28c6a1d5803d94923306e3b57806fe642c6eb5f76fa759be1',
-            'aplexer-windows-amd64.exe': '3631316273833ddc284be464f1491b5aeb862c32fbeaed978d8f3e16f46f2a68',
-            'aplexer-windows-arm64.exe': '303a68d42ef5c95a7496c3330d1af9f0bc23059e7f27cf60e09fbb42a7fe2b3a',
-            'aplexer_client-0.1.22-cp311-abi3-macosx_11_0_arm64.whl': 'c76c08125d699d2bdad53fb61fbca70f3a0989fbbcba00d7bdee221f59b1e13c',
-            'aplexer_client-0.1.22-cp311-abi3-macosx_11_0_x86_64.whl': '768511de030d2c47c48ebf6d2710370a4c1428a2ab087e32054823003c4c5d17'},
- '0.1.23': {'aplexer-linux-amd64': '33c9ab47694f073a61c90a3bb85c4cffb0ae100a9e56dfa540cce01267f9371f',
-            'aplexer-linux-arm64': 'ea475c94396e42b3e32b47a56567397ea2502ee3ae5357a32fa445203c9917eb',
-            'aplexer-windows-amd64.exe': 'bc21a0b61734461b870f02674e444885073e4c9077d476dcd0f2e09caa1235fe',
-            'aplexer-windows-arm64.exe': '8c64e5b9ed794626d70b87aca3640f949b6a90c40d5736a3dec2191916a3aa03'}}
+APLEXER_VERSION = '0.1.24'
+# v0.1.24 omits the macOS assets, so retain the last published macOS release.
+APLEXER_MACOS_VERSION = '0.1.22'
+APLEXER_SHA256 = {
+    '0.1.22': {
+        'aplexer-linux-amd64': 'cc8f79b9f34143cc1d38ba14410cf3bd8aab0a27b94fd3801f051b11b663de9c',
+        'aplexer-linux-arm64': 'fe4db9710bd3782d705e7601dcb17dd27642be0e2508a85ec87ecb308d9fdf29',
+        'aplexer-macos-amd64': 'b588bea800a36b642ee69a3701095d5d0512c1a7f8c41ad5fdd04d8e9d6939ca',
+        'aplexer-macos-arm64': '0d2a93df472949b28c6a1d5803d94923306e3b57806fe642c6eb5f76fa759be1',
+        'aplexer-windows-amd64.exe': '3631316273833ddc284be464f1491b5aeb862c32fbeaed978d8f3e16f46f2a68',
+        'aplexer-windows-arm64.exe': '303a68d42ef5c95a7496c3330d1af9f0bc23059e7f27cf60e09fbb42a7fe2b3a',
+        'aplexer_client-0.1.22-cp311-abi3-macosx_11_0_arm64.whl': 'c76c08125d699d2bdad53fb61fbca70f3a0989fbbcba00d7bdee221f59b1e13c',
+        'aplexer_client-0.1.22-cp311-abi3-macosx_11_0_x86_64.whl': '768511de030d2c47c48ebf6d2710370a4c1428a2ab087e32054823003c4c5d17',
+    },
+    '0.1.23': {
+        'aplexer-linux-amd64': '33c9ab47694f073a61c90a3bb85c4cffb0ae100a9e56dfa540cce01267f9371f',
+        'aplexer-linux-arm64': 'ea475c94396e42b3e32b47a56567397ea2502ee3ae5357a32fa445203c9917eb',
+        'aplexer-windows-amd64.exe': 'bc21a0b61734461b870f02674e444885073e4c9077d476dcd0f2e09caa1235fe',
+        'aplexer-windows-arm64.exe': '8c64e5b9ed794626d70b87aca3640f949b6a90c40d5736a3dec2191916a3aa03',
+    },
+    '0.1.24': {
+        'aplexer-linux-amd64': '7c3582957b44a994b9695aaa74057102a66ceca5b831c4fa527627f0aa40b833',
+        'aplexer-linux-arm64': '430b4179aac9fd5376bfec4bfeda783fb81fe2b24c0ce849eb592d8bd92c051d',
+        'aplexer-windows-amd64.exe': 'cc1c0044407de2182a9be95375bf6398a423c825b989eb1450054b7b59bdafaf',
+        'aplexer-windows-arm64.exe': '70c5dfa3fcf1a88e5f3c84a4db4118249b9e006a4cdb0a334eac2cd0fe128394',
+        'aplexer_client-0.1.24-cp311-abi3-manylinux_2_28_aarch64.whl': '4c836269a6ff4cefdf35c6d1b371dd76aa843c4ce7d17791403f145ae76a2919',
+        'aplexer_client-0.1.24-cp311-abi3-manylinux_2_28_x86_64.whl': '4e2f0d4d12e0c2d151af55c0256527dbfa77f225dae5a1251f1d373292a07d2e',
+        'aplexer_client-0.1.24-cp311-abi3-win_amd64.whl': 'b8ee1aecb20bf06b9791f7a83cd8a55909a18521734cd16a90fba86f594c47db',
+        'aplexer_client-0.1.24-cp311-abi3-win_arm64.whl': 'fef871c03641bb99712383b41cd61af938517a9309f7ff5cd44f0de32994a84c',
+    },
+}
 
 ANTIGRAVITY_RELEASES = {'darwin_amd64': {'sha512': '6e5c1f534d7c9d68cb90afc7cdce45984f927cb1c156e7c736d9a487159fee5cedbf2df7055ead65ba69da534cd0c4d883ba64593a012c69d1407b8aaf9629a6',
                   'url': 'https://storage.googleapis.com/antigravity-public/antigravity-cli/1.4.10-5501573669978112/darwin-x64/cli_mac_x64.tar.gz',
@@ -54,16 +73,7 @@ ENGINE_PACKAGES = {'claude': '@anthropic-ai/claude-code@2.1.312',
  'grok': '@xai-official/grok@1.0.70',
  'opencode': 'opencode-ai@1.19.5'}
 
-PYTHON_WHEELS = {'aplexer-client': {'requires_dist': None,
-                    'wheels': {'aplexer_client-0.1.23-cp311-abi3-manylinux_2_28_aarch64.whl': {'sha256': '50bf9639701208370d67888233195f76e9a9451744044fc62d35474a3ff02062',
-                                                                                               'url': 'https://files.pythonhosted.org/packages/47/7f/01065af0aa8437b5e56638401299e0ed07ac17327278883bf95b365425ab/aplexer_client-0.1.23-cp311-abi3-manylinux_2_28_aarch64.whl'},
-                               'aplexer_client-0.1.23-cp311-abi3-manylinux_2_28_x86_64.whl': {'sha256': 'def53ad61f824ff52061319b9ea39fb394ca134c5de2a959de9b8808620fdff6',
-                                                                                              'url': 'https://files.pythonhosted.org/packages/4b/81/afe1ed3644f1cc1a5da283c5057c45d8adbbe34b83a23a02fb2019d17061/aplexer_client-0.1.23-cp311-abi3-manylinux_2_28_x86_64.whl'},
-                               'aplexer_client-0.1.23-cp311-abi3-win_amd64.whl': {'sha256': '03e094916e805a664b16a0758d3aa6635f42b787e6d74f8f2c54faf312eec281',
-                                                                                  'url': 'https://files.pythonhosted.org/packages/ff/a0/17081580073347b1a5a3420522ee014191e8f92e3325a8638c39612072f5/aplexer_client-0.1.23-cp311-abi3-win_amd64.whl'},
-                               'aplexer_client-0.1.23-cp311-abi3-win_arm64.whl': {'sha256': 'fd4042d1b88f6a2c189dbd99e1a225311f20480126ddb3ca7fa1fb84b7589ca3',
-                                                                                  'url': 'https://files.pythonhosted.org/packages/ba/a2/7da72a785a7cf25e3d4c8d52d0c5b875fba423ca27f685d313513cfcc101/aplexer_client-0.1.23-cp311-abi3-win_arm64.whl'}}},
- 'click': {'requires_dist': ['colorama; platform_system == "Windows"'],
+PYTHON_WHEELS = {'click': {'requires_dist': ['colorama; platform_system == "Windows"'],
            'wheels': {'click-8.2.0-py3-none-any.whl': {'sha256': '6b303f0b2aa85f1cb4e5303078fadcbcd4e476f114fab9b5007005711839325c',
                                                        'url': 'https://files.pythonhosted.org/packages/a2/58/1f37bf81e3c689cc74ffa42102fa8915b59085f54a6e4a80bc6265c0f6bf/click-8.2.0-py3-none-any.whl'}}},
  'colorama': {'requires_dist': None,

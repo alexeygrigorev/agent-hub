@@ -389,13 +389,22 @@ describe('M14a authorized one-call status projection', () => {
   it('treats win35 stale checkins as expected offline, not an outage', async () => {
     await seedCanonicalHosts();
     await inDO(stub(), (h: any) => {
+      // Keep this behavioral assertion inside the documented exception
+      // window even after the real-world cutoff has elapsed.
+      h.statusService.now = () => Date.parse('2026-10-31T15:22:59Z');
       h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES ('win35','win35','DESKTOP-FP4OP26','2026-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z',0)");
     });
-    const data = await ok('');
+    let data: any;
+    try {
+      data = await ok('');
+    } finally {
+      // Restore the service clock: the Durable Object is shared across tests.
+      await inDO(stub(), (h: any) => { h.statusService.now = Date.now; });
+    }
     expect(data.coverage.missing_hosts).toContain('host-old');
-    // The window is wall-clock bounded; after it closes win35 is an ordinary
-    // missing host (expiry itself is pinned by the test below).
-    if (Date.now() <= Date.parse('2026-10-31T15:23:00Z')) {
+    // This request's Hub clock is pinned before the cutoff, independent of
+    // the machine's current wall clock (which may be long after the window).
+    if (Date.parse(data.snapshot_at) <= Date.parse('2026-10-31T15:23:00Z')) {
       expect(data.coverage.missing_hosts).not.toContain('win35');
       expect(data.coverage.expected_offline).toContain('win35');
       expect(data.coverage.expected_offline_until).toBe('2026-10-31T15:23:00Z');

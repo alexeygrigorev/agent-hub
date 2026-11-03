@@ -5,6 +5,40 @@ import type {Hub} from '../src/hub';
 import type {Env} from '../src/env';
 
 describe('unclaimed offer expiry (a5464408)', () => {
+  it('persists validated worktree lock owner details with dispatch refusal', async () => {
+    const binding = env as unknown as Env;
+    const stub = binding.HUB.get(binding.HUB.idFromName('worktree-owner-diagnostic-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+      const service = new FleetService(hub.sql, cb => state.storage.transactionSync(cb));
+      service.init();
+      const at = new Date().toISOString();
+      const addOffer = (id: string) => hub.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,
+        request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+        VALUES(?,'test','human','worktree lock',?,'{}','host','codex','account','interactive','demo','',
+          'offered',?,?)`, id, id, at, at);
+      const id = crypto.randomUUID(), owner = crypto.randomUUID();
+      const diagnostic = {reason:'dispatch_worktree_refused',
+        message:'The worktree could not be protected before native start.',
+        stage:'dispatch_route',error_type:'ValueError',lock_owner:owner,
+        lock_owner_state:'running',recovery:'hub sessions stop ' + owner};
+      addOffer(id);
+      const response = await service.handle(new Request('https://hub.test/api/fleet/launches/' + id + '/reject',
+        {method:'POST',body:JSON.stringify({reason:diagnostic.reason,diagnostic})}),
+        {caller:{kind:'host',actor:'host',machineId:'host'},scopes:['host']});
+      expect(response.status).toBe(200);
+      expect(JSON.parse(String(hub.sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id=?',id).one().launch_error_json)))
+        .toEqual(diagnostic);
+
+      const badId = crypto.randomUUID();
+      addOffer(badId);
+      const invalid = {...diagnostic,recovery:'hub sessions stop ' + crypto.randomUUID()};
+      const bad = await service.handle(new Request('https://hub.test/api/fleet/launches/' + badId + '/reject',
+        {method:'POST',body:JSON.stringify({reason:invalid.reason,diagnostic:invalid})}),
+        {caller:{kind:'host',actor:'host',machineId:'host'},scopes:['host']});
+      expect(bad.status).toBe(400);
+    });
+  });
+
   it('attests an exact terminal lock owner only to its assigned host', async () => {
     const binding = env as unknown as Env;
     const stub = binding.HUB.get(binding.HUB.idFromName('worktree-owner-' + crypto.randomUUID()));

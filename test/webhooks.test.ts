@@ -434,6 +434,116 @@ describe('webhook delivery pump', () => {
   });
 });
 
+// Driver and schedule pump guards (intake 1035ad06): driver deliveries die
+// with their generation, paused/deleted schedules never pile up, and both
+// sources resolve only to live interactive sessions.
+describe('driver and schedule pump guards', () => {
+  let stub: any;
+
+  beforeEach(async () => {
+    const id = defaultEnv.HUB.idFromName('hub');
+    stub = defaultEnv.HUB.get(id);
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.env = { ...instance.env, HUB_ADMIN_TOKEN_SHA256: await sha256Hex(ADMIN_TOKEN) } as Env;
+      for (const statement of SCHEMA_SQL.split(';')) {
+        const trimmed = statement.trim();
+        if (trimmed) { try { instance.sql.exec(trimmed); } catch (e) {} }
+      }
+      for (const table of ['session_deliveries', 'session_control_sessions',
+        'session_control_commands', 'hub_drivers', 'session_schedules', 'audit', 'credentials']) {
+        try { instance.sql.exec(`DELETE FROM ${table}`); } catch (e) {}
+      }
+    });
+  });
+
+  const LIVE_ID = 'e5f6a7b8-0001-4000-8000-000000000004';
+
+  async function fixture(sessionMode = 'interactive', sessionState = 'running') {
+    return runInDurableObject(stub, async (instance: Hub) => {
+      const now = new Date().toISOString();
+      instance.sql.exec(
+        `INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, created_at, updated_at)
+         VALUES (?, 'human:op', 'guard-k1', '{"name":"guard-target"}', ?, ?, ?, ?)`,
+        LIVE_ID, sessionMode, sessionState, now, now);
+      instance.sql.exec(
+        `INSERT INTO hub_drivers (id, actor, request_key, config, session_id, schedule_id, phase, created_at)
+         VALUES ('d1111111-0001-4000-8000-000000000001', 'human:op', 'guard-key', '{}', ?, NULL, 'starting', ?)`,
+        LIVE_ID, now);
+      instance.sql.exec(
+        `INSERT INTO session_schedules (id, name, target_label, cron, tz, prompt_text, enabled, created_by, created_at, updated_at)
+         VALUES ('s2222222-0001-4000-8000-000000000002', 'hub-driver-d1111111', ?, '*/15 * * * *', 'UTC', 'ping', 1, 'human:op', ?, ?)`,
+        LIVE_ID, now, now);
+    });
+  }
+
+  const pumpAndRead = (deliveryId: string) => runInDurableObject(stub, async (instance: Hub) => {
+    await instance.webhookService.pump();
+    return instance.sql.exec('SELECT status, last_error FROM session_deliveries WHERE id = ?', deliveryId).toArray()[0] as any;
+  });
+
+  it('fails driver deliveries when the driver generation is gone or stopped', async () => {
+    await fixture();
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      instance.sql.exec(
+        `INSERT INTO session_deliveries (id, source, source_id, delivery_key, target_label, body, status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES ('orphan', 'driver', 'missing-driver', 'k-orphan', ?, 'ping', 'pending', 0, ?, ?, ?)`,
+        LIVE_ID, past, past, past);
+      instance.sql.exec(
+        `INSERT INTO session_deliveries (id, source, source_id, delivery_key, target_label, body, status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES ('stopped', 'driver', 'd1111111-0001-4000-8000-000000000001', 'k-stopped', ?, 'ping', 'pending', 0, ?, ?, ?)`,
+        LIVE_ID, past, past, past);
+      instance.sql.exec("UPDATE hub_drivers SET phase = 'stopped' WHERE id = 'd1111111-0001-4000-8000-000000000001'");
+    });
+    expect(await pumpAndRead('orphan')).toMatchObject({ status: 'failed', last_error: 'driver_inactive' });
+    expect(await pumpAndRead('stopped')).toMatchObject({ status: 'failed', last_error: 'driver_inactive' });
+  });
+
+  it('fails schedule deliveries for paused or deleted schedules', async () => {
+    await fixture();
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      instance.sql.exec(
+        `INSERT INTO session_deliveries (id, source, source_id, delivery_key, target_label, body, status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES ('paused', 'schedule', 's2222222-0001-4000-8000-000000000002', 'k-paused', ?, 'ping', 'pending', 0, ?, ?, ?)`,
+        LIVE_ID, past, past, past);
+      instance.sql.exec(
+        `INSERT INTO session_deliveries (id, source, source_id, delivery_key, target_label, body, status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES ('deleted', 'schedule', 'missing-schedule', 'k-deleted', ?, 'ping', 'pending', 0, ?, ?, ?)`,
+        LIVE_ID, past, past, past);
+      instance.sql.exec("UPDATE session_schedules SET enabled = 0 WHERE id = 's2222222-0001-4000-8000-000000000002'");
+    });
+    expect(await pumpAndRead('paused')).toMatchObject({ status: 'failed', last_error: 'schedule_paused' });
+    expect(await pumpAndRead('deleted')).toMatchObject({ status: 'failed', last_error: 'schedule_deleted' });
+  });
+
+  it('resolves driver and schedule deliveries only to live interactive sessions', async () => {
+    await fixture('headless', 'running');
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      instance.sql.exec(
+        `INSERT INTO session_deliveries (id, source, source_id, delivery_key, target_label, body, status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES ('drv-headless', 'driver', 'd1111111-0001-4000-8000-000000000001', 'k-drv', ?, 'ping', 'pending', 0, ?, ?, ?)`,
+        LIVE_ID, past, past, past);
+      instance.sql.exec(
+        `INSERT INTO session_deliveries (id, source, source_id, delivery_key, target_label, body, status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES ('sch-headless', 'schedule', 's2222222-0001-4000-8000-000000000002', 'k-sch', ?, 'ping', 'pending', 0, ?, ?, ?)`,
+        LIVE_ID, past, past, past);
+    });
+    expect(await pumpAndRead('drv-headless')).toMatchObject({ status: 'failed', last_error: 'session_not_interactive' });
+    expect(await pumpAndRead('sch-headless')).toMatchObject({ status: 'failed', last_error: 'session_not_interactive' });
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      instance.sql.exec("UPDATE session_control_sessions SET mode = 'interactive', state = 'stopped' WHERE id = ?", LIVE_ID);
+      instance.sql.exec(
+        `INSERT INTO session_deliveries (id, source, source_id, delivery_key, target_label, body, status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES ('drv-terminal', 'driver', 'd1111111-0001-4000-8000-000000000001', 'k-term', ?, 'ping', 'pending', 0, ?, ?, ?)`,
+        LIVE_ID, past, past, past);
+    });
+    expect(await pumpAndRead('drv-terminal')).toMatchObject({ status: 'failed', last_error: 'session_stopped' });
+  });
+});
+
 describe('template rendering', () => {
   it('defaults to the raw payload', () => {
     expect(renderTemplate(null, '{"a":1}').text).toBe('{"a":1}');

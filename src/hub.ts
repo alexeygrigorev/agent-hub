@@ -1,6 +1,7 @@
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
+import { DRIVER_SCOPE, driverAccessContext, driverRequestAllowed } from './driver-access';
 import { IntakeWatchdog } from './intake-watchdog';
 import { stallThreshold } from './session_stall';
 import { liveQueuePolicy } from './intake-queue-policy';
@@ -58,12 +59,14 @@ import { BackupService } from './backup';
 import { WebhookService } from './webhooks';
 import { PromptLibraryService, SessionSchedulesService } from './scheduled_prompts';
 import { LaunchSchedulesService } from './launch_schedules';
+import { DriverService } from './driver';
 import { isValidMachineId } from './machine-id';
 import { HostHistoryService } from './host-history';
 import { HISTORY_RETENTION_MS } from './host-history';
 import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validateTokenPayload } from './token-history';
 import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
+import { sampleAccountCapacityHistory } from './account-capacity-history';
 
 const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
 const METER_FLUSH_INTERVAL_MS = 5 * 60_000;
@@ -158,6 +161,7 @@ export class Hub extends DurableObject {
   public promptLibrary: PromptLibraryService;
   public sessionSchedules: SessionSchedulesService;
   public launchSchedules: LaunchSchedulesService;
+  public driverService: DriverService;
 
   private idleWork: IdleWorkService;
   readonly meter = new RowsMeter();
@@ -259,6 +263,10 @@ export class Hub extends DurableObject {
       (source, sourceId, key, target, body) => this.webhookService.enqueueDelivery(source, sourceId, key, target, body),
       (source, sourceId, key, target, body) => this.webhookService.insertDelivery(source, sourceId, key, target, body),
       () => this.webhookService.pumpQueue());
+    this.driverService = new DriverService(this.sql,
+      (request, auth) => this.sessionControlService.handle(request, auth),
+      (request, auth) => this.sessionSchedules.handle(request, auth));
+    this.driverService.init();
     // Cron launch schedules (intake a839dfb6): each due tick creates a Hub
     // intake (source schedule) and starts the linked headless session through
     // the canonical admission path below; placement/capacity gates are never
@@ -1185,6 +1193,14 @@ export class Hub extends DurableObject {
         }
         return result;
       }
+      if (path === '/api/driver' || path.startsWith('/api/driver/')) {
+        const result = await this.driverService.handle(request, await this.sessionControlAuth(request));
+        if (request.method === 'POST' && (result.ok || result.status === 503)) {
+          const alarm = await this.ctx.storage.getAlarm();
+          if (alarm === null || alarm > Date.now() + 1000) await this.ctx.storage.setAlarm(Date.now() + 1000);
+        }
+        return result;
+      }
       // Inbound webhooks (intake 19ec91c2). Admin management surfaces live
       // under /api/webhooks with the same operator/cookie authority as
       // session control; the public ingest path authenticates per route.
@@ -2036,7 +2052,9 @@ export class Hub extends DurableObject {
       // as long as the session runs on its minted machine, never by the clock.
       const sessionActor = Boolean(cred && sessionIdOf(cred.registry_actor || ''));
       const worker = cred ? workerRefreshContext(this.sql, cred.id, nowMs) : null;
+      const driver = cred ? driverAccessContext(this.sql, cred.id, nowMs, true) : null;
       let workerScoped = false; try { workerScoped = JSON.parse(cred?.scopes || '[]').includes(WORKER_SCOPE); } catch {}
+      let driverScoped = false; try { driverScoped = JSON.parse(cred?.scopes || '[]').includes(DRIVER_SCOPE); } catch {}
       const hasMcp = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_grants'").toArray().length > 0;
       const mcpGrant = cred && hasMcp ? this.sql.exec('SELECT * FROM mcp_grants WHERE family=?', cred.family_id).toArray()[0] as any : null;
       // OAuth refresh is usable only through the client/resource-bound server path.
@@ -2053,11 +2071,13 @@ export class Hub extends DurableObject {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (workerScoped && !worker) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+      } else if (driverScoped && !driver) {
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (sessionActor && !sessionRefreshAllowed(this.sql, cred.registry_actor, cred.machine_id)) {
         // Stopped or rebound session: revoke the family so it cannot come back.
         this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-      } else if (!worker && !sessionActor && (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs)) {
+      } else if (!worker && !driver && !sessionActor && (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs)) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (cred.kind === 'agent' && !credentialActor(this.sql, cred)) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
@@ -2067,7 +2087,8 @@ export class Hub extends DurableObject {
         this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else {
-        const accessExpiresAt = worker ? new Date(Math.min(nowMs + 3600000, worker.expires_at)).toISOString()
+        const role = worker || driver;
+        const accessExpiresAt = role ? new Date(Math.min(nowMs + 3600000, role.expires_at)).toISOString()
           : sessionActor ? new Date(nowMs + 3600000).toISOString() : cred.expires_at;
         const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
         if (res.rowsWritten !== 1) {
@@ -2559,6 +2580,14 @@ export class Hub extends DurableObject {
     // for a root slot. Durable episode/command keys fence duplicate delivery.
     try { await m('idle_work', () => this.idleWorkTick()); } catch { console.warn('idle_work_tick_failed'); }
     try { await m('host_history', () => this.hostHistoryService.sample()); } catch { console.warn('resource_history_sampling_failed'); }
+    try {
+      await m('fleet_account_capacity_history', () => sampleAccountCapacityHistory(
+        this.sql,
+        now.getTime(),
+        () => dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[])
+          .map(account => this.fleetService.accountStatus(account)),
+      ));
+    } catch { console.warn('fleet_account_capacity_history_sample_failed'); }
     const cleanup = await m('bus_retention', () => this.busService.retentionCleanup(now.getTime(), 100));
     let nextAlarm = await m('jobs_alarms', () => this.jobsService.processAlarms());
     // Webhook delivery pump (intake 19ec91c2): pending redeliveries pull the
@@ -2771,6 +2800,9 @@ export class Hub extends DurableObject {
 
     if (scopes.includes(WORKER_SCOPE) && !workerRequestAllowed(this.sql, request, cred.id)) {
       return { error: Response.json({ error: workerDenialCode(this.sql, request, cred.id) }, { status: 403 }) };
+    }
+    if (scopes.includes(DRIVER_SCOPE) && !driverRequestAllowed(this.sql, request, cred.id)) {
+      return { error: Response.json({ error: 'driver_scope_forbidden' }, { status: 403 }) };
     }
 
     const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;

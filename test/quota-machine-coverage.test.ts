@@ -121,4 +121,65 @@ describe('quota machine coverage counts canonical machines only', () => {
       expect(view(hub).coverage).toMatchObject({ fresh: ['rmthz'], missing: ['tabo'], stale: [], route_reports: [] });
     });
   });
+
+  // Intake a963efe9 AC2: registration alone is not a check-in (machine
+  // registry spec). A machine that registered but never checked in has never
+  // joined the fleet, and a drained machine left it; neither may keep fleet
+  // coverage red forever.
+  const seedFleetWithUnjoined = (hub: Hub, freshAt: string) => {
+    seedTwoMachines(hub, freshAt);
+    // Registered, never checked in: no last_checkin_at, no snapshot, no reports.
+    hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at) VALUES ('laptop', 'agent-hub-host', 'LAPTOP-PHA6TCNC', ?, NULL)", ts(-86400000));
+    // A second registration for the same never-seen host aliases to the first.
+    hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at) VALUES ('laptop-2', 'agent-hub-host', 'laptop-pha6tcnc', ?, NULL)", ts(-3600000));
+  };
+
+  it('excludes a registration that never checked in from coverage, hosts and totals', async () => {
+    const e = env as unknown as Env;
+    await runInDurableObject(e.HUB.get(e.HUB.idFromName(crypto.randomUUID())), async (hub: Hub) => {
+      const freshAt = ts(-1000);
+      seedFleetWithUnjoined(hub, freshAt);
+      const body = view(hub);
+      expect(body.coverage).toMatchObject({
+        machines_total: 2, fresh: ['rmthz'], stale: [], missing: ['tabo'],
+        not_fleet: [{ machine_id: 'laptop', reason: 'never_checked_in' }],
+      });
+      expect(body.hosts.map((h: any) => h.host_id)).toEqual(['rmthz', 'tabo']);
+    });
+  });
+
+  it('still shows a never-checked-in machine under an explicit host filter', async () => {
+    const e = env as unknown as Env;
+    await runInDurableObject(e.HUB.get(e.HUB.idFromName(crypto.randomUUID())), async (hub: Hub) => {
+      const freshAt = ts(-1000);
+      seedFleetWithUnjoined(hub, freshAt);
+      const body = view(hub, { host_id: 'laptop' });
+      expect(body.hosts.map((h: any) => h.host_id)).toEqual(['laptop']);
+      expect(body.coverage).toMatchObject({ machines_total: 1, missing: ['laptop'] });
+    });
+  });
+
+  it('excludes a drained machine from fleet coverage but lists it as not_fleet', async () => {
+    const e = env as unknown as Env;
+    await runInDurableObject(e.HUB.get(e.HUB.idFromName(crypto.randomUUID())), async (hub: Hub) => {
+      const freshAt = ts(-1000);
+      seedFleetWithUnjoined(hub, freshAt);
+      // Retire tabo: stale snapshot plus a drain mark must leave the fleet
+      // instead of counting as stale forever.
+      hub.sql.exec("UPDATE machines SET drained = 1 WHERE id = 'tabo'");
+      const staleAt = ts(-1_300_000);
+      hub.sql.exec(`INSERT INTO host_quota_snapshots
+        (host_id, schema_version, collector_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json)
+        VALUES ('tabo', '1.1', 'quota_snapshot/1.1', ?, ?, ?, ?, 'ok', NULL, '{}')`,
+        staleAt, Date.parse(staleAt), staleAt, Date.parse(staleAt));
+      const body = view(hub);
+      expect(body.coverage).toMatchObject({
+        machines_total: 1, fresh: ['rmthz'], stale: [], missing: [],
+        not_fleet: expect.arrayContaining([
+          { machine_id: 'tabo', reason: 'drained' },
+          { machine_id: 'laptop', reason: 'never_checked_in' },
+        ]),
+      });
+    });
+  });
 });

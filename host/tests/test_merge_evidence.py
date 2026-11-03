@@ -10,8 +10,9 @@ B = 'b2' * 20
 
 
 class FakeRunner:
-    def __init__(self, in_main=(), runs=None, subject='feat: x', cherry='+ ' + A + '\n', fetch_rc=0):
+    def __init__(self, in_main=(), runs=None, subject='feat: x', cherry='+ ' + A + '\n', fetch_rc=0, ancestors=None):
         self.in_main, self.runs, self.subject, self.cherry, self.fetch_rc = set(in_main), runs or [], subject, cherry, fetch_rc
+        self.ancestors = {sha: set(items) for sha, items in (ancestors or {}).items()}
         self.calls = []
 
     def __call__(self, argv, **kw):
@@ -29,7 +30,7 @@ class FakeRunner:
             out = self.cherry
         elif argv[:3] == ['git', 'merge-base', '--is-ancestor']:
             sha, ref = argv[3], argv[4]
-            rc = 0 if (ref == 'origin/main' and sha in self.in_main) or (ref != 'origin/main' and sha == ref) else 1
+            rc = 0 if (ref == 'origin/main' and sha in self.in_main) or (ref != 'origin/main' and (sha == ref or sha in self.ancestors.get(ref, set()))) else 1
         elif argv[:2] == ['git', 'log']:
             out = self.subject + '\n'
         elif argv[0] == 'gh':
@@ -38,6 +39,18 @@ class FakeRunner:
 
 
 class MergeEvidenceTests(unittest.TestCase):
+    def test_hub_recorded_head_yields_deploy_evidence(self):
+        self.assertEqual(me.hub_recorded_shas({'head': A.upper(), 'commits': [{'sha': B}, {'sha': 'zz'}, 'x']}), [A, B])
+        self.assertEqual(me.hub_recorded_shas(None), [])
+        self.assertEqual(me.hub_recorded_shas({'head': A, 'commits': 7}), [A])
+        runner_ok = FakeRunner(in_main=[A], runs=[{'databaseId': 41479858903, 'headSha': A, 'conclusion': 'success', 'status': 'completed', 'url': 'u'}])
+        out = me.collect('/r', me.hub_recorded_shas({'head': A}), runner_ok, fetch=False, include_head=False)
+        self.assertEqual(out['deploy']['state'], 'success')
+        self.assertEqual(out['deploy']['run'], 'u')
+        self.assertEqual(out['deploy']['run_id'], '41479858903')
+        self.assertEqual(out['deploy']['conclusion'], 'success')
+        self.assertEqual(out['deploy']['deployed_sha'], A)
+
     def test_unmerged_commit_is_not_in_main_and_deploy_missing(self):
         out = me.collect('/r', [], FakeRunner())
         self.assertEqual(out['head'], A)
@@ -46,18 +59,52 @@ class MergeEvidenceTests(unittest.TestCase):
         self.assertEqual(out['deploy']['state'], 'missing')
 
     def test_merged_and_deploy_success(self):
-        runner = FakeRunner(in_main=[A], cherry='', runs=[{'headSha': A, 'conclusion': 'success', 'status': 'completed', 'url': 'https://example.invalid/r/1'}])
+        runner = FakeRunner(in_main=[A, B], cherry='', ancestors={B: [A]}, runs=[{'databaseId': 41, 'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'https://example.invalid/r/1'}])
         out = me.collect('/r', [], runner)
         self.assertTrue(out['commits'][0]['in_main'])
-        self.assertEqual(out['deploy'], {'state': 'success', 'sha': A, 'run': 'https://example.invalid/r/1'})
+        self.assertEqual(out['deploy'], {'state': 'success', 'sha': A, 'run': 'https://example.invalid/r/1',
+                                         'run_id': '41', 'conclusion': 'success', 'deployed_sha': B})
+
+    def test_older_success_does_not_prove_newer_pending_worktree_head(self):
+        runs = [
+            {'databaseId': 45, 'headSha': B, 'conclusion': None, 'status': 'in_progress', 'url': 'new'},
+            {'databaseId': 44, 'headSha': A, 'conclusion': 'success', 'status': 'completed', 'url': 'old'},
+        ]
+        runner = FakeRunner(in_main=[A, B], cherry='', ancestors={B: [A]}, runs=runs)
+        out = me.collect('/r', [A], runner, fetch=False, include_head=False, preferred_deploy_sha=B)
+        self.assertEqual(out['deploy']['state'], 'pending')
+        self.assertEqual(out['deploy']['deployed_sha'], B)
 
     def test_pending_failure_and_skip_ci(self):
-        pend = FakeRunner(in_main=[A], runs=[{'headSha': A, 'conclusion': None, 'status': 'in_progress', 'url': 'u'}])
+        pend = FakeRunner(in_main=[A], runs=[{'databaseId': 42, 'headSha': A, 'conclusion': None, 'status': 'in_progress', 'url': 'u'}])
         self.assertEqual(me.collect('/r', [], pend)['deploy']['state'], 'pending')
-        red = FakeRunner(in_main=[A], runs=[{'headSha': A, 'conclusion': 'failure', 'status': 'completed', 'url': 'u'}])
+        red = FakeRunner(in_main=[A], runs=[{'databaseId': 43, 'headSha': A, 'conclusion': 'failure', 'status': 'completed', 'url': 'u'}])
         self.assertEqual(me.collect('/r', [], red)['deploy']['state'], 'failure')
         skip = FakeRunner(in_main=[A], subject='docs: x [skip ci]', runs=[])
         self.assertEqual(me.collect('/r', [], skip)['deploy']['state'], 'skipped')
+
+    def test_skip_ci_commit_is_proven_by_later_deploy_containing_it(self):
+        later = FakeRunner(
+            in_main=[A, B], subject='docs: x [skip ci]', cherry='', ancestors={B: [A]},
+            runs=[{'databaseId': 46, 'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'later'}],
+        )
+        self.assertEqual(me.deploy_state('/r', A, later), {
+            'state': 'success', 'sha': A, 'run': 'later', 'run_id': '46',
+            'conclusion': 'success', 'deployed_sha': B,
+        })
+
+    def test_cancelled_own_run_is_proven_by_descendant_deploy(self):
+        cancelled_then_deployed = FakeRunner(
+            in_main=[A, B], cherry='', ancestors={B: [A]},
+            runs=[
+                {'databaseId': 47, 'headSha': A, 'conclusion': 'cancelled', 'status': 'completed', 'url': 'cancelled-own'},
+                {'databaseId': 48, 'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'descendant'},
+            ],
+        )
+        self.assertEqual(me.deploy_state('/r', A, cancelled_then_deployed), {
+            'state': 'success', 'sha': A, 'run': 'descendant', 'run_id': '48',
+            'conclusion': 'success', 'deployed_sha': B,
+        })
 
     def test_gh_failure_is_unknown_never_success(self):
         class NoGh(FakeRunner):

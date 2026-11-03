@@ -254,7 +254,7 @@ def step_once(base_url, state_dir, *, now=None, fetch=None, register=None, relea
         age = now - float(last['at'])
     except (KeyError, TypeError, ValueError):
         age = None  # no earlier attempt
-    if age is not None and ((last.get('sha') == served and age < RETRY_S) or age < MIN_INTERVAL_S):
+    if age is not None and last.get('sha') == served and age < max(RETRY_S, MIN_INTERVAL_S):
         return 'pending'
     if free_gb is None:
         import shutil

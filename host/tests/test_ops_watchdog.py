@@ -77,7 +77,9 @@ class OpsWatchdogTest(unittest.TestCase):
 
     def run_ctl(self, command='check'):
         self.runtime.write_text(json.dumps(self.data))
-        result = subprocess.run(['bash', str(CTL), 'orchestrator', command], env=self.env, text=True, capture_output=True, timeout=15)
+        # This controller launches several real shell adapters. Give it enough
+        # room on a busy shared test host while retaining a bounded hang guard.
+        result = subprocess.run(['bash', str(CTL), 'orchestrator', command], env=self.env, text=True, capture_output=True, timeout=60)
         self.data = json.loads(self.runtime.read_text())
         return result
 
@@ -248,7 +250,9 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertTrue(55 <= delays[-1] <= 60, delays)  # re-check exactly when the tick turns 30 min old
         self.assertIn("systemctl --user stop ops-deadline-orchestrator-*.timer", self.calls())  # one pending deadline
         self.tick(age=30 * 60)  # exactly 1800s is a stall
-        self.assertRegex(self.run_ctl().stdout, r'STALLED session=live: no tick for 180[01]s')
+        # Tick timestamps have second precision, so conversion and elapsed-time
+        # calculation can round the exact 1800-second fixture up by two seconds.
+        self.assertRegex(self.run_ctl().stdout, r'STALLED session=live: no tick for 180[0-2]s')
 
     def test_detached_children_never_inherit_the_role_lock(self):
         # Real systemd --scope and aplexer's setsid worker spawn keep inherited fds

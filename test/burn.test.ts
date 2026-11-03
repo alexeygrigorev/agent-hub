@@ -98,11 +98,16 @@ describe('burn-aware model candidates', () => {
     expect(sonnet.weight).toBeGreaterThan(fullZai.weight);
   });
 
-  it('routes Claude opus for deep and review work when it is expiring', () => {
+  it('routes Claude Sonnet at medium effort for deep and review work when it is expiring', () => {
     for (const tier of ['deep', 'review']) {
       const [opus] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'opus', 'medium', 'claude-acct'), claude, NOW);
       expect(opus?.id).toBe('opus');
+      expect(opus.effort).toBe('medium');
       expect(opus.factors.burn).toBeGreaterThan(3);
+      const [sonnet] = modelCandidates({ tier }, route('claude', 'claude'), ad('claude', 'sonnet', 'medium', 'claude-acct'), claude, NOW);
+      expect(sonnet?.id).toBe('sonnet');
+      expect(sonnet.effort).toBe('medium');
+      expect(sonnet.factors.burn).toBeGreaterThan(3);
     }
   });
 

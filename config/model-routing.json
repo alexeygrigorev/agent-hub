@@ -77,7 +77,7 @@
       "argon",
       "argon-gemini",
       "astra",
-      "opus"
+      "sonnet"
     ],
     "ask": [
       "argon",
@@ -86,7 +86,6 @@
       "glm-flash",
       "glm-flash-zcodex",
       "astra",
-      "opus",
       "sonnet"
     ],
     "review": [
@@ -96,7 +95,7 @@
       "muse",
       "glm-flash",
       "glm-flash-zcodex",
-      "opus"
+      "sonnet"
     ],
     "daily": [
       "muse",
@@ -456,6 +455,9 @@
       "grok": 0.2
     },
     "low_headroom_percent": 30,
+    "fallback_models": ["luna"],
+    "fallback_factor": 0.6,
+    "fallback_headroom_percent": 30,
     "desktop_codex_guard": {
       "enabled": true,
       "reason": "codex-vpn guard (Alexey): OpenAI codex is not placed on the Windows desktop. Set enabled=false (or edit machine_ids/hostnames) to lift; other engines there, including zcodex/zai, stay eligible.",

@@ -4,7 +4,7 @@ import { FleetService } from '../src/fleet';
 import { SessionControlService } from '../src/session_control';
 import { QuotaStore } from '../src/quota';
 import { modelCandidates } from '../src/model-routing';
-import { analyzeQuotaBurn, computeEngineDecision, isDesktopCodexExcluded, scheduleBurnFactor } from '../src/pacing';
+import { analyzeQuotaBurn, computeEngineDecision, fallbackFactor, isDesktopCodexExcluded, isHealthyAlternative, scheduleBurnFactor } from '../src/pacing';
 import routingPolicy from '../config/model-routing.json';
 import { freshCpu } from './cpu-fixture';
 import type { Hub } from '../src/hub';
@@ -86,6 +86,9 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       const sub = (account: string, service: string, q: any) =>
         hub.sql.exec('INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)',
           machine, account, service, null, iso(), JSON.stringify(q));
+      const updateSub = (account: string, service: string, pct: number) =>
+        hub.sql.exec('UPDATE fleet_subscriptions SET observed_at = ?, quota_json = ? WHERE machine_id = ? AND account = ? AND service = ?',
+          iso(), JSON.stringify(makeQuota(now, { pct7d: pct, hours7d: 100.8 })), machine, account, service);
       sub('hub-claude', 'claude', makeQuota(now, { pct7d: 15, hours7d: 100.8 }));
       sub('shared-claude', 'claude', makeQuota(now, { pct7d: 15, hours7d: 100.8 }));
       sub('hub-antigravity', 'gemini', makeQuota(now, { pct7d: 60, hours7d: 100.8 }));
@@ -105,6 +108,75 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(claudeCand).toBeTruthy();
       expect(agyCand.score).toBeGreaterThan(claudeCand.score * 10);
       expect(claudeCand.decision.factors.depleted).toBe(true);
+      expect(claudeCand.selection).toMatchObject({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
+      expect(plan.candidates.filter((c: any) => c.engine === 'claude').every((c: any) =>
+        c.selection?.id === 'sonnet' && c.selection?.effort === 'medium')).toBe(true);
+      expect(plan.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(false);
+      expect(plan.candidates.some((c: any) => /haiku/i.test(c.selection?.model ?? ''))).toBe(false);
+
+      // Astra requires an explicit deep/review tier; even another tier that
+      // contains it in policy must not turn routine placement into Astra.
+      const ordinaryAsk: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'routine ask', tier: 'ask' });
+      expect(ordinaryAsk.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(false);
+      const explicitDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'deep review', tier: 'deep' });
+      expect(explicitDeep.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(true);
+
+      // Luna is a config-driven fallback (rules.fallback_models): while a healthy
+      // non-fallback route exists its score is down-weighted by rules.fallback_factor
+      // INSIDE the decision function. It is never removed from the candidates and no
+      // engine is preferred by raw headroom (Alexey 2026-11-02: spread by burn rate).
+      updateSub('hub-claude', 'claude', 80);
+      updateSub('shared-claude', 'claude', 80);
+      updateSub('hub-antigravity', 'gemini', 50);
+      updateSub('shared-go', 'go', 45);
+      updateSub('zai-central', 'zai', 40);
+      updateSub('shared-codex', 'codex', 95);
+      const withHealthy: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'ordinary start' });
+      for (const id of ['argon', 'muse', 'sonnet', 'luna'])
+        expect(withHealthy.candidates.some((c: any) => c.selection?.id === id), id).toBe(true);
+      expect(withHealthy.candidates.some((c: any) =>
+        c.engine === 'zcodex' && c.account === 'zai-central' && c.selection?.provider === 'zai')).toBe(true);
+      const lunaHealthy = withHealthy.candidates.find((c: any) => c.selection?.id === 'luna');
+      expect(lunaHealthy.decision.factors.fallback_factor).toBe((routingPolicy.rules as any).fallback_factor);
+      expect(lunaHealthy.decision_reason).toContain('fallback=');
+      const product = (f: any) => f.headroom_factor * f.burn_factor * f.provider_weight * f.tier_fit * f.load_factor * f.failure_factor * f.host_factor * f.tbm_weight * f.fallback_factor;
+      expect(lunaHealthy.score / product(lunaHealthy.decision.factors)).toBeCloseTo(1, 1);
+      // Non-fallback candidates are untouched by the factor.
+      expect(withHealthy.candidates.filter((c: any) => c.selection?.id !== 'luna').every((c: any) => c.decision.factors.fallback_factor === 1)).toBe(true);
+
+      // Current fleet shape (2026-11-02): claude 10%, zai 8%, muse 43%, codex 45%,
+      // antigravity 40%. Claude is depleted and must lose to every healthy engine;
+      // healthy codex stays a real candidate (only the fallback factor applies).
+      updateSub('hub-claude', 'claude', 10);
+      updateSub('shared-claude', 'claude', 10);
+      updateSub('zai-central', 'zai', 8);
+      updateSub('shared-go', 'go', 43);
+      updateSub('hub-antigravity', 'gemini', 40);
+      updateSub('shared-codex', 'codex', 45);
+      const current: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'current quota' });
+      const best = (pred: (c: any) => boolean) => Math.max(...current.candidates.filter(pred).map((c: any) => c.score));
+      expect(current.selected.engine).not.toBe('claude');
+      expect(best((c: any) => c.engine === 'claude')).toBeLessThan(best((c: any) => c.engine === 'codex'));
+      expect(best((c: any) => c.engine === 'claude')).toBeLessThan(best((c: any) => c.engine === 'opencode'));
+      expect(best((c: any) => c.engine === 'claude')).toBeLessThan(best((c: any) => c.engine === 'antigravity'));
+      expect(current.candidates.find((c: any) => c.engine === 'codex').decision.factors.fallback_factor).toBe((routingPolicy.rules as any).fallback_factor);
+
+      // With no healthy non-fallback route left the fallback is not down-weighted
+      // and may win at max effort.
+      updateSub('hub-claude', 'claude', 15);
+      updateSub('shared-claude', 'claude', 15);
+      updateSub('hub-antigravity', 'gemini', 15);
+      updateSub('shared-go', 'go', 15);
+      updateSub('zai-central', 'zai', 15);
+      updateSub('shared-codex', 'codex', 95);
+      const noHealthy: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'ordinary start fallback' });
+      expect(noHealthy.selected?.selection).toMatchObject({ id: 'luna', model: 'gpt-6-luna', effort: 'max' });
+      expect(noHealthy.selected.decision.factors.fallback_factor).toBe(1);
+
+      // A model pin can cross tier membership, so luna + deep stays on Luna.
+      const lunaDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'pinned Luna', engine: 'luna', tier: 'deep' });
+      expect(lunaDeep.selected?.selection).toMatchObject({ id: 'luna', model: 'gpt-6-luna', effort: 'max' });
+      expect(lunaDeep.rejected.some((r: any) => r.reason === 'tier_unavailable')).toBe(false);
     });
   });
 
@@ -296,16 +368,18 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(recNoReason.status).toBe(400);
       expect(await recNoReason.json()).toMatchObject({ error: 'engine_reason_required' });
 
-      // 2. Unpinned session start picks antigravity and exposes decision_score & decision_reason in GET /api/sessions/:id
+      // 2. An unpinned start draws among eligible routes and records the draw
+      // probability in the session decision shown by GET /api/sessions/:id.
       const autoRes = await sessions.handle(new Request('https://hub.test/api/sessions', {
         method: 'POST',
         body: JSON.stringify({ key: 'auto-pick-1', mode: 'interactive', workspace: 'agent-hub' }),
       }), admin);
       expect(autoRes.status).toBe(201);
       const autoBody: any = await autoRes.json();
-      expect(autoBody.engine).toBe('antigravity');
+      expect(['claude', 'antigravity', 'opencode']).toContain(autoBody.engine);
       expect(typeof autoBody.decision_score).toBe('number');
-      expect(autoBody.decision_reason).toContain('auto: antigravity/hub-antigravity');
+      expect(autoBody.decision_reason).toContain(`auto: ${autoBody.engine}/`);
+      expect(autoBody.decision_reason).toContain('draw_probability=');
 
       const showRes = await sessions.handle(new Request(`https://hub.test/api/sessions/${autoBody.id}`), admin);
       expect(showRes.status).toBe(200);
@@ -346,6 +420,34 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(claudePool.decision_reason).toContain('status=depleted');
       expect(agyPool.decision_score).toBeGreaterThan(claudePool.decision_score);
     });
+  });
+
+  it('applies the config-driven fallback factor only while a healthy alternative exists, never removing or banning', () => {
+    const now = Date.parse('2026-11-02T17:15:00Z');
+    const q = makeQuota(now, { pct7d: 45, hours7d: 100.8 });
+    const base = { machine: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null, provider: 'codex',
+      model: { id: 'luna', model: 'gpt-6-luna' }, tier: 'daily', quota: q, headroomPercent: 45, nowMs: now,
+      cpuLoad: 0, pendingLaunches: 0, familyLoad: 0, accountActive: 0, accountMaxConcurrency: 4, recentAccountFailures: 0,
+      degraded: false, tbmWeight: 1 };
+    const plain = computeEngineDecision(base);
+    const withAlt = computeEngineDecision({ ...base, healthyAlternative: true });
+    const factor = (routingPolicy.rules as any).fallback_factor;
+    expect(factor).toBeLessThan(1);
+    expect(factor).toBeGreaterThan(0);
+    expect(plain.factors.fallback_factor).toBe(1);
+    expect(withAlt.factors.fallback_factor).toBe(factor);
+    expect(withAlt.score).toBeGreaterThan(0);
+    expect(withAlt.score / plain.score).toBeCloseTo(factor, 2);
+    // Non-fallback models are never touched.
+    const sonnet = computeEngineDecision({ ...base, engine: 'claude', provider: 'claude', model: { id: 'sonnet', model: 'sonnet' }, healthyAlternative: true });
+    expect(sonnet.factors.fallback_factor).toBe(1);
+    expect(fallbackFactor(true, false)).toBe(1);
+    // Healthy means: not exhausted, not behind-schedule-depleted, at least fallback_headroom_percent left.
+    expect(isHealthyAlternative({ factors: { remaining_pct: 45, burn_status: 'on_pace' } })).toBe(true);
+    expect(isHealthyAlternative({ factors: { remaining_pct: 10, burn_status: 'depleted' } })).toBe(false);
+    expect(isHealthyAlternative({ factors: { remaining_pct: 60, burn_status: 'depleted' } })).toBe(false);
+    expect(isHealthyAlternative({ factors: { remaining_pct: 20, burn_status: 'behind_schedule' } })).toBe(false);
+    expect(isHealthyAlternative(null)).toBe(false);
   });
 
   it('breaks ties deterministically across identical scores', () => {

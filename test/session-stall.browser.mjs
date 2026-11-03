@@ -22,7 +22,7 @@ try {
       if (url.pathname === '/api/status') return route.fulfill({json:{needs_attention:[attention]}});
       if (url.pathname === '/auth/me') return route.fulfill({ json: { email: 'fixture@example.invalid', csrf_token: 'fixture' } });
       if (url.pathname === '/api/sessions/' + id) return route.fulfill({ json: session });
-      if (url.pathname === '/api/sessions') return route.fulfill({ json: { sessions: [session], next_cursor: null } });
+      if (url.pathname === '/api/sessions') return route.fulfill({ json: { sessions: [session], next_cursor: null, active_count: 1 } });
       if (url.pathname.endsWith('/commands')) return route.fulfill({ json: { commands: [{ id: 'capture', kind: 'capture', state: 'acked', ack: { text: 'Last output' }, created_at: new Date().toISOString() }] } });
       if (url.pathname.startsWith('/api/')) return route.fulfill({ json: {} });
       try { return route.fulfill({ body: await readFile(resolve('public', '.' + url.pathname)), contentType: ({ '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css' })[extname(url.pathname)] || 'text/plain' }); }
@@ -38,9 +38,14 @@ try {
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     assert.deepEqual(errors, []);
     await page.goto('http://stall.fixture/attention-fixture.html');
-    await page.waitForFunction(() => document.querySelectorAll('#session-attention td').length === 6);
-    assert.deepEqual(await page.locator('#session-attention td').allTextContents(),[attention.session_id,attention.intake_id,attention.state,'1801',attention.last_activity_at,attention.last_nudge]);
-    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true,'attention table stays within phone viewport');
+    await page.waitForFunction(() => document.querySelectorAll('#session-attention .sessions-attention-item').length === 1);
+    const item = page.locator('#session-attention .sessions-attention-item').first();
+    assert.equal(await item.locator('.sessions-attention-item__title').textContent(), 'Task ' + attention.intake_id);
+    assert.equal(await item.locator('.sessions-attention-item__title').getAttribute('href'), '/sessions.html?session=' + attention.session_id);
+    assert.equal(await item.locator('.dk-badge').textContent(), 'Idle with unfinished work');
+    assert.equal(await item.locator('.dk-muted').textContent(), 'Linked task ' + attention.intake_id);
+    assert.equal(await page.locator('#session-attention-count').textContent(), '1 session');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true,'attention cards stay within phone viewport');
     assert.deepEqual(errors,[]);
     await context.close();
   }

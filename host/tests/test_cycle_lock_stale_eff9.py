@@ -1,5 +1,10 @@
-"""Intake eff9a5ce follow-up: a wedged cycle-lock holder must not starve
-every other fleet loop (timer skipped `concurrent_cycle` for hours)."""
+"""Intake 8cc2848c (rework of the eff9a5ce follow-up): the fleet cycle never
+skips wholesale. The former whole-cycle lock starved the 60s fleet-host timer
+behind a long-running session_host cycle (~2000 fleet_cycle_skipped
+concurrent_cycle/24h). Only the stateful slow-maintenance phase stays
+single-flight now: a fresh live holder costs one fleet_maintenance_skipped
+receipt while heartbeat, offers and the rest of the cycle still run; a wedged
+holder (pid gone, or held past cycle_lock_stale_s) is taken over."""
 import contextlib
 import io
 import json
@@ -35,7 +40,9 @@ def _base_runner(argv, **kw):
     return []
 
 
-def _stubbed_once(dispatcher):
+def _stubbed_once(dispatcher, reconcile_runs):
+    """Run once() with heavy seams stubbed; reconcile_launches records into
+    reconcile_runs so tests can tell a skipped phase from a run one."""
     buf = io.StringIO()
     with contextlib.ExitStack() as stack:
         stack.enter_context(patch('agent_hub_host.provisioning.tick'))
@@ -44,9 +51,12 @@ def _stubbed_once(dispatcher):
         stack.enter_context(patch('agent_hub_host.api.get_heartbeat_payload', return_value={}))
         stack.enter_context(patch('agent_hub_host.workclaim.sync_once', return_value={'ok': True}))
         stack.enter_context(patch.object(fleet, 'collect_subscriptions', return_value=[]))
-        for method, value in [('report_catalog_bindings', []), ('reconcile_launches', []),
-                              ('reconcile_imported_sessions', []), ('_derive_qualified_role_jobs', [])]:
+        for method, value in [('report_catalog_bindings', []), ('reconcile_imported_sessions', []),
+                              ('_derive_qualified_role_jobs', [])]:
             stack.enter_context(patch.object(dispatcher, method, return_value=value))
+        stack.enter_context(patch.object(
+            dispatcher, 'reconcile_launches',
+            side_effect=lambda *a, **k: reconcile_runs.append(1) or []))
         with contextlib.redirect_stdout(buf):
             results = dispatcher.once()
     events = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
@@ -76,7 +86,7 @@ def test_acquire_records_holder_pid_and_time():
             held.close()
 
 
-def test_fresh_live_holder_still_skips_with_holder_receipt():
+def test_fresh_live_holder_skips_only_the_maintenance_phase():
     with tempfile.TemporaryDirectory() as tmp:
         calls = []
         cfg = settings(Path(tmp))
@@ -84,12 +94,21 @@ def test_fresh_live_holder_still_skips_with_holder_receipt():
         held = holder._acquire_cycle_lock()
         try:
             loser = fleet.Dispatcher(cfg, _base_request_factory(calls), _base_runner, journal_dir=tmp)
-            results, events = _stubbed_once(loser)
-            assert results == [{'id': 'cycle', 'state': 'skipped', 'reason': 'concurrent_cycle'}]
-            skip = next(e for e in events if e.get('event') == 'fleet_cycle_skipped')
+            runs: list = []
+            results, events = _stubbed_once(loser, runs)
+            # The cycle itself ran: heartbeat and offers happened normally.
+            assert not any(e.get('event') == 'fleet_cycle_skipped' for e in events)
+            assert ('GET', '/api/fleet/offers') in calls, calls
+            assert ('POST', '/api/host/poll') in calls, calls
+            assert not any(r.get('reason') == 'concurrent_cycle' for r in results), results
+            # Only the guarded maintenance phase skipped, with a receipt.
+            skip = next(e for e in events if e.get('event') == 'fleet_maintenance_skipped')
+            assert skip['reason'] == 'concurrent_maintenance'
             assert skip['holder_pid'] == os.getpid() and skip['held_s'] < 60
-            assert not any(e.get('event') == 'fleet_cycle_lock_takeover' for e in events)
-            assert not calls
+            assert runs == [], 'reconcile must not run while the sibling owns the phase'
+            phases = next(e for e in events if e.get('event') == 'fleet_cycle_phases')['phases']
+            assert 'reconcile' in phases and 'watchdog' in phases
+            assert not any(e.get('event') == 'fleet_maintenance_lock_takeover' for e in events)
         finally:
             held.close()
 
@@ -104,11 +123,13 @@ def test_live_holder_past_stale_threshold_is_taken_over():
             path = Path(tmp) / fleet.CYCLE_LOCK_NAME
             _rewrite_owner(path, os.getpid(), time.time() - fleet.CYCLE_LOCK_STALE_S - 5)
             loser = fleet.Dispatcher(cfg, _base_request_factory(calls), _base_runner, journal_dir=tmp)
-            results, events = _stubbed_once(loser)
-            take = next(e for e in events if e.get('event') == 'fleet_cycle_lock_takeover')
+            runs: list = []
+            results, events = _stubbed_once(loser, runs)
+            take = next(e for e in events if e.get('event') == 'fleet_maintenance_lock_takeover')
             assert take['holder_pid'] == os.getpid() and take['holder_alive'] is True
             assert take['held_s'] > fleet.CYCLE_LOCK_STALE_S
-            assert not any(r.get('reason') == 'concurrent_cycle' for r in results), results
+            assert not any(e.get('event') == 'fleet_maintenance_skipped' for e in events)
+            assert runs, 'takeover must run the maintenance phase instead of skipping forever'
             assert ('GET', '/api/fleet/offers') in calls, calls
         finally:
             held.close()
@@ -126,9 +147,11 @@ def test_dead_holder_pid_is_taken_over():
         try:
             _rewrite_owner(Path(tmp) / fleet.CYCLE_LOCK_NAME, dead_pid, time.time())
             loser = fleet.Dispatcher(cfg, _base_request_factory(calls), _base_runner, journal_dir=tmp)
-            results, events = _stubbed_once(loser)
-            take = next(e for e in events if e.get('event') == 'fleet_cycle_lock_takeover')
+            runs: list = []
+            results, events = _stubbed_once(loser, runs)
+            take = next(e for e in events if e.get('event') == 'fleet_maintenance_lock_takeover')
             assert take['holder_pid'] == dead_pid and take['holder_alive'] is False
+            assert runs
             assert ('GET', '/api/fleet/offers') in calls, calls
         finally:
             held.close()
@@ -144,8 +167,13 @@ def test_legacy_holder_without_metadata_is_never_stale():
                 fh.truncate()
             calls = []
             loser = fleet.Dispatcher(cfg, _base_request_factory(calls), _base_runner, journal_dir=tmp)
-            results, _ = _stubbed_once(loser)
-            assert results == [{'id': 'cycle', 'state': 'skipped', 'reason': 'concurrent_cycle'}]
+            runs: list = []
+            results, events = _stubbed_once(loser, runs)
+            skip = next(e for e in events if e.get('event') == 'fleet_maintenance_skipped')
+            assert skip['reason'] == 'concurrent_maintenance'
+            assert runs == []
+            # The cycle still ran end to end despite the pre-upgrade holder.
+            assert ('GET', '/api/fleet/offers') in calls, calls
         finally:
             held.close()
 

@@ -1,5 +1,6 @@
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
+import { bindingMoveAllowed } from './session-binding-move';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
 import { IntakeWorktrees, namesWorktree, worktreePathAllowed } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
@@ -7,6 +8,7 @@ import { LivenessService } from './liveness';
 import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
 import { linkedIntake, linkedTaskIds, hasOpenWork, nativeGoalStatus, sessionWakeState, openWorkPreventsIdleReap } from './intake-session';
 import { workerAccessContext, workerWakeAllowed } from './worker-access';
+import { DRIVER_SCOPE, driverAccessContext, driverRequestAllowed } from './driver-access';
 import { registeredRepoLabel } from './repos';
 import { decodeRepoWorkspace, encodeRepoWorkspace } from './fleet';
 import { initResourceRequestProjection } from './sql-json-projection';
@@ -90,11 +92,15 @@ CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sess
 CREATE INDEX IF NOT EXISTS session_control_live_created ON session_control_sessions(created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_live_actor_created ON session_control_sessions(actor, created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
+CREATE INDEX IF NOT EXISTS session_control_unbound_live_launch ON session_control_sessions(fleet_launch_id) WHERE binding_json IS NULL AND fleet_launch_id IS NOT NULL AND state IN ('queued','held','offered','starting','running','uncertain');
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
 CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL, generation INTEGER NOT NULL, intake_id TEXT NOT NULL, PRIMARY KEY(subject, generation, intake_id));
 CREATE TABLE IF NOT EXISTS session_worktree_episodes (subject TEXT PRIMARY KEY, active INTEGER NOT NULL, generation INTEGER NOT NULL, completed INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS fleet_catalog_seen_fresh ON fleet_catalog_seen(observed_at, machine_id);
+CREATE TABLE IF NOT EXISTS session_stale_reconciliations (session_id TEXT PRIMARY KEY, previous_state TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL);
 `;
 
 type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string; tokenHash?: string };
@@ -155,10 +161,14 @@ const ACTIVE_HEARTBEAT_MS = 10 * 60 * 1000;
 function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
   const cutoff = new Date(nowMs - ACTIVE_HEARTBEAT_MS).toISOString();
   return {
-    sql: `(state IN ('queued','held','offered') OR (state IN ('starting','running','uncertain') AND EXISTS (
+    sql: `(state = 'queued' OR state = 'held' OR state = 'offered' OR ((state = 'starting' OR state = 'running' OR state = 'uncertain') AND EXISTS (
       SELECT 1 FROM fleet_sessions f WHERE f.machine_id = session_control_sessions.machine_id
-      AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id') AND f.observed_at >= ?)))`,
-    params: [cutoff],
+      AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id')
+      AND f.phase != 'exited' AND f.phase != 'dead' AND f.phase != 'pruned' AND f.phase != 'forgotten' AND f.phase != 'unobserved'
+      AND (f.observed_at >= ? OR instr(COALESCE((
+        SELECT '|' || group_concat(c.machine_id, '|') || '|' FROM fleet_catalog_seen c WHERE c.observed_at >= ?
+      ), ''), '|' || f.machine_id || '|') > 0))))`,
+    params: [cutoff, cutoff],
   };
 }
 /** Literal must match the partial indexes session_control_live_created / _live_actor_created. */
@@ -506,6 +516,8 @@ export class SessionControlService {
     if (!cred || cred.revoked_at) return false;
     const expires = Date.parse(cred.expires_at);
     if (!Number.isFinite(expires) || expires <= this.now()) return false;
+    let scopes: any; try { scopes = JSON.parse(cred.scopes); } catch { return false; }
+    if (Array.isArray(scopes) && scopes.includes(DRIVER_SCOPE) && !driverAccessContext(this.sql, caller.tokenId, this.now())) return false;
     return credentialActor(this.sql, cred) !== null;
   }
 
@@ -536,18 +548,18 @@ export class SessionControlService {
   }
 
   private cancelOwnerLive(row: any, caller: Caller, operatorStop = false): boolean {
-    // Explicit human operators already may stop any bound session. Apply the
-    // same authority to a provably unstarted intent, without broadening the
-    // owner-only /cancel endpoint or trusting a collapsed browser actor.
-    if (operatorStop && caller.isAdmin === true && caller.kind === 'human') {
-      // The internal recovery service uses the same canonical stop/cancellation
-      // transaction as operators. HTTP authentication never issues this actor.
-      if (caller.actor === 'hub:service:intake-watchdog') return true;
-      if (typeof caller.actor === 'string' && caller.actor.startsWith('human:admin-token:')) return true;
+    // Explicit operator stop may cross ownership only for an authenticated
+    // human bearer. Revalidate that bearer after the streamed body, inside the
+    // cancellation transaction. Cookie admins without a stable human identity
+    // may stop their own actor's intent; /cancel remains owner-only.
+    if (operatorStop && caller.isAdmin === true) {
       if (caller.tokenId) {
+        if (caller.kind !== 'human') return false;
         const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
-        if (validateHumanCredentialRecord(this.sql, this.options.env, cred, this.now())?.actor === caller.actor) return true;
+        return validateHumanCredentialRecord(this.sql, this.options.env, cred, this.now())?.actor === caller.actor;
       }
+      return row.actor === actorName(caller) || caller.actor === 'hub:service:intake-watchdog' ||
+        (typeof caller.actor === 'string' && caller.actor.startsWith('human:'));
     }
     if (row.actor !== actorName(caller) || !this.ownerOk(row, caller)) return false;
     // Legacy admin bearers have a stable actor but no credentials-table row.
@@ -1891,11 +1903,16 @@ export class SessionControlService {
       return { ok: false as const, error: 'invalid_binding' };
     }
     const prior = row.binding_json ? parsed(row.binding_json, null) : null;
-    // Exact UUID + tag + workspace reconciliation: a different native id is a
-    // conflict, never a silent adoption (protects tag reuse across generations).
-    if (prior && (prior.native_id !== binding.native_id || prior.tag !== binding.tag || prior.workspace !== binding.workspace)) {
+    // Native identity is immutable across workspace moves. Only the assigned
+    // host may reconcile a moved workspace, using the fresh catalog and the
+    // existing intake-owned worktree below; the internal seam cannot do so.
+    if (prior && (prior.native_id !== binding.native_id || prior.tag !== binding.tag ||
+        (prior.native_created_at_ms !== null && prior.native_created_at_ms !== undefined &&
+          prior.native_created_at_ms !== binding.native_created_at_ms))) {
       return { ok: false as const, error: 'binding_conflict' };
     }
+    const moving = !!prior && prior.workspace !== binding.workspace;
+    if (moving && !reporter) return { ok: false as const, error: 'binding_conflict' };
     // Canonical Fleet reconciliation (read-only; Fleet owns the launch
     // lifecycle, this service never writes fleet rows). The assigned launch
     // must exist on the session's machine in a live post-start state, the
@@ -1930,7 +1947,7 @@ export class SessionControlService {
     // prove the tag/workspace mapping, and an arbitrary workspace must never
     // be adopted on a launch id plus an unreported UUID.
     const reported: any = this.sql.exec(
-      'SELECT tag, workspace, phase, engine, cwd FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
+      'SELECT native_id, tag, workspace, phase, engine, cwd, created_at_ms, observed_at FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
       row.machine_id, binding.native_id).toArray()[0];
     if (!reported) return { ok: false as const, error: 'fleet_native_unreported' };
     if (reported.tag !== binding.tag || reported.workspace !== binding.workspace) {
@@ -1959,15 +1976,51 @@ export class SessionControlService {
         return { ok: false as const, error: 'fleet_cwd_mismatch' };
       }
     }
-    const generation = (prior?.generation ?? 0) + 1;
+    // A lost host reply may replay the exact binding. Keep its generation and
+    // credentials intact; replay must not invalidate newly claimed commands.
+    if (prior && !moving && prior.native_created_at_ms === binding.native_created_at_ms &&
+        prior.reported_by === (reporter ?? undefined) &&
+        Number.isSafeInteger(prior.generation) && prior.generation > 0) {
+      return { ok: true as const, generation: prior.generation };
+    }
+    if (moving) {
+      if (!this.workspaceMoveAllowed(row, binding, reported)) return { ok: false as const, error: 'binding_conflict' };
+      // Preserve original execution custody, including an unknown outcome.
+      // A generation update cannot cancel an already authorized native effect.
+      const pending = this.sql.exec(`SELECT 1 FROM session_control_commands WHERE session_id = ?
+        AND (state = 'uncertain' OR (claim_token IS NOT NULL AND state IN ('recorded','transported','claimed'))) LIMIT 1`, sessionId).toArray();
+      if (pending.length) return { ok: false as const, error: 'binding_commands_pending' };
+    }
+    const generation = moving
+      ? (prior?.generation ?? 0) + 1
+      : (Number.isSafeInteger(prior?.generation) && prior.generation > 0 ? prior.generation : 1);
     this.sql.exec('UPDATE session_control_sessions SET state = ?, binding_json = ?, updated_at = ? WHERE id = ?',
       'running', JSON.stringify({ native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation,
         native_created_at_ms: binding.native_created_at_ms,
         ...(reporter ? { reported_by: reporter } : {}), reported_at: this.at() }), this.at(), sessionId);
+    if (moving) {
+      // Unclaimed transport is not execution authority. Fence any old offer
+      // correlation and reoffer the same durable command at the new binding.
+      for (const command of this.sql.exec(`SELECT id FROM session_control_commands WHERE session_id = ?
+        AND claim_token IS NULL AND state IN ('recorded','transported')`, sessionId).toArray()) {
+        this.sql.exec(`UPDATE session_control_commands SET generation = ?, correlation = ?, state = 'recorded', poll_at = NULL, updated_at = ? WHERE id = ?`,
+          generation, `cmd:${command.id}:gen:${generation}`, this.at(), command.id);
+      }
+    }
     // A (re)bind revokes the session's messaging credential; the freshly
     // bound host re-mints within its provisioning cadence (M2 AC2).
     revokeSessionCredentials(this.sql, sessionId, this.now());
     return { ok: true as const, generation };
+  }
+
+  private workspaceMoveAllowed(row: any, binding: any, reported: any): boolean {
+    const prior = parsed(row.binding_json, null);
+    if (!Number.isSafeInteger(prior?.generation) || prior.generation <= 0 || prior.generation >= Number.MAX_SAFE_INTEGER) return false;
+    const intakeId = parsed(row.request_json, {}).intake_task_id;
+    if (typeof intakeId !== 'string' || !intakeId) return false;
+    const worktree = this.sql.exec("SELECT task_id, machine, path, state FROM intake_worktrees WHERE machine = ? AND path = ? AND state = 'active'",
+      row.machine_id, binding.workspace).toArray()[0];
+    return bindingMoveAllowed(prior, binding, reported, worktree, intakeId, row.machine_id, this.now());
   }
 
   private claimExpired(row: any): boolean {
@@ -2133,6 +2186,11 @@ export class SessionControlService {
     const threshold = thresholdRaw === null ? 10800 : Number(thresholdRaw);
     if (!Number.isSafeInteger(threshold) || threshold <= 0 || threshold > 31536000) return response({ error: 'invalid_threshold' }, 400);
     const admin = caller.isAdmin === true;
+    const driverScoped = auth.scopes?.includes(DRIVER_SCOPE) === true;
+    if (driverScoped && !driverRequestAllowed(this.sql, request, caller.tokenId!, this.now())) {
+      return response({ error: 'driver_scope_forbidden' }, 403);
+    }
+    const observeAll = admin || driverScoped;
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
 
@@ -2182,7 +2240,8 @@ export class SessionControlService {
         const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
           this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
             binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
-        return { session_id: row.id, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+        return { session_id: row.id, session_state: row.state, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+          native_last_activity_at: native?.last_activity_at ?? null,
           lock_release_permitted: !protectedSession || (adoptedLock && !row.guard_explicit_protection),
           engine: row.engine, adoption_intent_id: binding?.adoption_intent_id ?? null,
           tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),
@@ -2272,6 +2331,21 @@ export class SessionControlService {
       const promoted = this.sql.exec("SELECT s.id, s.host_family, f.machine_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE f.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('queued','held') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
       for (const row of promoted) if (this.hostOk(row, caller).ok) this.syncFleetPlacement(row.id);
       const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
+      // Already-bound native sessions can move to their intake worktree.
+      // Discover only exact same-incarnation, fresh catalog moves; the POST
+      // rechecks these facts under the mutation transaction and host family.
+      const moved = this.sql.exec(`SELECT s.* FROM session_control_sessions s
+        JOIN fleet_launches f ON f.id = s.fleet_launch_id
+        JOIN fleet_sessions n ON n.machine_id = s.machine_id AND n.native_id = json_extract(s.binding_json, '$.native_id')
+        WHERE s.machine_id = ? AND s.binding_json IS NOT NULL AND s.state IN ('running','starting','uncertain')
+        AND f.state IN ('starting','running') AND n.workspace <> json_extract(s.binding_json, '$.workspace') LIMIT 100`, caller.machineId!).toArray() as any[];
+      for (const row of moved) {
+        if (!this.hostOk(row, caller).ok) continue;
+        const prior = parsed(row.binding_json, null);
+        const reported: any = this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', row.machine_id, prior?.native_id).toArray()[0];
+        const binding = { ...prior, workspace: reported?.workspace };
+        if (this.workspaceMoveAllowed(row, binding, reported)) rows.push({ ...row, launch_native_id: prior.native_id });
+      }
       return response({
         sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, intake_task_id: JSON.parse(row.request_json).intake_task_id ?? null, engine: row.engine, native_id: row.launch_native_id ?? null })),
       });
@@ -2392,6 +2466,8 @@ export class SessionControlService {
       if (mode === 'headless' && input.brief !== undefined && !input.brief.trim()) {
         return response({ error: 'invalid_session_request', field: 'brief', detail: 'empty_brief' }, 400);
       }
+      if (driverScoped && (typeof input.intake_task_id !== 'string' || mode !== 'headless' ||
+          input.engine !== undefined || input.machine !== undefined)) return response({ error: 'driver_scope_forbidden' }, 403);
       const worker = workerAccessContext(this.sql, caller.tokenId);
       if (worker) {
         const intake = input.intake_task_id;
@@ -2410,6 +2486,15 @@ export class SessionControlService {
       }
       const actor = caller.actor || caller.machineId || 'admin';
       try { return this.transaction(() => {
+        const driver = driverScoped ? driverAccessContext(this.sql, caller.tokenId, this.now()) : null;
+        if (driverScoped) {
+          if (!driver || typeof input.intake_task_id !== 'string' || mode !== 'headless' ||
+              input.engine !== undefined || input.machine !== undefined ||
+              (input.parent_id !== undefined && input.parent_id !== driver.session_id)) {
+            return response({ error: 'driver_scope_forbidden' }, 403);
+          }
+          input.parent_id = driver.session_id;
+        }
         const finish = (row: any, extra: any = {}, status = 200) => {
           recordIntakeSessionLink(this.sql, row, this.now(), extra.hold);
           if (worker && !extra.replay) recordWorkerChildStart(this.sql, row, worker.session_id, this.now());
@@ -2432,7 +2517,7 @@ export class SessionControlService {
           if (!parentRow) {
             return response({ error: 'parent_session_not_found' }, 404);
           }
-          if (!admin && !(worker && parentRow.id === worker.session_id) && !this.ownerOk(parentRow, caller)) {
+          if (!admin && !(worker && parentRow.id === worker.session_id) && !(driver && parentRow.id === driver.session_id) && !this.ownerOk(parentRow, caller)) {
             return response({ error: 'parent_forbidden' }, 403);
           }
           let curr = parentRow;
@@ -2755,7 +2840,7 @@ export class SessionControlService {
           if (value.length > 128) return null;
           return value;
         };
-        const scope = admin
+        const scope = observeAll
           ? { owner: scopeParam('owner'), host: scopeParam('host'), task: scopeParam('task') }
           : { owner: caller.actor ?? null, host: scopeParam('host'), task: scopeParam('task') };
         const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit')) || 50));
@@ -2770,10 +2855,10 @@ export class SessionControlService {
         if (!dims) return response({ error: 'invalid_breakdown', allowed: ['host', 'engine', 'account'] }, 400);
         const cap = 1000;
         const states = LIVE_STORED_STATES.map(() => '?').join(',');
-        const live = (admin
+        const live = (observeAll
           ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE state IN (${states}) ORDER BY created_at DESC, id DESC LIMIT ?`, ...LIVE_STORED_STATES, cap + 1).toArray()
           : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? AND state IN (${states}) ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...LIVE_STORED_STATES, cap + 1).toArray()
-        ).filter((r: any) => this.ownerOk(r, caller));
+        ).filter((r: any) => observeAll || this.ownerOk(r, caller));
         const scanned = live.slice(0, cap);
         return response(buildSessionBreakdown(this.sql, scanned.map(r => this.view(r)), dims,
           { now_ms: this.now(), scanned: scanned.length, truncated: live.length > cap }));
@@ -2783,22 +2868,22 @@ export class SessionControlService {
       const params: any[] = [];
       let cursorSql = this.cursorClause(cursor, params, true);
       const liveOnly = url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1';
-      const listFrom = liveOnly ? liveFrom(admin) : 'session_control_sessions';
+      const listFrom = liveOnly ? liveFrom(observeAll) : 'session_control_sessions';
       if (liveOnly) {
         const frag = activeSessionsSql(this.now());
         cursorSql += ` AND ${LIVE_STATES_SQL} AND ${frag.sql}`;
         params.push(...frag.params);
       }
-      const rows = (admin
+      const rows = (observeAll
         ? this.sql.exec(`SELECT * FROM ${listFrom} WHERE 1 = 1 ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...params, limit + 1).toArray()
         : this.sql.exec(`SELECT * FROM ${listFrom} WHERE actor = ? ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...params, limit + 1).toArray()
-      ).filter((r: any) => this.ownerOk(r, caller));
+      ).filter((r: any) => observeAll || this.ownerOk(r, caller));
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
       const countFrag = activeSessionsSql(this.now());
       // Capped count over the partial live index: bounded by ACTIVE_COUNT_CAP matches, never a base-table scan.
-      const countFrom = liveFrom(admin);
-      const activeCount = Number((admin
+      const countFrom = liveFrom(observeAll);
+      const activeCount = Number((observeAll
         ? this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, ...countFrag.params, ACTIVE_COUNT_CAP)
         : this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE actor = ? AND ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, caller.actor, ...countFrag.params, ACTIVE_COUNT_CAP)
       ).toArray()[0]?.n ?? 0);
@@ -3467,6 +3552,7 @@ export class SessionControlService {
       const scopedSelfRead = request.method === 'GET' && scopedWorker?.session_id === session?.id &&
         (!sub || ['commands','wakes','pings'].includes(sub));
       if (!session || !(this.ownerOk(session,caller) || scopedSelfRead ||
+          (driverScoped && !sub && request.method === 'GET') ||
           (['wake','ping','ping-clear'].includes(sub as string) && request.method === 'POST' && wakeOwnerOk(session)))) return response({ error: 'not_found' },404);
 
       // Polling a capacity-queued intent adopts any Fleet-side promotion, so
@@ -4481,7 +4567,8 @@ export function reconcileUnboundFleetSessions(sql: SqlStorage, nowMs: number): v
   if (sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('fleet_launches','session_control_sessions')").toArray().length !== 2) return;
   const rows = sql.exec(`SELECT s.id, f.state FROM session_control_sessions s
     JOIN fleet_launches f ON f.id = s.fleet_launch_id
-    WHERE s.binding_json IS NULL AND s.state IN ('queued','held','offered','starting','running','uncertain')
+    WHERE s.binding_json IS NULL AND s.fleet_launch_id IS NOT NULL
+    AND s.state IN ('queued','held','offered','starting','running','uncertain')
     AND f.state IN ('failed','exited','expired','cancelled') LIMIT 100`).toArray() as any[];
   for (const row of rows) {
     const nextState = row.state === 'exited' ? 'stopped' : row.state === 'expired' ? 'failed' : row.state;
@@ -4678,12 +4765,14 @@ export function adoptObservedNativeSessions(
       }
 
       // Update existing adopted session if state or phase changed
+      const staleReconciled = existing.state === 'stopped' && !verifiedTerminal && (s.phase === 'starting' || s.phase === 'running') &&
+        sql.exec("SELECT 1 FROM session_stale_reconciliations WHERE session_id = ? AND reason = 'stale_no_heartbeat' LIMIT 1", nativeId).toArray().length > 0;
       let shouldUpdate = false;
       let nextState = existing.state;
       if (verifiedTerminal && existing.state !== 'stopped') {
         nextState = 'stopped';
         shouldUpdate = true;
-      } else if (!verifiedTerminal && existing.state !== 'stopped' && existing.state !== state) {
+      } else if (!verifiedTerminal && (existing.state !== 'stopped' || staleReconciled) && existing.state !== state) {
         nextState = state;
         shouldUpdate = true;
       }
@@ -4694,6 +4783,9 @@ export function adoptObservedNativeSessions(
           isoNow,
           nativeId,
         );
+        if (staleReconciled) {
+          sql.exec('DELETE FROM session_stale_reconciliations WHERE session_id = ?', nativeId);
+        }
         updated++;
       }
       if (parentId && !existing.parent_id) {

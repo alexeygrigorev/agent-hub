@@ -9,11 +9,13 @@ type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
 import { WORKER_CREATED_SCHEMA, WORKER_CREATE_LIMIT, WORKER_SCOPE, initSessionLinks, initLinkRefs, triageTargets, workerAccessContext, workerCreatedTargets, workerLinkedTargets } from './worker-access';
+import { DRIVER_SCOPE, driverAccessContext, driverIntakeMutationAllowed } from './driver-access';
 import { advanceIntakeExport, initIntakeExport, intakeExportCounts, intakeExportRecent, intakeExportPageIds, intakeExportMatches, type IntakeExportFilter } from './intake-export';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
 import { MergeGate, MergeGateError, mergeGateTick, type MergeGateHooks } from './merge-gate';
+import { projectVisibleIntakeStats, readStatsSources, intakeStatsTable } from './intake-stats';
 
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
 export function currentHistory(task: Obj): Obj[] {
@@ -240,6 +242,12 @@ const AC_MAX = 8192;
 function acNullable(value: any): string | null {
   if (value == null) return null;
   if (typeof value !== 'string' || new TextEncoder().encode(value).length > AC_MAX) throw new IntakeError('invalid_field', 400, 'acceptance_criteria', AC_MAX);
+  return value;
+}
+/** Queue priority (intake 68145244): high | normal | low, default normal. */
+const INTAKE_PRIORITIES = ['high', 'normal', 'low'];
+function priorityValue(value: any): string {
+  if (!INTAKE_PRIORITIES.includes(value)) throw new IntakeError('invalid_field', 400, 'priority');
   return value;
 }
 /** Server-trusted start gate: non-empty (non-whitespace) acceptance criteria. */
@@ -650,6 +658,13 @@ export class IntakeService {
           ...[...triage, ...created, ...linked].map(target => ({ scope: 'task', target, access: 'write', expires_at: worker.expires_at }))],
         valid_until: Math.min(Date.parse(c.expires_at), worker.expires_at) };
     }
+    if (JSON.parse(c.scopes).includes(DRIVER_SCOPE)) {
+      const driver = driverAccessContext(this.sql, c.id);
+      if (!driver || driver.actor !== binding.actor) fail('forbidden', 403);
+      return { admin: false, driver: true, actor: binding.actor, identity: 'family:' + binding.family_id, caller,
+        grants: [{ scope: 'all', target: null, access: 'write', expires_at: driver.expires_at }],
+        valid_until: Math.min(Date.parse(c.expires_at), driver.expires_at) };
+    }
     const grants = this.rows('grants').filter(g => !g.revoked_at && g.expires_at > Date.now() && canonical(g.binding) === canonical(binding));
     if (!grants.length) fail('forbidden', 403);
     return { admin: false, actor: binding.actor, identity: 'family:' + binding.family_id, grants, caller,
@@ -867,6 +882,16 @@ export class IntakeService {
   }
   private read(url: URL, p: Obj): Obj {
     const path = url.pathname.slice('/api/intake'.length); const revision = this.revision();
+    if (path === '/stats') {
+      try { return { snapshot_version: revision, ...intakeStatsTable(this.sql, this.statusAuthorizedTasks(p), url, Date.now(), p) }; }
+      catch (e) { if (e instanceof Error && /^invalid_stats_/.test(e.message)) fail(e.message); throw e; }
+    }
+    const statsMatch = /^\/tasks\/([A-Za-z0-9._:-]+)\/stats$/.exec(path);
+    if (statsMatch) {
+      const task = this.get('tasks', statsMatch[1]);
+      if (!task || !this.allowed(p, task)) fail('not_found', 404);
+      return { snapshot_version: revision, stats: projectVisibleIntakeStats(task, readStatsSources(this.sql), Date.now(), p) };
+    }
     if (path === '/storage') {
       this.operator(p);
       return { snapshot_version: revision, ...this.storageUsage(), warning: this.storageWarning() };
@@ -1067,7 +1092,9 @@ export class IntakeService {
         next_after: sizes.length > page.length ? page[page.length - 1].seq : null, total: task.history_archive?.count ?? 0,
         inline_sequences: inlineSequences, data_notice: DATA_NOTICE };
     }
-    return { snapshot_version: revision, task: this.view(task, p) };
+    return { snapshot_version: revision, task: { ...this.view(task, p),
+      ...(!match[2] && url.searchParams.get('include_stats') === 'true'
+        ? { stats: projectVisibleIntakeStats(task, readStatsSources(this.sql), Date.now(), p) } : {}) } };
   }
   private event(raw: Obj, task: Obj, p: Obj, now: number): Obj {
     // Session is the public spelling of an external session link. Keep the
@@ -1426,11 +1453,12 @@ export class IntakeService {
   private write(path: string, b: Obj, p: Obj): Obj {
     const now = Date.now();
     if (path === '/tasks') {
-      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria', 'verification']);
+      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria', 'verification', 'priority']);
       const project = identifier(b.project);
       const task: Obj = { id: crypto.randomUUID(), project, title: str(b.title, 256, 'title'), status: 'open', version: 1,
         created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null,
         acceptance_criteria: acNullable(b.acceptance_criteria), history: [],
+        priority: b.priority === undefined ? 'normal' : priorityValue(b.priority), promoted_at: null,
         ...(b.verification !== undefined ? { verification: verificationMode(b.verification) } : {}) };
       if (p.worker) {
         // Intake 34d0271b: a worker may file follow-up intakes in any project.
@@ -1497,7 +1525,7 @@ export class IntakeService {
       this.pushHistory(task, [{ kind: 'merge_evidence', state: merge.state, head: merge.head, problems: merge.problems, deploy: merge.deploy?.state ?? null }], p.actor, now, b.key);
       return { task_id: task.id, merge_state: merge, gate: this.mergeGate.check(task.id) };
     }
-    const match = /^\/tasks\/([A-Za-z0-9._:-]+)(\/(?:events|continue))?$/.exec(path);
+    const match = /^\/tasks\/([A-Za-z0-9._:-]+)(\/(?:events|continue|promote))?$/.exec(path);
     if (!match) fail('not_found', 404);
     const task = this.get('tasks', match[1]); if (!task || !this.allowed(p, task, true)) fail('not_found', 404);
     this.expected(b, task.version);
@@ -1509,6 +1537,14 @@ export class IntakeService {
       if (this.continuation(task) !== 'ready') fail('continuation_not_ready', 409);
       this.transition(task, 'in_progress', p.actor, now);
       task.history.push({ id: crypto.randomUUID(), kind: 'continuation', actor: p.actor, captured_at: now, evidence: 'recorded_active_not_started', authority: 'untrusted_task_data' });
+    } else if (match[2] === '/promote') {
+      // Promote (intake 68145244): stamp promoted_at; the autonomous queue
+      // picks promoted intakes first, newest promotion first, ahead of every
+      // priority. Re-promoting re-stamps the time, moving the intake back to
+      // the front. A promotion also overrides a retry backoff at dispatch.
+      keys(b, ['key', 'expected_version']);
+      task.promoted_at = now;
+      task.history.push({ id: crypto.randomUUID(), kind: 'update', changes: { promoted_at: now }, actor: p.actor, captured_at: now, authority: 'untrusted_task_data' });
     } else if (match[2]) {
       keys(b, ['key', 'expected_version', 'event', 'note', 'text']);
       // Keep the original event envelope and the documented MCP note shorthand
@@ -1525,7 +1561,7 @@ export class IntakeService {
         task.scope = scopeHint(task, (task.scope.basis_version ?? 1) + 1);
       }
     } else {
-      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by', 'force', 'outcome']);
+      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by', 'force', 'outcome', 'priority']);
       // AC5 triage reviewers only fill missing AC; enforced at effect time so an
       // exact retry of a successful fill replays its receipt instead.
       if (p.worker && 'acceptance_criteria' in b && hasAcceptanceCriteria(task)) fail('forbidden', 403);
@@ -1540,16 +1576,17 @@ export class IntakeService {
       }
       if ('force' in b && typeof b.force !== 'boolean') throw new IntakeError('invalid_field', 400, 'force');
       if (b.force === true && (b.status !== 'done' || typeof b.reason !== 'string' || !b.reason.trim())) fail('force_reason_required');
-      if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification'].some(k => k in b)) fail('empty_update');
+      if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'priority'].some(k => k in b)) fail('empty_update');
       const changes: Obj = {};
       const previousStatus = task.status;
       if (b.status === 'done' && ['title', 'project', 'acceptance_criteria'].some(k => k in b && b[k] !== task[k])) fail('done_evidence_required', 409);
       if ('status' in b) this.transition(task, b.status, p.actor, now, b.reason === undefined ? undefined : str(b.reason, 8192), b.superseded_by, b.force === true, unverified);
-      for (const field of ['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']) if (field in b) {
+      for (const field of ['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority']) if (field in b) {
         if (field === 'status' && !STATUSES.includes(b[field])) fail('invalid_status');
         const previous = field === 'status' ? previousStatus : task[field];
         task[field] = field === 'project' ? identifier(b[field]) : field === 'status' ? b[field]
           : field === 'acceptance_criteria' ? acNullable(b[field])
+          : field === 'priority' ? priorityValue(b[field])
           : nullable(b[field], field === 'title' ? 256 : 8192);
         if (previous !== task[field]) changes[field] = task[field];
       }
@@ -1615,6 +1652,7 @@ export class IntakeService {
     const fingerprint = canonical({ path: '/tasks/' + taskId + '/assign', payload: b });
     const pre: Obj = this.tx(() => {
       const p = this.principal(auth);
+      if (p.driver && !driverIntakeMutationAllowed('/tasks/' + taskId + '/assign', b)) fail('forbidden', 403);
       const task = this.get('tasks', taskId);
       if (!task || !this.allowed(p, task, true)) fail('not_found', 404);
       // Lost-response replay returns the original response even if the task
@@ -1965,6 +2003,7 @@ export class IntakeService {
         if (!payload) return json(this.read(url, p));
         identifier(payload.key);
         const path = url.pathname.slice('/api/intake'.length);
+        if (p.driver && !driverIntakeMutationAllowed(path, payload)) fail('forbidden', 403);
         // AC5 triage reviewers may also set AC/project on their requested intakes (never status).
         const triageUpdate = p.worker && p.triage?.has(/^\/tasks\/([^/]+)$/.exec(path)?.[1]) &&
           Object.keys(payload).every(k => ['key', 'expected_version', 'acceptance_criteria', 'project'].includes(k)) &&

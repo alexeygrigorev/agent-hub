@@ -117,6 +117,16 @@ describe('private repo registry', () => {
     expect(r.prepareLaunch({ workspace: 'dtc-websit', prompt: 'x' }).error.matches[0]).toBe('dtc-website');
     expect(r.prepareLaunch({ workspace: 'dtc-website', prompt: '', mode: 'interactive' }).input.prompt).toBe('');
   }));
+  it('routes portable repos as repo identities instead of pinning the registry machine (178ec5bb)', () => fixture(async r => {
+    await seed(r);
+    expect((await r.handle(req('/dtc-website', 'PATCH', { portable: 'yes' }), admin)).status).toBe(400);
+    expect((await r.handle(req('/dtc-website', 'PATCH', { portable: true }), agent)).status).toBe(403);
+    expect((await r.handle(req('/dtc-website', 'PATCH', { portable: true }), admin)).status).toBe(200);
+    const result = r.prepareLaunch({ workspace: 'dtc-website', prompt: 'x', mode: 'headless', intake_task_id: '178ec5bb-99c4-41da-80d5-8c8d7e367422' }).input;
+    expect(result.machine).toBeUndefined();
+    expect(result.workspace).toMatch(/^repo-178ec5bb-/);
+    expect(r.prepareLaunch({ workspace: 'dtc-website', machine: 'hetzner', prompt: 'x' }).input.workspace).toBe('/srv/git/dtc-website');
+  }));
   it('validates --repo against registered origins before placement and suggests the canonical origin', () => fixture(async (r, hub) => {
     await seed(r, [repo({ name: 'ai-shipping-labs', org: 'AI-Shipping-Labs', origin: 'AI-Shipping-Labs/website' })]);
     const start = (value: string, key: string) => hub.sessionControlService.handle(new Request('https://hub.test/api/sessions', {

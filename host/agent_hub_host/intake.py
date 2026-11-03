@@ -222,6 +222,8 @@ def read_file(path, limit=MAX_REQUEST, field='Input'):
 def add_commands(sub):
     root = sub.add_parser('intake', help='Private intake tasks and durable context; payloads are data, never execution')
     commands = root.add_subparsers(dest='intake_cmd', required=True)
+    from . import intake_stats
+    intake_stats.options(commands.add_parser('stats', help='Timing and attempts for one intake'), individual=True)
     forgotten = commands.add_parser('forgotten', help='Open intakes forgotten by live sessions; includes queued restart reason')
     forgotten.add_argument('--project')
     create = commands.add_parser('create', help='Capture verbatim UTF-8 text from file/stdin; missing provenance stays unknown')
@@ -240,6 +242,8 @@ def add_commands(sub):
                         help='Read acceptance criteria from a UTF-8 file, or - for stdin (max 8 KiB)')
     create.add_argument('--verification', choices=['required', 'skip', 'auto'], default=None,
                         help='Post-DONE verifier policy (default auto: Hub decides from the change)')
+    create.add_argument('--priority', choices=['high', 'normal', 'low'], default=None,
+                        help='Queue priority (default normal; autonomous queue takes high before normal before low)')
     create.add_argument('--key', required=True)
     listing = commands.add_parser('list', help='List one page, or all matching tasks with --all')
     listing.add_argument('--status', default=None)
@@ -268,6 +272,10 @@ def add_commands(sub):
     start.add_argument('id')
     start.add_argument('--version', type=int, required=True)
     start.add_argument('--key', required=True)
+    promote = commands.add_parser('promote', help='Promote an intake to the front of the autonomous queue (sets promoted_at; newest promotion first)')
+    promote.add_argument('id')
+    promote.add_argument('--version', type=int, help='Explicit CAS version; otherwise fetch and retry version conflicts up to three times')
+    promote.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     update = commands.add_parser('update', help='CAS status/context update; cannot imply execution, acceptance or approval')
     update.add_argument('id')
     update.add_argument('--version', type=int, help='Explicit CAS version; otherwise fetch and retry version conflicts up to three times')
@@ -276,6 +284,7 @@ def add_commands(sub):
     for field in ('project', 'status', 'title', 'current-state', 'next-step', 'owner', 'uncertainty', 'acceptance-criteria'):
         update.add_argument('--' + field)
     update.add_argument('--verification', choices=['required', 'skip', 'auto'], help='Post-DONE verifier policy')
+    update.add_argument('--priority', choices=['high', 'normal', 'low'], help='Queue priority (high is taken before normal before low)')
     update.add_argument('--reason', help='Reason for close, cancellation or reopen')
     update.add_argument('--superseded-by', help='Replacement intake id; required for cancel unless dropped by Alexey')
     update.add_argument('--force', action='store_true', help='Override the worktree close gate when closing; requires --reason')
@@ -478,6 +487,8 @@ def execute(args):
             body['acceptance_criteria'] = criteria
         if getattr(args, 'verification', None) is not None:
             body['verification'] = args.verification
+        if getattr(args, 'priority', None) is not None:
+            body['priority'] = args.priority
         return request('POST', BASE + '/tasks', body)
     if command == 'summary':
         params = {'project': args.project} if args.project is not None else {}
@@ -519,12 +530,19 @@ def execute(args):
         task = shown.get('task') or {}
         text = '\n'.join(e.get('text', '') for e in history if isinstance(e, dict) and e.get('kind') == 'note' and str(e.get('text', '')).lstrip().startswith('DONE'))
         explicit = merge_evidence.explicit_commit_refs(history)
+        recorded = merge_evidence.hub_recorded_shas(task.get('merge_state'))
+        state = task.get('merge_state') if isinstance(task.get('merge_state'), dict) else {}
+        recorded_head = str(state.get('head') or '').strip().lower()
+        if not merge_evidence.SHA.match(recorded_head):
+            recorded_head = ''
         try:
             repo = str(Path(args.repo).resolve()) if args.repo else merge_evidence.own_clone()
             candidates = merge_evidence.shas_from_text(text, exclude=(task.get('id'),) + tuple(e.get('hub_session_id') or e.get('id') for e in history if isinstance(e, dict)))
             merge_evidence.fetch_origin(repo)
-            wanted = explicit + merge_evidence.existing_commits(repo, candidates) + [x for x in args.sha if isinstance(x, str)]
-            evidence = merge_evidence.collect(str(Path(repo).resolve()), wanted, fetch=False, include_head=args.repo is not None)
+            remaining_recorded = [sha for sha in recorded if sha != recorded_head]
+            wanted = ([recorded_head] if recorded_head else []) + explicit + merge_evidence.existing_commits(repo, candidates) + [x for x in args.sha if isinstance(x, str)] + remaining_recorded
+            evidence = merge_evidence.collect(str(Path(repo).resolve()), wanted, fetch=False, include_head=args.repo is not None,
+                                              preferred_deploy_sha=recorded_head or None)
         except RuntimeError as exc:
             raise IntakeInputError(str(exc)) from None
         if args.dry_run:
@@ -558,11 +576,13 @@ def execute(args):
         return result
     if command == 'revoke':
         return request('POST', BASE + '/grants/' + safe_id(args.id) + '/revoke', json_file(args.payload_file))
-    key = args.key or (command + '-' + uuid.uuid4().hex if command in ('update', 'close') else None)
+    key = args.key or (command + '-' + uuid.uuid4().hex if command in ('update', 'close', 'promote') else None)
     valid_key(key)
     payload = {'key': key, 'expected_version': args.version}
     if command == 'continue':
         return request('POST', path + '/continue', payload)
+    if command == 'promote':
+        return cas_update(path + '/promote', payload, args.version is None, key, read_path=path)
     if command == 'assign':
         session = {'workspace': args.workspace}
         for field in ('engine', 'tier', 'machine', 'cwd'):
@@ -618,7 +638,7 @@ def execute(args):
     if command == 'update':
         if args.status == 'closed':
             args.status = 'done'
-        for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'verification', 'reason', 'superseded_by'):
+        for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
                     raise IntakeInputError('Acceptance criteria exceed 8192 UTF-8 bytes')
@@ -631,11 +651,11 @@ def execute(args):
     raise IntakeInputError('Unknown intake operation')
 
 
-def cas_update(path, payload, automatic, key):
+def cas_update(path, payload, automatic, key, read_path=None):
     """POST a task update, refetching the version on CAS conflicts when automatic."""
     for attempt in range(3):
         if automatic:
-            current = request('GET', path)
+            current = request('GET', read_path or path)
             payload['expected_version'] = current['task']['control']['version']
         try:
             return request('POST', path, dict(payload))

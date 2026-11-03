@@ -1,7 +1,8 @@
-"""Installed Git pre-push gate for Hub worker repositories (stdlib only).
+"""Git hook installers and the pre-push gate for Hub session repositories.
 
-Executed by filename too: the managed hook has a durable copy outside worktrees.
-No environment variable or cached pass can skip verification of a main update.
+The managed gate and Scope commit-message helper have durable copies outside
+worktrees. No environment variable or cached pass can skip verification of a
+main update.
 """
 from contextlib import contextmanager
 import os
@@ -13,6 +14,8 @@ import sys
 import tempfile
 
 MARKER = '# Agent Hub managed pre-push gate v1\n'
+CHAIN_MARKER = '# Agent Hub inherited hook chain v1\n'
+SCOPE_MARKER = '# Agent Hub managed Scope commit-msg v1\n'
 SHA = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})\Z')
 # Public lock contract from worktree_guard.lock_reason/parse_lock_reason.
 HUB_LOCK = re.compile(r'hub-session [0-9a-fA-F-]{8,64} intake [A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z')
@@ -60,15 +63,11 @@ def required(root, git_bin='git'):
                     and (Path(root) / 'host/agent_hub_host').is_dir()))
 
 
-def install(root, git_bin='git'):
-    """Install a durable per-worktree hook, preserving inherited hooks.
-
-    Only this worktree's core.hooksPath changes. Enabling worktreeConfig is a
-    repository capability; the main checkout keeps its existing hooks setting.
-    """
+def _install_hooks(root, git_bin='git', *, install_pre_push):
+    """Install the Scope hook and optionally the main-push verification gate."""
     gitdir = Path(git(root, 'rev-parse', '--absolute-git-dir', git_bin=git_bin))
-    common = Path(git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir', git_bin=git_bin))
-    if gitdir == common:
+    if (install_pre_push and
+            gitdir == Path(git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir', git_bin=git_bin))):
         raise RuntimeError('install from a linked worker worktree; main checkout is unchanged')
     state = gitdir / 'hub-prepush'
     hooks = state / 'hooks'
@@ -88,23 +87,64 @@ def install(root, git_bin='git'):
     # when assigning this worktree its own hooks directory.
     if previous.is_dir():
         for prior in previous.iterdir():
-            if prior.name == 'pre-push' or prior.name.endswith('.sample') or not prior.is_file():
+            if (prior.name.endswith('.sample') or not prior.is_file()
+                    or (install_pre_push and prior.name == 'pre-push')):
                 continue
             if not os.access(prior, os.X_OK):
                 continue
             target = hooks / prior.name
-            if target.exists() and MARKER not in target.read_text()[:256]:
+            if (not install_pre_push and prior.name == 'pre-push'
+                    and target.exists() and MARKER in target.read_text()[:256]):
+                continue
+            if target.exists() and not _managed_hook(target):
                 raise RuntimeError('unmanaged file in Hub-owned hooks directory')
-            atomic_write(target, '#!/bin/sh\n' + MARKER + 'exec '
+            atomic_write(target, '#!/bin/sh\n' + CHAIN_MARKER + 'exec '
                          + shlex.quote(str(prior)) + ' "$@"\n', 0o755)
-    hook = hooks / 'pre-push'
-    if hook.is_symlink() or (hook.exists() and MARKER not in hook.read_text()[:256]):
-        raise RuntimeError('unmanaged pre-push hook in Hub-owned hooks directory')
-    atomic_write(hook, '#!/bin/sh\n' + MARKER + 'exec ' + shlex.quote(sys.executable)
-                 + ' ' + shlex.quote(str(gate)) + ' hook "$@"\n', 0o755)
+    scope_script = state / 'scope_commit_hook.py'
+    atomic_write(scope_script, Path(__file__).with_name('scope_commit_hook.py').read_text(), 0o644)
+    previous_commit = previous / 'commit-msg'
+    scope_hook = hooks / 'commit-msg'
+    if scope_hook.is_symlink() or (scope_hook.exists() and not _managed_hook(scope_hook)):
+        raise RuntimeError('unmanaged commit-msg hook in Hub-owned hooks directory')
+    scope_lines = ['#!/bin/sh', SCOPE_MARKER.rstrip(), 'set -eu',
+                   shlex.quote(sys.executable) + ' ' + shlex.quote(str(scope_script)) + ' "$1"']
+    if previous_commit.is_file() and os.access(previous_commit, os.X_OK):
+        scope_lines.append(shlex.quote(str(previous_commit)) + ' "$@"')
+    scope_lines.append('exec ' + shlex.quote(sys.executable) + ' '
+                       + shlex.quote(str(scope_script)) + ' "$1"')
+    atomic_write(scope_hook, '\n'.join(scope_lines) + '\n', 0o755)
+    if install_pre_push:
+        gate = state / 'gate.py'
+        atomic_write(gate, Path(__file__).read_text(), 0o644)
+        hook = hooks / 'pre-push'
+        if hook.is_symlink() or (hook.exists() and MARKER not in hook.read_text()[:256]):
+            raise RuntimeError('unmanaged pre-push hook in Hub-owned hooks directory')
+        atomic_write(hook, '#!/bin/sh\n' + MARKER + 'exec ' + shlex.quote(sys.executable)
+                     + ' ' + shlex.quote(str(gate)) + ' hook "$@"\n', 0o755)
     git(root, 'config', '--local', 'extensions.worktreeConfig', 'true', git_bin=git_bin)
     git(root, 'config', '--worktree', 'core.hooksPath', str(hooks), git_bin=git_bin)
-    git(root, 'config', '--local', 'hub.prepushRequired', 'true', git_bin=git_bin)
+    if install_pre_push:
+        git(root, 'config', '--local', 'hub.prepushRequired', 'true', git_bin=git_bin)
+
+
+def _managed_hook(path):
+    try:
+        prefix = path.read_text()[:256]
+    except (OSError, UnicodeError):
+        return False
+    return any(marker in prefix for marker in (MARKER, CHAIN_MARKER, SCOPE_MARKER))
+
+
+def install_scope(root, git_bin='git'):
+    """Install only the automatic Scope commit-msg hook for this worktree."""
+    if not required(root, git_bin):
+        raise RuntimeError('not an Agent Hub checkout')
+    _install_hooks(root, git_bin, install_pre_push=False)
+
+
+def install(root, git_bin='git'):
+    """Install a durable per-worktree main-push gate and Scope trailer hook."""
+    _install_hooks(root, git_bin, install_pre_push=True)
 
 
 @contextmanager
@@ -209,6 +249,8 @@ def main():
         mode = sys.argv[1] if len(sys.argv) > 1 else ''
         if mode == 'install' and len(sys.argv) == 2:
             install(root)
+        elif mode == 'install-scope' and len(sys.argv) == 2:
+            install_scope(root)
         elif mode == 'install-workers' and len(sys.argv) == 2:
             install_workers(root)
         elif mode == 'hook' and len(sys.argv) == 4:
@@ -232,7 +274,7 @@ def main():
             return subprocess.call(['git', '-c', 'push.followTags=false', 'push',
                                     'origin', candidate + ':refs/heads/main'], cwd=root)
         else:
-            raise RuntimeError('usage: prepush.py install|install-workers|push (hook is called by Git)')
+            raise RuntimeError('usage: prepush.py install|install-scope|install-workers|push (hook is called by Git)')
         return 0
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         detail = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__

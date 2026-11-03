@@ -7,7 +7,7 @@ import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
 describe('managed Claude placement (798f0f8c)', () => {
-  it('keeps deep/Opus and daily/Sonnet starts headless on both hosts, including mixed legacy routes', async () => {
+  it('keeps deep and daily Claude starts on Sonnet at medium effort across both hosts', async () => {
     const now = Date.now();
     const iso = (delta = 0) => new Date(now + delta).toISOString();
     const bindings = env as unknown as Env;
@@ -37,11 +37,11 @@ describe('managed Claude placement (798f0f8c)', () => {
           } }] }),
         }), { caller: { machineId: machine, actor: 'machine:' + machine, kind: 'host' }, scopes: ['host'] });
         expect(reported.status).toBe(200);
-        for (const [tier, model] of [['deep', 'opus'], ['daily', 'sonnet']]) {
+        for (const tier of ['deep', 'daily']) {
           const plan = fleet.plan({ engine: 'claude', tier, machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' });
           expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({
             machine, engine: 'claude', account: 'hub-claude', profile: 'hub-hub-claude',
-            selection: { model, engine: 'claude', provider: 'claude' },
+            selection: { model: 'sonnet', effort: 'medium', engine: 'claude', provider: 'claude' },
           });
           expect(plan.selected?.mode).toBeUndefined();
           expect(plan.selected?.with_goal).toBeUndefined();
@@ -77,7 +77,9 @@ describe('managed Claude placement (798f0f8c)', () => {
       expect(reported.status).toBe(200);
       const intent = { engine: 'claude', tier: 'deep', machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' };
       const plan = fleet.plan(intent);
-      expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({ account: 'hub-claude', selection: { model: 'opus' } });
+      expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({
+        account: 'hub-claude', selection: { model: 'sonnet', effort: 'medium' },
+      });
       expect(plan.selected?.mode).toBeUndefined();
       expect(plan.request.mode).toBe('headless');
 

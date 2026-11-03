@@ -15,6 +15,17 @@ replacement for the ownership review in SCOPE.md.
 block for session control, registry, auth and public changes. Adoption starts
 2026-10-24 UTC: missing trailers warn for one week and fail from 2026-10-31 UTC.
 
+The Hub host installs a `commit-msg` hook when it starts or adopts an Agent Hub
+session checkout, including the primary checkout. On Linux and Windows the hook
+adds `Scope: in` when no Scope trailer is present, preserves a valid gray intake
+trailer, and refuses malformed or conflicting Scope lines. Git runs
+`commit-msg` for normal and merge commits. A session started directly through
+aplexer without the Hub host can install the same hook with
+`python3 host/agent_hub_host/prepush.py install-scope` on Linux or
+`python host/agent_hub_host/prepush.py install-scope` on Windows. The CI scope
+guard remains authoritative and rejects any sensitive commit, including merge
+commits, that lacks a valid final trailer; the hook is never a CI exemption.
+
 An exception is an exact `{path, token, intake_id, approved_by, date}` entry in
 scope-exceptions.json. It must already exist on the base revision; candidate
 exceptions are validated but cannot authorize code in the same checked range.

@@ -139,7 +139,7 @@ def installed_version(engine: str, timeout: int = 30) -> str | None:
         try:
             from . import provisioning
             dest = provisioning.root() / (label + '-' + revision)
-            bundle = provisioning.read_json(dest / 'bundle.json')
+            bundle = provisioning.load_bundle(dest)
             if (not isinstance(bundle, dict) or bundle.get('label') != label
                     or bundle.get('revision') != revision or bundle.get('provider') != provider):
                 continue
@@ -367,7 +367,7 @@ def smoke_engine(engine: str, timeout: int = 180) -> dict:
             if isinstance(entry, dict) and entry.get('provider') == provider:
                 cands = list(provisioning.root().glob(entry['label'] + '-*/bundle.json'))
                 if cands:
-                    bundle = provisioning.read_json(cands[0])
+                    bundle = provisioning.load_bundle(cands[0].parent)
                     dest = cands[0].parent
                     break
         if not isinstance(bundle, dict) or dest is None:

@@ -105,6 +105,8 @@ ENGINE_WORKER_MEMORY = {"zcodex": "6144M"}
 WORKER_PIDS = "256"
 WORKER_CPU_QUOTA_US = "100000"
 WORKER_CPU_PERIOD_US = "100000"
+WORKTREE_STALE_OWNER_HOURS = 24
+WORKTREE_STALE_OWNER_MAX_HOURS = 24 * 30
 
 
 def is_windows_host() -> bool:
@@ -128,24 +130,52 @@ def worker_resource_argv(engine: str | None = None) -> list[str]:
     return ["--memory", ENGINE_WORKER_MEMORY.get(engine, WORKER_MEMORY), "--pids", WORKER_PIDS,
             "--cpu-quota-us", WORKER_CPU_QUOTA_US, "--cpu-period-us", WORKER_CPU_PERIOD_US]
 
+
+# The published v0.1.24 Windows binary still defaults to 10 s; keep the Hub
+# provisioning allowance explicit until that release lag is gone.
+WINDOWS_SESSION_STARTUP_TIMEOUT_MS = 120_000
+
+
+def build_native_start_argv(native, workspace, tag, engine, *, profile=None, cwd=None):
+    """Build the interactive session command with the Windows provisioning budget."""
+    argv = [native, "start", "--workspace", str(workspace), "--tag", tag,
+            "--engine", engine] + worker_resource_argv(engine)
+    if is_windows_host():
+        argv += ["--startup-timeout-ms", str(WINDOWS_SESSION_STARTUP_TIMEOUT_MS)]
+    argv += ["--json"]
+    if profile:
+        argv += ["--profile", profile]
+    if cwd is not None and cwd != workspace:
+        argv += ["--cwd", str(cwd)]
+    return argv
+
 # Advertisement-only cache for qualified role profiles (intake eff9a5ce AC1:
 # derivation costs ~7 s per cycle on DEFLf4 and only feeds registration).
 ROLE_JOBS_CACHE_TTL_S = 120.0
 
-# Single-flight offer-claim lock shared by the 60s fleet-host timer and the
-# 20s session-host maintenance loop (intake eff9a5ce AC2). Both load the same
-# host settings, so the journal dir resolves to the same path and exactly
-# one loop owns offers per cycle. fcntl locks release on process death, so
-# a SIGTERMed cycle (TimeoutStartSec=240s) never wedges the other loop.
+# Single-flight lock for the stateful slow-maintenance phase of a fleet
+# cycle, shared by the 60s fleet-host timer and the 20s session-host loop
+# (intake eff9a5ce AC2; per-phase scope since intake 8cc2848c). Both load the
+# same host settings, so the journal dir resolves to the same path and
+# exactly one controller runs launcher reconcile effects, the native reaper
+# and the watchdog at a time. It no longer covers the whole cycle (8cc2848c
+# AC1: the old whole-cycle lock let a long-running sibling starve the timer,
+# ~2000 fleet_cycle_skipped concurrent_cycle/24h): register, heartbeat,
+# capabilities, probes, catalog, subscriptions, workclaim, offers and
+# dispatch are idempotent or per-offer locked and always run, so heartbeat,
+# offers and worktree refresh happen every minute. fcntl locks release on
+# process death, so a SIGTERMed controller (TimeoutStartSec=240s) never
+# wedges the other loop.
 CYCLE_LOCK_NAME = "fleet-cycle.lock"
 # Holder metadata ({pid, acquired_at}) is written into the lock file on every
 # acquisition so a loser can tell a sibling that is cycling normally from a
 # wedged one. flock already releases on process death; a live holder whose
 # current acquisition is older than this (2x the timer TimeoutStartSec=240 s;
-# a healthy session-host cycle takes ~90-130 s) or whose recorded pid is gone
-# (fd inherited by a surviving child) is treated as stuck: the loser logs
-# fleet_cycle_lock_takeover and runs the cycle without the lock instead of
-# skipping forever. Override with settings "cycle_lock_stale_s".
+# the guarded maintenance phase takes seconds to ~2 min) or whose recorded
+# pid is gone (fd inherited by a surviving child) is treated as stuck: the
+# loser logs fleet_maintenance_lock_takeover and runs the phase without the
+# lock instead of skipping forever. Override with settings
+# "cycle_lock_stale_s".
 CYCLE_LOCK_STALE_S = 480.0
 
 # Intake 4398ce2a: the full fleet cycle (provisioning, probes, reconcile,
@@ -1183,7 +1213,12 @@ def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
             cwd = cwd.removesuffix(' (deleted)')
         if exit_confirmed:
             phase = 'exited'
-        elif phase in ('exited', 'dead', 'pruned', 'forgotten'):
+        elif phase in ('exited', 'dead', 'pruned', 'forgotten') or (
+                phase in ('running', 'starting') and session.get('worker_alive') is not True):
+            # A complete census can observe a stale terminal row, or an active
+            # native row whose process liveness is unknown/dead without enough
+            # containment proof to retire it. Keep both out of the running
+            # projection until a later census supplies stronger evidence.
             phase = 'uncertain'
         clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": ws, "engine": engine,
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
@@ -1947,9 +1982,8 @@ class Dispatcher:
         if not self._active_launches:
             return reconciled
 
-        from .native_sessions import NativeTarget, SessionControlError
-
-        native = self.settings.get("aplexer_bin", "aplexer")
+        from .native_sessions import NativeTarget, SessionControlError, session_aplexer_executable
+        native = session_aplexer_executable(self.settings.get("aplexer_bin", "aplexer"))
         state_dir = self.settings.get("aplexer_state_dir")
         launcher = self.settings.get("launcher", {})
         has_launcher = all(launcher.get(k) for k in ["argv", "root", "config_dir"])
@@ -2306,8 +2340,142 @@ class Dispatcher:
                 if not guard.protect_successor_worktree(
                         self.request, "git", str(target_path),
                         offer.get("hub_session_id"), offer.get("intake_task_id")):
-                    raise ValueError("worktree_lock_failed: checkout could not be protected")
+                    error = self._stale_owner_takeover_or_refusal(offer, str(target_path))
+                    if error is not None:
+                        raise ValueError(error)
         return True
+
+    def _stale_owner_hours(self) -> Optional[int]:
+        """Return the configured stale-owner bound; invalid values disable takeover."""
+        raw = self.settings.get('worktree_stale_owner_hours', WORKTREE_STALE_OWNER_HOURS)
+        if type(raw) is not int or not 1 <= raw <= WORKTREE_STALE_OWNER_MAX_HOURS:
+            return None
+        return raw
+
+    @staticmethod
+    def _activity_timestamp_ms(value: Any) -> Optional[int]:
+        if type(value) is int and value > 0:
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    return None
+                stamp = int(parsed.timestamp() * 1000)
+                return stamp if stamp > 0 else None
+            except (ValueError, OverflowError, OSError):
+                return None
+        return None
+
+    def _stale_owner_activity_ms(self, fact: dict) -> Optional[int]:
+        """Get last activity only when a fresh local catalog proves the native stale.
+
+        A non-terminal native must be explicitly idle; a working or unknown
+        native stays protected. A missing native is usable only when the full
+        bounded catalog was returned and the Hub has a last-activity timestamp.
+        """
+        from . import native_list_cache
+        from .native_sessions import TERMINAL_PHASES, list_sessions
+        native_id = fact.get('native_id')
+        if not isinstance(native_id, str) or not native_id:
+            return None
+        try:
+            native_list_cache.invalidate('list')
+            rows = list_sessions(self.settings.get('aplexer_bin', 'aplexer'),
+                                 include_exited=True, fresh=True)
+        except Exception:
+            return None
+        matches = [row for row in rows if row.session_id == native_id]
+        if len(matches) > 1 or (not matches and len(rows) >= 500 and fact.get('native_terminal') is not True):
+            return None
+
+        local_activity = None
+        if matches:
+            row = matches[0]
+            if row.phase not in TERMINAL_PHASES and row.agent_state != 'idle':
+                return None
+            local_activity = row.last_activity_ms
+        hub_activity = self._activity_timestamp_ms(fact.get('native_last_activity_at'))
+        activity = [value for value in (local_activity, hub_activity)
+                    if type(value) is int and value > 0]
+        return max(activity) if activity else None
+
+    @staticmethod
+    def _worktree_owner_state(fact: Any, owner_id: str) -> str:
+        if not isinstance(fact, dict) or fact.get('session_id') != owner_id:
+            return 'unknown'
+        session_state = fact.get('session_state')
+        from .worktree_guard import SESSION_OWNER_STATES
+        if isinstance(session_state, str) and session_state in SESSION_OWNER_STATES:
+            return session_state
+        if fact.get('terminal') is True:
+            return 'terminal'
+        if fact.get('native_terminal') is True:
+            return 'native-terminal'
+        if fact.get('terminal') is False:
+            return 'non-terminal'
+        return 'unknown'
+
+    def _stale_owner_takeover_or_refusal(self, offer, target_path) -> Optional[str]:
+        """Transfer a stale same-intake lock or return a named bounded refusal.
+
+        Root cause: the native headless session can disappear without an ack,
+        while its Hub lifecycle row stays non-terminal and its Git worktree
+        lock remains. The old generic refusal discarded the owner identity.
+        """
+        from . import worktree_guard as guard
+        base = 'worktree_lock_failed: checkout could not be protected'
+        owner = None
+        state = 'unknown'
+        try:
+            root = guard.bound_worktree_root(target_path)
+            entry = guard.find_entry(guard.list_entries('git', root), root) if root else None
+            owner = guard.parse_lock_reason(entry.get('reason')) if entry else None
+            if not owner:
+                return base  # Manual or foreign lock: no Hub owner to name.
+
+            try:
+                facts = guard.guard_facts(self.request, session_id=owner[0])
+            except Exception:
+                facts = []
+            matches = [fact for fact in facts if isinstance(fact, dict)
+                       and fact.get('session_id') == owner[0]]
+            fact = matches[0] if len(matches) == 1 else None
+            state = self._worktree_owner_state(fact, owner[0])
+            intake = offer.get('intake_task_id')
+            hours = self._stale_owner_hours()
+            if (hours is not None and owner[0] != offer.get('hub_session_id')
+                    and owner[1] is not None and owner[1] == intake
+                    and isinstance(fact, dict) and fact.get('terminal') is False
+                    and fact.get('intake_task_id') == intake):
+                activity_ms = self._stale_owner_activity_ms(fact)
+                if activity_ms is not None and guard.stale_owner_takeover(
+                        self.request, 'git', target_path, offer.get('hub_session_id'), intake,
+                        last_activity_ms=activity_ms, stale_after_ms=hours * 3600 * 1000,
+                        now_ms=int(time.time() * 1000)):
+                    return None
+
+            # A concurrent operator may have changed the lock while Hub facts
+            # were read. Name only the owner still recorded in Git now.
+            current = guard.find_entry(guard.list_entries('git', root), root) if root else None
+            current_owner = guard.parse_lock_reason(current.get('reason')) if current else None
+            if current_owner != owner:
+                if not current_owner:
+                    return base
+                owner = current_owner
+                try:
+                    current_facts = guard.guard_facts(self.request, session_id=owner[0])
+                    current_matches = [item for item in current_facts if isinstance(item, dict)
+                                       and item.get('session_id') == owner[0]]
+                    fact = current_matches[0] if len(current_matches) == 1 else None
+                except Exception:
+                    fact = None
+                state = self._worktree_owner_state(fact, owner[0])
+            return guard.lock_owner_error(owner[0], state)
+        except Exception:
+            if owner:
+                return guard.lock_owner_error(owner[0], state)
+            return base
 
     def _maybe_cleanup_worktree(self, workspace: Path, native_id: Optional[str] = None):
         """Attempt safe auto-cleanup of finished headless worktree if configured in cleanup_roots.
@@ -2423,9 +2591,8 @@ class Dispatcher:
         if not isinstance(imported_bindings, list) or not imported_bindings:
             return reconciled
 
-        from .native_sessions import NativeTarget, SessionControlError
-
-        native = self.settings.get("aplexer_bin", "aplexer")
+        from .native_sessions import NativeTarget, SessionControlError, session_aplexer_executable
+        native = session_aplexer_executable(self.settings.get("aplexer_bin", "aplexer"))
         state_dir = self.settings.get("aplexer_state_dir")
 
         for item in imported_bindings:
@@ -2753,6 +2920,23 @@ class Dispatcher:
             if isinstance(row, dict) and str(row.get("id", "")).lower() == native_id.lower():
                 return row.get("cwd") == str(target_cwd)
         return False
+
+    def _seed_interactive_readiness(self, native, native_id, workspace):
+        """Report 'waiting' for a fresh empty interactive prompt (intake 2fdcaef5).
+
+        Engines like zcodex fire state hooks only on prompt events, so a
+        never-prompted session has no reported state at all and aplexer's
+        message-deliver readiness gate refuses every queued envelope (the
+        session preamble and cross-device hub messages alike) until a human
+        types first. An empty prompt is truthfully 'waiting'; the first
+        genuine harness event overwrites this report. Best effort: a failed
+        seed only leaves the message queued, never affects the launch.
+        """
+        try:
+            self.runner([native, "state-report", "waiting"], cwd=str(workspace),
+                        env=dict(os.environ, APLEXER_SESSION_ID=native_id))
+        except Exception:
+            pass
 
     def _drop_queued_launcher_task(self, launcher, task_id):
         """Best-effort clear of a still-queued launcher row for offer retry.
@@ -3117,7 +3301,8 @@ class Dispatcher:
         offer_workspace = workspace
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"), self.settings)
         stages.append(('workspace', time.monotonic()))
-        native = self.settings.get("aplexer_bin", "aplexer")
+        from .native_sessions import session_aplexer_executable
+        native = session_aplexer_executable(self.settings.get("aplexer_bin", "aplexer"))
         if mode == "interactive":
             if selection:
                 launcher = self.settings.get('launcher', {})
@@ -3141,11 +3326,14 @@ class Dispatcher:
             from .intake_worktree import launch_cwd
             target_cwd, wt_note, intake_wt = launch_cwd(self.request, offer, workspace, target_cwd)
             self._lock_session_worktree(offer, target_cwd)
-            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"]] + worker_resource_argv(offer["engine"]) + ["--json"]
-            if offer.get("profile"):
-                argv += ["--profile", offer["profile"]]
-            if target_cwd != workspace:
-                argv += ["--cwd", str(target_cwd)]
+            argv = build_native_start_argv(
+                native,
+                workspace,
+                "hub-" + offer_id,
+                offer["engine"],
+                profile=offer.get("profile"),
+                cwd=target_cwd,
+            )
             git_ident = normalize_git_identity(self.settings.get("git") if "git" in self.settings else self.settings.get("git_identity"))
             if not git_ident:
                 from . import provisioning
@@ -3431,6 +3619,8 @@ class Dispatcher:
                     raise ValueError("Native receipt mismatch")
                 if target_cwd != workspace and not self._verify_native_cwd(native, native_id, target_cwd, receipt):
                     raise ValueError("Native cwd mismatch")
+                if not offer.get("with_goal"):
+                    self._seed_interactive_readiness(native, native_id, workspace)
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
@@ -3919,8 +4109,11 @@ class Dispatcher:
         with self._catalog_report_lock:
             # Enrichment is never authoritative for identity or lifecycle.
             # Replace, rather than grow, the cache on every complete sample.
+            source_by_id = {row.get('id'): row for row in catalog
+                            if isinstance(row, dict) and isinstance(row.get('id'), str)}
             self._catalog_enrichment = {
-                self._catalog_identity(row): {key: row[key] for key in ('progress', 'tokens') if key in row}
+                self._catalog_identity(row, source_by_id.get(row.get('native_id'))):
+                    {key: row[key] for key in ('progress', 'tokens') if key in row}
                 for row in enriched[:500]
             }
             # A native may have appeared during slow transcript/token sampling.
@@ -3929,10 +4122,13 @@ class Dispatcher:
             return self._report_native_bindings()
 
     @staticmethod
-    def _catalog_identity(row):
-        return tuple(row.get(key) for key in (
+    def _catalog_identity(row, source=None):
+        source = source if isinstance(source, dict) else {}
+        native_state = source.get('state') or source.get('phase', 'unknown')
+        return (*tuple(row.get(key) for key in (
             'native_id', 'tag', 'workspace', 'cwd', 'engine', 'profile',
-            'account', 'created_at_ms', 'phase', 'confirmed_exit'))
+            'account', 'created_at_ms', 'phase', 'confirmed_exit')),
+            native_state, source.get('worker_alive'))
 
     def report_native_bindings(self):
         """Report a bounded fresh census and its completeness verdict.
@@ -3965,8 +4161,11 @@ class Dispatcher:
         census_complete = valid_envelope and census_is_complete(
             raw_rows, catalog, limit=CATALOG_LIMIT, confirmed_exit=confirmed_empty)
         metadata = session_metadata(catalog, self.settings, collect_tokens=False)
+        source_by_id = {row.get('id'): row for row in catalog
+                        if isinstance(row, dict) and isinstance(row.get('id'), str)}
         for row in metadata:
-            row.update(self._catalog_enrichment.get(self._catalog_identity(row), {}))
+            row.update(self._catalog_enrichment.get(
+                self._catalog_identity(row, source_by_id.get(row.get('native_id'))), {}))
         metadata_done = time.monotonic()
         from .catalog_transport import report_catalog
         report_catalog(self.request, metadata, census_complete=census_complete)
@@ -4028,11 +4227,12 @@ class Dispatcher:
         return Path(base) / CYCLE_LOCK_NAME
 
     def _acquire_cycle_lock(self):
-        """Non-blocking single claim-owner lock. True holder: file object.
+        """Non-blocking single-owner lock for the slow-maintenance phase.
 
-        Returns the open lock file when this cycle owns offers, False when
-        a sibling loop (timer vs session-host) already owns them, or None
-        when no journal is configured (unit-test callers keep legacy
+        Returns the open lock file when this controller owns the phase,
+        False when a sibling controller (timer vs session-host) already
+        owns it — the caller skips only this phase, never the cycle — or
+        None when no journal is configured (unit-test callers keep legacy
         behavior) or the platform lacks fcntl. The caller must close the
         file to release; fcntl also releases on process death.
         """
@@ -4067,10 +4267,11 @@ class Dispatcher:
         return value if value > 0 else CYCLE_LOCK_STALE_S
 
     def _cycle_lock_holder(self, now: Optional[float] = None) -> dict:
-        """Describe the current cycle-lock holder for a losing caller.
+        """Describe the current maintenance-lock holder for a losing caller.
 
         Returns {holder_pid, held_s, holder_alive, stale}. Missing/garbled
-        metadata (pre-upgrade holder) is never stale: skip as before.
+        metadata (pre-upgrade holder) is never stale: skip the phase as
+        before.
         """
         info: dict[str, Any] = {"holder_pid": None, "held_s": None, "holder_alive": None, "stale": False}
         path = self._cycle_lock_path()
@@ -4407,6 +4608,14 @@ class Dispatcher:
         self._native_labels = {s['account_label'] for s in native}
 
     def once(self):
+        # AC1 (intake 8cc2848c): the cycle never skips wholesale. The former
+        # whole-cycle lock made the losing controller (60s fleet-host timer vs
+        # the 20s session-host loop) drop its heartbeat, register, catalog and
+        # offer work whenever the sibling ran long, which starved placement
+        # freshness (~2000 fleet_cycle_skipped concurrent_cycle/24h). Only the
+        # stateful slow-maintenance region stays single-flight, via the
+        # per-phase lock inside _once_locked; offers additionally race safely
+        # through per-offer locks and atomic Hub claims.
         # AC1: per-phase timings, published as a fleet_cycle_phases event.
         phases: dict[str, float] = {}
         _mark_at = [time.monotonic()]
@@ -4439,39 +4648,9 @@ class Dispatcher:
             except (OSError, ValueError, TypeError, ImportError):
                 pass
         _mark('provisioning')
-        # AC2: exactly one of the 60s timer loop and the 20s session-host
-        # loop owns offers per cycle. The loser skips with a receipt instead
-        # of racing claims into already_claimed -> +1 cycle delays.
-        cycle_lock = self._acquire_cycle_lock()
-        if cycle_lock is False:
-            holder = self._cycle_lock_holder()
-            if not holder['stale']:
-                phases['lock'] = 0.0
-                self.last_cycle_phases = phases
-                print(json.dumps({'event': 'fleet_cycle_skipped',
-                                  'reason': 'concurrent_cycle',
-                                  'holder_pid': holder['holder_pid'],
-                                  'held_s': holder['held_s']}), flush=True)
-                return [{'id': 'cycle', 'state': 'skipped', 'reason': 'concurrent_cycle'}]
-            # Stuck holder (pid gone, or one acquisition held past
-            # CYCLE_LOCK_STALE_S): never let it starve every other loop.
-            # flock cannot be stolen from a live process, so run this cycle
-            # unlocked; Hub claims stay atomic (losers settle as
-            # already_claimed) and the offers lock still serialises dispatch.
-            print(json.dumps({'event': 'fleet_cycle_lock_takeover',
-                              'holder_pid': holder['holder_pid'],
-                              'held_s': holder['held_s'],
-                              'holder_alive': holder['holder_alive'],
-                              'stale_after_s': self._cycle_lock_stale_s()}), flush=True)
-            cycle_lock = None
         try:
             return self._once_locked(phases, _mark, _skip_telemetry)
         finally:
-            try:
-                if cycle_lock is not None:
-                    cycle_lock.close()
-            except Exception:
-                pass
             self.last_cycle_phases = dict(phases)
 
     def _admission_projection(self, caps):
@@ -4874,35 +5053,78 @@ class Dispatcher:
             except Exception as exc:
                 _skip_telemetry('capabilities', exc)
         _mark('capabilities')
-        reconciled = self.reconcile_launches()
-        self.reconcile_operator_adoptions()
-        imported_reconciled = self.reconcile_imported_sessions()
-        # e37b0e83 AC1: stop native trees whose Hub session is terminal or
-        # missing. Bounded per cycle; the server authorizes each incarnation.
-        if self.journal_dir and raw is not None:
-            from .session_reaper import reconcile as reconcile_native_trees
-            native_rows = raw if isinstance(raw, list) else raw.get('sessions') if isinstance(raw, dict) else None
-            reap = reconcile_native_trees(self.request, native_rows, self.journal_dir,
-                                          executable=self.settings.get('aplexer_bin', 'aplexer'))
-            if any(reap.values()):
-                print(json.dumps({'event': 'fleet_native_reconcile', **reap}), flush=True)
-        _mark('reconcile')
-        # Resource management (intake 4fcd3139): per-session exact sampler +
-        # safe watchdog. Best-effort only with durable local state in the
-        # journal dir; never fails the poll cycle and installs no scheduler.
-        # Skipped without a journal dir: peaks/reap journals require durable
-        # state, and existing callers without one keep their exact call shape.
-        if self.journal_dir:
+        # Intake 8cc2848c AC1: per-phase single-flight lock for the stateful
+        # slow-maintenance region (launcher reconcile/late-report effects,
+        # operator adoptions, native reaper, watchdog journal state). A
+        # sibling controller (60s fleet-host timer vs the 20s session-host
+        # loop) holding the lock only skips THIS region; heartbeat, offers
+        # and everything idempotent above and below still run every minute.
+        # A stale holder (pid gone, or held past cycle_lock_stale_s) never
+        # starves maintenance: flock cannot be stolen from a live process,
+        # so the takeover runs the region unlocked — launcher effects stay
+        # guarded by durable journal records and atomic Hub result POSTs.
+        reconciled: list = []
+        imported_reconciled: list = []
+        maintenance_lock = self._acquire_cycle_lock()
+        run_maintenance = True
+        if maintenance_lock is False:
+            holder = self._cycle_lock_holder()
+            if holder['stale']:
+                print(json.dumps({'event': 'fleet_maintenance_lock_takeover',
+                                  'holder_pid': holder['holder_pid'],
+                                  'held_s': holder['held_s'],
+                                  'holder_alive': holder['holder_alive'],
+                                  'stale_after_s': self._cycle_lock_stale_s()}), flush=True)
+                maintenance_lock = None
+            else:
+                # Fresh live holder: a receipt for the skipped phase only,
+                # never the whole cycle. Both phase marks stay in the
+                # fleet_cycle_phases event so freshness monitors keep their keys.
+                _mark('reconcile')
+                _mark('watchdog')
+                print(json.dumps({'event': 'fleet_maintenance_skipped',
+                                  'reason': 'concurrent_maintenance',
+                                  'holder_pid': holder['holder_pid'],
+                                  'held_s': holder['held_s']}), flush=True)
+                maintenance_lock = None
+                run_maintenance = False
+        if run_maintenance:
             try:
-                from . import resource_management as _rm
-                _ = _rm.run_watchdog_cycle(
-                    self.request,
-                    journal_dir=self.journal_dir,
-                    aplexer_bin=self.settings.get("aplexer_bin", "aplexer"),
-                )
-            except Exception:
-                pass
-        _mark('watchdog')
+                reconciled = self.reconcile_launches()
+                self.reconcile_operator_adoptions()
+                imported_reconciled = self.reconcile_imported_sessions()
+                # e37b0e83 AC1: stop native trees whose Hub session is terminal or
+                # missing. Bounded per cycle; the server authorizes each incarnation.
+                if self.journal_dir and raw is not None:
+                    from .session_reaper import reconcile as reconcile_native_trees
+                    native_rows = raw if isinstance(raw, list) else raw.get('sessions') if isinstance(raw, dict) else None
+                    reap = reconcile_native_trees(self.request, native_rows, self.journal_dir,
+                                                  executable=self.settings.get('aplexer_bin', 'aplexer'))
+                    if any(reap.values()):
+                        print(json.dumps({'event': 'fleet_native_reconcile', **reap}), flush=True)
+                _mark('reconcile')
+                # Resource management (intake 4fcd3139): per-session exact sampler +
+                # safe watchdog. Best-effort only with durable local state in the
+                # journal dir; never fails the poll cycle and installs no scheduler.
+                # Skipped without a journal dir: peaks/reap journals require durable
+                # state, and existing callers without one keep their exact call shape.
+                if self.journal_dir:
+                    try:
+                        from . import resource_management as _rm
+                        _ = _rm.run_watchdog_cycle(
+                            self.request,
+                            journal_dir=self.journal_dir,
+                            aplexer_bin=self.settings.get("aplexer_bin", "aplexer"),
+                        )
+                    except Exception:
+                        pass
+                _mark('watchdog')
+            finally:
+                try:
+                    if maintenance_lock is not None:
+                        maintenance_lock.close()
+                except Exception:
+                    pass
         # Quota monitoring does not prove launch capability. Group by engine:
         # a monitor-only account must not disable another runnable account on
         # the same engine. Never fabricate an admission adapter or bypass it.

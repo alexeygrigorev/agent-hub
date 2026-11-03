@@ -19,7 +19,7 @@ import time
 import tomllib
 import zipfile
 
-from . import bus, config, hook_command, hook_trust, private_fs, state_hook_commands
+from . import bus, config, engine_versions, hook_command, hook_trust, private_fs, state_hook_commands
 
 LABEL = re.compile(r'[a-z][a-z0-9_-]{0,47}\Z')
 REV = re.compile(r'[a-f0-9-]{36}\Z')
@@ -65,6 +65,52 @@ def read_json(path, fallback=None):
 
 def write_json(path, value):
     private_fs.atomic_write(path, json.dumps(value).encode(), 1048576)
+
+
+# Fixed relative credential sidecar next to a bundle receipt. The name is set
+# by the host, never by bundle data, so a receipt cannot point it elsewhere
+# (intake 935b266b AC2).
+CREDENTIALS_FILE = 'credentials.json'
+
+
+def load_bundle(dest):
+    """Resolve a local receipt's fixed private credential reference in memory.
+
+    Legacy receipts (full credential content, no reference) stay readable
+    until their next successful sync migrates them. Never accept an arbitrary
+    path from a receipt, and never include input in errors.
+    """
+    dest = Path(dest)
+    receipt = read_json(dest / 'bundle.json')
+    if not isinstance(receipt, dict) or 'credentials_file' not in receipt:
+        return receipt
+    if (receipt['credentials_file'] != CREDENTIALS_FILE
+            or receipt.get('files') != {} or receipt.get('env') != {}):
+        raise ValueError('Invalid managed credential reference')
+    stored = read_json(dest / CREDENTIALS_FILE)
+    if not isinstance(stored, dict) or set(stored) != {'files', 'env'}:
+        raise ValueError('Invalid managed credential store')
+    bundle = {k: v for k, v in receipt.items() if k != 'credentials_file'}
+    bundle['files'] = stored['files']
+    bundle['env'] = stored['env']
+    validate(bundle)
+    return bundle
+
+
+def save_bundle(dest, bundle):
+    """Write credentials first; publish a secret-free receipt only after success."""
+    dest = Path(dest)
+    write_json(dest / CREDENTIALS_FILE, {'files': bundle['files'], 'env': bundle['env']})
+    write_json(dest / 'bundle.json', _split_receipt(bundle))
+
+
+def _split_receipt(bundle):
+    """Secret-free receipt form of a bundle: metadata plus the fixed reference."""
+    receipt = {k: v for k, v in bundle.items() if k not in ('files', 'env')}
+    receipt['files'] = {}
+    receipt['env'] = {}
+    receipt['credentials_file'] = CREDENTIALS_FILE
+    return receipt
 
 
 def native_antigravity_token_path():
@@ -1216,7 +1262,21 @@ def profile_path():
     return base / 'aplexer' / 'config.toml'
 
 
+class LauncherUnavailable(OSError):
+    """The managed Windows engine launcher could not be materialized (retryable)."""
+
+
 def _windows_exe_launcher(command, label, stub=None):
+    """Native exe launcher for `a task run --engine opencode --profile hub-<label>`.
+
+    Never returns the bare python command: aplexer would run `python.exe run -c ...`
+    ("can't open file '...\run'", exit 2 after 0 s). Proven race (intake: launcher fallback):
+    MoveFileExW cannot replace an .exe that a running muse session holds open (ERROR_ACCESS_DENIED),
+    so a profile sync during any active run used to fall back to the python form.
+    The bytes are deterministic, an identical existing launcher is reused without any write, and when
+    the canonical path is busy the new content goes to a content-addressed sibling that nothing can
+    be running yet. The previous file is never removed first."""
+    import hashlib
     import io
     import zipfile
     if stub is None:
@@ -1229,19 +1289,73 @@ def _windows_exe_launcher(command, label, stub=None):
             pass
         stub = next((c for c in candidates if c.is_file()), None)
     if stub is None:
-        return command
+        raise LauncherUnavailable('no launcher stub available for ' + label)
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, 'w') as z:
-        z.writestr('__main__.py', command[2])
+        # Fixed timestamp: identical code must give identical bytes so a sync can skip the write.
+        info = zipfile.ZipInfo('__main__.py', date_time=(2020, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_STORED
+        z.writestr(info, command[2])
     shebang = ('#!"' + command[0] + '"').encode('utf-8') + bytes((13, 10))
+    data = stub.read_bytes() + shebang + archive.getvalue()
     path = root() / 'engine-launch' / (label + '.exe')
     try:
-        with private_fs.parent(path, create=True):
-            pass
-        private_fs.atomic_write(path, stub.read_bytes() + shebang + archive.getvalue(), 4 * 1024 * 1024)
-    except (OSError, ValueError):
-        return command
-    return [str(path), label]
+        if path.is_file() and path.read_bytes() == data:
+            return [str(path), label]
+    except OSError:
+        pass
+    last = None
+    for attempt in range(3):
+        try:
+            with private_fs.parent(path, create=True):
+                pass
+            private_fs.atomic_write(path, data, 4 * 1024 * 1024)
+            return [str(path), label]
+        except (OSError, ValueError) as exc:
+            last = exc
+            time.sleep(0.2 * (attempt + 1))
+    # Canonical path busy (a running session holds it open): publish under a new name instead.
+    alt = root() / 'engine-launch' / (label + '-' + hashlib.sha256(data).hexdigest()[:12] + '.exe')
+    try:
+        if not (alt.is_file() and alt.read_bytes() == data):
+            private_fs.atomic_write(alt, data, 4 * 1024 * 1024)
+        _prune_launchers(alt.parent, label, keep=alt)
+        return [str(alt), label]
+    except (OSError, ValueError) as exc:
+        raise LauncherUnavailable('cannot materialize launcher for %s: %s / %s' % (label, last, exc)) from exc
+
+
+def _prune_launchers(directory, label, keep):
+    """Best-effort removal of superseded content-addressed launchers; busy ones are left alone."""
+    for old in Path(directory).glob(label + '-*.exe'):
+        if old != keep:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+
+def _previous_profile_command(text, name):
+    """Launcher argv of an existing `[profiles.<name>]` block, or None when absent or the bare python form."""
+    header = '[profiles.' + name + ']'
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() != header:
+            continue
+        for follow in lines[i + 1:]:
+            if follow.lstrip().startswith('['):
+                break
+            key, _, raw = follow.partition('=')
+            if key.strip() == 'command':
+                try:
+                    value = json.loads(raw.strip())
+                except ValueError:
+                    return None
+                if (isinstance(value, list) and value and isinstance(value[0], str)
+                        and not value[0].replace(chr(92), '/').rsplit('/', 1)[-1].lower().startswith('python')):
+                    return value
+                return None
+    return None
 
 
 def _posix_engine_launcher(command, label, windows=False):
@@ -1263,8 +1377,8 @@ def _posix_engine_launcher(command, label, windows=False):
             pass
         private_fs.atomic_write(path, body.encode('utf-8'), 65536)
         os.chmod(path, 0o700)
-    except (OSError, ValueError):
-        return command
+    except (OSError, ValueError) as exc:
+        raise LauncherUnavailable('cannot materialize launcher for %s: %s' % (label, exc)) from exc
     return [str(path), label]
 
 
@@ -1344,6 +1458,7 @@ def profiles(bundles, path=None, is_windows=None):
         text = 'version = 1\n'
     if text.count(BEGIN) != text.count(END) or text.count(BEGIN) > 1:
         raise ValueError('Invalid managed profile block')
+    old_text = text
     if BEGIN in text:
         before, rest = text.split(BEGIN)
         _, after = rest.split(END)
@@ -1356,7 +1471,14 @@ def profiles(bundles, path=None, is_windows=None):
         # Only public label and paths go into native registry command metadata.
         command = module_command('execute', b['label'])
         if b.get('provider') == 'go':
-            command = _posix_engine_launcher(command, b['label'], windows=(os.name == 'nt' if is_windows is None else bool(is_windows)))
+            try:
+                command = _posix_engine_launcher(command, b['label'], windows=(os.name == 'nt' if is_windows is None else bool(is_windows)))
+            except LauncherUnavailable:
+                # Never publish the bare python form (aplexer runs `python run`, exit 2). Keep the
+                # previous launcher entry; with none, fail this sync so the next one retries.
+                command = _previous_profile_command(old_text, name)
+                if command is None:
+                    raise
         block += '\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
     # After our block is stripped, any [engines.opencode] left in the file is
     # operator-owned and wins over the managed pin (duplicate tables would not
@@ -1763,9 +1885,16 @@ def _go_engine_current(bundle, dest):
 def install(bundle, request=None):
     from . import credentials
     validate(bundle)
+    if bundle['provider'] == 'codex':
+        # AC1 (intake 935b266b): the managed Codex version comes from the
+        # reviewed host release pin, never from a per-account bundle, so a
+        # sync from a stale account record cannot roll the engine back.
+        bundle = dict(bundle, version=engine_versions.package_version('codex'))
+        validate(bundle)
     dest = root() / (bundle['label'] + '-' + bundle['revision'])
     home = dest / 'home'
-    receipt = read_json(dest / 'bundle.json')
+    raw = read_json(dest / 'bundle.json')
+    receipt = load_bundle(dest)
     # A new Hub credential generation is not a new install: only the
     # immutable snapshot (engine, version, config) triggers reinstallation.
     paths = bundle.get('credential_paths') or []
@@ -1776,8 +1905,10 @@ def install(bundle, request=None):
         if bundle.get('provider') == 'go':
             _ensure_opencode_quse_auth(bundle, home)
         credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
-        if receipt != bundle:
-            write_json(dest / 'bundle.json', bundle)
+        # A legacy receipt with identical content still migrates to the
+        # secret-free form; unchanged split receipts are left untouched.
+        if receipt != bundle or raw != _split_receipt(bundle):
+            save_bundle(dest, bundle)
         return
     pkg, binary, _ = PACKAGES[bundle['provider']]
     # Credentials are delivered only after package installation; installers never see them.
@@ -1877,7 +2008,7 @@ def install(bundle, request=None):
     if bundle.get('provider') == 'go':
         _ensure_opencode_quse_auth(bundle, home)
     credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
-    write_json(dest / 'bundle.json', bundle)
+    save_bundle(dest, bundle)
 
 
 def managed_model_allowed(provider, model, policy):
@@ -2191,7 +2322,7 @@ def managed_subscriptions():
         bundle = None
         try:
             dest = root() / (b['label'] + '-' + b['revision'])
-            bundle = read_json(dest / 'bundle.json')
+            bundle = load_bundle(dest)
         except Exception:
             pass
         # Installed for sync proofs (e.g. dummy-sync-5814), never advertised
@@ -2355,7 +2486,7 @@ def quotas():
             raw = {}
             try:
                 dest = root() / (entry['label'] + '-' + entry['revision'])
-                b = read_json(dest / 'bundle.json')
+                b = load_bundle(dest)
                 validate(b)
                 if b.get('provider') == 'gemini':
                     from . import native_google_quota
@@ -2478,7 +2609,7 @@ def execute():
         if record is None:
             raise ValueError('Managed profile removed')
         dest = root() / (label + '-' + record['revision'])
-        b = read_json(dest / 'bundle.json')
+        b = load_bundle(dest)
         validate(b)
         home = dest / 'home'
         provision_managed_home(b, home, dest)
@@ -2620,7 +2751,7 @@ def admission():
     def installed_bundle():
         state = read_json(root() / 'state.json', [])
         record = next((b for b in state if b['label'] == label), None)
-        return read_json(root() / (label + '-' + record['revision']) / 'bundle.json') if record else None
+        return load_bundle(root() / (label + '-' + record['revision'])) if record else None
 
     bundle = None
     lock_failed = False
@@ -2662,7 +2793,7 @@ def admission():
                     installed = []
                     for item in state:
                         b_path = root() / f"{item['label']}-{item['revision']}" / 'bundle.json'
-                        loaded = read_json(b_path)
+                        loaded = load_bundle(b_path.parent)
                         # A partial bundle must not block profiles for the others.
                         if isinstance(loaded, dict) and loaded.get('provider') in PACKAGES and isinstance(loaded.get('label'), str):
                             installed.append(loaded)
@@ -3086,9 +3217,9 @@ def command(args):
     else:
         if not args.label or not LABEL.fullmatch(args.label) or (args.provider not in ('gemini', 'go') and not (args.auth_file or getattr(args, 'token_file', None))):
             raise ValueError('Native import requires label and auth-file')
-        paths = {'codex': ('.codex/auth.json', '.codex/config.toml', '0.163.0'),
-                 'claude': ('.claude/.credentials.json', '.claude/settings.json', '2.1.304'),
-                 'gemini': ('.gemini/oauth_creds.json', '.gemini/settings.json', '0.64.0'),
+        paths = {'codex': ('.codex/auth.json', '.codex/config.toml', engine_versions.package_version('codex')),
+                 'claude': ('.claude/.credentials.json', '.claude/settings.json', engine_versions.package_version('claude')),
+                 'gemini': ('.gemini/oauth_creds.json', '.gemini/settings.json', engine_versions.package_version('gemini')),
                  'go': ('.local/share/opencode/auth.json', '.config/opencode/opencode.json', '1.19.3'),
                  'zai': ('.zcode/v2/credentials.json', '.zcodex/config.toml', '0.155.1'),
                  'antigravity': (ANTIGRAVITY_TOKEN, None, antigravity_pinned_version())}

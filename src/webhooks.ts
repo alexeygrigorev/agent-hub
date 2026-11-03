@@ -560,20 +560,28 @@ export class WebhookService {
    * Operator-configured routes resolve across owners (admin scope); zero
    * matches are retryable (the session may not exist yet), ambiguity is a
    * permanent configuration error. */
-  private resolveTarget(label: string): { session: any } | { error: string; permanent: boolean } {
+  private resolveTarget(label: string, interactiveOnly = false): { session: any } | { error: string; permanent: boolean } {
     if (UUID_RE.test(label)) {
       const row = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', label).toArray()[0];
+      if (row && interactiveOnly) {
+        if (row.mode !== 'interactive') return { error: 'session_not_interactive', permanent: true };
+        if (['stopped', 'exited', 'failed', 'finished', 'expired', 'refused', 'cancelled', 'canceled'].includes(String(row.state))) {
+          return { error: 'session_' + row.state, permanent: true };
+        }
+      }
       if (row) return { session: row };
     }
     const rows = this.sql.exec('SELECT * FROM session_control_sessions').toArray() as any[];
-    const byName = rows.filter(r => parsed(r.request_json, {}).name === label);
+    const states = new Set(['offered', 'starting', 'running', 'uncertain', 'queued', 'held']);
+    const eligible = interactiveOnly ? rows.filter(r => r.mode === 'interactive' && states.has(String(r.state))) : rows;
+    const byName = eligible.filter(r => parsed(r.request_json, {}).name === label);
     if (byName.length === 1) return { session: byName[0] };
     if (byName.length > 1) return { error: 'ambiguous_target', permanent: true };
     const colon = label.indexOf(':');
     if (colon > 0 && colon < label.length - 1) {
       const base = label.slice(0, colon);
       const tag = label.slice(colon + 1);
-      const byAlias = rows.filter(r => {
+      const byAlias = eligible.filter(r => {
         const binding = r.binding_json ? parsed(r.binding_json, null) : null;
         const request = parsed(r.request_json, {});
         const ws = binding?.workspace || request?.workspace;
@@ -637,7 +645,16 @@ export class WebhookService {
   }
 
   private retryOrFailed(delivery: any, error: string) {
-    const maxAttempts = this.absenceError(error) ? ABSENCE_MAX_ATTEMPTS : MAX_ATTEMPTS;
+    let isDriverSchedule = false;
+    if (delivery.source === 'schedule') {
+      try {
+        isDriverSchedule = this.sql.exec(
+          'SELECT 1 FROM hub_drivers WHERE schedule_id = ? LIMIT 1', delivery.source_id).toArray().length > 0;
+      } catch { /* narrow standalone WebhookService fixtures have no driver table */ }
+    }
+    const waitForSession = (delivery.source === 'driver' || isDriverSchedule) && this.absenceError(error);
+    const maxAttempts = waitForSession ? Number.MAX_SAFE_INTEGER
+      : this.absenceError(error) ? ABSENCE_MAX_ATTEMPTS : MAX_ATTEMPTS;
     this.txn(() => {
       const attempts = Number(delivery.attempts || 0) + 1;
       const applied = attempts >= maxAttempts
@@ -719,7 +736,23 @@ export class WebhookService {
       `SELECT * FROM session_deliveries WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
        ORDER BY next_attempt_at LIMIT ?`, this.at(), this.maxBatch).toArray() as any[];
     for (const delivery of due) {
-      const resolved = this.resolveTarget(delivery.target_label);
+      if (delivery.source === 'driver') {
+        const driver: any = this.sql.exec('SELECT phase FROM hub_drivers WHERE id = ?', delivery.source_id).toArray()[0];
+        if (!driver || !['starting', 'active'].includes(driver.phase)) {
+          this.txn(() => this.transition(delivery.id,
+            { status: 'failed', last_error: 'driver_inactive', next_attempt_at: null }, 'pending'));
+          continue;
+        }
+      }
+      if (delivery.source === 'schedule') {
+        const schedule: any = this.sql.exec('SELECT id, enabled FROM session_schedules WHERE id = ?', delivery.source_id).toArray()[0];
+        if (!schedule?.enabled) {
+          this.txn(() => this.transition(delivery.id,
+            { status: 'failed', last_error: schedule ? 'schedule_paused' : 'schedule_deleted', next_attempt_at: null }, 'pending'));
+          continue;
+        }
+      }
+      const resolved = this.resolveTarget(delivery.target_label, ['schedule', 'driver'].includes(delivery.source));
       if ('error' in resolved) {
         if (resolved.permanent) {
           this.txn(() => this.transition(delivery.id, { status: 'failed', last_error: resolved.error, next_attempt_at: null }, 'pending'));

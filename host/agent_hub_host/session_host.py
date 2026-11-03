@@ -608,17 +608,19 @@ def worktree_step_once(dispatcher, machine_id: str, journal_dir: str):
 
 
 def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
-    """One observer for in-flight starts and a bounded late-adoption tail.
+    """Observe in-flight starts and publish an external-session census at most 45s apart.
 
     A launcher can await its child's first action for minutes. Its offer
     thread cannot report bindings during that wait, and the slow maintenance
     census is also minutes apart. Send a full native identity census while
     slow enrichment runs separately; this observer never claims or starts work.
-    Idle controllers make no additional HTTP requests. A recovered journal
-    receives the same short tail to adopt native starts after a restart.
+    Idle controllers still publish a lightweight census so externally started
+    aplexer sessions become visible without waiting for the slower maintenance
+    cycle. A recovered journal receives the same short enrichment tail.
     """
     records = getattr(dispatcher, '_active_launches', None)
     tail_until = clock() + 30 if isinstance(records, dict) and records else 0
+    next_census = clock()
     sampler = None
     try:
         while not stop.is_set():
@@ -627,8 +629,11 @@ def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
             active = type(inflight) is int and inflight > 0
             if active:
                 tail_until = clock() + 30
-            if clock() < tail_until:
+            now = clock()
+            if now < tail_until:
                 bindings_step_once(dispatcher)
+                if now >= next_census:
+                    next_census = now + 45
                 if callable(getattr(dispatcher, 'report_native_bindings', None)):
                     # At most one slow sampler, independent of fast reporting.
                     # Its existing lock serializes durable progress and exit
@@ -640,6 +645,9 @@ def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
                         sampler.start()
                 if active:
                     tail_until = clock() + 30
+            elif now >= next_census:
+                bindings_step_once(dispatcher)
+                next_census = now + 45
             stop.wait(max(0, 5 - (clock() - started)))
     finally:
         if sampler is not None:
@@ -743,6 +751,10 @@ def acquire_journal_lock(lock):
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _is_windows() -> bool:
+    return os.name == 'nt'
+
+
 def ensure_private_journal(journal) -> None:
     """Re-protect an inherited-DACL journal tree we own before first use.
 
@@ -754,7 +766,7 @@ def ensure_private_journal(journal) -> None:
     unrepairable journal keeps the previous fail-closed per-operation
     behavior, surfacing as the bounded commands_error log.
     """
-    if os.name != 'nt':
+    if not _is_windows():
         return
     try:
         from . import win32_fs
@@ -782,7 +794,12 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         settings = fleet.load_settings(settings_path)
         native = settings.get('aplexer_bin', 'aplexer')
         ensure_runtime_bin_on_path()
-        binding = qualify_sender_binding(native, str(Path.cwd().resolve()))
+        # aplexer 0.1.23 on Windows mutates a live controller's observed
+        # workspace to %TEMP% seconds after startup (intake bf0863c4). Pinning
+        # sender_workspace to startup cwd causes qualify_sender_binding in
+        # host-receive to fail with native_sender_unbound once workspace drifts.
+        authorized_sender_ws = None if _is_windows() else str(Path.cwd().resolve())
+        binding = qualify_sender_binding(native, authorized_sender_ws)
         # M15d narrow plumbing: surface the trusted cleanup-root allowlist
         # size (no auto-delete daemon here; tree removal is explicit CLI only).
         roots = get_cleanup_roots(settings)
@@ -897,6 +914,14 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         next_terminal = 0
         worktree_thread = None
         next_worktree = 0
+        # Intake 8cc2848c AC2: the intake-worktree commands poll has its own
+        # cadence and thread. It previously shared next_worktree and
+        # worktree_thread with the worktree-observer step, whose check reset
+        # next_worktree to +60s before the commands check ran, so the commands
+        # step never fired, refresh requests stayed queued forever and the Hub
+        # worktree close gate kept reporting 'status unknown'.
+        worktree_commands_thread = None
+        next_worktree_commands = 0
         count = 0
         # Operator fleet settings (workspaces map, workspace_roots,
         # subscriptions, launcher) are re-read when the file changes, so a
@@ -973,7 +998,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     session_control.execute(SimpleNamespace(
                         sessions_cmd='host-receive', once=True, machine_id=cfg['machine_id'],
                         actor=None, credential_family=None, journal_dir=str(journal),
-                        aplexer_bin=native, limit=20, sender_workspace=binding.workspace,
+                        aplexer_bin=native, limit=20,
+                        sender_workspace=None if _is_windows() else binding.workspace,
                         # M15d narrow plumbing: HOST-config trusted cleanup roots
                         # arm the STOP-bundled owning-host tree step (never CLI
                         # paths). Invalid shapes fail that tree to uncertain;
@@ -993,11 +1019,12 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     _log(json.dumps({'event': 'session_intake_credentials_error', 'type': type(error).__name__}), flush=True)
                 # Intake 4b161918: intake-worktree status/remove commands run in
                 # one single-inflight daemon thread (git fetch can take a minute),
-                # polled every WORKTREE_POLL_S to bound Hub requests.
-                if time.monotonic() >= next_worktree:
-                    worktree_thread = maybe_start_named_thread(
-                        worktree_thread, worktree_commands_step_once, (dispatcher,), 'intake-worktree-commands')
-                    next_worktree = time.monotonic() + WORKTREE_POLL_S
+                # polled every WORKTREE_POLL_S to bound Hub requests. Independent
+                # cadence/thread from the worktree-observer step (8cc2848c AC2).
+                if time.monotonic() >= next_worktree_commands:
+                    worktree_commands_thread = maybe_start_named_thread(
+                        worktree_commands_thread, worktree_commands_step_once, (dispatcher,), 'intake-worktree-commands')
+                    next_worktree_commands = time.monotonic() + WORKTREE_POLL_S
                 # Status observation never blocks commands/quota: one bounded
                 # single-inflight daemon thread, skipped while alive.
                 status_thread = maybe_start_status_thread(status_thread, status_collector)

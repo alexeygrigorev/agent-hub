@@ -660,6 +660,15 @@ describe('private durable intake HTTP/SQLite', () => {
       expected_version: 1, session: { workspace: 'demo', brief: 'Synthetic foreign goal' }, provenance: source })).assigned_session.hub_session_id;
     expect((await call('/tasks/' + task.id + '/events', { key: 'foreign-link', expected_version: 2,
       event: { kind: 'link', hub_session_id: foreignSession, provenance: source } }, agent.token)).status).toBe(404);
+    // An intake grant cannot disclose another actor's session telemetry through stats.
+    await inDO(stub(), (h: any) => h.sql.exec('UPDATE session_control_sessions SET engine=?, state=?, binding_json=? WHERE id=?',
+      'foreign-fixture-engine', 'failed', JSON.stringify({ native_id: 'foreign-private-native', native_created_at_ms: Date.now() - 5000 }), foreignSession));
+    const foreignStats = (await ok('/tasks/' + foreign.id + '/stats', undefined, agent.token)).stats;
+    expect(foreignStats.failed_attempts).toBeNull();
+    expect(foreignStats.unknown_reasons.failed_attempts).toBe('session_owner_required');
+    expect(JSON.stringify(foreignStats)).not.toMatch(/foreign-fixture-engine|foreign-private-native/);
+    const table = await ok('/stats?project=demo', undefined, agent.token);
+    expect(table.items.find((s: any) => s.id === foreign.id).failed_attempts).toBeNull();
     // Without fleet:launch the canonical service refuses, so assignment fails.
     const plain = await seedAgent('demo:assistant');
     await grant(plain, 'project', 'demo', 'write');
@@ -1107,7 +1116,11 @@ describe('private durable intake HTTP/SQLite', () => {
   it('reconstruction from same durable SQLite retains tasks, receipts, rules and grants', async () => {
     const a = await seedAgent(); await grant(a); const created = await create();
     await inDO(stub(), (h: any, ctx: any) => { h.intakeService = new IntakeService(h.sql, fn => ctx.storage.transactionSync(fn)); h.intakeService.init(); });
-    expect((await ok('/tasks/' + created.task.id, undefined, a.token)).task).toEqual(created.task);
+    const retained = (await ok('/tasks/' + created.task.id, undefined, a.token)).task;
+    expect(retained).toEqual(created.task);
+    expect(retained.stats).toBeUndefined();
+    const withStats = (await ok('/tasks/' + created.task.id + '?include_stats=true', undefined, a.token)).task;
+    expect(withStats.stats).toMatchObject({ id: created.task.id, created_at: created.task.created_at, attempt_count: 0 });
   });
   it('streamed UTF-8 and field limits reject oversized content without private error echo', async () => {
     const before = await state();
@@ -1647,5 +1660,32 @@ describe('operator close without evidence (d8d509d2 AC9)', () => {
     const events = (await ok('/tasks/' + task.id + '/audit')).items;
     expect(events.map((e: any) => e.kind)).toContain('close_unverified');
     expect(events.map((e: any) => e.kind)).not.toContain('close');
+  });
+});
+
+describe('intake queue priority and promote (68145244)', () => {
+  it('defaults priority to normal, stores an explicit priority and refuses unknown values', async () => {
+    const created = await create();
+    expect(created.task).toMatchObject({ priority: 'normal', promoted_at: null });
+    const high = await ok('/tasks', { key: 'create-prio-' + ++seq, project: 'demo', title: 'High priority', text: 'x', source, priority: 'high' });
+    expect(high.task).toMatchObject({ priority: 'high', promoted_at: null });
+    const bad = await call('/tasks', { key: 'create-prio-bad-' + ++seq, project: 'demo', title: 'Bad', text: 'x', source, priority: 'urgent' });
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ error: 'invalid_field' });
+  });
+
+  it('updates priority through CAS and promote stamps promoted_at with an update event', async () => {
+    const { task } = await create();
+    const updated = await ok('/tasks/' + task.id, { key: 'update-prio-' + ++seq, expected_version: task.version, priority: 'low' });
+    expect(updated.task).toMatchObject({ priority: 'low', promoted_at: null });
+    expect(updated.task.payload_data.history.at(-1)).toMatchObject({ kind: 'update', changes: { priority: 'low' } });
+    const conflict = await call('/tasks/' + task.id + '/promote', { key: 'promo-conflict-' + ++seq, expected_version: task.version });
+    expect(conflict.status).toBe(409);
+    const before = Date.now();
+    const promoted = await ok('/tasks/' + task.id + '/promote', { key: 'promo-' + ++seq, expected_version: updated.task.version });
+    expect(promoted.task.promoted_at).toBeGreaterThanOrEqual(before);
+    expect(promoted.task.payload_data.history.at(-1)).toMatchObject({ kind: 'update', changes: { promoted_at: promoted.task.promoted_at } });
+    const again = await ok('/tasks/' + task.id + '/promote', { key: 'promo-again-' + ++seq, expected_version: promoted.task.version });
+    expect(again.task.promoted_at).toBeGreaterThan(promoted.task.promoted_at);
   });
 });

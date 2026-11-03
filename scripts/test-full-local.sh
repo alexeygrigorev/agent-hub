@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+# CI only (t2558u): the full suite runs on GitHub Actions, never on shared hosts.
+# Stale Hub briefs still ask agents to run this locally; refuse unless CI=true.
+if [ "${CI:-}" != "true" ]; then
+  echo "test-full-local: refused. CI only (t2558u): use test-affected-local.sh for local checks, then push a branch, open a PR and run gh pr merge --auto --rebase; CI runs the full suite." >&2
+  exit 2
+fi
+
 # Full local test suite verification for Agent Hub (Alexey 2026-10-17 22:54)
 # Executes all build, validation, Vitest discovery, and Python discovery suites.
 

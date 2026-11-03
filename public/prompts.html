@@ -29,7 +29,7 @@
     </div>
   </header>
 
-  <aside class="dk-sidebar" id="dk-sidebar" aria-label="Workspace">
+  <aside class="dk-sidebar" id="dk-sidebar" aria-label="Workspace"><nav class="dk-sidebar__nav" aria-label="Primary"><a class="dk-nav-item" href="/sessions.html">Sessions</a><a class="dk-nav-item" href="/intake.html">Tasks</a><a class="dk-nav-item" href="/quota.html">Quota</a><a class="dk-nav-item" href="/machines.html">Machines</a><a class="dk-nav-item" href="/inbox.html">Messages</a><a class="dk-nav-item" href="/metrics.html">Metrics</a><a class="dk-nav-item" href="/schedules.html">Automation</a><a class="dk-nav-item" href="/settings.html">Settings</a></nav>
     <div class="dk-menu__identity">
       <span class="dk-menu__name" id="menu-name">Signed out</span>
       <span class="dk-menu__email" id="menu-email"></span>
@@ -46,30 +46,31 @@
   </aside>
 
   <main class="dk-main" id="main-content">
+    <nav class="secondary-nav" aria-label="Automation views"><a href="/schedules.html">Start sessions</a><a href="/prompts.html" aria-current="page">Send prompts</a><a href="/prompts.html#library">Prompt library</a></nav>
     <div class="dk-page-head">
-      <h1 class="dk-page-head__title">Prompts &amp; schedules</h1>
-      <p class="dk-page-head__lede">Versioned prompt library and cron prompt schedules delivered into interactive sessions through the durable delivery queue (same queue as webhooks).</p>
+      <h1 class="dk-page-head__title">Automation</h1>
+      <p class="dk-page-head__lede">Send reusable prompts to existing sessions. These schedules send instructions; Start sessions creates new work.</p>
     </div>
 
-    <section class="dk-card" aria-labelledby="ps-prompts-title">
+    <section class="dk-card" aria-labelledby="ps-schedules-title" id="ps-schedules-panel">
+      <h2 class="dk-card__title" id="ps-schedules-title">Send prompts</h2>
+      <div class="dk-table-wrap"><table class="dk-table">
+        <thead><tr><th>Name</th><th>Target</th><th>Cadence / timezone</th><th>Next run</th><th>State</th><th>Actions</th></tr></thead>
+        <tbody id="ps-schedules-body"><tr><td colspan="6" class="dk-muted">Loading…</td></tr></tbody>
+      </table></div>
+    </section>
+
+    <section class="dk-card" aria-labelledby="ps-prompts-title" id="library" hidden>
       <h2 class="dk-card__title" id="ps-prompts-title">Prompt library</h2>
       <div class="dk-table-wrap"><table class="dk-table">
-        <thead><tr><th>Slug</th><th>Title</th><th>Version</th><th>Updated</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Title</th><th>Reference</th><th>Version</th><th>Updated</th><th>Actions</th></tr></thead>
         <tbody id="ps-prompts-body"><tr><td colspan="5" class="dk-muted">Loading…</td></tr></tbody>
       </table></div>
       <pre class="dk-mono" id="ps-prompt-body" hidden></pre>
     </section>
 
-    <section class="dk-card" aria-labelledby="ps-schedules-title">
-      <h2 class="dk-card__title" id="ps-schedules-title">Session schedules</h2>
-      <div class="dk-table-wrap"><table class="dk-table">
-        <thead><tr><th>Name</th><th>Target</th><th>Cron</th><th>Prompt</th><th>Enabled</th><th>Next</th><th>Last fire</th><th>Actions</th></tr></thead>
-        <tbody id="ps-schedules-body"><tr><td colspan="8" class="dk-muted">Loading…</td></tr></tbody>
-      </table></div>
-    </section>
-
-    <section class="dk-card" aria-labelledby="ps-deliveries-title">
-      <h2 class="dk-card__title" id="ps-deliveries-title">Recent schedule deliveries</h2>
+    <section class="dk-card" aria-labelledby="ps-deliveries-title" id="ps-schedule-detail" hidden>
+      <h2 class="dk-card__title" id="ps-deliveries-title">Schedule history</h2><button class="dk-button dk-button--secondary" type="button" id="ps-close-detail">Back to schedules</button><p id="ps-detail-summary"></p>
       <div class="dk-table-wrap"><table class="dk-table">
         <thead><tr><th>Delivery</th><th>Schedule</th><th>Target</th><th>Status</th><th>Attempts</th><th>Error</th><th>Created</th><th>Delivered</th></tr></thead>
         <tbody id="ps-deliveries-body"></tbody>
