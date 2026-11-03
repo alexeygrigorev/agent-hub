@@ -19,6 +19,7 @@ import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOT
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
 import { runHeldReconciler } from './intake-recovery';
+import { settleUnstartedInteractiveLaunches } from './launch-start-settlement';
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { SILENT_START_MS, SILENT_START_REASON, ABANDONED_RECOVERY_MS, abandonedLaunch, expireSilentStartRows } from './silent-start';
@@ -2813,6 +2814,7 @@ export class FleetService {
         const revisionMoved = !revision || this.linkRevisions.get(caller.machineId!) !== revision;
         this.linkRevisions.set(caller.machineId!, revision);
         adoptObservedNativeSessions(this.sql, caller.machineId!, changedSessions, this.now(), undefined, revisionMoved ? cleanSessions : changedSessions);
+        settleUnstartedInteractiveLaunches(this.sql, caller.machineId!, this.now(), censusComplete);
         if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
         reconcileVerifiedNoStarts(this.sql, this.now());

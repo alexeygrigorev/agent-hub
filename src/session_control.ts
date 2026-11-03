@@ -14,6 +14,7 @@ import { decodeRepoWorkspace, disabledEngines, encodeRepoWorkspace } from './fle
 import { modelDisabledByPolicy } from './model-routing';
 import { initResourceRequestProjection } from './sql-json-projection';
 import { abandonedLaunch, expireSilentStartRows } from './silent-start';
+import { wakeNoNativeReason } from './wake-native-evidence';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
  *
  * Placement itself is never reimplemented here: starts delegate to the existing
@@ -1021,6 +1022,15 @@ export class SessionControlService {
         const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', wake.session_id).toArray()[0];
         const req = session ? parsed(session.request_json, {}) : {};
         const intakeId = wake.intake_task_id ?? req?.intake_task_id ?? null;
+        const binding = session?.binding_json ? parsed(session.binding_json, null) : null;
+        const noNativeReason = session ? wakeNoNativeReason(this.sql, session, binding, nowMs) : null;
+        if (noNativeReason) {
+          this.missWake(wake, intakeId, noNativeReason,
+            'Wake ' + wake.id.slice(0, 8) + ' missed: session has no live native (' +
+              noNativeReason + '). Handed to idle-with-open-AC recovery.');
+          missed++;
+          continue;
+        }
         if (!session || !['running', 'offered', 'starting', 'uncertain'].includes(session.state)) {
           const detail = !session ? 'wake_session_gone' : `wake_session_not_running:${session.state}`;
           this.missWake(wake, intakeId, detail,
@@ -1029,15 +1039,17 @@ export class SessionControlService {
           continue;
         }
         if (nowMs >= wake.wake_at_ms + WAKE_ACK_TIMEOUT_MS) {
+          const startContext = !binding
+            ? `Session stayed ${session.state} with no native binding. `
+            : '';
           this.missWake(wake, intakeId, 'wake_delivery_deadline_exceeded',
-            `Wake ${wake.id.slice(0, 8)} missed: could not queue delivery within 10 min of due time. Handed to idle-with-open-AC recovery.`);
+            `${startContext}Wake ${wake.id.slice(0, 8)} missed: could not queue delivery within 10 min of due time. Handed to idle-with-open-AC recovery.`);
           missed++;
           continue;
         }
         // A start/binding still in flight is not a gone session. Retry until
         // the delivery deadline; only a running binding can receive a send.
         if (session.state !== 'running') continue;
-        const binding = session.binding_json ? parsed(session.binding_json, null) : null;
         const generation = binding?.generation ?? 0;
         const pendingCount = Number(this.sql.exec(
           "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").toArray()[0]?.n ?? 0);
@@ -1108,7 +1120,7 @@ export class SessionControlService {
     for (const wake of unresolved) {
       const cmd: any = wake.command_id && this.sql.exec('SELECT state FROM session_control_commands WHERE id=?', wake.command_id).toArray()[0];
       const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', wake.session_id).toArray()[0];
-      const binding = parsed(session?.binding_json, {});
+      const binding = parsed(session?.binding_json, {}) ?? {};
       const native: any = binding.native_id && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', session?.machine_id, binding.native_id).toArray()[0];
       if (cmd?.state === 'acked') {
         this.sql.exec("UPDATE session_control_wakes SET state='acked',acked_at=?,updated_at=? WHERE id=?", at, at, wake.id);
@@ -2134,7 +2146,7 @@ export class SessionControlService {
     // matching: any other tag is refused, and the exact tag plus the
     // launch native UUID/result, machine, engine, workspace, and incarnation
     // checks below still bind the exact native row (never tag-only).
-    // Unstarted (offered), failed/exited/uncertain, foreign-machine, or inconsistent
+    // Unstarted (offered), failed/exited, foreign-machine, or inconsistent
     // launches are refused. The binding workspace (absolute native path) is
     // NOT compared to the Fleet workspace label: they live in different
     // domains (hub label vs. canonical native path); machine + tag + native
@@ -2144,7 +2156,7 @@ export class SessionControlService {
       row.fleet_launch_id).toArray()[0];
     if (!launch) return { ok: false as const, error: 'missing_fleet_launch' };
     if (launch.machine_id !== row.machine_id) return { ok: false as const, error: 'fleet_machine_mismatch' };
-    if (launch.state !== 'starting' && launch.state !== 'running') {
+    if (!['starting', 'running', 'uncertain'].includes(launch.state)) {
       return { ok: false as const, error: 'fleet_launch_state' };
     }
     if (binding.tag !== 'hub-' + launch.id && binding.tag !== 'task-hub-' + launch.id) return { ok: false as const, error: 'fleet_tag_mismatch' };
@@ -2165,7 +2177,7 @@ export class SessionControlService {
       return { ok: false as const, error: 'fleet_native_mismatch' };
     }
     if (reported.phase === 'exited' || reported.phase === 'dead' ||
-        reported.phase === 'forgotten' || reported.phase === 'pruned') {
+        reported.phase === 'forgotten' || reported.phase === 'pruned' || reported.phase === 'unobserved') {
       return { ok: false as const, error: 'fleet_native_terminal' };
     }
     // Expected engine enforcement (vs canonical Fleet report AND actual
@@ -2205,17 +2217,32 @@ export class SessionControlService {
     const generation = moving
       ? (prior?.generation ?? 0) + 1
       : (Number.isSafeInteger(prior?.generation) && prior.generation > 0 ? prior.generation : 1);
+    const at = this.at();
+    // A verified binding is the first exact native receipt for this Fleet
+    // launch. Persist it on both records so offers stop retrying and later
+    // exit reconciliation can match the launch identity. Preserve unrelated
+    // diagnostics; clear only the transient "binding is pending" marker.
+    const settledLaunch = this.sql.exec(`UPDATE fleet_launches SET state = 'running',
+        native_id = COALESCE(native_id, ?),
+        launch_error_json = CASE WHEN json_valid(launch_error_json)
+          AND json_extract(launch_error_json, '$.reason') = 'binding_pending_native_observed'
+          THEN NULL ELSE launch_error_json END,
+        updated_at = ?
+      WHERE id = ? AND machine_id = ? AND state IN ('starting','running','uncertain')
+        AND (native_id IS NULL OR native_id = ?) RETURNING id`,
+    binding.native_id, at, row.fleet_launch_id, row.machine_id, binding.native_id).toArray();
+    if (!settledLaunch.length) return { ok: false as const, error: 'fleet_launch_state' };
     this.sql.exec('UPDATE session_control_sessions SET state = ?, binding_json = ?, updated_at = ? WHERE id = ?',
       'running', JSON.stringify({ native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation,
         native_created_at_ms: binding.native_created_at_ms,
-        ...(reporter ? { reported_by: reporter } : {}), reported_at: this.at() }), this.at(), sessionId);
+        ...(reporter ? { reported_by: reporter } : {}), reported_at: at }), at, sessionId);
     if (moving) {
       // Unclaimed transport is not execution authority. Fence any old offer
       // correlation and reoffer the same durable command at the new binding.
       for (const command of this.sql.exec(`SELECT id FROM session_control_commands WHERE session_id = ?
         AND claim_token IS NULL AND state IN ('recorded','transported')`, sessionId).toArray()) {
         this.sql.exec(`UPDATE session_control_commands SET generation = ?, correlation = ?, state = 'recorded', poll_at = NULL, updated_at = ? WHERE id = ?`,
-          generation, `cmd:${command.id}:gen:${generation}`, this.at(), command.id);
+          generation, `cmd:${command.id}:gen:${generation}`, at, command.id);
       }
     }
     // A (re)bind revokes the session's messaging credential; the freshly
@@ -2539,9 +2566,9 @@ export class SessionControlService {
       // offered state before the host claimed it.
       this.transaction(() => this.reconcileHeldSessions());
       this.transaction(() => promoteStartedOffers(this.sql, this.now(), { machineId: caller.machineId! }));
-      const promoted = this.sql.exec("SELECT s.id, s.host_family, f.machine_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE f.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('queued','held') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
+      const promoted = this.sql.exec("SELECT s.id, s.host_family, f.machine_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE f.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('queued','held') AND f.state IN ('starting','running','uncertain') LIMIT 100", caller.machineId!).toArray() as any[];
       for (const row of promoted) if (this.hostOk(row, caller).ok) this.syncFleetPlacement(row.id);
-      const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
+      const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running','uncertain') LIMIT 100", caller.machineId!).toArray() as any[];
       // Already-bound native sessions can move to their intake worktree.
       // Discover only exact same-incarnation, fresh catalog moves; the POST
       // rechecks these facts under the mutation transaction and host family.

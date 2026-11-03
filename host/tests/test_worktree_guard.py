@@ -538,7 +538,7 @@ class LifecycleReconciliationTests(unittest.TestCase):
              patch.object(guard, 'expected_repository', return_value=None), \
              patch.object(guard, 'remember_repository') as remember:
             self.assertFalse(guard.protect_adoption(row, session))
-            lock.assert_called_once_with('git', '/tree', '11111111', 'intake')
+            lock.assert_called_once_with('git', '/tree', '11111111', 'intake', owner_terminal=None)
             remember.assert_not_called()
 
     def test_missing_durable_observation_ack_retries_even_for_unknown_phase(self):

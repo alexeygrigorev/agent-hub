@@ -100,6 +100,20 @@ export class IdleWorkService {
         const lastNote = [...(task.history || [])].reverse().find((e: any) => e.kind === 'note')?.text || '(no intake note)';
         if (nudges.filter((n: any) => n.failed === true).length >= 2) {
           const key = episode.replacement_key || 'idle-replace-' + episode.episode;
+          // Intake 718b1c18 AC4: a pending unbound start counts as a live
+          // replacement. Keep this guard ahead of both generic and managed
+          // replacement owners so one stalled source cannot fan out siblings.
+          const sibling: any = this.sql.exec(`SELECT id FROM session_control_sessions WHERE id != ?
+            AND state IN ('queued','held','offered','starting','running','uncertain')
+            AND (parent_id IS NOT NULL OR binding_json IS NULL)
+            AND json_extract(request_json, '$.intake_task_id') = ? LIMIT 1`, row.id, task.id).toArray()[0];
+          if (sibling) {
+            const heldKey = 'idle-replacement-held:' + episode.episode;
+            if (!(task.history || []).some((e: any) => e?.source?.reference === heldKey)) {
+              this.note(task, heldKey, `Replacement for ${row.id} held: intake ${task.id} already has live session ${sibling.id}.`);
+            }
+            continue;
+          }
           if (ownership.mode === 'managed') {
             // The controller owns generation fencing and lineage, but eligibility
             // comes exclusively from this shared verified-nudge episode.
