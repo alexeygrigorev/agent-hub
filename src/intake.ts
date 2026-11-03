@@ -1046,7 +1046,8 @@ export class IntakeService {
     const page = this.page(url, [], revision); // shared limit/cursor/revision validation
     const total = intakeExportCounts(this.sql, p, filter.project).filter(r => intakeExportMatches(r, filter)).reduce((n, r) => n + Number(r.n), 0);
     const candidates = intakeExportPageIds(this.sql, p, filter, url.searchParams.get('after'), page.effective_limit + 1);
-    const items = candidates.slice(0, page.effective_limit).map(id => this.taskView(this.get('tasks', id)!, p));
+    const pageTasks = candidates.slice(0, page.effective_limit).map(id => this.get('tasks', id)!);
+    const items = this.taskViews(pageTasks, p);
     // Rules are capped at 128; check only their exact project counter keys.
     const rules = rulesFor();
     const warn = warnFor();
