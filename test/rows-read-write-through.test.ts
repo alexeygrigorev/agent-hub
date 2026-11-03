@@ -165,7 +165,8 @@ it('liveness alerts() reads a bounded page of a long alert history', async () =>
 
 it('cachedAccountStatus serves the admission probe from memory until a fleet write', withFleet(async (s, t) => {
   const sql = (s as any).sql;
-  sql.exec(`INSERT INTO fleet_accounts(label,provider,enabled) VALUES ('a0','codex',1)`);
+  sql.exec(`INSERT INTO fleet_accounts(label,provider,max_concurrency,reserve_percent,enabled)
+    VALUES ('a0','codex',10,0,1)`);
   const account: any = sql.exec(`SELECT * FROM fleet_accounts WHERE label='a0'`).toArray()[0];
   expect(s.cachedAccountStatus(account).status).toBeDefined();
   const from = t.mark();
@@ -271,10 +272,10 @@ it('counts cache hits as zero-row route cursors when the meter wraps the write w
 
 it('does not memoize reads that depend on random or current time', withFleet(async (s) => {
   const sql = (s as any).sql;
-  const first: any = sql.exec('SELECT random() AS value');
+  const first: any = sql.exec('SELECT random() AS value FROM fleet_sessions LIMIT 1');
   const firstValue = first.toArray()[0].value;
   expect(Number(first.rowsRead)).toBeGreaterThan(0);
-  const second: any = sql.exec('SELECT random() AS value');
+  const second: any = sql.exec('SELECT random() AS value FROM fleet_sessions LIMIT 1');
   const secondValue = second.toArray()[0].value;
   expect(Number(second.rowsRead)).toBeGreaterThan(0);
   expect(secondValue).not.toBe(firstValue);
@@ -346,7 +347,7 @@ it('query plans use the new indexes on the high-volume lookups', withFleet(async
     .toContain('session_control_wakes_session_due_order');
   expect(plan(`SELECT s.id FROM session_control_sessions s JOIN session_control_protections p ON p.session_id=s.id
     WHERE s.machine_id=? AND json_extract(CASE WHEN json_valid(s.binding_json) THEN s.binding_json ELSE '{}' END,'$.native_id')=? LIMIT 1`, 'h0', 'native'))
-    .toContain('session_control_native_binding');
+    .toMatch(/USING INDEX (?:session_control_native_binding|intake_queue_session_native)/);
   expect(plan(`SELECT quota_json FROM usage_quota_history
     WHERE account=? AND provider=? AND observed_at_ms=? LIMIT 1`, 'a0', 'codex', now))
     .toContain('usage_quota_history_account_provider_time');

@@ -2877,7 +2877,7 @@ export class FleetService {
           changedSessions.push(s);
           if (!metadataChanged) {
             const metaFields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account'];
-            metadataChanged = metaFields.some(f => (prior[f] ?? null) !== (row[f] ?? null));
+            metadataChanged = !prior || metaFields.some(f => (prior[f] ?? null) !== (row[f] ?? null));
           }
           const observedAt = new Date(this.now()).toISOString();
           this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms, progress_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, observedAt, s.workspace, row.cwd, s.profile, s.account, row.last_activity_at, row.created_at_ms, row.progress_json);
