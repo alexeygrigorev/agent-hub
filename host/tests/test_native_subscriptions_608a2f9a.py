@@ -105,18 +105,14 @@ class NativeSubscriptionsTest(unittest.TestCase):
         self.login(".gemini", "antigravity-cli", "antigravity-oauth-token", content='{"token":{}}')
         self.assertEqual(self.render(), [])
 
-    def test_native_antigravity_subscription_collects_parsed_usage(self):
+    def test_native_antigravity_credentials_are_not_probed_for_quota(self):
         subscription = {"service": "gemini", "account_label": "shared-gemini",
                         "engine": "antigravity", "profile": None}
-        raw = {"gemini": {"status": "ok", "error": None,
-                           "details": {"limit_reached": False},
-                           "windows": {"5h": {"percent_remaining": 82,
-                                               "reset_at": "2030-01-02T17:00:00Z"}}}}
+        calls = []
         reports = fleet.collect_subscriptions({"subscriptions": [subscription]},
-                                              antigravity_probe=lambda: raw)
-        self.assertEqual(reports[0]["account"], "shared-gemini")
-        self.assertEqual(reports[0]["quota"]["status"], "ok")
-        self.assertEqual(reports[0]["quota"]["windows"]["5h"]["percent_remaining"], 82)
+                                              antigravity_probe=lambda: calls.append("probe"))
+        self.assertEqual(reports, [])
+        self.assertEqual(calls, [])
 
     def test_local_bin_fallback(self):
         self.login(".zcode", "v2", "credentials.json")

@@ -14,7 +14,7 @@ export const QUOTA_OBSERVATION_TTL_MS = 1_200_000; // 20 minutes, matches QUOTA_
 export interface QuotaAdmissionInput {
   provider: string;
   quota: any;
-  /** fleet_subscriptions.observed_at, or host snapshot captured_at for snapshot-backed reads. Null skips the subscription leg. */
+  /** Authoritative Hub-server captured_at for server-backed reads. Null skips the observation-freshness leg. */
   subscriptionObservedAt: string | null;
   nowMs: number;
   /** e.g. policy.rules.reserve_percent: { codex: 15, grok: 5 } */

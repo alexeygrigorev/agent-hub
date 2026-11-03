@@ -5,9 +5,10 @@ The canonical account catalog lives in config/model-routing.json `accounts`
 aplexer profile, credential location/mode, quota probe selector). This module
 renders host files from that catalog and checks them for drift:
 
-- subscriptions.json `subscriptions` entries (catalog-owned identity fields:
-  service, engine, profile, quota_argv; host-local fields such as
-  admission_argv, launcher_* and startup_argv are preserved, never invented),
+- subscriptions.json `subscriptions` entries (catalog-owned identity fields;
+  legacy `quota_argv` metadata is preserved for file compatibility but never
+  executed by HostAgent; host-local admission, launcher and startup fields are
+  preserved, never invented),
 - the `# BEGIN HUB MANAGED ENGINES` block of the aplexer config (hub-*
   profiles for managed-bundle accounts, rendered through provisioning so the
   format always matches what bundle installation writes),

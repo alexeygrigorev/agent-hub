@@ -1,11 +1,10 @@
-# Quota Dashboard (M13)
+# Quota Dashboard
 
-Collect per-engine usage on each enrolled host, serve sanitized fleet-wide and
-per-host quota over authenticated API + `hub quota` CLI + dakit dashboard, and
-gate existing routing dispatch and launch claim fail-closed on
-exhausted/stale/unknown quota. No second quota store: single
-`host_quota_snapshots` row per host plus existing `fleet_accounts`,
-`fleet_routes`, `fleet_subscriptions`.
+The fleet quota view reads provider usage only from Hub-server observations in
+`server_quota_snapshots`. It does not merge host subscriptions or host quota
+snapshots, and it does not expose per-machine quota rows. Account definitions
+and routes still supply the account, harness and profile labels shown beside
+the Hub reading. The legacy host snapshot API is retired for reads and writes.
 
 ## Schema versions
 
@@ -27,23 +26,24 @@ exhausted/stale/unknown quota. No second quota store: single
 
 ## API
 
-- `POST /api/quota`: host bearer only (machine-bound, registered, unrevoked,
-  unexpired). Replay/out-of-order `captured_at` → `409`.
-- `GET /api/quota`: own-host read (host bearer) or admin session with explicit
-  `?host_id=` (Origin/CSRF integrity kept). Unchanged from the M3 contract.
+- `POST /api/quota`: retired. Authenticated, valid legacy submissions return
+  `410 machine_quota_collection_disabled` and do not write machine snapshots.
+- Fleet quota uses only Hub-server account probes and `server_quota_snapshots`;
+  machine snapshots and subscription reports do not supply fleet quota.
+- `GET /api/quota`: retired host-scoped read. A valid host bearer or verified
+  admin session receives `410 machine_quota_collection_disabled`; host snapshot
+  rows are not exposed.
 - `GET /api/quota?view=fleet[&host_id=&provider=&engine=&account=]`: fleet-wide
   projection. Grants reuse the canonical Hub authority
   (`authenticateBusRequest`): human admins (session or admin bearer),
   `agent` bearers with `fleet:launch` scope, `routing-client` bearers with
-  `routing:submit`. Host bearers are denied (`403`); revoked/expired callers get
-  `401`/`403` from canonical auth. Admin sessions without `?host_id=` and
-  without `view=fleet` still get `400` (legacy contract preserved).
+  `routing:submit`, and host bearers with their fleet read grant; revoked or
+  expired callers are denied by canonical auth.
 - The fleet body (`schema_version "1.1"`, `Cache-Control: private, no-store`)
-  carries `pools[]` (one row per canonical verified
-  `(provider, account_label)`, never summed: `remaining_percent` is the minimum
-  across fresh observations, `observed_by_hosts` retains provenance,
-  conflicting/stale observations resolve to `stale`/`unknown`), `hosts[]`
-  (per-host snapshot + subscriptions), and `coverage` (fresh/stale/missing).
+  carries `pools[]` (one row per canonical account, sourced only from the Hub
+  server) and `account_coverage`. It omits the former per-host `hosts` and
+  machine `coverage` fields. Each pool identifies its source as `server`; an
+  absent reading remains unknown and a stale server reading remains stale.
 - Pool states: `fresh`, `stale`, `exhausted` (`limit_reached`), `unavailable`
   (route/window error), `unknown` (no fresh evidence). A passed `reset_at`
   alone never marks capacity recovered.
@@ -85,8 +85,9 @@ and no deadline is ever invented.
   handoff and session commands are untouched.
 - Dashboard `public/fleet.html` quota card + `public/fleet.js renderQuota()`:
   existing dakit classes/components only, `textContent`/DOM rendering,
-  pool states, native units, resets, account/profile/host attribution and
-  honest coverage (`Coverage: N fresh, N stale, N missing`).
+  pool states, native units, resets, account/profile attribution and coverage
+  counted across Hub-managed accounts. Exhausted accounts display `0%` and the
+  reset time when the Hub reading provides one.
 
 ## Verification
 

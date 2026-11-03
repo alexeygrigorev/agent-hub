@@ -8,8 +8,9 @@ resets or open purchase/credit options. There is no approval-to-apply endpoint.
 
 The existing five-minute checks cron reads every registered Codex and zai account,
 including accounts currently disabled for agent placement.
-It uses fresh account-level server/subscription quota snapshots and unambiguous
-registered host quota routes. Each `details.banked_resets` grant supplies its type,
+It uses only fresh account-level Hub-server quota snapshots. Host subscription
+reports and legacy host snapshots do not supply reset evidence. Each
+`details.banked_resets` grant supplies its type,
 availability and exact expiry. An unavailable/stale read does not erase a known
 deadline. A fresh successful empty list confirms no grants remain.
 

@@ -197,64 +197,14 @@ def test_offers_fetch_exhausted_timeouts_never_reject_or_claim():
         assert calls == [('GET', '/api/fleet/offers')] * fleet.OFFERS_FETCH_ATTEMPTS
 
 
-@pytest.mark.parametrize('age,status,expected', [
-    (1300, 'ok', 'unknown'), (-30, 'ok', 'unknown'),
-    (None, 'ok', 'unknown'), (60, 'ok', 'ok'),
-    (1300, 'unknown', 'unknown'),
-])
-def test_subscription_freshness_cannot_turn_stale_or_future_into_fresh(tmp_path, age, status, expected):
-    import datetime as dt
-    now = dt.datetime.now(dt.timezone.utc)
-    observed = (now - dt.timedelta(seconds=age)).isoformat() if age is not None else None
-    quota = {'status': status, 'observed_at': observed, 'windows': {},
-             'details': {'cooldown_until': '2026-11-01T00:00:00Z'}}
-    rows = [{'account': 'shared-codex', 'service': 'codex', 'plan': 'pro', 'quota': quota}]
+def test_machine_quota_report_path_is_retired(tmp_path):
     calls = []
-    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]), \
-            patch.object(fleet, 'collect_subscriptions', return_value=rows):
-        dispatcher = fleet.Dispatcher(settings(tmp_path), lambda m, p, b: calls.append(b), lambda *a: {})
-        dispatcher._report_subscriptions()
-    sent = calls[0]['subscriptions'][0]['quota']
-    assert sent['status'] == expected
-    if expected != status or age is None or age < 0:
-        assert sent['observed_at'] is None
-    else:
-        assert sent['observed_at'] == observed
-    assert sent['details'] == quota['details']  # known cooldown is never erased
-
-
-def test_subscription_server_timestamp_refusal_retries_once_with_unknown(tmp_path):
-    rows = [{'account': 'shared-codex', 'service': 'codex', 'plan': 'pro',
-             'quota': {'status': 'ok', 'observed_at': fleet.utcnow(), 'windows': {}, 'details': {}}}]
-    requests = []
-
-    def request(method, path, body):
-        requests.append(body)
-        if len(requests) == 1:
-            raise ValueError('HTTP request failed with status 400: subscription_unmapped_or_invalid:invalid_timestamp')
-        return {'status': 'reported'}
-
-    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]), \
-            patch.object(fleet, 'collect_subscriptions', return_value=rows):
-        dispatcher = fleet.Dispatcher(settings(tmp_path), request, lambda *a: {})
-        assert dispatcher._report_subscriptions() == {'status': 'reported'}
-    assert len(requests) == 2
-    assert requests[0]['subscriptions'][0]['quota']['status'] == 'ok'
-    assert requests[1]['subscriptions'][0]['quota']['status'] == 'unknown'
-    assert requests[1]['subscriptions'][0]['quota']['observed_at'] is None
-
-
-@pytest.mark.parametrize('error', ['HTTP request failed with status 403',
-                                  'HTTP request failed with status 400: subscription_unmapped_or_invalid:unmapped'])
-def test_other_subscription_refusals_never_retry_or_relax_validation(tmp_path, error):
-    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]), \
-            patch.object(fleet, 'collect_subscriptions', return_value=[]):
-        from unittest.mock import Mock
-        request = Mock(side_effect=ValueError(error))
-        dispatcher = fleet.Dispatcher(settings(tmp_path), request, lambda *a: {})
-        with pytest.raises(ValueError):
-            dispatcher._report_subscriptions()
-        assert request.call_count == 1
+    dispatcher = fleet.Dispatcher(settings(tmp_path),
+                                  lambda method, path, body=None: calls.append((method, path, body)),
+                                  _gate_runner)
+    with patch.object(fleet, 'collect_subscriptions', side_effect=AssertionError('host quota probe invoked')):
+        assert dispatcher._report_subscriptions() == {'status': 'disabled', 'source': 'hub_server'}
+    assert calls == []
 
 
 def test_census_sampled_before_start_never_suppresses_its_followup(tmp_path):

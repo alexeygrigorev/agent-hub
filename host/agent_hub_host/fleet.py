@@ -1,4 +1,4 @@
-"""Generic host placement client. Secrets stay in native clients, never subscription reports."""
+"""Generic host placement client. Secrets stay in native clients; quota comes from the Hub server."""
 from __future__ import annotations
 
 import datetime as dt
@@ -81,9 +81,8 @@ def _sanitize_launcher_slug(text, limit=64):
 
 
 # Canonical quota services: `codex-orin` is not a service — it is the second
-# Codex account (service `codex`, account `codex-orin`). The quse wire route
-# key `codex-orin` is still collected by quota_snapshot; only this service
-# namespace is canonical.
+# Codex account (service `codex`, account `codex-orin`). The legacy `codex-orin`
+# wire route key is only a Hub-server quota alias; it is not a host service.
 SERVICES = {"codex", "claude", "grok", "gemini", "zai", "go", "copilot"}
 WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
@@ -1107,63 +1106,9 @@ def codex_plan():
     return None
 
 
-def _is_quota_cli(argv):
-    """True for the retired host-side quota CLI (any path to quse / quse.exe / -m quse.cli)."""
-    if not isinstance(argv, list) or not argv:
-        return False
-    name = re.split(r"[\\/]", str(argv[0]))[-1].lower()
-    return name in ("quse", "quse.exe") or any(str(a) in ("quse", "quse.cli") for a in argv[1:3])
-
-
-def collect_subscriptions(settings, runner=run_json, antigravity_probe=None):
-    """Probe default accounts once per service. Alternate accounts require explicit wrappers."""
-    subscriptions = settings["subscriptions"]
-    counts = {service: sum(s["service"] == service for s in subscriptions) for service in SERVICES}
-    reports = []
-    for sub in subscriptions:
-        service = sub["service"]
-        raw = {}
-        profile = sub.get("profile")
-        # Hub-managed quota is read centrally. Host-home Antigravity accounts
-        # use its official, read-only /usage command after account_registry has
-        # verified the account-specific credential; no login flow is started.
-        command = sub.get("quota_argv")
-        if service == "gemini" and sub.get("engine") == "antigravity":
-            try:
-                if antigravity_probe is None:
-                    from . import account_registry, native_antigravity_quota
-                    # CLI only: never the Antigravity desktop app / editor launcher.
-                    binary = account_registry._find_binary(("agy",))
-                    raw = native_antigravity_quota.probe(binary, Path.home()) if binary else {}
-                else:
-                    raw = antigravity_probe()
-            except Exception:
-                pass
-        elif command and not _is_quota_cli(command):
-            try:
-                raw = runner(command)
-            except Exception:
-                pass
-        plan = sub.get("plan")
-        if plan is None and service == "codex" and counts[service] == 1 and sub.get("profile") is None:
-            plan = codex_plan()
-        # Only this documented status command is used for automatic tier metadata.
-        # Account identity is explicitly configured; never emit email/org IDs or hash credentials.
-        if plan is None and service == "claude" and counts[service] == 1 and sub.get("profile") is None:
-            try:
-                detected = runner(["claude", "auth", "status", "--json"]).get("subscriptionType")
-                if detected in {"free", "pro", "max", "team", "enterprise"}:
-                    plan = detected
-            except Exception:
-                pass
-        if plan is None and service in {"claude", "grok"}:
-            route = raw.get(service, raw) if isinstance(raw, dict) else {}
-            details = route.get("details") if isinstance(route, dict) else None
-            value = details.get("subscription") if isinstance(details, dict) else None
-            if value in {"free", "pro", "max", "team", "enterprise", "SuperGrok", "SuperGrokPlus", "SuperGrokHeavy"}:
-                plan = value
-        reports.append({"service": service, "account": sub["account_label"], "plan": plan, "quota": quota_metadata(raw, service, profile=profile, account=sub.get("account_label"))})
-    return reports
+def collect_subscriptions(*_args, **_kwargs):
+    """Compatibility stub: machine-side subscription and quota probes are retired."""
+    return []
 
 
 def _no_symlink_components(path: Path) -> bool:
@@ -4091,57 +4036,8 @@ class Dispatcher:
         return {"id": offer_id, **result}
 
     def _report_subscriptions(self):
-        from .quota_snapshot import parse_iso_utc, STALE_AGE_THRESHOLD
-        from .native_admission import routing_rules
-        # Hub maps a subscription report all-or-nothing: one entry without a
-        # route for this machine 400s the whole batch (unmapped). A provider
-        # disabled by routing policy (Grok) is never routed, so a lingering
-        # operator entry for it hid every other quota observation on
-        # DESKTOP-FP4OP26 (intake 8d006dc3). Disabled providers are neither
-        # probed nor reported; re-enabling the provider re-includes them.
-        disabled = set(routing_rules().get('disabled_providers', []))
-        subscriptions = self.settings.get('subscriptions', [])
-        skipped = sorted(s.get('account_label') for s in subscriptions if s.get('service') in disabled)
-        if skipped:
-            print(json.dumps({'event': 'fleet_subscription_skipped', 'reason': 'provider_disabled',
-                              'accounts': skipped}), flush=True)
-        settings = dict(self.settings, subscriptions=[s for s in subscriptions if s.get('service') not in disabled])
-        reports = collect_subscriptions(settings, self.runner)
-        now = dt.datetime.now(dt.timezone.utc)
-        downgraded = []
-        for sub in reports:
-            quota = sub['quota']
-            observed = parse_iso_utc(quota.get('observed_at'))
-            age = (now - observed).total_seconds() if observed is not None else None
-            reason = ('invalid_timestamp' if quota.get('observed_at') is not None and observed is None
-                      else 'future_timestamp' if age is not None and age < 0
-                      else 'stale_timestamp' if age is not None and age >= STALE_AGE_THRESHOLD and quota.get('status') == 'ok'
-                      else 'missing_timestamp' if observed is None and quota.get('status') == 'ok' else None)
-            if reason:
-                # A stale/future sample becomes unknown. Never backdate it or
-                # manufacture a new observation to make it pass admission.
-                sub['quota'] = dict(quota, status='unknown', observed_at=None)
-                downgraded.append({'account': sub['account'], 'reason': reason,
-                                   'observed_at': quota.get('observed_at'),
-                                   'age_s': round(age, 3) if age is not None else None})
-        if downgraded:
-            print(json.dumps({'event': 'fleet_subscription_freshness', 'downgraded': downgraded}), flush=True)
-        try:
-            return self.request('PUT', '/api/fleet/subscriptions', {'subscriptions': reports})
-        except ValueError as exc:
-            if 'status 400: subscription_unmapped_or_invalid:invalid_timestamp' not in str(exc):
-                raise
-            # The live 400 is this exact freshness refusal. Local and server
-            # clocks can disagree; make one bounded retry with no freshness
-            # assertions rather than relabeling stale quota as newly observed.
-            print(json.dumps({'event': 'fleet_subscription_freshness',
-                              'reason': 'server_invalid_timestamp',
-                              'samples': [{'account': s['account'],
-                                           'status': s['quota'].get('status'),
-                                           'observed_at': s['quota'].get('observed_at')}
-                                          for s in reports]}), flush=True)
-            unknown = [dict(sub, quota=dict(sub['quota'], status='unknown', observed_at=None)) for sub in reports]
-            return self.request('PUT', '/api/fleet/subscriptions', {'subscriptions': unknown})
+        """Compatibility stub: the Hub server owns quota collection."""
+        return {'status': 'disabled', 'source': 'hub_server'}
 
     def report_catalog_bindings(self, fresh=False):
         """Share a census only if its sampling began after this call arrived.
@@ -5140,11 +5036,6 @@ class Dispatcher:
             except Exception:
                 pass  # dispatch repeats the check before allowing any claim.
         _mark('probes')
-        try:
-            self._report_subscriptions()
-        except Exception as exc:
-            _skip_telemetry('subscriptions', exc)
-        _mark('subscriptions')
         try:
             raw = self.report_catalog_bindings()
         except Exception as exc:

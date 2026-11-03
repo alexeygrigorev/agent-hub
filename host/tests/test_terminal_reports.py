@@ -62,7 +62,7 @@ class TerminalReportsTests(unittest.TestCase):
             entered.set(); release.wait(5)
             return []
         self.d.once = maintenance
-        thread = session_host.maybe_start_maintenance_thread(None, self.d, Mock())
+        thread = session_host.maybe_start_maintenance_thread(None, self.d)
         self.assertTrue(entered.wait(1))
         try:
             started = time.monotonic()
@@ -110,7 +110,6 @@ class TerminalReportsTests(unittest.TestCase):
             stack.enter_context(patch.object(session_host, 'qualify_sender_binding', return_value=SimpleNamespace(session_id='controller', workspace=str(self.ws))))
             stack.enter_context(patch.object(session_host.fleet, 'Dispatcher', side_effect=factory))
             stack.enter_context(patch.object(Dispatcher, 'once', maintenance))
-            stack.enter_context(patch.object(session_host, 'QuotaCollector', return_value=Mock()))
             stack.enter_context(patch.object(session_host, 'maybe_start_named_thread', side_effect=start))
             stack.enter_context(patch.object(session_host.session_control, 'execute', side_effect=command))
             for name in ('status', 'metrics', 'disk', 'host_health', 'role_consumer', 'token'):

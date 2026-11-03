@@ -159,28 +159,7 @@ class ArchWindowsArm64Test(unittest.TestCase):
 
 
 class CodexQuotaGateWindowsTest(unittest.TestCase):
-    """AC4 history: Tabo's service PATH lacked quse, so every Codex route was
-    refused as quota_check_failed. Since intake 5814e109 Hub owns the quota
-    verdict and managed launches never invoke quse; the resolver below only
-    serves the native-account collector.
-    """
-
-    def test_resolves_quse_next_to_interpreter_when_not_on_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            scripts = Path(tmp) / 'Scripts'
-            scripts.mkdir()
-            quse = scripts / 'quse'
-            quse.write_text('#!/bin/sh\n')
-            quse.chmod(0o755)
-            with patch.object(quota_snapshot.sys, 'executable', str(scripts / 'python')):
-                self.assertEqual(quota_snapshot.quse_argv({'PATH': str(Path(tmp) / 'empty')}), [str(quse)])
-
-    def test_falls_back_to_installed_module(self):
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(quota_snapshot.sys, 'executable', str(Path(tmp) / 'python')), \
-                patch('importlib.util.find_spec', return_value=object()):
-            self.assertEqual(quota_snapshot.quse_argv({'PATH': tmp}),
-                             [str(Path(tmp) / 'python'), '-m', 'quse.cli'])
+    """Hub's server collector owns quota; hosts never run or submit it."""
 
     def test_managed_launch_gate_ignores_missing_quse(self):
         """A host without quse is never rejected: Hub decides (I4)."""
@@ -337,22 +316,6 @@ class CycleReportsWindowsTest(unittest.TestCase):
                 patch.object(native_sessions, 'list_sessions', side_effect=listing):
             collector.step()
         self.assertEqual(seen, [('whoami', exe), ('list', exe)])
-
-    def test_quota_collector_holds_when_quse_absent(self):
-        from agent_hub_host import quota_snapshot
-        collector = quota_snapshot.QuotaCollector(base_url='https://hub.example')
-        cfg = {'machine_id': 'tabo', 'access_token': 't', 'base_url': 'https://hub.example'}
-        with patch.object(quota_snapshot.config, 'load_config', return_value=cfg), \
-                patch.object(quota_snapshot.shutil, 'which', return_value=None), \
-                patch.object(quota_snapshot.subprocess, 'Popen', side_effect=AssertionError('no spawn')):
-            self.assertIsNone(collector.collect_and_post())
-        self.assertEqual((collector.last_hold, collector.last_error), ('quse_unavailable', None))
-
-    def test_session_host_resolves_quse_for_quota_collector(self):
-        with patch('agent_hub_host.quota_snapshot.quse_argv', return_value=['C:\\venv\\Scripts\\quse.exe']):
-            self.assertEqual(session_host.resolve_quse_cmd(), 'C:\\venv\\Scripts\\quse.exe')
-        with patch('agent_hub_host.quota_snapshot.quse_argv', return_value=['py', '-m', 'quse.cli']):
-            self.assertEqual(session_host.resolve_quse_cmd(), ['py', '-m', 'quse.cli', '--json'])
 
     def test_native_cli_output_decodes_as_utf8(self):
         from agent_hub_host import native_sessions

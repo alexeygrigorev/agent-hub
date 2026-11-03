@@ -1,10 +1,25 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { loadProviderPacing } from './pacing';
 import { handleResetCreditEvidence } from './reset-credit-evidence';
+import { canonicalAccountLabel, canonicalQuotaProvider } from './quota';
 
 const reply = (data: unknown, status = 200) => Response.json(data, {
   status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' },
 });
+
+function archiveState(sql: SqlStorage) {
+  const labels = new Set<string>();
+  try {
+    for (const row of sql.exec('SELECT label FROM fleet_account_archives').toArray() as any[])
+      labels.add(canonicalAccountLabel(String(row.label)));
+  } catch { /* isolated TBM stores may predate fleet account archives */ }
+  const pools = sql.exec("SELECT pool_id, provider, account FROM tbm_quota_pools WHERE pool_id != '*' ORDER BY pool_id").toArray() as any[];
+  const archivedProviders = new Set(pools.filter(pool => labels.has(canonicalAccountLabel(String(pool.account))))
+    .map(pool => canonicalQuotaProvider(String(pool.provider))));
+  const visiblePoolIds = new Set(pools.filter(pool => !labels.has(canonicalAccountLabel(String(pool.account))))
+    .map(pool => String(pool.pool_id)));
+  return { labels, archivedProviders, visiblePoolIds };
+}
 
 /** Caller authentication and cookie CSRF checks run in the Hub mount before this handler. */
 export async function handleTbmApi(request: Request, sql: SqlStorage, now = Date.now(), actor = 'unknown'): Promise<Response> {
@@ -16,20 +31,35 @@ export async function handleTbmApi(request: Request, sql: SqlStorage, now = Date
   }
   const as_of = new Date(now).toISOString();
   if (path === '/api/quota/pacing') {
-    const pools = sql.exec("SELECT * FROM tbm_quota_pools WHERE pool_id != '*' ORDER BY provider, account, pool_id").toArray();
+    const { labels, archivedProviders, visiblePoolIds } = archiveState(sql);
+    const pools = sql.exec("SELECT * FROM tbm_quota_pools WHERE pool_id != '*' ORDER BY provider, account, pool_id")
+      .toArray().filter((pool: any) => visiblePoolIds.has(String(pool.pool_id)));
     const tickTable = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='tbm_tick_state'").toArray().length;
     const tick: any = tickTable ? sql.exec('SELECT * FROM tbm_tick_state WHERE id=1').toArray()[0] : null;
+    const controller = sql.exec('SELECT * FROM tbm_controller_state ORDER BY pool_id').toArray()
+      .filter((row: any) => row.pool_id === '*' || visiblePoolIds.has(String(row.pool_id)));
+    const routingFactors = [...loadProviderPacing(sql, now)].filter(([key]) => {
+      const separator = key.indexOf(':');
+      return separator < 0
+        ? key === '*' || !archivedProviders.has(canonicalQuotaProvider(key))
+        : !labels.has(canonicalAccountLabel(key.slice(separator + 1)));
+    });
     return reply({ as_of, pools, last_tick_ms: tick?.last_tick_ms ?? null,
-      controller: sql.exec('SELECT * FROM tbm_controller_state ORDER BY pool_id').toArray(),
-      routing_factors: Object.fromEntries(loadProviderPacing(sql, now)) });
+      controller, routing_factors: Object.fromEntries(routingFactors) });
   }
   if (path === '/api/quota/banked') {
-    return reply({ as_of, tranches: sql.exec('SELECT * FROM tbm_banked_tranches ORDER BY expires_at_ms, tranche_id LIMIT 1000').toArray() });
+    const { visiblePoolIds } = archiveState(sql);
+    const tranches = sql.exec('SELECT * FROM tbm_banked_tranches ORDER BY expires_at_ms, tranche_id LIMIT 1000').toArray()
+      .filter((row: any) => visiblePoolIds.has(String(row.pool_id)));
+    return reply({ as_of, tranches });
   }
   if (path === '/api/quota/rewards') {
+    const { visiblePoolIds } = archiveState(sql);
     return reply({ as_of,
-      events: sql.exec('SELECT * FROM tbm_reward_events ORDER BY timestamp_ms DESC LIMIT 100').toArray(),
-      rollups: sql.exec('SELECT * FROM tbm_metrics_rollup ORDER BY end_time_ms DESC LIMIT 100').toArray() });
+      events: sql.exec('SELECT * FROM tbm_reward_events ORDER BY timestamp_ms DESC LIMIT 100').toArray()
+        .filter((row: any) => visiblePoolIds.has(String(row.pool_id))),
+      rollups: sql.exec('SELECT * FROM tbm_metrics_rollup ORDER BY end_time_ms DESC LIMIT 100').toArray()
+        .filter((row: any) => visiblePoolIds.has(String(row.pool_id))) });
   }
   if (request.method === 'POST') {
     // Bound the stream itself: Content-Length is optional and untrusted.

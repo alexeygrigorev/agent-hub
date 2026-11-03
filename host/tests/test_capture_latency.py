@@ -102,11 +102,10 @@ class CaptureLatency(unittest.TestCase):
             release.wait(5)
             return []
         dispatcher.once.side_effect = block
-        quota = SimpleNamespace(last_collect_monotonic=0,step=lambda: None)
-        thread = session_host.maybe_start_maintenance_thread(None, dispatcher, quota)
+        thread = session_host.maybe_start_maintenance_thread(None, dispatcher)
         self.addCleanup(lambda: (release.set(), thread.join(2)))
         self.assertTrue(entered.wait(1))
-        self.assertIs(session_host.maybe_start_maintenance_thread(thread, dispatcher, quota), thread)
+        self.assertIs(session_host.maybe_start_maintenance_thread(thread, dispatcher), thread)
         # Run the real controller for two cycles while Fleet remains blocked.
         import tempfile
         from pathlib import Path

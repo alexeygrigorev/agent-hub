@@ -21,9 +21,9 @@ async function fixture(fn: (s: FleetService, sql: any, queries: {query:string,ar
     sql.exec("INSERT INTO fleet_accounts(label,provider,max_concurrency,reserve_percent,enabled) VALUES('zai-main','zai',10,15,1)");
     machine(sql,'online');
     sql.exec("INSERT INTO fleet_routes(machine_id,engine,account,profile) VALUES('online','zcodex','zai-main',NULL)");
-    sql.exec(`INSERT INTO host_quota_snapshots(host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,routes_json)
-      VALUES('online','1.0',?,?,?,?,'ok',?)`,iso(),now,iso(),now,JSON.stringify({zai:{status:'ok',observed_at:iso(),
-      details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:iso(86400000)}}}}));
+    sql.exec(`INSERT INTO server_quota_snapshots(account,provider,captured_at,quota_json)
+      VALUES('zai-main','zai',?,?)`,iso(),JSON.stringify({status:'ok',observed_at:iso(),
+      details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:iso(86400000)}}}));
     sql.exec("INSERT INTO fleet_catalog_seen VALUES('online',?)",iso());
     sql.exec("INSERT INTO fleet_catalog_census(machine_id,observed_at,complete) VALUES('online',?,1)",iso());
     queries.length=0; fn(s,sql,queries);
@@ -62,6 +62,16 @@ describe('bounded real Fleet autonomous capacity snapshot',()=>{
     expect(queries.every(q=>/^\s*(SELECT|WITH)/i.test(q.query))).toBe(true);
     expect(queries.some(q=>q.query.includes('FROM machines WHERE revoked_at'))).toBe(false);
     expect(queries.some(q=>q.query.includes('session_cpu_usage'))).toBe(false);
+  }));
+  it('does not project archived account definitions or their retained stale routes',()=>fixture((s,sql)=>{
+    sql.exec("INSERT INTO fleet_accounts(label,provider,max_concurrency,reserve_percent,enabled) VALUES('dummy-sync-5814','zai',4,15,0)");
+    sql.exec("INSERT INTO fleet_routes(machine_id,engine,account,profile) VALUES('online','zcodex','dummy-sync-5814','legacy-profile')");
+    sql.exec('INSERT INTO fleet_account_archives VALUES(?,?,?,?,?,?)', 'dummy-sync-5814', iso(), 'admin:test',
+      'retired test account', 1, '[]');
+    const snapshot=s.queueCapacitySnapshot(now);
+    expect(snapshot.definitions.map(a=>a.label)).not.toContain('dummy-sync-5814');
+    expect(snapshot.routes.map(route=>route.account)).not.toContain('dummy-sync-5814');
+    expect([...snapshot.familyAccounts.values()].some(accounts=>accounts.has('dummy-sync-5814'))).toBe(false);
   }));
   it('preserves exact native reservation deduplication and idle catalog accounting',()=>fixture((s,sql)=>{
     launch(sql,'bound','running','native'); native(sql,'native');

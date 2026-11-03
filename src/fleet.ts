@@ -15,7 +15,7 @@ import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type Ad
 import { effectiveCheckin, effectiveRoutesAt } from './registry';
 import { commandChannelHealth } from './command-channel';
 import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
-import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
+import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
 import { runHeldReconciler } from './intake-recovery';
@@ -29,7 +29,6 @@ import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
 import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, reservationHoldsCapacity, RESERVATION_TTL_MS, INFLIGHT_LAUNCH_ID_SQL, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
-import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { applyNormalizedScores, computeEngineDecision, fallbackModelIds, isDesktopCodexExcluded, isHealthyAlternative, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
 import { burnFactor, burnForecast, type BurnForecast } from './burn';
@@ -54,6 +53,7 @@ CREATE TABLE IF NOT EXISTS fleet_catalog_census (machine_id TEXT PRIMARY KEY, ob
 CREATE TABLE IF NOT EXISTS fleet_queue_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), after_rowid INTEGER NOT NULL, high_water INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT, evidence_json TEXT, host_load_machine TEXT, host_load_factor REAL, host_load_trigger TEXT, host_load_limit REAL);
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS fleet_account_archives (label TEXT PRIMARY KEY, archived_at TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, previous_enabled INTEGER NOT NULL, routes_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
 CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
 CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id TEXT NOT NULL, tag TEXT NOT NULL, engine TEXT, phase TEXT NOT NULL, agent_state TEXT, observed_at TEXT NOT NULL, workspace TEXT NOT NULL, profile TEXT, account TEXT, last_activity_at TEXT, cwd TEXT, PRIMARY KEY(machine_id, native_id));
@@ -407,59 +407,6 @@ function validHostLoad(reason: string, value: any): boolean {
   return false;
 }
 function parsed(value: any, fallback: any = {}) { try { return JSON.parse(value || '{}'); } catch { return fallback; } }
-const NATIVE_AMOUNTS: Record<string, number> = { credits_remaining: 1e12, spend_used: 1e15, spend_limit: 1e15 };
-const NATIVE_UNITS = new Set(['percent', 'credits', 'usd_cents', 'requests', 'tokens']);
-const PROFILE_LABEL = /^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$/;
-const COLLECTOR_VERSION = /^[A-Za-z0-9][A-Za-z0-9_.+/-]{0,63}$/;
-const UTC_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|\+00:00)$/;
-function nativeAmount(value: any, cap: number): boolean {
-  return value === null || value === undefined || (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= cap);
-}
-function sanitizedQuota(raw: any): any {
-  const topKeys = ['status', 'observed_at', 'details', 'windows'];
-  const hasCv = !!raw && typeof raw === 'object' && !Array.isArray(raw) && (raw as any).collector_version !== undefined;
-  if (!object(raw, hasCv ? [...topKeys, 'collector_version'] : topKeys) || !['ok', 'unknown', 'error'].includes(raw.status) || !object(raw.details, Object.keys(raw.details)) || !object(raw.windows, Object.keys(raw.windows || {})) || Object.keys(raw.windows).length > 32) return null;
-  if (raw.collector_version !== undefined && raw.collector_version !== null && (typeof raw.collector_version !== 'string' || !COLLECTOR_VERSION.test(raw.collector_version))) return null;
-  const details: any = {};
-  for (const [key, value] of Object.entries(raw.details)) {
-    if (['limit_reached', 'has_grok_code_access', 'stale'].includes(key)) {
-      if (value !== null && typeof value !== 'boolean') return null;
-    } else if (key in NATIVE_AMOUNTS) {
-      if (!nativeAmount(value, NATIVE_AMOUNTS[key])) return null;
-    } else if (key === 'unit') {
-      if (value !== null && (typeof value !== 'string' || !NATIVE_UNITS.has(value))) return null;
-    } else if (key === 'profile') {
-      if (value !== null && (typeof value !== 'string' || !PROFILE_LABEL.test(value))) return null;
-    } else if (key === 'cooldown_until') {
-      if (value !== null && (typeof value !== 'string' || value.length > 64 || !UTC_ISO.test(value) || !Number.isFinite(Date.parse(value)))) return null;
-    } else if (key === 'banked_resets') {
-      if (!Array.isArray(value) || value.length > 32 || value.some(g =>
-        !object(g, ['expires_at', 'available', 'label']) || typeof g.available !== 'boolean' ||
-        typeof g.expires_at !== 'string' || !UTC_ISO.test(g.expires_at) || !Number.isFinite(Date.parse(g.expires_at)) ||
-        typeof g.label !== 'string' || !/^[A-Za-z0-9 ._-]{0,80}$/.test(g.label))) return null;
-    } else if (key === 'banked_resets_error') {
-      // Reset-credits sub-probe failure marker (intake 7bf6f6ee): an opaque
-      // short reason that keeps an ok-status empty grant list from reading
-      // as "no banked resets". Null/omitted means no known probe failure.
-      if (value !== null && (typeof value !== 'string' || value.length === 0 || value.length > 256)) return null;
-    } else return null;
-    details[key] = value;
-  }
-  const windows: any = {};
-  for (const [key, w] of Object.entries(raw.windows) as any) {
-    if (!label(key) || !object(w, Object.keys(w)) || typeof w.present !== 'boolean' || (w.percent_remaining !== null && (typeof w.percent_remaining !== 'number' || !Number.isFinite(w.percent_remaining) || w.percent_remaining < 0 || w.percent_remaining > 100)) || (w.reset_at !== null && (typeof w.reset_at !== 'string' || !Number.isFinite(Date.parse(w.reset_at)))) || (w.rolling !== undefined && typeof w.rolling !== 'boolean') || (w.error !== undefined && w.error !== null && w.error !== 'unavailable')) return null;
-    for (const nk of Object.keys(NATIVE_AMOUNTS)) if (!nativeAmount(w[nk], NATIVE_AMOUNTS[nk])) return null;
-    if (w.unit !== undefined && w.unit !== null && (typeof w.unit !== 'string' || !NATIVE_UNITS.has(w.unit))) return null;
-    if (w.profile !== undefined && w.profile !== null && (typeof w.profile !== 'string' || !PROFILE_LABEL.test(w.profile))) return null;
-    for (const k of Object.keys(w)) if (!['present', 'percent_remaining', 'reset_at', 'rolling', 'error', ...Object.keys(NATIVE_AMOUNTS), 'unit', 'profile'].includes(k)) return null;
-    const nativesNull = w.credits_remaining == null && w.spend_used == null && w.spend_limit == null && w.unit == null && w.profile == null;
-    if (!w.present && (w.percent_remaining !== null || w.reset_at !== null || !nativesNull)) return null;
-    windows[key] = { present: w.present, percent_remaining: w.percent_remaining, reset_at: w.reset_at, rolling: w.rolling === true, error: w.error === 'unavailable' ? 'unavailable' : null,
-      credits_remaining: w.credits_remaining ?? null, spend_used: w.spend_used ?? null, spend_limit: w.spend_limit ?? null, unit: w.unit ?? null, profile: w.profile ?? null };
-  }
-  if (raw.observed_at !== null && (typeof raw.observed_at !== 'string' || !Number.isFinite(Date.parse(raw.observed_at)))) return null;
-  return { status: raw.status, observed_at: raw.observed_at, details, windows, collector_version: raw.collector_version ?? null };
-}
 function fresh(value: any, now: number, ttl: number) {
   const at = typeof value === 'string' && /T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? Date.parse(value) : NaN;
   return Number.isFinite(at) && at <= now && now - at <= ttl;
@@ -775,6 +722,9 @@ export class FleetService {
     const now = snapshot?.now ?? this.now();
     const provider = canonicalQuotaProvider(account.provider);
     const label = canonicalAccountLabel(account.label);
+    try {
+      if (this.sql.exec('SELECT 1 FROM fleet_account_archives WHERE label = ? LIMIT 1', account.label).toArray().length) return null;
+    } catch { /* older isolated stores have no archive table */ }
     const legacyLabel = Object.entries(LEGACY_ACCOUNT_LABELS).find(([, c]) => c === label)?.[0] ?? label;
     const central: any = this.sql.exec('SELECT * FROM server_quota_snapshots WHERE (account = ? OR account = ?) AND (provider = ? OR provider = ?)', label, legacyLabel, provider, legacyRouteKeyFor(provider) ?? provider).toArray()[0];
     if (central && fresh(central.captured_at, now, QUOTA_STALE_MS - 1)) {
@@ -783,24 +733,9 @@ export class FleetService {
         return { quota, subscriptionObservedAt: central.captured_at };
       }
     }
-    const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
-    if (subscription) {
-      if (canonicalQuotaProvider(subscription.service) !== provider || !fresh(subscription.observed_at, now, 1200000)) return null;
-      const quota = parsed(subscription.quota_json);
-      const quotaObs = quota?.observed_at || subscription.observed_at;
-      return fresh(quotaObs, now, 1200000) ? { quota: quota?.observed_at ? quota : { ...quota, observed_at: quotaObs }, subscriptionObservedAt: subscription.observed_at } : null;
-    }
-    // A default CLI reading cannot describe a named profile or two accounts on one service.
-    if (route.profile !== null && route.profile !== provider) return null;
-    const count = snapshot ? (snapshot.familyAccounts.get(capacityFamilyKey(route.machine_id, provider))?.size ?? 0)
-      : Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)', route.machine_id, provider, legacyRouteKeyFor(provider) ?? provider).one().n);
-    const hostSnapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
-    if (count !== 1 || !hostSnapshot || !fresh(hostSnapshot.captured_at, now, 1200000)) return null;
-    const quota = snapshotRouteForAccount(account.label, provider, parsed(hostSnapshot.routes_json));
-    const obsTs = quota?.observed_at || hostSnapshot.captured_at;
-    if (!quota || !fresh(obsTs, now, 1200000)) return null;
-    const quotaWithTs = quota.observed_at ? quota : { ...quota, observed_at: obsTs };
-    return { quota: hostSnapshot.status === 'ok' ? quotaWithTs : { ...quotaWithTs, status: 'unknown' }, subscriptionObservedAt: hostSnapshot.captured_at };
+    // Per-machine subscriptions and host snapshots are retired. Admission
+    // consumes only the Hub server observation above.
+    return null;
   }
 
   private observation(account: any, route: any) {
@@ -930,7 +865,7 @@ export class FleetService {
     const provider = canonicalQuotaProvider(account.provider);
     const routes = snapshot ? snapshot.routes.filter(r => r.account === account.label)
       : this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
-    let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled; let healthy = false; let unmeteredOk = false;
+    let remaining: number | null = null; let resetAt: string | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled; let healthy = false; let unmeteredOk = false;
     let burn: BurnForecast | null = null;
     const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
     for (const route of routes) {
@@ -938,9 +873,15 @@ export class FleetService {
       if (!prov) continue;
       observed++;
       burn ??= burnForecast(prov.quota, now, Math.max(Number(account.reserve_percent) || 0, reserves[provider] ?? 0));
+      const routeResets = Object.values(prov.quota?.windows || {})
+        .map((window: any) => window?.reset_at)
+        .filter((value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value)))
+        .sort((a, b) => Date.parse(a) - Date.parse(b));
+      if (routeResets.length && (!resetAt || Date.parse(routeResets[0]) < Date.parse(resetAt))) resetAt = routeResets[0];
       const adm = evaluateLaunchQuota({ provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: now, reserves });
       if (!adm.ok) {
-        if (['limit_reached', 'cooldown_active'].includes(adm.reason)) blocked = true;
+        if (adm.reason === 'limit_reached') { blocked = true; remaining = 0; }
+        else if (adm.reason === 'cooldown_active') blocked = true;
         else if (adm.reason === 'reserve') {
           if (adm.remaining !== null) remaining = remaining === null ? adm.remaining : Math.min(remaining, adm.remaining);
         } else unknown = true;
@@ -1029,7 +970,7 @@ export class FleetService {
       } else placementReasons.add(liveIds.has(String(route.machine_id)) ? 'engine_unavailable' : 'machine_unavailable');
     }
     return { label: canonicalAccountLabel(account.label), provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: GOAL_PROVIDERS.has(provider),
-      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || (remaining === null && !unmeteredOk) || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
+      remaining_percent: remaining, reset_at: resetAt, status: blocked ? 'blocked' : (!observed || (remaining === null && !unmeteredOk) || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
       // Counted vs live: active splits into launch reservations + orphan
       // observed sessions; native_live is the host-catalog verified live
       // process count for this account (includes launch-linked sessions).
@@ -2287,16 +2228,6 @@ export class FleetService {
     }
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
-      // Harness per (machine, account) for the subscriptions table: every
-      // quota row exposes both the harness and the provider/account pair.
-      const routeHarness = new Map<string, Set<string>>();
-      try {
-        for (const r of this.sql.exec('SELECT machine_id, account, engine FROM fleet_routes').toArray() as any[]) {
-          const key = String(r.machine_id) + ' ' + String(r.account);
-          if (!routeHarness.has(key)) routeHarness.set(key, new Set());
-          routeHarness.get(key)!.add(canonicalHarness(String(r.engine)));
-        }
-      } catch { /* harness reads as unknown below */ }
       const controlIds = new Map<string, string>();      try {
         for (const row of this.sql.exec('SELECT id, fleet_launch_id FROM session_control_sessions WHERE fleet_launch_id IN (SELECT id FROM fleet_launches ORDER BY created_at DESC LIMIT 200)').toArray() as any[]) controlIds.set(row.fleet_launch_id, row.id);
       } catch { /* optional session-control store */ }
@@ -2324,15 +2255,14 @@ export class FleetService {
       } catch { capsByMachine = new Map(); }
       const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
       const liveSessions = this.liveSessionsByAccount();
-      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => { const s = this.accountStatus(a); return { ...s, sessions: liveSessions.get(s.label) ?? 0 }; }), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = capsByMachine.get(String(r.machine_id)); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
+      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec(`SELECT a.* FROM fleet_accounts a
+        WHERE NOT EXISTS (SELECT 1 FROM fleet_account_archives x WHERE x.label = a.label) ORDER BY a.label`).toArray() as any[]).map(a => { const s = this.accountStatus(a); return { ...s, sessions: liveSessions.get(s.label) ?? 0 }; }), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = capsByMachine.get(String(r.machine_id)); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
         machines, machine_aliases: machineAliases,
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions,
         host_resources: this.hostResources(),
         resource_management: this.resources.overview(),
         placement: this.placementOverview(),
-        subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
-          harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() })),
         launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: ['queued','offered','failed'].includes(row.state) ? this.launchRejections(row) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, decision_score: selection?.decision_score ?? null, decision_reason: selection?.decision_reason ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
     }
     const revokeMatch = /^\/api\/fleet\/machines\/([A-Za-z0-9_-]{1,64})\/revoke$/.exec(path);
@@ -2408,7 +2338,8 @@ export class FleetService {
       if (!admin) return response({ error: 'forbidden' }, 403);
       const routes = this.sql.exec('SELECT account, engine FROM fleet_routes ORDER BY engine').toArray() as any[];
       const liveSessions = this.liveSessionsByAccount();
-      const accounts = dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(row => {
+      const accounts = dedupeAccountsByCanonical(this.sql.exec(`SELECT a.* FROM fleet_accounts a
+        WHERE NOT EXISTS (SELECT 1 FROM fleet_account_archives x WHERE x.label = a.label) ORDER BY a.label`).toArray() as any[]).map(row => {
         const s = this.accountStatus(row);
         return { account: s.label, provider: s.provider, engines: [...new Set(routes.filter(r => canonicalAccountLabel(String(r.account)) === s.label).map(r => String(r.engine)))],
           max_concurrency: Number(s.max_concurrency), active: s.active, reserved: s.reserved, observed_sessions: s.observed_sessions,
@@ -2430,7 +2361,8 @@ export class FleetService {
           (data.allow_lower !== undefined && typeof data.allow_lower !== 'boolean'))
         return response({ error: 'invalid_limit' }, 400);
       return this.transaction(() => {
-        const rows = this.sql.exec('SELECT label, provider, max_concurrency FROM fleet_accounts ORDER BY label').toArray() as any[];
+        const rows = this.sql.exec(`SELECT a.label, a.provider, a.max_concurrency FROM fleet_accounts a
+          WHERE NOT EXISTS (SELECT 1 FROM fleet_account_archives x WHERE x.label = a.label) ORDER BY a.label`).toArray() as any[];
         const routes = this.sql.exec('SELECT account, engine FROM fleet_routes').toArray() as any[];
         const resolved = resolveLimitTarget(data.target, rows, routes);
         if (!resolved.rows.length) return response({ error: 'unknown_limit_target' }, 404);
@@ -2450,6 +2382,38 @@ export class FleetService {
     // disabled account keeps its registry row, routes, credentials and
     // history, but accountStatus() reports it blocked so plan() never offers
     // it. Re-enabling restores placement; nothing is deleted.
+    const accountArchive = /^\/api\/fleet\/accounts\/([^/]+)\/archive$/.exec(path);
+    if (accountArchive && request.method === 'POST') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      let target = '';
+      try { target = decodeURIComponent(accountArchive[1]); } catch { target = ''; }
+      const data = await body(request);
+      const reason = typeof data?.reason === 'string' ? data.reason.trim() : '';
+      if (!label(target) || !object(data, ['reason']) || !reason || reason.length > 500 || /[\x00-\x1f\x7f]/.test(reason))
+        return response({ error: 'invalid_account_archive' }, 400);
+      return this.transaction(() => {
+        const account: any = this.sql.exec('SELECT label, enabled FROM fleet_accounts WHERE label = ?', target).toArray()[0];
+        if (!account) return response({ error: 'unknown_account' }, 404);
+        const prior: any = this.sql.exec('SELECT archived_at FROM fleet_account_archives WHERE label = ?', target).toArray()[0];
+        if (prior) return response({ status: 'archived', account: target, archived_at: prior.archived_at, changed: false });
+        const routes = this.sql.exec('SELECT machine_id, engine, account, profile FROM fleet_routes WHERE account = ? ORDER BY machine_id, engine', target).toArray();
+        const at = new Date(this.now()).toISOString();
+        const actor = String(caller.actor ?? 'admin');
+        try {
+          this.sql.exec('INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)', actor,
+            'fleet_account_archived', 'fleet_account', target,
+            JSON.stringify({ reason, previous_enabled: !!account.enabled, removed_routes: routes.length }), at);
+        } catch {
+          return response({ error: 'archive_audit_unavailable' }, 503);
+        }
+        this.sql.exec(`INSERT INTO fleet_account_archives
+          (label, archived_at, actor, reason, previous_enabled, routes_json) VALUES (?, ?, ?, ?, ?, ?)`,
+          target, at, actor, reason, Number(account.enabled), JSON.stringify(routes));
+        this.sql.exec('UPDATE fleet_accounts SET enabled = 0 WHERE label = ?', target);
+        this.sql.exec('DELETE FROM fleet_routes WHERE account = ?', target);
+        return response({ status: 'archived', account: target, archived_at: at, changed: true, removed_routes: routes.length });
+      });
+    }
     const accountRead = /^\/api\/fleet\/accounts\/([^/]+)\/(reserved-launches|capacity-history)$/.exec(path);
     if (accountRead && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
@@ -2458,6 +2422,8 @@ export class FleetService {
       if (!label(accountLabel)) return response({ error: 'invalid_account' }, 400);
       const account = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', accountLabel).toArray()[0] as any;
       if (!account) return response({ error: 'unknown_account' }, 404);
+      if (this.sql.exec('SELECT 1 FROM fleet_account_archives WHERE label = ? LIMIT 1', accountLabel).toArray().length)
+        return response({ error: 'account_archived' }, 404);
       const params = new URL(request.url).searchParams;
       const limitRaw = params.get('limit') ?? '100';
       const limit = /^\d{1,3}$/.test(limitRaw) ? Number(limitRaw) : 0;
@@ -2500,6 +2466,8 @@ export class FleetService {
       return this.transaction(() => {
         const row: any = this.sql.exec('SELECT label, enabled FROM fleet_accounts WHERE label = ?', target).toArray()[0];
         if (!row) return response({ error: 'unknown_account' }, 404);
+        if (this.sql.exec('SELECT 1 FROM fleet_account_archives WHERE label = ? LIMIT 1', target).toArray().length)
+          return response({ error: 'account_archived' }, 404);
         const from = !!row.enabled;
         if (from !== data.enabled) {
           this.sql.exec('UPDATE fleet_accounts SET enabled = ? WHERE label = ?', Number(data.enabled), target);
@@ -2526,6 +2494,8 @@ export class FleetService {
         if (!object(r, ['machine_id', 'engine', 'account', 'profile']) || !isValidMachineId(r.machine_id) || !label(r.engine) || !labels.has(r.account) || (r.profile !== null && !label(r.profile)) || keys.has(key) || !this.sql.exec('SELECT id FROM machines WHERE id = ?', r.machine_id).toArray().length) return response({ error: 'invalid_route' }, 400);
         keys.add(key);
       }
+      const archivedLabels = new Set((this.sql.exec('SELECT label FROM fleet_account_archives').toArray() as any[]).map(row => String(row.label)));
+      if (data.accounts.some((account: any) => archivedLabels.has(account.label))) return response({ error: 'account_archived' }, 409);
       return this.transaction(() => {
         this.admission.reconcileOffers();
         if (Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE state IN ${ACTIVE}`).one().n)) {
@@ -2860,50 +2830,7 @@ export class FleetService {
       });
     }
     if (path === '/api/fleet/subscriptions' && request.method === 'PUT') {
-      if (!host) return response({ error: 'forbidden' }, 403);
-      const data = await body(request);
-      if (!object(data, ['subscriptions']) || !Array.isArray(data.subscriptions) || data.subscriptions.length > 128) return response({ error: 'invalid_subscriptions' }, 400);
-      const clean: any[] = []; const labels = new Set();
-      for (const sub of data.subscriptions) {
-        if (!object(sub, ['service', 'account', 'plan', 'quota']) || !label(sub.account) || !PROVIDERS.has(sub.service) || (sub.plan !== null && (typeof sub.plan !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9 ._+-]{0,63}$/.test(sub.plan))) || labels.has(sub.account)) return response({ error: 'invalid_subscription' }, 400);
-        labels.add(sub.account);
-        // Canonical provider AND account match: a legacy `codex-orin` service
-        // report maps to an account registered under provider `codex`, and a
-        // legacy `urgent-muse` account report maps to `shared-go` — in either
-        // update order — so a half-updated fleet never fails the whole
-        // per-machine report with unmapped.
-        const canonicalService = canonicalQuotaProvider(sub.service);
-        const canonicalSubAccount = canonicalAccountLabel(sub.account);
-        const legacySubAccount = Object.entries(LEGACY_ACCOUNT_LABELS).find(([, c]) => c === canonicalSubAccount)?.[0];
-        if ([...labels].some((l) => canonicalAccountLabel(l as string) === canonicalSubAccount && l !== sub.account)) return response({ error: 'invalid_subscription', reason: 'duplicate_account' }, 400);
-        const mapped = this.sql.exec('SELECT a.label, a.provider FROM fleet_accounts a JOIN fleet_routes r ON a.label = r.account WHERE r.machine_id = ? AND (a.label = ? OR a.label = ? OR a.label = ?)', caller.machineId!, sub.account, canonicalSubAccount, legacySubAccount ?? sub.account).toArray()
-          .filter((row: any) => canonicalQuotaProvider(row.provider) === canonicalService);
-        const quota = sanitizedQuota(sub.quota);
-        if (!mapped.length || !quota || (quota.observed_at !== null && Date.parse(quota.observed_at) > this.now()) || (quota.status === 'ok' && !fresh(quota.observed_at, this.now(), 1200000))) return response({ error: 'subscription_unmapped_or_invalid', reason: !mapped.length ? 'unmapped' : !quota ? 'invalid_quota' : 'invalid_timestamp' }, 400);
-        // Store canonical names so subscription reads join the canonical
-        // account registry regardless of which legacy name a host reported.
-        clean.push({ ...sub, account: canonicalSubAccount, service: canonicalService, quota });
-      }
-      return this.transaction(() => {
-        const prior = new Map((this.sql.exec('SELECT account, quota_json FROM fleet_subscriptions WHERE machine_id = ?', caller.machineId!).toArray() as any[]).map(r => [r.account, r.quota_json]));
-        this.sql.exec('DELETE FROM fleet_subscriptions WHERE machine_id = ?', caller.machineId!);
-        for (const s of clean) {
-          // A newer report that omits a cooldown deadline must not erase an unexpired known hold.
-          if (s.quota.details?.cooldown_until == null) {
-            try {
-              const oldQ = JSON.parse(prior.get(s.account) || 'null');
-              const oldCd = oldQ?.details?.cooldown_until;
-              if (typeof oldCd === 'string' && Number.isFinite(Date.parse(oldCd)) && Date.parse(oldCd) > this.now()) {
-                s.quota.details.cooldown_until = oldCd;
-              }
-            } catch { /* keep the field absent */ }
-          }
-          this.sql.exec('INSERT INTO fleet_subscriptions VALUES (?, ?, ?, ?, ?, ?)', caller.machineId!, s.account, s.service, s.plan, new Date(this.now()).toISOString(), JSON.stringify(s.quota));
-          syncTbmFromServerAccounts(this.sql, [{ account: s.account, provider: s.service, quota: s.quota }],
-            Date.parse(s.quota.observed_at));
-        }
-        return response({ status: 'reported' });
-      });
+      return response({ error: 'machine_quota_collection_disabled', source: 'hub_server' }, 410);
     }
     if (path === '/api/fleet/engine-health' && request.method === 'GET') {
       if (!admin && !caller) return response({ error: 'forbidden' }, 403);

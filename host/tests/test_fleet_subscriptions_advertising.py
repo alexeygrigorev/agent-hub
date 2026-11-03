@@ -101,32 +101,21 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
             registered_engines = register_calls[0][2]["capabilities"]["engines"]
 
             sub_calls = [c for c in calls if c[0] == "PUT" and c[1] == "/api/fleet/subscriptions"]
-            self.assertEqual(len(sub_calls), 1)
-            reported_subs = sub_calls[0][2]["subscriptions"]
-            return registered_engines, [s["account"] for s in reported_subs]
+            self.assertEqual(sub_calls, [])
+            return registered_engines, []
 
-    def test_dispatcher_advertises_all_configured_subscription_engines(self):
-        # Every provider explicitly enabled: all configured engines and accounts.
+    def test_dispatcher_advertises_configured_engines_without_quota_reports(self):
+        # Every provider enabled: all configured engines remain routable.
         registered_engines, reported_accounts = self._advertise_and_report(disabled_providers=[])
         expected_engines = sorted(["claude", "codex", "antigravity", "opencode", "grok", "zcodex"])
         self.assertEqual(registered_engines, expected_engines)
-        self.assertIn("shared-claude", reported_accounts)
-        self.assertIn("shared-codex", reported_accounts)
-        self.assertIn("shared-gemini", reported_accounts)
-        self.assertIn("shared-go", reported_accounts)
-        self.assertIn("shared-grok", reported_accounts)
-        self.assertIn("shared-zai", reported_accounts)
+        self.assertEqual(reported_accounts, [])
 
-    def test_routing_disabled_provider_is_omitted_from_subscription_report_only(self):
-        # Paired regression (611d57e0): Hub rejects the whole report when one entry
-        # has no route, and a routing-disabled provider is never routed. Only the
-        # subscription report omits it; engine advertisement is unchanged.
+    def test_routing_policy_does_not_enable_machine_quota_reporting(self):
         registered_engines, reported_accounts = self._advertise_and_report(disabled_providers=["grok"])
         expected_engines = sorted(["claude", "codex", "antigravity", "opencode", "grok", "zcodex"])
         self.assertEqual(registered_engines, expected_engines)
-        self.assertNotIn("shared-grok", reported_accounts)
-        self.assertEqual(sorted(reported_accounts),
-                         ["shared-claude", "shared-codex", "shared-gemini", "shared-go", "shared-zai"])
+        self.assertEqual(reported_accounts, [])
 
     def test_antigravity_without_credential_is_dropped_only_then(self):
         # Decision for intake 3d1f8702: antigravity/shared-gemini stay advertised
@@ -134,9 +123,8 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
         # run); they are dropped only when that credential is truly missing.
         registered_engines, reported_accounts = self._advertise_and_report(
             disabled_providers=[], antigravity_credential=False)
-        self.assertNotIn("shared-gemini", reported_accounts)
-        self.assertIn("shared-go", reported_accounts)
-        self.assertIn("shared-claude", reported_accounts)
+        self.assertNotIn("antigravity", registered_engines)
+        self.assertEqual(reported_accounts, [])
 
     def test_monitor_only_account_does_not_disable_runnable_account_on_same_engine(self):
         from unittest.mock import Mock
@@ -159,30 +147,7 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
         self.assertEqual([b for _, p, b in calls if p == '/api/fleet/probe'], [
             {'engine': 'zcodex', 'status': 'unavailable', 'reason': 'admission_unconfigured'}])
 
-    def test_collect_subscriptions_claude(self):
-        def runner(argv):
-            if argv[:2] == ["quse", "claude"]:
-                return {
-                    "claude": {
-                        "status": "ok",
-                        "windows": {
-                            "5h": {
-                                "percent_remaining": 80.0,
-                                "reset_at": "2026-10-24T19:00:00Z",
-                                "rolling": False,
-                            },
-                            "7d": {
-                                "percent_remaining": 90.0,
-                                "reset_at": "2026-10-29T15:00:00Z",
-                            },
-                        },
-                        "details": {"subscription": "max"},
-                    }
-                }
-            if argv[:1] == ["claude"]:
-                return {"subscriptionType": "max"}
-            return {}
-
+    def test_machine_subscription_collection_is_retired(self):
         settings = {
             "subscriptions": [
                 {
@@ -193,15 +158,8 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
             ]
         }
         seen = []
-        reports = fleet.collect_subscriptions(settings, runner=lambda argv: seen.append(argv) or runner(argv))
-        self.assertEqual(len(reports), 1)
-        sub = reports[0]
-        self.assertEqual(sub["service"], "claude")
-        self.assertEqual(sub["account"], "shared-claude")
-        self.assertEqual(sub["plan"], "max")
-        # Intake 5814e109 I4: Hub owns quota; the host never runs quse, even when configured.
-        self.assertFalse(any(a[:1] == ["quse"] for a in seen))
-        self.assertEqual(sub["quota"]["status"], "unknown")
+        self.assertEqual(fleet.collect_subscriptions(settings, runner=lambda argv: seen.append(argv)), [])
+        self.assertEqual(seen, [])
 
     def test_supervisor_default_config_path(self):
         supervisor_path = Path(__file__).resolve().parent.parent.parent / "scripts" / "session-host-supervisor.py"

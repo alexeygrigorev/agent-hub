@@ -297,26 +297,17 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
     }
   });
 
-  it('returns 404 with explicit status:unknown and error:unavailable when host has no snapshot yet', async () => {
+  it('retires host quota reads when host has no snapshot', async () => {
     const res = await doFetch(
       new Request('http://example.com/api/quota', {
         method: 'GET',
         headers: { Authorization: `Bearer ${hostAlpha.accessToken}` },
       })
     );
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(410);
     expect(res.headers.get('Cache-Control')).toBe('private, no-store');
     const body = (await res.json()) as any;
-    expect(body).toEqual({
-      schema_version: '1.0',
-      captured_at: null,
-      received_at: null,
-      host_id: hostAlpha.machineId,
-      stale: true,
-      status: 'unknown',
-      error: 'unavailable',
-      routes: {},
-    });
+    expect(body).toEqual({ error: 'machine_quota_collection_disabled', source: 'hub_server' });
   });
 
   it('rejects anonymous, job, agent, human, expired, revoked, unregistered, cross-machine, and header/body spoof with zero SQLite writes', async () => {
@@ -592,123 +583,19 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
     });
   });
 
-  it('accepts valid registered host POST, preserves absent Codex 5h vs 7d, and updates when 5h becomes available', async () => {
+  it('retires authenticated per-machine quota collection without inserting a snapshot', async () => {
     const t0 = 1760421000000;
-    const cap0 = new Date(t0 - 2000).toISOString();
-    const obsOlder = new Date(t0 - 180000).toISOString(); // 3 minutes older than captured_at
-
     await runInDurableObject(stub, async (instance: Hub) => {
       instance.quotaStore.setClock(() => t0);
-      try {
-        const snap1 = buildValidSnapshot(hostAlpha.machineId, cap0);
-        // Set codex observed_at older than captured_at to verify preservation
-        (snap1.routes.codex as any).observed_at = obsOlder;
-
-        const postRes = await instance.fetch(
-          new Request('http://example.com/api/quota', {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${hostAlpha.accessToken}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(snap1),
-          })
-        );
-        expect(postRes.status).toBe(200);
-        expect(postRes.headers.get('Cache-Control')).toBe('private, no-store');
-        const postBody = (await postRes.json()) as any;
-        expect(postBody.status).toBe('ok');
-        expect(postBody.stale).toBe(false);
-        expect(postBody.host_id).toBe(hostAlpha.machineId);
-        expect(postBody.received_at).toBe(new Date(t0).toISOString());
-
-        // Read back via GET /api/quota (no host_id selector needed for host token)
-        const getRes = await instance.fetch(
-          new Request('http://example.com/api/quota', {
-            method: 'GET',
-            headers: { Authorization: `Bearer ${hostAlpha.accessToken}` },
-          })
-        );
-        expect(getRes.status).toBe(200);
-        expect(getRes.headers.get('Cache-Control')).toBe('private, no-store');
-        const getBody = (await getRes.json()) as any;
-        expect(getBody.schema_version).toBe('1.0');
-        expect(getBody.captured_at).toBe(cap0);
-        expect(getBody.received_at).toBe(new Date(t0).toISOString());
-        expect(getBody.stale).toBe(false);
-        expect(getBody.status).toBe('ok');
-        expect(getBody.error).toBeNull();
-
-        // Provider-native observed_at preserved (not overwritten by captured_at)
-        expect(getBody.routes.codex.observed_at).toBe(obsOlder);
-
-        // Absent Codex 5h stays present:false, percent_remaining:null (never 0, never weekly 7d substitute)
-        expect(getBody.routes.codex.windows['5h']).toEqual({
-          percent_remaining: null,
-          reset_at: null,
-          present: false,
-          rolling: true,
-        });
-        expect(getBody.routes.codex.windows['7d'].percent_remaining).toBe(78.5);
-        expect(getBody.routes.codex.details).toEqual({ limit_reached: false });
-
-        // Grok retains has_grok_code_access
-        expect(getBody.routes.grok.details).toEqual({
-          limit_reached: false,
-          has_grok_code_access: true,
-        });
-
-        // Gemini +00:00 reset_at normalized to canonical Z ISO
-        expect(getBody.routes.gemini.windows.daily.reset_at).toBe('2026-10-15T00:00:00.000Z');
-
-        // Now post a newer snapshot where Codex 5h genuinely appears
-        const t1 = t0 + 600_000;
-        instance.quotaStore.setClock(() => t1);
-        const cap1 = new Date(t1 - 1000).toISOString();
-        const snap2 = buildValidSnapshot(hostAlpha.machineId, cap1);
-        (snap2.routes.codex.windows as any)['5h'] = {
-          percent_remaining: 88.25,
-          reset_at: '2026-10-14T16:00:00Z',
-          present: true,
-          rolling: true,
-        };
-
-        const postRes2 = await instance.fetch(
-          new Request('http://example.com/api/quota', {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${hostAlpha.accessToken}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(snap2),
-          })
-        );
-        expect(postRes2.status).toBe(200);
-
-        const getRes2 = await instance.fetch(
-          new Request('http://example.com/api/quota', {
-            method: 'GET',
-            headers: { Authorization: `Bearer ${hostAlpha.accessToken}` },
-          })
-        );
-        const getBody2 = (await getRes2.json()) as any;
-        expect(getBody2.routes.codex.windows['5h']).toEqual({
-          percent_remaining: 88.25,
-          reset_at: '2026-10-14T16:00:00.000Z',
-          present: true,
-          rolling: true,
-        });
-
-        // Bounded retention: only 1 row exists for hostAlpha in host_quota_snapshots
-        const rowCount = (
-          instance.sql
-            .exec('SELECT COUNT(*) AS cnt FROM host_quota_snapshots WHERE host_id = ?', hostAlpha.machineId)
-            .toArray()[0] as any
-        ).cnt;
-        expect(rowCount).toBe(1);
-      } finally {
-        instance.quotaStore.setClock(undefined);
-      }
+      const response = await instance.fetch(new Request('http://example.com/api/quota', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${hostAlpha.accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildValidSnapshot(hostAlpha.machineId, new Date(t0 - 1000).toISOString())),
+      }));
+      expect(response.status).toBe(410);
+      expect(await response.json()).toEqual({ error: 'machine_quota_collection_disabled', source: 'hub_server' });
+      expect(instance.sql.exec('SELECT COUNT(*) AS n FROM host_quota_snapshots WHERE host_id = ?', hostAlpha.machineId).one()?.n).toBe(0);
+      instance.quotaStore.setClock(undefined);
     });
   });
 
@@ -827,27 +714,8 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
             body: JSON.stringify(dynamicPayload),
           })
         );
-        expect(res.status).toBe(200);
-        const body = (await res.json()) as any;
-
-        // Claude route became error/unavailable due to details.stale === true, preserving details.stale
-        expect(body.routes.claude.status).toBe('error');
-        expect(body.routes.claude.error).toBe('unavailable');
-        expect(body.routes.claude.details.stale).toBe(true);
-        expect(body.routes.claude.windows.sonnet_7d_window.percent_remaining).toBe(55);
-        expect(body.routes.claude.windows['5h']).toBeUndefined(); // Not remapped to 5h
-
-        // ZAI route became error/unavailable due to explicit window error: "unavailable"
-        expect(body.routes.zai.status).toBe('error');
-        expect(body.routes.zai.error).toBe('unavailable');
-        expect(body.routes.zai.windows.optional_broken_win.error).toBe('unavailable');
-        expect(body.routes.zai.windows['glm-coding-window_1'].error).toBeNull();
-
-        // Copilot empty optional window without error stays absent/null and route stays ok
-        expect(body.routes.copilot.status).toBe('ok');
-        expect(body.routes.copilot.error).toBeNull();
-        expect(body.routes.copilot.windows.monthly_chat.percent_remaining).toBeNull();
-        expect(body.routes.copilot.windows.monthly_chat.present).toBe(false);
+        expect(res.status).toBe(410);
+        expect(await res.json()).toEqual({ error: 'machine_quota_collection_disabled', source: 'hub_server' });
 
         // 2. Up to 32 windows allowed, 33 windows rejected
         const tNext = tBase + 10_000;
@@ -897,6 +765,7 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
     await runInDurableObject(stub, async (instance: Hub) => {
       instance.quotaStore.setClock(() => tNow);
       try {
+        instance.quotaStore.putSnapshot(hostAlpha.machineId, buildValidSnapshot(hostAlpha.machineId, new Date(tNow - 2000).toISOString()), tNow - 1000);
         const baselineRow = instance.sql
           .exec('SELECT captured_at, received_at, routes_json FROM host_quota_snapshots WHERE host_id = ?', hostAlpha.machineId)
           .toArray()[0] as any;
@@ -1082,7 +951,7 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
             body: JSON.stringify(buildValidSnapshot(hostAlpha.machineId, baselineRow.captured_at)),
           })
         );
-        expect(replayRes.status).toBe(409);
+        expect(replayRes.status).toBe(410);
 
         const olderIso = new Date(Date.parse(baselineRow.captured_at) - 60000).toISOString();
         const olderRes = await instance.fetch(
@@ -1095,7 +964,7 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
             body: JSON.stringify(buildValidSnapshot(hostAlpha.machineId, olderIso)),
           })
         );
-        expect(olderRes.status).toBe(409);
+        expect(olderRes.status).toBe(410);
 
         // Verify stored row in SQLite was NOT modified or reset by any rejected/replay/older post
         const afterRow = instance.sql
@@ -1117,17 +986,7 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
       instance.quotaStore.setClock(() => tReceive);
       try {
         const snap = buildValidSnapshot(hostAlpha.machineId, captureIso);
-        const postRes = await instance.fetch(
-          new Request('http://example.com/api/quota', {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${hostAlpha.accessToken}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(snap),
-          })
-        );
-        expect(postRes.status).toBe(200);
+        expect(instance.quotaStore.putSnapshot(hostAlpha.machineId, snap, tReceive).ok).toBe(true);
 
         // Simulate cold restart by instantiating a brand new QuotaStore against the same SQLite storage
         const coldStore = new QuotaStore(
@@ -1143,7 +1002,7 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
         expect(justBeforeStale.body.error).toBeNull();
         expect(justBeforeStale.body.routes.grok.status).toBe('ok');
 
-        // At exact 1200s (1,200,000 ms) boundary => stale: true, HTTP 503, status: "stale", error: "unavailable"
+        // The legacy host read endpoint stays retired even when legacy rows exist.
         instance.quotaStore.setClock(() => tCapture + QUOTA_STALE_MS);
         const atBoundaryRes = await instance.fetch(
           new Request('http://example.com/api/quota', {
@@ -1151,16 +1010,10 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
             headers: { Authorization: `Bearer ${hostAlpha.accessToken}` },
           })
         );
-        expect(atBoundaryRes.status).toBe(503);
+        expect(atBoundaryRes.status).toBe(410);
         expect(atBoundaryRes.headers.get('Cache-Control')).toBe('private, no-store');
         const atBoundaryBody = (await atBoundaryRes.json()) as any;
-        expect(atBoundaryBody.stale).toBe(true);
-        expect(atBoundaryBody.status).toBe('stale');
-        expect(atBoundaryBody.error).toBe('unavailable');
-        expect(atBoundaryBody.captured_at).toBe(captureIso);
-        expect(atBoundaryBody.received_at).toBe(new Date(tReceive).toISOString());
-        expect(atBoundaryBody.routes.grok.status).toBe('error');
-        expect(atBoundaryBody.routes.grok.error).toBe('unavailable');
+        expect(atBoundaryBody).toEqual({ error: 'machine_quota_collection_disabled', source: 'hub_server' });
 
         // Caller clock headers / query params cannot spoof server read time to make stale snapshot look fresh
         const spoofClockRes = await instance.fetch(
@@ -1174,10 +1027,9 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
             },
           })
         );
-        expect(spoofClockRes.status).toBe(503);
+        expect(spoofClockRes.status).toBe(410);
         const spoofClockBody = (await spoofClockRes.json()) as any;
-        expect(spoofClockBody.stale).toBe(true);
-        expect(spoofClockBody.status).toBe('stale');
+        expect(spoofClockBody).toEqual({ error: 'machine_quota_collection_disabled', source: 'hub_server' });
       } finally {
         instance.quotaStore.setClock(undefined);
       }
@@ -1189,28 +1041,21 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
     const tFresh = Date.now();
     const capFresh = new Date(tFresh - 5000).toISOString();
 
-    const postRes = await doFetch(
-      new Request('http://example.com/api/quota', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${hostAlpha.accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(buildValidSnapshot(hostAlpha.machineId, capFresh)),
-      })
-    );
-    expect(postRes.status).toBe(200);
+    const stub = (defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub'));
+    await runInDurableObject(stub, async (instance: Hub) => {
+      expect(instance.quotaStore.putSnapshot(hostAlpha.machineId, buildValidSnapshot(hostAlpha.machineId, capFresh)).ok).toBe(true);
+    });
 
-    // 1. Admin GET without ?host_id is rejected (no global anonymous/admin feed without host selector)
+    // Legacy admin host reads are retired even with a verified session.
     const noHostRes = await doFetch(
       new Request('http://example.com/api/quota', {
         method: 'GET',
-        headers: { Cookie: sessionCookie },
+        headers: { Cookie: sessionCookie, 'x-csrf-token': csrfToken },
       })
     );
-    expect(noHostRes.status).toBe(400);
+    expect(noHostRes.status).toBe(410);
 
-    // 2. Admin GET with explicit ?host_id succeeds
+    // Explicit host selectors do not restore the retired read path.
     const adminGetRes = await doFetch(
       new Request(`http://example.com/api/quota?host_id=${encodeURIComponent(hostAlpha.machineId)}`, {
         method: 'GET',
@@ -1220,11 +1065,9 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
         },
       })
     );
-    expect(adminGetRes.status).toBe(200);
+    expect(adminGetRes.status).toBe(410);
     expect(adminGetRes.headers.get('Cache-Control')).toBe('private, no-store');
-    const adminGetBody = (await adminGetRes.json()) as any;
-    expect(adminGetBody.host_id).toBe(hostAlpha.machineId);
-    expect(adminGetBody.stale).toBe(false);
+    expect(await adminGetRes.json()).toEqual({ error: 'machine_quota_collection_disabled', source: 'hub_server' });
 
     // 3. Admin GET with mismatched CSRF token or foreign Origin is denied
     const badCsrfRes = await doFetch(
@@ -1330,11 +1173,7 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
         body: JSON.stringify(allProvidersPayload),
       })
     );
-    expect(postRes.status).toBe(200);
-    const postBody = (await postRes.json()) as any;
-    expect(Object.keys(postBody.routes).sort()).toEqual(
-      ['claude', 'codex', 'copilot', 'gemini', 'go', 'grok', 'zai']
-    );
+    expect(postRes.status).toBe(410);
 
     // Unsupported method returns 405
     const putRes = await doFetch(
@@ -1379,7 +1218,7 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
         headers: { Authorization: `Bearer ${hostGamma.accessToken}` },
       })
     );
-    expect(stillValidGet.status).toBe(200);
+    expect(stillValidGet.status).toBe(410);
 
     // Refresh host token via /api/token/refresh: old token must be denied, new token must succeed
     const refreshRes = await doFetch(
@@ -1410,7 +1249,7 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
         headers: { Authorization: `Bearer ${refreshed.access_token}` },
       })
     );
-    expect(newTokenGet.status).toBe(200);
+    expect(newTokenGet.status).toBe(410);
 
     // Rotated credential of an already paired host still registers to the same machine_id
     const reRegister = await registerWith(refreshed.access_token, { hostname: 'gamma.local' });
@@ -1446,14 +1285,10 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
       host_id: hostDelta.machineId,
       captured_at: new Date(capturedMs).toISOString(),
     });
-    const post = (instance: Hub, body: any) =>
-      instance.fetch(
-        new Request('http://example.com/api/quota', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${hostDelta.accessToken}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        })
-      );
+    const post = async (instance: Hub, body: any) => {
+      const result = instance.quotaStore.putSnapshot(hostDelta.machineId, body, COLLECTOR_CAPTURED_MS + 60_000);
+      return { status: result.status, json: async () => result.body };
+    };
     const countRows = (instance: Hub) =>
       (instance.sql.exec('SELECT COUNT(*) AS cnt FROM host_quota_snapshots WHERE host_id = ?', hostDelta.machineId).toArray()[0] as any).cnt;
 
@@ -1487,14 +1322,7 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
         }
 
         // One bad Codex window no longer drops the good providers of the same snapshot
-        const getRes = await instance.fetch(
-          new Request('http://example.com/api/quota', {
-            method: 'GET',
-            headers: { Authorization: `Bearer ${hostDelta.accessToken}` },
-          })
-        );
-        expect(getRes.status).toBe(200);
-        const got = (await getRes.json()) as any;
+        const got = instance.quotaStore.getSnapshot(hostDelta.machineId).body as any;
         expect(got.captured_at).toBe(new Date(capturedMs).toISOString());
         expect(got.routes.claude.status).toBe('ok');
         expect(got.routes.claude.windows['5h'].percent_remaining).toBe(55);

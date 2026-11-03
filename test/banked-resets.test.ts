@@ -158,14 +158,23 @@ describe('scheduled reset alerts and operator fallback', () => {
       expect(h.sql.exec('SELECT id FROM banked_reset_grants WHERE active=1').toArray()).toHaveLength(0);
     });
   });
-  it('uses account-specific subscription probes for alternate Codex homes', async () => {
+  it('ignores legacy machine subscriptions and snapshots for reset evidence', async () => {
     await inDO(stub(), async (h: any) => {
       setup(h);
+      const routes = { 'codex-orin': quota([grant()]) };
+      h.sql.exec("INSERT INTO fleet_routes VALUES ('legacy-host','codex','codex-orin','hub-codex-orin')");
       h.sql.exec('INSERT INTO fleet_subscriptions VALUES (?,?,?,?,?,?)', 'host', 'codex-orin', 'codex', 'pro', new Date(NOW).toISOString(), JSON.stringify(quota([grant()])));
+      h.sql.exec(`INSERT INTO host_quota_snapshots
+        (host_id,schema_version,collector_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json)
+        VALUES ('legacy-host','1.1','legacy',?,?,?,?,'ok',NULL,?)`,
+        new Date(NOW).toISOString(), NOW, new Date(NOW).toISOString(), NOW, JSON.stringify(routes));
       const service = new BankedResets(h.sql, h.livenessService, () => NOW);
       const alerts = service.run().filter(a => a.subject_kind === 'banked_reset_expiry');
-      expect(alerts).toHaveLength(1);
-      expect(alerts[0].detail).toContain('codex-orin');
+      expect(alerts).toHaveLength(0);
+      expect(h.sql.exec("SELECT id FROM banked_reset_grants WHERE account='codex-orin' AND active=1").toArray()).toHaveLength(0);
+      expect(h.sql.exec("SELECT account FROM banked_reset_accounts WHERE account='codex-orin'").toArray()).toHaveLength(0);
+      const listing = await (await service.handle(new Request('https://hub/api/quota/resets'), operator)).json() as any;
+      expect(listing.grants.some((row: any) => row.account === 'codex-orin')).toBe(false);
     });
   });
   it('records explicit none, rejects unauthorised and invalid manual values', async () => {

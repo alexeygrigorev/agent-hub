@@ -1,4 +1,4 @@
-"""Host quota probes never run a probe that can launch engine login (intake 5814e109 AC e/A3)."""
+"""The Hub-server quota probe never runs an engine login flow (intake 5814e109 AC e/A3)."""
 
 import os
 import sys

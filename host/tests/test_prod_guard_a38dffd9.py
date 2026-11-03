@@ -21,6 +21,8 @@ PROTECTED_PATHS = (
     "/api/host/routes",
     "/api/fleet/routing/capabilities",
     "/api/routing/capabilities",
+    "/api/fleet/accounts",
+    "/api/fleet/accounts/dummy-sync-5814/archive",
     "/api/device/code",
 )
 
@@ -92,7 +94,7 @@ class TestProductionHubWriteGuard(unittest.TestCase):
         with mock.patch.object(_prod_guard, "in_test_context", return_value=True), \
                 mock.patch.object(api, "_get_opener") as opener:
             request = urllib.request.Request(
-                PROD + "/api/host/poll",
+                PROD + "/api/fleet/accounts/dummy-sync-5814/archive",
                 data=b"{}",
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -105,7 +107,10 @@ class TestProductionHubWriteGuard(unittest.TestCase):
         with mock.patch.object(_prod_guard, "in_test_context", return_value=True):
             with self.assertRaises(_prod_guard.ProductionHubWriteError):
                 _prod_guard.assert_test_hub_write(PROD, "/api/device/code", "POST")
+            with self.assertRaises(_prod_guard.ProductionHubWriteError):
+                _prod_guard.assert_test_hub_write(PROD, "/api/fleet/accounts", "PUT")
             _prod_guard.assert_test_hub_write(PROD, "/api/fleet/routing/machines", "GET")
+            _prod_guard.assert_test_hub_write(PROD, "/api/fleet/accounts/shared-codex", "GET")
             _prod_guard.assert_test_hub_write(PROD, "/api/heartbeat", "POST")
             _prod_guard.assert_test_hub_write(LOCAL, "/api/host/poll", "POST")
 

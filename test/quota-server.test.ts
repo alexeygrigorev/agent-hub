@@ -25,6 +25,8 @@ beforeEach(async () => {
     isAdmin: true, csrfToken: csrf, exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
   await runInDurableObject(stub, (hub: Hub) => {
     hub.sql.exec('DELETE FROM server_quota_snapshots');
+    hub.sql.exec('DELETE FROM host_quota_snapshots');
+    hub.sql.exec('DELETE FROM fleet_subscriptions');
     hub.sql.exec('DELETE FROM fleet_launches');
     hub.sql.exec('DELETE FROM fleet_routes');
     hub.sql.exec('DELETE FROM fleet_accounts');
@@ -38,6 +40,8 @@ describe('Hub server account quota', () => {
     expect((await post([{ account: 'main', provider: 'codex', quota: observation(62) },
       { account: 'orin', provider: 'codex-orin', quota: observation(99) }])).status).toBe(200);
     const q = await view();
+    expect(q.hosts).toBeUndefined();
+    expect(q.coverage).toBeUndefined();
     expect(q.pools.find((p: any) => p.account === 'main')).toMatchObject({ provider: 'codex', state: 'fresh', source: 'server', remaining_percent: 62 });
     expect(q.pools.find((p: any) => p.account === 'orin')).toMatchObject({ provider: 'codex', state: 'fresh', source: 'server', remaining_percent: 99 });
     expect(q.pools.some((p: any) => p.provider === 'codex-orin')).toBe(false);
@@ -70,6 +74,43 @@ describe('Hub server account quota', () => {
     expect(q.pools.find((p: any) => p.account === 'shared-codex')).toMatchObject({ state: 'fresh', remaining_percent: 77 });
     expect(q.account_coverage).toMatchObject({ total: 2, unavailable: [] });
     expect([...q.account_coverage.fresh].sort()).toEqual(['codex-orin', 'shared-codex']);
+  });
+
+  it('never uses machine quota reports and shows both exhausted Codex accounts at zero with reset times', async () => {
+    await runInDurableObject(stub, (hub: Hub) => {
+      for (const [account, profile] of [['shared-codex', 'hub-shared-codex'], ['codex-orin', 'hub-codex-orin']]) {
+        hub.sql.exec('INSERT INTO fleet_accounts VALUES (?, \'codex\', 4, 0, 1)', account);
+        hub.sql.exec('INSERT INTO fleet_routes VALUES (\'machine\', \'codex\', ?, ?)', account, profile);
+      }
+      const machineQuota = observation(88);
+      hub.sql.exec('INSERT INTO fleet_subscriptions VALUES (\'machine\', ?, \'codex\', NULL, ?, ?)',
+        'shared-codex', timestamp(), JSON.stringify(machineQuota));
+      hub.sql.exec('INSERT INTO host_quota_snapshots VALUES (?,?,?,?,?,?,?,?,?,?)',
+        'machine', '1', 'collector', timestamp(), Date.now(), timestamp(), Date.now(), 'ok', null,
+        JSON.stringify({ status: 'ok', routes: { codex: machineQuota } }));
+    });
+
+    const withoutServer = await view();
+    for (const account of ['shared-codex', 'codex-orin']) {
+      expect(withoutServer.pools.find((p: any) => p.account === account)).toMatchObject({
+        state: 'unknown', source: 'server', remaining_percent: null, observed_by_hosts: [],
+      });
+    }
+
+    const reset = timestamp(3600000);
+    const exhausted = { status: 'ok', error: null, observed_at: timestamp(-100), details: { limit_reached: true },
+      windows: { weekly: { present: true, percent_remaining: 0, reset_at: reset, rolling: false } } };
+    expect((await post([
+      { account: 'shared-codex', provider: 'codex', quota: exhausted },
+      { account: 'codex-orin', provider: 'codex', quota: exhausted },
+    ])).status).toBe(200);
+    const withServer = await view();
+    for (const account of ['shared-codex', 'codex-orin']) {
+      expect(withServer.pools.find((p: any) => p.account === account)).toMatchObject({
+        state: 'exhausted', source: 'server', remaining_percent: 0, reset_at: reset,
+        observed_by_hosts: ['hub-server'], profiles: [`hub-${account}`],
+      });
+    }
   });
 
   it('adds account definitions while retaining live launches and existing account policy', async () => {
@@ -109,7 +150,7 @@ describe('Hub server account quota', () => {
     expect((await post([{ account: 'future', provider: 'go', quota: observation() }], {}, timestamp(60000))).status).toBe(400);
   });
 
-  it('prefers server failures over apparently healthy host data; expires stale server evidence', async () => {
+  it('does not let healthy machine reports replace failed or stale Hub quota', async () => {
     await runInDurableObject(stub, (hub: Hub) => {
       const at = timestamp(-100);
       const bad = { status: 'error', error: 'unavailable', observed_at: at, details: { limit_reached: null }, windows: {} };
@@ -119,7 +160,8 @@ describe('Hub server account quota', () => {
       hub.sql.exec('INSERT INTO server_quota_snapshots VALUES (?, ?, ?, ?)', 'main', 'codex', at, JSON.stringify(bad));
       expect(hub.fleetService.accountStatus({ label: 'main', provider: 'codex', enabled: 1, reserve_percent: 15, max_concurrency: 4 }).status).toBe('unknown');
       hub.sql.exec('UPDATE server_quota_snapshots SET captured_at = ?', timestamp(-1200001));
-      expect(hub.fleetService.accountStatus({ label: 'main', provider: 'codex', enabled: 1, reserve_percent: 15, max_concurrency: 4 }).remaining_percent).toBe(95);
+      expect(hub.fleetService.accountStatus({ label: 'main', provider: 'codex', enabled: 1, reserve_percent: 15, max_concurrency: 4 }))
+        .toMatchObject({ status: 'unknown', remaining_percent: null });
     });
   });
 });

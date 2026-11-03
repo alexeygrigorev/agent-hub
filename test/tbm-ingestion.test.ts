@@ -8,7 +8,6 @@ import {
   resolveTokenCapacity,
   syncTbmFromServerAccounts,
   syncWindowsIntoTbm,
-  accountsForHostProvider,
   tbmPoolId,
 } from "../src/tbm-ingestion";
 
@@ -27,18 +26,6 @@ function seedFleet(sql: any): void {
     "INSERT OR REPLACE INTO fleet_accounts (label, provider, max_concurrency, reserve_percent, enabled) VALUES ('tbm-ingest-claude', 'claude', 1, 0, 1)"
   );
   for (const id of [1,2,3,4]) sql.exec("INSERT OR REPLACE INTO fleet_routes (machine_id,engine,account) VALUES (?,'codex','tbm-ingest-main')", `tbm-ingest-host-${id}`);
-}
-
-function hostSnap(hostId: string, capturedIso: string, routes: any): any {
-  return {
-    schema_version: "1.1",
-    collector_version: "test/1.0",
-    captured_at: capturedIso,
-    host_id: hostId,
-    status: "ok",
-    error: null,
-    routes,
-  };
 }
 
 describe("AC1 tbm live ingestion", () => {
@@ -63,12 +50,17 @@ describe("AC1 tbm live ingestion", () => {
       expect(pool).toMatchObject({ quota_unit: 'percent', capacity_known: 0, remaining_percent: 72 });
     });
   });
-  it('never spreads one provider observation across multiple accounts', async () => {
+  it('ingests only the explicit account named by a Hub observation', async () => {
     await runInDurableObject(stub, async (hub: Hub) => {
       const sql: any = hub.sql;
       sql.exec("INSERT OR REPLACE INTO fleet_accounts (label,provider,max_concurrency,reserve_percent,enabled) VALUES ('codex-a','codex',1,15,1)");
       sql.exec("INSERT OR REPLACE INTO fleet_accounts (label,provider,max_concurrency,reserve_percent,enabled) VALUES ('codex-b','codex',1,15,1)");
-      expect(accountsForHostProvider(sql, 'ambiguous-host', 'codex')).toEqual([]);
+      const quota = { status: 'ok', details: { limit_reached: false }, windows: {
+        '7d': { present: true, percent_remaining: 60, reset_at: new Date(NOW + 7 * DAY).toISOString(), rolling: false },
+      } };
+      syncTbmFromServerAccounts(sql, [{ provider: 'codex', account: 'codex-a', quota }], NOW);
+      expect(sql.exec("SELECT pool_id FROM tbm_quota_pools WHERE account='codex-a'").toArray()).toHaveLength(1);
+      expect(sql.exec("SELECT pool_id FROM tbm_quota_pools WHERE account='codex-b'").toArray()).toHaveLength(0);
     });
   });
   it("pure helpers: pool id, cycle inference and token capacity never fabricate", () => {
@@ -100,39 +92,20 @@ describe("AC1 tbm live ingestion", () => {
     ).toMatchObject({ known: false, remaining: 800_000 });
   });
 
-  it("accepted host collection fills pools per account/window with real reset and cycle", async () => {
+  it("Hub account observations fill pools per account/window with real reset and cycle", async () => {
     await runInDurableObject(stub, async (hub: Hub) => {
       const sql: any = hub.sql;
       ensureTbmQuotaSchema(sql);
       seedFleet(sql);
-      const hostId = "tbm-ingest-host-1";
       sql.exec("DELETE FROM tbm_banked_tranches WHERE pool_id LIKE 'codex:tbm-ingest-main:%'");
       sql.exec("DELETE FROM tbm_quota_pools WHERE pool_id LIKE 'codex:tbm-ingest-main:%'");
-      hub.quotaStore.setClock(() => NOW);
-      try {
-        const captured = new Date(NOW - 1000).toISOString();
-        const reset7d = new Date(NOW + 7 * DAY).toISOString();
-        const res = hub.quotaStore.putSnapshot(
-          hostId,
-          hostSnap(hostId, captured, {
-            codex: {
-              status: "ok",
-              error: null,
-              observed_at: captured,
-              details: { limit_reached: false },
-              windows: {
-                "7d": {
-                  percent_remaining: 78.5,
-                  reset_at: reset7d,
-                  present: true,
-                  rolling: false,
-                },
-              },
-            },
-          }),
-          NOW
-        );
-        expect(res.ok).toBe(true);
+      const reset7d = new Date(NOW + 7 * DAY).toISOString();
+      const counts = syncTbmFromServerAccounts(sql, [{ account: 'tbm-ingest-main', provider: 'codex', quota: {
+        status: 'ok', error: null, observed_at: new Date(NOW - 1000).toISOString(),
+        details: { limit_reached: false },
+        windows: { '7d': { percent_remaining: 78.5, reset_at: reset7d, present: true, rolling: false } },
+      } }], NOW);
+      expect(counts.pools).toBe(1);
         const pool: any = sql
           .exec("SELECT * FROM tbm_quota_pools WHERE pool_id = ?", "codex:tbm-ingest-main:7d")
           .toArray()[0];
@@ -154,9 +127,6 @@ describe("AC1 tbm live ingestion", () => {
             .exec("SELECT * FROM tbm_banked_tranches WHERE pool_id = ?", pool.pool_id)
             .toArray()
         ).toHaveLength(0);
-      } finally {
-        hub.quotaStore.setClock(undefined);
-      }
     });
   });
 
@@ -165,37 +135,14 @@ describe("AC1 tbm live ingestion", () => {
       const sql: any = hub.sql;
       ensureTbmQuotaSchema(sql);
       seedFleet(sql);
-      const hostId = "tbm-ingest-host-2";
       sql.exec("DELETE FROM tbm_banked_tranches WHERE pool_id = 'codex:tbm-ingest-main:7d'");
       sql.exec("DELETE FROM tbm_quota_pools WHERE pool_id = 'codex:tbm-ingest-main:7d'");
-      hub.quotaStore.setClock(() => NOW);
-      try {
-        const captured = new Date(NOW - 1000).toISOString();
-        const reset = new Date(NOW + 7 * DAY).toISOString();
-        const res = hub.quotaStore.putSnapshot(
-          hostId,
-          hostSnap(hostId, captured, {
-            codex: {
-              status: "ok",
-              error: null,
-              observed_at: captured,
-              details: { limit_reached: false },
-              windows: {
-                "7d": {
-                  percent_remaining: 80,
-                  reset_at: reset,
-                  present: true,
-                  rolling: false,
-                  unit: "tokens",
-                  credits_remaining: 800_000,
-                  spend_limit: 1_000_000,
-                },
-              },
-            },
-          }),
-          NOW
-        );
-        expect(res.ok).toBe(true);
+      const reset = new Date(NOW + 7 * DAY).toISOString();
+      syncTbmFromServerAccounts(sql, [{ account: 'tbm-ingest-main', provider: 'codex', quota: {
+        status: 'ok', error: null, observed_at: new Date(NOW - 1000).toISOString(), details: { limit_reached: false },
+        windows: { '7d': { percent_remaining: 80, reset_at: reset, present: true, rolling: false,
+          unit: 'tokens', credits_remaining: 800_000, spend_limit: 1_000_000 } },
+      } }], NOW);
         const pool: any = sql
           .exec("SELECT * FROM tbm_quota_pools WHERE pool_id = ?", "codex:tbm-ingest-main:7d")
           .toArray()[0];
@@ -208,9 +155,6 @@ describe("AC1 tbm live ingestion", () => {
           .exec("SELECT * FROM tbm_banked_tranches WHERE pool_id = ?", pool.pool_id)
           .toArray() as any[];
         expect(tranches).toHaveLength(0);
-      } finally {
-        hub.quotaStore.setClock(undefined);
-      }
     });
   });
 
@@ -219,37 +163,14 @@ describe("AC1 tbm live ingestion", () => {
       const sql: any = hub.sql;
       ensureTbmQuotaSchema(sql);
       seedFleet(sql);
-      const hostId = "tbm-ingest-host-3";
       sql.exec("DELETE FROM tbm_banked_tranches WHERE pool_id LIKE 'codex:tbm-ingest-main:5h'");
       sql.exec("DELETE FROM tbm_quota_pools WHERE pool_id LIKE 'codex:tbm-ingest-main:5h'");
-      hub.quotaStore.setClock(() => NOW);
-      try {
-        const captured = new Date(NOW - 1000).toISOString();
-        const reset = new Date(NOW + 5 * HOUR).toISOString();
-        const res = hub.quotaStore.putSnapshot(
-          hostId,
-          hostSnap(hostId, captured, {
-            codex: {
-              status: "ok",
-              error: null,
-              observed_at: captured,
-              details: { limit_reached: false },
-              windows: {
-                "5h": {
-                  percent_remaining: 60,
-                  reset_at: reset,
-                  present: true,
-                  rolling: true,
-                  unit: "tokens",
-                  credits_remaining: 600_000,
-                  spend_limit: 1_000_000,
-                },
-              },
-            },
-          }),
-          NOW
-        );
-        expect(res.ok).toBe(true);
+      const reset = new Date(NOW + 5 * HOUR).toISOString();
+      syncTbmFromServerAccounts(sql, [{ account: 'tbm-ingest-main', provider: 'codex', quota: {
+        status: 'ok', error: null, observed_at: new Date(NOW - 1000).toISOString(), details: { limit_reached: false },
+        windows: { '5h': { percent_remaining: 60, reset_at: reset, present: true, rolling: true,
+          unit: 'tokens', credits_remaining: 600_000, spend_limit: 1_000_000 } },
+      } }], NOW);
         const pool: any = sql
           .exec("SELECT * FROM tbm_quota_pools WHERE pool_id = ?", "codex:tbm-ingest-main:5h")
           .toArray()[0];
@@ -258,45 +179,29 @@ describe("AC1 tbm live ingestion", () => {
         expect(
           sql.exec("SELECT * FROM tbm_banked_tranches WHERE pool_id = ?", pool.pool_id).toArray()
         ).toHaveLength(0);
-      } finally {
-        hub.quotaStore.setClock(undefined);
-      }
     });
   });
 
-  it("rejected replay captures do not refill TBM pools", async () => {
+  it("older Hub observations do not refill TBM pools", async () => {
     await runInDurableObject(stub, async (hub: Hub) => {
       const sql: any = hub.sql;
       ensureTbmQuotaSchema(sql);
       seedFleet(sql);
-      const hostId = "tbm-ingest-host-4";
       sql.exec("DELETE FROM tbm_banked_tranches WHERE pool_id LIKE 'codex:%tbm-ingest%'");
       sql.exec("DELETE FROM tbm_quota_pools WHERE pool_id LIKE 'codex:%tbm-ingest%'");
-      hub.quotaStore.setClock(() => NOW);
-      try {
-        const captured = new Date(NOW - 1000).toISOString();
-        const reset = new Date(NOW + 7 * DAY).toISOString();
-        const snap = hostSnap(hostId, captured, {
-          codex: {
-            status: "ok",
-            error: null,
-            observed_at: captured,
-            details: { limit_reached: false },
-            windows: {
-              "7d": { percent_remaining: 70, reset_at: reset, present: true, rolling: false },
-            },
-          },
-        });
-        expect(hub.quotaStore.putSnapshot(hostId, snap, NOW).ok).toBe(true);
+      const reset = new Date(NOW + 7 * DAY).toISOString();
+      const input = (percent: number) => [{ account: 'tbm-ingest-main', provider: 'codex', quota: {
+        status: 'ok', error: null, observed_at: new Date(NOW - 1000).toISOString(), details: { limit_reached: false },
+        windows: { '7d': { percent_remaining: percent, reset_at: reset, present: true, rolling: false } },
+      } }];
+      syncTbmFromServerAccounts(sql, input(70), NOW);
         const before: any = sql
           .exec(
             "SELECT last_updated_ms FROM tbm_quota_pools WHERE pool_id = ?",
             "codex:tbm-ingest-main:7d"
           )
           .toArray()[0];
-        const replay = hub.quotaStore.putSnapshot(hostId, snap, NOW + 1000);
-        expect(replay.ok).toBe(false);
-        expect(replay.status).toBe(409);
+      syncTbmFromServerAccounts(sql, input(20), NOW - 500);
         const after: any = sql
           .exec(
             "SELECT last_updated_ms FROM tbm_quota_pools WHERE pool_id = ?",
@@ -304,9 +209,6 @@ describe("AC1 tbm live ingestion", () => {
           )
           .toArray()[0];
         expect(after.last_updated_ms).toBe(before.last_updated_ms);
-      } finally {
-        hub.quotaStore.setClock(undefined);
-      }
     });
   });
 

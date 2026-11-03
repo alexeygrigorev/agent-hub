@@ -1,4 +1,4 @@
-"""Fail closed when tests try to mutate the production Hub machine registry.
+"""Fail closed when tests try to mutate production Hub host/account registries.
 
 Installer E2Es must point the installed host at an isolated test Hub. Setting
 ``HUB_E2E=1`` for the whole process tree arms this guard even after the
@@ -21,6 +21,7 @@ PROTECTED_PREFIXES = (
     "/api/machines/",
     "/api/host/",
     "/api/fleet/routing/",
+    "/api/fleet/accounts/",
     "/api/routing/",
     "/api/device/",
 )
@@ -59,7 +60,7 @@ def is_machine_registry_write(path, method):
 
 
 def assert_test_hub_write(base_url, path, method="POST", *, cfg=None):
-    """Reject all test-context writes to production enrollment/host APIs.
+    """Reject all test-context writes to production enrollment, host, or account APIs.
 
     The test path is isolation-only: a test credential is not an exemption.
     This prevents an installer E2E from creating a production machine even if
@@ -68,7 +69,7 @@ def assert_test_hub_write(base_url, path, method="POST", *, cfg=None):
     if (is_production_base_url(base_url) and in_test_context()
             and is_machine_registry_write(path, method.upper())):
         raise ProductionHubWriteError(
-            "Test context refused a production Hub enrollment or machine-registry "
+            "Test context refused a production Hub enrollment, host-registry or account-registry "
             "write; point the test at an isolated Hub."
         )
 

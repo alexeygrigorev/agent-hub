@@ -58,6 +58,27 @@ describe('quota window history (AC1)', () => {
       }
     }
   }));
+  it('ignores legacy machine quota rows in TBM replay and chart history', () => fixture((h, hub) => {
+    const account = 'legacy-machine-quota-account';
+    const at = NOW - 60000;
+    const legacyQuota = JSON.parse(quotaJson({ '7d': { pct: 80, reset: '2026-11-01T00:00:00Z' } }));
+    const encoded = JSON.stringify(legacyQuota);
+    hub.sql.exec('INSERT INTO fleet_subscriptions(machine_id,account,service,plan,observed_at,quota_json) VALUES(?,?,?,?,?,?)',
+      'legacy-machine', account, 'codex', 'pro', new Date(at).toISOString(), encoded);
+    hub.sql.exec(`INSERT INTO host_quota_snapshots
+      (host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json)
+      VALUES('legacy-machine','1.0',?,?,?,?,'ok',NULL,?)`,
+      new Date(at).toISOString(), at, new Date(at).toISOString(), at, JSON.stringify({ codex: legacyQuota }));
+    hub.sql.exec(`INSERT INTO usage_quota_history(account,engine,provider,observed_at_ms,quota_json,source)
+      VALUES(?, 'codex','codex',?,?,'legacy')`, account, at, encoded);
+
+    syncStoredTbmSnapshots(hub.sql, NOW);
+    h.sample();
+
+    expect(hub.sql.exec('SELECT pool_id FROM tbm_quota_pools WHERE account=?', account).toArray()).toEqual([]);
+    expect(h.query('24h').series.filter((row: any) => row.entity === account &&
+      ['quota_window', 'quota'].includes(row.kind) && row.points.some((point: any) => point.value === 80))).toEqual([]);
+  }));
   it('preserves a common quota bucket identity across off-grid alias ingestion and real outages', () => fixture((h, hub, clock) => {
     const start=NOW-DAY;
     for(let minute=2;minute<24*60;minute+=10) {

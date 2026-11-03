@@ -18,12 +18,6 @@ class MockRNG:
     def random(self): return 0.5
     def randbytes(self, n): return b"x" * n
 
-class InertQuotaCollector:
-    def __init__(self, *args, **kwargs):
-        self.base_url = None
-    def step(self):
-        pass
-
 class TestAgent(unittest.TestCase):
     def setUp(self):
         self._orig_config = getattr(config, "_CONFIG", None)
@@ -35,7 +29,6 @@ class TestAgent(unittest.TestCase):
         self._host_cfg_patcher.start()
         self.clock = MockClock()
         self.rng = MockRNG()
-        self.quota_collector = InertQuotaCollector()
 
     def tearDown(self):
         self._host_cfg_patcher.stop()
@@ -49,7 +42,7 @@ class TestAgent(unittest.TestCase):
     def test_agent_immediate_close_backoff(self, mock_poll, mock_ws_handshake, mock_reg, mock_get_token, mock_get_host_token):
         mock_get_token.return_value = "acc123"
         mock_get_host_token.return_value = "acc123"
-        agent = api.HostAgent(clock=self.clock, rng=self.rng, quota_collector=self.quota_collector)
+        agent = api.HostAgent(clock=self.clock, rng=self.rng)
         
         iteration = 0
         def ws_side_effect(*args, **kwargs):
@@ -75,7 +68,7 @@ class TestAgent(unittest.TestCase):
     def test_agent_poll_error_backoff(self, mock_safe_http, mock_ws_handshake, mock_reg, mock_get_token, mock_get_host_token):
         mock_get_token.return_value = "acc123"
         mock_get_host_token.return_value = "acc123"
-        agent = api.HostAgent(clock=self.clock, rng=self.rng, quota_collector=self.quota_collector)
+        agent = api.HostAgent(clock=self.clock, rng=self.rng)
         
         iteration = 0
         def ws_side_effect(*args, **kwargs):
@@ -100,7 +93,7 @@ class TestAgent(unittest.TestCase):
     def test_agent_healthy_ws_resets_backoff(self, mock_poll, mock_ws_handshake, mock_reg, mock_get_token, mock_get_host_token):
         mock_get_token.return_value = "acc123"
         mock_get_host_token.return_value = "acc123"
-        agent = api.HostAgent(clock=self.clock, rng=self.rng, quota_collector=self.quota_collector)
+        agent = api.HostAgent(clock=self.clock, rng=self.rng)
         
         iteration = 0
         def ws_side_effect(*args, **kwargs):

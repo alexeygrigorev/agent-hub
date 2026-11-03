@@ -191,36 +191,12 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(advertised[0], '/home/operator/git')
         self.assertEqual(len(advertised), 96)
 
-    def test_default_quota_is_not_copied_to_multiple_accounts_or_nondefault_profile(self):
+    def test_machine_subscription_collection_is_retired(self):
         cfg = settings(Path('/repo'))
-        cfg['subscriptions'].append({**cfg['subscriptions'][0], 'account_label': 'second-codex', 'profile': 'second'})
         calls = []
-        reports = fleet.collect_subscriptions(cfg, lambda argv: calls.append(argv))
-        self.assertFalse(calls)
-        self.assertTrue(all(r['quota']['status'] == 'unknown' for r in reports))
-        cfg['subscriptions'] = cfg['subscriptions'][1:]
-        fleet.collect_subscriptions(cfg, lambda argv: calls.append(argv))
-        self.assertFalse(calls)
-
-    def test_collector_whitelists_quota_and_detected_tier_without_email_token_or_error_body(self):
-        # An explicitly configured non-quse adapter is still sanitized (quse itself never runs: 5814e109).
-        cfg = settings(Path('/repo')); cfg['subscriptions'][0].update(service='claude', engine='claude', plan=None, quota_argv=['/opt/quota-adapter', 'claude'])
-        def runner(argv):
-            if argv[0] == 'claude':
-                return {'subscriptionType': 'max', 'email': 'private@example.invalid', 'token': 'MUST_NOT_LEAK'}
-            return {'claude': {'status': 'ok', 'details': {'limit_reached': False, 'token': 'MUST_NOT_LEAK'}, 'windows': {'weekly': {'percent_remaining': 50, 'reset_at': '2099-01-01T00:00:00Z'}}, 'error': 'MUST_NOT_LEAK'}}
-        report = fleet.collect_subscriptions(cfg, runner)
-        self.assertEqual(report[0]['plan'], 'max')
-        self.assertEqual(report[0]['quota']['windows']['weekly']['percent_remaining'], 50)
-        text = json.dumps(report)
-        self.assertNotIn('MUST_NOT_LEAK', text); self.assertNotIn('private@example', text)
-
-    def test_probe_failure_and_malformed_route_remain_unknown(self):
-        cfg = settings(Path('/repo'))
-        def runner(_): raise RuntimeError('MUST_NOT_LEAK')
-        report = fleet.collect_subscriptions(cfg, runner)
-        self.assertEqual(report[0]['quota']['status'], 'unknown')
-        self.assertNotIn('MUST_NOT_LEAK', json.dumps(report))
+        self.assertEqual(fleet.collect_subscriptions(cfg, lambda argv: calls.append(argv)), [])
+        self.assertEqual(calls, [])
+        # The server collector still uses this shared sanitizer for its own readings.
         self.assertEqual(fleet.quota_metadata({'codex': []}, 'codex')['status'], 'unknown')
 
     def test_sessions_include_workspace_profile_account_but_no_command_environment(self):
@@ -520,7 +496,7 @@ class FleetTests(unittest.TestCase):
         self.assertFalse(sent[-1]['params']['refreshToken'])
         proc.terminate.assert_called_once()
 
-    def test_finite_cycle_registers_capabilities_and_reports_only_this_machine_metadata(self):
+    def test_finite_cycle_registers_capabilities_without_machine_quota_reports(self):
         cfg = settings(Path('/repo')); calls = []
         def request(method, path, body=None):
             calls.append((method, path, body))
@@ -540,7 +516,7 @@ class FleetTests(unittest.TestCase):
             self.assertTrue(results[0]['ok'])
             self.assertEqual(results[0]['claims'], 0)
             self.assertEqual(results[0]['messages'], 0)
-        self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/routes', '/api/host/poll', '/api/fleet/probe', '/api/fleet/subscriptions', '/api/fleet/sessions', '/api/sessions/host-bindings', '/api/sessions/host-adoption', '/api/sessions/host-bindings?kind=imported', '/api/fleet/offers'])
+        self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/routes', '/api/host/poll', '/api/fleet/probe', '/api/fleet/sessions', '/api/sessions/host-bindings', '/api/sessions/host-adoption', '/api/sessions/host-bindings?kind=imported', '/api/fleet/offers'])
         self.assertEqual(calls[3], ('POST', '/api/fleet/probe', {
             'engine': 'codex', 'status': 'ok', 'reason': 'admission_configured'}))
         self.assertTrue(calls[2][2]['gate']['launch_allowed'])

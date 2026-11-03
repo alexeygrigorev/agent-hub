@@ -436,34 +436,18 @@ def ws_handshake(host: str, port: int, path: str, token: str, is_secure: bool, r
 from .ws import WSConnection
 
 class HostAgent:
-    def __init__(self, clock=None, rng=None, dispatcher=None, quota_collector=None):
+    def __init__(self, clock=None, rng=None, dispatcher=None):
         self.clock = clock or Clock()
         self.rng = rng or RNG()
         self.shutdown_requested = False
         self.cfg = _host_cfg()
         self.base_url = self.cfg.get("base_url")
         self.dispatcher = dispatcher
-        if quota_collector is not None:
-            self.quota_collector = quota_collector
-        else:
-            from .quota_snapshot import QuotaCollector
-            self.quota_collector = QuotaCollector(clock=self.clock, base_url=None)
 
     def _monotonic(self) -> float:
         if hasattr(self.clock, "monotonic"):
             return self.clock.monotonic()
         return self.clock.time()
-
-    def _tick_quota(self):
-        if not self.quota_collector:
-            return
-        try:
-            if self.base_url is not None and hasattr(self.quota_collector, "base_url"):
-                if self.quota_collector.base_url is None:
-                    self.quota_collector.base_url = self.base_url
-            self.quota_collector.step()
-        except Exception:
-            pass
 
     def _send_ws_heartbeat(self, ws) -> float:
         from . import provisioning
@@ -540,7 +524,6 @@ class HostAgent:
                     last_hb = self._send_ws_heartbeat(ws)
 
                 if not getattr(ws, "buf", b""):
-                    self._tick_quota()
                     if self._monotonic() - last_hb >= 60.0:
                         last_hb = self._send_ws_heartbeat(ws)
                     
@@ -575,7 +558,6 @@ class HostAgent:
     def _poll_fallback(self):
         from . import provisioning
         provisioning.tick()
-        self._tick_quota()
         target_base = self.base_url
         if not target_base:
             target_base = _host_cfg().get("base_url")

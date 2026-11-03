@@ -6,7 +6,14 @@ export function initUsageStore(sql: SqlStorage) {
   sql.exec(`CREATE TABLE IF NOT EXISTS usage_quota_history (
     account TEXT NOT NULL, engine TEXT NOT NULL, provider TEXT NOT NULL,
     observed_at_ms INTEGER NOT NULL, quota_json TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'hub-server',
     PRIMARY KEY(account,engine,provider,observed_at_ms))`);
+  const columns = sql.exec('PRAGMA table_info(usage_quota_history)').toArray().map((column: any) => String(column.name));
+  if (!columns.includes('source')) {
+    // Existing journal rows cannot be proven to come from the Hub server;
+    // keep them for audit but never promote them into current quota views.
+    sql.exec("ALTER TABLE usage_quota_history ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'");
+  }
   sql.exec('CREATE INDEX IF NOT EXISTS usage_quota_history_time ON usage_quota_history(observed_at_ms)');
 }
 export function recordUsageQuota(sql: SqlStorage, account: string, provider: string, quota: any, at: number) {
@@ -21,6 +28,8 @@ export function recordUsageQuota(sql: SqlStorage, account: string, provider: str
   let engines: string[]=[];
   try { engines=sql.exec('SELECT DISTINCT engine FROM fleet_routes WHERE account=?',account).toArray().map((r:any)=>r.engine==='zcodex'?'codex':String(r.engine)); } catch { /* schema bootstrap */ }
   if (!engines.length) engines=[provider==='zai'?'codex':provider==='go'?'opencode':provider];
-  for(const engine of new Set(engines)) sql.exec(`INSERT INTO usage_quota_history VALUES(?,?,?,?,?) ON CONFLICT(account,engine,provider,observed_at_ms) DO UPDATE SET quota_json=excluded.quota_json WHERE usage_quota_history.quota_json<>excluded.quota_json`,account,engine,provider,at,payload);
+  for(const engine of new Set(engines)) sql.exec(`INSERT INTO usage_quota_history(account,engine,provider,observed_at_ms,quota_json,source)
+    VALUES(?,?,?,?,?,'hub-server') ON CONFLICT(account,engine,provider,observed_at_ms) DO UPDATE SET
+    quota_json=excluded.quota_json,source='hub-server' WHERE usage_quota_history.quota_json<>excluded.quota_json OR usage_quota_history.source<>'hub-server'`,account,engine,provider,at,payload);
   sql.exec('DELETE FROM usage_quota_history WHERE observed_at_ms<?',at-USAGE_RETENTION_MS);
 }
