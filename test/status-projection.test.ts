@@ -58,9 +58,9 @@ it('keeps projection and byte totals exact through writes, rollback and cold mig
   h.intakeService.init();
   expect(verify()).toEqual(migrated);
   expect(projected().status).toBe('done');
-  h.sql.exec("DELETE FROM intake_tasks WHERE id='task'");
-  expect(h.intakeService.statusTaskSummaries({admin: true})).toEqual([]);
-  expect(verify().counts.tasks).toBe(0);
+  expect(() => h.sql.exec("DELETE FROM intake_tasks WHERE id='task'")).toThrow('intake_tasks_hard_delete_forbidden');
+  expect(h.intakeService.statusTaskSummaries({admin: true})).toMatchObject([{id: 'task', status: 'done'}]);
+  expect(verify().counts.tasks).toBe(1);
 }));
 
 it('bounded lifecycle joins preserve duplicate-native session and launch precedence', async () => fixture(h => {

@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { env, SELF, runInDurableObject } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import {
   evaluateTbmAdmission, tbmHardFloor, tbmSoftReserve, engineProvider, withPolicyTbmFloors, type TbmPoolRow,
 } from '../src/quota_admission';
 
 const inDO: any = runInDurableObject;
-const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
+let testDO = '';
+const stub = () => (env as any).HUB.get((env as any).HUB.idFromName(testDO));
 const source = { type: 'unknown', reference: null, timestamp: null };
 const NOW = Date.parse('2026-10-22T12:00:00Z');
 const DAY = 86400000;
@@ -81,7 +82,7 @@ describe('evaluateTbmAdmission (pure)', () => {
 });
 
 async function api(path: string, payload?: any) {
-  const res = await SELF.fetch('https://hub.test' + path, { method: payload ? 'POST' : 'GET',
+  const res = await stub().fetch('https://hub.test' + path, { method: payload ? 'POST' : 'GET',
     headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }, ...(payload ? { body: JSON.stringify(payload) } : {}) });
   return { status: res.status, data: await res.json() as any };
 }
@@ -100,12 +101,10 @@ const setPool = (row: Partial<TbmPoolRow> & { pool_id: string; provider: string 
 });
 
 beforeEach(async () => {
+  testDO = 'tbm-admission-tests-' + crypto.randomUUID();
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
   await inDO(stub(), (h: any) => {
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
-    for (const t of ['tasks', 'grants', 'rules', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    h.sql.exec('UPDATE intake_meta SET revision=0');
-    h.sql.exec('DELETE FROM tbm_quota_pools');
     h.sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('fixture', 'admin@fake.local', 1, '2026-01-01', '2026-01-01')");
   });
 });

@@ -10,11 +10,13 @@ class IntakeWatchdog extends BaseIntakeWatchdog {
   }
 }
 const NOW = Date.parse('2026-10-28T10:00:00Z');
-const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('queue-tests'));
+let queueTestSeq = 0;
+const stub = (name: string) => (env as any).HUB.get((env as any).HUB.idFromName(name));
 const task = (id = 'queue-task'): any => ({ id, project:'demo', title:'Queue task', status:'open', version:1,
   created_at:NOW, updated_at:NOW, acceptance_criteria:'Verify the result', history:[] });
 async function fixture(fn: (h:any)=>any) {
-  return (runInDurableObject as any)(stub(), async (h:any) => {
+  const namespace = 'queue-tests-' + (++queueTestSeq);
+  return (runInDurableObject as any)(stub(namespace), async (h:any) => {
     for (const table of ['intake_queue_admissions','intake_queue_budget_meta','intake_queue_budget_alerts','intake_queue_digest','intake_queue_escalations','session_control_wakes','intake_queue_movement','intake_restart_queue','intake_watchdog_meta','session_control_sessions','fleet_sessions','claims','fleet_catalog_seen']) h.sql.exec('DELETE FROM '+table);
     h.sql.exec("UPDATE intake_queue_cursor SET after_id='',forgotten_seen=0");
     h.sql.exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,capabilities) VALUES('queue-host','queue-host','queue-host','2026-10-28T10:00:00Z',?)",JSON.stringify({workspaces:['demo']}));
@@ -302,7 +304,6 @@ describe('autonomous intake queue',()=>{
   }));
   it('paginates authorized queue reads with bounded ordinal cursors',()=>fixture(async h=>{
     h.intakeWatchdog.init();
-    h.sql.exec('DELETE FROM intake_tasks');
     for(let i=0;i<65;i++){const t=task('page-'+i);h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',t.id,JSON.stringify(t));}
     const auth=async()=>({caller:{isAdmin:true,actor:'queue-reader',kind:'human'},scopes:['admin']});
     const response=await h.intakeService.handle(new Request('https://hub.test/api/intake/queue'),auth);const first=await response.json();expect(response.status,JSON.stringify(first)).toBe(200);
@@ -313,7 +314,7 @@ describe('autonomous intake queue',()=>{
     expect((await h.intakeService.handle(new Request('https://hub.test/api/intake/queue?limit=10000'),auth)).status).toBe(400);
   }));
   it('bounds production-size tick reads and rotates through every intake',()=>fixture(async h=>{
-    h.sql.exec('DELETE FROM intake_tasks');let now=NOW;
+    let now=NOW;
     const intake=h.intakeService;
     h.ctx.storage.transactionSync(()=>{
       for(let i=0;i<764;i++){const t=task('budget-'+String(i).padStart(4,'0'));h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',t.id,JSON.stringify(t));}

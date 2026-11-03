@@ -186,7 +186,7 @@ describe('idle with open acceptance criteria', () => {
     adoptObservedNativeSessions(sql,'idle-host',[native],at);
     const row=()=>sql.exec('SELECT * FROM session_control_sessions WHERE id=?',native.native_id).one();
     expect(JSON.parse(row().request_json).intake_task_id).toBeUndefined();
-    sql.exec('DELETE FROM intake_tasks WHERE id=?',otherId);
+    sql.exec('UPDATE intake_tasks SET data=json_set(data,\'$.history\',json(\'[]\')) WHERE id=?',otherId);
     sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify({...task,history:[{kind:'link',native_id:native.native_id,host:'foreign-host'}]}),taskId);
     adoptObservedNativeSessions(sql,'idle-host',[native],at+1000);
     expect(JSON.parse(row().request_json).intake_task_id).toBeUndefined();

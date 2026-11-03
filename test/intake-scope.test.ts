@@ -1,17 +1,18 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { env, SELF, runInDurableObject } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
 import { classifyScope, SCOPE_POLICY_VERSION } from '../src/intake_scope';
 
 const inDO: any = runInDurableObject;
-const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
+let testDO = '';
+const stub = () => (env as any).HUB.get((env as any).HUB.idFromName(testDO));
 const source = { type: 'unknown', reference: null, timestamp: null };
 let cookie: string;
 let seq = 0;
 
 async function call(path: string, payload?: any, extra: any = {}) {
-  return SELF.fetch('https://hub.test/api/intake' + path, { method: payload ? 'POST' : 'GET',
+  return stub().fetch('https://hub.test/api/intake' + path, { method: payload ? 'POST' : 'GET',
     headers: { Cookie: cookie, 'x-csrf-token': 'csrf', ...extra },
     ...(payload ? { body: JSON.stringify(payload) } : {}) });
 }
@@ -20,7 +21,7 @@ async function ok(path: string, payload?: any): Promise<any> {
   expect(res.status, JSON.stringify(data)).toBe(200); return data;
 }
 async function sessionsCall(payload: any): Promise<{ status: number; data: any }> {
-  const res = await SELF.fetch('https://hub.test/api/sessions', { method: 'POST',
+  const res = await stub().fetch('https://hub.test/api/sessions', { method: 'POST',
     headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }, body: JSON.stringify(payload) });
   return { status: res.status, data: await res.json() as any };
 }
@@ -45,18 +46,15 @@ async function seedAgent(actor = 'demo:assistant', scopes = '["bus:read","bus:se
   return { id, token, actor };
 }
 async function agentCall(token: string, path: string, payload?: any) {
-  return SELF.fetch('https://hub.test/api/intake' + path, { method: payload ? 'POST' : 'GET',
+  return stub().fetch('https://hub.test/api/intake' + path, { method: payload ? 'POST' : 'GET',
     headers: { Authorization: 'Bearer ' + token }, ...(payload ? { body: JSON.stringify(payload) } : {}) });
 }
 
 beforeEach(async () => {
+  testDO = 'intake-scope-tests-' + crypto.randomUUID();
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
   await inDO(stub(), (h: any) => {
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
-    for (const t of ['tasks','grants','rules','receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    h.sql.exec('UPDATE intake_meta SET revision=0');
-    h.sessionControlService.hooks.reserve = undefined;
-    h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
     h.sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('fixture', 'admin@fake.local', 1, '2026-01-01', '2026-01-01')");
   });
 });
@@ -256,7 +254,7 @@ describe('F2 Hub scope rule', () => {
         'scope-human', 'human', hash, 'scope-human-family', 'admin@fake.local', 'human:fixture', '["admin"]', 'fixture', new Date().toISOString(), new Date(Date.now()+86400000).toISOString());
     });
     const invoke = async (name: string, args: any) => {
-      const r = await SELF.fetch('https://hub.test/mcp', { method: 'POST', headers: { Authorization: 'Bearer '+token, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+      const r = await stub().fetch('https://hub.test/mcp', { method: 'POST', headers: { Authorization: 'Bearer '+token, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) });
       const body: any = await r.json();
       return JSON.parse(body.result.content[0].text);
