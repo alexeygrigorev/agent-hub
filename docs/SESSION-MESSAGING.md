@@ -241,7 +241,7 @@ polled). For session recipients, inbox polling by the host never sets it.
    queues twice.
 4. For `delivery=tui`: `aplexer message deliver <envelope>`. The aplexer
    readiness rule decides (hooks report `waiting|idle`). On `NotReady` the host
-   acks `not_ready`: Hub returns the message to `accepted` with backoff
+   acks with outcome `not_ready`: Hub returns the message to `accepted` with backoff
    (5 s, 15 s, 30 s, then every 60 s) without consuming an attempt.
 5. On deliver success, ack `delivered` with the envelope id. Hub does **not**
    wait for a reply (the current `validateSendProof` rule stays for
@@ -256,7 +256,9 @@ polled). For session recipients, inbox polling by the host never sets it.
    blocks capture/stop (fixes G7).
 
 The host decides readiness only through aplexer (`message deliver`), not by
-scraping the prompt glyph. The old bridge heuristic is retired.
+scraping the prompt glyph. `hub bridge` skips messages with a Hub
+`to_session_id` or a `session:<uuid>` recipient; the session-command offer
+loop owns that delivery, so the legacy bridge cannot inject a second copy.
 
 ### 5.3 Rendered TUI text
 
@@ -510,7 +512,6 @@ How it maps onto the design:
 
 Not built yet (follow-ups): named agent forwarding (`agent:orchestrator-main`
 → its current session) — today those coordinators are reachable once they are
-Hub sessions (operator adoption), as `<tag>@<machine>`; capture-marker
-resolution of `uncertain` deliveries (they stay `uncertain` with the inbox
-copy authoritative); the `tui_unverified_platform` fallback (Windows TUI
+Hub sessions (operator adoption), as `<tag>@<machine>`; the
+`tui_unverified_platform` fallback (Windows TUI
 delivery is proven on Tabo instead).

@@ -45,7 +45,7 @@ def offer(env, rec, command_id=None, delivery="tui"):
             "binding": {"native_id": rec["id"], "tag": "agent1", "workspace": env["work"], "generation": 1,
                         "native_created_at_ms": 1700000000000},
             "payload": {"message_id": MESSAGE_ID, "delivery": delivery, "from_actor": "agent:developer",
-                        "body": "⟦hub:GHJKMNPQ⟧ from agent:developer: ping"}}
+                        "body": "⟦hub:HJKMNPQR⟧ from agent:developer (thread thread-1): ping\n[Reply: a message reply <this inbox message id> \"text\", or hub reply MESSAGE --body \"text\"]"}}
 
 
 def handle(env, hub, o):
@@ -74,7 +74,8 @@ def test_tui_delivery_writes_once_and_acks_delivered_with_envelope(env):
     envelopes = [e for e in native_log(env) if e.get("kind") == "hub-message"]
     assert len(envelopes) == 1 and ack["proof"] == {"native_message_id": envelopes[0]["id"]}
     # A lost ack re-offered under a new claim replays without a second write.
-    assert handle(env, hub, o) == {"command_id": o["command_id"], "state": "delivered", "replayed": True}
+    retry = offer(env, rec, command_id=str(uuid.uuid4()))
+    assert handle(env, hub, retry) == {"command_id": retry["command_id"], "state": "delivered", "replayed": True}
     assert len([e for e in native_log(env) if e.get("kind") == "hub-message"]) == 1
 
 
@@ -84,7 +85,7 @@ def test_not_ready_backs_off_then_delivers_the_same_envelope(env):
     o = offer(env, rec)
     env["monkeypatch"].setenv("FAKE_DELIVER_BEHAVIOR", "refused-busy")
     assert handle(env, hub, o)["state"] == "not_ready"
-    assert acks(hub)[-1]["outcome"] == "refused" and acks(hub)[-1]["reason"].startswith("not_ready")
+    assert acks(hub)[-1]["outcome"] == "not_ready"
     env["monkeypatch"].delenv("FAKE_DELIVER_BEHAVIOR")
     assert handle(env, hub, o)["state"] == "delivered"
     assert acks(hub)[-1]["outcome"] == "delivered"
@@ -120,13 +121,69 @@ def test_native_reply_is_relayed_once_as_the_hub_session(env):
     rep = subprocess.run([env["fake"], "message", "reply", envelope, "pong from Tabo", "--json"],
                          capture_output=True, text=True, timeout=20, env=reply_env)
     assert rep.returncode == 0, rep.stderr
-    relayed = sm.relay_replies(journal_dir=env["journal"], executable=env["fake"], request=hub)
+    auth_dir = os.path.join(env["work"], ".local", "hub-session-auth")
+    os.makedirs(auth_dir, mode=0o700, exist_ok=True)
+    with open(os.path.join(auth_dir, rec["id"] + ".json"), "w", encoding="utf-8") as fh:
+        json.dump({"base_url": "https://hub.example", "client_kind": "agent",
+                   "actor": "session:" + HUB_SESSION, "hub_session_id": HUB_SESSION,
+                   "access_token": "test-session-access", "refresh_token": "test-session-refresh"}, fh)
+    os.chmod(os.path.join(auth_dir, rec["id"] + ".json"), 0o600)
+    session_calls = []
+
+    def session_request(profile, method, path, payload):
+        session_calls.append((profile, method, path, payload))
+        return {"id": "hub-reply-1"}
+
+    relayed = sm.relay_replies(journal_dir=env["journal"], executable=env["fake"], request=hub,
+                               session_request=session_request)
     assert len(relayed) == 1
-    sends = [p for m, path, p in hub.calls if path == "/api/bus/send"]
-    assert sends == [{"from_actor": "session:" + HUB_SESSION, "to_actor": "agent:developer", "kind": "reply",
-                      "body": "pong from Tabo", "reply_to": MESSAGE_ID,
-                      "idempotency_key": "native-" + json.loads(rep.stdout)["id"]}]
-    assert sm.relay_replies(journal_dir=env["journal"], executable=env["fake"], request=hub) == []
+    assert len(session_calls) == 1
+    profile, method, path, payload = session_calls[0]
+    assert profile["actor"] == "session:" + HUB_SESSION
+    assert (method, path) == ("POST", "/api/bus/reply")
+    assert payload == {"to_actor": "agent:developer", "kind": "reply", "body": "pong from Tabo",
+                       "reply_to": MESSAGE_ID, "idempotency_key": "native:" + json.loads(rep.stdout)["id"]}
+    assert "from_actor" not in payload
+    assert sm.relay_replies(journal_dir=env["journal"], executable=env["fake"], request=hub,
+                            session_request=session_request) == []
+
+
+def test_uncertain_delivery_capture_marker_resolves_without_retyping(env, monkeypatch):
+    rec = seed_session(env)
+    hub = FakeHub()
+    o = offer(env, rec)
+    monkeypatch.setenv("FAKE_DELIVER_BEHAVIOR", "crash")
+    assert handle(env, hub, o)["state"] == "uncertain"
+    monkeypatch.delenv("FAKE_DELIVER_BEHAVIOR")
+    captures = []
+
+    class Capture:
+        text = "previous output " + sm._marker(MESSAGE_ID) + " trailing output"
+
+    def capture(executable, target, *, limit_bytes, mode):
+        captures.append((limit_bytes, mode))
+        return Capture()
+
+    monkeypatch.setattr(sm, "capture_output", capture)
+    journal_path = sm._message_journal_path(env["journal"], MESSAGE_ID)
+    record = sm._read_journal(journal_path)
+    reconcile_now = int(time.time() * 1000) + 16000
+    journals = sm.pending_message_reconciliations(env["journal"], now_ms=reconcile_now)
+    eligible = (record.get("state") == "uncertain"
+                and isinstance(record.get("message_id"), str)
+                and isinstance(record.get("command_id"), str)
+                and isinstance(record.get("hub_session_id"), str)
+                and isinstance(record.get("correlation"), str)
+                and isinstance(record.get("claim_token"), str) and bool(record.get("claim_token"))
+                and reconcile_now - int(record.get("last_capture_at_ms") or 0) >= sm.UNCERTAIN_CAPTURE_INTERVAL_MS)
+    assert eligible and len(journals) == 1
+    path, _ = journals[0]
+    resolved = sm.reconcile_message_record(path, executable=env["fake"], request=hub,
+                                           now_ms=int(time.time() * 1000) + 16000)
+    assert resolved["state"] == "delivered" and resolved["reconciled"]
+    assert captures == [(65536, "screen")]
+    assert acks(hub)[-1]["outcome"] == "delivered"
+    assert len([e for e in native_log(env) if e.get("kind") == "hub-message"]) == 1
 
 
 def test_reply_from_another_session_is_not_relayed(env):

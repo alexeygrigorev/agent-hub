@@ -542,6 +542,8 @@ class MailboxBridge:
         to_actor that names a different native tag, or has no native mailbox, is refused before
         any native effect.
         """
+        if _is_hub_session_message(hub_msg):
+            raise BridgeCapabilityGap("Hub session message is delivered by session-commands, not hub bridge")
         mapped = native_tag_for_address(hub_msg.get("to_actor"))
         if native_tag is None:
             native_tag = mapped
@@ -972,8 +974,11 @@ def registered_bridge_targets(actors: Any, only_tags: list[str] | None = None) -
 
 
 def _bridge_inbox_message(bridge: MailboxBridge, msg: dict[str, Any], tag: str, summary: dict[str, Any]) -> bool:
-    """Forward one hub inbox message; True when it is settled (hub-acked, or forwarded now or before)."""
+    """Forward one inbox row or settle it when Hub session delivery owns it."""
     hub_id = msg["id"]
+    if _is_hub_session_message(msg):
+        summary["hub_session_skipped"] = summary.get("hub_session_skipped", 0) + 1
+        return True
     if msg.get("acked_at") or hub_id in bridge.receipts.get("acked_hub_messages", []):
         summary["acked_skipped"] += 1
         return True
@@ -990,6 +995,13 @@ def _bridge_inbox_message(bridge: MailboxBridge, msg: dict[str, Any], tag: str, 
         return False
     summary["forwarded"].append({"hub_id": hub_id, "native_id": native_id, "tag": tag})
     return True
+
+
+def _is_hub_session_message(msg: dict[str, Any]) -> bool:
+    """True when the Hub owns delivery to a session-control session."""
+    to_actor = msg.get("to_actor")
+    return (isinstance(to_actor, str) and to_actor.startswith("session:")
+            or isinstance(msg.get("to_session_id"), str) and bool(msg["to_session_id"]))
 
 
 def poll_once(

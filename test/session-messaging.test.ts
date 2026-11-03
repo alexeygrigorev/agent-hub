@@ -68,7 +68,7 @@ describe('cross-device session messaging', () => {
 
     let granted = await claim(sc, offer);
     expect(sql.exec('SELECT state FROM messages WHERE id = ?', sent.id).one().state).toBe('dispatched');
-    const busy = await ack(sc, offer, granted.claim_token, 'refused', { reason: 'not_ready: composer busy' });
+    const busy = await ack(sc, offer, granted.claim_token, 'not_ready', { reason: 'composer busy' });
     expect(await busy.json()).toMatchObject({ state: 'recorded', not_before_ms: 5000 });
     expect(await offers(sc)).toEqual([]); // backoff, attempt not consumed
     sql.exec("UPDATE session_control_commands SET not_before = NULL WHERE kind = 'message'");
@@ -119,10 +119,13 @@ describe('cross-device session messaging', () => {
   }));
 
   it('renders bounded TUI text without control characters', () => {
-    const text = renderTui({ id: '01JD3K7QXYZABCDEFGHJKMNPQR', from_actor: 'agent:developer', thread_id: 't', body: 'a\x1b[2Jb\x03' + 'x'.repeat(5000) });
+    const text = renderTui({ id: '01JD3K7QXYZABCDEFGHJKMNPQR', from_actor: 'agent:developer\u0085', thread_id: 't\u009f', body: 'a\x1b[2Jb\x03🙂'.repeat(1500) });
     expect(text).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f]/);
+    expect(text).not.toMatch(/[\u0080-\u009f]/);
     expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(2048);
-    expect(text).toContain('[truncated: hub show 01JD3K7QXYZABCDEFGHJKMNPQR]');
+    expect(text).toContain('⟦hub:HJKMNPQR⟧ from agent:developer');
+    expect(text).toContain('[truncated: hub msg show 01JD3K7QXYZABCDEFGHJKMNPQR]');
+    expect(text).toContain('hub reply 01JD3K7QXYZABCDEFGHJKMNPQR --body');
   });
 });
 

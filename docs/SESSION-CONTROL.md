@@ -86,6 +86,7 @@ hub msg --profile developer inbox [--wait 60]
 - A session's sender is always `session:<uuid>`; replies thread back across hosts.
 - `delivery=tui` writes the native inbox copy first, then `aplexer message deliver` types the rendered text at a ready prompt (hooks must report `waiting|idle`). `not_ready` backs off without consuming attempts; the inbox copy stays authoritative. Each session provisiones its own messaging credential at bind (`msg:send msg:read` only); no tokens enter the engine environment.
 - The host relays native `a message reply` answers that reference a `hub-message` envelope back to Hub as the session.
+- The `hub bridge` poller skips any inbox row with `to_session_id` or a `session:<uuid>` recipient. The session-commands receiver owns Hub-session delivery, preventing duplicate native inbox/TUI injection.
 
 ## Non-goals and holds
 
