@@ -298,6 +298,45 @@ describe('forgotten intake watchdog', () => {
     now+=QUEUE_RETRY_BASE_MS;await w.tick();
     expect(alerts.filter(a=>a[0]==='intake_queue'&&a[1]===t.id)).toHaveLength(1);
   }));
+  it('rechecks a stale criteria escalation and surfaces the current blocker without bypassing admission', async () => fixture(async h => {
+    const t=task('criteria-added-after-escalation');let starts=0;
+    h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
+      VALUES(?,'escalated','hold_ttl_acceptance_criteria_required',?,?,?)`,t.id,NOW-QUEUE_HOLD_TTL_MS,NOW,NOW);
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      start:async()=>{starts++;return {status:202,body:{id:'unexpected-start',state:'queued'}}}
+    },()=>NOW);w.init();
+    await w.tick();
+    expect(h.sql.exec('SELECT state,reason FROM intake_restart_queue WHERE task_id=?',t.id).one())
+      .toMatchObject({state:'queued',reason:'workspace_configuration_required'});
+    expect(starts).toBe(0);
+  }));
+  it('returns a cleared TTL hold to canonical admission instead of leaving it escalated', async () => fixture(async h => {
+    const t=task('criteria-hold-cleared');let starts=0;
+    h.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,capabilities) VALUES('criteria-host','criteria-host','criteria-host','2026-10-26T12:00:00Z',?)",
+      JSON.stringify({repo_workspaces:true}));
+    h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
+      VALUES(?,'escalated','hold_ttl_acceptance_criteria_required',?,?,?)`,t.id,NOW-QUEUE_HOLD_TTL_MS,NOW,NOW);
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      repoForProject:()=> 'org/demo',
+      start:async()=>{starts++;return {status:202,body:{id:'canonical-retry',state:'queued'}}}
+    },()=>NOW);w.init();
+    await w.tick();
+    expect(starts).toBe(1);
+    expect(h.sql.exec('SELECT state,reason FROM intake_restart_queue WHERE task_id=?',t.id).one())
+      .toMatchObject({state:'submitted',reason:'canonical_queued'});
+  }));
+  it('replaces an invalid stale criteria reason with the live missing-criteria blocker', async () => fixture(async h => {
+    const t={...task('criteria-still-missing'),acceptance_criteria:'   '};let starts=0;
+    h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
+      VALUES(?,'escalated','hold_ttl_workspace_configuration_required',?,?,?)`,t.id,NOW-QUEUE_HOLD_TTL_MS,NOW,NOW);
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
+      start:async()=>{starts++;return {status:202,body:{id:'unexpected-start',state:'queued'}}}
+    },()=>NOW);w.init();
+    await w.tick();
+    expect(h.sql.exec('SELECT state,reason FROM intake_restart_queue WHERE task_id=?',t.id).one())
+      .toMatchObject({state:'escalated',reason:'hold_ttl_acceptance_criteria_required'});
+    expect(starts).toBe(0);
+  }));
   it.each(['watchdog_project_not_enabled','reported_completion_requires_operator_review'])('keeps %s out of the hold TTL', async reason => fixture(async h => {
     const t=task('exempt');let now=NOW;const notes:string[]=[];
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{

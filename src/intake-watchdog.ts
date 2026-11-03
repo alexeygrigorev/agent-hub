@@ -959,7 +959,7 @@ export class IntakeWatchdog {
         .sort((a,b) => ms(b.created_at) - ms(a.created_at));
       const s = links[0];
       if (!s || (!ACTIVE.has(s.state) && !s.binding_json)) {
-        if (q?.state === 'escalated' && q.next_at <= now) { actions++; await this.escalate(t,q.reason,now); }
+        if (q?.state === 'escalated' && !q.reason.startsWith('hold_ttl_') && q.next_at <= now) { actions++; await this.escalate(t,q.reason,now); }
         continue;
       }
       const binding = parse(s.binding_json), n = native.find(n => n.machine_id === s.machine_id && n.native_id === binding.native_id);
@@ -975,7 +975,10 @@ export class IntakeWatchdog {
         continue;
       }
       if (q && q.next_at > now) continue;
-      if (q?.state === 'escalated') { actions++; await this.escalate(t, q.reason, now); continue; }
+      if (q?.state === 'escalated') {
+        if (!q.reason.startsWith('hold_ttl_')) { actions++; await this.escalate(t, q.reason, now); }
+        continue;
+      }
       if (context.wakes.some((w:Obj)=>w.session_id===s.id && w.state==='pending')) continue;
       const terminal = matches && s.mode==='interactive' && s.engine===n.engine && nativeTerminalError(n);
       const sampled = parse(n?.progress_json);
@@ -1039,6 +1042,29 @@ export class IntakeWatchdog {
       if (actions >= QUEUE_SWEEP_LIMIT) break;
       const t = byId.get(q.task_id);
       if (!t || t.archived_at) continue; // out-of-batch rows: table sweep below
+      if (q.state === 'escalated' && q.reason.startsWith('hold_ttl_')) {
+        // A TTL escalation records why a hold existed, not a permanent veto.
+        // Re-read current task/readiness state each sweep. Keep unresolved work
+        // escalated with its actual blocker; if the hold cleared, let the normal
+        // admission path recheck every gate before it can start anything.
+        actions++;
+        if (!DISPATCHABLE.has(t.status)) { this.closeRestart(t, q, 'intake_' + t.status, now); continue; }
+        const currentHold = this.automationHold(t) ?? intakeCompletionHoldReason(t) ??
+          (!t.acceptance_criteria?.trim() ? 'acceptance_criteria_required' : null);
+        if (currentHold) { await this.escalate(t, 'hold_ttl_' + currentHold, now); continue; }
+        const readiness = this.project([t], now, context)[0];
+        if (!readiness?.ready) {
+          if (readiness?.state === 'active') { this.closeRestart(t, q, 'canonical_session_active', now); continue; }
+          await this.escalate(t, 'hold_ttl_' + (readiness?.reason ?? 'readiness_recheck_required'), now);
+          continue;
+        }
+        this.sql.exec(`UPDATE intake_restart_queue SET state='queued',reason='hold_cleared_recheck',held_since=?,next_at=?,updated_at=?
+          WHERE task_id=? AND state='escalated'`, now, now, now, t.id);
+        this.movement(t, 'queued', 'hold_cleared_recheck', now);
+        this.audit(t, 'hold_rechecked', 'previous TTL hold cleared; canonical admission will recheck all gates', now);
+        await this.hooks.notify?.('intake_queue', t.id, null);
+        continue;
+      }
       if (q.state === 'submitted' && q.session_id) {
         if (!DISPATCHABLE.has(t.status)) { actions++; this.closeRestart(t, q, 'intake_' + t.status, now); continue; }
         const s = context.sessions.find(s => s.id === q.session_id);
