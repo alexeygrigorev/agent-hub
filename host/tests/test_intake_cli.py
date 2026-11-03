@@ -114,3 +114,54 @@ class TestMergeCheckCli(unittest.TestCase):
         collect.assert_called_once_with(str(Path('/repo').resolve()), [other_sha, new_sha], fetch=False,
                                         include_head=True, preferred_deploy_sha=None)
         self.assertTrue(json.loads(output.getvalue())['dry_run'])
+
+    def test_newer_superseding_report_drops_stale_merge_state_shas(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        old_sha, new_sha = 'a1' * 20, 'b2' * 20
+        stale_head, stale_commit = 'c3' * 20, 'd4' * 20
+        shown = {'task': {
+            'id': 'fixture-task',
+            'payload_data': {'history': [
+                {'id': old_id, 'kind': 'report', 'reference': old_sha, 'captured_at': 100},
+                {'id': new_id, 'kind': 'report', 'reference': new_sha, 'captured_at': 301,
+                 'supersedes': [old_id]},
+            ]},
+            'merge_state': {'head': stale_head, 'commits': [{'sha': stale_commit}],
+                            'activity_at': 200, 'evidence_at': 250},
+        }}
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'merge-check', 'fixture-task', '--repo', '/repo', '--dry-run']), \
+                patch('sys.stdout', output), \
+                patch.object(intake, 'request', return_value=shown), \
+                patch('agent_hub_host.merge_evidence.fetch_origin'), \
+                patch('agent_hub_host.merge_evidence.collect', return_value={'commits': []}) as collect:
+            cli.main()
+        collect.assert_called_once_with(str(Path('/repo').resolve()), [new_sha], fetch=False,
+                                        include_head=True, preferred_deploy_sha=None)
+
+    def test_older_superseding_report_keeps_merge_state_shas_required(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        old_sha, new_sha = 'a1' * 20, 'b2' * 20
+        recorded_head, recorded_commit = 'c3' * 20, 'd4' * 20
+        shown = {'task': {
+            'id': 'fixture-task',
+            'payload_data': {'history': [
+                {'id': old_id, 'kind': 'report', 'reference': old_sha, 'captured_at': 100},
+                {'id': new_id, 'kind': 'report', 'reference': new_sha, 'captured_at': 201,
+                 'supersedes': [old_id]},
+            ]},
+            'merge_state': {'head': recorded_head, 'commits': [{'sha': recorded_commit}],
+                            'activity_at': 200, 'evidence_at': 250},
+        }}
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'merge-check', 'fixture-task', '--repo', '/repo', '--dry-run']), \
+                patch('sys.stdout', output), \
+                patch.object(intake, 'request', return_value=shown), \
+                patch('agent_hub_host.merge_evidence.fetch_origin'), \
+                patch('agent_hub_host.merge_evidence.collect', return_value={'commits': []}) as collect:
+            cli.main()
+        collect.assert_called_once_with(str(Path('/repo').resolve()),
+                                        [recorded_head, new_sha, recorded_commit], fetch=False,
+                                        include_head=True, preferred_deploy_sha=recorded_head)

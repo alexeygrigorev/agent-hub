@@ -58,20 +58,21 @@ def existing_commits(repo: str, candidates: list, runner: Callable = subprocess.
             if (p := _run(runner, ['git', 'cat-file', '-e', c + '^{commit}'], repo)) is not None and p.returncode == 0]
 
 
-def active_report_references(history: list) -> list:
-    """Return report/commit refs, excluding only explicitly superseded reports.
-
-    Supersession points to a prior report event id, never to a SHA by itself.
-    Malformed or dangling supersession data is ignored so the original report
-    remains required and missing commits continue to fail closed.
-    """
+def _supersession_state(history: list) -> tuple[set[str], set[int]]:
+    """Return unambiguously superseded report ids and valid superseding indexes."""
     reports = {}
-    for index, event in enumerate(history if isinstance(history, list) else []):
+    events = history if isinstance(history, list) else []
+    duplicate_ids = set()
+    for index, event in enumerate(events):
         if isinstance(event, dict) and event.get('kind') == 'report' and isinstance(event.get('id'), str):
-            reports[event['id'].lower()] = (index, event)
+            ident = event['id'].lower()
+            if ident in reports:
+                duplicate_ids.add(ident)
+            reports[ident] = (index, event)
+    for ident in duplicate_ids:
+        reports.pop(ident, None)
 
     supersession_claims = []
-    events = history if isinstance(history, list) else []
     for index, event in enumerate(events):
         if not isinstance(event, dict) or event.get('kind') != 'report':
             continue
@@ -88,21 +89,38 @@ def active_report_references(history: list) -> list:
         for target in normalized:
             prior = reports.get(target)
             reference = prior[1].get('reference') if prior else None
-            if prior is None or prior[0] >= index or not isinstance(reference, str) or not SHA.fullmatch(reference):
+            if (prior is None or prior[0] >= index or not isinstance(reference, str)
+                    or not SHA.fullmatch(reference.strip())):
                 valid = False
                 break
         if valid:
-            supersession_claims.append(normalized)
+            supersession_claims.append((index, normalized))
 
     claim_counts = {}
-    for targets in supersession_claims:
+    for _, targets in supersession_claims:
         for target in targets:
             claim_counts[target] = claim_counts.get(target, 0) + 1
     # Ambiguous history must keep the old reference required. The worker API
     # rejects duplicate targets, but this parser also fails closed on malformed
     # or legacy history containing competing supersession events.
-    superseded = {target for targets in supersession_claims
+    superseded = {target for _, targets in supersession_claims
                   for target in targets if claim_counts[target] == 1}
+    valid_superseding_indexes = {
+        index for index, targets in supersession_claims
+        if all(claim_counts[target] == 1 for target in targets)
+    }
+    return superseded, valid_superseding_indexes
+
+
+def active_report_references(history: list) -> list:
+    """Return report/commit refs, excluding only explicitly superseded reports.
+
+    Supersession points to a prior report event id, never to a SHA by itself.
+    Malformed or dangling supersession data is ignored so the original report
+    remains required and missing commits continue to fail closed.
+    """
+    events = history if isinstance(history, list) else []
+    superseded, _ = _supersession_state(events)
 
     refs = []
     for event in events:
@@ -119,9 +137,10 @@ def active_report_references(history: list) -> list:
 def explicit_commit_refs(history: list) -> list:
     """Return commit refs, using explicit links when an intake opts into them.
 
-    Older histories keep the latest-report checkpoint behavior. Once a report
-    carries ``supersedes``, every report remains required unless a valid event
-    id explicitly supersedes it; commit events always remain cumulative.
+    Older histories keep the latest-report checkpoint behavior. When explicit
+    supersession begins, the legacy prefix still contributes only its latest
+    report checkpoint; later reports use event-id supersession. Commit events
+    always remain cumulative.
     """
     events = history if isinstance(history, list) else []
     explicit_mode = any(
@@ -129,7 +148,31 @@ def explicit_commit_refs(history: list) -> list:
         for entry in events
     )
     if explicit_mode:
-        candidates = active_report_references(events)
+        superseded, _ = _supersession_state(events)
+        first_explicit_index = next(
+            index for index, entry in enumerate(events)
+            if isinstance(entry, dict) and entry.get('kind') == 'report' and 'supersedes' in entry
+        )
+        latest_legacy_index = None
+        for index, entry in enumerate(events[:first_explicit_index]):
+            reference = entry.get('reference') if isinstance(entry, dict) and entry.get('kind') == 'report' else None
+            if isinstance(reference, str) and SHA.fullmatch(reference.strip()):
+                latest_legacy_index = index
+
+        candidates = []
+        for index, entry in enumerate(events):
+            if not isinstance(entry, dict) or entry.get('kind') not in ('report', 'commit'):
+                continue
+            reference = entry.get('reference')
+            if not isinstance(reference, str) or not SHA.fullmatch(reference.strip()):
+                continue
+            if entry.get('kind') == 'report':
+                ident = entry.get('id')
+                if isinstance(ident, str) and ident.lower() in superseded:
+                    continue
+                if index < first_explicit_index and index != latest_legacy_index:
+                    continue
+            candidates.append(reference.strip())
     else:
         active: list[tuple[int, str]] = []
         latest_report: tuple[int, str] | None = None
@@ -154,6 +197,31 @@ def explicit_commit_refs(history: list) -> list:
         if SHA.fullmatch(normalized) and normalized not in refs:
             refs.append(normalized)
     return refs
+
+
+def superseding_report_is_newer_than_merge_state(history: list, merge_state: Any) -> bool:
+    """Whether a valid explicit report supersedes an older stored state checkpoint.
+
+    Stored merge-state SHAs are normally retained as evidence. A newer valid
+    superseding report is the explicit signal that a rebase replaced that
+    checkpoint; otherwise the old SHAs remain required.
+    """
+    state = merge_state if isinstance(merge_state, dict) else {}
+    activity_at, evidence_at = state.get('activity_at'), state.get('evidence_at')
+    if (type(activity_at) is not int or activity_at < 0
+            or type(evidence_at) is not int or evidence_at < 0):
+        return False
+    checkpoint_at = max(activity_at, evidence_at)
+    events = history if isinstance(history, list) else []
+    _, superseding_indexes = _supersession_state(events)
+    for index in superseding_indexes:
+        event = events[index]
+        captured_at = event.get('captured_at') if isinstance(event, dict) else None
+        reference = event.get('reference') if isinstance(event, dict) else None
+        if (type(captured_at) is int and captured_at > checkpoint_at
+                and isinstance(reference, str) and SHA.fullmatch(reference.strip())):
+            return True
+    return False
 
 
 def hub_recorded_shas(merge_state: Any) -> list:

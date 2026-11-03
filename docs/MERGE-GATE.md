@@ -27,9 +27,17 @@ earlier report event on the same intake with a commit SHA reference and may be
 superseded only once. Merge-check excludes only those explicitly superseded
 report events; commit events and malformed or dangling supersession data remain
 required evidence, so missing commits still fail closed. Histories without a
-`supersedes` field retain the existing latest-report checkpoint behavior; adding
-the field opts that intake into explicit event-ID supersession. Supersession
-does not alter historical event content.
+`supersedes` field retain the existing latest-report checkpoint behavior. When
+explicit supersession begins, the older legacy history prefix still contributes
+only its latest report checkpoint; later report events remain required until
+explicitly superseded. Commit events remain cumulative in either mode.
+
+A valid superseding report captured after both stored merge-state timestamps
+(`activity_at` and `evidence_at`) also replaces that state's old worktree head
+and commit checkpoints. This lets a post-rebase report retire stale pre-rebase
+SHAs. If the report is malformed, ambiguous, or not newer than the stored
+state, merge-check keeps those recorded SHAs required. Supersession does not
+alter historical event content.
 
 Deploy states: `success`, `skipped`, `not_required` are green; `failure`,
 `pending`, `missing`, `unknown` block.
