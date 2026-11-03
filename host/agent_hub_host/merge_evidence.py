@@ -58,37 +58,185 @@ def existing_commits(repo: str, candidates: list, runner: Callable = subprocess.
             if (p := _run(runner, ['git', 'cat-file', '-e', c + '^{commit}'], repo)) is not None and p.returncode == 0]
 
 
-def explicit_commit_refs(history: list) -> list:
-    """Return the latest report head plus every explicit commit event SHA.
+def _supersession_state(history: list) -> tuple[set[str], set[int]]:
+    """Return unambiguously superseded report ids and valid superseding indexes."""
+    reports = {}
+    events = history if isinstance(history, list) else []
+    duplicate_ids = set()
+    for index, event in enumerate(events):
+        if isinstance(event, dict) and event.get('kind') == 'report' and isinstance(event.get('id'), str):
+            ident = event['id'].lower()
+            if ident in reports:
+                duplicate_ids.add(ident)
+            reports[ident] = (index, event)
+    for ident in duplicate_ids:
+        reports.pop(ident, None)
 
-    A ``report`` reference records a branch-head checkpoint. Rebase replaces
-    that checkpoint, so older report references are audit history, not commits
-    that must also become reachable from main. A ``commit`` event is an
-    immutable deliverable reference and remains required cumulatively. Note
-    text, intake/session/launch ids and uuid fragments never count here;
-    free-text candidates go through ``shas_from_text`` + ``existing_commits``.
+    supersession_claims = []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or event.get('kind') != 'report':
+            continue
+        event_id = event.get('id')
+        if not isinstance(event_id, str) or reports.get(event_id.lower(), (None,))[0] != index:
+            continue
+        current_reference = event.get('reference')
+        if not isinstance(current_reference, str) or not SHA.fullmatch(current_reference.strip()):
+            continue
+        targets = event.get('supersedes')
+        if not isinstance(targets, list) or not targets or len(targets) > 32:
+            continue
+        normalized = [target.lower() for target in targets if isinstance(target, str)]
+        if len(normalized) != len(targets) or len(set(normalized)) != len(normalized):
+            continue
+        valid = True
+        for target in normalized:
+            prior = reports.get(target)
+            reference = prior[1].get('reference') if prior else None
+            if (prior is None or prior[0] >= index or not isinstance(reference, str)
+                    or not SHA.fullmatch(reference.strip())):
+                valid = False
+                break
+        if valid:
+            supersession_claims.append((index, normalized))
+
+    claim_counts = {}
+    for _, targets in supersession_claims:
+        for target in targets:
+            claim_counts[target] = claim_counts.get(target, 0) + 1
+    # Ambiguous history must keep every target of a competing claim required.
+    # Reject the entire claim when any target is contested; otherwise a
+    # multi-target claim could still hide its uncontested targets.
+    valid_claims = [
+        (index, targets) for index, targets in supersession_claims
+        if all(claim_counts[target] == 1 for target in targets)
+    ]
+    superseded = {target for _, targets in valid_claims for target in targets}
+    valid_superseding_indexes = {index for index, _ in valid_claims}
+    return superseded, valid_superseding_indexes
+
+
+def _active_report_indexes(history: list) -> list[int]:
+    """Return report indexes that contribute a required checkpoint reference."""
+    events = history if isinstance(history, list) else []
+    valid = {
+        index for index, entry in enumerate(events)
+        if isinstance(entry, dict) and entry.get('kind') == 'report'
+        and isinstance(entry.get('reference'), str)
+        and SHA.fullmatch(entry['reference'].strip())
+    }
+    explicit_indexes = [
+        index for index, entry in enumerate(events)
+        if isinstance(entry, dict) and entry.get('kind') == 'report' and 'supersedes' in entry
+    ]
+    if not explicit_indexes:
+        return [max(valid)] if valid else []
+
+    first_explicit_index = explicit_indexes[0]
+    superseded, _ = _supersession_state(events)
+    latest_legacy = max((index for index in valid if index < first_explicit_index), default=None)
+    active = []
+    if latest_legacy is not None:
+        event = events[latest_legacy]
+        ident = event.get('id')
+        if not isinstance(ident, str) or ident.lower() not in superseded:
+            active.append(latest_legacy)
+    active.extend(
+        index for index in sorted(valid)
+        if index >= first_explicit_index
+        and not (isinstance(events[index].get('id'), str)
+                 and events[index]['id'].lower() in superseded)
+    )
+    return active
+
+
+def active_report_references(history: list) -> list:
+    """Return report/commit refs, excluding only explicitly superseded reports.
+
+    Supersession points to a prior report event id, never to a SHA by itself.
+    Malformed or dangling supersession data is ignored so the original report
+    remains required and missing commits continue to fail closed.
     """
-    active: list[tuple[int, str]] = []
-    latest_report: tuple[int, str] | None = None
-    for index, entry in enumerate(history if isinstance(history, list) else []):
+    events = history if isinstance(history, list) else []
+    superseded, _ = _supersession_state(events)
+    refs = []
+    for event in events:
+        if not isinstance(event, dict) or event.get('kind') not in ('report', 'commit'):
+            continue
+        if event.get('kind') == 'report' and isinstance(event.get('id'), str) and event['id'].lower() in superseded:
+            continue
+        reference = event.get('reference')
+        if isinstance(reference, str) and SHA.fullmatch(reference.strip()):
+            refs.append(reference.strip())
+    return refs
+
+
+def latest_active_report_reference(history: list) -> Optional[str]:
+    """Return the SHA of the latest report checkpoint that remains active."""
+    events = history if isinstance(history, list) else []
+    indexes = _active_report_indexes(events)
+    if not indexes:
+        return None
+    reference = events[indexes[-1]].get('reference')
+    return reference.strip().lower() if isinstance(reference, str) else None
+
+
+def explicit_commit_refs(history: list) -> list:
+    """Return commit refs, using explicit links when an intake opts into them.
+
+    Older histories keep the latest-report checkpoint behavior. When explicit
+    supersession begins, the legacy prefix still contributes only its latest
+    report checkpoint; later reports use event-id supersession. Commit events
+    always remain cumulative.
+    """
+    events = history if isinstance(history, list) else []
+    active_reports = set(_active_report_indexes(events))
+    candidates = []
+    for index, entry in enumerate(events):
         if not isinstance(entry, dict) or entry.get('kind') not in ('report', 'commit'):
             continue
-        ref = str(entry.get('reference') or '').strip()
-        if not SHA.fullmatch(ref):
+        if entry.get('kind') == 'report' and index not in active_reports:
             continue
-        normalized = ref.lower()
-        if entry.get('kind') == 'report':
-            latest_report = (index, normalized)
-        else:
-            active.append((index, normalized))
+        reference = entry.get('reference')
+        if isinstance(reference, str) and SHA.fullmatch(reference.strip()):
+            candidates.append(reference.strip())
 
-    if latest_report is not None:
-        active.append(latest_report)
     refs = []
-    for _, ref in sorted(active):
-        if ref not in refs:
-            refs.append(ref)
+    for ref in candidates:
+        normalized = ref.strip().lower()
+        if SHA.fullmatch(normalized) and normalized not in refs:
+            refs.append(normalized)
     return refs
+
+
+def superseding_report_checkpoint(history: list, merge_state: Any) -> Optional[str]:
+    """Return a safe replacement SHA for a newer, sole active report checkpoint.
+
+    ``evidence_at`` records when merge evidence was last submitted. ``activity_at``
+    also moves when the watcher defers an intake for a live session, so it cannot
+    establish that a report predates the recorded evidence. A checkpoint may
+    replace stored state only when it is the only active report reference.
+    """
+    state = merge_state if isinstance(merge_state, dict) else {}
+    evidence_at = state.get('evidence_at')
+    if type(evidence_at) is not int or evidence_at < 0:
+        return None
+    events = history if isinstance(history, list) else []
+    _, superseding_indexes = _supersession_state(events)
+    active = _active_report_indexes(events)
+    if len(active) != 1 or active[0] not in superseding_indexes:
+        return None
+    event = events[active[0]]
+    captured_at = event.get('captured_at') if isinstance(event, dict) else None
+    reference = event.get('reference') if isinstance(event, dict) else None
+    if (type(captured_at) is int and captured_at > evidence_at
+            and isinstance(reference, str) and SHA.fullmatch(reference.strip())):
+        return reference.strip().lower()
+    return None
+
+
+def superseding_report_is_newer_than_merge_state(history: list, merge_state: Any) -> bool:
+    """Compatibility predicate for callers that only need a checkpoint flag."""
+    return superseding_report_checkpoint(history, merge_state) is not None
 
 
 def hub_recorded_shas(merge_state: Any) -> list:

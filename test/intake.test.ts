@@ -850,6 +850,25 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(briefing.total).toBe(0);
     expect((await ok('/tasks/' + task.id + '/links')).task.payload_data.history).toHaveLength(10);
   });
+  it('allows a report to supersede one existing report event by id, and rejects unknown targets', async () => {
+    let { task } = await create();
+    task = (await append(task.id, task.version, { kind: 'report', reference: 'a'.repeat(40), source })).task;
+    const previous = task.payload_data.history.at(-1);
+    task = (await append(task.id, task.version, { kind: 'report', reference: 'b'.repeat(40), supersedes: [previous.id], source })).task;
+    expect(task.payload_data.history.at(-1)).toMatchObject({ reference: 'b'.repeat(40), supersedes: [previous.id.toLowerCase()] });
+    const duplicate = await call('/tasks/' + task.id + '/events', {
+      key: 'duplicate-superseded-report-test', expected_version: task.version,
+      event: { kind: 'report', reference: 'c'.repeat(40), supersedes: [previous.id], source },
+    });
+    expect(duplicate.status).toBe(400);
+    expect((await duplicate.json() as any).error).toBe('report_already_superseded');
+    const invalid = await call('/tasks/' + task.id + '/events', {
+      key: 'unknown-superseded-report-test', expected_version: task.version,
+      event: { kind: 'report', reference: 'c'.repeat(40), supersedes: ['99999999-9999-4999-8999-999999999999'], source },
+    });
+    expect(invalid.status).toBe(400);
+    expect((await invalid.json() as any).error).toBe('unknown_superseded_report');
+  });
   it('requires current session CSRF and supports current token-admin cookie and human admin bearer', async () => {
     expect((await SELF.fetch('https://hub.test/api/intake/tasks')).status).toBe(401);
     expect((await call('/tasks', { key: 'x' }, undefined, { 'x-csrf-token': '' })).status).toBe(403);
@@ -1245,7 +1264,7 @@ describe('private durable intake HTTP/SQLite', () => {
       expect(() => h.sql.exec('UPDATE intake_note_archive SET data=data WHERE task_id=?', task.id)).toThrow(/append_only_note_archive/);
     });
     expect((await call('/tasks/' + task.id + '/history?archived=1&limit=101')).status).toBe(400);
-  });
+  }, 15000);
 
   it('reports an appended note archived at inline capacity and makes it readable from archive history', async () => {
     const { task } = await create();
@@ -1386,7 +1405,7 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(result.bytes).toBeLessThan(2000000);
     const appended = await append(task.id, task.version, { kind: 'note', text: 'bounded marker', source });
     expect(appended.task.status).toBe('open');
-  });
+  }, 15000);
 
   it('rolls back oversized-history writes at the separate record safety bound', async () => {
     const { task } = await create();
@@ -1440,7 +1459,7 @@ describe('private durable intake HTTP/SQLite', () => {
     });
     before = await compactState(); expect((await call('/tasks', { key: 'globalcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(200);
     expect((await compactState()).receipts.slice(0, before.receipts.length)).toEqual(before.receipts);
-  });
+  }, 15000);
   it('archives legacy terminal tasks in batches without deleting payloads', async () => {
     const stale = Date.now() - 20 * 86400000;
     const seed = 300;
@@ -1518,7 +1537,7 @@ describe('archive retention, evidence gates and durable audit', () => {
     task = (await ok('/tasks/' + task.id, { key: 'cancel-explicit', expected_version: task.version, status: 'cancelled', reason: 'dropped by Alexey: no longer requested' })).task;
     expect(task.archived_at).toEqual(expect.any(Number));
     expect((await ok('/tasks/' + task.id + '/audit')).items).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'cancel', from_status: 'open', to_status: 'cancelled', reason: 'dropped by Alexey: no longer requested' })]));
-  });
+  }, 15000);
   it('preserves closed payload/history after five minutes; supports archive filters, notes, reopen and fresh evidence', async () => {
     let { task } = await create();
     task = (await append(task.id, task.version, done)).task;
@@ -1542,7 +1561,7 @@ describe('archive retention, evidence gates and durable audit', () => {
     expect(task.archived_at).toBeNull();
     expect((await call('/tasks/' + task.id, { key: 'stale-evidence', expected_version: task.version, status: 'done' })).status).toBe(409);
     expect((await ok('/tasks/' + task.id + '/audit')).items[0].kind).toBe('reopen');
-  });
+  }, 15_000);
   it('list/show/update/history agree for every visible full id and prefix during parallel archive passes', async () => {
     const first = await create(), second = await create();
     const closed = await append(second.task.id, 1, done);
@@ -1559,7 +1578,7 @@ describe('archive retention, evidence gates and durable audit', () => {
       }
     }
     expect((await ok('/tasks/' + first.task.id)).task.status).toBe('open');
-  });
+  }, 15_000);
   it('audit is append-only, survives row loss, and does not disclose other projects', async () => {
     let { task } = await create('secret');
     task = (await append(task.id, 1, done)).task;

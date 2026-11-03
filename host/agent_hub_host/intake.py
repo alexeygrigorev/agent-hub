@@ -605,6 +605,13 @@ def execute(args):
         recorded_head = str(state.get('head') or '').strip().lower()
         if not merge_evidence.SHA.match(recorded_head):
             recorded_head = ''
+        checkpoint_sha = merge_evidence.superseding_report_checkpoint(history, state)
+        if checkpoint_sha:
+            # A newer explicit report marks a rebase checkpoint. Keeping the
+            # pre-rebase worktree head/commits would reintroduce stale SHAs.
+            recorded = []
+            recorded_head = ''
+        preferred_deploy_sha = recorded_head or checkpoint_sha or merge_evidence.latest_active_report_reference(history)
         try:
             repo = str(Path(args.repo).resolve()) if args.repo else merge_evidence.own_clone()
             candidates = merge_evidence.shas_from_text(text, exclude=(task.get('id'),) + tuple(e.get('hub_session_id') or e.get('id') for e in history if isinstance(e, dict)))
@@ -612,7 +619,12 @@ def execute(args):
             remaining_recorded = [sha for sha in recorded if sha != recorded_head]
             wanted = ([recorded_head] if recorded_head else []) + explicit + merge_evidence.existing_commits(repo, candidates) + [x for x in args.sha if isinstance(x, str)] + remaining_recorded
             evidence = merge_evidence.collect(str(Path(repo).resolve()), wanted, fetch=False, include_head=args.repo is not None,
-                                              preferred_deploy_sha=recorded_head or None)
+                                              preferred_deploy_sha=preferred_deploy_sha)
+            if checkpoint_sha and args.repo is None:
+                # The private clone has no current worktree HEAD. Persist the
+                # replacement checkpoint so Hub's COALESCE does not retain the
+                # stale pre-rebase head after this evidence submission.
+                evidence['head'] = checkpoint_sha
         except RuntimeError as exc:
             raise IntakeInputError(str(exc)) from None
         if args.dry_run:

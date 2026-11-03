@@ -14,12 +14,40 @@ Hub stores one row per intake in `intake_merge_state`: tracked worktree
 - every worktree recorded for the intake (starts tracking, `state=tracking`),
 - every host worktree status result (head, unmerged count),
 - `hub intake merge-check <intake> [--repo DIR] [--sha SHA] [--dry-run]`, which
-  runs `git fetch origin main` in a private clone of the project repo (`--repo DIR` overrides and also checks that checkout's HEAD; the caller's cwd is never used), takes the latest report SHA as the current head checkpoint, retains every explicit `commit` event SHA, and adds DONE-note hex tokens verified with `git cat-file -e` (uuids and intake/session ids are ignored), ancestry (`merge-base --is-ancestor`) for the
-  DONE-note commits plus HEAD, and `gh run list --workflow deploy.yml` for the
-  exact commits (a later green Deploy that contains the commit counts; `[skip ci]`
-  commits are `skipped`; `gh` failure is `unknown`, never green). It posts
+  runs `git fetch origin main` in a private clone of the project repo (`--repo DIR`
+  overrides and also checks that checkout's HEAD; the caller's cwd is never used),
+  retains active report checkpoints and every explicit `commit` event SHA, and
+  adds DONE-note hex tokens verified with `git cat-file -e` (uuids and intake/session
+  ids are ignored). It checks ancestry (`merge-base --is-ancestor`) for the
+  recorded or selected report head, DONE-note commits, and the checked-out HEAD
+  when `--repo` is supplied. Deploy evidence comes from
+  `gh run list --workflow deploy.yml` for the exact commits (a later green Deploy
+  that contains the commit counts; `[skip ci]` commits are `skipped`; `gh` failure
+  is `unknown`, never green). It posts
   `POST /api/intake/tasks/ID/merge-evidence` (CLI/REST only: it runs git and gh locally, and the MCP
   tool surface is at its compact-schema budget).
+
+When a report commit is rebased, append a new `report` event for the replacement
+SHA with `supersedes: ["<prior-report-event-id>"]`. The target must identify an
+earlier report event on the same intake with a commit SHA reference and may be
+superseded only once. Merge-check excludes only those explicitly superseded
+report events; commit events and malformed or dangling supersession data remain
+required evidence, so missing commits still fail closed. Histories without a
+`supersedes` field retain the existing latest-report checkpoint behavior. When
+explicit supersession begins, the older legacy history prefix still contributes
+only its latest report checkpoint; later report events remain required until
+explicitly superseded. Commit events remain cumulative in either mode.
+
+A valid superseding report captured after the last stored merge evidence
+(`evidence_at`) replaces the old worktree head and commit checkpoints only when
+it is the sole active report checkpoint. `activity_at` is not used for this
+freshness check because watcher deferrals can advance it without changing merge
+evidence. The private-clone flow submits the replacement report SHA as `head`,
+so Hub replaces its stale stored head, and checks deployment for that SHA rather
+than an older green report. Later checks retain that persisted head. If the
+report is malformed, ambiguous, older than the stored evidence, or leaves
+another active report checkpoint, merge-check keeps the recorded SHAs required.
+Supersession does not alter historical event content.
 
 Deploy states: `success`, `skipped`, `not_required` are green; `failure`,
 `pending`, `missing`, `unknown` block.

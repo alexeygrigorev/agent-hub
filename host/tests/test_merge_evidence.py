@@ -129,6 +129,73 @@ class MergeEvidenceTests(unittest.TestCase):
 
 
 class CommitExtractionTests(unittest.TestCase):
+    def test_active_report_references_excludes_only_explicit_prior_reports(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        other_id = '33333333-3333-4333-8333-333333333333'
+        old_sha = 'a1' * 20
+        new_sha = 'b2' * 20
+        other_sha = 'c3' * 20
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': old_sha},
+            {'id': other_id, 'kind': 'report', 'reference': other_sha},
+            {'id': new_id, 'kind': 'report', 'reference': new_sha, 'supersedes': [old_id]},
+            {'id': '44444444-4444-4444-8444-444444444444', 'kind': 'commit', 'reference': old_sha},
+        ]
+        self.assertEqual(me.active_report_references(history), [other_sha, new_sha, old_sha])
+
+    def test_malformed_or_dangling_supersession_fails_closed(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        old_sha = 'a1' * 20
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': old_sha},
+            {'id': new_id, 'kind': 'report', 'reference': 'b2' * 20, 'supersedes': ['missing-id']},
+        ]
+        self.assertEqual(me.active_report_references(history), [old_sha, 'b2' * 20])
+
+    def test_malformed_superseding_report_cannot_drop_prior_reference(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        old_sha = 'a1' * 20
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': old_sha},
+            {'id': new_id, 'kind': 'report', 'reference': 'not-a-sha', 'supersedes': [old_id]},
+        ]
+        self.assertEqual(me.active_report_references(history), [old_sha])
+
+    def test_competing_supersession_claims_keep_prior_report_required(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        first_id = '22222222-2222-4222-8222-222222222222'
+        second_id = '33333333-3333-4333-8333-333333333333'
+        old_sha = 'a1' * 20
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': old_sha},
+            {'id': first_id, 'kind': 'report', 'reference': 'b2' * 20,
+             'supersedes': [old_id]},
+            {'id': second_id, 'kind': 'report', 'reference': 'c3' * 20,
+             'supersedes': [old_id]},
+        ]
+
+        self.assertEqual(me.active_report_references(history), [old_sha, 'b2' * 20, 'c3' * 20])
+
+    def test_contested_multi_target_claim_does_not_supersede_any_target(self):
+        first_old = '11111111-1111-4111-8111-111111111111'
+        second_old = '22222222-2222-4222-8222-222222222222'
+        first_claim = '33333333-3333-4333-8333-333333333333'
+        second_claim = '44444444-4444-4444-8444-444444444444'
+        history = [
+            {'id': first_old, 'kind': 'report', 'reference': 'a1' * 20},
+            {'id': second_old, 'kind': 'report', 'reference': 'b2' * 20},
+            {'id': first_claim, 'kind': 'report', 'reference': 'c3' * 20,
+             'supersedes': [first_old, second_old]},
+            {'id': second_claim, 'kind': 'report', 'reference': 'd4' * 20,
+             'supersedes': [first_old]},
+        ]
+
+        self.assertEqual(me.active_report_references(history),
+                         ['a1' * 20, 'b2' * 20, 'c3' * 20, 'd4' * 20])
+
     def test_uuid_and_known_id_fragments_are_not_candidates(self):
         text = ('DONE afab8367 intake 5e2cc166-0b5c-4a7d-9f11-34a66405e0e7 session c30f1f98 commit 89f55bd7 '
                 'and 0c934b64e1 task a5821c84')
@@ -178,6 +245,88 @@ class CommitExtractionTests(unittest.TestCase):
             {'kind': 'report', 'reference': current_head},
         ]
         self.assertEqual(me.explicit_commit_refs(history), [shipped_commit, current_head])
+
+    def test_explicit_mode_preserves_legacy_latest_report_checkpoint(self):
+        first_id = '11111111-1111-4111-8111-111111111111'
+        latest_id = '22222222-2222-4222-8222-222222222222'
+        current_id = '33333333-3333-4333-8333-333333333333'
+        history = [
+            {'id': first_id, 'kind': 'report', 'reference': 'a1' * 20},
+            {'kind': 'commit', 'reference': 'b2' * 20},
+            {'id': latest_id, 'kind': 'report', 'reference': 'c3' * 20},
+            {'id': current_id, 'kind': 'report', 'reference': 'd4' * 20,
+             'supersedes': [latest_id]},
+        ]
+        self.assertEqual(me.explicit_commit_refs(history), ['b2' * 20, 'd4' * 20])
+
+    def test_newer_valid_superseding_report_replaces_stale_merge_state_checkpoint(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': 'a1' * 20, 'captured_at': 50},
+            {'id': new_id, 'kind': 'report', 'reference': 'b2' * 20, 'captured_at': 301,
+             'supersedes': [old_id]},
+        ]
+        state = {'activity_at': 200, 'evidence_at': 250, 'head': 'c3' * 20}
+        self.assertEqual(me.superseding_report_checkpoint(history, state), 'b2' * 20)
+        self.assertTrue(me.superseding_report_is_newer_than_merge_state(history, state))
+        self.assertEqual(me.superseding_report_checkpoint(
+            history, {**state, 'activity_at': 500}), 'b2' * 20)
+        self.assertTrue(me.superseding_report_is_newer_than_merge_state(
+            history, {**state, 'activity_at': 301}))
+        self.assertFalse(me.superseding_report_is_newer_than_merge_state(
+            history, {**state, 'evidence_at': 302}))
+        self.assertFalse(me.superseding_report_is_newer_than_merge_state(
+            history, {'activity_at': 200}))
+
+    def test_mixed_legacy_prefix_keeps_checkpoint_when_another_report_remains_active(self):
+        first_id = '11111111-1111-4111-8111-111111111111'
+        second_id = '22222222-2222-4222-8222-222222222222'
+        replacement_id = '33333333-3333-4333-8333-333333333333'
+        history = [
+            {'id': first_id, 'kind': 'report', 'reference': 'a1' * 20, 'captured_at': 100},
+            {'id': second_id, 'kind': 'report', 'reference': 'b2' * 20, 'captured_at': 150},
+            {'id': replacement_id, 'kind': 'report', 'reference': 'c3' * 20, 'captured_at': 301,
+             'supersedes': [first_id]},
+        ]
+
+        self.assertEqual(me.explicit_commit_refs(history), ['b2' * 20, 'c3' * 20])
+        self.assertIsNone(me.superseding_report_checkpoint(
+            history, {'activity_at': 200, 'evidence_at': 250, 'head': 'd4' * 20}))
+
+    def test_latest_active_report_reference_tracks_replacement_checkpoint(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': 'a1' * 20},
+            {'id': new_id, 'kind': 'report', 'reference': 'b2' * 20,
+             'supersedes': [old_id]},
+        ]
+        self.assertEqual(me.latest_active_report_reference(history), 'b2' * 20)
+
+    def test_malformed_superseding_report_cannot_replace_merge_state_checkpoint(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        new_id = '22222222-2222-4222-8222-222222222222'
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': 'a1' * 20},
+            {'id': new_id, 'kind': 'report', 'reference': 'b2' * 20, 'captured_at': 301,
+             'supersedes': ['missing-id']},
+        ]
+        self.assertFalse(me.superseding_report_is_newer_than_merge_state(
+            history, {'activity_at': 200, 'evidence_at': 250}))
+
+    def test_duplicate_current_report_id_cannot_supersede_or_replace_state(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        duplicate_id = '22222222-2222-4222-8222-222222222222'
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': 'a1' * 20},
+            {'id': duplicate_id, 'kind': 'report', 'reference': 'b2' * 20,
+             'captured_at': 301, 'supersedes': [old_id]},
+            {'id': duplicate_id, 'kind': 'report', 'reference': 'c3' * 20},
+        ]
+        self.assertEqual(me.explicit_commit_refs(history), ['a1' * 20, 'b2' * 20, 'c3' * 20])
+        self.assertFalse(me.superseding_report_is_newer_than_merge_state(
+            history, {'activity_at': 200, 'evidence_at': 250}))
 
     def test_collect_include_head_false_skips_head_and_cherry(self):
         runner = FakeRunner(in_main=[B], cherry='', runs=[{'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'u'}])
