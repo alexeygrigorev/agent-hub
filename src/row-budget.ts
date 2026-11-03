@@ -7,10 +7,11 @@ import type { SqlStorage } from '@cloudflare/workers-types';
  * that exceeds credit can overshoot. Queries must ALSO be bounded and indexed.
  * The breaker prevents any subsequent SQL, even if an application catches it.
  */
-export const DAILY_ROW_LIMITS = Object.freeze({ read: 1_000_000, written: 20_000 });
+export const DAILY_COMBINED_ROW_LIMIT = 20_000;
+export const DAILY_ROW_LIMITS = Object.freeze({ read: 20_000, written: 20_000 });
 const DAY_MS = 86_400_000;
 const LEDGER_KEY = 'cf_daily_row_budget_v1';
-const DEFAULT_CHUNK = Object.freeze({ read: 50_000, written: 1_000 });
+const DEFAULT_CHUNK = Object.freeze({ read: 192, written: 64 });
 /** Index DDL scans its entire source before exposing cursor counters. Never
  * let a new migration perform that scan against retained large tables. */
 export const INDEX_BUILD_SOURCE_LIMIT = 1000;
@@ -21,7 +22,7 @@ type IndexBuild = { name: string; table: string; predicate?: string };
 
 /** Tokenize identifiers, punctuation and literals separately so comments or
  * a quoted column containing CREATE INDEX cannot hide or invent a build. */
-function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolean } {
+function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolean; executable: string } {
   const matches = [...query.matchAll(/--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[^\s]/g)]
     .filter(match => !match[0].startsWith('--') && !match[0].startsWith('/*'));
   const tokens=matches.map(match=>match[0]);
@@ -74,7 +75,10 @@ function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolea
   // A batch could mutate/recreate the source after preflight and before its
   // CREATE INDEX. Require separate calls so every build sees its real source.
   if (builds.length && tokens.slice(0, -1).includes(';')) unsupported = true;
-  return { builds, unsupported };
+  const last = tokens.at(-1) === ';' ? matches.length - 2 : matches.length - 1;
+  const executable = builds.length && last >= 0
+    ? query.slice(0, matches[last].index! + matches[last][0].length) : query;
+  return { builds, unsupported, executable };
 }
 
 type Counts = { read: number; written: number };
@@ -96,18 +100,20 @@ export class RowBudget {
   private loggedDay = -1;
   private readonly limits: Counts;
   private readonly chunk: Counts;
+  private readonly combinedLimit: number;
   private readonly storage: Store;
   private emergencyAlarmDeleted = false;
   private ledgerFailure = false;
 
   constructor(storage: Store, private now: () => number = Date.now,
-    limits: Counts = DAILY_ROW_LIMITS, chunk: Counts = DEFAULT_CHUNK) {
+    limits: Counts = DAILY_ROW_LIMITS, chunk: Counts = DEFAULT_CHUNK, combinedLimit = DAILY_COMBINED_ROW_LIMIT) {
     // Capture native ledger calls before installing KV guards on the object.
     this.storage = { get: storage.get.bind(storage), put: storage.put.bind(storage) };
     // Even configuration mistakes cannot raise the production hard ceiling.
     const safe = (value: number, ceiling: number) => Number.isSafeInteger(value) && value > 0 ? Math.min(value, ceiling) : 0;
     this.limits = { read: safe(limits.read, DAILY_ROW_LIMITS.read), written: safe(limits.written, DAILY_ROW_LIMITS.written) };
     this.chunk = { read: safe(chunk.read, this.limits.read), written: safe(chunk.written, this.limits.written) };
+    this.combinedLimit = safe(combinedLimit, Math.min(DAILY_COMBINED_ROW_LIMIT,this.limits.read+this.limits.written));
   }
 
   private day() { return Math.floor(this.now() / DAY_MS); }
@@ -136,7 +142,7 @@ export class RowBudget {
     if (this.loggedDay !== this.day()) {
       this.loggedDay = this.day();
       console.error(JSON.stringify({ event: 'do_daily_row_budget_exceeded', day: this.day(), detail,
-        reserved: this.ledger, limit: this.limits }));
+        reserved: this.ledger, limit: this.limits, limit_total: this.combinedLimit }));
     }
     throw new RowBudgetExceeded(detail);
   }
@@ -166,7 +172,7 @@ export class RowBudget {
         this.emergencyAlarmDeleted = false;
       }
       if (this.ledger.stopped) this.trip('durable daily allowance exhausted');
-      if (!this.limits.read || !this.limits.written || !this.chunk.read || !this.chunk.written) this.trip('invalid budget configuration');
+      if (!this.limits.read || !this.limits.written || !this.chunk.read || !this.chunk.written || !this.combinedLimit) this.trip('invalid budget configuration');
       if (!this.stopped && this.credit.read > this.chunk.read / 4 && this.credit.written > this.chunk.written / 4 && !this.dirty) return;
       await this.checkpoint(true, bootstrap);
       if (this.ledger.stopped || this.credit.read <= 0 || this.credit.written <= 0) this.trip('daily allowance exhausted');
@@ -185,24 +191,35 @@ export class RowBudget {
 
   private async checkpoint(refill: boolean, bootstrap = false): Promise<void> {
     const old = this.ledger!;
-    const ledger: Ledger = { ...old, read: old.read + this.debt.read, written: old.written + this.debt.written + 1 };
-    const add = { read: 0, written: 0 };
-    const chunk = bootstrap ? { read: Math.max(this.chunk.read, Math.min(250_000, this.limits.read)), written: Math.max(this.chunk.written, Math.min(5_000, this.limits.written)) } : this.chunk;
+    // A refill returns its old UNUSED directional reservations in this same
+    // durable write, then issues a fresh small block. Hot write-only traffic
+    // must not be denied because an untouched read reservation held the pool.
+    const ledger: Ledger = { ...old,
+      read: old.read-(refill ? this.credit.read : 0)+this.debt.read,
+      written: old.written-(refill ? this.credit.written : 0)+this.debt.written+1 };
+    const add = { read: 0,written: 0 };
+    const chunk = bootstrap ? { read: Math.max(this.chunk.read,Math.min(16_000,this.limits.read)),
+      written: Math.max(this.chunk.written,Math.min(3_000,this.limits.written)) } : this.chunk;
     if (refill) {
-      add.read = Math.max(0, Math.min(chunk.read - this.credit.read, this.limits.read - ledger.read));
-      add.written = Math.max(0, Math.min(chunk.written - this.credit.written, this.limits.written - ledger.written));
+      add.read = Math.max(0,Math.min(chunk.read,this.limits.read-ledger.read));
+      add.written = Math.max(0,Math.min(chunk.written,this.limits.written-ledger.written));
+      const available = Math.max(0,this.combinedLimit-1-ledger.read-ledger.written);
+      const requested = add.read+add.written;
+      if (requested > available) {
+        add.read = Math.floor(available*add.read/requested);
+        add.written = Math.max(0,Math.min(add.written,available-add.read));
+      }
     }
     ledger.read += add.read;
     ledger.written += add.written;
-    ledger.stopped = ledger.stopped || ledger.read >= this.limits.read || ledger.written >= this.limits.written ||
-      (refill && (this.credit.read + add.read <= 0 || this.credit.written + add.written <= 0));
+    ledger.stopped ||= ledger.read >= this.limits.read || ledger.written >= this.limits.written ||
+      ledger.read+ledger.written >= this.combinedLimit || (refill && (add.read <= 0 || add.written <= 0));
     // Fail closed across a failed write. Never hand out credit until durable.
     this.stopped = true;
     try { await this.storage.put(LEDGER_KEY, ledger); }
     catch (error) { this.ledgerFailure = true; throw error; }
     this.ledger = ledger;
-    this.credit.read += add.read;
-    this.credit.written += add.written;
+    if (refill) this.credit = { ...add };
     this.debt = { read: 0, written: 0 };
     this.dirty = false;
   }
@@ -224,7 +241,7 @@ export class RowBudget {
         written: Math.max(0,previous.written-this.credit.written)+this.debt.written+1,
         stopped: previous.stopped,
       };
-      ledger.stopped ||= ledger.read >= this.limits.read || ledger.written >= this.limits.written;
+      ledger.stopped ||= ledger.read >= this.limits.read || ledger.written >= this.limits.written || ledger.read+ledger.written >= this.combinedLimit;
       // Freeze the old credits until the checkpoint is durable. New events
       // serialize begin() behind this operation, rather than spending them.
       this.stopped = true;
@@ -248,7 +265,8 @@ export class RowBudget {
   status() {
     return { stopped: this.stopped, day: this.ledger?.day ?? this.day(),
       reserved: this.ledger ? { read: this.ledger.read, written: this.ledger.written } : null,
-      available: { ...this.credit }, limit: { ...this.limits } };
+      available: { ...this.credit }, limit: { ...this.limits }, limit_total: this.combinedLimit,
+      reserved_total: this.ledger ? this.ledger.read+this.ledger.written : null, available_total: this.credit.read+this.credit.written };
   }
 
   private assertAllowed() {
@@ -350,7 +368,7 @@ export class RowBudget {
   /** Preflight queries use this same native-cursor wrapper, so their real
    * rows are charged too. Metadata stays table-local and capped. A large
    * existing index is a no-op and never probes/scans its source table. */
-  private preflightIndexes(sql: SqlStorage, query: string): void {
+  private preflightIndexes(sql: SqlStorage, query: string): string {
     const parsed = indexBuilds(query);
     const deny = (detail: string): never => {
       this.ledger!.stopped = true;
@@ -386,6 +404,7 @@ export class RowBudget {
         if(matching.length>partialWriteCap) deny('partial index entries exceed bounded migration allowance');
       }
     }
+    return parsed.executable;
   }
 
   wrap(sql: SqlStorage): SqlStorage {
@@ -400,9 +419,9 @@ export class RowBudget {
           budget.assertAllowed();
           // Run through a wrapped native handle: preflight must never be
           // unmetered SQL hidden behind the application-level cursor meter.
-          budget.preflightIndexes(budget.wrap(target as SqlStorage), String(query));
+          const executable = budget.preflightIndexes(budget.wrap(target as SqlStorage), String(query));
           let cursor: any;
-          try { cursor = target.exec(query, ...bindings); }
+          try { cursor = target.exec(executable, ...bindings); }
           catch (error) {
             // These schema compilation failures execute no row work. Older
             // migrations intentionally catch them while adding existing columns.

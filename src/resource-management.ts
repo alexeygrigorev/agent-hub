@@ -109,6 +109,15 @@ const SLIM_REQUEST = `CASE WHEN json_valid(request_json) THEN json_object('intak
 // match and need no per-row json_type guard in the indexed expression.
 const NATIVE_KEY = `json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END, '$.native_id')`;
 export class ResourceManagement {
+  /** Live telemetry is advisory memory, not a per-poll durable event log.
+   * A restart loses freshness and falls back to conservative reservation. */
+  private liveTelemetry=new Map<string,{sample:any;meta:string;persistedAt:number}>();
+  private freshLiveTelemetry(launch:string,now:number,nativeId:unknown):any|null {
+    const value=this.liveTelemetry.get(launch)?.sample;
+    if(!value || value.native_id!==nativeId)return null;
+    const at=Date.parse(value.observed_at);
+    return Number.isFinite(at)&&at>=now-180000&&at<=now+30000?value:null;
+  }
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
   private catalogRawRows=new Map<string,{rev:string|null;value:any[]}>();
@@ -379,7 +388,7 @@ export class ResourceManagement {
     // applies the running-ramp cutoff or the bounded in-flight window and is
     // NULL (no reservation) for any other state, so the index filter stays
     // an optimisation only.
-    const pending=this.readRows(`SELECT l.id,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,
+    const pending=this.readRows(`SELECT l.id,l.native_id,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,
       c.current_cpu_cores,c.observed_at AS cpu_observed_at FROM fleet_launches l
       LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_cpu_samples c ON c.launch_id=l.id WHERE machine_id=?
       AND l.state IN ('offered','starting','running','uncertain')
@@ -393,8 +402,10 @@ export class ResourceManagement {
       // Dispatcher reports per-session counters after the host heartbeat, on
       // separate 30–60s polls. Fresh exact-binding measurements are advisory
       // ramp credit; they need not land inside the 200ms host /proc/stat sample.
-        const at=Date.parse(row.cpu_observed_at);
-        const credit=Number.isFinite(at)&&at>=now-180000&&at<=now+30000&&finite(row.current_cpu_cores) ? row.current_cpu_cores : 0;
+        const live=this.freshLiveTelemetry(row.id,now,row.native_id);
+        const at=Date.parse(live?.observed_at ?? row.cpu_observed_at);
+        const current=live?.current_cpu_cores ?? row.current_cpu_cores;
+        const credit=Number.isFinite(at)&&at>=now-180000&&at<=now+30000&&finite(current) ? current : 0;
         return {id:row.id,remaining:Math.max(0,committed-credit)};
       });
       this.cpuPendingSnapshot?.set(pendingKey,commitments);
@@ -482,7 +493,7 @@ export class ResourceManagement {
     for (const state of ['offered','starting','running','uncertain']) {
       const remaining = MEMORY_PENDING_SCAN_LIMIT + 1 - candidates.length;
       if (remaining <= 0) break;
-      candidates.push(...this.readRows(`SELECT l.id,l.engine,l.workspace,l.state,l.created_at,
+      candidates.push(...this.readRows(`SELECT l.id,l.native_id,l.engine,l.workspace,l.state,l.created_at,
         ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb,p.started_at AS ramp_started_at
         FROM fleet_launches l INDEXED BY fleet_launch_machine_state
         LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
@@ -499,7 +510,9 @@ export class ResourceManagement {
     for (const row of pending) {
       const req = parse(row.request_json);
       const estimate = this.estimate(req.project || row.workspace, row.engine, req.task_kind || req.kind || 'goal');
-      reserved += Math.max(0, estimate - (finite(row.resident_mb) ? row.resident_mb : 0));
+      const live=this.freshLiveTelemetry(row.id,now,row.native_id);
+      const resident=live?.current_rss_mb ?? row.resident_mb;
+      reserved += Math.max(0, estimate - (finite(resident) ? resident : 0));
     }
     return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
       reserved_mb: reserved, floor_mb: effectiveFloorMb(config, hb.mem_total_mb),
@@ -824,17 +837,35 @@ export class ResourceManagement {
     const sessions = new Map(this.canonicalSessions(machine).flatMap(s => s.aliases.map(id=>[id,s] as const)));
     if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100
       || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
-    for (const sample of value.samples) {
+    for (const reportedSample of value.samples) {
+      let sample={...reportedSample};
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
       for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores','oom_kills']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
       const at=Date.parse(sample.observed_at);
       if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
+      const cacheKey=session.fleet_launch_id || JSON.stringify([machine,session.native_id]);
+      const cached=this.liveTelemetry.get(cacheKey);
+      const meta=JSON.stringify([machine,session.native_id,session.session_id,session.fleet_launch_id,session.intake_id,session.project,session.engine,session.model,session.tier,session.kind,session.started_at,session.finished_at,session.state,session.workspace]);
+      if(cached) {
+        const newest=at>=Date.parse(cached.sample.observed_at)?sample:cached.sample;
+        sample={...newest};
+        for(const key of ['peak_rss_mb','peak_pss_mb','cpu_seconds','runtime_s','oom_kills']) {
+          const values=[cached.sample[key],reportedSample[key]].filter(finite);
+          if(values.length)sample[key]=Math.max(...values);
+        }
+      }
+      const oomChanged=finite(sample.oom_kills) && sample.oom_kills>(cached?.sample.oom_kills ?? 0);
+      const flush=!cached || cached.meta!==meta || this.now()-cached.persistedAt>=3600000 || oomChanged;
+      // Cap advisory memory only; eviction never grants admission credit.
+      if(!cached && this.liveTelemetry.size>=2048)this.liveTelemetry.delete(this.liveTelemetry.keys().next().value!);
+      this.liveTelemetry.set(cacheKey,{sample,meta,persistedAt:flush?this.now():cached.persistedAt});
+      if(!flush)continue;
       const old:any=this.sql.exec('SELECT * FROM session_resource_usage WHERE machine_id=? AND native_id=?',machine,session.native_id).toArray()[0];
       const ledgerId=old?.session_id ?? session.session_id;
       this.sql.exec('INSERT INTO session_resource_metadata VALUES(?,?) ON CONFLICT(session_id) DO UPDATE SET workspace=excluded.workspace WHERE session_resource_metadata.workspace IS NOT excluded.workspace',ledgerId,session.workspace);
       if (session.fleet_launch_id && finite(sample.current_cpu_cores)) this.sql.exec(`INSERT INTO resource_cpu_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET current_cpu_cores=excluded.current_cpu_cores,observed_at=excluded.observed_at
-        WHERE excluded.observed_at>resource_cpu_samples.observed_at AND (excluded.current_cpu_cores IS NOT resource_cpu_samples.current_cpu_cores OR substr(excluded.observed_at,1,16)>substr(resource_cpu_samples.observed_at,1,16))`,session.fleet_launch_id,sample.current_cpu_cores,sample.observed_at);
+        WHERE excluded.observed_at>resource_cpu_samples.observed_at AND (excluded.current_cpu_cores IS NOT resource_cpu_samples.current_cpu_cores)`,session.fleet_launch_id,sample.current_cpu_cores,sample.observed_at);
       if (finite(sample.p95_cpu_cores)) {
         const finalized=this.sql.exec('SELECT 1 FROM session_cpu_finalized WHERE session_id=?',ledgerId).toArray().length>0;
         const prior:any=this.sql.exec('SELECT observed_at FROM session_cpu_usage WHERE session_id=?',ledgerId).toArray()[0];
@@ -842,15 +873,15 @@ export class ResourceManagement {
         // only an actual terminal CPU report, never a memory-only final row.
         if (!finalized && (!prior || at>=Date.parse(prior.observed_at))) {
           this.sql.exec(`INSERT INTO session_cpu_usage VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p95_cpu_cores=excluded.p95_cpu_cores,observed_at=excluded.observed_at
-            WHERE excluded.observed_at>=session_cpu_usage.observed_at AND (excluded.p95_cpu_cores IS NOT session_cpu_usage.p95_cpu_cores OR substr(excluded.observed_at,1,16)>substr(session_cpu_usage.observed_at,1,16))`,ledgerId,sample.p95_cpu_cores,sample.observed_at);
+            WHERE excluded.observed_at>=session_cpu_usage.observed_at AND (excluded.p95_cpu_cores IS NOT session_cpu_usage.p95_cpu_cores)`,ledgerId,sample.p95_cpu_cores,sample.observed_at);
           if (TERMINAL.has(session.state)) this.sql.exec('INSERT OR IGNORE INTO session_cpu_finalized VALUES(?,?)',ledgerId,sample.observed_at);
         }
       }
       if (finite(sample.oom_kills) && Number.isInteger(sample.oom_kills) && sample.oom_kills>=0) this.sql.exec('INSERT INTO session_oom_kills VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET oom_kills=excluded.oom_kills,observed_at=excluded.observed_at WHERE excluded.oom_kills>session_oom_kills.oom_kills',ledgerId,sample.oom_kills,sample.observed_at);
       if (finite(sample.p50_rss_mb)) this.sql.exec(`INSERT INTO session_rss_median VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p50_rss_mb=excluded.p50_rss_mb,observed_at=excluded.observed_at
-        WHERE excluded.observed_at>=session_rss_median.observed_at AND (excluded.p50_rss_mb IS NOT session_rss_median.p50_rss_mb OR substr(excluded.observed_at,1,16)>substr(session_rss_median.observed_at,1,16))`,ledgerId,sample.p50_rss_mb,sample.observed_at);
+        WHERE excluded.observed_at>=session_rss_median.observed_at AND (excluded.p50_rss_mb IS NOT session_rss_median.p50_rss_mb)`,ledgerId,sample.p50_rss_mb,sample.observed_at);
       if (session.fleet_launch_id && finite(sample.current_rss_mb)) this.sql.exec(`INSERT INTO resource_resident_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET resident_mb=excluded.resident_mb,observed_at=excluded.observed_at
-        WHERE excluded.observed_at>=resource_resident_samples.observed_at AND (excluded.resident_mb IS NOT resource_resident_samples.resident_mb OR substr(excluded.observed_at,1,16)>substr(resource_resident_samples.observed_at,1,16))`,session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
+        WHERE excluded.observed_at>=resource_resident_samples.observed_at AND (excluded.resident_mb IS NOT resource_resident_samples.resident_mb)`,session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
       const max = (k:string) => finite(sample[k]) ? Math.max(old?.[k] ?? 0,sample[k]) : old?.[k] ?? null;
       const cpu=max('cpu_seconds'),runtime=max('runtime_s');
       this.sql.exec(`INSERT INTO session_resource_usage VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -868,8 +899,7 @@ export class ResourceManagement {
           OR session_resource_usage.finished_at IS NOT excluded.finished_at OR session_resource_usage.state IS NOT excluded.state
           OR session_resource_usage.peak_rss_mb IS NOT excluded.peak_rss_mb OR session_resource_usage.peak_pss_mb IS NOT excluded.peak_pss_mb
           OR session_resource_usage.cpu_seconds IS NOT excluded.cpu_seconds OR session_resource_usage.runtime_s IS NOT excluded.runtime_s
-          OR session_resource_usage.avg_cpu_cores IS NOT excluded.avg_cpu_cores
-          OR substr(excluded.observed_at,1,16)>substr(session_resource_usage.observed_at,1,16)`,
+          OR session_resource_usage.avg_cpu_cores IS NOT excluded.avg_cpu_cores`,
         ledgerId,machine,session.native_id,session.fleet_launch_id,session.intake_id,session.project,session.engine,session.model,session.tier,session.kind,
         // Legacy storage requires text; an empty unknown is exposed as null,
         // never replaced with the time a launch entered the queue.

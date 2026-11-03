@@ -50,17 +50,17 @@ describe('index migration cost preflight', () => {
   }));
 
   it('bounds source reads and matching writes separately for a sparse partial index', () => nativeCase(async raw => {
-    fixture(raw,'sparse_source',5000);
+    fixture(raw,'sparse_source',500);
     const budget=new RowBudget(new LedgerStore());await budget.begin(true);
     const observed=observe(raw),sql=budget.wrap(observed.sql),before=budget.status().available;
     sql.exec('CREATE INDEX sparse_live ON sparse_source(value) WHERE value<=5 /* internal */ AND id>0; -- trailing comment').toArray();
     const after=budget.status().available;
     expect(before.read-after.read).toBe(observed.calls.reduce((n,c)=>n+Number(c.cursor.rowsRead),0));
     expect(before.written-after.written).toBe(observed.calls.reduce((n,c)=>n+Number(c.cursor.rowsWritten),0));
-    expect(before.read-after.read).toBeLessThan(22000);
+    expect(before.read-after.read).toBeLessThan(2500);
     expect(before.written-after.written).toBeLessThan(20);
     expect(budget.status().stopped).toBe(false);
-    console.log('sparse partial index: source=5000 entries=5 rows_read='+(before.read-after.read)+' rows_written='+(before.written-after.written));
+    console.log('sparse partial index: source=500 entries=5 rows_read='+(before.read-after.read)+' rows_written='+(before.written-after.written));
   }));
 
   it('refuses a partial index whose matching write set exceeds the hard build cap', () => nativeCase(async raw => {

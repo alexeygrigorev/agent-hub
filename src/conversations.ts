@@ -1,3 +1,4 @@
+import { jobCredentialAllowed } from './auth/job-credential';
 import { AUTOMATION_SCHEMA, AUTOMATION_REVOKE_TRIGGER, AUTOMATION_SENDER, type BacklogQuery, type FollowUpIntent } from './conversation-automation';
 import { ConversationLinksService } from './conversation-links';
 import { credentialActor, validRegistryName, registryAddress } from './agent_registry';
@@ -697,6 +698,8 @@ export async function authenticateConversationRequest(
     };
   }
 
+  if (!jobCredentialAllowed(sql, cred, nowMs)) return { error: jsonResponse({ error: 'unauthorized' }, 401) };
+
   let scopes: string[] = [];
   try {
     scopes =
@@ -724,7 +727,7 @@ export async function authenticateConversationRequest(
     }
 
     const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
-    if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 300_000) {
+    if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 3_600_000) {
       const nowIso = new Date(nowMs).toISOString();
       try {
         sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', nowIso, cred.id);
@@ -748,7 +751,7 @@ export async function authenticateConversationRequest(
   }
 
   const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
-  if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 300_000) {
+  if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 3_600_000) {
     const nowIso = new Date(nowMs).toISOString();
     try {
       sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', nowIso, cred.id);

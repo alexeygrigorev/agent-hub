@@ -1,13 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { DAILY_ROW_LIMITS, RowBudget, RowBudgetExceeded } from '../src/row-budget';
+import { DAILY_COMBINED_ROW_LIMIT, DAILY_ROW_LIMITS, RowBudget, RowBudgetExceeded } from '../src/row-budget';
 
 class MemoryStore {
   data = new Map<string, unknown>();
   reads = 0;
   writes = 0;
+  failWrites: string | null = null;
   async get<T>(key: string): Promise<T | undefined> { this.reads++; return structuredClone(this.data.get(key)) as T | undefined; }
-  async put<T>(key: string, value: T): Promise<void> { this.writes++; this.data.set(key, structuredClone(value)); }
+  async put<T>(key: string, value: T): Promise<void> { this.writes++; if (this.failWrites) throw new Error(this.failWrites); this.data.set(key, structuredClone(value)); }
 }
 
 /** Cursor counters grow as a real SQL cursor advances, rather than all being
@@ -258,13 +259,42 @@ describe('durable daily SQL row circuit breaker', () => {
     const budget = new RowBudget(store,()=>0,LIMITS,CHUNK);
     await budget.begin();
     const before = budget.status().reserved;
-    store.put = vi.fn(async()=>{throw new Error('checkpoint unavailable');});
+    store.failWrites = 'checkpoint unavailable';
     await expect(budget.releaseUnused()).rejects.toThrow('checkpoint unavailable');
     expect(budget.status().reserved).toEqual(before);
     expect(budget.status().available).toEqual(CHUNK);
     expect(await budget.releaseUnused()).toBe(false);
     await expect(budget.begin()).rejects.toThrow(RowBudgetExceeded);
-    expect(store.put).toHaveBeenCalledTimes(1);
+    expect(store.writes).toBe(2); // initial reservation plus the failed checkpoint
+  });
+
+  it('enforces the 20k combined ceiling when each direction alone is below 20k', async () => {
+    const store = new MemoryStore();
+    const budget = new RowBudget(store,()=>0);
+    await budget.begin(true);
+    expect(budget.status().limit_total).toBe(DAILY_COMBINED_ROW_LIMIT);
+    expect(budget.status().reserved_total!).toBeLessThan(20_000);
+    const native = { exec() { return { rowsRead:12_000,rowsWritten:9_000 }; } };
+    expect(()=>budget.wrap(native as any).exec('SELECT bounded_work')).toThrow(RowBudgetExceeded);
+    await budget.finish();
+    await budget.releaseUnused();
+    const persisted = [...store.data.values()][0] as any;
+    expect(persisted.read).toBeLessThan(20_000);
+    expect(persisted.written).toBeLessThan(20_000);
+    expect(persisted.read+persisted.written).toBeGreaterThan(20_000);
+    expect(persisted.stopped).toBe(true);
+    await expect(new RowBudget(store,()=>0).begin()).rejects.toThrow(RowBudgetExceeded);
+  });
+
+  it('rebalances unused bootstrap credits in one refill write instead of denying a hot directional workload', async () => {
+    const store = new MemoryStore();
+    const budget = new RowBudget(store,()=>0);
+    await budget.begin(true);
+    budget.wrap(nativeSql(0,0,2985) as any).exec('UPDATE bounded_bootstrap');
+    await budget.begin();
+    expect(budget.status().available_total).toBe(256);
+    expect(budget.status().reserved_total!).toBeLessThan(4000);
+    expect(store.writes).toBe(2);
   });
 
   it('refuses corrupt persisted counters and clamps configured limits to free-plan safety ceilings', async () => {

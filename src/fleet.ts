@@ -32,7 +32,7 @@ import { ACTIVE_LAUNCH_STATES_SQL, isEligibleReservedLaunch, parseReservedLaunch
 import { readAccountCapacityHistory } from './account-capacity-history';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
-import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
+import { freshCatalogs, freshCompleteCatalogs, noteCatalogObservation } from './catalog-freshness';
 import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, reservationHoldsCapacity, RESERVATION_TTL_MS, INFLIGHT_LAUNCH_ID_SQL, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
@@ -2969,10 +2969,11 @@ export class FleetService {
         // immediately; unchanged reports retain the existing 60 s write cap.
         const censusNow = this.now();
         const censusObservedAt = new Date(censusNow).toISOString();
-        this.sql.exec(`INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES (?, ?, ?)
+        const persistCensus=noteCatalogObservation(this.sql,caller.machineId!,censusNow,censusComplete);
+        if(persistCensus)this.sql.exec(`INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES (?, ?, ?)
           ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at, complete=excluded.complete
           WHERE fleet_catalog_census.complete != excluded.complete OR fleet_catalog_census.observed_at <= ?`,
-          caller.machineId!, censusObservedAt, censusComplete ? 1 : 0, new Date(censusNow - 60000).toISOString());
+          caller.machineId!, censusObservedAt, censusComplete ? 1 : 0, new Date(censusNow - 900000).toISOString());
         // Write only rows that changed: hosts report every minute and Durable Object row writes
         // are metered. observed_at therefore means "last changed"; host freshness comes from heartbeats.
         const fields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'progress_json'];
@@ -3053,13 +3054,15 @@ export class FleetService {
           };
           const rowStable = { ...row, progress_json: stableProgress(row.progress_json) };
           const priorStable = prior ? { ...prior, progress_json: stableProgress(prior.progress_json) } : null;
-          if (!staleRecoverable && prior && priorStable && fields.every(f => ((priorStable as any)[f] ?? null) === ((rowStable as any)[f] ?? null))) {
+          if (!staleRecoverable && prior && priorStable && fields.filter(f=>f!=='last_activity_at').every(f => ((priorStable as any)[f] ?? null) === ((rowStable as any)[f] ?? null))) {
+            // Activity and sampling timestamps coalesce together; actual control state
+            // changes above persist immediately. Keep the latest timestamps when due.
             // Volatile progress timestamps alone must not rewrite the row every minute:
             // touch observed_at at most every 5 min to keep the 10-min liveness window.
             try {
               const prevObs = prior.observed_at ? Date.parse(prior.observed_at) : 0;
               if (this.now() - prevObs >= 5 * 60 * 1000) {
-                this.sql.exec('UPDATE fleet_sessions SET observed_at = ? WHERE machine_id = ? AND native_id = ?', new Date(this.now()).toISOString(), caller.machineId!, s.native_id);
+                this.sql.exec('UPDATE fleet_sessions SET observed_at = ?,last_activity_at=?,progress_json=? WHERE machine_id = ? AND native_id = ?', new Date(this.now()).toISOString(), row.last_activity_at,row.progress_json,caller.machineId!, s.native_id);
                 written++;
                 observedRows.push({ machine_id: caller.machineId!, native_id: s.native_id, tag: s.tag, engine: s.engine, phase: s.phase, agent_state: s.agent_state, observed_at: new Date(this.now()).toISOString(), workspace: s.workspace, cwd: row.cwd, profile: s.profile, account: s.account, last_activity_at: row.last_activity_at });
               }
@@ -3146,7 +3149,7 @@ export class FleetService {
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }
         // unchanged rows retain last-change timestamps; the complete census
         // has separate freshness evidence, bounded to one host write/minute.
-        this.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at WHERE fleet_catalog_seen.observed_at <= ?', caller.machineId!, new Date(this.now()).toISOString(), new Date(this.now() - 60000).toISOString());
+        if(persistCensus)this.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at WHERE fleet_catalog_seen.observed_at <= ?', caller.machineId!, new Date(this.now()).toISOString(), new Date(this.now() - 900000).toISOString());
         return response({ status: 'reported', written });
       });
     }

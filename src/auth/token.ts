@@ -1,3 +1,4 @@
+import { jobCredentialAllowed } from './job-credential';
 import { randomString, sha256, signHmac } from './crypto';
 
 export interface TokenPair {
@@ -56,6 +57,8 @@ export async function verifyBearerScope(
   const cred = sql.exec('SELECT * FROM credentials WHERE token_hash = ?', tokenHash).toArray()[0] as any;
   if (!cred || cred.revoked_at || !Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= Date.now()) return null;
   
+  if (!jobCredentialAllowed(sql, cred)) return null;
+
   let scopes: unknown;
   try { scopes = typeof cred.scopes === 'string' ? JSON.parse(cred.scopes) : cred.scopes; } catch { return null; }
   if (!Array.isArray(scopes) || scopes.includes('admin') || !scopes.includes(requiredScope)) return null;
@@ -66,7 +69,10 @@ export async function verifyBearerScope(
     if (optional.actor && cred.actor !== optional.actor) return null;
   }
   
-  sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', new Date().toISOString(), cred.id);
+  const lastUsed = Date.parse(cred.last_used_at || '');
+  if (!Number.isFinite(lastUsed) || Date.now() - lastUsed >= 3_600_000) {
+    sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', new Date().toISOString(), cred.id);
+  }
   
   return cred;
 }

@@ -1,3 +1,4 @@
+import { jobCredentialAllowed } from './auth/job-credential';
 import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, pollSessionCredentials, mintSessionCredential, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
 import { handleNamedAgentRequest } from './named-agents';
@@ -79,7 +80,7 @@ import { ObservedCatalog } from './observed-catalog';
 
 const HUMAN_REFRESH_REPLAY_GRACE_MS = 30_000;
 const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
-const METER_FLUSH_INTERVAL_MS = 5 * 60_000;
+const METER_FLUSH_INTERVAL_MS = 60 * 60_000;
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -703,8 +704,8 @@ export class Hub extends DurableObject {
   /** One quiet checkpoint, never an alarm or per-request write. Frequent
    * host polling cancels the timer and retains its shared reservation. The
    * pending timer keeps the DO alive; waitUntil covers only the checkpoint
-   * once it actually fires, not twenty seconds of every event's idle time. */
-  private scheduleBudgetRefund(delayMs = 20_000): void {
+   * once it actually fires, not five minutes of every event's idle time. */
+  private scheduleBudgetRefund(delayMs = 5 * 60_000): void {
     this.cancelBudgetRefund();
     const epoch = this.budgetActivityEpoch;
     this.budgetRefundTimer = setTimeout(() => {
@@ -937,7 +938,7 @@ export class Hub extends DurableObject {
 
   private lastMeterFlush = 0;
 
-  /** Meter totals are persisted at most every 5 minutes (each flush writes one
+  /** Meter totals are persisted at most every hour (each flush writes one
    * row per active scope). A hibernating DO can be evicted before its next
    * alarm, so requests and WebSocket messages flush too, and the first call
    * after a cold start flushes the constructor's schema reads at once. */
@@ -2265,6 +2266,9 @@ export class Hub extends DurableObject {
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         }
+      } else if (cred.kind === 'job') {
+        // Job tokens are bound to the claim hash, never refreshable.
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (workerScoped && !worker) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (driverScoped && !driver) {
@@ -3207,6 +3211,8 @@ export class Hub extends DurableObject {
       return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
     }
 
+    if (!jobCredentialAllowed(this.sql, cred)) return { error: Response.json({ error: 'unauthorized' }, { status: 401 }) };
+
     const expiresMs = Date.parse(cred.expires_at);
     if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
       return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
@@ -3232,7 +3238,7 @@ export class Hub extends DurableObject {
 
     const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
     const nowMs = Date.now();
-    if (!lastUsedMs || isNaN(lastUsedMs) || (nowMs - lastUsedMs) >= 300_000) {
+    if (!lastUsedMs || isNaN(lastUsedMs) || (nowMs - lastUsedMs) >= 3_600_000) {
       const nowIso = new Date().toISOString();
       this.sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', nowIso, cred.id);
       cred.last_used_at = nowIso;
