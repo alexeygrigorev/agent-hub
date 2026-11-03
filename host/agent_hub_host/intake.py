@@ -478,6 +478,16 @@ def request(method, path, payload=None):
         raise IntakeInputError(f'Intake request exceeds {MAX_REQUEST} UTF-8 bytes (JSON envelope included)')
     env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
     token = env_token or cfg.get('access_token') or auth.get_access_token()
+    # GETs are safe to repeat. Task writes are safe only when the exact
+    # idempotency key and serialized payload can be replayed; the Hub stores
+    # their response receipt in the same transaction as the write.
+    retry_key = None
+    if method == 'POST' and isinstance(payload, dict) and (
+            path == BASE + '/tasks' or path.startswith(BASE + '/tasks/')):
+        candidate = payload.get('key')
+        if isinstance(candidate, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', candidate):
+            retry_key = candidate
+    max_attempts = 2 if method == 'GET' or retry_key else 1
 
     def send(access):
         try:
@@ -501,13 +511,32 @@ def request(method, path, payload=None):
             error_type = IntakeResponseTooLarge if isinstance(exc, RuntimeError) and str(exc) == 'Response too large' else IntakeTransportError
             raise error_type(reason + recovery) from None
 
+    def send_with_retry(access):
+        for attempt in range(max_attempts):
+            try:
+                return send(access)
+            except urllib.error.HTTPError as exc:
+                if attempt + 1 < max_attempts and exc.code in (408, 500, 502, 503, 504):
+                    try:
+                        exc.close()
+                    except Exception:
+                        pass
+                    continue
+                raise
+            except IntakeTransportError as exc:
+                if attempt + 1 < max_attempts and not isinstance(exc, IntakeResponseTooLarge):
+                    continue
+                if retry_key and f'retry key: {retry_key}' not in str(exc):
+                    raise type(exc)(f'{exc}; retry key: {retry_key}') from None
+                raise
+
     try:
-        return send(token)
+        return send_with_retry(token)
     except urllib.error.HTTPError as exc:
         if exc.code == 401 and not env_token:
             auth.refresh_token(expected_token=token) if cfg.get('worker_launch_id') else auth.refresh_token()
             try:
-                return send(auth.get_access_token())
+                return send_with_retry(auth.get_access_token())
             except urllib.error.HTTPError as retry:
                 raise http_error(retry, method, payload) from None
         raise http_error(exc, method, payload) from None
