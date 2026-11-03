@@ -155,7 +155,8 @@ export function drawAutoStart(candidates: any[], request: any, overrideModels: a
   }
   const pinned = Boolean(request?.engine) || overrideModels.length > 0 ||
     input?.tier != null || input?.account != null;
-  if (!rand || pinned || !distribution.eligible.length || distribution.total <= 0) return candidates[0];
+  if (!rand || pinned) return candidates[0];
+  if (!distribution.eligible.length || distribution.total <= 0) return null;
   const drawn = distribution.eligible[weightedDrawIndex(distribution.weights, rand)];
   const probability = distribution.probabilities.get(drawn) ?? 0;
   const drawReason = `${drawn.decision_reason ?? drawn.decision?.reason ?? 'decision'}; draw_probability=${probability.toFixed(6)}`;
