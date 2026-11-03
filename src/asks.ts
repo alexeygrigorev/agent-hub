@@ -25,7 +25,12 @@ const WATCHERS = new Set(['grok-bot-replica', 'tabo-replica']);
 export const ASK_STATES = ['pending', 'unmapped', 'mapped', 'verified', 'dropped_after_done', 'closed_unverified', 'cancelled', 'not_an_ask'];
 const OPEN = new Set(['open', 'in_progress', 'blocked', 'pending_approval']);
 const ACTIVE_SESSION = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncertain']);
+const TERMINAL_SESSION = new Set(['stopped', 'finished', 'failed', 'refused', 'cancelled', 'exited', 'dead', 'forgotten', 'pruned']);
 export const RECONCILE_DEBOUNCE_MS = 2 * 60000;
+/** Safe defaults; limits are operator-configurable within settings() bounds. */
+export const RECONCILE_MAX_LIVE = 1;
+export const RECONCILE_DAILY_CAP = 8;
+const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 const berlin = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
   hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });
 export function reconcilerBrief(intakeId: string, count: number): string {
@@ -182,6 +187,17 @@ export class AskLedger {
       last_tick INTEGER, last_result TEXT, daily_day TEXT, last_user_batch_at INTEGER, reconcile_intake TEXT, reconcile_session TEXT,
       reconcile_started_at INTEGER, reconcile_batch_at INTEGER)`);
     this.sql.exec('INSERT OR IGNORE INTO ask_meta(id) VALUES(1)');
+    // Reconciler start intents reserve a slot before awaiting session start. An
+    // unknown result keeps that slot until the same idempotency key is replayed
+    // and resolves; absence of a status is never treated as proof of no session.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_reconcile_caps(
+      id INTEGER PRIMARY KEY CHECK(id=1), max_live INTEGER NOT NULL, daily_cap INTEGER NOT NULL, capped_note_day TEXT)`);
+    this.sql.exec('INSERT OR IGNORE INTO ask_reconcile_caps(id,max_live,daily_cap) VALUES(1,?,?)', RECONCILE_MAX_LIVE, RECONCILE_DAILY_CAP);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_reconcile_launches(
+      attempt_id TEXT PRIMARY KEY, request_key TEXT NOT NULL, input_json TEXT NOT NULL, session_id TEXT,
+      day TEXT NOT NULL, started_at INTEGER NOT NULL, asks INTEGER NOT NULL, outcome TEXT NOT NULL, last_error TEXT)`);
+    this.sql.exec('CREATE INDEX IF NOT EXISTS ask_reconcile_launches_day ON ask_reconcile_launches(day, started_at)');
+    this.sql.exec("CREATE INDEX IF NOT EXISTS ask_reconcile_launches_open ON ask_reconcile_launches(started_at) WHERE outcome IN ('starting','unknown','started')");
     // Status counters (polled by /api/status): maintained per write, never a scan of history.
     const fresh = !this.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ask_counts'").length;
     this.sql.exec('CREATE TABLE IF NOT EXISTS ask_counts(k TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0)');
@@ -652,24 +668,119 @@ export class AskLedger {
   async reconcileDue(now = this.now()): Promise<Obj> {
     const m = this.meta();
     if (!m.reconcile_intake || !this.hooks.start) return { state: 'not_configured' };
-    if (m.reconcile_session) {
-      const st = this.hooks.sessionState?.(m.reconcile_session) ?? null;
-      if (st && ACTIVE_SESSION.has(st)) return { state: 'running', session_id: m.reconcile_session };
+    const caps = this.rows('SELECT * FROM ask_reconcile_caps WHERE id=1')[0];
+    const day = utcDay(now);
+
+    // Settle known session outcomes. Unknown state stays reserved: it may be a
+    // real live session, so spawning around it would break the hard cap.
+    const open = this.rows("SELECT * FROM ask_reconcile_launches WHERE outcome IN ('starting','unknown','started') ORDER BY started_at");
+    for (const attempt of open) {
+      if (attempt.outcome === 'started' && attempt.session_id) {
+        let state: string | null = null;
+        try { state = this.hooks.sessionState?.(attempt.session_id) ?? null; } catch { /* unknown is held below */ }
+        if (state && TERMINAL_SESSION.has(state)) {
+          this.sql.exec("UPDATE ask_reconcile_launches SET outcome='finished' WHERE attempt_id=?", attempt.attempt_id);
+          if (m.reconcile_session === attempt.session_id) this.sql.exec('UPDATE ask_meta SET reconcile_session=NULL WHERE id=1');
+          continue;
+        }
+        if (!state || !ACTIVE_SESSION.has(state)) {
+          return { state: 'running', session_id: attempt.session_id, live: open.length, max_live: caps.max_live, status_unknown: true };
+        }
+        continue;
+      }
+
+      // A start may have crossed the external boundary before this DO lost its
+      // response. Once the grace period passes, replay the exact same request
+      // key and payload so SessionControl returns the existing intent instead
+      // of creating another one. Keep the reserved slot while resolving it.
+      if (now - attempt.started_at >= ASK_GRACE_MS) {
+        let result: { status: number; body: Obj };
+        try { result = await this.hooks.start(JSON.parse(attempt.input_json)); }
+        catch { result = { status: 502, body: { error: 'admission_outcome_unknown' } }; }
+        const id = typeof result.body?.id === 'string' ? result.body.id : null;
+        const error = String(result.body?.error ?? 'unknown').slice(0, 128);
+        if (id) {
+          this.sql.exec("UPDATE ask_reconcile_launches SET outcome='started',session_id=?,last_error=NULL WHERE attempt_id=?", id, attempt.attempt_id);
+          this.sql.exec('UPDATE ask_meta SET reconcile_session=? WHERE id=1', id);
+          this.noteReconcile(m.reconcile_intake, `Ask reconciler launch resolved to existing session ${id} for ${attempt.asks} ask(s) (attempt ${attempt.attempt_id}).`, now);
+          return { state: 'started', session_id: id, asks: attempt.asks, replay: true };
+        }
+        if (result.status >= 500 || error === 'admission_outcome_unknown') {
+          this.sql.exec("UPDATE ask_reconcile_launches SET outcome='unknown',last_error=? WHERE attempt_id=?", `${result.status} ${error}`.slice(0, 160), attempt.attempt_id);
+          this.noteReconcile(m.reconcile_intake, `Ask reconciler launch outcome remains unknown for attempt ${attempt.attempt_id}; the live slot stays reserved and the same key will be retried.`, now);
+          return { state: 'uncertain', attempt_id: attempt.attempt_id, live: open.length, max_live: caps.max_live };
+        }
+        this.sql.exec("UPDATE ask_reconcile_launches SET outcome='refused',last_error=? WHERE attempt_id=?", `${result.status} ${error}`.slice(0, 160), attempt.attempt_id);
+        this.noteReconcile(m.reconcile_intake, `Ask reconciler start refused (${result.status} ${error}) for ${attempt.asks} ask(s), attempt ${attempt.attempt_id} after replay.`, now);
+        break;
+      }
+
+      return { state: 'launching', attempt_id: attempt.attempt_id, live: open.length, max_live: caps.max_live };
     }
+
+    const live = this.rows("SELECT session_id,attempt_id FROM ask_reconcile_launches WHERE outcome IN ('starting','unknown','started')");
+    if (live.length >= caps.max_live) return { state: 'running', session_id: live[0]?.session_id ?? null, live: live.length, max_live: caps.max_live };
     const waiting = this.rows(`SELECT COUNT(*) AS n FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.state IN ('pending','unmapped') AND m.source<>'backfill'`)[0].n;
     if (!waiting) return { state: 'idle' };
+
+    const launchesToday = this.rows('SELECT COUNT(*) AS n FROM ask_reconcile_launches WHERE day=?', day)[0].n;
+    if (launchesToday >= caps.daily_cap) {
+      if (caps.capped_note_day !== day) {
+        const note = `Ask reconciler daily launch-attempt cap reached (${launchesToday}/${caps.daily_cap}, UTC ${day}). ${waiting} ask(s) stay queued until the next UTC day; map them by hand with hub asks map or raise the cap with hub asks settings --reconcile-daily-cap.`;
+        this.noteReconcile(m.reconcile_intake, note, now);
+        this.sql.exec('UPDATE ask_reconcile_caps SET capped_note_day=? WHERE id=1', day);
+      }
+      return { state: 'capped', launches_today: launchesToday, daily_cap: caps.daily_cap, queued: waiting };
+    }
     const newBatch = m.last_user_batch_at != null && m.last_user_batch_at > (m.reconcile_batch_at ?? 0);
     if (newBatch && now - m.last_user_batch_at < RECONCILE_DEBOUNCE_MS) return { state: 'debouncing' };
     // Without a new batch, retry leftovers at most every 30 min.
     if (!newBatch && m.reconcile_started_at != null && now - m.reconcile_started_at < ASK_GRACE_MS) return { state: 'waiting' };
-    const input = { key: 'ask-reconcile-' + crypto.randomUUID(), mode: 'headless', task_kind: 'review', workspace: 'agent-hub',
+    const attemptId = crypto.randomUUID();
+    const input = { key: 'ask-reconcile-' + attemptId, mode: 'headless', task_kind: 'review', workspace: 'agent-hub',
       intake_task_id: m.reconcile_intake, brief: reconcilerBrief(m.reconcile_intake, waiting) };
-    this.sql.exec('UPDATE ask_meta SET reconcile_started_at=?,reconcile_batch_at=? WHERE id=1', now, m.last_user_batch_at ?? now);
+    // The synchronous claim is visible to any concurrent reconcileDue call
+    // before this function awaits the external session start.
+    const reservation = this.tx(() => {
+      const current = this.rows('SELECT max_live,daily_cap FROM ask_reconcile_caps WHERE id=1')[0];
+      const running = this.rows("SELECT COUNT(*) AS n FROM ask_reconcile_launches WHERE outcome IN ('starting','unknown','started')")[0].n;
+      const attemptsToday = this.rows('SELECT COUNT(*) AS n FROM ask_reconcile_launches WHERE day=?', day)[0].n;
+      if (running >= current.max_live) return { state: 'running', live: running, max_live: current.max_live };
+      if (attemptsToday >= current.daily_cap) return { state: 'capped', launches_today: attemptsToday, daily_cap: current.daily_cap };
+      this.sql.exec(`INSERT INTO ask_reconcile_launches(attempt_id,request_key,input_json,day,started_at,asks,outcome)
+        VALUES(?,?,?,?,?,?, 'starting')`, attemptId, input.key, JSON.stringify(input), day, now, waiting);
+      this.sql.exec('UPDATE ask_meta SET reconcile_started_at=?,reconcile_batch_at=? WHERE id=1', now, m.last_user_batch_at ?? now);
+      return { state: 'reserved', max_live: current.max_live, daily_cap: current.daily_cap, attempts_today: attemptsToday };
+    });
+    if (reservation.state !== 'reserved') return reservation;
+    try { this.noteReconcile(m.reconcile_intake, `Ask reconciler launch starting: attempt ${attemptId}, ${waiting} ask(s), intake ${m.reconcile_intake}.`, now); }
+    catch (e: any) {
+      this.sql.exec('DELETE FROM ask_reconcile_launches WHERE attempt_id=? AND outcome=\'starting\'', attemptId);
+      this.sql.exec('UPDATE ask_meta SET reconcile_started_at=?,reconcile_batch_at=? WHERE id=1', m.reconcile_started_at ?? null, m.reconcile_batch_at ?? null);
+      return { state: 'audit_blocked', error: String(e?.message ?? e).slice(0, 128) };
+    }
     let r: { status: number; body: Obj };
     try { r = await this.hooks.start(input); } catch { r = { status: 502, body: { error: 'admission_outcome_unknown' } }; }
     const id = typeof r.body?.id === 'string' ? r.body.id : null;
-    this.sql.exec('UPDATE ask_meta SET reconcile_session=? WHERE id=1', id);
-    return id ? { state: 'started', session_id: id, asks: waiting } : { state: 'refused', status: r.status, error: String(r.body?.error ?? 'unknown').slice(0, 128) };
+    const error = String(r.body?.error ?? 'unknown').slice(0, 128);
+    if (id) {
+      this.sql.exec("UPDATE ask_reconcile_launches SET outcome='started',session_id=? WHERE attempt_id=?", id, attemptId);
+      this.sql.exec('UPDATE ask_meta SET reconcile_session=? WHERE id=1', id);
+      this.noteReconcile(m.reconcile_intake, `Ask reconciler launched session ${id} for ${waiting} ask(s) (launch attempt ${reservation.attempts_today + 1}/${reservation.daily_cap} today, max ${reservation.max_live} live).`, now);
+      return { state: 'started', session_id: id, asks: waiting };
+    }
+    if (r.status >= 500 || error === 'admission_outcome_unknown') {
+      this.sql.exec("UPDATE ask_reconcile_launches SET outcome='unknown',last_error=? WHERE attempt_id=?", `${r.status} ${error}`.slice(0, 160), attemptId);
+      this.noteReconcile(m.reconcile_intake, `Ask reconciler launch outcome is unknown (${r.status} ${error}) for attempt ${attemptId}; the live slot stays reserved and the daily cap counts this attempt.`, now);
+      return { state: 'uncertain', status: r.status, attempt_id: attemptId, error };
+    }
+    this.sql.exec("UPDATE ask_reconcile_launches SET outcome='refused',last_error=? WHERE attempt_id=?", `${r.status} ${error}`.slice(0, 160), attemptId);
+    this.noteReconcile(m.reconcile_intake, `Ask reconciler launch refused (${r.status} ${error}) for ${waiting} ask(s) (attempt ${reservation.attempts_today + 1}/${reservation.daily_cap} today).`, now);
+    return { state: 'refused', status: r.status, error };
+  }
+  private noteReconcile(intakeId: string, text: string, now: number): void {
+    const result = this.intake.serviceRecordEvent(intakeId, { now, event: { kind: 'note', actor: 'hub:service:ask-ledger', authority: 'operator_record', text } });
+    if (!result.ok) throw new Error(`reconcile_intake_note_${result.error}`);
   }
   /** A13: append-only JSONL export in arrival order; `after` is the last row cursor. */
   jsonl(q: URLSearchParams): string {
@@ -717,8 +828,12 @@ export class AskLedger {
   }
   summary(): Obj {
     const m = this.meta();
+    const caps = this.rows('SELECT max_live,daily_cap FROM ask_reconcile_caps WHERE id=1')[0];
+    const day = utcDay(this.now());
     return { counts: this.counts(), meta: { gap_scope: m.gap_scope, last_tick: m.last_tick, last_result: JSON.parse(m.last_result || 'null'),
-      reconcile: { intake: m.reconcile_intake, session_id: m.reconcile_session, started_at: m.reconcile_started_at, last_user_batch_at: m.last_user_batch_at } },
+      reconcile: { ...caps, launches_today: this.rows('SELECT COUNT(*) AS n FROM ask_reconcile_launches WHERE day=?', day)[0].n,
+        pending_or_live: this.rows("SELECT COUNT(*) AS n FROM ask_reconcile_launches WHERE outcome IN ('starting','unknown','started')")[0].n,
+        intake: m.reconcile_intake, session_id: m.reconcile_session, started_at: m.reconcile_started_at, last_user_batch_at: m.last_user_batch_at } },
       sources: this.rows('SELECT machine_id,source,last_ingest_at,last_reason,alerted FROM ask_sources ORDER BY last_ingest_at DESC'),
       agents: this.rows('SELECT * FROM ask_agents ORDER BY agent_id'),
       gaps: this.rows('SELECT scope,from_seq,to_seq,kind,detected_at,resolved_at FROM ask_gaps ORDER BY detected_at DESC LIMIT 100') };
@@ -764,8 +879,16 @@ export class AskLedger {
       const id = b.reconcile_intake === null ? null : this.task(String(b.reconcile_intake)).id;
       this.sql.exec('UPDATE ask_meta SET reconcile_intake=? WHERE id=1', id);
     }
+    for (const [key, column, min] of [['reconcile_max_live', 'max_live', 1], ['reconcile_daily_cap', 'daily_cap', 0]] as const) {
+      if (!(key in b)) continue;
+      const n = Number(b[key]);
+      if (!Number.isInteger(n) || n < min || n > 100) fail('invalid_' + key);
+      this.sql.exec(`UPDATE ask_reconcile_caps SET ${column}=? WHERE id=1`, n);
+    }
     const m = this.meta();
-    return { gap_scope: m.gap_scope, reconcile_intake: m.reconcile_intake };
+    const caps = this.rows('SELECT max_live,daily_cap FROM ask_reconcile_caps WHERE id=1')[0];
+    return { gap_scope: m.gap_scope, reconcile_intake: m.reconcile_intake,
+      reconcile_max_live: caps.max_live, reconcile_daily_cap: caps.daily_cap };
   }
 
   /** REST surface. Reads and mutations are operator-only; hosts may only ingest and read their cursor. */
