@@ -334,7 +334,7 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   const taskId = request.intake_task_id;
   if (typeof taskId !== 'string' || !taskId) return false;
   let rows: any[] = sql.exec('SELECT data FROM intake_tasks WHERE id=?', taskId).toArray();
-  if (!rows.length && taskId.length >= 6) rows = sql.exec("SELECT data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", taskId).toArray();
+  if (!rows.length && taskId.length >= 6) rows = sql.exec('SELECT data FROM intake_tasks WHERE id COLLATE NOCASE LIKE ? LIMIT 2', taskId + '%').toArray();
   if (rows.length !== 1) return false; // pruned, missing or ambiguous historical task
   const task = JSON.parse(rows[0].data);
   if (task.history.some((e: Obj) => e !== null && typeof e === 'object' && ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
@@ -428,6 +428,7 @@ export class IntakeService {
         ON CONFLICT(id) DO UPDATE SET data=excluded.data,links=excluded.links; END`);
       this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_projection_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_task_projection WHERE id=OLD.id; END');
       this.sql.exec("CREATE INDEX IF NOT EXISTS intake_watchdog_open ON intake_task_projection(id) WHERE json_extract(data,'$.status') IN ('open','in_progress','blocked','pending_approval') AND json_extract(data,'$.archived_at') IS NULL");
+      this.sql.exec('CREATE INDEX IF NOT EXISTS intake_tasks_id_nocase ON intake_tasks(id COLLATE NOCASE)');
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_note_archive(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,seq INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(task_id,seq))');
       for (const op of ['UPDATE', 'DELETE']) this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_note_archive_no_' + op.toLowerCase() +
         ' BEFORE ' + op + " ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");

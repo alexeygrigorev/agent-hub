@@ -157,6 +157,7 @@ export class IntakeWatchdog {
   constructor(private sql: SqlStorage, private intake: IntakeService,
     private tx: <T>(fn: () => T) => T, private hooks: WatchdogHooks = {}, private now = Date.now) {}
   init() {
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_sessions_workspace_phase_native ON fleet_sessions(workspace, phase, machine_id, native_id)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_watchdog_meta(id INTEGER PRIMARY KEY CHECK(id=1),last_tick INTEGER,nonzero_since INTEGER,digest_day TEXT,last_source TEXT,last_result TEXT)');
     this.sql.exec('INSERT OR IGNORE INTO intake_watchdog_meta(id) VALUES(1)');
     this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_restart_queue(task_id TEXT PRIMARY KEY, state TEXT NOT NULL,

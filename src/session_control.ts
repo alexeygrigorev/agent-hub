@@ -86,6 +86,7 @@ CREATE INDEX IF NOT EXISTS session_control_wakes_due_order ON session_control_wa
 CREATE INDEX IF NOT EXISTS session_control_wakes_delivery_order ON session_control_wakes(state, delivered_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_resolution_order ON session_control_wakes(state, updated_at);
 CREATE INDEX IF NOT EXISTS session_control_wakes_session ON session_control_wakes(session_id, state);
+CREATE INDEX IF NOT EXISTS session_control_wakes_session_due_order ON session_control_wakes(session_id, state, wake_at_ms, created_at, id);
 CREATE TABLE IF NOT EXISTS session_control_wake_alerts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, wake_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, intake_task_id TEXT, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_control_wake_alerts_session ON session_control_wake_alerts(session_id, created_at);
 `;
@@ -100,6 +101,8 @@ CREATE INDEX IF NOT EXISTS intake_queue_session_task ON session_control_sessions
 CREATE INDEX IF NOT EXISTS session_control_machine_created ON session_control_sessions(machine_id, created_at, id);
 CREATE INDEX IF NOT EXISTS session_control_machine_created_state ON session_control_sessions(machine_id, created_at, id, state);
 CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sessions(machine_id, state, created_at);
+CREATE INDEX IF NOT EXISTS session_control_native_binding ON session_control_sessions(machine_id,
+  json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id'));
 CREATE INDEX IF NOT EXISTS session_control_live_created ON session_control_sessions(created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_live_actor_created ON session_control_sessions(actor, created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
@@ -1464,7 +1467,7 @@ export class SessionControlService {
       try {
         let taskRows: any[] = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', req.intake_task_id).toArray();
         if (!taskRows.length && req.intake_task_id.length >= 6) {
-          taskRows = this.sql.exec("SELECT data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", req.intake_task_id).toArray();
+          taskRows = this.sql.exec('SELECT data FROM intake_tasks WHERE id COLLATE NOCASE LIKE ? LIMIT 2', req.intake_task_id + '%').toArray();
         }
         if (taskRows.length === 1) {
           const task = parsed(taskRows[0].data, null);
@@ -1683,7 +1686,7 @@ export class SessionControlService {
             try {
               let taskRows: any[] = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id = ?', req.intake_task_id).toArray();
               if (!taskRows.length && req.intake_task_id.length >= 6) {
-                taskRows = this.sql.exec("SELECT id, data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", req.intake_task_id).toArray();
+                taskRows = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id COLLATE NOCASE LIKE ? LIMIT 2', req.intake_task_id + '%').toArray();
               }
               if (taskRows.length === 1) {
                 const task = parsed(taskRows[0].data, {});
@@ -2813,7 +2816,7 @@ export class SessionControlService {
         if (input.intake_task_id) {
           let row: any = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id = ?', input.intake_task_id).toArray()[0];
           if (!row && input.intake_task_id.length >= 6) {
-            const candidates: any[] = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id LIKE ? || "%" LIMIT 2', input.intake_task_id).toArray();
+            const candidates: any[] = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id COLLATE NOCASE LIKE ? LIMIT 2', input.intake_task_id + '%').toArray();
             if (candidates.length === 1) {
               row = candidates[0];
               input.intake_task_id = row.id;

@@ -219,7 +219,7 @@ export class ProvisioningService {
       if (!data || !LABEL.test(data.label)) return reply({ error: 'invalid_label' }, 400);
       const a = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', data.label).toArray()[0];
       const installed = this.sql.exec('SELECT 1 FROM engine_installations i JOIN engine_bundles b ON b.label=i.label AND b.revision=i.revision WHERE i.machine_id=? AND i.label=?', auth.caller.machineId, data.label).toArray().length;
-      const quotaStatus = a ? this.fleet.accountStatus(a).status : 'unmapped';
+      const quotaStatus = a ? this.fleet.cachedAccountStatus(a).status : 'unmapped';
       const cred = this.credentialRow(data.label);
       const rejected = cred && this.sql.exec('SELECT 1 FROM engine_credential_rejections WHERE machine_id=? AND label=? AND generation=?', auth.caller.machineId, data.label, cred.generation).toArray().length;
       // Hub-held quota and credential state decide admission; the host runs no quota probe.
