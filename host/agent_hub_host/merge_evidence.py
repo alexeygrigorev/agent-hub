@@ -76,6 +76,9 @@ def _supersession_state(history: list) -> tuple[set[str], set[int]]:
     for index, event in enumerate(events):
         if not isinstance(event, dict) or event.get('kind') != 'report':
             continue
+        event_id = event.get('id')
+        if not isinstance(event_id, str) or reports.get(event_id.lower(), (None,))[0] != index:
+            continue
         current_reference = event.get('reference')
         if not isinstance(current_reference, str) or not SHA.fullmatch(current_reference.strip()):
             continue

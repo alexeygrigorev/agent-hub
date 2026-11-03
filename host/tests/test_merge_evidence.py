@@ -270,6 +270,19 @@ class CommitExtractionTests(unittest.TestCase):
         self.assertFalse(me.superseding_report_is_newer_than_merge_state(
             history, {'activity_at': 200, 'evidence_at': 250}))
 
+    def test_duplicate_current_report_id_cannot_supersede_or_replace_state(self):
+        old_id = '11111111-1111-4111-8111-111111111111'
+        duplicate_id = '22222222-2222-4222-8222-222222222222'
+        history = [
+            {'id': old_id, 'kind': 'report', 'reference': 'a1' * 20},
+            {'id': duplicate_id, 'kind': 'report', 'reference': 'b2' * 20,
+             'captured_at': 301, 'supersedes': [old_id]},
+            {'id': duplicate_id, 'kind': 'report', 'reference': 'c3' * 20},
+        ]
+        self.assertEqual(me.explicit_commit_refs(history), ['a1' * 20, 'b2' * 20, 'c3' * 20])
+        self.assertFalse(me.superseding_report_is_newer_than_merge_state(
+            history, {'activity_at': 200, 'evidence_at': 250}))
+
     def test_collect_include_head_false_skips_head_and_cherry(self):
         runner = FakeRunner(in_main=[B], cherry='', runs=[{'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'u'}])
         out = me.collect('/r', [B], runner, fetch=False, include_head=False)
