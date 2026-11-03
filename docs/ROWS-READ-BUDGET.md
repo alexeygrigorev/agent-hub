@@ -102,3 +102,20 @@ path unchanged (probes, adoption, reconciles, drain). The intake linkage
 revision is deliberately not part of the key: it moves on every fleet-wide
 intake write while adoption is idempotent and reruns on the next changed
 census (credential/liveness paths read links live).
+
+## Read cuts, round 2 (intake e8a22f4c)
+
+- `reconciliationCandidates`: each UNION branch now takes its oldest 100
+  (the global top-100 is always contained in the per-branch top-100s, so the
+  answer is identical) over the new
+  `fleet_launch_machine_state_updated(machine_id,state,updated_at)` index
+  instead of scanning the machine's whole live launch history per 2s poll.
+- Credentials: the candidate scan folds the credential-existence and link
+  probes into indexed EXISTS subqueries; the ended-credential sweep is
+  watermarked (only sessions ended since the last sweep, plus a full sweep
+  every 128th poll for stragglers) instead of re-reading the whole
+  worker_access history on every poll.
+- `launcher_memory_reserve` scan: new partial index
+  `fleet_launch_failed_reason(state,exit_reason,updated_at) WHERE state='failed'`.
+- Host polls (take effect as hosts update): offers 2s->10s, credential and
+  messaging provisioning 120s->300s.

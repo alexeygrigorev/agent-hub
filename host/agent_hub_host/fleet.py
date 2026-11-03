@@ -214,7 +214,7 @@ CYCLE_LOCK_STALE_S = 480.0
 # slow cycle. Keep TELEMETRY_REFRESH_S * 3 <= HUB_TELEMETRY_STALE_S
 # (regression test test_telemetry_cadence_4398ce2a.py).
 TELEMETRY_REFRESH_S = 45.0
-OFFERS_POLL_S = 2.0
+OFFERS_POLL_S = 10.0
 HUB_TELEMETRY_STALE_S = 180.0
 # Intake 056a4131 AC1: liveness check-in (heartbeat /api/host/poll plus the
 # routing capabilities PUT) on its own bounded cadence. The Hub online window

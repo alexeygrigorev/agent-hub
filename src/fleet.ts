@@ -779,6 +779,9 @@ export class FleetService {
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_state ON fleet_launches(state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_machine_state ON fleet_launches(machine_id,state)');
+    // Intake e8a22f4c: reconciliation candidates take the oldest 100 per branch; the
+    // updated_at tail keeps each branch to an index prefix instead of the machine history.
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_machine_state_updated ON fleet_launches(machine_id,state,updated_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_expiry ON fleet_launches(state,created_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state ON fleet_launches(account,state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state_id ON fleet_launches(account,state,id)');
@@ -787,6 +790,9 @@ export class FleetService {
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_recent ON fleet_launches(machine_id,finished_at) WHERE state = 'failed' AND mode = 'headless' AND verification_status = 'unverified'");
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_account_failed_recent ON fleet_launches(account,updated_at DESC) WHERE state = 'failed'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native_state ON fleet_launches(machine_id,native_id,state)');
+    // Intake e8a22f4c: the launcher memory-reserve scan runs on the cron path;
+    // keep it off the retained failed-launch history.
+    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_reason ON fleet_launches(state,exit_reason,updated_at) WHERE state = 'failed'");
     // Intake e8a22f4c: plan() and the choking watchdog look for these rare exit reasons on every poll;
     // partial indexes keep both lookups independent of the machine's retained launch history.
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_model_unsupported ON fleet_launches(machine_id,engine,account) WHERE exit_reason = 'model_unsupported'");
@@ -916,11 +922,14 @@ export class FleetService {
     const unobserved = `AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
         WHERE s.machine_id = l.machine_id AND s.native_id = l.native_id AND s.engine = l.engine
         AND s.phase IN ('starting','running') AND (s.observed_at >= ? OR ?)))`;
+    // Intake e8a22f4c: bound each branch to the same top-100 the union
+    // keeps. A global top-100 is always contained in the per-branch top-100s,
+    // so the result is identical while deep launch histories stop scanning.
     return this.sql.exec(`SELECT * FROM (
-      SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain') ${unobserved}
+      SELECT * FROM (SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain') ${unobserved} ORDER BY updated_at ASC LIMIT 100)
       UNION ALL
-      SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state = 'failed' AND l.mode = 'headless' AND l.exit_reason = ?
-        AND l.verification_status = 'unverified' AND l.finished_at > ? ${unobserved}
+      SELECT * FROM (SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state = 'failed' AND l.mode = 'headless' AND l.exit_reason = ?
+        AND l.verification_status = 'unverified' AND l.finished_at > ? ${unobserved} ORDER BY updated_at ASC LIMIT 100)
     ) ORDER BY updated_at LIMIT 100`, machine, cutoff, catalogFresh ? 1 : 0,
       machine, SILENT_START_REASON, new Date(this.now() - ABANDONED_RECOVERY_MS).toISOString(), cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
       const binding = controlStore ? parsed(r.binding_json) : null;
