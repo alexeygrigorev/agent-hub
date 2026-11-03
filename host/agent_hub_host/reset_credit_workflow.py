@@ -13,6 +13,7 @@ import json
 import time
 from . import codex_reset_credit as native
 from . import session_control
+from .model_contract import account_plan_expired, plan_end_burn_deadline, plan_end_horizon_days
 
 PATH = '/api/quota/reset-credits'
 
@@ -24,8 +25,16 @@ def _event(response):
 
 
 def prepare(rpc, hub, account, credit_id):
+    now = int(time.time())
+    if account_plan_expired(account, now):
+        raise native.CreditError('account_plan_expired')
     before = native.snapshot(rpc.call(native.READ))
-    native._eligible(before, credit_id, int(time.time()))
+    try:
+        horizon = plan_end_horizon_days()
+    except ValueError:
+        horizon = None
+    plan_deadline = plan_end_burn_deadline(account, now, horizon) if horizon is not None else None
+    native._eligible(before, credit_id, now, plan_end_deadline=plan_deadline)
     credit = native._credit(before, credit_id)
     event = _event(hub('POST', PATH, {'action': 'prepare', 'account': account,
         'credit_id': credit_id, 'provider_account_id': before['accountId'],

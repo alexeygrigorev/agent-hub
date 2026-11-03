@@ -494,6 +494,8 @@ export interface EngineDecisionInput {
   overrideReason?: string | null;
   /** Account reserve (percent) excluded from the expiry forecast. */
   reservePercent?: number;
+  /** Inclusive subscription end as the next UTC midnight; its remaining quota is lost then. */
+  planEndMs?: number | null;
   /** false for interactive sessions: no expiry boost (they are not burnable backlog). */
   expiryForecast?: boolean;
   /** True when a healthy non-fallback candidate exists (computed by the planner over all candidates). */
@@ -518,6 +520,7 @@ export interface EngineDecisionResult {
     projected_unused_percent: number | null;
     burn_status: QuotaBurnStatus;
     depleted: boolean;
+    plan_end_factor: number;
     provider_weight: number;
     tier_fit: number;
     load_factor: number;
@@ -572,6 +575,8 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
   const burn = analyzeQuotaBurn(input.quota, input.nowMs, unmeteredProviders.includes(input.provider), { reservePercent: input.reservePercent, forecast: input.expiryForecast !== false });
   const remainingPct = burn.remaining !== null ? burn.remaining : input.headroomPercent;
   const headroomFactor = Math.max(0.01, input.headroomPercent / 100);
+  const planEndFactor = input.expiryForecast === false ? 1
+    : planEndUrgency(input.headroomPercent / 100, input.planEndMs ?? null, input.nowMs);
   const pref = providerWeight(input.provider, input.project);
   const caps = (policy.rules as any).engine_capabilities?.[input.engine]
     ?? (policy.rules as any).engine_capabilities?.[input.provider]
@@ -593,7 +598,7 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
   const hostFactor = 1 / (1 + hostCpu + hostPending + hostRunning);
   const tbm = Number.isFinite(input.tbmWeight) && input.tbmWeight > 0 ? input.tbmWeight : 1;
   const fbFactor = fallbackFactor(fallbackModelIds().has(String(input.model?.id)), input.healthyAlternative === true);
-  const rawScore = headroomFactor * burn.factor * pref * tierFit * loadFactor * failureFactor * hostFactor * tbm * fbFactor;
+  const rawScore = headroomFactor * burn.factor * pref * tierFit * loadFactor * failureFactor * hostFactor * tbm * fbFactor * planEndFactor;
   const score = Math.round(rawScore * 1e6) / 1e6;
   const mode: 'auto' | 'pinned' = input.pinnedEngine ? 'pinned' : 'auto';
   const modelLabel = input.model?.id ? `${input.model.id}` : input.engine;
@@ -604,7 +609,8 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
   const overridePart = input.pinnedEngine && input.overrideReason
     ? ` override_reason=${JSON.stringify(input.overrideReason)}`
     : '';
-  const reason = `${mode}: ${input.engine}/${input.account ?? 'default'} (${modelLabel}) on ${input.machine} score=${formatScore(score)} [rem=${Math.round(remainingPct)}% ${winPart} ${ratioPart} status=${burn.burn_status} burn=${burn.factor.toFixed(2)}x${burn.expiry_factor > 1 ? `(pace ${burn.pace_factor.toFixed(2)}x expiry ${burn.expiry_factor.toFixed(2)}x unused ${burn.forecast?.projected_unused_percent ?? 0}%)` : ""} pref=${pref.toFixed(2)}x${fbFactor < 1 ? ` fallback=${fbFactor.toFixed(2)}x` : ''} tier=${input.tier}(${tierFit.toFixed(2)}x) load=acct:${acctActive}/${maxConc},fam:${famActive}(${loadFactor.toFixed(2)}x) host=cpu:${hostCpu.toFixed(2)},pend:${hostPending},run:${Math.max(0, input.runningSessions ?? 0)}(${hostFactor.toFixed(2)}x) fail=${failures}(${failureFactor.toFixed(2)}x)${overridePart}]`;
+  const planPart = planEndFactor > 1 ? ` plan_end=${new Date(input.planEndMs! - 86_400_000).toISOString().slice(0, 10)}(${planEndFactor.toFixed(2)}x)` : '';
+  const reason = `${mode}: ${input.engine}/${input.account ?? 'default'} (${modelLabel}) on ${input.machine} score=${formatScore(score)} [rem=${Math.round(remainingPct)}% ${winPart} ${ratioPart} status=${burn.burn_status} burn=${burn.factor.toFixed(2)}x${burn.expiry_factor > 1 ? `(pace ${burn.pace_factor.toFixed(2)}x expiry ${burn.expiry_factor.toFixed(2)}x unused ${burn.forecast?.projected_unused_percent ?? 0}%)` : ""}${planPart} pref=${pref.toFixed(2)}x${fbFactor < 1 ? ` fallback=${fbFactor.toFixed(2)}x` : ''} tier=${input.tier}(${tierFit.toFixed(2)}x) load=acct:${acctActive}/${maxConc},fam:${famActive}(${loadFactor.toFixed(2)}x) host=cpu:${hostCpu.toFixed(2)},pend:${hostPending},run:${Math.max(0, input.runningSessions ?? 0)}(${hostFactor.toFixed(2)}x) fail=${failures}(${failureFactor.toFixed(2)}x)${overridePart}]`;
   return {
     mode,
     score,
@@ -623,6 +629,7 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
       projected_unused_percent: burn.forecast ? burn.forecast.projected_unused_percent : null,
       burn_status: burn.burn_status,
       depleted: burn.depleted,
+      plan_end_factor: Math.round(planEndFactor * 1000) / 1000,
       provider_weight: Math.round(pref * 1000) / 1000,
       tier_fit: Math.round(tierFit * 1000) / 1000,
       load_factor: Math.round(loadFactor * 1000) / 1000,
@@ -641,6 +648,15 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
     normalized_score: null,
   };
 }
+
+/** Give remaining quota a use-it-or-lose-it preference until its plan ends. */
+export function planEndUrgency(headroom: number, planEndMs: number | null, nowMs: number): number {
+  if (planEndMs === null || !Number.isFinite(planEndMs) || planEndMs <= nowMs || !Number.isFinite(headroom) || headroom <= 0) return 1;
+  const configured = Number((policy.rules as any).plan_end_urgency_factor);
+  if (!Number.isFinite(configured) || configured <= 0) return 1;
+  return 1 + configured * Math.min(1, headroom);
+}
+
 /** `burn` (src/burn.ts) is the use-it-or-lose-it multiplier; absent stays neutral. */
 export const routeScore = (f: RouteScoreFactors) => f.fit * f.health * f.preference * f.headroom * f.urgency * f.pacing * f.grok * f.banked * (f.burn ?? 1);
 

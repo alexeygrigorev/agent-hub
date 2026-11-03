@@ -1,6 +1,7 @@
 /** Operator-mediated earned-credit evidence. Never writes quota, routing or rewards. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { loadProviderPacing } from './pacing';
+import { accountPlanEndDate, accountPlanEndMs, accountPlanExpired, planEndBurnMode, policy } from './model-routing';
 
 const response = (data: unknown, status = 200) => Response.json(data, {
   status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' },
@@ -27,6 +28,69 @@ function view(row: any) {
     authority: 'operator_attestation_with_hub_state', ac2_accepted: false };
 }
 
+/** Durable per-account totals. Counts stay unknown until a complete grant
+ * list was observed; verified operator receipts remain visible independently. */
+export function resetUsageSummary(sql: SqlStorage, now: number): any[] {
+  const hasTable = (name: string) => sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", name).toArray().length > 0;
+  const hasTranches = hasTable('tbm_banked_tranches') && hasTable('tbm_quota_pools');
+  const hasEvidence = hasTable('tbm_reset_credit_evidence');
+  const hasObservations = hasTable('banked_reset_accounts');
+  const names = new Set<string>(((policy as any).accounts ?? [])
+    .filter((a: any) => a?.provider === 'codex' && typeof a.account === 'string')
+    .map((a: any) => a.account));
+  if (hasTranches) {
+    for (const row of sql.exec("SELECT DISTINCT p.account AS account FROM tbm_banked_tranches t JOIN tbm_quota_pools p ON p.pool_id=t.pool_id WHERE t.provider='codex' AND p.account IS NOT NULL").toArray() as any[]) {
+      names.add(String(row.account));
+    }
+  }
+  if (hasEvidence) {
+    for (const row of sql.exec("SELECT DISTINCT account FROM tbm_reset_credit_evidence WHERE provider_account_id IS NOT NULL").toArray() as any[]) names.add(String(row.account));
+  }
+  return [...names].sort().map(account => {
+    const tranches: any[] = hasTranches
+      ? sql.exec(`SELECT t.tranche_id,t.status,t.expires_at_ms FROM tbm_banked_tranches t
+          JOIN tbm_quota_pools p ON p.pool_id=t.pool_id
+          WHERE t.provider='codex' AND p.account=? AND COALESCE(t.quantity_known,1)=0`, account).toArray()
+      : [];
+    const observation: any = hasObservations
+      ? sql.exec('SELECT observed_at,source FROM banked_reset_accounts WHERE account=?', account).toArray()[0]
+      : null;
+    const verifiedUsed = new Set<string>();
+    if (hasEvidence) {
+      const events: any[] = sql.exec('SELECT decision_json,receipt_json FROM tbm_reset_credit_evidence WHERE account=? AND receipt_json IS NOT NULL', account).toArray();
+      for (const event of events) {
+        try {
+          const decision = JSON.parse(event.decision_json);
+          const receipt = JSON.parse(event.receipt_json);
+          if (['reset', 'alreadyRedeemed'].includes(receipt.outcome) && typeof decision.tranche_id === 'string') verifiedUsed.add(decision.tranche_id);
+        } catch { /* malformed historical evidence is not counted */ }
+      }
+    }
+    const used = new Set<string>(tranches.filter(t => t.status === 'exhausted').map(t => String(t.tranche_id)));
+    for (const id of verifiedUsed) used.add(id);
+    const planEnd = accountPlanEndMs(account);
+    const planExpired = planEnd !== null && now >= planEnd;
+    const lost = new Set<string>(tranches.filter(t => t.status === 'expired' ||
+      (t.status === 'active' && (Number(t.expires_at_ms) <= now || planExpired))).map(t => String(t.tranche_id)));
+    for (const id of used) lost.delete(id);
+    const available = tranches.filter(t => t.status === 'active' && Number(t.expires_at_ms) > now && !planExpired).length;
+    const known = !!observation || tranches.length > 0;
+    return {
+      account,
+      plan_end: accountPlanEndDate(account),
+      plan_expired: planExpired,
+      observed: known,
+      observed_at_ms: observation ? Date.parse(String(observation.observed_at)) : null,
+      source: observation?.source ?? null,
+      as_of_ms: now,
+      resets_available: known ? available : null,
+      resets_used: known ? used.size : (verifiedUsed.size || null),
+      resets_used_verified: verifiedUsed.size,
+      resets_lost: known ? lost.size : null,
+    };
+  });
+}
+
 /** Mounted behind the existing TBM admin authentication and cookie CSRF checks. */
 export async function handleResetCreditEvidence(request: Request, sql: SqlStorage, now: number, actor = 'unknown'): Promise<Response> {
   schema(sql);
@@ -37,7 +101,7 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
       : sql.exec('SELECT * FROM tbm_reset_credit_evidence ORDER BY created_at_ms DESC LIMIT 50').toArray();
     const sentinel: any = sql.exec("SELECT kill_switch_active FROM tbm_quota_pools WHERE pool_id='*'").toArray()[0];
     const globalHealthHold = sql.exec("SELECT engine FROM fleet_engine_health WHERE engine='codex' AND status='unavailable' AND (machine_id='' OR machine_id IS NULL) LIMIT 1").toArray().length > 0;
-    return response({ events: rows.map((r: any) => {
+    return response({ summary: resetUsageSummary(sql, now), events: rows.map((r: any) => {
       const d = JSON.parse(r.decision_json);
       const pools: any[] = sql.exec("SELECT pool_id,last_updated_ms,kill_switch_active FROM tbm_quota_pools WHERE provider='codex' AND account=?", r.account).toArray();
       const account: any = sql.exec('SELECT provider,enabled FROM fleet_accounts WHERE label=?', r.account).toArray()[0];
@@ -46,12 +110,12 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
       const poolIds = new Set(pools.map(p => p.pool_id));
       const tranches: any[] = sql.exec("SELECT tranche_id,pool_id,expires_at_ms FROM tbm_banked_tranches WHERE provider='codex' AND status='active' AND expires_at_ms>? ORDER BY expires_at_ms,tranche_id", now).toArray()
         .filter((t: any) => poolIds.has(t.pool_id));
-      return { ...view(r), consumption_ready: !r.receipt_json && !sentinel?.kill_switch_active && !globalHealthHold &&
+      return { ...view(r), consumption_ready: !r.receipt_json && !accountPlanExpired(r.account, now) && !sentinel?.kill_switch_active && !globalHealthHold &&
         account?.enabled === 1 && account.provider === 'codex' && fresh(r.created_at_ms, now, 300000) &&
         fresh(tick?.last_tick_ms, now, 300000) && !!loadProviderPacing(sql, now).get('codex:' + r.account) &&
         tranches[0]?.tranche_id === d.tranche_id && tranches[0]?.expires_at_ms === d.expires_at_ms &&
         tranches.filter(t => t.expires_at_ms === d.expires_at_ms).length === 1 &&
-        d.expires_at_ms > now && pools.length > 0 && pools.every(p => fresh(p.last_updated_ms, now) && !p.kill_switch_active) };
+        (d.effective_expires_at_ms ?? d.expires_at_ms) > now && pools.length > 0 && pools.every(p => fresh(p.last_updated_ms, now) && !p.kill_switch_active) };
     }) });
   }
   if (request.method !== 'POST') return response({ error: 'method_not_allowed' }, 405);
@@ -89,14 +153,15 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
     const tranche = tranches[0];
     const sentinel: any = sql.exec("SELECT kill_switch_active FROM tbm_quota_pools WHERE pool_id='*'").toArray()[0];
     const account: any = sql.exec('SELECT provider,enabled FROM fleet_accounts WHERE label=?', body.account).toArray()[0];
+    const planEnd = planEndBurnMode(body.account, now);
     const globalHealthHold = sql.exec("SELECT engine FROM fleet_engine_health WHERE engine='codex' AND status='unavailable' AND (machine_id='' OR machine_id IS NULL) LIMIT 1").toArray().length > 0;
     const hasTick = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='tbm_tick_state'").toArray().length > 0;
     const tick: any = hasTick ? sql.exec('SELECT last_tick_ms FROM tbm_tick_state WHERE id=1').toArray()[0] : null;
     const factors = loadProviderPacing(sql, now).get('codex:' + body.account);
-    if (sentinel?.kill_switch_active || pools.some(p => p.kill_switch_active) || !account?.enabled || account.provider !== 'codex' || globalHealthHold ||
+    if (accountPlanExpired(body.account, now) || sentinel?.kill_switch_active || pools.some(p => p.kill_switch_active) || !account?.enabled || account.provider !== 'codex' || globalHealthHold ||
       !tranche || tranche.expires_at_ms !== body.expires_at_ms ||
       tranches.filter(t => t.expires_at_ms === body.expires_at_ms).length !== 1 ||
-      body.expires_at_ms - now > 86400000 || !fresh(tick?.last_tick_ms, now, 300000) ||
+      (body.expires_at_ms - now > 86400000 && planEnd === null) || !fresh(tick?.last_tick_ms, now, 300000) ||
       !pools.length || pools.some(p => !fresh(p.last_updated_ms, now)) || !factors) {
       return response({ error: 'fresh_urgent_hub_decision_required' }, 409);
     }
@@ -105,10 +170,12 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
       idempotency_key: crypto.randomUUID(),
       account: body.account, provider_account_id: body.provider_account_id, credit_id: body.credit_id,
       expires_at_ms: body.expires_at_ms, provider_observed_at_ms: body.observed_at_ms,
+      plan_end_ms: planEnd,
+      effective_expires_at_ms: planEnd === null ? body.expires_at_ms : Math.min(body.expires_at_ms, planEnd),
       provider_available_count: body.available_count, tranche_id: tranche.tranche_id,
       provider_used_percent: body.provider_used_percent,
       pool_id: tranche.pool_id, routing_factors: factors,
-      reason: 'expiring_earned_reset_edf', reset_needed_basis: 'native_quota_at_or_below_reserve',
+      reason: planEnd === null ? 'expiring_earned_reset_edf' : 'plan_end_burn_reset_edf', reset_needed_basis: 'native_quota_at_or_below_reserve',
       routing_eligibility_unchanged: true, provider_identity_authority: 'operator_native_read',
       pools: pools.map(p => ({ pool_id: p.pool_id, remaining_percent: p.remaining_percent,
         last_updated_ms: p.last_updated_ms, reset_at_ms: p.reset_at_ms })),
@@ -139,7 +206,7 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
       !['reset', 'alreadyRedeemed', 'nothingToReset', 'noCredit', 'unknown'].includes(r.outcome) ||
       !integer(r.before_at_ms) || r.before_at_ms < row.created_at_ms - 1000 || r.before_at_ms > now + 5000 ||
       !integer(r.before_count) || (successful ? (!integer(r.after_at_ms) || !integer(r.after_count) ||
-        r.after_at_ms < r.before_at_ms || r.after_at_ms > now + 5000 || r.after_at_ms >= decision.expires_at_ms)
+        r.after_at_ms < r.before_at_ms || r.after_at_ms > now + 5000 || r.after_at_ms >= (decision.effective_expires_at_ms ?? decision.expires_at_ms))
         : (r.after_at_ms !== null || r.after_count !== null || r.selected_credit_state !== 'unknown')) ||
       !['available', 'redeemed', 'absent', 'unknown'].includes(r.selected_credit_state) ||
       typeof r.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(r.sha256)) return response({ error: 'invalid_receipt' }, 400);
@@ -160,7 +227,7 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
       FROM routing_jobs j JOIN fleet_launches l ON l.id=j.launch_id WHERE j.id=?`, body.routing_job_id).toArray()[0];
     if (!job || job.account !== row.account || job.state !== 'done' || !job.selection_json ||
       !Number.isFinite(Date.parse(job.created_at)) || !Number.isFinite(Date.parse(job.updated_at)) ||
-      Date.parse(job.created_at) < postReceipt || Date.parse(job.updated_at) >= decision.expires_at_ms) {
+      Date.parse(job.created_at) < postReceipt || Date.parse(job.updated_at) >= (decision.effective_expires_at_ms ?? decision.expires_at_ms)) {
       return response({ error: 'completed_post_reset_routed_work_required' }, 409);
     }
     const intent = JSON.parse(job.request_json);
@@ -176,7 +243,7 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
       w.window_minutes * 60000 === pool.cycle_ms && w.reset_at_ms === pool.reset_at_ms);
     if (receipt.after_usage_allowed !== true || baselines.length !== 1 || typeof pool.remaining_percent !== 'number' ||
       pool.remaining_percent < 0 || pool.remaining_percent >= 100 - baselines[0].used_percent ||
-      pool.last_updated_ms < Date.parse(job.updated_at) || pool.last_updated_ms >= decision.expires_at_ms) {
+      pool.last_updated_ms < Date.parse(job.updated_at) || pool.last_updated_ms >= (decision.effective_expires_at_ms ?? decision.expires_at_ms)) {
       return response({ error: 'same_window_post_work_drawdown_required' }, 409);
     }
     const work = { linked_at_ms: now, operator_actor: actor, routing_job_id: job.id, launch_id: job.launch_id,

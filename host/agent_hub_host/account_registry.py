@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date
 import shutil
 import socket
 import subprocess
@@ -81,7 +82,15 @@ def policy_accounts(policy=None):
         probe = entry.get("quota_probe")
         if probe is not None and (not isinstance(probe, list) or any(not isinstance(x, str) or not x or "\0" in x for x in probe)):
             raise ValueError("Account %s has an invalid legacy `quota_probe`" % account)
-        if set(entry) - {"account", "harness", "provider", "aplexer_profile", "credential", "quota_probe"}:
+        plan_end = entry.get("plan_end")
+        if plan_end is not None:
+            try:
+                valid_plan_end = isinstance(plan_end, str) and date.fromisoformat(plan_end).isoformat() == plan_end
+            except ValueError:
+                valid_plan_end = False
+            if not valid_plan_end:
+                raise ValueError("Account %s needs `plan_end` null or YYYY-MM-DD" % account)
+        if set(entry) - {"account", "harness", "provider", "aplexer_profile", "credential", "quota_probe", "plan_end"}:
             raise ValueError("Account %s has unknown catalog fields" % account)
     return accounts
 

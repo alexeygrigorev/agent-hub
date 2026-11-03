@@ -23,7 +23,7 @@ class NoResetApplyTests(unittest.TestCase):
     def test_alert_service_has_no_provider_transport_or_execution_dependency(self):
         source = (ROOT / 'src/banked-resets.ts').read_text()
         imports = re.findall(r"from ['\"]([^'\"]+)['\"]", source)
-        self.assertEqual(imports, ['@cloudflare/workers-types', './liveness'])
+        self.assertEqual(imports, ['@cloudflare/workers-types', './liveness', './model-routing', './reset-credit-evidence'])
         self.assertIsNone(re.search(r'\b(?:fetch|spawn|execFile|subprocess|redeem|consume)\s*\(', source))
         self.assertIn('Alexey, please approve', source)
         self.assertIn('Hub and agents must not redeem it', source)

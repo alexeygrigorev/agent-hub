@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
-import { handleResetCreditEvidence } from '../src/reset-credit-evidence';
+import { handleResetCreditEvidence, resetUsageSummary } from '../src/reset-credit-evidence';
 import { loadProviderPacing } from '../src/pacing';
 
 const inDO: any = runInDurableObject;
@@ -66,6 +66,55 @@ describe('earned-reset genuine evidence correlation (offline fixtures)', () => {
     expect(e.decision).toMatchObject({ reset_needed_basis: 'native_quota_at_or_below_reserve', routing_eligibility_unchanged: true });
     expect(e.decision.routing_factors).toEqual(before);
     expect(await inDO(stub(), (h: any) => loadProviderPacing(h.sql, now).get('codex:credit-test'))).toEqual(before);
+  });
+  it('allows codex-orin plan-end reset evidence with a longer-lived credit at zero reserve', async () => {
+    now = Date.parse('2026-11-03T12:00:00.000Z');
+    const creditExpiry = now + 20 * 86400000;
+    await inDO(stub(), (h: any) => {
+      h.sql.exec('DELETE FROM tbm_banked_tranches');
+      h.sql.exec('DELETE FROM tbm_quota_pools');
+      h.sql.exec('DELETE FROM fleet_accounts');
+      h.sql.exec("INSERT INTO fleet_accounts VALUES('codex-orin','codex',1,0,1)");
+      h.sql.exec(`INSERT INTO tbm_quota_pools (pool_id,provider,account,total_capacity_tokens,remaining_tokens,
+        headroom_percentage,remaining_percent,hard_floor_percent,reset_at_ms,last_updated_ms,capacity_known,quota_unit,cycle_ms)
+        VALUES('codex:codex-orin:7d','codex','codex-orin',0,0,0,0,0,?,?,0,'percent',604800000)`, now + 86400000, now);
+      h.sql.exec(`INSERT INTO tbm_banked_tranches (tranche_id,pool_id,provider,label,allocated_tokens,remaining_tokens,
+        granted_at_ms,expires_at_ms,updated_at_ms,quantity_known)
+        VALUES('orin-grant','codex:codex-orin:7d','codex','Full reset',0,0,?,?,?,0)`, now - 1000, creditExpiry, now);
+      h.sql.exec('UPDATE tbm_tick_state SET last_tick_ms=?', now);
+    });
+    const body = { ...input(), account:'codex-orin', expires_at_ms:creditExpiry, observed_at_ms:now, provider_used_percent:85 };
+    const response = await call(body);
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ decision: {
+      reason:'plan_end_burn_reset_edf', plan_end_ms:Date.parse('2026-11-14T00:00:00.000Z'),
+      effective_expires_at_ms:Date.parse('2026-11-14T00:00:00.000Z'), reset_needed_basis:'native_quota_at_or_below_reserve',
+    } });
+  });
+  it('reports observed used and lost resets and marks remaining codex-orin grants lost after plan end', async () => {
+    now = Date.parse('2026-11-13T12:00:00.000Z');
+    await inDO(stub(), (h: any) => {
+      h.sql.exec('DELETE FROM tbm_banked_tranches');
+      h.sql.exec('DELETE FROM tbm_quota_pools');
+      h.sql.exec(`INSERT INTO tbm_quota_pools (pool_id,provider,account,total_capacity_tokens,remaining_tokens,
+        headroom_percentage,remaining_percent,reset_at_ms,last_updated_ms,capacity_known,quota_unit,cycle_ms)
+        VALUES('codex:codex-orin:7d','codex','codex-orin',0,0,50,50,?,?,0,'percent',604800000)`, now + 86400000, now);
+      h.sql.exec(`CREATE TABLE IF NOT EXISTS banked_reset_accounts (
+        account TEXT PRIMARY KEY, observed_at INTEGER NOT NULL, source TEXT NOT NULL)`);
+      h.sql.exec("INSERT INTO banked_reset_accounts VALUES('codex-orin',?,'quota')", new Date(now).toISOString());
+      for (const [id,status,expires] of [
+        ['orin-used','exhausted',Date.parse('2026-12-01T00:00:00.000Z')],
+        ['orin-lost','expired',Date.parse('2026-11-12T00:00:00.000Z')],
+        ['orin-active','active',Date.parse('2026-12-01T00:00:00.000Z')],
+      ]) h.sql.exec(`INSERT INTO tbm_banked_tranches (tranche_id,pool_id,provider,label,allocated_tokens,remaining_tokens,
+        granted_at_ms,expires_at_ms,status,updated_at_ms,quantity_known)
+        VALUES(?,'codex:codex-orin:7d','codex','Full reset',0,0,?,?,?, ?,0)`, id, now - 1000, expires, status, now);
+    });
+    let totals = await inDO(stub(), (h: any) => resetUsageSummary(h.sql, now).find((row: any) => row.account === 'codex-orin'));
+    expect(totals).toMatchObject({ resets_used:1, resets_used_verified:0, resets_lost:1, resets_available:1, plan_expired:false });
+    const afterPlanEnd = Date.parse('2026-11-14T00:00:00.000Z');
+    totals = await inDO(stub(), (h: any) => resetUsageSummary(h.sql, afterPlanEnd).find((row: any) => row.account === 'codex-orin'));
+    expect(totals).toMatchObject({ resets_used:1, resets_lost:2, resets_available:0, plan_expired:true });
   });
   it('does not prepare across actual disabled-account, global health or explicit pool kill policies', async () => {
     await inDO(stub(), (h: any) => h.sql.exec("UPDATE fleet_accounts SET enabled=0 WHERE label='credit-test'"));
