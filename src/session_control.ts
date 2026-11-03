@@ -1,5 +1,6 @@
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
+import { bindingMoveAllowed } from './session-binding-move';
 import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages, revokeSessionCredentials, sessionEndedStatus } from './session-messaging';
 import { IntakeWorktrees, namesWorktree, worktreePathAllowed } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
@@ -1901,11 +1902,16 @@ export class SessionControlService {
       return { ok: false as const, error: 'invalid_binding' };
     }
     const prior = row.binding_json ? parsed(row.binding_json, null) : null;
-    // Exact UUID + tag + workspace reconciliation: a different native id is a
-    // conflict, never a silent adoption (protects tag reuse across generations).
-    if (prior && (prior.native_id !== binding.native_id || prior.tag !== binding.tag || prior.workspace !== binding.workspace)) {
+    // Native identity is immutable across workspace moves. Only the assigned
+    // host may reconcile a moved workspace, using the fresh catalog and the
+    // existing intake-owned worktree below; the internal seam cannot do so.
+    if (prior && (prior.native_id !== binding.native_id || prior.tag !== binding.tag ||
+        (prior.native_created_at_ms !== null && prior.native_created_at_ms !== undefined &&
+          prior.native_created_at_ms !== binding.native_created_at_ms))) {
       return { ok: false as const, error: 'binding_conflict' };
     }
+    const moving = !!prior && prior.workspace !== binding.workspace;
+    if (moving && !reporter) return { ok: false as const, error: 'binding_conflict' };
     // Canonical Fleet reconciliation (read-only; Fleet owns the launch
     // lifecycle, this service never writes fleet rows). The assigned launch
     // must exist on the session's machine in a live post-start state, the
@@ -1940,7 +1946,7 @@ export class SessionControlService {
     // prove the tag/workspace mapping, and an arbitrary workspace must never
     // be adopted on a launch id plus an unreported UUID.
     const reported: any = this.sql.exec(
-      'SELECT tag, workspace, phase, engine, cwd FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
+      'SELECT native_id, tag, workspace, phase, engine, cwd, created_at_ms, observed_at FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
       row.machine_id, binding.native_id).toArray()[0];
     if (!reported) return { ok: false as const, error: 'fleet_native_unreported' };
     if (reported.tag !== binding.tag || reported.workspace !== binding.workspace) {
@@ -1969,15 +1975,51 @@ export class SessionControlService {
         return { ok: false as const, error: 'fleet_cwd_mismatch' };
       }
     }
-    const generation = (prior?.generation ?? 0) + 1;
+    // A lost host reply may replay the exact binding. Keep its generation and
+    // credentials intact; replay must not invalidate newly claimed commands.
+    if (prior && !moving && prior.native_created_at_ms === binding.native_created_at_ms &&
+        prior.reported_by === (reporter ?? undefined) &&
+        Number.isSafeInteger(prior.generation) && prior.generation > 0) {
+      return { ok: true as const, generation: prior.generation };
+    }
+    if (moving) {
+      if (!this.workspaceMoveAllowed(row, binding, reported)) return { ok: false as const, error: 'binding_conflict' };
+      // Preserve original execution custody, including an unknown outcome.
+      // A generation update cannot cancel an already authorized native effect.
+      const pending = this.sql.exec(`SELECT 1 FROM session_control_commands WHERE session_id = ?
+        AND (state = 'uncertain' OR (claim_token IS NOT NULL AND state IN ('recorded','transported','claimed'))) LIMIT 1`, sessionId).toArray();
+      if (pending.length) return { ok: false as const, error: 'binding_commands_pending' };
+    }
+    const generation = moving
+      ? (prior?.generation ?? 0) + 1
+      : (Number.isSafeInteger(prior?.generation) && prior.generation > 0 ? prior.generation : 1);
     this.sql.exec('UPDATE session_control_sessions SET state = ?, binding_json = ?, updated_at = ? WHERE id = ?',
       'running', JSON.stringify({ native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation,
         native_created_at_ms: binding.native_created_at_ms,
         ...(reporter ? { reported_by: reporter } : {}), reported_at: this.at() }), this.at(), sessionId);
+    if (moving) {
+      // Unclaimed transport is not execution authority. Fence any old offer
+      // correlation and reoffer the same durable command at the new binding.
+      for (const command of this.sql.exec(`SELECT id FROM session_control_commands WHERE session_id = ?
+        AND claim_token IS NULL AND state IN ('recorded','transported')`, sessionId).toArray()) {
+        this.sql.exec(`UPDATE session_control_commands SET generation = ?, correlation = ?, state = 'recorded', poll_at = NULL, updated_at = ? WHERE id = ?`,
+          generation, `cmd:${command.id}:gen:${generation}`, this.at(), command.id);
+      }
+    }
     // A (re)bind revokes the session's messaging credential; the freshly
     // bound host re-mints within its provisioning cadence (M2 AC2).
     revokeSessionCredentials(this.sql, sessionId, this.now());
     return { ok: true as const, generation };
+  }
+
+  private workspaceMoveAllowed(row: any, binding: any, reported: any): boolean {
+    const prior = parsed(row.binding_json, null);
+    if (!Number.isSafeInteger(prior?.generation) || prior.generation <= 0 || prior.generation >= Number.MAX_SAFE_INTEGER) return false;
+    const intakeId = parsed(row.request_json, {}).intake_task_id;
+    if (typeof intakeId !== 'string' || !intakeId) return false;
+    const worktree = this.sql.exec("SELECT task_id, machine, path, state FROM intake_worktrees WHERE machine = ? AND path = ? AND state = 'active'",
+      row.machine_id, binding.workspace).toArray()[0];
+    return bindingMoveAllowed(prior, binding, reported, worktree, intakeId, row.machine_id, this.now());
   }
 
   private claimExpired(row: any): boolean {
@@ -2288,6 +2330,21 @@ export class SessionControlService {
       const promoted = this.sql.exec("SELECT s.id, s.host_family, f.machine_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE f.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('queued','held') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
       for (const row of promoted) if (this.hostOk(row, caller).ok) this.syncFleetPlacement(row.id);
       const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
+      // Already-bound native sessions can move to their intake worktree.
+      // Discover only exact same-incarnation, fresh catalog moves; the POST
+      // rechecks these facts under the mutation transaction and host family.
+      const moved = this.sql.exec(`SELECT s.* FROM session_control_sessions s
+        JOIN fleet_launches f ON f.id = s.fleet_launch_id
+        JOIN fleet_sessions n ON n.machine_id = s.machine_id AND n.native_id = json_extract(s.binding_json, '$.native_id')
+        WHERE s.machine_id = ? AND s.binding_json IS NOT NULL AND s.state IN ('running','starting','uncertain')
+        AND f.state IN ('starting','running') AND n.workspace <> json_extract(s.binding_json, '$.workspace') LIMIT 100`, caller.machineId!).toArray() as any[];
+      for (const row of moved) {
+        if (!this.hostOk(row, caller).ok) continue;
+        const prior = parsed(row.binding_json, null);
+        const reported: any = this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', row.machine_id, prior?.native_id).toArray()[0];
+        const binding = { ...prior, workspace: reported?.workspace };
+        if (this.workspaceMoveAllowed(row, binding, reported)) rows.push({ ...row, launch_native_id: prior.native_id });
+      }
       return response({
         sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, intake_task_id: JSON.parse(row.request_json).intake_task_id ?? null, engine: row.engine, native_id: row.launch_native_id ?? null })),
       });
