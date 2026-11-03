@@ -5,8 +5,18 @@ from pathlib import Path
 import subprocess
 import time
 import urllib.request
+from urllib.parse import urlsplit
 
 BASE = os.environ.get('TEST_HUB_URL', 'http://127.0.0.1:19487')
+_base_host = (urlsplit(BASE).hostname or '').lower().rstrip('.')
+if (_base_host == 'hub.dtcdev.click' or _base_host.endswith('.dtcdev.click')
+        or _base_host == 'agent-hub.cloudflare-ai-agent-de9ca0.workers.dev'):
+    raise SystemExit('installer lifecycle E2E requires an isolated test Hub URL')
+
+# Arm the installed process tree, too: if a test accidentally points its host
+# config at production, the shared HTTP guard must fail before sending a write.
+os.environ['HUB_E2E'] = '1'
+os.environ['HUB_BASE_URL'] = BASE
 
 def http(path, data=None, headers=None, method=None):
     req = urllib.request.Request(BASE + path, data=None if data is None else json.dumps(data).encode(),
