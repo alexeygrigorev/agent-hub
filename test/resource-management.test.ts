@@ -71,7 +71,7 @@ describe('resource management',()=>{
     FROM retained`,iso(-600000),iso(),iso());
   let ledgerReads=0,ledgerWrites=0;
   const boundedSql:any={exec:(query:string,...args:any[])=>{
-   if(query.startsWith('SELECT state,finished_at FROM session_resource_usage')) ledgerReads++;
+   if(query.startsWith('SELECT native_id FROM session_resource_usage WHERE machine_id=')) ledgerReads++;
    if(query.startsWith('INSERT INTO session_resource_usage VALUES')) ledgerWrites++;
    return sql.exec(query,...args);
   }};
