@@ -35,8 +35,8 @@
  * only expires as `stop_not_claimed` when the host was reachable at expiry.
  *
  * A CHANNEL PROOF is any later command on the host that reached
- * claimed/acked/refused/uncertain, or a terminal failed row with a claim token:
- * the claim direction demonstrably worked.
+ * claimed/acked/refused/uncertain, or a terminal failed row whose persisted
+ * host ack contains the matching claim token: the claim direction worked.
  * A proof newer than a stuck command supersedes it (AC2 automatic recovery),
  * and exhausted claim retries (`claim_expired_retry_exhausted`) are not
  * evidence at all because claims happened.
@@ -107,7 +107,7 @@ const PROOF_STATES_SQL = "('claimed','acked','refused','uncertain','failed')";
 export const COMMAND_CHANNEL_PLAN_SQL = {
   proof: `SELECT MAX(c.created_at) AS p FROM session_control_commands c INDEXED BY session_control_commands_proof_created_v2
      CROSS JOIN session_control_sessions s ON s.id = c.session_id
-     WHERE c.state IN ${PROOF_STATES_SQL} AND (c.state != 'failed' OR c.claim_token IS NOT NULL)
+     WHERE c.state IN ${PROOF_STATES_SQL} AND (c.state != 'failed' OR json_extract(c.ack_json, '$.claim_token') = c.claim_token)
        AND c.created_at >= ? AND s.machine_id = ?`,
   stuck: `SELECT c.id, c.kind, c.created_at, c.poll_at FROM session_control_commands c INDEXED BY session_control_commands_pending_created
      CROSS JOIN session_control_sessions s ON s.id = c.session_id
