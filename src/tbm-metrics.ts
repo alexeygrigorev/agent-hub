@@ -133,7 +133,7 @@ function metricsForPool(sql: SqlStorage, pool: any, now: number, since: number, 
       }, 0), 'tokens');
     const activeRates = active.map(t => safeNumber(t.banked_burn_rate_tpm));
     metrics.banked_burn_rate = activeRates.length && activeRates.every(rate => rate !== null && rate > 0)
-      ? known(activeRates.reduce((sum, value) => sum + (value ?? 0), 0), 'tokens/minute')
+      ? known(activeRates.reduce<number>((sum, value) => sum + (value ?? 0), 0), 'tokens/minute')
       : unknown('tokens/minute', active.length ? 'At least one active tranche has no measured banked token burn rate.' : 'No active banked tranche is available in this window.');
   } catch {
     for (const key of ['banked_remaining', 'time_to_expiry', 'expired_unused', 'banked_burn_rate']) {
