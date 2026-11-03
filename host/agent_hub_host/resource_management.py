@@ -770,7 +770,8 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
 
 def _cpu_max_for_cap(cap_cores: float) -> str:
     """cgroup v2 cpu.max value capping the scope to ``cap_cores`` cores."""
-    return "%d %d" % (int(round(cap_cores * 1_000_000)), CPU_THROTTLE_PERIOD_US)
+    quota_us = int(round(cap_cores * CPU_THROTTLE_PERIOD_US))
+    return "%d %d" % (quota_us, CPU_THROTTLE_PERIOD_US)
 
 
 def _read_cpu_max(cgroup: str) -> Optional[str]:
@@ -812,6 +813,8 @@ def _release_throttle_state(peak: dict[str, Any]) -> Optional[dict[str, Any]]:
     throttle = peak.pop("cpu_throttle", None)
     peak.pop("cpu_over_ms", None)
     peak.pop("cpu_over_last_ms", None)
+    peak.pop("cpu_throttle_restore_failure_reported", None)
+    peak.pop("cpu_throttle_restore_reason", None)
     return throttle if isinstance(throttle, dict) else None
 
 
@@ -823,11 +826,51 @@ def _restore_cpu_max(throttle: dict[str, Any]) -> dict[str, Any]:
         return {"cpu_max": None, "outcome": "cgroup_gone"}
     current = _read_cpu_max(cgroup)
     if current is None:
-        # Scope already destroyed with the session: the cap died with it.
+        # A missing scope means its cap died with it. If the directory still
+        # exists, unreadable cpu.max is not proof that restoration is complete.
+        if os.path.isdir(cgroup):
+            return {"cpu_max": None, "outcome": "unverified"}
         return {"cpu_max": None, "outcome": "cgroup_gone"}
     if _write_cpu_max(cgroup, prior):
         return {"cpu_max": prior, "outcome": "restored"}
     return {"cpu_max": None, "outcome": "unverified"}
+
+
+def _release_cpu_throttle(
+    entry: dict[str, Any],
+    peak: dict[str, Any],
+    now_ms: int,
+    observed_at: str,
+    reason: str,
+) -> list[dict[str, Any]]:
+    """Restore a saved cpu.max, retaining state until restoration is verified."""
+    sid = entry.get("session_id")
+    nid = entry.get("native_id")
+    if not isinstance(sid, str) or not isinstance(nid, str):
+        return []
+    throttle = peak.get("cpu_throttle")
+    if not isinstance(throttle, dict):
+        return []
+    detail = _restore_cpu_max(throttle)
+    outcome = detail.get("outcome")
+    if outcome == "unverified":
+        # Report the failure once, but retry restoration every heartbeat. The
+        # Hub keeps this receipt active until a later verified release arrives.
+        if peak.get("cpu_throttle_restore_failure_reported") is True:
+            return []
+        peak["cpu_throttle_restore_failure_reported"] = True
+        peak["cpu_throttle_restore_reason"] = reason
+    else:
+        _release_throttle_state(peak)
+    reported_reason = peak.get("cpu_throttle_restore_reason") if outcome == "unverified" else reason
+    if not isinstance(reported_reason, str):
+        reported_reason = "restore_retry"
+    cap = _finite_number(throttle.get("cap_cores"))
+    return [_throttle_receipt(
+        sid, nid, "released",
+        entry.get("native_created_at_ms"), now_ms, observed_at,
+        {"cap_cores": cap if cap is not None else 0.0,
+         "sustain_s": throttle.get("sustain_s"), "reason": reported_reason, **detail})]
 
 
 def evaluate_cpu_throttle(
@@ -862,18 +905,23 @@ def evaluate_cpu_throttle(
     current = _finite_number(peak.get("current_cpu_cores"))
     cgroup = measured.get("cgroup_path") if isinstance(measured, dict) else None
     if throttle is not None:
+        restore_pending = peak.get("cpu_throttle_restore_failure_reported") is True
         # Protection wins immediately at ANY usage level: a session that
         # gained the keep marker (or was never managed) has its saved
         # cpu.max restored even while pinned at the throttled ceiling,
-        # otherwise the cap would outlive its authority.
+        # otherwise the cap would outlive its authority. A prior unverified
+        # restore also retries regardless of current usage, so a transient
+        # write failure cannot leave the cap applied indefinitely.
         if (entry.get("keep") is True or entry.get("managed") is not True
+                or restore_pending
                 or (current is not None and current < cap * CPU_THROTTLE_RELEASE_RATIO)):
-            prior_throttle = _release_throttle_state(peak)
-            if prior_throttle is not None:
-                detail = _restore_cpu_max(prior_throttle)
-                receipts.append(_throttle_receipt(
-                    sid, nid, "released", entry.get("native_created_at_ms"), now_ms, observed_at,
-                    {"cap_cores": cap, "sustain_s": config.get("cpu_throttle_sustain_s"), **detail}))
+            reason = (peak.get("cpu_throttle_restore_reason") if restore_pending
+                      else "session_protected" if entry.get("keep") is True
+                      else "session_unmanaged" if entry.get("managed") is not True
+                      else "usage_below_cap")
+            if not isinstance(reason, str):
+                reason = "restore_retry"
+            receipts.extend(_release_cpu_throttle(entry, peak, now_ms, observed_at, reason))
         return receipts
     if entry.get("keep") is True or entry.get("managed") is not True:
         peak.pop("cpu_over_ms", None)
@@ -912,7 +960,8 @@ def evaluate_cpu_throttle(
         receipts.append(_throttle_receipt(
             sid, nid, "throttled", entry.get("native_created_at_ms"), now_ms, observed_at,
             {"cap_cores": cap, "sustain_s": config.get("cpu_throttle_sustain_s"),
-             "cpu_max": value, "prior_cpu_max": prior, "outcome": "applied"}))
+             "cpu_max": value, "prior_cpu_max": prior, "outcome": "applied",
+             "reason": "sustained_over_cap"}))
     else:
         peak.pop("cpu_over_ms", None)
         peak.pop("cpu_over_last_ms", None)
@@ -926,22 +975,7 @@ def release_terminal_throttle(
     observed_at: str,
 ) -> list[dict[str, Any]]:
     """Lift any active throttle when the session finishes. Never kills."""
-    receipts: list[dict[str, Any]] = []
-    sid = entry.get("session_id")
-    nid = entry.get("native_id")
-    throttle = peak.get("cpu_throttle") if isinstance(peak.get("cpu_throttle"), dict) else None
-    if throttle is None or not isinstance(sid, str) or not isinstance(nid, str):
-        return receipts
-    prior_throttle = _release_throttle_state(peak)
-    if prior_throttle is None:
-        return receipts
-    detail = _restore_cpu_max(prior_throttle)
-    cap = _finite_number(prior_throttle.get("cap_cores"))
-    receipts.append(_throttle_receipt(
-        sid, nid, "released", entry.get("native_created_at_ms"), now_ms, observed_at,
-        {"cap_cores": cap if cap is not None else 0.0,
-         "sustain_s": prior_throttle.get("sustain_s"), **detail}))
-    return receipts
+    return _release_cpu_throttle(entry, peak, now_ms, observed_at, "session_finished")
 
 
 def _evidence_id(session_id: str, reason: str, created_ms: Any, activity_ms: Any, output_digest: str) -> str:

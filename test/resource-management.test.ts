@@ -319,7 +319,7 @@ describe('resource management',()=>{
   expect(r.usage()[0]).toMatchObject({state:'stopped',finished_at:iso()});
  }));
  it('records reversible CPU throttle receipts, notes the intake and exposes active state (intake f31b678f)',async()=>fixture(async(r,sql)=>{
-  const throttled={id:'cpu-throttle:session:native:throttled:1',session_id:'session',native_id:'native',action:'throttled',cap_cores:2,sustain_s:300,cpu_max:'2000000 100000',prior_cpu_max:'max 100000',outcome:'applied',at:iso()};
+  const throttled={id:'cpu-throttle:session:native:throttled:1',session_id:'session',native_id:'native',action:'throttled',cap_cores:2,sustain_s:300,cpu_max:'200000 100000',prior_cpu_max:'max 100000',outcome:'applied',reason:'sustained_over_cap',at:iso()};
   r.report('host',{samples:[sample()],reaps:[],throttles:[throttled]});
   const rows=r.throttles();
   expect(rows).toHaveLength(1);
@@ -329,24 +329,34 @@ describe('resource management',()=>{
   // Live usage row is marked throttled; the overview carries the active count.
   expect(r.usage()[0].cpu_throttled).toBe(true);
   expect(r.overview().active_throttles).toBe(1);
-  // Release lifts the flag: latest action per native decides.
-  const released={...throttled,id:'cpu-throttle:session:native:released:2',action:'released',cpu_max:'max 100000',prior_cpu_max:null,outcome:'restored',at:iso(1000)};
-  r.report('host',{samples:[],reaps:[],throttles:[released]});
+  // An unverified restore remains active and is visible until a later write succeeds.
+  const failedRelease={...throttled,id:'cpu-throttle:session:native:released:2',action:'released',cpu_max:null,prior_cpu_max:null,outcome:'unverified',reason:'usage_below_cap',at:iso(1000)};
+  r.report('host',{samples:[],reaps:[],throttles:[failedRelease]});
   expect(r.throttles()).toHaveLength(2);
+  expect(r.throttles()[0]).toMatchObject({action:'released',outcome:'unverified',active:true});
+  expect(r.usage()[0].cpu_throttled).toBe(true);
+  expect(r.overview().active_throttles).toBe(1);
+  const failedHistory=JSON.parse(sql.exec("SELECT data FROM intake_tasks WHERE id='task'").one().data).history;
+  expect(failedHistory.some((h:any)=>h.text.includes('remains active') && h.text.includes('will retry'))).toBe(true);
+  // A verified restore clears the flag.
+  const released={...throttled,id:'cpu-throttle:session:native:released:3',action:'released',cpu_max:'max 100000',prior_cpu_max:null,outcome:'restored',reason:'usage_below_cap',at:iso(2000)};
+  r.report('host',{samples:[],reaps:[],throttles:[released]});
+  expect(r.throttles()).toHaveLength(3);
   expect(r.throttles()[0]).toMatchObject({action:'released',active:false});
   expect(r.usage()[0].cpu_throttled).toBe(false);
   expect(r.overview().active_throttles).toBe(0);
   // Idempotent replay and binding/payload validation.
   r.report('host',{samples:[],reaps:[],throttles:[released]});
-  expect(r.throttles()).toHaveLength(2);
+  expect(r.throttles()).toHaveLength(3);
   // Re-throttle after release: exactly ONE active row (the newest), the
   // overview count never inflates across the native's receipt history.
-  const rethrottled={...throttled,id:'cpu-throttle:session:native:throttled:3',at:iso(2000)};
+  const rethrottled={...throttled,id:'cpu-throttle:session:native:throttled:4',at:iso(3000)};
   r.report('host',{samples:[],reaps:[],throttles:[rethrottled]});
   const rows3=r.throttles();
-  expect(rows3).toHaveLength(3);
+  expect(rows3).toHaveLength(4);
   expect(rows3.filter((t:any)=>t.active)).toHaveLength(1);
-  expect(rows3[0]).toMatchObject({id:'cpu-throttle:session:native:throttled:3',action:'throttled',active:true});
+  expect(rows3[0]).toMatchObject({id:'cpu-throttle:session:native:throttled:4',action:'throttled',active:true});
+  expect(rows3.find((t:any)=>t.id==='cpu-throttle:session:native:released:3')!.active).toBe(false);
   expect(rows3.find((t:any)=>t.id==='cpu-throttle:session:native:released:2')!.active).toBe(false);
   expect(r.overview().active_throttles).toBe(1);
   expect(r.usage()[0].cpu_throttled).toBe(true);
@@ -354,6 +364,7 @@ describe('resource management',()=>{
   expect(()=>r.report('host',{samples:[],reaps:[],throttles:5})).toThrow('invalid_resource_report');
   expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,session_id:'nope',id:'cross-native'}]})).toThrow('resource_binding_mismatch');
   expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,id:'spaces not allowed'}]})).toThrow('invalid_throttle');
+  expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,id:'bad-reason',reason:'not allowed'}]})).toThrow('invalid_throttle');
   expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,action:'killed'}]})).toThrow('invalid_throttle');
   expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,session_id:'other'}]})).toThrow('resource_binding_mismatch');
   expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,at:'not-a-time'}]})).toThrow('invalid_resource_timestamp');

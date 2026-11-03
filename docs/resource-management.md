@@ -130,12 +130,15 @@ Detection and action (host `resource_management.py`):
   its dedicated workload cgroup. When a managed, non-keep session stays above
   `cpu_throttle_cores` (default 2) for `cpu_throttle_sustain_s` (default 300),
   the watchdog writes `cpu.max` on that session's own workload scope
-  (`<cap>*1000000 100000`).
+  (`round(<cap>*100000) 100000`; for example, 2 cores is `200000 100000`).
 - The throttle is REVERSIBLE and bounded to the offending scope: the previous
   `cpu.max` value is saved before the write and restored when usage falls
   below 80% of the cap (hysteresis, so a session at the ceiling never flaps)
   or when the session finishes. A scope that already died with the session is
-  recorded as `cgroup_gone`.
+  recorded as `cgroup_gone`. If a restore write cannot be verified, the saved
+  limit stays in watchdog state and restoration retries on later heartbeats;
+  Hub continues to show the throttle as active until restoration succeeds or
+  the cgroup disappears.
 - It never stops, kills or signals a process. Keep-marked sessions
   (including interactive) are never throttled; an existing cap on a session
   that later gains protection is still lifted. An unreadable `cpu.max` fails
