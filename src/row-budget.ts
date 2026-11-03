@@ -33,6 +33,7 @@ export class RowBudget {
   private readonly chunk: Counts;
   private readonly storage: Store;
   private emergencyAlarmDeleted = false;
+  private ledgerFailure = false;
 
   constructor(storage: Store, private now: () => number = Date.now,
     limits: Counts = DAILY_ROW_LIMITS, chunk: Counts = DEFAULT_CHUNK) {
@@ -71,9 +72,12 @@ export class RowBudget {
   begin(bootstrap = false): Promise<void> {
     return this.exclusive(async () => {
       const day = this.day();
+      if (this.ledgerFailure) this.trip('durable budget storage unavailable');
       if (!this.ledger) {
-        const stored = await this.storage.get<Ledger>(LEDGER_KEY);
-        if (stored !== undefined && !this.valid(stored)) this.trip('invalid durable ledger');
+        let stored: Ledger | undefined;
+        try { stored = await this.storage.get<Ledger>(LEDGER_KEY); }
+        catch (error) { this.ledgerFailure = true; throw error; }
+        if (stored !== undefined && !this.valid(stored)) { this.ledgerFailure = true; this.trip('invalid durable ledger'); }
         this.ledger = stored ?? { day, read: 0, written: 0, stopped: false };
         // KV lookup itself consumes a row; persist it with the next reservation.
         this.debt.read++;
@@ -99,6 +103,7 @@ export class RowBudget {
    * performs no I/O. Always await this in the event's finally block. */
   finish(): Promise<void> {
     return this.exclusive(async () => {
+      if (this.ledgerFailure) return;
       if (this.dirty && this.ledger) await this.checkpoint(false);
     });
   }
@@ -118,7 +123,8 @@ export class RowBudget {
       (refill && (this.credit.read + add.read <= 0 || this.credit.written + add.written <= 0));
     // Fail closed across a failed write. Never hand out credit until durable.
     this.stopped = true;
-    await this.storage.put(LEDGER_KEY, ledger);
+    try { await this.storage.put(LEDGER_KEY, ledger); }
+    catch (error) { this.ledgerFailure = true; throw error; }
     this.ledger = ledger;
     this.credit.read += add.read;
     this.credit.written += add.written;
@@ -138,7 +144,11 @@ export class RowBudget {
   }
   private consume(read: number, written: number) {
     const charge = (key: keyof Counts, amount: number) => {
-      if (!Number.isFinite(amount) || amount < 0) this.trip('invalid SQL row counters');
+      if (!Number.isFinite(amount) || amount < 0) {
+        if (this.ledger) this.ledger.stopped = true;
+        this.dirty = true;
+        this.trip('invalid SQL row counters');
+      }
       const paid = Math.min(this.credit[key], amount);
       this.credit[key] -= paid;
       const overdraw = amount - paid;
@@ -250,7 +260,12 @@ export class RowBudget {
           }
           let lastRead = 0, lastWritten = 0;
           const charge = () => {
-            const read = Number(cursor.rowsRead), written = Number(cursor.rowsWritten);
+            let read = NaN, written = NaN;
+            try { read = Number(cursor.rowsRead); written = Number(cursor.rowsWritten); }
+            catch {
+              budget.ledger!.stopped = true; budget.dirty = true;
+              budget.trip('SQL row counters unavailable');
+            }
             const deltaRead = read - lastRead, deltaWritten = written - lastWritten;
             lastRead = read; lastWritten = written;
             budget.consume(deltaRead, deltaWritten);
@@ -258,15 +273,29 @@ export class RowBudget {
           charge();
           // Charge every next(), including raw() and Symbol.iterator. toArray()
           // must drain incrementally rather than bypassing the per-next guard.
+          const advance = (source: any, args: any[]) => {
+            budget.assertAllowed();
+            let value: any;
+            try { value = source.next(...args); }
+            catch {
+              // Failed cursor stepping may already have scanned rows. Charge
+              // observable counters, then stop the day even if a caller catches.
+              try { charge(); } catch { /* daily stop below is stronger */ }
+              budget.ledger!.stopped = true; budget.dirty = true;
+              budget.trip('SQL cursor stepping failed');
+            }
+            charge();
+            return value;
+          };
           const iterator = (source: any): any => ({
-            next(...args: any[]) { budget.assertAllowed(); const value = source.next(...args); charge(); return value; },
+            next(...args: any[]) { return advance(source, args); },
             [Symbol.iterator]() { return this; },
           });
           return new Proxy(cursor, {
             get(c, key) {
               if (key === Symbol.iterator) return () => iterator(c[Symbol.iterator]());
               if (key === 'raw') return (...args: any[]) => iterator(c.raw(...args));
-              if (key === 'next') return (...args: any[]) => { budget.assertAllowed(); const value = c.next(...args); charge(); return value; };
+              if (key === 'next') return (...args: any[]) => advance(c, args);
               if (key === 'toArray') return () => Array.from(iterator(c[Symbol.iterator]()));
               if (key === 'one') return () => {
                 const rows = iterator(c[Symbol.iterator]());

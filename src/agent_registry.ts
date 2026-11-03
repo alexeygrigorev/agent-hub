@@ -36,8 +36,10 @@ export function migrateAgentRegistry(sql: SqlStorage, transaction: <T>(fn: () =>
     }
     sql.exec('CREATE INDEX IF NOT EXISTS idx_agents_tag_lookup ON agents(tag)');
     sql.exec("CREATE INDEX IF NOT EXISTS idx_agents_projectless_tag ON agents(tag) WHERE COALESCE(project,'')=''");
-    if (sql.exec("SELECT 1 FROM agents a INDEXED BY idx_agents_projectless_tag WHERE COALESCE(a.project,'') = '' AND EXISTS (SELECT 1 FROM agents b WHERE b.tag = a.tag AND b.rowid <> a.rowid LIMIT 1) LIMIT 1").toArray().length) {
-      throw new Error('ambiguous_legacy_registry');
+    sql.exec('CREATE TABLE IF NOT EXISTS hub_init_stamps (key TEXT PRIMARY KEY, at INTEGER NOT NULL)');
+    if (!sql.exec("SELECT 1 FROM hub_init_stamps WHERE key='agents_projectless_collision_validation_v1'").toArray().length) {
+      if (sql.exec("SELECT 1 FROM agents a INDEXED BY idx_agents_projectless_tag WHERE COALESCE(a.project,'') = '' AND EXISTS (SELECT 1 FROM agents b WHERE b.tag = a.tag AND b.rowid <> a.rowid LIMIT 1) LIMIT 1").toArray().length)
+        throw new Error('ambiguous_legacy_registry');
     }
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_project_tag_unique ON agents(COALESCE(project, ''), tag)");
     sql.exec('CREATE INDEX IF NOT EXISTS idx_agents_tag_lookup ON agents(tag)');
@@ -132,6 +134,9 @@ export function bindAgentCredentials(sql: SqlStorage, transaction: <T>(fn: () =>
           AND (COALESCE(project,'') = '' OR COALESCE(NEW.project,'') = ''))
         BEGIN SELECT RAISE(ABORT, 'agent_exists'); END`);
     }
+    // The validation can be skipped only after these guards are installed.
+    // Hub initializes migration + bindings in one outer transaction.
+    sql.exec("INSERT OR IGNORE INTO hub_init_stamps VALUES('agents_projectless_collision_validation_v1',?)", Date.now());
   });
 }
 

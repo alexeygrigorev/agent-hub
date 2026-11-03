@@ -1,3 +1,5 @@
+import { readPlacementPressure, PLACEMENT_PRESSURE_REASONS } from './placement-pressure';
+export { PLACEMENT_PRESSURE_REASONS } from './placement-pressure';
 import { repoAllowsMachine } from './repo-host-policy';
 import { engineEpoch } from './engine-epoch';
 import { WriteWatch } from './write-watch';
@@ -208,7 +210,7 @@ import { MEMORY_FLOOR_MB, NEXT_SLOT_MB, ResourceManagement, memoryVerdict } from
 export { MEMORY_FLOOR_MB, NEXT_SLOT_MB };
 /** Placement-pressure reasons that degrade host health and raise operator
  * alerts: any launch rejected or held for memory/capacity. */
-export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high']);
+
 /** Incidental per-route reasons that may accompany capacity but never queue alone
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
@@ -1178,32 +1180,14 @@ export class FleetService {
    * Counts queued holds, hard rejections recorded at reserve time, and
    * recent terminal failures with memory/capacity reasons. Read-only; the
    * accounting verdicts stay with plan()/accountStatus(). */
-  placementOverview(): { queued_held: number; queued_total: number; recent_rejects: number; recent_failed: number } {
-    const nowMs = this.now();
-    let queuedTotal = 0, queuedHeld = 0, recentRejects = 0, recentFailed = 0;
-    try {
-      queuedTotal = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued'").one().n);
-      const heldBefore = new Date(nowMs - 5 * 60000).toISOString();
-      queuedHeld = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued' AND created_at <= ?", heldBefore).one().n);
-    } catch { /* fail closed: pressure unknown reads as none here; liveness re-checks */ }
-    try {
-      const dayAgo = nowMs - 24 * 3600000;
-      recentRejects = Number(this.sql.exec('SELECT COUNT(*) AS n FROM placement_rejections WHERE created_at_ms >= ?', dayAgo).one().n);
-    } catch { recentRejects = 0; }
-    try {
-      const dayAgoIso = new Date(nowMs - 24 * 3600000).toISOString();
-      const rows = this.sql.exec("SELECT exit_reason, launch_error_json FROM fleet_launches WHERE state = 'failed' AND updated_at >= ?", dayAgoIso).toArray() as any[];
-      for (const row of rows) {
-        const reasons: string[] = [];
-        if (typeof row.exit_reason === 'string') reasons.push(row.exit_reason);
-        try {
-          const diag = JSON.parse(row.launch_error_json || 'null');
-          if (diag && typeof diag.reason === 'string') reasons.push(diag.reason);
-        } catch { /* ignore unparseable diagnostics */ }
-        if (reasons.some((r) => PLACEMENT_PRESSURE_REASONS.has(r))) recentFailed++;
-      }
-    } catch { recentFailed = 0; }
-    return { queued_held: queuedHeld, queued_total: queuedTotal, recent_rejects: recentRejects, recent_failed: recentFailed };
+  placementOverview() {
+    const sample = readPlacementPressure(this.sql, this.now());
+    const known = (source: keyof typeof sample.truncated, value: number) => sample.truncated[source] || sample.unknown[source] ? null : value;
+    return { queued_total: known('queued', sample.queuedTotal), queued_held: known('queued', sample.queuedHeld),
+      recent_rejects: known('rejections', sample.recentRejects), recent_failed: known('failures', sample.failedTotal),
+      observed_lower_bounds: { queued_total: sample.queuedTotal, queued_held: sample.queuedHeld,
+        recent_rejects: sample.recentRejects, recent_failed: sample.failedTotal },
+      truncated: sample.truncated, unknown: sample.unknown };
   }
 
   /** Record a hard placement rejection for operator alerting.
@@ -2530,12 +2514,10 @@ export class FleetService {
       } catch { capsByMachine = new Map(); }
       }
       let sessions: any[] = [];
-      let sessionsTotal = 0;
+      let sessionsTotal: number | null = null;
       let sessionsCursorNext: string | null = null;
       let sessionsTruncated = false;
       if (want('sessions')) {
-        const totalRow: any = this.sql.exec('SELECT COUNT(*) AS n FROM fleet_sessions').toArray()[0];
-        sessionsTotal = Number(totalRow?.n) || 0;
         const take = sessLimit + 1;
         const sessRows = (sessCursor
           ? this.sql.exec('SELECT * FROM fleet_sessions WHERE (machine_id, tag, native_id) > (?, ?, ?) ORDER BY machine_id, tag, native_id LIMIT ?',
@@ -2544,6 +2526,9 @@ export class FleetService {
         ).toArray() as any[];
         sessionsTruncated = sessRows.length > sessLimit;
         const pageRows = sessRows.slice(0, sessLimit);
+        // Only an exhausted first page proves the entire table size. Every
+        // other page reports an unknown total instead of counting history.
+        sessionsTotal = !sessCursor && !sessionsTruncated ? pageRows.length : null;
         sessions = projectAliasSessions(pageRows, new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
         if (sessionsTruncated && pageRows.length) {
           const last = pageRows[pageRows.length - 1];
@@ -2560,6 +2545,7 @@ export class FleetService {
       if (want('sessions')) {
         out.sessions = sessions;
         out.sessions_total = sessionsTotal;
+        out.sessions_total_unknown = sessionsTotal === null;
         out.sessions_cursor_next = sessionsCursorNext;
         out.sessions_truncated = sessionsTruncated;
       }

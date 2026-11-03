@@ -26,6 +26,22 @@ function launches(sql: any, count: number, state = 'failed') {
 }
 
 describe('bounded host history maintenance', () => {
+  it('keeps writes inside the minute throttle pending until a sample actually completes', () => fixture((_history, sql, meter) => {
+    const watch = new WriteWatch(), tracked = meter.wrap(watch.wrap(sql));
+    let now = NOW;
+    const history = new HostHistoryService(tracked, { hostResources: () => [], cachedAccountStatus: () => ({}) } as any, () => now, watch);
+    history.init(); history.sample();
+    now += 30000;
+    tracked.exec('INSERT INTO usage_quota_history VALUES(?,?,?,?,?)', 'test', 'codex', 'codex', now,
+      JSON.stringify({ status: 'ok', windows: { weekly: { present: true, percent_remaining: 71 } } }));
+    history.sample();
+    expect(history.query('1h').series.some((s: any) => s.kind === 'quota_window')).toBe(false);
+    now += 30000;
+    history.sample();
+    const weekly = history.query('1h').series.find((s: any) => s.kind === 'quota_window' && s.metric === 'weekly');
+    expect(weekly.points.some((point: any) => point.value === 71)).toBe(true);
+  }));
+
   it('does zero SQL work for unchanged sources after the old timer ceiling, but observes new quota journals', () => fixture((_history, sql, meter) => {
     const watch = new WriteWatch(), tracked = meter.wrap(watch.wrap(sql));
     let now = NOW;

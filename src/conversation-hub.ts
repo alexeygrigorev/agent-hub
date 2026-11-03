@@ -19,13 +19,13 @@ import type { ConversationLinksService } from './conversation-links';
  * WebSocket hibernation behavior.
  */
 export class Hub extends BaseHub {
-  public mcpUsage: McpUsage;
-  public mcpOAuth: McpOAuth;
-  public conversationsService: ConversationsService;
-  public linksService: ConversationLinksService;
+  public mcpUsage!: McpUsage;
+  public mcpOAuth!: McpOAuth;
+  public conversationsService!: ConversationsService;
+  public linksService!: ConversationLinksService;
 
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
+  protected override afterInitializeServices(env: Env): void {
+    super.afterInitializeServices(env);
     this.mcpUsage = new McpUsage(this.sql);
     this.mcpOAuth = new McpOAuth(this.sql, env, fn => this.ctx.storage.transactionSync(fn), (req, client, resource) => this.refreshCredential(req, { client, resource }));
     const storage = this.ctx.storage as DurableObjectStorage & {
@@ -182,6 +182,11 @@ export class Hub extends BaseHub {
   }
 
   override async fetch(request: Request): Promise<Response> {
+    return this.budgeted(() => this.conversationFetch(request), Response.json(
+      { error: 'do_daily_row_budget_exceeded' }, { status: 503, headers: { 'Retry-After': '3600' } }));
+  }
+
+  private async conversationFetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     if (path === '/mcp') return handleMcp(request, async req => {

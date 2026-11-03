@@ -625,8 +625,8 @@ export class ProvisioningService {
   private async maintainOnce(nowMs: number) {
     const out: any[] = [];
     await this.migrateCredentials(nowMs);
-    const rows = this.sql.exec("SELECT * FROM engine_credentials ORDER BY label").toArray() as any[];
-    for (const row of rows.slice(0, 32)) {
+    const rows = this.sql.exec("SELECT * FROM engine_credentials ORDER BY label LIMIT 32").toArray() as any[];
+    for (const row of rows) {
       const result: any = { label: row.label, generation: row.generation };
       try {
         let files = await this.openCredential(row);

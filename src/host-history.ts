@@ -218,13 +218,13 @@ export class HostHistoryService {
    */
   sample() {
     const now = this.now();
+    let sampleStamp: string | null = null;
     // Source-driven sampling: unchanged evidence cannot create a new sample.
     // Quota journals are dependencies too, so new quota samples invalidate
     // the stamp without a timer-driven full census of an idle fleet.
     if (this.writes) {
-      const stamp = this.writes.stamp('host_health_observations','disk_observations','fleet_accounts','fleet_launches','fleet_sessions_meta','machines','session_resource_usage','resource_resident_samples','usage_quota_history','server_quota_snapshots','fleet_subscriptions');
-      if (stamp === this.lastSampleStamp) return;
-      this.lastSampleStamp = stamp;
+      sampleStamp = this.writes.stamp('host_health_observations','disk_observations','fleet_accounts','fleet_launches','fleet_sessions_meta','machines','session_resource_usage','resource_resident_samples','usage_quota_history','server_quota_snapshots','fleet_subscriptions');
+      if (sampleStamp === this.lastSampleStamp) return;
     }
     this.backfill();
     const last = this.rows("SELECT value FROM resource_history_meta WHERE key='sample'")[0]?.value;
@@ -266,6 +266,9 @@ export class HostHistoryService {
     this.sql.exec("INSERT OR REPLACE INTO resource_history_meta VALUES('sample',?)", now);
     const compacted = this.rows("SELECT value FROM resource_history_meta WHERE key='compact'")[0]?.value;
     if (!compacted || now - Number(compacted) >= 3600000) { this.compact(); this.sql.exec("INSERT OR REPLACE INTO resource_history_meta VALUES('compact',?)", now); }
+    // Only a completed sample serves this source generation. A write inside
+    // the minute throttle (or a failed sample) must remain pending for retry.
+    this.lastSampleStamp = sampleStamp;
   }
   private nativeRunning(machine: string, now: number): number | null {
     const host = this.rows('SELECT last_checkin_at FROM machines WHERE id=?', machine)[0];

@@ -81,6 +81,9 @@ export class OpsLiveness {
     this.sql.exec("CREATE INDEX IF NOT EXISTS ops_intake_closed_time ON intake_audit(captured_at,task_id) WHERE kind IN ('close','cancel')");
     this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_intake_native_started ON session_control_sessions(
       json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_created_at_ms'))`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_active_sessions ON session_control_sessions(id) WHERE state IN ${ACTIVE_STATES}`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_ended_intake_sessions ON session_control_sessions(created_at DESC)
+      WHERE state NOT IN ${ACTIVE_STATES} AND ${requestIntake} IS NOT NULL`);
   }
 
   /** One report from the orchestrator tick (kind=tick) or the host watchdog (kind=watchdog). */
@@ -148,14 +151,17 @@ export class OpsLiveness {
    * fresh host AND made host-sampled progress within the window. A fresh observation of an
    * idle process is not work. `last_work_at` is the newest such evidence (including recent
    * session ends), so the idle clock starts at the last useful work, not at detection. */
-  backlog(now = this.now()): { open_with_ac: number; active_sessions: number; last_work_at: number | null } {
+  backlog(now = this.now()): { open_with_ac: number; active_sessions: number; last_work_at: number | null; truncated?: boolean; open_with_ac_truncated?: boolean } {
     const open = this.rows(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM intake_task_projection INDEXED BY ops_intake_open_ac
       WHERE json_extract(data,'$.status') IN ('open','in_progress') AND json_extract(data,'$.archived_at') IS NULL
       AND length(trim(coalesce(json_extract(data,'$.acceptance_criteria'),'')))>0 ORDER BY id LIMIT 1001)`)[0]?.n ?? 0;
-    const candidates = this.rows(`SELECT s.state, s.updated_at, s.machine_id,
-        CASE WHEN json_valid(s.binding_json) THEN json_extract(s.binding_json,'$.native_id') END AS native_id
-      FROM session_control_sessions s JOIN intake_task_projection p ON p.id=${requestIntake}
-      WHERE s.state IN ${ACTIVE_STATES} AND json_extract(p.data,'$.status') IN ('open','in_progress') LIMIT 201`);
+    // Bound the indexed source BEFORE checking linked intake state. An ocean
+    // of closed/unlinked sessions must not be scanned to find 201 matches.
+    const raw = this.rows(`SELECT state,updated_at,machine_id,${requestIntake} AS intake_id,
+        CASE WHEN json_valid(binding_json) THEN json_extract(binding_json,'$.native_id') END AS native_id
+      FROM session_control_sessions INDEXED BY ops_active_sessions WHERE state IN ${ACTIVE_STATES} ORDER BY id LIMIT 201`);
+    const candidates = raw.slice(0,200).filter(row => row.intake_id && this.rows(`SELECT 1 FROM intake_task_projection
+      WHERE id=? AND json_extract(data,'$.status') IN ('open','in_progress')`,row.intake_id).length);
     const cache = new Map();
     let active = 0, lastWork: number | null = null;
     const saw = (t: number | null) => { if (t !== null && Number.isFinite(t) && t <= now) lastWork = lastWork === null ? t : Math.max(lastWork, t); };
@@ -175,9 +181,10 @@ export class OpsLiveness {
       if (progress !== null && now - progress <= OPS_WINDOW_MS) active++;
     }
     // A recent intake session end is useful work too (bounded: newest rows by creation).
-    for (const r of this.rows(`SELECT updated_at FROM session_control_sessions WHERE state NOT IN ${ACTIVE_STATES}
+    for (const r of this.rows(`SELECT updated_at FROM session_control_sessions INDEXED BY ops_ended_intake_sessions WHERE state NOT IN ${ACTIVE_STATES}
       AND ${requestIntake} IS NOT NULL ORDER BY created_at DESC LIMIT 32`)) saw(Date.parse(r.updated_at) || null);
-    return { open_with_ac: open, active_sessions: active, last_work_at: lastWork };
+    return { open_with_ac: open, active_sessions: active, last_work_at: lastWork,
+      ...(raw.length > 200 ? { truncated: true } : {}), ...(open > 1000 ? { open_with_ac_truncated: true } : {}) };
   }
 
   /** Rolling [now-24h, now) counts. A native binding proves a start; queue creation
@@ -263,6 +270,8 @@ export class OpsLiveness {
 
   private async idleTick(now: number, byRole: Map<any, Obj>): Promise<Obj> {
     const b = this.backlog(now);
+    if (b.truncated && b.active_sessions === 0 && b.open_with_ac > 0)
+      return { state: 'observation_incomplete', ...b };
     const open = this.rows('SELECT * FROM ops_backlog_idle WHERE resolved_at IS NULL ORDER BY id DESC LIMIT 1')[0];
     if (b.open_with_ac === 0 || b.active_sessions > 0) {
       if (open) {

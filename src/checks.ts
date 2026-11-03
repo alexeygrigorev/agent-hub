@@ -112,6 +112,7 @@ export class ChecksService {
 
   init() {
     for (const stmt of CHECKS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
+    this.sql.exec("CREATE INDEX IF NOT EXISTS hub_check_slots_retry_due ON hub_check_slots(lease_until,name) WHERE state!='done'");
     // Bound candidate visits before testing expiry; an expired backlog must
     // never force a whole-history scan just to discover a live overdue row.
     this.sql.exec('CREATE INDEX IF NOT EXISTS messages_check_pending_created ON messages(created_at,to_actor,expires_at,registry_unbound_to) WHERE acked_at IS NULL');
@@ -161,10 +162,12 @@ export class ChecksService {
   async runDue(deps: ActionDeps, only?: string): Promise<any[]> {
     const results: any[] = [];
     let insertedRun = false;
-    const names = (only
+    const dueNames = (only
       ? this.sql.exec('SELECT name FROM hub_checks WHERE name=?', only).toArray()
       : this.sql.exec('SELECT name FROM hub_checks WHERE enabled=1 AND next_due_at<=? ORDER BY next_due_at,name LIMIT 100', new Date(this.now()).toISOString()).toArray())
       .map(r => String(r.name));
+    const retryNames = only ? [] : this.sql.exec("SELECT name FROM hub_check_slots WHERE state!='done' AND lease_until<=? ORDER BY lease_until,name LIMIT 100",this.now()).toArray().map(r=>String(r.name));
+    const names=[...new Set([...retryNames,...dueNames])];
     for (const name of names) {
       if (only && name !== only) continue;
       const now = this.now(); const at = new Date(now).toISOString();

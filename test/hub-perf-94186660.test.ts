@@ -217,7 +217,8 @@ describe('fleet sessions are keyset-paged with a small default page', () => {
     const svc = new FleetService(t.proxy, (cb: any) => cb(), () => Date.now());
     const first: any = await (await svc.handle(new Request('https://hub.test/api/fleet'), admin)).json();
     expect(first.sessions).toHaveLength(FLEET_SESSIONS_DEFAULT);
-    expect(first.sessions_total).toBe(250);
+    expect(first.sessions_total).toBeNull();
+    expect(first.sessions_total_unknown).toBe(true);
     expect(first.sessions_truncated).toBe(true);
     expect(typeof first.sessions_cursor_next).toBe('string');
     // Walk the whole list at limit 50, including across duplicate-tag pages.
@@ -268,7 +269,8 @@ describe('fleet sessions are keyset-paged with a small default page', () => {
     hub.sql.exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
       'fleetm9', 'nat-new', 'tag-new', 'codex', 'running', 'active', new Date().toISOString(), '/w/new', null, 'acc');
     const changed: any = await (await svc.handle(new Request('https://hub.test/api/fleet?sections=sessions&sessions_limit=10'), admin)).json();
-    expect(changed.sessions_total).toBe(31);
+    expect(changed.sessions_total).toBeNull();
+    expect(changed.sessions_total_unknown).toBe(true);
   }));
 
   it('keeps the default page small as the table grows past 1000 rows', withHub(async (hub: Hub, state: DurableObjectState) => {
@@ -278,7 +280,8 @@ describe('fleet sessions are keyset-paged with a small default page', () => {
     const res = await svc.handle(new Request('https://hub.test/api/fleet'), admin);
     const body: any = await res.json();
     expect(body.sessions).toHaveLength(FLEET_SESSIONS_DEFAULT);
-    expect(body.sessions_total).toBe(1200);
+    expect(body.sessions_total).toBeNull();
+    expect(body.sessions_total_unknown).toBe(true);
     expect(body.sessions_truncated).toBe(true);
     const bytes = JSON.stringify(body).length;
     expect(bytes, 'default fleet page must stay a small page').toBeLessThan(512 * 1024);

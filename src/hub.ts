@@ -682,12 +682,16 @@ export class Hub extends DurableObject {
     }
 
     this.quotaStore = new QuotaStore(this.sql, this.ctx, this.env);
+    this.afterInitializeServices(env);
   }
+
+  /** Extension initialization runs inside the same prepaid constructor gate. */
+  protected afterInitializeServices(_env: Env): void {}
 
   /** Every native event passes through this gate, including WebSocket events.
    * No SQL alert/meter flush is permitted after exhaustion: the budget logs
    * once, and deleting the alarm prevents runtime/background retry storms. */
-  private async budgeted<T>(fn: () => Promise<T>, exhausted: T): Promise<T> {
+  protected async budgeted<T>(fn: () => Promise<T>, exhausted: T): Promise<T> {
     try {
       if (!this.initializationComplete) {
         await this.rowBudget.begin(true);

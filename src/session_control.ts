@@ -970,8 +970,8 @@ export class SessionControlService {
         // Coalesce: at most one tick is ever outstanding, never a catch-up burst.
         const next = nowMs + ping.every_ms;
         if (session.state !== 'running') { this.sql.exec('UPDATE session_control_pings SET next_at_ms=?, updated_at=? WHERE id=?', nowMs + 15000, at, ping.id); continue; }
-        const busy = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", session.id).toArray()[0]?.n ?? 0);
-        const pendingAll = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").toArray()[0]?.n ?? 0);
+        const busy = Number(this.sql.exec("SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed') LIMIT ?)", session.id, 1).toArray()[0]?.n ?? 0);
+        const pendingAll = Number(this.sql.exec("SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE state IN ('recorded', 'transported', 'claimed') LIMIT ?)", this.maxPending).toArray()[0]?.n ?? 0);
         if (busy > 0 || pendingAll >= this.maxPending) {
           this.sql.exec('UPDATE session_control_pings SET skipped_count = skipped_count + 1, next_at_ms=?, updated_at=? WHERE id=?', next, at, ping.id);
           out.skipped++;
@@ -1065,10 +1065,10 @@ export class SessionControlService {
         const binding = session.binding_json ? parsed(session.binding_json, null) : null;
         const generation = binding?.generation ?? 0;
         const pendingCount = Number(this.sql.exec(
-          "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").toArray()[0]?.n ?? 0);
+          "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE state IN ('recorded', 'transported', 'claimed') LIMIT ?)", this.maxPending).toArray()[0]?.n ?? 0);
         if (pendingCount >= this.maxPending) continue;
         const perSession = Number(this.sql.exec(
-          "SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", session.id).toArray()[0]?.n ?? 0);
+          "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed') LIMIT ?)", session.id, this.maxPerSession).toArray()[0]?.n ?? 0);
         if (perSession >= this.maxPerSession) continue;
         const commandId = crypto.randomUUID();
         const correlation = `cmd:${commandId}:gen:${generation}`;
@@ -3452,13 +3452,13 @@ export class SessionControlService {
               }
             }
             const pendingCount = Number(this.sql.exec(
-              "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").one().n);
+              "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE state IN ('recorded', 'transported', 'claimed') LIMIT ?)", this.maxPending).one().n);
             if (pendingCount >= this.maxPending) {
               refused.push({ key: target.session_key, reasons: ['queue_full: reconciled via commands listing, do not blind-retry'] });
               continue;
             }
             const perSession = Number(this.sql.exec(
-              "SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", live.id).one().n);
+              "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed') LIMIT ?)", live.id, this.maxPerSession).one().n);
             if (perSession >= this.maxPerSession) {
               refused.push({ key: target.session_key, reasons: ['session_queue_full: reconciled via commands listing, do not blind-retry'] });
               continue;
@@ -4865,10 +4865,10 @@ export class SessionControlService {
     if (!this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
     // True caps: refuse new work without evicting pending work.
     const pending = Number(this.sql.exec(
-      "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").one().n);
+      "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE state IN ('recorded', 'transported', 'claimed') LIMIT ?)", this.maxPending).one().n);
     if (pending >= this.maxPending) return response({ error: 'queue_full' }, 429);
     const perSession = Number(this.sql.exec(
-      "SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", session.id).one().n);
+      "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed') LIMIT ?)", session.id, this.maxPerSession).one().n);
     if (perSession >= this.maxPerSession) return response({ error: 'session_queue_full' }, 429);
     const prior: any = this.sql.exec(
       'SELECT * FROM session_control_commands WHERE session_id = ? AND actor = ? AND request_key = ?', session.id, actor, key).toArray()[0];

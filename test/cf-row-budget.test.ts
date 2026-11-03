@@ -137,11 +137,31 @@ describe('durable daily SQL row circuit breaker', () => {
     expect(native.exec).toHaveBeenCalledTimes(1);
   });
 
+  it('charges failed cursor stepping and persists a daily stop even if the caller catches it', async () => {
+    const store = new MemoryStore();
+    const budget = new RowBudget(store, () => 0, LIMITS, CHUNK);
+    await budget.begin();
+    let scanned = 0;
+    const native = { exec() { return {
+      get rowsRead() { return scanned; }, rowsWritten: 0,
+      next() { scanned += 70; throw new Error('malformed JSON after scan'); },
+      [Symbol.iterator]() { return this; },
+    }; } };
+    const sql = budget.wrap(native as any);
+    expect(() => sql.exec('SELECT failing_step').toArray()).toThrow(RowBudgetExceeded);
+    await budget.finish();
+    expect(budget.status().reserved!.read).toBeGreaterThanOrEqual(71);
+    await expect(new RowBudget(store, () => 0, LIMITS, CHUNK).begin()).rejects.toThrow(RowBudgetExceeded);
+  });
+
   it('does not issue SQL allowance if a ledger write fails', async () => {
     const store = new MemoryStore();
-    store.put = async () => { throw new Error('storage unavailable'); };
+    store.put = vi.fn(async () => { throw new Error('storage unavailable'); });
     const budget = new RowBudget(store, () => 0, LIMITS, CHUNK);
     await expect(budget.begin()).rejects.toThrow('storage unavailable');
+    await expect(budget.begin()).rejects.toThrow(RowBudgetExceeded);
+    await budget.finish();
+    expect(store.put).toHaveBeenCalledTimes(1);
     const native = nativeSql(1);
     expect(() => budget.wrap(native as any).exec('SELECT 1')).toThrow(RowBudgetExceeded);
     expect(native.exec).not.toHaveBeenCalled();

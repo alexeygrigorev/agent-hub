@@ -1,3 +1,4 @@
+import { readPlacementPressure, type PlacementPressureSnapshot } from './placement-pressure';
 /**
  * M14/Addendum 6: Disk space monitoring, alert episodes and host ingestion.
  *
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS disk_observations (
   reporter TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_disk_obs_machine ON disk_observations(machine_id, observed_at_ms);
+CREATE INDEX IF NOT EXISTS idx_disk_obs_time ON disk_observations(observed_at_ms);
 
 CREATE TABLE IF NOT EXISTS disk_episodes (
   episode_key TEXT PRIMARY KEY,
@@ -344,6 +346,8 @@ export type HostReservation = {
 export type HostPlacement = {
   machine_pressure: boolean;
   global_pressure: boolean;
+  evidence_truncated?: boolean;
+  evidence_unknown?: boolean;
   reason: string | null;
 };
 
@@ -1063,33 +1067,26 @@ export class MonitoringService {
   private pruneStorage(machineId: string, now: number): void {
     try {
       const retentionCutoff = now - DISK_LIMITS.retentionDays * 86400000;
-      this.sql.exec('DELETE FROM disk_observations WHERE observed_at_ms < ?', retentionCutoff);
+      this.sql.exec(`DELETE FROM disk_observations WHERE id IN (SELECT id FROM disk_observations
+        WHERE observed_at_ms < ? ORDER BY observed_at_ms LIMIT 100)`, retentionCutoff);
 
       // Per-machine cap
       const machineRows = this.sql
         .exec(
-          'SELECT id FROM disk_observations WHERE machine_id = ? ORDER BY observed_at_ms DESC',
-          machineId,
+          'SELECT id FROM disk_observations WHERE machine_id = ? ORDER BY observed_at_ms DESC LIMIT 100 OFFSET ?',
+          machineId, DISK_LIMITS.maxHistoryPerMachine,
         )
         .toArray() as any[];
-      if (machineRows.length > DISK_LIMITS.maxHistoryPerMachine) {
-        const toDelete = machineRows.slice(DISK_LIMITS.maxHistoryPerMachine).map(r => r.id);
+      if (machineRows.length) {
+        const toDelete = machineRows.map(r => r.id);
         const placeholders = toDelete.map(() => '?').join(',');
         this.sql.exec(`DELETE FROM disk_observations WHERE id IN (${placeholders})`, ...toDelete);
       }
 
       // Global cap
-      const totalCount = Number(
-        (this.sql.exec('SELECT COUNT(*) AS n FROM disk_observations').toArray()[0] as any)?.n ?? 0,
-      );
-      if (totalCount > DISK_LIMITS.maxGlobalObservations) {
-        this.sql.exec(
-          `DELETE FROM disk_observations WHERE id IN (
-            SELECT id FROM disk_observations ORDER BY observed_at_ms ASC LIMIT ?
-          )`,
-          totalCount - DISK_LIMITS.maxGlobalObservations,
-        );
-      }
+      this.sql.exec(`DELETE FROM disk_observations WHERE id IN (
+        SELECT id FROM disk_observations ORDER BY observed_at_ms DESC LIMIT 100 OFFSET ?
+      )`, DISK_LIMITS.maxGlobalObservations);
     } catch {
       // Best-effort storage trim
     }
@@ -2034,34 +2031,9 @@ export class MonitoringService {
   /** Read-only placement-pressure snapshot shared by the health projection.
    * Queued holds older than 5 minutes, hard rejections recorded at reserve
    * time (24h), and terminal failures with memory/capacity reasons (24h,
-   * per machine). Fail closed to "no pressure" on any storage error. */
-  private readPlacementPressure(now: number): { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number } {
-    let queuedTotal = 0, queuedHeld = 0, recentRejects = 0, failedTotal = 0;
-    const failedByMachine = new Map<string, number>();
-    try {
-      const heldBefore = new Date(now - 5 * 60000).toISOString();
-      queuedTotal = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued'").toArray()[0]?.n ?? 0);
-      queuedHeld = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued' AND created_at <= ?", heldBefore).toArray()[0]?.n ?? 0);
-    } catch { queuedHeld = 0; }
-    try {
-      recentRejects = Number(this.sql.exec('SELECT COUNT(*) AS n FROM placement_rejections WHERE created_at_ms >= ?', now - 24 * 3600000).toArray()[0]?.n ?? 0);
-    } catch { recentRejects = 0; }
-    try {
-      const dayAgoIso = new Date(now - 24 * 3600000).toISOString();
-      const rows = this.sql.exec("SELECT machine_id, exit_reason, launch_error_json FROM fleet_launches WHERE state = 'failed' AND updated_at >= ?", dayAgoIso).toArray() as any[];
-      for (const row of rows) {
-        const reasons: string[] = [];
-        if (typeof row.exit_reason === 'string' && row.exit_reason) reasons.push(row.exit_reason);
-        try {
-          const diag = JSON.parse(row.launch_error_json || 'null');
-          if (diag && typeof diag.reason === 'string' && diag.reason) reasons.push(diag.reason);
-        } catch { /* ignore */ }
-        if (!reasons.some((r) => r === 'launcher_memory_reserve' || r === 'account_capacity' || r === 'account_concurrency' || r === 'machine_capacity')) continue;
-        failedTotal++;
-        if (row.machine_id) failedByMachine.set(String(row.machine_id), (failedByMachine.get(String(row.machine_id)) ?? 0) + 1);
-      }
-    } catch { failedTotal = 0; }
-    return { queuedTotal, queuedHeld, recentRejects, failedByMachine, failedTotal };
+   * per machine). Samples carry explicit partial/unknown evidence flags. */
+  private readPlacementPressure(now: number): PlacementPressureSnapshot {
+    return readPlacementPressure(this.sql, now);
   }
 
   // The canonical FleetService projection is injected by Hub. This service
@@ -2072,7 +2044,7 @@ export class MonitoringService {
     return this.resourceProjection?.(machineId) ?? { mem_avail_mb: null, reserved_mb: null, floor_mb: MEMORY_FLOOR_MB, next_slot_mb: NEXT_SLOT_MB, headroom_mb: null, headroom_ok: null, stale_telemetry: true, observed_at: null };
   }
 
-  private placementFor(machineId: string, pressure: { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number }, reservation: HostReservation | null): HostPlacement {
+  private placementFor(machineId: string, pressure: PlacementPressureSnapshot, reservation: HostReservation | null): HostPlacement {
     const overdrawn = Boolean(reservation && reservation.headroom_mb !== null && reservation.headroom_mb < 0 && !reservation.stale_telemetry);
     const hostReasons = new Set(['disk_floor', 'launcher_memory_reserve', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
     const reasons = new Set<string>();
@@ -2081,7 +2053,7 @@ export class MonitoringService {
     let hasMachineHoldReason = false;
     // Show the actual current route reasons, including CPU budget numbers.
     try {
-      const holds = this.sql.exec(`SELECT h.rejected_json FROM fleet_memory_holds h JOIN fleet_launches l ON l.id=h.launch_id WHERE l.state='queued' ORDER BY l.created_at LIMIT 20`).toArray();
+      const holds = this.sql.exec(`SELECT h.rejected_json FROM (SELECT id FROM fleet_launches INDEXED BY fleet_launch_expiry WHERE state='queued' ORDER BY created_at LIMIT 20) l JOIN fleet_memory_holds h ON h.launch_id=l.id`).toArray();
       hasHoldRows = holds.length > 0;
       for (const h of holds) for (const r of JSON.parse(String(h.rejected_json))) {
         if (hostReasons.has(String(r.reason))) {
@@ -2098,15 +2070,18 @@ export class MonitoringService {
     const machinePressure = overdrawn || (pressure.queuedTotal > 0 && hasMachineHoldReason);
     const globalPressure = overdrawn || activeQueuedPressure;
     const bits: string[] = [];
+    const countLabel = (source: keyof typeof pressure.truncated, value: number) => pressure.truncated[source] ? `at least ${value}` : String(value);
     if (machinePressure || globalPressure) {
       if (reasons.size) bits.push([...reasons].join(', '));
-      if (pressure.queuedTotal > 0) bits.push(`${pressure.queuedTotal} launch(es) held queued for placement admission (${pressure.queuedHeld} >5 min)`);
-      if (overdrawn && pressure.recentRejects > 0) bits.push(`${pressure.recentRejects} launch rejection(s) for placement admission in 24h`);
+      if (pressure.queuedTotal > 0) bits.push(`${countLabel('queued', pressure.queuedTotal)} launch(es) held queued for placement admission (${countLabel('queued', pressure.queuedHeld)} >5 min)`);
+      if (overdrawn && pressure.recentRejects > 0) bits.push(`${countLabel('rejections', pressure.recentRejects)} launch rejection(s) for placement admission in 24h`);
       const machineFailures = pressure.failedByMachine.get(machineId) ?? 0;
-      if (overdrawn && machineFailures > 0) bits.push(`${machineFailures} terminal failure(s) for placement admission on this host in 24h`);
-      else if (overdrawn && pressure.failedTotal > 0) bits.push(`${pressure.failedTotal} terminal failure(s) for placement admission elsewhere in 24h`);
+      if (overdrawn && machineFailures > 0) bits.push(`${countLabel('failures', machineFailures)} terminal failure(s) for placement admission on this host in 24h`);
+      else if (overdrawn && pressure.failedTotal > 0) bits.push(`${countLabel('failures', pressure.failedTotal)} terminal failure(s) for placement admission elsewhere in 24h`);
     }
-    return { machine_pressure: machinePressure, global_pressure: globalPressure, reason: bits.length ? bits.join('; ') : null };
+    return { machine_pressure: machinePressure, global_pressure: globalPressure,
+      evidence_truncated: Object.values(pressure.truncated).some(Boolean), evidence_unknown: Object.values(pressure.unknown).some(Boolean),
+      reason: bits.length ? bits.join('; ') : null };
   }
 
   /** Host health is never 'ok' while launches are rejected/held for memory

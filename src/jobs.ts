@@ -125,7 +125,12 @@ CREATE INDEX IF NOT EXISTS jobs_root_offered_due_ms ON jobs(${OFFER_MS}) WHERE s
 CREATE INDEX IF NOT EXISTS jobs_nonroot_offered_due_ms ON jobs(${OFFER_MS}) WHERE status='offered' AND kind<>'root-run';
 CREATE INDEX IF NOT EXISTS jobs_root_offered_deadline_ms ON jobs(${DEADLINE_MS}) WHERE kind='root-run' AND status='offered';
 CREATE INDEX IF NOT EXISTS leases_active_due_ms ON leases(${LEASE_MS}) WHERE holder_job_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS leases_active_acquired_ms ON leases(${ACQUIRED_MS}) WHERE holder_job_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS leases_active_name ON leases(name) WHERE holder_job_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS leases_holder_job ON leases(holder_job_id) WHERE holder_job_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS job_claim_deadlines(lease_name TEXT PRIMARY KEY,job_id TEXT NOT NULL,due_ms INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS job_claim_deadlines_due ON job_claim_deadlines(due_ms,lease_name);
+CREATE INDEX IF NOT EXISTS job_claim_deadlines_job ON job_claim_deadlines(job_id);
+CREATE TABLE IF NOT EXISTS job_claim_backfill(id INTEGER PRIMARY KEY CHECK(id=1),after_name TEXT NOT NULL,done INTEGER NOT NULL);
 
 CREATE TABLE IF NOT EXISTS offers (
   job_id TEXT,
@@ -329,6 +334,9 @@ export class JobsService {
       if (trimmed) this.sql.exec(trimmed);
     }
 
+    this.sql.exec("CREATE INDEX IF NOT EXISTS credentials_job_subject_live ON credentials(subject) WHERE kind='job' AND revoked_at IS NULL");
+    this.initClaimDeadlines();
+
     const agentCols = ['engine TEXT', 'session_id TEXT', 'workspace TEXT', 'state TEXT', 'health_state TEXT', 'detail TEXT', 'lasthealth TEXT', 'health_at TEXT', 'last_seen_at TEXT'];
     for (const col of agentCols) {
       try {
@@ -466,6 +474,52 @@ export class JobsService {
     }
   }
 
+  /** A maintained queue makes first-action deadlines a singleton index seek.
+   * Filtering claimed jobs after walking every running lease is unbounded,
+   * even when the SELECT ends in LIMIT 1. Both source write orders are safe. */
+  private initClaimDeadlines() {
+    const acquired = expiryMsSql('NEW.acquired_at');
+    for (const event of ['INSERT', 'UPDATE OF holder_job_id,acquired_at']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_lease_${event === 'INSERT' ? 'insert' : 'update'}
+      AFTER ${event} ON leases BEGIN
+        DELETE FROM job_claim_deadlines WHERE lease_name=NEW.name;
+        INSERT INTO job_claim_deadlines SELECT NEW.name,NEW.holder_job_id,${acquired}+300000
+          FROM jobs WHERE id=NEW.holder_job_id AND status='claimed' AND started_at IS NULL AND ${acquired} IS NOT NULL;
+      END`);
+    for (const event of ['INSERT', 'UPDATE OF status,started_at']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_job_${event === 'INSERT' ? 'insert' : 'update'}
+      AFTER ${event} ON jobs BEGIN
+        DELETE FROM job_claim_deadlines WHERE job_id=NEW.id;
+        INSERT INTO job_claim_deadlines SELECT name,NEW.id,${ACQUIRED_MS}+300000
+          FROM leases WHERE holder_job_id=NEW.id AND holder_job_id IS NOT NULL
+            AND NEW.status='claimed' AND NEW.started_at IS NULL AND ${ACQUIRED_MS} IS NOT NULL;
+      END`);
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_lease_delete AFTER DELETE ON leases
+      BEGIN DELETE FROM job_claim_deadlines WHERE lease_name=OLD.name; END`);
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_job_delete AFTER DELETE ON jobs
+      BEGIN DELETE FROM job_claim_deadlines WHERE job_id=OLD.id; END`);
+    this.sql.exec("INSERT OR IGNORE INTO job_claim_backfill VALUES(1,'',0)");
+    this.backfillClaimDeadlines();
+  }
+
+  /** Existing leases migrate in indexed pages. A durable cursor and a real
+   * continuation alarm avoid an unbounded first-deploy scan or starvation. */
+  private backfillClaimDeadlines() {
+    const state: any = this.sql.exec('SELECT after_name,done FROM job_claim_backfill WHERE id=1').toArray()[0];
+    if (!state || state.done) return;
+    this.ctx.storage.transactionSync(() => {
+      const leases = this.sql.exec(`SELECT name,holder_job_id,acquired_at FROM leases INDEXED BY leases_active_name
+        WHERE holder_job_id IS NOT NULL AND name>? ORDER BY name LIMIT ?`, state.after_name, ALARM_BATCH + 1).toArray() as any[];
+      const page = leases.slice(0, ALARM_BATCH);
+      for (const lease of page) {
+        const acquired = parseExpiryMs(lease.acquired_at);
+        if (acquired === null) continue;
+        this.sql.exec(`INSERT OR REPLACE INTO job_claim_deadlines SELECT ?,id,? FROM jobs
+          WHERE id=? AND status='claimed' AND started_at IS NULL`, lease.name, acquired + 300000, lease.holder_job_id);
+      }
+      this.sql.exec('UPDATE job_claim_backfill SET after_name=?,done=? WHERE id=1',
+        page.length ? page[page.length - 1].name : state.after_name, leases.length <= ALARM_BATCH ? 1 : 0);
+    });
+  }
+
   private scheduleAlarm() {
     const jobAlarmTime = this.getAlarmTime();
     const observer = this.deps?.alarmDeadline?.();
@@ -538,13 +592,9 @@ export class JobsService {
       first(`SELECT ${DEADLINE_MS} AS due FROM jobs WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
     }
     first(`SELECT ${LEASE_MS} AS due FROM leases WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
-    // At most ALARM_BATCH active claims per pass; the acquisition index
-    // avoids joining retained terminal jobs or inactive leases.
-    const claimed = this.sql.exec(`SELECT ${ACQUIRED_MS} AS due FROM leases
-      WHERE holder_job_id IS NOT NULL AND ${ACQUIRED_MS} IS NOT NULL
-      AND EXISTS (SELECT 1 FROM jobs WHERE id=leases.holder_job_id AND status='claimed' AND started_at IS NULL)
-      ORDER BY ${ACQUIRED_MS} LIMIT 1`).toArray() as any[];
-    for (const claim of claimed) if (typeof claim.due === 'number') nextTimes.push(claim.due + 5 * 60000);
+    first('SELECT due_ms AS due FROM job_claim_deadlines ORDER BY due_ms,lease_name LIMIT 1');
+    if (!this.sql.exec('SELECT done FROM job_claim_backfill WHERE id=1').toArray()[0]?.done)
+      nextTimes.push(this.now().getTime() + 15000);
 
     if (nextTimes.length === 0) return null;
     nextTimes.sort((a, b) => a - b);
@@ -556,6 +606,7 @@ export class JobsService {
       const nowMs = now.getTime();
       const nowIso = now.toISOString();
 
+      this.backfillClaimDeadlines();
       this.ctx.storage.transactionSync(() => {
         // 1. Expire offers (root-run)
         const rootSchedulingEnabled = isRootSchedulingEnabled(this.sql);
@@ -599,11 +650,9 @@ export class JobsService {
         }
 
         // 3. Claims awaiting first action (5 mins)
-        const noStartLeases = this.sql.exec(
-          `SELECT leases.* FROM leases WHERE holder_job_id IS NOT NULL AND ${ACQUIRED_MS}<=?
-          AND EXISTS (SELECT 1 FROM jobs WHERE id=leases.holder_job_id AND started_at IS NULL AND status='claimed')
-          ORDER BY ${ACQUIRED_MS} LIMIT ?`, nowMs - 5 * 60000, ALARM_BATCH
-        ).toArray();
+        const noStartLeases = this.sql.exec(`SELECT leases.* FROM
+          (SELECT lease_name FROM job_claim_deadlines WHERE due_ms<=? ORDER BY due_ms,lease_name LIMIT ?) pending
+          JOIN leases ON leases.name=pending.lease_name`, nowMs, ALARM_BATCH).toArray();
         for (const lease of noStartLeases) {
           const acq = parseExpiryMs(lease.acquired_at as string);
           if (acq !== null && (acq + 5 * 60000) <= nowMs) {
