@@ -105,10 +105,11 @@ describe('burn-aware model candidates', () => {
       expect(sonnet?.id).toBe('sonnet');
       expect(sonnet.effort).toBe('medium');
       expect(sonnet.factors.burn).toBeGreaterThan(3);
-      const [opus] = modelCandidates({ tier, engine_override_reason: 'This task explicitly requires the Opus route for deep reasoning.' }, route('claude', 'claude'), ad('claude', 'opus', 'medium', 'claude-acct'), claude, NOW);
-      expect(opus?.id).toBe('opus');
-      expect(opus.effort).toBe('medium');
-      expect(opus.factors.burn).toBeGreaterThan(3);
+      // A stale Opus advertisement cannot override the configured route.
+      const [unconfiguredOpus] = modelCandidates(
+        { tier, engine_override_reason: 'This task explicitly requests deep reasoning.' },
+        route('claude', 'claude'), ad('claude', 'opus', 'medium', 'claude-acct'), claude, NOW);
+      expect(unconfiguredOpus).toBeUndefined();
     }
   });
 

@@ -4,11 +4,11 @@ import { canonicalAccountLabel } from './quota';
 import { burnFactor, burnForecast, burnReleasesExplicitOnly, burnRules } from './burn';
 import { grokDemotion, netHeadroom, pacingFor, providerPreference, resetUrgency, routeScore, type ProviderPacing, type RouteScoreFactors } from './pacing';
 export { policy };
-const HEAVY_MODEL_IDS = new Set(['sol', 'astra', 'argon', 'argon-gemini', 'opus']);
+const HEAVY_MODEL_IDS = new Set(['sol', 'astra', 'argon', 'argon-gemini']);
 const FORBIDDEN_HEAVY_EFFORTS = new Set(['high', 'max', 'xhigh']);
 // These are the heavy deep-model selectors. Some deep-tier models (for
 // example Sonnet) are intentionally also eligible in daily.
-const DEEP_MODEL_IDS = new Set(['argon', 'argon-gemini', 'astra', 'opus']);
+const DEEP_MODEL_IDS = new Set(['argon', 'argon-gemini', 'astra']);
 const isGeminiArgonModelName = (value: unknown) =>
   typeof value === 'string' && value.startsWith('gemini-4-argon-');
 
@@ -33,6 +33,11 @@ export function isHeavyModel(model: any): boolean {
 }
 
 export function heavyModelEffortAllowed(model: any, effort: unknown): boolean {
+  // Claude has a strict route contract independent of the heavy-model tiers.
+  if (model && typeof model === 'object' &&
+      (model.provider === 'claude' || model.engine === 'claude')) {
+    return model.id === 'sonnet' && model.model === 'sonnet' && effort === 'medium';
+  }
   if (!isHeavyModel(model)) return true;
   if (typeof effort !== 'string' || !effort.trim()) return false;
   return !FORBIDDEN_HEAVY_EFFORTS.has(effort.trim().toLowerCase());
@@ -49,7 +54,7 @@ export function isDeepModel(model: any): boolean {
 export function deepModelAllowedForTier(model: any, tier: unknown, explicitlyRequested: boolean): boolean {
   if (!isDeepModel(model)) return true;
   // Daily and deep are explicit-use tiers for these heavy model selectors;
-  // review may still contain a deliberately configured model such as Opus.
+  // review can include a configured deep model directly in its tier list.
   if (tier === 'daily' || tier === 'deep') return explicitlyRequested;
   const id = typeof model === 'string' ? model : model?.id;
   const members: unknown = (policy.tiers as any)[tier as string];

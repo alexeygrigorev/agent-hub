@@ -27,6 +27,45 @@ const metered = (at: string, pct: number, now: number) => JSON.stringify({
 const broken = (at: string) => JSON.stringify({ status: 'unknown', error: 'unavailable', observed_at: at, details: { limit_reached: null }, windows: {} });
 
 describe('default tier policy', () => {
+  it('routes Claude only through Sonnet at medium effort in every tier', () => {
+    const claudeModels = (policy.models as any[]).filter(model =>
+      model.provider === 'claude' || model.engine === 'claude' ||
+      /claude/i.test(`${model.id} ${model.model}`));
+    expect(claudeModels.map(({ id, model, effort }) => ({ id, model, effort })))
+      .toEqual([{ id: 'sonnet', model: 'sonnet', effort: 'medium' }]);
+
+    const byId = new Map((policy.models as any[]).map(model => [model.id, model]));
+    for (const model of policy.models as any[]) {
+      expect(`${model.id} ${model.model}`.toLowerCase()).not.toContain('haiku');
+    }
+    for (const [tier, ids] of Object.entries(policy.tiers) as [string, string[]][]) {
+      for (const id of ids) {
+        expect(id.toLowerCase(), `${tier}:${id}`).not.toContain('haiku');
+        const model: any = byId.get(id);
+        if (model && (model.provider === 'claude' || model.engine === 'claude' ||
+            /claude/i.test(`${model.id} ${model.model}`))) {
+          expect({ id, model: model.model, effort: model.effort }, `${tier}:${id}`)
+            .toEqual({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
+        }
+      }
+    }
+    const defaultRouteIds = [
+      ...((Array.isArray((policy.rules as any).auto_start_models)
+        ? (policy.rules as any).auto_start_models : []) as string[]),
+      ...((Array.isArray((policy.rules as any).fallback_models)
+        ? (policy.rules as any).fallback_models : []) as string[]),
+    ];
+    for (const id of defaultRouteIds) {
+      expect(String(id).toLowerCase()).not.toContain('haiku');
+      const model: any = byId.get(id);
+      if (model && (model.provider === 'claude' || model.engine === 'claude' ||
+          /claude/i.test(`${model.id} ${model.model}`))) {
+        expect({ id, model: model.model, effort: model.effort })
+          .toEqual({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
+      }
+    }
+  });
+
   it('does not list luna first and excludes haiku, sol-high and GLM on opencode', () => {
     const daily = policy.tiers.daily as string[];
     expect(policy.default_tier).toBe('daily');

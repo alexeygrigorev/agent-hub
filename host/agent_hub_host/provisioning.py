@@ -2623,6 +2623,53 @@ def managed_codex_effort_args(bundle, extra_argv):
     return ['-c', 'model_reasoning_effort=' + json.dumps(effort)] if effort else []
 
 
+def managed_claude_route_args(bundle, bypass_flags, extra_argv):
+    """Force managed Claude invocations to the Hub Sonnet/medium contract.
+
+    Bundle and session argv can both contain old model/effort defaults. Remove
+    those flags and place the authoritative route arguments after other
+    options, before print-mode prompts. Hub's adapter marker is accepted only
+    for medium; all other values fail closed.
+    """
+    if bundle.get('provider') != 'claude':
+        return []
+    marker = '--hub-session-effort='
+    session_efforts = [arg[len(marker):] for arg in extra_argv
+                       if isinstance(arg, str) and arg.startswith(marker)]
+    if len(set(session_efforts)) > 1 or any(e != 'medium' for e in session_efforts):
+        raise ValueError('Claude routes require Sonnet at medium effort')
+
+    def strip_route_flags(args):
+        result = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == '-p':
+                result.append(arg)
+                i += 1
+                if i < len(args):
+                    result.append(args[i])
+                    i += 1
+            elif arg == '--print':
+                result.append(arg)
+                i += 1
+            elif arg.startswith(marker):
+                i += 1
+            elif arg in ('--model', '-m', '--effort'):
+                i += 2
+            elif arg.startswith('--model=') or arg.startswith('--effort='):
+                i += 1
+            else:
+                result.append(arg)
+                i += 1
+        return result
+
+    args = strip_route_flags(list(bundle.get('args') or []) + list(bypass_flags or []) + list(extra_argv))
+    route_args = ['--model', 'sonnet', '--effort', 'medium']
+    prompt_index = next((i for i, arg in enumerate(args) if arg in ('-p', '--print')), len(args))
+    return args[:prompt_index] + route_args + args[prompt_index:]
+
+
 def normalize_engine_argv(argv):
     """`prog run <label> ...` (engine subcommand injected before the label) -> `prog <label> run ...`."""
     argv = list(argv)
@@ -2719,12 +2766,16 @@ def execute():
                     if '--dangerously-skip-permissions' not in extra_argv and '--dangerously-skip-permissions' not in b.get('args', []):
                         bypass_flags = ['--dangerously-skip-permissions']
             from .codex_interactive import isolated_argv
-            effort_args = managed_codex_effort_args(b, extra_argv)
-            # This adapter-only marker is consumed above and must never reach Codex.
-            extra_argv = [arg for arg in extra_argv if not arg.startswith('--hub-session-effort=')]
-            # Bundle args carry startup defaults. Place Hub policy/session effort
-            # after them, with explicit caller argv last so it can override policy.
-            argv = command + isolated_argv(b['provider'], b['args'] + bypass_flags + effort_args + extra_argv)
+            if b['provider'] == 'claude' and not is_diagnostic:
+                claude_args = managed_claude_route_args(b, bypass_flags, extra_argv)
+                argv = command + isolated_argv(b['provider'], claude_args)
+            else:
+                effort_args = managed_codex_effort_args(b, extra_argv)
+                # This adapter-only marker is consumed above and must never reach Codex.
+                extra_argv = [arg for arg in extra_argv if not arg.startswith('--hub-session-effort=')]
+                # Bundle args carry startup defaults. Place Hub policy/session effort
+                # after them, with explicit caller argv last so it can override policy.
+                argv = command + isolated_argv(b['provider'], b['args'] + bypass_flags + effort_args + extra_argv)
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
         if not is_diagnostic:
             allowed, reason = hub_launch_gate(label)

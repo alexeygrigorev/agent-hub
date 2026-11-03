@@ -1624,6 +1624,48 @@ def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, exp
         assert overrides[0] == 'model_reasoning_effort="high"'
 
 
+def test_managed_claude_execution_argv_forces_sonnet_medium(tmp_path, monkeypatch):
+    managed = tmp_path / 'managed'
+    managed.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: managed)
+    label = 'shared-claude'
+    b = {'label': label, 'provider': 'claude', 'version': '1.0.0',
+         'revision': '22222222-2222-4222-8222-222222222222',
+         'files': {}, 'env': {}, 'args': ['--model', 'opus', '--effort', 'high']}
+    dest = managed / (label + '-' + b['revision'])
+    dest.mkdir(mode=0o700)
+    p.write_json(dest / 'bundle.json', b)
+    p.write_json(managed / 'state.json', [{'label': label, 'revision': b['revision'], 'provider': 'claude'}])
+    monkeypatch.setattr(p, 'provision_managed_home', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(p, 'refresh_launch_credential', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(p, 'install_managed_engine_permissions', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(p, 'engine_argv', lambda *_args, **_kwargs: ['/managed/bin/claude'])
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda *_args: (True, 'ok'))
+    calls = []
+    monkeypatch.setattr(p.os, 'execve', lambda command, argv, env: calls.append((command, argv, env)))
+    monkeypatch.setattr(sys, 'argv', [
+        'hub', label, '--model', 'sonnet', '--effort', 'high',
+        '--hub-session-effort=medium', '-p', 'synthetic prompt',
+    ])
+
+    p.execute()
+
+    command, argv, _env = calls[0]
+    assert command == '/managed/bin/claude'
+    assert argv.count('--model') == 1
+    assert argv.count('--effort') == 1
+    assert argv[argv.index('--model') + 1] == 'sonnet'
+    assert argv[argv.index('--effort') + 1] == 'medium'
+    assert argv[-2:] == ['-p', 'synthetic prompt']
+    assert '--hub-session-effort=medium' not in argv
+
+
+def test_managed_claude_effort_marker_rejects_non_medium():
+    with pytest.raises(ValueError, match='Claude routes require Sonnet at medium effort'):
+        p.managed_claude_route_args(
+            {'provider': 'claude', 'args': []}, [], ['--hub-session-effort=high'])
+
+
 def test_antigravity_environment_drops_user_proxy_variables(tmp_path, monkeypatch):
     # Desktop: HTTPS_PROXY=127.0.0.1:8899 made agy's OAuth refresh fail ('Authentication required')
     # with a valid, Hub-identical token; the same home answered OK without the proxy env.
