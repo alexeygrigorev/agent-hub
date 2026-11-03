@@ -1812,5 +1812,3 @@ def test_admission_partial_opus_selection_and_model_mismatch_diagnostic(tmp_path
     classified = dispatch_diagnostics.classify(exc_info.value)
     assert classified['reason'] == 'model_unsupported'
     assert classified['reason'] != 'admission_refused'
-
-
