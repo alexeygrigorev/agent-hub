@@ -68,6 +68,59 @@ agent readers can list/show. API routes are `GET /api/repos`,
 Seed/refresh accept `{"repos": [...]}` in bounded batches. MCP tools `repos_list`,
 `repos_show`, `repos_edit` use the same routes and authorization.
 
+## Deployment readiness: green edge is not a usable duplicate API
+
+Incident evidence (1 Nov 2026, intake 4c0bae31): GitHub Actions run
+`41291900819` completed successfully for `6d0aa9d` at 09:27:06 UTC. The
+operator reported that both Hub domain manifests advertised that commit, while
+PATCH requests containing `status`/`canonical` still returned HTTP 400
+`invalid_human_fields` on both domains until at least 09:30 UTC; a queried
+PATCH and then an ordinary CLI PATCH succeeded at 09:33:22 UTC. The delay's
+cause is unverified.
+
+The source history explains what the error establishes. Before `6d0aa9d`, the
+PATCH validator allowed only human metadata keys and returned
+`invalid_human_fields` for `status`/`canonical` before it looked up a registry
+row. In `6d0aa9d`, those keys became operator-editable and the validator's
+error changed to `invalid_repo_fields`. With a valid body and a missing repo,
+the updated handler proceeds to the lookup and returns `repo_not_found`.
+Thus the observed `invalid_human_fields` is evidence that those requests hit
+the pre-change API behavior. It does not establish why that behavior remained
+reachable after the green run; no cache or propagation cause is known.
+
+The deployment smoke in that run checked `/livez`, the CLI manifest's
+`built_from_commit`, and the worker's JSON authentication response from
+`/api/sessions`. These checks do not exercise
+`PATCH /api/repos/{name}`. `/livez` is constant unauthenticated edge liveness;
+the manifest is a static asset. Authenticated `GET /api/healthz` exercises the
+Durable Object and returns a constant body,
+`{"status":"ok","component":"hub-do"}`; it establishes authenticated DO
+reachability, not that a particular repo API contract is active.
+
+After a registry deploy, verify readiness before editing classifications:
+
+1. Confirm both Hub domain manifests report the expected release commit.
+2. Using the existing authenticated operator client, confirm
+   `GET /api/healthz` returns 200 and the expected `hub-do` body. Keep the
+   credential private.
+3. Generate a fresh UUID repo name. First request
+   `GET /api/repos/<probe>` and require 404 `repo_not_found`; stop if the row
+   exists or the response differs. Send an authenticated
+   `PATCH /api/repos/<probe>` with
+   `{"status":"duplicate","canonical":"readiness-probe-target"}`.
+   Require 404 `repo_not_found`, then GET the same name and require 404 again.
+   This exercises the new field validator and missing-row lookup without
+   creating, changing, or cleaning up any registry record. In particular,
+   `invalid_human_fields` means the new API contract is not active. Treat any
+   other unexpected result as not ready and investigate; do not proceed with
+   production classifications.
+4. Only after the probe passes, run ordinary `hub repos edit` classifications.
+
+`test/repos.test.ts` pins the contract at the real exported Worker entry point
+(`SELF.fetch` through Worker auth into the Durable Object): authenticated
+health and unauthorized health, duplicate PATCH and canonical resolution,
+refresh preservation, and a missing-row PATCH probe with no write.
+
 ## Session resolution
 
 An exact repository name takes precedence over labels/aliases of other entries.
