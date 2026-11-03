@@ -442,15 +442,15 @@ print(json.dumps({
                          "credential_generation": 6,
                          "observed_at": "2026-10-30T09:00:00Z",
                      }), \
-                     patch.object(sys, "stdin", io.StringIO(json.dumps({"selection": {"model": "opus"}}))):
-                    buf_opus = io.StringIO()
-                    with patch.object(sys, "stdout", buf_opus):
+                     patch.object(sys, "stdin", io.StringIO(json.dumps({"selection": {"model": "sonnet"}}))):
+                    buf_sonnet = io.StringIO()
+                    with patch.object(sys, "stdout", buf_sonnet):
                         provisioning.admission()
-                    out_opus = json.loads(buf_opus.getvalue())
-                    self.assertTrue(out_opus["launch_allowed"])
-                    self.assertTrue(out_opus["model_supported"])
-                    self.assertEqual(out_opus["model"], "opus")
-                    self.assertEqual(out_opus["effort"], "high")
+                    out_sonnet = json.loads(buf_sonnet.getvalue())
+                    self.assertTrue(out_sonnet["launch_allowed"])
+                    self.assertTrue(out_sonnet["model_supported"])
+                    self.assertEqual(out_sonnet["model"], "sonnet")
+                    self.assertEqual(out_sonnet["effort"], "medium")
 
 
 if __name__ == "__main__":

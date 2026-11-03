@@ -1743,8 +1743,8 @@ def test_admission_reports_host_identity_missing_when_host_json_absent_or_unauth
     assert '"host_identity_missing": ' + json.dumps(classified['message']) in fleet_ts
 
 
-def test_admission_partial_opus_selection_and_model_mismatch_diagnostic(tmp_path, monkeypatch, capsys):
-    """Intake 9104edb4 AC(c): partial selection {'model': 'opus'} resolves against policy_models, and model_mismatch surfaces as model_unsupported."""
+def test_admission_partial_sonnet_selection_and_model_mismatch_diagnostic(tmp_path, monkeypatch, capsys):
+    """A policy-defined partial Claude selection resolves and model mismatch stays explicit."""
     import io
     from agent_hub_host import dispatch_diagnostics, fleet
 
@@ -1776,15 +1776,15 @@ def test_admission_partial_opus_selection_and_model_mismatch_diagnostic(tmp_path
     })
     monkeypatch.setattr(sys, 'argv', ['admission', 'hub-claude'])
 
-    # Partial selection {'model': 'opus'} without 'id' or 'engine' resolves 'opus' + 'high'
-    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps({'selection': {'model': 'opus'}})))
+    # Partial selection {'model': 'sonnet'} without 'id' or 'engine' resolves to the current policy effort.
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps({'selection': {'model': 'sonnet'}})))
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: False)
     p.admission()
-    out_opus = json.loads(capsys.readouterr().out)
-    assert out_opus['launch_allowed'] is True
-    assert out_opus['model_supported'] is True
-    assert out_opus['model'] == 'opus'
-    assert out_opus['effort'] == 'high'
+    out_sonnet = json.loads(capsys.readouterr().out)
+    assert out_sonnet['launch_allowed'] is True
+    assert out_sonnet['model_supported'] is True
+    assert out_sonnet['model'] == 'sonnet'
+    assert out_sonnet['effort'] == 'medium'
 
     # Unsupported model returns reason='model_mismatch' and fleet surfaces model_unsupported (not admission_refused)
     monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps({'selection': {'model': 'nonexistent-model'}})))
