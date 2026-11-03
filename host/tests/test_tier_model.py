@@ -81,10 +81,12 @@ def test_configured_model_accepts_per_session_effort_override():
     assert configured_selection(selection, 'codex', 'codex')['effort'] == 'low'
     with pytest.raises(ValueError, match='model_unsupported'):
         configured_selection(dict(selection, effort='xhigh'), 'codex', 'codex')
-    # The host sees the selected effort but not whether it was a policy
-    # default or an explicit request. Hub routing rejects explicit high for
-    # Astra/Sol; the host still needs to accept the configured default.
-    assert configured_selection(dict(selection, effort='high'), 'codex', 'codex')['effort'] == 'high'
+    # Intake 8852ba59: astra defaults to medium; Hub routing rejects explicit
+    # high for Astra/Sol, so the host accepts the configured medium default
+    # (exact policy match) and the low override, but refuses high.
+    assert configured_selection(dict(selection, effort='medium'), 'codex', 'codex')['effort'] == 'medium'
+    with pytest.raises(ValueError, match='model_unsupported'):
+        configured_selection(dict(selection, effort='high'), 'codex', 'codex')
 
 
 def test_model_visible_in_list():
