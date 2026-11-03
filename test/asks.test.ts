@@ -33,8 +33,10 @@ const DONE = (extra: string) => `DONE\nevidence: agent-hub@0123456789abcdef push
 async function fixture(fn: (h: any, ledger: AskLedger, alerts: any[], clock: { now: number }) => any) {
   return inDO(stub(), async (h: any) => {
     for (const t of ['tasks', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    for (const t of ['ask_messages', 'asks', 'ask_agents', 'ask_gaps', 'ask_sources', 'liveness_alerts']) h.sql.exec('DELETE FROM ' + t);
-    h.sql.exec("UPDATE ask_meta SET gap_scope='agent',last_tick=NULL,last_result=NULL,daily_day=NULL WHERE id=1");
+    for (const t of ['ask_messages', 'asks', 'ask_agents', 'ask_gaps', 'ask_sources', 'ask_reconcile_launches', 'liveness_alerts']) h.sql.exec('DELETE FROM ' + t);
+    h.sql.exec('UPDATE ask_reconcile_caps SET max_live=1,daily_cap=8,capped_note_day=NULL WHERE id=1');
+    h.sql.exec(`UPDATE ask_meta SET gap_scope='agent',last_tick=NULL,last_result=NULL,daily_day=NULL,last_user_batch_at=NULL,
+      reconcile_intake=NULL,reconcile_session=NULL,reconcile_started_at=NULL,reconcile_batch_at=NULL WHERE id=1`);
     const alerts: any[] = [];
     const clock = { now: Date.now() };
     const ledger = new AskLedger(h.sql, h.intakeService, (f: any) => f(), {
@@ -180,6 +182,92 @@ describe('contract v2: both sides, JSONL, reconciler (290b935a A10-A13)', () => 
     expect((await rl.reconcileDue()).state).toBe('started');
     state = 'running'; // the fake reports the new session rec-2 as live
     expect((await rl.reconcileDue()).state).toBe('running');
+  }));
+});
+
+describe('reconciler caps (intake 7e7f778e)', () => {
+  it('reserves the single default live slot before awaiting start, so concurrent ticks do not spawn twice', () => fixture(async (h, l, alerts, clock) => {
+    let resolveStart!: (value: any) => void;
+    const starts: any[] = [];
+    const rl = new AskLedger(h.sql, h.intakeService, (f: any) => f(), {
+      start: async (input: any) => { starts.push(input); return await new Promise(resolve => { resolveStart = resolve; }); },
+      sessionState: () => 'running',
+    }, () => clock.now);
+    const t = await intake(h, '1. Track asks');
+    expect(rl.settings({ reconcile_intake: t.id.slice(0, 8) }).reconcile_max_live).toBe(1);
+    expect(rl.summary().meta.reconcile).toMatchObject({ max_live: 1, daily_cap: 8, launches_today: 0 });
+    ingest(rl, 'dev', [msg('t990u', 'please map this ask')]);
+    await rl.tick();
+    clock.now += 2 * 60000 + 1;
+    const first = rl.reconcileDue();
+    const concurrent = rl.reconcileDue();
+    expect(starts).toHaveLength(1);
+    expect((await concurrent).state).toBe('launching');
+    resolveStart({ status: 202, body: { id: 'rec-single' } });
+    expect(await first).toMatchObject({ state: 'started', session_id: 'rec-single' });
+    expect(starts[0]).toMatchObject({ intake_task_id: t.id, mode: 'headless', workspace: 'agent-hub' });
+    const history = h.intakeService.statusTaskById({ admin: true }, t.id).history;
+    expect(JSON.stringify(history)).toContain('Ask reconciler launch starting');
+    expect(JSON.stringify(history)).toContain('Ask reconciler launched session rec-single');
+  }));
+
+  it('daily launch-attempt cap leaves excess asks queued and records the cap on the standing intake', () => fixture(async (h, l, alerts, clock) => {
+    const starts: any[] = [];
+    const rl = new AskLedger(h.sql, h.intakeService, (f: any) => f(), {
+      start: async (input: any) => { starts.push(input); return { status: 202, body: { id: 'rec-' + starts.length } }; },
+      sessionState: () => 'stopped',
+    }, () => clock.now);
+    const t = await intake(h, '1. Track asks');
+    expect(rl.settings({ reconcile_intake: t.id.slice(0, 8), reconcile_daily_cap: 2 })).toMatchObject({ reconcile_max_live: 1, reconcile_daily_cap: 2 });
+    for (let i = 0; i < 4; i++) {
+      ingest(rl, 'dev', [msg(`t${960 + i}u`, `please do thing number ${i}`)]);
+      await rl.tick();
+      clock.now += 2 * 60000 + 1;
+      const result = await rl.reconcileDue();
+      expect(result.state).toBe(i < 2 ? 'started' : 'capped');
+    }
+    expect(starts).toHaveLength(2);
+    expect((await rl.reconcileDue()).state).toBe('capped');
+    expect(starts).toHaveLength(2);
+    const history = JSON.stringify(h.intakeService.statusTaskById({ admin: true }, t.id).history);
+    expect(history).toContain('launched session rec-1');
+    expect(history).toContain('launched session rec-2');
+    expect(history).toContain('daily launch-attempt cap reached');
+    expect(rl.summary().meta.reconcile).toMatchObject({ launches_today: 2, daily_cap: 2, max_live: 1, pending_or_live: 0 });
+    expect(() => rl.settings({ reconcile_max_live: 0 })).toThrow();
+    expect(() => rl.settings({ reconcile_daily_cap: 101 })).toThrow();
+    clock.now += 24 * 3600000;
+    ingest(rl, 'dev', [msg('t970u', 'one more thing')]);
+    await rl.tick();
+    clock.now += 2 * 60000 + 1;
+    expect((await rl.reconcileDue()).state).toBe('started');
+  }));
+
+  it('holds an unknown start slot and replays the same key instead of launching a second session', () => fixture(async (h, l, alerts, clock) => {
+    const starts: any[] = [];
+    const rl = new AskLedger(h.sql, h.intakeService, (f: any) => f(), {
+      start: async (input: any) => {
+        starts.push(input);
+        return starts.length === 1 ? { status: 502, body: { error: 'admission_outcome_unknown' } } : { status: 202, body: { id: 'rec-replayed' } };
+      },
+      sessionState: () => null,
+    }, () => clock.now);
+    const t = await intake(h, '1. Track asks');
+    rl.settings({ reconcile_intake: t.id.slice(0, 8) });
+    ingest(rl, 'dev', [msg('t980u', 'first ask here')]);
+    await rl.tick();
+    clock.now += 2 * 60000 + 1;
+    expect((await rl.reconcileDue()).state).toBe('uncertain');
+    ingest(rl, 'dev', [msg('t981u', 'second ask here')]);
+    await rl.tick();
+    expect((await rl.reconcileDue()).state).toBe('launching');
+    clock.now += 31 * 60000;
+    expect(await rl.reconcileDue()).toMatchObject({ state: 'started', session_id: 'rec-replayed', replay: true });
+    expect(starts).toHaveLength(2);
+    expect(starts[0].key).toBe(starts[1].key);
+    expect(starts.every(input => input.intake_task_id === t.id)).toBe(true);
+    expect((await rl.reconcileDue()).state).toBe('running');
+    expect(starts).toHaveLength(2);
   }));
 });
 

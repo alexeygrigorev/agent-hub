@@ -21,8 +21,9 @@ Alexey's asks kept getting dropped. Each fix so far was a prose rule that only w
 4. **Reconciler (290b935a A10).**
    - When a batch brings new user asks, the 5-minute cron starts one headless reconciler session 2 minutes after the last such batch. The engine follows routing policy.
    - The reconciler maps each ask, adds a verbatim AC line, files a missing intake, or dismisses the ask with a reason.
-   - It never runs two at a time.
-   - Turn it on with `hub asks settings --reconcile-intake <id>`.
+   - It defaults to at most one live reconciler session and eight launch attempts per UTC day. Both limits are hard admission caps: asks beyond either limit stay queued and do not start another session. An unknown start result keeps its concurrency slot reserved; recovery replays the same idempotency key so an uncertain response cannot create a duplicate.
+   - Every start attempt is noted on the configured intake, and successful sessions also carry that intake id in their session request. Refusals, unknown results and the daily-cap queue are visible there too.
+   - Configure it with `hub asks settings --reconcile-intake <id>`, `--reconcile-max-live <1..100>` and `--reconcile-daily-cap <0..100>`. A daily cap of zero disables launches. The reconciler remains off until an intake is configured.
 5. **Watchdog tick** (existing 30-minute IntakeWatchdog):
    - An ask still unmapped 30 minutes after it arrived becomes `unmapped`. It is listed in one aggregated `asks_unmapped` alert per tick, once per ask. Mapping every ask in that batch resolves the alert.
    - An intake that closed done without proving a mapped ask makes that ask `dropped_after_done`, alerted once as `asks_dropped`, and the intake is reopened with a note. The alert line says whether the intake was reopened. It resolves once every ask in it is proven, verified, dismissed or closed. Backfilled asks (source `backfill`) are flagged in the ledger state only: they never page, reopen intakes or start the reconciler.

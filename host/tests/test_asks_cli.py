@@ -80,6 +80,8 @@ class AsksCli(unittest.TestCase):
         self.assertEqual(calls[0], ('POST', '/api/asks/abcdef/verify', {'evidence': 'live'}))
         calls, *_ = self._run(['asks', 'settings', '--reconcile-intake', 'none'])
         self.assertEqual(calls[0], ('POST', '/api/asks/settings', {'reconcile_intake': None}))
+        calls, *_ = self._run(['asks', 'settings', '--reconcile-max-live', '2', '--reconcile-daily-cap', '5'])
+        self.assertEqual(calls[0], ('POST', '/api/asks/settings', {'reconcile_max_live': 2, 'reconcile_daily_cap': 5}))
 
     def test_tail_and_search_print_jsonl_oldest_first(self):
         resp = {'messages': [{'msg_id': 't2u', 'text': 'Second about stats'}, {'msg_id': 't1u', 'text': 'first'}]}

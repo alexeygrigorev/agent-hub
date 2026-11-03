@@ -72,6 +72,9 @@ def execute(args: argparse.Namespace):
             payload['gap_scope'] = args.gap_scope
         if args.reconcile_intake:
             payload['reconcile_intake'] = None if args.reconcile_intake == 'none' else args.reconcile_intake
+        for key in ('reconcile_max_live', 'reconcile_daily_cap'):
+            if getattr(args, key) is not None:
+                payload[key] = getattr(args, key)
         return session_control.request('POST', '/api/asks/settings', payload)
     raise session_control.SessionInputError('unknown asks command')
 
@@ -151,4 +154,6 @@ def add_parser(sub) -> None:
     settings = commands.add_parser('settings', help='Operator settings')
     settings.add_argument('--gap-scope', choices=['agent', 'global', 'window'])
     settings.add_argument('--reconcile-intake', help='Intake the reconciler sessions attach to, or none')
+    settings.add_argument('--reconcile-max-live', type=int, help='Max concurrent reconciler sessions (default 1)')
+    settings.add_argument('--reconcile-daily-cap', type=int, help='Max reconciler launch attempts per UTC day (default 8)')
     settings.add_argument('--json', action='store_true')
