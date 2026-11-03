@@ -628,6 +628,7 @@ export class BusService {
    * Filters (§11): unread hides read messages; thread narrows to one thread id.
    */
   private inboxOffsets = new Map<string, any[]>();
+  invalidateInboxOffsets():void { this.inboxOffsets.clear(); }
 
   inbox(caller: CallerContext, actor: string, limit = 50, cursor?: string, filters?: { unread?: boolean; thread?: string }): any[] {
     return this.inboxPage(caller,actor,limit,cursor,filters).rows;

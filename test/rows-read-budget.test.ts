@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 /**
  * DO rows-read budgets (intake 8081a05a). Cloudflare bills Durable Object
  * SQL by rows read; the minute alarm and the cron ticks used to scan whole
@@ -56,7 +57,7 @@ async function measure(hub: Hub, fn: () => Promise<unknown>): Promise<Record<str
 }
 
 const withHub = (fn: (hub: Hub) => Promise<void>) => runInDurableObject(
-  (env as any).HUB.get((env as any).HUB.idFromName('rows-budget-' + crypto.randomUUID())), async (hub: Hub) => { seed(hub.sql); await fn(hub); });
+  (env as any).HUB.get((env as any).HUB.idFromName('rows-budget-' + crypto.randomUUID())), async (hub: Hub, state: DurableObjectState) => { await freshFixtureBudgetDay(hub); seed(fixtureSql(hub,state)); await fn(hub); });
 
 describe('schema probe rewrite', () => {
   it('maps the probe shapes in use and leaves anything else alone', () => {

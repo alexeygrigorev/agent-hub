@@ -27,6 +27,8 @@ export interface Env {
   // Liveness and alerts. HUB_ALERT_WEBHOOK defaults to the existing Dapier
   // dev-mailbox webhook; its bearer credential is stored as a Worker secret.
   // Additional bus actors require an active credential and inbox read loop.
+  /** Isolated CI dev must not start recurring root jobs on an auth smoke. */
+  HUB_AUTOMATION_DISABLED?: string;
   HUB_ALERT_TO?: string;
   HUB_ALERT_WEBHOOK?: string;
   HUB_ALERT_WEBHOOK_TOKEN?: string;

@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import {freshCpu} from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
@@ -16,6 +17,7 @@ async function fixture(fn: (ctx: { fleet: FleetService; live: LivenessService; m
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-health-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const tx = <T>(fn: () => T): T => state.storage.transactionSync(fn);
     const clock = () => now;
     const fleet = new FleetService(hub.sql, tx, clock);
@@ -31,7 +33,7 @@ async function fixture(fn: (ctx: { fleet: FleetService; live: LivenessService; m
 }
 
 function machine(sql: any, id: string, hostname: string, checkinMs: number | null, drained = 0, caps: any = null, hb: any = null) {
-  sql.exec(
+  fixtureStatements(sql).exec(
     'INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained, capabilities, last_heartbeat) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     id, id, hostname, iso(-86400000), checkinMs === null ? null : new Date(checkinMs).toISOString(), drained,
     JSON.stringify(caps ?? { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }),
@@ -42,65 +44,65 @@ function machine(sql: any, id: string, hostname: string, checkinMs: number | nul
 describe('fleet health visibility + machine aliasing', () => {
   it('excludes idle bound and orphan sessions at the configured idle threshold', () => fixture(async ({ fleet, sql }) => {
     machine(sql, 'idle-host', 'idle-host', now);
-    sql.exec("INSERT INTO resource_settings VALUES (1, ?)", JSON.stringify({idle_minutes: 10}));
-    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('idle-host', ?)", iso(0));
-    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('idle-host', ?, 1)", iso(0));
-    sql.exec("INSERT INTO fleet_accounts VALUES ('idle-account', 'codex', 8, 15, 1)");
+    fixtureStatements(sql).exec("INSERT INTO resource_settings VALUES (1, ?)", JSON.stringify({idle_minutes: 10}));
+    fixtureStatements(sql).exec("INSERT INTO fleet_catalog_seen VALUES ('idle-host', ?)", iso(0));
+    fixtureStatements(sql).exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('idle-host', ?, 1)", iso(0));
+    fixtureStatements(sql).exec("INSERT INTO fleet_accounts VALUES ('idle-account', 'codex', 8, 15, 1)");
     const add = (id: string, state: string, activity: string | null, bound = true) => {
-      sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES ('idle-host',?,?, 'codex','running','idle',?,'demo','idle-account',?)", id, id, iso(0), activity);
-      if (bound) sql.exec("INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at) VALUES (?,'admin','human','fixture',?,'{}','idle-host','codex','idle-account','headless','demo','fixture',?,?,?,?)", id, id, state, id, iso(-3600000), iso(0));
+      fixtureStatements(sql).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES ('idle-host',?,?, 'codex','running','idle',?,'demo','idle-account',?)", id, id, iso(0), activity);
+      if (bound) fixtureStatements(sql).exec("INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at) VALUES (?,'admin','human','fixture',?,'{}','idle-host','codex','idle-account','headless','demo','fixture',?,?,?,?)", id, id, state, id, iso(-3600000), iso(0));
     };
     add('idle-bound', 'running', iso(-11 * 60000));
     add('idle-orphan', 'running', iso(-11 * 60000), false);
     add('fresh-bound', 'running', iso(-60000));
     add('unknown-bound', 'running', null);
     add('starting', 'starting', iso(-11 * 60000));
-    const status = () => fleet.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='idle-account'").one());
+    const status = () => fleet.accountStatus(fixtureStatements(sql).exec("SELECT * FROM fleet_accounts WHERE label='idle-account'").one());
     expect(status()).toMatchObject({active: 3, reserved: 0, observed_sessions: 3});
     // A fresh incomplete report cannot turn retained old activity into proof
     // that either a bound launch or an orphan stopped consuming capacity.
-    sql.exec("UPDATE fleet_catalog_census SET complete=0 WHERE machine_id='idle-host'");
+    fixtureStatements(sql).exec("UPDATE fleet_catalog_census SET complete=0 WHERE machine_id='idle-host'");
     expect(status()).toMatchObject({active: 5, reserved: 0, observed_sessions: 5});
-    sql.exec("UPDATE fleet_catalog_census SET complete=1 WHERE machine_id='idle-host'");
+    fixtureStatements(sql).exec("UPDATE fleet_catalog_census SET complete=1 WHERE machine_id='idle-host'");
     expect(status()).toMatchObject({active: 3, reserved: 0, observed_sessions: 3});
     // Productive activity immediately restores the bound admission slot.
-    sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(0));
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(0));
     expect(status().active).toBe(4);
-    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_sessions').one().n).toBe(5);
+    expect(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM fleet_sessions').one().n).toBe(5);
     // Independent host heartbeats do not prove the native catalog is current.
-    sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
-    sql.exec("UPDATE fleet_catalog_census SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
+    fixtureStatements(sql).exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
+    fixtureStatements(sql).exec("UPDATE fleet_catalog_census SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
     expect(status()).toMatchObject({active: 5, reserved: 0, observed_sessions: 5});
-    sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(0));
-    sql.exec("UPDATE fleet_catalog_census SET observed_at=? WHERE machine_id='idle-host'", iso(0));
-    sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(-11 * 60000));
+    fixtureStatements(sql).exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(0));
+    fixtureStatements(sql).exec("UPDATE fleet_catalog_census SET observed_at=? WHERE machine_id='idle-host'", iso(0));
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(-11 * 60000));
     for (const phase of ['unknown', 'uncertain', 'starting', 'broken']) {
-      sql.exec("UPDATE fleet_sessions SET phase=? WHERE native_id='idle-bound'", phase);
+      fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase=? WHERE native_id='idle-bound'", phase);
       expect(status()).toMatchObject({active: 4, reserved: 0, observed_sessions: 4});
     }
-    sql.exec("UPDATE fleet_sessions SET phase='unobserved' WHERE native_id='idle-bound'");
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase='unobserved' WHERE native_id='idle-bound'");
     expect(status()).toMatchObject({active: 3, reserved: 0, observed_sessions: 3}); // A fresh complete census releases only this physical reservation.
-    sql.exec("UPDATE fleet_sessions SET phase='running' WHERE native_id='idle-bound'");
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET phase='running' WHERE native_id='idle-bound'");
     expect(status()).toMatchObject({active: 3, reserved: 0, observed_sessions: 3});
 
   }));
 
   it('raises account caps atomically without replacing live routes or alias accounts', () => fixture(async ({ fleet, sql }) => {
-    sql.exec("INSERT INTO fleet_accounts VALUES ('shared-zai', 'zai', 8, 10, 1)");
-    sql.exec("INSERT INTO fleet_accounts VALUES ('urgent-muse', 'go', 100, 5, 1)");
+    fixtureStatements(sql).exec("INSERT INTO fleet_accounts VALUES ('shared-zai', 'zai', 8, 10, 1)");
+    fixtureStatements(sql).exec("INSERT INTO fleet_accounts VALUES ('urgent-muse', 'go', 100, 5, 1)");
     const patch = (accounts: any[], auth = admin) => fleet.handle(new Request('https://hub.test/api/fleet/accounts', {method:'PATCH', body:JSON.stringify({accounts})}), auth);
     expect((await patch([{label:'shared-zai', max_concurrency:100}])).status).toBe(200);
-    expect(sql.exec("SELECT max_concurrency FROM fleet_accounts WHERE label='shared-zai'").one().max_concurrency).toBe(100);
+    expect(fixtureStatements(sql).exec("SELECT max_concurrency FROM fleet_accounts WHERE label='shared-zai'").one().max_concurrency).toBe(100);
     expect((await patch([{label:'shared-zai', max_concurrency:100}, {label:'missing', max_concurrency:100}])).status).toBe(409);
     expect((await patch([{label:'shared-zai', max_concurrency:8}])).status).toBe(409);
     expect((await patch([{label:'shared-zai', max_concurrency:100}], {caller:{isAdmin:false},scopes:[]} as any)).status).toBe(403);
-    expect(sql.exec("SELECT max_concurrency FROM fleet_accounts WHERE label='urgent-muse'").one().max_concurrency).toBe(100);
+    expect(fixtureStatements(sql).exec("SELECT max_concurrency FROM fleet_accounts WHERE label='urgent-muse'").one().max_concurrency).toBe(100);
   }));
 
   it('maps stale hetzner sessions to the live urgent-hetzner host with real state', () => fixture(async ({ live, sql }) => {
     machine(sql, 'hetzner', 'RMTHZ', now - 220 * 3600000);
     machine(sql, 'urgent-hetzner', 'rmthz', now);
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at) VALUES ('hetzner', 'n-1', 'worker-1', 'codex', 'running', 'working', ?, '/repo', NULL, NULL, ?)",
       iso(0), iso(0),
     );
@@ -114,8 +116,8 @@ describe('fleet health visibility + machine aliasing', () => {
     expect(stale!.alias_of).toBe('urgent-hetzner');
     expect(stale!.detail).toContain('alias of urgent-hetzner');
     // No records are deleted by aliasing.
-    expect(sql.exec("SELECT COUNT(*) AS n FROM machines").one().n).toBe(2);
-    expect(sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions").one().n).toBe(1);
+    expect(fixtureStatements(sql).exec("SELECT COUNT(*) AS n FROM machines").one().n).toBe(2);
+    expect(fixtureStatements(sql).exec("SELECT COUNT(*) AS n FROM fleet_sessions").one().n).toBe(1);
   }));
 
   it('projects live memory with ramp commitments instead of resident cap sums', () => fixture(async ({ fleet, sql }) => {
@@ -152,36 +154,36 @@ describe('fleet health visibility + machine aliasing', () => {
 
   it('splits account slots into counted reservations, orphans and live natives', () => fixture(async ({ fleet, sql }) => {
     machine(sql, 'hetzner', 'hetzner', now);
-    sql.exec("INSERT INTO fleet_accounts VALUES ('shared-codex', 'codex', 8, 15, 1)");
-    sql.exec("INSERT INTO fleet_routes VALUES ('hetzner', 'codex', 'shared-codex', NULL)");
+    fixtureStatements(sql).exec("INSERT INTO fleet_accounts VALUES ('shared-codex', 'codex', 8, 15, 1)");
+    fixtureStatements(sql).exec("INSERT INTO fleet_routes VALUES ('hetzner', 'codex', 'shared-codex', NULL)");
     const quota = { status: 'ok', observed_at: iso(0), details: { limit_reached: false }, windows: { '5h': { present: true, percent_remaining: 80, reset_at: iso(86400000) }, '7d': { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
-    sql.exec("INSERT INTO fleet_subscriptions VALUES ('hetzner', 'shared-codex', 'codex', 'pro', ?, ?)", iso(0), JSON.stringify(quota));
+    fixtureStatements(sql).exec("INSERT INTO fleet_subscriptions VALUES ('hetzner', 'shared-codex', 'codex', 'pro', ?, ?)", iso(0), JSON.stringify(quota));
     // One launch reservation with a live native binding.
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('a0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 't', 'k1', '{}', 'hetzner', 'codex', 'shared-codex', NULL, 'headless', 'demo', 'goal', 'running', 'n-live', ?, ?)",
       iso(-60000), iso(-1000),
     );
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at) VALUES ('hetzner', 'n-live', 'task-hub-x', 'codex', 'running', 'working', ?, 'demo', NULL, 'shared-codex', ?)",
       iso(0), iso(0),
     );
     // One orphan observed session (no Hub launch) holding a slot.
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at) VALUES ('hetzner', 'n-orphan', 'parked', 'codex', 'running', 'idle', ?, 'demo', NULL, 'shared-codex', ?)",
       iso(0), iso(0),
     );
     // One fresh in-flight reservation without an observed native session (counts in reserved),
     // and one expired reservation past the 15m TTL (does not count).
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('a0000000-0000-4000-8000-000000000002', 'admin', 'human', NULL, 't2', 'k2', '{}', 'hetzner', 'codex', 'shared-codex', NULL, 'headless', 'demo', 'goal', 'starting', NULL, ?, ?)",
       iso(-60000), iso(-1000),
     );
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('a0000000-0000-4000-8000-000000000003', 'admin', 'human', NULL, 't3', 'k3', '{}', 'hetzner', 'codex', 'shared-codex', NULL, 'headless', 'demo', 'goal', 'starting', NULL, ?, ?)",
       iso(-20 * 60000), iso(-16 * 60000),
     );
-    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso(0));
-    sql.exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1)", iso(0));
+    fixtureStatements(sql).exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso(0));
+    fixtureStatements(sql).exec("INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES ('hetzner', ?, 1)", iso(0));
     const status: any = fleet.accountStatus({ label: 'shared-codex', provider: 'codex', max_concurrency: 8, reserve_percent: 15, enabled: 1 });
     expect(status.active).toBe(status.reserved + status.observed_sessions);
     expect(status.reserved).toBe(1);
@@ -191,7 +193,7 @@ describe('fleet health visibility + machine aliasing', () => {
   }));
 
   it('raises a stuck alert subject for launches held queued over 5 minutes without current numbers', () => fixture(async ({ live, sql }) => {
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('b0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'held work', 'kq', '{}', '', '', '', NULL, 'headless', 'demo', 'goal', 'queued', NULL, ?, ?)",
       iso(-10 * 60000), iso(-10 * 60000),
     );
@@ -203,7 +205,7 @@ describe('fleet health visibility + machine aliasing', () => {
     expect(subjects[0].detail).toContain('no recorded rejection evidence');
     expect(subjects[0].detail).not.toContain('mem_avail_mb=');
     // A fresh queue (<5 min) stays silent.
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('b0000000-0000-4000-8000-000000000002', 'admin', 'human', NULL, 'fresh wait', 'kq2', '{}', '', '', '', NULL, 'headless', 'demo', 'goal', 'queued', NULL, ?, ?)",
       iso(-60000), iso(-60000),
     );
@@ -214,11 +216,11 @@ describe('fleet health visibility + machine aliasing', () => {
   it('shows rejection-time MemAvailable, PSI cpu/memory/io full and reason from the hold, never current numbers', () => fixture(async ({ live, sql }) => {
     machine(sql, 'now-host', 'now-host', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 },
       { mem_avail_mb: 36000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso(0)) });
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('f0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'held work', 'kq3', '{}', '', '', '', NULL, 'headless', 'demo', 'goal', 'queued', NULL, ?, ?)",
       iso(-7 * 3600000), iso(-7 * 3600000),
     );
-    sql.exec("INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused, evidence_json) VALUES ('f0000000-0000-4000-8000-000000000001', ?, ?, 1, ?)",
+    fixtureStatements(sql).exec("INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused, evidence_json) VALUES ('f0000000-0000-4000-8000-000000000001', ?, ?, 1, ?)",
       iso(-7 * 3600000), JSON.stringify([{ machine: 'now-host', engine: 'codex', reason: 'codex_quota_gate_codex_reserve_15_percent_required' }]),
       JSON.stringify({ 'now-host': { mem_avail_mb: 1234, psi_cpu_full_avg10: 4.5, psi_memory_full_avg10: 2.5, psi_io_full_avg10: 0.5, observed_at: iso(-7 * 3600000) } }));
     const subjects = live.evaluate().subjects.filter((s) => s.kind === 'launch' && s.id === 'placement-queue:f0000000-0000-4000-8000-000000000001');
@@ -237,11 +239,11 @@ describe('fleet health visibility + machine aliasing', () => {
   it('persists rejection-time evidence on the launch hold when reserve parks for account capacity', () => fixture(async ({ fleet, live, sql }) => {
     machine(sql, 'm1', 'm1', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 },
       { mem_avail_mb: 32000, disk_free_gb: 100, load: [1], cpu_usage: freshCpu(iso(0), 8, 0, 1.5), gate: { launch_allowed: true, at: iso(0) } });
-    sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', 'm1', '1.0', iso(0), now, iso(0), now, 'ok', null,
+    fixtureStatements(sql).exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', 'm1', '1.0', iso(0), now, iso(0), now, 'ok', null,
       JSON.stringify({ codex: { status: 'ok', observed_at: iso(0), details: { limit_reached: false }, windows: { '5h': { present: true, percent_remaining: 80, reset_at: iso(86400000) }, '7d': { present: true, percent_remaining: 80, reset_at: iso(86400000) } } } }));
-    sql.exec("INSERT INTO fleet_accounts VALUES ('a1', 'codex', 1, 15, 1)");
-    sql.exec("INSERT INTO fleet_routes VALUES ('m1', 'codex', 'a1', NULL)");
-    sql.exec(
+    fixtureStatements(sql).exec("INSERT INTO fleet_accounts VALUES ('a1', 'codex', 1, 15, 1)");
+    fixtureStatements(sql).exec("INSERT INTO fleet_routes VALUES ('m1', 'codex', 'a1', NULL)");
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('g0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'holder', 'kg', '{}', 'm1', 'codex', 'a1', NULL, 'headless', 'demo', 'goal', 'running', 'n-hold', ?, ?)",
       iso(-60000), iso(-1000),
     );
@@ -250,12 +252,12 @@ describe('fleet health visibility + machine aliasing', () => {
     const value: any = res.value;
     // Rejection-time evidence lands on the launch's hold record, captured
     // from the heartbeat that drove the refusal.
-    const hold: any = sql.exec("SELECT rejected_json, evidence_json FROM fleet_memory_holds WHERE launch_id=?", value.id).one();
+    const hold: any = fixtureStatements(sql).exec("SELECT rejected_json, evidence_json FROM fleet_memory_holds WHERE launch_id=?", value.id).one();
     const persisted = JSON.parse(hold.evidence_json);
     expect(persisted['m1']).toMatchObject({ mem_avail_mb: 32000, psi_cpu_full_avg10: 0, psi_memory_full_avg10: 0, psi_io_full_avg10: 1.5, observed_at: iso(0) });
     expect(JSON.parse(hold.rejected_json)[0].reason).toBe('account_concurrency');
     // The parked launch warns with the recorded evidence, not live numbers.
-    sql.exec("UPDATE fleet_launches SET created_at=? WHERE id=?", iso(-10 * 60000), value.id);
+    fixtureStatements(sql).exec("UPDATE fleet_launches SET created_at=? WHERE id=?", iso(-10 * 60000), value.id);
     const subjects = live.evaluate().subjects.filter((s) => s.id === `placement-queue:${value.id}`);
     expect(subjects.length).toBe(1);
     expect(subjects[0].detail).toContain('account_concurrency');
@@ -264,35 +266,35 @@ describe('fleet health visibility + machine aliasing', () => {
   }));
 
   it('keeps terminal machine_capacity failures out of live stuck subjects', () => fixture(async ({ live, sql }) => {
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at, exit_reason, launch_error_json) VALUES ('c0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'mem work', 'kf', '{}', 'hetzner', 'codex', 'shared-codex', NULL, 'headless', 'demo', 'goal', 'failed', NULL, 'hub-c0000000-0000-4000-8000-000000000001', ?, ?, 'machine_capacity', ?)",
       iso(-3600000), iso(-600000), JSON.stringify({ reason: 'machine_capacity', message: 'below floor', error_type: 'Memory', stage: 'dispatch_headless' }),
     );
     const subjects = live.evaluate().subjects.filter((s) => s.id === 'placement-failed:c0000000-0000-4000-8000-000000000001');
     expect(subjects).toEqual([]);
-    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='c0000000-0000-4000-8000-000000000001'").one().state).toBe('failed');
+    expect(fixtureStatements(sql).exec("SELECT state FROM fleet_launches WHERE id='c0000000-0000-4000-8000-000000000001'").one().state).toBe('failed');
   }));
 
   it('records hard rejections without presenting history as a live hold', () => fixture(async ({ fleet, live, sql }) => {
     machine(sql, 'm1', 'm1', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }, {mem_avail_mb: 32000, disk_free_gb: 100, load: [1], cpu_usage: freshCpu(iso(0)), gate: {launch_allowed: true, at: iso(0)}});
     machine(sql, 'm2', 'm2', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['other'], cpu_count: 8 });
     for (const m of ['m1', 'm2']) {
-      sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', m, '1.0', iso(0), now, iso(0), now, 'ok', null,
+      fixtureStatements(sql).exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', m, '1.0', iso(0), now, iso(0), now, 'ok', null,
         JSON.stringify({ codex: { status: 'ok', observed_at: iso(0), details: { limit_reached: false }, windows: { '5h': { present: true, percent_remaining: 80, reset_at: iso(86400000) }, '7d': { present: true, percent_remaining: 80, reset_at: iso(86400000) } } } }));
     }
-    sql.exec("INSERT INTO fleet_accounts VALUES ('a1', 'codex', 1, 15, 1)");
-    sql.exec("INSERT INTO fleet_routes VALUES ('m1', 'codex', 'a1', NULL)");
-    sql.exec("INSERT INTO fleet_routes VALUES ('m2', 'codex', 'a1', NULL)");
+    fixtureStatements(sql).exec("INSERT INTO fleet_accounts VALUES ('a1', 'codex', 1, 15, 1)");
+    fixtureStatements(sql).exec("INSERT INTO fleet_routes VALUES ('m1', 'codex', 'a1', NULL)");
+    fixtureStatements(sql).exec("INSERT INTO fleet_routes VALUES ('m2', 'codex', 'a1', NULL)");
     // Fill the single slot so m1 rejects with account_capacity while m2
     // rejects with a hard capability reason: mixed failure stays a 409.
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('d0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'holder', 'kh', '{}', 'm1', 'codex', 'a1', NULL, 'headless', 'demo', 'goal', 'running', 'n-hold', ?, ?)",
       iso(-60000), iso(-1000),
     );
     const res = fleet.reserve({ workspace: 'demo', prompt: 'goal reached', idempotency_key: 'pressure-probe-1' }, admin);
     expect(res.status).toBe(409);
     expect(JSON.stringify(res.value.rejected)).toContain('account_concurrency');
-    const count = Number(sql.exec('SELECT COUNT(*) AS n FROM placement_rejections').one().n);
+    const count = Number(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM placement_rejections').one().n);
     expect(count).toBe(1);
     const subjects = live.evaluate().subjects.filter((s) => String(s.id).startsWith('placement-reject:'));
     expect(subjects).toEqual([]);
@@ -303,13 +305,13 @@ describe('fleet health visibility + machine aliasing', () => {
       { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8, launcher_resources: true },
       { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso(0)), gate: { launch_allowed: true, at: iso(0) }, launcher_resources: { active_mem_mb: 29000, observed_at: iso(0) } });
     const payload = { load: { load1: 0.5, load5: 0.4, load15: 0.3 }, memory: { total_bytes: 64 * 1024 ** 3, available_bytes: 32 * 1024 ** 3, used_bytes: 32 * 1024 ** 3, percent: 50, status: 'ok' } };
-    sql.exec('INSERT INTO host_health_observations (machine_id, observed_at, observed_at_ms, received_at, payload_json, reporter) VALUES (?, ?, ?, ?, ?, ?)',
+    fixtureStatements(sql).exec('INSERT INTO host_health_observations (machine_id, observed_at, observed_at_ms, received_at, payload_json, reporter) VALUES (?, ?, ?, ?, ?, ?)',
       'hetzner', iso(0), now, iso(0), JSON.stringify(payload), 'host:test');
     // Healthy baseline first.
     let status = monitoring.getHostHealthStatus(now);
     expect(status.machines[0].memory.status).toBe('ok');
     // Then a launch held queued for memory/capacity degrades the host.
-    sql.exec(
+    fixtureStatements(sql).exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, created_at, updated_at) VALUES ('e0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'held work', 'ke', '{}', '', '', '', NULL, 'headless', 'demo', 'goal', 'queued', NULL, ?, ?)",
       iso(-10 * 60000), iso(-10 * 60000),
     );
@@ -334,8 +336,8 @@ describe('fleet health visibility + machine aliasing', () => {
   }));
   it('degrades visibility immediately for a new capacity hold while delaying ordinary hold alerts until five minutes', () => fixture(async ({ monitoring, live, sql }) => {
     machine(sql,'live','live',now);
-    sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','live',iso(0),now,iso(0),JSON.stringify({memory:{total_bytes:64000,available_bytes:32000,used_bytes:32000,percent:50,status:'ok'},load:{load1:1,load5:1,load15:1}}),'test');
-    sql.exec("INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at) VALUES('fresh-hold','admin','human','held','fresh-key','{}','','','','headless','demo','goal','queued',?,?)",iso(-60000),iso(-60000));
+    fixtureStatements(sql).exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','live',iso(0),now,iso(0),JSON.stringify({memory:{total_bytes:64000,available_bytes:32000,used_bytes:32000,percent:50,status:'ok'},load:{load1:1,load5:1,load15:1}}),'test');
+    fixtureStatements(sql).exec("INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at) VALUES('fresh-hold','admin','human','held','fresh-key','{}','','','','headless','demo','goal','queued',?,?)",iso(-60000),iso(-60000));
     const host=monitoring.getHostHealthStatus(now).machines[0];
     expect(host.memory.status).toBe('warn');
     expect(host.placement?.reason).toContain('held queued');
@@ -351,30 +353,30 @@ describe('fleet health visibility + machine aliasing', () => {
    const payload: {sessions: any[]; census_complete?: boolean}={sessions:[{native_id:'n1',tag:'worker',engine:'codex',phase:'running',agent_state:null,workspace:'demo',profile:null,account:null}],census_complete:true};
    const send=(body: typeof payload = payload)=>fleet.handle(new Request('https://hub/api/fleet/sessions',{method:'PUT',body:JSON.stringify(body)}),caller);
    expect((await send()).status).toBe(200);
-   const first=sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at;
-   expect(sql.exec("SELECT complete FROM fleet_catalog_census WHERE machine_id='census-host'").one().complete).toBe(1);
+   const first=fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at;
+   expect(fixtureStatements(sql).exec("SELECT complete FROM fleet_catalog_census WHERE machine_id='census-host'").one().complete).toBe(1);
    tick+=30000; expect((await (await send()).json() as any).written).toBe(0);
-   expect(sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(first);
-   expect(sql.exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(first);
+   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(first);
+   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(first);
    tick+=60000; expect((await (await send()).json() as any).written).toBe(0);
-   expect(sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(iso(90000));
-   expect(sql.exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(first);
-   expect(sql.exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(iso(90000));
+   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(iso(90000));
+   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(first);
+   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(iso(90000));
    const malformed=await send({...payload,census_complete:1 as any});
    expect(malformed.status).toBe(400);
-   expect(sql.exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:1});
+   expect(fixtureStatements(sql).exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:1});
    const flipsImmediately=await send({...payload,census_complete:false});
    expect(flipsImmediately.status).toBe(200);
-   expect(sql.exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:0});
+   expect(fixtureStatements(sql).exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:0});
    tick+=30000;
    expect((await send({...payload,census_complete:false})).status).toBe(200);
-   expect(sql.exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:0});
+   expect(fixtureStatements(sql).exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:0});
  }));
 
  it('keeps absent native observations unknown rather than asserting exit', () => fixture(async ({live,sql}) => {
    machine(sql,'absence-host','absence-host',now);
-   for(const phase of ['unobserved','unknown','uncertain','starting','exiting']) sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('absence-host',?,?,?,?,'demo')",phase,phase,phase,iso(-86400000));
-   sql.exec("INSERT INTO fleet_catalog_seen VALUES('absence-host',?)",iso(0));
+   for(const phase of ['unobserved','unknown','uncertain','starting','exiting']) fixtureStatements(sql).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('absence-host',?,?,?,?,'demo')",phase,phase,phase,iso(-86400000));
+   fixtureStatements(sql).exec("INSERT INTO fleet_catalog_seen VALUES('absence-host',?)",iso(0));
    const subjects=live.evaluate().subjects.filter(s=>s.kind==='session' && s.machine_id==='absence-host');
    for(const phase of ['unobserved','unknown','uncertain','starting','exiting']) expect(subjects.find(s=>s.id.endsWith('/'+phase))?.state).toBe(['unobserved','unknown'].includes(phase)?'unknown':phase);
  }));

@@ -67,10 +67,10 @@ export function worktreeIntakeSnapshot(sql: SqlStorage, scope?: WorktreeSnapshot
         if (native) needles.add(native);
       }
       const taskIds=new Set<string>();
-      const linked=sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_link_refs'").toArray().length>0;
-      if(linked) {
-        for(const ref of needles) {
-          const rows=sql.exec('SELECT task_id FROM intake_link_refs WHERE ref=? LIMIT 129',ref).toArray();
+      const linkTables=sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('intake_link_refs','intake_projection_link_refs')").toArray().map(row=>String(row.name));
+      if(linkTables.length) {
+        for(const table of linkTables) for(const ref of needles) {
+          const rows=sql.exec(`SELECT task_id FROM ${table} WHERE ref=? LIMIT 129`,ref).toArray();
           if(rows.length>128)throw new Error('worktree_observation_limit');
           for(const row of rows)taskIds.add(String(row.task_id));
           if(taskIds.size>128)throw new Error('worktree_observation_limit');

@@ -1,3 +1,4 @@
+import { restartFixtureHub, fixtureSql } from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { Hub, BaseHub } from '../src/conversation-hub';
@@ -98,35 +99,35 @@ describe('Conversation Security Regressions (Cluster 1: F1, F3, F4)', () => {
     );
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       const nowIso = new Date().toISOString();
 
       // Seed imported/registered rows with reserved project/tag namespaces
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('alice', 'human', 'worker', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('ops', 'role', 'worker', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('node1', 'machine', 'worker', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('bot1', 'routing-client', 'worker', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('human', 'projA', 'worker', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('valid-worker', 'projA', 'worker', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('oncall', 'agent', 'worker', ?)",
         nowIso,
       );
@@ -258,7 +259,7 @@ describe('Conversation Security Regressions (Cluster 1: F1, F3, F4)', () => {
         },
         { kind: 'group', title: 'Kind Defense In Depth' },
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         `INSERT INTO conversation_members (conversation_id, actor, kind, role, added_at, added_by, last_read_seq)
          VALUES (?, 'projA:valid-worker', 'human', 'member', ?, 'human:alice', 0)`,
         c2.id,
@@ -289,11 +290,11 @@ describe('Conversation Security Regressions (Cluster 1: F1, F3, F4)', () => {
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
       let currentMs = Date.now();
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       (hub.conversationsService as any).now = () => currentMs;
 
       const nowIso = new Date(currentMs).toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('bot', 'proj', 'worker', ?)",
         nowIso,
       );
@@ -337,7 +338,7 @@ describe('Conversation Security Regressions (Cluster 1: F1, F3, F4)', () => {
         }),
       );
       await gate1.pulled;
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE credentials SET revoked_at = ? WHERE id = ?',
         new Date(currentMs).toISOString(),
         'cred-race-revoke',
@@ -389,7 +390,7 @@ describe('Conversation Security Regressions (Cluster 1: F1, F3, F4)', () => {
         }),
       );
       await gate3.pulled;
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE credentials SET scopes = ? WHERE id = ?',
         JSON.stringify(['bus:read']),
         'cred-race-scope',
@@ -479,7 +480,7 @@ describe('Conversation Security Regressions (Cluster 1: F1, F3, F4)', () => {
     );
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
 
       const cookieAlice = await makeSignedCookie('alice', 'admin@fake.local');
       const cookiePrefixedAlice = await makeSignedCookie(
@@ -559,7 +560,7 @@ describe('Conversation Security Regressions (Cluster 2: F2, F5, F8)', () => {
     );
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       const cookieAlice = await makeSignedCookie('alice', 'admin@fake.local');
       const cookieBob = await makeSignedCookie('bob', 'another@fake.local');
 
@@ -711,9 +712,9 @@ describe('Conversation Security Regressions (Cluster 2: F2, F5, F8)', () => {
     );
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       const nowIso = new Date().toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('bot', 'proj', 'worker', ?)",
         nowIso,
       );
@@ -831,9 +832,9 @@ describe('Conversation Security Regressions (Cluster 2: F2, F5, F8)', () => {
     );
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       const nowIso = new Date().toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('bot', 'proj', 'worker', ?)",
         nowIso,
       );
@@ -988,7 +989,7 @@ describe('Conversation Security Regressions (Cluster 3: F6 Bounded Storage & Ret
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
       let currentMs = Date.parse('2026-10-17T01:05:00.000Z');
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       (hub.conversationsService as any).now = () => currentMs;
       (hub.jobsService as any).now = () => new Date(currentMs);
 
@@ -1008,7 +1009,7 @@ describe('Conversation Security Regressions (Cluster 3: F6 Bounded Storage & Ret
       };
 
       const nowIso = new Date(currentMs).toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('bot1', 'proj', 'worker', ?), ('bot2', 'proj', 'worker', ?)",
         nowIso,
         nowIso,
@@ -1333,7 +1334,7 @@ describe('Conversation Security Regressions (Cluster 4: F7 Real Registry & F9 De
     );
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       const cookieAlice = await makeSignedCookie('alice', 'admin@fake.local');
 
       // 1. Register 'shared-worker' in 'projA' via real /api/agents endpoint -> 201 Created
@@ -1448,7 +1449,7 @@ describe('Conversation Security Regressions (Cluster 4: F7 Real Registry & F9 De
     );
 
     await runInDurableObject(stub, async (baseHub: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(baseHub as Hub);
 
       // Valid slot: 01:05:00Z (5 minutes into 01:00Z window, age = 300,000ms < 1,500,000ms)
       const validTime = new Date('2026-10-17T01:05:00.000Z');
@@ -1486,7 +1487,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
       let clockMs = Date.now() - 65 * 24 * 60 * 60 * 1000;
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       (hub.conversationsService as any).now = () => (clockMs += 100);
 
       const cookieAlice = await makeSignedCookie(
@@ -1504,13 +1505,13 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
 
       // Register bob in users and 130 agents using real SCHEMA_SQL
       const nowIso = new Date(clockMs).toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('bob', 'admin@fake.local', 1, ?, ?)",
         nowIso,
         nowIso,
       );
       for (let i = 1; i <= 130; i++) {
-        hub.sql.exec(
+        fixtureSql(hub).exec(
           'INSERT INTO agents (tag, project, role, registered_at) VALUES (?, ?, ?, ?)',
           `churn-${i}`,
           'proj',
@@ -1793,7 +1794,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
       let clockMs = Date.now() - 65 * 24 * 60 * 60 * 1000;
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       (hub.conversationsService as any).now = () => clockMs;
 
       const cookieAlice = await makeSignedCookie(
@@ -1803,7 +1804,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
         7200,
       );
       const nowIso = new Date(clockMs).toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('bot', 'proj', 'worker', ?)",
         nowIso,
       );
@@ -1974,7 +1975,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
       let clockMs = Date.now() - 65 * 24 * 60 * 60 * 1000;
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       (hub.conversationsService as any).now = () => clockMs;
 
       const cookieAlice = await makeSignedCookie(
@@ -1984,7 +1985,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
         7200,
       );
       const nowIso = new Date(clockMs).toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('bot', 'proj', 'worker', ?)",
         nowIso,
       );
@@ -2222,7 +2223,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
       let clockMs = Date.now() - 65 * 24 * 60 * 60 * 1000;
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       (hub.conversationsService as any).now = () => (clockMs += 100);
 
       const cookieAlice = await makeSignedCookie(
@@ -2232,7 +2233,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
         7200,
       );
       const nowIso = new Date(clockMs).toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('readd-bot', 'proj', 'worker', ?), ('late-joiner', 'proj', 'worker', ?)",
         nowIso,
         nowIso,
@@ -2390,7 +2391,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
 
     await runInDurableObject(stub, async (_base: unknown, state: DurableObjectState) => {
       let clockMs = Date.now() - 65 * 24 * 60 * 60 * 1000;
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       (hub.conversationsService as any).now = () => (clockMs += 10);
 
       const cookieAlice = await makeSignedCookie(
@@ -2400,7 +2401,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
         7200,
       );
       const nowIso = new Date(clockMs).toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('bot', 'proj', 'worker', ?)",
         nowIso,
       );
@@ -2568,7 +2569,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
 
       // Verify mixed bus + conversation backlog progresses both domains within shared limit via busService.retentionCleanup
       for (let i = 1; i <= 6; i++) {
-        hub.sql.exec(
+        fixtureSql(hub).exec(
           "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'a', 'b', 'note', 'th-1', '{}', ?, ?, ?)",
           `bus-exp-${i}`,
           `bus-idem-${i}`,
@@ -2727,7 +2728,7 @@ describe('Conversation Security Regressions (Cluster 5: F10-F16 Retention & Acco
 
       // Instantiate Hub -> triggers init() and versioned v2 atomic backfill
       let clockMs = Date.parse('2026-10-17T01:05:00.000Z');
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       (hub.conversationsService as any).now = () => clockMs;
 
       // Verify per-conversation counters and body_bytes were backfilled

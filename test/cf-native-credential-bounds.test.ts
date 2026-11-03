@@ -52,7 +52,7 @@ describe('production-schema credential polling bounds',()=>{
     expect(indexes).toEqual([]);
   }));
 
-  it('bounds the running-state page before machine filtering on the actual deployed index layout',()=>fixture(async(_hub,raw)=>{
+  it('bounds per-host equal-created pages on the actual deployed index layout',()=>fixture(async(_hub,raw)=>{
     raw.exec('DROP INDEX IF EXISTS session_control_machine_state');
     raw.exec('CREATE INDEX session_control_machine_state ON session_control_sessions(machine_id,state,created_at)');
     raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2100)
@@ -69,8 +69,8 @@ describe('production-schema credential polling bounds',()=>{
       expect(meter.snapshot()['page-'+i].rows_read).toBeLessThan(200);
     }
     expect(found).toBe(true);
-    const plan=raw.exec("EXPLAIN QUERY PLAN SELECT rowid,id,machine_id FROM session_control_sessions INDEXED BY session_control_state WHERE state='running' AND rowid>? ORDER BY rowid LIMIT 65",0).toArray().map((r:any)=>r.detail).join(' ');
-    expect(plan).toContain('session_control_state');
+    const plan=raw.exec("EXPLAIN QUERY PLAN SELECT rowid,id,machine_id FROM session_control_sessions INDEXED BY session_control_machine_state WHERE machine_id=? AND state='running' AND created_at=? AND rowid>? ORDER BY rowid LIMIT 65",'host',iso,0).toArray().map((r:any)=>r.detail).join(' ');
+    expect(plan).toContain('session_control_machine_state');
     expect(plan).not.toMatch(/TEMP B-TREE|SCAN session_control_sessions/);
   }));
 
@@ -129,4 +129,19 @@ describe('production-schema credential polling bounds',()=>{
     expect(first.map(row=>row.session_id)).toEqual(['messaging']);
     expect(meter.snapshot().messaging.rows_read).toBeLessThan(40);
   }));
+  it('refuses overflowing actor history before a native host rebind can fire broad revocation triggers',()=>fixture(async(_hub,raw)=>{
+    const id=crypto.randomUUID(),actor=NATIVE_WORKER_PROJECT+':native-'+id;
+    session(raw,id);access(raw,id);
+    raw.exec("INSERT INTO agents(tag,project,machine_id,registered_at) VALUES(?,?,'old-host',?)",'native-'+id,NATIVE_WORKER_PROJECT,iso);
+    raw.exec("INSERT INTO intake_tasks(id,data) VALUES('task',?)",JSON.stringify({id:'task',project:'demo',status:'open'}));
+    raw.exec("INSERT INTO intake_session_links VALUES(?,'task','host_census_verified')",id);
+    for(let i=0;i<129;i++)credential(raw,'history-'+i,'family-'+id,actor);
+    const meter=new RowsMeter(),worker=new WorkerAccess(meter.wrap(raw),fn=>fn(),()=>true);worker.init();
+    const response=await meter.run('overflow-rebind',()=>worker.issueNative(new Request('https://hub.test/api/sessions/'+id+'/intake-credential',{method:'POST'}),{kind:'host',machineId:'host'} as any,['host']));
+    expect(response.status).toBe(503);expect((await response.json() as any).error).toBe('native_credential_observation_limit');
+    expect(meter.snapshot()['overflow-rebind'].rows_written).toBe(0);
+    expect(raw.exec("SELECT machine_id FROM agents WHERE project=? AND tag=?",NATIVE_WORKER_PROJECT,'native-'+id).one().machine_id).toBe('old-host');
+    expect(Number(raw.exec("SELECT COUNT(*) AS n FROM credentials WHERE family_id=? AND revoked_at IS NULL",'family-'+id).one().n)).toBe(129);
+  }));
+
 });

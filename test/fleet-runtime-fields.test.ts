@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -16,11 +17,12 @@ async function fixture(fn: (service: FleetService, sql: any) => Promise<void>) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-runtime-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now);
     service.init(); const sql = hub.sql;
     for (const machine of ['hetzner', 'win35']) {
-      sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
-      sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', machine, '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify(Object.fromEntries(['codex', 'claude'].map(provider => [provider, { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } }]))));
+      fixtureStatements(sql).exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
+      fixtureStatements(sql).exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', machine, '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify(Object.fromEntries(['codex', 'claude'].map(provider => [provider, { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } }]))));
     }
     await fn(service, sql);
   });
@@ -39,7 +41,7 @@ describe('runtime diagnostic fields (intake a19cac9e AC1)', () => {
     await s.handle(request(path, { state: 'running', native_id: receipt.native_id, launcher_task_id: receipt.launcher_task_id }), host('hetzner'));
     const diagnostic = { reason: 'engine_exit_code', message: 'The running engine exited with code 1 (code=1, signal=none, wall_time_ms=2000000); no engine result was produced.', error_type: 'RuntimeError', stage: 'runtime', exit_code: 1, wall_time_ms: 2000000, tail: 'last log line' };
     expect((await s.handle(request(path, { ...receipt, diagnostic }), host('hetzner'))).status).toBe(200);
-    const row: any = sql.exec('SELECT * FROM fleet_launches WHERE id = ?', l.id).one();
+    const row: any = fixtureStatements(sql).exec('SELECT * FROM fleet_launches WHERE id = ?', l.id).one();
     expect(JSON.parse(row.launch_error_json)).toEqual(diagnostic);
   }));
   it('rejects control chars, out-of-range signal and unknown keys', async () => fixture(async (s) => {
@@ -67,7 +69,7 @@ describe('runtime diagnostic fields (intake a19cac9e AC1)', () => {
     await s.handle(request(path, { state: 'running', native_id: receipt.native_id, launcher_task_id: receipt.launcher_task_id }), host('hetzner'));
     const diagnostic = { reason: 'engine_children_running', message: 'The engine exited while backgrounded child processes were still running (code=unknown, signal=none, wall_time_ms=580279); no engine result was produced.', error_type: 'RuntimeError', stage: 'runtime', wall_time_ms: 580279, tail: 'panic(main thread): abort() called | oh no: Bun has crashed.' };
     expect((await s.handle(request(path, { ...receipt, diagnostic }), host('hetzner'))).status).toBe(200);
-    const row: any = sql.exec('SELECT * FROM fleet_launches WHERE id = ?', l.id).one();
+    const row: any = fixtureStatements(sql).exec('SELECT * FROM fleet_launches WHERE id = ?', l.id).one();
     expect(JSON.parse(row.launch_error_json)).toEqual(diagnostic);
   }));
 });

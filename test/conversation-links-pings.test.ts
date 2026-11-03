@@ -1,3 +1,4 @@
+import { restartFixtureHub, fixtureSql } from './helpers/fixture-budget';
 import { expect, it } from 'vitest';
 import { env as testBindings, runInDurableObject } from 'cloudflare:test';
 import type { Env } from '../src/env';
@@ -18,7 +19,7 @@ type Http = (path: string, method?: string, body?: unknown, cookie?: string) => 
 
 async function within(fn: (h: Hub, state: DurableObjectState) => Promise<void>) {
   const stub = env.HUB.get(env.HUB.idFromName('compose-' + crypto.randomUUID()));
-  await runInDurableObject(stub, async (_h, state) => fn(new Hub(state, env), state));
+  await runInDurableObject(stub, async (_h, state) => fn(await restartFixtureHub(_h as Hub), state));
 }
 async function data(response: Response, status = 200): Promise<any> {
   expect(response.status).toBe(status);

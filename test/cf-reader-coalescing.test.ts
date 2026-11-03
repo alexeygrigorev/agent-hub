@@ -44,6 +44,32 @@ describe('reader loop write coalescing',()=>{
     expect(state.storage.sql.exec('SELECT last_read_at FROM bus_reader_activity').one().last_read_at).toBe(persisted);
   }));
 
+  it('an outer Hub transaction rollback clears proof published by a nested inbox call',()=>withHub((hub,state)=>{
+    let now=Date.now();const caller=seed(hub,state,now),clock=vi.spyOn(Date,'now').mockImplementation(()=>now);
+    try {
+      hub.busService.inboxPage(caller,'team:reader');
+      const persisted=now;now+=20*60000;
+      expect(()=>state.storage.transactionSync(()=>{
+        hub.busService.inboxPage(caller,'team:reader');
+        throw new Error('outer-rollback');
+      })).toThrow('outer-rollback');
+      expect(inboxReaderStatus(hub.sql,'team:reader',now).active_reader).toBe(false);
+      expect(state.storage.sql.exec('SELECT last_read_at FROM bus_reader_activity').one().last_read_at).toBe(persisted);
+    } finally {clock.mockRestore();}
+  }));
+
+  it('outer rollback cannot retain an inbox resume offset past a transient read',()=>withHub((hub,state)=>{
+    const now=Date.now(),caller=seed(hub,state,now);
+    hub.sql.exec(`INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at,recipient_seq)
+      VALUES('rolled-back-read','human:test','team:reader','note','rollback-thread','body','rollback-read',?,?,1)`,now,now+3600000);
+    expect(()=>state.storage.transactionSync(()=>{
+      hub.sql.exec("UPDATE messages SET read_at=? WHERE id='rolled-back-read'",now);
+      expect(hub.busService.inboxPage(caller,'team:reader',50,undefined,{unread:true}).rows).toEqual([]);
+      throw new Error('outer-read-rollback');
+    })).toThrow('outer-read-rollback');
+    expect(hub.busService.inboxPage(caller,'team:reader',50,undefined,{unread:true}).rows.map((r:any)=>r.id)).toEqual(['rolled-back-read']);
+  }));
+
   it('an inbox delivery failure cannot fabricate a fresh live read loop',()=>withHub((hub,state)=>{
     let now=Date.now();const caller=seed(hub,state,now),clock=vi.spyOn(Date,'now').mockImplementation(()=>now);
     try{

@@ -706,7 +706,7 @@ export class ResourceManagement {
     // no new watchdog stop authority, including when an intake is attached.
     const shadowIds=new Map(bound.filter(s=>s.observed_shadow).map(s=>[JSON.stringify([s.machine_id,s.native_id]),s.session_id]));
     const fleetOnly = launches.flatMap(l => {
-      if (!l.machine_id || !l.workspace || !l.engine || !['headless','interactive'].includes(l.mode)) return [];
+      if (!l.machine_id || !l.native_id || !l.workspace || !l.engine || !['headless','interactive'].includes(l.mode)) return [];
       const {req,model}=launchData.get(l.id)!;
       const observed:any=observedByNative.get(key(l.machine_id,l.native_id));
       const intakeId=req.intake_task_id || null;
@@ -895,7 +895,9 @@ export class ResourceManagement {
   }
 
   evidence(machine: string, value: any) {
-    const session = this.sessions(machine).find(s => s.session_id===value.session_id && s.native_id===value.native_id);
+    const canonical=this.canonicalSessions(machine,[value.session_id]);
+    const match=canonical.find(s => s.aliases.includes(value.session_id) && s.native_id===value.native_id);
+    const session=match ? {...match,idle_reap_allowed:this.idleReapAllowed(match)} : null;
     if (!session?.managed || session.keep || (value.reason === 'idle' && !session.idle_reap_allowed) || !session.intake_id) throw new Error('session_not_reapable');
     // Worktree-guard (AC2): never reap for idleness while the linked intake
     // is open. Nudge/replace instead; reaping resumes after DONE/archive.
@@ -939,7 +941,12 @@ export class ResourceManagement {
         }
       }
       const oomChanged=finite(sample.oom_kills) && sample.oom_kills>(cached?.sample.oom_kills ?? 0);
-      const flush=!cached || cached.meta!==meta || this.now()-cached.persistedAt>=3600000 || oomChanged;
+      // Terminal evidence can arrive after a memory-only final checkpoint.
+      // Flush changed measurements, while timestamp-only terminal polls stay free.
+      const terminalChanged=TERMINAL.has(session.state) && cached &&
+        ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores','oom_kills']
+          .some(key=>finite(sample[key]) && sample[key]!==cached.sample[key]);
+      const flush=!cached || cached.meta!==meta || this.now()-cached.persistedAt>=3600000 || oomChanged || terminalChanged;
       // Cap advisory memory only; eviction never grants admission credit.
       if(!cached && this.liveTelemetry.size>=2048)this.liveTelemetry.delete(this.liveTelemetry.keys().next().value!);
       this.liveTelemetry.set(cacheKey,{sample,meta,persistedAt:flush?this.now():cached.persistedAt});

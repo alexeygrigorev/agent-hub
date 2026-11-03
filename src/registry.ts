@@ -435,9 +435,9 @@ export async function handleRegistryRoutes(
       const registered = sql.exec(`
         UPDATE machines
         SET hostname = ?, os = ?, arch = ?, network = ?, roles = ?, capabilities = ?, credential_id = ?
-        WHERE id = ? AND (credential_id IS NULL OR credential_id = '' OR credential_id = ?)
-      `, hostname, os, arch, network, rolesJson, capJson, live.id, machineId, live.id);
-      if (registered.rowsWritten !== 1) {
+        WHERE id = ? AND (credential_id IS NULL OR credential_id = '' OR credential_id = ?) RETURNING id
+      `, hostname, os, arch, network, rolesJson, capJson, live.id, machineId, live.id).toArray();
+      if (registered.length !== 1) {
         const raced = sql.exec('SELECT credential_id FROM machines WHERE id = ?', machineId).toArray()[0] as any;
         if (!raced) return Response.json({ error: 'unknown_machine' }, { status: 404 });
         if (raced.credential_id !== live.id) {

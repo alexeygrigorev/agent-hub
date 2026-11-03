@@ -1,7 +1,8 @@
+import { invalidateCatalogObservations } from './catalog-freshness';
 import { initRootIncumbentProjection, advanceRootIncumbentProjection } from './root-incumbent';
 import { BackgroundWorkQueue } from './background-work';
 import { jobCredentialAllowed } from './auth/job-credential';
-import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
+import { alertDestinations, inboxReaderStatus, invalidateReaderObservations, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, pollSessionCredentials, mintSessionCredential, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
 import { handleNamedAgentRequest } from './named-agents';
 import { IdleWorkService } from './idle-work';
@@ -225,7 +226,13 @@ export class Hub extends DurableObject {
       const invokeTransactionSync = nativeTransactionSync.bind(storage);
       const trackedTransactionSync = (fn: any) => this.writes.transaction(
         () => invokeTransactionSync(fn),
-        () => this.observedCatalog.reset(),
+        () => {
+          this.observedCatalog.reset();
+          invalidateReaderObservations(this.sql);
+          this.busService?.invalidateInboxOffsets();
+          invalidateCatalogObservations(this.sql);
+          this.fleetService?.resources?.invalidateLiveTelemetry();
+        },
       );
       Object.defineProperty(storage, 'transactionSync', {
         configurable: true,
@@ -1300,7 +1307,8 @@ export class Hub extends DurableObject {
           return this.ctx.storage.transactionSync(() => {
             const tables = ['agents', 'session_control_sessions'];
             const changed = this.credentialSweepChanged('messaging-credential', ...tables);
-            const sessions = pollSessionCredentials(this.sql, caller.machineId, now, changed !== null);
+            const sessions = pollSessionCredentials(this.sql, caller.machineId, now, changed !== null,
+              () => this.writes.stamp('agents','session_control_sessions','credentials','native_credential_authority'));
             if (changed !== null) this.credentialSweepDone('messaging-credential', ...tables);
             return Response.json({ sessions });
           });
@@ -1531,9 +1539,9 @@ export class Hub extends DurableObject {
         const stateHash = await sha256(state);
         const stateRows = this.sql.exec('SELECT consumed, expires_at FROM login_states WHERE state_hash = ?', stateHash).toArray() as any[];
         const stateRow = stateRows[0];
-        const consume = this.sql.exec('UPDATE login_states SET consumed = 1 WHERE state_hash = ? AND consumed = 0 AND expires_at > ?', stateHash, Math.floor(Date.now() / 1000));
+        const consume = this.sql.exec('UPDATE login_states SET consumed = 1 WHERE state_hash = ? AND consumed = 0 AND expires_at > ? RETURNING state_hash', stateHash, Math.floor(Date.now() / 1000)).toArray();
         
-        if (consume.rowsWritten !== 1) {
+        if (consume.length !== 1) {
           // Check if caller already has a valid authenticated session (valid sess refresh/replay recovery)
           const existingSession = await getSession(this.env, request);
           if (existingSession) {
@@ -2311,8 +2319,8 @@ export class Hub extends DurableObject {
         const accessExpiresAt = role ? new Date(Math.min(nowMs + 3600000, role.expires_at)).toISOString()
           : sessionActor ? new Date(nowMs + 3600000).toISOString() : cred.expires_at;
         const rotatedAt = cred.kind === 'human' ? now : null;
-        const res = this.sql.exec('UPDATE credentials SET revoked_at = ?, refresh_rotated_at = ? WHERE id = ? AND revoked_at IS NULL', now, rotatedAt, cred.id);
-        if (res.rowsWritten !== 1) {
+        const res = this.sql.exec('UPDATE credentials SET revoked_at = ?, refresh_rotated_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING id', now, rotatedAt, cred.id).toArray();
+        if (res.length !== 1) {
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else {
@@ -2331,13 +2339,13 @@ export class Hub extends DurableObject {
           // subsequent register calls still pass the owner CAS.
           if (cred.kind === 'host' && typeof cred.machine_id === 'string' && cred.machine_id) {
             const machineUpdate = this.sql.exec(
-              'UPDATE machines SET credential_id = ? WHERE id = ? AND credential_id = ?',
+              'UPDATE machines SET credential_id = ? WHERE id = ? AND credential_id = ? RETURNING id',
               newId, cred.machine_id, cred.id
-            );
+            ).toArray();
             // M9 metrics continuity: migrate rows bound to the validated
             // predecessor only when the machine binding actually rotated.
             // Stale/foreign/rebound refreshes mutate nothing.
-            if (machineUpdate.rowsWritten === 1) {
+            if (machineUpdate.length === 1) {
               try {
                 const hasLatest = this.sql.exec(
                   "SELECT name FROM sqlite_master WHERE type='table' AND name='host_metrics_latest'"
@@ -2993,7 +3001,7 @@ export class Hub extends DurableObject {
     if (!work) { await this.armBackgroundQueue(true,false); return; }
     if (work.exhausted) {
       console.error(JSON.stringify({event:'background_work_attempts_exhausted',kind:work.kind,id:work.id}));
-      if(work.kind==='root-slot' && isRootSchedulingEnabled(this.sql) && typeof work.payload.entity_id==='string') {
+      if(work.kind==='root-slot' && this.env.HUB_AUTOMATION_DISABLED !== 'true' && isRootSchedulingEnabled(this.sql) && typeof work.payload.entity_id==='string') {
         const slot=Date.parse(work.payload.entity_id);
         if(Number.isFinite(slot)) this.enqueueRootSlot(Math.max(slot+1800000,Math.ceil(Date.now()/1800000)*1800000));
       }
@@ -3010,7 +3018,7 @@ export class Hub extends DurableObject {
       else due = await this.processRootSlotWork(entity);
       if (due === null) {
         this.backgroundWork.complete(work);
-        if (work.kind === 'root-slot' && isRootSchedulingEnabled(this.sql)) this.enqueueRootSlot(Date.parse(entity)+1800000);
+        if (work.kind === 'root-slot' && this.env.HUB_AUTOMATION_DISABLED !== 'true' && isRootSchedulingEnabled(this.sql)) this.enqueueRootSlot(Date.parse(entity)+1800000);
       } else this.backgroundWork.reschedule(work,due);
     } catch (error) {
       if (error instanceof RowBudgetExceeded) throw error;
@@ -3025,7 +3033,7 @@ export class Hub extends DurableObject {
   private async refreshBackgroundJobs() {
     const stamp=this.writes.stamp('root_scheduling');
     if(stamp===this.backgroundRootStamp)return;
-    if(isRootSchedulingEnabled(this.sql)) {
+    if(this.env.HUB_AUTOMATION_DISABLED !== 'true' && isRootSchedulingEnabled(this.sql)) {
       const now=Date.now(),slot=Math.floor(now/1800000)*1800000;
       this.enqueueRootSlot(now-slot<1500000?slot:slot+1800000);
     } else this.backgroundWork.cancel('root-slot');
@@ -3053,7 +3061,7 @@ export class Hub extends DurableObject {
   }
 
   private async processRootSlotWork(slot: string): Promise<number | null> {
-    return this.jobsService.processRootSlotBackground(slot);
+    return this.env.HUB_AUTOMATION_DISABLED === 'true' ? null : this.jobsService.processRootSlotBackground(slot);
   }
 
   private idleWorkAt = 0;

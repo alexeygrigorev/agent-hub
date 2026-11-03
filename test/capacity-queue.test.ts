@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import {freshCpu} from './cpu-fixture';
 import { describe, it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
@@ -30,15 +31,15 @@ function registry() {
 }
 function seedMachines(sql: any) {
   for (const machine of ['hetzner', 'win35']) {
-    sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
-    sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', machine, '1.0', iso(), NOW, iso(), NOW, 'ok', null, JSON.stringify(Object.fromEntries(['codex', 'claude'].map(provider => [provider, { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } }]))));
+    fixtureStatements(sql).exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
+    fixtureStatements(sql).exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', machine, '1.0', iso(), NOW, iso(), NOW, 'ok', null, JSON.stringify(Object.fromEntries(['codex', 'claude'].map(provider => [provider, { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } }]))));
   }
 }
 function seedAgent(sql: any) {
   const at = new Date(NOW).toISOString();
   const far = new Date(NOW + 30 * 86400000).toISOString();
-  sql.exec(`INSERT OR IGNORE INTO agents (tag, project, role, machine_id, registered_at) VALUES ('assistant', 'demo', 'worker', NULL, ?)`, at);
-  sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
+  fixtureStatements(sql).exec(`INSERT OR IGNORE INTO agents (tag, project, role, machine_id, registered_at) VALUES ('assistant', 'demo', 'worker', NULL, ?)`, at);
+  fixtureStatements(sql).exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
     VALUES ('cred-1', 'agent', 'hash-cred-1', 'refresh-cred-1', 'agent-family-1', 'demo-agent', NULL, 'demo:assistant', '["fleet:launch"]', 'test', ?, ?, 'demo:assistant')`, at, far);
 }
 const intent = (extra = {}) => ({ workspace: 'demo', prompt: 'capacity queue probe', idempotency_key: crypto.randomUUID(), ...extra });
@@ -47,6 +48,7 @@ async function fleetFixture(fn: (s: FleetService, sql: any) => Promise<void>) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('capacity-fleet-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => NOW);
     service.init();
     seedMachines(hub.sql);
@@ -57,6 +59,7 @@ async function combinedFixture(fn: (f: FleetService, s: SessionControlService, s
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('capacity-combined-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const tx = <T>(cb: () => T): T => state.storage.transactionSync(cb);
     const fleet = new FleetService(hub.sql, tx, () => NOW);
     fleet.init();
@@ -158,8 +161,8 @@ describe('fleet reserve capacity queue', () => {
     }) as any);
     await claimAndFinish(f, first.id, 'hetzner', 'shared-codex');
     expect(promotedPlans).toContainEqual(expect.objectContaining({ idempotency_key: 'drain-' + parked.id, effort: 'max' }));
-    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', parked.id).one().state).toBe('offered');
-    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', third.id).one().state).toBe('queued');
+    expect(fixtureStatements(sql).exec('SELECT state FROM fleet_launches WHERE id = ?', parked.id).one().state).toBe('offered');
+    expect(fixtureStatements(sql).exec('SELECT state FROM fleet_launches WHERE id = ?', third.id).one().state).toBe('queued');
     // The promoted intent replays as offered; the still-queued one replays queued.
     const promoted: any = await (await f.handle(fleetReq('/launches', secondInput), admin)).json();
     expect(promoted.state).toBe('offered');
@@ -177,11 +180,11 @@ describe('fleet reserve capacity queue', () => {
     const parked: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', idempotency_key: 'stale-hold' })), admin)).json();
     expect(parked.state).toBe('queued');
     // The route now refuses the model: the row can never place, and status must say so.
-    const caps = JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id = 'hetzner'").one().capabilities);
+    const caps = JSON.parse(fixtureStatements(sql).exec("SELECT capabilities FROM machines WHERE id = 'hetzner'").one().capabilities);
     caps.fleet_route_rejections = [{ engine: 'codex', account: 'shared-codex', profile: null, mode: 'headless', reason: 'model_unsupported' }];
-    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify(caps));
+    fixtureStatements(sql).exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify(caps));
     await claimAndFinish(f, first.id, 'hetzner', 'shared-codex');
-    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', parked.id).one().state).toBe('queued');
+    expect(fixtureStatements(sql).exec('SELECT state FROM fleet_launches WHERE id = ?', parked.id).one().state).toBe('queued');
     const replay: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', idempotency_key: 'stale-hold' })), admin)).json();
     expect(replay.state).toBe('queued');
     expect(replay.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
@@ -189,9 +192,9 @@ describe('fleet reserve capacity queue', () => {
 
   it('names mode_unavailable (not capability_unavailable) when a host lacks only the requested mode', () => fleetFixture(async (f, sql) => {
     await configure(f);
-    const caps = JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id = 'win35'").one().capabilities);
+    const caps = JSON.parse(fixtureStatements(sql).exec("SELECT capabilities FROM machines WHERE id = 'win35'").one().capabilities);
     caps.fleet_modes = ['interactive'];
-    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'win35'", JSON.stringify(caps));
+    fixtureStatements(sql).exec("UPDATE machines SET capabilities = ? WHERE id = 'win35'", JSON.stringify(caps));
     const res = await f.handle(fleetReq('/launches', intent({ machine: 'win35', mode: 'headless', idempotency_key: 'mode-missing' })), admin);
     expect(res.status).toBe(409);
     const body: any = await res.json();
@@ -203,28 +206,28 @@ describe('fleet reserve capacity queue', () => {
     await configure(f);
     const first: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();
     expect(first.state).toBe('offered');
-    sql.exec("UPDATE machines SET capabilities = '{}' WHERE id = 'win35'");
+    fixtureStatements(sql).exec("UPDATE machines SET capabilities = '{}' WHERE id = 'win35'");
     const res = await f.handle(fleetReq('/launches', intent({ idempotency_key: 'mixed-reject' })), admin);
     expect(res.status).toBe(409);
     const body: any = await res.json();
     expect(body.error).toBe('no_eligible_route');
     expect(body.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'account_concurrency' }));
     expect(body.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'capability_unavailable' });
-    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE request_key = ?', 'mixed-reject').one().n).toBe(0);
+    expect(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE request_key = ?', 'mixed-reject').one().n).toBe(0);
   }));
 
   it('queues beside incidental stale routes but rejects incidentals alone', () => fleetFixture(async (f, sql) => {
     await configure(f);
     const first: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();
     expect(first.state).toBe('offered');
-    sql.exec('UPDATE machines SET drained = 1 WHERE id = ?', 'win35');
+    fixtureStatements(sql).exec('UPDATE machines SET drained = 1 WHERE id = ?', 'win35');
     const queued = await f.handle(fleetReq('/launches', intent({ idempotency_key: 'incidental-queue' })), admin);
     expect(queued.status).toBe(202);
     expect(((await queued.json()) as any).state).toBe('queued');
     const alone = await f.handle(fleetReq('/launches', intent({ machine: 'win35', idempotency_key: 'incidental-alone' })), admin);
     expect(alone.status).toBe(409);
     expect(((await alone.json()) as any).rejected).toEqual([{ machine: 'win35', engine: 'codex', reason: 'machine_unavailable' }]);
-    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE request_key = ?', 'incidental-alone').one().n).toBe(0);
+    expect(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE request_key = ?', 'incidental-alone').one().n).toBe(0);
   }));
 
   it('marks engines no live host advertises as engine_unavailable and queues them with capacity', () => fleetFixture(async (f, sql) => {
@@ -246,7 +249,7 @@ describe('fleet reserve capacity queue', () => {
     // A stale engine alone (no capacity in the mix) still hard-rejects.
     const alone = await f.handle(fleetReq('/launches', intent({ engine: 'gemini', idempotency_key: 'stale-alone' })), admin);
     expect(alone.status).toBe(409);
-    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE request_key = ?', 'stale-alone').one().n).toBe(0);
+    expect(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE request_key = ?', 'stale-alone').one().n).toBe(0);
   }));
 });
 
@@ -255,13 +258,13 @@ describe('fleet account status liveness', () => {
     const config = registry();
     config.routes.push({ machine_id: 'hetzner', engine: 'claude', account: 'shared-codex', profile: null });
     expect((await f.handle(fleetReq('/accounts', config, 'PUT'), admin)).status).toBe(200);
-    const status = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one());
+    const status = () => f.accountStatus(fixtureStatements(sql).exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one());
     expect(status().registry_drift).toBe(false);
     expect(status().placeable_slots).toBe(1);
     expect(status().placeable_machines).toEqual(['hetzner']);
     // A dead host route is diagnostic debt; it never zeros a healthy route.
-    sql.exec("INSERT INTO fleet_routes VALUES ('win35', 'gemini', 'shared-codex', NULL)");
-    sql.exec("UPDATE machines SET drained = 1 WHERE id = 'win35'");
+    fixtureStatements(sql).exec("INSERT INTO fleet_routes VALUES ('win35', 'gemini', 'shared-codex', NULL)");
+    fixtureStatements(sql).exec("UPDATE machines SET drained = 1 WHERE id = 'win35'");
     expect(status().registry_drift).toBe(true);
     expect(status().placeable_slots).toBe(1);
     const plan: any = f.plan(intent());
@@ -271,7 +274,7 @@ describe('fleet account status liveness', () => {
 
   it('reports drifted registry routes as zero placeable slots while the raw pool stays honest', () => fleetFixture(async (f, sql) => {
     await configure(f);
-    const status = (label: string) => f.accountStatus(sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', label).one()) as any;
+    const status = (label: string) => f.accountStatus(fixtureStatements(sql).exec('SELECT * FROM fleet_accounts WHERE label = ?', label).one()) as any;
     const healthy: any = status('desktop-codex');
     expect(healthy.available_slots).toBe(1);
     expect(healthy.placeable_slots).toBe(1);
@@ -279,7 +282,7 @@ describe('fleet account status liveness', () => {
     expect(healthy.registry_drift).toBe(false);
     // A host release stops serving codex on win35 (subscription change) while
     // the registry route stays: raw pool unchanged, nothing placeable.
-    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'win35'", JSON.stringify({ engines: ['claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
+    fixtureStatements(sql).exec("UPDATE machines SET capabilities = ? WHERE id = 'win35'", JSON.stringify({ engines: ['claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
     const drifted: any = status('desktop-codex');
     expect(drifted.available_slots).toBe(1);
     expect(drifted.placeable_slots).toBe(0);
@@ -290,7 +293,7 @@ describe('fleet account status liveness', () => {
     // Once no live machine advertises codex at all, plan() classifies every
     // codex route engine_unavailable (correct) — the lying half was fleet
     // status advertising phantom slots.
-    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
+    fixtureStatements(sql).exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
     const all: any = status('shared-codex');
     expect(all.available_slots).toBe(1);
     expect(all.placeable_slots).toBe(0);
@@ -309,11 +312,11 @@ describe('fleet account status liveness', () => {
 
   it('explains free pools without routes and unavailable machines without inventing capacity', () => fleetFixture(async (f, sql) => {
     await configure(f);
-    const status = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'desktop-codex'").one());
+    const status = () => f.accountStatus(fixtureStatements(sql).exec("SELECT * FROM fleet_accounts WHERE label = 'desktop-codex'").one());
     expect(status().placement_reasons).toEqual([]);
-    sql.exec("UPDATE machines SET drained = 1 WHERE id = 'win35'");
+    fixtureStatements(sql).exec("UPDATE machines SET drained = 1 WHERE id = 'win35'");
     expect(status()).toMatchObject({ available_slots: 1, placeable_slots: 0, placement_reasons: ['machine_unavailable'] });
-    sql.exec("DELETE FROM fleet_routes WHERE account = 'desktop-codex'");
+    fixtureStatements(sql).exec("DELETE FROM fleet_routes WHERE account = 'desktop-codex'");
     expect(status()).toMatchObject({ available_slots: 1, placeable_slots: 0, placement_reasons: ['no_routes'] });
   }));
 });
@@ -324,7 +327,7 @@ describe('sessions_start capacity queue', () => {
     config.accounts.push({ label: 'muse', provider: 'go', max_concurrency: 1, reserve_percent: 15, enabled: true });
     config.routes.push({ machine_id: 'hetzner', engine: 'opencode', account: 'muse', profile: null });
     expect((await f.handle(fleetReq('/accounts', config, 'PUT'), admin)).status).toBe(200);
-    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['codex', 'opencode'], fleet_modes: ['headless', 'interactive'], workspaces: ['/repos'], cpu_count: 8 }));
+    fixtureStatements(sql).exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['codex', 'opencode'], fleet_modes: ['headless', 'interactive'], workspaces: ['/repos'], cpu_count: 8 }));
     const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', engine: 'codex' })), admin)).json();
     const input = { key: 'tier-capacity', workspace: 'demo', machine: 'hetzner', tier: 'deep', engine_override_reason: 'This task needs deep reasoning for its capacity queue probe.', mode: 'headless', brief: 'capacity queue probe' };
     const response = await s.handle(sessReq('/api/sessions', input), admin);
@@ -338,8 +341,8 @@ describe('sessions_start capacity queue', () => {
     const replay: any = await (await s.handle(sessReq('/api/sessions', input), admin)).json();
     expect(replay).toMatchObject({ id: parked.id, state: 'queued', replay: true });
     await claimAndFinish(f, blocking.id, 'hetzner', 'shared-codex');
-    expect(sql.exec('SELECT state, engine, workspace FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one()).toMatchObject({ state: 'offered', engine: 'codex', workspace: '/repos/demo' });
-    expect(JSON.parse(String(sql.exec('SELECT model_selection_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one().model_selection_json))).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
+    expect(fixtureStatements(sql).exec('SELECT state, engine, workspace FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one()).toMatchObject({ state: 'offered', engine: 'codex', workspace: '/repos/demo' });
+    expect(JSON.parse(String(fixtureStatements(sql).exec('SELECT model_selection_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one().model_selection_json))).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
     const placed: any = await (await s.handle(sessReq('/api/sessions/' + parked.id, undefined, 'GET'), admin)).json();
     expect(placed).toMatchObject({ id: parked.id, state: 'offered', engine: 'codex' });
     const changed = await s.handle(sessReq('/api/sessions', { ...input, brief: 'different task' }), admin);
@@ -353,7 +356,7 @@ describe('sessions_start capacity queue', () => {
     expect((await f.handle(fleetReq('/accounts', config, 'PUT'), admin)).status).toBe(200);
     // Goal placement requires host-advertised goal routes: hetzner serves the
     // Codex goal route, while the free Claude route stays goal-ineligible.
-    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: [{ engine: 'codex', account: 'shared-codex', profile: null }] }));
+    fixtureStatements(sql).exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: [{ engine: 'codex', account: 'shared-codex', profile: null }] }));
     const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', engine: 'codex' })), admin)).json();
     const response = await s.handle(sessReq('/api/sessions', { key: 'goal-capacity', workspace: 'demo', machine: 'hetzner', mode: 'interactive', with_goal: true, brief: 'Fix capacity' }), admin);
     expect(response.status).toBe(202);
@@ -361,15 +364,15 @@ describe('sessions_start capacity queue', () => {
     expect(parked.rejected).toContainEqual({ machine: 'hetzner', engine: 'claude', reason: 'goal_unsupported' });
     expect(f.drainCapacityQueue().promoted).toBe(0);
     await claimAndFinish(f, blocking.id, 'hetzner', 'shared-codex');
-    expect(sql.exec('SELECT state, engine, request_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one()).toMatchObject({ state: 'offered', engine: 'codex' });
-    expect(JSON.parse(String(sql.exec('SELECT request_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one().request_json)).with_goal).toBe(true);
+    expect(fixtureStatements(sql).exec('SELECT state, engine, request_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one()).toMatchObject({ state: 'offered', engine: 'codex' });
+    expect(JSON.parse(String(fixtureStatements(sql).exec('SELECT request_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one().request_json)).with_goal).toBe(true);
   }));
 
   it.each(['starting', 'running'])('reconciles a queued intent after Fleet already reached %s, without a client poll', state => combinedFixture(async (f, s, sql) => {
     await configure(f);
     for (const machine of ['hetzner', 'win35']) {
-      sql.exec("INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, 'host', ?, ?, ?, 'test-host', ?, '[\"host\"]', 'test', ?, ?)", 'host-' + machine, 'hash-' + machine, 'refresh-' + machine, 'family-' + machine, machine, iso(), iso(86400000));
-      sql.exec('UPDATE machines SET credential_id = ? WHERE id = ?', 'host-' + machine, machine);
+      fixtureStatements(sql).exec("INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, 'host', ?, ?, ?, 'test-host', ?, '[\"host\"]', 'test', ?, ?)", 'host-' + machine, 'hash-' + machine, 'refresh-' + machine, 'family-' + machine, machine, iso(), iso(86400000));
+      fixtureStatements(sql).exec('UPDATE machines SET credential_id = ? WHERE id = ?', 'host-' + machine, machine);
     }
     const enrolled = (machine: string) => ({ ...host(machine), caller: { ...host(machine).caller, tokenId: 'host-' + machine } });
     const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();
@@ -378,14 +381,14 @@ describe('sessions_start capacity queue', () => {
     await claimAndFinish(f, blocking.id, 'hetzner', 'shared-codex');
     const nativeId = '11111111-2222-4333-8444-555555555555';
     const claimResponse = await f.handle(fleetReq('/launches/' + parked.fleet_launch_id + '/claim', { gate_allowed: true, model: 'gpt-6-luna', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
-    expect(claimResponse.status, JSON.stringify({ receipt: await claimResponse.clone().json(), selection: sql.exec('SELECT model_selection_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one() })).toBe(200);
+    expect(claimResponse.status, JSON.stringify({ receipt: await claimResponse.clone().json(), selection: fixtureStatements(sql).exec('SELECT model_selection_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one() })).toBe(200);
     if (state === 'running') expect((await f.handle(fleetReq('/launches/' + parked.fleet_launch_id + '/result', { state: 'running', native_id: nativeId, launcher_task_id: 'queue-race' }), host('hetzner'))).status).toBe(200);
     // A foreign host cannot adopt the assignment, and no native identity is invented.
     const foreign: any = await (await s.handle(sessReq('/api/sessions/host-bindings', undefined, 'GET'), enrolled('win35'))).json();
     expect(foreign.sessions).toHaveLength(0);
     const stale: any = await (await s.handle(sessReq('/api/sessions/host-bindings', undefined, 'GET'), host('hetzner'))).json();
     expect(stale.sessions).toHaveLength(0);
-    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', parked.id).one().state).toBe('queued');
+    expect(fixtureStatements(sql).exec('SELECT state FROM session_control_sessions WHERE id = ?', parked.id).one().state).toBe('queued');
     const pending: any = await (await s.handle(sessReq('/api/sessions/host-bindings', undefined, 'GET'), enrolled('hetzner'))).json();
     // Worktree-guard AC1: binding offers carry the canonical intake id;
     // combinedFixture starts carry the seeded open fixture intake.
@@ -413,7 +416,7 @@ describe('sessions_start capacity queue', () => {
     expect(polled.id).toBe(parked.id);
     expect(polled.replay).toBe(true);
     expect(polled.state).toBe('queued');
-    expect(sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions WHERE request_key = ?', 'cap-start').one().n).toBe(1);
+    expect(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM session_control_sessions WHERE request_key = ?', 'cap-start').one().n).toBe(1);
     // Freeing the slot places the intent; the session poll adopts the offer.
     await claimAndFinish(f, blocking.id, 'hetzner', 'shared-codex');
     const placed: any = await (await s.handle(new Request('https://hub.test/api/sessions/' + parked.id, { method: 'GET' }), admin)).json();
@@ -426,7 +429,7 @@ describe('sessions_start capacity queue', () => {
     await configure(f);
     const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();
     expect(blocking.state).toBe('offered');
-    sql.exec("UPDATE machines SET capabilities = '{}' WHERE id = 'win35'");
+    fixtureStatements(sql).exec("UPDATE machines SET capabilities = '{}' WHERE id = 'win35'");
     const res = await s.handle(sessReq('/api/sessions', { key: 'cap-mixed', workspace: 'demo', brief: 'mixed probe' }), admin);
     expect(res.status).toBe(409);
     const body: any = await res.json();
@@ -444,14 +447,14 @@ describe('sessions_start capacity queue', () => {
     expect(start.status).toBe(202);
     const parked: any = await start.json();
     expect(parked.state).toBe('queued');
-    const probe = sql.exec("UPDATE fleet_launches SET state = state WHERE id = ? RETURNING id", parked.fleet_launch_id);
+    const probe = fixtureStatements(sql).exec("UPDATE fleet_launches SET state = state WHERE id = ? RETURNING id", parked.fleet_launch_id);
     expect(probe.toArray()).toHaveLength(1);
     expect(probe.rowsWritten).toBeGreaterThan(1);
     const cancel = await s.handle(sessReq('/api/sessions/' + parked.id + '/cancel', { key: 'cancel-once' }, 'POST'), agent());
     expect(cancel.status, JSON.stringify(await cancel.clone().json())).toBe(200);
     const cancelled: any = await cancel.json();
     expect(cancelled.state).toBe('cancelled');
-    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one().state).toBe('cancelled');
+    expect(fixtureStatements(sql).exec('SELECT state FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one().state).toBe('cancelled');
   }));
 });
 
@@ -459,12 +462,12 @@ describe('sessions_start capacity queue', () => {
 describe('bounded queue maintenance', () => {
   it('performs no durable writes for repeated idle offer polls', () => fleetFixture(async(f,sql)=>{
     await configure(f);
-    for(const table of ['routing_scan_cursor','fleet_queue_cursor']) expect(sql.exec(`SELECT * FROM ${table}`).toArray()).toEqual([]);
+    for(const table of ['routing_scan_cursor','fleet_queue_cursor']) expect(fixtureStatements(sql).exec(`SELECT * FROM ${table}`).toArray()).toEqual([]);
     await f.handle(fleetReq('/offers',undefined,'GET'),host('hetzner'));
     for(const table of ['routing_scan_cursor','fleet_queue_cursor']) {
-      expect(sql.exec(`SELECT after_rowid,high_water FROM ${table}`).one()).toEqual({after_rowid:0,high_water:0});
+      expect(fixtureStatements(sql).exec(`SELECT after_rowid,high_water FROM ${table}`).one()).toEqual({after_rowid:0,high_water:0});
       // A previous finite round can outlive all its queued rows.
-      sql.exec(`UPDATE ${table} SET after_rowid=50,high_water=50`);
+      fixtureStatements(sql).exec(`UPDATE ${table} SET after_rowid=50,high_water=50`);
     }
     let writes=0;
     const measured=new Proxy(sql,{get(target,key){
@@ -477,14 +480,14 @@ describe('bounded queue maintenance', () => {
     writes=0;
     for(let i=0;i<3;i++) {
       const result:any=await (await restarted.handle(fleetReq('/offers',undefined,'GET'),host('hetzner'))).json();
-      expect(result).toEqual({offers:[],reconciliation:[],engine_epoch:'0'});
+      expect(result).toEqual({offers:[],reconciliation:[],engine_epoch:'0',observation_scope:'raw_state_page',observation_pending:false,offer_cursor:null,resume_cursor:null});
     }
     expect(writes).toBe(0);
   }));
 
   function park(sql: any, template: string, id: string, patch = {}, created = iso()) {
-    const row = sql.exec('SELECT request_json FROM fleet_launches WHERE id=?', template).one();
-    sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+    const row = fixtureStatements(sql).exec('SELECT request_json FROM fleet_launches WHERE id=?', template).one();
+    fixtureStatements(sql).exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
       SELECT ?,actor,requester_kind,summary,?,?,machine_id,engine,account,mode,workspace,prompt,'queued',?,? FROM fleet_launches WHERE id=?`,
       id, id, JSON.stringify({...JSON.parse(row.request_json), ...patch}), created, created, template);
   }
@@ -492,16 +495,16 @@ describe('bounded queue maintenance', () => {
     await configure(f);
     const first=f.reserve(intent({machine:'hetzner'}),admin).value;
     park(sql,first.id,'rollback-eligible');
-    sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id=?",first.id);
-    const before=sql.exec('SELECT * FROM fleet_queue_cursor').toArray();
+    fixtureStatements(sql).exec("UPDATE fleet_launches SET state='stopped' WHERE id=?",first.id);
+    const before=fixtureStatements(sql).exec('SELECT * FROM fleet_queue_cursor').toArray();
     expect(()=>(f as any).transaction(()=>{
       expect(f.drainCapacityQueue().promoted).toBe(1);
       throw new Error('rollback probe');
     })).toThrow('rollback probe');
-    expect(sql.exec('SELECT * FROM fleet_queue_cursor').toArray()).toEqual(before);
-    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='rollback-eligible'").one().state).toBe('queued');
+    expect(fixtureStatements(sql).exec('SELECT * FROM fleet_queue_cursor').toArray()).toEqual(before);
+    expect(fixtureStatements(sql).exec("SELECT state FROM fleet_launches WHERE id='rollback-eligible'").one().state).toBe('queued');
     expect(f.drainCapacityQueue().promoted).toBe(1);
-    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='rollback-eligible'").one().state).toBe('offered');
+    expect(fixtureStatements(sql).exec("SELECT state FROM fleet_launches WHERE id='rollback-eligible'").one().state).toBe('offered');
   }));
   it('keeps the host poll budget when nested maintenance asks for the default slice',()=>fleetFixture(async(f,sql)=>{
     await configure(f);
@@ -520,7 +523,7 @@ describe('bounded queue maintenance', () => {
     const first = f.reserve(intent({machine:'hetzner'}), admin).value;
     for (let i=0;i<205;i++) park(sql,first.id,'blocked-'+i,{machine:'missing'});
     park(sql,first.id,'eligible');
-    sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id=?",first.id);
+    fixtureStatements(sql).exec("UPDATE fleet_launches SET state='stopped' WHERE id=?",first.id);
     const plan = vi.spyOn(f,'plan');
     const reconcile = vi.spyOn(f.admission,'reconcileOffers');
     f.withMaintenance(() => { f.drainCapacityQueue(); f.drainCapacityQueue(); f.routing.dispatchNow(); });
@@ -532,8 +535,8 @@ describe('bounded queue maintenance', () => {
       park(sql,first.id,'new-'+i,{machine:'missing'});
       restarted.drainCapacityQueue();
     }
-    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='eligible'").one().state).toBe('offered');
-    expect(sql.exec("SELECT COUNT(*) n FROM fleet_launches WHERE account='shared-codex' AND state='offered'").one().n).toBe(1);
+    expect(fixtureStatements(sql).exec("SELECT state FROM fleet_launches WHERE id='eligible'").one().state).toBe('offered');
+    expect(fixtureStatements(sql).exec("SELECT COUNT(*) n FROM fleet_launches WHERE account='shared-codex' AND state='offered'").one().n).toBe(1);
   }));
   it('wraps a finite round despite new arrivals and never promotes expired or dead-parent work', () => fleetFixture(async(f,sql)=>{
     await configure(f);
@@ -542,15 +545,15 @@ describe('bounded queue maintenance', () => {
     for(let i=0;i<12;i++) park(sql,first.id,'old-'+i,{},iso(-49*3600000));
     for(let i=0;i<11;i++) park(sql,first.id,'blocked-'+i,{machine:'missing'});
     park(sql,first.id,'dead-parent',{parent_id:'missing'});
-    sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id=?",first.id);
+    fixtureStatements(sql).exec("UPDATE fleet_launches SET state='stopped' WHERE id=?",first.id);
     f.drainCapacityQueue();
-    sql.exec("UPDATE fleet_launches SET request_json=json_set(request_json,'$.machine','hetzner') WHERE id='early'");
+    fixtureStatements(sql).exec("UPDATE fleet_launches SET request_json=json_set(request_json,'$.machine','hetzner') WHERE id='early'");
     for(let i=0;i<12;i++) { park(sql,first.id,'new-'+i,{machine:'missing'}); f.drainCapacityQueue(); }
-    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='early'").one().state).toBe('offered');
-    expect(sql.exec("SELECT COUNT(*) n FROM fleet_launches WHERE id LIKE 'old-%' AND state='offered'").one().n).toBe(0);
-    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='dead-parent'").one().state).toBe('queued');
+    expect(fixtureStatements(sql).exec("SELECT state FROM fleet_launches WHERE id='early'").one().state).toBe('offered');
+    expect(fixtureStatements(sql).exec("SELECT COUNT(*) n FROM fleet_launches WHERE id LIKE 'old-%' AND state='offered'").one().n).toBe(0);
+    expect(fixtureStatements(sql).exec("SELECT state FROM fleet_launches WHERE id='dead-parent'").one().state).toBe('queued');
     const newcomer=f.reserve(intent({machine:'hetzner'}),admin);
     expect(newcomer.value.state).toBe('queued');
-    expect(sql.exec("SELECT COUNT(*) n FROM fleet_launches WHERE account='shared-codex' AND state='offered'").one().n).toBe(1);
+    expect(fixtureStatements(sql).exec("SELECT COUNT(*) n FROM fleet_launches WHERE account='shared-codex' AND state='offered'").one().n).toBe(1);
   }));
 });

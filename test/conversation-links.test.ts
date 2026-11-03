@@ -1,3 +1,4 @@
+import { restartFixtureHub, fixtureSql } from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { Hub, BaseHub } from '../src/conversation-hub';
@@ -35,21 +36,21 @@ async function withHub(
   await runInDurableObject(
     stub,
     async (_base: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       const nowIso = new Date().toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT OR IGNORE INTO machines (id, name, hostname, registered_at) VALUES ('machine-A', 'A', 'host-a', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT OR IGNORE INTO machines (id, name, hostname, registered_at) VALUES ('machine-B', 'B', 'host-b', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT OR IGNORE INTO agents (tag, project, role, machine_id, registered_at) VALUES ('worker-1', 'projA', 'implementer', 'machine-A', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT OR IGNORE INTO agents (tag, project, role, machine_id, registered_at) VALUES ('worker-2', 'projB', 'reviewer', 'machine-B', ?)",
         nowIso,
       );
@@ -192,7 +193,7 @@ describe('M4 conversation links HTTP (Miniflare SQL)', () => {
       insertJob(hub.sql, { id: jobId, actor: 'routing-client:x' });
 
       const beforeJobs = Number(
-        hub.sql.exec('SELECT COUNT(*) AS n FROM routing_jobs').toArray()[0].n,
+        fixtureSql(hub).exec('SELECT COUNT(*) AS n FROM routing_jobs').toArray()[0].n,
       );
       const attached = await hub.fetch(
         jsonReq(`/api/conversations/${conv.id}/links`, {
@@ -217,7 +218,7 @@ describe('M4 conversation links HTTP (Miniflare SQL)', () => {
       expect(JSON.stringify(body)).not.toContain('routing-client:x');
       expect(
         Number(
-          hub.sql.exec('SELECT COUNT(*) AS n FROM routing_jobs').toArray()[0].n,
+          fixtureSql(hub).exec('SELECT COUNT(*) AS n FROM routing_jobs').toArray()[0].n,
         ),
       ).toBe(beforeJobs);
 
@@ -314,7 +315,7 @@ describe('M4 conversation links HTTP (Miniflare SQL)', () => {
       expect(out.target.complete).toBe(true);
       expect(out.target.terminal).toBe(true);
 
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "UPDATE fleet_launches SET state = 'failed' WHERE id = ?",
         launchId,
       );
@@ -596,7 +597,7 @@ describe('M4 idempotency, cap, restart, retention', () => {
         error: 'storage_limit_exceeded',
       });
 
-      const restarted = new Hub(state, testEnv);
+      const restarted = await restartFixtureHub(hub);
       const listed = await restarted.fetch(
         jsonReq(`/api/conversations/${conv.id}/links`, { cookie }),
       );
@@ -637,7 +638,7 @@ describe('M4 idempotency, cap, restart, retention', () => {
       ).toBe(200);
 
       hub.conversationsService.limits.archivedConversationRetentionMs = 1;
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "UPDATE conversations SET archived_at = '2000-01-01T00:00:00.000Z' WHERE id = ?",
         conv.id,
       );
@@ -687,7 +688,7 @@ describe('M4 idempotency, cap, restart, retention', () => {
       );
       expect(attached.status).toBe(201);
       expect((await attached.json() as any).target.complete).toBe(true);
-      hub.sql.exec('DELETE FROM routing_jobs WHERE id = ?', jobId);
+      fixtureSql(hub).exec('DELETE FROM routing_jobs WHERE id = ?', jobId);
       const listed = await hub.fetch(
         jsonReq(`/api/conversations/${conv.id}/links`, { cookie }),
       );

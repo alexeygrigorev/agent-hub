@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { initIntakeExport, advanceIntakeExport } from '../src/intake-export';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
@@ -55,16 +56,18 @@ async function state() { return inDO(stub(), (h: any) => Object.fromEntries(['ta
 
 beforeEach(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
-  await inDO(stub(), (h: any) => {
+  await inDO(stub(), async (h: any, state: any) => {
+    await freshFixtureBudgetDay(h);
+    const sql=fixtureSql(h,state);
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
     // Only fixture-owned archive rows are reset; production archives are append-only.
-    h.sql.exec('DROP TRIGGER IF EXISTS intake_note_archive_no_delete');
-    h.sql.exec('DELETE FROM intake_note_archive');
-    h.sql.exec("CREATE TRIGGER intake_note_archive_no_delete BEFORE DELETE ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
-    for (const t of ['tasks','grants','rules','receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    h.sql.exec('UPDATE intake_meta SET revision=0');
-    h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
-    h.sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('fixture', 'admin@fake.local', 1, '2026-01-01', '2026-01-01')");
+    sql.exec('DROP TRIGGER IF EXISTS intake_note_archive_no_delete');
+    sql.exec('DELETE FROM intake_note_archive');
+    sql.exec("CREATE TRIGGER intake_note_archive_no_delete BEFORE DELETE ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
+    for (const t of ['tasks','grants','rules','receipts']) sql.exec('DELETE FROM intake_' + t);
+    sql.exec('UPDATE intake_meta SET revision=0');
+    sql.exec('DELETE FROM credentials'); sql.exec('DELETE FROM agents');
+    sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('fixture', 'admin@fake.local', 1, '2026-01-01', '2026-01-01')");
   });
 });
 
@@ -146,10 +149,11 @@ describe('private durable intake HTTP/SQLite', () => {
   });
 
   it('summarizes 1083 retained histories without reading ledgers and hydrates only one export page', async () => {
-    await inDO(stub(), (h: any) => {
+    await inDO(stub(), (h: any, state:any) => {
+      const seedSql=fixtureSql(h,state);
       for (let i = 0; i < 1083; i++) {
         const id = 'export-' + String(i).padStart(4, '0');
-        h.sql.exec('INSERT INTO intake_tasks VALUES (?,?)', id, JSON.stringify({ id, project: 'export-fixture',
+        seedSql.exec('INSERT INTO intake_tasks VALUES (?,?)', id, JSON.stringify({ id, project: 'export-fixture',
           title: 'Task ' + i, status: i % 2 ? 'done' : 'open', version: 1, created_at: i, updated_at: i,
           archived_at: i % 2 ? 1 : null, history: [{ id: 'note', kind: 'note', text: 'x'.repeat(8192), captured_at: i }] }));
       }

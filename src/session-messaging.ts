@@ -1,3 +1,4 @@
+import { runningCredentialSessionPage, credentialSessionCursor } from './credential-session-page';
 /** Cross-device session messaging (docs/SESSION-MESSAGING.md; intakes 4fc83e80,
  * a3227276 AC4/AC6).
  *
@@ -407,13 +408,11 @@ const CREDENTIAL_TTL_MS = 3600 * 1000; // 1 h access token (docs/SESSION-MESSAGI
  * lookups only. */
 export function sessionsNeedingCredentials(sql:SqlStorage,machineId:string,now:number):{session_id:string;native_id:string;tag:string;workspace:string}[] {
   const key='machine:'+machineId;
-  const old=Number(sql.exec('SELECT cursor FROM session_credential_scan WHERE key=?',key).toArray()[0]?.cursor??0);
-  const raw=sql.exec(`SELECT rowid AS scan_id,id,machine_id,binding_json FROM session_control_sessions INDEXED BY session_control_state
-    WHERE state='running' AND rowid>? ORDER BY rowid LIMIT 65`,old).toArray() as any[];
+  const old=String(sql.exec('SELECT cursor FROM session_credential_scan WHERE key=?',key).toArray()[0]?.cursor??'0');
+  const raw=runningCredentialSessionPage(sql,machineId,old);
   const out:any[]=[];let last=old,unfinished=false;
   for(const row of raw.slice(0,64)) {
-    last=Number(row.scan_id);
-    if(row.machine_id!==machineId)continue;
+    last=credentialSessionCursor(row);
     const identity:any=sql.exec("SELECT machine_id FROM agents INDEXED BY idx_agents_project_tag_unique WHERE COALESCE(project,'')=? AND tag=?",SESSION_PROJECT,row.id).toArray()[0];
     if(!identity || identity.machine_id!==machineId || row.binding_json===null)continue;
     let binding:any;try{binding=JSON.parse(row.binding_json);}catch{continue;}
@@ -423,16 +422,38 @@ export function sessionsNeedingCredentials(sql:SqlStorage,machineId:string,now:n
     if(!live)out.push({session_id:String(row.id),native_id:String(binding.native_id),tag:String(binding.tag),workspace:String(binding.workspace)});
     if(out.length>=10){unfinished=true;break;}
   }
-  const next=unfinished || raw.length>64 ? last : 0;
+  const next=unfinished || raw.length>64 ? last : '0';
   if(next!==old)sql.exec('INSERT INTO session_credential_scan VALUES(?,?) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor',key,String(next));
   return out;
 }
 const endedScanPending=new WeakMap<object,boolean>();
-/** Host polling and backstop lifecycle cleanup are both bounded cursor walks. */
-export function pollSessionCredentials(sql:SqlStorage,machineId:string,now:number,sweep=true):{session_id:string;native_id:string;tag:string;workspace:string}[] {
+type MessagingScan={generation:string;hadWork:boolean;empty:boolean};
+const messagingScans=new WeakMap<object,Map<string,MessagingScan>>();
+/** Complete-empty observations are reused only while exact source generations
+ * match. Unfinished pages continue; cold mid-cycle cursors require one full
+ * fresh cycle before they can prove absence. */
+export function pollSessionCredentials(sql:SqlStorage,machineId:string,now:number,sweep=true,generation?:()=>string):{session_id:string;native_id:string;tag:string;workspace:string}[] {
   if(sweep || endedScanPending.get(sql as object))endedScanPending.set(sql as object,revokeEndedSessionCredentials(sql,now));
-  return sessionsNeedingCredentials(sql,machineId,now);
+  let scans=messagingScans.get(sql);if(!scans)messagingScans.set(sql,scans=new Map());
+  const stamp=generation?.(),prior=scans.get(machineId);
+  if(stamp!==undefined&&prior?.generation===stamp&&prior.empty)return [];
+  const key='machine:'+machineId;
+  let cursor=String(sql.exec('SELECT cursor FROM session_credential_scan WHERE key=?',key).toArray()[0]?.cursor??'0');
+  const changed=stamp!==undefined&&prior!==undefined&&prior.generation!==stamp;
+  if(changed&&cursor!=='0') {sql.exec('UPDATE session_credential_scan SET cursor=? WHERE key=?','0',key);cursor='0';}
+  const state:MessagingScan=stamp!==undefined&&prior?.generation===stamp?prior:{generation:stamp??'',hadWork:cursor!=='0',empty:false};
+  if(cursor==='0')state.hadWork=false;
+  const sessions=sessionsNeedingCredentials(sql,machineId,now);
+  if(sessions.length)state.hadWork=true;
+  const next=String(sql.exec('SELECT cursor FROM session_credential_scan WHERE key=?',key).toArray()[0]?.cursor??'0');
+  state.empty=next==='0'&&!state.hadWork;
+  state.generation=generation?.()??'';
+  if(next==='0'&&!state.empty)state.hadWork=false;
+  if(scans.size>=128&&!scans.has(machineId))scans.delete(scans.keys().next().value!);
+  scans.set(machineId,state);
+  return sessions;
 }
+
 function revokeMessagingActor(sql:SqlStorage,actor:string,now:number):void {
   const at=new Date(now).toISOString();
   for(const credential of credentialActorRows(sql,actor))if(credential.kind==='agent' && credential.revoked_at===null)

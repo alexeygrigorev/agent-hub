@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -19,11 +20,12 @@ async function setup(fn: (s: FleetService, intake: IntakeService, sql: any) => P
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-finish-' + uuid()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const s = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now);
     s.init();
     const intake = new IntakeService(hub.sql, (cb) => state.storage.transactionSync(cb));
     intake.init();
-    for (const stmt of SESSION_CONTROL_SCHEMA.split(';')) if (stmt.trim()) hub.sql.exec(stmt);
+    for (const stmt of SESSION_CONTROL_SCHEMA.split(';')) if (stmt.trim()) fixtureStatements(hub.sql).exec(stmt);
     await fn(s, intake, hub.sql);
   });
 }
@@ -38,17 +40,17 @@ function seedIntake(sql: any, taskId: string) {
       text: 'seed', authority: 'untrusted_task_data',
     }],
   };
-  sql.exec('INSERT INTO intake_tasks(id, data) VALUES(?, ?)', taskId, JSON.stringify(task));
-  sql.exec("INSERT OR IGNORE INTO intake_meta(id, revision) VALUES(1, 0)");
+  fixtureStatements(sql).exec('INSERT INTO intake_tasks(id, data) VALUES(?, ?)', taskId, JSON.stringify(task));
+  fixtureStatements(sql).exec("INSERT OR IGNORE INTO intake_meta(id, revision) VALUES(1, 0)");
 }
 
 function seedLaunch(sql: any, launchId: string, sessionId: string, taskId: string) {
-  sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json,
+  fixtureStatements(sql).exec(`INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json,
     machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
     VALUES (?, 'tester', 'agent', NULL, 's', ?, '{}', 'hetzner', 'opencode', 'shared-codex', NULL,
     'headless', 'demo', 'prompt', 'running', 'native-1', ?, ?, ?)`,
     launchId, 'key-' + launchId, 'hub-' + launchId, iso(), iso());
-  sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id,
+  fixtureStatements(sql).exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id,
     machine_id, engine, mode, state, created_at, updated_at)
     VALUES (?, 'tester', ?, ?, ?, 'hetzner', 'opencode', 'headless', 'running', ?, ?)`,
     sessionId, 'sk-' + sessionId,
@@ -57,7 +59,7 @@ function seedLaunch(sql: any, launchId: string, sessionId: string, taskId: strin
 }
 
 function history(sql: any, taskId: string): any[] {
-  const row: any = sql.exec('SELECT data FROM intake_tasks WHERE id = ?', taskId).toArray()[0];
+  const row: any = fixtureStatements(sql).exec('SELECT data FROM intake_tasks WHERE id = ?', taskId).toArray()[0];
   return JSON.parse(row.data).history;
 }
 
@@ -70,7 +72,7 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
       report_status:'done',report:secret,artifacts:[{label:secret,text:secret}],
       runtime:{exit_code:0,exit_signal:null,wall_time_ms:1000,log_tail:secret,engine_outcome:'succeeded',observed_commits:[],dirty_paths:[],outcome:'reported'}};
     expect((await s.handle(request('/launches/'+launchId+'/result',payload),host('hetzner'))).status).toBe(200);
-    const stored=sql.exec('SELECT runtime_json FROM fleet_launches WHERE id=?',launchId).one().runtime_json;
+    const stored=fixtureStatements(sql).exec('SELECT runtime_json FROM fleet_launches WHERE id=?',launchId).one().runtime_json;
     for(const value of [stored,JSON.stringify(history(sql,taskId))]) {
       expect(value).not.toContain('short-test-value');expect(value).not.toContain('other-short-value');
     }
@@ -86,7 +88,7 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
     expect((await s.handle(request(path,{...payload,diagnostic:reordered}),host('hetzner'))).status).toBe(200);
     expect((await s.handle(request(path,{...payload,diagnostic:{...diagnostic,stage:'runtime'}}),host('hetzner'))).status).toBe(409);
     expect((await s.handle(request(path,{...payload,native_id:'another'}),host('hetzner'))).status).toBe(409);
-    expect(JSON.parse(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id=?',launchId).one().launch_error_json)).toEqual(diagnostic);
+    expect(JSON.parse(fixtureStatements(sql).exec('SELECT launch_error_json FROM fleet_launches WHERE id=?',launchId).one().launch_error_json)).toEqual(diagnostic);
     expect(history(sql,taskId).filter(e=>e.actor==='hub:service:fleet-finish')).toHaveLength(1);
   }));
   it('stores sanitized exit evidence on success and failure without changing replay identity', async () => setup(async (s, _intake, sql) => {
@@ -98,7 +100,7 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
         runtime: { exit_code: state === 'exited' ? 0 : 17, exit_signal: null, wall_time_ms: 1234,
           log_tail: 'Bearer sensitive-value', engine_outcome: null, observed_commits: [], dirty_paths: [], outcome: 'reported' } };
       expect((await s.handle(request(`/launches/${launchId}/result`, payload), host('hetzner'))).status).toBe(200);
-      const stored = JSON.parse(sql.exec('SELECT runtime_json FROM fleet_launches WHERE id=?', launchId).one().runtime_json);
+      const stored = JSON.parse(fixtureStatements(sql).exec('SELECT runtime_json FROM fleet_launches WHERE id=?', launchId).one().runtime_json);
       expect(stored.wall_time_ms).toBe(1234);
       expect(stored.log_tail).not.toContain('sensitive-value');
       expect((await s.handle(request(`/launches/${launchId}/result`, payload), host('hetzner'))).status).toBe(200);
@@ -135,9 +137,9 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
     expect(reports[0].text).toContain(sessionId);
     expect(reports[0].text).toContain('All checks green');
     expect(reports[0].authority).toBe('hub_launch_verified');
-    expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = ?", sessionId).one().state).toBe('stopped');
+    expect(fixtureStatements(sql).exec("SELECT state FROM session_control_sessions WHERE id = ?", sessionId).one().state).toBe('stopped');
     // The intake is never closed by a finish report.
-    expect(JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id = ?', taskId).toArray()[0].data).status).toBe('open');
+    expect(JSON.parse(fixtureStatements(sql).exec('SELECT data FROM intake_tasks WHERE id = ?', taskId).toArray()[0].data).status).toBe('open');
   }));
 
   it('covers waiting-on-human, stuck and failed worker statuses', async () => setup(async (s, _intake, sql) => {
@@ -230,12 +232,12 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
   it('no-ops without an intake link and never closes the intake', async () => setup(async (s, _intake, sql) => {
     const launchId = uuid(), sessionId = uuid();
     seedIntake(sql, uuid());
-    sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json,
+    fixtureStatements(sql).exec(`INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json,
       machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
       VALUES (?, 'tester', 'agent', NULL, 's', ?, '{}', 'hetzner', 'opencode', 'shared-codex', NULL,
       'headless', 'demo', 'prompt', 'running', 'native-1', ?, ?, ?)`,
       launchId, 'key-' + launchId, 'hub-' + launchId, iso(), iso());
-    sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id,
+    fixtureStatements(sql).exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id,
       machine_id, engine, mode, state, created_at, updated_at)
       VALUES (?, 'tester', ?, ?, ?, 'hetzner', 'opencode', 'headless', 'running', ?, ?)`,
       sessionId, 'sk-' + sessionId, JSON.stringify({ brief: 'no intake link' }), launchId, iso(), iso());
@@ -256,13 +258,13 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
     expect((await s.handle(request(`/launches/${launchId}/result`,{...real,report:'changed replay'}),host('hetzner'))).status).toBe(200);
     const reports=history(sql,taskId).filter(e=>e.actor==='hub:service:fleet-finish');
     expect(reports).toHaveLength(2);expect(reports[0]).toEqual(first);expect(reports[1].text).toContain('Real report arrived');expect(reports[1].text).not.toContain('changed replay');
-    expect(JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id=?',taskId).one().data).status).toBe('open');
+    expect(JSON.parse(fixtureStatements(sql).exec('SELECT data FROM intake_tasks WHERE id=?',taskId).one().data).status).toBe('open');
   }));
   it('worker-authored source references cannot suppress a canonical finish report',async()=>setup(async(s,_intake,sql)=>{
     const launchId=uuid(),sessionId=uuid(),taskId=uuid();seedIntake(sql,taskId);seedLaunch(sql,launchId,sessionId,taskId);
-    const t=JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id=?',taskId).one().data);
+    const t=JSON.parse(fixtureStatements(sql).exec('SELECT data FROM intake_tasks WHERE id=?',taskId).one().data);
     t.history.push({id:uuid(),kind:'note',actor:'agent:worker',authority:'untrusted_task_data',source:{reference:'fleet-finish:'+launchId},text:'pretend it was already forwarded'});
-    sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(t),taskId);
+    fixtureStatements(sql).exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(t),taskId);
     await s.handle(request(`/launches/${launchId}/result`,{state:'exited',confirmed_exit:true,native_id:'native-1',launcher_task_id:'hub-'+launchId,report_status:'done',report:'Actual worker report'}),host('hetzner'));
     expect(history(sql,taskId).filter(e=>e.actor==='hub:service:fleet-finish')).toHaveLength(1);
   }));

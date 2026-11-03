@@ -1,3 +1,4 @@
+import { runningCredentialSessionPage, credentialSessionCursor } from './credential-session-page';
 /** Host-issued, refreshable worker credentials restricted to one linked intake.
  * Uses the normal credential/registry lifecycle; no host or human bearer is
  * copied into the worker and no new signing secret is needed.
@@ -336,17 +337,15 @@ function revokeNativeFamily(sql:SqlStorage,sessionId:string,family:string,now:nu
   for(const credential of nativeFamilyCredentials(sql,sessionId,family))
     sql.exec('UPDATE credentials SET revoked_at=? WHERE id=? AND family_id=? AND revoked_at IS NULL',at,credential.id,family);
 }
-export function nativeSessionsNeedingIntakeCredentialPage(sql:SqlStorage,machineId:string,after=0):{sessions:any[];next:number} {
+export function nativeSessionsNeedingIntakeCredentialPage(sql:SqlStorage,machineId:string,after:string|number=0):{sessions:any[];next:string|0} {
   // Bound raw running-machine rows before binding/link/credential filtering.
-  // This uses the deployed (state,implicit rowid) index and does
+  // This uses the deployed per-host state/created_at/rowid index and does
   // not sort or anti-join the entire retained session/credential population.
-  const raw=sql.exec(`SELECT rowid AS scan_id,id,machine_id,binding_json,fleet_launch_id FROM session_control_sessions
-    INDEXED BY session_control_state WHERE state='running' AND rowid>?
-    ORDER BY rowid LIMIT ?`,after,NATIVE_SCAN_BATCH+1).toArray() as any[];
+  const raw=runningCredentialSessionPage(sql,machineId,after);
   const out:any[]=[];
-  let last=after;
+  let last=String(after);
   for(const row of raw.slice(0,NATIVE_SCAN_BATCH)) {
-    last=Number(row.scan_id);
+    last=credentialSessionCursor(row);
     if(row.machine_id!==machineId || row.fleet_launch_id || row.binding_json===null)continue;
     let binding:any;try{binding=JSON.parse(row.binding_json);}catch{continue;}
     if(!binding?.native_id || !binding?.workspace)continue;
@@ -432,6 +431,7 @@ export class WorkerAccess {
    * ended-session revoke sweep is a backstop (transitions revoke directly);
    * it runs only after a write to the tables it reads, never on every poll. */
   private nativePages=new Map<string,any>();
+  private nativePageGenerations=new Map<string,string>();
   private nativeCyclePending=new Map<string,boolean>();
   private endedScanPending=true;
   listNative(caller: CallerContext | undefined, scopes: string[] | undefined): Response {
@@ -449,14 +449,20 @@ export class WorkerAccess {
       const key='native-list:'+caller.machineId;
       const dependencies=['worker_access','native_credential_authority','session_control_sessions','credentials','intake_session_links','intake_tasks'];
       const cached=this.nativePages.get(caller.machineId!);
-      if(cached && this.sweep?.changed(key,...dependencies)===null)return Response.json(cached,{headers:{'Cache-Control':'no-store'}});
+      const observation=this.sweep?.changed(key,...dependencies);
+      if(cached && observation===null)return Response.json(cached,{headers:{'Cache-Control':'no-store'}});
       const cursorKey='machine:'+caller.machineId;
-      const old=Number(this.sql.exec('SELECT cursor FROM native_credential_scan WHERE key=?',cursorKey).toArray()[0]?.cursor??0);
-      if(!old)this.nativeCyclePending.set(caller.machineId!,false);
+      let old=String(this.sql.exec('SELECT cursor FROM native_credential_scan WHERE key=?',cursorKey).toArray()[0]?.cursor??'0');
+      const previousGeneration=this.nativePageGenerations.get(caller.machineId!);
+      if(observation!==undefined&&observation!==null&&previousGeneration!==undefined&&previousGeneration!==observation&&old!=='0') {
+        this.sql.exec('UPDATE native_credential_scan SET cursor=? WHERE key=?','0',cursorKey);old='0';
+      }
+      if(old==='0')this.nativeCyclePending.set(caller.machineId!,false);
       else if(!this.nativeCyclePending.has(caller.machineId!))this.nativeCyclePending.set(caller.machineId!,true);
       const page=nativeSessionsNeedingIntakeCredentialPage(this.sql,caller.machineId!,old);
       if(page.sessions.length)this.nativeCyclePending.set(caller.machineId!,true);
-      if(page.next!==old)this.sql.exec('INSERT INTO native_credential_scan VALUES(?,?) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor',cursorKey,String(page.next));
+      if(String(page.next)!==old)this.sql.exec('INSERT INTO native_credential_scan VALUES(?,?) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor',cursorKey,String(page.next));
+      if(observation!==undefined&&observation!==null)this.nativePageGenerations.set(caller.machineId!,observation);
       const payload={sessions:page.sessions,...(page.next?{observation_scope:'cursor_batch',observation_pending:true}:{})};
       // Nonempty work must be offered again until issuance changes authority.
       // Continue unfinished scans on later polls even without a source write.
@@ -489,7 +495,18 @@ export class WorkerAccess {
       const tag = 'native-' + id, actor = NATIVE_WORKER_PROJECT + ':' + tag;
       const prior: any = this.sql.exec('SELECT family_id FROM worker_access WHERE launch_id=?', id).toArray()[0];
       const family = prior?.family_id || crypto.randomUUID();
-      if (!prior) this.sql.exec('INSERT INTO agents(tag,project,role,machine_id,registered_at) VALUES(?,?,?,?,?)', tag, NATIVE_WORKER_PROJECT, 'worker', caller.machineId!, at);
+      if(prior && !this.sql.exec("SELECT tag FROM agents INDEXED BY idx_agents_project_tag_unique WHERE COALESCE(project,'')=? AND tag=?",NATIVE_WORKER_PROJECT,tag).toArray().length)
+        return reply({error:'native_registry_missing'},409);
+      // Registry rebind triggers revoke retained actor credentials. Prove
+      // their complete bounded population BEFORE that trigger can write.
+      try { credentialActorRows(this.sql,actor); }
+      catch(error) {
+        if(!(error instanceof NativeCredentialObservationLimit))throw error;
+        return reply({error:'native_credential_observation_limit',observation_pending:true},503);
+      }
+      if(prior) {
+        this.sql.exec("UPDATE agents SET machine_id=?,workspace=? WHERE COALESCE(project,'')=? AND tag=?",caller.machineId!,String(binding.workspace),NATIVE_WORKER_PROJECT,tag);
+      } else this.sql.exec('INSERT INTO agents(tag,project,role,machine_id,workspace,registered_at) VALUES(?,?,?,?,?,?)',tag,NATIVE_WORKER_PROJECT,'worker',caller.machineId!,String(binding.workspace),at);
       revokeNativeFamily(this.sql,id,family,now);
       const credId = crypto.randomUUID();
       this.sql.exec('INSERT INTO native_credential_authority VALUES(?,1) ON CONFLICT(family_id) DO UPDATE SET enabled=1',family);
@@ -497,7 +514,7 @@ export class WorkerAccess {
         VALUES(?,'agent',?,?,?,?,?,?,?,?,?,?,?)`, credId, tokens.accessHash, tokens.refreshHash, family, actor, caller.machineId!, actor,
         JSON.stringify(['bus:read', WORKER_SCOPE]), 'host:' + caller.machineId, at, new Date(now + 3600000).toISOString(),actor);
       this.sql.exec(`INSERT INTO worker_access(family_id,launch_id,session_id,task_id,workspace,expires_at) VALUES(?,?,?,?,?,?)
-        ON CONFLICT(family_id) DO UPDATE SET task_id=excluded.task_id, expires_at=excluded.expires_at`, family, id, id, intake, String(binding.workspace), expires);
+        ON CONFLICT(family_id) DO UPDATE SET task_id=excluded.task_id,workspace=excluded.workspace,expires_at=excluded.expires_at`, family, id, id, intake, String(binding.workspace), expires);
       return reply({ access_token: tokens.accessToken, refresh_token: tokens.refreshToken, client_kind: 'agent',
         worker_launch_id: id, base_url: new URL(request.url).origin, worker_expires_at: expires, intake_task_id: intake });
     });

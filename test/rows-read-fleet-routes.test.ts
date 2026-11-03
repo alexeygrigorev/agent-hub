@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 /**
  * Rows-read bounds for the two host-polled fleet routes (intake e8a22f4c):
  * GET /api/fleet/offers and PUT /api/fleet/sessions. Seeds a production-shaped
@@ -52,7 +53,8 @@ const withFleet = (fn: (s: FleetService, t: ReturnType<typeof tracked>, hub: Hub
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-rows-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    seed(hub.sql);
+    await freshFixtureBudgetDay(hub);
+    seed(fixtureSql(hub,state));
     const t = tracked(hub.sql);
     const s = new FleetService(t.proxy, (cb) => state.storage.transactionSync(cb), () => now);
     s.init();

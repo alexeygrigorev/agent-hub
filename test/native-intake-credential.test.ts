@@ -147,5 +147,41 @@ describe('native session intake credential', () => {
     expect((await call('/api/sessions/' + session + '/intake-credential', {})).status).toBe(409);
     expect(await (await call('/api/session-intake/credentials')).json()).toEqual({ sessions: [] });
   }));
+  it('reissues a usable refresh family after an authorized native host/workspace rebind',()=>setup(async({stub,task,session,native,call,link,otherToken}:any)=>{
+    await link(task,native);
+    const first=await call('/api/sessions/'+session+'/intake-credential',{});expect(first.status).toBe(200);
+    const old:any=await first.json(),workspace='/home/u/git/moved-native';
+    await runInDurableObject<Hub,any>(stub,(hub:any)=>{
+      const row=hub.sql.exec('SELECT binding_json FROM session_control_sessions WHERE id=?',session).one();
+      hub.sql.exec('UPDATE session_control_sessions SET machine_id=?,binding_json=?,updated_at=? WHERE id=?','other-host',JSON.stringify({...JSON.parse(row.binding_json),workspace}),new Date().toISOString(),session);
+    });
+    const issued=await call('/api/sessions/'+session+'/intake-credential',{},otherToken);
+    expect(issued.status,await issued.clone().text()).toBe(200);const credential:any=await issued.json();
+    expect((await call('/api/intake/tasks/'+task,undefined,credential.access_token)).status).toBe(200);
+    expect((await call('/api/intake/tasks/'+task,undefined,old.access_token)).status).toBeGreaterThanOrEqual(401);
+    const refreshed=await stub.fetch('https://hub.test/api/token/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grant_type:'refresh_token',refresh_token:credential.refresh_token})});
+    expect(refreshed.status,await refreshed.clone().text()).toBe(200);const renewed:any=await refreshed.json();
+    expect((await call('/api/intake/tasks/'+task,undefined,renewed.access_token)).status).toBe(200);
+    await runInDurableObject<Hub,any>(stub,(hub:any)=>{
+      expect(hub.sql.exec("SELECT machine_id,workspace FROM agents INDEXED BY idx_agents_project_tag_unique WHERE COALESCE(project,'')=? AND tag=?",'hub-native-workers','native-'+session).one()).toMatchObject({machine_id:'other-host',workspace});
+      expect(hub.sql.exec('SELECT workspace FROM worker_access WHERE launch_id=?',session).one().workspace).toBe(workspace);
+    });
+  }));
+
+  it('refuses reissue when the stable native registry identity was deleted',()=>setup(async({stub,task,session,native,call,link}:any)=>{
+    await link(task,native);expect((await call('/api/sessions/'+session+'/intake-credential',{})).status).toBe(200);
+    let before=0;
+    await runInDurableObject<Hub,any>(stub,(hub:any)=>{
+      hub.sql.exec("DELETE FROM agents WHERE COALESCE(project,'')=? AND tag=?",'hub-native-workers','native-'+session);
+      before=Number(hub.sql.exec("SELECT COUNT(*) AS n FROM credentials WHERE kind='agent'").one().n);
+    });
+    const refused=await call('/api/sessions/'+session+'/intake-credential',{});expect(refused.status).toBe(409);
+    expect((await refused.json() as any).error).toBe('native_registry_missing');
+    await runInDurableObject<Hub,any>(stub,(hub:any)=>{
+      expect(Number(hub.sql.exec("SELECT COUNT(*) AS n FROM credentials WHERE kind='agent'").one().n)).toBe(before);
+      expect(hub.sql.exec("SELECT tag FROM agents WHERE COALESCE(project,'')=? AND tag=?",'hub-native-workers','native-'+session).toArray()).toEqual([]);
+    });
+  }));
+
 });
 

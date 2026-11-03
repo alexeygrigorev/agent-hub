@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
@@ -22,6 +23,8 @@ async function cookieFor(): Promise<{ cookie: string; csrf: string }> {
 it('status reads stay bounded to the capped selection and keep their output shape', async () => fixture(async h => {
   const now = Date.now();
   const statuses = ['open', 'in_progress', 'blocked', 'pending_approval', 'done', 'cancelled'];
+  await freshFixtureBudgetDay(h);
+  const seedSql=fixtureSql(h);
   h.ctx.storage.transactionSync(() => {
     for (let i = 0; i < 900; i++) {
       const task = {
@@ -34,7 +37,7 @@ it('status reads stay bounded to the capped selection and keep their output shap
           ...(i % 3 === 0 ? [{ kind: 'blocker', id: `blk-${i}`, text: 'Blocked on review' }] : []),
         ],
       };
-      h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES (?,?)', task.id, JSON.stringify(task));
+      seedSql.exec('INSERT INTO intake_tasks(id,data) VALUES (?,?)', task.id, JSON.stringify(task));
     }
   });
 

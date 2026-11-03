@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 /** Lock-free intake summary fast path (intake ef429827).
  *
  * Covers: complete machine-readable counts on a 600+ task fixture with no
@@ -7,7 +8,7 @@
  * afterwards so other suites never observe them.
  */
 import { advanceIntakeExport } from '../src/intake-export';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 
@@ -39,19 +40,23 @@ function taskData(i: number) {
 beforeAll(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local',
     isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
+  await inDO(stub(),freshFixtureBudgetDay);
   baseTotal = (await summary()).body.total;
-  await inDO(stub(), (h: any) => {
+  await inDO(stub(), (h: any, state: any) => {
+    const sql=fixtureSql(h,state);
     for (let i = 0; i < SEED; i++) {
-      h.sql.exec('INSERT OR IGNORE INTO intake_tasks(id,data) VALUES(?,?)', `perf-${i}`, taskData(i));
+      sql.exec('INSERT OR IGNORE INTO intake_tasks(id,data) VALUES(?,?)', `perf-${i}`, taskData(i));
     }
     let guard = 0;
-    while (!advanceIntakeExport(h.sql) && guard++ < 100) { /* drain the cursor */ }
+    while (!advanceIntakeExport(sql) && guard++ < 100) { /* drain the cursor */ }
   });
 });
 
+beforeEach(async()=>{await inDO(stub(),freshFixtureBudgetDay);});
+
 afterAll(async () => {
-  await inDO(stub(), (h: any) => {
-    h.sql.exec('DELETE FROM intake_tasks WHERE id LIKE ?', 'perf-%');
+  await inDO(stub(), (h: any, state:any) => {
+    fixtureSql(h,state).exec('DELETE FROM intake_tasks WHERE id LIKE ?', 'perf-%');
   });
 });
 

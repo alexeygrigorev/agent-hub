@@ -7,6 +7,7 @@ const READER_CHECKPOINT_MS=60*60*1000;
 const READER_LIMIT=128;
 type LiveReader={recipient:string;credentialId:string;readAt:number;persistedAt:number};
 const liveReaders=new WeakMap<object,Map<string,LiveReader>>();
+export function invalidateReaderObservations(sql:object):void { liveReaders.delete(sql); }
 function readerIdentity(sql:ReaderSql,actor:string):{actor:string;agent:any;unknown:boolean} {
   let rows:any[]=[];
   if(actor.startsWith('role:')) {

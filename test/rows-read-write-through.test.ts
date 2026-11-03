@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 /**
  * Write-through cache budgets (intake 8081a05a/e8a22f4c phase 2). The
  * host-polled routes serve from in-memory caches stamped by per-table write
@@ -63,7 +64,8 @@ function seed(sql: any) {
 const withFleet = (fn: (s: any, t: ReturnType<typeof tracked>, watch: WriteWatch, catalog: ObservedCatalog, rawSql: SqlStorage) => Promise<void>) => async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('write-through-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    seed(hub.sql);
+    await freshFixtureBudgetDay(hub);
+    seed(fixtureSql(hub,state));
     const t = tracked(hub.sql);
     const watch = new WriteWatch();
     watch.trackAll(['session_control_sessions','fleet_launches','machines','intake_tasks','intake_task_projection','resource_request_projection','session_control_protections','resource_reaps','resource_settings','host_health_observations','session_idle_episodes']);

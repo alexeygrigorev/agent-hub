@@ -1,3 +1,4 @@
+import { accountFailurePrefix,routeFailureObservation,routeQuarantineObservation,unsupportedModelObservation } from './fleet-failure-observation';
 import { readPlacementPressure, PLACEMENT_PRESSURE_REASONS } from './placement-pressure';
 export { PLACEMENT_PRESSURE_REASONS } from './placement-pressure';
 import { repoAllowsMachine } from './repo-host-policy';
@@ -1225,7 +1226,7 @@ export class FleetService {
 
   private planWithinMaintenance(input: any, loadRefusal?: { machine: string; factor: number; trigger?: string; limit?: number }, rand?: () => number):
     { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
-    { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any>; hold_reason?: string; needs_machines?: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] } {
+    { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any;observation?:string }[]; evidence: Record<string, any>; hold_reason?: string; needs_machines?: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] } {
     if (input && (modelDisabledByPolicy(input.engine) || modelDisabledByPolicy(input.model) ||
         policy.models.some(m => [m.id, m.model].includes(input.engine) && modelDisabledByPolicy(m)))) return { error: 'model_disabled_by_policy' };
     if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'effort', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project', 'needs', 'repo_context']) ||
@@ -1293,7 +1294,7 @@ export class FleetService {
     if (input.effort !== undefined) request.effort = input.effort;
     const needs: string[] = Array.isArray(input.needs) ? [...input.needs] : [];
     if (needs.length) request.needs = needs;
-    const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = []; const redecide = new Map<any, (healthyAlt: boolean) => any>(); const gateDegraded = new Set<number>();
+    const rejected: { machine: string; engine: string; reason: string; memory?: any;observation?:string }[] = []; const candidates: any[] = []; const redecide = new Map<any, (healthyAlt: boolean) => any>(); const gateDegraded = new Set<number>();
     // Hub-held credential state (intake 5814e109 I5): an account whose Hub
     // credential the provider rejected is offered nowhere, and a host that
     // reported a generation rejected is not offered that account again until
@@ -1343,22 +1344,19 @@ export class FleetService {
     // window, and only count failures a route can be blamed for: capacity holds,
     // expired offers and model refusals say nothing about the account (they were
     // the reason every route read fail=8, the global cap of the old per-label count).
-    const recentFailuresByRoute = new Map<string, { n: number; launcher: string[] }>();
+    const recentFailuresByRoute = new Map<string, { n: number; launcher: string[];limited:boolean }>();
+    const failurePrefixes=new Map<string,ReturnType<typeof accountFailurePrefix>>();
     const hostLaunchCounts = new Map<string, { pending: number; running: number }>();
-    const routeFailures = (acct: string, machineId: string): { n: number; launcher: string[] } => {
+    const routeFailures = (acct: string, machineId: string): { n: number; launcher: string[];limited:boolean } => {
       const key = acct + '\0' + machineId;
       if (!recentFailuresByRoute.has(key)) {
-        let n = 0;
-        let launcher: string[] = [];
+        let observation:{n:number;launcher:string[];limited:boolean}={n:0,launcher:[],limited:true};
         try {
-          const sinceIso = new Date(this.now() - ROUTE_FAILURE_WINDOW_MS).toISOString();
-          const skip = [...ROUTE_FAILURE_NEUTRAL_REASONS];
-          const rows = this.sql.exec(`SELECT exit_reason, updated_at FROM fleet_launches WHERE account = ? AND machine_id = ? AND state = 'failed' AND exit_reason IS NOT NULL AND exit_reason NOT IN (${skip.map(() => '?').join(',')}) AND updated_at > ? ORDER BY updated_at DESC LIMIT ${ROUTE_FAILURE_CAP}`,
-            acct, machineId, ...skip, sinceIso).toArray() as any[];
-          n = rows.length;
-          launcher = rows.filter(r => r.exit_reason === 'launcher_command_failed').map(r => String(r.updated_at));
-        } catch { n = 0; launcher = []; }
-        recentFailuresByRoute.set(key, { n, launcher });
+          let prefix=failurePrefixes.get(acct);
+          if(!prefix){prefix=accountFailurePrefix(this.sql,acct,new Date(this.now()-ROUTE_FAILURE_WINDOW_MS).toISOString());failurePrefixes.set(acct,prefix);}
+          observation=routeFailureObservation(prefix,machineId,ROUTE_FAILURE_NEUTRAL_REASONS,ROUTE_FAILURE_CAP);
+        } catch { /* unknown evidence refuses admission below */ }
+        recentFailuresByRoute.set(key,observation);
       }
       return recentFailuresByRoute.get(key)!;
     };
@@ -1366,19 +1364,19 @@ export class FleetService {
     // Reuses the per-route failure statement above (no extra SQL call per route). Only when it shows
     // ROUTE_QUARANTINE_FAILURES launcher_command_failed rows inside the window does one more statement check that
     // no other launch on the route is newer than the third of them (a start or other outcome re-opens the route).
-    const quarantineByRoute = new Map<string, boolean>();
-    const routeQuarantined = (acct: string, machineId: string): boolean => {
+    const quarantineByRoute = new Map<string, boolean|null>();
+    const routeQuarantined = (acct: string, machineId: string): boolean|null => {
       const key = acct + ' ' + machineId;
       if (!quarantineByRoute.has(key)) {
-        let q = false;
+        let q:boolean|null = false;
         try {
           const cutoff = new Date(this.now() - ROUTE_QUARANTINE_WINDOW_MS).toISOString();
           const inWindow = routeFailures(acct, machineId).launcher.filter(t => t > cutoff);
           if (inWindow.length >= ROUTE_QUARANTINE_FAILURES) {
             const third = inWindow[ROUTE_QUARANTINE_FAILURES - 1];
-            q = this.sql.exec(`SELECT 1 FROM fleet_launches WHERE account = ? AND machine_id = ? AND updated_at > ? AND NOT (state = 'failed' AND exit_reason = 'launcher_command_failed') LIMIT 1`, acct, machineId, third).toArray().length === 0;
+            q=routeQuarantineObservation(this.sql,acct,machineId,third);
           }
-        } catch { q = false; }
+        } catch { q = null; }
         quarantineByRoute.set(key, q);
       }
       return quarantineByRoute.get(key)!;
@@ -1658,11 +1656,11 @@ export class FleetService {
       // Host adapter refusals are scoped to the exact route, mode and model
       // within the engine health retry window so transient historical launch
       // rows cannot permanently poison a route after host/launcher updates.
-      const unsupported = this.sql.exec("SELECT id FROM fleet_launches WHERE machine_id = ? AND engine = ? AND account = ? AND profile IS ? AND mode = ? AND exit_reason = 'model_unsupported' AND COALESCE(finished_at, updated_at) > ? AND json_extract(model_selection_json, '$.model') = ? AND json_extract(model_selection_json, '$.effort') IS ? LIMIT 1",
-        route.machine_id, route.engine, route.account, route.profile, request.mode, new Date(this.now() - ENGINE_HEALTH_RETRY_MS).toISOString(), model.model, model.effort).toArray().length;
+      const unsupported=unsupportedModelObservation(this.sql,route as any,request.mode,new Date(this.now()-ENGINE_HEALTH_RETRY_MS).toISOString(),model.model,model.effort);
       const advertisedRefusal = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.some((r: any) =>
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile && r.mode === request.mode && r.reason === 'model_unsupported');
       if (unsupported || advertisedRefusal) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
+      if(unsupported===null){rejected.push({machine:route.machine_id,engine:route.engine,reason:'route_observation_limited',observation:'unsupported_model'});continue;}
       // Host factor input: launches still being started on this host (not yet visible in
       // its CPU telemetry). Running sessions already show up as busy cores / load, so they only add a
       // small capped spread term; counting every active row as pending gave a host with many sessions a
@@ -1700,7 +1698,10 @@ export class FleetService {
       // Circuit breaker (intake 0e1b61c9): a route whose last launches all died at the
       // launcher before the engine produced work is skipped until the window passes, then
       // one probe is let through. Evaluated here so routes already rejected above never pay for the lookup. An operator pinning account AND machine still probes it.
-      if (!(request.account && request.machine) && routeQuarantined(route.account, route.machine_id)) {
+      if(routeFailures(route.account,route.machine_id).limited){rejected.push({machine:route.machine_id,engine:route.engine,reason:'route_observation_limited',observation:'recent_failures'});continue;}
+      const quarantine=!(request.account&&request.machine)?routeQuarantined(route.account,route.machine_id):false;
+      if(quarantine===null){rejected.push({machine:route.machine_id,engine:route.engine,reason:'route_observation_limited',observation:'route_quarantine'});continue;}
+      if (quarantine) {
         rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'route_quarantined' });
         continue;
       }

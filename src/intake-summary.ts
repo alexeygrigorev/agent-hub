@@ -13,7 +13,12 @@ export function initIntakeSummary(sql: SqlStorage) {
   sql.exec(`CREATE TABLE IF NOT EXISTS intake_status_summary (${columns.split(',').map((k,i)=>i===0?'id TEXT PRIMARY KEY':k).join(',')}) WITHOUT ROWID`);
   sql.exec('CREATE TABLE IF NOT EXISTS intake_summary_migration(id INTEGER PRIMARY KEY CHECK(id=1),after_id TEXT,phase INTEGER NOT NULL)');
   const receipt=sql.exec('SELECT phase FROM intake_summary_migration WHERE id=1').toArray()[0];
-  if(!receipt) {
+  if(!receipt && !sql.exec('SELECT id FROM intake_tasks ORDER BY id LIMIT 1').toArray().length &&
+      !sql.exec('SELECT id FROM intake_status_summary ORDER BY id LIMIT 1').toArray().length) {
+    // A fresh empty source and empty projection are a complete observation,
+    // proved with two indexed heads. Construction never backfills history.
+    sql.exec('INSERT INTO intake_summary_migration VALUES(1,NULL,2)');
+  } else if(!receipt) {
     // The previous version committed full bootstrap and these exact triggers
     // atomically. Prove that legacy boundary ONCE; later cold starts use the
     // durable receipt instead of re-reading the entire SQLite catalog.

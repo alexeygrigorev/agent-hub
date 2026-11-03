@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -15,9 +16,10 @@ async function fixture(refusals: any[], fn: (service: FleetService) => void) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('managed-admission-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const service = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
     service.init();
-    hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    fixtureStatements(hub.sql).exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       'host', 'host', 'host', iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80,
         cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0,
       JSON.stringify({ engines: ['codex'], fleet_modes: ['interactive', 'headless'], workspaces: ['demo'],

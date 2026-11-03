@@ -1,3 +1,4 @@
+import { restartFixtureHub, fixtureSql } from './helpers/fixture-budget';
 import { expect, it } from 'vitest';
 import { env as testBindings, runInDurableObject } from 'cloudflare:test';
 import type { Env } from '../src/env';
@@ -14,7 +15,7 @@ const target = 'human:adv-target';
 
 async function within<T>(fn: (h: Hub, state: DurableObjectState) => Promise<T>): Promise<T> {
   const stub = env.HUB.get(env.HUB.idFromName('adv-' + crypto.randomUUID()));
-  return await runInDurableObject(stub, async (_h, state) => fn(new Hub(state, env), state));
+  return await runInDurableObject(stub, async (_h, state) => fn(await restartFixtureHub(_h as Hub), state));
 }
 
 it('F1 drains more automation rows than archived children with a one-row allowance', async () => {

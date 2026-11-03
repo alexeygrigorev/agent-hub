@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 /**
  * Credential-poll rows-read budgets (intake e8a22f4c, phase 2). Hosts poll
  * GET /api/session-messaging/credentials and GET /api/session-intake/credentials
@@ -83,7 +84,7 @@ function seed(sql: any) {
 }
 
 const withHub = (fn: (hub: Hub) => Promise<void>) => runInDurableObject(
-  (env as any).HUB.get((env as any).HUB.idFromName('rows-cred-' + crypto.randomUUID())), async (hub: Hub) => { seed(hub.sql); await fn(hub); });
+  (env as any).HUB.get((env as any).HUB.idFromName('rows-cred-' + crypto.randomUUID())), async (hub: Hub, state: DurableObjectState) => { await freshFixtureBudgetDay(hub); seed(fixtureSql(hub,state)); await fn(hub); });
 
 const read = (hub: Hub, q: string, ...b: any[]) => { const c: any = hub.sql.exec(q, ...b); const rows = c.toArray(); return { rows, read: Number(c.rowsRead) }; };
 const MESSAGING_TABLES = ['agents', 'session_control_sessions', 'credentials'] as const;

@@ -131,7 +131,7 @@ jobs:
           UV_THREADPOOL_SIZE: "1"
           GOMAXPROCS: "1"
           NODE_OPTIONS: "--v8-pool-size=1"
-        run: npx --no-install vitest run test/cf-row-budget.test.ts test/cf-row-budget-hub.test.ts test/cf-loop-alarm.test.ts test/cf-background-bounds.test.ts test/cf-placement-pressure-bounded.test.ts test/host-history-bounded.test.ts test/cf-tbm-bounds.test.ts test/cf-intake-services-bounded.test.ts test/cf-memory-snapshot-budget.test.ts test/cf-index-migration-budget.test.ts test/cf-legacy-cost-replay.test.ts test/cf-existing-bootstrap-indexes.test.ts test/cf-fleet-existing-indexes.test.ts test/cf-native-credential-bounds.test.ts test/cf-command-channel-projection.test.ts test/command-channel-placement.test.ts test/cf-job-authority.test.ts test/cf-telemetry-coalescing.test.ts test/cf-intake-summary-bootstrap.test.ts test/cf-background-dispatch.test.ts test/cf-bootstrap-cost.test.ts test/cf-background-queue.test.ts test/cf-bus-agent-projection.test.ts test/cf-root-incumbent.test.ts test/cf-bus-history-bounds.test.ts test/cf-bus-inbox-bounds.test.ts test/cf-reader-coalescing.test.ts test/cf-returning-cache.test.ts test/cf-webhook-ack-deadline.test.ts --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept
+        run: npx --no-install vitest run test/cf-row-budget.test.ts test/cf-row-budget-hub.test.ts test/cf-loop-alarm.test.ts test/cf-background-bounds.test.ts test/cf-placement-pressure-bounded.test.ts test/host-history-bounded.test.ts test/cf-tbm-bounds.test.ts test/cf-intake-services-bounded.test.ts test/cf-memory-snapshot-budget.test.ts test/cf-index-migration-budget.test.ts test/cf-legacy-cost-replay.test.ts test/cf-existing-bootstrap-indexes.test.ts test/cf-fleet-existing-indexes.test.ts test/cf-native-credential-bounds.test.ts test/cf-command-channel-projection.test.ts test/command-channel-placement.test.ts test/cf-job-authority.test.ts test/cf-telemetry-coalescing.test.ts test/cf-intake-summary-bootstrap.test.ts test/cf-background-dispatch.test.ts test/cf-bootstrap-cost.test.ts test/cf-background-queue.test.ts test/cf-bus-agent-projection.test.ts test/cf-root-incumbent.test.ts test/cf-bus-history-bounds.test.ts test/cf-bus-inbox-bounds.test.ts test/cf-reader-coalescing.test.ts test/cf-returning-cache.test.ts test/cf-webhook-ack-deadline.test.ts test/cf-fleet-failure-observation.test.ts test/cf-credential-session-cache.test.ts test/cf-job-cas-trigger.test.ts test/cf-auth-cas-trigger.test.ts test/helpers/fixture-budget.test.ts --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept
 
       - name: Worker discovery tests (Vitest)
         env:
@@ -244,6 +244,7 @@ jobs:
           config['main'] = str(root / 'src/worker.ts')
           config['assets']['directory'] = str(root / 'public')
           config['triggers'] = {'crons': []}
+          config.setdefault('vars', {})['HUB_AUTOMATION_DISABLED'] = 'true'
           Path('.local').mkdir(exist_ok=True)
           Path('.local/dev-wrangler.json').write_text(json.dumps(config))
           PYDEV

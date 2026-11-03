@@ -1,3 +1,4 @@
+import { restartFixtureHub, fixtureSql } from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { Hub, ConversationHub, BaseHub } from '../src/conversation-hub';
@@ -64,7 +65,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-hub-meta-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_baseInstance as Hub);
       expect(Hub).toBe(ConversationHub);
       expect(Hub.name).toBe('Hub');
       expect(hub).toBeInstanceOf(BaseHub);
@@ -75,7 +76,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
 
       // Verify conversation schema tables exist alongside base Hub tables in the same SQLite database
       const tables = new Set(
-        (hub.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray() as any[]).map(
+        (fixtureSql(hub).exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray() as any[]).map(
           (r) => r.name
         )
       );
@@ -97,7 +98,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-hub-auth-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_baseInstance as Hub);
 
       const alice = await makeAdminSession(bindings, {
         sub: 'oidc-alice-001',
@@ -236,17 +237,17 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-hub-bearer-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_baseInstance as Hub);
       const nowIso = new Date().toISOString();
 
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         `INSERT INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES (?, ?, 1, ?, ?)`,
         'sub-owner',
         'admin@fake.local',
         nowIso,
         nowIso
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         `INSERT INTO agents (tag, project, role, registered_at) VALUES (?, ?, ?, ?)`,
         'worker-1',
         'proj-a',
@@ -346,7 +347,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
       expect(sent.message.sender_actor).toBe('proj-a:worker-1');
 
       // Re-instantiate Hub on the same DurableObjectState (simulating DO cold start) and verify persistence
-      const coldHub = new Hub(state, bindings);
+      const coldHub = await restartFixtureHub(hub);
       const listRes = await coldHub.fetch(
         new Request(`https://hub.test/api/conversations/${convId}/messages`, {
           method: 'GET',
@@ -365,7 +366,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-hub-delegate-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(baseInstance as Hub);
       const admin = await makeAdminSession(bindings, {
         sub: 'oidc-admin-delegate',
         email: 'admin@fake.local',
@@ -466,7 +467,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     );
 
     await runInDurableObject(stub, async (_baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, bindings);
+      const hub = await restartFixtureHub(_baseInstance as Hub);
       const admin = await makeAdminSession(bindings, {
         sub: 'oidc-admin-ret',
         email: 'admin@fake.local',
@@ -526,7 +527,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
 
       // Backdate archived_at by 35 days so it is expired
       const pastIso = new Date(Date.now() - 35 * 86_400_000).toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversations SET archived_at = ? WHERE id = ?',
         pastIso,
         convId,

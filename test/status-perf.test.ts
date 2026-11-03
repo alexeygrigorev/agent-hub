@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { sha256 } from '../src/auth/crypto';
@@ -33,49 +34,51 @@ it('bounds status and host query work with retained production-scale history', a
   const cookie = (await createSessionCookie(env as any, { sub: 'perf-operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'perf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
   const token = 'hubt_perf_synthetic_host';
   const hash = await sha256(token);
-  await inDO(stub, (h: any) => {
+  await inDO(stub, async (h: any, state:any) => {
+    await freshFixtureBudgetDay(h);
+    const sql=fixtureSql(h,state);
     const now = new Date().toISOString();
     h.ctx.storage.transactionSync(() => {
-      h.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES ('perf-host','perf-host','perf-host',?,?,0)", now, now);
-      h.sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES ('perf-host','perf-host','perf-host',?,?,0)", now, now);
+      sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
         'perf-credential', 'host', hash, 'perf-family', 'host:perf-host', 'perf-host', 'host:perf-host', '["host"]', 'perf-operator', now, new Date(Date.now() + 86400000).toISOString());
-      h.sql.exec("UPDATE machines SET credential_id='perf-credential' WHERE id='perf-host'");
-      h.sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      sql.exec("UPDATE machines SET credential_id='perf-credential' WHERE id='perf-host'");
+      sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
         'perf-owner','agent','synthetic-owner-hash','perf-owner-family','perf-owner','perf:owner','[]','perf-operator',now,new Date(Date.now()+86400000).toISOString());
       for (let i = 0; i < 500; i++) {
         const id = `perf-task-${String(i).padStart(4, '0')}`;
         const history = Array.from({length: 40}, (_, j) => ({ kind: 'note', text: 'Synthetic retained history. '.repeat(20), captured_at: Date.now(), id: `${id}-${j}` }));
-        h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES (?,?)', id, JSON.stringify({ id, project: 'perf', title: id, status: 'open', version: 1, created_at: Date.now(), updated_at: Date.now(), history: [{kind: 'intake', text: 'Original request. '.repeat(480), source: {reference: null}}, ...history, ...(i % 2 === 0 ? [{kind: 'link', hub_session_id: sessionId(i + 500)}] : []), {kind: 'link', hub_session_id: sessionId(i)}] }));
+        sql.exec('INSERT INTO intake_tasks(id,data) VALUES (?,?)', id, JSON.stringify({ id, project: 'perf', title: id, status: 'open', version: 1, created_at: Date.now(), updated_at: Date.now(), history: [{kind: 'intake', text: 'Original request. '.repeat(480), source: {reference: null}}, ...history, ...(i % 2 === 0 ? [{kind: 'link', hub_session_id: sessionId(i + 500)}] : []), {kind: 'link', hub_session_id: sessionId(i)}] }));
       }
       for (let i = 0; i < 2000; i++) {
-        h.sql.exec('INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        sql.exec('INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
           sessionId(i), 'perf:owner', `perf-${i}`, JSON.stringify({prompt:'Retained synthetic prompt. '.repeat(320),intake_task_id:`perf-task-${String(i%500).padStart(4,'0')}`}), 'perf-host', 'codex', 'headless', i < 100 ? 'running' : 'stopped', JSON.stringify({native_id: `native-${i}`,tag:`perf-${i}`,workspace:'/synthetic'}), now, now);
-        h.sql.exec('INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace) VALUES (?,?,?,?,?,?,?,?)',
+        sql.exec('INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace) VALUES (?,?,?,?,?,?,?,?)',
           'perf-host', `native-${i}`, `perf-${i}`, 'codex', i < 100 ? 'running' : i < 156 ? 'exited' : 'stopped', 'working', new Date(Date.now()-3600000).toISOString(), '/synthetic');
-        h.sql.exec('INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        sql.exec('INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
           sessionId(i + 10000), 'perf:owner', 'agent', 'Synthetic', `perf-launch-${i}`, JSON.stringify({prompt:'Retained synthetic prompt. '.repeat(320),intake_task_id:`perf-task-${String(i%500).padStart(4,'0')}`}), 'perf-host', 'codex', 'default', 'headless', '/synthetic', 'Synthetic', i < 100 ? 'running' : i < 156 ? 'uncertain' : 'stopped', `native-${i}`, now, now);
         for (let j = 0; j < 3; j++) {
           const at = new Date(Date.now() - (3-j)*1000).toISOString();
-          h.sql.exec('INSERT INTO status_observations(id,machine_id,hub_session_id,kind,observed_at,payload_json,reporter,received_at) VALUES (?,?,?,?,?,?,?,?)',
+          sql.exec('INSERT INTO status_observations(id,machine_id,hub_session_id,kind,observed_at,payload_json,reporter,received_at) VALUES (?,?,?,?,?,?,?,?)',
             `obs-${i}-${j}`, 'perf-host', sessionId(i), 'session', at, '{"state":"working"}', 'perf-host', at);
-          h.sql.exec('INSERT INTO session_lifecycle_decisions(session_key,decision_id,kind,actor,reason,created_at) VALUES (?,?,?,?,?,?)',
+          sql.exec('INSERT INTO session_lifecycle_decisions(session_key,decision_id,kind,actor,reason,created_at) VALUES (?,?,?,?,?,?)',
             `perf-host/native-${i}`, `decision-${i}-${j}`, 'resume_on_reset', 'perf:owner', 'Synthetic', at);
         }
       }
-      h.sql.exec("UPDATE session_control_sessions SET owner_token_id='perf-owner',owner_family='perf-owner-family',session_type='headless' WHERE actor='perf:owner'");
-      for(let i=0;i<850;i++) h.sql.exec('INSERT INTO session_lifecycle_observations VALUES(?,?,?,?,?)',
+      sql.exec("UPDATE session_control_sessions SET owner_token_id='perf-owner',owner_family='perf-owner-family',session_type='headless' WHERE actor='perf:owner'");
+      for(let i=0;i<850;i++) sql.exec('INSERT INTO session_lifecycle_observations VALUES(?,?,?,?,?)',
         `perf-host/native-${i}`,'perf-host',`native-${i}`,now,'{"waiting_input":false,"report_written":false}');
-      h.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?)','perf-host',now);
+      sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?)','perf-host',now);
       // Keep 56 genuine reconciliation rows after excluding unchanged live
       // natives, with production-sized bindings to exercise the batched lookup.
-      for(let i=100;i<156;i++) h.sql.exec('UPDATE session_control_sessions SET fleet_launch_id=?,binding_json=? WHERE id=?',
+      for(let i=100;i<156;i++) sql.exec('UPDATE session_control_sessions SET fleet_launch_id=?,binding_json=? WHERE id=?',
         sessionId(i+10000),JSON.stringify({native_id:`native-${i}`,tag:`perf-${i}`,workspace:'/synthetic',detail:'x'.repeat(200)}),sessionId(i));
       // Retention permits 200 disk observations per host / 1000 total.
       // Trend reads must not repeatedly materialize top-consumer histories.
       for (let host = 0; host < 5; host++) {
         const machine = host === 0 ? 'perf-host' : `history-host-${host}`;
-        if (host) h.sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES(?,?,?,?,?,0)', machine, machine, machine, now, now);
-        h.sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)', machine, now, Date.now(), now,
+        if (host) sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES(?,?,?,?,?,0)', machine, machine, machine, now, now);
+        sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)', machine, now, Date.now(), now,
           JSON.stringify({memory:{total_bytes:64000000000,available_bytes:32000000000,used_bytes:32000000000,percent:50,status:'ok'},services:[]}), machine);
         for (let i = 0; i < 200; i++) {
           const at = Date.now() - (199-i)*1800000;
@@ -83,7 +86,7 @@ it('bounds status and host query work with retained production-scale history', a
           const filesystems = ['/', '/data', '/backup'].map(mount => ({mount_point:mount,device_id:mount,is_primary:true,total_bytes:100000000000,
             used_bytes:used,free_bytes:100000000000-used,percent:used/1000000000,status:'ok',
             top_consumers:Array.from({length:20},(_,j)=>({path:`/synthetic/${j}/`+'x'.repeat(230),bytes:1000000}))}));
-          h.sql.exec('INSERT INTO disk_observations VALUES(?,?,?,?,?,?,?)', `${machine}-${i}`,machine,new Date(at).toISOString(),at,now,JSON.stringify({filesystems}),machine);
+          sql.exec('INSERT INTO disk_observations VALUES(?,?,?,?,?,?,?)', `${machine}-${i}`,machine,new Date(at).toISOString(),at,now,JSON.stringify({filesystems}),machine);
         }
       }
     });
@@ -156,18 +159,19 @@ it('bounds status and host query work with retained production-scale history', a
   // An independent healthy host avoids altering the retained workload above.
   const claimToken = 'hubt_perf_synthetic_claim_host';
   const claimHash = await sha256(claimToken);
-  await inDO(stub, (h: any) => {
+  await inDO(stub, (h: any, state:any) => {
+    const sql=fixtureSql(h,state);
     const now = new Date().toISOString();
-    h.sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities) VALUES (?,?,?,?,?,?,0,?)',
+    sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities) VALUES (?,?,?,?,?,?,0,?)',
       'claim-host', 'claim-host', 'claim-host', now, now,
       JSON.stringify({mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(now), gate: {launch_allowed: true, at: now}}),
       JSON.stringify({engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8}));
-    h.sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+    sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
       'claim-credential', 'host', claimHash, 'claim-family', 'host:claim-host', 'claim-host', 'host:claim-host', '["host"]', 'perf-operator', now, new Date(Date.now() + 86400000).toISOString());
-    h.sql.exec("UPDATE machines SET credential_id='claim-credential' WHERE id='claim-host'");
-    h.sql.exec("INSERT INTO fleet_accounts VALUES ('claim-account','codex',1,15,1)");
-    h.sql.exec("INSERT INTO fleet_routes VALUES ('claim-host','codex','claim-account',NULL)");
-    h.sql.exec('INSERT INTO host_quota_snapshots(host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json) VALUES (?,?,?,?,?,?,?,?,?)',
+    sql.exec("UPDATE machines SET credential_id='claim-credential' WHERE id='claim-host'");
+    sql.exec("INSERT INTO fleet_accounts VALUES ('claim-account','codex',1,15,1)");
+    sql.exec("INSERT INTO fleet_routes VALUES ('claim-host','codex','claim-account',NULL)");
+    sql.exec('INSERT INTO host_quota_snapshots(host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json) VALUES (?,?,?,?,?,?,?,?,?)',
       'claim-host', '1.0', now, Date.now(), now, Date.now(), 'ok', null,
       JSON.stringify({codex: {status: 'ok', observed_at: now, details: {limit_reached: false}, windows: {weekly: {present: true, percent_remaining: 80, reset_at: new Date(Date.now() + 86400000).toISOString()}}}}));
   });
@@ -207,54 +211,54 @@ it('bounds status and host query work with retained production-scale history', a
     // Empty history and unroutable workloads hide multiplicative SQL reads.
     const at = new Date().toISOString();
     for (let i = 0; i < 2000; i++) {
-      h.sql.exec(`INSERT INTO session_resource_usage(session_id,machine_id,native_id,project,engine,kind,started_at,finished_at,state,peak_rss_mb,observed_at)
+      fixtureSql(h).exec(`INSERT INTO session_resource_usage(session_id,machine_id,native_id,project,engine,kind,started_at,finished_at,state,peak_rss_mb,observed_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?)`, `usage-${i}`, 'claim-host', `usage-${i}`, `project-${i % 20}`, 'codex', 'goal', at, at, 'stopped', 64 + i % 64, at);
-      h.sql.exec('INSERT INTO session_cpu_usage VALUES(?,?,?)', `usage-${i}`, 0.01, at);
+      fixtureSql(h).exec('INSERT INTO session_cpu_usage VALUES(?,?,?)', `usage-${i}`, 0.01, at);
     }
     for (let i = 0; i < 100; i++) {
-      h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+      fixtureSql(h).exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
         SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'uncertain',created_at,updated_at
         FROM fleet_launches WHERE account='claim-account' AND state='stopped' LIMIT 1`, sessionId(40000+i), `perf-pending-${i}`);
     }
     for (let i = 0; i < 20; i++) {
-      h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+      fixtureSql(h).exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
         SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'offered',created_at,updated_at
         FROM fleet_launches WHERE account='claim-account' AND state='stopped' LIMIT 1`, sessionId(41000+i), `perf-offered-${i}`);
     }
     for (let i = 0; i < 6; i++) {
-      h.sql.exec("INSERT INTO fleet_accounts VALUES (?,'codex',1,15,1)", `history-account-${i}`);
-      h.sql.exec("INSERT INTO fleet_routes VALUES ('claim-host','codex',?,NULL)", `history-account-${i}`);
+      fixtureSql(h).exec("INSERT INTO fleet_accounts VALUES (?,'codex',1,15,1)", `history-account-${i}`);
+      fixtureSql(h).exec("INSERT INTO fleet_routes VALUES ('claim-host','codex',?,NULL)", `history-account-${i}`);
     }
     // Live account-tagged native history must reach the orphan correlation:
     // terminal-only history and an early memory refusal hide its scan cost.
-    h.sql.exec("UPDATE fleet_accounts SET max_concurrency=1");
-    h.sql.exec("UPDATE machines SET capabilities=json_set(capabilities,'$.cpu_count',1024),last_heartbeat=? WHERE id='claim-host'",
+    fixtureSql(h).exec("UPDATE fleet_accounts SET max_concurrency=1");
+    fixtureSql(h).exec("UPDATE machines SET capabilities=json_set(capabilities,'$.cpu_count',1024),last_heartbeat=? WHERE id='claim-host'",
       JSON.stringify({mem_avail_mb:640000,disk_free_gb:1000,cpu_usage:freshCpu(at,1024),gate:{launch_allowed:true,at}}));
     const accounts = ['claim-account',...Array.from({length:6},(_,i)=>`history-account-${i}`)];
-    for (const account of accounts) h.sql.exec("INSERT INTO fleet_subscriptions VALUES('claim-host',?,'codex','synthetic',?,?)",account,at,
+    for (const account of accounts) fixtureSql(h).exec("INSERT INTO fleet_subscriptions VALUES('claim-host',?,'codex','synthetic',?,?)",account,at,
       JSON.stringify({status:'ok',observed_at:at,details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:new Date(Date.now()+86400000).toISOString()}}}));
     for (let i=0;i<200;i++) {
       const account=accounts[i%accounts.length];
-      h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES('claim-host',?,?,'codex','running','working',?,'demo',?,?)",
+      fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES('claim-host',?,?,'codex','running','working',?,'demo',?,?)",
         `active-${i}`,`active-${i}`,at,account,at);
-      if (i<36) h.sql.exec("UPDATE fleet_launches SET state='running',native_id=?,account=? WHERE id=?",`active-${i}`,account,sessionId(40000+i));
+      if (i<36) fixtureSql(h).exec("UPDATE fleet_launches SET state='running',native_id=?,account=? WHERE id=?",`active-${i}`,account,sessionId(40000+i));
     }
     // The 200 synthetic actives above are scan-cost scaffolding for the
     // orphan correlation, not a real 200-session host: lift the per-host
     // live-session cap here so this perf test keeps measuring the intended
     // account-concurrency path (the cap itself is covered in cpu-headroom tests).
-    h.sql.exec("INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+    fixtureSql(h).exec("INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
       JSON.stringify({host_max_sessions:500}));
     const fixturePlan:any = new FleetService(h.sql,(cb)=>h.ctx.storage.transactionSync(cb)).plan({workspace:'demo',prompt:'Synthetic',machine:'claim-host'});
     expect(fixturePlan.rejected.length===7 && fixturePlan.rejected.every((r:any)=>r.reason==='account_concurrency')).toBe(true);
     for (let i = 0; i < 200; i++) {
-      h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+      fixtureSql(h).exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
         SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'queued',created_at,updated_at
         FROM fleet_launches WHERE account='claim-account' AND state='stopped' LIMIT 1`, sessionId(20000+i), `perf-parked-${i}`);
     }
   }));
   await inDO(stub, (h: any) => h.ctx.storage.transactionSync(() => {
-    for (let i=0;i<200;i++) h.sql.exec(`INSERT INTO routing_jobs(id,actor,request_key,request_json,state,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?)`,
+    for (let i=0;i<200;i++) fixtureSql(h).exec(`INSERT INTO routing_jobs(id,actor,request_key,request_json,state,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?)`,
       sessionId(30000+i),'perf:owner',`routing-backlog-${i}`,JSON.stringify({workspace:'demo',needs:['unavailable'],tasks:[],access:{mode:'read'}}),new Date().toISOString(),new Date().toISOString());
   }));
   const backlogTimes: number[] = [];

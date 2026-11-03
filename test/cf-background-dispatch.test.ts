@@ -32,6 +32,21 @@ describe('strict queue background dispatch', () => {
     vi.restoreAllMocks();
   }));
 
+  it('isolated dev automation stays idle even with default root scheduling enabled',()=>fixture(async(hub,state)=>{
+    const previous=hub.env.HUB_AUTOMATION_DISABLED;
+    try {
+      hub.env.HUB_AUTOMATION_DISABLED='true';
+      hub.sql.exec('UPDATE root_scheduling SET enabled=1 WHERE id=1');
+      await hub.refreshBackgroundJobs();
+      expect(hub.backgroundWork.nextAt()).toBeNull();
+      expect(await state.storage.getAlarm()).toBeNull();
+      const root=vi.spyOn(hub.jobsService,'processRootSlotBackground');
+      expect(await hub.processRootSlotWork(new Date().toISOString())).toBeNull();
+      expect(root).not.toHaveBeenCalled();
+      root.mockRestore();
+    } finally {hub.env.HUB_AUTOMATION_DISABLED=previous;}
+  }));
+
   it('one invocation consumes only the first pending entity', () => fixture(async (hub, state) => {
     hub.sql.exec('UPDATE root_scheduling SET enabled=0 WHERE id=1');
     hub.backgroundWork.cancel('root-slot');

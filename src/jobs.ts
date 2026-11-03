@@ -1295,11 +1295,11 @@ export class JobsService {
         const jobActor = job.kind === 'root-run' ? 'role:root' : (job.actor || 'role:worker');
 
         const acquire = this.sql.exec(
-          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = ?, epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ? WHERE name = ? AND epoch = ?",
+          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = ?, epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ? WHERE name = ? AND epoch = ? RETURNING name",
           jobId, hostId, hostId, jobActor, nowIso, nowIso, new Date(leaseExpiresMs).toISOString(), leaseName, currentEpoch
-        );
+        ).toArray();
 
-        if (acquire.rowsWritten !== 1) {
+        if (acquire.length !== 1) {
           result = { error: 'conflict' }; return;
         }
 
@@ -1542,10 +1542,10 @@ export class JobsService {
         const newExpiresIso = new Date(newExpiresMs).toISOString();
 
         const updateRes = this.sql.exec(
-          "UPDATE leases SET expires_at = ?, renewed_at = ? WHERE name = ? AND epoch = ? AND holder_job_id = ?",
+          "UPDATE leases SET expires_at = ?, renewed_at = ? WHERE name = ? AND epoch = ? AND holder_job_id = ? RETURNING name",
           newExpiresIso, now.toISOString(), lease.name, epoch, jobId
-        );
-        if (updateRes.rowsWritten !== 1) {
+        ).toArray();
+        if (updateRes.length !== 1) {
           result = { error: 'unauthorized_or_stale' }; return;
         }
 
@@ -1637,10 +1637,10 @@ export class JobsService {
         const safeSummary = safeUtf8Summary(summary, 4096);
 
         const leaseUpdate = this.sql.exec(
-          "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ? AND epoch = ?",
+          "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ? AND epoch = ? RETURNING name",
           nowIso, status, lease.name, epoch
-        );
-        if (leaseUpdate.rowsWritten !== 1) {
+        ).toArray();
+        if (leaseUpdate.length !== 1) {
           result = { error: 'unauthorized_or_stale' };
           return;
         }
@@ -2616,11 +2616,11 @@ export class JobsService {
 
         // 6. Strong atomic CAS update against expectedEpoch
         const updateLease = this.sql.exec(
-          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = 'role:root', epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ?, release_reason = NULL, released_at = NULL WHERE name = 'root' AND epoch = ?",
+          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = 'role:root', epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ?, release_reason = NULL, released_at = NULL WHERE name = 'root' AND epoch = ? RETURNING name",
           candidateJobId, hostId, hostId, nowIso, nowIso, leaseExpiresIso, expectedEpoch
-        );
+        ).toArray();
 
-        if (updateLease.rowsWritten !== 1) {
+        if (updateLease.length !== 1) {
           result = {
             error: 'cas_failed',
             reason: 'concurrent update race; epoch changed',

@@ -1,3 +1,4 @@
+import {freshFixtureBudgetDay,fixtureSql} from './helpers/fixture-budget';
 import { beforeEach, expect, it } from 'vitest';
 import { SELF, env, runInDurableObject } from 'cloudflare:test';
 import { Hub } from '../src/conversation-hub';
@@ -28,10 +29,11 @@ function deps(h: Hub): ActionDeps {
   return { liveness: h.livenessService, notify: async () => {}, message: async () => '', launch: async () => '', fetch: async () => new Response(null), evaluateQuota: () => [], conversation: { evaluateBacklog: q => h.conversationsService.evaluateScheduledBacklog(q), sendFollowUp: i => h.conversationsService.postScheduledFollowUp(i) } };
 }
 function scalar(h: Hub, q: string) { return Number(h.sql.exec(q).toArray()[0].n); }
-beforeEach(async () => inside(h => {
+beforeEach(async () => inside(async h => {
+  await freshFixtureBudgetDay(h);
   Reflect.deleteProperty(h, 'extraCheckDeps');
-  for (const table of ['conversation_automation_receipts', 'conversation_automation_grants', 'hub_check_slots', 'hub_checks', 'hub_check_runs', 'conversation_messages', 'conversation_members', 'conversations', 'users']) h.sql.exec('DELETE FROM ' + table);
-  h.sql.exec('UPDATE conversation_storage_usage SET conversation_count=0,message_count=0,message_bytes=0,removed_member_count=0');
+  for (const table of ['conversation_automation_receipts', 'conversation_automation_grants', 'hub_check_slots', 'hub_checks', 'hub_check_runs', 'conversation_messages', 'conversation_members', 'conversations', 'users']) fixtureSql(h).exec('DELETE FROM ' + table);
+  fixtureSql(h).exec('UPDATE conversation_storage_usage SET conversation_count=0,message_count=0,message_bytes=0,removed_member_count=0');
 }));
 
 it('reclaims more than 4096 settled historical receipts and keeps current intervals bounded and unread', async () => {
@@ -41,10 +43,13 @@ it('reclaims more than 4096 settled historical receipts and keeps current interv
     const firstReceipt = h.sql.exec('SELECT * FROM conversation_automation_receipts').toArray()[0];
     // Bounded R2 fixture: 4095 completed historical slots whose messages have
     // already expired, using a real effect's serialized request and bindings.
-    h.sql.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<4095)
+    fixtureSql(h).exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<4095)
       INSERT INTO conversation_automation_receipts SELECT 'settled-'||i,json_set(?, '$.idempotencyKey', 'settled-'||i),'old-'||i,?,0 FROM n`, firstReceipt.request_json, cid);
     let retired = 0;
+    // Explicit manual cleanup requests on separate strict synthetic budget days.
+    // Retained legacy history is larger than one permitted production day.
     for (let i = 0; i < 50; i++) {
+      await freshFixtureBudgetDay(h);
       const result = h.busService.retentionCleanup(t, 100) as any;
       expect(Number(result.conversationRowsDeleted) + Number(result.messagesDeleted) + Number(result.claimsDeleted)).toBeLessThanOrEqual(100);
       retired += result.automationRowsDeleted;
@@ -54,6 +59,7 @@ it('reclaims more than 4096 settled historical receipts and keeps current interv
     const watermarks = h.sql.exec('SELECT actor,last_read_seq FROM conversation_members ORDER BY actor').toArray();
     const clock = { t: t + 300000 }; const checks = new ChecksService(h.sql, () => clock.t);
     for (let i = 0; i < 32; i++) {
+      await freshFixtureBudgetDay(h);
       expect((await checks.runDue(deps(h)))[0].action).toMatch(/^conversation_message /);
       h.busService.retentionCleanup(clock.t, 5);
       expect(scalar(h, 'SELECT count(*) n FROM conversation_automation_receipts')).toBe(0);
@@ -154,9 +160,9 @@ for (const mutation of ['expire', 'revoke', 'remove', 'archive', 'replace-grant'
 it('reclaims orphan slot and grant caps with a shared one-row allowance, leaving live progress intact', async () => {
   const { t } = await fixture();
   await inside(async h => {
-    h.sql.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+    fixtureSql(h).exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
       INSERT INTO hub_check_slots SELECT 'orphan-'||i,'old-'||i,0,'{"action":{}}','{"status":"pass","detail":"settled"}',NULL,NULL,'done',NULL,0 FROM n`);
-    h.sql.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<999)
+    fixtureSql(h).exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<999)
       INSERT INTO conversation_automation_grants SELECT 'expired-'||i,'gone-'||i,'expired','human:retire-target',NULL,'retire-owner',0,'old','always',NULL FROM n`);
     for (let i = 0; i < 6; i++) {
       const before = scalar(h, 'SELECT (SELECT count(*) FROM hub_check_slots)+(SELECT count(*) FROM conversation_automation_grants) n');

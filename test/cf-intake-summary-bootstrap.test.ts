@@ -8,6 +8,14 @@ const reads=(calls:{cursor:any}[])=>calls.reduce((n,c)=>n+c.cursor.rowsRead,0);
 const metadata=(call:{query:string})=>call.query==='SELECT name,type,sql FROM sqlite_master LIMIT 4097';
 function boundedMetadata(calls:{query:string;cursor:any}[]){const probes=calls.filter(metadata);expect(probes).toHaveLength(1);expect(reads(probes)).toBeLessThanOrEqual(4097);return calls.filter(c=>!metadata(c));}
 describe('retained intake and alert bootstrap uses deployed indexes',()=>{
+ it('proves a fresh empty summary ready using only indexed heads, with no backfill or catalog scan',()=>fixture(raw=>{
+  raw.exec('DROP TABLE intake_summary_migration');
+  const o=observe(raw);initIntakeSummary(o.sql);
+  expect(o.calls.some(metadata)).toBe(false);
+  expect(o.calls.filter(c=>/FROM intake_tasks/.test(c.query)).map(c=>c.query)).toEqual(['SELECT id FROM intake_tasks ORDER BY id LIMIT 1']);
+  expect(raw.exec('SELECT phase FROM intake_summary_migration WHERE id=1').one().phase).toBe(2);
+  expect(reads(o.calls)).toBeLessThan(100);
+ }));
  it('proves legacy trigger bootstrap without COUNT or rewriting 1270 summaries',()=>fixture(raw=>{
   initIntakeSummary(raw);while(!advanceIntakeSummary(raw)){}
   for(let i=0;i<1270;i++)raw.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)','legacy-summary-'+i,JSON.stringify({id:'legacy-summary-'+i,status:'done',title:'retained',history:[]}));

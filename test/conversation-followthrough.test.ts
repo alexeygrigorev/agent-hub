@@ -1,3 +1,4 @@
+import { restartFixtureHub, fixtureSql } from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { Hub, BaseHub } from '../src/conversation-hub';
@@ -31,21 +32,21 @@ async function withHub(
   await runInDurableObject(
     stub,
     async (_base: BaseHub, state: DurableObjectState) => {
-      const hub = new Hub(state, testEnv);
+      const hub = await restartFixtureHub(_base as Hub);
       const nowIso = new Date().toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT OR IGNORE INTO machines (id, name, hostname, registered_at) VALUES ('machine-A', 'A', 'host-a', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT OR IGNORE INTO machines (id, name, hostname, registered_at) VALUES ('machine-B', 'B', 'host-b', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT OR IGNORE INTO agents (tag, project, role, machine_id, registered_at) VALUES ('worker-1', 'projA', 'implementer', 'machine-A', ?)",
         nowIso,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "INSERT OR IGNORE INTO agents (tag, project, role, machine_id, registered_at) VALUES ('reviewer-1', 'projA', 'reviewer', 'machine-B', ?)",
         nowIso,
       );
@@ -1148,7 +1149,7 @@ describe('M10 conversation follow-through authority and canonical links', () => 
 
       // Positive migrated-bare actor + qualified registry_actor fixture:
       // A migrated credential retains bare actor 'worker-1' while registry_actor is qualified 'projA:worker-1'.
-      hub.sql.exec("UPDATE credentials SET actor = 'worker-1' WHERE id = 'tok-w1'");
+      fixtureSql(hub).exec("UPDATE credentials SET actor = 'worker-1' WHERE id = 'tok-w1'");
       const countMigrated = hub.conversationsService.linksHandler.followThrough.countOverdueObligationsForConversation(
         conv.id,
         Date.now(),
@@ -1207,7 +1208,7 @@ describe('M10 conversation follow-through authority and canonical links', () => 
         bodyTemplate: 'Please address overdue obligation',
         on: 'fail' as const,
       };
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         `INSERT INTO hub_check_slots (name, slot_key, next_at, check_json, intent_json, state, lease_until)
          VALUES (?, ?, ?, '{}', ?, 'dispatch', ?)`,
         followUpIntent.checkName,
@@ -1247,7 +1248,7 @@ describe('M10 conversation follow-through authority and canonical links', () => 
       expect(revokedGrantEval.detail).toBe('target_authority_unavailable');
 
       // Revoking worker-1 credential causes evaluateScheduledBacklog to fail closed with unauthoried error
-      hub.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ?', new Date().toISOString(), 'tok-w1');
+      fixtureSql(hub).exec('UPDATE credentials SET revoked_at = ? WHERE id = ?', new Date().toISOString(), 'tok-w1');
       expect(() =>
         hub.conversationsService.evaluateScheduledBacklog({
           actor: 'projA:worker-1',

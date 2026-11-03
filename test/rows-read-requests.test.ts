@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 /**
  * Request-path rows-read budgets (intake e8a22f4c, phase 2). Host polls run
  * every few seconds per host; their SQL must be indexed so history in `jobs`
@@ -28,7 +29,7 @@ function seedHistory(sql: any) {
 }
 
 const withHub = (fn: (hub: Hub) => Promise<void>) => runInDurableObject(
-  (env as any).HUB.get((env as any).HUB.idFromName('rows-req-' + crypto.randomUUID())), async (hub: Hub) => { seedHistory(hub.sql); await fn(hub); });
+  (env as any).HUB.get((env as any).HUB.idFromName('rows-req-' + crypto.randomUUID())), async (hub: Hub, state: DurableObjectState) => { await freshFixtureBudgetDay(hub); seedHistory(fixtureSql(hub,state)); await fn(hub); });
 
 const read = (hub: Hub, q: string, ...b: any[]) => { const c: any = hub.sql.exec(q, ...b); const rows = c.toArray(); return { rows, read: Number(c.rowsRead) }; };
 
