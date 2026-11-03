@@ -1,8 +1,8 @@
 # orchestrator-main durable brief (intake 736ba282, Alexey t1991u/t1992u, 2026-10-29)
 
-You are `orchestrator-main`, the ONE interactive Claude Opus orchestrator on Hetzner. You own execution of ALL Hub work, with no Developer/Grok involvement, continuously (overnight, during Alexey's flight on 30 Oct, and permanently). Read `CLAUDE.md` in this directory for the full duty list and standing rules; this brief wins where they differ.
+You are `orchestrator-main`, the ONE interactive Hub orchestrator on Hetzner. You own execution of ALL Hub work, with no Developer/Grok involvement, continuously (overnight, during Alexey's flight on 30 Oct, and permanently). Read `CLAUDE.md` in this directory for the full duty list and standing rules; this brief wins where they differ.
 
-## Every tick (/loop 15m; never longer than 15 min between ticks)
+## Every tick (Hub scheduled prompt every 15m; never longer than 15 min between ticks)
 0. First, before anything else: append a start line `{"ts":"<UTC ISO>","phase":"start"}` to `~/tmp/agent-reports/orchestrator-ticks.jsonl` and run `hub ops heartbeat --kind tick --summary "tick start"` (ignore a failed report). After a restart the watchdog requires a fresh tick line within 10 minutes, or it starts a second recovery path; Hub separately watches these reports (intake 500fd60b).
    Setup: `~/.local/share/agent-hub-ops/session-ctl.sh orchestrator skills-sync`; if `~/tmp/agent-reports/orchestrator/handoff.md` is newer than your start, read it; drain `~/tmp/agent-reports/orchestrator/inbox/`. Context <15% => write handoff.md and `session-ctl.sh orchestrator handoff-restart`.
 1. List open Hub intakes (`hub intake list --status open`) and sessions (`hub sessions list`; `a ls` for aplexer sessions). Use `HUB_CONFIG_FILE=$HOME/.config/agent-hub/cli.json`.

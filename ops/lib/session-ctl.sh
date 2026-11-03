@@ -213,23 +213,27 @@ collect(engines_doc)
 pools = quota.get("pools", []) if isinstance(quota, dict) else []
 routes = {engine: [] for engine in allowed}
 for pool in pools if isinstance(pools, list) else []:
-    if not isinstance(pool, dict):
+    if not isinstance(pool, dict) or pool.get("routing") == "disabled":
         continue
-    harness = pool.get("harness") or pool.get("engines") or []
-    if not isinstance(harness, list):
-        continue
-    for value in harness:
+    names = []
+    for key in ("harness", "engines"):
+        value = pool.get(key)
+        if isinstance(value, list):
+            names.extend(value)
+    for value in names:
         if isinstance(value, str) and value.lower() in allowed:
             engine = value.lower()
-            if pool.get("provider") == allowed[engine]:
+            if pool.get("provider") == allowed[engine] and pool not in routes[engine]:
                 routes[engine].append(pool)
 
 def has_headroom(engine, pool):
     if pool.get("state") != "fresh" or pool.get("routing") == "disabled":
         return False
-    if pool.get("limit_reached") is True:
+    if pool.get("limit_reached") is True or pool.get("depleted") is True:
         return False
     remaining = pool.get("remaining_percent")
+    if remaining is None and (pool.get("burn_status") == "unmetered" or pool.get("source") == "unmetered-engine"):
+        return True
     if isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining):
         return False
     reserve = 5 if allowed[engine] == "grok" else 0
@@ -276,9 +280,12 @@ oldest_oncall_inbox_item() {
 oncall_inbox_stalled() {
   [ "$ROLE" = oncall ] || return 1
   [[ "$MAX_ONCALL_INBOX_AGE" =~ ^[0-9]+$ ]] || return 1
-  local oldest now
+  local oldest ls_ts now
   oldest=$(oldest_oncall_inbox_item)
   [[ "$oldest" =~ ^[0-9]+$ ]] || return 1
+  ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
+  [[ "$ls_ts" =~ ^[0-9]+$ ]] || ls_ts=0
+  [ "$oldest" -lt "$ls_ts" ] && oldest=$ls_ts
   now=$(date +%s)
   [ $((now-oldest)) -ge "$MAX_ONCALL_INBOX_AGE" ]
 }
@@ -302,7 +309,7 @@ start() {
     sleep 3; s=$(screen "$id")
     if grep -qi -E 'Yes, I accept|Bypass Permissions mode' <<<"$s" && grep -q 'No, exit' <<<"$s"; then a send "$id" --hex 32 >/dev/null; sleep 1; a send "$id" --hex 0d >/dev/null; continue; fi
     if grep -qi -E 'trust this folder|Do you trust|Yes, proceed' <<<"$s"; then a send "$id" --hex 0d >/dev/null; continue; fi
-    if grep -q -E '❯|> $|for shortcuts' <<<"$s"; then ready=1; break; fi
+    if grep -q -E '❯|> $|for shortcuts|Ask anything|ctrl\+p commands' <<<"$s"; then ready=1; break; fi
   done
   [ "$ready" = 1 ] || { log "prompt readiness failed: $id"; return 1; }
   local prompt="Run the $ROLE check now: follow $RUNDIR/$SUB/hourly-check.md, starting with step 0 (skills sync, handoff, inbox). Hub scheduled prompts continue the recurring work for session tag $TAG."
