@@ -102,6 +102,25 @@ describe('durable daily SQL row circuit breaker', () => {
     expect(budget.status().available).toEqual(CHUNK);
   });
 
+  it('isolates many concurrent handled denials from the reservation queue and recovers next UTC day', async () => {
+    const store = new MemoryStore();
+    let now = 0;
+    const budget = new RowBudget(store, () => now, LIMITS, CHUNK);
+    await budget.begin();
+    expect(() => budget.wrap(nativeSql(0, 0, 70) as any).exec('UPDATE bounded')).toThrow(RowBudgetExceeded);
+    await budget.finish();
+    const handled = Array.from({ length: 25 }, async () => {
+      try { await budget.begin(); return false; }
+      catch (error) { expect(error).toBeInstanceOf(RowBudgetExceeded); return true; }
+    });
+    expect((await Promise.all(handled)).every(Boolean)).toBe(true);
+    now = 86_400_000;
+    await budget.begin();
+    expect(budget.status().stopped).toBe(false);
+    // Any intermediate unhandled promise also fails this test through the
+    // native CI runtime's normal unhandled-rejection capture.
+  });
+
   it('keeps repeated idle preflights and event completions at zero storage I/O', async () => {
     const store = new MemoryStore();
     const budget = new RowBudget(store, () => 0, LIMITS, CHUNK);

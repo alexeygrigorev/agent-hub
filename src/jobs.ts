@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 -- Intake e8a22f4c: host polls and the alarm look at offered jobs only, so the
 -- partial index keeps those reads independent of finished-job history.
 CREATE INDEX IF NOT EXISTS jobs_offered ON jobs(offer_expires_at) WHERE status = 'offered';
+CREATE INDEX IF NOT EXISTS jobs_offered_host_created ON jobs(offer_host_id,created_at DESC) WHERE status='offered';
+CREATE INDEX IF NOT EXISTS jobs_offered_machine_created ON jobs(offer_machine_id,created_at DESC) WHERE status='offered';
 
 CREATE TABLE IF NOT EXISTS leases (
   name TEXT PRIMARY KEY,

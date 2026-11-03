@@ -14,6 +14,7 @@ import { sessionLaunchFailure, staleHeldReviewer } from './intake-triage';
 type Obj = Record<string, any>;
 export const VERIFIER_INTERVAL = 25 * 60000; // runs from the */30 scheduler slot
 export const VERIFIER_LAUNCH_BUDGET = 3;
+export const VERIFIER_OBSERVATION_BATCH = 64;
 /** A verifier that ended without a verdict is retried once, then escalated. */
 export const VERIFIER_MAX_ATTEMPTS = 2;
 const ACTIVE = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncertain']);
@@ -87,10 +88,12 @@ export type VerifierHooks = {
   alert?: (subject: string, detail: string) => Promise<void>;
 };
 export class IntakeVerifier {
-  constructor(private sql: SqlStorage, private intake: { statusAuthorizedTasks(p: Obj): Obj[] },
+  constructor(private sql: SqlStorage, private intake: { statusAuthorizedTasks(p: Obj): Obj[]; watchdogTasks?(after: string, limit: number): Obj[]; statusTaskById?(p: Obj, id: string): Obj | undefined },
     private tx: <T>(fn: () => T) => T, private hooks: VerifierHooks = {}, private now = Date.now) {}
   init() {
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_verifier_meta(id INTEGER PRIMARY KEY CHECK(id=1),enabled_at INTEGER NOT NULL,last_tick INTEGER,last_result TEXT)');
+    const cols = new Set(this.rows('PRAGMA table_info(intake_verifier_meta)').map(row => row.name));
+    if (!cols.has('task_cursor')) this.sql.exec("ALTER TABLE intake_verifier_meta ADD COLUMN task_cursor TEXT NOT NULL DEFAULT ''");
     this.sql.exec('INSERT OR IGNORE INTO intake_verifier_meta(id,enabled_at) VALUES(1,?)', this.now());
     this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_verifications(task_id TEXT NOT NULL, claim_id TEXT NOT NULL, mode TEXT NOT NULL,
       reason TEXT NOT NULL, state TEXT NOT NULL, engine TEXT, session_id TEXT, request_key TEXT, attempts INTEGER NOT NULL DEFAULT 0,
@@ -99,17 +102,22 @@ export class IntakeVerifier {
   private rows(query: string, ...args: any[]): Obj[] { return this.sql.exec(query, ...args).toArray() as Obj[]; }
   status(): Obj {
     const m = this.rows('SELECT enabled_at,last_tick,last_result FROM intake_verifier_meta WHERE id=1')[0] ?? {};
-    const counts = Object.fromEntries(this.rows('SELECT state, COUNT(*) AS n FROM intake_verifications GROUP BY state').map(r => [r.state, r.n]));
-    return { enabled_at: m.enabled_at ?? null, last_checked_at: m.last_tick ?? null, last_result: parse(m.last_result), states: counts };
+    const rows = this.rows('SELECT state FROM intake_verifications ORDER BY task_id,claim_id LIMIT 1001');
+    const counts: Obj = {};
+    for (const row of rows.slice(0,1000)) counts[row.state] = (counts[row.state] ?? 0) + 1;
+    return { enabled_at: m.enabled_at ?? null, last_checked_at: m.last_tick ?? null, last_result: parse(m.last_result),
+      states: rows.length > 1000 ? null : counts, states_lower_bounds: counts, states_truncated: rows.length > 1000 };
   }
   private workspace(task: Obj): string {
-    const prior = this.rows('SELECT request_json FROM session_control_sessions ORDER BY created_at DESC')
+    const prior = this.rows(`SELECT request_json FROM session_control_sessions INDEXED BY intake_queue_session_task
+      WHERE json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id')=?
+      ORDER BY rowid DESC LIMIT 33`, task.id)
       // Never an intake worktree path: the verifier runs detached from it (79458f2d). Never a concrete host
       // path either: a prior session's per-host checkout (drain-*, rr-*) is gone or lives on another machine,
       // and pinning it made auto placement fail (workspace_unavailable, launcher errors). Registry labels only.
       .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace && !namesWorktree(r.workspace) && isWorkspaceLabel(r.workspace));
     if (prior) return prior.workspace;
-    const configured = this.rows('SELECT capabilities FROM machines').some(m => {
+    const configured = this.rows('SELECT capabilities FROM machines ORDER BY id LIMIT 128').some(m => {
       const roots = parse(m.capabilities).workspaces;
       return Array.isArray(roots) ? roots.includes(task.project) : !!roots && Object.hasOwn(roots, task.project);
     });
@@ -132,7 +140,8 @@ export class IntakeVerifier {
     return this.write(`/tasks/${task.id}/events`, { key, expected_version: task.version, note: { text } });
   }
   private async close(task: Obj, claim: Obj, why: string) {
-    const fresh = this.intake.statusAuthorizedTasks({ admin: true }).find(t => t.id === task.id) ?? task;
+    const fresh = (typeof this.intake.statusTaskById === 'function' ? this.intake.statusTaskById({ admin: true }, task.id)
+      : this.intake.statusAuthorizedTasks({ admin: true }).find(t => t.id === task.id)) ?? task;
     const r = await this.write(`/tasks/${task.id}`, { key: 'verifier-close-' + claim.id, expected_version: fresh.version, status: 'done', reason: why });
     if (r.status < 300) return this.set(task, claim, { state: 'closed', detail: why.slice(0, 500) });
     const code = String(r.body?.error || 'close_refused');
@@ -188,8 +197,15 @@ export class IntakeVerifier {
     if (!meta) return { state: 'already_checked' };
     const counts: Obj = { skipped: 0, launched: 0, closed: 0, failed: 0, escalated: 0, waiting: 0 };
     let budget = VERIFIER_LAUNCH_BUDGET;
-    const tasks = this.intake.statusAuthorizedTasks({ admin: true })
-      .filter(t => OPEN.has(t.status) && !t.archived_at && intakeCompletionHoldReason(t))
+    const after = String(meta.task_cursor ?? '');
+    const page = typeof this.intake.watchdogTasks === 'function'
+      ? this.intake.watchdogTasks(after, VERIFIER_OBSERVATION_BATCH)
+      : this.intake.statusAuthorizedTasks({ admin: true }).filter(t => OPEN.has(t.status) && !t.archived_at && String(t.id) > after)
+        .sort((a,b) => String(a.id).localeCompare(String(b.id))).slice(0,VERIFIER_OBSERVATION_BATCH);
+    const limited = page.length >= VERIFIER_OBSERVATION_BATCH || after !== '';
+    const next = page.length >= VERIFIER_OBSERVATION_BATCH ? String(page[page.length-1].id) : '';
+    this.sql.exec('UPDATE intake_verifier_meta SET task_cursor=? WHERE id=1', next);
+    const tasks = page.filter(t => OPEN.has(t.status) && !t.archived_at && intakeCompletionHoldReason(t))
       .sort((a, b) => ms(a.updated_at) - ms(b.updated_at));
     for (const task of tasks) {
       const claim = latestDoneClaim(task);
@@ -260,7 +276,8 @@ export class IntakeVerifier {
         else if (budget > 0) { budget--; if (await this.launch(task, claim, row)) counts.launched++; }
       }
     }
-    const result = { state: 'checked', checked_at: now, source, ...counts };
+    const result = { state: 'checked', checked_at: now, source, ...counts,
+      observation_scope: 'cursor_batch', observed_tasks: page.length, observation_truncated: limited, next_task_cursor: next || null };
     this.sql.exec('UPDATE intake_verifier_meta SET last_result=? WHERE id=1', JSON.stringify(result));
     return result;
   }

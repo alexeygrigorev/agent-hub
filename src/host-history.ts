@@ -236,7 +236,9 @@ export class HostHistoryService {
         INDEXED BY idx_disk_obs_machine WHERE machine_id=? ORDER BY observed_at_ms DESC LIMIT 1`, machine.id)[0];
       if (row) this.disk(row);
     }
-    for (const h of this.fleet.hostResources()) {
+    const sampleMachines = this.rows('SELECT id FROM machines ORDER BY id LIMIT ?', HISTORY_SCAN_LIMIT + 1);
+    if (sampleMachines.length > HISTORY_SCAN_LIMIT) this.flag('sample_truncated');
+    for (const machine of sampleMachines.slice(0,HISTORY_SCAN_LIMIT)) for (const h of this.fleet.hostResources(String(machine.id))) {
       // Reuse the memory owner's complete reservation, including pending
       // offers. A stale heartbeat must not masquerade as fresh headroom.
       if (h.stale_telemetry) continue;

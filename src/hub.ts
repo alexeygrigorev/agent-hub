@@ -54,7 +54,7 @@ import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enroll
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, dedupeAccountsByCanonical, handleQuotaRoutes } from './quota';
 import { handleTbmApi } from './tbm-api';
-import { tickTbm } from './tbm-controller';
+import { tickTbm,ensureTbmControllerSchema,nextTbmDue } from './tbm-controller';
 import { syncStoredTbmSnapshots } from './tbm-ingestion';
 import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
@@ -1096,15 +1096,12 @@ export class Hub extends DurableObject {
         updateHeartbeat(cred.machine_id, body, this.sql);
 
         const nowIso = new Date().toISOString();
-        const rows = this.sql.exec(
-          `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor, role_name, role_generation
-           FROM jobs
-           WHERE status = 'offered'
-             AND (offer_host_id = ? OR offer_machine_id = ?)
-             AND (offer_expires_at IS NULL OR offer_expires_at > ?)
-           ORDER BY created_at DESC`,
-          cred.machine_id, cred.machine_id, nowIso
-        ).toArray() as any[];
+        const candidates = ['offer_host_id','offer_machine_id'].flatMap(column => this.sql.exec(
+          `SELECT id,kind,payload,status,deadline_at,offer_host_id,offer_machine_id,offer_expires_at,created_at,actor,role_name,role_generation
+            FROM jobs WHERE status='offered' AND ${column}=? ORDER BY created_at DESC LIMIT 101`,cred.machine_id).toArray() as any[]);
+        const rows = [...new Map(candidates.map(row=>[row.id,row])).values()]
+          .filter(row=>row.offer_expires_at===null || row.offer_expires_at>nowIso)
+          .sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at))).slice(0,100);
         // Root scheduling flag: root-run offers are not listed while disabled.
         const visibleRows = isRootSchedulingEnabled(this.sql) ? rows : rows.filter((r: any) => r.kind !== 'root-run');
 
@@ -1121,7 +1118,7 @@ export class Hub extends DurableObject {
           ...(r.role_name ? { role_binding: this.jobsService.roleJobBinding(r) } : {})
         }));
 
-        return Response.json({ status: 'ok', server_time: nowIso, offers });
+        return Response.json({ status: 'ok', server_time: nowIso, offers, offers_truncated: candidates.length>100 });
       }
 
       if (path === '/api/agents' || path.startsWith('/api/agents/')) return this.handleAgentRegistry(request, path);
@@ -2907,25 +2904,29 @@ export class Hub extends DurableObject {
     }, undefined);
   }
 
-  /** Durable cadence survives hibernation. Alarm plus the existing five-minute cron own the tick. */
+  /** Source changes and concrete future reset/expiry work drive the tick.
+   * An idle hot object performs no SQL, including no freshness probe. */
   private tbmStamp: string | null = null;
+  private tbmNextDue = Infinity;
   runTbmTick(nowMs = Date.now()) {
+    const dependencies = ['tbm_session_tokens','tbm_quota_pools','tbm_reward_events','tbm_pool_resets','tbm_banked_tranches','tbm_controller_state',
+      'fleet_sessions_meta','session_resource_usage','session_control_sessions','fleet_launches','usage_quota_history','server_quota_snapshots','fleet_subscriptions'];
+    const stamp = this.writes.stamp(...dependencies);
+    if (stamp === this.tbmStamp && nowMs < this.tbmNextDue) return;
     const previous: any = this.sql.exec('SELECT last_tick_ms FROM tbm_tick_state WHERE id=1').toArray()[0];
     if (previous && nowMs - previous.last_tick_ms < 240000) return;
-    // Change-driven ceiling: with no quota/session/outcome writes since the
-    // last tick there is nothing new to reward or roll up (rows-read budget).
-    if (this.writes) {
-      const stamp = this.writes.stamp('tbm_session_tokens','tbm_quota_pools','tbm_reward_events','tbm_pool_resets','tbm_banked_tranches','tbm_controller_state',
-        'fleet_sessions_meta','session_resource_usage','session_control_sessions','fleet_launches','usage_quota_history','server_quota_snapshots','fleet_subscriptions');
-      if (stamp === this.tbmStamp && previous && nowMs - previous.last_tick_ms < 900000) return;
-      this.tbmStamp = stamp;
-    }
-    return this.ctx.storage.transactionSync(() => {
+    const completed = this.ctx.storage.transactionSync(() => {
+      ensureTbmControllerSchema(this.sql);
       syncStoredTbmSnapshots(this.sql, nowMs);
       const summary = tickTbm(this.sql, nowMs);
       this.sql.exec('INSERT OR REPLACE INTO tbm_tick_state VALUES (1,?,?)', nowMs, JSON.stringify(summary));
-      return summary;
+      return { summary, nextDue: nextTbmDue(this.sql,nowMs) };
     });
+    // Own projection writes are now served; a rollback or minute throttle
+    // must never acknowledge an unprocessed generation.
+    this.tbmStamp = this.writes.stamp(...dependencies);
+    this.tbmNextDue = completed.nextDue ?? Infinity;
+    return completed.summary;
   }
 
   async alarm() {

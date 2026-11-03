@@ -2262,7 +2262,7 @@ export class IntakeService {
   /** Internal watchdog range, including paused work for observation/digests.
    * Full histories are fetched only for this bounded indexed range. */
   watchdogTasks(after: string, limit: number): Obj[] {
-    return this.sql.exec(`SELECT t.data FROM intake_task_projection p JOIN intake_tasks t ON t.id=p.id
+    return this.sql.exec(`SELECT t.data FROM intake_task_projection p INDEXED BY intake_watchdog_open JOIN intake_tasks t ON t.id=p.id
       WHERE p.id>? AND json_extract(p.data,'$.status') IN ('open','in_progress','blocked','pending_approval')
       AND json_extract(p.data,'$.archived_at') IS NULL ORDER BY p.id LIMIT ?`,after,Math.min(64,limit)).toArray().map((r:any)=>JSON.parse(r.data));
   }

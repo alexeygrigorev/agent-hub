@@ -131,7 +131,7 @@ jobs:
           UV_THREADPOOL_SIZE: "1"
           GOMAXPROCS: "1"
           NODE_OPTIONS: "--v8-pool-size=1"
-        run: npx --no-install vitest run test/cf-row-budget.test.ts test/cf-row-budget-hub.test.ts test/cf-loop-alarm.test.ts test/cf-background-bounds.test.ts test/cf-placement-pressure-bounded.test.ts test/host-history-bounded.test.ts --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept
+        run: npx --no-install vitest run test/cf-row-budget.test.ts test/cf-row-budget-hub.test.ts test/cf-loop-alarm.test.ts test/cf-background-bounds.test.ts test/cf-placement-pressure-bounded.test.ts test/host-history-bounded.test.ts test/cf-tbm-bounds.test.ts test/cf-intake-services-bounded.test.ts --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept
 
       - name: Worker discovery tests (Vitest)
         env:

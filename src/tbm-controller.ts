@@ -17,6 +17,7 @@ import {
 } from './quota_admission';
 import {
   FREE_POOL_PROVIDERS,
+  TBM_CONTROL_LIMIT, TBM_HISTORY_LIMIT, boundedTbmRows,
   hardFloorTokens,
   isDeadlineOnlyTranche,
   isPercentPool,
@@ -119,6 +120,10 @@ function tableColumns(sql: SqlStorage, table: string): Set<string> {
 
 /** Idempotent schema & trigger initialization for the TBM controller. */
 export function ensureTbmControllerSchema(sql: SqlStorage): void {
+  // A durable schema receipt rolls back with DDL; an in-memory WeakSet could
+  // incorrectly skip initialization after the enclosing tick transaction fails.
+  sql.exec('CREATE TABLE IF NOT EXISTS tbm_maintenance_cursor(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+  if (sql.exec("SELECT value FROM tbm_maintenance_cursor WHERE key='schema_version'").toArray()[0]?.value === '2') return;
   ensureTbmQuotaSchema(sql);
   for (const stmt of TBM_CONTROLLER_SCHEMA_SQL.split(';')) {
     const trimmed = stmt.trim();
@@ -175,6 +180,32 @@ export function ensureTbmControllerSchema(sql: SqlStorage): void {
     sql.exec('DROP INDEX IF EXISTS idx_tbm_binding_native');
     if (hasTable(sql, 'session_control_sessions')) sql.exec("CREATE INDEX IF NOT EXISTS idx_tbm_binding_native_valid ON session_control_sessions(CASE WHEN json_valid(binding_json) THEN json_extract(binding_json, '$.native_id') END)");
   } catch {}
+  sql.exec('CREATE TABLE IF NOT EXISTS tbm_maintenance_cursor(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
+  sql.exec('CREATE INDEX IF NOT EXISTS tbm_resets_unrewarded_due ON tbm_pool_resets(reset_at_ms,pool_id) WHERE rewarded=0');
+  sql.exec('CREATE INDEX IF NOT EXISTS tbm_pools_reset_due ON tbm_quota_pools(reset_at_ms,pool_id)');
+  sql.exec('CREATE INDEX IF NOT EXISTS tbm_tranches_pool ON tbm_banked_tranches(pool_id,tranche_id)');
+  sql.exec("CREATE INDEX IF NOT EXISTS tbm_tranches_unknown_active ON tbm_banked_tranches(pool_id,expires_at_ms) WHERE quantity_known=0 AND status='active'");
+  sql.exec("CREATE INDEX IF NOT EXISTS tbm_reward_unknown_sessions ON tbm_reward_events(timestamp_ms DESC,event_id) WHERE event_kind='session' AND tokens_known=0");
+  if (hasTable(sql, 'session_control_sessions')) {
+    sql.exec(`CREATE INDEX IF NOT EXISTS tbm_terminal_candidates ON session_control_sessions(id)
+      WHERE state IN ('stopped','failed','cancelled','refused')
+      AND (mode != 'interactive' OR json_extract(request_json,'$.intake_task_id') IS NOT NULL)`);
+    sql.exec('CREATE INDEX IF NOT EXISTS tbm_session_created ON session_control_sessions(created_at DESC,id)');
+  }
+  if (hasTable(sql, 'session_control_commands')) sql.exec('CREATE INDEX IF NOT EXISTS tbm_command_ack ON session_control_commands(session_id,updated_at DESC) WHERE ack_json IS NOT NULL');
+  sql.exec("INSERT OR REPLACE INTO tbm_maintenance_cursor VALUES('schema_version','2')");
+}
+
+/** Indexed one-shot time dependencies, plus bounded sweep continuation. */
+export function nextTbmDue(sql: SqlStorage, nowMs: number): number | null {
+  const due: number[] = [];
+  const pool = sql.exec('SELECT reset_at_ms AS due FROM tbm_quota_pools WHERE reset_at_ms>? ORDER BY reset_at_ms LIMIT 1', nowMs).toArray()[0] as any;
+  const tranche = sql.exec("SELECT expires_at_ms AS due FROM tbm_banked_tranches WHERE status='active' ORDER BY expires_at_ms LIMIT 1").toArray()[0] as any;
+  const reset = sql.exec('SELECT reset_at_ms AS due FROM tbm_pool_resets WHERE rewarded=0 ORDER BY reset_at_ms LIMIT 1').toArray()[0] as any;
+  for (const row of [pool,tranche,reset]) if (typeof row?.due === 'number') due.push(Math.max(nowMs + 300000,row.due));
+  const cursor = sql.exec("SELECT value FROM tbm_maintenance_cursor WHERE key='terminal_session'").toArray()[0] as any;
+  if (cursor?.value) due.push(nowMs + 300000);
+  return due.length ? Math.min(...due) : null;
 }
 
 export interface SessionTokensInput {
@@ -579,7 +610,7 @@ export function upgradePendingSessionRewards(sql: SqlStorage, nowMs = Date.now()
   if (!hasTable(sql, 'tbm_reward_events')) return 0;
   const rows = filterSessionId
     ? (sql.exec("SELECT * FROM tbm_reward_events WHERE event_id = ?", `session:${filterSessionId}`).toArray() as any[])
-    : (sql.exec("SELECT * FROM tbm_reward_events WHERE event_id LIKE 'session:%' ORDER BY timestamp_ms DESC LIMIT 100").toArray() as any[]);
+    : (sql.exec("SELECT * FROM tbm_reward_events WHERE event_kind='session' AND tokens_known=0 ORDER BY timestamp_ms DESC LIMIT 100").toArray() as any[]);
   let upgraded = 0;
   for (const r of rows) {
     const sid = r.session_id || String(r.event_id).replace(/^session:/, '');
@@ -606,15 +637,17 @@ export function upgradePendingSessionRewards(sql: SqlStorage, nowMs = Date.now()
 export function sweepTerminalSessionRewards(sql: SqlStorage, nowMs = Date.now()): { written: number; upgraded: number } {
   let written = 0;
   if (hasTable(sql, 'session_control_sessions')) {
-    const rows = sql.exec(
-      `SELECT s.id, s.engine, s.mode, s.state, s.request_json, s.binding_json, s.fleet_launch_id, s.updated_at
-       FROM session_control_sessions s
-       LEFT JOIN tbm_reward_events r ON r.event_id = ('session:' || s.id)
-       WHERE s.state IN ('stopped', 'failed', 'cancelled', 'refused')
-         AND r.event_id IS NULL
-         AND (s.mode != 'interactive' OR json_extract(s.request_json, '$.intake_task_id') IS NOT NULL)
-       ORDER BY s.updated_at DESC LIMIT 100`
-    ).toArray() as any[];
+    const previous = String(sql.exec("SELECT value FROM tbm_maintenance_cursor WHERE key='terminal_session'").toArray()[0]?.value ?? '');
+    // Bound the raw indexed candidates before the reward anti-join. A LIMIT
+    // after excluding already rewarded rows would rescan all retained history.
+    const candidates = sql.exec(`SELECT id,engine,mode,state,request_json,binding_json,fleet_launch_id,updated_at
+      FROM session_control_sessions INDEXED BY tbm_terminal_candidates WHERE id>?
+      AND state IN ('stopped','failed','cancelled','refused')
+      AND (mode != 'interactive' OR json_extract(request_json,'$.intake_task_id') IS NOT NULL)
+      ORDER BY id LIMIT 101`, previous).toArray() as any[];
+    const rows = candidates.slice(0,100).filter(row => !sql.exec('SELECT 1 FROM tbm_reward_events WHERE event_id=?', 'session:' + row.id).toArray().length);
+    const cursor = candidates.length > 100 ? String(candidates[99].id) : '';
+    if (cursor !== previous) sql.exec("INSERT INTO tbm_maintenance_cursor VALUES('terminal_session',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", cursor);
     for (const s of rows) {
       const req = parseJsonSafe(s.request_json) || {};
       const intakeId = typeof req.intake_task_id === 'string' && req.intake_task_id ? req.intake_task_id : null;
@@ -688,7 +721,7 @@ function processResetPenalties(sql: SqlStorage, pools: TbmPoolRow[], nowMs: numb
   // Only observed expired boundaries or the ingestion UPDATE trigger prove rollover.
   // PID watermarks can predate a corrected future deadline and are not expiry evidence.
 
-  const unrewarded = sql.exec('SELECT * FROM tbm_pool_resets WHERE rewarded = 0 AND reset_at_ms <= ? ORDER BY reset_at_ms ASC', nowMs).toArray() as any[];
+  const unrewarded = sql.exec('SELECT * FROM tbm_pool_resets WHERE rewarded = 0 AND reset_at_ms <= ? ORDER BY reset_at_ms ASC LIMIT 100', nowMs).toArray() as any[];
   for (const r of unrewarded) {
     const eventId = `reset:${r.pool_id}:${r.reset_at_ms}`;
     const pctOnly = Number(r.capacity_known) === 0 || Number(r.total_capacity_tokens) <= 0;
@@ -738,7 +771,7 @@ function processResetPenalties(sql: SqlStorage, pools: TbmPoolRow[], nowMs: numb
 function settleTranchesAndPenalties(sql: SqlStorage, nowMs: number): number {
   if (!hasTable(sql, 'tbm_banked_tranches')) return 0;
   const expiring = sql.exec(
-    "SELECT * FROM tbm_banked_tranches WHERE status = 'active' AND expires_at_ms <= ?",
+    "SELECT * FROM tbm_banked_tranches WHERE status = 'active' AND expires_at_ms <= ? ORDER BY expires_at_ms LIMIT 100",
     nowMs
   ).toArray() as any[];
   for (const t of expiring) {
@@ -766,21 +799,13 @@ function settleTranchesAndPenalties(sql: SqlStorage, nowMs: number): number {
       );
     }
   }
-  const trancheCols = tableColumns(sql, 'tbm_banked_tranches');
-  const exhaustCond = trancheCols.has('quantity_known')
-    ? "status = 'active' AND remaining_tokens <= 0 AND COALESCE(quantity_known, 1) != 0"
-    : "status = 'active' AND remaining_tokens <= 0";
-  sql.exec(
-    "UPDATE tbm_banked_tranches SET status = 'expired', expired_unused_tokens = expired_unused_tokens + remaining_tokens, remaining_tokens = 0, target_banked_burn_rate_tpm = 0, updated_at_ms = ? WHERE status = 'active' AND expires_at_ms <= ?",
-    nowMs,
-    nowMs
-  );
-  sql.exec(
-    `UPDATE tbm_banked_tranches SET status = 'exhausted', target_banked_burn_rate_tpm = 0, updated_at_ms = ? WHERE ${exhaustCond}`,
-    nowMs
-  );
+  for (const t of expiring) sql.exec("UPDATE tbm_banked_tranches SET status='expired',expired_unused_tokens=expired_unused_tokens+remaining_tokens,remaining_tokens=0,target_banked_burn_rate_tpm=0,updated_at_ms=? WHERE tranche_id=? AND status='active'", nowMs, t.tranche_id);
   const active = loadActiveTranches(sql, nowMs);
   for (const t of active) {
+    if (t.remaining_tokens <= 0 && t.quantity_known !== 0) {
+      sql.exec("UPDATE tbm_banked_tranches SET status='exhausted',target_banked_burn_rate_tpm=0,updated_at_ms=? WHERE tranche_id=?", nowMs, t.tranche_id);
+      continue;
+    }
     sql.exec(
       'UPDATE tbm_banked_tranches SET target_banked_burn_rate_tpm = ?, updated_at_ms = ? WHERE tranche_id = ?',
       trancheUrgencyTpm(t, nowMs),
@@ -810,7 +835,7 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
     try {
       const sinceIso = new Date(nowMs - DAY).toISOString();
       const sess = sql.exec(
-        "SELECT engine, state, created_at, updated_at FROM session_control_sessions WHERE created_at >= ? AND mode != 'interactive' ORDER BY created_at DESC LIMIT 200",
+        "SELECT engine,state,created_at,updated_at FROM (SELECT engine,state,created_at,updated_at,mode FROM session_control_sessions INDEXED BY tbm_session_created WHERE created_at>=? ORDER BY created_at DESC LIMIT 200) WHERE mode!='interactive'",
         sinceIso
       ).toArray() as any[];
       if (sess.length > 0) {
@@ -849,7 +874,7 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
     const idleWasted = !isPercentPool(pool) && st && typeof st.deficit_tokens === 'number'
       ? Math.max(0, Math.round(st.deficit_tokens))
       : 0;
-    const bankedRows = sql.exec('SELECT allocated_tokens, remaining_tokens, expired_unused_tokens FROM tbm_banked_tranches WHERE pool_id = ?', pool.pool_id).toArray() as any[];
+    const bankedRows = boundedTbmRows(sql.exec('SELECT allocated_tokens,remaining_tokens,expired_unused_tokens FROM tbm_banked_tranches INDEXED BY tbm_tranches_pool WHERE pool_id=? ORDER BY tranche_id LIMIT ?', pool.pool_id, TBM_HISTORY_LIMIT + 1).toArray() as any[], TBM_HISTORY_LIMIT, 'tranche_rollup');
     let bankedBurned = 0;
     let bankedExpired = 0;
     for (const b of bankedRows) {
@@ -869,24 +894,18 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
         ? pool.reset_at_ms - cycleMs
         : nowMs - cycleMs;
       const endMs = nowMs;
-      const rewards = sql.exec(
-        `SELECT SUM(CASE WHEN tokens_known = 1 AND tokens_burned IS NOT NULL AND event_kind = 'session' THEN tokens_burned ELSE 0 END) AS tok,
-                SUM(CASE WHEN event_kind = 'session' AND work_units > 0 THEN work_units ELSE 0 END) AS work,
-                SUM(CASE WHEN event_kind = 'session' AND tokens_known = 1 AND tokens_burned > 0 THEN work_units ELSE 0 END) AS measured_work
-         FROM tbm_reward_events
-         WHERE pool_id = ? AND timestamp_ms >= ? AND timestamp_ms <= ?`,
-        pool.pool_id,
-        startMs,
-        endMs
-      ).toArray()[0] as any;
-      const resets = sql.exec(
-        `SELECT SUM(CASE WHEN capacity_known = 1 AND remaining_tokens > 0 THEN remaining_tokens ELSE 0 END) AS leftover
-         FROM tbm_pool_resets
-         WHERE pool_id = ? AND reset_at_ms >= ? AND reset_at_ms <= ?`,
-        pool.pool_id,
-        startMs,
-        endMs
-      ).toArray()[0] as any;
+      const events = boundedTbmRows(sql.exec(`SELECT tokens_known,tokens_burned,event_kind,work_units FROM tbm_reward_events
+        INDEXED BY idx_tbm_reward_pool_time WHERE pool_id=? AND timestamp_ms>=? AND timestamp_ms<=?
+        ORDER BY timestamp_ms LIMIT ?`, pool.pool_id,startMs,endMs,TBM_HISTORY_LIMIT + 1).toArray() as any[], TBM_HISTORY_LIMIT, 'reward_rollup');
+      const rewards = { tok: 0, work: 0, measured_work: 0 };
+      for (const event of events) if (event.event_kind === 'session') {
+        if (event.tokens_known === 1 && event.tokens_burned !== null) rewards.tok += Number(event.tokens_burned) || 0;
+        if (event.work_units > 0) rewards.work += Number(event.work_units);
+        if (event.tokens_known === 1 && event.tokens_burned > 0) rewards.measured_work += Number(event.work_units) || 0;
+      }
+      const boundaries = boundedTbmRows(sql.exec(`SELECT capacity_known,remaining_tokens FROM tbm_pool_resets
+        WHERE pool_id=? AND reset_at_ms>=? AND reset_at_ms<=? ORDER BY reset_at_ms LIMIT ?`, pool.pool_id,startMs,endMs,TBM_HISTORY_LIMIT + 1).toArray() as any[], TBM_HISTORY_LIMIT, 'reset_rollup');
+      const resets = { leftover: boundaries.reduce((sum,event) => sum + (event.capacity_known === 1 && event.remaining_tokens > 0 ? Number(event.remaining_tokens) : 0),0) };
       const totalTokens = Math.max(0, Math.round(Number(rewards?.tok) || 0));
       const usefulWork = Math.max(0, Number(rewards?.work) || 0);
       const tokensKnown = totalTokens > 0 ? 1 : 0;

@@ -14,8 +14,8 @@ describe('bounded cron observations', () => {
     const now = Date.now();
     // Raw fixture setup is deliberately outside the production event budget.
     for (let i=0;i<1200;i++) sql.exec(`INSERT INTO messages
-      (id,from_actor,to_actor,kind,thread_id,body,created_at,expires_at)
-      VALUES (?,'test','test:reader','note','thread','x',?,?)`, 'bg-' + String(i).padStart(5,'0'),now-600000,now-1000);
+      (id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at)
+      VALUES (?,'test','test:reader','note','thread','x',?,?,?)`, 'bg-' + String(i).padStart(5,'0'),'bg-key-'+i,now-600000,now-1000);
     const cursors: any[] = [];
     const observed = new Proxy(sql, { get(target,key) {
       if(key==='exec') return (q:string,...args:any[])=>{ const c=target.exec(q,...args);cursors.push(c);return c; };
@@ -41,8 +41,8 @@ describe('bounded cron observations', () => {
   it('bounds sparse intake joins before filtering and does not declare an incomplete census idle', () => fixture(async (_hub,state) => {
     const sql = state.storage.sql, now=Date.now(), at=new Date(now).toISOString();
     sql.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1200)
-      INSERT INTO session_control_sessions(id,actor,request_key,request_json,state,created_at,updated_at)
-      SELECT 'bg-session-'||i,'test','bg-key-'||i,'{}','running',?,? FROM n`,at,at);
+      INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at)
+      SELECT 'bg-session-'||i,'test','bg-key-'||i,'{}','headless','running',?,? FROM n`,at,at);
     const cursors:any[]=[];
     const observed=new Proxy(sql,{get(target,key){
       if(key==='exec')return(q:string,...args:any[])=>{const c=target.exec(q,...args);cursors.push(c);return c;};

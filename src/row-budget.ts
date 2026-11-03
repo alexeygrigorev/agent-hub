@@ -51,10 +51,20 @@ export class RowBudget {
     return !!v && Number.isSafeInteger(v.day) && Number.isSafeInteger(v.read) && v.read >= 0 &&
       Number.isSafeInteger(v.written) && v.written >= 0 && typeof v.stopped === 'boolean';
   }
-  private exclusive(fn: () => Promise<void>): Promise<void> {
-    const task = this.queue.then(fn);
-    this.queue = task.catch(() => {});
-    return task;
+  private async exclusive(fn: () => Promise<void>): Promise<void> {
+    // Catch the operation INSIDE the queued callback. Passing an async fn
+    // directly to .then() creates an intermediate rejected promise before
+    // promise adoption installs its handler in workerd. Expected circuit
+    // breaker denials must not emit unhandled-rejection events.
+    const task = this.queue.then(async () => {
+      try { await fn(); return { ok: true as const }; }
+      catch (error) { return { ok: false as const, error }; }
+    });
+    // The serialization chain is always fulfilled; only this caller's awaited
+    // promise rejects. A rejected event never poisons later queue entries.
+    this.queue = task.then(() => {});
+    const outcome = await task;
+    if (!outcome.ok) throw outcome.error;
   }
   private trip(detail: string): never {
     this.stopped = true;

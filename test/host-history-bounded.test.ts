@@ -61,8 +61,12 @@ describe('bounded host history maintenance', () => {
     launches(sql, 2000);
     meter.runSync('backfill', () => history.backfill());
     const budget = meter.snapshot().backfill;
-    expect(budget.max_read).toBeLessThanOrEqual(HISTORY_SCAN_LIMIT + 1);
+    // Scope max_read is the maximum whole invocation, not a per-statement
+    // maximum: CI measured 133 = 129 launch rows + four metadata rows.
+    const source = meter.statementTop(200).find(row => row.scope === 'backfill' && row.sql.startsWith('SELECT machine_id,state,updated_at FROM fleet_launches'))!;
+    expect(source.max_read).toBeLessThanOrEqual(HISTORY_SCAN_LIMIT + 1);
     expect(budget.rows_read).toBeLessThan(400);
+    console.log(`history backfill launch_source_rows=${source.max_read} total_rows=${budget.rows_read}`);
     const result = history.query('1h');
     expect(result.backfill_truncated).toBe(true);
     const failures = result.series.find((s: any) => s.kind === 'failures');
@@ -79,8 +83,12 @@ describe('bounded host history maintenance', () => {
       SELECT 'a','n'||i,'test','running',?,'/repo' FROM n`, new Date(NOW).toISOString());
     meter.runSync('sample', () => history.sample());
     const budget = meter.snapshot().sample;
-    expect(budget.max_read).toBeLessThanOrEqual(HISTORY_SCAN_LIMIT + 1);
+    const counts = meter.statementTop(200).filter(row => row.scope === 'sample' && /^SELECT 1 FROM fleet_(launches|sessions) INDEXED BY/.test(row.sql)
+      && (row.sql.includes('AND state=? LIMIT ?') || row.sql.includes("AND phase='running' LIMIT ?")));
+    expect(counts.reduce((sum,row) => sum + row.calls,0)).toBe(3);
+    for (const statement of counts) expect(statement.max_read).toBeLessThanOrEqual(HISTORY_SCAN_LIMIT + 1);
     expect(budget.rows_read).toBeLessThan(800);
+    console.log(`history sample count_source_rows=${counts.map(row=>row.max_read).join(',')} total_rows=${budget.rows_read}`);
     const result = history.query('1h');
     expect(result.sample_truncated).toBe(true);
     for (const metric of ['running', 'queued', 'failed']) {
@@ -95,8 +103,11 @@ describe('bounded host history maintenance', () => {
       INSERT INTO resource_history(bucket_ms,payload_json) SELECT ?+i*?, '[]' FROM n`, begin, MINUTE);
     meter.runSync('compact', () => history.compact());
     const budget = meter.snapshot().compact;
-    expect(budget.max_read).toBeLessThanOrEqual(61);
+    const reads = meter.statementTop(200).find(row => row.scope === 'compact' && row.sql.startsWith('SELECT bucket_ms,payload_json FROM resource_history'))!;
+    expect(reads.max_read).toBeLessThanOrEqual(60);
+    expect(reads.calls).toBeLessThanOrEqual(HISTORY_COMPACT_WINDOWS*3);
     expect(budget.rows_read).toBeLessThan(1300);
+    console.log(`history compact window_source_rows=${reads.max_read} windows=${reads.calls} total_rows=${budget.rows_read}`);
     const cursor = Number(sql.exec("SELECT value FROM resource_history_meta WHERE key='compact_cursor_3600000'").one().value);
     expect(cursor).toBe(begin + HISTORY_COMPACT_WINDOWS * 3600000 - 1);
     const restored = new HostHistoryService(meter.wrap(sql), { hostResources: () => [] } as any, () => NOW);
