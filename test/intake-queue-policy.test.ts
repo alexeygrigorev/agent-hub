@@ -27,17 +27,16 @@ describe('live autonomous queue policy', () => {
     expect(providerPreference('zai')).toBeGreaterThan(providerPreference('claude'));
     expect(providerPreference('gemini')).toBeGreaterThan(providerPreference('claude'));
   });
-  it('routes deep automatic goals to advertised Gemini models with fresh quota', () => {
+  it('keeps deep Gemini out of default automatic goals but allows reasoned deep requests', () => {
     const model = routingPolicy.models.find(m => m.id === 'argon')!;
     const route = { provider:'gemini',engine:model.engine,profile:model.profile,account:'shared-gemini' };
     const quota = {status:'ok',observed_at:new Date(NOW).toISOString(),details:{limit_reached:false},
       windows:{'5h':{present:true,percent_remaining:81,reset_at:new Date(NOW+3600000).toISOString()}}};
     const ad = [{...model,account:route.account}];
-    // Argon is a deep-only model (intake 8852ba59): default daily placement
-    // must not offer it, but an explicit deep goal routes to it.
-    expect(modelCandidates({tier:'deep'},route,ad,quota,NOW).map(m=>m.id)).toContain('argon');
     expect(modelCandidates({},route,ad,quota,NOW).map(m=>m.id)).not.toContain('argon');
-    expect(modelCandidates({},route,ad,{...quota,details:{limit_reached:true}},NOW)).toEqual([]);
+    expect(modelCandidates({tier:'daily'},route,ad,quota,NOW).map(m=>m.id)).not.toContain('argon');
+    expect(modelCandidates({tier:'deep',engine_override_reason:'This autonomous task requires deep reasoning.'},route,ad,quota,NOW).map(m=>m.id)).toContain('argon');
+    expect(modelCandidates({tier:'deep'},route,ad,{...quota,details:{limit_reached:true}},NOW)).toEqual([]);
   });
   it('enables real projects with a capacity budget above the proof-only 2/1 limits', () => fixture((h, fleet) => {
     expect(liveQueuePolicy(settings, h.sql, fleet, NOW)).toMatchObject({ enabled: true, valid: true,

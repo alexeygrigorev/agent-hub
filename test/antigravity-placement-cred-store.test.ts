@@ -8,7 +8,7 @@ import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
 describe('antigravity placement', () => {
-  it('plans engine=antigravity without a tier and with tier=deep on a hub-antigravity route', async () => {
+  it('keeps plain daily work off Antigravity and allows reasoned deep placement', async () => {
     const now = Date.now();
     const iso = (delta = 0) => new Date(now + delta).toISOString();
     const bindings = env as unknown as Env;
@@ -28,13 +28,14 @@ describe('antigravity placement', () => {
         }),
       }), { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] });
       expect(put.status, await put.clone().text()).toBe(200);
-      for (const tier of [undefined, 'deep']) {
-        const plan = fleet.plan({ engine: 'antigravity', ...(tier ? { tier } : {}), machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' });
-        expect((plan.rejected ?? []).filter((r: any) => r.reason === 'model_unsupported'), JSON.stringify(plan.rejected)).toEqual([]);
-        expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({
-          machine, engine: 'antigravity', account: 'hub-antigravity', selection: { engine: 'antigravity', provider: 'gemini' },
-        });
-      }
+      const plain = fleet.plan({ engine: 'antigravity', machine, mode: 'headless', workspace: 'demo', prompt: 'plain implement', task_kind: 'implement' } as any);
+      expect(plain.selected, JSON.stringify(plain)).toBeNull();
+      expect(plain.rejected).toContainEqual({ machine, engine: 'antigravity', reason: 'model_unsupported' });
+
+      const deep = fleet.plan({ engine: 'antigravity', tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning on the Gemini route.', machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' } as any);
+      expect(deep.selected, JSON.stringify(deep.rejected)).toMatchObject({
+        machine, engine: 'antigravity', account: 'hub-antigravity', selection: { engine: 'antigravity', provider: 'gemini', id: 'argon', model: 'gemini-4-argon-medium', effort: 'medium' },
+      });
     });
   });
 });

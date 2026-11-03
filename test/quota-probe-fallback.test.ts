@@ -156,7 +156,7 @@ describe('quota probe failure placement (b3749cbb)', () => {
       expect(defaultStart.selected?.engine).toBe('opencode');
       expect(defaultStart.selected?.selection.id).toBe('muse');
       // Deep tier cannot silently degrade to a daily model.
-      const deep = service.plan({workspace: 'demo', mode: 'interactive', engine: 'astra', tier: 'deep', prompt: 'test'});
+      const deep = service.plan({workspace: 'demo', mode: 'interactive', engine: 'astra', tier: 'deep', engine_override_reason: 'This task explicitly checks deep Astra quota fallback.', prompt: 'test'});
       expect(deep.selected).toBeNull();
       expect(deep.candidates?.some((route: any) => route.engine !== 'codex')).toBe(false);
       expect(deep.rejected).toContainEqual(expect.objectContaining({engine: 'codex', reason: 'account_blocked'}));
