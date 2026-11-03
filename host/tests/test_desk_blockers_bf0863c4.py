@@ -349,11 +349,23 @@ def test_package_update_schedules_once_per_served_archive(tmp_path):
     assert run(now=1000.0 + u.RETRY_S + 1) == 'pending'
     assert run(now=1000.0 + u.MIN_INTERVAL_S + 1) == 'scheduled'
     assert len(registered) == 2
-    # A newer served archive schedules immediately without waiting 12h.
+    # Automatic updates keep 12h spacing even when a newer archive is served,
+    # while an operator-requested update bypasses the 12h window once.
+    t_next = 1000.0 + u.MIN_INTERVAL_S + 60
     assert u.step_once('https://hub.example', tmp_path, release=release,
                        fetch=lambda url: 'f' * 64 + '\n',
                        register=lambda *a: registered.append(a), free_gb=500,
-                       now=1000.0 + u.MIN_INTERVAL_S + 60) == 'scheduled'
+                       now=t_next) == 'pending'
+    assert len(registered) == 2
+    assert u.step_once('https://hub.example', tmp_path, release=release,
+                       fetch=lambda url: 'f' * 64 + '\n',
+                       register=lambda *a: registered.append(a), free_gb=500,
+                       now=t_next, requested_sha='9' * 40) == 'scheduled'
+    assert len(registered) == 3
+    assert u.step_once('https://hub.example', tmp_path, release=release,
+                       fetch=lambda url: '0' * 64 + '\n',
+                       register=lambda *a: registered.append(a), free_gb=500,
+                       now=t_next + 60, requested_sha='9' * 40) == 'pending'
     assert len(registered) == 3
 
 
