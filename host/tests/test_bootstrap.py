@@ -152,6 +152,51 @@ class BootstrapTests(unittest.TestCase):
             b.ensure_aplexer(self.root)
         copy.assert_not_called()
 
+    def test_windows_aplexer_install_uses_current_hub_pinned_release(self):
+        (self.root / 'tmp').mkdir()
+        (self.root / 'bin').mkdir()
+        asset = 'aplexer-windows-amd64.exe'
+        checksum = b.APLEXER_SHA256['0.1.24'][asset]
+
+        def download(_url, target):
+            Path(target).write_bytes(b'current Hub aplexer')
+
+        with patch.object(b.sys, 'platform', 'win32'), \
+                patch.object(b, 'architecture', return_value='x64'), \
+                patch.object(b, 'download', side_effect=download) as fetch, \
+                patch.object(b, 'verify') as verify, patch.object(b, 'run'):
+            b.ensure_aplexer(self.root)
+
+        fetch.assert_called_once()
+        self.assertEqual(
+            fetch.call_args.args[0],
+            'https://github.com/PocketShell-io/aplexer/releases/download/v0.1.24/' + asset,
+        )
+        self.assertEqual(verify.call_args.args[1:], (checksum + '  ' + asset, asset))
+        self.assertEqual((self.root / 'bin/aplexer-version').read_text(), '0.1.24')
+
+    def test_aplexer_client_wheel_uses_matching_release_and_checksum(self):
+        with patch.object(b.sys, 'platform', 'win32'), \
+                patch.object(b, 'architecture', return_value='x64'):
+            url, checksum = b.aplexer_client_release_asset()
+        self.assertEqual(
+            url,
+            'https://github.com/PocketShell-io/aplexer/releases/download/v0.1.24/'
+            'aplexer_client-0.1.24-cp311-abi3-win_amd64.whl',
+        )
+        self.assertEqual(
+            checksum,
+            b.APLEXER_SHA256['0.1.24']['aplexer_client-0.1.24-cp311-abi3-win_amd64.whl'],
+        )
+        with patch.object(b.sys, 'platform', 'darwin'), \
+                patch.object(b, 'architecture', return_value='arm64'):
+            mac_url, mac_checksum = b.aplexer_client_release_asset()
+        self.assertIn('/v0.1.22/aplexer_client-0.1.22-cp311-abi3-macosx_11_0_arm64.whl', mac_url)
+        self.assertEqual(
+            mac_checksum,
+            b.APLEXER_SHA256['0.1.22']['aplexer_client-0.1.22-cp311-abi3-macosx_11_0_arm64.whl'],
+        )
+
     def test_failed_aplexer_alias_copy_preserves_previous_executable(self):
         _, alias = self.prepare_aplexer_alias()
         previous = alias.read_bytes()

@@ -307,19 +307,42 @@ def _bound_native_response(proc, args):
     return proc
 
 
-def ensure_runtime_bin_on_path() -> None:
-    """Windows venv layout: <root>/venv/Scripts/python.exe, <root>/bin/aplexer.exe.
-
-    The scheduled task / aplexer shell may not carry the installer's PATH, so
-    the native CLI would be found nowhere. Prepend the sibling bin directory.
-    """
+def _hub_runtime_bin_dir() -> Optional[Path]:
+    """Return the binary directory belonging to this installed Hub venv."""
     if sys.platform != "win32":
-        return
+        return None
     try:
+        executable = Path(sys.executable).resolve()
         candidate = Path(sys.executable).resolve().parent.parent.parent / "bin"
-    except OSError:
-        return
-    if (candidate / "aplexer.exe").is_file():
+    except (OSError, RuntimeError):
+        return None
+    scripts_dir = executable.parent
+    venv_dir = scripts_dir.parent
+    if scripts_dir.name.casefold() != "scripts" or venv_dir.name.casefold() != "venv":
+        return None
+    return candidate
+
+
+def session_aplexer_executable(configured: str) -> str:
+    """Use the Hub release's checked aplexer binary for Windows session starts.
+
+    A managed venv never falls back to PATH or a stale settings override: if
+    its sibling binary is missing, refuse the start so bootstrap can repair it.
+    Unmanaged development processes keep honoring their configured executable.
+    """
+    runtime_bin = _hub_runtime_bin_dir()
+    if runtime_bin is None:
+        return configured
+    binary = runtime_bin / "aplexer.exe"
+    if not binary.is_file():
+        raise SessionControlError("Hub-managed aplexer executable is missing")
+    return str(binary)
+
+
+def ensure_runtime_bin_on_path() -> None:
+    """Prepend the checked Hub release binary directory for Windows helpers."""
+    candidate = _hub_runtime_bin_dir()
+    if candidate is not None and (candidate / "aplexer.exe").is_file():
         parts = os.environ.get("PATH", "").split(os.pathsep)
         if str(candidate) not in parts:
             os.environ["PATH"] = os.pathsep.join([str(candidate), *parts])

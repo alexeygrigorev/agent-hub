@@ -130,6 +130,25 @@ def worker_resource_argv(engine: str | None = None) -> list[str]:
     return ["--memory", ENGINE_WORKER_MEMORY.get(engine, WORKER_MEMORY), "--pids", WORKER_PIDS,
             "--cpu-quota-us", WORKER_CPU_QUOTA_US, "--cpu-period-us", WORKER_CPU_PERIOD_US]
 
+
+# The published v0.1.24 Windows binary still defaults to 10 s; keep the Hub
+# provisioning allowance explicit until that release lag is gone.
+WINDOWS_SESSION_STARTUP_TIMEOUT_MS = 120_000
+
+
+def build_native_start_argv(native, workspace, tag, engine, *, profile=None, cwd=None):
+    """Build the interactive session command with the Windows provisioning budget."""
+    argv = [native, "start", "--workspace", str(workspace), "--tag", tag,
+            "--engine", engine] + worker_resource_argv(engine)
+    if is_windows_host():
+        argv += ["--startup-timeout-ms", str(WINDOWS_SESSION_STARTUP_TIMEOUT_MS)]
+    argv += ["--json"]
+    if profile:
+        argv += ["--profile", profile]
+    if cwd is not None and cwd != workspace:
+        argv += ["--cwd", str(cwd)]
+    return argv
+
 # Advertisement-only cache for qualified role profiles (intake eff9a5ce AC1:
 # derivation costs ~7 s per cycle on DEFLf4 and only feeds registration).
 ROLE_JOBS_CACHE_TTL_S = 120.0
@@ -1954,9 +1973,8 @@ class Dispatcher:
         if not self._active_launches:
             return reconciled
 
-        from .native_sessions import NativeTarget, SessionControlError
-
-        native = self.settings.get("aplexer_bin", "aplexer")
+        from .native_sessions import NativeTarget, SessionControlError, session_aplexer_executable
+        native = session_aplexer_executable(self.settings.get("aplexer_bin", "aplexer"))
         state_dir = self.settings.get("aplexer_state_dir")
         launcher = self.settings.get("launcher", {})
         has_launcher = all(launcher.get(k) for k in ["argv", "root", "config_dir"])
@@ -2564,9 +2582,8 @@ class Dispatcher:
         if not isinstance(imported_bindings, list) or not imported_bindings:
             return reconciled
 
-        from .native_sessions import NativeTarget, SessionControlError
-
-        native = self.settings.get("aplexer_bin", "aplexer")
+        from .native_sessions import NativeTarget, SessionControlError, session_aplexer_executable
+        native = session_aplexer_executable(self.settings.get("aplexer_bin", "aplexer"))
         state_dir = self.settings.get("aplexer_state_dir")
 
         for item in imported_bindings:
@@ -3275,7 +3292,8 @@ class Dispatcher:
         offer_workspace = workspace
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"), self.settings)
         stages.append(('workspace', time.monotonic()))
-        native = self.settings.get("aplexer_bin", "aplexer")
+        from .native_sessions import session_aplexer_executable
+        native = session_aplexer_executable(self.settings.get("aplexer_bin", "aplexer"))
         if mode == "interactive":
             if selection:
                 launcher = self.settings.get('launcher', {})
@@ -3299,11 +3317,14 @@ class Dispatcher:
             from .intake_worktree import launch_cwd
             target_cwd, wt_note, intake_wt = launch_cwd(self.request, offer, workspace, target_cwd)
             self._lock_session_worktree(offer, target_cwd)
-            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"]] + worker_resource_argv(offer["engine"]) + ["--json"]
-            if offer.get("profile"):
-                argv += ["--profile", offer["profile"]]
-            if target_cwd != workspace:
-                argv += ["--cwd", str(target_cwd)]
+            argv = build_native_start_argv(
+                native,
+                workspace,
+                "hub-" + offer_id,
+                offer["engine"],
+                profile=offer.get("profile"),
+                cwd=target_cwd,
+            )
             git_ident = normalize_git_identity(self.settings.get("git") if "git" in self.settings else self.settings.get("git_identity"))
             if not git_ident:
                 from . import provisioning

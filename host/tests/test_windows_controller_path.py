@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host import auth, native_sessions as ns
+from agent_hub_host import auth, fleet, native_sessions as ns
 
 
 class RuntimePathTests(unittest.TestCase):
@@ -24,6 +24,48 @@ class RuntimePathTests(unittest.TestCase):
                 ns.ensure_runtime_bin_on_path()
                 self.assertEqual(os.environ['PATH'].count('aplexer'), 0)
                 self.assertEqual(os.environ['PATH'].split(os.pathsep).count(str((root / 'bin').resolve())), 1)
+
+    def test_session_start_uses_the_hub_release_binary_over_a_stale_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary_dir = root / 'bin'
+            binary_dir.mkdir()
+            binary = binary_dir / 'aplexer.exe'
+            binary.write_bytes(b'hub release')
+            python = root / 'venv/Scripts/python.exe'
+            python.parent.mkdir(parents=True)
+            python.write_bytes(b'python')
+            with patch.object(ns.sys, 'platform', 'win32'), \
+                    patch.object(ns.sys, 'executable', str(python)):
+                self.assertEqual(ns.session_aplexer_executable('old-aplexer-0.1.10.exe'), str(binary))
+
+    def test_managed_windows_runtime_refuses_to_fall_back_when_binary_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            python = root / 'venv/Scripts/python.exe'
+            python.parent.mkdir(parents=True)
+            python.write_bytes(b'python')
+            with patch.object(ns.sys, 'platform', 'win32'), \
+                    patch.object(ns.sys, 'executable', str(python)):
+                with self.assertRaisesRegex(ns.SessionControlError, 'Hub-managed aplexer executable is missing'):
+                    ns.session_aplexer_executable('old-aplexer-0.1.10.exe')
+
+    def test_windows_fleet_start_has_explicit_120_second_startup_timeout(self):
+        with patch.object(fleet, 'is_windows_host', return_value=True):
+            argv = fleet.build_native_start_argv(
+                'C:/agent-hub/bin/aplexer.exe', 'C:/workspace', 'hub-offer', 'codex'
+            )
+        self.assertEqual(
+            argv[argv.index('--startup-timeout-ms') + 1],
+            '120000',
+        )
+        self.assertEqual(argv[0], 'C:/agent-hub/bin/aplexer.exe')
+        self.assertEqual(argv[1], 'start')
+
+    def test_non_windows_fleet_start_keeps_platform_default(self):
+        with patch.object(fleet, 'is_windows_host', return_value=False):
+            argv = fleet.build_native_start_argv('/hub/bin/aplexer', '/workspace', 'hub-offer', 'codex')
+        self.assertNotIn('--startup-timeout-ms', argv)
 
     def test_noop_off_windows(self):
         with patch.dict(os.environ, {'PATH': 'x'}):
