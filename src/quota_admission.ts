@@ -8,6 +8,7 @@
  * elsewhere; dispatch filters its shortlist through this evaluator.
  */
 import policy from "../config/model-routing.json";
+import { isRecord } from "./is-record";
 
 export const QUOTA_OBSERVATION_TTL_MS = 1_200_000; // 20 minutes, matches QUOTA_STALE_MS
 
@@ -32,10 +33,6 @@ function validObservedAt(value: unknown, nowMs: number): boolean {
   if (typeof value !== "string") return false;
   const at = Date.parse(value);
   return Number.isFinite(at) && at <= nowMs && nowMs - at <= QUOTA_OBSERVATION_TTL_MS;
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function evaluateQuotaAdmission(input: QuotaAdmissionInput): QuotaAdmissionResult {
