@@ -3803,13 +3803,16 @@ class Dispatcher:
         # Re-sample after slow preparation, before any claim.
         check_live_load(self.settings)
         claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
+        claim_confirmed = False
+        native_start_invoked = False
+        interactive_effect_invoked = False
         self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, offer_workspace)
+        claim_confirmed = True
         stages.append(('claim', time.monotonic()))
         _emit_stage_timing(offer_id, stages)
         from .launch_diagnostics import capture_log_offsets
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()
-        native_start_invoked = False
         try:
             if mode == "headless":
                 # Explicit workspaces and fail-open launches skip the planned
@@ -3834,6 +3837,7 @@ class Dispatcher:
                 # compose_prompt keeps the worktree-guard footer on this path
                 # too (AC3): an empty interactive brief still carries the
                 # cleanup rules, after the planned-worktree note.
+                interactive_effect_invoked = True
                 self.runner([native, "message", "send",
                              "--to", "hub-" + offer_id, "--queue",
                              "--kind", "hub-session-preamble", "--json", wt_note + compose_prompt("")],
@@ -3856,6 +3860,7 @@ class Dispatcher:
             # Headless starts are launcher `run` commands; interactive starts are
             # native aplexer and never receive the launcher-only host path.
             if mode == 'interactive':
+                interactive_effect_invoked = True
                 native_start_invoked = True
                 receipt = self.runner(argv, cwd=cwd, timeout=120)
             else:
@@ -3988,7 +3993,7 @@ class Dispatcher:
                 failure = exception_diagnostic(exc, stage,
                                                engine=engine_name, cwd=t_cwd, task_id=t_id,
                                                launched_at=l_at, start_offsets=l_offsets)
-            if mode == 'interactive' and not native_start_invoked:
+            if mode == 'interactive' and claim_confirmed and not interactive_effect_invoked:
                 return self._record_interactive_no_start(
                     offer_id, workspace, target_cwd, type(exc).__name__)
             if mode == "headless" and t_id and failure.get("reason") == "launcher_command_failed":
