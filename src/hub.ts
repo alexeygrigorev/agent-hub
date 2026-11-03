@@ -1038,7 +1038,6 @@ export class Hub extends DurableObject {
       if (path === '/api/host-credentials' || path.startsWith('/api/host-credentials/')) {
         return this.hostCredentialService.handle(request, await this.authenticateBusRequest(request));
       }
-      }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
         const url = new URL(request.url);
         if (path === '/api/engines' && url.searchParams.getAll('view').length === 1 && url.searchParams.get('view') === 'worker') {
