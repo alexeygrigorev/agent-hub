@@ -17,6 +17,30 @@ function pool(sql:any,id:string,reset=NOW+600000) {
 }
 
 describe('bounded TBM background maintenance',()=>{
+  it('installs session indexes after routing created the earlier core schema receipt',async()=>{
+    const stub=(env as any).HUB.get((env as any).HUB.idFromName('tbm-index-init-'+crypto.randomUUID()));
+    await(runInDurableObject as any)(stub,(_hub:any,state:any)=>{
+      const sql=state.storage.sql;
+      expect(sql.exec("SELECT value FROM tbm_maintenance_cursor WHERE key='schema_version'").one().value).toBe('2');
+      const indexes=sql.exec("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('tbm_terminal_candidates','tbm_session_created','tbm_command_ack')").toArray();
+      expect(indexes.map((row:any)=>row.name).sort()).toEqual(['tbm_command_ack','tbm_session_created','tbm_terminal_candidates']);
+    });
+  });
+
+  it('refuses incomplete session-mix observations before publishing healthy aggregate metrics',()=>fixture((_hub,sql)=>{
+    pool(sql,'codex:test:5h');
+    const newest=new Date(NOW).toISOString(),older=new Date(NOW-60000).toISOString();
+    sql.exec(`WITH RECURSIVE n(i) AS(SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<201)
+      INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      SELECT 'mix-'||i,'test','mix-'||i,'{}','codex',CASE WHEN i=0 THEN 'headless' ELSE 'interactive' END,
+        CASE WHEN i=0 THEN 'failed' ELSE 'running' END,CASE WHEN i=0 THEN ? ELSE ? END,? FROM n`,older,newest,newest);
+    const meter=new RowsMeter(()=>NOW),tracked=meter.wrap(sql);
+    expect(()=>meter.runSync('mix',()=>tickTbm(tracked,NOW))).toThrowError('tbm_observation_limit:session_mix');
+    expect(sql.exec('SELECT COUNT(*) AS n FROM tbm_metrics_rollup').one().n).toBe(0);
+    const source=meter.statementTop(200).find(row=>row.scope==='mix' && row.sql.startsWith('SELECT engine,state,created_at,updated_at,mode'))!;
+    expect(source.max_read).toBeLessThanOrEqual(201);
+  }));
+
   it('pages raw terminal sessions before checking reward existence, independent of rewarded history',()=>fixture((_hub,sql)=>{
     const at=new Date(NOW-2*DAY).toISOString();
     sql.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000)

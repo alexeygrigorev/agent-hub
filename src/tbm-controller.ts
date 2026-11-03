@@ -17,7 +17,7 @@ import {
 } from './quota_admission';
 import {
   FREE_POOL_PROVIDERS,
-  TBM_CONTROL_LIMIT, TBM_HISTORY_LIMIT, boundedTbmRows,
+  TBM_CONTROL_LIMIT, TBM_HISTORY_LIMIT, boundedTbmRows, TbmObservationLimit,
   hardFloorTokens,
   isDeadlineOnlyTranche,
   isPercentPool,
@@ -123,7 +123,10 @@ export function ensureTbmControllerSchema(sql: SqlStorage): void {
   // A durable schema receipt rolls back with DDL; an in-memory WeakSet could
   // incorrectly skip initialization after the enclosing tick transaction fails.
   sql.exec('CREATE TABLE IF NOT EXISTS tbm_maintenance_cursor(key TEXT PRIMARY KEY,value TEXT NOT NULL)');
-  if (sql.exec("SELECT value FROM tbm_maintenance_cursor WHERE key='schema_version'").toArray()[0]?.value === '2') return;
+  if (sql.exec("SELECT value FROM tbm_maintenance_cursor WHERE key='schema_version'").toArray()[0]?.value === '2') {
+    ensureTbmSessionIndexes(sql);
+    return;
+  }
   ensureTbmQuotaSchema(sql);
   for (const stmt of TBM_CONTROLLER_SCHEMA_SQL.split(';')) {
     const trimmed = stmt.trim();
@@ -186,14 +189,26 @@ export function ensureTbmControllerSchema(sql: SqlStorage): void {
   sql.exec('CREATE INDEX IF NOT EXISTS tbm_tranches_pool ON tbm_banked_tranches(pool_id,tranche_id)');
   sql.exec("CREATE INDEX IF NOT EXISTS tbm_tranches_unknown_active ON tbm_banked_tranches(pool_id,expires_at_ms) WHERE quantity_known=0 AND status='active'");
   sql.exec("CREATE INDEX IF NOT EXISTS tbm_reward_unknown_sessions ON tbm_reward_events(timestamp_ms DESC,event_id) WHERE event_kind='session' AND tokens_known=0");
-  if (hasTable(sql, 'session_control_sessions')) {
+  sql.exec("INSERT OR REPLACE INTO tbm_maintenance_cursor VALUES('schema_version','2')");
+  ensureTbmSessionIndexes(sql);
+}
+
+/** Routing initializes core TBM before SessionControl creates its tables.
+ * Optional indexes have separate durable receipts; absence is never recorded
+ * as completion, so the later session initialization installs its indexes. */
+function ensureTbmSessionIndexes(sql: SqlStorage): void {
+  if (hasTable(sql,'session_control_sessions') && !sql.exec("SELECT 1 FROM tbm_maintenance_cursor WHERE key='session_indexes_v1'").toArray().length) {
     sql.exec(`CREATE INDEX IF NOT EXISTS tbm_terminal_candidates ON session_control_sessions(id)
       WHERE state IN ('stopped','failed','cancelled','refused')
       AND (mode != 'interactive' OR json_extract(request_json,'$.intake_task_id') IS NOT NULL)`);
     sql.exec('CREATE INDEX IF NOT EXISTS tbm_session_created ON session_control_sessions(created_at DESC,id)');
+    sql.exec("CREATE INDEX IF NOT EXISTS idx_tbm_binding_native_valid ON session_control_sessions(CASE WHEN json_valid(binding_json) THEN json_extract(binding_json,'$.native_id') END)");
+    sql.exec("INSERT INTO tbm_maintenance_cursor VALUES('session_indexes_v1','1')");
   }
-  if (hasTable(sql, 'session_control_commands')) sql.exec('CREATE INDEX IF NOT EXISTS tbm_command_ack ON session_control_commands(session_id,updated_at DESC) WHERE ack_json IS NOT NULL');
-  sql.exec("INSERT OR REPLACE INTO tbm_maintenance_cursor VALUES('schema_version','2')");
+  if (hasTable(sql,'session_control_commands') && !sql.exec("SELECT 1 FROM tbm_maintenance_cursor WHERE key='command_indexes_v1'").toArray().length) {
+    sql.exec('CREATE INDEX IF NOT EXISTS tbm_command_ack ON session_control_commands(session_id,updated_at DESC) WHERE ack_json IS NOT NULL');
+    sql.exec("INSERT INTO tbm_maintenance_cursor VALUES('command_indexes_v1','1')");
+  }
 }
 
 /** Indexed one-shot time dependencies, plus bounded sweep continuation. */
@@ -834,10 +849,10 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
   if (hasTable(sql, 'session_control_sessions')) {
     try {
       const sinceIso = new Date(nowMs - DAY).toISOString();
-      const sess = sql.exec(
-        "SELECT engine,state,created_at,updated_at FROM (SELECT engine,state,created_at,updated_at,mode FROM session_control_sessions INDEXED BY tbm_session_created WHERE created_at>=? ORDER BY created_at DESC LIMIT 200) WHERE mode!='interactive'",
+      const sess = boundedTbmRows(sql.exec(
+        "SELECT engine,state,created_at,updated_at,mode FROM session_control_sessions INDEXED BY tbm_session_created WHERE created_at>=? ORDER BY created_at DESC LIMIT 201",
         sinceIso
-      ).toArray() as any[];
+      ).toArray() as any[],200,'session_mix').filter(row=>row.mode!=='interactive');
       if (sess.length > 0) {
         let freeCnt = 0;
         let grokCnt = 0;
@@ -860,7 +875,7 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
         noRouteRate = sess.filter(s => s.state === 'held').length / sess.length;
         avgOutcomeSec = durCnt > 0 ? durSum / durCnt : 0;
       }
-    } catch {}
+    } catch(error) { if(error instanceof TbmObservationLimit)throw error; }
   }
 
   for (const pool of pools) {

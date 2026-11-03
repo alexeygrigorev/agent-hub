@@ -11,6 +11,56 @@ export const DAILY_ROW_LIMITS = Object.freeze({ read: 1_000_000, written: 20_000
 const DAY_MS = 86_400_000;
 const LEDGER_KEY = 'cf_daily_row_budget_v1';
 const DEFAULT_CHUNK = Object.freeze({ read: 50_000, written: 1_000 });
+/** Index DDL scans its entire source before exposing cursor counters. Never
+ * let a new migration perform that scan against retained large tables. */
+export const INDEX_BUILD_SOURCE_LIMIT = 1000;
+const INDEX_METADATA_LIMIT = 64;
+
+type IndexBuild = { name: string; table: string };
+
+/** Tokenize identifiers, punctuation and literals separately so comments or
+ * a quoted column containing CREATE INDEX cannot hide or invent a build. */
+function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolean } {
+  const tokens = (query.match(/--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[^\s]/g) ?? [])
+    .filter(token => !token.startsWith('--') && !token.startsWith('/*'));
+  const word = (i: number, text: string) => tokens[i]?.toUpperCase() === text;
+  const identifier = (i: number): string | null => {
+    const value = tokens[i];
+    if (!value) return null;
+    if (/^[A-Za-z_][A-Za-z0-9_$]*$/.test(value)) return value;
+    if (value[0] === '"') return value.slice(1, -1).replaceAll('""', '"');
+    if (value[0] === '`') return value.slice(1, -1).replaceAll('``', '`');
+    if (value[0] === '[') return value.slice(1, -1);
+    return null;
+  };
+  const builds: IndexBuild[] = [];
+  let unsupported = false;
+  for (let i = 0; i < tokens.length; i++) {
+    if (!word(i, 'CREATE')) continue;
+    let j = i + 1;
+    if (word(j, 'UNIQUE')) j++;
+    if (!word(j, 'INDEX')) continue;
+    j++;
+    if (word(j, 'IF') && word(j + 1, 'NOT') && word(j + 2, 'EXISTS')) j += 3;
+    let name = identifier(j++);
+    if (tokens[j] === '.') {
+      if (name?.toLowerCase() !== 'main') unsupported = true;
+      name = identifier(j + 1); j += 2;
+    }
+    if (!word(j++, 'ON')) { unsupported = true; continue; }
+    let table = identifier(j++);
+    if (tokens[j] === '.') {
+      if (table?.toLowerCase() !== 'main') unsupported = true;
+      table = identifier(j + 1); j += 2;
+    }
+    if (!name || !table || tokens[j] !== '(') { unsupported = true; continue; }
+    builds.push({ name, table });
+  }
+  // A batch could mutate/recreate the source after preflight and before its
+  // CREATE INDEX. Require separate calls so every build sees its real source.
+  if (builds.length && tokens.slice(0, -1).includes(';')) unsupported = true;
+  return { builds, unsupported };
+}
 
 type Counts = { read: number; written: number };
 type Ledger = Counts & { day: number; stopped: boolean };
@@ -245,6 +295,35 @@ export class RowBudget {
     install('deleteAll', () => budget.trip('bulk storage deletion forbidden'));
   }
 
+  /** Preflight queries use this same native-cursor wrapper, so their real
+   * rows are charged too. Metadata stays table-local and capped. A large
+   * existing index is a no-op and never probes/scans its source table. */
+  private preflightIndexes(sql: SqlStorage, query: string): void {
+    const parsed = indexBuilds(query);
+    const deny = (detail: string): never => {
+      this.ledger!.stopped = true;
+      this.dirty = true;
+      return this.trip(detail);
+    };
+    if (parsed.unsupported) deny('index migration requires a supported single-statement build');
+    for (const build of parsed.builds) {
+      const indexes = sql.exec("SELECT name FROM pragma_index_list(?, 'main') LIMIT ?", build.table, INDEX_METADATA_LIMIT + 1).toArray() as any[];
+      // SQLite identifier folding is ASCII-only. Unicode lowercasing could
+      // mistake a different non-ASCII index for the requested existing one.
+      const fold = (value: string) => value.replace(/[A-Z]/g, char => char.toLowerCase());
+      if (indexes.some(row => fold(String(row.name)) === fold(build.name))) continue;
+      if (indexes.length > INDEX_METADATA_LIMIT) deny('index metadata exceeds bounded migration allowance');
+      // Keep source probe + build within current prepaid credit, allowing
+      // conservative schema overhead. This does not preempt arbitrary SQL:
+      // it bounds the particular full-source operation before native exec.
+      const cap = Math.min(INDEX_BUILD_SOURCE_LIMIT, Math.floor((this.credit.read - 64) / 3), Math.floor(this.credit.written - 16));
+      if (cap < 0) deny('insufficient prepaid credit for index migration');
+      const table = '"main"."' + build.table.replaceAll('"', '""') + '"';
+      const source = sql.exec(`SELECT 1 FROM ${table} LIMIT ?`, cap + 1).toArray();
+      if (source.length > cap) deny('index source exceeds bounded migration allowance');
+    }
+  }
+
   wrap(sql: SqlStorage): SqlStorage {
     const budget = this;
     return new Proxy(sql as any, {
@@ -255,6 +334,9 @@ export class RowBudget {
         }
         return (query: string, ...bindings: any[]) => {
           budget.assertAllowed();
+          // Run through a wrapped native handle: preflight must never be
+          // unmetered SQL hidden behind the application-level cursor meter.
+          budget.preflightIndexes(budget.wrap(target as SqlStorage), String(query));
           let cursor: any;
           try { cursor = target.exec(query, ...bindings); }
           catch (error) {

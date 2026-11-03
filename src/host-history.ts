@@ -345,7 +345,9 @@ export class HostHistoryService {
           after = -1; break;
         }
         const start = Math.floor(Number(first.bucket_ms) / step) * step;
-        const rows = this.rows('SELECT bucket_ms,payload_json FROM resource_history WHERE bucket_ms>=? AND bucket_ms<? ORDER BY bucket_ms LIMIT 61', start, start + step);
+        // Minute-keyed packets allow at most 60 rows in an hourly window.
+        // LIMIT60 also stops the native cursor before its 61st range-end probe.
+        const rows = this.rows('SELECT bucket_ms,payload_json FROM resource_history WHERE bucket_ms>=? AND bucket_ms<? ORDER BY bucket_ms LIMIT 60', start, start + step);
         const merged = new Map<string, Observation>();
         for (const row of rows) for (const o of this.packet(row.payload_json)) {
           const id = this.identity(o), previous = merged.get(id);

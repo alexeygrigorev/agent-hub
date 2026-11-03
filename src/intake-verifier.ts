@@ -108,20 +108,25 @@ export class IntakeVerifier {
     return { enabled_at: m.enabled_at ?? null, last_checked_at: m.last_tick ?? null, last_result: parse(m.last_result),
       states: rows.length > 1000 ? null : counts, states_lower_bounds: counts, states_truncated: rows.length > 1000 };
   }
-  private workspace(task: Obj): string {
-    const prior = this.rows(`SELECT request_json FROM session_control_sessions INDEXED BY intake_queue_session_task
+  private workspaceObservationLimited = false;
+  private workspace(task: Obj): string | null {
+    const sessions = this.rows(`SELECT request_json FROM session_control_sessions INDEXED BY intake_queue_session_task
       WHERE json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id')=?
-      ORDER BY rowid DESC LIMIT 33`, task.id)
+      ORDER BY rowid DESC LIMIT 33`, task.id);
+    const prior = sessions.slice(0,32)
       // Never an intake worktree path: the verifier runs detached from it (79458f2d). Never a concrete host
       // path either: a prior session's per-host checkout (drain-*, rr-*) is gone or lives on another machine,
       // and pinning it made auto placement fail (workspace_unavailable, launcher errors). Registry labels only.
       .map(s => parse(s.request_json)).find(r => r.intake_task_id === task.id && r.workspace && !namesWorktree(r.workspace) && isWorkspaceLabel(r.workspace));
     if (prior) return prior.workspace;
-    const configured = this.rows('SELECT capabilities FROM machines ORDER BY id LIMIT 128').some(m => {
+    const machines = this.rows('SELECT capabilities FROM machines ORDER BY id LIMIT 129');
+    const configured = machines.slice(0,128).some(m => {
       const roots = parse(m.capabilities).workspaces;
       return Array.isArray(roots) ? roots.includes(task.project) : !!roots && Object.hasOwn(roots, task.project);
     });
-    return configured ? task.project : 'agent-hub';
+    if (configured) return task.project;
+    if (machines.length > 128 || sessions.length > 32) return null;
+    return 'agent-hub';
   }
   private async write(path: string, payload: Obj): Promise<{ status: number; body: Obj }> {
     if (!this.hooks.write) return { status: 503, body: { error: 'intake_write_unavailable' } };
@@ -154,10 +159,16 @@ export class IntakeVerifier {
     // No engine pin (Alexey 2026-11-02, usage draining while claude kept being picked): the review
     // tier is placed by Hub's burn-aware routing, so a low-headroom Claude loses to the engine most behind schedule.
     const engine = 'auto';
+    const workspace = this.workspace(task);
+    if (workspace === null) {
+      this.workspaceObservationLimited = true;
+      this.set(task, claim, { state: 'pending', detail: 'workspace_observation_incomplete' });
+      return false;
+    }
     const attempt = (row.attempts ?? 0) + 1;
     const input = { key: 'verify-' + crypto.randomUUID(), tier: 'review', task_kind: 'review', mode: 'headless',
       // Detached (79458f2d): a live owner session on the intake's worktree never blocks the verifier.
-      workspace: this.workspace(task), intake_task_id: task.id, intake_worktree: 'detached', brief: verifierBrief(task, claim, attempt) };
+      workspace, intake_task_id: task.id, intake_worktree: 'detached', brief: verifierBrief(task, claim, attempt) };
     this.set(task, claim, { state: 'starting', engine, request_key: input.key, attempts: attempt, session_id: null });
     let result: { status: number; body: Obj };
     try { result = await this.hooks.start(input); } catch { result = { status: 502, body: { error: 'admission_outcome_unknown' } }; }
@@ -197,6 +208,7 @@ export class IntakeVerifier {
     if (!meta) return { state: 'already_checked' };
     const counts: Obj = { skipped: 0, launched: 0, closed: 0, failed: 0, escalated: 0, waiting: 0 };
     let budget = VERIFIER_LAUNCH_BUDGET;
+    this.workspaceObservationLimited = false;
     const after = String(meta.task_cursor ?? '');
     const page = typeof this.intake.watchdogTasks === 'function'
       ? this.intake.watchdogTasks(after, VERIFIER_OBSERVATION_BATCH)
@@ -240,7 +252,7 @@ export class IntakeVerifier {
       }
       if (row.state === 'pending') {
         if (budget <= 0) { counts.waiting++; continue; }
-        budget--; if (await this.launch(task, claim, row)) counts.launched++;
+        budget--; if (await this.launch(task, claim, row)) counts.launched++; else counts.waiting++;
         continue;
       }
       if (row.state !== 'requested') continue; // closed, failed or needs_human: terminal for this claim
@@ -268,16 +280,16 @@ export class IntakeVerifier {
         // A start that failed before running (any launch_error) is surfaced once, never retried silently.
         const failure = sessionLaunchFailure(this.sql, row.session_id);
         if (failure && TRANSIENT_START.has(failure) && row.attempts < VERIFIER_MAX_ATTEMPTS) {
-          if (budget > 0) { budget--; if (await this.launch(task, claim, row)) counts.launched++; } else counts.waiting++;
+          if (budget > 0) { budget--; if (await this.launch(task, claim, row)) counts.launched++; else counts.waiting++; } else counts.waiting++;
           continue;
         }
         if (failure) { await this.escalate(task, claim, `verifier session ${row.session_id} failed to start: ${failure}`); counts.escalated++; continue; }
         if (row.attempts >= VERIFIER_MAX_ATTEMPTS) { await this.escalate(task, claim, `verifier ended ${row.attempts}x without a verdict`); counts.escalated++; }
-        else if (budget > 0) { budget--; if (await this.launch(task, claim, row)) counts.launched++; }
+        else if (budget > 0) { budget--; if (await this.launch(task, claim, row)) counts.launched++; else counts.waiting++; }
       }
     }
     const result = { state: 'checked', checked_at: now, source, ...counts,
-      observation_scope: 'cursor_batch', observed_tasks: page.length, observation_truncated: limited, next_task_cursor: next || null };
+      observation_scope: 'cursor_batch', observed_tasks: page.length, observation_truncated: limited || this.workspaceObservationLimited, next_task_cursor: next || null };
     this.sql.exec('UPDATE intake_verifier_meta SET last_result=? WHERE id=1', JSON.stringify(result));
     return result;
   }

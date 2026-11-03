@@ -1156,7 +1156,7 @@ export class FleetService {
         ? (reservedMb !== null && observedAt !== null && fresh(observedAt, this.now(), 180000))
         : true;
       const memory = this.memoryHeadroom(id);
-      const headroomMb = memory.mem_available_mb !== null && reservedMb !== null && telemetryFresh
+      const headroomMb = memory.mem_available_mb !== null && memory.reserved_mb !== null && memory.requested_mb !== null && reservedMb !== null && telemetryFresh
         ? memory.mem_available_mb - memory.reserved_mb - memory.requested_mb
         : null;
       out.push({
@@ -1168,7 +1168,9 @@ export class FleetService {
         headroom_mb: headroomMb,
         headroom_ok: headroomMb === null ? null : headroomMb >= memory.floor_mb,
         launcher_managed: launcherManaged,
-        stale_telemetry: launcherManaged ? !telemetryFresh : false,
+        stale_telemetry: memory.snapshot_truncated || (launcherManaged ? !telemetryFresh : false),
+        snapshot_truncated: memory.snapshot_truncated,
+        resource_reason: memory.reason,
         observed_at: observedAt || m.last_checkin_at || null,
       });
     }
@@ -1603,6 +1605,7 @@ export class FleetService {
         return runaway || (usage?.busy_percent_window != null && age <= 180000 && age >= -30000 && usage.busy_percent_window >= CPU_SATURATED_PCT);
       })()) reason = ['mem_available','swap_pressure'].includes(loadRefusal.trigger || '') ? 'memory_pressure'
         : ['cpu_busy','cpu_psi_full'].includes(loadRefusal.trigger || '') ? 'cpu_pressure' : 'host_load_high';
+      else if (memory().snapshot_truncated) reason = 'launcher_memory_reserve';
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         memory().reserved_mb,
         memory().requested_mb, this.resources.config(), hb.mem_total_mb)) reason = 'launcher_memory_reserve';

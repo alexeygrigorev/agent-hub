@@ -1096,12 +1096,7 @@ export class Hub extends DurableObject {
         updateHeartbeat(cred.machine_id, body, this.sql);
 
         const nowIso = new Date().toISOString();
-        const candidates = ['offer_host_id','offer_machine_id'].flatMap(column => this.sql.exec(
-          `SELECT id,kind,payload,status,deadline_at,offer_host_id,offer_machine_id,offer_expires_at,created_at,actor,role_name,role_generation
-            FROM jobs WHERE status='offered' AND ${column}=? ORDER BY created_at DESC LIMIT 101`,cred.machine_id).toArray() as any[]);
-        const rows = [...new Map(candidates.map(row=>[row.id,row])).values()]
-          .filter(row=>row.offer_expires_at===null || row.offer_expires_at>nowIso)
-          .sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at))).slice(0,100);
+        const { rows,truncated } = this.jobsService.offeredForHost(cred.machine_id);
         // Root scheduling flag: root-run offers are not listed while disabled.
         const visibleRows = isRootSchedulingEnabled(this.sql) ? rows : rows.filter((r: any) => r.kind !== 'root-run');
 
@@ -1118,7 +1113,7 @@ export class Hub extends DurableObject {
           ...(r.role_name ? { role_binding: this.jobsService.roleJobBinding(r) } : {})
         }));
 
-        return Response.json({ status: 'ok', server_time: nowIso, offers, offers_truncated: candidates.length>100 });
+        return Response.json({ status: 'ok', server_time: nowIso, offers, offers_truncated: truncated });
       }
 
       if (path === '/api/agents' || path.startsWith('/api/agents/')) return this.handleAgentRegistry(request, path);
@@ -4341,16 +4336,7 @@ export class Hub extends DurableObject {
         return Response.json({ error: 'forbidden', reason: 'machine_binding_required' }, { status: 403 });
       }
 
-      const nowIso = new Date().toISOString();
-      const rows = this.sql.exec(
-        `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor, role_name, role_generation
-         FROM jobs
-         WHERE status = 'offered'
-           AND (offer_host_id = ? OR offer_machine_id = ?)
-           AND (offer_expires_at IS NULL OR offer_expires_at > ?)
-         ORDER BY created_at DESC`,
-        hostId, hostId, nowIso
-      ).toArray() as any[];
+      const { rows,truncated } = this.jobsService.offeredForHost(hostId);
       // Root scheduling flag: root-run offers are not listed while disabled.
       const visibleRows = isRootSchedulingEnabled(this.sql) ? rows : rows.filter((r: any) => r.kind !== 'root-run');
 
@@ -4372,7 +4358,7 @@ export class Hub extends DurableObject {
         };
       });
 
-      return Response.json({ offers });
+      return Response.json({ offers, offers_truncated: truncated });
     }
 
     // 2. Root endpoints (/api/root/...)

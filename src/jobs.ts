@@ -105,8 +105,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 -- Intake e8a22f4c: host polls and the alarm look at offered jobs only, so the
 -- partial index keeps those reads independent of finished-job history.
 CREATE INDEX IF NOT EXISTS jobs_offered ON jobs(offer_expires_at) WHERE status = 'offered';
-CREATE INDEX IF NOT EXISTS jobs_offered_host_created ON jobs(offer_host_id,created_at DESC) WHERE status='offered';
-CREATE INDEX IF NOT EXISTS jobs_offered_machine_created ON jobs(offer_machine_id,created_at DESC) WHERE status='offered';
+CREATE INDEX IF NOT EXISTS jobs_offered_host_created ON jobs(offer_host_id,created_at DESC,id DESC) WHERE status='offered';
+CREATE INDEX IF NOT EXISTS jobs_offered_machine_created ON jobs(offer_machine_id,created_at DESC,id DESC) WHERE status='offered';
 
 CREATE TABLE IF NOT EXISTS leases (
   name TEXT PRIMARY KEY,
@@ -313,6 +313,33 @@ export class JobsService {
   private healthService?: any;
   private env?: any;
   private clockSnapshot: Date | null = null;
+  private offerCursors = new Map<string, [string,string]>();
+
+  /** Fair, bounded host polls. Advance over expired/frozen offers as well as
+   * eligible ones, so a stale prefix cannot hide an older role offer forever.
+   * This transient cursor affects observation only; claims remain durable. */
+  offeredForHost(host: string): { rows: any[]; truncated: boolean } {
+    const candidates: any[] = [];
+    let truncated = false;
+    for (const column of ['offer_host_id','offer_machine_id']) {
+      const key = host + ':' + column, after = this.offerCursors.get(key);
+      const rows = this.sql.exec(`SELECT * FROM jobs WHERE status='offered' AND ${column}=?
+        ${after ? 'AND (created_at,id)<(?,?)' : ''} ORDER BY created_at DESC,id DESC LIMIT 101`,
+        host,...(after ?? [])).toArray() as any[];
+      const page = rows.slice(0,100);
+      if (rows.length>100) {
+        if (this.offerCursors.size>=256 && !this.offerCursors.has(key)) this.offerCursors.clear();
+        this.offerCursors.set(key,[String(page.at(-1)!.created_at),String(page.at(-1)!.id)]);
+        truncated=true;
+      } else this.offerCursors.delete(key);
+      candidates.push(...page);
+    }
+    const now=this.now().getTime();
+    const rows=[...new Map(candidates.map(row=>[row.id,row])).values()]
+      .filter(row=>row.offer_expires_at===null || (parseExpiryMs(row.offer_expires_at) ?? 0)>now)
+      .sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)));
+    return { rows,truncated };
+  }
 
   constructor(sql: SqlStorage, ctx: DurableObjectState, deps?: JobsDependencies) {
     this.sql = sql;
@@ -627,6 +654,18 @@ export class JobsService {
             this.addHealthEvent('job', job.id as string, 'failed', 'offer expired', nowIso);
             this.tryOfferNext(job, now);
           }
+        }
+
+        // Every offered deadline returned by getAlarmTime must have a
+        // terminal transition here. Non-root role offers are host-bound;
+        // expiry cannot re-route them using the root host-selection policy
+        // or disturb a different holder of the role lease.
+        const expiredNonRoot = this.sql.exec(`SELECT id FROM jobs
+          WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS}<=?
+          ORDER BY ${OFFER_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray() as any[];
+        for (const job of expiredNonRoot) {
+          this.sql.exec("UPDATE jobs SET status='expired',finished_at=?,outcome_summary='offer expired' WHERE id=? AND status='offered'", nowIso, job.id);
+          this.addHealthEvent('job', job.id, 'failed', 'offer expired', nowIso);
         }
 
         // 2. Expire leases (hard deadline or missed renew)

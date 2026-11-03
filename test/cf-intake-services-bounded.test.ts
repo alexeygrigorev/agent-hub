@@ -40,7 +40,11 @@ describe('bounded triage and post-DONE verifier cron observations', () => {
     for(let i=0;i<1000;i++) session(raw,'same-task-'+i,'open-069',i===999?'demo':'/retired/worktree');
     const m=measure(raw); const intake=services(m.sql);let now=NOW;const started:any[]=[];
     const make=()=>new IntakeVerifier(m.sql,intake,(fn:any)=>fn(),{start:async input=>{started.push(input);return{status:202,body:{id:'verifier-1'}};}},()=>now);
-    const first=make();first.init();m.reset();
+    const first=make();first.init();
+    // Hub bootstrap already enabled its verifier on the real CI clock. This
+    // fixture's synthetic DONE claim must follow its synthetic enabled_at.
+    raw.exec("UPDATE intake_verifier_meta SET enabled_at=?,last_tick=NULL,task_cursor='' WHERE id=1",NOW);
+    m.reset();
     const a=await first.tick();
     expect(a).toMatchObject({launched:0,observed_tasks:VERIFIER_OBSERVATION_BATCH,observation_truncated:true});
     expect(m.rows()).toBeLessThan(350);
@@ -51,6 +55,23 @@ describe('bounded triage and post-DONE verifier cron observations', () => {
     expect(started[0].workspace).toBe('demo');
     expect(started[0].intake_task_id).toBe('open-069');
     expect(m.rows()).toBeLessThan(200);
+  }));
+
+  it('refuses an unknown workspace when the machine registry exceeds its bounded observation', () => fixture(async (_hub,raw) => {
+    task(raw,'workspace-unknown','open',true);
+    for(let i=0;i<129;i++) raw.exec(`INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities)
+      VALUES(?,?,?,?,?,?)`,'machine-'+String(i).padStart(3,'0'),'test','test',new Date(NOW).toISOString(),new Date(NOW).toISOString(),
+      JSON.stringify({workspaces:i===128?['demo']:[]}));
+    const m=measure(raw);const started:any[]=[];
+    const verifier=new IntakeVerifier(m.sql,services(m.sql),(fn:any)=>fn(),{start:async input=>{started.push(input);return{status:202,body:{id:'must-not-start'}};}},()=>NOW);
+    verifier.init();
+    raw.exec("UPDATE intake_verifier_meta SET enabled_at=?,last_tick=NULL,task_cursor='' WHERE id=1",NOW);
+    m.reset();const result=await verifier.tick();
+    expect(result).toMatchObject({launched:0,waiting:1,observation_truncated:true});
+    expect(started).toHaveLength(0);
+    expect(raw.exec("SELECT state,detail,attempts FROM intake_verifications WHERE task_id='workspace-unknown'").one())
+      .toMatchObject({state:'pending',detail:'workspace_observation_incomplete',attempts:0});
+    expect(m.rows()).toBeLessThan(180);
   }));
 
   it('triage bounds requested history, preserves unseen pending tasks, and progresses after restart', () => fixture(async (_hub,raw) => {

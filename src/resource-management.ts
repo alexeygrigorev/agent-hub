@@ -12,6 +12,9 @@ import { resolveMachineAliases } from './machine-alias';
 import { jsonFields, resourceRequest } from './sql-json-projection';
 export const MEMORY_FLOOR_MB = defaults.memory_floor_mb;
 export const NEXT_SLOT_MB = defaults.ramp_reserve_default_mb;
+/** Above this candidate count, resource visibility is unknown and admission
+ * refuses. Eligibility is checked only AFTER this indexed source bound. */
+export const MEMORY_PENDING_SCAN_LIMIT = 128;
 // Intake 63a9ee3a / 736ba282: an offered, starting or uncertain launch holds
 // its full estimate only this long after its claim (or creation when never
 // claimed). Parked offers (host_overload) and stuck uncertain rows otherwise
@@ -24,7 +27,7 @@ export const IN_FLIGHT_RESERVE_SECONDS = 600;
 export const CPU_LOAD_FACTOR = defaults.cpu_load_factor;
 export type ResourceConfig = typeof defaults;
 const parse = (s: any): any => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
-const finite = (n: any) => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+const finite = (n: any): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
 const TERMINAL = new Set(['exited', 'finished', 'failed', 'stopped', 'dead', 'refused']);
 export const RESOURCE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS resource_resident_samples (launch_id TEXT PRIMARY KEY, resident_mb REAL NOT NULL, observed_at TEXT NOT NULL);
@@ -94,7 +97,7 @@ export function effectiveFloorMb(config: ResourceConfig, totalMb: unknown): numb
   if (!finite(totalMb) || (totalMb as number) <= 0) return config.memory_floor_mb;
   return Math.min(config.memory_floor_mb, Math.max(512, Math.round((totalMb as number) * config.memory_floor_pct / 100)));
 }
-export function memoryVerdict(available: number, ramp: number, estimate: number, config: ResourceConfig, totalMb?: unknown) {
+export function memoryVerdict(available: number | null, ramp: number | null, estimate: number | null, config: ResourceConfig, totalMb?: unknown) {
   return finite(available) && finite(ramp) && finite(estimate) && available - ramp - estimate >= effectiveFloorMb(config, totalMb);
 }
 // Idle-reap authority reads only request.intake_task_id; skip copying and
@@ -218,6 +221,8 @@ export class ResourceManagement {
   private cpuPendingSnapshot: Map<string, {id:string;remaining:number}[]> | null = null;
   init() {
     for (const statement of RESOURCE_SCHEMA.split(';')) if (statement.trim()) this.sql.exec(statement);
+    if (this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='fleet_launches'").toArray().length)
+      this.sql.exec("CREATE INDEX IF NOT EXISTS resource_launch_pending ON fleet_launches(machine_id,state,id) WHERE state IN ('offered','starting','running','uncertain')");
     for (const table of ['session_resource_usage', 'session_cpu_usage', 'resource_settings']) {
       for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
         const sides = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
@@ -304,7 +309,7 @@ export class ResourceManagement {
     if (!rows) {
       // Typical resident size (p50 of the session's own samples) when recorded, else its peak. A multi-day goal session's
       // test-run peak is not what a new launch needs.
-      rows = this.sql.exec('SELECT u.project,u.kind,u.model,COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.engine IS ? AND u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500', engine).toArray() as any[];
+      rows = this.sql.exec('SELECT u.project,u.kind,u.model,COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u INDEXED BY resource_memory_recent LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.engine IS ? AND u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500', engine).toArray() as any[];
       if (this.memoryHistory.size >= 64) this.memoryHistory.clear();
       this.memoryHistory.set(engine, rows);
     }
@@ -471,11 +476,19 @@ export class ResourceManagement {
     const inFlightCutoff = new Date(now - IN_FLIGHT_RESERVE_SECONDS * 1000).toISOString();
     // Only launch ramps are additional commitments. Resident usage is already in MemAvailable.
     // The explicit state range lets SQLite skip retained terminal history.
-    const pending = this.readRows(`SELECT l.id,l.engine,l.workspace,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb FROM fleet_launches l
+    const candidates = this.readRows(`SELECT l.id,l.engine,l.workspace,l.state,l.created_at,
+      ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb,p.started_at AS ramp_started_at
+      FROM fleet_launches l INDEXED BY resource_launch_pending
       LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
-      WHERE l.machine_id=? AND l.state IN ('offered','starting','running','uncertain')
-      AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),l.created_at)
-        >=CASE WHEN l.state='running' THEN ? WHEN l.state IN ('offered','starting','uncertain') THEN ? END`, cutoff, machine, cutoff, inFlightCutoff) as any[];
+      LEFT JOIN resource_ramps p ON p.launch_id=l.id
+      WHERE l.state IN ('offered','starting','running','uncertain') AND l.machine_id=? LIMIT ?`,
+      cutoff, machine, MEMORY_PENDING_SCAN_LIMIT + 1) as any[];
+    const overflow = candidates.length > MEMORY_PENDING_SCAN_LIMIT;
+    if (overflow) return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
+      reserved_mb: null, floor_mb: effectiveFloorMb(config, hb.mem_total_mb), requested_mb: null,
+      observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null,
+      snapshot_truncated: true as boolean, reason: 'resource_snapshot_overflow' };
+    const pending = candidates.filter(row => (row.ramp_started_at ?? row.created_at) >= (row.state === 'running' ? cutoff : inFlightCutoff));
     let reserved = 0;
     for (const row of pending) {
       const req = parse(row.request_json);
@@ -485,7 +498,8 @@ export class ResourceManagement {
     return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
       reserved_mb: reserved, floor_mb: effectiveFloorMb(config, hb.mem_total_mb),
       requested_mb: this.estimate(input.project || input.workspace || null, engine, input.task_kind || input.kind || 'goal', input.model ?? null),
-      observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null };
+      observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null,
+      snapshot_truncated: false as boolean, reason: null as string | null };
   }
   private boundSessions(machine?: string) {
     // Share repeated immutable JSON only within this catalog read. Protection

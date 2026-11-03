@@ -11,6 +11,22 @@ const plan = (hub: Hub, q: string, ...args: any[]) => (hub.sql.exec('EXPLAIN QUE
   .map(row => String(row.detail)).join('\n');
 
 describe('CF runaway alarm regression', () => {
+  it('bounds host offer polls and advances past expired prefixes without starving an older live offer', () => withHub(async (hub,state) => {
+    const sql=state.storage.sql, now=Date.now();
+    for(let i=0;i<221;i++) sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_machine_id,offer_expires_at)
+      VALUES(?,'root-run',?,'{}','offered',?,?,'test','a','a',?)`,
+      'poll-'+i,'poll-'+i,new Date(now-i*1000).toISOString(),new Date(now+3600000).toISOString(),new Date(now+(i===220?3600000:-3600000)).toISOString());
+    const pages:any[]=[];
+    for(let i=0;i<3;i++) pages.push(hub.meter.runSync('probe:offers',()=>hub.jobsService.offeredForHost('a')));
+    expect(pages[0]).toMatchObject({rows:[],truncated:true});
+    expect(pages[1]).toMatchObject({rows:[],truncated:true});
+    expect(pages[2].rows.map((r:any)=>r.id)).toEqual(['poll-220']);
+    expect(pages[2].truncated).toBe(false);
+    expect(hub.meter.snapshot()['probe:offers'].rows_read).toBeLessThan(1500);
+    for(const column of ['offer_host_id','offer_machine_id']) expect(plan(hub,
+      `SELECT * FROM jobs WHERE status='offered' AND ${column}=? ORDER BY created_at DESC,id DESC LIMIT 101`,'a'))
+      .not.toMatch(/TEMP B-TREE/);
+  }));
   it('constructs the exported conversation Hub through the real Worker fetch path', async () => {
     const id = (env as any).HUB.idFromName('cf-worker-construction-' + crypto.randomUUID());
     const bindings = { ...(env as any), HUB: {
@@ -38,6 +54,31 @@ describe('CF runaway alarm regression', () => {
     await state.storage.deleteAlarm();
     await schedule([]);
     expect(await state.storage.getAlarm()).toBe(null);
+  }));
+
+  it('expires non-root offers once without a repeating past alarm or changing another role holder', () => withHub(async (hub, state) => {
+    const now = Date.now(), at = new Date(now).toISOString(), past = new Date(now - 60000).toISOString();
+    const future = new Date(now + 60000).toISOString(), leaseFuture = new Date(now + 3600000).toISOString();
+    const raw = state.storage.sql;
+    raw.exec("INSERT INTO leases(name,holder_job_id,epoch,acquired_at,expires_at) VALUES('automation:demo:writer','other-holder',7,?,?)", at, leaseFuture);
+    for (const kind of ['writer-run','principal-wake','head-recovery']) raw.exec(`INSERT INTO jobs
+      (id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_expires_at,role_name,role_generation)
+      VALUES(?,?,?,'{}','offered',?,?,'test',?,'automation:demo:writer',3)`, 'expired-' + kind, kind, 'expired-' + kind, at, leaseFuture, past);
+    raw.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_expires_at)
+      VALUES('future-writer','writer-run','future-writer','{}','offered',?,?,'test',?)`, at, leaseFuture, future);
+    expect(hub.jobsService.getAlarmTime()).toBe(now - 60000);
+    for (let i = 0; i < 3; i++) expect(hub.jobsService.processAlarms()).toBe(now + 60000);
+    for (const kind of ['writer-run','principal-wake','head-recovery']) expect(raw.exec('SELECT status FROM jobs WHERE id=?', 'expired-' + kind).toArray()[0].status).toBe('expired');
+    expect(raw.exec("SELECT COUNT(*) AS n FROM health_events WHERE detail='offer expired'").toArray()[0].n).toBe(3);
+    const lease: any = raw.exec("SELECT holder_job_id,epoch FROM leases WHERE name='automation:demo:writer'").toArray()[0];
+    expect(lease).toEqual({ holder_job_id: 'other-holder', epoch: 7 });
+    hub.sql.exec("UPDATE jobs SET status='cancelled' WHERE id='future-writer'");
+    hub.sql.exec("UPDATE leases SET holder_job_id=NULL WHERE name='automation:demo:writer'");
+    expect(hub.jobsService.processAlarms()).toBe(null);
+    await hub.alarm();
+    expect(await state.storage.getAlarm()).toBe(null);
+    expect(plan(hub, `SELECT id FROM jobs WHERE status='offered' AND kind<>'root-run' AND ${expiryMsSql('offer_expires_at')}<=? ORDER BY ${expiryMsSql('offer_expires_at')} LIMIT 100`, now))
+      .toContain('jobs_nonroot_offered_due_ms');
   }));
 
   it('preserves expiry formats while seeking indexed due jobs and leases', () => withHub(async hub => {
