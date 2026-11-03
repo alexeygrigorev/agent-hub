@@ -1,4 +1,4 @@
-import { randomString, sha256 } from './crypto';
+import { randomString, sha256, signHmac } from './crypto';
 
 export interface TokenPair {
   accessToken: string;
@@ -15,6 +15,31 @@ export async function generateTokenPair(): Promise<TokenPair> {
     refreshToken,
     accessHash: await sha256(accessToken),
     refreshHash: await sha256(refreshToken)
+  };
+}
+
+/**
+ * Make the successor for a human refresh token repeatable for a given
+ * predecessor. A retry inside the short replay window can then return the
+ * exact pair already issued, without persisting either raw token. The Hub
+ * session secret keys the derivation, so possession of a rotated predecessor
+ * cannot be used offline to calculate its successor.
+ */
+export async function deriveHumanRefreshSuccessor(previousRefreshToken: string, previousCredentialId: string, serverSecret: string): Promise<TokenPair & { credentialId: string }> {
+  const context = `hub-human-refresh-v1:${previousCredentialId}:${previousRefreshToken}:`;
+  const [access, refresh, id] = await Promise.all([
+    signHmac(serverSecret, context + 'access'),
+    signHmac(serverSecret, context + 'refresh'),
+    signHmac(serverSecret, context + 'credential'),
+  ]);
+  const accessToken = 'hubt_' + access;
+  const refreshToken = 'hubr_' + refresh;
+  return {
+    credentialId: id.slice(0, 22),
+    accessToken,
+    refreshToken,
+    accessHash: await sha256(accessToken),
+    refreshHash: await sha256(refreshToken),
   };
 }
 

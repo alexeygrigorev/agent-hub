@@ -157,6 +157,27 @@ class TestCliUpdate(unittest.TestCase):
         self.assertIn('mode 700', error.getvalue())
         self.assertNotIn('Not logged in', error.getvalue())
 
+    def test_auth_status_prints_distinct_nonzero_next_steps(self):
+        import argparse
+        import io
+        from unittest.mock import patch
+        from agent_hub_host import cli
+
+        cases = (
+            ({'logged_in': False, 'state': 'never_logged_in'},
+             'Status: Never logged in as human. Run `hub auth login` to sign in.\n'),
+            ({'logged_in': False, 'state': 'revoked'},
+             'Status: Revoked by server (refresh replay or admin). Run `hub auth login` to create a new human session.\n'),
+        )
+        for status, expected in cases:
+            output = io.StringIO()
+            with patch.object(cli.human_auth, 'human_status', return_value=status), \
+                 patch('sys.stdout', output):
+                with self.assertRaises(SystemExit) as raised:
+                    cli.cmd_auth_status(argparse.Namespace(json=False))
+            self.assertEqual(raised.exception.code, 1)
+            self.assertEqual(output.getvalue(), expected)
+
     @unittest.skipIf(sys.platform == 'win32', 'POSIX symlinks')
     def test_auth_status_surfaces_config_permission_error_on_symlink_paths(self):
         import io
