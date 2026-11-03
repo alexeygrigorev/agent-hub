@@ -115,11 +115,14 @@ class ImmutableReleaseTest(unittest.TestCase):
     def test_launcher_repoint_refuses_writable_built_release_and_keeps_dropin(self):
         original = self.run_command
         switch_script = Path(__file__).resolve().parents[2] / 'scripts' / 'switch-host-release.py'
+        switch_results = []
 
         def run(argv, **kwargs):
             if len(argv) > 1 and argv[1].endswith('switch-host-release.py'):
                 kwargs.pop('umask', None)
-                return subprocess.run([sys.executable, str(switch_script), *argv[2:]], **kwargs)
+                result = subprocess.run([sys.executable, str(switch_script), *argv[2:]], **kwargs)
+                switch_results.append(result)
+                return result
             result = original(argv, **kwargs)
             if len(argv) > 1 and argv[1].endswith('build-host-release.py'):
                 writable = self.root.parent.joinpath(self.target, 'writable')
@@ -129,6 +132,9 @@ class ImmutableReleaseTest(unittest.TestCase):
 
         with patch.object(self, 'run_command', side_effect=run):
             self.assertEqual(self.apply(), ('failed', 'release_switch_failed', self.before))
+        self.assertEqual(len(switch_results), 1)
+        self.assertNotEqual(switch_results[0].returncode, 0)
+        self.assertIn('group/world-writable', switch_results[0].stderr)
         self.assertEqual(self.template.read_text(), self.text)
         self.assertFalse((self.unit_dir / update.DROPIN).exists())
 
