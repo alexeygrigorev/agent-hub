@@ -21,6 +21,14 @@ class MockRNG:
         return b"x" * n
 
 class TestApi(unittest.TestCase):
+    @patch("agent_hub_host.gate.get_gate_status", return_value={"launch_allowed": True})
+    @patch("agent_hub_host.cpu_resources.sample_cpu_usage", return_value={"observed_at": "2026-11-03T00:00:00Z"})
+    @patch("agent_hub_host.host_memory.read_host_swap_used_percent", return_value=81.5)
+    @patch("agent_hub_host.host_memory.read_host_memory", return_value={"available_bytes": 1024, "total_bytes": 2048})
+    def test_heartbeat_reports_swap_pressure_sample(self, _memory, _swap, _cpu, _gate):
+        payload = api.get_heartbeat_payload()
+        self.assertEqual(payload["swap_used_percent"], 81.5)
+
     @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.auth.get_host_access_token")
     def test_register_machine(self, mock_get_token, mock_urlopen):

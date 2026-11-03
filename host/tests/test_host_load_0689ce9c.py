@@ -13,20 +13,21 @@ GIB = 1024 ** 3
 def clear_probes(**over):
     """Idle-host probes; override single signals per test."""
     probes = {"loadavg_fn": lambda: (4.0, 4.0, 4.0), "cpu_count_fn": lambda: 12,
-              "cpu_busy_fn": lambda: (35.0, 10.0), "mem_fn": lambda: (30 * GIB, 64 * GIB)}
+              "cpu_busy_fn": lambda: (35.0, 10.0), "mem_fn": lambda: (30 * GIB, 64 * GIB),
+              "swap_fn": lambda: 0.0, "cpu_psi_fn": lambda: 0.0}
     probes.update(over)
     return probes
 
 
 class LoadFactorTests(unittest.TestCase):
     def test_default_factor_is_runaway_cap(self):
-        self.assertEqual(host_load.load_factor(None), 6.0)
-        self.assertEqual(host_load.load_factor({}), 6.0)
+        self.assertEqual(host_load.load_factor(None), 2.0)
+        self.assertEqual(host_load.load_factor({}), 2.0)
 
     def test_invalid_factor_falls_back_to_default(self):
         for bad in ("high", None, True, 0.1, 99.0, float("nan")):
             with self.subTest(bad=bad):
-                self.assertEqual(host_load.load_factor({"host_load_factor": bad}), 6.0)
+                self.assertEqual(host_load.load_factor({"host_load_factor": bad}), 2.0)
 
     def test_valid_override_is_honored(self):
         self.assertEqual(host_load.load_factor({"host_load_factor": 2.0}), 2.0)
@@ -45,11 +46,13 @@ class LoadFactorTests(unittest.TestCase):
 
 
 class LiveLoadStatusTests(unittest.TestCase):
-    def test_high_load_average_alone_is_not_busy(self):
+    def test_high_load_average_respects_configured_limit(self):
         # RMTHZ 2026-11-02: load 36.7 on 12 cores, CPU 68%, 31G free.
+        # The existing RMTHZ sample is admitted under its explicit 4x policy;
+        # the default 2x guard is separately covered at its boundary.
         status = host_load.live_load_status(
-            {}, **clear_probes(loadavg_fn=lambda: (36.7, 27.0, 22.0), cpu_busy_fn=lambda: (68.0, 10.0),
-                               mem_fn=lambda: (31 * GIB, 64 * GIB)))
+            {"cpu_load_factor": 4}, **clear_probes(loadavg_fn=lambda: (36.7, 27.0, 22.0), cpu_busy_fn=lambda: (68.0, 10.0),
+                                                    mem_fn=lambda: (31 * GIB, 64 * GIB)))
         self.assertFalse(status["overloaded"])
         self.assertIsNone(status["trigger"])
 
@@ -67,6 +70,24 @@ class LiveLoadStatusTests(unittest.TestCase):
         status = host_load.live_load_status({}, **clear_probes(mem_fn=lambda: (1 * GIB, 64 * GIB)))
         self.assertEqual(status["trigger"], "mem_available")
 
+    def test_cpu_full_psi_holds_and_reports_threshold(self):
+        status = host_load.live_load_status(
+            {"cpu_psi_full_hard_cap_pct": 5}, **clear_probes(cpu_psi_fn=lambda: 5.1))
+        self.assertEqual(status["trigger"], "cpu_psi_full")
+        self.assertIn("CPU full PSI", host_load.overload_reason(status))
+        self.assertEqual(host_load.hub_refusal(status), ("cpu_pressure", {
+            "trigger": "cpu_psi_full", "cpu_psi_full_pct": 5.1,
+            "cpu_psi_full_limit_pct": 5.0}))
+
+    def test_swap_pressure_holds_and_is_visible_to_hub(self):
+        status = host_load.live_load_status(
+            {"swap_max_used_percent": 80}, **clear_probes(swap_fn=lambda: 81.2))
+        self.assertEqual(status["trigger"], "swap_pressure")
+        self.assertEqual(host_load.hub_refusal(status), ("memory_pressure", {
+            "trigger": "swap_pressure", "swap_used_pct": 81.2,
+            "swap_limit_pct": 80.0}))
+        self.assertIn("81.2%", host_load.overload_reason(status))
+
     def test_memory_floor_scales_down_on_small_hosts(self):
         status = host_load.live_load_status({}, **clear_probes(mem_fn=lambda: (2634 * 1024 ** 2, 32 * GIB)))
         self.assertFalse(status["overloaded"])
@@ -80,12 +101,12 @@ class LiveLoadStatusTests(unittest.TestCase):
         def boom():
             raise AssertionError("cpu must not be sampled when load is runaway")
         status = host_load.live_load_status(
-            {}, **clear_probes(loadavg_fn=lambda: (73.0, 1.0, 1.0), cpu_busy_fn=boom))
+            {}, **clear_probes(loadavg_fn=lambda: (25.0, 1.0, 1.0), cpu_busy_fn=boom))
         self.assertEqual(status["trigger"], "load_runaway")
-        self.assertEqual(host_load.overload_reason(status), "host_overload: load1 73.0 above 6.0x12 cores")
+        self.assertEqual(host_load.overload_reason(status), "host_overload: load1 25.0 above 2.0x12 cores")
 
     def test_runaway_boundary(self):
-        for load1, expected in ((72.0, False), (72.1, True)):
+        for load1, expected in ((24.0, False), (24.1, True)):
             with self.subTest(load1=load1):
                 status = host_load.live_load_status({}, **clear_probes(loadavg_fn=lambda: (load1, 1.0, 1.0)))
                 self.assertEqual(status["overloaded"], expected)
@@ -95,7 +116,8 @@ class LiveLoadStatusTests(unittest.TestCase):
             raise OSError("no proc")
         status = host_load.live_load_status(
             {}, loadavg_fn=unreadable, cpu_count_fn=lambda: None,
-            cpu_busy_fn=lambda: None, mem_fn=lambda: None)
+            cpu_busy_fn=lambda: None, mem_fn=lambda: None,
+            swap_fn=lambda: None, cpu_psi_fn=lambda: None)
         self.assertFalse(status["overloaded"])
         self.assertTrue(status["unknown"])
         status = host_load.live_load_status(
@@ -104,10 +126,10 @@ class LiveLoadStatusTests(unittest.TestCase):
 
     def test_check_raises_bounded_slug_on_overload(self):
         with self.assertRaises(ValueError) as ctx:
-            host_load.check_live_load({}, **clear_probes(loadavg_fn=lambda: (80.0, 1.0, 1.0)))
+            host_load.check_live_load({}, **clear_probes(loadavg_fn=lambda: (25.0, 1.0, 1.0)))
         message = str(ctx.exception)
         self.assertTrue(message.startswith("host_overload: "))
-        self.assertIn("80.0", message)
+        self.assertIn("25.0", message)
         self.assertNotIn("\n", message)
         self.assertEqual(ctx.exception.host_load_status["trigger"], "load_runaway")
 
@@ -119,8 +141,22 @@ class LiveLoadStatusTests(unittest.TestCase):
                                   "mem_floor_mb": 1966.0})
 
     def test_check_passes_status_through_when_clear(self):
-        status = host_load.check_live_load({}, **clear_probes(loadavg_fn=lambda: (36.0, 4.0, 4.0)))
+        # Default 2x-core guard (AC2): 20 on 12 cores is high but clear.
+        status = host_load.check_live_load({}, **clear_probes(loadavg_fn=lambda: (20.0, 4.0, 4.0)))
         self.assertFalse(status["overloaded"])
+
+
+class HostSwapReadingTests(unittest.TestCase):
+    def test_proc_swap_percentage_is_bounded_and_zero_swap_is_clear(self):
+        import io
+        from agent_hub_host.host_memory import read_proc_swap_used_percent
+
+        def source(text):
+            return lambda *_a, **_k: io.StringIO(text)
+
+        self.assertEqual(read_proc_swap_used_percent(open_fn=source("SwapTotal: 1000 kB\nSwapFree: 250 kB\n")), 75.0)
+        self.assertEqual(read_proc_swap_used_percent(open_fn=source("SwapTotal: 0 kB\nSwapFree: 0 kB\n")), 0.0)
+        self.assertIsNone(read_proc_swap_used_percent(open_fn=source("SwapTotal: 1 kB\nSwapFree: 2 kB\n")))
 
 
 class CpuWindowTests(unittest.TestCase):
@@ -186,7 +222,7 @@ class GateMergeTests(unittest.TestCase):
             with self.subTest(allowed=allowed):
                 gate = {"launch_allowed": allowed, "reason": "r", "at": "t"}
                 merged = host_load.gate_with_live_load(
-                    gate, {}, **clear_probes(loadavg_fn=lambda: (36.0, 1.0, 1.0)))
+                    gate, {}, **clear_probes(loadavg_fn=lambda: (20.0, 1.0, 1.0)))
                 self.assertIs(merged, gate)
 
 

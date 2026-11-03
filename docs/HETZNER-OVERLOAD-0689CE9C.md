@@ -55,12 +55,13 @@ unclaimed, non-task offer it refreshes the heartbeat and refuses that attempt
 as `host_load_high` (heartbeat gates publish `host_overload`); Hub records the
 attempt as not started and durably retains the refusing host and its factor on
 the retry hold. Hub re-evaluates that retry live from the host's heartbeat:
-fresh `cpu_usage.busy_percent_window` >= 98 or load above `max(stored factor,
-6) x cores`. Legacy holds that stored factor 1.5 therefore release as soon as
-the host is not actually busy. Fresh placement keeps its existing advisory-load
-policy; launcher memory, quota and PSI/OOM gates still apply. Unreadable inputs
-fail open. The optional local `host_load_factor` setting (0.5-8, default 6)
-only moves the runaway cap; it is a valid `subscriptions.json` key (it was
+load above `cpu_load_factor` (default 2) x cores, measured CPU busy >= 98% over
+10 seconds, CPU-full PSI above its configured limit, MemAvailable below the
+host floor, or swap use above its configured limit (default 80%). The same
+signals gate fresh placement through `src/cpu-headroom.ts`; a refused route
+includes the measured trigger in placement diagnostics. Unreadable inputs fail
+open. The optional local `host_load_factor` setting (0.5-8, default 2) can
+override the Hub load factor; it is a valid `subscriptions.json` key (it was
 missing from the validator until 2026-11-02, which made every host cycle fail
 with "Invalid subscription configuration"). The host rechecks before every
 claim as the final admission boundary.

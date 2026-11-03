@@ -726,6 +726,29 @@ def offers_loop(dispatcher, stop, polling=None, *, clock=time.monotonic, poll_s=
         stop.wait(max(0.0, interval - (clock() - started)))
 
 
+def urgent_stop_loop(dispatcher, stop, machine_id, journal_dir, sender_workspace,
+                     clock=time.monotonic, poll_s=2.0):
+    """Poll and execute stop commands independently of ordinary command work."""
+    last_error = float("-inf")
+    while not stop.is_set():
+        started = clock()
+        try:
+            settings = dispatcher.settings
+            session_control.execute(SimpleNamespace(
+                sessions_cmd='host-receive', once=True, machine_id=machine_id,
+                actor=None, credential_family=None, journal_dir=journal_dir,
+                aplexer_bin=settings.get('aplexer_bin', 'aplexer'), limit=20,
+                sender_workspace=sender_workspace,
+                cleanup_roots=get_cleanup_roots(settings), settings=None,
+                command_kind='stop'))
+        except Exception as error:
+            now = clock()
+            if now - last_error >= 60:
+                _log(json.dumps({'event': 'urgent_stop_receive_error', 'type': type(error).__name__}), flush=True)
+                last_error = now
+        stop.wait(max(0.0, poll_s - (clock() - started)))
+
+
 def maybe_start_named_thread(current, target, args, name):
     if current is not None and current.is_alive():
         return current
@@ -952,6 +975,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         next_checkin = 0
         checkin_thread = None
         offers_thread = None
+        urgent_stop_thread = None
         offers_polling = threading.Event()
         bindings_thread = None
         terminal_thread = None
@@ -984,6 +1008,13 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 None, bindings_loop, (dispatcher, stop), 'fleet-bindings')
             offers_thread = maybe_start_named_thread(
                 None, offers_loop, (dispatcher, stop, offers_polling), 'fleet-offers')
+            if cycles is None:
+                urgent_stop_thread = maybe_start_named_thread(
+                    None, urgent_stop_loop,
+                    (dispatcher, stop, cfg['machine_id'], str(journal),
+                     None if _is_windows() else binding.workspace),
+                    'urgent-session-stops',
+                )
             # Intake a3227276: Hub-pinned host release for checkout installs
             # (Windows hosts without ssh). An applied update sets ``stop``;
             # the supervisor restarts the controller on the new code.
@@ -1053,7 +1084,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                         # arm the STOP-bundled owning-host tree step (never CLI
                         # paths). Invalid shapes fail that tree to uncertain;
                         # stops are unaffected.
-                        cleanup_roots=roots, settings=None))
+                        cleanup_roots=roots, settings=None, command_kind='non_stop'))
                 except Exception as error:
                     _log(json.dumps({'event': 'commands_error', 'type': type(error).__name__}), flush=True)
                 # Per-session messaging credentials (throttled to one pass a
@@ -1109,6 +1140,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 bindings_thread.join(timeout=1)
             if offers_thread is not None:
                 offers_thread.join(timeout=2)
+            if urgent_stop_thread is not None:
+                urgent_stop_thread.join(timeout=2)
             # The release poller wakes on ``release_stop``; give it a moment to
             # exit so its own error line is not written after the fence closes
             # (bounded: it may be inside a network call).

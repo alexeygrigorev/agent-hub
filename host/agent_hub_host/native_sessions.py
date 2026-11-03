@@ -481,6 +481,55 @@ def _fresh_list(executable):
     return list_sessions(executable, include_exited=True)
 
 
+def _targeted_status(executable: str, target: NativeTarget) -> Optional[NativeSession]:
+    """Read one exact native UUID without scanning every host session."""
+    proc = run_native(executable, ["status", target.session_id, "--workspace", target.workspace,
+                                   "--tag", target.tag, "--json"], timeout=QUICK_TIMEOUT)
+    if proc.returncode != 0:
+        diagnostic = " ".join((getattr(proc, "stdout", "") or "", getattr(proc, "stderr", "") or "")).lower()
+        if "no matching session" in diagnostic:
+            return None
+        raise SessionUncertain("Targeted native status failed; reconcile before retry")
+    try:
+        detail = json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise SessionUncertain("Targeted native status was not JSON; reconcile") from exc
+    if not isinstance(detail, dict):
+        raise SessionUncertain("Targeted native status had an unknown shape; reconcile")
+    nested = detail.get("session")
+    raw = dict(nested) if isinstance(nested, dict) else dict(detail)
+    # Some aplexer builds group process/cgroup receipts under liveness while
+    # others emit them beside phase. Preserve both before strict projection.
+    liveness = detail.get("liveness")
+    if isinstance(liveness, dict):
+        raw.update(liveness)
+    for key in ("phase", "state", "exit_info", "worker_alive", "worker_pid", "workload_pid",
+                "processes", "containment_empty", "containment_cgroup", "workload_cgroup"):
+        if key in detail and key not in raw:
+            raw[key] = detail[key]
+    sid = raw.get("id", raw.get("session_id", target.session_id))
+    if not isinstance(sid, str) or sid.lower() != target.session_id.lower():
+        raise SessionControlError("Targeted native status UUID mismatch; refusing")
+    tag = raw.get("tag", target.tag)
+    if tag != target.tag:
+        raise SessionControlError("Targeted native status tag mismatch; refusing")
+    workspace = raw.get("workspace", target.workspace)
+    if not isinstance(workspace, str) or not _stop_workspace_matches_nested(workspace, target.workspace):
+        raise SessionControlError("Targeted native status workspace mismatch; refusing")
+    created = raw.get("created_at_ms")
+    if target.created_at_ms is not None and created is not None and created != target.created_at_ms:
+        raise SessionControlError("Native generation mismatch in targeted status; refusing")
+    raw["id"], raw["tag"], raw["workspace"] = sid, tag, workspace
+    raw.setdefault("phase", raw.get("state", "unknown"))
+    if target.created_at_ms is not None:
+        raw.setdefault("created_at_ms", target.created_at_ms)
+    if target.engine is not None:
+        if raw.get("engine") is not None and raw.get("engine") != target.engine:
+            raise SessionControlError("Native engine mismatch in targeted status; refusing")
+        raw.setdefault("engine", target.engine)
+    return project_session(raw)
+
+
 def list_sessions(
     executable: str = "aplexer",
     workspace: Optional[str] = None,
@@ -1446,11 +1495,8 @@ def stop_session(
         raise SessionControlError("Signal must be HUP|TERM")
     if type(grace_ms) is not int or not 0 <= grace_ms <= 30000:
         raise SessionControlError("grace_ms must be 0..30000")
-    before = [s for s in _fresh_list(executable)
-              if s.session_id.lower() == target.session_id.lower()
-              and s.tag == target.tag
-              and _stop_workspace_matches_nested(s.workspace, target.workspace)]
-    if not before:
+    before = _targeted_status(executable, target)
+    if before is None:
         from .retired_native import verify_native_retirement
         is_retired, tombstone, reason = verify_native_retirement(
             executable, target, allow_nested_workspace=True)
@@ -1463,28 +1509,26 @@ def stop_session(
                 ),
             )
         raise SessionControlError("Target not in native catalog (tag reuse or absent; %s); refusing" % reason)
-    if len(before) != 1:
-        raise SessionControlError("Target has multiple matching native catalog rows; refusing")
-    if target.created_at_ms is not None and before[0].created_at_ms != target.created_at_ms:
+    if target.created_at_ms is not None and before.created_at_ms != target.created_at_ms:
         raise SessionControlError("Native generation mismatch before kill; refusing")
-    if target.engine is not None and before[0].engine != target.engine:
+    if target.engine is not None and before.engine != target.engine:
         raise SessionControlError(
             "Native engine mismatch (reported %r, expected %r); refusing"
-            % (before[0].engine, target.engine)
+            % (before.engine, target.engine)
         )
-    already_gone, gone_reason = _confirm_native_process_gone(before[0])
+    already_gone, gone_reason = _confirm_native_process_gone(before)
     if already_gone:
         return StopResult(state="stopped", session_id=target.session_id,
                           reason="native process already gone (%s)" % gone_reason)
-    generation = before[0].created_at_ms
-    oracle = _oracle_from_row(before[0])
+    generation = before.created_at_ms
+    oracle = _oracle_from_row(before)
     attempt = {"signal": signal, "grace_ms": grace_ms}
     # Even terminal/exiting records go through retaining native shutdown:
     # a phase label alone neither proves exit nor protects the record from
     # a later list/prune sweep. Native containment recovery verifies both.
     proc = run_native(
         executable,
-        ["kill", target.session_id, "--workspace", before[0].workspace, "--tag", target.tag,
+        ["kill", target.session_id, "--workspace", before.workspace, "--tag", target.tag,
          "--signal", signal, "--grace-ms", str(grace_ms), "--keep-record", "--json"],
         timeout=QUICK_TIMEOUT,
     )
@@ -1494,38 +1538,39 @@ def stop_session(
         raise _uncertain_with_oracle(
             "Kill reported failure; target exit unproven — reconcile",
             oracle, {**attempt, "killed": False, "result": "kill_failed"})
-    remaining = [s for s in _fresh_list(executable)
-                   if s.session_id.lower() == target.session_id.lower()
-                   and s.tag == target.tag
-                   and _stop_workspace_matches_nested(s.workspace, target.workspace)]
-    if len(remaining) > 1:
+    try:
+        remaining = _targeted_status(executable, target)
+    except (SessionControlError, SessionUncertain) as exc:
         raise _uncertain_with_oracle(
-            "Multiple matching native catalog rows after kill; exit unproven",
-            oracle, {**attempt, "killed": True, "result": "ambiguous_catalog"})
-    if not remaining:
-        # Kill reported success AND the exact bound UUID/tag/workspace record is
-        # gone. Absence WITHOUT our kill proof (forget/prune) is never exit
-        # proof — that case refuses above, before any effect. Even with our
-        # kill, absence alone is not confirmation: prove the workload gone.
-        confirmed, why = _confirm_workload_exit(before[0])
+            "Post-kill targeted status unavailable; reconcile",
+            oracle, {**attempt, "killed": True, "result": "status_unavailable"}) from exc
+    if remaining is None:
+        # Kill reported success AND the exact bound UUID is gone. Absence
+        # alone is not confirmation: verify the pre-kill workload cgroup/PIDs.
+        confirmed, why = _confirm_workload_exit(before)
         if confirmed:
             return StopResult(state="stopped", session_id=target.session_id,
                               reason="native record cleaned up after kill (%s)" % why)
         raise _uncertain_with_oracle(
             "Native record gone after kill but %s; reconcile" % why,
             oracle, {**attempt, "killed": True, "result": "record_absent_unproven"})
-    if generation is not None and remaining[0].created_at_ms != generation:
+    if generation is not None and remaining.created_at_ms != generation:
         raise _uncertain_with_oracle(
             "Native generation changed across kill; exit unproven",
             oracle, {**attempt, "killed": True, "result": "generation_changed"})
-    if remaining[0].phase in TERMINAL_PHASES:
-        confirmed, why = _confirm_workload_exit(remaining[0])
+    if remaining.phase in TERMINAL_PHASES:
+        confirmed, why = _confirm_workload_exit(remaining)
+        if not confirmed:
+            # Some native builds omit the cgroup witness from `status`; the
+            # saved exact pre-kill cgroup/PIDs remain a valid empty-containment
+            # oracle after kill, never a catalog-only success.
+            confirmed, why = _confirm_workload_exit(before)
         if confirmed:
             return StopResult(state="stopped", session_id=target.session_id,
-                              reason="terminal phase observed: %s (%s)" % (remaining[0].phase, why))
+                              reason="terminal phase observed: %s (%s)" % (remaining.phase, why))
         raise _uncertain_with_oracle(
-            "Target terminal (%s) but %s; reconcile" % (remaining[0].phase, why),
+            "Target terminal (%s) but %s; reconcile" % (remaining.phase, why),
             oracle, {**attempt, "killed": True, "result": "terminal_unproven"})
     raise _uncertain_with_oracle(
-        "Target still %s after kill; capacity NOT released" % remaining[0].phase,
+        "Target still %s after kill; capacity NOT released" % remaining.phase,
         oracle, {**attempt, "killed": True, "result": "still_running"})

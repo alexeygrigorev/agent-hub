@@ -332,6 +332,7 @@ def receive_once(
     sender_workspace: Optional[str] = None,
     cleanup_roots: Optional[list] = None,
     message_workers: Optional[MessageDeliveryWorkers] = None,
+    command_kind: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run ONE bounded receiver cycle: poll -> claim -> execute -> ack.
 
@@ -359,6 +360,8 @@ def receive_once(
         raise SessionControlError("Hub request callable is required")
     if type(limit) is not int or not 1 <= limit <= 20:
         raise SessionControlError("Receiver limit must be 1..20")
+    if command_kind not in (None, "stop", "non_stop"):
+        raise SessionControlError("command_kind must be stop|non_stop")
     if sender_workspace is not None and (
             not isinstance(sender_workspace, str) or not os.path.isabs(sender_workspace)):
         raise SessionControlError("sender_workspace must be an absolute path")
@@ -368,7 +371,7 @@ def receive_once(
     # Reconcile crash-left message intents before polling. These workers share
     # the same per-session and host-wide bounds as fresh delivery.
     try:
-        pending_messages = session_messages.pending_message_reconciliations(
+        pending_messages = [] if command_kind == "stop" else session_messages.pending_message_reconciliations(
             journal_dir, now_ms=now_ms, limit=32)
     except OSError:
         pending_messages = []
@@ -378,13 +381,20 @@ def receive_once(
             workers.submit(session_id, command_id, lambda path=path: session_messages.reconcile_message_record(
                 path, executable=executable, request=request, now_ms=now_ms))
 
+    offers_path = "/api/session-commands/offers"
+    if command_kind is not None:
+        offers_path += "?kind=" + command_kind
     try:
-        listing = request("GET", "/api/session-commands/offers", None)
+        listing = request("GET", offers_path, None)
     except Exception as exc:
         raise SessionUncertain("Offers poll failed; reconcile before retry: %s" % type(exc).__name__) from exc
     offers = listing.get("offers", []) if isinstance(listing, dict) else []
     if not isinstance(offers, list):
         raise SessionControlError("Offers listing is malformed")
+    if command_kind == "stop":
+        offers = [offer for offer in offers if isinstance(offer, dict) and offer.get("kind") == "stop"]
+    elif command_kind == "non_stop":
+        offers = [offer for offer in offers if not isinstance(offer, dict) or offer.get("kind") != "stop"]
     offers = offers[:limit]
 
     processed: list[dict[str, Any]] = []
@@ -421,51 +431,76 @@ def receive_once(
         except SessionUncertain as exc:
             skipped.append({"command_id": command_id, "reason": str(exc)[:300]})
             continue
-        # Stop with no native target: fence via claim, verify no live native
-        # process for the linked fleet launch (stopping any correlated tag if
-        # present), then ack delivered with confirmed_exit=True so unbound
-        # uncertain sessions settle to stopped instead of stranding.
+        # Stop with no bound native target: a correlated launch tag can help
+        # discover the exact native identity, but an empty catalog result is
+        # not containment proof. Never ack an unbound stop unless an exact
+        # native target was found and stop_session verified it empty.
         if command.get("target") is None:
             try:
-                attempt_id = get_or_create_attempt(journal_dir, str(command_id), str(correlation or ""))
+                launch_id = offer.get("fleet_launch_id") if isinstance(offer, dict) else None
+                if not isinstance(launch_id, str) or not launch_id:
+                    skipped.append({"command_id": command_id,
+                                    "reason": "unbound_stop_missing_launch_identity"})
+                    continue
+                expected_tags = {f"hub-{launch_id}", f"task-hub-{launch_id}"}
                 try:
+                    rows = [row for row in list_sessions(executable, include_exited=True)
+                            if row.tag in expected_tags]
+                except Exception as exc:
+                    skipped.append({"command_id": command_id,
+                                    "reason": "unbound_stop_discovery_%s_reconcile" % type(exc).__name__})
+                    continue
+                if len(rows) != 1:
+                    skipped.append({"command_id": command_id,
+                                    "reason": "unbound_stop_native_identity_missing_or_ambiguous"})
+                    continue
+                row = rows[0]
+                target = NativeTarget(
+                    session_id=row.session_id,
+                    tag=row.tag,
+                    workspace=row.workspace,
+                    created_at_ms=row.created_at_ms,
+                    engine=row.engine,
+                )
+                try:
+                    attempt_id = get_or_create_attempt(journal_dir, str(command_id), str(correlation or ""))
                     server_claim = request("POST", "/api/session-commands/" + str(command_id) + "/claim",
                                            {"correlation": correlation, "attempt_id": attempt_id})
                 except Exception as exc:
-                    skipped.append({"command_id": command_id, "reason": "claim_unresolved_%s_reconcile" % type(exc).__name__})
+                    skipped.append({"command_id": command_id,
+                                    "reason": "unbound_stop_claim_unresolved_%s_reconcile" % type(exc).__name__})
                     continue
                 token = server_claim.get("claim_token") if isinstance(server_claim, dict) else None
-                launch_id = offer.get("fleet_launch_id") if isinstance(offer, dict) else None
-                native_payload = {"native_id": "00000000-0000-0000-0000-000000000000",
-                                  "tag": "unbound", "workspace": "/"}
-                reason_text = "unbound stop: confirmed no live native process"
-                if isinstance(launch_id, str) and launch_id:
-                    expected_tags = {f"hub-{launch_id}", f"task-hub-{launch_id}"}
-                    for row in list_sessions(executable, include_exited=True):
-                        if row.tag in expected_tags and row.phase not in ("exited", "dead", "forgotten", "pruned"):
-                            stop_session(executable, NativeTarget(
-                                session_id=row.session_id,
-                                tag=row.tag,
-                                workspace=row.workspace,
-                                created_at_ms=row.created_at_ms,
-                            ))
-                            native_payload = {"native_id": row.session_id, "tag": row.tag, "workspace": row.workspace}
-                            reason_text = "unbound stop: correlated native process stopped"
-                            break
+                if not isinstance(token, str) or not token:
+                    skipped.append({"command_id": command_id, "reason": "claim_missing_token_reconcile"})
+                    continue
+                stopped = stop_session(executable, target)
+                if getattr(stopped, "state", None) != "stopped":
+                    skipped.append({"command_id": command_id,
+                                    "reason": "unbound_stop_exit_unverified_reconcile"})
+                    continue
+                native_payload = {"native_id": target.session_id, "tag": target.tag,
+                                  "workspace": target.workspace}
                 try:
-                    request("POST", "/api/session-commands/" + str(command_id) + "/ack",
-                            {"correlation": correlation, "outcome": "delivered",
-                             "confirmed_exit": True,
-                             "native": native_payload,
-                             "reason": reason_text,
-                             "claim_token": token})
+                    ack = request("POST", "/api/session-commands/" + str(command_id) + "/ack",
+                                  {"correlation": correlation, "outcome": "delivered",
+                                   "confirmed_exit": True,
+                                   "native": native_payload,
+                                   "reason": "unbound stop: " + str(getattr(stopped, "reason", "containment verified"))[:180],
+                                   "claim_token": token})
+                    if not isinstance(ack, dict) or ack.get("command_id") != command_id or ack.get("state") != "acked":
+                        skipped.append({"command_id": command_id, "reason": "ack_unverified_reconcile"})
+                        continue
                     processed.append({"command_id": command_id, "op": "stop",
-                                      "state": "stopped", "reason": "unbound_no_target"})
+                                      "state": "stopped", "reason": "unbound_target_stopped_and_verified"})
                 except Exception as exc:
                     skipped.append({"command_id": command_id,
                                     "reason": "ack_unresolved_%s_reconcile" % type(exc).__name__})
             except (SessionControlError, SessionUncertain) as exc:
                 skipped.append({"command_id": command_id, "reason": str(exc)[:300]})
+            except Exception as exc:
+                skipped.append({"command_id": command_id,
+                                "reason": "unbound_stop_%s_reconcile" % type(exc).__name__})
             continue
         # Stable attempt BEFORE claim (lost-reply safe).
         try:
@@ -543,7 +578,7 @@ def receive_once(
     # durable record (never deleted to hide history).
     reconciled: list[dict[str, Any]] = []
     try:
-        pending = _pending_reconcile_names(journal_dir, limit=20)
+        pending = _pending_reconcile_names(journal_dir, limit=20, command_kind=command_kind)
     except OSError:
         pending = []
     for name in pending:
@@ -570,13 +605,13 @@ def receive_once(
                                "ack_submitted": bool((updated.get("ack") or {}).get("submitted", False)),
                                "reconciled": True})
     try:
-        relayed = session_messages.relay_replies(journal_dir=journal_dir, executable=executable,
-                                                 request=request, now_ms=now_ms)
+        relayed = [] if command_kind == "stop" else session_messages.relay_replies(
+            journal_dir=journal_dir, executable=executable, request=request, now_ms=now_ms)
     except Exception:
         relayed = []
     return {"offers_seen": len(offers), "processed": processed, "skipped": skipped,
             "reconciled": reconciled, "relayed": relayed,
-            "message_workers": workers.drain_completed()}
+            "message_workers": [] if command_kind == "stop" else workers.drain_completed()}
 
 
 def _is_terminal_ack_error(err: Any) -> bool:
@@ -588,7 +623,8 @@ def _is_terminal_ack_error(err: Any) -> bool:
         for code in (400, 404, 409))
 
 
-def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
+def _pending_reconcile_names(journal_dir: str, limit: int = 20,
+                             command_kind: Optional[str] = None) -> list[str]:
     """Fair pending scan: completed/terminal journals never consume the cap.
 
     A journal needs attention when it is an unreconciled send (state unknown
@@ -617,6 +653,10 @@ def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
         except (OSError, ValueError, UnicodeDecodeError):
             continue  # corrupt journal: fail closed, surface via manual reconcile
         if not isinstance(record, dict):
+            continue
+        if command_kind == "stop" and record.get("op") != "stop":
+            continue
+        if command_kind == "non_stop" and record.get("op") == "stop":
             continue
         ack_err = record.get("ack_error")
         if record.get("ack_submitted") or _is_terminal_ack_error(ack_err):

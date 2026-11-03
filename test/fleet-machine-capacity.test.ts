@@ -17,8 +17,12 @@ async function fixture(check: (fleet: FleetService, sql: any, heartbeat: any) =>
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
     const fleet = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
     fleet.init();
+    // This fixture intentionally contains 110 synthetic natives to ensure
+    // max_agents is not treated as the host safety ceiling. Tests for the
+    // explicit host_max_sessions policy lower it independently below.
+    fleet.resources.configure({ host_max_sessions: 256 });
     const sql = hub.sql;
-    const heartbeat = { mem_avail_mb: 37000, disk_free_gb: 80, load: [100, 100, 100], cpu_usage: freshCpu(iso(), 8, 8) };
+    const heartbeat = { mem_avail_mb: 37000, disk_free_gb: 80, load: [1, 1, 1], cpu_usage: freshCpu(iso(), 8, 8) };
     sql.exec('INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities) VALUES (?,?,?,?,?,?,?,?)',
       'host', 'host', 'host', iso(), iso(), JSON.stringify(heartbeat), 0,
       JSON.stringify({ engines: [engine], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
@@ -54,6 +58,13 @@ describe('machine admission uses resource evidence instead of a session ceiling'
     expect(sql.exec("SELECT phase,agent_state,last_activity_at FROM fleet_sessions WHERE native_id='native-109'").one())
       .toMatchObject({ phase: 'running', agent_state: 'working', last_activity_at: iso() });
   }, engine));
+
+  it('honors the explicit per-host live-session cap independently of max_agents', async () => fixture(async fleet => {
+    fleet.resources.configure({ host_max_sessions: 24 });
+    const plan = fleet.plan(intent());
+    expect(plan.selected).toBeNull();
+    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'host', reason: 'machine_capacity' }));
+  }));
 
   it('promotes a held launch after pressure clears despite an unchanged native census', async () => fixture(async (fleet, sql, heartbeat) => {
     heartbeat.cpu_usage.psi_full_avg10 = 99;

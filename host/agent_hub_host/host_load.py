@@ -1,10 +1,9 @@
 """Live host-load admission signal (intake 0689ce9c AC2, reworked 2026-11-02).
 
 Launcher admission (``check_resources`` in the maintained launcher) and Hub
-server placement (``src/cpu-headroom.ts``) are deliberately choking-only. On
-2026-10-28 that let RMTHZ reach load 275-295 on 12 cores (46 vitest, 21
-workerd, 25 playwright, 9 pytest from many sessions each running full suites)
-while admission kept launching.
+server placement (``src/cpu-headroom.ts``) use the same bounded resource
+policy. This host-side check enforces that policy again immediately before
+claim, so a stale placement cannot bypass current load or memory pressure.
 
 This module is the host-side counterweight: a live, fail-open check that runs
 in ``Dispatcher.dispatch`` BEFORE any admission subprocess, claim or native
@@ -13,11 +12,10 @@ start, and is ANDed into the heartbeat gate. Nothing running is ever touched.
 A host is busy only on a MEASURED signal (Alexey t2358u-t2363u):
 
 * CPU busy >= 98% averaged over >= 10s (``/proc/stat`` deltas, iowait excluded);
-* MemAvailable below 3% of RAM (at least 512 MiB, capped at 2 GiB);
-* a runaway 1-minute load average above ``factor`` (default 6) x cores. Load
-  counts IO-wait and runnable threads, so 1.5x cores is routine on a healthy
-  host (RMTHZ at load 24-37 on 12 cores was 35-70% CPU with 30 GiB free).
-  Only an extreme multiple, the 2026-10-28 signature, trips it.
+* a 1-minute load average above ``factor`` (default 2) x cores;
+* CPU-full PSI above its configured limit when that Linux signal is available;
+* MemAvailable below 3% of RAM (at least 512 MiB, capped at 2 GiB); or
+* swap use above its configured limit (default 80%).
 
 Unreadable inputs fail OPEN (no refusal); the status dict always says why.
 """
@@ -29,8 +27,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-#: Runaway-load cap as a multiple of cores (the 10-28 incident was ~24x).
-HOST_LOAD_FACTOR = 6.0
+#: Load cap as a multiple of cores. Hub policy can override this value.
+HOST_LOAD_FACTOR = 2.0
 #: Bounds for the operator ``host_load_factor`` settings override.
 HOST_LOAD_FACTOR_MIN = 0.5
 HOST_LOAD_FACTOR_MAX = 8.0
@@ -48,9 +46,10 @@ _STATE_KEEP_S = 300.0
 
 
 def load_factor(settings: Optional[dict] = None) -> float:
-    """Operator override for the runaway-load factor; invalid falls back to default."""
+    """Operator override for the host-load factor; invalid falls back to default."""
     try:
-        raw = (settings or {}).get("host_load_factor", HOST_LOAD_FACTOR)
+        values = settings or {}
+        raw = values.get("host_load_factor", values.get("cpu_load_factor", HOST_LOAD_FACTOR))
         if isinstance(raw, bool):
             raise ValueError("bool factor")
         value = float(raw)
@@ -59,6 +58,24 @@ def load_factor(settings: Optional[dict] = None) -> float:
     if not (HOST_LOAD_FACTOR_MIN <= value <= HOST_LOAD_FACTOR_MAX):
         return HOST_LOAD_FACTOR
     return value
+
+
+def policy_settings(settings: Optional[dict] = None, offer: Optional[dict] = None) -> dict:
+    """Merge the local host override with the Hub's bounded resource policy."""
+    result = dict(settings) if isinstance(settings, dict) else {}
+    policy = result.get("resource_management")
+    merged = dict(policy) if isinstance(policy, dict) else {}
+    offered = offer.get("resource_management") if isinstance(offer, dict) else None
+    if isinstance(offered, dict):
+        merged.update(offered)
+    if merged:
+        result["resource_management"] = merged
+        if "host_load_factor" not in result and "cpu_load_factor" in merged:
+            result["host_load_factor"] = merged["cpu_load_factor"]
+        for key in ("swap_max_used_percent", "cpu_psi_full_hard_cap_pct"):
+            if key in merged:
+                result[key] = merged[key]
+    return result
 
 
 def _state_path() -> Path:
@@ -134,17 +151,36 @@ def _default_mem() -> Optional[tuple]:
         return None
 
 
+def _default_swap() -> Optional[float]:
+    try:
+        from .host_memory import read_host_swap_used_percent
+        return read_host_swap_used_percent()
+    except Exception:
+        return None
+
+
+def _default_cpu_psi_full() -> Optional[float]:
+    try:
+        from .cpu_resources import read_cpu_psi
+        return read_cpu_psi(category="full")
+    except Exception:
+        return None
+
+
 def live_load_status(settings: Optional[dict] = None, *,
                      loadavg_fn: Optional[Callable[[], tuple]] = None,
                      cpu_count_fn: Optional[Callable[[], Optional[int]]] = None,
                      cpu_busy_fn: Optional[Callable[[], Optional[tuple]]] = None,
-                     mem_fn: Optional[Callable[[], Optional[tuple]]] = None) -> dict[str, Any]:
+                     mem_fn: Optional[Callable[[], Optional[tuple]]] = None,
+                     swap_fn: Optional[Callable[[], Optional[float]]] = None,
+                     cpu_psi_fn: Optional[Callable[[], Optional[float]]] = None) -> dict[str, Any]:
     """Measure the host. Never raises.
 
     Returns load1, cores, factor, CPU usage/window and MemAvailable/floor in
     measured units, plus ``overloaded``, the triggering signal, and whether
     all signals were unreadable.
     """
+    settings = settings or {}
     factor = load_factor(settings)
     load1: Optional[float] = None
     cores: Optional[int] = None
@@ -180,6 +216,38 @@ def live_load_status(settings: Optional[dict] = None, *,
     except Exception:
         pass
 
+    swap_pct = None
+    try:
+        measured_swap = (swap_fn or _default_swap)()
+        if measured_swap is not None and 0 <= float(measured_swap) <= 100:
+            swap_pct = round(float(measured_swap), 1)
+    except Exception:
+        pass
+    swap_limit = settings.get("swap_max_used_percent", 80)
+    try:
+        if isinstance(swap_limit, bool) or not 1 <= float(swap_limit) <= 100:
+            swap_limit = 80
+        else:
+            swap_limit = float(swap_limit)
+    except (TypeError, ValueError):
+        swap_limit = 80
+
+    psi_full = None
+    try:
+        measured_psi = (cpu_psi_fn or _default_cpu_psi_full)()
+        if measured_psi is not None and 0 <= float(measured_psi) <= 100:
+            psi_full = round(float(measured_psi), 2)
+    except Exception:
+        pass
+    psi_limit = settings.get("cpu_psi_full_hard_cap_pct", 5)
+    try:
+        if isinstance(psi_limit, bool) or not 0.1 <= float(psi_limit) <= 100:
+            psi_limit = 5
+        else:
+            psi_limit = float(psi_limit)
+    except (TypeError, ValueError):
+        psi_limit = 5
+
     mem_floor = None
     if mem_total and mem_total > 0:
         total_mb = mem_total / (1024 ** 2)
@@ -193,14 +261,20 @@ def live_load_status(settings: Optional[dict] = None, *,
         trigger = "load_runaway"
     elif cpu_busy is not None and cpu_busy >= CPU_SATURATED_PCT:
         trigger = "cpu_busy"
+    elif psi_full is not None and psi_full > psi_limit:
+        trigger = "cpu_psi_full"
     elif mem_avail is not None and mem_floor is not None and mem_avail < mem_floor:
         trigger = "mem_available"
-    known = load1 is not None or cpu_busy is not None or mem_avail is not None
+    elif swap_pct is not None and swap_pct > swap_limit:
+        trigger = "swap_pressure"
+    known = load1 is not None or cpu_busy is not None or mem_avail is not None or swap_pct is not None or psi_full is not None
     return {"load1": load1, "cores": cores, "factor": factor,
             "cpu_busy": cpu_busy, "cpu_window_s": cpu_window,
             "mem_avail_gb": None if mem_avail is None else round(mem_avail / 1024 ** 3, 1),
             "mem_avail_mb": None if mem_avail is None else mem_avail / 1024 ** 2,
             "mem_floor_mb": None if mem_floor is None else mem_floor / 1024 ** 2,
+            "cpu_psi_full_pct": psi_full, "cpu_psi_full_limit_pct": psi_limit,
+            "swap_used_pct": swap_pct, "swap_limit_pct": swap_limit,
             "trigger": trigger, "overloaded": trigger is not None, "unknown": not known}
 
 
@@ -209,8 +283,12 @@ def overload_reason(status: dict[str, Any]) -> str:
     trigger = status.get("trigger")
     if trigger == "cpu_busy":
         text = f"cpu busy {status.get('cpu_busy')}% over {status.get('cpu_window_s')}s"
+    elif trigger == "cpu_psi_full":
+        text = f"CPU full PSI {status.get('cpu_psi_full_pct')}% above {status.get('cpu_psi_full_limit_pct')}%"
     elif trigger == "mem_available":
         text = f"MemAvailable {status.get('mem_avail_gb')}G below floor"
+    elif trigger == "swap_pressure":
+        text = f"swap used {status.get('swap_used_pct')}% above {status.get('swap_limit_pct')}%"
     else:
         text = f"load1 {status.get('load1')} above {status.get('factor')}x{status.get('cores')} cores"
     return f"{HOST_OVERLOAD_PREFIX}: {text}"
@@ -243,6 +321,18 @@ def hub_refusal(status: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             "trigger": trigger,
             "cpu_busy_pct": status.get("cpu_busy"),
             "cpu_window_s": status.get("cpu_window_s"),
+        }
+    if trigger == "cpu_psi_full":
+        return "cpu_pressure", {
+            "trigger": trigger,
+            "cpu_psi_full_pct": status.get("cpu_psi_full_pct"),
+            "cpu_psi_full_limit_pct": status.get("cpu_psi_full_limit_pct"),
+        }
+    if trigger == "swap_pressure":
+        return "memory_pressure", {
+            "trigger": trigger,
+            "swap_used_pct": status.get("swap_used_pct"),
+            "swap_limit_pct": status.get("swap_limit_pct"),
         }
     if trigger == "load_runaway":
         return "host_load_high", {

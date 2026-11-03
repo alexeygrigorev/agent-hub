@@ -226,6 +226,23 @@ describe('resource management',()=>{
     expect(r.headroom('host')).toMatchObject({reserved_mb:0,floor_mb:4096});
   });
  }));
+ it('gates Hub admission on fresh host load, swap pressure, and the reserved session cap',async()=>fixture(async(r,sql)=>{
+  r.configure({cpu_load_factor:2,swap_max_used_percent:80,host_max_sessions:24});
+  const heartbeat=JSON.parse(String(sql.exec("SELECT last_heartbeat FROM machines WHERE id='host'").one().last_heartbeat));
+  heartbeat.load=[25,20,10];heartbeat.swap_used_percent=0;
+  sql.exec("UPDATE machines SET last_heartbeat=?,last_checkin_at=? WHERE id='host'",JSON.stringify(heartbeat),iso());
+  expect(r.cpuHeadroom('host')).toMatchObject({reason:'host_load_high',admitted:false,host_load1:25,host_load_limit:24});
+  heartbeat.load=[1,1,1];heartbeat.swap_used_percent=81;
+  sql.exec("UPDATE machines SET last_heartbeat=?,last_checkin_at=? WHERE id='host'",JSON.stringify(heartbeat),iso());
+  expect(r.cpuHeadroom('host')).toMatchObject({reason:'memory_pressure',admitted:false,swap_used_percent:81});
+  r.configure({host_max_sessions:1});heartbeat.swap_used_percent=0;
+  sql.exec("UPDATE machines SET last_heartbeat=?,last_checkin_at=? WHERE id='host'",JSON.stringify(heartbeat),iso());
+  expect(r.cpuHeadroom('host')).toMatchObject({reason:'machine_capacity',admitted:false,host_session_count:1,host_max_sessions:1});
+  r.configure({host_max_sessions:2});
+  sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,'pending','admin','human','pending','pending-key','{}','host','opencode','go','headless','/repo','pending','offered',iso(),iso());
+  expect(r.cpuHeadroom('host')).toMatchObject({reason:'machine_capacity',admitted:false,host_session_count:2,host_max_sessions:2});
+ }));
  it('invalidates measured-history caches on writes, configuration changes and rolled-back generations',async()=>fixture(async(r,sql,f)=>{
   r.report('host',{samples:[sample()],reaps:[]});
   sql.exec("UPDATE session_resource_usage SET finished_at=?,peak_rss_mb=200 WHERE session_id='session'",iso());
@@ -280,6 +297,9 @@ describe('resource management',()=>{
   const cfg=resourceConfig();expect(memoryVerdict(2560,0,512,cfg)).toBe(true);expect(memoryVerdict(2559,0,512,cfg)).toBe(false);
   expect(memoryVerdict(2047,0,0,cfg)).toBe(false);expect(memoryVerdict(NaN,0,512,cfg)).toBe(false);expect(memoryVerdict(8000,-1000,512,cfg)).toBe(false);
   expect(()=>resourceConfig({memory_floor_mb:-1})).toThrow();expect(()=>resourceConfig({cpu_load_factor:Infinity})).toThrow();
+  expect(resourceConfig()).toMatchObject({cpu_load_factor:2,swap_max_used_percent:80,host_max_sessions:24});
+  expect(()=>resourceConfig({swap_max_used_percent:101})).toThrow('invalid_resource_config');
+  expect(()=>resourceConfig({host_max_sessions:0})).toThrow('invalid_resource_config');
   expect(percentile([100,200,300,400,500,600,700,800,900,1000],90)).toBe(900);
  });
  it('does not subtract resident caps but reserves unstarted ramps, crediting measured resident usage',async()=>fixture(async(r,sql)=>{

@@ -75,7 +75,7 @@ export function resourceConfig(value: any = {}): ResourceConfig {
   const result = { ...defaults };
   const bounds: Record<string, number[]> = {
     memory_floor_mb: [128, 1048576], disk_floor_gb: [1, 1048576], ramp_reserve_default_mb: [64, 65536], estimate_percentile: [50,100], estimate_cap_mb: [64,65536], memory_floor_pct: [.5,20],
-    estimate_multiplier: [1,4], ramp_seconds: [30,900], cpu_load_factor: [.5,4],
+    estimate_multiplier: [1,4], ramp_seconds: [30,900], cpu_load_factor: [.5,4], swap_max_used_percent: [1,100], host_max_sessions: [1,512],
     watchdog_interval_s: [300,600], idle_minutes: [10,10080], rss_flag_gb: [.125,1024],
     cpu_target_utilization:[.1,1],cpu_default_cores:[.05,128],cpu_estimate_multiplier:[1,4],cpu_psi_hard_cap_pct:[1,100],cpu_psi_full_hard_cap_pct:[.1,100],memory_psi_full_hard_cap_pct:[.1,100],choking_cooldown_seconds:[30,3600],
     cpu_throttle_cores:[.25,128],cpu_throttle_sustain_s:[30,3600],
@@ -83,7 +83,7 @@ export function resourceConfig(value: any = {}): ResourceConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_resource_config');
   for (const [k,v] of Object.entries(value)) {
     if (!bounds[k] || !finite(v) || (v as number) < bounds[k][0] || (v as number) > bounds[k][1]) throw new Error('invalid_resource_config');
-    if (!['disk_floor_gb','cpu_load_factor','estimate_multiplier','rss_flag_gb','memory_floor_pct','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct','cpu_psi_full_hard_cap_pct','memory_psi_full_hard_cap_pct','cpu_throttle_cores'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
+    if (!['disk_floor_gb','cpu_load_factor','swap_max_used_percent','estimate_multiplier','rss_flag_gb','memory_floor_pct','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct','cpu_psi_full_hard_cap_pct','memory_psi_full_hard_cap_pct','cpu_throttle_cores'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
     (result as any)[k] = v;
   }
   return result;
@@ -347,12 +347,28 @@ export class ResourceManagement {
   cpuStart(launch: string) {
     return this.sql.exec('SELECT expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts WHERE launch_id=?',launch).toArray()[0] ?? null;
   }
+  private hostSessionCount(machine: string, excludeLaunch?: string) {
+    const row: any = this.readRows(`SELECT COUNT(*) AS active_sessions FROM (
+      SELECT native_id AS session_key FROM fleet_sessions WHERE machine_id=?
+        AND phase NOT IN ('exited','finished','failed','stopped','dead','refused')
+      UNION
+      SELECT COALESCE(native_id,'launch:'||id) AS session_key FROM fleet_launches WHERE machine_id=?
+        AND state IN ('offered','starting','running','uncertain') AND (? IS NULL OR id<>?)
+    )`, machine, machine, excludeLaunch ?? null, excludeLaunch ?? null)[0];
+    const count = Number(row?.active_sessions);
+    return Number.isSafeInteger(count) && count >= 0 ? count : 0;
+  }
+  private hostAdmissionState(machine: string, heartbeat: any, observedAt: unknown, excludeLaunch?: string) {
+    const load = Array.isArray(heartbeat?.load) ? heartbeat.load[0] : null;
+    return {load1: load, swap_used_percent: heartbeat?.swap_used_percent,
+      observed_at: observedAt, active_sessions: this.hostSessionCount(machine, excludeLaunch)};
+  }
   cpuHeadroom(machine: string, input: any = {}, excludeLaunch?: string) {
     return this.withHistory(() => this.cpuHeadroomFromHistory(machine, input, excludeLaunch));
   }
   private cpuHeadroomFromHistory(machine: string, input: any, excludeLaunch?: string) {
     const now = this.snapshotNow ?? this.now();
-    const m:any=this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine)[0];
+    const m:any=this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?',machine)[0];
     const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
     const inFlightCutoff=new Date(now-IN_FLIGHT_RESERVE_SECONDS*1000).toISOString();
     const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal',input.engine ?? null,input.model ?? null);
@@ -383,7 +399,8 @@ export class ResourceManagement {
     // Keep the original summation order, excluding only this exact launch.
     let remaining=0;
     for(const row of commitments) if(row.id!==excludeLaunch) remaining+=row.remaining;
-    const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,now,hb.mem_avail_mb,effectiveFloorMb(config,hb.mem_total_mb),hb.at ?? hb.launcher_resources?.observed_at ?? hb.gate?.at ?? null);
+    const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,now,hb.mem_avail_mb,effectiveFloorMb(config,hb.mem_total_mb),hb.at ?? hb.launcher_resources?.observed_at ?? hb.gate?.at ?? null,
+      this.hostAdmissionState(machine,hb,m?.last_checkin_at,excludeLaunch));
     const choking=this.chokingState(machine,now,config,verdict.reason);
     return {...verdict,...choking,admitted:choking.reason===null,expected_cpu_source:estimate.expected_cpu_source};
   }
@@ -392,18 +409,20 @@ export class ResourceManagement {
    * avoiding its unrelated global CPU estimation history/pending scans. */
   capacityCpuAdmitted(machine: string): boolean {
     const now = this.snapshotNow ?? this.now(), config = this.config();
-    const m: any = this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?', machine)[0];
+    const m: any = this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?', machine)[0];
     const heartbeat = parse(m?.last_heartbeat);
-    const verdict = cpuVerdict(heartbeat.cpu_usage, parse(m?.capabilities).cpu_count, 0, 0, config, now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null);
+    const verdict = cpuVerdict(heartbeat.cpu_usage, parse(m?.capabilities).cpu_count, 0, 0, config, now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null,
+      this.hostAdmissionState(machine,heartbeat,m?.last_checkin_at));
     return this.chokingState(machine, now, config, verdict.reason).reason === null;
   }
   resourceChoking(machine: string) {
     // Watchdog needs current failure evidence, not a hypothetical launch's
     // reservation estimate across every pending request.
     const now=this.snapshotNow ?? this.now(),config=this.config();
-    const m:any=this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine)[0];
+    const m:any=this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?',machine)[0];
     const heartbeat=parse(m?.last_heartbeat);
-    const verdict=cpuVerdict(heartbeat.cpu_usage,parse(m?.capabilities).cpu_count,0,0,config,now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null);
+    const verdict=cpuVerdict(heartbeat.cpu_usage,parse(m?.capabilities).cpu_count,0,0,config,now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null,
+      this.hostAdmissionState(machine,heartbeat,m?.last_checkin_at));
     return this.chokingState(machine,now,config,verdict.reason).resource_choking;
   }
   /** Watchdog-poll path: the choking evidence window is time-based, so this
