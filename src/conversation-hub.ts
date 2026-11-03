@@ -189,7 +189,7 @@ export class Hub extends BaseHub {
       if (auth.caller?.tokenId && !this.mcpOAuth.acceptsResource(auth.caller.tokenId, new URL(req.url).origin + '/mcp'))
         return { error: Response.json({ error: 'invalid_target' }, { status: 401 }) };
       return auth;
-    }, req => this.fetch(req), (tool, kind) => this.mcpUsage.record(tool, kind));
+    }, req => this.fetch(req), (tool, kind, canonicalTool, usageKind) => this.mcpUsage.record(tool, kind, canonicalTool, undefined, usageKind));
     if (path.startsWith('/oauth/') || path.startsWith('/.well-known/')) return this.mcpOAuth.handle(request);
 
     if (path === '/api/conversations' || path.startsWith('/api/conversations/')) {

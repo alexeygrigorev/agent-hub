@@ -3,8 +3,8 @@
 ## Current deployment (15 October 2026)
 
 - Worker `agent-hub` (DO class `Hub`, instance `hub`) is deployed from `main` at `https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev`, crons `*/30` (root slot, root scheduling switched **off**) and `*/5` (scheduled checks). Previous version for rollback: `1ec25f7c-0f00-4087-a4d6-c621ad34fba5` (`npx wrangler rollback <id>`).
-- Secrets: `SESSION_SECRET`, `HUB_ADMIN_TOKEN_SHA256` (admin token kept at `~/.config/agent-hub/admin-token` on Hetzner, mode 0600). `HUB_ADMINS` is unset because DTC sign-in only admits `@datatalks.club` Google accounts and the right address has not been confirmed; set it with `wrangler secret put HUB_ADMINS` to enable OIDC sign-in.
-- Optional: `HUB_ALERT_TO` (comma-separated bus actors) and `HUB_ALERT_WEBHOOK` (secret).
+- Secrets: `SESSION_SECRET`, `HUB_ADMIN_TOKEN_SHA256` (admin token kept at `~/.config/agent-hub/admin-token` on Hetzner, mode 0600), and `HUB_ALERT_WEBHOOK_TOKEN` for bearer authentication to the default Dapier dev-mailbox webhook. The alert token must come from the existing Dapier webhook configuration and must never be committed or copied into issues or bus messages. Without it, default webhook delivery fails visibly. `HUB_ADMINS` is unset because DTC sign-in only admits `@datatalks.club` Google accounts and the right address has not been confirmed; set it with `wrangler secret put HUB_ADMINS` to enable OIDC sign-in.
+- Optional alert routing: `HUB_ALERT_TO` is a comma-separated list of bus actors that already have active readers. `HUB_ALERT_WEBHOOK` is the webhook URL variable pinned in `wrangler.jsonc` to the existing Dapier `/hooks/webhook/dev` route; it is not a secret. See [Alert routing](ALERT-ROUTING.md) for the no-reader and retry behavior.
 - Deploy: `npx --no-install wrangler deploy` with `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` from `~/.config/cloudflare/agent-branches.env`. Never deploy from a checkout that has a `.dev.vars`.
 
 ## Domain cutover: hub.dtcdev.click

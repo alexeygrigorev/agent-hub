@@ -36,6 +36,15 @@ describe('antigravity placement', () => {
       expect(deep.selected, JSON.stringify(deep.rejected)).toMatchObject({
         machine, engine: 'antigravity', account: 'hub-antigravity', selection: { engine: 'antigravity', provider: 'gemini', id: 'argon', model: 'gemini-4-argon-medium', effort: 'medium' },
       });
+
+      // Operator smoke shape (intake 5b905e55 AC4): engine named with a reason
+      // but no tier. The e0bc0b50 any-tier engine fallback still applies under
+      // the reason regime: argon lives outside daily, so the default tier
+      // alone would refuse every route as model_unsupported.
+      const smoke = fleet.plan({ engine: 'antigravity', engine_override_reason: 'antigravity placement smoke for intake 5b905e55', task_kind: 'ask', machine, mode: 'headless', workspace: 'demo', prompt: 'reply OK' } as any);
+      expect(smoke.selected, JSON.stringify(smoke.rejected)).toMatchObject({
+        machine, engine: 'antigravity', account: 'hub-antigravity', selection: { engine: 'antigravity', provider: 'gemini', id: 'argon' },
+      });
     });
   });
 });
