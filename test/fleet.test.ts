@@ -57,6 +57,74 @@ describe('generic accounts and launch placement', () => {
     expect(unlinked.offers.find((o: any) => o.id === id)?.worker_credential_required).toBeUndefined();
   }));
 
+  it('preserves measured host quota evidence when a fresh central row fails or has no windows', async () => fixture(async (service, sql) => {
+    const account = { label: 'hub-antigravity', provider: 'gemini', enabled: 1 };
+    const route = { machine_id: 'win35', engine: 'antigravity', account: account.label, profile: null };
+    sql.exec('INSERT INTO fleet_accounts (label,provider,max_concurrency,reserve_percent,enabled) VALUES (?,?,?,?,?)', account.label, account.provider, 1, 0, 1);
+    sql.exec('INSERT INTO fleet_routes (machine_id,engine,account,profile) VALUES (?,?,?,?)', route.machine_id, route.engine, route.account, route.profile);
+    const hostQuota = { status: 'unknown', observed_at: iso(-1000), details: { limit_reached: false },
+      windows: { weekly: { present: true, percent_remaining: 0, reset_at: iso(86400000), rolling: false } } };
+    sql.exec('INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)',
+      route.machine_id, account.label, 'gemini', null, iso(-1000), JSON.stringify(hostQuota));
+    const centralError = { status: 'error', observed_at: iso(-1000), details: {},
+      windows: { weekly: { present: false, percent_remaining: null, reset_at: null, error: 'unavailable' } } };
+    sql.exec('INSERT INTO server_quota_snapshots (account,provider,captured_at,quota_json) VALUES (?,?,?,?)',
+      account.label, account.provider, iso(-1000), JSON.stringify(centralError));
+
+    const errored = service.observationProvenance(account, route);
+    expect(errored?.quota.status).toBe('unknown');
+    expect(errored?.quota.windows.weekly.percent_remaining).toBe(0);
+    sql.exec('UPDATE server_quota_snapshots SET quota_json=? WHERE account=?', JSON.stringify({
+      status: 'ok', observed_at: iso(-1000), details: { limit_reached: false }, windows: {},
+    }), account.label);
+    const unmeteredCentral = service.observationProvenance(account, route);
+    expect(unmeteredCentral?.quota.windows.weekly.percent_remaining).toBe(0);
+    expect(unmeteredCentral?.quota.details.unmetered).not.toBe(true);
+  }));
+
+  it('keeps fleet-wide fail-open when the only synthetic unmetered route is offline', async () => fixture(async (service, sql) => {
+    await configure(service);
+    const unknown = { status: 'unknown', observed_at: iso(-1000), details: {}, windows: {} };
+    for (const machine of ['hetzner', 'win35']) {
+      sql.exec('UPDATE host_quota_snapshots SET routes_json=? WHERE host_id=?', JSON.stringify({ codex: unknown, claude: unknown }), machine);
+    }
+    sql.exec('INSERT INTO fleet_accounts (label,provider,max_concurrency,reserve_percent,enabled) VALUES (?,?,?,?,?)', 'hub-antigravity', 'gemini', 1, 0, 1);
+    sql.exec('INSERT INTO fleet_routes (machine_id,engine,account,profile) VALUES (?,?,?,NULL)', 'win35', 'antigravity', 'hub-antigravity');
+    sql.exec('UPDATE machines SET last_checkin_at=? WHERE id=?', iso(-300000), 'win35');
+    const unmetered = { label: 'hub-antigravity', provider: 'gemini', enabled: 1 };
+    expect(service.observationProvenance(unmetered, { machine_id: 'win35', engine: 'antigravity', account: 'hub-antigravity', profile: null })).toBeNull();
+
+    const plan = service.plan(intent());
+    expect(plan.candidates.some((candidate: any) => candidate.account === 'shared-codex')).toBe(true);
+    expect(plan.selected?.account).toBe('shared-codex');
+  }));
+
+  it('includes later-route sessions in family load before scoring the first route', async () => fixture(async (service, sql) => {
+    await configure(service);
+    sql.exec(`INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account,last_activity_at)
+      VALUES ('win35','active-later','test','codex','running',NULL,?,'demo',NULL,'desktop-codex',?)`, iso(-1000), iso(-1000));
+    const plan = service.plan(intent());
+    const firstRoute = plan.candidates.find((candidate: any) => candidate.account === 'shared-codex');
+    expect(firstRoute?.decision.factors.active_family).toBe(1);
+  }));
+
+  it('ranks a failed unmetered route with measured account headroom from its sibling route', async () => fixture(async (service, sql) => {
+    const account = 'hub-antigravity';
+    sql.exec('INSERT INTO fleet_accounts (label,provider,max_concurrency,reserve_percent,enabled) VALUES (?,?,?,?,?)', account, 'gemini', 1, 0, 1);
+    for (const machine of ['hetzner', 'win35']) {
+      sql.exec('UPDATE machines SET capabilities=? WHERE id=?', JSON.stringify({ engines: ['codex', 'claude', 'antigravity'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }), machine);
+      sql.exec('INSERT INTO fleet_routes (machine_id,engine,account,profile) VALUES (?,?,?,NULL)', machine, 'antigravity', account);
+    }
+    const quota = { status: 'ok', observed_at: iso(-1000), details: { limit_reached: false },
+      windows: { weekly: { present: true, percent_remaining: 20, reset_at: iso(86400000), rolling: false } } };
+    sql.exec('INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)',
+      'win35', account, 'gemini', null, iso(-1000), JSON.stringify(quota));
+
+    const plan = service.plan(intent({ engine: 'antigravity' }));
+    const failedRoute = plan.candidates.find((candidate: any) => candidate.machine === 'hetzner');
+    expect(failedRoute?.decision.factors.remaining_pct).toBe(20);
+  }));
+
   it('changes real Fleet placement for banked deadlines and excludes only the depleted account', async () => fixture(async (service, sql) => {
     await configure(service);
     const quota = (pct: number, banked = false) => ({ status: 'ok', observed_at: iso(-1000),
