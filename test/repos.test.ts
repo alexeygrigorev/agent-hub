@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { env, runInDurableObject } from 'cloudflare:test';
+import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { RepoRegistry } from '../src/repos';
 import { toolRequest } from '../src/mcp-tools';
+import { createSessionCookie } from '../src/auth/session';
 
 const admin = { caller: { kind: 'human', isAdmin: true }, scopes: ['admin'] };
 const host = { caller: { kind: 'host', machineId: 'hetzner' }, scopes: ['host'] };
@@ -20,6 +21,71 @@ async function fixture(fn: (registry: RepoRegistry, hub: Hub, state: any) => Pro
 const seed = (r: RepoRegistry, repos = [repo()]) => r.handle(req('/seed', 'POST', { repos }), admin);
 
 describe('private repo registry', () => {
+  it('classifies duplicates through the exported Worker, authenticated health and Durable Object', async () => {
+    const binding = env as unknown as Env;
+    const csrf = crypto.randomUUID();
+    const cookie = (await createSessionCookie(binding, {
+      sub: 'repo-runtime-operator', email: 'admin@fake.local', isAdmin: true,
+      csrfToken: csrf, exp: Math.floor(Date.now() / 1000) + 3600,
+    })).split(';')[0];
+    const health = await SELF.fetch('https://hub.test/api/healthz', { headers: { Cookie: cookie } });
+    expect(health.status, await health.clone().text()).toBe(200);
+    expect(await health.json()).toEqual({ status: 'ok', component: 'hub-do' });
+    const anonymousHealth = await SELF.fetch('https://hub.test/api/healthz');
+    expect(anonymousHealth.status).toBe(401);
+
+    const call = (path: string, method = 'GET', body?: unknown, authenticated = true) =>
+      SELF.fetch('https://hub.test/api/repos' + path, {
+        method, headers: { 'Content-Type': 'application/json',
+          ...(authenticated ? { Cookie: cookie, 'x-csrf-token': csrf } : {}) },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+    const target = 'runtime-target-' + crypto.randomUUID();
+    const copy = 'runtime-copy-' + crypto.randomUUID();
+    const seeded = await call('/seed', 'POST', { repos: [
+      repo({ name: target, aliases: [] }), repo({ name: copy, aliases: [] }),
+    ] });
+    expect(seeded.status, await seeded.clone().text()).toBe(200);
+    const update = { status: 'duplicate', canonical: target };
+    expect((await call('/' + copy, 'PATCH', update, false)).status).toBe(401);
+    const patched = await call('/' + copy, 'PATCH', update);
+    expect(patched.status, await patched.clone().text()).toBe(200);
+    expect(await patched.json()).toMatchObject({ repo: { name: copy, ...update } });
+    const refreshed = await call('/refresh', 'POST', { repos: [{
+      name: copy, machine: 'hetzner', dir: '/srv/git/copy', status: 'active', canonical: null,
+    }] });
+    expect(refreshed.status, await refreshed.clone().text()).toBe(200);
+    const shown = await call('/' + copy);
+    expect(await shown.json()).toMatchObject({ repo: { name: copy, ...update }, canonical: target });
+    const invalid = await call('/' + copy, 'PATCH', { status: 'duplicate', canonical: copy });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toEqual({ error: 'invalid_canonical' });
+  });
+  it('proves PATCH API readiness using a missing repo without writing', async () => {
+    const binding = env as unknown as Env;
+    const csrf = crypto.randomUUID();
+    const cookie = (await createSessionCookie(binding, {
+      sub: 'repo-readiness-probe', email: 'admin@fake.local', isAdmin: true,
+      csrfToken: csrf, exp: Math.floor(Date.now() / 1000) + 3600,
+    })).split(';')[0];
+    const probe = 'readiness-probe-' + crypto.randomUUID();
+    const url = 'https://hub.test/api/repos/' + probe;
+    const headers = { Cookie: cookie, 'x-csrf-token': csrf, 'Content-Type': 'application/json' };
+    const get = () => SELF.fetch(url, { headers: { Cookie: cookie } });
+
+    const before = await get();
+    expect(before.status).toBe(404);
+    expect(await before.json()).toEqual({ error: 'repo_not_found' });
+    const response = await SELF.fetch(url, {
+      method: 'PATCH', headers,
+      body: JSON.stringify({ status: 'duplicate', canonical: 'readiness-probe-target' }),
+    });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'repo_not_found' });
+    const after = await get();
+    expect(after.status).toBe(404);
+    expect(await after.json()).toEqual({ error: 'repo_not_found' });
+  });
   it('persists verbatim human cells across instances and reseeding', () => fixture(async (r, hub, state) => {
     expect((await seed(r)).status).toBe(200);
     const reloaded = new RepoRegistry(hub.sql, fn => state.storage.transactionSync(fn));
