@@ -1271,32 +1271,41 @@ export class FleetService {
     // window, and only count failures a route can be blamed for: capacity holds,
     // expired offers and model refusals say nothing about the account (they were
     // the reason every route read fail=8, the global cap of the old per-label count).
-    const recentFailuresByRoute = new Map<string, number>();
+    const recentFailuresByRoute = new Map<string, { n: number; launcher: string[] }>();
     const hostLaunchCounts = new Map<string, { pending: number; running: number }>();
-    const countRecentAccountFailures = (acct: string, machineId: string): number => {
+    const routeFailures = (acct: string, machineId: string): { n: number; launcher: string[] } => {
       const key = acct + ' ' + machineId;
       if (!recentFailuresByRoute.has(key)) {
         let n = 0;
+        let launcher: string[] = [];
         try {
           const sinceIso = new Date(this.now() - ROUTE_FAILURE_WINDOW_MS).toISOString();
           const skip = [...ROUTE_FAILURE_NEUTRAL_REASONS];
-          n = this.sql.exec(`SELECT 1 FROM fleet_launches WHERE account = ? AND machine_id = ? AND state = 'failed' AND exit_reason IS NOT NULL AND exit_reason NOT IN (${skip.map(() => '?').join(',')}) AND updated_at > ? LIMIT ${ROUTE_FAILURE_CAP}`,
-            acct, machineId, ...skip, sinceIso).toArray().length;
-        } catch { n = 0; }
-        recentFailuresByRoute.set(key, n);
+          const rows = this.sql.exec(`SELECT exit_reason, updated_at FROM fleet_launches WHERE account = ? AND machine_id = ? AND state = 'failed' AND exit_reason IS NOT NULL AND exit_reason NOT IN (${skip.map(() => '?').join(',')}) AND updated_at > ? ORDER BY updated_at DESC LIMIT ${ROUTE_FAILURE_CAP}`,
+            acct, machineId, ...skip, sinceIso).toArray() as any[];
+          n = rows.length;
+          launcher = rows.filter(r => r.exit_reason === 'launcher_command_failed').map(r => String(r.updated_at));
+        } catch { n = 0; launcher = []; }
+        recentFailuresByRoute.set(key, { n, launcher });
       }
       return recentFailuresByRoute.get(key)!;
     };
+    const countRecentAccountFailures = (acct: string, machineId: string): number => routeFailures(acct, machineId).n;
+    // Reuses the per-route failure statement above (no extra SQL call per route). Only when it shows
+    // ROUTE_QUARANTINE_FAILURES launcher_command_failed rows inside the window does one more statement check that
+    // no other launch on the route is newer than the third of them (a start or other outcome re-opens the route).
     const quarantineByRoute = new Map<string, boolean>();
     const routeQuarantined = (acct: string, machineId: string): boolean => {
       const key = acct + ' ' + machineId;
       if (!quarantineByRoute.has(key)) {
         let q = false;
         try {
-          const sinceIso = new Date(this.now() - ROUTE_QUARANTINE_WINDOW_MS).toISOString();
-          const recent = this.sql.exec(`SELECT state, exit_reason FROM fleet_launches WHERE account = ? AND machine_id = ? AND updated_at > ? ORDER BY updated_at DESC LIMIT ${ROUTE_QUARANTINE_FAILURES}`,
-            acct, machineId, sinceIso).toArray() as any[];
-          q = recent.length >= ROUTE_QUARANTINE_FAILURES && recent.every(r => r.state === 'failed' && r.exit_reason === 'launcher_command_failed');
+          const cutoff = new Date(this.now() - ROUTE_QUARANTINE_WINDOW_MS).toISOString();
+          const inWindow = routeFailures(acct, machineId).launcher.filter(t => t > cutoff);
+          if (inWindow.length >= ROUTE_QUARANTINE_FAILURES) {
+            const third = inWindow[ROUTE_QUARANTINE_FAILURES - 1];
+            q = this.sql.exec(`SELECT 1 FROM fleet_launches WHERE account = ? AND machine_id = ? AND updated_at > ? AND NOT (state = 'failed' AND exit_reason = 'launcher_command_failed') LIMIT 1`, acct, machineId, third).toArray().length === 0;
+          }
         } catch { q = false; }
         quarantineByRoute.set(key, q);
       }
