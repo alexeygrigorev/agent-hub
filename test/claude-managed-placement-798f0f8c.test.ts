@@ -7,7 +7,7 @@ import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
 describe('managed Claude placement (798f0f8c)', () => {
-  it('keeps deep and daily Claude starts on Sonnet at medium effort across both hosts', async () => {
+  it('keeps daily Claude on Sonnet and routes reasoned deep starts to medium Opus across both hosts', async () => {
     const now = Date.now();
     const iso = (delta = 0) => new Date(now + delta).toISOString();
     const bindings = env as unknown as Env;
@@ -38,10 +38,13 @@ describe('managed Claude placement (798f0f8c)', () => {
         }), { caller: { machineId: machine, actor: 'machine:' + machine, kind: 'host' }, scopes: ['host'] });
         expect(reported.status).toBe(200);
         for (const tier of ['deep', 'daily']) {
-          const plan = fleet.plan({ engine: 'claude', tier, machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' });
+          const plan = fleet.plan({ engine: 'claude', tier,
+            ...(tier === 'deep' ? { engine_override_reason: 'This task requires deep reasoning.' } : {}),
+            machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' });
+          const expectedModel = tier === 'deep' ? 'opus' : 'sonnet';
           expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({
             machine, engine: 'claude', account: 'hub-claude', profile: 'hub-hub-claude',
-            selection: { model: 'sonnet', effort: 'medium', engine: 'claude', provider: 'claude' },
+            selection: { model: expectedModel, effort: 'medium', engine: 'claude', provider: 'claude' },
           });
           expect(plan.selected?.mode).toBeUndefined();
           expect(plan.selected?.with_goal).toBeUndefined();
@@ -75,10 +78,10 @@ describe('managed Claude placement (798f0f8c)', () => {
         } })) }),
       }), { caller: { machineId: machine, actor: 'machine:' + machine, kind: 'host' }, scopes: ['host'] });
       expect(reported.status).toBe(200);
-      const intent = { engine: 'claude', tier: 'deep', machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' };
+      const intent = { engine: 'claude', engine_override_reason: 'This task explicitly requires deep reasoning.', tier: 'deep', machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' };
       const plan = fleet.plan(intent);
       expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({
-        account: 'hub-claude', selection: { model: 'sonnet', effort: 'medium' },
+        account: 'hub-claude', selection: { model: 'opus', effort: 'medium' },
       });
       expect(plan.selected?.mode).toBeUndefined();
       expect(plan.request.mode).toBe('headless');

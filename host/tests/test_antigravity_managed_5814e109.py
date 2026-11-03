@@ -94,7 +94,9 @@ def test_requested_models_resolve_through_the_gemini_policy_family():
     from agent_hub_host.model_contract import policy_models
     policy = policy_models()
     default = p.launcher_metadata('antigravity', {'args': []})['launcher_model']
+    assert default == 'gemini-4-argon-medium'
     assert p.managed_model_allowed('antigravity', default, policy)
-    assert p.managed_model_allowed('antigravity', 'gemini-4-argon-high', policy)
+    assert p.managed_model_allowed('antigravity', 'gemini-4-argon-medium', policy)
+    assert not p.managed_model_allowed('antigravity', 'gemini-4-argon-high', policy)
     assert not p.managed_model_allowed('antigravity', 'opus', policy)
     assert not p.managed_model_allowed('antigravity', 'gemini-0-unknown', policy)

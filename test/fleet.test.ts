@@ -244,8 +244,9 @@ describe('generic accounts and launch placement', () => {
       sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
       sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
       await s.handle(request('/subscriptions', { subscriptions: [{ service: 'gemini', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
-      expect(s.plan(intent({ engine: modelId })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: modelId, model: 'gemini-4-argon-high' } });
-      expect(s.plan(intent({ tier: 'deep', engine })).selected?.selection).toMatchObject({ id: modelId, model: 'gemini-4-argon-high' });
+      const reason = 'This task explicitly requires the selected Gemini deep model.';
+      expect(s.plan(intent({ engine: modelId, engine_override_reason: reason })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' } });
+      expect(s.plan(intent({ tier: 'deep', engine, engine_override_reason: reason })).selected?.selection).toMatchObject({ id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' });
     }
   }));
   it('filters Grok models behind allowed aliases from automatic placement and old offer claims', async () => fixture(async (s, sql) => {
@@ -1092,10 +1093,10 @@ describe('generic accounts and launch placement', () => {
     expect(s.plan(intent()).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
     expect(s.plan(intent({ mode: 'interactive', prompt: '' })).selected?.machine).toBe('hetzner');
   }));
-  it('places default daily work on eligible Gemini and falls back to Z.ai when Gemini is depleted (intakes 4f6cf562/85318207)', async () => fixture(async (s, sql) => {
+  it('keeps deep Gemini out of daily placement and falls back to Z.ai when no daily Gemini model is eligible (intakes 4f6cf562/85318207)', async () => fixture(async (s, sql) => {
     // One host advertises Claude, Gemini and Z.ai, but refuses Claude headless.
-    // Gemini is now eligible for daily work; known quota exhaustion must still
-    // route the same default goal through the remaining admitted Z.ai model.
+    // Argon is a deep model, so this Gemini account has no eligible daily
+    // model. Default work routes through the remaining admitted Z.ai model.
     const entries = [['shared-claude', 'claude', 'claude', 90], ['shared-gemini', 'gemini', 'antigravity', 50], ['shared-zai', 'zai', 'zcodex', 20]];
     const config = {
       accounts: entries.map(([label, provider]) => ({ label, provider, max_concurrency: 8, reserve_percent: 0, enabled: true })),
@@ -1108,21 +1109,21 @@ describe('generic accounts and launch placement', () => {
       fleet_route_rejections: [{ engine: 'claude', account: 'shared-claude', profile: null, mode: 'headless', reason: 'model_unsupported' }] };
     sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'hetzner');
     const headless = s.plan(intent({ mode: 'headless' }));
-    expect(headless.selected?.engine, JSON.stringify(headless.rejected)).toBe('antigravity');
-    expect(headless.selected?.account).toBe('shared-gemini');
-    expect(headless.selected?.selection).toMatchObject({ id: 'argon' });
+    expect(headless.selected?.engine, JSON.stringify(headless.rejected)).toBe('zcodex');
+    expect(headless.selected?.account).toBe('shared-zai');
+    expect(headless.selected?.selection).toMatchObject({ id: 'glm-flash', model: 'glm-5.3-flash' });
     expect(headless.rejected).toContainEqual({ machine: 'hetzner', engine: 'claude', reason: 'model_unsupported' });
-    expect(headless.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
+    expect(headless.rejected).toContainEqual({ machine: 'hetzner', engine: 'antigravity', reason: 'model_unsupported' });
     // The headless refusal remains mode-scoped, and actual quota headroom
     // still lets the healthier Claude account win this interactive request.
     const interactive = s.plan(intent({ mode: 'interactive', prompt: '' }));
     expect(interactive.selected?.engine, JSON.stringify(interactive.rejected)).toBe('claude');
     expect(interactive.selected?.selection).toMatchObject({ id: 'sonnet' });
-    expect(interactive.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
+    expect(interactive.rejected).toContainEqual({ machine: 'hetzner', engine: 'antigravity', reason: 'model_unsupported' });
     expect(interactive.rejected).not.toContainEqual(expect.objectContaining({ engine: 'claude' }));
-    const deep = s.plan(intent({ mode: 'headless', tier: 'deep' }));
+    const deep = s.plan(intent({ mode: 'headless', tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning.' }));
     expect(deep.selected?.engine, JSON.stringify(deep.rejected)).toBe('antigravity');
-    expect(deep.selected?.selection).toMatchObject({ id: 'argon' });
+    expect(deep.selected?.selection).toMatchObject({ id: 'argon', model: 'gemini-4-argon-medium', effort: 'medium' });
     expect(deep.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
     // Subscription reports replace the entire host snapshot; retain the healthy
     // fallback accounts while reporting Gemini's known exhausted quota.
