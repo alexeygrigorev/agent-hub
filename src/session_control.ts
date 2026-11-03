@@ -1733,27 +1733,28 @@ export class SessionControlService {
                   const observedNative = (s.actor === 'unknown' || linkedRequest.provenance === 'observed_native' ||
                     linkedBinding?.provenance === 'observed_native') && !s.fleet_launch_id;
                   if (observedNative) {
-                    let observedAt = NaN;
                     try {
-                      const observed: any = this.sql.exec('SELECT observed_at FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
-                        s.machine_id, s.id).toArray()[0];
-                      observedAt = Date.parse(observed?.observed_at ?? linkedBinding?.observed_at ?? s.updated_at);
-                    } catch { observedAt = Date.parse(linkedBinding?.observed_at ?? s.updated_at); }
-                    if (!Number.isFinite(observedAt) || observedAt > now + 60000 || now - observedAt > 180000) return false;
+                      if (typeof linkedBinding?.native_id !== 'string' || !s.machine_id) return false;
+                      const observed: any = this.sql.exec(`SELECT f.native_id, f.tag, f.engine, f.phase, f.workspace,
+                        f.created_at_ms, c.observed_at AS census_at, c.complete AS census_complete
+                        FROM fleet_sessions f LEFT JOIN fleet_catalog_census c ON c.machine_id = f.machine_id
+                        WHERE f.machine_id = ? AND f.native_id = ?`, s.machine_id, linkedBinding.native_id).toArray()[0];
+                      const censusAt = Date.parse(String(observed?.census_at ?? ''));
+                      if (!observed || observed.census_complete !== 1 || !Number.isFinite(censusAt) ||
+                          censusAt > now + 60000 || now - censusAt > 180000 ||
+                          !['starting', 'running'].includes(String(observed.phase))) return false;
+                      if ((linkedBinding.tag && observed.tag !== linkedBinding.tag) ||
+                          (linkedBinding.workspace && observed.workspace !== linkedBinding.workspace) ||
+                          (s.engine && observed.engine !== s.engine) ||
+                          (Number.isSafeInteger(linkedBinding.native_created_at_ms) &&
+                            observed.created_at_ms !== linkedBinding.native_created_at_ms)) return false;
+                    } catch { return false; }
                   }
                   return true;
                 };
                 const candidates = linkIds.map(id => linkedRows.get(id)).filter(isLiveReplacement)
                   .sort((a: any, b: any) => Date.parse(String(b.created_at)) - Date.parse(String(a.created_at)) || String(b.id).localeCompare(String(a.id)));
                 let supersededBy: string | null = candidates.length ? String(candidates[0].id) : null;
-                if (!supersededBy && isRecovery) {
-                  const siblings = this.sql.exec(
-                    "SELECT id, state, created_at, updated_at, actor, machine_id, fleet_launch_id, request_json, binding_json FROM session_control_sessions WHERE id <> ? AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.intake_task_id') = ? AND state IN ('queued','offered','starting','running','uncertain','held') ORDER BY created_at DESC, id DESC LIMIT 16",
-                    row.id, req.intake_task_id,
-                  ).toArray() as any[];
-                  const winningSibling = siblings.find(isLiveReplacement);
-                  if (winningSibling) supersededBy = String(winningSibling.id);
-                }
                 if (supersededBy) {
                   const at = this.at();
                   const supersededHold = JSON.stringify({
