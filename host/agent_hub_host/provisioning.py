@@ -1216,7 +1216,21 @@ def profile_path():
     return base / 'aplexer' / 'config.toml'
 
 
+class LauncherUnavailable(OSError):
+    """The managed Windows engine launcher could not be materialized (retryable)."""
+
+
 def _windows_exe_launcher(command, label, stub=None):
+    """Native exe launcher for `a task run --engine opencode --profile hub-<label>`.
+
+    Never returns the bare python command: aplexer would run `python.exe run -c ...`
+    ("can't open file '...\run'", exit 2 after 0 s). Proven race (intake: launcher fallback):
+    MoveFileExW cannot replace an .exe that a running muse session holds open (ERROR_ACCESS_DENIED),
+    so a profile sync during any active run used to fall back to the python form.
+    The bytes are deterministic, an identical existing launcher is reused without any write, and when
+    the canonical path is busy the new content goes to a content-addressed sibling that nothing can
+    be running yet. The previous file is never removed first."""
+    import hashlib
     import io
     import zipfile
     if stub is None:
@@ -1229,19 +1243,73 @@ def _windows_exe_launcher(command, label, stub=None):
             pass
         stub = next((c for c in candidates if c.is_file()), None)
     if stub is None:
-        return command
+        raise LauncherUnavailable('no launcher stub available for ' + label)
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, 'w') as z:
-        z.writestr('__main__.py', command[2])
+        # Fixed timestamp: identical code must give identical bytes so a sync can skip the write.
+        info = zipfile.ZipInfo('__main__.py', date_time=(2020, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_STORED
+        z.writestr(info, command[2])
     shebang = ('#!"' + command[0] + '"').encode('utf-8') + bytes((13, 10))
+    data = stub.read_bytes() + shebang + archive.getvalue()
     path = root() / 'engine-launch' / (label + '.exe')
     try:
-        with private_fs.parent(path, create=True):
-            pass
-        private_fs.atomic_write(path, stub.read_bytes() + shebang + archive.getvalue(), 4 * 1024 * 1024)
-    except (OSError, ValueError):
-        return command
-    return [str(path), label]
+        if path.is_file() and path.read_bytes() == data:
+            return [str(path), label]
+    except OSError:
+        pass
+    last = None
+    for attempt in range(3):
+        try:
+            with private_fs.parent(path, create=True):
+                pass
+            private_fs.atomic_write(path, data, 4 * 1024 * 1024)
+            return [str(path), label]
+        except (OSError, ValueError) as exc:
+            last = exc
+            time.sleep(0.2 * (attempt + 1))
+    # Canonical path busy (a running session holds it open): publish under a new name instead.
+    alt = root() / 'engine-launch' / (label + '-' + hashlib.sha256(data).hexdigest()[:12] + '.exe')
+    try:
+        if not (alt.is_file() and alt.read_bytes() == data):
+            private_fs.atomic_write(alt, data, 4 * 1024 * 1024)
+        _prune_launchers(alt.parent, label, keep=alt)
+        return [str(alt), label]
+    except (OSError, ValueError) as exc:
+        raise LauncherUnavailable('cannot materialize launcher for %s: %s / %s' % (label, last, exc)) from exc
+
+
+def _prune_launchers(directory, label, keep):
+    """Best-effort removal of superseded content-addressed launchers; busy ones are left alone."""
+    for old in Path(directory).glob(label + '-*.exe'):
+        if old != keep:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+
+def _previous_profile_command(text, name):
+    """Launcher argv of an existing `[profiles.<name>]` block, or None when absent or the bare python form."""
+    header = '[profiles.' + name + ']'
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() != header:
+            continue
+        for follow in lines[i + 1:]:
+            if follow.lstrip().startswith('['):
+                break
+            key, _, raw = follow.partition('=')
+            if key.strip() == 'command':
+                try:
+                    value = json.loads(raw.strip())
+                except ValueError:
+                    return None
+                if (isinstance(value, list) and value and isinstance(value[0], str)
+                        and not value[0].replace(chr(92), '/').rsplit('/', 1)[-1].lower().startswith('python')):
+                    return value
+                return None
+    return None
 
 
 def _posix_engine_launcher(command, label, windows=False):
@@ -1263,8 +1331,8 @@ def _posix_engine_launcher(command, label, windows=False):
             pass
         private_fs.atomic_write(path, body.encode('utf-8'), 65536)
         os.chmod(path, 0o700)
-    except (OSError, ValueError):
-        return command
+    except (OSError, ValueError) as exc:
+        raise LauncherUnavailable('cannot materialize launcher for %s: %s' % (label, exc)) from exc
     return [str(path), label]
 
 
@@ -1344,6 +1412,7 @@ def profiles(bundles, path=None, is_windows=None):
         text = 'version = 1\n'
     if text.count(BEGIN) != text.count(END) or text.count(BEGIN) > 1:
         raise ValueError('Invalid managed profile block')
+    old_text = text
     if BEGIN in text:
         before, rest = text.split(BEGIN)
         _, after = rest.split(END)
@@ -1356,7 +1425,14 @@ def profiles(bundles, path=None, is_windows=None):
         # Only public label and paths go into native registry command metadata.
         command = module_command('execute', b['label'])
         if b.get('provider') == 'go':
-            command = _posix_engine_launcher(command, b['label'], windows=(os.name == 'nt' if is_windows is None else bool(is_windows)))
+            try:
+                command = _posix_engine_launcher(command, b['label'], windows=(os.name == 'nt' if is_windows is None else bool(is_windows)))
+            except LauncherUnavailable:
+                # Never publish the bare python form (aplexer runs `python run`, exit 2). Keep the
+                # previous launcher entry; with none, fail this sync so the next one retries.
+                command = _previous_profile_command(old_text, name)
+                if command is None:
+                    raise
         block += '\n[profiles.' + name + ']\nengine = ' + json.dumps(PACKAGES[b['provider']][2]) + '\ncommand = ' + json.dumps(command) + '\n'
     # After our block is stripped, any [engines.opencode] left in the file is
     # operator-owned and wins over the managed pin (duplicate tables would not

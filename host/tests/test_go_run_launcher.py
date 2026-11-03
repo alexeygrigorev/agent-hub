@@ -73,5 +73,77 @@ class WindowsLauncherAndStalePin(unittest.TestCase):
         self.assertEqual(p._drop_stale_release_opencode_pin('version = 1\n'), 'version = 1\n')
 
 
+class LauncherRace(unittest.TestCase):
+    """Replacing an .exe a running muse session holds open fails on Windows (ERROR_ACCESS_DENIED);
+    that used to make the profile fall back to `python.exe run -c ...` (exit 2)."""
+
+    def _setup(self):
+        tmp = Path(tempfile.mkdtemp())
+        stub = tmp / 'stub.exe'
+        stub.write_bytes(b'MZ-stub')
+        (tmp / 'engine-launch').mkdir()
+        return tmp, stub, ['C:/py/python.exe', '-c', 'print(1)', 'shared-go']
+
+    @staticmethod
+    def _plain_write(path, raw, limit, **kw):
+        Path(path).write_bytes(raw)
+
+    def _run(self, tmp, stub, command, write):
+        with mock.patch.object(p, 'root', lambda: tmp),                 mock.patch.object(p.private_fs, 'parent', mock.MagicMock()),                 mock.patch.object(p.private_fs, 'atomic_write', write):
+            return p._windows_exe_launcher(command, 'shared-go', stub=stub)
+
+    def test_identical_launcher_is_not_rewritten(self):
+        tmp, stub, command = self._setup()
+        first = self._run(tmp, stub, command, self._plain_write)
+        calls = []
+        again = self._run(tmp, stub, command, lambda *a, **k: calls.append(a))
+        self.assertEqual(first, again)
+        self.assertEqual(calls, [])
+
+    def test_busy_launcher_keeps_old_file_and_never_returns_python(self):
+        tmp, stub, command = self._setup()
+        canonical = self._run(tmp, stub, command, self._plain_write)
+        old_bytes = Path(canonical[0]).read_bytes()
+        changed = ['C:/py2/python.exe'] + command[1:]
+
+        def busy(path, raw, limit, **kw):
+            if Path(path).name == 'shared-go.exe':
+                raise PermissionError(13, 'Access is denied')
+            Path(path).write_bytes(raw)
+
+        with mock.patch.object(p.time, 'sleep'):
+            result = self._run(tmp, stub, changed, busy)
+        self.assertNotEqual(Path(result[0]).name.lower().split('.')[0], 'python')
+        self.assertTrue(result[0].endswith('.exe'))
+        self.assertNotEqual(result[0], canonical[0])
+        self.assertEqual(result[1], 'shared-go')
+        self.assertEqual(Path(canonical[0]).read_bytes(), old_bytes)  # old launcher stays complete
+        self.assertIn(b'C:/py2/python.exe', Path(result[0]).read_bytes())
+
+    def test_total_failure_raises_retryable_error_instead_of_python_form(self):
+        tmp, stub, command = self._setup()
+
+        def broken(*a, **k):
+            raise PermissionError(13, 'Access is denied')
+
+        with mock.patch.object(p.time, 'sleep'), self.assertRaises(p.LauncherUnavailable):
+            self._run(tmp, stub, command, broken)
+
+    def test_missing_stub_raises(self):
+        tmp, stub, command = self._setup()
+        with mock.patch.object(p, 'root', lambda: tmp), mock.patch.object(p.Path, 'is_file', lambda self: False):
+            with self.assertRaises(p.LauncherUnavailable):
+                p._windows_exe_launcher(command, 'shared-go')
+
+    def test_previous_profile_command_ignores_bare_python(self):
+        bs = chr(92)
+        exe = 'C:' + bs + bs + 'x' + bs + bs + 'shared-go.exe'
+        good = 'version = 1' + chr(10) + '[profiles.hub-shared-go]' + chr(10) + 'engine = "opencode"' + chr(10) + 'command = ["' + exe + '", "shared-go"]' + chr(10)
+        bad = good.replace('shared-go.exe', 'python.exe')
+        self.assertEqual(p._previous_profile_command(good, 'hub-shared-go'), ['C:' + bs + 'x' + bs + 'shared-go.exe', 'shared-go'])
+        self.assertIsNone(p._previous_profile_command(bad, 'hub-shared-go'))
+        self.assertIsNone(p._previous_profile_command('version = 1' + chr(10), 'hub-shared-go'))
+
+
 if __name__ == '__main__':
     unittest.main()
