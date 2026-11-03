@@ -101,7 +101,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
     const id = (env as any).HUB.idFromName("hub");
     const stub = (env as any).HUB.get(id);
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      await resetAndSeedIntegrationDb(instance.ctx.storage.sql);
+      await resetAndSeedIntegrationDb(instance.sql);
     });
   });
 
@@ -115,13 +115,13 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     // Setup two offered root-run jobs offered to host-alpha and host-beta respectively
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-race-root-alpha', 'root-run', 'root-run:race-alpha', JSON.stringify({}), 'offered', now, future, 'role:root',
         'host-alpha', 'host-alpha', future
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-race-root-beta', 'root-run', 'root-run:race-beta', JSON.stringify({}), 'offered', now, future, 'role:root',
@@ -155,7 +155,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     // Verify exactly one lease holder in SQLite with epoch 1
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const lease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
+      const lease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
       expect(['job-race-root-alpha', 'job-race-root-beta']).toContain(lease.holder_job_id);
       expect(['host-alpha', 'host-beta']).toContain(lease.holder_host_id);
       expect(lease.epoch).toBe(1);
@@ -172,24 +172,24 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
       // Set active root lease for host-alpha
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `UPDATE leases SET holder_job_id = 'job-healthy-root', holder_host_id = 'host-alpha', holder_machine_id = 'host-alpha', epoch = 1, acquired_at = ?, renewed_at = ?, expires_at = ? WHERE name = 'root'`,
         now, now, future
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, holder_machine_id, lease_epoch, started_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-healthy-root', 'root-run', 'root-run:healthy-1', JSON.stringify({}), 'running', now, future, 'role:root',
         'host-alpha', 'host-alpha', 1, now
       );
       // Register agent as working/healthy
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO agents (tag, project, role, machine_id, state, health_state, last_seen_at)
          VALUES ('root', 'system', 'root', 'host-alpha', 'working', 'healthy', ?)`,
         now
       );
       // Candidate job for host-beta
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-candidate-beta', 'root-run', 'root-run:cand-beta', JSON.stringify({}), 'offered', now, future, 'role:root',
@@ -223,7 +223,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     // Lease remains safely held by host-alpha
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const lease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
+      const lease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
       expect(lease.holder_job_id).toBe('job-healthy-root');
       expect(lease.epoch).toBe(1);
     });
@@ -241,27 +241,27 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
       // Host Alpha checkin is stale (10m ago)
-      instance.ctx.storage.sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id = 'host-alpha'", pastTime);
+      instance.sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id = 'host-alpha'", pastTime);
 
       // Stale root lease with expired deadline
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `UPDATE leases SET holder_job_id = 'job-stale-root', holder_host_id = 'host-alpha', holder_machine_id = 'host-alpha', epoch = 1, acquired_at = ?, renewed_at = ?, expires_at = ? WHERE name = 'root'`,
         pastTime, pastTime, expiredTime
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, holder_machine_id, lease_epoch, started_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-stale-root', 'root-run', 'root-run:stale-1', JSON.stringify({}), 'running', pastTime, expiredTime, 'role:root',
         'host-alpha', 'host-alpha', 1, pastTime
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO agents (tag, project, role, machine_id, state, health_state, last_seen_at)
          VALUES ('root', 'system', 'root', 'host-alpha', 'broken', 'stale', ?)`,
         pastTime
       );
 
       // Candidate job for host-beta
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-takeover-beta', 'root-run', 'root-run:to-beta', JSON.stringify({}), 'offered', new Date().toISOString(), future, 'role:root',
@@ -295,12 +295,12 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     // Verify DB updated: new holder is host-beta, epoch 2, old job marked fenced
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const lease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
+      const lease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
       expect(lease.holder_job_id).toBe('job-takeover-beta');
       expect(lease.holder_host_id).toBe('host-beta');
       expect(lease.epoch).toBe(2);
 
-      const oldJob = instance.ctx.storage.sql.exec("SELECT * FROM jobs WHERE id = 'job-stale-root'").toArray()[0];
+      const oldJob = instance.sql.exec("SELECT * FROM jobs WHERE id = 'job-stale-root'").toArray()[0];
       expect(oldJob.status).toBe('fenced');
     });
   });
@@ -316,17 +316,17 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
     const tokenJobExpired = await sha256('token_job_expired');
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `UPDATE leases SET holder_job_id = 'job-expired-1', holder_host_id = 'host-alpha', holder_machine_id = 'host-alpha', epoch = 1, acquired_at = ?, renewed_at = ?, expires_at = ? WHERE name = 'root'`,
         pastTime, pastTime, expiredTime
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, holder_machine_id, claim_token_hash, lease_epoch, started_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-expired-1', 'root-run', 'root-run:exp-1', JSON.stringify({}), 'running', pastTime, expiredTime, 'role:root',
         'host-alpha', 'host-alpha', tokenJobExpired, 1, pastTime
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
          VALUES (?, 'job', ?, ?, ?, ?, ?, ?, 'system', ?, ?)`,
         'cred_job_exp', tokenJobExpired, 'fam_j_exp', 'job-expired-1', 'host-alpha', 'role:root', JSON.stringify(['lease:root', 'jobs:create']), pastTime, expiredTime
@@ -343,10 +343,10 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     // Verify in DB that job was marked expired and lease cleared
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const lease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
+      const lease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
       expect(lease.holder_job_id).toBeNull();
 
-      const job = instance.ctx.storage.sql.exec("SELECT * FROM jobs WHERE id = 'job-expired-1'").toArray()[0];
+      const job = instance.sql.exec("SELECT * FROM jobs WHERE id = 'job-expired-1'").toArray()[0];
       expect(job.status).toBe('expired');
     });
 
@@ -366,7 +366,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     const tokenUnknown = await sha256('token_host_unknown');
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         'cred_unknown', 'host', tokenUnknown, 'fam_unk', 'host-unknown', 'host-unknown', JSON.stringify(['host']), 'admin-1', new Date().toISOString(), new Date(Date.now() + 86400000).toISOString()
       );
@@ -400,11 +400,11 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
       // Lease is currently at epoch 2, held by host-beta
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `UPDATE leases SET holder_job_id = 'job-beta-active', holder_host_id = 'host-beta', holder_machine_id = 'host-beta', epoch = 2, expires_at = ? WHERE name = 'root'`,
         future
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, holder_machine_id, lease_epoch, started_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-beta-active', 'root-run', 'root-run:beta-act', JSON.stringify({}), 'running', new Date().toISOString(), future, 'role:root',
@@ -412,13 +412,13 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       );
 
       // Old job from epoch 1 (superseded)
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, holder_machine_id, claim_token_hash, lease_epoch, started_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-alpha-old', 'root-run', 'root-run:alpha-old', JSON.stringify({}), 'fenced', new Date().toISOString(), future, 'role:root',
         'host-alpha', 'host-alpha', tokenAlphaRoot, 1, new Date().toISOString()
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
          VALUES (?, 'job', ?, ?, ?, ?, ?, ?, 'system', ?, ?)`,
         'cred_alpha_old', tokenAlphaRoot, 'fam_old', 'job-alpha-old', 'host-alpha', 'role:root', JSON.stringify(['lease:root', 'jobs:create']), new Date().toISOString(), future
@@ -447,7 +447,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     // Verify ZERO rows in root_actions table for this stale attempt
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      const actions = instance.ctx.storage.sql.exec("SELECT * FROM root_actions WHERE job_id = 'job-alpha-old'").toArray();
+      const actions = instance.sql.exec("SELECT * FROM root_actions WHERE job_id = 'job-alpha-old'").toArray();
       expect(actions.length).toBe(0);
     });
   });
@@ -513,7 +513,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
       // Create a job offered to host-alpha, where attempts already include all capable hosts
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at, offer_attempts)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-offer-exhausted', 'root-run', 'root-run:off-ex', JSON.stringify({}), 'offered', pastTime, pastTime, 'role:root',
@@ -524,7 +524,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
     // Run alarm on the DO to process offer expiration
     await (runInDurableObject as any)(stub, async (instance: any) => {
       instance.jobsService.processAlarms();
-      const job = instance.ctx.storage.sql.exec("SELECT * FROM jobs WHERE id = 'job-offer-exhausted'").toArray()[0];
+      const job = instance.sql.exec("SELECT * FROM jobs WHERE id = 'job-offer-exhausted'").toArray()[0];
       expect(job.status).toBe('no-host');
     });
 
@@ -533,11 +533,11 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
     const tokenNoStart = await sha256('token_no_start');
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `UPDATE leases SET holder_job_id = 'job-no-first-act', holder_host_id = 'host-alpha', holder_machine_id = 'host-alpha', epoch = 10, acquired_at = ?, expires_at = ? WHERE name = 'root'`,
         sixMinsAgo, new Date(Date.now() + 600000).toISOString()
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, holder_machine_id, claim_token_hash, lease_epoch, started_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         'job-no-first-act', 'root-run', 'root-run:no-start-1', JSON.stringify({}), 'claimed', sixMinsAgo, new Date(Date.now() + 600000).toISOString(), 'role:root',
@@ -549,11 +549,11 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
     await (runInDurableObject as any)(stub, async (instance: any) => {
       instance.jobsService.processAlarms();
 
-      const job = instance.ctx.storage.sql.exec("SELECT * FROM jobs WHERE id = 'job-no-first-act'").toArray()[0];
+      const job = instance.sql.exec("SELECT * FROM jobs WHERE id = 'job-no-first-act'").toArray()[0];
       expect(job.status).toBe('failed');
       expect(job.outcome_summary).toBe('no first action');
 
-      const lease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
+      const lease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0];
       expect(lease.holder_job_id).toBeNull();
       expect(lease.release_reason).toBe('no first action');
     });
@@ -566,8 +566,8 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     await (runInDurableObject as any)(stub, async (instance: any) => {
       // Clear all existing jobs and reset lease
-      instance.ctx.storage.sql.exec('DELETE FROM jobs');
-      instance.ctx.storage.sql.exec("UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, epoch = 0, expires_at = NULL WHERE name = 'root'");
+      instance.sql.exec('DELETE FROM jobs');
+      instance.sql.exec("UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, epoch = 0, expires_at = NULL WHERE name = 'root'");
 
       const baseMs = Date.parse('2026-10-15T00:00:00.000Z');
 
@@ -582,7 +582,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
         instance.jobsService.tickRootSlot(slotIso);
 
         // 2. Query the job created for this slot
-        const jobsForSlot = instance.ctx.storage.sql.exec(
+        const jobsForSlot = instance.sql.exec(
           "SELECT * FROM jobs WHERE idempotency_key = ?",
           `root-run:${slotIso}`
         ).toArray() as any[];
@@ -590,7 +590,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
         const job = jobsForSlot[0];
 
         // 3. Check lease state: never more than one holder
-        const lease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+        const lease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
         expect(lease).toBeDefined();
 
         if (job.status === 'offered') {
@@ -611,7 +611,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
           expect(startRes.error).toBeUndefined();
 
           // Lease is held by this job
-          const heldLease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+          const heldLease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
           expect(heldLease.holder_job_id).toBe(job.id);
 
           // Finish job
@@ -624,7 +624,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
           );
 
           // After finish, lease holder is released
-          const releasedLease = instance.ctx.storage.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+          const releasedLease = instance.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
           expect(releasedLease.holder_job_id).toBeNull();
         } else if (job.status === 'skip') {
           // If skipped, lease was held by incumbent
@@ -633,7 +633,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
         // Idempotency check: duplicate tick for same slot produces no duplicate job
         instance.jobsService.tickRootSlot(slotIso);
-        const duplicateJobs = instance.ctx.storage.sql.exec(
+        const duplicateJobs = instance.sql.exec(
           "SELECT * FROM jobs WHERE idempotency_key = ?",
           `root-run:${slotIso}`
         ).toArray();
@@ -641,7 +641,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       }
 
       // Final verification: 48 jobs created in total
-      const totalJobs = instance.ctx.storage.sql.exec("SELECT COUNT(*) as cnt FROM jobs").toArray()[0] as any;
+      const totalJobs = instance.sql.exec("SELECT COUNT(*) as cnt FROM jobs").toArray()[0] as any;
       expect(totalJobs.cnt).toBe(48);
     });
   });
@@ -653,13 +653,13 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     // Part A: Startup over a real M3 BUS_SCHEMA_SQL agents table (project NOT NULL, no tag PK)
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec('DROP TABLE IF EXISTS agents');
+      instance.sql.exec('DROP TABLE IF EXISTS agents');
       for (const stmt of BUS_SCHEMA_SQL.split(';').map((s: string) => s.trim()).filter(Boolean)) {
-        instance.ctx.storage.sql.exec(stmt);
+        instance.sql.exec(stmt);
       }
       // Seed pre-existing M3 agent with project
       const now = new Date().toISOString();
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES (?, ?, ?, ?, ?)`,
         'm3-old-agent', 'm3-proj', 'worker', 'host-alpha', now
       );
@@ -668,7 +668,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       instance.initDb();
 
       // Verify M3 agent is preserved
-      const oldAgent = instance.ctx.storage.sql.exec("SELECT * FROM agents WHERE tag = 'm3-old-agent'").toArray()[0] as any;
+      const oldAgent = instance.sql.exec("SELECT * FROM agents WHERE tag = 'm3-old-agent'").toArray()[0] as any;
       expect(oldAgent.tag).toBe('m3-old-agent');
       expect(oldAgent.project).toBe('m3-proj');
 
@@ -677,28 +677,28 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       // pre-migration rows remain. The legacy constraint is preserved and
       // projectless inserts on such a database fail closed.
       expect(() =>
-        instance.ctx.storage.sql.exec(
+        instance.sql.exec(
           `INSERT INTO agents (tag, role, machine_id, registered_at, state, updated_at) VALUES ('m3-agent-no-proj', 'worker', 'host-1', ?, 'idle', ?)`,
           now, now
         )
       ).toThrow();
 
       // Verify project-qualified uniqueness (no global tag PRIMARY KEY)
-      const agentCols = instance.ctx.storage.sql.exec("PRAGMA table_info(agents)").toArray();
+      const agentCols = instance.sql.exec("PRAGMA table_info(agents)").toArray();
       const tagCol = agentCols.find((c: any) => c.name === 'tag');
       expect(tagCol.pk).toBe(0);
       // The unique identity index keeps per-project uniqueness with same-tag peers.
-      instance.ctx.storage.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')");
-      instance.ctx.storage.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'second')");
-      expect(() => instance.ctx.storage.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')")).toThrow();
+      instance.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')");
+      instance.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'second')");
+      expect(() => instance.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')")).toThrow();
     });
 
     // Part B: Upgrade from SPEC §6 tables (jobs, leases, audit before M4 columns)
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.ctx.storage.sql.exec('DROP TABLE IF EXISTS jobs');
-      instance.ctx.storage.sql.exec('DROP TABLE IF EXISTS leases');
-      instance.ctx.storage.sql.exec('DROP TABLE IF EXISTS audit');
-      instance.ctx.storage.sql.exec(`
+      instance.sql.exec('DROP TABLE IF EXISTS jobs');
+      instance.sql.exec('DROP TABLE IF EXISTS leases');
+      instance.sql.exec('DROP TABLE IF EXISTS audit');
+      instance.sql.exec(`
         CREATE TABLE jobs (
           id TEXT PRIMARY KEY,
           kind TEXT NOT NULL,
@@ -719,7 +719,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
           finished_at TEXT
         )
       `);
-      instance.ctx.storage.sql.exec(`
+      instance.sql.exec(`
         CREATE TABLE leases (
           name TEXT PRIMARY KEY,
           holder_job_id TEXT,
@@ -729,7 +729,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
           expires_at TEXT
         )
       `);
-      instance.ctx.storage.sql.exec(`
+      instance.sql.exec(`
         CREATE TABLE audit (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           ts TEXT NOT NULL,
@@ -741,14 +741,14 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
       // Seed pre-existing records
       const now = new Date().toISOString();
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO jobs (id, kind, status, created_at) VALUES ('spec6-job-1', 'generic', 'completed', ?)`,
         now
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO leases (name, epoch) VALUES ('root', 0)`
       );
-      instance.ctx.storage.sql.exec(
+      instance.sql.exec(
         `INSERT INTO audit (ts, actor, action) VALUES (?, 'system', 'test_init')`,
         now
       );
@@ -757,13 +757,13 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       instance.initDb();
 
       // Verify all M4 extra columns exist on jobs, leases, audit
-      const jobCols = instance.ctx.storage.sql.exec("PRAGMA table_info(jobs)").toArray().map((c: any) => c.name);
+      const jobCols = instance.sql.exec("PRAGMA table_info(jobs)").toArray().map((c: any) => c.name);
       expect(jobCols).toContain('offer_attempts');
       expect(jobCols).toContain('outcome_summary');
       expect(jobCols).toContain('outcome_evidence');
       expect(jobCols).toContain('deadline_at');
 
-      const leaseCols = instance.ctx.storage.sql.exec("PRAGMA table_info(leases)").toArray().map((c: any) => c.name);
+      const leaseCols = instance.sql.exec("PRAGMA table_info(leases)").toArray().map((c: any) => c.name);
       expect(leaseCols).toContain('holder_host_id');
       expect(leaseCols).toContain('holder_machine_id');
       expect(leaseCols).toContain('holder_actor');
@@ -771,15 +771,15 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       expect(leaseCols).toContain('released_at');
       expect(leaseCols).toContain('release_reason');
 
-      const auditCols = instance.ctx.storage.sql.exec("PRAGMA table_info(audit)").toArray().map((c: any) => c.name);
+      const auditCols = instance.sql.exec("PRAGMA table_info(audit)").toArray().map((c: any) => c.name);
       expect(auditCols).toContain('resource');
       expect(auditCols).toContain('target');
       expect(auditCols).toContain('at');
 
       // Verify pre-existing data preserved
-      const oldJob = instance.ctx.storage.sql.exec("SELECT * FROM jobs WHERE id = 'spec6-job-1'").toArray()[0] as any;
+      const oldJob = instance.sql.exec("SELECT * FROM jobs WHERE id = 'spec6-job-1'").toArray()[0] as any;
       expect(oldJob.id).toBe('spec6-job-1');
-      const oldAudit = instance.ctx.storage.sql.exec("SELECT * FROM audit WHERE action = 'test_init'").toArray()[0] as any;
+      const oldAudit = instance.sql.exec("SELECT * FROM audit WHERE action = 'test_init'").toArray()[0] as any;
       expect(oldAudit.actor).toBe('system');
     });
 
