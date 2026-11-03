@@ -467,7 +467,7 @@ export class SessionControlService {
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
     initLifecycleTables(this.sql);
-    registerHeldReconciler(this.sql, () => this.reconcileHeldSessions());
+    registerHeldReconciler(this.sql, () => this.reconcileHeldSessions(5, undefined, { urgentRecovery: true }));
     try { ensureTbmControllerSchema(this.sql); } catch {}
     // Repair this day's pre-fix starts from canonical requests, once per id.
     // Run each repair atomically; historical manual links are left untouched.
@@ -1580,7 +1580,7 @@ export class SessionControlService {
 
   /** Re-evaluate unplaced held sessions whose hold was caused by transient
    * resource/capacity limits once real capacity exists (intake e25fa26e). */
-  reconcileHeldSessions(limit = 5, targetSessionId?: string): { promoted: number; cancelled: number } {
+  reconcileHeldSessions(limit = 5, targetSessionId?: string, opts: { urgentRecovery?: boolean } = {}): { promoted: number; cancelled: number } {
     let promoted = 0, cancelled = 0;
     if (!this.hooks.reserve) return { promoted, cancelled };
     if (limit <= 0 && !targetSessionId) {
@@ -1612,7 +1612,7 @@ export class SessionControlService {
         // Intake 461f355e AC2: already-held recovery sessions whose only
         // rejection is a per-intake engine failure or an account block must be
         // re-placed on an eligible engine (or superseded) within one cycle.
-        const urgentRecoveryRows = (this.sql.exec(
+        const loadUrgentRecovery = () => (this.sql.exec(
           `${HELD_UNPLACED_SQL} AND (actor = 'hub:service:intake-watchdog' OR json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.engine_override_reason') LIKE 'Intake recovery%') ORDER BY created_at, id LIMIT 32`
         ).toArray() as any[]).filter(r => {
           const req = parsed(r.request_json, {});
@@ -1621,12 +1621,19 @@ export class SessionControlService {
           if (typeof hInfo.reason === 'string' && hInfo.reason.startsWith('no_eligible_route(') && r.engine == null) return false;
           return r.engine != null || (hInfo.rejected.length > 0 && hInfo.rejected.every((rej: any) => isReplaceableRecoveryRejection(rej?.reason)));
         });
+        // Only the offers loop (registered reconciler) may bypass the interval
+        // for urgent recovery rows; list/GET/host-poll callers inside the
+        // interval read nothing (held-reconcile 5551f943 no-op budget).
+        let urgentRecoveryRows: any[] = [];
         if (now - this.heldReconcileAt < HELD_RECONCILE_INTERVAL_MS) {
+          if (!opts.urgentRecovery) return { promoted, cancelled };
+          urgentRecoveryRows = loadUrgentRecovery();
           if (!urgentRecoveryRows.length) return { promoted, cancelled };
           rows = urgentRecoveryRows;
           effectiveLimit = Math.max(limit, urgentRecoveryRows.length);
         } else {
           this.heldReconcileAt = now;
+          urgentRecoveryRows = loadUrgentRecovery();
           cursor = this.sql.exec('SELECT created_at, session_id FROM session_control_held_cursor WHERE id = 1').toArray()[0] ?? null;
           rows = (cursor
             ? this.sql.exec(`${HELD_UNPLACED_SQL} AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?`,
