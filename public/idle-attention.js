@@ -46,5 +46,7 @@
       const running = document.getElementById('overview-running-count'); if (running) running.textContent = 'Unavailable';
     }
   }
-  refresh(); setInterval(refresh, 60000);
+  refresh();
+  // Intake 94186660: hidden tabs skip the 60s poll.
+  setInterval(() => { if (!document.hidden) refresh(); }, 60000);
 })();

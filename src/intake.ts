@@ -847,8 +847,13 @@ export class IntakeService {
     if (all && all !== 'true') fail('invalid_all');
     if (status && status !== 'all' && !STATUSES.includes(status)) fail('invalid_status');
     const defaultOpen = archived !== 'true' && all !== 'true' && status !== 'all' && !['done','cancelled'].includes(status ?? '');
+    // Intake 94186660: the dashboard default "Open" filter (status=open)
+    // selects the whole open-work set, not only status=open rows (the
+    // terminal-but-unresolved tail stays visible via /handoff). The export
+    // read model serves it with indexed page ids, never a full-table parse.
+    const openSet = status === 'open' && all !== 'true' && archived !== 'true';
     const filter: IntakeExportFilter = { project: url.searchParams.get('project'),
-      statuses: status && status !== 'all' ? [status] : defaultOpen ? OPEN : null,
+      statuses: openSet ? OPEN : status && status !== 'all' ? [status] : defaultOpen ? OPEN : null,
       archived: archived === 'true' ? 1 : defaultOpen ? 0 : null };
     const total = intakeExportCounts(this.sql, p, filter.project).filter(r => intakeExportMatches(r, filter)).reduce((n, r) => n + Number(r.n), 0);
     const candidates = intakeExportPageIds(this.sql, p, filter, url.searchParams.get('after'), page.effective_limit + 1);
@@ -1007,14 +1012,45 @@ export class IntakeService {
           id = ids[0].task_id;
         }
       }
-      const events = this.sql.exec('SELECT * FROM intake_audit ORDER BY seq DESC').toArray() as any[];
-      const visible = events.filter(e => (!id || e.task_id === id) && (p.admin || this.allowed(p, { id: e.task_id, project: e.project })));
-      // seq padded for the common revision-pinned cursor implementation.
-      return this.page(url, visible.map(e => ({ ...e, id: String(Number.MAX_SAFE_INTEGER - e.seq).padStart(20, '0') })).sort((a, b) => a.id.localeCompare(b.id)), revision);
+      const probe = this.page(url, [], revision); // shared limit/cursor/revision validation
+      const take = probe.effective_limit;
+      const afterSeq = ((): number | null => {
+        const after = url.searchParams.get('after');
+        if (!after) return null;
+        try { return Number(BigInt(Number.MAX_SAFE_INTEGER) - BigInt(after)); } catch { return null; }
+      })();
+      const toItem = (e: any) => ({ ...e, id: String(Number.MAX_SAFE_INTEGER - e.seq).padStart(20, '0') });
+      const seen = (e: any) => p.admin || this.allowed(p, { id: e.task_id, project: e.project });
+      if (id) {
+        // Indexed (task_id, seq) range with a SQL cursor; exact total is a
+        // covered index count, not a row scan.
+        const atotal = Number((this.sql.exec('SELECT COUNT(*) AS n FROM intake_audit WHERE task_id=?', id).toArray()[0] as any)?.n ?? 0);
+        const rows = this.sql.exec(`SELECT * FROM intake_audit WHERE task_id=?${afterSeq !== null ? ' AND seq<?' : ''} ORDER BY seq DESC LIMIT ?`,
+          ...(afterSeq !== null ? [id, afterSeq, take + 1] : [id, take + 1])).toArray() as any[];
+        const items = rows.slice(0, take).filter(seen).map(toItem);
+        return { snapshot_version: revision, effective_limit: take, items,
+          next: rows.length > take && items.length ? items[items.length - 1].id : null,
+          total: atotal, truncated: rows.length > take };
+      }
+      // Cross-task reads take the most recent window and say so (truncated)
+      // instead of parsing the whole retained ledger per request.
+      const AUDIT_WINDOW = 500;
+      const rows = this.sql.exec(`SELECT * FROM intake_audit${afterSeq !== null ? ' WHERE seq<?' : ''} ORDER BY seq DESC LIMIT ?`,
+        ...(afterSeq !== null ? [afterSeq, AUDIT_WINDOW + 1] : [AUDIT_WINDOW + 1])).toArray() as any[];
+      const truncated = rows.length > AUDIT_WINDOW;
+      const window = rows.slice(0, AUDIT_WINDOW).filter(e => (!id || e.task_id === id) && seen(e)).map(toItem);
+      const items = window.slice(0, take);
+      return { snapshot_version: revision, effective_limit: take, items,
+        next: window.length > take && items.length ? items[items.length - 1].id : null,
+        total: window.length, truncated, ...(truncated ? { coverage: `recent_${AUDIT_WINDOW}` } : {}) };
     }
     if (path === '/summary') return this.exportSummary(url, p, revision);
-    if (path === '/tasks' && url.searchParams.get('status') !== 'open') return this.exportPage(url, p, revision);
-    if (path === '/tasks' || path === '/handoff') {
+    // Intake 94186660: every /tasks list (including the dashboard default
+    // status=open) runs on the bounded export read model (indexed page ids +
+    // per-page PK hydration). Only /handoff keeps the full-body union filter
+    // (open work plus terminal-but-unresolved/uncertain items need history).
+    if (path === '/tasks') return this.exportPage(url, p, revision);
+    if (path === '/handoff') {
       if (url.searchParams.has('authorization_valid_until') && Number(url.searchParams.get('authorization_valid_until')) !== (p.valid_until ?? null)) fail('stale_snapshot', 409);
       if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');
       let tasks = this.rows('tasks').filter(t => this.allowed(p, t));

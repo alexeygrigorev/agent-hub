@@ -2281,9 +2281,15 @@ export class FleetService {
         const canonical = machineAliases[String(m.id)] ?? null;
         return { ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at), alias_of: canonical, canonical_id: canonical ?? String(m.id) };
       });
+      // Intake 94186660: capabilities for the supports_goal flag come from
+      // one machines read, not one query per route (N+1 on this page).
+      let capsByMachine = new Map<string, any>();
+      try {
+        capsByMachine = new Map((this.sql.exec('SELECT id, capabilities FROM machines').toArray() as any[]).map(m => [String(m.id), parsed(m.capabilities)]));
+      } catch { capsByMachine = new Map(); }
       const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
       const liveSessions = this.liveSessionsByAccount();
-      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => { const s = this.accountStatus(a); return { ...s, sessions: liveSessions.get(s.label) ?? 0 }; }), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = parsed(this.sql.exec('SELECT capabilities FROM machines WHERE id = ?', r.machine_id).toArray()[0]?.capabilities); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
+      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => { const s = this.accountStatus(a); return { ...s, sessions: liveSessions.get(s.label) ?? 0 }; }), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = capsByMachine.get(String(r.machine_id)); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
         machines, machine_aliases: machineAliases,
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions,

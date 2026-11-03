@@ -45,5 +45,6 @@
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', refresh, {once:true});
   else refresh();
-  setInterval(refresh, 60000);
+  // Intake 94186660: hidden tabs skip the 60s poll.
+  setInterval(() => { if (!document.hidden) refresh(); }, 60000);
 })();

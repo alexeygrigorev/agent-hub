@@ -33,7 +33,7 @@
     } catch { unmergedNode.textContent = 'Unmerged: unavailable — sign in or retry'; }
   }
   updateUnmerged();
-  setInterval(updateUnmerged, 60000);
+  setInterval(() => { if (!document.hidden) updateUnmerged(); }, 60000); // Intake 94186660: hidden tabs skip the 60s poll.
   const queue = document.getElementById('intake-queue');
   let queueCursor = '', queueGeneration = 0;
   async function updateQueue(cursor = queueCursor) {
@@ -128,9 +128,9 @@
     } catch { throughput.textContent = '24h throughput: unavailable — sign in or retry'; }
   }
   updateThroughput();
-  setInterval(updateThroughput, 60000);
+  setInterval(() => { if (!document.hidden) updateThroughput(); }, 60000);
   updateQueue();
-  setInterval(updateQueue, 60000);
+  setInterval(() => { if (!document.hidden) updateQueue(); }, 60000);
   update();
-  setInterval(update, 60000);
+  setInterval(() => { if (!document.hidden) update(); }, 60000);
 })();

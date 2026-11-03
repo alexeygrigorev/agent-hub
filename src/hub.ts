@@ -2318,7 +2318,19 @@ export class Hub extends DurableObject {
         return json({ alerts: this.livenessService.alerts(100, subject) });
       }
       const { thresholds, subjects } = this.livenessService.evaluate();
-      return json({ thresholds, subjects, alerts: this.livenessService.alerts() });
+      // Intake 94186660: the subjects array carried the whole fleet detail
+      // (~1 MB). Paginate it with limit/after; default 500 covers the fleet
+      // table while bounding the response. Alert subjects keep their own read.
+      const params = new URL(request.url).searchParams;
+      const rawLimit = params.get('limit');
+      const lim = rawLimit === null ? 500 : Math.min(5000, Math.max(1, Number(rawLimit) || 500));
+      const after = params.get('after');
+      const key = (s: any) => `${s.kind}/${s.id}`;
+      const window = subjects.filter(s => !after || key(s) > after);
+      const spage = window.slice(0, lim);
+      return json({ thresholds, subjects: spage, total: subjects.length, effective_limit: lim,
+        next: window.length > lim && spage.length ? key(spage[spage.length - 1]) : null,
+        truncated: window.length > lim, alerts: this.livenessService.alerts() });
     }
     if (path === '/api/checks' && request.method === 'GET') return json({ checks: this.checksService.list(), runs: this.checksService.runs() });
     if (path === '/api/checks' && request.method === 'PUT') {
