@@ -74,6 +74,29 @@ async function startAndBind(s: SessionControlService, sql: any, key: string) {
   return bdata.id ? { ...bdata, id: data.id } : data;
 }
 
+async function markNativeInboxReceipt(
+  s: SessionControlService,
+  sessionId: string,
+  status = 'waiting in inbox for recipient',
+) {
+  const commands = await (await s.handle(request(`/api/sessions/${sessionId}/commands`, undefined, 'GET'), admin)).json() as any;
+  const send = commands.commands.find((c: any) => c.kind === 'send' && c.request_key.startsWith('wake-'));
+  expect(send).toBeTruthy();
+  const offers = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
+  const offer = offers.offers.find((o: any) => o.command_id === send.id);
+  expect(offer).toBeTruthy();
+  const claimResponse = await s.handle(request(`/api/session-commands/${send.id}/claim`, {
+    correlation: offer.correlation, attempt_id: ATTEMPT,
+  }), host('hetzner'));
+  expect(claimResponse.status).toBe(200);
+  const claim = await claimResponse.json() as any;
+  const receipt = await s.handle(request(`/api/session-commands/${send.id}/status`, {
+    claim_token: claim.claim_token, status,
+  }), host('hetzner'));
+  expect(receipt.status).toBe(200);
+  return send.id;
+}
+
 describe('session scheduled wakes', () => {
   it('does not let a null delivered timestamp hide the next alarm', async () => {
     await fixture(async (_s, sql, _hub, state) => {
@@ -112,12 +135,12 @@ describe('session scheduled wakes', () => {
       const service = new SessionControlService(traced as any, cb => state.storage.transactionSync(cb), () => now, {}, {});
       expect(service.nextWakeTime()).toBe(now - 1000);
       expect(service.processDueWakes()).toEqual({ delivered: 0, acked: 0, missed: 200 });
-      for (const phase of ['pending', 'delivered']) {
-        expect(sql.exec('SELECT COUNT(*) AS n FROM session_control_wakes WHERE state=?', phase).toArray()[0].n).toBe(1);
+      for (const [phase, remaining] of [['pending', 1], ['queued', 0], ['delivered', 1]] as const) {
+        expect(sql.exec('SELECT COUNT(*) AS n FROM session_control_wakes WHERE state=?', phase).toArray()[0].n).toBe(remaining);
       }
       // Inspect the actual service queries: LIMIT alone must not hide a full
       // retained-history sort. SQLite must seek each ordered queue by index.
-      expect(reads).toHaveLength(4);
+      expect(reads).toHaveLength(5);
       for (const {query, bindings} of reads) {
         const plan = sql.exec('EXPLAIN QUERY PLAN ' + query, ...bindings).toArray().map((r: any) => r.detail).join('\n');
         expect(plan).not.toMatch(/SCAN session_control_wakes|USE TEMP B-TREE/);
@@ -136,7 +159,9 @@ describe('session scheduled wakes', () => {
         expect(s.processDueWakes()).toMatchObject({ delivered: 0, missed: 0 });
         expect(sql.exec('SELECT state FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0].state).toBe('pending');
         sql.exec("UPDATE session_control_sessions SET state='running' WHERE id=?", sess.id);
-        expect(s.processDueWakes()).toMatchObject({ delivered: 1, missed: 0 });
+        expect(s.processDueWakes()).toMatchObject({ delivered: 0, missed: 0 });
+        expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0])
+          .toMatchObject({ state: 'queued', delivered_at: null });
       });
   });
 
@@ -239,7 +264,7 @@ describe('session scheduled wakes', () => {
       expect(wres.status).toBe(201);
       const wdata = await wres.json() as any;
       const sweep = (s as any).processDueWakes();
-      expect(wdata.wake_state).toBe('delivered');
+      expect(wdata.wake_state).toBe('queued');
       expect(sweep.delivered).toBe(0); // registration already queued this due wake
       const cmds = await (await s.handle(request(`/api/sessions/${sess.id}/commands`, undefined, 'GET'), admin)).json() as any;
       const send = cmds.commands.find((c: any) => c.kind === 'send' && c.request_key.startsWith('wake-'));
@@ -250,6 +275,15 @@ describe('session scheduled wakes', () => {
       const claimResponse = await s.handle(request(`/api/session-commands/${send.id}/claim`, { correlation: offer.correlation, attempt_id: ATTEMPT }), host('hetzner'));
       expect(claimResponse.status).toBe(200);
       const claim = await claimResponse.json() as any;
+      // A host-side status receipt means the native inbox write completed.
+      // Claiming or transporting the Hub command alone is not delivery.
+      const receipt = await s.handle(request(`/api/session-commands/${send.id}/status`, {
+        claim_token: claim.claim_token, status: 'waiting in inbox for recipient',
+      }), host('hetzner'));
+      expect(receipt.status).toBe(200);
+      expect((s as any).processDueWakes().delivered).toBe(0);
+      expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wdata.wake_id).toArray()[0])
+        .toMatchObject({ state: 'delivered', delivered_at: expect.any(String) });
       const base = { correlation: offer.correlation, outcome: 'delivered', native: { native_id: NATIVE_ID, tag: 'hub-launch-1', workspace: NATIVE_WS }, claim_token: claim.claim_token };
       // Queue transport alone never proves the wake was acknowledged.
       expect((await s.handle(request(`/api/session-commands/${send.id}/ack`, base), host('hetzner'))).status).toBe(409);
@@ -266,6 +300,76 @@ describe('session scheduled wakes', () => {
     });
   });
 
+  it('does not deliver a wake when the claimed host cannot write the native inbox', async () => {
+    await fixture(async (s, sql) => {
+      const sess = await startAndBind(s, sql, 'wake-native-write-fails');
+      const response = await s.handle(request(`/api/sessions/${sess.id}/wake`, {
+        key: 'native-write-fails', at: 'now', prompt: 'resume after native rejection',
+      }), admin);
+      const wake: any = await response.json();
+      expect(wake.wake_state).toBe('queued');
+      const commands = await (await s.handle(request(`/api/sessions/${sess.id}/commands`, undefined, 'GET'), admin)).json() as any;
+      const send = commands.commands.find((c: any) => c.kind === 'send' && c.request_key.startsWith('wake-'));
+      const offers = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
+      const offer = offers.offers.find((o: any) => o.command_id === send.id);
+      const claimed = await s.handle(request(`/api/session-commands/${send.id}/claim`, {
+        correlation: offer.correlation, attempt_id: ATTEMPT,
+      }), host('hetzner'));
+      const claim = await claimed.json() as any;
+      const ack = await s.handle(request(`/api/session-commands/${send.id}/ack`, {
+        correlation: offer.correlation, outcome: 'failed', reason: 'Inbox refused: native write denied',
+        native: { native_id: NATIVE_ID, tag: 'hub-launch-1', workspace: NATIVE_WS },
+        claim_token: claim.claim_token,
+      }), host('hetzner'));
+      expect(ack.status, JSON.stringify(await ack.json())).toBe(200);
+      (s as any).processDueWakes();
+      expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
+        .toMatchObject({ state: 'missed', delivered_at: null });
+      expect(sql.exec('SELECT detail FROM session_control_wake_alerts WHERE wake_id=?', wake.wake_id).toArray()[0].detail)
+        .toContain('wake_native_delivery_failed:Inbox refused: native write denied');
+    });
+  });
+
+  it('accepts the headless native inbox receipt while its recipient reply is pending', async () => {
+    await fixture(async (s, sql) => {
+      const sess = await startAndBind(s, sql, 'wake-headless-inbox-receipt');
+      const response = await s.handle(request(`/api/sessions/${sess.id}/wake`, {
+        key: 'headless-inbox-receipt', at: 'now', prompt: 'resume on next headless turn',
+      }), admin);
+      const wake: any = await response.json();
+      expect(response.status).toBe(201);
+
+      await markNativeInboxReceipt(s, sess.id, 'delivered; awaiting recipient reply');
+
+      expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
+        .toMatchObject({ state: 'delivered', delivered_at: expect.any(String) });
+      expect((s as any).processDueWakes().missed).toBe(0);
+      const listing: any = await (await s.handle(request(`/api/sessions/${sess.id}/wakes`, undefined, 'GET'), admin)).json();
+      expect(listing).not.toHaveProperty('waiting_until');
+    });
+  });
+
+  it('backfills the acknowledgement window from a pre-upgrade native receipt', async () => {
+    await fixture(async (s, sql) => {
+      const sess = await startAndBind(s, sql, 'wake-upgrade-receipt-window');
+      const response = await s.handle(request(`/api/sessions/${sess.id}/wake`, {
+        key: 'upgrade-receipt-window', at: 'now', prompt: 'resume after upgrade',
+      }), admin);
+      const wake: any = await response.json();
+      const send = sql.exec('SELECT * FROM session_control_commands WHERE id=(SELECT command_id FROM session_control_wakes WHERE id=?)', wake.wake_id).toArray()[0];
+      const oldEnqueueTime = send.created_at;
+      const receiptTime = new Date(Date.now() + 1000).toISOString();
+      sql.exec("UPDATE session_control_commands SET host_status=?,updated_at=? WHERE id=?",
+        'delivered; awaiting recipient reply', receiptTime, send.id);
+      sql.exec("UPDATE session_control_wakes SET state='delivered',delivered_at=? WHERE id=?", oldEnqueueTime, wake.wake_id);
+
+      s.init();
+
+      expect(sql.exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
+        .toMatchObject({ state: 'delivered', delivered_at: receiptTime });
+    });
+  });
+
   it('never aliases a user send key and rolls back a partial enqueue', async () => {
     await fixture(async (s, sql) => {
       const sess = await startAndBind(s, sql, 'wake-command-isolation');
@@ -277,11 +381,11 @@ describe('session scheduled wakes', () => {
       }), admin)).json();
       sql.exec('UPDATE session_control_wakes SET wake_at_ms=? WHERE id=?',Date.now()-1,wake.wake_id);
       sql.exec(`CREATE TRIGGER reject_wake_delivery BEFORE UPDATE ON session_control_wakes
-        WHEN NEW.state='delivered' BEGIN SELECT RAISE(ABORT,'fixture rollback'); END`);
+        WHEN NEW.state='queued' BEGIN SELECT RAISE(ABORT,'fixture rollback'); END`);
       expect(s.processDueWakes().delivered).toBe(0);
       expect(sql.exec('SELECT id FROM session_control_commands').toArray()).toHaveLength(1);
       sql.exec('DROP TRIGGER reject_wake_delivery');
-      expect(s.processDueWakes().delivered).toBe(1);
+      expect(s.processDueWakes().delivered).toBe(0);
       const stored = sql.exec('SELECT command_id FROM session_control_wakes WHERE id=?',wake.wake_id).toArray()[0];
       expect(stored.command_id).not.toBe(unrelated.command_id);
       expect(JSON.parse(sql.exec('SELECT payload_json FROM session_control_commands WHERE id=?',stored.command_id).toArray()[0].payload_json)).toEqual({body:'scheduled evidence'});
@@ -297,7 +401,8 @@ describe('session scheduled wakes', () => {
       const wdata = await wres.json() as any;
       expect(wres.status).toBe(201);
       (s as any).processDueWakes();
-      // Backdate delivery beyond the ack window.
+      await markNativeInboxReceipt(s, sess.id);
+      // Backdate the native inbox receipt beyond the acknowledgement window.
       const past = new Date(Date.now() - 11 * 60_1000).toISOString();
       sql.exec("UPDATE session_control_wakes SET delivered_at = ? WHERE id = ?", past, wdata.wake_id);
       const sweep = (s as any).processDueWakes();
@@ -320,7 +425,8 @@ describe('session scheduled wakes', () => {
     await fixture(async (s, sql, hub) => {
       const sess = await startAndBind(s, sql, 'wake-gone-after-delivery');
       const result: any = await (await s.handle(request(`/api/sessions/${sess.id}/wake`, { key: 'gone-after', at: 'now', prompt: 'resume' }), admin)).json();
-      expect(result.wake_state).toBe('delivered');
+      await markNativeInboxReceipt(s, sess.id);
+      expect(sql.exec('SELECT state FROM session_control_wakes WHERE id=?', result.wake_id).toArray()[0].state).toBe('delivered');
       sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", sess.id);
       const sweep = s.processDueWakes();
       expect(sweep.missed).toBe(1);
@@ -349,6 +455,7 @@ describe('session scheduled wakes', () => {
     await fixture(async (s, sql) => {
       const sess = await startAndBind(s, sql, 'wake-late-proof');
       const result: any = await (await s.handle(request(`/api/sessions/${sess.id}/wake`, { key:'late', at:'now', prompt:'resume' }), admin)).json();
+      await markNativeInboxReceipt(s, sess.id);
       sql.exec('UPDATE session_control_wakes SET delivered_at=? WHERE id=?',new Date(Date.now()-660000).toISOString(),result.wake_id);
       sql.exec("UPDATE session_control_commands SET state='acked',updated_at=? WHERE id=?",new Date().toISOString(),result.command_id);
       expect(s.processDueWakes()).toMatchObject({missed:1,acked:1});

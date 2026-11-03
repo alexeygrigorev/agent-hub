@@ -86,6 +86,7 @@ CREATE INDEX IF NOT EXISTS session_control_wakes_due ON session_control_wakes(st
 CREATE INDEX IF NOT EXISTS session_control_wakes_due_order ON session_control_wakes(state, wake_at_ms, created_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_delivery_order ON session_control_wakes(state, delivered_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_resolution_order ON session_control_wakes(state, updated_at);
+CREATE INDEX IF NOT EXISTS session_control_wakes_resolution_order_v2 ON session_control_wakes(state, updated_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_session ON session_control_wakes(session_id, state);
 CREATE TABLE IF NOT EXISTS session_control_wake_alerts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, wake_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, intake_task_id TEXT, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_control_wake_alerts_session ON session_control_wake_alerts(session_id, created_at);
@@ -464,6 +465,24 @@ export class SessionControlService {
     // Intake e8a22f4c: host command polls filter by state; without this each poll walked the machine's whole
     // session history. Callers must not count index writes in rowsWritten (see the claim, which uses RETURNING).
     this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_commands_state ON session_control_commands(state, session_id)");
+    // Older builds marked a wake delivered when the Hub merely queued its
+    // command. Reclassify unacknowledged rows without a host inbox receipt so
+    // they continue through the queued-receipt path instead of preserving a
+    // false delivery timestamp across upgrade.
+    this.sql.exec(`UPDATE session_control_wakes SET state='queued', delivered_at=NULL, updated_at=?
+      WHERE state='delivered' AND acked_at IS NULL AND command_id IN (
+        SELECT id FROM session_control_commands
+        WHERE state!='acked' AND COALESCE(host_status,'') NOT IN
+          ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`, this.at());
+    // The old delivered_at recorded Hub enqueue time. For rows with a native
+    // receipt, restart the acknowledgement window from the receipt-bearing
+    // command update; only touch rows whose old timestamp still equals enqueue.
+    this.sql.exec(`UPDATE session_control_wakes SET delivered_at = (
+        SELECT updated_at FROM session_control_commands WHERE id = session_control_wakes.command_id)
+      WHERE state='delivered' AND acked_at IS NULL AND delivered_at = (
+        SELECT created_at FROM session_control_commands WHERE id = session_control_wakes.command_id)
+      AND command_id IN (SELECT id FROM session_control_commands
+        WHERE COALESCE(host_status,'') IN ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`);
     // M15c lifecycle: additive observations/decisions tables. Server-owned
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
@@ -888,6 +907,8 @@ export class SessionControlService {
     const row: any = this.sql.exec(`SELECT MIN(deadline) AS deadline FROM (
       SELECT (SELECT wake_at_ms FROM session_control_wakes WHERE state='pending'
         ORDER BY wake_at_ms, created_at, id LIMIT 1) AS deadline
+      UNION ALL SELECT (SELECT wake_at_ms FROM session_control_wakes WHERE state='queued'
+        ORDER BY wake_at_ms, created_at, id LIMIT 1)+600000
       UNION ALL SELECT CAST((julianday((SELECT delivered_at FROM session_control_wakes
         WHERE state='delivered' AND delivered_at IS NOT NULL ORDER BY delivered_at, id LIMIT 1))-2440587.5)*86400000 AS INTEGER)+600000
       UNION ALL SELECT next_at_ms AS deadline FROM session_control_pings WHERE state='active')`).toArray()[0];
@@ -973,8 +994,8 @@ export class SessionControlService {
   private pendingWakeFor(sessionId: string): any | null {
     try {
       const rows = this.sql.exec(
-        "SELECT * FROM session_control_wakes WHERE session_id = ? AND state = 'pending' ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 1",
-        sessionId).toArray() as any[];
+        "SELECT * FROM session_control_wakes WHERE session_id = ? AND state = 'pending' AND wake_at_ms > ? ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 1",
+        sessionId, this.now()).toArray() as any[];
       return rows[0] ?? null;
     } catch { return null; }
   }
@@ -1057,11 +1078,44 @@ export class SessionControlService {
             'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             commandId, session.id, 'send', wake.actor, requestKey, JSON.stringify({ body: wake.prompt }),
             'recorded', generation, correlation, wake.owner_token_id ?? null, wake.owner_family ?? null, 0, at, at);
-          this.sql.exec("UPDATE session_control_wakes SET state = 'delivered', command_id = ?, delivered_at = ?, updated_at = ? WHERE id = ? AND state = 'pending'",
-            commandId, at, at, wake.id);
+          // Queueing a Hub command is not proof that the host wrote a native
+          // inbox envelope. `queued` becomes `delivered` only after the host
+          // posts its native inbox receipt through the command status route.
+          this.sql.exec("UPDATE session_control_wakes SET state = 'queued', command_id = ?, delivered_at = NULL, updated_at = ? WHERE id = ? AND state = 'pending'",
+            commandId, at, wake.id);
         });
-        delivered++;
       } catch { /* next wake */ }
+    }
+    // A wake is delivered only after the host reports that the envelope was
+    // written to the native recipient inbox. Queue transport alone does not
+    // satisfy this receipt.
+    let queued: any[] = [];
+    try { queued = this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'queued' ORDER BY updated_at, id LIMIT 100").toArray() as any[]; }
+    catch { queued = []; }
+    for (const wake of queued) {
+      try {
+        const cmd: any = wake.command_id ? this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', wake.command_id).toArray()[0] : null;
+        if (['waiting in inbox for recipient', 'delivered; awaiting recipient reply'].includes(cmd?.host_status)) {
+          this.sql.exec("UPDATE session_control_wakes SET state='delivered',delivered_at=?,updated_at=? WHERE id=? AND state='queued'",
+            cmd.updated_at ?? at, at, wake.id);
+          delivered++;
+        } else if (cmd && ['failed', 'refused'].includes(cmd.state)) {
+          const reason = parsed(cmd.ack_json, {})?.reason ?? `command_${cmd.state}`;
+          const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', wake.session_id).toArray()[0];
+          const req = session ? parsed(session.request_json, {}) : {};
+          const intakeId = wake.intake_task_id ?? req?.intake_task_id ?? null;
+          this.missWake(wake, intakeId, `wake_native_delivery_failed:${String(reason).slice(0, 120)}`,
+            `Wake ${wake.id.slice(0, 8)} failed before a native inbox receipt (${String(reason).slice(0, 120)}). Handed to idle-with-open-AC recovery.`);
+          missed++;
+        } else if (nowMs >= wake.wake_at_ms + WAKE_ACK_TIMEOUT_MS) {
+          const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', wake.session_id).toArray()[0];
+          const req = session ? parsed(session.request_json, {}) : {};
+          const intakeId = wake.intake_task_id ?? req?.intake_task_id ?? null;
+          this.missWake(wake, intakeId, 'wake_delivery_receipt_deadline_exceeded',
+            `Wake ${wake.id.slice(0, 8)} missed: no native inbox receipt within 10 min of due time. Handed to idle-with-open-AC recovery.`);
+          missed++;
+        }
+      } catch { /* next */ }
     }
     // Ack reconciliation + 10-minute missed-wake expiry.
     let awaiting: any[] = [];
@@ -3945,8 +3999,8 @@ export class SessionControlService {
             }
             return response({ wake_id: prior.id, session_id: prior.session_id, wake_at: prior.wake_at, wake_state: prior.state, replay: true });
           }
-          const outstanding = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_wakes WHERE state IN ('pending','delivered')").toArray()[0]?.n ?? 0);
-          const sessionOutstanding = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_wakes WHERE session_id=? AND state IN ('pending','delivered')", live.id).toArray()[0]?.n ?? 0);
+          const outstanding = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_wakes WHERE state IN ('pending','queued','delivered')").toArray()[0]?.n ?? 0);
+          const sessionOutstanding = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_wakes WHERE session_id=? AND state IN ('pending','queued','delivered')", live.id).toArray()[0]?.n ?? 0);
           if (outstanding >= this.maxPending || sessionOutstanding >= this.maxPerSession) return response({ error: 'wake_queue_full' }, 429);
           const req = parsed(live.request_json, {});
           const id = crypto.randomUUID();
@@ -4376,6 +4430,11 @@ export class SessionControlService {
           'UPDATE session_control_commands SET host_status = ?, host_reason = ?, updated_at = ? WHERE id = ?',
           status, reason, this.at(), row.id
         );
+        if (['waiting in inbox for recipient', 'delivered; awaiting recipient reply'].includes(status)) {
+          const receiptAt = this.at();
+          this.sql.exec("UPDATE session_control_wakes SET state='delivered', delivered_at=?, updated_at=? WHERE command_id=? AND state='queued'",
+            receiptAt, receiptAt, row.id);
+        }
         return response({ ok: true, command_id: row.id, status, reason });
       });
     }
