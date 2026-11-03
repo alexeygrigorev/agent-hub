@@ -67,7 +67,8 @@ export function initSessionMessaging(sql: SqlStorage): void {
   // headful sessions are replaced. Their current session is set on start.
   const seededAt = new Date().toISOString();
   for (const name of ['orchestrator-main', 'oncall']) {
-    sql.exec("INSERT OR IGNORE INTO agents (tag, project, registered_at) VALUES (?, 'agent', ?)", name, seededAt);
+    // Named bus identities are intentionally separate from the general agent
+    // registry, which also feeds the conversation participant directory.
     sql.exec("INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at) VALUES (?, ?, 'hub:migration', ?)", name, name, seededAt);
   }
   sql.exec('CREATE INDEX IF NOT EXISTS messages_recipient_seq ON messages(to_actor, recipient_seq)');
