@@ -64,6 +64,10 @@ describe('resource management',()=>{
     SELECT 'terminal-'||n,'admin','terminal-'||n,'{}','host','opencode','headless','exited',
       json_object('native_id','terminal-native-'||n,'tag','terminal-tag-'||n,'workspace','/repo','native_created_at_ms',?),?,?
     FROM retained`,now-600000,iso(-600000),iso());
+  sql.exec(`WITH RECURSIVE retained(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM retained WHERE n<210)
+    INSERT INTO session_resource_usage
+    SELECT 'terminal-'||n,'host','terminal-native-'||n,NULL,NULL,'demo','opencode',NULL,'normal','goal',?,?,'exited',NULL,NULL,NULL,NULL,NULL,?
+    FROM retained`,iso(-600000),iso(),iso());
   let ledgerReads=0,ledgerWrites=0;
   const boundedSql:any={exec:(query:string,...args:any[])=>{
    if(query.startsWith('SELECT state,finished_at FROM session_resource_usage')) ledgerReads++;
@@ -73,7 +77,7 @@ describe('resource management',()=>{
   const reporter=new ResourceManagement(boundedSql,()=>now);
   reporter.report('host',{samples:[],reaps:[]});
   reporter.report('host',{samples:[],reaps:[]});
-  expect(ledgerReads).toBe(0);
+  expect(ledgerReads).toBeLessThanOrEqual(4);
   expect(ledgerWrites).toBe(0);
   expect(sql.exec("SELECT state FROM session_resource_usage WHERE session_id='session'").one().state).toBe('exited');
  }));

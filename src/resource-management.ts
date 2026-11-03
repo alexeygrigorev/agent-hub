@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS session_rss_median (session_id TEXT PRIMARY KEY, p50_
 CREATE TABLE IF NOT EXISTS session_oom_kills (session_id TEXT PRIMARY KEY, oom_kills INTEGER NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_finalized (session_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_metadata (session_id TEXT PRIMARY KEY, workspace TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS resource_terminal_reconcile (machine_id TEXT PRIMARY KEY, revision TEXT NOT NULL, cursor_session_id TEXT, complete INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS resource_ramps (launch_id TEXT PRIMARY KEY, started_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_usage (
@@ -108,6 +109,7 @@ const NATIVE_KEY = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(
 export class ResourceManagement {
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
+  private catalogRevision:string|null=null;
   private catalogRawRows=new Map<string,any[]>();
   private catalogRawBytes=0;
   private catalogIntakes: ReturnType<typeof worktreeIntakeSnapshot> | null = null;
@@ -485,6 +487,7 @@ export class ResourceManagement {
     // durable random generation, including rollback and retry. Activity is live.
     const raw=this.catalogReady ? this.sql.exec('SELECT revision,structure_revision FROM resource_catalog_revision WHERE id=1').toArray()[0] : null;
     const revision=typeof raw?.revision==='string' && /^[a-f0-9]{32}$/.test(raw.revision) ? raw.revision : null;
+    this.catalogRevision=revision;
     const structure=revision!==null && typeof raw?.structure_revision==='string' && /^[a-f0-9]{32}$/.test(raw.structure_revision) ? raw.structure_revision : null;
     if(structure===null || structure!==this.catalogStructureRevision) {this.catalogRawRows.clear();this.catalogRawBytes=0;this.catalogIntakes=null;}
     this.catalogStructureRevision=structure;
@@ -514,6 +517,36 @@ export class ResourceManagement {
       ...(machine ? [machine] : [])).map(row=>[JSON.stringify([row.machine_id,row.native_id]),row.last_activity_at]));
     // Callers cannot mutate a cached protection or alias list.
     return rows.map(row=>({...row,aliases:[...row.aliases],last_activity_at:activity.get(JSON.stringify([row.machine_id,row.native_id])) ?? null}));
+  }
+  /** Reconcile missed terminal reports in bounded pages, once per canonical
+   * catalog revision. Explicit confirmed exits still use finishObserved(). */
+  private terminalSamples(machine: string, sessions: Map<string,any>, sampled: Set<string>, limit: number) {
+    if(limit<=0 || !this.catalogRevision) return [];
+    const current=this.sql.exec('SELECT revision,cursor_session_id,complete FROM resource_terminal_reconcile WHERE machine_id=?',machine).toArray()[0] as any;
+    if(current?.revision===this.catalogRevision && current.complete===1) return [];
+    const cursor=current?.revision===this.catalogRevision ? current.cursor_session_id as string|null : null;
+    const candidates=[...new Map([...sessions.values()].filter(s=>TERMINAL.has(s.state) && s.finished_at)
+      .map(s=>[s.native_id,s])).values()]
+      .filter(s=>!s.aliases.some((id:string)=>sampled.has(id)) && (!cursor || s.session_id>cursor))
+      .sort((a,b)=>a.session_id.localeCompare(b.session_id));
+    const window=candidates.slice(0,Math.min(200,limit));
+    if(!window.length) {
+      this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_session_id,complete) VALUES(?,?,NULL,1)
+        ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,cursor_session_id=NULL,complete=1`,machine,this.catalogRevision);
+      return [];
+    }
+    const finished=new Set<string>();
+    for(let i=0;i<window.length;i+=99) {
+      const batch=window.slice(i,i+99);
+      for(const row of this.sql.exec('SELECT native_id FROM session_resource_usage WHERE machine_id=? AND finished_at IS NOT NULL AND native_id IN ('+batch.map(()=>'?').join(',')+')',machine,...batch.map(s=>s.native_id)).toArray()) finished.add(String(row.native_id));
+    }
+    const last=window[window.length-1].session_id;
+    const hasMore=candidates.length>window.length;
+    this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_session_id,complete) VALUES(?,?,?,?)
+      ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,cursor_session_id=excluded.cursor_session_id,complete=excluded.complete`,
+      machine,this.catalogRevision,hasMore?last:null,hasMore?0:1);
+    const at=new Date(this.now()).toISOString();
+    return window.filter(s=>!finished.has(s.native_id)).map(s=>({session_id:s.session_id,native_id:s.native_id,observed_at:at}));
   }
   private buildCanonicalSessions(machine?: string) {
     type Bound = ReturnType<ResourceManagement['boundSessions']>[number];
@@ -670,11 +703,12 @@ export class ResourceManagement {
     const sessions = new Map(this.canonicalSessions(machine).flatMap(s => s.aliases.map(id=>[id,s] as const)));
     if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100
       || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
-    // Keep work bounded by the validated host payload. Confirmed exits that
-    // had no sample are reconciled by finishObserved from the census path;
-    // scanning all historical terminal bindings here made every report do
-    // one ledger read and potentially one write per retained session.
-    for (const sample of value.samples) {
+    // Keep the payload bounded. Confirmed exits without a sample are reconciled
+    // in revision-scoped pages, never by a per-session lookup on every report.
+    const samples=[...value.samples];
+    const sampled=new Set(samples.map(s=>s.session_id));
+    samples.push(...this.terminalSamples(machine,sessions,sampled,200-samples.length));
+    for (const sample of samples) {
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
       for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores','oom_kills']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
