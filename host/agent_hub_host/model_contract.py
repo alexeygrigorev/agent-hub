@@ -99,11 +99,12 @@ def configured_selection(selection, engine, provider):
     # native shared-zai route was refused as admission_refused (intake 8d006dc3).
     policy_engines = {engine, 'codex'} if family == 'zai' and engine == 'zcodex' else {engine}
     effort = selection.get('effort')
-    prohibited_high_tier = selection.get('id') in ('astra', 'sol') and effort == 'high'
     matches = [m for m in policy_models() if m['id'] == selection.get('id') and
                m['model'] == selection.get('model') and m['engine'] in policy_engines and
-               m['provider'] == family and not prohibited_high_tier and
-               (effort == m['effort'] or effort in ('low', 'medium', 'high', 'max'))]
+               m['provider'] == family and
+               (effort == m['effort'] or
+                (effort in ('low', 'medium', 'high', 'max') and
+                 not (selection.get('id') in ('astra', 'sol') and effort == 'high')))]
     if not matches:
         raise ValueError('model_unsupported: model is not configured for this route')
     return dict(matches[0], effort=effort)

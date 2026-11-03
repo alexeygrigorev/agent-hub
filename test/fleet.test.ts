@@ -184,6 +184,9 @@ describe('generic accounts and launch placement', () => {
     expect(plan.selected).toMatchObject({ machine: 'hetzner', engine: 'codex', account: 'shared-codex' });
     expect(plan.request.engine).toBe('astra');
     expect(plan.selected.selection).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
+    const explicitHigh = s.plan({ ...input, effort: 'high' });
+    expect(explicitHigh.selected).toBeNull();
+    expect(explicitHigh.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
     expect(s.plan({ ...input, tier: 'quick' }).selected).toBeNull();
     expect(s.plan({ ...input, machine: 'win35' }).selected).toBeNull();
     expect(s.plan({ ...input, account: 'desktop-codex' }).selected).toBeNull();
