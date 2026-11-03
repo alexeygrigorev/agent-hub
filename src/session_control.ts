@@ -3108,7 +3108,9 @@ export class SessionControlService {
         const alerts = this.sql.exec("SELECT a.* FROM session_control_wake_alerts a JOIN session_control_wakes w ON w.id=a.wake_id WHERE w.state='missed' ORDER BY a.created_at DESC, a.id DESC LIMIT 100").toArray() as any[];
         wake_alerts = alerts.filter(a => ownedIds.has(a.session_id) || admin);
       } catch {}
-      return response({ warnings, wake_alerts, truncated: warningsTruncated });
+      // The page reports truncation only when the cap binds, keeping the
+      // common response byte-identical for existing readers.
+      return response(warningsTruncated ? { warnings, wake_alerts, truncated: true } : { warnings, wake_alerts });
     }
 
     if (path === '/api/sessions' && request.method === 'GET') {
