@@ -2825,6 +2825,7 @@ export class FleetService {
         let written = 0;
         const cleanSessions: any[] = [];
         const changedSessions: any[] = [];
+        const linkChangedSessions: any[] = [];
         const observedRows: any[] = [];
         const unobservedIds: string[] = [];
         let metadataChanged = false;
@@ -2848,6 +2849,11 @@ export class FleetService {
           const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null, progress_json: s.progress ? JSON.stringify(s.progress) : null };
           if (!staleRecoverable && prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
           changedSessions.push(s);
+          // Activity/progress refreshes do not change the launch-to-session
+          // relationship. Keep them on the write-through catalog path without
+          // repeating per-native adoption and linkage probes on every census.
+          const linkFields = ['tag', 'engine', 'phase', 'workspace', 'created_at_ms'];
+          if (!prior || linkFields.some(f => (prior[f] ?? null) !== (row[f] ?? null))) linkChangedSessions.push(s);
           if (!metadataChanged) {
             const metaFields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account'];
             metadataChanged = !prior || metaFields.some(f => (prior[f] ?? null) !== (row[f] ?? null));
@@ -2913,7 +2919,8 @@ export class FleetService {
         try { revision = String((this.sql.exec('SELECT revision FROM session_observation_intake_meta WHERE id=1').toArray()[0] as any)?.revision ?? ''); } catch { /* table not created yet */ }
         const revisionMoved = !revision || this.linkRevisions.get(caller.machineId!) !== revision;
         this.linkRevisions.set(caller.machineId!, revision);
-        adoptObservedNativeSessions(this.sql, caller.machineId!, changedSessions, this.now(), undefined, revisionMoved ? cleanSessions : changedSessions);
+        adoptObservedNativeSessions(this.sql, caller.machineId!, linkChangedSessions, this.now(), undefined,
+          revisionMoved ? cleanSessions : linkChangedSessions);
         if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
         reconcileVerifiedNoStarts(this.sql, this.now());

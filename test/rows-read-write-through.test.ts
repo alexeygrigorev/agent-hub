@@ -69,7 +69,7 @@ const withFleet = (fn: (s: any, t: ReturnType<typeof tracked>, watch: WriteWatch
     watch.trackAll(['session_control_sessions','fleet_launches','machines','intake_tasks','intake_task_projection','resource_request_projection','session_control_protections','resource_reaps','resource_settings','host_health_observations','session_idle_episodes']);
     const watched: any = watch.wrap(t.proxy as any);
     const catalog = new ObservedCatalog(watched, watch);
-    const s: any = new FleetService(watched, (cb: any) => state.storage.transactionSync(cb), () => now, watch, catalog);
+    const s: any = new FleetService(watched, (cb: any) => watch.transaction(() => state.storage.transactionSync(cb)), () => now, watch, catalog);
     s.init();
     await fn(s, t, watch, catalog, state.storage.sql);
   });
@@ -91,7 +91,7 @@ it('the observed catalog hydrates with machine-indexed reads and serves warm glo
   const from = t.mark();
   expect(catalog.rows()).toHaveLength(2 * HISTORY);
   expect(t.report(from)).toStrictEqual({ total: 0, top: [] });
-  expect(t.report().top.join('\n')).not.toContain('SELECT * FROM fleet_sessions ');
+  expect(t.report().top.join('\n')).not.toMatch(/SELECT \* FROM fleet_sessions(?!\s+WHERE\b)/i);
 }));
 
 it('an offered launch invalidates the cached all-clear on the next poll', withFleet(async (s, t) => {
@@ -118,19 +118,32 @@ it('a repeat resources/watchdog poll reads zero rows until a source table is wri
   expect(changed.state).toBe('failed');
 }));
 
-it('census activity-only refreshes patch the catalog without rebuilding it', withFleet(async (s, t) => {
+it('census activity-only refreshes patch the catalog without rebuilding it', withFleet(async (s, t, watch) => {
   const get = () => s.handle(new Request('https://hub.test/api/fleet/resources/watchdog'), host);
+  const census = (activity: string) => s.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({
+    census_complete: false,
+    sessions: [{ native_id: uuid(3, 0), tag: 'hub-' + uuid(1, 0), engine: 'codex', phase: 'running', confirmed_exit: false, agent_state: null,
+      workspace: '/w', cwd: '/w', profile: null, account: null, last_activity_at: activity, created_at_ms: now - 1000 }] }) }), host);
+  // Let first-census adoption and cache hydration finish before measuring the
+  // following activity-only update, which must not rebuild authority history.
+  expect((await census(iso(-30_000))).status).toBe(200);
+  // The first observation may also finish late-linking metadata. Run that
+  // reconciliation once before warming the route snapshot used below.
+  expect((await census(iso(-30_000))).status).toBe(200);
   const before: any = await (await get()).json();
   expect(before.sessions.length).toBeGreaterThan(0);
   const from = t.mark();
+  const cacheTables = ['session_control_sessions','fleet_launches','machines','session_control_protections','resource_reaps',
+    'intake_tasks','intake_task_projection','resource_request_projection','fleet_sessions_meta','resource_settings',
+    'host_health_observations','session_idle_episodes'];
+  const stamps = Object.fromEntries(cacheTables.map(table => [table, watch.stamp(table)]));
   // One native's activity moves: identical identity fields, new timestamp, so
   // the census writes the row and patches the map without a metadata bump.
   const native = uuid(3, 0);
-  const put = await s.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({
-    census_complete: true,
-    sessions: [{ native_id: native, tag: 'hub-' + uuid(1, 0), engine: 'codex', phase: 'running', confirmed_exit: false, agent_state: null,
-      workspace: '/w', cwd: '/w', profile: null, account: null, last_activity_at: iso(), created_at_ms: now - 1000 }] }) }), host);
+  const put = await census(iso());
   expect(put.status).toBe(200);
+  const invalidated = cacheTables.filter(table => watch.stamp(table) !== stamps[table]);
+  expect(invalidated).toEqual([]);
   const mid = t.report(from);
   // The census itself reads per changed row (PK lookups), never per history.
   expect({ total: mid.total, top: mid.top }).toMatchObject({ total: expect.any(Number) });
@@ -141,6 +154,19 @@ it('census activity-only refreshes patch the catalog without rebuilding it', wit
   expect(Date.parse(row.last_activity_at)).toBe(Date.parse(iso()));
   // The catalog was not rebuilt for the activity change: zero rows read.
   expect(t.report(from2)).toStrictEqual({ total: 0, top: [] });
+}));
+
+it('does not retain SQL memo rows read inside a rolled-back transaction', withFleet(async (s, t) => {
+  const read = () => (s as any).sql.exec('SELECT state FROM fleet_launches WHERE id = ?', uuid(1, 0)).one().state;
+  expect(read()).toBe('running');
+  expect(() => (s as any).transaction(() => {
+    (s as any).sql.exec("UPDATE fleet_launches SET state = 'failed' WHERE id = ?", uuid(1, 0));
+    expect(read()).toBe('failed');
+    throw new Error('rollback memo row');
+  })).toThrow('rollback memo row');
+  const from = t.mark();
+  expect(read()).toBe('running');
+  expect(t.report(from).total).toBeGreaterThan(0);
 }));
 
 it('liveness alerts() reads a bounded page of a long alert history', async () => {

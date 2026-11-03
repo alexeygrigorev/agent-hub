@@ -187,6 +187,23 @@ export class Hub extends DurableObject {
     // calls (with rowsRead=0); the inner write watch owns SQL invalidation.
     this.sql = this.meter.wrap(this.writes.wrap(ctx.storage.sql));
     this.observedCatalog = new ObservedCatalog(this.sql, this.writes);
+    // Cache generations advance for SQL writes, including those later rolled
+    // back. Observe the native transaction boundary so aborted SQL/memory
+    // snapshots cannot remain current or have their stamps reused.
+    const storage = this.ctx.storage as any;
+    const nativeTransactionSync = storage.transactionSync;
+    if (typeof nativeTransactionSync === 'function') {
+      const invokeTransactionSync = nativeTransactionSync.bind(storage);
+      const trackedTransactionSync = (fn: any) => this.writes.transaction(
+        () => invokeTransactionSync(fn),
+        () => this.observedCatalog.reset(),
+      );
+      Object.defineProperty(storage, 'transactionSync', {
+        configurable: true,
+        writable: true,
+        value: trackedTransactionSync,
+      });
+    }
     this.meter.runSync('init:schema', () => {
       this.initDb();
       for (const stmt of ROWS_STATS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
@@ -513,7 +530,7 @@ export class Hub extends DurableObject {
         setAlert: (kind, subject, problem) => this.livenessService.setAlert(kind, subject, problem),
         deliverAlert: alert => this.notifyAlert(alert),
       }),
-    }, Date.now, makeHeuristicDecider, this.env);
+    }, Date.now, makeHeuristicDecider, this.env, undefined, () => this.observedCatalog.rows());
     this.sessionAudit.init();
     this.livenessService.setPressureProjection(() => placementPressureSubjects(this.sql, Date.now()));
     this.checksService = new ChecksService(this.sql);

@@ -54,7 +54,7 @@ cursor with zero `rowsRead`.
 | Hot path | Change |
 | --- | --- |
 | `GET /api/sessions` CPU estimate | Cache CPU history and cohort estimates on exact resource/CPU/RSS/config write stamps; skip unchanged resource upserts. A rebuild reads at most 500 recent rows. |
-| Fleet session catalog, watchdog and liveness | Write-through `fleet_sessions` rows on census/reap/phase changes; cold hydration uses indexed per-machine reads. Canonical/session authority and resource evidence use per-machine stamps. |
+| Fleet session catalog, watchdog, liveness and idle audit | Write-through `fleet_sessions` rows on census/reap/phase changes; cold hydration uses indexed per-machine reads. The 30-minute idle audit shares this catalog for outcome verification and feature collection instead of issuing two retained-table scans per run. Canonical/session authority and resource evidence use per-machine stamps. |
 | `GET /api/fleet/offers` | Cache only the empty response, keyed by all fleet/session inputs and a 20-second ceiling; active offers still use bounded indexed reads. |
 | Admission/account status | Share a per-account in-memory result keyed by fleet/quota/resource writes with a 30-second ceiling. |
 | `GET /api/liveness` | Read only indexed open/recent alert branches and bounded top-N history; live observed sessions use the write-through catalog. |

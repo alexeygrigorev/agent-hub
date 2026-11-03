@@ -267,6 +267,35 @@ export class WriteWatch {
   private memo = new Map<string, MemoEntry>();
   private memoBytes = 0;
 
+  /** Run a storage transaction while keeping cache stamps safe on rollback.
+   * Generations are deliberately advanced after an aborted write instead of
+   * restored: a cache populated from uncommitted rows must never match a
+   * later, different transaction that happens to reuse the same generation. */
+  transaction<T>(run: () => T, onRollback?: () => void): T {
+    const generations = new Map(this.generations);
+    const schemaGeneration = this.schemaGeneration;
+    const triggerTargets = new Map<string, Set<string>>();
+    for (const [key, targets] of this.triggerTargets) triggerTargets.set(key, new Set(targets));
+    try {
+      return run();
+    } catch (error) {
+      const tables = new Set([...generations.keys(), ...this.generations.keys()]);
+      for (const table of tables) {
+        const before = generations.get(table) ?? 0;
+        const current = this.generations.get(table) ?? 0;
+        if (before !== current || generations.has(table) !== this.generations.has(table)) {
+          this.generations.set(table, Math.max(before, current) + 1);
+        }
+      }
+      if (this.schemaGeneration !== schemaGeneration) {
+        this.schemaGeneration = Math.max(schemaGeneration, this.schemaGeneration) + 1;
+      }
+      this.triggerTargets = triggerTargets;
+      try { onRollback?.(); } catch { /* cache invalidation is best-effort */ }
+      throw error;
+    }
+  }
+
   /** Record one executed statement. Cheap no-op for reads. */
   note(query: string, rowsWritten?: number): void {
     if (DDL_RE.test(query)) {
