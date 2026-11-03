@@ -162,8 +162,8 @@ function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
       SELECT 1 FROM fleet_sessions f WHERE f.machine_id = session_control_sessions.machine_id
       AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id')
       AND f.phase NOT IN ('exited','dead','pruned','forgotten','unobserved')
-      AND (f.observed_at >= ? OR EXISTS (
-        SELECT 1 FROM fleet_catalog_seen c WHERE c.machine_id = f.machine_id AND c.observed_at >= ?
+      AND (f.observed_at >= ? OR f.machine_id IN (
+        SELECT c.machine_id FROM fleet_catalog_seen c WHERE c.observed_at >= ?
       )))))`,
     params: [cutoff, cutoff],
   };

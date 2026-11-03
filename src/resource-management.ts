@@ -11,6 +11,9 @@ import { resolveMachineAliases } from './machine-alias';
 import { jsonFields, resourceRequest } from './sql-json-projection';
 export const MEMORY_FLOOR_MB = defaults.memory_floor_mb;
 export const NEXT_SLOT_MB = defaults.ramp_reserve_default_mb;
+const RESOURCE_SETTINGS_VERSION = 1;
+const LEGACY_MEMORY_FLOOR_PCT = 3;
+const RESOURCE_SETTINGS_VERSION_KEY = '__resource_settings_version';
 // Intake 63a9ee3a / 736ba282: an offered, starting or uncertain launch holds
 // its full estimate only this long after its claim (or creation when never
 // claimed). Parked offers (host_overload) and stuck uncertain rows otherwise
@@ -89,7 +92,7 @@ export function resourceConfig(value: any = {}): ResourceConfig {
   return result;
 }
 /** Floor scaled to the host: memory_floor_pct of total RAM, never above the configured ceiling and never below 512 MiB.
- * Unknown total keeps the configured value. A 32 GiB laptop gets ~960 MiB, a 16 GiB tablet 512 MiB, a 64 GiB server 1920 MiB. */
+ * Unknown total keeps the configured value. With the 1.5% default, a 32 GiB laptop gets 512 MiB, a 64 GiB server ~960 MiB. */
 export function effectiveFloorMb(config: ResourceConfig, totalMb: unknown): number {
   if (!finite(totalMb) || (totalMb as number) <= 0) return config.memory_floor_mb;
   return Math.min(config.memory_floor_mb, Math.max(512, Math.round((totalMb as number) * config.memory_floor_pct / 100)));
@@ -105,6 +108,7 @@ const SLIM_REQUEST = `CASE WHEN json_valid(request_json) THEN json_object('intak
 const NATIVE_KEY = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
   THEN json_extract(binding_json, '$.native_id') END END`;
 export class ResourceManagement {
+  private resourceSettingsMigrationChecked = false;
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
   private catalogRawRows=new Map<string,any[]>();
@@ -157,6 +161,25 @@ export class ResourceManagement {
           AFTER ${op} ON ${table} WHEN ${relevant} BEGIN UPDATE resource_history_revision SET revision=lower(hex(randomblob(16))) WHERE id=1; END`);
       }
     }
+    this.migrateResourceSettings();
+  }
+  private migrateResourceSettings() {
+    if (this.resourceSettingsMigrationChecked) return;
+    this.resourceSettingsMigrationChecked = true;
+    const row = this.sql.exec('SELECT data FROM resource_settings WHERE id=1').toArray()[0] as any;
+    if (!row) return;
+    const stored = parse(row.data);
+    const version = Number.isSafeInteger(stored[RESOURCE_SETTINGS_VERSION_KEY]) ? stored[RESOURCE_SETTINGS_VERSION_KEY] : 0;
+    if (version >= RESOURCE_SETTINGS_VERSION) return;
+    delete stored[RESOURCE_SETTINGS_VERSION_KEY];
+    const config = resourceConfig(stored);
+    // Existing Durable Objects have a persisted 3% default, which would
+    // otherwise mask the new shipped default forever. Migrate that legacy
+    // default once; later explicit configure() calls are versioned and kept.
+    if (stored.memory_floor_pct === LEGACY_MEMORY_FLOOR_PCT && defaults.memory_floor_pct < LEGACY_MEMORY_FLOOR_PCT) {
+      config.memory_floor_pct = defaults.memory_floor_pct;
+    }
+    this.sql.exec('UPDATE resource_settings SET data=? WHERE id=1', JSON.stringify({ ...config, [RESOURCE_SETTINGS_VERSION_KEY]: RESOURCE_SETTINGS_VERSION }));
   }
   private refreshHistory() {
     if (this.historyScope) return;
@@ -195,10 +218,15 @@ export class ResourceManagement {
     const m: any = this.readRows('SELECT last_heartbeat FROM machines WHERE id=?', machine)[0];
     return { ...config, memory_floor_mb: effectiveFloorMb(config, parse(m?.last_heartbeat).mem_total_mb) };
   }
-  config(): ResourceConfig { return resourceConfig(parse(this.readRows('SELECT data FROM resource_settings WHERE id=1')[0]?.data)); }
+  config(): ResourceConfig {
+    this.migrateResourceSettings();
+    const stored = parse(this.readRows('SELECT data FROM resource_settings WHERE id=1')[0]?.data);
+    delete stored[RESOURCE_SETTINGS_VERSION_KEY];
+    return resourceConfig(stored);
+  }
   configure(value: any) {
     const config = resourceConfig(value);
-    this.sql.exec('INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', JSON.stringify(config));
+    this.sql.exec('INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', JSON.stringify({ ...config, [RESOURCE_SETTINGS_VERSION_KEY]: RESOURCE_SETTINGS_VERSION }));
     return config;
   }
   estimate(project: string | null, engine: string | null, kind: string | null, model: string | null = null) {

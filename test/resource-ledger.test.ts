@@ -31,17 +31,21 @@ describe('host-proportional memory floor and robust estimate defaults',()=>{
   expect(config.estimate_cap_mb).toBe(1024);
   expect(()=>resourceConfig({estimate_cap_mb:10})).toThrow();
  });
- it('scales the floor to host RAM with a 512 MiB minimum and the configured ceiling',()=>{
-  expect(effectiveFloorMb(config,32279)).toBe(968);   // 32 GiB laptop
+ it('scales the small floor to host RAM with a 512 MiB minimum and the configured ceiling',()=>{
+  expect(effectiveFloorMb(config,32279)).toBe(512);   // 32 GiB laptop
   expect(effectiveFloorMb(config,15980)).toBe(512);   // 16 GiB tablet
-  expect(effectiveFloorMb(config,64223)).toBe(1927);  // 64 GiB server
+  expect(effectiveFloorMb(config,64223)).toBe(963);  // 64 GiB server
   expect(effectiveFloorMb(config,256000)).toBe(config.memory_floor_mb);
   expect(effectiveFloorMb(config,null)).toBe(config.memory_floor_mb);
   expect(effectiveFloorMb(config,0)).toBe(config.memory_floor_mb);
  });
- it('lets the 32 GiB laptop with ~1.6 GiB free accept a few-hundred-MiB session',()=>{
+ it('lets light Codex, Claude, and OpenCode estimates fit at ~1.6 GiB free',()=>{
+  expect(memoryVerdict(1600,0,157,config,32279)).toBe(true); // Codex: p90 125 × 1.25
+  expect(memoryVerdict(1600,0,1024,config,32279)).toBe(true); // Claude: p90 943 × 1.25, capped
+  expect(memoryVerdict(1600,0,512,config,32279)).toBe(true); // OpenCode without a cohort yet
+  expect(memoryVerdict(1400,0,1024,config,32279)).toBe(false); // floor still protects the host
   expect(memoryVerdict(1600,0,414,config,32279)).toBe(true);
-  expect(memoryVerdict(1300,0,414,config,32279)).toBe(false);
+  expect(memoryVerdict(900,0,414,config,32279)).toBe(false);
   expect(memoryVerdict(1600,0,414,config)).toBe(false); // legacy unknown-total keeps the ceiling floor
  });
 });

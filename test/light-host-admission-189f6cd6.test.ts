@@ -63,28 +63,34 @@ describe('light-host memory admission (189f6cd6)',()=>{
   expect(f.resources.estimate('repo','claude','implement')).toBe(1024);
  }));
 
+ it('admits the measured Claude p90 on a 32 GiB host with ~1.6 GiB available',()=>fixture(async(f)=>{
+  const planned=f.plan(req({engine:'claude'}));
+  expect(planned.rejected??[]).not.toContainEqual(expect.objectContaining({reason:'launcher_memory_reserve'}));
+  expect(planned.selected).toMatchObject({machine:'host'});
+ }));
+
  it('a host with ~1.6 GiB free admits light codex sessions until the floor, leaked rows never count',()=>fixture(async(f,{launch})=>{
   const est=f.resources.estimate('repo','codex','implement');
-  // Two codex sessions already admitted and ramping, plus one hours-old
-  // uncertain leak (63a9ee3a) that must not count towards the reservation.
+  // Two codex sessions already admitted and ramping, plus stale leaked
+  // offered, starting and uncertain rows (63a9ee3a) that must not count.
   launch('inflight-1','codex','offered',60000);
   launch('inflight-2','codex','starting',60000);
+  launch('leaked-offered','codex','offered',4*3600000);
+  launch('leaked-starting','codex','starting',4*3600000);
   launch('leaked-uncertain','codex','uncertain',4*3600000);
   const memory=f.resources.headroom('host',req(),'codex');
-  expect(memory.floor_mb).toBe(968);          // 3% of the 32 GiB laptop RAM
+  expect(memory.floor_mb).toBe(512);          // 1.5% of RAM, with the 512 MiB minimum
   expect(memory.reserved_mb).toBe(2*est);     // leaked row ignored
-  // Third and fourth light codex sessions fit above the floor...
-  const third=f.plan(req());
-  expect(third.rejected??[]).not.toContainEqual(expect.objectContaining({reason:'launcher_memory_reserve'}));
-  expect(third.selected).toMatchObject({machine:'host'});
-  launch('inflight-3','codex','offered',30000);
-  const fourth=f.plan({...req(),idempotency_key:crypto.randomUUID()});
-  expect(fourth.rejected??[]).not.toContainEqual(expect.objectContaining({reason:'launcher_memory_reserve'}));
-  expect(fourth.selected).toMatchObject({machine:'host'});
-  // ...and MemAvailable projected under the floor refuses the next one.
-  launch('inflight-4','codex','starting',30000);
-  const fifth=f.plan({...req(),idempotency_key:crypto.randomUUID()});
-  expect(fifth.rejected).toContainEqual(expect.objectContaining({reason:'launcher_memory_reserve'}));
-  expect(fifth.selected).toBeNull();
+  // Four more light Codex starts fit (six total including the active ramps).
+  for (let i=3;i<=6;i++) {
+    const planned=f.plan(req());
+    expect(planned.rejected??[]).not.toContainEqual(expect.objectContaining({reason:'launcher_memory_reserve'}));
+    expect(planned.selected).toMatchObject({machine:'host'});
+    launch(`inflight-${i}`,'codex',i%2?'offered':'starting',30000);
+  }
+  // The seventh start would leave less than the 512 MiB floor.
+  const seventh=f.plan(req());
+  expect(seventh.rejected).toContainEqual(expect.objectContaining({reason:'launcher_memory_reserve'}));
+  expect(seventh.selected).toBeNull();
  }));
 });
