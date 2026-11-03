@@ -36,12 +36,23 @@ if name=='a':
         save()
     elif cmd=='capture': print('❯')
     elif cmd=='send': sys.exit(s.get('send_error',0))
+    elif cmd=='engines':
+        print(json.dumps([{'name':engine} for engine in ('gemini','antigravity','grok','opencode','zcodex','codex','claude')]))
 elif name=='systemd-run':
     import subprocess
     # Proof timers (--on-active) are only recorded; scope launches run their command.
     sys.exit(subprocess.call(args[args.index('--')+1:]) if '--' in args else 0)
 elif name=='hub':
-    sys.exit(s.get('hub_error',0))
+    if args and args[0]=='quota':
+        print(json.dumps({'pools':[
+            {'provider':'gemini','state':'fresh','remaining_percent':44,'harness':['gemini','antigravity']},
+            {'provider':'go','state':'fresh','remaining_percent':36,'harness':['opencode']},
+            {'provider':'grok','state':'fresh','remaining_percent':32,'harness':['grok']},
+            {'provider':'zai','state':'fresh','remaining_percent':50,'harness':['zcodex']},
+            {'provider':'claude','state':'exhausted','remaining_percent':0,'harness':['claude','sonnet','opus','haiku']},
+        ]}))
+    else:
+        sys.exit(s.get('hub_error',0))
 elif name=='git':
     if 'rev-parse' in args:
         print(str(p/'exclude') if '--git-path' in args else 'abcdef')
@@ -70,7 +81,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.ticks.parent.mkdir(parents=True)
         self.ticks.write_text('{}\n')  # fresh tick log: the orchestrator is progressing
         self.data = {'sessions': []}
-        self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)+':'+os.environ['PATH'], 'LOOP_INTERVAL': 'off', 'MIN_RESTART_GAP': '0', 'OPS_LOCK_DIR': str(self.home)}
+        self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)+':'+os.environ['PATH'], 'LOOP_INTERVAL': 'off', 'MIN_RESTART_GAP': '0', 'OPS_LOCK_DIR': str(self.home), 'ORCH_ENGINE': 'gemini', 'ORCH_FALLBACK_ENGINE': 'opencode'}
 
     def session(self, alive=False, pid=2147483647):
         return dict(id='old', tag='orchestrator-main', workspace=str(self.workspace), phase='running', worker_alive=alive, worker_pid=pid, workload_pid=pid)
@@ -194,8 +205,8 @@ class OpsWatchdogTest(unittest.TestCase):
 
     def due_now(self):
         due = self.state / 'proof_due'
-        _, path = due.read_text().split()
-        due.write_text(f'{int(time.time()) - 1} {path}\n')
+        fields = due.read_text().split()
+        due.write_text(f'{int(time.time()) - 1} {" ".join(fields[1:])}\n')
 
     def timer_delays(self, kind):
         out = []
@@ -217,7 +228,7 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl()
         self.assertIn('recovery proof FAILED (path 1)', result.stdout)
         self.assertIn('recovery path 2 started', result.stdout)
-        self.assertIn('--engine sonnet', self.starts()[-1])
+        self.assertIn('--engine opencode', self.starts()[-1])
         self.assertEqual((self.state / 'restart_failures').read_text().strip(), '1')
 
     def test_on_time_tick_in_history_proves_even_after_a_later_tick(self):
@@ -319,12 +330,12 @@ class OpsWatchdogTest(unittest.TestCase):
         self.data['sessions'] = [self.session()]
         self.data['kill_ok'] = True
         self.run_ctl()
-        self.assertIn('--engine opus', self.starts()[-1])
+        self.assertIn('--engine gemini', self.starts()[-1])
         self.due_now()
         result = self.run_ctl()
         self.assertIn('recovery proof FAILED (path 1)', result.stdout)
         self.assertIn('recovery path 2 started', result.stdout)
-        self.assertIn('--engine sonnet', self.starts()[-1])
+        self.assertIn('--engine opencode', self.starts()[-1])
         needs = self.home / 'tmp/agent-reports/orchestrator/NEEDS_ALEXEY.md'
         self.assertFalse(needs.exists())  # one failed recovery is not an alert
         self.assertIn('--state proof_failed --recovery-failures 1', self.calls())
@@ -333,7 +344,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertIn('recovery proof FAILED (path 2)', result.stdout)
         self.assertIn('automatic recovery failed 2 consecutive times', needs.read_text())
         self.assertIn('--recovery-failures 2', self.calls())
-        self.assertIn('--engine opus', self.starts()[-1])  # keeps recovering after the alert
+        self.assertIn('--engine gemini', self.starts()[-1])  # keeps recovering after the alert
         self.assertEqual(len(self.starts()), 3)
 
     def test_session_dying_inside_proof_window_fails_proof_immediately(self):
