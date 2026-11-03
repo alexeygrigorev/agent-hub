@@ -602,6 +602,7 @@ function workspaceReady(caps: any, workspace: any): boolean {
  * timestamps (sampled_at/last_progress_at/last_cpu_at) do not move the key.
  * Tokens are excluded on purpose: idle catalogs keep a stable key while
  * active catalogs change activity/progress every census anyway. */
+// Canonical catalog key: identical quiet polls skip every probe below.
 export function censusCatalogKey(sessions: any[]): string {
   const parts: string[] = [];
   const sorted = [...sessions].sort((a, b) => String(a?.native_id ?? '').localeCompare(String(b?.native_id ?? '')));
