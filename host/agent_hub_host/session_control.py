@@ -581,6 +581,11 @@ def add_commands(sub):
     count.add_argument('--by', default='host,engine,account',
                        help='Comma-separated grouping: any of host,engine,account (default host,engine,account)')
     count.add_argument('--json', action='store_true', help='Output machine-readable JSON')
+    first_try = commands.add_parser('first-attempt-report', help='First-attempt outcome ledger: per-cause counts and examples for one Berlin-day window (intake 95fd7f1a)')
+    first_try.add_argument('--day', required=True, help='Berlin calendar day YYYY-MM-DD')
+    first_try.add_argument('--examples', type=int, default=3, help='Example sessions per cause (0..10, default 3)')
+    first_try.add_argument('--input-file', default=None,
+                           help='Offline session snapshot JSON file (object with sessions list, or bare list); omit to page the live /api/sessions listing')
     tree = commands.add_parser('tree', help='Display session lineage tree')
     tree.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     link = commands.add_parser('link', help='Link a session to an intake (operator or same-intake/machine/workspace worker credential; works while it runs and after it ended; repeats are idempotent, a different existing linkage is refused)')
@@ -905,6 +910,47 @@ def _execute(args):
         from urllib.parse import quote
         by = normalize_breakdown_dims(getattr(args, 'by', None))
         return request('GET', '/api/sessions?view=breakdown&by=' + quote(','.join(by), safe=','))
+    if cmd == 'first-attempt-report':
+        from .first_attempt_outcome import berlin_day_range, report_for_day
+        day = getattr(args, 'day', None)
+        berlin_day_range(day)
+        examples = getattr(args, 'examples', 3)
+        if examples is None:
+            examples = 3
+        if type(examples) is not int or not 0 <= examples <= 10:
+            raise ValueError('Examples per cause must be 0..10')
+        input_file = getattr(args, 'input_file', None)
+        if input_file:
+            import json as _json
+            with open(input_file, 'r', encoding='utf-8') as stream:
+                snapshot = _json.load(stream)
+            sessions = snapshot.get('sessions') if isinstance(snapshot, dict) else snapshot
+            if not isinstance(sessions, list):
+                raise ValueError('Input file must hold a sessions list or an object with a sessions list')
+        else:
+            # Page the full historical listing (the API caps pages at 100).
+            from urllib.parse import quote
+            sessions = []
+            known = set()
+            cursor = None
+            cursors = set()
+            while True:
+                path = '/api/sessions?limit=100'
+                if cursor:
+                    path += '&cursor=' + quote(cursor, safe='')
+                page = request('GET', threshold_path(args, path))
+                for entry in page.get('sessions', []):
+                    if not isinstance(entry, dict) or entry.get('id') in known:
+                        continue
+                    known.add(entry.get('id'))
+                    sessions.append(entry)
+                cursor = page.get('next_cursor')
+                if not cursor:
+                    break
+                if cursor in cursors:
+                    raise ValueError('Session list pagination repeated a cursor; retry the listing')
+                cursors.add(cursor)
+        return report_for_day(sessions, day, examples)
     if cmd == 'tree' or (cmd == 'list' and getattr(args, 'tree', False)):
         return request('GET', '/api/sessions/tree')
     if cmd == 'list':

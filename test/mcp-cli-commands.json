@@ -160,6 +160,7 @@
   "sessions commands",
   "sessions count",
   "sessions events",
+  "sessions first-attempt-report",
   "sessions host-receive",
   "sessions link",
   "sessions list",
