@@ -132,6 +132,11 @@ def _note_hub_failure(error, *, now=None, emit=None):
 
 
 def safe_http_json(req: urllib.request.Request, timeout: float = 10.0, *, _token_exchange=None):
+    # One transport-level fence covers enrollment, registration, host check-in,
+    # route advertisements, and direct fleet callers. A test context must use
+    # an isolated Hub even if a production credential is present in its config.
+    from . import _prod_guard
+    _prod_guard.assert_request_allowed(req)
     if _token_exchange is not None:
         _token_exchange.begin(req)
     opener = _get_opener()
