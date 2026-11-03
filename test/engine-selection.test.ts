@@ -115,7 +115,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       const ordinaryAsk: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'routine ask', tier: 'ask' });
       expect(ordinaryAsk.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(false);
       const explicitDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'deep review', tier: 'deep', engine_override_reason: 'This task requires deep reasoning for the review.' });
-      expect(explicitDeep.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(true);
+      expect(explicitDeep.candidates.some((c: any) => c.selection?.id === 'astra' && c.selection?.effort === 'medium')).toBe(true);
 
       // Luna is a config-driven fallback (rules.fallback_models): while a healthy
       // non-fallback route exists its score is down-weighted by rules.fallback_factor
@@ -142,7 +142,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(withHealthy.candidates.filter((c: any) => c.selection?.id !== 'luna').every((c: any) => c.decision.factors.fallback_factor === 1)).toBe(true);
 
       // Current fleet shape (2026-11-02): claude 10%, zai 8%, muse 43%, codex 45%,
-      // antigravity 40%. Claude is depleted and must lose to every healthy engine;
+      // Antigravity is deep-only. Claude is depleted and must lose to every healthy daily engine;
       // healthy codex stays a real candidate (only the fallback factor applies).
       updateSub('hub-claude', 'claude', 10);
       updateSub('shared-claude', 'claude', 10);

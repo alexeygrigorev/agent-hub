@@ -81,7 +81,7 @@ describe('managed Claude placement (798f0f8c)', () => {
       const intent = { engine: 'claude', engine_override_reason: 'This task explicitly requires deep reasoning.', tier: 'deep', machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' };
       const plan = fleet.plan(intent);
       expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({
-        account: 'hub-claude', selection: { model: 'opus', effort: 'medium' },
+        account: 'hub-claude', selection: { model: 'sonnet', effort: 'medium' },
       });
       expect(plan.selected?.mode).toBeUndefined();
       expect(plan.request.mode).toBe('headless');

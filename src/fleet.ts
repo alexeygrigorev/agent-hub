@@ -1875,7 +1875,7 @@ export class FleetService {
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
         const input: any = { mode: bound.mode || 'headless', workspace: bound.workspace, prompt: bound.prompt ?? '', idempotency_key: 'drain-' + row.id };
-        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project', 'needs']) {
+        for (const key of ['machine', 'engine', 'account', 'tier', 'effort', 'engine_override_reason', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project', 'needs']) {
           if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
         }
         // These columns survive updates to the currently displayed hold reason.
