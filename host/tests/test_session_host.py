@@ -112,6 +112,19 @@ class SessionHostTests(unittest.TestCase):
         receipt=dict(id='synthetic-id',tag='controller',workspace='/synthetic',engine='shell',created_at_ms=1,command=['python','host'])
         self.assertTrue(module.same_controller(dict(receipt,workspace='C:/Users/u/AppData/Local/Temp'),receipt))
 
+    def test_windows_session_host_does_not_pin_drifting_sender_workspace(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(session_host, '_is_windows', return_value=True), \
+             patch.object(session_host, 'ensure_private_journal'), \
+             patch.object(session_host.config, 'load_config', return_value={'machine_id': 'test-machine', 'access_token': 'synthetic'}), \
+             patch.object(session_host.fleet, 'load_settings', return_value={}), \
+             patch.object(session_host, 'qualify_sender_binding', return_value=SimpleNamespace(session_id='test-native', workspace='C:\\Users\\u\\AppData\\Local\\Temp')) as qualify, \
+             patch.object(session_host.fleet, 'Dispatcher'), \
+             patch.object(session_host.session_control, 'execute') as execute:
+            session_host.run('synthetic-settings', directory, cycles=1)
+            qualify.assert_called_once_with('aplexer', None)
+            self.assertIsNone(execute.call_args.args[0].sender_workspace)
+
     def test_session_host_loads_role_config_independently_of_disabled_consumer(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = pathlib.Path(directory)
