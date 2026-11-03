@@ -670,17 +670,11 @@ export class ResourceManagement {
     const sessions = new Map(this.canonicalSessions(machine).flatMap(s => s.aliases.map(id=>[id,s] as const)));
     if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100
       || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
-    const samples = [...value.samples];
-    const sampled = new Set(samples.map(s => s.session_id));
-    // A native can finish between host measurements. Preserve its confirmed
-    // identity and terminal state durably, with unknown resource measurements.
-    for (const session of new Set(sessions.values())) {
-      if (!TERMINAL.has(session.state) || session.aliases.some(id => sampled.has(id))) continue;
-      const old:any=this.sql.exec('SELECT state,finished_at FROM session_resource_usage WHERE machine_id=? AND native_id=?',machine,session.native_id).toArray()[0];
-      if (old?.finished_at && old.state===session.state) continue;
-      samples.push({session_id:session.session_id,native_id:session.native_id,observed_at:new Date(this.now()).toISOString()});
-    }
-    for (const sample of samples) {
+    // Keep work bounded by the validated host payload. Confirmed exits that
+    // had no sample are reconciled by finishObserved from the census path;
+    // scanning all historical terminal bindings here made every report do
+    // one ledger read and potentially one write per retained session.
+    for (const sample of value.samples) {
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
       for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores','oom_kills']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');

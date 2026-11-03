@@ -55,6 +55,28 @@ describe('resource management',()=>{
   })));
   expect(queries).toBeGreaterThan(1);expect(reads).toBe(501);
  }));
+ it('keeps resource reports bounded across retained terminal sessions and repeated state changes',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec("UPDATE session_resource_usage SET state='exited',finished_at=? WHERE session_id='session'",iso());
+  sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id='session'");
+  sql.exec(`WITH RECURSIVE retained(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM retained WHERE n<210)
+    INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    SELECT 'terminal-'||n,'admin','terminal-'||n,'{}','host','opencode','headless','exited',
+      json_object('native_id','terminal-native-'||n,'tag','terminal-tag-'||n,'workspace','/repo','native_created_at_ms',?),?,?
+    FROM retained`,now-600000,iso(-600000),iso());
+  let ledgerReads=0,ledgerWrites=0;
+  const boundedSql:any={exec:(query:string,...args:any[])=>{
+   if(query.startsWith('SELECT state,finished_at FROM session_resource_usage')) ledgerReads++;
+   if(query.startsWith('INSERT INTO session_resource_usage VALUES')) ledgerWrites++;
+   return sql.exec(query,...args);
+  }};
+  const reporter=new ResourceManagement(boundedSql,()=>now);
+  reporter.report('host',{samples:[],reaps:[]});
+  reporter.report('host',{samples:[],reaps:[]});
+  expect(ledgerReads).toBe(0);
+  expect(ledgerWrites).toBe(0);
+  expect(sql.exec("SELECT state FROM session_resource_usage WHERE session_id='session'").one().state).toBe('exited');
+ }));
  it('excludes negative, fractional and unsafe token counts consistently from period totals',async()=>fixture(async(r,sql)=>{
   r.report('host',{samples:[sample()],reaps:[]});
   sql.exec('UPDATE session_resource_usage SET finished_at=?',iso(-1000));
