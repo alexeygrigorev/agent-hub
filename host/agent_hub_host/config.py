@@ -3,6 +3,8 @@ import json
 import copy
 import os
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from . import _test_isolation, private_fs
 
@@ -198,6 +200,33 @@ class ConfigPermissionError(PermissionError):
     """Safe diagnostic; never includes profile contents or arbitrary OS text."""
 
 
+@contextmanager
+def _profile_write_lock(path: Path):
+    """Serialize profile replacement and deletion across Hub processes.
+
+    The human-profile check and the following atomic rename must be one
+    operation with respect to host writers. Otherwise a host save can inspect
+    an empty profile, lose a race to human login, then replace the new login.
+    Lock files are persistent; the OS releases their lock when a process exits.
+    """
+    lock_path = path.with_name(path.name + '.write.lock')
+    deadline = time.monotonic() + 30
+    manager = None
+    while manager is None:
+        candidate = private_fs.exclusive_lock(lock_path)
+        try:
+            candidate.__enter__()
+            manager = candidate
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EACCES) or time.monotonic() >= deadline:
+                raise ConfigPermissionError('Hub profile is busy; retry the config operation.') from None
+            time.sleep(.05)
+    try:
+        yield
+    finally:
+        manager.__exit__(None, None, None)
+
+
 # Test hard guard (intake 6b624e65 AC2). host/tests hermetic isolation records
 # where the real user profiles lived before the suite forced a temporary HOME;
 # The bootstrap retains those roots in-process too: clearing or replacing
@@ -294,20 +323,21 @@ def _save_to(path: Path, data: dict, *, human_flow: bool = False):
     _forbid_real_user_profile(path)
     if not isinstance(data, dict):
         raise ValueError("Config data must be a dict")
-    if is_human_config(_load_from(path)) and not (human_flow and is_human_config(data)):
-        raise ConfigPermissionError(
-            'Refusing to replace the human profile outside the human authentication flow.')
     cleaned = {}
     for k, v in data.items():
         if k == "refresh_token" and v is None:
             continue
         cleaned[k] = v
-    if cleaned and _validate_data(cleaned) != cleaned:
-        raise ValueError("Invalid config data")
-    try:
-        private_fs.atomic_write(path, json.dumps(cleaned).encode('utf-8'), 1024 * 1024)
-    except Exception:
-        raise RuntimeError('Config save failed') from None
+    with _profile_write_lock(path):
+        if is_human_config(_load_from(path)) and not (human_flow and is_human_config(data)):
+            raise ConfigPermissionError(
+                'Refusing to replace the human profile outside the human authentication flow.')
+        if cleaned and _validate_data(cleaned) != cleaned:
+            raise ValueError("Invalid config data")
+        try:
+            private_fs.atomic_write(path, json.dumps(cleaned).encode('utf-8'), 1024 * 1024)
+        except Exception:
+            raise RuntimeError('Config save failed') from None
 
 
 def load_host_config() -> dict:
@@ -347,12 +377,13 @@ def clear_human_config():
     # destroy the host profile too. Human logout in that mode only clears
     # human credentials when the file actually holds a human profile; a
     # host-kind file is left untouched and logout reports already-logged-out.
-    if path == host_path:
-        cfg = _load_from(path)
-        if not is_human_config(cfg):
-            return False
-    if path.exists():
-        path.unlink()
+    with _profile_write_lock(path):
+        if path == host_path:
+            cfg = _load_from(path)
+            if not is_human_config(cfg):
+                return False
+        if path.exists():
+            path.unlink()
     return True
 
 
@@ -422,6 +453,10 @@ def update_config(**kwargs):
 
 def clear_config():
     path = _forbid_real_user_profile(get_config_path())
-    if path.exists():
-        path.unlink()
+    with _profile_write_lock(path):
+        if is_human_config(_load_from(path)):
+            raise ConfigPermissionError(
+                'Refusing to remove the human profile outside the human authentication flow.')
+        if path.exists():
+            path.unlink()
 
