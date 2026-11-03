@@ -73,3 +73,14 @@ session. The installer never elevates or requests a password; a policy denying
 both logon types is an explicit failure. A Linux fixture cannot prove Windows
 scheduler execution: acceptance still requires a real reboot/wake cycle and
 resumed checkin within two minutes on Tabo.
+
+On failure the installer prints one bounded marker, `AUTOSTART_ERROR=<token>`,
+with no paths or account names; the supervisor forwards it as `autostart_error`
+next to `autostart_state` in the host-release report, and the Hub stores and
+shows it in `routing-machines` (and the host-goal view). The token is one of
+`access_denied` (S4U/Interactive registration denied for a non-elevated token),
+`logon_type_denied` (the logon type is not granted to the user), 
+`task_exists_other_user` (a same-named task belongs to another user and was
+left untouched), or `script_error` (anything else, including an unmarked
+failure or an unexpected marker). A recovery report sends `autostart_error`
+null, which clears the previously stored token.

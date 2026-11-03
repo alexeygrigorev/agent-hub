@@ -16,6 +16,25 @@ $ownedByMe = {
   param($PrincipalUserId)
   $PrincipalUserId -and ($user, $account, $identity.User.Value) -ccontains $PrincipalUserId
 }
+# Bounded failure taxonomy (intake c964dbd6 AC1): the supervisor reports the
+# marker printed here as autostart_error next to autostart_state. Only these
+# tokens are ever emitted; anything unrecognized classifies as script_error.
+# No paths, account names or command lines are printed — the token alone
+# carries no secrets.
+$script:autostartErrorEmitted = $false
+function Write-AutostartError {
+  param([string]$Token)
+  $script:autostartErrorEmitted = $true
+  Write-Output "AUTOSTART_ERROR=$Token"
+}
+function Get-AutostartErrorToken {
+  param($Err)
+  $text = "$Err $($Err.Exception.Message) $($Err.CategoryInfo) $($Err.FullyQualifiedErrorId)"
+  if ($text -match '(?i)another user|belongs to') { return 'task_exists_other_user' }
+  if ($text -match '(?i)logon type|0x80070569') { return 'logon_type_denied' }
+  if ($text -match '(?i)access (is )?denied|0x80070005|unauthorized|privilege') { return 'access_denied' }
+  return 'script_error'
+}
 function Resolve-TaskName {
   if (-not [string]::IsNullOrWhiteSpace($TaskName)) { return $TaskName }
   # A legacy boot task may have an administrator-owned ACL; create this
@@ -39,6 +58,7 @@ if ($TaskName.Length -gt 238 -or $TaskName -notmatch '^AgentHubSessionHost(?:-[A
 }
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existing -and -not (& $ownedByMe $existing.Principal.UserId)) {
+  Write-AutostartError 'task_exists_other_user'
   throw 'Existing task belongs to another user'
 }
 $psExe = (Get-Command powershell.exe).Source
@@ -73,9 +93,21 @@ $register = {
 try {
   & $register 'S4U'
 } catch {
-  & $register 'Interactive'
+  try {
+    & $register 'Interactive'
+  } catch {
+    Write-AutostartError (Get-AutostartErrorToken $_)
+    throw
+  }
 }
-Start-ScheduledTask -TaskName $TaskName
+try {
+  Start-ScheduledTask -TaskName $TaskName
+} catch {
+  if (-not $script:autostartErrorEmitted) {
+    Write-AutostartError (Get-AutostartErrorToken $_)
+  }
+  throw
+}
 $taskRecord = Join-Path (Split-Path -Parent $runnerPath) 'autostart-task-name.txt'
 Set-Content -LiteralPath $taskRecord -Value $TaskName -Encoding ASCII
 Write-Output 'Host autostart registered: per-user Limited, one-minute timer, no elevation. Reboot/wake verification still required.'
