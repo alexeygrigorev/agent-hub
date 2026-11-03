@@ -296,13 +296,21 @@ describe('worktree-owner/guards rows-read budget at production scale (36c4cf38 i
       HOST, owner.at)).toBeLessThanOrEqual(40);
     // The exclusivity read is bounded too: many live same-intake sessions on
     // the host cannot turn worktree-owner into a history scan.
+    const probeIds: string[] = [];
     for (let i = 0; i < 30; i++) {
-      seedLaunch(c, { intake_task_id: intakeId, workspace: 'demo' }, { state: 'running', launchState: 'running' });
+      probeIds.push(seedLaunch(c, { intake_task_id: intakeId, workspace: 'demo' }, { state: 'running', launchState: 'running' }).sessionId);
     }
     const contenderPlan = (c.hub.sql.exec('EXPLAIN QUERY PLAN ' + WORKTREE_OWNER_CONTENDERS_SQL,
       HOST, owner.sessionId, null, null, intakeId).toArray() as any[]).map(r => String(r.detail)).join('\n');
     expect(contenderPlan).not.toMatch(/SCAN session_control_sessions/i);
     expect(reads(WORKTREE_OWNER_CONTENDERS_SQL, HOST, owner.sessionId, null, null, intakeId)).toBeLessThanOrEqual(60);
+    // Retire the live-contender probes: the verdict below runs without a
+    // ?requester=, so any live contender would (correctly, per Review-2 P1
+    // exclusivity) refuse the owner. The probes already proved the read is
+    // bounded; they must not fence the terminal verdict.
+    for (const id of probeIds) {
+      c.hub.sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?", id);
+    }
 
     const ownerOf = (id: string) => service.handle(
       new Request('https://hub.test/api/fleet/worktree-owner/' + id), hostCaller);

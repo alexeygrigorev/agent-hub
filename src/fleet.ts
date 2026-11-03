@@ -744,7 +744,7 @@ export class FleetService {
     // the small indexed (machine_id, created_at) pair and compares
     // request_json in JS over a bounded candidate set — never as correlated
     // request_json text equality in SQL (that degraded the prod DO).
-    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_host_created ON fleet_launches(machine_id,created_at)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_host_created ON fleet_launches(created_at,machine_id)');
     // Intake e8a22f4c: plan() and the choking watchdog look for these rare exit reasons on every poll;
     // partial indexes keep both lookups independent of the machine's retained launch history.
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_model_unsupported ON fleet_launches(machine_id,engine,account) WHERE exit_reason = 'model_unsupported'");
