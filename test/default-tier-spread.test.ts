@@ -92,6 +92,25 @@ describe('default tier placement', () => {
       expect(recommendBody.candidates.every((candidate: any) => Number.isFinite(candidate.draw_probability))).toBe(true);
       expect(recommendBody.candidates.reduce((sum: number, candidate: any) => sum + candidate.draw_probability, 0)).toBeCloseTo(1, 6);
 
+      // Naming Antigravity alone must not use the legacy any-tier fallback to
+      // escape the daily tier and place a deep model on a plain implement start.
+      const engineOnly = fleet.plan({ machine, mode: 'headless', workspace: 'demo', prompt: 'plain implement',
+        engine: 'antigravity', task_kind: 'implement' } as any);
+      expect(engineOnly.selected).toBeNull();
+      expect(engineOnly.rejected).toContainEqual({ machine, engine: 'antigravity', reason: 'model_unsupported' });
+      expect(isDeepModel(engineOnly.selected?.selection), JSON.stringify(engineOnly)).toBe(false);
+      const reasonedEngine = fleet.plan({ machine, mode: 'headless', workspace: 'demo', prompt: 'explicit deep implement',
+        engine: 'antigravity', tier: 'deep', engine_override_reason: 'This task requires deep reasoning on the requested Gemini route.',
+        task_kind: 'implement' } as any);
+      expect(reasonedEngine.selected?.selection, JSON.stringify(reasonedEngine)).toMatchObject({
+        id: 'argon', model: 'gemini-4-argon-medium', effort: 'medium',
+      });
+      const reasonedDailyEngine = fleet.plan({ machine, mode: 'headless', workspace: 'demo', prompt: 'explicit deep implement',
+        engine: 'antigravity', tier: 'daily', engine_override_reason: 'This task requires deep reasoning on the requested Gemini route.',
+        task_kind: 'implement' } as any);
+      expect(reasonedDailyEngine.selected, JSON.stringify(reasonedDailyEngine)).toBeNull();
+      expect(reasonedDailyEngine.rejected).toContainEqual({ machine, engine: 'antigravity', reason: 'tier_unavailable' });
+
       const engines: string[] = [];
       for (let i = 0; i < 4; i++) {
         const prompt = 'start ' + i;
@@ -167,7 +186,6 @@ describe('default tier placement', () => {
       // quotas is opencode + codex (claude 10 and zai 8 depleted, antigravity
       // out of daily): spread across the 2 healthy daily engines.
       expect(Object.keys(counts).length, JSON.stringify(counts)).toBeGreaterThanOrEqual(2);
-      expect(counts.antigravity ?? 0, JSON.stringify(counts)).toBe(0);
       expect(counts.antigravity ?? 0, JSON.stringify(counts)).toBe(0);
     });
   });
