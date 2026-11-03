@@ -1154,8 +1154,23 @@ export class IntakeService {
       open_non_terminal_count: openCount, open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
       ...(warn ? { intake_open_warning: warn } : {}) };
   }
-  private exportSummary(url: URL, p: Obj, revision: number): Obj {
-    // Counts include every authorized task, including retained terminal/archive rows.
+  /** Lock-free status read (intake ef429827): pure SELECTs over the trigger-
+   * maintained export read model, no write transaction. Returns null when the
+   * export backfill is incomplete or a concurrent write moved the revision
+   * mid-read, so the caller falls back to the serializing path. A matching
+   * revision before and after keeps counts/recent/sessions snapshot
+   * consistent without holding the exclusive lock. */
+  private summaryFast(url: URL, p: Obj): Obj | null {
+    const done = (this.sql.exec('SELECT done FROM intake_export_migration WHERE id=1').toArray()[0] as Obj | undefined)?.done;
+    if (!done) return null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const rev = this.revision();
+      const out = this.exportSummary(url, p, rev);
+      if (this.revision() === rev) return out;
+    }
+    return null;
+  }
+  private exportSummary(url: URL, p: Obj, revision: number): Obj {    // Counts include every authorized task, including retained terminal/archive rows.
     const counts: Obj = Object.fromEntries(STATUSES.map(s => [s, 0])); let total = 0; let archived = 0; let open = 0;
     for (const row of intakeExportCounts(this.sql, p, url.searchParams.get('project'))) {
       counts[row.status] = (counts[row.status] ?? 0) + Number(row.n); total += Number(row.n);
@@ -2540,6 +2555,14 @@ export class IntakeService {
         : null;
       if (assignMatch) return await this.assign(assignMatch[1], payload, auth, json);
       const exportUrl = new URL(request.url);
+      if (request.method === 'GET' && exportUrl.pathname === '/api/intake/summary') {
+        // Fast status path (intake ef429827): no write transaction, so a
+        // status read never queues behind (or blocks) concurrent intake
+        // writes. Falls through on incomplete backfill or mid-read revision
+        // churn, preserving the exact legacy body and 503 semantics.
+        const fast = this.summaryFast(exportUrl, this.principal(auth));
+        if (fast) return json(fast);
+      }
       if (request.method === 'GET' && ['/api/intake/summary', '/api/intake/tasks', '/api/intake/handoff'].includes(exportUrl.pathname) &&
           !this.tx(() => advanceIntakeExport(this.sql))) return json({ error: 'intake_export_migrating', retry_after: 1 }, 503);
       return this.tx(() => {
