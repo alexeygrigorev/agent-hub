@@ -118,6 +118,62 @@ class ReleaseCompletenessTests(unittest.TestCase):
             "scripts/metrics-dashboard-export.py",
         })
 
+    def test_release_own_template_and_verifier_win_over_runner(self):
+        # Intake hubfail-t2596u: the update deadlock (old runner verifier
+        # rejecting a newer-format release) is fixed by verifying each tree
+        # with its own template/verifier.
+        import importlib.util
+        for name, rel in (("verify_mod", "scripts/verify-host-release.py"),
+                          ("build_mod", "scripts/build-host-release.py")):
+            spec = importlib.util.spec_from_file_location(name, str(REPO / rel))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if name == "verify_mod":
+                self._check_release_template(mod)
+            else:
+                self._check_verifier_for(mod)
+
+    def _check_release_template(self, mod):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            template, source = mod.release_template(target)
+            self.assertEqual(source, "runner")
+            self.assertEqual(template["version"], json.loads(MANIFEST.read_text())["version"])
+            (target / "scripts").mkdir()
+            own = {"version": 999, "files": [], "hashed_trees": []}
+            (target / "scripts" / "host-release-manifest.json").write_text(json.dumps(own))
+            template, source = mod.release_template(target)
+            self.assertEqual(source, "release")
+            self.assertEqual(template["version"], 999)
+            (target / "scripts" / "host-release-manifest.json").write_text("{broken")
+            template, source = mod.release_template(target)
+            self.assertEqual(source, "runner")
+
+    def _check_verifier_for(self, mod):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            default = Path("/runner/verify-host-release.py")
+            self.assertEqual(mod.verifier_for(target, default), default)
+            (target / "scripts").mkdir()
+            (target / "scripts" / "verify-host-release.py").write_text("#")
+            self.assertEqual(mod.verifier_for(target, default), target / "scripts" / "verify-host-release.py")
+            link = target / "link.py"
+            (target / "scripts" / "verify-link.py").write_text("#")
+            import os as _os
+            try:
+                _os.symlink(target / "scripts" / "verify-link.py", target / "scripts" / "verify-host-release.py")
+            except OSError:
+                return
+            (target / "scripts" / "verify-host-release.py").unlink()
+            _os.symlink("/etc/hostname", target / "scripts" / "verify-host-release.py")
+            self.assertEqual(mod.verifier_for(target, default), default)
+        # A new release-relative read must be a conscious manifest addition.
+        found, _ = release_relative_paths()
+        self.assertEqual(found, {
+            "config/model-routing.json",
+            "scripts/metrics-dashboard-export.py",
+        })
+
     def test_verify_refuses_incomplete_release(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "rel"

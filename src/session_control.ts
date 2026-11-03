@@ -1354,6 +1354,7 @@ export class SessionControlService {
             repo_clone_auth_failed: 'The host could not authenticate to GitHub while cloning the requested repository.',
             repo_not_found: 'The repository origin was not found during host cloning.',
             repo_clone_failed: 'The host could not clone the requested repository.',
+            repo_proxy_unreachable: 'The host proxy required for GitHub cloning is unreachable.',
             model_unsupported: 'The requested model is unsupported by the configured host adapter.',
             dispatch_refused: 'The host refused the dispatch before native start.',
             launcher_not_started: 'The maintained launcher did not start a native session.',

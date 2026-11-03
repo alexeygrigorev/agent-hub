@@ -4494,10 +4494,13 @@ class Dispatcher:
                                                launched_at=l_at, start_offsets=l_offsets)
             if mode == "headless" and t_id and failure.get("reason") == "launcher_command_failed":
                 # Intake 17e774f8: an empty-pipe launcher exit still saved its
-                # cause in this launch's own record; keep it, sanitized.
+                # cause in this launch's own record; keep it, sanitized. The
+                # intake-worktree target cwd may hold the record when it
+                # differs from the offer workspace (intake fae60b8a).
                 try:
                     from .launch_diagnostics import launcher_record_cause
-                    failure = launcher_record_cause(failure, workspace, t_id, l_at)
+                    extra = [t_cwd] if str(t_cwd) != str(workspace) else []
+                    failure = launcher_record_cause(failure, workspace, t_id, l_at, extra_dirs=extra)
                 except Exception:
                     pass
             if mode == "headless" and t_id:

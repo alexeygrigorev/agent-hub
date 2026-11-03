@@ -45,6 +45,14 @@ class TestNamedPreStartRefusals(unittest.TestCase):
             self.assertEqual(diag['reason'], slug, message)
             self.assertNotIn('Username', json.dumps(diag))
 
+    def test_dead_proxy_refusal_names_the_proxy_without_secrets(self):
+        diag = classify(ValueError('repo_proxy_unreachable: DataTalksClub/website: proxy 127.0.0.1:8899 unreachable (ConnectionRefusedError)'))
+        self.assertEqual(diag['reason'], 'repo_proxy_unreachable')
+        self.assertIn('127.0.0.1:8899', diag.get('tail', ''))
+        dumped = json.dumps(diag)
+        for shape in ('token=', 'ghp_', 'sk-', '-----BEGIN', 'Traceback (most recent call last)'):
+            self.assertNotIn(shape, dumped)
+
     def test_claude_headless_value_errors_have_named_reasons(self):
         cases = {
             'Native profile receipt mismatch': 'native_profile_mismatch',
