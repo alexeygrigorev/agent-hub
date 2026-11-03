@@ -237,7 +237,7 @@ export function loginRefusal(status: number, text: string): { ok: false; invalid
 
 export type QuotaWindow = { percent_remaining: number | null; reset_at: string | null; present: boolean; rolling: boolean };
 export type QuotaBankedGrant = { expires_at: string; available: boolean; label: string };
-export type QuotaRoute = { status: 'ok' | 'error' | 'unknown'; error: 'unavailable' | null; observed_at: string | null; details: { limit_reached: boolean | null; banked_resets?: QuotaBankedGrant[]; banked_resets_error?: string | null }; windows: Record<string, QuotaWindow> };
+export type QuotaRoute = { status: 'ok' | 'error' | 'unknown'; error: string | null; observed_at: string | null; details: { limit_reached: boolean | null; banked_resets?: QuotaBankedGrant[]; banked_resets_error?: string | null }; windows: Record<string, QuotaWindow> };
 export type QuotaResult = { ok: true; quota: QuotaRoute } | { ok: false; unauthorized: boolean; reason: string };
 
 const pct = (used: unknown) => typeof used === 'number' && Number.isFinite(used) ? Math.max(0, Math.min(100, 100 - used)) : null;

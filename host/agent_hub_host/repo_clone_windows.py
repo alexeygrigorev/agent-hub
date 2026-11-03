@@ -83,9 +83,10 @@ def checkout_lock(path, *, timeout=30):
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def _run(argv, *, timeout):
+def _run(argv, *, timeout, stderr=None):
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               stdout=subprocess.DEVNULL,
+                               stderr=stderr if stderr is not None else subprocess.DEVNULL)
     try:
         return process.wait(timeout=timeout)
     except BaseException:
@@ -95,6 +96,36 @@ def _run(argv, *, timeout):
                        stderr=subprocess.DEVNULL, timeout=15, check=False)
         process.wait(timeout=15)
         raise
+
+
+# Bounded clone-output evidence (intake fae60b8a): gh/git stderr must reach
+# the journal's repo_clone_failed diagnostic instead of dying in DEVNULL.
+CLONE_OUTPUT_LIMIT = 16384
+CLONE_DETAIL_LIMIT = 200
+
+
+def _scrub_clone_text(text):
+    """Redact secrets and paths from bounded clone output (never fail)."""
+    try:
+        from .log_redaction import redact_log
+        text = redact_log(text)
+    except Exception:
+        pass
+    text = re.sub(r'\S*[/\\]\S*', '[path]', text)
+    return ''.join(ch if 32 <= ord(ch) < 127 else ' ' for ch in text)
+
+
+def _short_clone_detail(raw, code):
+    """First scrubbed non-empty clone-output line, or a named exit fallback."""
+    if raw:
+        text = raw.decode('utf-8', 'replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
+        for line in text.splitlines():
+            clean = _scrub_clone_text(line).strip()
+            if clean:
+                return clean[:CLONE_DETAIL_LIMIT]
+    if type(code) is int:
+        return 'exit %d' % code
+    return 'clone command failed'
 
 
 def _remove_staging(path):
@@ -161,10 +192,21 @@ def clone(settings, repo, origin, target_dir, *, disk_floor_gb, auth_ok, verify_
             clone_filter = config.get('clone_filter', 'blob:none')
             if clone_filter:
                 argv.append('--filter=' + clone_filter)
-            if _run(argv, timeout=config.get('clone_timeout_sec', 300)) != 0:
-                raise ValueError('repo_clone_failed')
+            # Intake fae60b8a: capture bounded gh/git stderr so the failure
+            # record carries the real clone error, never a bare exit code.
+            # A pipe would risk deadlock on voluminous gh progress; the
+            # disk-backed temp file cannot block the child.
+            with tempfile.TemporaryFile(prefix='hub-clone-err-') as err:
+                code = _run(argv, timeout=config.get('clone_timeout_sec', 300), stderr=err)
+                try:
+                    err.seek(0)
+                    captured = err.read(CLONE_OUTPUT_LIMIT + 1)
+                except OSError:
+                    captured = b''
+            if code != 0:
+                raise ValueError('repo_clone_failed: ' + _short_clone_detail(captured, code))
             if not _plain(staging) or not (staging / '.git').is_dir() or not _plain(staging / '.git'):
-                raise ValueError('repo_clone_failed')
+                raise ValueError('repo_clone_failed: incomplete checkout')
             verify_origin(staging, origin)
             if target.exists() or target.is_symlink():
                 raise ValueError('repo_checkout_missing')
@@ -174,6 +216,8 @@ def clone(settings, repo, origin, target_dir, *, disk_floor_gb, auth_ok, verify_
                 on_created(target)
             return target
         except (OSError, subprocess.SubprocessError) as exc:
-            raise ValueError('repo_clone_failed') from exc
+            # Never a bare slug: name the scrubbed OS/process cause.
+            detail = _short_clone_detail(str(exc), None)
+            raise ValueError('repo_clone_failed: ' + detail) from exc
         finally:
             _remove_staging(staging)

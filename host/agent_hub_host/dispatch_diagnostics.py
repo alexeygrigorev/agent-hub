@@ -1,4 +1,6 @@
 """Fixed pre-start reasons plus bounded, redacted typed command evidence."""
+import re
+
 MESSAGES = {
     'host_overload': 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
     'host_load_high': 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
@@ -141,6 +143,24 @@ class AdmissionRefusedError(ValueError):
                        and type(v) in (int, float) and math.isfinite(v) and abs(v) <= 86400}
 
 
+# Bounded git-stderr evidence for repo_clone_failed journal records (intake
+# fae60b8a). Secrets, paths and non-ASCII never survive; at most 400 chars.
+CLONE_TAIL_LIMIT = 400
+
+
+def _scrub_clone_tail(value: str) -> str:
+    """Scrubbed variable tail of a repo_clone_failed message (never fail)."""
+    try:
+        text = value.split(':', 1)[1] if ':' in value else ''
+        from .log_redaction import redact_log
+        text = redact_log(text)
+    except Exception:
+        return ''
+    text = re.sub(r'\S*[/\\]\S*', '[path]', text)
+    text = ''.join(ch if 32 <= ord(ch) < 127 else ' ' for ch in text)
+    return ' '.join(text.split())[:CLONE_TAIL_LIMIT]
+
+
 def classify(exc, *, workspace_available=True, value_error_fallback=None):
     if isinstance(exc, ClaimRefusedError):
         return dict(exc.diagnostic)
@@ -174,6 +194,14 @@ def classify(exc, *, workspace_available=True, value_error_fallback=None):
         reason = 'workspace_unavailable'
     value = {'reason': reason, 'message': MESSAGES[reason], 'stage': 'dispatch_route',
             'error_type': type(exc).__name__ if type(exc).__name__.isalpha() and len(type(exc).__name__) <= 64 else 'Error'}
+    if reason == 'repo_clone_failed' and isinstance(exc, ValueError):
+        # Intake fae60b8a: the journal record must carry the real git
+        # stderr, never a bare slug. Only this reason keeps a tail;
+        # auth/not-found refusals stay slug-only (ad8aa931), and the tail
+        # is scrubbed, bounded and ASCII-only.
+        scrubbed = _scrub_clone_tail(str(exc))
+        if scrubbed:
+            value['tail'] = scrubbed
     if reason == 'dispatch_worktree_refused' and lock_owner:
         value.update(lock_owner=lock_owner[0], lock_owner_state=lock_owner[1],
                      recovery='hub sessions stop ' + lock_owner[0])
