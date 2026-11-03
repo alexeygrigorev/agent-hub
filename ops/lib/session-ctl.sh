@@ -300,8 +300,8 @@ start() {
   local i s ready=0
   for i in $(seq 1 60); do
     sleep 3; s=$(screen "$id")
-    if grep -qi -E 'Yes, I accept|Bypass Permissions mode' <<<"$s" && grep -q 'No, exit' <<<"$s"; then a send "$id" --raw --hex 32 >/dev/null; sleep 1; a send "$id" --raw --hex 0d >/dev/null; continue; fi
-    if grep -qi -E 'trust this folder|Do you trust|Yes, proceed' <<<"$s"; then a send "$id" --raw --hex 0d >/dev/null; continue; fi
+    if grep -qi -E 'Yes, I accept|Bypass Permissions mode' <<<"$s" && grep -q 'No, exit' <<<"$s"; then a send "$id" --hex 32 >/dev/null; sleep 1; a send "$id" --hex 0d >/dev/null; continue; fi
+    if grep -qi -E 'trust this folder|Do you trust|Yes, proceed' <<<"$s"; then a send "$id" --hex 0d >/dev/null; continue; fi
     if grep -q -E '❯|> $|for shortcuts' <<<"$s"; then ready=1; break; fi
   done
   [ "$ready" = 1 ] || { log "prompt readiness failed: $id"; return 1; }
