@@ -205,13 +205,28 @@ export class RepoRegistry {
     let old = this.named(r.name);
     const origin = r.origin || r.origin_url;
     const desired = this.identity({ ...r, origin });
-    const sameOrigin = origin && old?.status !== 'duplicate' && r.status !== 'duplicate' && this.sql.exec('SELECT data,repo_id FROM repo_registry WHERE repo_id=?', desired).toArray()[0];
-    if (sameOrigin) old = { ...JSON.parse(String(sameOrigin.data)), repo_id: sameOrigin.repo_id };
+    const sameOrigin = !seed && !old && origin && r.status !== 'duplicate'
+      && (this.sql.exec('SELECT data,repo_id FROM repo_registry WHERE repo_id=?', desired).toArray()[0] as any);
+    // Host scans (refresh) link an unknown name to the entry for the same
+    // remote; a seed names its own entry and never merges into another name.
+    if (sameOrigin) {
+      const linked = { ...JSON.parse(String(sameOrigin.data)), repo_id: sameOrigin.repo_id };
+      if (linked.status !== 'duplicate') old = linked;
+    }
     // Different remotes using the same short name cannot overwrite one another.
     if (old && origin && old.origin && old.origin.toLowerCase() !== origin.toLowerCase()) old = undefined;
     if (seed && old) return;
     const name = old?.name || (this.named(r.name) ? this.availableName(origin ? origin.replace('/', '-') : r.name) : r.name);
     let id = old?.repo_id || desired;
+    // A distinct entry whose canonical identity is already taken (a second
+    // name for the same remote, needed for duplicate classification) keeps
+    // its own row under a local identity instead of overwriting the other
+    // entry through the shared primary key.
+    if (!old && (this.sql.exec('SELECT repo_id FROM repo_registry WHERE repo_id=?', id).toArray().length)) {
+      id = 'local/' + String(r.name).toLowerCase();
+      let suffix = 1;
+      while (this.sql.exec('SELECT repo_id FROM repo_registry WHERE repo_id=?', id).toArray().length) id = 'local/' + String(r.name).toLowerCase() + '-' + (++suffix);
+    }
     if (old?.repo_id.startsWith('local/') && origin && old.status !== 'duplicate') {
       id = desired;
       this.sql.exec('UPDATE repo_checkouts SET repo_id=? WHERE repo_id=?', id, old.repo_id);
