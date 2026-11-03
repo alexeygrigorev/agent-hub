@@ -59,7 +59,7 @@ def test_gh_object_and_api_hosts_join_the_bypass_check():
     env = {"HTTPS_PROXY": "http://127.0.0.1:8899", "NO_PROXY": "github.com"}
     assert gn.dead_proxy_finding(env, opener=refused) is None
     assert gn.dead_proxy_finding(env, opener=refused, hosts=gn._GITHUB_SUFFIXES + gn._GH_EXTRA_HOSTS) is not None
-    # Operator codex-vpn workaround: every GitHub host bypassed keeps working.
+    # An operator NO_PROXY workaround: every GitHub host bypassed keeps working.
     env["NO_PROXY"] = "github.com, api.github.com, *.githubusercontent.com, codeload.github.com:443"
     assert gn.dead_proxy_finding(env, opener=refused, hosts=gn._GITHUB_SUFFIXES + gn._GH_EXTRA_HOSTS) is None
 

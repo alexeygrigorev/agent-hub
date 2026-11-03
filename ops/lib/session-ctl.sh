@@ -229,7 +229,11 @@ for pool in pools if isinstance(pools, list) else []:
 def has_headroom(engine, pool):
     if pool.get("state") != "fresh" or pool.get("routing") == "disabled":
         return False
-    if pool.get("limit_reached") is True or pool.get("depleted") is True:
+    # `depleted` describes burn pace, not exhausted quota. A fresh pool with
+    # positive remaining quota is still usable even when usage is ahead of
+    # its linear schedule; `limit_reached` and the remaining reserve are the
+    # exhaustion signals for recovery routing.
+    if pool.get("limit_reached") is True:
         return False
     remaining = pool.get("remaining_percent")
     if remaining is None and (pool.get("burn_status") == "unmetered" or pool.get("source") == "unmetered-engine"):
@@ -248,7 +252,9 @@ for candidate in order:
     if candidate == excluded.strip().lower() or candidate not in configured:
         continue
     matching = routes.get(candidate, [])
-    if matching and all(has_headroom(candidate, pool) for pool in matching):
+    # Provider families can contain multiple account pools. Any usable pool
+    # is sufficient for routing to that engine.
+    if matching and any(has_headroom(candidate, pool) for pool in matching):
         print(candidate)
         sys.exit(0)
 sys.exit(1)

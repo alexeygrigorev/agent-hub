@@ -32,7 +32,7 @@ function engineMix(sql: SqlStorage, poolId: string, since: number, now: number):
       else if (provider && FREE_POOL_PROVIDERS.includes(provider)) { totals.free += count; classified += count; }
       else if (provider) { totals.paid += count; classified += count; }
     }
-    if (!classified) return unknown('token_share', 'No token usage with a classifiable engine was recorded in this window.');
+    if (!classified) return unknown('fraction', 'No token usage with a classifiable engine was recorded in this window.');
     return { value: { free: totals.free / classified, paid: totals.paid / classified, grok: totals.grok / classified }, unit: 'fraction', reason: 'Shares cover only token usage with a recorded, classifiable engine.' };
   } catch {
     return unknown('fraction', 'Engine-tagged token usage is unavailable.');
@@ -131,13 +131,14 @@ function metricsForPool(sql: SqlStorage, pool: any, now: number, since: number, 
         if (t.status === 'active') return sum + (safeNumber(t.remaining_tokens) ?? 0);
         return sum;
       }, 0), 'tokens');
-    const activeRates = active.map(t => safeNumber(t.banked_burn_rate_tpm)).filter((v): v is number => v !== null && v > 0);
-    metrics.banked_burn_rate = activeRates.length
-      ? known(activeRates.reduce((sum, value) => sum + value, 0), 'tokens/minute')
-      : unknown('tokens/minute', active.length ? 'No measured banked token burn rate is recorded for active tranches.' : 'No active banked tranche is available in this window.');
+    const activeRates = active.map(t => safeNumber(t.banked_burn_rate_tpm));
+    metrics.banked_burn_rate = activeRates.length && activeRates.every(rate => rate !== null && rate > 0)
+      ? known(activeRates.reduce<number>((sum, value) => sum + (value ?? 0), 0), 'tokens/minute')
+      : unknown('tokens/minute', active.length ? 'At least one active tranche has no measured banked token burn rate.' : 'No active banked tranche is available in this window.');
   } catch {
     for (const key of ['banked_remaining', 'time_to_expiry', 'expired_unused', 'banked_burn_rate']) {
-      metrics[key] = unknown(key === 'time_to_expiry' ? 'seconds' : 'tokens', 'Banked tranche data is unavailable.');
+      const unit = key === 'time_to_expiry' ? 'seconds' : key === 'banked_burn_rate' ? 'tokens/minute' : 'tokens';
+      metrics[key] = unknown(unit, 'Banked tranche data is unavailable.');
     }
   }
 
