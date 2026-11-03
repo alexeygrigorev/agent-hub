@@ -97,7 +97,9 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
       // live canonical row: one pool per canonical identity.
       hub.sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', 'urgent-muse', 'go', ts(-2000000), JSON.stringify(route(10, ts(-2000000))));
       hub.sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', 'shared-go', 'go', at, JSON.stringify(route(83, at)));
-      // Old host subscription reports (legacy service + legacy label).
+      // The second Codex home has its own Hub-server observation. Old host
+      // subscription reports below remain legacy data and cannot supply it.
+      hub.sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', 'codex-orin', 'codex', at, JSON.stringify(route(72, at)));
       for (const [account, service, pct] of [['codex-orin', 'codex-orin', 72], ['urgent-muse', 'go', 61], ['shared-zai', 'zai', 50]] as const) {
         hub.sql.exec('INSERT INTO fleet_subscriptions VALUES (?,?,?,?,?,?)', 'm1', account, service, null, at, JSON.stringify(route(pct, at)));
       }
@@ -142,7 +144,7 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
     ]).map((r) => r.label).sort()).toEqual(['codex-orin', 'shared-codex']);
   });
 
-  it('server snapshots and subscription reports accept legacy names and store canonical rows', async () => {
+  it('retires host subscription writes without storing machine quota', async () => {
     const e = env as unknown as Env;
     await runInDurableObject(e.HUB.get(e.HUB.idFromName(crypto.randomUUID())), async (hub: Hub) => {
       hub.fleetService.init();
@@ -158,25 +160,23 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
         quota: { status: 'ok', observed_at: at, details: { limit_reached: false },
           windows: { weekly: { present: true, percent_remaining: pct, reset_at: ts(86400000) } } },
       });
-      // Legacy host reports map onto the canonical registry in either update order.
+      // Host subscription writes are retired; only Hub-server ingestion may
+      // update account quota after canonicalization.
       const legacy = await hub.fleetService.handle(new Request('http://example.com/api/fleet/subscriptions', {
         method: 'PUT', body: JSON.stringify({ subscriptions: [sub('codex-orin', 'codex-orin', 72), sub('go', 'urgent-muse', 61)] }),
       }), host);
-      expect(legacy.status).toBe(200);
+      expect(legacy.status).toBe(410);
       const rows = hub.sql.exec('SELECT account, service FROM fleet_subscriptions WHERE machine_id = ? ORDER BY account', 'm1').toArray() as any[];
-      expect(rows).toEqual([
-        { account: 'codex-orin', service: 'codex' },
-        { account: 'shared-go', service: 'go' },
-      ]);
-      // A contradictory double report for one canonical pool fails closed.
+      expect(rows).toEqual([]);
+      // Duplicate or contradictory host reports cannot create a quota row either.
       const dup = await hub.fleetService.handle(new Request('http://example.com/api/fleet/subscriptions', {
         method: 'PUT', body: JSON.stringify({ subscriptions: [sub('go', 'urgent-muse', 61), sub('go', 'shared-go', 62)] }),
       }), host);
-      expect(dup.status).toBe(400);
+      expect(dup.status).toBe(410);
     });
   });
 
-  it('one broken host probe does not hold the pool when another host reports a known 7d window', async () => {
+  it('ignores legacy host reports when the Hub has one authoritative account observation', async () => {
     const e = env as unknown as Env;
     await runInDurableObject(e.HUB.get(e.HUB.idFromName(crypto.randomUUID())), async (hub: Hub) => {
       const now = Date.now();
@@ -197,14 +197,12 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
       const broken = { status: 'unknown', observed_at: at, details: { limit_reached: null }, windows: {} };
       hub.sql.exec('INSERT INTO fleet_subscriptions VALUES (?,?,?,?,?,?)', 'm1', 'shared-codex', 'codex', null, at, JSON.stringify(healthy));
       hub.sql.exec('INSERT INTO fleet_subscriptions VALUES (?,?,?,?,?,?)', 'm2', 'shared-codex', 'codex', null, at, JSON.stringify(broken));
+      hub.sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', 'shared-codex', 'codex', at, JSON.stringify(healthy));
       const body = store.getFleetView({ host_id: null, provider: null, engine: null, account: null }, now).body as any;
       const pool = body.pools.find((p: any) => p.account === 'shared-codex');
-      expect(pool.state).toBe('fresh');
-      expect(pool.remaining_percent).toBe(80);
+      expect(pool).toMatchObject({ state: 'fresh', source: 'server', remaining_percent: 80, observed_by_hosts: ['hub-server'] });
       expect(pool.windows['7d']).toMatchObject({ present: true, percent_remaining: 80 });
-      // The healthy observation backs the display even though a sibling probe failed.
-      expect(pool.observed_by_hosts.sort()).toEqual(['m1', 'm2']);
-      // Account health agrees: one healthy route is enough for ok.
+      // Account health agrees with the single central observation.
       const status = hub.fleetService.accountStatus({ label: 'shared-codex', provider: 'codex', enabled: 1, reserve_percent: 0, max_concurrency: 4 });
       expect(status.status).toBe('ok');
       expect(status.remaining_percent).toBe(80);

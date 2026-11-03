@@ -7,6 +7,7 @@ import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { SESSION_CONTROL_SCHEMA, SessionControlService } from '../src/session_control';
 import { tickTbm } from '../src/tbm-controller';
+import { syncTbmFromServerAccounts } from '../src/tbm-ingestion';
 
 const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] };
 const host = (id: string) => ({ caller: { machineId: id, kind: 'host', actor: 'machine:' + id }, scopes: ['host'] });
@@ -14,6 +15,10 @@ const now = Date.now();
 const iso = (delta = 0) => new Date(now + delta).toISOString();
 function request(path: string, data?: any, method = 'POST') {
   return new Request('https://hub.test/api/fleet' + path, { method, body: data === undefined ? undefined : JSON.stringify(data) });
+}
+function saveHubQuota(sql: any, account: string, provider: string, quota: any, capturedAt = iso()) {
+  sql.exec('INSERT OR REPLACE INTO server_quota_snapshots VALUES (?,?,?,?)', account, provider, capturedAt, JSON.stringify(quota));
+  syncTbmFromServerAccounts(sql, [{ account, provider, quota }], Date.parse(capturedAt));
 }
 async function fixture(fn: (service: FleetService, sql: any) => Promise<void>) {
   const bindings = env as unknown as Env;
@@ -64,43 +69,33 @@ describe('generic accounts and launch placement', () => {
         { expires_at: iso(3600000), available: true, label: 'Full reset' },
       ] } : {}) }, windows: { weekly: { present: true, percent_remaining: pct,
         reset_at: iso(86400000), rolling: false } } });
-    for (const [machine, account] of [['hetzner', 'shared-codex'], ['win35', 'desktop-codex']]) {
-      const response = await service.handle(request('/subscriptions', { subscriptions: [{
-        service: 'codex', account, plan: 'pro', quota: quota(80),
-      }] }, 'PUT'), host(machine));
-      expect(response.status).toBe(200);
-    }
+    saveHubQuota(sql, 'shared-codex', 'codex', quota(80), iso(-1000));
+    saveHubQuota(sql, 'desktop-codex', 'codex', quota(80), iso(-1000));
     tickTbm(sql, now);
     const baseline = service.plan(intent());
     expect(baseline.selected?.account).toBe('shared-codex');
-    await service.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'desktop-codex',
-      plan: 'pro', quota: quota(80, true) }] }, 'PUT'), host('win35'));
+    saveHubQuota(sql, 'desktop-codex', 'codex', quota(80, true), iso(-500));
     tickTbm(sql, now + 1000);
     const urgent = service.plan(intent());
     expect(urgent.selected?.account).toBe('desktop-codex');
     expect(urgent.selected?.tbm.banked).toBeGreaterThan(1);
     expect(urgent.selected?.tbm.pacing).toBeGreaterThan(1);
     // One drained account must not deny the healthy account on the same provider.
-    const depleted = await service.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'desktop-codex',
-      plan: 'pro', quota: { ...quota(3), observed_at: iso() } }] }, 'PUT'), host('win35'));
-    expect(depleted.status).toBe(200);
+    saveHubQuota(sql, 'desktop-codex', 'codex', { ...quota(3), observed_at: iso() }, iso(-200));
     const low = service.plan(intent());
     expect(low.selected?.account).toBe('shared-codex');
     expect(low.candidates?.some((r: any) => r.account === 'desktop-codex')).toBe(false);
   }));
 
-  it('accepts the banked probe-failure marker on subscriptions instead of reading 0 banked', async () => fixture(async (service, sql) => {
+  it('preserves the Hub-server banked probe-failure marker instead of reading 0 banked', async () => fixture(async (service, sql) => {
     // Intake 7bf6f6ee AC3: ok + [] + banked_resets_error is explicit unknown.
     // The subscription is accepted and the marker is preserved verbatim.
     await configure(service);
-    const res = await service.handle(request('/subscriptions', { subscriptions: [{
-      service: 'codex', account: 'shared-codex', plan: 'pro',
-      quota: { status: 'ok', observed_at: iso(-1000),
-        details: { limit_reached: false, banked_resets: [], banked_resets_error: 'quota_unreachable' },
-        windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000), rolling: false } } },
-    }] }, 'PUT'), host('hetzner'));
-    expect(res.status).toBe(200);
-    const stored: any = sql.exec("SELECT quota_json FROM fleet_subscriptions WHERE machine_id='hetzner' AND account='shared-codex'").toArray()[0];
+    const quota = { status: 'ok', observed_at: iso(-1000),
+      details: { limit_reached: false, banked_resets: [], banked_resets_error: 'quota_unreachable' },
+      windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000), rolling: false } } };
+    saveHubQuota(sql, 'shared-codex', 'codex', quota, iso(-1000));
+    const stored: any = sql.exec("SELECT quota_json FROM server_quota_snapshots WHERE account='shared-codex'").toArray()[0];
     expect(JSON.parse(stored.quota_json).details.banked_resets_error).toBe('quota_unreachable');
   }));
   it('keeps configured Claude, native ZAI and Grok visible and routes policy models under allowed absolute workspace roots', async () => fixture(async (s, sql) => {
@@ -113,7 +108,7 @@ describe('generic accounts and launch placement', () => {
     const roots = ['/srv/projects', '/data/agents/project/worktrees'];
     sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify({ engines: ['claude', 'zcodex', 'grok'], fleet_modes: ['interactive', 'headless'], workspaces: roots, cpu_count: 8 }), 'hetzner');
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false, has_grok_code_access: true }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
-    await s.handle(request('/subscriptions', { subscriptions: entries.map(([account, service]) => ({ account, service, plan: 'pro', quota })) }, 'PUT'), host('hetzner'));
+    for (const [account, provider] of entries) saveHubQuota(sql, account, provider, quota);
     const fleet = await (await s.handle(request('', undefined, 'GET'), admin)).json() as any;
     for (const [label] of entries) {
       expect(fleet.accounts.find((a: any) => a.label === label)).toMatchObject({ placeable_slots: 8, placement_reasons: [] });
@@ -163,14 +158,14 @@ describe('generic accounts and launch placement', () => {
     data.routes[0].profile = 'secondary' as any;
     await s.handle(request('/accounts', data, 'PUT'), admin);
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
-    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
+    saveHubQuota(sql, 'shared-codex', 'codex', quota, iso(-1000));
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected?.profile).toBe('secondary');
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected).toBeNull();
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'tier_unavailable' });
     // A centrally managed account profile replaces the adapter profile name.
     sql.exec("UPDATE fleet_routes SET profile='hub-shared-codex' WHERE machine_id='hetzner'");
-    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'zai', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
+    saveHubQuota(sql, 'shared-codex', 'zai', quota, iso(-500));
     for (const selector of [{}, { tier: 'daily' }, { engine: 'glm-flash' }]) {
       expect(s.plan(intent({ machine: 'hetzner', ...selector })).selected?.selection).toMatchObject({ id: 'glm-flash', model: 'glm-5.3-flash' });
     }
@@ -243,7 +238,7 @@ describe('generic accounts and launch placement', () => {
     for (const [engine, modelId] of [['antigravity', 'argon'], ['gemini', 'argon-gemini']] as const) {
       sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
       sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
-      await s.handle(request('/subscriptions', { subscriptions: [{ service: 'gemini', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
+      saveHubQuota(sql, 'shared-codex', 'gemini', quota);
       const reason = 'This task explicitly requires the selected Gemini deep model.';
       expect(s.plan(intent({ engine: modelId, engine_override_reason: reason })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' } });
       expect(s.plan(intent({ tier: 'deep', engine, engine_override_reason: reason })).selected?.selection).toMatchObject({ id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' });
@@ -427,14 +422,17 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'win35'", JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: false, at: iso() } }));
     expect((s.plan(intent({ machine: 'win35' })) as any).rejected?.some((r: any) => r.reason === 'admission_unknown') ?? false).toBe(false);
   }));
-  it('uses conservative shared quota, ignores absent windows, and warns on unknown/expired snapshots', async () => fixture(async (s, sql) => {
+  it('uses Hub quota and ignores machine snapshots during placement', async () => fixture(async (s, sql) => {
     await configure(s, true);
-    const quota = (percent: number | null) => JSON.stringify({ codex: { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { week: { present: true, percent_remaining: percent, reset_at: iso(3600000) }, absent: { present: false, percent_remaining: null } } } });
-    sql.exec("UPDATE host_quota_snapshots SET routes_json = ? WHERE host_id = 'win35'", quota(15));
+    const quota = (percent: number) => ({ status: 'ok', observed_at: iso(), details: { limit_reached: false },
+      windows: { week: { present: true, percent_remaining: percent, reset_at: iso(3600000) }, absent: { present: false, percent_remaining: null } } });
+    saveHubQuota(sql, 'shared-codex', 'codex', quota(15), iso(-1000));
     expect((s.plan(intent()) as any).selected).toBeNull();
-    sql.exec("UPDATE host_quota_snapshots SET routes_json = ? WHERE host_id = 'win35'", quota(null));
+    sql.exec("UPDATE host_quota_snapshots SET routes_json = ? WHERE host_id = 'win35'", JSON.stringify({ codex: quota(99) }));
+    expect((s.plan(intent()) as any).selected).toBeNull();
+    saveHubQuota(sql, 'shared-codex', 'codex', quota(80), iso(-500));
     expect((s.plan(intent()) as any).selected).toBeTruthy();
-    sql.exec('UPDATE host_quota_snapshots SET captured_at = ?', iso(-1200001));
+    sql.exec("UPDATE server_quota_snapshots SET captured_at = ? WHERE account = 'shared-codex'", iso(-1200001));
     expect((s.plan(intent()) as any).selected.quota_warning).toBe('quota_probe_unavailable');
   }));
   it('reserves a shared account once across machines; the second waiter queues instead of failing', async () => fixture(async (s) => {
@@ -993,11 +991,8 @@ describe('generic accounts and launch placement', () => {
   it('offers goal starts only to host-advertised Codex-family routes', async () => fixture(async (s, sql) => {
     await configure(s);
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
-    await s.handle(request('/subscriptions', { subscriptions: [
-      { service: 'codex', account: 'shared-codex', plan: 'pro', quota },
-      { service: 'codex', account: 'desktop-codex', plan: 'pro', quota },
-    ] }, 'PUT'), host('hetzner'));
-    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'desktop-codex', plan: 'pro', quota }] }, 'PUT'), host('win35'));
+    saveHubQuota(sql, 'shared-codex', 'codex', quota, iso(-1000));
+    saveHubQuota(sql, 'desktop-codex', 'codex', quota, iso(-1000));
     const goalCaps = (routes: any[]) => ({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: routes });
     sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(goalCaps([{ engine: 'codex', account: 'shared-codex', profile: null }])), 'hetzner');
     const goal = intent({ mode: 'interactive', with_goal: true, tier: 'deep' });
@@ -1023,10 +1018,8 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(200);
     const quota = (pct: number) => ({ status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: pct, reset_at: iso(86400000) } } });
     // shared-zai is nearly unused: its healthier quota wins the goal start over Codex.
-    await s.handle(request('/subscriptions', { subscriptions: [
-      { service: 'codex', account: 'shared-codex', plan: 'pro', quota: quota(40) },
-      { service: 'zai', account: 'shared-zai', plan: 'pro', quota: quota(98) },
-    ] }, 'PUT'), host('hetzner'));
+    saveHubQuota(sql, 'shared-codex', 'codex', quota(40), iso(-1000));
+    saveHubQuota(sql, 'shared-zai', 'zai', quota(98), iso(-1000));
     const caps = { engines: ['codex', 'zcodex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8,
       fleet_goal_routes: [{ engine: 'codex', account: 'shared-codex', profile: null }, { engine: 'zcodex', account: 'shared-zai', profile: null }] };
     sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'hetzner');
@@ -1097,14 +1090,14 @@ describe('generic accounts and launch placement', () => {
     // One host advertises Claude, Gemini and Z.ai, but refuses Claude headless.
     // Argon is a deep model, so this Gemini account has no eligible daily
     // model. Default work routes through the remaining admitted Z.ai model.
-    const entries = [['shared-claude', 'claude', 'claude', 90], ['shared-gemini', 'gemini', 'antigravity', 50], ['shared-zai', 'zai', 'zcodex', 20]];
+    const entries = [['shared-claude', 'claude', 'claude', 90], ['shared-gemini', 'gemini', 'antigravity', 50], ['shared-zai', 'zai', 'zcodex', 20]] as const;
     const config = {
       accounts: entries.map(([label, provider]) => ({ label, provider, max_concurrency: 8, reserve_percent: 0, enabled: true })),
       routes: entries.map(([account, , engine]) => ({ machine_id: 'hetzner', engine, account, profile: null })),
     };
     expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(200);
     const quota = (pct: number) => ({ status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: pct, reset_at: iso(86400000) } } });
-    await s.handle(request('/subscriptions', { subscriptions: entries.map(([account, service, , pct]) => ({ account, service, plan: 'pro', quota: quota(Number(pct)) })) }, 'PUT'), host('hetzner'));
+    for (const [account, provider, , pct] of entries) saveHubQuota(sql, account, provider, quota(Number(pct)), iso(-1000));
     const caps = { engines: ['claude', 'antigravity', 'zcodex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8,
       fleet_route_rejections: [{ engine: 'claude', account: 'shared-claude', profile: null, mode: 'headless', reason: 'model_unsupported' }] };
     sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'hetzner');
@@ -1125,11 +1118,10 @@ describe('generic accounts and launch placement', () => {
     expect(deep.selected?.engine, JSON.stringify(deep.rejected)).toBe('antigravity');
     expect(deep.selected?.selection).toMatchObject({ id: 'argon', model: 'gemini-4-argon-medium', effort: 'medium' });
     expect(deep.rejected).not.toContainEqual(expect.objectContaining({ engine: 'antigravity' }));
-    // Subscription reports replace the entire host snapshot; retain the healthy
-    // fallback accounts while reporting Gemini's known exhausted quota.
-    expect((await s.handle(request('/subscriptions', { subscriptions: entries.map(([account, service, , pct]) => ({
-      account, service, plan:'pro', quota:quota(account === 'shared-gemini' ? 0 : Number(pct)),
-    })) }, 'PUT'), host('hetzner'))).status).toBe(200);
+    // Central account readings retain healthy alternatives while Gemini's
+    // known exhausted quota moves the route to Z.ai.
+    for (const [account, provider, , pct] of entries)
+      saveHubQuota(sql, account, provider, quota(account === 'shared-gemini' ? 0 : Number(pct)), iso(-500));
     const fallback = s.plan(intent({ mode: 'headless' }));
     expect(fallback.selected?.engine, JSON.stringify(fallback.rejected)).toBe('zcodex');
     expect(fallback.selected?.account).toBe('shared-zai');
@@ -1175,23 +1167,21 @@ describe('generic accounts and launch placement', () => {
     expect(json.accounts[0].label).toBeTruthy(); expect(json.launches[0].prompt).toBeUndefined();
     expect(result.headers.get('Cache-Control')).toBe('private, no-store');
   }));
-  it('supports two accounts for one service on a machine without reusing its default quota for both', async () => fixture(async (s, sql) => {
+  it('keeps same-provider accounts independent and refuses per-machine quota reports', async () => fixture(async (s, sql) => {
     const config = registry();
     config.routes[1].machine_id = 'hetzner';
     config.routes[1].profile = 'secondary' as any;
     await s.handle(request('/accounts', config, 'PUT'), admin);
     expect((s.plan(intent({ machine: 'hetzner' })) as any).selected.quota_warning).toBe('quota_probe_unavailable');
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
-    const reports = { subscriptions: [{ service: 'codex', account: 'desktop-codex', plan: 'pro', quota }] };
-    expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('hetzner'))).status).toBe(200);
+    saveHubQuota(sql, 'desktop-codex', 'codex', quota, iso(-1000));
     expect((s.plan(intent({ machine: 'hetzner' })) as any).selected.account).toBe('desktop-codex');
-    quota.windows.weekly.present = false;
-    expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('hetzner'))).status).toBe(400);
-    quota.windows.weekly.present = true;
-    (reports.subscriptions[0] as any).token = 'forbidden';
-    expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('hetzner'))).status).toBe(400);
-    delete (reports.subscriptions[0] as any).token;
-    expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('win35'))).status).toBe(400);
+    saveHubQuota(sql, 'shared-codex', 'codex', { ...quota, windows: { weekly: { ...quota.windows.weekly, percent_remaining: 20 } } }, iso(-500));
+    expect(s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='desktop-codex'").one()).remaining_percent).toBe(80);
+    expect(s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).remaining_percent).toBe(20);
+    const legacyReport = { subscriptions: [{ service: 'codex', account: 'desktop-codex', plan: 'pro', quota }] };
+    expect((await s.handle(request('/subscriptions', legacyReport, 'PUT'), host('hetzner'))).status).toBe(410);
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_subscriptions').one().n).toBe(0);
   }));
   it('writes only changed session rows and retains vanished sessions as inactive history', async () => fixture(async (s, sql) => {
     const base = { tag: 't', workspace: '/repo', profile: null, account: null, engine: 'codex', phase: 'running', agent_state: 'idle' };
@@ -1216,8 +1206,9 @@ describe('generic accounts and launch placement', () => {
     expect(view.sessions[0].machine_id).toBe('win35'); expect(view.sessions[0].workspace).toBe('/repo');
     expect((await s.handle(request('/sessions', { ...sessions, machine_id: 'hetzner' }, 'PUT'), host('win35'))).status).toBe(400);
   }));
-  it('warns for a missing machine observation while keeping the fresh machine usable', async () => fixture(async (s, sql) => {
+  it('ignores fresh or stale machine observations when the Hub has no quota', async () => fixture(async (s, sql) => {
     await configure(s, true);
+    expect((s.plan(intent({ machine: 'win35' })) as any).selected.quota_warning).toBe('quota_probe_unavailable');
     sql.exec("UPDATE host_quota_snapshots SET captured_at = ? WHERE host_id = 'win35'", iso(-1200001));
     expect((s.plan(intent({ machine: 'win35' })) as any).selected.quota_warning).toBe('quota_probe_unavailable');
     expect((s.plan(intent({ machine: 'hetzner' })) as any).selected.machine).toBe('hetzner');
@@ -1401,10 +1392,10 @@ describe('goal placement respects per-host load budgets', () => {
     }
     sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.load', json('[20]')) WHERE id = 'hetzner'");
     sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.load', json('[3]')) WHERE id = 'win35'");
-    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'shared-codex', plan: 'pro', quota: {
+    saveHubQuota(sql, 'shared-codex', 'codex', {
       status: 'ok', observed_at: iso(), details: { limit_reached: false },
       windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } },
-    } }] }, 'PUT'), host('hetzner'));
+    }, iso(-1000));
 
     const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep' }));
     expect(plan.selected?.machine).toBe('win35');
@@ -1558,7 +1549,8 @@ describe('pending claim reserve refusal', () => {
       sql.exec(`UPDATE fleet_launches SET ${column}=NULL WHERE id=?`, launch.id);
     }
     // A real quota hold keeps the retry queued; no quota/admission gate is bypassed.
-    sql.exec("UPDATE host_quota_snapshots SET routes_json=? WHERE host_id='hetzner'", JSON.stringify({codex:{status:'ok',observed_at:iso(),details:{limit_reached:true},windows:{weekly:{present:true,percent_remaining:5,reset_at:iso(86400000)}}}}));
+    saveHubQuota(sql, 'shared-codex', 'codex', { status: 'ok', observed_at: iso(), details: { limit_reached: true },
+      windows: { weekly: { present: true, percent_remaining: 0, reset_at: iso(86400000) } } }, iso());
     const result = await s.handle(request('/launches/'+launch.id+'/reject', payload), host('hetzner'));
     expect(result.status).toBe(200);
     const retry:any = await result.json();
