@@ -47,7 +47,13 @@ def verify_tree(root):
 
 
 def harden_tree(root):
-    """Remove group/world write bits from regular files and directories only."""
+    """Remove group/world write bits from regular files and directories only.
+
+    Only permission bits are changed. Note: chmod follows the inode, so a
+    hard-linked file (e.g. uv cache hardlinks into a release .venv) also
+    loses go-w on the shared inode outside the tree. That only removes bits,
+    never content, so it is safe.
+    """
     changed = []
     for path in _entries(root):
         mode = path.stat(follow_symlinks=False).st_mode

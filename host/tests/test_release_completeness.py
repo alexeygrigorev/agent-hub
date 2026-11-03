@@ -11,6 +11,7 @@ so a degraded settings state cannot overwrite the real host concurrency.
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -149,15 +150,24 @@ class ReleaseCompletenessTests(unittest.TestCase):
             admission = target / "host" / "agent_hub_host" / "heavy_test_admission.py"
             admission.write_text("ADMISSION_PROTOCOL_VERSION = 1\n")
             files = {}
-            for name, body in [
-                ("config/model-routing.json", "{}"),
-                ("scripts/session-host-supervisor.py", "#"),
-                ("scripts/metrics-dashboard-export.py", "#"),
-                ("scripts/build-host-release.py", "#"),
-                ("scripts/verify-host-release.py", "#"),
-                ("scripts/switch-host-release.py", "#"),
-                ("pyproject.toml", ""), ("uv.lock", ""),
-            ]:
+            # Anchor bodies for the manifest's required top-level files. Any
+            # manifest file without an explicit body here is created with a
+            # placeholder so a future manifest addition cannot silently turn
+            # this tamper test into a "required file is missing" test.
+            anchor_bodies = {
+                "config/model-routing.json": "{}",
+                "scripts/session-host-supervisor.py": "#",
+                "scripts/metrics-dashboard-export.py": "#",
+                "scripts/build-host-release.py": "#",
+                "scripts/verify-host-release.py": "#",
+                "scripts/switch-host-release.py": "#",
+                "pyproject.toml": "", "uv.lock": "",
+            }
+            template_files = json.loads(MANIFEST.read_text())["files"]
+            for name in template_files:
+                if name == "host/agent_hub_host/heavy_test_admission.py":
+                    continue  # written below with its protocol body
+                body = anchor_bodies.get(name, "#")
                 dest = target / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(body)
@@ -170,6 +180,16 @@ class ReleaseCompletenessTests(unittest.TestCase):
                 "release_rev": "0" * 40,
                 "files_sha256": files,
             }))
+            # verify-host-release.py checks permissions before hashes, so the
+            # fixture must be go-w-clean (build hosts use umask 0002, which
+            # makes fresh files 664 and dirs 775) for the tamper to be
+            # reported as a content mismatch. chmod affects no sha256.
+            for path in [target, *target.rglob("*")]:
+                if path.is_symlink():
+                    continue
+                mode = path.stat(follow_symlinks=False).st_mode
+                if mode & 0o022:
+                    path.chmod(stat.S_IMODE(mode) & ~0o022)
             init.write_text("# tampered")
             proc = subprocess.run([sys.executable, str(VERIFY), str(target)],
                                   capture_output=True, text=True, timeout=60)
