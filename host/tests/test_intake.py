@@ -353,11 +353,78 @@ class TestIntakeCli(unittest.TestCase):
                 thread.join()
             with self.subTest(kind=kind):
                 self.assertEqual(code, 1)
-                self.assertEqual(len(writes), 1, f'{kind} should not auto-retry')
+                self.assertEqual(len(writes), 2, f'{kind} should make only one same-key replay')
+                self.assertEqual(writes[0], writes[1], f'{kind} replay must preserve the exact mutation')
                 self.assertTrue(writes[0]['key'].startswith('update-'))
                 self.assertIn(writes[0]['key'], err, f'{kind} must preserve generated recovery key')
                 self.assertIn('attempted version: 7', err, f'{kind} must preserve attempted version')
                 self.assertIn('outcome unknown', err)
+
+    def test_task_write_replays_receipt_after_committed_write_returns_500(self):
+        requests, receipts = [], {}
+        success = json.dumps({'task': {'id': 'fixture-task', 'version': 2}}).encode()
+        failure = b'{"error":"internal_error"}'
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers['Content-Length']))
+                requests.append(raw)
+                payload = json.loads(raw)
+                key = payload['key']
+                if key not in receipts:
+                    # Synthetic commit happens before the first response is lost.
+                    receipts[key] = (raw, success)
+                    status, body = 500, failure
+                elif receipts[key][0] == raw:
+                    status, body = 200, receipts[key][1]
+                else:
+                    status, body = 409, b'{"error":"idempotency_conflict"}'
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        payload = {'key': 'lost-response-fixture', 'expected_version': 1,
+                   'event': {'kind': 'note', 'text': 'Synthetic note'}}
+        try:
+            with patch.object(intake.config, 'load_config', return_value={'base_url': f'http://127.0.0.1:{server.server_port}'}), \
+                 patch.dict(os.environ, {'HUB_TOKEN': 'synthetic-fixture', 'HUB_URL': '', 'HUB_BASE_URL': ''}):
+                result = intake.request('POST', '/api/intake/tasks/fixture-task/events', payload)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.assertEqual(result, {'task': {'id': 'fixture-task', 'version': 2}})
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(requests, [json.dumps(payload, ensure_ascii=False).encode()] * 2)
+
+    def test_read_retries_one_transient_server_error_and_writes_do_not_retry_conflicts(self):
+        for method, path, payload, status, expected_calls in (
+                ('GET', '/api/intake/tasks/fixture-task', None, 503, 2),
+                ('POST', '/api/intake/tasks/fixture-task/events',
+                 {'key': 'conflict-fixture', 'expected_version': 1, 'event': {'kind': 'note', 'text': 'Synthetic'}}, 409, 1)):
+            calls = []
+
+            def respond(req):
+                calls.append(req)
+                body = b'{"error":"internal_error"}' if status == 503 else b'{"error":"idempotency_conflict"}'
+                raise urllib.error.HTTPError(req.full_url, status, 'synthetic', {}, io.BytesIO(body))
+
+            with self.subTest(method=method, status=status), \
+                 patch.object(intake.config, 'load_config', return_value={'base_url': 'https://fixture.test'}), \
+                 patch.dict(os.environ, {'HUB_TOKEN': 'synthetic-fixture', 'HUB_URL': '', 'HUB_BASE_URL': ''}), \
+                 patch.object(intake.api, 'safe_http_json', side_effect=respond):
+                with self.assertRaises(intake.IntakeHTTPError) as caught:
+                    intake.request(method, path, payload)
+            self.assertEqual(caught.exception.status, status)
+            self.assertEqual(len(calls), expected_calls)
 
     def test_http_error_diagnostics_allow_only_safe_codes(self):
         for raw, expected in ((b'{"error":"version_conflict"}', 'version_conflict'),
