@@ -246,8 +246,8 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
   });
 
   it('excludes depleted routes from the weighted draw even when they have a positive score', () => {
-    const healthy = { engine: 'codex', decision: { score: 1, factors: { depleted: false } } };
-    const depleted = { engine: 'claude', decision: { score: 100, factors: { depleted: true } } };
+    const healthy = { engine: 'codex', decision: { score: 1, factors: { remaining_pct: 40, depleted: false } } };
+    const depleted = { engine: 'claude', decision: { score: 100, factors: { remaining_pct: 99, depleted: true } } };
     expect(drawAutoStart([healthy, depleted], {}, [], {}, () => 0.9999)).toBe(healthy);
     expect((depleted as any).draw_probability).toBe(0);
   });
@@ -298,6 +298,9 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
       expect(top.selected, JSON.stringify(top.rejected)).toBeTruthy();
       expect(top.candidates!.length).toBe(5);
       expect(top.selected).toBe(top.candidates![0]);
+      const codexTop: any = top.candidates!.find((candidate: any) => candidate.engine === 'codex');
+      const claudeTop: any = top.candidates!.find((candidate: any) => candidate.engine === 'claude');
+      expect(codexTop.draw_probability / claudeTop.draw_probability).toBeCloseTo(60 / 35, 5);
       // A pinned engine keeps the top pick even with a random source.
       const pinned = fleet.plan({ mode: 'headless', workspace: 'demo', prompt: 'pinned', engine: 'codex' }, undefined, mulberry32(9647));
       expect(pinned.selected).toBe(pinned.candidates![0]);
