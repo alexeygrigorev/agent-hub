@@ -17,6 +17,7 @@ import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
 import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
+import { runHeldReconciler } from './intake-recovery';
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { SILENT_START_MS, SILENT_START_REASON, ABANDONED_RECOVERY_MS, abandonedLaunch, expireSilentStartRows } from './silent-start';
@@ -159,7 +160,7 @@ export function drawAutoStart(candidates: any[], request: any, overrideModels: a
   return drawn;
 }
 /** Engines whose providers the canonical model policy disables. New grok sessions hold here. */
-function disabledEngines(): Set<string> {
+export function disabledEngines(): Set<string> {
   const rules = ((policy as any).rules || {}) as any;
   const disabled = new Set<string>(Array.isArray(rules.disabled_providers) ? rules.disabled_providers : []);
   return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
@@ -2496,6 +2497,7 @@ export class FleetService {
           // One re-plan per host poll; durable cursors preserve backlog progress.
           try { this.drainCapacityQueue(1); } catch { /* best-effort */ };
         }
+        try { runHeldReconciler(this.sql); } catch { /* best-effort */ }
         const valid: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;

@@ -522,7 +522,7 @@ describe('forgotten intake watchdog', () => {
     expect(h.sql.exec('SELECT state FROM session_control_sessions WHERE id=?',id).one().state).toBe(state);
     expect(h.sql.exec("SELECT kind,state FROM session_control_commands WHERE session_id=?",id).one()).toMatchObject({kind:'stop',state:'recorded'});
   }));
-  it.each(['codex','opencode','zcodex','antigravity'])('advances beyond %s when all engines have historical failures', async previous => fixture(async h => {
+  it.each(['codex','opencode','zcodex','antigravity'])('never pins to a failed engine when all engines have historical failures and records every rejected engine (after %s)', async previous => fixture(async h => {
     const t=task(),order=['codex','opencode','zcodex','antigravity'];
     const history=[...order.filter(engine=>engine!==previous),previous];
     history.forEach((engine,i)=>{
@@ -534,11 +534,13 @@ describe('forgotten intake watchdog', () => {
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(fn:any)=>fn(),{
       start:async input=>{inputs.push(input);return {status:202,body:{id:'next-cycle',state:'queued'}};}
     },()=>NOW);w.init();
-    // Engine choice must not select any recorded failed attempt.
+    // Engine choice must not select any recorded failed attempt; when none is eligible, record a held reason naming every rejected engine.
     h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,request_key,request_json,session_id,attempts,next_at,updated_at)
       VALUES(?,'submitted','canonical_failed','old-key',?,'cycle-3',0,?,?)`,t.id,JSON.stringify({engine:previous,key:'old-key'}),NOW-1000,NOW-1000);
-    await w.tick();expect(inputs).toHaveLength(1);
-    expect(inputs[0].engine).toBe(order[(order.indexOf(previous)+1)%order.length]);
+    await w.tick();expect(inputs).toHaveLength(0);
+    const q:any=h.sql.exec('SELECT state,reason FROM intake_restart_queue WHERE task_id=?',t.id).one();
+    expect(q.state).toBe('queued');
+    for (const eng of order) expect(q.reason).toContain(eng);
   }));
   it('REST refuses unauthenticated readers', async () => {
     const res=await SELF.fetch('https://hub.test/api/intake/forgotten');expect([401,403]).toContain(res.status);
