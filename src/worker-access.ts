@@ -169,7 +169,7 @@ export function workerCreatedTargets(sql: SqlStorage, sessionId: string | null |
   return new Set(sql.exec('SELECT task_id FROM worker_created_intakes WHERE session_id=? ORDER BY task_id LIMIT ?', sessionId, WORKER_CREATE_LIMIT)
     .toArray().map((r: any) => r.task_id as string));
 }
-const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context|\/depend|\/blocker|\/decompose|\/stats)?$/;
+const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context|\/depend|\/blocker|\/decompose|\/stats|\/merge-evidence)?$/;
 /** Intake 08658ee8 AC3: unique short-id prefixes (>= 8 chars, like sessions)
  * resolve to the full task id for the worker's own, created and linked intakes.
  * Triage requests stay exact-id (intake d8d509d2), so the caller passes the raw
@@ -242,8 +242,12 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
     const own = id === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id));
     const writeTarget = own || workerCreatedTargets(sql, worker.session_id).has(id) || workerLinkedTargets(sql, worker).has(id);
     // Self-report: the session's own token may file a blocker follow-up, link prerequisites and request decomposition.
-    const write = ['/events', '/depend', '/blocker', '/decompose'].includes(ownIntake[2] ?? '');
-    return request.method === 'GET' ? !write : request.method === 'POST' && write && writeTarget;
+    const suffix = ownIntake[2] ?? '';
+    const write = ['/events', '/depend', '/blocker', '/decompose', '/merge-evidence'].includes(suffix);
+    // Merge evidence is accepted only for the worker's own linked intake.
+    // The intake handler validates and normalizes the evidence payload.
+    const writeAllowed = suffix === '/merge-evidence' ? own : writeTarget;
+    return request.method === 'GET' ? !write : request.method === 'POST' && write && writeAllowed;
   }
   if (path === '/api/sessions') return ['GET', 'POST'].includes(request.method);
   const link = /^\/api\/sessions\/([^/]{8,128})\/link$/.exec(path);
