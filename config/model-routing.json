@@ -455,6 +455,7 @@
       "claude": 0.85,
       "grok": 0.2
     },
+    "auto_start_models": ["sonnet", "argon", "glm-flash-zcodex", "muse", "luna"],
     "low_headroom_percent": 30,
     "fallback_models": ["luna"],
     "fallback_factor": 0.6,

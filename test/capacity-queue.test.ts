@@ -130,7 +130,8 @@ describe('fleet reserve capacity queue', () => {
     await configure(f);
     const first: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();
     expect(first.state).toBe('offered');
-    const second = await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', idempotency_key: 'queue-second' })), admin);
+    const secondInput = intent({ machine: 'hetzner', effort: 'max', idempotency_key: 'queue-second' });
+    const second = await f.handle(fleetReq('/launches', secondInput), admin);
     expect(second.status).toBe(202);
     const parked: any = await second.json();
     expect(parked.state).toBe('queued');
@@ -138,7 +139,7 @@ describe('fleet reserve capacity queue', () => {
     expect(parked.queue_position).toBe(1);
     expect(parked.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'account_concurrency' }));
     // Same-key replay observes the same queued intent (no second reservation).
-    const replay = await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', idempotency_key: 'queue-second' })), admin);
+    const replay = await f.handle(fleetReq('/launches', secondInput), admin);
     expect(replay.status).toBe(202);
     const replayed: any = await replay.json();
     expect(replayed.id).toBe(parked.id);
@@ -149,11 +150,18 @@ describe('fleet reserve capacity queue', () => {
     expect(third.state).toBe('queued');
     expect(third.queue_position).toBe(2);
     // Freeing the slot auto-places the oldest waiter; the later waiter stays queued.
+    const originalPlan = f.plan.bind(f);
+    const promotedPlans: any[] = [];
+    vi.spyOn(f, 'plan').mockImplementation(((input: any, ...args: any[]) => {
+      if (String(input.idempotency_key ?? '').startsWith('drain-')) promotedPlans.push(input);
+      return originalPlan(input, ...args);
+    }) as any);
     await claimAndFinish(f, first.id, 'hetzner', 'shared-codex');
+    expect(promotedPlans).toContainEqual(expect.objectContaining({ idempotency_key: 'drain-' + parked.id, effort: 'max' }));
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', parked.id).one().state).toBe('offered');
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', third.id).one().state).toBe('queued');
     // The promoted intent replays as offered; the still-queued one replays queued.
-    const promoted: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', idempotency_key: 'queue-second' })), admin)).json();
+    const promoted: any = await (await f.handle(fleetReq('/launches', secondInput), admin)).json();
     expect(promoted.state).toBe('offered');
     expect(promoted.replay).toBe(true);
     expect(promoted.machine).toBe('hetzner');
