@@ -197,12 +197,21 @@ export class ResourceManagement {
     const scope: WorktreeSnapshotScope = { sessionIds, nativeIds };
     return worktreeIntakeSnapshot(this.sql, scope);
   }
-  private historyRevision: string | null = null;
-  private historyStamp: string | null = null;
-  private memoryHistory = new Map<string | null, any[]>();
-  private cpuHistory: any[] | null = null;
-  private memoryEstimates = new Map<string, number>();
-  private cpuEstimates = new Map<string, {expected_cpu_cores: number; expected_cpu_source: string}>();
+  private static sharedHistoryRevision: string | null = null;
+  private static sharedHistoryStamp: string | null = null;
+  private static sharedMemoryHistory = new Map<string | null, any[]>();
+  private static sharedCpuHistory: any[] | null = null;
+  private static sharedMemoryEstimates = new Map<string, number>();
+  private static sharedCpuEstimates = new Map<string, {expected_cpu_cores: number; expected_cpu_source: string}>();
+  private get historyRevision(): string | null { return ResourceManagement.sharedHistoryRevision; }
+  private set historyRevision(v: string | null) { ResourceManagement.sharedHistoryRevision = v; }
+  private get historyStamp(): string | null { return ResourceManagement.sharedHistoryStamp; }
+  private set historyStamp(v: string | null) { ResourceManagement.sharedHistoryStamp = v; }
+  private get memoryHistory(): Map<string | null, any[]> { return ResourceManagement.sharedMemoryHistory; }
+  private get cpuHistory(): any[] | null { return ResourceManagement.sharedCpuHistory; }
+  private set cpuHistory(v: any[] | null) { ResourceManagement.sharedCpuHistory = v; }
+  private get memoryEstimates(): Map<string, number> { return ResourceManagement.sharedMemoryEstimates; }
+  private get cpuEstimates(): Map<string, {expected_cpu_cores: number; expected_cpu_source: string}> { return ResourceManagement.sharedCpuEstimates; }
   private historyScope = 0;
   private readSnapshot: Map<string, any[]> | null = null;
   private snapshotNow: number | null = null;
