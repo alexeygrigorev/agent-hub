@@ -49,10 +49,13 @@ case "${1:-}" in
     done
     printf '%s\n' "$engine" > "$FAKE_START_ENGINE"
     printf '[{"id":"new-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true}]\n' "$tag" "$workspace" "$tag" > "$FAKE_SESSIONS"
-    printf '❯\n' > "$FAKE_SCREEN"
+    printf '%s\n' "${FAKE_START_SCREEN:-❯}" > "$FAKE_SCREEN"
     ;;
   send)
     printf '%s\n' "$*" >> "$FAKE_SEND_LOG"
+    if [[ " $* " == *" --hex "* && -n "${FAKE_AFTER_HEX_SCREEN:-}" ]]; then
+      printf '%s\n' "$FAKE_AFTER_HEX_SCREEN" > "$FAKE_SCREEN"
+    fi
     ;;
   *)
     echo "unexpected fake a command: $1" >&2
@@ -123,7 +126,7 @@ write_live() {
   printf '%s\n' "$pane" > "$FAKE_SCREEN"
   : > "$FAKE_KILLED"
   : > "$FAKE_SEND_LOG"
-  rm -f "$FAKE_START_ENGINE"
+  rm -f "$FAKE_START_ENGINE" "$HOME/tmp/agent-reports/$sub/state/last_start"
 }
 
 write_default_quota() {
@@ -162,6 +165,33 @@ assert_not_contains "$output" 'OK session='
 [[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
 assert_contains "$(<"$FAKE_SEND_LOG")" 'Run the oncall check now:'
 assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
+
+# Immediately after a restart, oncall gets a MAX_ONCALL_INBOX_AGE grace window from last_start
+# to finish draining pre-existing inbox items instead of being killed mid-triage.
+rm -f "$FAKE_START_ENGINE"
+output="$(run_ctl oncall check 2>&1)"
+assert_contains "$output" 'OK session=new-oncall-engineer'
+[[ ! -e "$FAKE_START_ENGINE" ]]
+rm -f "$HOME/tmp/agent-reports/oncall/inbox/old.md"
+
+# Unmetered OpenCode Go pool (remaining_percent: null, burn_status: unmetered) is accepted,
+# folder trust uses --hex without --raw, and OpenCode TUI prompt is recognized as ready.
+write_quota <<'JSON'
+{"pools":[
+ {"provider":"claude","state":"exhausted","remaining_percent":0,"harness":["claude","sonnet","opus","haiku"]},
+ {"provider":"go","state":"fresh","source":"unmetered-engine","burn_status":"unmetered","depleted":false,"remaining_percent":null,"engines":["opencode"],"harness":["opencode"]}
+]}
+JSON
+write_live oncall 'You have hit your weekly limit - resets Nov 5'
+export FAKE_START_SCREEN='Do you trust the contents of this project? Yes, proceed'
+export FAKE_AFTER_HEX_SCREEN='Ask anything…  ctrl+p commands'
+output="$(run_ctl oncall check 2>&1)"
+unset FAKE_START_SCREEN FAKE_AFTER_HEX_SCREEN
+assert_contains "$output" 'provider usage limit screen'
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+assert_contains "$(<"$FAKE_SEND_LOG")" 'new-oncall-engineer --hex 0d'
+assert_not_contains "$(<"$FAKE_SEND_LOG")" '--raw --hex'
+assert_contains "$(<"$FAKE_SEND_LOG")" 'Run the oncall check now:'
 
 # Both roles recover from limit screens, and exhausted Claude quota is never selected.
 for role in oncall orchestrator; do
