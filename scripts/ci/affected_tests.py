@@ -61,9 +61,27 @@ def all_tests(root=ROOT):
     return sorted(found)
 
 
-def module_regex(stem):
-    s = re.escape(stem)
-    return re.compile(rf'(agent_hub_host\.{s}\b|from agent_hub_host import [^\n]*\b{s}\b|^\s*(?:import|from) {s}\b|{s}\.(?:py|ts|js|html)\b)', re.M)
+def module_regex(source_path):
+    """Match imports of a source module without crossing language boundaries.
+
+    A basename-only fallback made ``src/fleet.ts`` match every Python test
+    mentioning ``agent_hub_host/fleet.py``. Keep import syntax language-aware;
+    explicit references to the full changed path are handled separately in
+    ``select``.
+    """
+    path = Path(source_path)
+    stem = re.escape(path.stem)
+    suffix = path.suffix
+    if suffix == '.py':
+        return re.compile(
+            rf'(agent_hub_host\.{stem}\b|from agent_hub_host import [^\n]*\b{stem}\b|'
+            rf'^\s*(?:import|from) {stem}\b)', re.M)
+    if suffix in {'.ts', '.js'}:
+        extension = r'(?:\.ts|\.js)?'
+        return re.compile(
+            rf'(?:\bfrom\s*[\'"][^\'"]*(?:/|\\){stem}{extension}[\'"]|'
+            rf'\bimport\s*[\'"][^\'"]*(?:/|\\){stem}{extension}[\'"])', re.M)
+    return re.compile(r'(?!)')
 
 
 def select(changed, root=ROOT):
@@ -79,7 +97,7 @@ def select(changed, root=ROOT):
         if not path.startswith(SOURCE_DIRS) or TEST_RE.match(path) or not (root / path).exists():
             continue
         stem = Path(path).stem
-        rx = module_regex(stem)
+        rx = module_regex(path)
         for test in tests:
             if test not in texts:
                 texts[test] = (root / test).read_text(errors='replace')

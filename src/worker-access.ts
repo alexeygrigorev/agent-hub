@@ -329,7 +329,11 @@ export function revokeEndedNativeWorkerCredentials(sql: SqlStorage, now: number)
 
 export class WorkerAccess {
   constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private hostAllowed: (caller: CallerContext) => boolean) {}
-  init() { this.sql.exec(WORKER_ACCESS_SCHEMA); this.sql.exec(DRIVER_ACCESS_SCHEMA); this.sql.exec(WORKER_CREATED_SCHEMA); this.sql.exec(WORKER_CREATED_INDEX); }
+  init() {
+    this.sql.exec(WORKER_ACCESS_SCHEMA);
+    this.sql.exec('CREATE INDEX IF NOT EXISTS worker_access_session_family ON worker_access(session_id,family_id)');
+    this.sql.exec(DRIVER_ACCESS_SCHEMA); this.sql.exec(WORKER_CREATED_SCHEMA); this.sql.exec(WORKER_CREATED_INDEX);
+  }
   releaseClaim(caller: CallerContext, target: string): Response {
     return this.tx(() => {
       const worker = workerAccessContext(this.sql, caller.tokenId);
