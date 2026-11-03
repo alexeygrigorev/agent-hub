@@ -151,3 +151,35 @@ it('CPU admission refuses an oversized raw active prefix before retained history
   expect(verdict).toMatchObject({admitted:false,reason:'resource_snapshot_overflow',snapshot_truncated:true,ramping_cpu_cores:null});
   expect(meter.snapshot()['cpu-prefix'].rows_read).toBeLessThan(1000);
 }));
+
+
+describe('resource hotpaths ignore retained terminal history',()=>{
+  it('finds late live natives and complete old protected aliases without reading 40k retained control/launch rows',()=>fixture(({r,raw,meter,sample,iso}:any)=>{
+    raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<21000)
+      INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+      SELECT 'history-'||i,'test','history-'||i,'{}','host','codex','interactive','stopped',json_object('native_id','history-'||i,'tag','old','workspace','/old'),?,? FROM n`,iso(),iso());
+    raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<21000)
+      INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+      SELECT 'history-launch-'||i,'test','human','test','history-launch-'||i,'{}','host','codex','go','headless','/old','test','exited','history-'||i,?,? FROM n`,iso(),iso());
+    raw.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+      VALUES('protected-old','test','protected-old','{}','host','opencode','interactive','stopped',?,?,?)`,JSON.stringify({native_id:'native',tag:'old-alias',workspace:'/repo'}),iso(),iso());
+    raw.exec("INSERT INTO session_control_protections VALUES('protected-old','human','keep',?)",iso());
+    // Keep the eligible rows physically after the retained terminal prefix.
+    raw.exec("UPDATE session_control_sessions SET rowid=30000 WHERE id='session'");
+    raw.exec("UPDATE fleet_launches SET rowid=30000 WHERE id='launch'");
+    const sessions=meter.runSync('bounded-watchdog',()=>r.sessions('host'));
+    expect(sessions.find((row:any)=>row.native_id==='native')).toMatchObject({keep:true,managed:false,idle_reap_allowed:false,authority_observation_limited:true});
+    expect(meter.snapshot()['bounded-watchdog'].rows_read).toBeLessThan(500);
+    meter.runSync('bounded-report',()=>r.report('host',{samples:[sample()],reaps:[]}));
+    expect(meter.snapshot()['bounded-report'].rows_read).toBeLessThan(500);
+  }));
+
+  it('refuses oversized native alias authority before any report write',()=>fixture(({r,raw,meter,sample,iso}:any)=>{
+    raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<129)
+      INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+      SELECT 'alias-'||i,'test','alias-'||i,'{}','host','opencode','interactive','stopped',?, ?,? FROM n`,JSON.stringify({native_id:'native',tag:'old-alias',workspace:'/repo'}),iso(),iso());
+    expect(()=>meter.runSync('alias-overflow',()=>r.report('host',{samples:[sample()],reaps:[]}))).toThrow('resource_catalog_observation_limit');
+    expect(meter.snapshot()['alias-overflow'].rows_written).toBe(0);
+    expect(meter.snapshot()['alias-overflow'].rows_read).toBeLessThan(300);
+  }));
+});

@@ -206,7 +206,7 @@ const HOST_LOAD_FACTOR = 6;
  * it only projects the same inputs (MemAvailable, reserved total, floor for
  * the next slot) so operators see why starts hold. Owned by the launcher
  * reservation fixer; visibility reuses its accounting. */
-import { MEMORY_FLOOR_MB, NEXT_SLOT_MB, ResourceManagement, memoryVerdict } from "./resource-management";
+import { MEMORY_FLOOR_MB, NEXT_SLOT_MB, ResourceManagement, ResourceObservationLimit, memoryVerdict } from "./resource-management";
 export { MEMORY_FLOOR_MB, NEXT_SLOT_MB };
 /** Placement-pressure reasons that degrade host health and raise operator
  * alerts: any launch rejected or held for memory/capacity. */
@@ -2385,7 +2385,8 @@ export class FleetService {
         }
         if (suffix === '/watchdog') {
           if (!host) return response({error:'forbidden'},403);
-          return response({config:this.resources.cachedConfig(), sessions:this.resources.sessions(caller.machineId!), choking:this.resources.cachedResourceChoking(caller.machineId!)});
+          try {return response({config:this.resources.cachedConfig(), sessions:this.resources.sessions(caller.machineId!), choking:this.resources.cachedResourceChoking(caller.machineId!)});}
+          catch(error){if(error instanceof ResourceObservationLimit)return response({error:error.message,observation_pending:true},503);throw error;}
         }
         if (!admin) return response({error:'forbidden'},403);
         if (!suffix) return response(this.resources.overview());
@@ -2403,6 +2404,7 @@ export class FleetService {
           const data=await body(request);
           return this.transaction(() => response(suffix === '/report' ? this.resources.report(caller.machineId!,data) : this.resources.evidence(caller.machineId!,data)));
         } catch (error) {
+          if(error instanceof ResourceObservationLimit)return response({error:error.message,observation_pending:true},503);
           const allowed=new Set(['invalid_resource_report','resource_binding_mismatch','invalid_resource_sample','invalid_resource_timestamp','invalid_reap','reap_conflict','invalid_throttle','throttle_conflict','session_not_reapable','invalid_evidence','evidence_conflict','intake_required','intake_not_found','intake_history_capacity','intake_capacity']);
           const code=error instanceof Error && allowed.has(error.message) ? error.message : 'resource_report_failed';
           return response({error:code},400);

@@ -109,6 +109,8 @@ const SLIM_REQUEST = `CASE WHEN json_valid(request_json) THEN json_object('intak
 // The caller binds only native-id strings, so non-text JSON values cannot
 // match and need no per-row json_type guard in the indexed expression.
 const NATIVE_KEY = `json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END, '$.native_id')`;
+export class ResourceObservationLimit extends Error { constructor(){super('resource_catalog_observation_limit');this.name='ResourceObservationLimit';} }
+const RESOURCE_CATALOG_LIMIT=128;
 export class ResourceManagement {
   /** Live telemetry is advisory memory, not a per-poll durable event log.
    * A restart loses freshness and falls back to conservative reservation. */
@@ -120,6 +122,7 @@ export class ResourceManagement {
     return Number.isFinite(at)&&at>=now-180000&&at<=now+30000?value:null;
   }
   invalidateLiveTelemetry():void { this.liveTelemetry.clear(); }
+  private idleBindingValidity=new Map<string,{stamp:string|null;corrupt:boolean;limited:boolean}>();
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
   private catalogRawRows=new Map<string,{rev:string|null;value:any[]}>();
@@ -203,11 +206,10 @@ export class ResourceManagement {
   private scopedIntakeSnapshot(
     machine: string | undefined,
     controlData: Map<string, {binding: any; req: any; launch: any; model: any}>,
-    launchData: Map<string, {req: any; model: any}>,
+    launchData: Map<string, {req: any; model: any;native_id?:string}>,
   ): ReturnType<typeof worktreeIntakeSnapshot> {
-    if (!machine) return worktreeIntakeSnapshot(this.sql);
     const sessionIds = [...controlData.keys()];
-    const nativeIds = [...new Set([...controlData.values()].map(d => d.binding.native_id).filter(v => typeof v === 'string' && v))];
+    const nativeIds = [...new Set([...controlData.values()].map(d => d.binding.native_id).concat([...launchData.values()].map(d=>d.native_id)).filter(v => typeof v === 'string' && v))];
     const scope: WorktreeSnapshotScope = { sessionIds, nativeIds };
     return worktreeIntakeSnapshot(this.sql, scope);
   }
@@ -529,7 +531,7 @@ export class ResourceManagement {
       observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null,
       snapshot_truncated: false as boolean, reason: null as string | null };
   }
-  private boundSessions(machine?: string) {
+  private boundSessions(machine?: string, requested?: string[]) {
     // Share repeated immutable JSON only within this catalog read. Protection
     // and binding facts are always re-read on the next request.
     const parsed = new Map<any, any>();
@@ -556,38 +558,71 @@ export class ResourceManagement {
       }
       return value;
     };
-    // Canonical binding, not tag matching; external interactive sessions can be sampled but never reaped.
-    const rows = read(`SELECT s.id,s.machine_id,s.fleet_launch_id,s.binding_json,${resourceRequest('session_control_sessions','s.id','s.request_json')} AS request_json,s.request_key,
+    // Seed a complete bounded active population, or only explicitly reported
+    // IDs for final telemetry. Retained terminal history is never a seed scan.
+    const controlIds=new Set<string>(),launchIds=new Set<string>();
+    const nativeKeys=new Map<string,{machine:string;native:string}>();
+    const check=()=>{if(controlIds.size+launchIds.size>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();};
+    const native=(host:any,id:any)=>{if(typeof host==='string'&&typeof id==='string'&&id)nativeKeys.set(JSON.stringify([host,id]),{machine:host,native:id});};
+    const addControl=(row:any)=>{if(!row || machine && row.machine_id!==machine)return;controlIds.add(String(row.id));native(row.machine_id,parse(row.binding_json).native_id);check();};
+    const addLaunch=(row:any)=>{if(!row || machine && row.machine_id!==machine)return;launchIds.add(String(row.id));native(row.machine_id,row.native_id);check();};
+    if(requested) {
+      if(requested.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+      for(const id of requested) {
+        if(id.startsWith('fleet:'))addLaunch(read('SELECT id,machine_id,native_id FROM fleet_launches WHERE id=?',id.slice(6))[0]);
+        else addControl(read('SELECT id,machine_id,binding_json FROM session_control_sessions WHERE id=?',id)[0]);
+      }
+    } else {
+      for(const state of ['queued','held','offered','starting','running','uncertain']) {
+        const source=read(`SELECT id,machine_id,binding_json FROM session_control_sessions INDEXED BY ${machine?'session_control_machine_state':'session_control_state'}
+          WHERE ${machine?'machine_id=? AND ':''}state=? ORDER BY ${machine?'created_at,':''}rowid LIMIT 129`,...(machine?[machine,state]:[state]));
+        if(source.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+        for(const row of source)addControl(row);
+      }
+      for(const state of ['offered','starting','running','uncertain']) {
+        const source=read(`SELECT id,machine_id,native_id FROM fleet_launches INDEXED BY ${machine?'fleet_launch_machine_state':'fleet_launch_state'}
+          WHERE ${machine?'machine_id=? AND ':''}state=? ORDER BY rowid LIMIT 129`,...(machine?[machine,state]:[state]));
+        if(source.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+        for(const row of source)addLaunch(row);
+      }
+    }
+    // Complete native alias closure includes terminal/protected identities.
+    // A cap refuses authority rather than silently dropping an old protection.
+    for(const identity of nativeKeys.values()) {
+      const controls=read(`SELECT id,machine_id,binding_json FROM session_control_sessions INDEXED BY session_control_native
+        WHERE machine_id=? AND CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json,'$.native_id')='text' THEN json_extract(binding_json,'$.native_id') END END=? LIMIT 129`,identity.machine,identity.native);
+      const fleets=read('SELECT id,machine_id,native_id FROM fleet_launches INDEXED BY fleet_launch_native WHERE machine_id=? AND native_id=? LIMIT 129',identity.machine,identity.native);
+      if(controls.length>RESOURCE_CATALOG_LIMIT || fleets.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+      for(const row of controls)addControl(row);for(const row of fleets)addLaunch(row);
+    }
+    if(!controlIds.size&&!launchIds.size)return [];
+    const rows = controlIds.size?read(`SELECT s.id,s.machine_id,s.fleet_launch_id,s.binding_json,${resourceRequest('session_control_sessions','s.id','s.request_json')} AS request_json,s.request_key,
       s.engine,s.mode,s.state,s.created_at,s.updated_at,${resourceRequest('fleet_launches','l.id','l.request_json')} AS launch_request,l.state AS launch_state,l.created_at AS launch_created,
       l.finished_at AS launch_finished,${jsonFields('l.model_selection_json',['model'])} AS model_selection_json,l.workspace AS launch_workspace
       FROM session_control_sessions s LEFT JOIN fleet_launches l ON l.id=s.fleet_launch_id
-      ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC`, ...(machine ? [machine] : []));
-    const launches = read(`SELECT l.id,l.machine_id,l.native_id,l.workspace,l.engine,l.mode,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,
+      WHERE s.id IN(SELECT value FROM json_each(?))`,JSON.stringify([...controlIds])):[];
+    rows.sort((a,b)=>Number(TERMINAL.has(a.state))-Number(TERMINAL.has(b.state)) || String(b.updated_at).localeCompare(String(a.updated_at)));
+    const launches=launchIds.size?read(`SELECT l.id,l.machine_id,l.native_id,l.workspace,l.engine,l.mode,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,
       ${jsonFields('l.model_selection_json',['model'])} AS model_selection_json,l.state,l.finished_at,l.updated_at
-      FROM fleet_launches l WHERE l.native_id IS NOT NULL AND l.native_id<>'' ${machine ? 'AND l.machine_id=?' : ''}`,
-      ...(machine ? [machine] : []));
-    // Hydrate the complete alias set before selecting canonical sessions. Batch
-    // catalog facts instead of re-reading full intake histories for every alias.
+      FROM fleet_launches l WHERE l.id IN(SELECT value FROM json_each(?))`,JSON.stringify([...launchIds])):[];
     const key = (...parts: any[]) => JSON.stringify(parts);
-    // Write-through observed rows (census/reap paths patch the map; zero row
-    // reads on the hot path). Per-rebuild scan stays for the fallback mode.
-    const observedByNative = this.observed ? this.observed.byNative(machine) : new Map(this.sql.exec(`SELECT machine_id,native_id,tag,last_activity_at,created_at_ms,phase
-      FROM fleet_sessions ${machine ? 'WHERE machine_id=?' : ''}`, ...(machine ? [machine] : [])).toArray()
-      .map((r:any)=>[key(r.machine_id,r.native_id),r]));
-    const protectedIds = new Set(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_protections'").toArray().length
-      ? this.sql.exec(`SELECT p.session_id FROM session_control_protections p JOIN session_control_sessions s ON s.id=p.session_id
-          ${machine ? 'WHERE s.machine_id=?' : ''}`, ...(machine ? [machine] : [])).toArray().map((r:any)=>r.session_id) : []);
-    const reapRows = this.sql.exec(`SELECT session_id,machine_id,native_id FROM resource_reaps ${machine ? 'WHERE machine_id=?' : ''}`,
-      ...(machine ? [machine] : [])).toArray();
-    const reapedAliases = new Set(reapRows.map((r:any)=>key(r.session_id,r.machine_id,r.native_id)));
-    const reapedNatives = new Set(reapRows.map((r:any)=>key(r.machine_id,r.native_id)));
+    const observedByNative=new Map<string,any>();
+    const reapedNatives=new Set<string>(),reapedAliases=new Set<string>();
+    for(const identity of nativeKeys.values()) {
+      const observed=read('SELECT machine_id,native_id,tag,last_activity_at,created_at_ms,phase FROM fleet_sessions WHERE machine_id=? AND native_id=?',identity.machine,identity.native)[0];
+      if(observed)observedByNative.set(key(identity.machine,identity.native),observed);
+      const reap=read('SELECT session_id FROM resource_reaps INDEXED BY resource_reaps_native WHERE machine_id=? AND native_id=? LIMIT 1',identity.machine,identity.native)[0];
+      if(reap){reapedNatives.add(key(identity.machine,identity.native));reapedAliases.add(key(reap.session_id,identity.machine,identity.native));}
+    }
+    const protectedIds=new Set<string>();
+    for(const id of controlIds)if(read('SELECT session_id FROM session_control_protections WHERE session_id=?',id).length)protectedIds.add(id);
     const controlData = new Map(rows.flatMap(s=>{
       const binding=catalogJson(s.binding_json);
       if(!binding.native_id || !binding.workspace || !binding.tag) return [];
       return [[s.id,{binding,req:catalogJson(s.request_json),launch:catalogJson(s.launch_request),model:catalogJson(s.model_selection_json)}] as const];
     }));
     const launchData = new Map(launches.filter(l=>l.machine_id && l.workspace && l.engine && ['headless','interactive'].includes(l.mode))
-      .map(l=>[l.id,{req:catalogJson(l.request_json),model:catalogJson(l.model_selection_json)}]));
+      .map(l=>[l.id,{req:catalogJson(l.request_json),model:catalogJson(l.model_selection_json),native_id:l.native_id}]));
     const intakeIds = [...new Set([...controlData.values()].map(s=>s.req.intake_task_id || s.launch.intake_task_id)
       .concat([...launchData.values()].map(l=>l.req.intake_task_id)).filter(Boolean))];
     const projects = new Map<any,any>();
@@ -604,8 +639,8 @@ export class ResourceManagement {
     // stamp-cached; without a watch the unscoped snapshot is cached as before.
     // Keep failures uncached.
     const worktreeLinks = this.intakeSnapshots
-      ? this.intakeSnapshots.get(machine ?? '', () => this.scopedIntakeSnapshot(machine, controlData, launchData))
-      : (this.catalogIntakes ?? worktreeIntakeSnapshot(this.sql));
+      ? this.intakeSnapshots.get(JSON.stringify([machine,[...controlData.keys()].sort(),[...launchData.keys()].sort()]), () => this.scopedIntakeSnapshot(machine, controlData, launchData))
+      : this.scopedIntakeSnapshot(machine,controlData,launchData);
     if (!this.intakeSnapshots && !this.catalogIntakes && this.catalogStructureRevision !== null && worktreeLinks.valid) {
       const entries = [...worktreeLinks.machines, ...worktreeLinks.projections, ...worktreeLinks.sessions];
       if (entries.length <= 10000 && entries.reduce((n, row) => n + 512 + JSON.stringify(row).length * 2, 0) <= 4 * 1024 * 1024) {
@@ -624,6 +659,7 @@ export class ResourceManagement {
           && req.provenance==='observed_native' && binding.provenance==='observed_native',
         intake_id:intakeId,
         linked_intake_open:worktreeIntakeProtected(this.sql, s, worktreeLinks),
+        intake_authority_observation_limited:!worktreeLinks.valid,
         native_id:binding.native_id, tag:binding.tag, workspace:binding.workspace,
         native_created_at_ms:binding.native_created_at_ms ?? observed?.created_at_ms ?? null,
         engine:s.engine, mode:s.mode, model:model.model ?? null, project,
@@ -649,6 +685,7 @@ export class ResourceManagement {
         workspace:l.workspace,native_created_at_ms:observed?.created_at_ms ?? null,
         engine:l.engine,mode:l.mode,model:model.model ?? null,project:projects.get(intakeId) || req.project || l.workspace,
         tier:req.tier || policy.default_tier,kind:req.task_kind || 'goal',state:l.state,keep:req.keep===true,managed:false,
+        intake_authority_observation_limited:!worktreeLinks.valid,
         reaped:reapedNatives.has(key(l.machine_id,l.native_id)),
         last_activity_at:observed?.last_activity_at ?? null,
         // The request may have queued for hours; it is not a native start time.
@@ -657,21 +694,17 @@ export class ResourceManagement {
     });
     return [...bound,...fleetOnly];
   }
-  private canonicalSessions(machine?: string) {
+  private canonicalSessions(machine?: string, requested?:string[]) {
     // No time-based authority cache: metadata/authority writes change the
     // durable random generation, including rollback and retry. With the
     // write-through watch, the stamp check reads zero rows and is exactly as
     // fresh as the database; otherwise the trigger-maintained revision row
     // decides (and activity is still read live per call below).
     if (this.canonicalByMachine) {
-      const rows = this.canonicalByMachine.get(machine ?? '', () => this.buildCanonicalSessions(machine));
+      const rows = this.canonicalByMachine.get(JSON.stringify([machine,requested]), () => this.buildCanonicalSessions(machine,requested));
       // Activity overlays live from the write-through catalog: a census that
       // only refreshes timestamps must not rebuild retained identity history.
-      const activity = this.observed ? this.observed.activity(machine) : null;
-      const keyOf = (row: any) => JSON.stringify([row.machine_id, row.native_id]);
-      // Callers cannot mutate a cached protection or alias list.
-      return rows.map(row=>({...row,aliases:[...row.aliases],
-        last_activity_at: activity ? (activity.get(keyOf(row)) ?? null) : row.last_activity_at}));
+      return this.overlayActivity(rows);
     }
     const raw=this.catalogReady ? this.sql.exec('SELECT revision,structure_revision FROM resource_catalog_revision WHERE id=1').toArray()[0] : null;
     const revision=typeof raw?.revision==='string' && /^[a-f0-9]{32}$/.test(raw.revision) ? raw.revision : null;
@@ -679,11 +712,11 @@ export class ResourceManagement {
     if(structure===null || structure!==this.catalogStructureRevision) {this.catalogRawRows.clear();this.catalogIntakes=null;}
     this.catalogStructureRevision=structure;
     if(revision===null) this.catalogCache.clear();
-    const key=machine ?? ''; const cached=this.catalogCache.get(key);
+    const key=JSON.stringify([machine,requested]); const cached=this.catalogCache.get(key);
     let rows:ReturnType<ResourceManagement['buildCanonicalSessions']>;
     if(revision!==null && cached?.revision===revision) rows=cached.rows;
     else {
-      rows=this.buildCanonicalSessions(machine);
+      rows=this.buildCanonicalSessions(machine,requested);
       // Bound retained memory, including aliases; malformed legacy nested
       // values bypass caching so callers never share mutable nested data.
       const bytes=rows.reduce((n,row)=>n+256+Object.values(row).reduce<number>((sum,v)=>sum+(typeof v==='string'?v.length*2:Array.isArray(v)?v.reduce((a,b)=>a+String(b).length*2,0):8),0),0);
@@ -700,15 +733,16 @@ export class ResourceManagement {
     // A census activity refresh must not rebuild retained identity/protection
     // history. Read the live timestamps even when canonical metadata is cached,
     // including inside transactions and after their rollback.
-    const activity = new Map(this.readRows(`SELECT machine_id,native_id,last_activity_at FROM fleet_sessions ${machine ? 'WHERE machine_id=?' : ''}`,
-      ...(machine ? [machine] : [])).map(row=>[JSON.stringify([row.machine_id,row.native_id]),row.last_activity_at]));
-    // Callers cannot mutate a cached protection or alias list.
-    return rows.map(row=>({...row,aliases:[...row.aliases],last_activity_at:activity.get(JSON.stringify([row.machine_id,row.native_id])) ?? null}));
+    return this.overlayActivity(rows);
   }
-  private buildCanonicalSessions(machine?: string) {
+  private overlayActivity(rows:any[]):any[] {
+    return rows.map(row=>({...row,...(row.aliases?{aliases:[...row.aliases]}:{}),last_activity_at:this.readRows('SELECT last_activity_at FROM fleet_sessions WHERE machine_id=? AND native_id=?',row.machine_id,row.native_id)[0]?.last_activity_at ?? null}));
+  }
+
+  private buildCanonicalSessions(machine?: string,requested?:string[]) {
     type Bound = ReturnType<ResourceManagement['boundSessions']>[number];
     const groups = new Map<string, {canonical: Bound; keep: boolean; reaped: boolean; intakeOpen: boolean; aliases: Set<string>}>();
-    for (const session of this.boundSessions(machine)) {
+    for (const session of this.boundSessions(machine,requested)) {
       const key = JSON.stringify([session.machine_id,session.native_id]);
       let group = groups.get(key);
       if (!group) {
@@ -737,7 +771,7 @@ export class ResourceManagement {
    * native_id) = (machine, native)`. One projection loads them in bulk instead
    * of a json_extract table scan per session. A corrupt binding on a host makes
    * that host's native authority unreadable, which is never reap permission. */
-  private idleAuthority(sessions: any[]) {
+  private idleAuthority(sessions: any[]):((session:any)=>any[]|null)&{limited?:Set<string>} {
     const byId = new Map<string, any>(), byNative = new Map<string, any[]>(), corrupt = new Set<string>();
     const add = (row: any) => {
       if (byId.has(row.id)) return;
@@ -754,13 +788,24 @@ export class ResourceManagement {
       if (typeof s.native_id === 'string') set.add(s.native_id);
       natives.set(s.machine_id, set);
     }
+    const limited=new Set<string>();
     for (const [machine, set] of natives) {
-      if (this.sql.exec(`SELECT 1 FROM session_control_sessions WHERE machine_id=? AND binding_json IS NOT NULL
-        AND NOT json_valid(binding_json) LIMIT 1`, machine).toArray().length) { corrupt.add(machine); continue; }
+      const stamp=this.writes?.stamp('session_control_sessions') ?? this.catalogStructureRevision;
+      let validity=this.idleBindingValidity.get(machine);
+      if(!validity || stamp===null || validity.stamp!==stamp) {
+        const page=this.sql.exec(`SELECT binding_json FROM session_control_sessions INDEXED BY session_control_machine_created
+          WHERE machine_id=? ORDER BY created_at,id LIMIT 129`,machine).toArray();
+        const malformed=page.some(row=>{if(row.binding_json===null)return false;try{JSON.parse(String(row.binding_json));return false;}catch{return true;}});
+        validity={stamp,corrupt:malformed,limited:page.length>128};this.idleBindingValidity.set(machine,validity);
+      }
+      if(validity.limited)limited.add(machine);
+      if(validity.corrupt || validity.limited){corrupt.add(machine);continue;}
       const list = [...set];
       for (let i = 0; i < list.length; i += 100) {
         const chunk = list.slice(i, i + 100);
-        for (const row of this.sql.exec(`SELECT ${columns} FROM session_control_sessions WHERE machine_id=? AND ${NATIVE_KEY} IN (${chunk.map(() => '?').join(',')})`, machine, ...chunk).toArray()) add(row);
+        const page=this.sql.exec(`SELECT ${columns} FROM session_control_sessions INDEXED BY intake_queue_session_native WHERE machine_id=? AND ${NATIVE_KEY} IN (${chunk.map(() => '?').join(',')}) LIMIT 129`, machine, ...chunk).toArray();
+        if(page.length>128){limited.add(machine);corrupt.add(machine);break;}
+        for(const row of page)add(row);
       }
     }
     const ids = [...new Set(sessions.map(s => s.session_id).filter(id => id !== null && id !== undefined && !byId.has(id)))];
@@ -768,7 +813,7 @@ export class ResourceManagement {
       const chunk = ids.slice(i, i + 100);
       for (const row of this.sql.exec(`SELECT ${columns} FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray()) add(row);
     }
-    return (session: any): any[] | null => {
+    const lookup=((session: any): any[] | null => {
       if (session.machine_id !== null && session.machine_id !== undefined && corrupt.has(session.machine_id)) return null;
       const rows = new Map<string, any>();
       const own = byId.get(session.session_id);
@@ -777,7 +822,8 @@ export class ResourceManagement {
         for (const row of byNative.get(JSON.stringify([session.machine_id, session.native_id])) ?? []) rows.set(row.id, row);
       }
       return [...rows.values()];
-    };
+    }) as ((session:any)=>any[]|null)&{limited?:Set<string>};
+    lookup.limited=limited;return lookup;
   }
   private idleReapAllowed(session: any, authority?: (session: any) => any[] | null, cache: IdleReapCache = { intakes: new Map() }): boolean {
     try {
@@ -796,22 +842,18 @@ export class ResourceManagement {
     // rebuilding the much larger authority projection.
     if (this.watchdogSessions && machine) {
       const sessions = this.watchdogSessions.get(machine, () => this.sessionsUncached(machine));
-      if (!this.observed) return sessions;
-      const activity = this.observed.activity(machine);
-      return sessions.map(session => {
-        const lastActivity = activity.get(JSON.stringify([session.machine_id, session.native_id])) ?? null;
-        return lastActivity === session.last_activity_at ? session : { ...session, last_activity_at: lastActivity };
-      });
+      return this.overlayActivity(sessions);
     }
     return this.sessionsUncached(machine);
   }
   private sessionsUncached(machine?: string) {
     const canonical = this.canonicalSessions(machine).slice(0,1000);
-    let authority: (session: any) => any[] | null;
+    let authority:ReturnType<ResourceManagement['idleAuthority']>;
     try { authority = this.idleAuthority(canonical); } catch { authority = () => { throw new Error('idle_authority_unavailable'); }; }
     const cache: IdleReapCache = { intakes: new Map() };
     return canonical.map(({aliases,...session}) => {
-      return { ...session, idle_reap_allowed: this.idleReapAllowed(session, authority, cache) };
+      return { ...session, idle_reap_allowed: this.idleReapAllowed(session, authority, cache),
+        authority_observation_limited:authority.limited?.has(session.machine_id) ?? false };
     });
   }
   private note(session: any, key: string, text: string) {
@@ -843,9 +885,11 @@ export class ResourceManagement {
   report(machine: string, value: any) {
     // Accept reports already in flight under an older canonical alias, but put
     // every physical native in exactly one durable ledger row.
-    const sessions = new Map(this.canonicalSessions(machine).flatMap(s => s.aliases.map(id=>[id,s] as const)));
     if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100
       || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
+    if(!value.samples.length&&!value.reaps.length&&!(value.throttles?.length))return {reported:true,samples:0,reaps:0};
+    const requested=[...new Set<string>([...value.samples,...value.reaps,...(value.throttles??[])].map(item=>item?.session_id).filter(id=>typeof id==='string'))];
+    const sessions = new Map<string,any>(this.canonicalSessions(machine,requested).flatMap(s => s.aliases.map((id:string)=>[id,s] as const)));
     for (const reportedSample of value.samples) {
       let sample={...reportedSample};
       const session = sessions.get(sample.session_id);

@@ -26,38 +26,60 @@ function parseNative(raw: unknown): string | null {
 
 export function worktreeIntakeSnapshot(sql: SqlStorage, scope?: WorktreeSnapshotScope): WorktreeIntakeSnapshot {
   try {
-    const machines = sql.exec('SELECT id, hostname FROM machines').toArray();
+    const machines = sql.exec('SELECT id, hostname FROM machines ORDER BY id LIMIT 65').toArray();
+    if(machines.length>64)throw new Error('worktree_observation_limit');
     const NATIVE = `CASE WHEN json_valid(s.binding_json) THEN CASE WHEN json_type(s.binding_json, '$.native_id') = 'text'
       THEN json_extract(s.binding_json, '$.native_id') END END`;
-    // Scoped: the given sessions plus their native aliases on every machine
-    // (the machine-leading expression index seeks each machine once).
-    const sessionRows = sql.exec(`SELECT s.id,s.machine_id,s.binding_json,
+    // Complete bounded identity closure. LIMIT applies before any alias or
+    // machine postfilter; overflow is unknown authority and forbids cleanup.
+    const ids=new Set<string>();
+    const add=(rows:any[])=>{for(const row of rows)ids.add(String(row.id));if(ids.size>128)throw new Error('worktree_observation_limit');};
+    if(scope) {
+      if(scope.sessionIds.length>128 || scope.nativeIds.length>128)throw new Error('worktree_observation_limit');
+      add(scope.sessionIds.map(id=>({id})));
+      for(const native of new Set(scope.nativeIds))for(const machine of machines) {
+        const aliases=sql.exec(`SELECT id FROM session_control_sessions INDEXED BY session_control_native
+          WHERE machine_id=? AND ${NATIVE.replaceAll('s.binding_json','binding_json')}=? LIMIT 129`,machine.id,native).toArray();
+        if(aliases.length>128)throw new Error('worktree_observation_limit');add(aliases);
+      }
+    } else {
+      const rows=sql.exec('SELECT id FROM session_control_sessions ORDER BY id LIMIT 129').toArray();
+      if(rows.length>128)throw new Error('worktree_observation_limit');add(rows);
+    }
+    const sessionRows=ids.size?sql.exec(`SELECT s.id,s.machine_id,s.binding_json,
       CASE WHEN json_valid(s.request_json) THEN json_type(s.request_json)='object' ELSE 0 END AS request_valid,
       CASE WHEN f.request_json IS NULL THEN s.fleet_launch_id IS NULL WHEN json_valid(f.request_json) THEN json_type(f.request_json)='object' ELSE 0 END AS launch_valid,
       json_extract(CASE WHEN json_valid(s.request_json) THEN s.request_json ELSE '{}' END,'$.intake_task_id') AS direct_intake,
       json_extract(CASE WHEN json_valid(f.request_json) THEN f.request_json ELSE '{}' END,'$.intake_task_id') AS launch_intake
-      FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id${scope ? `
-      WHERE s.id IN (SELECT value FROM json_each(?) UNION SELECT s2.id FROM json_each(?) j CROSS JOIN machines m CROSS JOIN session_control_sessions s2
-        ON s2.machine_id=m.id AND ${NATIVE.replaceAll('s.binding_json', 's2.binding_json')} = j.value)` : ''}`,
-      ...(scope ? [JSON.stringify(scope.sessionIds), JSON.stringify(scope.nativeIds)] : [])).toArray();
+      FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id
+      WHERE s.id IN(SELECT value FROM json_each(?))`,JSON.stringify([...ids])).toArray():[];
     // Scoped: only projections whose link events name a scoped session or
     // native id (including cross-machine aliases resolved above) can protect a
     // scoped session. The indexed intake_link_refs side table replaces a
     // per-row json_each/instr scan; the old text prefilter remains the
     // fallback only when the side table does not exist yet.
     const projectionRows = (() => {
-      if (!scope) return sql.exec('SELECT id, links FROM intake_task_projection').toArray();
+      if (!scope) {const rows=sql.exec('SELECT id, links FROM intake_task_projection ORDER BY id LIMIT 129').toArray();if(rows.length>128)throw new Error('worktree_observation_limit');return rows;}
       const needles = new Set<string>([...scope.sessionIds, ...scope.nativeIds]);
       for (const row of sessionRows as any[]) {
         needles.add(String(row.id));
         const native = parseNative(row.binding_json);
         if (native) needles.add(native);
       }
-      const refs = JSON.stringify([...needles]);
-      try {
-        return sql.exec('SELECT id, links FROM intake_task_projection WHERE id IN (SELECT task_id FROM intake_link_refs WHERE ref IN (SELECT value FROM json_each(?)))', refs).toArray();
-      } catch { /* side table not created yet (pre-init): fall back to the text prefilter */ }
-      return sql.exec('SELECT id, links FROM intake_task_projection WHERE EXISTS (SELECT 1 FROM json_each(?) j WHERE instr(links, j.value) > 0)', refs).toArray();
+      const taskIds=new Set<string>();
+      const linked=sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_link_refs'").toArray().length>0;
+      if(linked) {
+        for(const ref of needles) {
+          const rows=sql.exec('SELECT task_id FROM intake_link_refs WHERE ref=? LIMIT 129',ref).toArray();
+          if(rows.length>128)throw new Error('worktree_observation_limit');
+          for(const row of rows)taskIds.add(String(row.task_id));
+          if(taskIds.size>128)throw new Error('worktree_observation_limit');
+        }
+        return taskIds.size?sql.exec('SELECT id,links FROM intake_task_projection WHERE id IN(SELECT value FROM json_each(?))',JSON.stringify([...taskIds])).toArray():[];
+      }
+      const rows=sql.exec('SELECT id,links FROM intake_task_projection ORDER BY id LIMIT 129').toArray();
+      if(rows.length>128)throw new Error('worktree_observation_limit');
+      return rows.filter(row=>[...needles].some(ref=>String(row.links).includes(ref)));
     })();
     const projections = projectionRows.map((row: any) => {
       const links = JSON.parse(row.links);
@@ -74,10 +96,10 @@ export function worktreeIntakeSnapshot(sql: SqlStorage, scope?: WorktreeSnapshot
     // are parsed and released row by row. Retaining (or re-parsing per call)
     // production-scale payloads is a memory and CPU hazard inside the 128 MB
     // isolate, and the resource watchdog renders every session row.
-    const ids = new Set<string>();
-    for (const projection of projections) ids.add(String(projection.id));
+    const intakeIds = new Set<string>();
+    for (const projection of projections) intakeIds.add(String(projection.id));
     for (const row of sessions) for (const id of [row.direct_intake, row.launch_intake]) {
-      if (typeof id === 'string' && id) ids.add(id);
+      if (typeof id === 'string' && id) intakeIds.add(id);
     }
     const verdicts = new Map<string, boolean>();
     const verdictOf = (task: any): boolean => {
@@ -86,7 +108,8 @@ export function worktreeIntakeSnapshot(sql: SqlStorage, scope?: WorktreeSnapshot
       if (intakeHasDoneEvidence(task)) return false;
       return true;
     };
-    const all = [...ids];
+    if(intakeIds.size>128)throw new Error('worktree_observation_limit');
+    const all = [...intakeIds];
     for (let i = 0; i < all.length; i += 90) {
       const chunk = all.slice(i, i + 90);
       for (const row of sql.exec(`SELECT id, data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray()) {
