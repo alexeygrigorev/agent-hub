@@ -1962,6 +1962,14 @@ class Dispatcher:
         offer_id = record.get("offer_id")
         if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
             return
+        try:
+            # Intake 95fd7f1a: stamp durable per-attempt outcome evidence for
+            # failed/cancelled/held launches. Never raises, never copies
+            # free-form text; first-attempt-ness is resolved at report time.
+            from .first_attempt_outcome import stamp_launch_record
+            stamp_launch_record(record)
+        except Exception:
+            pass
         from .terminal_reports import persist
         persist(self, record)
 
