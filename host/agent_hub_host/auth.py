@@ -1,3 +1,5 @@
+import contextlib
+import errno
 import importlib
 import json
 import os
@@ -9,6 +11,7 @@ import urllib.parse
 from pathlib import Path
 from . import config
 from . import api
+from . import private_fs
 
 HOST_SCOPES = ['host', 'bus:send', 'bus:read', 'health:report']
 AGENT_SCOPES = ['bus:send', 'bus:read', 'health:report']
@@ -163,13 +166,55 @@ def _active_profile():
     return (kind, cfg, config.load_config, config.save_config)
 
 
+@contextlib.contextmanager
+def human_refresh_guard():
+    """Serialize processes rotating one human refresh token (any config path).
+
+    Unlike refresh_guard() this also covers HUB_CONFIG_FILE, which the loops
+    and every service unit use. Lock contention waits (30 s); other lock
+    errors fail open to the previous unlocked behaviour.
+    """
+    try:
+        cfg = config.load_config()
+        if cfg.get('worker_launch_id') or not config.is_human_config(cfg):
+            yield
+            return
+        path = config.get_human_config_path()
+        path = path.with_name(path.name + '.refresh.lock')
+    except Exception:
+        yield
+        return
+    manager = None
+    deadline = time.monotonic() + 30
+    while manager is None:
+        candidate = private_fs.exclusive_lock(path)
+        try:
+            candidate.__enter__()
+            manager = candidate
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EACCES) and time.monotonic() < deadline:
+                time.sleep(.05)
+                continue
+            yield  # cannot lock (read-only dir etc.): unlocked, as before
+            return
+    try:
+        yield
+    finally:
+        manager.__exit__(None, None, None)
+
+
 def refresh_token(expected_token=None):
     from .worker_auth import refresh_guard
-    with _refresh_lock, refresh_guard():
+    # The token this caller saw fail; a human profile is rotated by every CLI
+    # process sharing the file, so snapshot it before queueing on the lock.
+    seen_token = expected_token or config.load_config().get('access_token')
+    with _refresh_lock, refresh_guard(), human_refresh_guard():
         kind, cfg, load_fn, save_fn = _active_profile()
         worker = bool(cfg.get('worker_launch_id'))
-        if worker and expected_token and cfg.get('access_token') != expected_token:
+        if (worker or kind == 'human') and seen_token and cfg.get('access_token') != seen_token:
             # A different CLI process already rotated the shared family.
+            # Refreshing again would replay the old refresh token and the
+            # server revokes the whole family (2026-11-03 RMTHZ/desktop loss).
             if cfg.get('access_token'):
                 return cfg['access_token']
         refresh = cfg.get("refresh_token")
