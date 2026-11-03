@@ -270,6 +270,7 @@ export class RepoRegistry {
         if (new Set(canonical.map(r => r.repo_id)).size !== 1) return {error:{error:'ambiguous_repo'}};
         repo = canonical[0];
       } catch (e) { return {error:{error:(e as Error).message}}; }
+      if (repo.status === 'archived') return { error: { error: 'repo_archived' } };
       const summary = this.summary(repo);
       return {input:{...input,
         repo_context:{repo_id:repo.repo_id, name:repo.name, explicit_path:input.workspace,
