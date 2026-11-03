@@ -1,4 +1,5 @@
-import { publicTools, toolRequest, dispatchToolRequest } from './mcp-tools';
+import { toolRequest, dispatchToolRequest } from './mcp-tools';
+import { canonicalNameForTool, curatedTools, legacyTools, resolveMcpCall } from './mcp-curation';
 
 export const MCP_VERSIONS = ['2025-03-26', '2025-06-18', '2025-11-25'];
 export const NO_STORE = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
@@ -25,7 +26,9 @@ export async function boundedText(request: Request, limit = 32768): Promise<stri
   for (const part of chunks) { joined.set(part, offset); offset += part.byteLength; }
   return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(joined);
 }
-export async function handleMcp(request: Request, authenticate: (r: Request) => Promise<any>, dispatch: (r: Request) => Promise<Response>, recordUsage: (tool: string, kind: string) => void = () => {}) {
+type RecordMcpUsage = (tool: string, kind: string, canonicalTool?: string, usageKind?: 'alias' | 'canonical') => void;
+
+export async function handleMcp(request: Request, authenticate: (r: Request) => Promise<any>, dispatch: (r: Request) => Promise<Response>, recordUsage: RecordMcpUsage = () => {}) {
   // The MCP edge must never throw: an uncaught Worker exception surfaces as
   // Cloudflare 1101 with no JSON-RPC body (intake aefcc150). Any unexpected
   // failure (auth, usage accounting, framing) becomes a structured -32603.
@@ -36,7 +39,7 @@ export async function handleMcp(request: Request, authenticate: (r: Request) => 
   }
 }
 
-async function handleMcpRequest(request: Request, authenticate: (r: Request) => Promise<any>, dispatch: (r: Request) => Promise<Response>, recordUsage: (tool: string, kind: string) => void = () => {}) {
+async function handleMcpRequest(request: Request, authenticate: (r: Request) => Promise<any>, dispatch: (r: Request) => Promise<Response>, recordUsage: RecordMcpUsage = () => {}) {
   const url = new URL(request.url);
   const origin = request.headers.get('Origin');
   // No cookie authority: an MCP caller must explicitly present its bearer.
@@ -71,16 +74,24 @@ async function handleMcpRequest(request: Request, authenticate: (r: Request) => 
   if (rpc.method === 'tools/list') {
     recordUsage('tools/list', auth.caller.kind);
     if (rpc.params?.cursor) return error(-32602, 'This tool list has no pagination cursor');
-    return result({ tools: publicTools() });
+    const toolset = url.searchParams.get('toolsets');
+    if (toolset !== null && toolset !== 'all' && toolset !== 'legacy') return error(-32602, 'Unsupported toolsets query; use all or legacy');
+    return result({ tools: toolset ? legacyTools() : curatedTools() });
   }
   if (rpc.method !== 'tools/call') return error(-32601, 'Method not found');
-  recordUsage(typeof rpc.params?.name === 'string' ? rpc.params.name : 'unknown', auth.caller.kind);
   if (typeof rpc.params?.name !== 'string') return error(-32602, 'Tool name required');
+  let call: ReturnType<typeof resolveMcpCall>;
+  try { call = resolveMcpCall(rpc.params.name, rpc.params.arguments ?? {}); }
+  catch (e: any) {
+    recordUsage(rpc.params.name, auth.caller.kind, canonicalNameForTool(rpc.params.name));
+    return error(-32602, e.message);
+  }
+  recordUsage(rpc.params.name, auth.caller.kind, call.canonicalName, call.usageKind);
   let apiRequest: Request;
-  try { apiRequest = toolRequest(url.origin, rpc.params.name, rpc.params.arguments ?? {}, request.headers.get('Authorization')!); }
+  try { apiRequest = toolRequest(url.origin, call.routeName, call.args, request.headers.get('Authorization')!); }
   catch (e: any) { return error(-32602, e.message); }
   try {
-    const response = await dispatchToolRequest(apiRequest, rpc.params.name, dispatch);
+    const response = await dispatchToolRequest(apiRequest, call.routeName, dispatch);
     // API data stays data; retain the exact API status/error and pagination DTO.
     const text = await response.text();
     let data: unknown;
