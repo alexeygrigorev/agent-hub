@@ -2908,7 +2908,10 @@ export class FleetService {
           }
           const finalHold = current.state === 'offered' ? this.admission.retireInvalidOffer(current) : current.exit_reason || 'already_claimed';
           if (finalHold) return refuse({ error: finalHold }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed', 'already_claimed'].includes(finalHold) ? 409 : 403);
-          this.sql.exec("UPDATE fleet_launches SET state = 'starting', claim_key = COALESCE(?, claim_key), updated_at = ? WHERE id = ? AND state = 'offered'", typeof claimKey === 'string' ? claimKey : null, new Date(this.now()).toISOString(), row.id);
+          const staleCapacityRefusal = ['launcher_memory_reserve', 'launcher_disk_reserve'].includes(parsed(row.launch_error_json)?.reason);
+          this.sql.exec(`UPDATE fleet_launches SET state = 'starting', claim_key = COALESCE(?, claim_key),
+            launch_error_json = CASE WHEN ? THEN NULL ELSE launch_error_json END,
+            updated_at = ? WHERE id = ? AND state = 'offered'`, typeof claimKey === 'string' ? claimKey : null, staleCapacityRefusal ? 1 : 0, new Date(this.now()).toISOString(), row.id);
           this.sql.exec('INSERT INTO resource_ramps VALUES(?,?) ON CONFLICT(launch_id) DO UPDATE SET started_at=excluded.started_at', row.id, new Date(this.now()).toISOString());
           return response({ ...row, state: 'starting', ...(typeof claimKey === 'string' ? { claim_key: claimKey } : {}) });
         }
