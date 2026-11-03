@@ -102,7 +102,11 @@ with fleet events, not with clocks. The DO alarm is a one-shot for due work
 
 Worst-case mechanical bounds (test pins x maximum runs/day) exceed the
 guideline under pathological continuous-due-work; the expected column is the
-quiet-fleet steady state the tests pin (repeat poll == 0 rows).
+quiet-fleet steady state the tests pin (repeat poll == 0 rows). Schema
+existence probes (`sqlite_master` rewrites to `pragma_table_list`) are
+memoized on the schema generation: every DDL bumps it, so a cached probe
+stays exact until the schema changes and repeat polls read zero rows for
+probes too.
 
 | Job | Trigger | Worst case / run (test) | Expected / day, quiet fleet |
 | --- | --- | --- | --- |

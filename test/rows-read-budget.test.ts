@@ -81,6 +81,17 @@ describe('schema probe rewrite', () => {
     // Indexes are not tables; the probe must keep saying so.
     expect(hub.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_expires_at'").toArray()).toHaveLength(0);
   }));
+
+  it('memoizes probes on the schema generation: repeats read zero rows until DDL', () => withHub(async hub => {
+    const probe = () => { const c: any = hub.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_tasks'"); c.toArray(); return Number(c.rowsRead) || 0; };
+    probe(); // first: at most one row
+    expect(probe()).toBe(0); // repeat: memoized zero-read cursor
+    hub.sql.exec('CREATE TABLE IF NOT EXISTS probe_memo_ddl_sentinel(id TEXT PRIMARY KEY)');
+    const afterDdl = probe();
+    expect(afterDdl).toBeLessThanOrEqual(1); // schema changed: re-probed once
+    hub.sql.exec('DROP TABLE probe_memo_ddl_sentinel');
+    expect(probe()).toBeLessThanOrEqual(1);
+  }));
 });
 
 describe('indexed intake link lookups', () => {
