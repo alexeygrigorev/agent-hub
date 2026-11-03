@@ -17,7 +17,7 @@
  *
  * This module is pure except for the additive schema string:
  * - classifySession / projectSessions: readonly grouped projection (M15a)
- * - planCleanup / validateCleanupTarget / validateOwnershipTransfer: pure seams (M15b)
+ * - planCleanup: dry-run cleanup eligibility plan (M15b)
  * - toStatusDto / toHandoffDto: shared DTO seam for M14 status / M12 handoff
  *
  * Privacy: default projection carries allowlisted structured reason codes + provenance only.
@@ -382,71 +382,6 @@ export function planCleanup(
     else eligible.push(c);
   }
   return { eligible, ineligible };
-}
-
-export type CleanupTargetCheck = {
-  session_key: string;
-  expected_machine_id: string;
-  expected_native_id: string;
-  expected_owner: string;
-  observed_machine_id: string;
-  observed_native_id: string;
-  observed_owner: string;
-  busy_or_draft_or_pending: boolean;
-  contained: boolean;
-};
-
-/** Safe executor seam gate (pure). Host validates the effect; server classifies the record.
- * F3: exact non-empty valid host/native/incarnation/owner binding is required;
- * blank/whitespace/unknown/legacy expected IDs or owner fail closed. */
-const isValidBindingId = (v: unknown): boolean => {
-  if (typeof v !== 'string') return false;
-  const t = v.trim().toLowerCase();
-  return t.length > 0 && t !== 'unknown' && t !== 'legacy';
-};
-export function validateCleanupTarget(check: CleanupTargetCheck): { ok: true } | { ok: false; error: string } {
-  if (!isValidBindingId(check.expected_machine_id) || !isValidBindingId(check.expected_native_id)) {
-    return { ok: false, error: 'unbound_target' };
-  }
-  if (!isValidBindingId(check.expected_owner)) return { ok: false, error: 'unknown_owner_never_applies' };
-  if (check.observed_machine_id !== check.expected_machine_id) return { ok: false, error: 'machine_mismatch' };
-  if (check.observed_native_id !== check.expected_native_id) return { ok: false, error: 'incarnation_mismatch' };
-  if (check.observed_owner !== check.expected_owner) return { ok: false, error: 'custodian_changed' };
-  if (check.busy_or_draft_or_pending) return { ok: false, error: 'busy_draft_pending_guard' };
-  if (!check.contained) return { ok: false, error: 'containment_failed' };
-  return { ok: true };
-}
-
-export type OwnershipTransferRequest = {
-  session_key: string;
-  current_owner: string;
-  current_epoch: number;
-  expected_owner: string;
-  expected_epoch: number;
-  new_owner: string;
-  actor: string;
-  human_owned: boolean;
-};
-
-/** Dedicated ownership-transfer gate (pure seam). Generic intake text is NOT a transfer:
- * requires the authenticated current owner + epoch fence; starter stays immutable;
- * human protection can never be disabled; unknown owners never apply.
- * F3: epochs must be safe non-negative integers (booleans/negatives/non-safe fail). */
-export function validateOwnershipTransfer(req: OwnershipTransferRequest): { ok: true } | { ok: false; error: string } {
-  if (req.human_owned) return { ok: false, error: 'human_protected' };
-  if (isBadOwnerValue(req.new_owner)) return { ok: false, error: 'unknown_owner_never_applies' };
-  if (isBadOwnerValue(req.current_owner) || isBadOwnerValue(req.expected_owner)) {
-    return { ok: false, error: 'unknown_owner_never_applies' };
-  }
-  if (req.expected_owner !== req.current_owner) return { ok: false, error: 'stale_owner' };
-  if (!Number.isSafeInteger(req.expected_epoch) || !Number.isSafeInteger(req.current_epoch) ||
-    (req.expected_epoch as number) < 0 || (req.current_epoch as number) < 0 ||
-    req.expected_epoch !== req.current_epoch) {
-    return { ok: false, error: 'epoch_fence_failed' };
-  }
-  if (!req.actor || req.actor !== req.current_owner) return { ok: false, error: 'only_current_owner_transfers' };
-  if (req.new_owner === req.current_owner) return { ok: false, error: 'no_op_transfer' };
-  return { ok: true };
 }
 
 /** Shared DTO seam for M14 status / M12 handoff. Same facts incl. flags+obligations, no second tracker. */

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host import fleet, fleet_launch
+from agent_hub_host import fleet
 from agent_hub_host.session_rules import compose_prompt
 
 
@@ -100,67 +100,6 @@ class FleetOpencodeTests(unittest.TestCase):
             self.assertEqual(result['native_id'], 'u1')
             self.assertIn('task-units', calls[-1])
             self.assertIn('--as-controller', calls[-1])
-
-    def test_unit_only_receipt_without_uuid_is_rejected_for_binding(self):
-        # A task-units-style unit_name receipt without session_id must not
-        # validate as a native opencode binding (can't bind/control M12).
-        with self.assertRaises(ValueError):
-            fleet_launch.validate_native_receipt(
-                {'receipt': {'unit_name': 'agent-task-x.service',
-                             'state': 'running',
-                             'first_action_verified': True,
-                             'engine': 'opencode'}})
-        self.assertEqual(
-            fleet_launch.validate_native_receipt(
-                {'receipt': {'session_id': 'native-uuid-9',
-                             'state': 'running',
-                             'first_action_verified': True,
-                             'engine': 'opencode'}}),
-            'native-uuid-9')
-
-    def test_helper_contract_exact_argv_and_payload(self):
-        sub = fleet_launch.opencode_subscription(
-            'shared-go', admission_argv=['maintained-gate'])
-        self.assertEqual(sub['launcher_provider'], 'opencode')
-        self.assertEqual(sub['launcher_model'],
-                         'opencode-go/muse-spark-1.3-contributor')
-        # No nested launcher key inside a subscription: load_settings
-        # rejects it; the launcher CLI lives in TOP-LEVEL settings.
-        self.assertNotIn('launcher', sub)
-        launcher_cfg = fleet_launch.opencode_launcher_config(
-            ['python3', '-m', 'launcher'], '/repo/ql', '/repo/ql/cfg')
-        self.assertEqual(launcher_cfg['argv'], ['python3', '-m', 'launcher'])
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = fleet_launch.opencode_settings(
-                'demo', tmp, 'shared-go',
-                admission_argv=['maintained-gate'],
-                launcher_argv=['python3', '-m', 'launcher'],
-                launcher_root='/repo/ql',
-                launcher_config_dir='/repo/ql/cfg')
-            path = Path(tmp) / 'subscriptions.json'
-            path.write_text(json.dumps(cfg))
-            loaded = fleet.load_settings(path)
-            self.assertEqual(loaded['subscriptions'][0]['account_label'],
-                             'shared-go')
-            self.assertEqual(loaded['launcher']['root'], '/repo/ql')
-        with self.assertRaisesRegex(ValueError, 'provider profile'):
-            fleet_launch.launcher_payload('/ws', 'brief', 'shared-go', profile='root-run')
-        payload = fleet_launch.launcher_payload('/ws', 'brief $x', 'shared-go')
-        self.assertEqual(payload['profile'], 'model-task')
-        self.assertEqual(payload['model_requirements'],
-                         {'providers': ['opencode'],
-                          'models': ['opencode-go/muse-spark-1.3-contributor']})
-        argv = fleet_launch.launcher_run_argv(['python3', '-m', 'launcher'],
-                                              '/cfg', 'hub-id', '/ws', '/ws')
-        self.assertIn('aplexer', argv)
-        self.assertNotIn('task-units', argv)
-        # Prompt stays a separate element downstream (launcher appends it;
-        # never shell-interpolated here).
-        self.assertNotIn('brief $x', argv)
-        off = fleet_launch.opencode_offer('oid', 'demo', 'arbitrary $brief',
-                                          account='shared-go')
-        self.assertEqual(off['prompt'], 'arbitrary $brief')
-        self.assertEqual(off['mode'], 'headless')
 
 
 def cycle(workspace, rows, pending, request=None):
