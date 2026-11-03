@@ -44,6 +44,24 @@ for s in json.load(sys.stdin):
             print(s["id"])' "$RUNDIR/$SUB" "$TAG" "${1:-live}"
 }
 find_session() { matching_sessions | head -1; }
+session_census() {
+  t a list --json | python3 -c '
+import json,sys
+w,t=sys.argv[1:3]
+try:
+    sessions=json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+matches=[s for s in sessions if s.get("workspace")==w and s.get("tag")==t]
+if not matches:
+    print("missing"); sys.exit(0)
+live=[s for s in matches if s.get("phase")=="running" and s.get("worker_alive") is True]
+if live:
+    print("live",live[0].get("id","")); sys.exit(0)
+if all(s.get("worker_alive") is False for s in matches):
+    print("dead"); sys.exit(0)
+print("uncertain")' "$RUNDIR/$SUB" "$TAG"
+}
 
 # a forget explicitly does NOT stop surviving workloads. Require fresh evidence
 # that both recorded processes and any recorded containment have drained first.
@@ -215,13 +233,18 @@ restart() {  # $1 = reason; called only by an explicit handoff or dead-session c
 }
 
 check() {
-  local id
-  id=$(find_session) || { log "session census failed; no recovery attempted"; return 1; }
-  if [ -n "$id" ]; then
-    log "OK session=$id (live process; /loop owns cadence)"
-    return 0
-  fi
-  log "DEAD (no live process); restarting from handoff"
+  local id census
+  census=$(session_census) || { log "session census failed; no recovery attempted"; return 1; }
+  case "$census" in
+    live\ *)
+      id="${census#live }"
+      log "OK session=$id (live process; /loop owns cadence)"
+      return 0
+      ;;
+    missing|dead) ;;
+    *) log "session state uncertain; no recovery attempted"; return 1 ;;
+  esac
+  log "DEAD/MISSING (confirmed by aplexer census); restarting from handoff"
   restart "session process dead/missing" || { log "restart failed; see this service journal"; return 1; }
   id=$(find_session) || { log "session census failed after restart"; return 1; }
   [ -n "$id" ] || { log "restart completed without a verified live session"; return 1; }
