@@ -76,12 +76,15 @@ try {
     assert.equal((path.match(/M/g) || []).length, 2, 'line breaks at unknown bucket');
     assert.match(await page.locator('#activity-charts').innerText(), /partial.*observed portion/);
     assert.match(await page.locator('#activity-charts').innerText(), /unattributed/);
+    await page.getByRole('button', { name: 'Usage', exact: true }).click();
+    await page.getByText('External producer report · fixed 24-hour snapshot', { exact: true }).click();
     assert.equal(await page.locator('#usage-chart [data-value]').count(), 2);
     assert.equal(await page.locator('#usage-chart .metrics-bar-unknown').count(), 2);
     assert.match(await page.locator('#usage-chart').innerText(), /12,000|12.000/);
     assert.match(await page.locator('#usage-chart').innerText(), /Partial token coverage/);
     assert.equal(await page.locator('#accepted-chart [data-value="3"]').count(), 1);
     assert.equal(await page.locator('#accepted-chart .metrics-bar-unknown').count(), 1);
+    await page.getByRole('button', { name: 'Outcomes', exact: true }).click();
     await page.locator('#activity-charts .metrics-point').first().focus();
     assert.match(await page.locator('.metrics-point-detail').first().innerText(), /2026-10-22 12:15 UTC.*Active agents: 0/);
     await page.getByLabel('Chart project', { exact: true }).selectOption('unattributed');
