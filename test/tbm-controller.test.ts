@@ -400,8 +400,9 @@ describe('Persisted PID controller, reset ledger, rewards, rollups & routing fee
       };
       const adsFast = [{ engine: 'codex', profile: null, model: 'gpt-6-astra', effort: 'medium', account: 'acct-fast' }];
       const adsSlow = [{ engine: 'codex', profile: null, model: 'gpt-6-astra', effort: 'medium', account: 'acct-slow' }];
-      const [candFast] = modelCandidates({ tier: 'deep', preferred_runner: 'codex' }, { provider: 'codex', engine: 'codex', profile: null, account: 'acct-fast' }, adsFast, quota, NOW + 10_000, pacingMap);
-      const [candSlow] = modelCandidates({ tier: 'deep', preferred_runner: 'codex' }, { provider: 'codex', engine: 'codex', profile: null, account: 'acct-slow' }, adsSlow, quota, NOW + 10_000, pacingMap);
+      const input = { tier: 'deep', preferred_runner: 'codex', engine_override_reason: 'This task explicitly routes to Astra for a deep comparison.' };
+      const [candFast] = modelCandidates(input, { provider: 'codex', engine: 'codex', profile: null, account: 'acct-fast' }, adsFast, quota, NOW + 10_000, pacingMap);
+      const [candSlow] = modelCandidates(input, { provider: 'codex', engine: 'codex', profile: null, account: 'acct-slow' }, adsSlow, quota, NOW + 10_000, pacingMap);
       expect(candFast.weight).toBeGreaterThan(candSlow.weight);
     });
   });

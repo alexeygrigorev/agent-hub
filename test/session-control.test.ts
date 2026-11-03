@@ -220,7 +220,6 @@ describe('hub session control durable queue', () => {
       expect(conflict.status).toBe(409);
     }, fake.hook);
   });
-
   it('requires a stated reason for explicit deep-tier starts before placement', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {

@@ -27,10 +27,20 @@ export function unmeteredObservation(observedAt: string): Record<string, any> {
 }
 
 /** True when a reading carries positive exhaustion/backoff evidence. */
-export function quotaPositivelyBlocked(quota: any, nowMs: number): boolean {
+export function quotaPositivelyBlocked(quota: any, nowMs: number, provider?: string): boolean {
   if (quota?.details?.limit_reached === true) return true;
   const until = Date.parse(quota?.details?.cooldown_until);
-  return Number.isFinite(until) && until > nowMs;
+  if (Number.isFinite(until) && until > nowMs) return true;
+  // Unmetered-engine fallback must not erase a fresh, explicit exhausted
+  // window. In particular, Gemini may report `limit_reached: false` alongside
+  // 0% remaining; that is still positive depletion evidence for placement.
+  const quotaProvider = provider ? canonicalQuotaProvider(provider) : null;
+  const configuredReserve = quotaProvider && typeof (routingPolicy.rules as any).reserve_percent?.[quotaProvider] === 'number'
+    ? (routingPolicy.rules as any).reserve_percent[quotaProvider] : 0;
+  return Object.values(quota?.windows ?? {}).some((window: any) =>
+    window?.present === true && typeof window.percent_remaining === 'number' &&
+    Number.isFinite(window.percent_remaining) && window.percent_remaining >= 0 &&
+    window.percent_remaining <= configuredReserve);
 }
 
 export const QUOTA_MAX_BODY_BYTES = 32_768;
@@ -1583,7 +1593,7 @@ export class QuotaStore {
       // Fresh when a routed machine is live and its engine has no health hold;
       // percentage stays unknown. Positive exhaustion keeps its own state.
       if (["unavailable", "unknown", "stale"].includes(state) && Number(account.enabled) !== 0 && isUnmeteredProvider(account.provider) &&
-          !freshObs.some((o) => quotaPositivelyBlocked(o.quota, nowMs))) {
+          !freshObs.some((o) => quotaPositivelyBlocked(o.quota, nowMs, account.provider))) {
         const liveRoute = routes.find((r) => {
           const m: any = this.sql.exec("SELECT last_checkin_at, drained FROM machines WHERE id = ? AND revoked_at IS NULL", r.machine_id).toArray()[0];
           if (!m || m.drained || !isFreshTs(m.last_checkin_at, nowMs, 180_000)) return false;

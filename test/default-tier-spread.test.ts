@@ -102,7 +102,7 @@ describe('default tier placement', () => {
           idempotency_key: 'spread-' + i, mode: 'headless' }, { caller: admin.caller, scopes: ['admin'] });
         expect(reserved.status, JSON.stringify(reserved.value)).toBeLessThan(300);
       }
-      expect(new Set(engines).size, engines.join(',')).toBeGreaterThanOrEqual(3);
+      expect(new Set(engines).size, engines.join(',')).toBeGreaterThanOrEqual(2);
       expect(engines.slice(0, 3).every(e => e === 'codex'), engines.join(',')).toBe(false);
       // Argon is deep-only (intake 8852ba59): default daily placement spreads
       // across the daily engines and must not place antigravity.
@@ -112,7 +112,7 @@ describe('default tier placement', () => {
     });
   });
 
-  it('keeps healthy codex in the mix and starves depleted claude at the 2026-11-02 quota (claude 10, zai 8, muse 43, codex 45, antigravity 40)', async () => {
+  it('keeps healthy daily routes in the mix and starves depleted claude at the 2026-11-02 quota (claude 10, zai 8, muse 43, codex 45)', async () => {
     const now = Date.now();
     const iso = (d = 0) => new Date(now + d).toISOString();
     const bindings = env as unknown as Env;
@@ -162,11 +162,12 @@ describe('default tier placement', () => {
       }
       console.log('ENGINE_MIX ' + JSON.stringify(counts));
       expect(counts.codex ?? 0, JSON.stringify(counts)).toBeGreaterThanOrEqual(1);
-      expect(counts.claude ?? 0, JSON.stringify(counts)).toBeLessThanOrEqual(Math.min(counts.codex ?? 0, counts.antigravity ?? 0, counts.opencode ?? 0));
+      expect(counts.claude ?? 0, JSON.stringify(counts)).toBeLessThanOrEqual(Math.min(counts.codex ?? 0, counts.opencode ?? 0));
       // Argon is deep-only (intake 8852ba59), so the daily pool at these live
       // quotas is opencode + codex (claude 10 and zai 8 depleted, antigravity
       // out of daily): spread across the 2 healthy daily engines.
       expect(Object.keys(counts).length, JSON.stringify(counts)).toBeGreaterThanOrEqual(2);
+      expect(counts.antigravity ?? 0, JSON.stringify(counts)).toBe(0);
       expect(counts.antigravity ?? 0, JSON.stringify(counts)).toBe(0);
     });
   });

@@ -318,7 +318,7 @@ describe('sessions_start capacity queue', () => {
     expect((await f.handle(fleetReq('/accounts', config, 'PUT'), admin)).status).toBe(200);
     sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['codex', 'opencode'], fleet_modes: ['headless', 'interactive'], workspaces: ['/repos'], cpu_count: 8 }));
     const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', engine: 'codex' })), admin)).json();
-    const input = { key: 'tier-capacity', workspace: 'demo', machine: 'hetzner', tier: 'deep', engine_override_reason: 'Use deep reasoning to verify capacity queue placement', mode: 'headless', brief: 'capacity queue probe' };
+    const input = { key: 'tier-capacity', workspace: 'demo', machine: 'hetzner', tier: 'deep', engine_override_reason: 'This task needs deep reasoning for its capacity queue probe.', mode: 'headless', brief: 'capacity queue probe' };
     const response = await s.handle(sessReq('/api/sessions', input), admin);
     expect(response.status, JSON.stringify(await response.clone().json())).toBe(202);
     const parked: any = await response.json();

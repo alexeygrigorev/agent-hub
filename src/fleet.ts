@@ -14,7 +14,7 @@ import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin, effectiveRoutesAt } from './registry';
 import { commandChannelHealth } from './command-channel';
-import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
+import { taskTier, policy, modelDisabledByPolicy, heavyModelEffortAllowed, deepModelAllowedForTier } from './model-routing';
 import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
@@ -766,7 +766,7 @@ export class FleetService {
     const found = this.observationProvenanceRaw(account, route, snapshot);
     if (!isUnmeteredProvider(account.provider)) return found;
     const now = snapshot?.now ?? this.now();
-    if (found && (found.quota?.status === 'ok' || quotaPositivelyBlocked(found.quota, now))) return found;
+    if (found && (found.quota?.status === 'ok' || quotaPositivelyBlocked(found.quota, now, account.provider))) return found;
     const at = new Date(now).toISOString();
     return { quota: unmeteredObservation(at), subscriptionObservedAt: at };
   }
@@ -1529,15 +1529,18 @@ export class FleetService {
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
-      const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) &&
-        (m.id !== 'astra' || allowAstra) &&
-        !(input.effort === 'high' && (m.id === 'astra' || m.id === 'sol')) &&
+      const hasOverrideReason = typeof input.engine_override_reason === 'string' && input.engine_override_reason.trim().length > 0;
+      const explicitlyRequestedDeep = hasOverrideReason &&
+        (tier === 'deep' || overrideModels.length > 0 || Boolean(request.engine));
+      const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) && (m.id !== 'astra' || allowAstra) &&
+        deepModelAllowedForTier(m, tier, explicitlyRequestedDeep) &&
+        heavyModelEffortAllowed(m, input.effort ?? m.effort) &&
         (anyTier || members.includes(m.id)) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
-      // Explicit model selectors and native engines named without a tier may
-      // resolve their model across tiers while preserving current model policy.
+      // Explicit model selectors and native engines may cross tiers only
+      // when the caller states why the deep model is required.
       const explicitModelFallback = overrideModels.length ? pick(true) : undefined;
       const configuredModel = pick(false) ?? explicitModelFallback ??
-        (input.tier == null && request.engine && !overrideModels.length ? pick(true) : undefined);
+        ((input.tier == null || tier === 'daily') && request.engine && hasOverrideReason && !overrideModels.length ? pick(true) : undefined);
       const model = configuredModel && input.effort !== undefined ? { ...configuredModel, effort: input.effort } : configuredModel;
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       // Host adapter refusals are scoped to the exact route, mode and model
@@ -2021,6 +2024,19 @@ export class FleetService {
     const result = (value: any, status = 200) => ({ value, status });
     const caller = auth.caller;
     if (!caller || !(caller.isAdmin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch')))) return result({ error: 'forbidden' }, 403);
+    if (input?.engine_override_reason !== undefined &&
+        (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) {
+      return result({ error: 'invalid_launch_request', field: 'engine_override_reason' }, 400);
+    }
+    const deepTierRequested = taskTier({ tier: input?.tier }) === 'deep';
+    const deepModelIds: string[] = (policy.tiers as any).deep || [];
+    const deepModelRequested = typeof input?.engine === 'string' && policy.models.some(model =>
+      deepModelIds.includes(model.id) && [model.id, model.model].includes(input.engine));
+    if ((deepTierRequested || deepModelRequested) &&
+        (typeof input?.engine_override_reason !== 'string' || !input.engine_override_reason.trim())) {
+      return result({ error: 'deep_tier_reason_required', field: 'engine_override_reason',
+        detail: 'Explicit deep-tier or deep-model starts require an explanation why deep reasoning is needed.' }, 400);
+    }
     return this.transaction(() => {
       this.reconcileCapacity();
       // Give the retained waitlist a bounded turn before a new reservation;
@@ -2033,7 +2049,8 @@ export class FleetService {
       const parsed = this.admission.parseDeclaration(input?.access);
       if ('error' in parsed) return result({ error: parsed.error }, 400);
       if (parsed.access.mode === 'edit' && !input.approved_action?.trim()) return result({ error: 'approved_action_required' }, 400);
-      const bound = { ...plan.request, access: parsed.access };
+      const bound = { ...plan.request, access: parsed.access,
+        ...(input.engine_override_reason !== undefined ? { engine_override_reason: input.engine_override_reason } : {}) };
       // Bare-label alias admission: the normalized absolute is what the
       // host executes and always gates. When the operator additionally
       // configured a claim policy for the requested alias itself, that
