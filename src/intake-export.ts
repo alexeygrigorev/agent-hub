@@ -11,7 +11,7 @@ const select = (prefix: string) => {
         'created_at',${j('created_at')},'updated_at',${j('updated_at')},'archived_at',${j('archived_at')},
         'last_event_kind',${j('history[#-1].kind')},'last_event_at',${j('history[#-1].captured_at')},
         'last_session_id',(SELECT json_extract(value,'$.hub_session_id') FROM json_each(${d},'$.history')
-          WHERE json_extract(value,'$.kind')='link' AND json_extract(value,'$.hub_session_id') IS NOT NULL ORDER BY CAST(key AS INTEGER) DESC LIMIT 1))`;
+          WHERE type='object' AND json_extract(value,'$.kind')='link' AND json_extract(value,'$.hub_session_id') IS NOT NULL ORDER BY CAST(key AS INTEGER) DESC LIMIT 1))`;
   };
 
 export function initIntakeExport(sql: SqlStorage) {
