@@ -3145,16 +3145,9 @@ export class FleetService {
         this.linkRevisions.set(caller.machineId!, revision);
         adoptObservedNativeSessions(this.sql, caller.machineId!, linkChangedSessions, this.now(), undefined,
           revisionMoved ? cleanSessions : linkChangedSessions);
-        // Intake e8a22f4c: only new/changed/vanished rows can present new
-        // positive terminal evidence. An unchanged census re-scans the same
-        // retained history on every host poll, so the fleet-wide reconciles
-        // run only when this census changed something; other hosts' changed
-        // censuses and the manual /reconcile endpoint still settle promptly.
-        if (changedSessions.length || gone.length) {
-          this.maintenanceDirty = true;
-          reconcileAccountCapacity(this.sql, this.now());
-          reconcileVerifiedNoStarts(this.sql, this.now());
-        }
+        if (changedSessions.length || gone.length) this.maintenanceDirty = true;
+        reconcileAccountCapacity(this.sql, this.now());
+        reconcileVerifiedNoStarts(this.sql, this.now());
         // A refreshed catalog can free machine_capacity: promote waiters.
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }
         // unchanged rows retain last-change timestamps; the complete census
