@@ -343,6 +343,12 @@ class TestHumanStatusLogout(unittest.TestCase):
         self.assertEqual(seen_before, a)
         self.assertTrue(cfg_path.with_name("loop-cli.json.refresh.lock").exists())
 
+    def test_refresh_guard_propagates_body_exception(self):
+        self._write_human()
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            with auth.human_refresh_guard():
+                raise RuntimeError("boom")
+
     def test_logout_revokes_human_and_preserves_host(self):
         self._write_human()
         config.save_host_config({"base_url": "https://hub.example.com",
