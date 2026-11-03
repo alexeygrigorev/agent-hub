@@ -19,7 +19,7 @@ import { projectVisibleIntakeStats, readStatsSources, intakeStatsTable } from '.
 
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
 export function currentHistory(task: Obj): Obj[] {
-  const history: Obj[] = task.history ?? [];
+  const history: Obj[] = readEvents(task);
   const boundary = history.reduce((n, e, i) =>
     e.kind === 'update' && ['status', 'title', 'project', 'acceptance_criteria'].some(k => k in (e.changes ?? {})) ? i : n, -1);
   return history.slice(boundary + 1);
@@ -124,6 +124,13 @@ export function activeAssignmentEventIds(task: Obj): Set<string> {
   }
   return protectedIds;
 }
+/** Read-path history scan (intake aefcc150): legacy and service writers may
+ * leave non-object or partial entries in the stored array. Derived projections
+ * skip those instead of throwing; the raw history array is still returned
+ * verbatim in payload_data. Unknown kinds are preserved, never rejected. */
+function readEvents(task: Obj): Obj[] {
+  return Array.isArray(task?.history) ? task.history.filter((e: Obj) => e !== null && typeof e === 'object') : [];
+}
 /** Scoped worker denials keep their specific code; everything else stays generic (no oracle). */
 async function denialCode(error: Response): Promise<string> {
   if (error.status !== 403) return 'unauthorized_or_forbidden';
@@ -172,11 +179,11 @@ const encoded = (value: unknown) => new TextEncoder().encode(JSON.stringify(valu
 // the caller's transaction. Failed validation/service capacity checks write nothing.
 const pendingNoteArchives = new WeakMap<object, Obj[]>();
 function prepareIntakeHistory(task: Obj, reserveEvents = 0) {
-  const history: Obj[] = task.history ?? [];
+  const history: Obj[] = Array.isArray(task.history) ? task.history : [];
   const pressured = encoded(task) > INTAKE_LIMITS.taskBytes || history.length + reserveEvents > INTAKE_LIMITS.events;
   if (!pressured && !task._history_order) return;
   // Legacy malformed identities cannot be silently rewritten or reordered.
-  if (history.some(e => typeof e.id !== 'string') || new Set(history.map(e => e.id)).size !== history.length) return;
+  if (history.some(e => !e || typeof e !== 'object' || typeof e.id !== 'string') || new Set(history.map(e => e?.id)).size !== history.length) return;
   const previous = task._history_order ?? {};
   let next = task._history_next_seq ?? 0;
   const order: Obj = Object.create(null);
@@ -190,9 +197,9 @@ function prepareIntakeHistory(task: Obj, reserveEvents = 0) {
     // Completion claims and every structured event retain their live semantics;
     // when ordinary notes are exhausted and event count overflows, archive
     // worktree or superseded link events while keeping the latest link inline.
-    let index = history.findIndex((e, i) => i > 0 && e.kind === 'note' && !/^\s*(?:DONE\b|START(?:ED)?\b|ORIGINAL FINAL STATE\b|TRIAGE (?:ACTUAL|DONE|OBSOLETE|DUPLICATE)\b|VERIFICATION (?:FAILED|SKIPPED)\b)/im.test(e.text ?? ''));
+    let index = history.findIndex((e, i) => i > 0 && e !== null && typeof e === 'object' && e.kind === 'note' && !/^\s*(?:DONE\b|START(?:ED)?\b|ORIGINAL FINAL STATE\b|TRIAGE (?:ACTUAL|DONE|OBSOLETE|DUPLICATE)\b|VERIFICATION (?:FAILED|SKIPPED)\b)/im.test(e.text ?? ''));
     if (index < 0 && history.length + reserveEvents > INTAKE_LIMITS.events) {
-      index = history.findIndex((e, i) => i > 0 && (e.kind === 'worktree' || (e.kind === 'link' && history.slice(i + 1).some(later => later.kind === 'link'))));
+      index = history.findIndex((e, i) => i > 0 && e !== null && typeof e === 'object' && (e.kind === 'worktree' || (e.kind === 'link' && history.slice(i + 1).some(later => later !== null && typeof later === 'object' && later.kind === 'link'))));
     }
     if (index < 0) break;
     const event = history[index];
@@ -330,7 +337,7 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   if (!rows.length && taskId.length >= 6) rows = sql.exec("SELECT data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", taskId).toArray();
   if (rows.length !== 1) return false; // pruned, missing or ambiguous historical task
   const task = JSON.parse(rows[0].data);
-  if (task.history.some((e: Obj) => ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
+  if (task.history.some((e: Obj) => e !== null && typeof e === 'object' && ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
   prepareIntakeHistory(task, 1);
   if (task.history.length >= INTAKE_LIMITS.events) throw new IntakeSessionLinkError('history_capacity');
   const binding = JSON.parse(session.binding_json || '{}');
@@ -405,14 +412,16 @@ export class IntakeService {
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_task_projection(id TEXT PRIMARY KEY, data TEXT NOT NULL, links TEXT NOT NULL)');
       // Only events consumed by status/continuation enter this projection.
       // Notes and original audit bodies remain exclusively in the full ledger.
+      // Non-object entries (legacy/service writers) are skipped: json() on a
+      // bare scalar string is malformed JSON and would abort the write (aefcc150).
       const project = (prefix: string) => `json_set(json_remove(${prefix}data,'$.history'), '$.history',
         json((SELECT json_group_array(json(CASE WHEN json_extract(e.value,'$.kind')='intake' THEN
             json_object('kind','intake','text',CASE WHEN json_type(e.value,'$.text')='null' THEN NULL ELSE '' END,
               'transcription',json_extract(e.value,'$.transcription'), 'source',json_object('reference',json_extract(e.value,'$.source.reference')))
             ELSE e.value END)) FROM json_each(${prefix}data,'$.history') e
-          WHERE json_extract(e.value,'$.kind') IN ('intake','link','report','commit','followup','blocker','pending_approval','resolution','approval_decision')))),
+          WHERE e.type='object' AND json_extract(e.value,'$.kind') IN ('intake','link','report','commit','followup','blocker','pending_approval','resolution','approval_decision')))),
         (SELECT json_group_array(json(e.value)) FROM json_each(${prefix}data,'$.history') e
-         WHERE json_extract(e.value,'$.kind') IN ('link','report'))`;
+         WHERE e.type='object' AND json_extract(e.value,'$.kind') IN ('link','report'))`;
       if (!projectionExists) this.sql.exec(`INSERT INTO intake_task_projection SELECT id, ${project('')} FROM intake_tasks`);
       for (const op of ['INSERT', 'UPDATE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_projection_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN
         INSERT INTO intake_task_projection(id,data,links) SELECT NEW.id, ${project('NEW.')}
@@ -446,7 +455,7 @@ export class IntakeService {
           const hot = table === 'tasks' ? `CASE WHEN json_extract(${c('data')},'$.archived_at') IS NULL AND json_extract(${c('data')},'$.status') NOT IN ('done','cancelled') THEN ${bytes} ELSE 0 END`
             : ['grants', 'rules'].includes(table) ? bytes : '0';
           const events = table === 'tasks' ? `COALESCE(length(CAST(json_extract(${c('data')},'$.history') AS BLOB)),0)` : '0';
-          const original = table === 'tasks' ? `(SELECT COALESCE(SUM(length(CAST(e.value AS BLOB))),0) FROM json_each(json_extract(${c('data')},'$.history')) e WHERE json_extract(e.value,'$.kind')='intake')` : '0';
+          const original = table === 'tasks' ? `(SELECT COALESCE(SUM(length(CAST(e.value AS BLOB))),0) FROM json_each(json_extract(${c('data')},'$.history')) e WHERE e.type='object' AND json_extract(e.value,'$.kind')='intake')` : '0';
           return [bytes, hot, events, original, '1'];
         };
         // Only the first migration reads old retained data. Subsequent cold
@@ -731,8 +740,8 @@ export class IntakeService {
     return this.rows('rules').filter(r => r.project === null || tasks.some(t => t.project === r.project));
   }
   private unresolved(task: Obj): Obj[] {
-    const resolved = new Set(task.history.filter((e: Obj) => e.kind === 'resolution' || e.kind === 'approval_decision').map((e: Obj) => e.ref));
-    return task.history.filter((e: Obj) => ['followup', 'blocker', 'pending_approval'].includes(e.kind) && !resolved.has(e.id));
+    const resolved = new Set(readEvents(task).filter((e: Obj) => e.kind === 'resolution' || e.kind === 'approval_decision').map((e: Obj) => e.ref));
+    return readEvents(task).filter((e: Obj) => ['followup', 'blocker', 'pending_approval'].includes(e.kind) && !resolved.has(e.id));
   }
   /** Read-only lookup of a canonical Hub session row. The session-control
    * service owns these rows; intake never writes them. A missing table (older
@@ -750,8 +759,9 @@ export class IntakeService {
    * and keeps looking: a historical link never masks a live assignment, and
    * when only ended sessions remain the task is free for new work. */
   private activeAssignment(task: Obj): string | null {
-    for (let i = task.history.length - 1; i >= 0; i--) {
-      const e = task.history[i];
+    const events = readEvents(task);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
       if (e?.kind === 'link' && typeof e.hub_session_id === 'string' && SESSION_UUID.test(e.hub_session_id)) {
         const row = this.sessionRow(e.hub_session_id);
         // A missing row is unreadable custody: fail closed to unassigned, as before.
@@ -768,8 +778,10 @@ export class IntakeService {
    * not_visible marker (the link event itself already discloses the id). */
   private assignedSessions(task: Obj, p: Obj): Obj[] {
     const seen = new Set<string>(); const out: Obj[] = [];
-    for (let i = task.history.length - 1; i >= 0; i--) {
-      const e = task.history[i];
+    const events = readEvents(task);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      try {
       if (e?.kind === 'link' && e.evidence === 'external_live_verified' && e.native_id) {
         const key = 'external:' + e.host + '/' + e.native_id;
         if (!seen.has(key)) {
@@ -794,14 +806,21 @@ export class IntakeService {
         ...(row.state === 'held' ? { hold: e.assignment_hold ?? 'placement_pending' } : {}),
         engine: row.engine ?? null, mode: row.mode ?? null, fleet_launch_id: row.fleet_launch_id ?? null,
         binding, updated_at: row.updated_at ?? null, linkage: 'hub_session' });
+      } catch {
+        // One unreadable link entry (bad census row, corrupt JSON) must not
+        // 500 the whole history view (intake aefcc150): mark and continue.
+        out.push({ hub_session_id: typeof e?.hub_session_id === 'string' ? e.hub_session_id : null,
+          native_id: e?.native_id ?? null, linkage: 'unreadable_entry' });
+      }
     }
     return out;
   }
   private continuation(task: Obj): string {
+    const events = readEvents(task);
     const pending = this.unresolved(task);
     if (task.status === 'pending_approval' || pending.some(e => e.kind === 'pending_approval')) return 'approval_blocked';
-    const pendingVoice = task.history.some((e: Obj, i: number) => e.kind === 'intake' && e.text === null &&
-      !task.history.slice(i + 1).some((later: Obj) => later.kind === 'intake' && later.transcription === 'provided' && later.source.reference === e.source.reference));
+    const pendingVoice = events.some((e: Obj, i: number) => e.kind === 'intake' && e.text === null &&
+      !events.slice(i + 1).some((later: Obj) => later.kind === 'intake' && later.transcription === 'provided' && later.source?.reference === e.source?.reference));
     if (task.uncertainty || pendingVoice) return 'uncertain';
     if (task.status === 'blocked' || pending.some(e => e.kind === 'blocker')) return 'blocked';
     if (task.status === 'in_progress') return 'active';
@@ -1265,7 +1284,7 @@ export class IntakeService {
       // Legacy service writers may append a structured event directly. Expose
       // its stable next sequence without mutating the ledger during a read.
       let next = task._history_next_seq ?? 0;
-      const inlineSequences = Object.fromEntries(task.history.map((event: Obj) => [event.id,
+      const inlineSequences = Object.fromEntries(readEvents(task).map((event: Obj) => [event.id,
         Object.hasOwn(task._history_order ?? {}, event.id) ? task._history_order[event.id] : next++]));
       return { snapshot_version: revision, task_id: task.id, task_version: task.version,
         items: page.map(row => ({ sequence: row.seq, event: JSON.parse(row.data) })),
@@ -1336,7 +1355,7 @@ export class IntakeService {
       fields = { rule_id: raw.rule_id, version: raw.version, source: source(raw.source) };
     } else if (kind === 'resolution' || kind === 'approval_decision') {
       keys(raw, ['kind', 'ref', 'text', 'source', ...(kind === 'approval_decision' ? ['decision'] : [])]);
-      const ref = task.history.find((e: Obj) => e.id === raw.ref);
+      const ref = readEvents(task).find((e: Obj) => e.id === raw.ref);
       if (!ref || !this.unresolved(task).some(e => e.id === raw.ref)) fail('unknown_obligation');
       if (kind === 'approval_decision') {
         this.operator(p); if (ref.kind !== 'pending_approval' || !['granted', 'denied', 'withdrawn'].includes(raw.decision)) fail('invalid_approval_decision');
@@ -1373,7 +1392,7 @@ export class IntakeService {
     } else if (kind === 'first_action' || kind === 'work_action') {
       keys(raw, ['kind', 'action_type', 'text', 'source', 'evidence_digest', 'native_session', 'host_id']);
       const isOwner = task.owner && task.owner === p.actor;
-      const isAssigned = task.history.some((e: Obj) => e.kind === 'assignment' && e.assignee === p.actor);
+      const isAssigned = readEvents(task).some((e: Obj) => e.kind === 'assignment' && e.assignee === p.actor);
       if (!p.admin && !isOwner && !isAssigned) fail('forbidden', 403);
       const action_type = raw.action_type ? str(raw.action_type, 64) : 'work_action';
       const text = str(raw.text, 8192, 'text');
@@ -1403,6 +1422,7 @@ export class IntakeService {
       const contributors = new Set<string>();
       if (Array.isArray(task.history)) {
         for (const item of task.history) {
+          if (!item || typeof item !== 'object') continue;
           if (item.kind === 'commit' && item.actor) contributors.add(item.actor);
           if (item.kind === 'report' && item.actor) contributors.add(item.actor);
           if ((item.kind === 'work_action' || item.kind === 'first_action') && item.actor) contributors.add(item.actor);
@@ -1436,7 +1456,7 @@ export class IntakeService {
       if (!/^[0-9a-f]{40}$/.test(source_sha)) fail('invalid_source_sha');
       const review_ref = str(raw.review_ref, 128);
 
-      const reviewEvent = task.history.find((e: Obj) =>
+      const reviewEvent = readEvents(task).find((e: Obj) =>
         e.kind === 'independent_review' && e.id === review_ref
       );
       if (!reviewEvent) fail('missing_independent_review', 409);
@@ -1446,6 +1466,7 @@ export class IntakeService {
       const reviewIndex = task.history.indexOf(reviewEvent);
       for (let j = reviewIndex + 1; j < task.history.length; j++) {
         const later = task.history[j];
+        if (!later || typeof later !== 'object') continue;
         if (later.kind === 'commit' && later.reference && later.reference.toLowerCase() !== source_sha) {
           fail('stale_reviewed_source', 409);
         }
@@ -1468,7 +1489,7 @@ export class IntakeService {
       const recipient = p.caller.actor;
       if (raw.recipient && raw.recipient !== recipient) fail('recipient_mismatch', 403);
 
-      const acceptedOutcome = task.history.slice().reverse().find((e: Obj) => e.kind === 'accepted_outcome' && e.verdict === 'accepted');
+      const acceptedOutcome = readEvents(task).slice().reverse().find((e: Obj) => e.kind === 'accepted_outcome' && e.verdict === 'accepted');
       if (!acceptedOutcome) fail('no_accepted_outcome', 409);
       if (raw.source_sha && raw.source_sha.toLowerCase() !== acceptedOutcome.source_sha.toLowerCase()) {
         fail('stale_outcome_source', 409);
@@ -1480,6 +1501,7 @@ export class IntakeService {
       const outcomeIndex = task.history.lastIndexOf(acceptedOutcome);
       for (let j = outcomeIndex + 1; j < task.history.length; j++) {
         const later = task.history[j];
+        if (!later || typeof later !== 'object') continue;
         if (later.kind === 'commit' && later.reference && later.reference.toLowerCase() !== acceptedOutcome.source_sha.toLowerCase()) {
           fail('stale_outcome_source', 409);
         }
@@ -1498,7 +1520,7 @@ export class IntakeService {
     } else if (kind === 'obligation') {
       keys(raw, ['kind', 'obligation_id', 'text', 'default_action', 'wait_s', 'deadline', 'source']);
       const obligationId = identifier(raw.obligation_id || crypto.randomUUID());
-      if (task.history.some((e: Obj) => e.kind === 'obligation' && e.obligation_id === obligationId)) {
+      if (readEvents(task).some((e: Obj) => e.kind === 'obligation' && e.obligation_id === obligationId)) {
         fail('duplicate_obligation_id', 409);
       }
       const text = str(raw.text, 8192, 'text');
@@ -1522,12 +1544,12 @@ export class IntakeService {
       };
     } else if (kind === 'obligation_response') {
       keys(raw, ['kind', 'ref', 'response_type', 'text', 'source']);
-      const ref = task.history.find((e: Obj) => e.obligation_id === raw.ref || e.id === raw.ref);
+      const ref = readEvents(task).find((e: Obj) => e.obligation_id === raw.ref || e.id === raw.ref);
       if (!ref) fail('unknown_obligation');
       const responseType = str(raw.response_type, 32);
       if (!['answer', 'proceed'].includes(responseType)) fail('invalid_response_type');
       const refId = ref.obligation_id || ref.id;
-      const priorResponses = task.history.filter((e: Obj) => e.kind === 'obligation_response' && e.ref === refId);
+      const priorResponses = readEvents(task).filter((e: Obj) => e.kind === 'obligation_response' && e.ref === refId);
       const hasAnswer = priorResponses.some((e: Obj) => e.response_type === 'answer');
       const hasProceeded = priorResponses.some((e: Obj) => e.response_type === 'proceed');
 
@@ -1846,7 +1868,7 @@ export class IntakeService {
       const sessionKey = 'ia-' + sha256Sync(p.identity + ':' + taskId + ':' + b.key).slice(0, 24);
       let prior: any = null;
       try { prior = this.sql.exec('SELECT * FROM session_control_sessions WHERE actor=? AND request_key=?', p.actor, sessionKey).toArray()[0]; } catch { /* session service absent: assignment_unavailable below */ }
-      const ownLink = prior && task.history.find((e: Obj) => e.kind === 'link' && e.hub_session_id === prior.id && e.authority === 'hub_launch_verified');
+      const ownLink = prior && readEvents(task).find((e: Obj) => e.kind === 'link' && e.hub_session_id === prior.id && e.authority === 'hub_launch_verified');
       const version = previous?.started_version ?? task.version;
       const ownAdvance = !!ownLink && task.version === version + 1;
       this.expected(b, task.version - (ownAdvance ? 1 : 0));
@@ -1890,7 +1912,7 @@ export class IntakeService {
         if (previous.fingerprint !== fingerprint) fail('idempotency_conflict', 409);
         if (previous.response) return json(previous.response);
       }
-      const startLink = task.history.find((e: Obj) => e.kind === 'link' && e.hub_session_id === created.id && e.authority === 'hub_launch_verified');
+      const startLink = readEvents(task).find((e: Obj) => e.kind === 'link' && e.hub_session_id === created.id && e.authority === 'hub_launch_verified');
       // The canonical start committed our link. Only that one known version
       // advance belongs to this assignment; any concurrent edit still conflicts.
       this.expected(b, task.version - (startLink && task.version === pre.version + 1 ? 1 : 0));

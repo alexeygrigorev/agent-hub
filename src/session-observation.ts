@@ -55,11 +55,11 @@ export function observationIntakeRevision(sql: SqlStorage, machine: string): str
     'kind',json_extract(e.value,'$.kind'),'intake_key',json_extract(e.value,'$.intake_key'),
     'text',CASE WHEN json_extract(e.value,'$.kind')='note'
       THEN json_extract(e.value,'$.text') ELSE NULL END))
-    FROM json_each(${data},'$.history') e WHERE json_extract(e.value,'$.hub_session_id') IS NOT NULL
+    FROM json_each(${data},'$.history') e WHERE e.type='object' AND (json_extract(e.value,'$.hub_session_id') IS NOT NULL
       OR json_extract(e.value,'$.native_id') IS NOT NULL
       OR (json_extract(e.value,'$.kind')='note' AND (
         upper(ltrim(json_extract(e.value,'$.text'))) LIKE 'START%'
-        OR json_extract(e.value,'$.intake_key') GLOB 'note-aplexer-*')))`;
+        OR json_extract(e.value,'$.intake_key') GLOB 'note-aplexer-*'))))`;
   const schema: any = sql.exec('SELECT version FROM session_observation_intake_schema WHERE id=1').toArray()[0];
   const rebuildAplexerNotes = Number(schema?.version ?? 0) < 2;
   if (rebuildAplexerNotes) {

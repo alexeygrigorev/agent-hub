@@ -4,6 +4,7 @@ import { defaultEnv, doFetch } from './m1-focus-setup';
 import { createSessionCookie } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
 import { CLI_EXCLUSIONS, MCP_ROUTES, publicTools, toolRequest, dispatchToolRequest } from '../src/mcp-tools';
+import { handleMcp } from '../src/mcp';
 import cliCommands from './mcp-cli-commands.json';
 
 const origin = 'http://example.com';
@@ -160,8 +161,69 @@ describe('Hub MCP protocol and parity', () => {
     expect(held.data.hold).toBeTruthy();
     expect(held.data.assigned_session.hold).toEqual(held.data.hold);
   });
-  it('sessions_start links its intake once through the canonical server path', async () => {
+  it('returns intake history with legacy and malformed entries instead of a Worker exception (intake aefcc150)', async () => {
     const invoke = async (name: string, args: any) => {
+      const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
+      return JSON.parse(response.result.content[0].text);
+    };
+    const created = await invoke('intake_create', { payload: { key: 'mcp-history-robustness', project: 'demo', title: 'Fixture', text: 'Fixture', source: { type: 'unknown' },
+      acceptance_criteria: 'Synthetic history robustness fixture.' } });
+    expect(created.status).toBe(200);
+    const id = created.data.task.id;
+    const heldId = crypto.randomUUID();
+    const now = Date.now();
+    await inHub(h => {
+      const iso = new Date().toISOString();
+      h.sql.exec(`INSERT INTO session_control_sessions
+        (id,actor,request_key,request_json,mode,state,owner_token_id,created_at,updated_at)
+        VALUES (?,?, 'mcp-history-held','{"workspace":"mcp-fixture"}','interactive','held','mcp-test-human',?,?)`,
+        heldId, 'human:' + sub, iso, iso);
+      const rows = h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', id).toArray() as any[];
+      const task = JSON.parse(rows[0].data);
+      const entry = (kind: string, extra: any = {}) => ({ id: crypto.randomUUID(), kind, actor: 'human:' + sub, captured_at: now, authority: 'untrusted_task_data', ...extra });
+      // The 1101-era shape: a held link carrying an object assignment_hold,
+      // plus entries legacy/service writers may leave behind (non-objects,
+      // unknown kinds, null sources) that must never 500 the history view.
+      task.history = [
+        entry('intake', { text: 'Fixture', source: { type: 'unknown' }, transcription: 'not_applicable' }),
+        null,
+        'stray-string-entry',
+        entry('mystery_future_kind', { text: 'unknown kinds are preserved' }),
+        entry('link', { hub_session_id: heldId, native_id: null, engine: 'codex', provenance: { type: 'hub_launch_verified' }, evidence: 'hub_launch_verified',
+          assignment_hold: { error: 'no_eligible_route', rejected: [{ machine: 'm', engine: 'codex', reason: 'resource_limit' }], access: 'legacy_unspecified' } }),
+        entry('intake', { text: null, source: null, transcription: 'not_applicable' }),
+        entry('note', { text: 'later', source: { type: 'unknown' } }),
+      ];
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(task), id);
+    });
+    const response = await rpc('tools/call', { name: 'intake_history', arguments: { id } });
+    // A Worker exception would surface as a failed transport fetch (Cloudflare
+    // 1101 style), never a JSON-RPC body.
+    expect(response.status).toBe(200);
+    const body: any = await response.json();
+    expect(body.result.isError).toBe(false);
+    const content = JSON.parse(body.result.content[0].text);
+    expect(content.status).toBe(200);
+    expect(content.data.task.payload_data.history.length).toBe(7);
+    const held = content.data.task.assigned_sessions.find((s: any) => s.hub_session_id === heldId);
+    expect(held).toMatchObject({ state: 'held', hold: { error: 'no_eligible_route' }, linkage: 'hub_session' });
+  });
+  it('never throws a Worker exception when MCP auth or usage accounting fail (intake aefcc150)', async () => {
+    const mcpCall = { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'intake_history', arguments: { id: 'fixture' } } };
+    const req = () => new Request(origin + '/mcp', { method: 'POST', headers: { Authorization: 'Bearer ' + bearer,
+      'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }, body: JSON.stringify(mcpCall) });
+    const boom = async (): Promise<any> => { throw new Error('private diagnostic'); };
+    const boomUsage = (): void => { throw new Error('private diagnostic'); };
+    for (const [auth, dispatch, usage] of [
+      [boom, boom, () => {}],
+      [async () => ({ caller: { kind: 'human' } }), boom, boomUsage],
+    ] as any[]) {
+      const res = await handleMcp(req(), auth, dispatch, usage);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ error: { code: -32603 } });
+    }
+  });
+  it('sessions_start links its intake once through the canonical server path', async () => {    const invoke = async (name: string, args: any) => {
       const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
       return JSON.parse(response.result.content[0].text);
     };
