@@ -20,7 +20,7 @@ import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFlee
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { SILENT_START_MS, SILENT_START_REASON, ABANDONED_RECOVERY_MS, abandonedLaunch, expireSilentStartRows } from './silent-start';
-import { reconcileAccountCapacity } from './account_capacity';
+import { reconcileAccountCapacity, reconcileVerifiedNoStarts } from './account_capacity';
 import { ACTIVE_LAUNCH_STATES_SQL, isEligibleReservedLaunch, parseReservedLaunchCursor, reservedLaunchPage, type ReservedLaunchContext } from './account-reserved-launches';
 import { readAccountCapacityHistory } from './account-capacity-history';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
@@ -724,6 +724,11 @@ export class FleetService {
       this.sql.exec(runtimeDDL.replace('CREATE INDEX ', 'CREATE INDEX IF NOT EXISTS '));
     });
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_inflight_identity ON fleet_launches(machine_id,engine,account,profile) WHERE native_id IS NULL AND state IN ('starting','uncertain')");
+    // Intake 6c9ed671: the verified no-start settlement scan runs only on the
+    // host-census path and the manual /reconcile endpoint, never inside
+    // claim/accountStatus maintenance; this partial index keeps that lookup
+    // independent of retained launch history.
+    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_nostart_receipt ON fleet_launches(updated_at) WHERE mode = 'headless' AND state IN ('starting','running','uncertain') AND launch_error_json IS NOT NULL AND native_id IS NULL AND launcher_task_id IS NULL");
     // Intake b527e905: the launcher-failure quarantine reads the most recent
     // launches, and Fleet's own retry custody maps retry_id -> held launch.
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_updated ON fleet_launches(updated_at)');
@@ -2162,7 +2167,8 @@ export class FleetService {
       const input = await body(request);
       if (!object(input, ['apply']) || typeof input.apply !== 'boolean') return response({ error: 'invalid_reconcile' }, 400);
       return this.transaction(() => {
-        const changes = reconcileAccountCapacity(this.sql, this.now(), input.apply);
+        const changes = [...reconcileAccountCapacity(this.sql, this.now(), input.apply),
+          ...reconcileVerifiedNoStarts(this.sql, this.now(), input.apply)];
         if (input.apply) this.drainCapacityQueue();
         return response({ applied: input.apply, changes });
       });
@@ -2731,6 +2737,7 @@ export class FleetService {
         adoptObservedNativeSessions(this.sql, caller.machineId!, changedSessions, this.now(), undefined, revisionMoved ? cleanSessions : changedSessions);
         if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
+        reconcileVerifiedNoStarts(this.sql, this.now());
         // A refreshed catalog can free machine_capacity: promote waiters.
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }
         // unchanged rows retain last-change timestamps; the complete census
