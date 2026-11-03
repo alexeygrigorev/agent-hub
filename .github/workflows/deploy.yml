@@ -125,6 +125,14 @@ jobs:
           mkdir -p .local/tmp
           bash scripts/with-temp-home.sh -- bash ops/tests/session-ctl.test.sh
 
+      - name: Cloudflare cost safety regressions
+        timeout-minutes: 5
+        env:
+          UV_THREADPOOL_SIZE: "1"
+          GOMAXPROCS: "1"
+          NODE_OPTIONS: "--v8-pool-size=1"
+        run: npx --no-install vitest run test/cf-row-budget.test.ts test/cf-row-budget-hub.test.ts test/cf-loop-alarm.test.ts test/cf-background-bounds.test.ts test/cf-placement-pressure-bounded.test.ts test/host-history-bounded.test.ts --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept
+
       - name: Worker discovery tests (Vitest)
         env:
           UV_THREADPOOL_SIZE: "1"

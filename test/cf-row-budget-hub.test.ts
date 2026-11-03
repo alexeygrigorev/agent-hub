@@ -26,8 +26,10 @@ describe('Hub daily cost circuit breaker integration', () => {
       await hub.alarm();
       const tick = await hub.scheduledTick();
       const checks = await hub.runChecks();
-      const response = await hub.fetch(new Request('https://hub/api/sessions'));
-      expect(response.status).toBe(503);
+      for (const path of ['/api/sessions', '/mcp', '/oauth/authorize', '/.well-known/oauth-authorization-server', '/api/conversations', '/api/status']) {
+        const response = await hub.fetch(new Request('https://hub' + path));
+        expect(response.status, path).toBe(503);
+      }
       expect(tick.reason).toBe('do_daily_row_budget_exceeded');
       expect(checks).toEqual([]);
       expect(hub.meter.snapshot()).toEqual(before);
@@ -52,8 +54,10 @@ describe('Hub daily cost circuit breaker integration', () => {
       Object.defineProperty(hub, 'initializationComplete', { value: false, writable: true });
       const initialize = vi.spyOn(hub, 'initializeServices');
       const before = hub.meter.snapshot();
-      const response = await hub.fetch(new Request('https://hub/api/sessions'));
-      expect(response.status).toBe(503);
+      for (const path of ['/api/sessions', '/mcp', '/oauth/authorize', '/.well-known/oauth-authorization-server', '/api/conversations', '/api/status']) {
+        const response = await hub.fetch(new Request('https://hub' + path));
+        expect(response.status, path).toBe(503);
+      }
       expect(initialize).not.toHaveBeenCalled();
       expect(hub.meter.snapshot()).toEqual(before);
       vi.restoreAllMocks();
