@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from agent_hub_host import credentials as c
+from agent_hub_host import bootstrap_pins
 from agent_hub_host import provisioning as p
 
 LABEL = 'codex-orin'
@@ -31,7 +32,11 @@ def auth(tag, last_refresh='2026-10-28T15:56:27Z'):
 
 
 def bundle(gen, content, **extra):
-    b = {'label': LABEL, 'provider': 'codex', 'version': '0.162.1', 'revision': REV,
+    # The managed Codex version is pin-authoritative (intake 935b266b AC1):
+    # install() replaces any bundle version with the reviewed release pin,
+    # so the helper uses the pin to express "same engine, new credential".
+    b = {'label': LABEL, 'provider': 'codex',
+         'version': bootstrap_pins.ENGINE_PACKAGES['codex'].rsplit('@', 1)[1], 'revision': REV,
          'files': {PATH: content, '.codex/config.toml': 'approval_policy = "never"\n'}, 'env': {}, 'args': [],
          'credential_generation': gen, 'credential_paths': [PATH], 'credential_status': 'ok'}
     b.update(extra)
