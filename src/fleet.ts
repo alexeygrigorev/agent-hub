@@ -1543,7 +1543,7 @@ export class FleetService {
       const explicitlyRequestedDeep = hasOverrideReason &&
         (tier === 'deep' || overrideModels.length > 0 || Boolean(request.engine));
       const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) && (m.id !== 'astra' || allowAstra) &&
-        deepModelAllowedForTier(m, tier, explicitlyRequestedDeep) &&
+        (autoStartPool || deepModelAllowedForTier(m, tier, explicitlyRequestedDeep)) &&
         heavyModelEffortAllowed(m, input.effort ?? m.effort) &&
         (anyTier || members.includes(m.id)) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
       // Explicit model selectors and native engines may cross tiers only
