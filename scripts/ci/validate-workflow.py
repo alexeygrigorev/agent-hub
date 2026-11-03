@@ -83,6 +83,35 @@ def validate_deploy_workflow(file_path: Path):
         assert "deploy" in data["jobs"], "Missing deploy job"
         assert data["jobs"]["deploy"].get("needs") == "test", "Deploy job must depend on test job"
 
+    # Concurrency gate (intake 9b43c2f0): the workflow must serialize per
+    # workflow+ref so PR pushes cancel superseded runs while main pushes never
+    # cancel an in-progress deploy but collapse pending mains to the newest.
+    check_concurrency(content, file_path)
+
+    print(f"  ✓ {file_path.name} passed all checks.")
+
+
+def check_concurrency(content: str, file_path: Path):
+    """Ref-keyed concurrency: group on workflow+ref, cancel only PR runs."""
+    if "concurrency:" not in content:
+        raise ValueError(f"Top-level concurrency group missing in {file_path}; PR runs must cancel, main runs must collapse to newest")
+    for token in ("github.workflow", "github.ref", "cancel-in-progress", "pull_request"):
+        if token not in content:
+            raise ValueError(f"Concurrency group in {file_path} must be keyed by workflow+ref with cancel-in-progress on pull_request (missing {token})")
+
+
+def validate_host_canary_workflow(file_path: Path):
+    print(f"Validating {file_path.name}...")
+    content = file_path.read_text(encoding="utf-8")
+
+    if "contents: read" not in content:
+        raise ValueError(f"Permissions must specify minimal 'contents: read' in {file_path}")
+
+    if "timeout-minutes:" not in content:
+        raise ValueError(f"Bounded timeout-minutes missing in {file_path}")
+
+    check_concurrency(content, file_path)
+
     print(f"  ✓ {file_path.name} passed all checks.")
 
 
@@ -119,6 +148,7 @@ def validate_rollback_workflow(file_path: Path):
 def main():
     deploy_path = WORKFLOWS_DIR / "deploy.yml"
     rollback_path = WORKFLOWS_DIR / "rollback.yml"
+    canary_path = WORKFLOWS_DIR / "host-canary.yml"
 
     if not deploy_path.is_file():
         print(f"ERROR: {deploy_path} does not exist", file=sys.stderr)
@@ -126,10 +156,14 @@ def main():
     if not rollback_path.is_file():
         print(f"ERROR: {rollback_path} does not exist", file=sys.stderr)
         sys.exit(1)
+    if not canary_path.is_file():
+        print(f"ERROR: {canary_path} does not exist", file=sys.stderr)
+        sys.exit(1)
 
     try:
         validate_deploy_workflow(deploy_path)
         validate_rollback_workflow(rollback_path)
+        validate_host_canary_workflow(canary_path)
         print("All CI/CD workflow validations PASSED.")
     except Exception as exc:
         print(f"Validation FAILED: {exc}", file=sys.stderr)
