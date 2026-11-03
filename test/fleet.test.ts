@@ -2,7 +2,7 @@ import policy from '../config/model-routing.json';
 import {freshCpu} from './cpu-fixture';
 import { describe, it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { FleetService, isCapacityOnlyHold, PLACEMENT_PRESSURE_REASONS } from '../src/fleet';
+import { FleetService, isCapacityOnlyHold, PLACEMENT_PRESSURE_REASONS, RETRIABLE_ENGINE_HOLDS } from '../src/fleet';
 import { RepoRegistry } from '../src/repos';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
@@ -939,6 +939,29 @@ describe('generic accounts and launch placement', () => {
     expect(s.drainCapacityQueue().promoted).toBeGreaterThan(0);
     expect(sql.exec('SELECT state, machine_id FROM fleet_launches WHERE id = ?', retry.id).one()).toMatchObject({ state: 'offered', machine_id: 'hetzner' });
   }));
+  it('holds the refusing host engine after a capacity reject (intake e8a22f4c)', async () => fixture(async (s, sql) => {
+    await configure(s);
+    s.resources.configure({cpu_load_factor:3});
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
+    heartbeat.load = [8 * 6 + 1, 5, 2]; heartbeat.mem_avail_mb = 32000; heartbeat.at = iso();
+    sql.exec('UPDATE machines SET last_heartbeat = ? WHERE id = ?', JSON.stringify(heartbeat), 'hetzner');
+    const diagnostic = {
+      reason: 'host_load_high',
+      message: 'Host is measurably busy (CPU at least 98% over 10s, MemAvailable under 6 GiB, or runaway load); new launches stay queued.',
+      stage: 'dispatch_route', error_type: 'ValueError',
+    };
+    const retry: any = await (await s.handle(request('/launches/' + launch.id + '/reject', { reason: 'host_load_high', diagnostic }), host('hetzner'))).json();
+    expect(retry).toMatchObject({ state: 'queued', queued: true });
+    // The route is held for one retrial cooldown instead of being re-offered
+    // to the same host every 2s poll (the reject storm).
+    expect(sql.exec("SELECT status, reason FROM fleet_engine_health WHERE engine = 'codex' AND machine_id = 'hetzner'").one()).toMatchObject({ status: 'unavailable', reason: 'host_load_high' });
+    for (const reason of ['host_load_high', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']) {
+      expect(RETRIABLE_ENGINE_HOLDS.has(reason)).toBe(true);
+    }
+  }));
+
   it('persists swap pressure as a memory hold and promotes after swap recovers', async () => fixture(async (s, sql) => {
     await configure(s);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();

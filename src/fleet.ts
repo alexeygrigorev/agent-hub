@@ -48,7 +48,7 @@ export const GATE_STALE_MS = 300000;
 /** Engine holds that expire into a single retrial after this cooldown. */
 export const ENGINE_HEALTH_RETRY_MS = 600000;
 export const UNCLAIMED_OFFER_TTL_MS = 15 * 60 * 1000;
-export const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused', 'worker_silent_start']);
+export const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused', 'worker_silent_start', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
 export { SILENT_START_MS, SILENT_START_REASON };
 
 export const FLEET_SCHEMA = `
@@ -3344,6 +3344,15 @@ export class FleetService {
               this.sql.exec('INSERT OR REPLACE INTO fleet_login_holds (machine_id, engine, account, profile, held_at_ms) VALUES (?, ?, ?, ?, ?)', row.machine_id, row.engine, row.account, row.profile ?? '', this.now());
             }
             if (data.reason === 'engine_auth_expired') {
+              this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
+            }
+            // Intake e8a22f4c: a capacity refusal proves this host cannot take
+            // this engine right now. Hold the (machine, engine) route for one
+            // retrial cooldown instead of minting a retry that is immediately
+            // re-offered to the same host and rejected again (the reject storm).
+            // The hold is retriable (RETRIABLE_ENGINE_HOLDS): one probe passes
+            // per ENGINE_HEALTH_RETRY_MS, and a successful launch lifts it.
+            if (['host_load_high', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking'].includes(data.reason)) {
               this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
             }
             // The fenced pre-claim refusal proves no native start. Retain the

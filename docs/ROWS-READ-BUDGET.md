@@ -90,3 +90,12 @@ remainder is per-intent volume and needs admission-side quarantine).
 - `recordSessionTokens`: active-phase token upserts persist at most once per
   60s per session (`TOKEN_PERSIST_COOLDOWN_MS`); terminal phases always
   persist so the final count is never lost.
+
+## Reject quarantine (intake e8a22f4c)
+
+POST /api/fleet/launches/:id/reject ran 3.25M calls/day for ~1M writes: each
+capacity mint was immediately re-offered to the same refusing host and
+rejected again. Capacity reasons (host_load_high, cpu_headroom/cpu_pressure,
+memory_pressure, host_oom, host_runtime_choking) now upsert a retriable
+fleet_engine_health hold for the (machine, engine) route: one retrial passes
+per ENGINE_HEALTH_RETRY_MS (10 min) and a successful launch lifts it.
