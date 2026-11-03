@@ -1247,6 +1247,7 @@ export class SessionControlService {
     let modelReason: string | null = null;
     let memoryRejected: any[] = [];
     let holdReason: string | null = null;
+    let supersededBy: string | null = null;
     // Intake dcac7cd4 AC1: top-level needs-hold diagnosis from the stored
     // hold payload (why no routed host matches, which hosts advertise the
     // needs), surfaced alongside the per-route rejected[] entries.
@@ -1312,8 +1313,13 @@ export class SessionControlService {
       const holdInfo = this.readHoldInfo(row, request);
       if (holdInfo.rejected.length > 0) memoryRejected = holdInfo.rejected;
       if (holdInfo.reason && (row.state === 'refused' || row.state === 'held' || row.state === 'cancelled')) holdReason = holdInfo.reason;
+      if (row.state === 'cancelled' && typeof holdInfo.hold?.superseded_by === 'string') supersededBy = holdInfo.hold.superseded_by;
       needsHoldReason = holdInfo.needs_reason;
       needsMachines = holdInfo.needs_machines;
+    }
+    if (row.state === 'cancelled' && !supersededBy) {
+      const persistedHold = parsed(row.hold_json, null);
+      if (typeof persistedHold?.superseded_by === 'string') supersededBy = persistedHold.superseded_by;
     }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     // Scheduled wake: a pending future wake suspends stall/idle classification.
@@ -1360,6 +1366,7 @@ export class SessionControlService {
       ...(modelReason ? { reason: modelReason } : {}),
       ...(memoryRejected.length ? { reason: holdReason ?? memoryRejected[0]?.reason ?? 'placement_unknown', rejected: memoryRejected } : holdReason ? { reason: holdReason } : {}),
       ...(['refused', 'held'].includes(row.state) ? { reason: holdReason || memoryRejected[0]?.reason || 'placement_unknown', rejected: memoryRejected } : {}),
+      ...(supersededBy ? { superseded_by: supersededBy } : {}),
       ...(needsHoldReason ? { hold_reason: needsHoldReason, ...(needsMachines ? { needs_machines: needsMachines } : {}) } : {}),
       ...(offeredRoute ? { offered_route: offeredRoute } : {}),
       ...(launchError ? { reason: launchError.reason, message: launchError.message,
@@ -1701,26 +1708,50 @@ export class SessionControlService {
                   if (['link', 'session'].includes(e?.kind) && typeof e?.hub_session_id === 'string' && e.hub_session_id &&
                       !seenLinks.has(e.hub_session_id)) { seenLinks.add(e.hub_session_id); linkIds.push(e.hub_session_id); }
                 }
-                // Supersession is live work replacing live work. A manual link
-                // of an already ended session (27505f04 AC8) sits later in the
-                // ledger than older links but names a terminal row, so it must
-                // never cancel a held intent that still waits for placement.
-                // Only a known-terminal row is historical; a missing row keeps
-                // the old fail-closed yield, and one indexed read covers the batch.
-                const terminalStates = ['stopped', 'finished', 'failed', 'refused', 'cancelled'];
-                const rowState = new Map<string, string>();
+                // A linked row supersedes a held intent only when it is known
+                // live and was created strictly later. Older links and missing
+                // rows are historical/unknown, not evidence that the held
+                // intent was replaced. Observed-native rows also need a fresh
+                // session observation; otherwise a stale shell record can
+                // cancel a start while the host has not seen it for hours.
+                const linkedRows = new Map<string, any>();
                 for (let i = 0; i < linkIds.length; i += 200) {
-                  for (const s of this.sql.exec('SELECT id, state FROM session_control_sessions WHERE id IN (SELECT value FROM json_each(?))',
-                    JSON.stringify(linkIds.slice(i, i + 200))).toArray() as any[]) rowState.set(String(s.id), String(s.state));
+                  for (const s of this.sql.exec(`SELECT id, state, created_at, updated_at, actor, engine, machine_id,
+                    fleet_launch_id, request_json, binding_json FROM session_control_sessions
+                    WHERE id IN (SELECT value FROM json_each(?))`, JSON.stringify(linkIds.slice(i, i + 200))).toArray() as any[]) {
+                    linkedRows.set(String(s.id), s);
+                  }
                 }
-                const newer = linkIds.filter(id => id !== row.id && !(rowState.get(id) && terminalStates.includes(rowState.get(id)!)));
-                let supersededBy: string | null = (linkIds.includes(row.id) && newer.length) ? newer[newer.length - 1] : null;
+                const heldCreatedAt = Date.parse(row.created_at);
+                const isLiveReplacement = (s: any): boolean => {
+                  if (!s || s.id === row.id) return false;
+                  if (!['queued', 'held', 'offered', 'starting', 'running', 'uncertain'].includes(String(s.state))) return false;
+                  const createdAt = Date.parse(String(s.created_at));
+                  if (!Number.isFinite(createdAt) || !Number.isFinite(heldCreatedAt) || createdAt <= heldCreatedAt) return false;
+                  const linkedRequest = parsed(s.request_json, {});
+                  const linkedBinding = parsed(s.binding_json, null);
+                  const observedNative = (s.actor === 'unknown' || linkedRequest.provenance === 'observed_native' ||
+                    linkedBinding?.provenance === 'observed_native') && !s.fleet_launch_id;
+                  if (observedNative) {
+                    let observedAt = NaN;
+                    try {
+                      const observed: any = this.sql.exec('SELECT observed_at FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
+                        s.machine_id, s.id).toArray()[0];
+                      observedAt = Date.parse(observed?.observed_at ?? linkedBinding?.observed_at ?? s.updated_at);
+                    } catch { observedAt = Date.parse(linkedBinding?.observed_at ?? s.updated_at); }
+                    if (!Number.isFinite(observedAt) || observedAt > now + 60000 || now - observedAt > 180000) return false;
+                  }
+                  return true;
+                };
+                const candidates = linkIds.map(id => linkedRows.get(id)).filter(isLiveReplacement)
+                  .sort((a: any, b: any) => Date.parse(String(b.created_at)) - Date.parse(String(a.created_at)) || String(b.id).localeCompare(String(a.id)));
+                let supersededBy: string | null = candidates.length ? String(candidates[0].id) : null;
                 if (!supersededBy && isRecovery) {
                   const siblings = this.sql.exec(
-                    "SELECT id, state, created_at FROM session_control_sessions WHERE id <> ? AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.intake_task_id') = ? AND state IN ('queued','offered','starting','running','uncertain','held') ORDER BY created_at DESC, id DESC LIMIT 16",
+                    "SELECT id, state, created_at, updated_at, actor, machine_id, fleet_launch_id, request_json, binding_json FROM session_control_sessions WHERE id <> ? AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.intake_task_id') = ? AND state IN ('queued','offered','starting','running','uncertain','held') ORDER BY created_at DESC, id DESC LIMIT 16",
                     row.id, req.intake_task_id,
                   ).toArray() as any[];
-                  const winningSibling = siblings.find(s => s.state !== 'held' || s.created_at > row.created_at || (s.created_at === row.created_at && s.id > row.id));
+                  const winningSibling = siblings.find(isLiveReplacement);
                   if (winningSibling) supersededBy = String(winningSibling.id);
                 }
                 if (supersededBy) {
