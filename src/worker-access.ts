@@ -306,12 +306,13 @@ export function nativeSessionIntakes(sql: SqlStorage, sessionId: string, nativeI
  * link and no live scoped credential yet. Bounded; indexed lookups. */
 export function nativeSessionsNeedingIntakeCredential(sql: SqlStorage, machineId: string): { session_id: string; native_id: string; workspace: string; intake_task_id: string }[] {
   const out: any[] = [];
-  const rows = sql.exec("SELECT id, binding_json FROM session_control_sessions WHERE state = 'running' AND binding_json IS NOT NULL AND machine_id = ? AND fleet_launch_id IS NULL ORDER BY updated_at DESC LIMIT 300", machineId).toArray() as any[];
+  const rows = sql.exec(`SELECT s.id, s.binding_json FROM session_control_sessions s WHERE s.state = 'running' AND s.binding_json IS NOT NULL AND s.machine_id = ? AND s.fleet_launch_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id = w.family_id WHERE w.session_id = s.id AND c.revoked_at IS NULL)
+    AND EXISTS (SELECT 1 FROM intake_session_links l WHERE l.session_key = s.id OR l.session_key = json_extract(s.binding_json, '$.native_id'))
+    ORDER BY s.updated_at DESC LIMIT 300`, machineId).toArray() as any[];
   for (const row of rows) {
     let binding: any; try { binding = JSON.parse(row.binding_json); } catch { continue; }
     if (!binding?.native_id || !binding?.workspace) continue;
-    const live = sql.exec('SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id = w.family_id WHERE w.session_id = ? AND c.revoked_at IS NULL LIMIT 1', row.id).toArray().length;
-    if (live) continue;
     const intake = nativeSessionIntakes(sql, String(row.id), String(binding.native_id))[0];
     if (!intake) continue;
     out.push({ session_id: String(row.id), native_id: String(binding.native_id), workspace: String(binding.workspace), intake_task_id: intake });
@@ -325,12 +326,18 @@ export function revokeNativeWorkerCredentials(sql: SqlStorage, sessionId: string
   sql.exec(`UPDATE credentials SET revoked_at = ? WHERE revoked_at IS NULL AND family_id IN
     (SELECT family_id FROM worker_access WHERE session_id = ? AND launch_id = session_id)`, new Date(now).toISOString(), sessionId);
 }
-/** Sweep backstop: revoke native intake credentials of sessions no longer running. */
-export function revokeEndedNativeWorkerCredentials(sql: SqlStorage, now: number): void {
+/** Sweep backstop: revoke native intake credentials of sessions no longer running.
+ * Intake e8a22f4c: hosts poll every few minutes and the unscoped sweep re-read
+ * the whole worker_access history on every poll. `sinceMs` bounds the sweep to
+ * sessions that ended after the watermark (plus deleted sessions, which carry
+ * no timestamp); pass 0 (or omit) for a full sweep after restarts. Callers
+ * advance the watermark to the sweep start so an ending racing the sweep is
+ * picked up by the next pass, never skipped. */
+export function revokeEndedNativeWorkerCredentials(sql: SqlStorage, now: number, sinceMs = 0): void {
   if (!sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_access'").toArray().length) return;
   sql.exec(`UPDATE credentials SET revoked_at = ? WHERE revoked_at IS NULL AND family_id IN
     (SELECT w.family_id FROM worker_access w LEFT JOIN session_control_sessions s ON s.id = w.session_id
-     WHERE w.launch_id = w.session_id AND (s.id IS NULL OR s.state <> 'running'))`, new Date(now).toISOString());
+     WHERE w.launch_id = w.session_id AND (s.id IS NULL OR (s.state <> 'running' AND s.updated_at > ?)))`, new Date(now).toISOString(), new Date(sinceMs).toISOString());
 }
 
 /** Write-stamp gate for the ended-session backstop sweeps (intake e8a22f4c).

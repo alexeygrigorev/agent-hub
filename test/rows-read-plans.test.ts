@@ -65,6 +65,12 @@ describe('hot-path query plans use indexes, never full scans', () => {
     expect(p).toContain('usage_quota_history_account_provider_time');
   }));
 
+  it('launcher memory-reserve scans stay off the failed-launch history', () => withHub(async hub => {
+    const p = plan(hub, "SELECT id, updated_at, finished_at, machine_id, native_id, verification_status FROM fleet_launches WHERE state = 'failed' AND exit_reason = 'launcher_memory_reserve' AND updated_at >= ?", iso(Date.now() - 86400000));
+    expect(p).toContain('fleet_launch_failed_reason');
+    expect(fullScan(p, 'fleet_launches')).toBe(false);
+  }));
+
   it('cleanup protections use the session primary key', () => withHub(async hub => {
     const p = plan(hub, 'SELECT request_key, created_at FROM session_control_protections WHERE session_id = ?', 's');
     expect(fullScan(p, 'session_control_protections')).toBe(false);
