@@ -1,7 +1,7 @@
 /**
  * Credential-poll rows-read budgets (intake e8a22f4c, phase 2). Hosts poll
  * GET /api/session-messaging/credentials and GET /api/session-intake/credentials
- * every 2 minutes per host; their SQL must be indexed so credential and agent
+ * every 10 minutes per host; their SQL must be indexed so credential and agent
  * history never changes what a poll reads, and the ended-session revoke
  * sweeps must be write-driven (backstop only) instead of running per poll.
  */
