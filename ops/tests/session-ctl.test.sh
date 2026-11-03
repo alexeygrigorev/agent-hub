@@ -254,4 +254,28 @@ assert_contains "$output" 'no configured non-Claude engine has fresh Hub quota h
 [[ ! -s "$FAKE_KILLED" ]]
 [[ ! -e "$FAKE_START_ENGINE" ]]
 
+# Burn-pace depletion is not quota exhaustion, and one usable account pool
+# keeps an engine routable when another pool in that provider family is spent.
+write_quota <<'JSON'
+{"pools":[
+ {"provider":"go","state":"fresh","remaining_percent":0,"depleted":true,"harness":["opencode"]},
+ {"provider":"go","state":"fresh","remaining_percent":27,"depleted":true,"burn_status":"depleted","harness":["opencode"]}
+]}
+JSON
+write_live oncall 'usage limit'
+output="$(run_ctl oncall check 2>&1)"
+assert_contains "$output" 'provider usage limit screen'
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+
+# A positive remaining percentage does not override an explicit hard limit.
+write_quota <<'JSON'
+{"pools":[{"provider":"go","state":"fresh","remaining_percent":27,"depleted":true,"limit_reached":true,"harness":["opencode"]}]}
+JSON
+write_live oncall 'usage limit'
+status=0
+output="$(run_ctl oncall check 2>&1)" || status=$?
+[[ "$status" -ne 0 ]]
+assert_contains "$output" 'no configured non-Claude engine has fresh Hub quota headroom'
+[[ ! -e "$FAKE_START_ENGINE" ]]
+
 echo 'session-ctl targeted tests passed'
