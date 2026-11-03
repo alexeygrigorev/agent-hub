@@ -43,6 +43,25 @@ def rotate_while_running(path, stop):
         rotate(path)
 
 
+def bind_log_streams(handle):
+    """Use owned log streams even when inherited Windows std handles are invalid."""
+    stdout = os.fdopen(os.dup(handle.fileno()), 'w', encoding='utf-8',
+                       errors='backslashreplace', buffering=1)
+    stderr = os.fdopen(os.dup(handle.fileno()), 'w', encoding='utf-8',
+                       errors='backslashreplace', buffering=1)
+    sys.stdout = sys.__stdout__ = stdout
+    sys.stderr = sys.__stderr__ = stderr
+    # Keep native writes and descendants on the same private log where the
+    # C-level descriptors exist. Python logging already has independent valid
+    # streams above, so a missing/invalid inherited descriptor is recoverable.
+    for descriptor in (1, 2):
+        try:
+            os.dup2(handle.fileno(), descriptor)
+        except OSError:
+            pass
+    return stdout, stderr
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--log', required=True, help='Bounded bootstrap log path')
@@ -62,12 +81,8 @@ def main(argv=None):
               % time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())).encode()
     handle.write(marker)
     handle.flush()
-    os.dup2(handle.fileno(), 1)
-    os.dup2(handle.fileno(), 2)
+    bind_log_streams(handle)
     handle.close()
-    # Even without an outer -u, dying tracebacks must reach the file.
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
     rest = command[2:]
     sys.argv = [PINNED_MODULE] + rest
     rotation_stop = threading.Event()
