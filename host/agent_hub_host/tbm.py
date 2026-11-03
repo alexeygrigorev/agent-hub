@@ -26,6 +26,11 @@ def _require_dict(data, what):
     return data
 
 
+def get_metrics():
+    from . import session_control
+    return _require_dict(session_control.request("GET", "/api/quota/metrics"), "metrics")
+
+
 def get_pacing():
     from . import session_control
     return _require_dict(session_control.request("GET", PACING_PATH), "pacing")
@@ -137,7 +142,24 @@ def render_kill_switch_text(data):
     return "kill-switch: %s" % state
 
 
+def render_metrics_text(data):
+    import json
+    lines = ["as_of: %s" % data.get("as_of", "unknown")]
+    for pool in ([data["global"]] if data.get("global") else []) + data.get("pools", []):
+        for window, rollup in pool.get("windows", {}).items():
+            lines.append("%s · %s" % (pool.get("pool_id", "?"), window))
+            for name, entry in rollup.get("metrics", {}).items():
+                value = entry.get("value")
+                shown = "unknown (%s)" % entry.get("reason", "no_observations") if value is None else json.dumps(value, ensure_ascii=False)
+                lines.append("  %s: %s %s" % (name, shown, entry.get("unit", "")))
+    if not data.get("pools"):
+        lines.append("No quota pools reported.")
+    return "\n".join(lines)
+
+
 def render_text(kind, data):
+    if kind == "metrics":
+        return render_metrics_text(data)
     if kind == "pacing":
         return render_pacing_text(data)
     if kind == "banked":

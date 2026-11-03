@@ -1,3 +1,4 @@
+import { readTbmMetrics } from './tbm-metrics';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { loadProviderPacing } from './pacing';
 import { handleResetCreditEvidence } from './reset-credit-evidence';
@@ -15,6 +16,7 @@ export async function handleTbmApi(request: Request, sql: SqlStorage, now = Date
     return reply({ error: 'method_not_allowed' }, 405);
   }
   const as_of = new Date(now).toISOString();
+  if (path === '/api/quota/metrics') return reply(readTbmMetrics(sql, now));
   if (path === '/api/quota/pacing') {
     const pools = sql.exec("SELECT * FROM tbm_quota_pools WHERE pool_id != '*' ORDER BY provider, account, pool_id").toArray();
     const tickTable = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='tbm_tick_state'").toArray().length;

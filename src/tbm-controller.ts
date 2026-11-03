@@ -6,6 +6,7 @@
  *   when available (unknown stays unknown; delayed native tokens upgrade in-place)
  * - Multi-window rollups (`tbm_metrics_rollup`) and routing efficiency feedback
  */
+import { captureTbmMetrics } from './tbm-metrics';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { ensureTbmQuotaSchema } from './quota';
 import {
@@ -1030,6 +1031,7 @@ export function tickTbm(sql: SqlStorage, nowMs = Date.now()): TbmTickSummary {
 
   const sessionRewards = sweepTerminalSessionRewards(sql, nowMs);
   const updatedPools = loadPools(sql, false).map(p => withPolicyTbmFloors(p));
+  captureTbmMetrics(sql, updatedPools, nowMs);
   const rollupsWritten = writePoolRollups(sql, updatedPools, nowMs);
   const routingFactors = Object.fromEntries(loadProviderPacing(sql, nowMs));
 

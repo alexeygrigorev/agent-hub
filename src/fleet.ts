@@ -2813,6 +2813,7 @@ export class FleetService {
         const revisionMoved = !revision || this.linkRevisions.get(caller.machineId!) !== revision;
         this.linkRevisions.set(caller.machineId!, revision);
         adoptObservedNativeSessions(this.sql, caller.machineId!, changedSessions, this.now(), undefined, revisionMoved ? cleanSessions : changedSessions);
+        this.resources.finishObserved(caller.machineId!, cleanSessions);
         if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
         reconcileVerifiedNoStarts(this.sql, this.now());

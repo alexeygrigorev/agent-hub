@@ -19,6 +19,7 @@ async function fixture(fn:(r:ResourceManagement,sql:any,f:FleetService)=>Promise
   sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,'launch','admin','human','work','key',JSON.stringify({intake_task_id:'task'}),'host','opencode','go','headless','/repo','goal','running','native',iso(-600000),iso());
   sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,'session','admin','control',JSON.stringify({intake_task_id:'task'}),'launch','host','opencode','headless','running',JSON.stringify(binding),iso(-600000),iso());
   sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,last_activity_at) VALUES(?,?,?,?,?,?,?,?)`,'host','native','agent','opencode','running',iso(),'/repo',iso(-3600001));
+  r.initCatalogCache();
   await fn(r,sql,f);
  });
 }
@@ -28,6 +29,153 @@ const sample=(extra={})=>({session_id:'session',native_id:'native',current_rss_m
 const closeIntake=(sql:any)=>sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.status','done','$.history',json(?)) WHERE id='task'",
  JSON.stringify([{kind:'note',text:'DONE abc1234\nlive check: synthetic resource fixture\nresult: synthetic acceptance criteria verified'}]));
 describe('resource management',()=>{
+
+
+
+
+
+ it('bounds already-recorded exit reads to incoming native IDs despite retained history',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec('UPDATE session_resource_usage SET finished_at=?',iso());
+  sql.exec(`WITH RECURSIVE retained(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM retained WHERE n<1001)
+    INSERT INTO session_resource_usage SELECT 'retained-'||n,machine_id,'retained-native-'||n,NULL,NULL,project,engine,model,tier,kind,started_at,finished_at,state,NULL,NULL,NULL,NULL,NULL,observed_at
+    FROM session_resource_usage,retained WHERE session_id='session'`);
+  let reads=0,queries=0;
+  const boundedSql:any={exec:(query:string,...args:any[])=>{
+   const cursor=sql.exec(query,...args);
+   if(query.startsWith('SELECT native_id FROM session_resource_usage')) return {toArray:()=>{const rows=cursor.toArray();reads+=rows.length;queries++;return rows;}};
+   return cursor;
+  }};
+  const observer=new ResourceManagement(boundedSql,()=>now);
+  observer.finishObserved('host',[{native_id:'native',phase:'exited',confirmed_exit:true}]);
+  expect(queries).toBe(1);expect(reads).toBe(1);
+  // A full host census must remain inside SQLite's bind limit, including
+  // the machine filter, and still inspect IDs in the final partial batch.
+  observer.finishObserved('host',Array.from({length:500},(_,i)=>({
+   native_id:i===499?'native':'retained-native-'+(i+1),phase:'exited',confirmed_exit:true,
+  })));
+  expect(queries).toBeGreaterThan(1);expect(reads).toBe(501);
+ }));
+ it('keeps resource reports bounded across retained terminal sessions and repeated state changes',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec("UPDATE session_resource_usage SET state='exited',finished_at=? WHERE session_id='session'",iso());
+  sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id='session'");
+  sql.exec(`WITH RECURSIVE retained(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM retained WHERE n<210)
+    INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    SELECT 'terminal-'||n,'admin','terminal-'||n,'{}','host','opencode','headless','exited',
+      json_object('native_id','terminal-native-'||n,'tag','terminal-tag-'||n,'workspace','/repo','native_created_at_ms',?),?,?
+    FROM retained`,now-600000,iso(-600000),iso());
+  sql.exec(`WITH RECURSIVE retained(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM retained WHERE n<210)
+    INSERT INTO session_resource_usage
+    SELECT 'terminal-'||n,'host','terminal-native-'||n,NULL,NULL,'demo','opencode',NULL,'normal','goal',?,?,'exited',NULL,NULL,NULL,NULL,NULL,?
+    FROM retained`,iso(-600000),iso(),iso());
+  let ledgerReads=0,ledgerWrites=0;
+  const boundedSql:any={exec:(query:string,...args:any[])=>{
+   if(query.startsWith('SELECT native_id FROM session_resource_usage WHERE machine_id=')) ledgerReads++;
+   if(query.startsWith('INSERT INTO session_resource_usage VALUES')) ledgerWrites++;
+   return sql.exec(query,...args);
+  }};
+  const reporter=new ResourceManagement(boundedSql,()=>now);
+  reporter.initCatalogCache();
+  reporter.report('host',{samples:[],reaps:[]});
+  // An unrelated source revision must not restart an in-progress terminal sweep.
+  sql.exec("UPDATE session_control_sessions SET updated_at=? WHERE id='session'",iso(-1));
+  reporter.report('host',{samples:[],reaps:[]});
+  expect(ledgerReads).toBeLessThanOrEqual(4);
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    VALUES('aaa-late','admin','aaa-late','{}','host','opencode','headless','exited',?, ?, ?)` ,
+    JSON.stringify({native_id:'aaa-late-native',tag:'aaa-late-tag',workspace:'/repo',native_created_at_ms:now-600000}),iso(-600000),iso());
+  reporter.report('host',{samples:[],reaps:[]});
+  expect(ledgerWrites).toBe(1);
+  expect(sql.exec("SELECT session_id FROM session_resource_usage WHERE session_id='aaa-late'").toArray()).toHaveLength(1);
+  expect(sql.exec("SELECT state FROM session_resource_usage WHERE session_id='session'").one().state).toBe('exited');
+ }));
+ it('excludes negative, fractional and unsafe token counts consistently from period totals',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec('UPDATE session_resource_usage SET finished_at=?',iso(-1000));
+  sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','host:native','native','agent','opencode','go',100,20,120,now);
+  for(const field of ['input_tokens','output_tokens','total_tokens']) for(const invalid of [-1,.5,9007199254740992]) {
+   sql.exec('UPDATE tbm_session_tokens SET input_tokens=100,output_tokens=20,total_tokens=120');
+   sql.exec('UPDATE tbm_session_tokens SET '+field+'=?',invalid);
+   expect(r.usage()[0]).toMatchObject({tokens_known:false,total_tokens:null,token_join_reason:'invalid_token_counts'});
+   expect(r.costTotals()['24h'].project[0]).toMatchObject({tokens_known_sessions:0,total_tokens:null});
+   expect(r.costTotals()['7d'].engine[0]).toMatchObject({tokens_known_sessions:0,total_tokens:null});
+  }
+ }));
+ it('joins tokens and persists resource rows directly from confirmed Fleet catalog exits',async()=>fixture(async(r,sql,f)=>{
+  sql.exec('DELETE FROM session_control_sessions');
+  const native={native_id:'native',tag:'agent',workspace:'/repo',engine:'opencode',created_at_ms:now-600000,phase:'exited',confirmed_exit:true,agent_state:null,profile:null,account:'go',tokens:{input_tokens:100,output_tokens:20}};
+  const response=await f.handle(new Request('https://hub.test/api/fleet/sessions',{method:'PUT',body:JSON.stringify({sessions:[native]})}),{caller:{kind:'host',machineId:'host',actor:'host:host'},scopes:['host']});
+  expect(response.status).toBe(200);
+  expect(r.usage()).toHaveLength(1);
+  expect(r.usage()[0]).toMatchObject({state:'exited',finished_at:iso(),tokens_known:true,total_tokens:120,cpu_seconds:null,peak_rss_mb:null});
+ }));
+ it('records confirmed Fleet native death while the routed task remains running, without samples',async()=>fixture(async(r,sql)=>{
+  sql.exec('DELETE FROM session_control_sessions');
+  sql.exec('UPDATE fleet_sessions SET created_at_ms=?',now-600000);
+  const native={native_id:'native',tag:'agent',workspace:'/repo',engine:'opencode',created_at_ms:now-600000,phase:'exited',confirmed_exit:true};
+  for(const mismatch of [{confirmed_exit:false},{tag:'other'},{workspace:'/other'},{engine:'codex'},{created_at_ms:now}]) {
+   r.finishObserved('host',[{...native,...mismatch}]); expect(r.usage()).toHaveLength(0);
+  }
+  r.finishObserved('host',[native]); r.finishObserved('host',[native]);
+  expect(r.usage()).toHaveLength(1);
+  expect(r.usage()[0]).toMatchObject({session_id:'fleet:launch',finished_at:iso(),state:'exited',peak_rss_mb:null,cpu_seconds:null});
+  expect(sql.exec("SELECT state FROM fleet_launches WHERE id='launch'").one().state).toBe('running');
+  expect(sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions').one().n).toBe(0);
+ }));
+ it('aggregates the full finish window beyond the 500-row table with honest token coverage',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec("UPDATE session_resource_usage SET finished_at=?",iso(-1000));
+  sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','host:native','native','agent','opencode','go',100,20,120,now);
+  for(let i=0;i<501;i++) sql.exec(`INSERT INTO session_resource_usage SELECT ?,machine_id,?,NULL,NULL,project,engine,model,tier,kind,started_at,finished_at,state,NULL,NULL,NULL,NULL,NULL,observed_at FROM session_resource_usage WHERE session_id='session'`,'extra'+i,'native'+i);
+  expect(r.usage()).toHaveLength(500);
+  expect(r.costTotals()['24h'].project[0]).toMatchObject({name:'demo',sessions:502,tokens_known_sessions:1,total_tokens:120,cpu_seconds:20,cpu_known_sessions:1});
+  sql.exec("UPDATE session_resource_usage SET finished_at=? WHERE session_id='session'",iso(-2*86400000));
+  expect(r.costTotals()['24h'].project[0]).toMatchObject({sessions:501,tokens_known_sessions:0,total_tokens:null,cpu_seconds:null});
+  expect(r.costTotals()['7d'].engine[0]).toMatchObject({sessions:502,total_tokens:120});
+ }));
+ it('rejects conflicting alias token records in both rows and totals',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec("UPDATE session_resource_usage SET finished_at=?",iso(-1000));
+  for(const [id,total] of [['host:native',120],['session',150]]) sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)',id,'native','agent','opencode','go',100,20,total,now);
+  expect(r.usage()[0]).toMatchObject({tokens_known:false,total_tokens:null,token_join_reason:'conflicting_token_records'});
+  expect(r.costTotals()['24h'].project[0]).toMatchObject({tokens_known_sessions:0,total_tokens:null});
+ }));
+ it('durably records a Fleet-only finish without inventing missed measurements',async()=>fixture(async(r,sql)=>{
+  sql.exec('DELETE FROM session_control_sessions');
+  sql.exec("UPDATE fleet_launches SET state='exited',finished_at=? WHERE id='launch'",iso());
+  r.report('host',{samples:[],reaps:[]});
+  r.report('host',{samples:[],reaps:[]});
+  expect(r.usage()).toHaveLength(1);
+  expect(r.usage()[0]).toMatchObject({session_id:'fleet:launch',state:'exited',finished_at:iso(),peak_rss_mb:null,cpu_seconds:null,resource_measurement_reason:'host_measurement_missing'});
+  r.report('host',{samples:[sample({session_id:'fleet:launch'})],reaps:[]});
+  expect(r.usage()[0]).toMatchObject({peak_rss_mb:200,cpu_seconds:20,resource_measurement_reason:null});
+ }));
+ it('joins proven machine/native tokens for Hub, observed and Fleet-only ledger identities',async()=>fixture(async(r,sql)=>{
+  sql.exec(`CREATE TABLE IF NOT EXISTS tbm_session_tokens(session_id TEXT PRIMARY KEY,native_id TEXT,tag TEXT,engine TEXT,account TEXT,input_tokens INTEGER,output_tokens INTEGER,total_tokens INTEGER,observed_at_ms INTEGER)`);
+  for (const mode of ['hub','observed','fleet']) {
+   sql.exec('DELETE FROM session_resource_usage');
+   if(mode==='observed') sql.exec("UPDATE session_control_sessions SET fleet_launch_id=NULL");
+   if(mode==='fleet') sql.exec('DELETE FROM session_control_sessions');
+   const session=r.sessions('host')[0];
+   r.report('host',{samples:[sample({session_id:session.session_id})],reaps:[]});
+   sql.exec('INSERT OR REPLACE INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','host:native','native','agent','opencode','go',100,20,120,now);
+   expect(r.usage()).toHaveLength(1);
+   expect(r.usage()[0]).toMatchObject({tokens_known:true,input_tokens:100,output_tokens:20,total_tokens:120,cpu_seconds:20,peak_rss_mb:200,token_join_key:'host:native',token_join_reason:null});
+  }
+ }));
+ it('keeps missing and unproven tokens unknown, and preserves measured zero',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec('DELETE FROM tbm_session_tokens');
+  expect(r.usage()[0]).toMatchObject({tokens_known:false,total_tokens:null,token_join_reason:'token_record_missing'});
+  sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','other:native','native','agent','opencode','go',100,20,120,now);
+  expect(r.usage()[0].tokens_known).toBe(false);
+  sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','host:native','wrong','agent','opencode','go',100,20,120,now);
+  expect(r.usage()[0].token_join_reason).toBe('native_binding_mismatch');
+  sql.exec("UPDATE tbm_session_tokens SET native_id='native',input_tokens=0,output_tokens=0,total_tokens=0 WHERE session_id='host:native'");
+  expect(r.usage()[0]).toMatchObject({tokens_known:true,total_tokens:0});
+ }));
+
  it('keeps cached canonical identities and protections current across writes and rollbacks',async()=>fixture(async(r,sql,f)=>{
   r.initCatalogCache();
   let builds=0; const build=(r as any).buildCanonicalSessions.bind(r);

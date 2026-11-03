@@ -78,6 +78,12 @@ try {
         }
         return route.fulfill({ json: { mode: grokPreference, effective_mode: 'disabled', factor: 0, enabled: false } });
       }
+      if (u.pathname === '/api/quota/metrics') {
+        return route.fulfill({ json: { pools: [{ pool_id: 'codex:main', windows: Object.fromEntries(['24h', '7d'].map(w => [w, { metrics: {
+          useful_work_per_tokens: { value: null, reason: 'no_measured_native_tokens', unit: 'work_units/million_tokens', source: 'native tokens' },
+          burn_rate_vs_pacing_target: { value: 0.5, unit: 'ratio', source: 'observed samples' },
+        } }])) }] } });
+      }
       if (u.pathname === '/api/quota/pacing') {
         assert.equal(request.headers()['x-csrf-token'], 'fixture');
         if (mode === 'error') return route.fulfill({ status: 503, body: '' });
@@ -129,6 +135,10 @@ try {
     await page.getByRole('link', { name: 'Back to Metrics', exact: true }).click();
     await page.getByRole('button', { name: 'Usage', exact: true }).click();
     await page.locator('#tbm > summary').click();
+    await page.waitForFunction(() => document.getElementById('tbm-catalog').textContent.includes('no_measured_native_tokens'));
+    assert.equal(await page.locator('#tbm-catalog details').count(), 2);
+    assert.match(await page.locator('#tbm-catalog').innerText(), /Unknown/);
+    assert.match(await page.locator('#tbm-catalog').innerText(), /0.5/);
     // Spend-vs-pace per pool.
     assert.equal(await page.locator('#tbm-pacing .tbm-pool').count(), 2);
     assert.equal(await page.locator('#tbm-pacing .tbm-pool svg').count(), 1, 'only the pool with reset renders a chart');

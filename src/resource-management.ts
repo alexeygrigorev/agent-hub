@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS session_rss_median (session_id TEXT PRIMARY KEY, p50_
 CREATE TABLE IF NOT EXISTS session_oom_kills (session_id TEXT PRIMARY KEY, oom_kills INTEGER NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_finalized (session_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_metadata (session_id TEXT PRIMARY KEY, workspace TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS resource_terminal_reconcile (machine_id TEXT PRIMARY KEY, revision TEXT NOT NULL, cursor_key TEXT, complete INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS resource_ramps (launch_id TEXT PRIMARY KEY, started_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_usage (
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS session_resource_usage (
  started_at TEXT NOT NULL, finished_at TEXT, state TEXT NOT NULL,
  peak_rss_mb REAL, peak_pss_mb REAL, cpu_seconds REAL, runtime_s REAL, avg_cpu_cores REAL,
  observed_at TEXT NOT NULL, UNIQUE(machine_id,native_id));
+CREATE INDEX IF NOT EXISTS resource_cost_finished ON session_resource_usage(finished_at);
 CREATE INDEX IF NOT EXISTS session_resource_estimate ON session_resource_usage(engine,project,kind,finished_at);
 CREATE INDEX IF NOT EXISTS resource_memory_recent ON session_resource_usage(engine,observed_at DESC) WHERE finished_at IS NOT NULL AND peak_rss_mb > 0;
 CREATE INDEX IF NOT EXISTS resource_cpu_recent ON session_resource_usage(observed_at DESC) WHERE finished_at IS NOT NULL;
@@ -107,6 +109,7 @@ const NATIVE_KEY = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(
 export class ResourceManagement {
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
+  private catalogRevision:string|null=null;
   private catalogRawRows=new Map<string,any[]>();
   private catalogRawBytes=0;
   private catalogIntakes: ReturnType<typeof worktreeIntakeSnapshot> | null = null;
@@ -484,6 +487,7 @@ export class ResourceManagement {
     // durable random generation, including rollback and retry. Activity is live.
     const raw=this.catalogReady ? this.sql.exec('SELECT revision,structure_revision FROM resource_catalog_revision WHERE id=1').toArray()[0] : null;
     const revision=typeof raw?.revision==='string' && /^[a-f0-9]{32}$/.test(raw.revision) ? raw.revision : null;
+    this.catalogRevision=revision;
     const structure=revision!==null && typeof raw?.structure_revision==='string' && /^[a-f0-9]{32}$/.test(raw.structure_revision) ? raw.structure_revision : null;
     if(structure===null || structure!==this.catalogStructureRevision) {this.catalogRawRows.clear();this.catalogRawBytes=0;this.catalogIntakes=null;}
     this.catalogStructureRevision=structure;
@@ -513,6 +517,45 @@ export class ResourceManagement {
       ...(machine ? [machine] : [])).map(row=>[JSON.stringify([row.machine_id,row.native_id]),row.last_activity_at]));
     // Callers cannot mutate a cached protection or alias list.
     return rows.map(row=>({...row,aliases:[...row.aliases],last_activity_at:activity.get(JSON.stringify([row.machine_id,row.native_id])) ?? null}));
+  }
+  /** Reconcile missed terminal reports in bounded pages, once per canonical
+   * catalog revision. Explicit confirmed exits still use finishObserved(). */
+  private terminalSamples(machine: string, sessions: Map<string,any>, sampled: Set<string>, limit: number) {
+    if(limit<=0 || !this.catalogRevision) return [];
+    const current=this.sql.exec('SELECT revision,cursor_key,complete FROM resource_terminal_reconcile WHERE machine_id=?',machine).toArray()[0] as any;
+    if(current?.revision===this.catalogRevision && current.complete===1) return [];
+    // Preserve progress through unrelated catalog changes while a sweep is in
+    // flight. At its end, restart if the source revision moved so late or
+    // backdated bindings before the cursor are picked up on the next pass.
+    const cursor=current?.complete===1 && current.revision!==this.catalogRevision
+      ? null : (current?.cursor_key as string|null ?? null);
+    const scanRevision=current?.complete===1 && current.revision!==this.catalogRevision
+      ? this.catalogRevision : (current?.revision ?? this.catalogRevision);
+    const candidates=[...new Map([...sessions.values()].filter(s=>TERMINAL.has(s.state) && s.finished_at)
+      .map(s=>[s.native_id,s])).values()]
+      .filter(s=>!s.aliases.some((id:string)=>sampled.has(id)) && (!cursor || s.session_id>cursor))
+      .sort((a,b)=>a.session_id<b.session_id?-1:a.session_id>b.session_id?1:0);
+    const window=candidates.slice(0,Math.min(200,limit));
+    if(!window.length) {
+      const changed=scanRevision!==this.catalogRevision;
+      this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_key,complete) VALUES(?,?,NULL,?)
+        ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,cursor_key=NULL,complete=excluded.complete`,
+        machine,changed?this.catalogRevision:scanRevision,changed?0:1);
+      return [];
+    }
+    const finished=new Set<string>();
+    for(let i=0;i<window.length;i+=99) {
+      const batch=window.slice(i,i+99);
+      for(const row of this.sql.exec('SELECT native_id FROM session_resource_usage WHERE machine_id=? AND finished_at IS NOT NULL AND native_id IN ('+batch.map(()=>'?').join(',')+')',machine,...batch.map(s=>s.native_id)).toArray()) finished.add(String(row.native_id));
+    }
+    const last=window[window.length-1].session_id;
+    const hasMore=candidates.length>window.length;
+    const changedAtEnd=!hasMore && scanRevision!==this.catalogRevision;
+    this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_key,complete) VALUES(?,?,?,?)
+      ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,cursor_key=excluded.cursor_key,complete=excluded.complete`,
+      machine,changedAtEnd?this.catalogRevision:scanRevision,hasMore?last:null,hasMore||changedAtEnd?0:1);
+    const at=new Date(this.now()).toISOString();
+    return window.filter(s=>!finished.has(s.native_id)).map(s=>({session_id:s.session_id,native_id:s.native_id,observed_at:at}));
   }
   private buildCanonicalSessions(machine?: string) {
     type Bound = ReturnType<ResourceManagement['boundSessions']>[number];
@@ -631,13 +674,50 @@ export class ResourceManagement {
     }
     return {saved:true,evidence_id:value.id};
   }
+  /** Account for a confirmed native exit even when the process was never
+   * sampled. This records costs only; routed task completion and stop authority
+   * still belong to their existing services. */
+  finishObserved(machine: string, natives: any[]) {
+    const exits=natives.filter(native=>native.confirmed_exit===true && ['exited','dead'].includes(native.phase));
+    if(!exits.length) return;
+    const recorded=new Set<string>();
+    const ids=[...new Set(exits.map(native=>native.native_id))];
+    // Durable Object SQLite allows 100 binds; reserve one for machine_id.
+    for(let i=0;i<ids.length;i+=99) {
+      const batch=ids.slice(i,i+99);
+      for(const row of this.sql.exec('SELECT native_id FROM session_resource_usage WHERE machine_id=? AND finished_at IS NOT NULL AND native_id IN ('+batch.map(()=>'?').join(',')+')',machine,...batch).toArray()) recorded.add(String(row.native_id));
+    }
+    const pending=exits.filter(native=>!recorded.has(native.native_id));
+    if(!pending.length) return;
+    const sessions=new Map(this.canonicalSessions(machine).map(s=>[s.native_id,s]));
+    const finished=pending.flatMap(native=>{
+      const session=sessions.get(native.native_id);
+      if(!session || native.confirmed_exit!==true || !['exited','dead'].includes(native.phase)
+        || !Number.isFinite(native.created_at_ms) || native.created_at_ms!==session.native_created_at_ms
+        || native.tag!==session.tag || native.workspace!==session.workspace || native.engine!==session.engine) return [];
+      return [{session,native}];
+    });
+    if(!finished.length) return;
+    const at=new Date(this.now()).toISOString();
+    // Reuse the same native-unique upsert and metadata rules as measurements.
+    for(let i=0;i<finished.length;i+=200) this.report(machine,{samples:finished.slice(i,i+200).map(({session})=>({
+      session_id:session.session_id,native_id:session.native_id,observed_at:at})),reaps:[]});
+    for(const {session,native} of finished) this.sql.exec(`UPDATE session_resource_usage SET
+      state=CASE WHEN finished_at IS NULL THEN ? ELSE state END,finished_at=COALESCE(finished_at,?)
+      WHERE machine_id=? AND native_id=?`,native.phase,at,machine,session.native_id);
+  }
   report(machine: string, value: any) {
     // Accept reports already in flight under an older canonical alias, but put
     // every physical native in exactly one durable ledger row.
     const sessions = new Map(this.canonicalSessions(machine).flatMap(s => s.aliases.map(id=>[id,s] as const)));
     if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100
       || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
-    for (const sample of value.samples) {
+    // Keep the payload bounded. Confirmed exits without a sample are reconciled
+    // in revision-scoped pages, never by a per-session lookup on every report.
+    const samples=[...value.samples];
+    const sampled=new Set(samples.map(s=>s.session_id));
+    samples.push(...this.terminalSamples(machine,sessions,sampled,200-samples.length));
+    for (const sample of samples) {
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
       for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores','oom_kills']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
@@ -721,6 +801,22 @@ export class ResourceManagement {
     }
     return {reported:true,samples:value.samples.length,reaps:value.reaps.length};
   }
+  private tokenUsage(row: any, tokens: Map<string,any>) {
+    const key = row.machine_id + ':' + row.native_id;
+    const unknown = (reason: string) => ({token_join_key:key,tokens_known:false,
+      input_tokens:null,output_tokens:null,total_tokens:null,token_join_reason:reason});
+    // Native ids and tags alone are not machine-scoped identities.
+    const rows = [...new Set([tokens.get(key),tokens.get(row.session_id)])].filter(Boolean);
+    const proven = rows.filter(t => t.native_id === row.native_id);
+    if (!proven.length) return unknown(rows.length ? 'native_binding_mismatch' : 'token_record_missing');
+    const token = proven.find(t => t.session_id === key) ?? proven[0];
+    if (proven.some(t => ['input_tokens','output_tokens','total_tokens'].some(k => t[k] !== token[k])))
+      return unknown('conflicting_token_records');
+    if (['input_tokens','output_tokens','total_tokens'].some(k => !Number.isSafeInteger(token[k]) || token[k] < 0))
+      return unknown('invalid_token_counts');
+    return {token_join_key:key,tokens_known:true,input_tokens:token.input_tokens,
+      output_tokens:token.output_tokens,total_tokens:token.total_tokens,token_join_reason:null};
+  }
   usage(filters: any = {}) {
     const clauses:string[]=[], args:string[]=[];
     for (const k of ['project','engine','kind']) if(filters[k]) { clauses.push(k+'=?');args.push(filters[k]); }
@@ -729,7 +825,52 @@ export class ResourceManagement {
       const key=r.machine_id+':'+r.native_id;
       if (!latestThrottle.has(key)) latestThrottle.set(key,r.action);
     }
-    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,p50_rss_mb:this.sql.exec('SELECT p50_rss_mb FROM session_rss_median WHERE session_id=?',r.session_id).toArray()[0]?.p50_rss_mb ?? null,oom_kills:this.sql.exec('SELECT oom_kills FROM session_oom_kills WHERE session_id=?',r.session_id).toArray()[0]?.oom_kills ?? null,project_label:projectLabel(r.project),rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)==='throttled'}));
+    const rows=this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray() as any[];
+    const tokens=new Map<string,any>();
+    const hasTokens=this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tbm_session_tokens'").toArray().length>0;
+    if(hasTokens && rows.length) {
+      const ids=[...new Set(rows.flatMap(r=>[r.session_id,r.machine_id+':'+r.native_id]))];
+      for(let i=0;i<ids.length;i+=100) {
+        const batch=ids.slice(i,i+100);
+        for(const t of this.sql.exec('SELECT * FROM tbm_session_tokens WHERE session_id IN ('+batch.map(()=>'?').join(',')+')',...batch).toArray() as any[]) tokens.set(t.session_id,t);
+      }
+    }
+    return rows.map((r:any)=>({...r,
+      started_at:r.started_at || null,
+      workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,
+      p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,
+      p50_rss_mb:this.sql.exec('SELECT p50_rss_mb FROM session_rss_median WHERE session_id=?',r.session_id).toArray()[0]?.p50_rss_mb ?? null,
+      oom_kills:this.sql.exec('SELECT oom_kills FROM session_oom_kills WHERE session_id=?',r.session_id).toArray()[0]?.oom_kills ?? null,
+      project_label:projectLabel(r.project),
+      resource_measurement_reason:r.peak_rss_mb==null || r.cpu_seconds==null ? 'host_measurement_missing' : null,
+      rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)==='throttled',...this.tokenUsage(r,tokens),...(!hasTokens ? {token_join_reason:'token_ledger_unavailable'} : {})}));
+  }
+  costTotals() {
+    const hasTokens=this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tbm_session_tokens'").toArray().length>0;
+    const result:Record<string,any>={};
+    for(const [period,hours] of [['24h',24],['7d',168]] as const) {
+      const since=new Date(this.now()-hours*3600000).toISOString(),until=new Date(this.now()).toISOString();
+      const joined=hasTokens ? `LEFT JOIN tbm_session_tokens t ON t.session_id=u.machine_id || ':' || u.native_id AND t.native_id=u.native_id
+        LEFT JOIN tbm_session_tokens d ON d.session_id=u.session_id AND d.native_id=u.native_id` : '';
+      const countsValid=['input_tokens','output_tokens','total_tokens'].map(k=>{
+        const value=`COALESCE(t.${k},d.${k})`;
+        return `(typeof(${value}) IN ('integer','real') AND ${value}>=0 AND ${value}<=9007199254740991 AND CAST(${value} AS INTEGER)=${value})`;
+      }).join(' AND ');
+      const valid=hasTokens ? `${countsValid} AND
+        (t.session_id IS NULL OR d.session_id IS NULL OR (t.total_tokens=d.total_tokens AND t.input_tokens=d.input_tokens AND t.output_tokens=d.output_tokens))` : '0';
+      const total=hasTokens ? 'COALESCE(t.total_tokens,d.total_tokens)' : 'NULL';
+      const groups:Record<string,any>={};
+      for(const dimension of ['project','engine']) groups[dimension]=this.sql.exec(`SELECT u.${dimension} AS name,COUNT(*) AS sessions,
+        SUM(CASE WHEN ${valid} THEN 1 ELSE 0 END) AS tokens_known_sessions,
+        SUM(CASE WHEN ${valid} THEN ${total} ELSE NULL END) AS total_tokens,
+        SUM(u.cpu_seconds) AS cpu_seconds,COUNT(u.cpu_seconds) AS cpu_known_sessions,
+        SUM(u.runtime_s) AS runtime_s,COUNT(u.runtime_s) AS runtime_known_sessions,
+        MAX(u.peak_rss_mb) AS peak_rss_mb,COUNT(u.peak_rss_mb) AS memory_known_sessions
+        FROM session_resource_usage u ${joined} WHERE u.finished_at>=? AND u.finished_at<=?
+        GROUP BY u.${dimension} ORDER BY u.${dimension}`,since,until).toArray();
+      result[period]={since,until,...groups};
+    }
+    return result;
   }
   reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
   throttles() {
@@ -790,7 +931,7 @@ export class ResourceManagement {
     const sessions=this.usage(),groups=new Map<string,any[]>();
     for (const row of sessions as any[]) {const key=JSON.stringify([row.project_label,row.engine,row.model,row.kind]); if(!groups.has(key))groups.set(key,[]);groups.get(key)!.push(row);}
     const throttles=this.throttles();
-    return {config:this.config(),hosts,sessions,stats:[...groups.values()].map(rows=>({project:rows[0].project_label,engine:rows[0].engine,model:rows[0].model,kind:rows[0].kind,samples:rows.length,
+    return {config:this.config(),hosts,sessions,cost_totals:this.costTotals(),stats:[...groups.values()].map(rows=>({project:rows[0].project_label,engine:rows[0].engine,model:rows[0].model,kind:rows[0].kind,samples:rows.length,
       p50_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),50),p90_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),90)})),reaps:this.reaps(),
       throttles,active_throttles:throttles.filter((t:any)=>t.active).length};
   }

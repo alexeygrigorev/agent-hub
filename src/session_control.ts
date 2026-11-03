@@ -12,6 +12,7 @@ import { DRIVER_SCOPE, driverAccessContext, driverRequestAllowed } from './drive
 import { registeredRepoLabel } from './repos';
 import { decodeRepoWorkspace, disabledEngines, encodeRepoWorkspace } from './fleet';
 import { modelDisabledByPolicy } from './model-routing';
+import { recordTbmAdmission } from './tbm-metrics';
 import { initResourceRequestProjection } from './sql-json-projection';
 import { abandonedLaunch, expireSilentStartRows } from './silent-start';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
@@ -2845,11 +2846,21 @@ export class SessionControlService {
           if (guard.error) return response(guard.error, 409);
           worktreeMachine = guard.machine;
         }
+        // First terminal admission decision per authorized actor/key. Replays
+        // retain the original observation; no task text or credentials stored.
+        const admission = (outcome: 'accepted' | 'rejected' | 'no_eligible_route' | 'queued', poolId: string | null = null) => {
+          if (mode === 'interactive') return;
+          if (admin && caller.kind === 'human' && caller.tokenId) {
+            if (!this.cleanupCallerLive(caller)) return;
+          } else if (!admin && !this.agentLive(caller)) return;
+          recordTbmAdmission(this.sql, { request_id: JSON.stringify([actor, input.key]), pool_id: poolId, outcome }, this.now());
+        };
         // TBM Phase 2: kill-switch + hard floor + dynamic soft reserve for
         // autonomous starts (fail closed; interactive starts unaffected).
         if (mode !== 'interactive') {
           const gate = this.tbmGate(input.engine);
           if (!gate.ok) {
+            admission('rejected', gate.pool_id ?? null);
             const status = gate.reason === 'kill_switch_active' ? 423 : 409;
             return response({ error: 'tbm_admission_denied', reason: gate.reason, pool_id: gate.pool_id, detail: gate.detail ?? null }, status);
           }
@@ -2906,6 +2917,7 @@ export class SessionControlService {
           if (!creatorFamily) return response({ error: 'forbidden' }, 403);
         }
         if (!this.hooks.reserve) {
+          admission('no_eligible_route');
           if (!prior) {
             const id = crypto.randomUUID();
             const at = this.at();
@@ -2958,6 +2970,8 @@ export class SessionControlService {
           recoveryRes.engine, effectiveMode, effectiveSessionType, JSON.stringify(currentCanonical), id,
         );
       }
+        admission(reserved.value?.error === 'no_eligible_route' ? 'no_eligible_route'
+          : reserved.status >= 300 ? 'rejected' : reserved.value?.state === 'queued' ? 'queued' : 'accepted');
         if (reserved.status === 400) {
           const rejected = Array.isArray(reserved.value?.rejected) ? reserved.value.rejected : [];
           const reason = [reserved.value?.reason, rejected[0]?.reason, reserved.value?.error]
