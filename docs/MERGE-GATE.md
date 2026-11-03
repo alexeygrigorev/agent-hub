@@ -26,8 +26,10 @@ SHA with `supersedes: ["<prior-report-event-id>"]`. The target must identify an
 earlier report event on the same intake with a commit SHA reference and may be
 superseded only once. Merge-check excludes only those explicitly superseded
 report events; commit events and malformed or dangling supersession data remain
-required evidence, so missing commits still fail closed. Supersession does not
-alter historical event content.
+required evidence, so missing commits still fail closed. Histories without a
+`supersedes` field retain the existing latest-report checkpoint behavior; adding
+the field opts that intake into explicit event-ID supersession. Supersession
+does not alter historical event content.
 
 Deploy states: `success`, `skipped`, `not_required` are green; `failure`,
 `pending`, `missing`, `unknown` block.

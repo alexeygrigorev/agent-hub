@@ -111,5 +111,6 @@ class TestMergeCheckCli(unittest.TestCase):
                 patch('agent_hub_host.merge_evidence.collect', return_value={'commits': []}) as collect:
             cli.main()
         request.assert_called_once_with('GET', '/api/intake/tasks/fixture-task')
-        collect.assert_called_once_with(str(Path('/repo').resolve()), [other_sha, new_sha], fetch=False, include_head=True)
+        collect.assert_called_once_with(str(Path('/repo').resolve()), [other_sha, new_sha], fetch=False,
+                                        include_head=True, preferred_deploy_sha=None)
         self.assertTrue(json.loads(output.getvalue())['dry_run'])

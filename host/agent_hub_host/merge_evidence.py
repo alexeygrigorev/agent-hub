@@ -117,9 +117,39 @@ def active_report_references(history: list) -> list:
 
 
 def explicit_commit_refs(history: list) -> list:
-    """Return normalized, unique explicit commit refs after report supersession."""
+    """Return commit refs, using explicit links when an intake opts into them.
+
+    Older histories keep the latest-report checkpoint behavior. Once a report
+    carries ``supersedes``, every report remains required unless a valid event
+    id explicitly supersedes it; commit events always remain cumulative.
+    """
+    events = history if isinstance(history, list) else []
+    explicit_mode = any(
+        isinstance(entry, dict) and entry.get('kind') == 'report' and 'supersedes' in entry
+        for entry in events
+    )
+    if explicit_mode:
+        candidates = active_report_references(events)
+    else:
+        active: list[tuple[int, str]] = []
+        latest_report: tuple[int, str] | None = None
+        for index, entry in enumerate(events):
+            if not isinstance(entry, dict) or entry.get('kind') not in ('report', 'commit'):
+                continue
+            ref = str(entry.get('reference') or '').strip()
+            if not SHA.fullmatch(ref):
+                continue
+            normalized = ref.lower()
+            if entry.get('kind') == 'report':
+                latest_report = (index, normalized)
+            else:
+                active.append((index, normalized))
+        if latest_report is not None:
+            active.append(latest_report)
+        candidates = [ref for _, ref in sorted(active)]
+
     refs = []
-    for ref in active_report_references(history):
+    for ref in candidates:
         normalized = ref.strip().lower()
         if SHA.fullmatch(normalized) and normalized not in refs:
             refs.append(normalized)
