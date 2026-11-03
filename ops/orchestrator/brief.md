@@ -31,3 +31,9 @@ Never approve prod deploys or GitHub environment gates. Never delete prod data o
 
 - AC6g: intake 34d0271b (src/intake.ts session-token 403) is the single fix for 71c56c6f; session fix-cred403 29785ad9 owns both. Do not duplicate.
 - Watch aplexer session aef8923c (obs-archive-p0, intake bfd84d52); restart only if it dies or stalls, never duplicate.
+
+## GitHub Actions polling (intake ee7c3fb0)
+
+- Never use `gh run watch` or `gh pr checks --watch`. For manual CI checks, wait at least 60 seconds between polls.
+- For a repository and commit SHA, read status through the shared host cache: `python3 scripts/ci-status.py --repo OWNER/REPO --sha <commit-sha>`. It coalesces concurrent requests for that key, caches successful results for 60 seconds, and shares a cooldown after a 403/secondary rate limit. Exit 75 means the shared cooldown is active; wait the reported interval before retrying.
+- Do not run parallel CI polling loops or `sleep`/`gh run view` loops. Read the returned workflow run status once per minute at most.
