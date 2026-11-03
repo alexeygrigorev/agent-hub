@@ -10,7 +10,8 @@ import { linkedIntake, linkedTaskIds, hasOpenWork, nativeGoalStatus, sessionWake
 import { workerAccessContext, workerWakeAllowed } from './worker-access';
 import { DRIVER_SCOPE, driverAccessContext, driverRequestAllowed } from './driver-access';
 import { registeredRepoLabel } from './repos';
-import { decodeRepoWorkspace, encodeRepoWorkspace } from './fleet';
+import { decodeRepoWorkspace, disabledEngines, encodeRepoWorkspace } from './fleet';
+import { modelDisabledByPolicy } from './model-routing';
 import { initResourceRequestProjection } from './sql-json-projection';
 import { abandonedLaunch, expireSilentStartRows } from './silent-start';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
@@ -42,7 +43,17 @@ export const WORKER_CHILD_PER_HOUR = 12;
 export const WORKER_CHILD_PER_INTAKE = 8;
 import { ResourceManagement } from './resource-management';
 import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold, toolCallStallThreshold } from './session_stall';
-import { recoveryProtected, recoveryWakePending } from './intake-recovery';
+import {
+  candidateInputForEngine,
+  formatRecoveryHoldReason,
+  intakeFailedEngines,
+  isIntakeRecoverySession,
+  isReplaceableRecoveryRejection,
+  recoveryEngineOrder,
+  recoveryProtected,
+  recoveryWakePending,
+  registerHeldReconciler,
+} from './intake-recovery';
 import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, stopHostOnline, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
@@ -456,6 +467,7 @@ export class SessionControlService {
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
     initLifecycleTables(this.sql);
+    registerHeldReconciler(this.sql, () => this.reconcileHeldSessions());
     try { ensureTbmControllerSchema(this.sql); } catch {}
     // Repair this day's pre-fix starts from canonical requests, once per id.
     // Run each repair atomically; historical manual links are left untouched.
@@ -1475,11 +1487,106 @@ export class SessionControlService {
     return { reason, rejected, hold: holdObj, needs_reason, needs_machines };
   }
 
+  private reserveRecoverySession(
+    sessionId: string,
+    input: Record<string, any>,
+    auth: Auth,
+    worktreeMachine?: string,
+    excludeSessionId?: string,
+    extraFailed?: Iterable<[string, string]>,
+  ): {
+    reserved: { value: any; status: number };
+    engine: string | null;
+    mode: 'interactive' | 'headless';
+    with_goal: boolean;
+    tier: string | undefined;
+    rejected: any[];
+  } {
+    const failedForIntake = intakeFailedEngines(this.sql, input.intake_task_id, { excludeSessionId, extraFailed });
+    const disabled = disabledEngines();
+    const claudeEnabled = (this.options?.env as any)?.HUB_RECOVERY_CLAUDE_ENABLED === 'true' || input.engine === 'claude';
+    const baseOrder = recoveryEngineOrder([...(claudeEnabled ? ['claude'] : []), 'codex', 'opencode', 'zcodex', 'antigravity']);
+    const startIdx = typeof input.engine === 'string' ? baseOrder.indexOf(input.engine) : -1;
+    const order = startIdx >= 0
+      ? [...baseOrder.slice(startIdx), ...baseOrder.slice(0, startIdx)]
+      : baseOrder;
+    const project = input.intake_task_id
+      ? parsed(this.sql.exec('SELECT data FROM intake_tasks WHERE id=?', input.intake_task_id).toArray()[0]?.data, {}).project
+      : undefined;
+    const allRejected: any[] = [];
+    for (const eng of order) {
+      if (failedForIntake.has(eng)) {
+        allRejected.push({ machine: input.machine ?? worktreeMachine ?? '', engine: eng, reason: failedForIntake.get(eng)! });
+        continue;
+      }
+      if (disabled.has(eng) || modelDisabledByPolicy(eng)) {
+        allRejected.push({ machine: input.machine ?? worktreeMachine ?? '', engine: eng, reason: 'provider_disabled' });
+        continue;
+      }
+      const cand = candidateInputForEngine(input, eng, this.sql);
+      const candMode: 'interactive' | 'headless' = cand.mode === 'interactive' ? 'interactive' : 'headless';
+      const candWithGoal = cand.with_goal === true;
+      const candTier = typeof cand.tier === 'string' ? cand.tier : undefined;
+      if (candMode !== 'interactive' && !this.tbmGate(eng).ok) {
+        allRejected.push({ machine: input.machine ?? worktreeMachine ?? '', engine: eng, reason: 'tbm_admission_denied' });
+        continue;
+      }
+      const reservePayload = (m: 'interactive' | 'headless', wg: boolean, suffix = '') => ({
+        ...(input.task_kind !== undefined && input.task_kind !== null ? { task_kind: input.task_kind } : {}),
+        ...(project ? { project } : {}),
+        mode: m,
+        ...(input.machine || worktreeMachine ? { machine: input.machine ?? worktreeMachine } : {}),
+        engine: eng,
+        ...(candTier ? { tier: candTier } : {}),
+        ...(input.engine_override_reason ? { engine_override_reason: input.engine_override_reason } : {}),
+        ...(input.needs !== undefined && input.needs !== null ? { needs: input.needs } : {}),
+        workspace: input.workspace,
+        cwd: input.cwd ?? null,
+        prompt: input.brief || '',
+        ...(input.access !== undefined && input.access !== null ? { access: input.access } : {}),
+        ...(wg ? { with_goal: true } : {}),
+        idempotency_key: 'session-control-' + sessionId + (eng === input.engine && !suffix ? '' : '-' + eng + suffix),
+      });
+      let res = this.hooks.reserve!(reservePayload(candMode, candWithGoal), auth);
+      let usedMode = candMode;
+      let usedWithGoal = candWithGoal;
+      if (res.status >= 300 && candWithGoal && Array.isArray(res.value?.rejected) && res.value.rejected.length > 0 &&
+          res.value.rejected.every((r: any) => ['goal_unsupported', 'mode_unavailable'].includes(r.reason))) {
+        res = this.hooks.reserve!(reservePayload('headless', false, '-hl'), auth);
+        usedMode = 'headless';
+        usedWithGoal = false;
+      }
+      if (res.status < 300) {
+        return { reserved: res, engine: eng, mode: usedMode, with_goal: usedWithGoal, tier: candTier, rejected: allRejected };
+      }
+      const rej = Array.isArray(res.value?.rejected) && res.value.rejected.length
+        ? res.value.rejected
+        : [{ machine: input.machine ?? worktreeMachine ?? '', engine: eng, reason: res.value?.reason || res.value?.error || 'no_eligible_route' }];
+      allRejected.push(...rej);
+    }
+    const holdReason = formatRecoveryHoldReason(allRejected);
+    return {
+      reserved: {
+        status: 409,
+        value: { error: 'no_eligible_route', reason: holdReason, rejected: allRejected },
+      },
+      engine: null,
+      mode: (input.mode === 'interactive' ? 'interactive' : 'headless'),
+      with_goal: input.with_goal === true,
+      tier: input.tier,
+      rejected: allRejected,
+    };
+  }
+
   /** Re-evaluate unplaced held sessions whose hold was caused by transient
    * resource/capacity limits once real capacity exists (intake e25fa26e). */
   reconcileHeldSessions(limit = 5, targetSessionId?: string): { promoted: number; cancelled: number } {
     let promoted = 0, cancelled = 0;
     if (!this.hooks.reserve) return { promoted, cancelled };
+    if (limit <= 0 && !targetSessionId) {
+      this.heldReconcileAt = this.now();
+      return { promoted, cancelled };
+    }
     // Per-request (targeted) reads keep the original transient-only re-place so
     // GET /api/sessions/:id gains no new reserve work (intake e4123b02); the
     // rate-limited rotating pass below re-evaluates every hold reason.
@@ -1498,20 +1605,43 @@ export class SessionControlService {
       const now = this.now();
       let rows: any[];
       let cursor: any = null;
+      let effectiveLimit = limit;
       if (targetSessionId) {
         rows = this.sql.exec(`${HELD_UNPLACED_SQL} AND id = ?`, targetSessionId).toArray() as any[];
       } else {
-        if (now - this.heldReconcileAt < HELD_RECONCILE_INTERVAL_MS) return { promoted, cancelled };
-        this.heldReconcileAt = now;
-        cursor = this.sql.exec('SELECT created_at, session_id FROM session_control_held_cursor WHERE id = 1').toArray()[0] ?? null;
-        rows = (cursor
-          ? this.sql.exec(`${HELD_UNPLACED_SQL} AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?`,
-              cursor.created_at, cursor.session_id, window).toArray()
-          : this.sql.exec(`${HELD_UNPLACED_SQL} ORDER BY created_at, id LIMIT ?`, window).toArray()) as any[];
-        if (cursor && rows.length < window) {
-          // Wrap: continue from the start, up to (not past) the cursor.
-          rows.push(...this.sql.exec(`${HELD_UNPLACED_SQL} AND (created_at, id) <= (?, ?) ORDER BY created_at, id LIMIT ?`,
-            cursor.created_at, cursor.session_id, window - rows.length).toArray() as any[]);
+        // Intake 461f355e AC2: already-held recovery sessions whose only
+        // rejection is a per-intake engine failure or an account block must be
+        // re-placed on an eligible engine (or superseded) within one cycle.
+        const urgentRecoveryRows = (this.sql.exec(
+          `${HELD_UNPLACED_SQL} AND (actor = 'hub:service:intake-watchdog' OR json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.engine_override_reason') LIKE 'Intake recovery%') ORDER BY created_at, id LIMIT 32`
+        ).toArray() as any[]).filter(r => {
+          const req = parsed(r.request_json, {});
+          if (!isIntakeRecoverySession(r, req)) return false;
+          const hInfo = this.readHoldInfo(r, req);
+          if (typeof hInfo.reason === 'string' && hInfo.reason.startsWith('no_eligible_route(') && r.engine == null) return false;
+          return r.engine != null || (hInfo.rejected.length > 0 && hInfo.rejected.every((rej: any) => isReplaceableRecoveryRejection(rej?.reason)));
+        });
+        if (now - this.heldReconcileAt < HELD_RECONCILE_INTERVAL_MS) {
+          if (!urgentRecoveryRows.length) return { promoted, cancelled };
+          rows = urgentRecoveryRows;
+          effectiveLimit = Math.max(limit, urgentRecoveryRows.length);
+        } else {
+          this.heldReconcileAt = now;
+          cursor = this.sql.exec('SELECT created_at, session_id FROM session_control_held_cursor WHERE id = 1').toArray()[0] ?? null;
+          rows = (cursor
+            ? this.sql.exec(`${HELD_UNPLACED_SQL} AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?`,
+                cursor.created_at, cursor.session_id, window).toArray()
+            : this.sql.exec(`${HELD_UNPLACED_SQL} ORDER BY created_at, id LIMIT ?`, window).toArray()) as any[];
+          if (cursor && rows.length < window) {
+            // Wrap: continue from the start, up to (not past) the cursor.
+            rows.push(...this.sql.exec(`${HELD_UNPLACED_SQL} AND (created_at, id) <= (?, ?) ORDER BY created_at, id LIMIT ?`,
+              cursor.created_at, cursor.session_id, window - rows.length).toArray() as any[]);
+          }
+          if (urgentRecoveryRows.length) {
+            const seen = new Set(urgentRecoveryRows.map(r => r.id));
+            rows = [...urgentRecoveryRows, ...rows.filter(r => !seen.has(r.id))];
+            effectiveLimit = Math.max(limit, urgentRecoveryRows.length + limit);
+          }
         }
       }
       let last: any = null;
@@ -1520,13 +1650,15 @@ export class SessionControlService {
       const slowDue = now - this.heldSlowAt >= HELD_SLOW_INTERVAL_MS;
       const gates = new Map<string, boolean>();
       for (const row of rows) {
-        if (promoted >= limit || attempts >= limit) break;
+        if (promoted >= effectiveLimit || attempts >= effectiveLimit) break;
         if (!targetSessionId) last = row;
         // One failing row must not abort the pass for every row after it.
         try {
           const req = parsed(row.request_json, {});
           const holdInfo = this.readHoldInfo(row, req);
-          if (targetSessionId && (!holdInfo.rejected.length || !holdInfo.rejected.some((r: any) => transientReasons.has(String(r?.reason))))) continue;
+          const isRecovery = isIntakeRecoverySession(row, req);
+          const recoveryReplaceable = isRecovery && (row.engine != null || (holdInfo.rejected.length > 0 && holdInfo.rejected.every((r: any) => isReplaceableRecoveryRejection(r?.reason))));
+          if (targetSessionId && !recoveryReplaceable && (!holdInfo.rejected.length || !holdInfo.rejected.some((r: any) => transientReasons.has(String(r?.reason))))) continue;
           try {
             const priorCancel = this.sql.exec('SELECT 1 FROM session_control_cancellations WHERE session_id = ? LIMIT 1', row.id).toArray();
             if (priorCancel.length) continue;
@@ -1575,12 +1707,21 @@ export class SessionControlService {
                     JSON.stringify(linkIds.slice(i, i + 200))).toArray() as any[]) rowState.set(String(s.id), String(s.state));
                 }
                 const newer = linkIds.filter(id => id !== row.id && !(rowState.get(id) && terminalStates.includes(rowState.get(id)!)));
-                if (linkIds.includes(row.id) && newer.length) {
+                let supersededBy: string | null = (linkIds.includes(row.id) && newer.length) ? newer[newer.length - 1] : null;
+                if (!supersededBy && isRecovery) {
+                  const siblings = this.sql.exec(
+                    "SELECT id, state, created_at FROM session_control_sessions WHERE id <> ? AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.intake_task_id') = ? AND state IN ('queued','offered','starting','running','uncertain','held') ORDER BY created_at DESC, id DESC LIMIT 16",
+                    row.id, req.intake_task_id,
+                  ).toArray() as any[];
+                  const winningSibling = siblings.find(s => s.state !== 'held' || s.created_at > row.created_at || (s.created_at === row.created_at && s.id > row.id));
+                  if (winningSibling) supersededBy = String(winningSibling.id);
+                }
+                if (supersededBy) {
                   const at = this.at();
                   const supersededHold = JSON.stringify({
                     error: 'superseded_by_newer_session',
                     reason: 'superseded_by_newer_session',
-                    superseded_by: newer[newer.length - 1],
+                    superseded_by: supersededBy,
                     rejected: holdInfo.rejected,
                   });
                   this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", supersededHold, at, row.id);
@@ -1615,6 +1756,69 @@ export class SessionControlService {
               continue;
             }
             worktreeMachine = guard.machine;
+          }
+          if (recoveryReplaceable) {
+            attempts++;
+            const extraFailed = new Map<string, string>();
+            for (const rej of holdInfo.rejected) {
+              if (typeof rej?.engine === 'string' && rej.engine && ['zcodex_session_failed', 'engine_already_failed_for_intake', 'intake_engine_failed'].includes(String(rej.reason))) {
+                extraFailed.set(rej.engine, String(rej.reason));
+              }
+            }
+            const rec = this.reserveRecoverySession(
+              row.id,
+              { ...req, engine: row.engine ?? req.engine },
+              { caller: { kind: 'agent', actor: row.actor, isAdmin: true }, scopes: ['fleet:launch', 'admin'] },
+              worktreeMachine,
+              row.id,
+              extraFailed,
+            );
+            const at = this.at();
+            const patchedReq = { ...req, engine: rec.engine, mode: rec.mode };
+            if (rec.with_goal) patchedReq.with_goal = true;
+            else delete patchedReq.with_goal;
+            const sessionType = rec.mode === 'interactive' ? 'aplexer' : 'headless';
+            if (rec.reserved.status === 202 && rec.reserved.value && typeof rec.reserved.value.id === 'string' && rec.reserved.value.state === 'queued') {
+              this.sql.exec(
+                "UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, engine = ?, mode = ?, session_type = ?, request_json = ?, state = 'queued', hold_json = NULL, updated_at = ? WHERE id = ? AND state = 'held'",
+                rec.reserved.value.id,
+                rec.engine,
+                rec.mode,
+                sessionType,
+                JSON.stringify(patchedReq),
+                at,
+                row.id,
+              );
+              promoted++;
+            } else if (rec.reserved.status >= 200 && rec.reserved.status < 300 && rec.reserved.value && typeof rec.reserved.value.id === 'string') {
+              this.sql.exec(
+                "UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, mode = ?, session_type = ?, request_json = ?, state = ?, hold_json = NULL, updated_at = ? WHERE id = ? AND state = 'held'",
+                rec.reserved.value.id,
+                rec.reserved.value.machine ?? null,
+                rec.reserved.value.engine ?? rec.engine,
+                rec.mode,
+                sessionType,
+                JSON.stringify(patchedReq),
+                rec.reserved.value.state || 'offered',
+                at,
+                row.id,
+              );
+              promoted++;
+            } else if (rec.reserved.status === 400 && rec.reserved.value) {
+              const rejected = Array.isArray(rec.reserved.value.rejected) ? rec.reserved.value.rejected : [];
+              const cause = [rec.reserved.value.reason, rejected[0]?.reason, rec.reserved.value.error].find(v => typeof v === 'string' && v.trim()) || 'placement_refused';
+              this.cancelHeld(row.id, String(cause), rejected);
+              cancelled++;
+            } else if (rec.reserved.status >= 300 && rec.reserved.value) {
+              this.sql.exec(
+                "UPDATE session_control_sessions SET engine = NULL, request_json = ?, hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'",
+                JSON.stringify(patchedReq),
+                JSON.stringify(rec.reserved.value),
+                at,
+                row.id,
+              );
+            }
+            continue;
           }
           const mode = row.mode || req.mode || 'headless';
           if (mode !== 'interactive') {
@@ -2719,7 +2923,11 @@ export class SessionControlService {
       // match + tier-membership filter + M6/M8 gates). Nothing is silently
       // discarded: unknown tiers/cwds are rejected above, and a tier with no
       // eligible route becomes an honest held session.
-      const reserved = this.hooks.reserve({
+      const isRecoveryStart = isIntakeRecoverySession({ actor }, input);
+      const recoveryRes = isRecoveryStart
+        ? this.reserveRecoverySession(id, { ...input, mode }, auth, worktreeMachine, prior?.id)
+        : null;
+      const reserved = recoveryRes ? recoveryRes.reserved : this.hooks.reserve({
         ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
         ...(input.effort !== undefined ? {effort:input.effort} : {}),
         ...(input.intake_task_id ? {project:parsed(this.sql.exec('SELECT data FROM intake_tasks WHERE id=?',input.intake_task_id).toArray()[0]?.data,{}).project} : {}),
@@ -2730,6 +2938,19 @@ export class SessionControlService {
         prompt: input.brief || '', access: input.access, ...(input.with_goal === true ? { with_goal: true } : {}),
         idempotency_key: 'session-control-' + id,
       }, auth);
+      if (recoveryRes) {
+        const effectiveMode = recoveryRes.mode;
+        const effectiveSessionType = effectiveMode === 'interactive' ? 'aplexer' : 'headless';
+        const currentCanonical = parsed(canonical, {});
+        currentCanonical.engine = recoveryRes.engine;
+        currentCanonical.mode = effectiveMode;
+        if (recoveryRes.with_goal) currentCanonical.with_goal = true;
+        else delete currentCanonical.with_goal;
+        this.sql.exec(
+          'UPDATE session_control_sessions SET engine = ?, mode = ?, session_type = ?, request_json = ? WHERE id = ?',
+          recoveryRes.engine, effectiveMode, effectiveSessionType, JSON.stringify(currentCanonical), id,
+        );
+      }
         if (reserved.status === 400) {
           const rejected = Array.isArray(reserved.value?.rejected) ? reserved.value.rejected : [];
           const reason = [reserved.value?.reason, rejected[0]?.reason, reserved.value?.error]
@@ -3984,6 +4205,7 @@ export class SessionControlService {
       return this.transaction(() => {
         const gate = this.hostOk({ machine_id: caller.machineId }, caller);
         if (!gate.ok) return response({ offers: [] });
+        this.reconcileHeldSessions();
         const at = this.at();
         expireUnclaimedStops(this.sql, this.now(), undefined, caller.machineId!);
         // Retry expired custody with the original execution fence. Only the
