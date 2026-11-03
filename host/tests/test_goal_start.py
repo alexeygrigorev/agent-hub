@@ -1,7 +1,8 @@
-"""Goal starts preserve interactive semantics and pass goal text as one argv."""
+"""Goal starts preserve interactive semantics and submit Codex goals at a ready TUI."""
 import argparse
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 import pytest
 from agent_hub_host import fleet, session_control, session_rules
@@ -38,6 +39,10 @@ def test_goal_native_start_uses_trusted_command_and_literal_argument(monkeypatch
     # here to exercise the inline literal-argument path. The oversized path
     # (pointer + private full brief) is covered by dedicated tests below.
     monkeypatch.setattr(session_rules, 'SESSION_PREAMBLE', 'Hub session rules:\n' + AWS_MAIN_TEMP_RULE)
+    monkeypatch.setattr(fleet.Dispatcher, '_seed_interactive_readiness', lambda *a: None)
+    registered = []
+    monkeypatch.setattr('agent_hub_host.goal_registration.register_goal',
+                        lambda *a, **kw: registered.append(kw) or {'status': 'active', 'thread_id': 'thread-1'})
     with tempfile.TemporaryDirectory() as tmp:
         cfg = settings(Path(tmp))
         cfg['subscriptions'][0]['startup_argv'] = ['trusted-codex', '--safe']
@@ -50,12 +55,17 @@ def test_goal_native_start_uses_trusted_command_and_literal_argument(monkeypatch
         d = fleet.Dispatcher(cfg, lambda *a: http.append(a) or {}, runner)
         result = d.dispatch(offer(with_goal=True, prompt='Fix $(literal) `text`'))
         assert result['state'] == 'running'
-        assert calls[-1][-4:-1] == ['--', 'trusted-codex', '--safe']
-        assert calls[-1][-1].startswith('/goal ' + compose_prompt('Fix $(literal) `text`') + '\n')
-        assert AWS_MAIN_TEMP_RULE in calls[-1][-1]
-        assert 'docker run --rm' in calls[-1][-1]
-        assert 'agent.session=' in calls[-1][-1]
-        assert 'trap/finally' in calls[-1][-1]
+        start = calls[-1]
+        assert start[-3:] == ['--', 'trusted-codex', '--safe']
+        assert not any(isinstance(arg, str) and arg.startswith('/goal ') for arg in start)
+        goal = fleet.launch_goal('', 'Fix $(literal) `text`', offer()['id'])
+        assert goal.startswith('/goal ' + compose_prompt('Fix $(literal) `text`') + '\n')
+        assert registered[0]['goal_command'] == goal
+        assert registered[0]['engine'] == 'codex'
+        assert AWS_MAIN_TEMP_RULE in goal
+        assert 'docker run --rm' in goal
+        assert 'agent.session=' in goal
+        assert 'trap/finally' in goal
         with pytest.raises(ValueError):
             d.dispatch(offer(with_goal=True, mode='headless', prompt='fix'))
 
@@ -63,6 +73,10 @@ def test_goal_native_start_uses_trusted_command_and_literal_argument(monkeypatch
 def test_managed_codex_goal_route_has_admission_and_uses_installed_execution(tmp_path, monkeypatch):
     from agent_hub_host.model_contract import policy_models, native_model
     monkeypatch.setattr(session_rules, 'SESSION_PREAMBLE', 'Hub session rules:\n' + AWS_MAIN_TEMP_RULE)
+    monkeypatch.setattr(fleet.Dispatcher, '_seed_interactive_readiness', lambda *a: None)
+    registered = []
+    monkeypatch.setattr('agent_hub_host.goal_registration.register_goal',
+                        lambda *a, **kw: registered.append(kw) or {'status': 'active', 'thread_id': 'thread-1'})
     selected = next(m for m in policy_models() if m['id'] == 'astra')
     sub = dict(service='codex', engine='codex', account_label='shared-codex',
                profile='hub-shared-codex', admission_argv=['managed-admission'],
@@ -80,7 +94,7 @@ def test_managed_codex_goal_route_has_admission_and_uses_installed_execution(tmp
             return dict(supported=True, provider='codex', model=selected['model'])
         command = argv[argv.index('--') + 1:]
         assert native_model(command) == selected['model']
-        assert command[-1].startswith('/goal ' + compose_prompt('Literal goal'))
+        assert not any(isinstance(arg, str) and arg.startswith('/goal ') for arg in command)
         assert "from agent_hub_host.provisioning import execute" in command[2]
         assert 'shared-codex' in command
         return dict(id='native', workspace=str(tmp_path), tag='hub-' + offer()['id'],
@@ -90,6 +104,8 @@ def test_managed_codex_goal_route_has_admission_and_uses_installed_execution(tmp
         assert d.goal_routes() == [dict(engine='codex', account='shared-codex', profile=sub['profile'])]
         assert d.dispatch(offer(with_goal=True, profile=sub['profile'], prompt='Literal goal', selection=selected))['state'] == 'running'
     assert len(calls) == 3
+    assert len(registered) == 1 and registered[0]['engine'] == 'codex'
+    assert registered[0]['goal_command'].startswith('/goal ' + compose_prompt('Literal goal'))
 
 
 def test_goal_advertisement_excludes_unlaunchable_accounts(tmp_path):
@@ -110,10 +126,12 @@ ZCODEX_STARTUP_ARGV = ['/usr/local/bin/zcodex', '--dangerously-bypass-approvals-
 
 
 def test_zcodex_goal_route_advertised_and_started_from_trusted_argv(tmp_path, monkeypatch):
-    """t1654u: zcodex supports /goal — an unmanaged zcodex subscription with a
-    trusted startup argv advertises a goal route and the launcher delivers the
-    /goal brief as the literal final argument (intake 28302c74 AC1/AC2)."""
+    """Zcodex receives /goal through guarded TUI delivery, not initial argv."""
     monkeypatch.setattr(session_rules, 'SESSION_PREAMBLE', 'Hub session rules:\n' + AWS_MAIN_TEMP_RULE)
+    monkeypatch.setattr(fleet.Dispatcher, '_seed_interactive_readiness', lambda *a: None)
+    registered = []
+    monkeypatch.setattr('agent_hub_host.goal_registration.register_goal',
+                        lambda *a, **kw: registered.append(kw) or {'status': 'active', 'thread_id': 'thread-1'})
     cfg = settings(tmp_path)
     cfg['subscriptions'] += [dict(service='zai', engine='zcodex', account_label='shared-zai',
                                   profile=None, admission_argv=['gate'],
@@ -134,9 +152,12 @@ def test_zcodex_goal_route_advertised_and_started_from_trusted_argv(tmp_path, mo
         result = d.dispatch(offer(engine='zcodex', account='shared-zai',
                                   with_goal=True, prompt='Fix $(literal) `text`'))
     assert result['state'] == 'running'
-    assert calls[-1][-len(ZCODEX_STARTUP_ARGV) - 2:-1] == ['--'] + ZCODEX_STARTUP_ARGV
-    goal_arg = calls[-1][-1]
+    assert calls[-1][-len(ZCODEX_STARTUP_ARGV) - 1:] == ['--'] + ZCODEX_STARTUP_ARGV
+    assert not any(isinstance(arg, str) and arg.startswith('/goal ') for arg in calls[-1])
+    goal_arg = fleet.launch_goal('', 'Fix $(literal) `text`', offer()['id'])
     assert goal_arg.startswith('/goal ' + compose_prompt('Fix $(literal) `text`') + '\n')
+    assert registered[0]['goal_command'] == goal_arg
+    assert registered[0]['engine'] == 'zcodex'
     assert AWS_MAIN_TEMP_RULE in goal_arg
     assert 'docker run --rm' in goal_arg
     assert 'agent.session=' in goal_arg
@@ -167,17 +188,21 @@ def test_zcodex_goal_without_trusted_startup_refuses_before_native_start(tmp_pat
     assert not [c for c in calls if c[:1] == ['aplexer']]
 
 
-def test_plain_interactive_preamble_queues_same_workspace(tmp_path):
+def test_plain_interactive_preamble_queues_same_workspace(tmp_path, monkeypatch):
     """Empty interactive preamble must be a same-workspace queued send.
 
     A --workspace send to the not-yet-existing native tag is rejected as a
     cross-workspace queued target before native binding exists; the host
     bridge's durable queued-send shape (cwd, no --workspace) is required.
-    Goal starts carry /goal in native argv and must not queue a preamble.
+    Codex goal starts submit their goal through the registration helper and
+    must not queue the ordinary session preamble.
     """
     from agent_hub_host.session_rules import compose_prompt
     cfg = settings(tmp_path)
     cfg['subscriptions'][0]['startup_argv'] = ['trusted-codex', '--safe']
+    monkeypatch.setattr(fleet.Dispatcher, '_seed_interactive_readiness', lambda *a: None)
+    monkeypatch.setattr('agent_hub_host.goal_registration.register_goal',
+                        lambda *a, **kw: {'status': 'active', 'thread_id': 'thread-1'})
     calls, http = [], []
 
     def runner(argv, **kw):
@@ -209,7 +234,81 @@ def test_plain_interactive_preamble_queues_same_workspace(tmp_path):
     with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
         d = fleet.Dispatcher(cfg, request, runner)
         assert d.dispatch(offer(with_goal=True, prompt='Literal goal'))['state'] == 'running'
-    assert not [c for c in calls if len(c[0]) > 2 and c[0][1:3] == ['message', 'send']]
+    assert not [c for c in calls if len(c[0]) > 2 and c[0][1:3] == ['message', 'send']
+                and 'hub-session-preamble' in c[0]]
+    assert not any(isinstance(arg, str) and arg.startswith('/goal ')
+                   for argv, _ in calls if argv[:2] == ['aplexer', 'start'] for arg in argv)
+
+
+@pytest.mark.parametrize(('stop_state', 'expected_state'), [('stopped', 'failed'), ('uncertain', 'running')])
+def test_goal_registration_failure_reports_visible_receipt_without_retry(tmp_path, monkeypatch, stop_state, expected_state):
+    from agent_hub_host.goal_registration import GoalRegistrationError
+    cfg = settings(tmp_path)
+    cfg['subscriptions'][0]['startup_argv'] = ['trusted-codex', '--safe']
+    monkeypatch.setattr(fleet.Dispatcher, '_seed_interactive_readiness', lambda *a: None)
+    registration_calls = []
+    stop_calls = []
+
+    def fail_registration(*args, **kwargs):
+        registration_calls.append((args, kwargs))
+        raise GoalRegistrationError()
+
+    monkeypatch.setattr('agent_hub_host.goal_registration.register_goal', fail_registration)
+    monkeypatch.setattr('agent_hub_host.native_sessions.stop_session',
+                        lambda *args, **kwargs: stop_calls.append((args, kwargs)) or SimpleNamespace(state=stop_state))
+    calls, http = [], []
+    native_id = '12345678-1234-4234-8234-123456789abc'
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == 'maintained-gate':
+            return {'launch_allowed': True, 'profile_supported': True,
+                    'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+        return {'id': native_id, 'workspace': str(tmp_path), 'tag': 'hub-' + offer()['id'],
+                'engine': 'codex', 'profile': None, 'phase': 'running', 'created_at_ms': 1793707200000}
+
+    def request(method, path, body=None):
+        http.append((method, path, body))
+        return {}
+
+    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
+        result = fleet.Dispatcher(cfg, request, runner).dispatch(
+            offer(with_goal=True, prompt='Fix the binding'))
+    assert result['state'] == expected_state
+    assert len(registration_calls) == 1
+    assert len(stop_calls) == 1
+    assert sum(argv[:2] == ['aplexer', 'start'] for argv in calls) == 1
+    receipts = [body for method, path, body in http if method == 'POST' and path.endswith('/result')]
+    assert len(receipts) == 1
+    assert receipts[0]['diagnostic']['reason'] == 'goal_registration_failed'
+    assert receipts[0]['diagnostic']['stage'] == 'dispatch_interactive'
+    if stop_state == 'stopped':
+        assert receipts[0]['confirmed_exit'] is True
+    else:
+        assert 'confirmed_exit' not in receipts[0]
+
+
+def test_dispatch_refuses_goal_for_engine_without_goal_support(tmp_path):
+    cfg = settings(tmp_path)
+    cfg['subscriptions'].append({
+        'service': 'gemini', 'engine': 'gemini', 'account_label': 'shared-gemini',
+        'profile': None, 'admission_argv': ['gemini-gate'], 'startup_argv': ['gemini'],
+    })
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == 'gemini-gate':
+            return {'launch_allowed': True, 'profile_supported': True,
+                    'account_label': 'shared-gemini', 'observed_at': fleet.utcnow()}
+        return {}
+
+    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
+        dispatcher = fleet.Dispatcher(cfg, lambda *a: {}, runner)
+        with pytest.raises(ValueError, match='goal-capable engine'):
+            dispatcher.dispatch(offer(engine='gemini', account='shared-gemini',
+                                      with_goal=True, prompt='A goal'))
+    assert not any(argv[:2] == ['aplexer', 'start'] for argv in calls)
 
 
 def test_claude_goal_route_advertised_and_started_with_goal(tmp_path, monkeypatch):

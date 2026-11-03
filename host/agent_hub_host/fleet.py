@@ -232,8 +232,9 @@ OFFERS_LOCK_NAME = "fleet-offers.lock"
 # plus a slow Hub can exceed that, so the gate is re-run before claiming when
 # the first observation is older than this.
 CLAIM_ADMISSION_REFRESH_S = 15.0
-# Engines whose native CLI starts from a '/goal ...' prompt (src/fleet.ts GOAL_ENGINES).
+# Engines whose interactive routes support a native `/goal` command.
 GOAL_ENGINES = frozenset({'codex', 'zcodex', 'claude'})
+CODEX_GOAL_ENGINES = frozenset({'codex', 'zcodex'})
 # Bounded offer concurrency (settings "dispatch_concurrency", 1..13).
 # Intake eff9a5ce burst fix: serial dispatch (30-60 s per offer) made a
 # 10-launch burst take 5+ minutes. The earlier admission_refused failures with
@@ -3521,7 +3522,14 @@ class Dispatcher:
                         else:
                             native_effort = 'xhigh' if selection['effort'] == 'max' else selection['effort']
                             launch += ['-c', 'model_reasoning_effort=' + json.dumps(native_effort)]
-                argv += ["--"] + launch + ([launch_goal(wt_note, offer['prompt'], offer_id)] if with_goal else [])
+                # Codex and zcodex treat `/goal ...` in initial-prompt argv as
+                # ordinary model text on some or all launch paths. Start their
+                # TUI empty; the guarded native message-deliver path below
+                # submits the slash command after the prompt is ready. Claude's
+                # existing startup handling is unchanged by this Codex fix.
+                codex_goal = with_goal and offer.get('engine') in CODEX_GOAL_ENGINES
+                argv += ["--"] + launch + ([launch_goal(wt_note, offer['prompt'], offer_id)]
+                                           if with_goal and not codex_goal else [])
             prefix = sub.get("native_start_argv") or self.settings.get("native_start_argv")
             if prefix is not None:
                 prefix = validate_native_start_argv(prefix)
@@ -3774,9 +3782,64 @@ class Dispatcher:
                     raise ValueError("Native receipt mismatch")
                 if target_cwd != workspace and not self._verify_native_cwd(native, native_id, target_cwd, receipt):
                     raise ValueError("Native cwd mismatch")
-                if not offer.get("with_goal"):
+                codex_goal = offer.get('with_goal') is True and offer.get('engine') in CODEX_GOAL_ENGINES
+                if codex_goal:
+                    # Empty TUI starts do not fire a prompt hook. Seed the
+                    # documented empty-prompt state; aplexer's deliver guard
+                    # still independently checks the live screen before input.
                     self._seed_interactive_readiness(native, native_id, workspace)
-                result = {"state": "running", "native_id": native_id}
+                    from .goal_registration import register_goal
+                    goal_command = launch_goal(wt_note, offer['prompt'], offer_id)
+                    try:
+                        register_goal(
+                            native, native_id=native_id, tag="hub-" + offer_id,
+                            workspace=str(workspace), engine=offer['engine'],
+                            goal_command=goal_command, runner=self.runner,
+                            expected_created_at_ms=(receipt.get('created_at_ms')
+                                if type(receipt.get('created_at_ms')) is int else None),
+                        )
+                    except Exception:
+                        # Every uncertain registration outcome is the same
+                        # explicit launch failure. Do not expose helper output
+                        # or retry the native effect after an ambiguous result.
+                        diagnostic = {
+                            'reason': 'goal_registration_failed',
+                            'message': 'Codex did not register the requested goal in its thread goal store within 60 seconds.',
+                            'error_type': 'GoalRegistrationError',
+                            'stage': 'dispatch_interactive',
+                        }
+                        # Retire only this exact newly-created session. If
+                        # native exit cannot be proven, keep its Fleet lease
+                        # and record a visible failed projection on the Hub
+                        # session instead of claiming it stopped.
+                        from .native_sessions import NativeTarget, stop_session
+                        try:
+                            created = receipt.get('created_at_ms')
+                            target = NativeTarget(
+                                session_id=native_id, tag="hub-" + offer_id,
+                                workspace=str(workspace),
+                                created_at_ms=created if type(created) is int else None,
+                                engine=offer['engine'],
+                            )
+                            stopped = stop_session(native, target, grace_ms=1000).state == 'stopped'
+                        except Exception:
+                            stopped = False
+                        if stopped:
+                            result = {
+                                'state': 'failed', 'native_id': native_id,
+                                'confirmed_exit': True,
+                                'reason': 'goal_registration_failed',
+                                'diagnostic': diagnostic,
+                            }
+                        else:
+                            result = {'state': 'running', 'native_id': native_id,
+                                      'diagnostic': diagnostic}
+                    else:
+                        result = {'state': 'running', 'native_id': native_id}
+                else:
+                    if not offer.get("with_goal"):
+                        self._seed_interactive_readiness(native, native_id, workspace)
+                    result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
                 if selection and (details.get("model") != selection["model"] or details.get("model_verified") is not True):
