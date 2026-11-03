@@ -137,10 +137,11 @@ class CommitExtractionTests(unittest.TestCase):
 
     def test_explicit_commit_refs_only_report_and_commit_sha_fields(self):
         sha = '89f55bd76b37b85a8b2e862302ffd8d3b7c0fb9e'
+        newer_report = 'fedcba9876543210fedcba9876543210fedcba98'
         history = [
             {'kind': 'report', 'reference': sha},
             {'kind': 'commit', 'reference': '  0C934B64 '},
-            {'kind': 'report', 'reference': sha},
+            {'kind': 'report', 'reference': newer_report},
             {'kind': 'note', 'reference': sha},
             {'kind': 'report', 'reference': 'c30f1f98-06ba-4f58-8a9b-3b3fec17e2a8'},
             {'kind': 'commit', 'reference': 'not-a-commit'},
@@ -150,9 +151,20 @@ class CommitExtractionTests(unittest.TestCase):
             'not-a-dict',
             None,
         ]
-        self.assertEqual(me.explicit_commit_refs(history), [sha, '0c934b64'])
+        self.assertEqual(me.explicit_commit_refs(history), ['0c934b64', newer_report])
         self.assertEqual(me.explicit_commit_refs([]), [])
         self.assertEqual(me.explicit_commit_refs(None), [])
+
+    def test_rebased_report_supersedes_older_checkpoint_but_keeps_commit_events(self):
+        old_head = '1111111111111111111111111111111111111111'
+        current_head = '2222222222222222222222222222222222222222'
+        shipped_commit = '3333333333333333333333333333333333333333'
+        history = [
+            {'kind': 'report', 'reference': old_head},
+            {'kind': 'commit', 'reference': shipped_commit},
+            {'kind': 'report', 'reference': current_head},
+        ]
+        self.assertEqual(me.explicit_commit_refs(history), [shipped_commit, current_head])
 
     def test_collect_include_head_false_skips_head_and_cherry(self):
         runner = FakeRunner(in_main=[B], cherry='', runs=[{'headSha': B, 'conclusion': 'success', 'status': 'completed', 'url': 'u'}])
