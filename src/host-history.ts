@@ -9,6 +9,7 @@ import { resolveMachineAliases } from './machine-alias';
 import { isValidMachineId } from './machine-id';
 import { effectiveCheckin } from './registry';
 import { freshCatalogs } from './catalog-freshness';
+import type { WriteWatch } from './write-watch';
 
 const MINUTE = 60000, DAY = 86400000;
 export const HISTORY_RETENTION_MS = 32 * DAY;
@@ -45,7 +46,13 @@ export class HostHistoryService {
   private cache = new Map<string, {at: number; data: HistoryResponse}>();
   private identity(o: {kind:string;entity:string;machine_id:string}) { return JSON.stringify([o.kind,o.entity,o.machine_id]); }
   private packet(raw: string): Observation[] { const p = json(raw); return Array.isArray(p) ? p : []; }
-  constructor(private sql: SqlStorage, private fleet: FleetService, private now = Date.now) {}
+  private writes: WriteWatch | null = null;
+  private lastSampleStamp: string | null = null;
+  private lastSampleAt = 0;
+  constructor(private sql: SqlStorage, private fleet: FleetService, private now = Date.now, writes?: WriteWatch) {
+    this.writes = writes ?? null;
+    if (writes) writes.trackAll(['host_health_observations','disk_observations','fleet_accounts','fleet_launches','fleet_sessions_meta','machines','session_resource_usage','resource_resident_samples']);
+  }
   init() { initUsageStore(this.sql); for (const s of HOST_HISTORY_SCHEMA.split(';')) if (s.trim()) this.sql.exec(s); }
   /** One real observation per minute; retries and backfill cannot overwrite newer evidence. */
   record(kind: string, entity: string, machine: string, at: number, values: Values, source: string) {
@@ -189,6 +196,14 @@ export class HostHistoryService {
    */
   sample() {
     const now = this.now();
+    // Change-driven sampling: a quiet fleet repeats the whole census for no
+    // new data points. Sample when any source table was written, or at most
+    // every 5 minutes as the series ceiling (quota refreshes land within it).
+    if (this.writes) {
+      const stamp = this.writes.stamp('host_health_observations','disk_observations','fleet_accounts','fleet_launches','fleet_sessions_meta','machines','session_resource_usage','resource_resident_samples');
+      if (stamp === this.lastSampleStamp && now - this.lastSampleAt < 300000) return;
+      this.lastSampleStamp = stamp; this.lastSampleAt = now;
+    }
     this.backfill();
     const last = this.rows("SELECT value FROM resource_history_meta WHERE key='sample'")[0]?.value;
     if (typeof last === 'number' && now - last < MINUTE) return;
@@ -208,7 +223,7 @@ export class HostHistoryService {
     // Canonical identity: a rename transition can briefly hold two registry
     // rows for one pool; record the canonical one exactly once.
     for (const row of dedupeAccountsByCanonical(this.rows('SELECT * FROM fleet_accounts ORDER BY label LIMIT 128'))) {
-      const a = this.fleet.accountStatus(row);
+      const a = this.fleet.cachedAccountStatus(row);
       this.record('account', a.label, '', now, { used: a.active, max: a.max_concurrency, native_live: numeric((a as any).native_live) }, 'fleet_account_status_census_v2');
       this.record('quota', a.label, '', now, { remaining_percent: a.status === 'unknown' ? null : a.remaining_percent }, 'fleet_account_status');
     }
