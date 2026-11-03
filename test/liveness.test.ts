@@ -154,6 +154,23 @@ describe('stale alerts', () => {
     expect(live.undelivered(900)).toEqual([]);
   }));
 
+  it('suppresses cutover replay but re-enables delivery when an incident changes state', () => fixture((live, sql, clock) => {
+    machine(sql, 'hetzner', iso(300));
+    const [alert] = live.reconcileAlerts(live.evaluate().subjects);
+    live.markNotified(alert.id, 'old destination unavailable');
+    clock.t += 901000;
+    sql.exec('INSERT INTO alert_backfill_suppressed(alert_id,suppressed_at) VALUES (?,?)', alert.id, clock.t);
+    expect(live.undelivered(900)).toEqual([]);
+
+    const changed = live.setAlert('machine', 'hetzner', { state: 'offline', detail: 'host is now offline' });
+    expect(changed).toMatchObject({ id: alert.id, state: 'offline', notify_error: null, delivered_to: '[]' });
+    expect(live.undelivered(900).map((a: any) => a.id)).toEqual([alert.id]);
+
+    sql.exec('INSERT INTO alert_backfill_suppressed(alert_id,suppressed_at) VALUES (?,?)', alert.id, clock.t);
+    live.setAlert('machine', 'hetzner', null);
+    expect(sql.exec('SELECT COUNT(*) AS n FROM alert_backfill_suppressed').one().n).toBe(0);
+  }));
+
   it('retries an alert whose notification was never attempted', () => fixture((live, sql, clock) => {
     machine(sql, 'hetzner', iso(300));
     const [alert] = live.reconcileAlerts(live.evaluate().subjects);
@@ -167,33 +184,36 @@ describe('stale alerts', () => {
     const stub = bindings.HUB.get(bindings.HUB.idFromName('notify-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub) => {
       hub.env = { ...hub.env, HUB_ALERT_TO: 'nobody-registered', HUB_ALERT_WEBHOOK: 'https://hooks.example/alert' } as Env;
-      const calls: string[] = []; const original = globalThis.fetch;
-      globalThis.fetch = (async (url: any) => { calls.push(String(url)); return new Response('ok'); }) as any;
+      const calls: string[] = []; const subjects: string[] = []; const original = globalThis.fetch;
+      globalThis.fetch = (async (url: any, init: any) => { calls.push(String(url)); const {alert}=JSON.parse(init.body); subjects.push(alert.subject_kind+':'+alert.subject); return new Response('ok'); }) as any;
       try {
         hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)", new Date().toISOString(), new Date(Date.now() - 3600000).toISOString());
         await hub.runChecks('liveness');
         let [alert]: any[] = hub.livenessService.alerts();
-        expect(calls).toEqual(['https://hooks.example/alert']);
+        expect(calls).toEqual(['https://hooks.example/alert','https://hooks.example/alert']);
+        expect(subjects.sort()).toEqual(['alert_routing:destination','host_watch:m']);
         expect(alert.notify_error).toContain('nobody-registered');
-        expect(JSON.parse(alert.delivered_to)).toEqual(['webhook']);
+        expect(JSON.parse(alert.delivered_to)[0]).toMatch(/^webhook:/);
         hub.sql.exec('UPDATE liveness_alerts SET notified_at = ?', new Date(Date.now() - 3600000).toISOString());
         await hub.runChecks('liveness');
-        expect(calls).toHaveLength(1);
+        expect(calls).toHaveLength(2);
       } finally { globalThis.fetch = original; }
     });
   });
 
-  it('delivers alerts to the grok-bot inbox by default when HUB_ALERT_TO is unset', async () => {
+  it('refuses delivery only when both configured routes are explicitly disabled', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('notify-default-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub) => {
       delete (hub.env as any).HUB_ALERT_TO;
+      (hub.env as any).HUB_ALERT_WEBHOOK = '';
       hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
       hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)", new Date().toISOString(), new Date(Date.now() - 3600000).toISOString());
       await hub.runChecks('liveness');
       const [alert]: any[] = hub.livenessService.alerts();
-      expect(alert.notify_error).toBeNull();
-      expect(JSON.parse(alert.delivered_to)).toEqual(['inbox:grok-bot']);
+      expect(alert.notify_error).toContain('no alert target configured');
+      expect(JSON.parse(alert.delivered_to)).toEqual([]);
+      expect(hub.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE to_actor='grok-bot'").one().n).toBe(0);
     });
   });
 

@@ -276,7 +276,7 @@ export class StatusService {
     let rows: any[];
     try {
       rows = this.sql.exec(`SELECT a.id, a.subject_kind, a.subject, a.state, a.detail, a.opened_at
-        FROM liveness_alerts a WHERE a.resolved_at IS NULL AND ((a.subject_kind='check' OR
+        FROM liveness_alerts a WHERE a.resolved_at IS NULL AND ((a.subject_kind IN ('check','alert_routing','bus_auth') OR
           (a.subject_kind='session' AND a.state='worktree_removed')) OR
           (a.subject_kind='launch' AND a.state='stuck' AND (
             (a.subject LIKE 'placement-queue:%' AND EXISTS
@@ -301,7 +301,7 @@ export class StatusService {
     for (const row of rows) {
       const entry: Obj = {
         severity: 'warn', subject: row.subject_kind + ':' + row.subject,
-        title: (row.subject_kind === 'launch' ? 'Launch stuck: ' : row.subject_kind === 'session' ? 'Session worktree missing: ' : 'Scheduled check: ') + row.subject, detail: snippet(row.detail),
+        title: (row.subject_kind === 'launch' ? 'Launch stuck: ' : row.subject_kind === 'session' ? 'Session worktree missing: ' : row.subject_kind === 'alert_routing' ? 'Alert routing: ' : row.subject_kind === 'bus_auth' ? 'Bus reader authentication: ' : 'Scheduled check: ') + row.subject, detail: snippet(row.detail),
         state: row.state, alert_id: row.id, opened_at: row.opened_at,
         source: 'liveness_alerts', scope: 'hub',
       };
@@ -696,12 +696,12 @@ export class StatusService {
         const tasks = this.selectTasks(p, project, singleTask, sinceMs, summaries);
         const total = tasks.length;
         const window = tasks.filter(t => !after || t.id > after).slice(0, limit + 1);
-        const page = window.slice(0, limit);
-        const next = window.length > limit ? page[page.length - 1].id : null;
+        const pageIds = window.slice(0, limit).map(t => String(t.id));
+        const next = window.length > limit ? pageIds[pageIds.length - 1] : null;
         const revision = this.intake.statusRevision();
         const now = this.now();
         const nowIso = new Date(now).toISOString();
-        const built = this.buildItems(p, page, hostFilter, sinceMs, now, nowIso);
+        const built = this.buildItems(p, this.intake.statusTasksByIds(p, pageIds), hostFilter, sinceMs, now, nowIso);
         const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
         const agentCounts = this.computeAgentCounts(now);
         const intakeWarn = this.intake.statusIntakeOpenWarning(p, summaries);
@@ -763,7 +763,9 @@ export class StatusService {
         const { project, singleTask, hostFilter, sinceMs } = this.parseViewParams(params, true);
         const summaries = this.intake.statusTaskSummaries(p);
         const selected = this.selectTasks(p, project, singleTask, sinceMs, summaries);
-        const tasks = selected.slice(0, STATUS_BASELINE_CAP);
+        // Hydrate only the capped selection into projected bodies; the summary
+        // scan and this hydration are the task-body work per call (3bd2521a).
+        const tasks = this.intake.statusTasksByIds(p, selected.slice(0, STATUS_BASELINE_CAP).map(t => String(t.id)));
         const revision = this.intake.statusRevision();
         const now = this.now();
         const nowIso = new Date(now).toISOString();

@@ -26,11 +26,12 @@ async function fixture(fn: (live: LivenessService, sql: any) => Promise<void> | 
 }
 
 describe('hub-ops liveness reproducer', () => {
-  it('hubops-default-inbox delivers alerts to the grok-bot inbox when HUB_ALERT_TO is unset', async () => {
+  it('hubops-default-inbox refuses delivery when both destinations are disabled', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('hubops-default-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub) => {
       delete (hub.env as any).HUB_ALERT_TO;
+      (hub.env as any).HUB_ALERT_WEBHOOK = '';
       hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
       hub.sql.exec(
         "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)",
@@ -39,8 +40,9 @@ describe('hub-ops liveness reproducer', () => {
       );
       await hub.runChecks('liveness');
       const [alert]: any[] = hub.livenessService.alerts();
-      expect(alert.notify_error).toBeNull();
-      expect(JSON.parse(alert.delivered_to)).toEqual(['inbox:grok-bot']);
+      expect(alert.notify_error).toContain('no alert target configured');
+      expect(JSON.parse(alert.delivered_to)).toEqual([]);
+      expect(hub.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE to_actor='grok-bot'").one().n).toBe(0);
     });
   });
 

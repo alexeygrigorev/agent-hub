@@ -1,4 +1,5 @@
-import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
+import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
+import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
 import { handleNamedAgentRequest } from './named-agents';
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
@@ -1257,7 +1258,15 @@ export class Hub extends DurableObject {
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
       const busResponse = await this.handleBusRoutes(request, path);
-      if (busResponse) return busResponse;
+      if (busResponse) {
+        if (request.method === 'GET' && (busResponse.status === 401 || busResponse.ok)) {
+          const header = request.headers.get('Authorization') || '';
+          const cred = header.startsWith('Bearer ') ? this.sql.exec('SELECT * FROM credentials WHERE token_hash=?', await sha256(header.slice(7).trim())).toArray()[0] as any : null;
+          if (busResponse.status === 401) this.recordBusReadFailure(cred);
+          else this.resolveBusAuthFailure(cred);
+        }
+        return busResponse;
+      }
       const jobsResponse = await this.handleJobsRoutes(request, path, url);
       if (jobsResponse) return jobsResponse;
       if (['/api/quota/pacing', '/api/quota/banked', '/api/quota/kill-switch', '/api/quota/rewards', '/api/quota/reset-credits'].includes(path)) {
@@ -2213,8 +2222,13 @@ export class Hub extends DurableObject {
       }
 
       });
-      if (errorResponse) return errorResponse;
+      if (errorResponse) {
+        const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash=?', refreshHash).toArray()[0] as any;
+        if (cred && !cred.revoked_at) this.recordBusAuthFailure(cred, 'credential refresh rejected; bus reader cannot refresh');
+        return errorResponse;
+      }
 
+      this.resolveBusAuthFailure(this.sql.exec('SELECT * FROM credentials WHERE id=?', newId).toArray()[0]);
       return Response.json({
         access_token: accessToken,
         refresh_token: refreshToken,
@@ -2423,37 +2437,137 @@ export class Hub extends DurableObject {
     return json({ error: 'not_found' }, 404);
   }
 
-  /** Deliver a newly opened alert to the configured inbox actors and optional webhook.
-   * Returns the per-call receipt so callers (session audit) can only count an
-   * escalation as dispatched when it actually reached at least one target. */
-  private async notifyAlert(alert: any): Promise<{ delivered: string[]; errors: string[] }> {
-    const text = alertText(alert); const errors: string[] = [];
-    // Each target is delivered once; a retry only covers targets that have not succeeded yet.
-    const delivered = new Set(this.livenessService.deliveredTo(alert));
-    const targets = typeof this.env.HUB_ALERT_TO === 'string' ? this.env.HUB_ALERT_TO.split(',').map(t => t.trim()).filter(Boolean) : ['grok-bot'];
-    for (const to of targets) {
-      if (delivered.has('inbox:' + to)) continue;
-      try {
-        this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: `alert-${alert.id}-${to}` });
-        delivered.add('inbox:' + to);
-      } catch (e: any) { errors.push(`${to}: ${String(e?.message || e).slice(0, 80)}`); }
+  private busAuthSubject(cred: any): string | null {
+    if (!cred) return null;
+    const actor = cred.kind === 'agent' ? cred.registry_actor
+      : cred.actor || (cred.kind === 'host' && cred.machine_id ? 'machine:' + cred.machine_id : null);
+    return typeof actor === 'string' && actor ? actor : null;
+  }
+
+  private resolveBusAuthFailure(cred: any) {
+    const subject = this.busAuthSubject(cred);
+    if (!subject || cred.revoked_at) return;
+    this.sql.exec('DELETE FROM bus_auth_pending WHERE subject=?', subject);
+    this.livenessService.setAlert('bus_auth', subject, null);
+  }
+
+  private recordBusReadFailure(cred: any) {
+    const subject = this.busAuthSubject(cred);
+    // Anonymous scans and stopped/revoked readers cannot allocate incidents.
+    if (!subject || cred.revoked_at) return;
+    const expired = Date.parse(cred.expires_at) <= Date.now();
+    const refreshable = cred.refresh_hash && (workerRefreshContext(this.sql, cred.id) ||
+      (sessionIdOf(cred.registry_actor || '') && sessionRefreshAllowed(this.sql, cred.registry_actor, cred.machine_id)));
+    if (expired && refreshable) {
+      this.sql.exec(`INSERT INTO bus_auth_pending(subject,credential_id,first_failed_at) VALUES(?,?,?)
+        ON CONFLICT(subject) DO NOTHING`, subject, cred.id, Date.now());
+      return;
     }
-    const webhook = typeof this.env.HUB_ALERT_WEBHOOK === 'string' && this.env.HUB_ALERT_WEBHOOK.startsWith('https://') ? this.env.HUB_ALERT_WEBHOOK : null;
-    if (webhook && !delivered.has('webhook')) {
-      try {
-        const r = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, alert: { id: alert.id, subject_kind: alert.subject_kind, subject: alert.subject, state: alert.state, detail: alert.detail, opened_at: alert.opened_at } }), signal: AbortSignal.timeout(10000) });
-        if (r.ok) delivered.add('webhook'); else errors.push(`webhook: HTTP ${r.status}`);
-      } catch { errors.push('webhook: unreachable'); }
+    this.recordBusAuthFailure(cred, 'bus read rejected HTTP 401');
+  }
+
+  private recordBusAuthFailure(cred: any, detail: string) {
+    const subject = this.busAuthSubject(cred);
+    if (!subject) return;
+    this.sql.exec('DELETE FROM bus_auth_pending WHERE subject=?', subject);
+    const alert = this.livenessService.setAlert('bus_auth', subject, { state: 'unauthorized', detail });
+    if (alert) this.ctx.waitUntil(this.notifyAlert(alert));
+  }
+
+  private checkBusAuthFailures() {
+    const due = this.sql.exec(`SELECT c.*, p.subject AS pending_subject FROM bus_auth_pending p
+      LEFT JOIN credentials c ON c.id=p.credential_id WHERE p.first_failed_at<=?
+      ORDER BY p.first_failed_at LIMIT 20`, Date.now() - BUS_REFRESH_GRACE_MS).toArray() as any[];
+    for (const cred of due) {
+      this.sql.exec('DELETE FROM bus_auth_pending WHERE subject=?', cred.pending_subject);
+      if (cred.id && !cred.revoked_at) this.recordBusAuthFailure(cred, 'bus read HTTP 401; no successful refresh/read within 120s');
     }
-    const anyTarget = targets.length > 0 || !!webhook;
-    this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : (anyTarget ? null : 'no alert target configured'), [...delivered]);
-    // A delivered informational digest is not an ongoing incident. Preserve its
-    // receipt/history, but keep it out of the unresolved incident queue. Failed
-    // targets stay open for the ordinary retry path.
-    if (['intake_digest', 'host_recovery'].includes(alert.subject_kind) && anyTarget && !errors.length) {
-      this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
+  }
+
+  private notifyingAlerts = new Map<string, Promise<{ delivered: string[]; errors: string[] }>>();
+  private notifyAlert(input: any): Promise<{ delivered: string[]; errors: string[] }> {
+    if (!input) return Promise.resolve({ delivered: [], errors: [] });
+    const key = JSON.stringify([input.subject_kind, input.subject]);
+    const pending = this.notifyingAlerts.get(key);
+    if (pending) return pending.then(() => this.notifyAlert(input));
+    const delivery = this.deliverAlert(input).finally(() => this.notifyingAlerts.delete(key));
+    this.notifyingAlerts.set(key, delivery);
+    return delivery;
+  }
+
+  private async deliverAlert(input: any) {
+    // Callers can hold an old row across awaits. Receipts in storage win.
+    const alert = this.sql.exec('SELECT * FROM liveness_alerts WHERE id=? AND resolved_at IS NULL', input.id).toArray()[0] as any;
+    if (!alert) return { delivered: [], errors: [] };
+    {
+      const text = alertText(alert); const errors: string[] = [];
+      const delivered = new Set(this.livenessService.deliveredTo(alert));
+      const { actors: configuredActors, webhook, invalidWebhook, invalidActors, webhookAuthRequired } = alertDestinations(this.env);
+      const actors = [...new Set(configuredActors.map(to => this.busService.canonicalActor(to)))];
+      if (invalidActors) errors.push('invalid alert inbox configuration');
+      if (invalidWebhook) errors.push('invalid alert webhook configuration (HTTPS required)');
+      const webhookToken = typeof this.env.HUB_ALERT_WEBHOOK_TOKEN === 'string' ? this.env.HUB_ALERT_WEBHOOK_TOKEN.trim() : '';
+      if (webhookAuthRequired && !webhookToken) errors.push('webhook: missing bearer token');
+      if (!actors.length && !webhook) errors.push('no alert target configured');
+      // Audit summaries group distinct actionable batches under one display subject.
+      // Keep their payloads independent while identical batches remain idempotent.
+      const stallCooldown = alert.subject_kind === 'session' && alert.state === 'stalled' && alert.detail.includes('no_native_progress');
+      const receiptSubject = alert.subject_kind === 'session_audit'
+        ? alert.subject + ':' + await sha256(alert.detail) : JSON.stringify([alert.subject, alert.state, stallCooldown ? 'no_native_progress' : null]);
+      const receipt = (target: string) => this.sql.exec('SELECT * FROM alert_delivery_receipts WHERE subject_kind=? AND subject=? AND target=?', alert.subject_kind, receiptSubject, target).toArray()[0] as any;
+      const allowed = (target: string) => {
+        const last = receipt(target);
+        if (last?.alert_id === alert.id) { delivered.add(target); return false; }
+        if (last && Date.now() - last.sent_at < ALERT_SUBJECT_COOLDOWN_MS) {
+          if (alert.subject_kind === 'session_audit') delivered.add(target);
+          else if (stallCooldown) errors.push('subject rate limited for destination');
+          else return true;
+          return false;
+        }
+        return true;
+      };
+      const success = (target: string) => {
+        delivered.add(target);
+        this.sql.exec(`INSERT INTO alert_delivery_receipts VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(subject_kind, subject, target) DO UPDATE SET alert_id=excluded.alert_id, sent_at=excluded.sent_at`, alert.subject_kind, receiptSubject, target, alert.id, Date.now());
+      };
+      for (const to of actors) {
+        const target = 'inbox:' + to;
+        if (delivered.has(target)) continue;
+        const canonical = this.busService.canonicalActor(to);
+        if (!inboxReaderStatus(this.sql, canonical).active_reader) { errors.push(`${to}: no_active_credential_read_loop`); continue; }
+        if (!allowed(target)) continue;
+        try {
+          const key = 'alert-' + alert.id + '-' + (await sha256(target)).slice(0, 24);
+          this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: key });
+          success(target);
+        } catch { errors.push(`${to}: inbox delivery failed`); }
+      }
+      // Keep a destination fingerprint, never the webhook URL, in receipts.
+      const webhookTarget = webhook ? 'webhook:' + (await sha256(webhook)).slice(0, 24) : null;
+      if (webhook && webhookTarget && !(webhookAuthRequired && !webhookToken) && !delivered.has(webhookTarget) && allowed(webhookTarget)) {
+        try {
+          const fields = {
+            from: 'Agent Hub <alerts@dtcdev.click>',
+            to: 'dev@dtcdev.click',
+            subject: `[agent-hub] ${alert.subject_kind}: ${alert.subject} (${alert.state})`,
+            snippet: text.replace(/\s+/g, ' ').slice(0, 200),
+            text,
+            date: new Date().toISOString(),
+            message_id: `hub-alert-${alert.id}`,
+            attachments: [],
+            alert: { id: alert.id, subject_kind: alert.subject_kind, subject: alert.subject, state: alert.state, detail: alert.detail, opened_at: alert.opened_at },
+          };
+          const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Idempotency-Key': `hub-alert-${alert.id}` };
+          if (webhookAuthRequired) headers.Authorization = `Bearer ${webhookToken}`;
+          const r = await fetch(webhook, { method: 'POST', redirect: 'error', headers, body: JSON.stringify(fields), signal: AbortSignal.timeout(10000) });
+          if (r.ok) success(webhookTarget); else errors.push(`webhook: HTTP ${r.status}`);
+        } catch { errors.push('webhook: unreachable'); }
+      }
+      this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : null, [...delivered]);
+      if ((alert.subject_kind === 'intake_digest' || (alert.subject_kind === 'alert_routing' && alert.subject === 'cutover_backlog')) && !errors.length) this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
+      return { delivered: [...delivered], errors };
     }
-    return { delivered: [...delivered], errors };
   }
 
   protected extraCheckDeps(): Partial<ActionDeps> { return {}; }
@@ -2474,6 +2588,22 @@ export class Hub extends DurableObject {
 
   private async runChecksMetered(only?: string) {
     const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('checks:' + step, fn);
+    const destinations = alertDestinations(this.env);
+    const destinationHash = await sha256(JSON.stringify(destinations));
+    const previousDestinations = this.sql.exec("SELECT value FROM hub_meta WHERE key='alert_destination_hash'").toArray()[0]?.value;
+    if (previousDestinations !== destinationHash) {
+      // Do not replay every legacy open row to the newly watched mailbox.
+      // Suppress individual retries and send one bounded cutover summary instead.
+      const suppressed = suppressOpenAlertBackfill(this.sql);
+      if (suppressed) {
+        const notice = this.livenessService.setAlert('alert_routing', 'cutover_backlog', {
+          state: 'attention',
+          detail: `${suppressed} pre-existing open alert(s) were not replayed individually after the destination change. Review the Hub alerts and delivery SLO for the preserved backlog.`,
+        });
+        if (notice) await m('alert_backfill_notice', () => this.notifyAlert(notice));
+      }
+      this.sql.exec("INSERT INTO hub_meta(key,value) VALUES ('alert_destination_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", destinationHash);
+    }
     // Cron launch schedules (intake a839dfb6): due ticks create intakes and
     // enqueue sessions through the canonical admission path. Runs on both
     // crons (every 5 minutes); a manual single-check run never fires them.
@@ -2501,6 +2631,15 @@ export class Hub extends DurableObject {
     }
     for (const alert of await m('banked_resets', () => new BankedResets(this.sql, this.livenessService).run())) await this.notifyAlert(alert);
     await m('liveness_prune', () => this.livenessService.prune());
+    pruneAlertRouting(this.sql);
+    this.checkBusAuthFailures();
+    const routingErrors = destinations.actors.filter(to => !inboxReaderStatus(this.sql, this.busService.canonicalActor(to)).active_reader).map(to => `${to}: no_active_credential_read_loop`);
+    if (destinations.invalidWebhook) routingErrors.push('invalid alert webhook configuration');
+    if (destinations.invalidActors) routingErrors.push('invalid alert inbox configuration');
+    if (destinations.webhookAuthRequired && !this.env.HUB_ALERT_WEBHOOK_TOKEN?.trim()) routingErrors.push('alert webhook bearer secret missing');
+    if (!destinations.actors.length && !destinations.webhook) routingErrors.push('no alert target configured');
+    const routingAlert = this.livenessService.setAlert('alert_routing', 'destination', routingErrors.length ? { state: 'fail', detail: routingErrors.join('; ') } : null);
+    if (routingAlert) await m('alert_routing', () => this.notifyAlert(routingAlert));
     const results = await m('run_due', () => this.checksService.runDue({
       liveness: this.livenessService,
       notify: alert => this.notifyAlert(alert).then(() => undefined),
