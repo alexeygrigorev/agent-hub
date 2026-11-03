@@ -66,11 +66,10 @@ def loop_service_profile_path(config_root, label):
 
 
 def provision_loop_service_identities(base_url, config_root):
-    """Ensure each installed loop has an independent Hub human credential family.
+    """Provision optional loop credentials, each of which requires human approval.
 
-    The profiles are separate from both the interactive cli.json and the
-    fleet host.json. Device approval happens during install/bootstrap; each
-    consumer later selects only its own file through HUB_CONFIG_FILE.
+    This is deliberately not part of machine enrollment: each profile is a
+    separate admin credential family and would require another device approval.
     """
     from . import config, human_auth
 
@@ -998,7 +997,6 @@ def configure(base_url):
         auth.device_login(base_url, 'host', 'agent-hub-host', system.get_hostname(),
                           auth.HOST_SCOPES + ['repositories:read'])
     api.register_machine(base_url)
-    provision_loop_service_identities(base_url, config_root)
     settings = fleet.subscriptions_path()
     if not settings.exists():
         write_private(settings, json.dumps({'version': 1, 'subscriptions': [],

@@ -338,10 +338,54 @@ class BootstrapTests(unittest.TestCase):
              patch.object(provisioning, 'sync'), patch.object(b, 'install_service', return_value='systemd_user'), patch.dict(os.environ):
             b.configure('https://hub.test')
         login.assert_not_called()
-        self.provision_service_identities.assert_called_once()
-        self.assertEqual(self.provision_service_identities.call_args.args[0], 'https://hub.test')
+        self.provision_service_identities.assert_not_called()
         register.assert_called_once_with('https://hub.test')
         self.assertEqual(settings.read_text(), '{}')
+
+    def test_fresh_host_enrollment_requests_only_one_device_approval(self):
+        from agent_hub_host import api, auth, config, fleet, human_auth, provisioning, system
+        install_root = self.root / '.local/share/agent-hub'
+        package = install_root / 'package/host/agent_hub_host'
+        package.mkdir(parents=True)
+        for name in ('cli.py', 'host_supervisor.py'):
+            (package / name).write_text('')
+        python = install_root / 'venv/bin/python'
+        python.parent.mkdir(parents=True)
+        python.touch()
+        base = install_root / 'python/cpython-3.12'
+        base.mkdir(parents=True)
+        settings = self.root / 'subscriptions.json'
+        settings.write_text('{}')
+        with patch.object(b, 'root', return_value=install_root), \
+             patch.object(b.Path, 'home', return_value=self.root), \
+             patch.object(b.sys, 'executable', str(python)), \
+             patch.object(b.sys, 'base_prefix', str(base)), \
+             patch.object(b, 'validate_side_effect_context'), \
+             patch.object(config, 'get_host_config_path', return_value=self.root / 'host.json'), \
+             patch.object(config, 'load_host_config') as load_host, \
+             patch.object(auth, 'device_login') as login, \
+             patch.object(human_auth, 'human_login') as human_login, \
+             patch.object(api, 'register_machine') as register, \
+             patch.object(fleet, 'subscriptions_path', return_value=settings), \
+             patch.object(fleet, 'load_settings'), \
+             patch.object(b, 'publish_user_path'), \
+             patch.object(b, 'configure_default_engine'), \
+             patch.object(b, 'setup_launcher', return_value='configured'), \
+             patch.object(provisioning, 'sync'), \
+             patch.object(b, 'install_service', return_value='systemd_user'), \
+             patch.dict(os.environ):
+            load_host.side_effect = lambda: {
+                'base_url': 'https://hub.test', 'machine_id': 'new-machine',
+                **({'access_token': 'host-token', 'requested_scopes': ['repositories:read'],
+                    'granted_scopes': []} if login.called else {}),
+            }
+            b.configure('https://hub.test')
+
+        login.assert_called_once_with('https://hub.test', 'host', 'agent-hub-host',
+                                      system.get_hostname(), auth.HOST_SCOPES + ['repositories:read'])
+        human_login.assert_not_called()
+        self.provision_service_identities.assert_not_called()
+        register.assert_called_once_with('https://hub.test')
 
     def test_loop_service_identities_use_distinct_files_and_preserve_developer_cli(self):
         from agent_hub_host import config, human_auth

@@ -58,15 +58,11 @@ hub auth logout
 - Normal user commands (sessions/intake/status/bus) use the human profile
   when present (fresh Linux after login); host enrollment/poll/agent-run
   stay host-only.
-- Hub host bootstrap provisions independent human device-login profiles for
-  `refill-loop`, `ready-slim`, and `desktop-loop` under
-  `~/.config/agent-hub/services/` (or the platform config directory). Approve
-  their device codes during install/bootstrap. Each profile has its own
-  refresh family; the fleet host keeps its separate `host.json` family. Loop
-  service units must set `HUB_CONFIG_FILE` to their own profile path and must
-  never point at `cli.json`. The profiles are checked during re-bootstrap; a
-  revoked or expired one is re-created there, so loops do not run `hub auth
-  login` after installation.
+- Host enrollment provisions only its host credential in `host.json`. It does
+  not create human CLI or service profiles and does not run `hub auth login`.
+  A human CLI profile remains an explicit, separate choice. Optional loop
+  service profiles, when needed, each require their own human approval and
+  must use a dedicated `HUB_CONFIG_FILE`; they are not part of machine setup.
 
 ## Server contract (server worker implements; client expects)
 
