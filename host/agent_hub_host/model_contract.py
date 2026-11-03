@@ -1,5 +1,9 @@
 """Configured model contract shared by admission and native startup."""
+import calendar
 import json
+import math
+import re
+import time
 from importlib import resources
 from pathlib import Path
 
@@ -82,6 +86,53 @@ def canonical_account_label(label):
         if label == canonical or label in aliases:
             return canonical
     return label
+
+
+def account_plan_end(account):
+    """Return the account's last routable instant (UTC epoch seconds), or None.
+
+    Catalog dates are inclusive: YYYY-MM-DD remains eligible through that UTC
+    day and expires at the following midnight.
+    """
+    try:
+        accounts = _policy_document().get('accounts') or []
+    except Exception:
+        return None
+    if not isinstance(accounts, list):
+        return None
+    label = canonical_account_label(account)
+    for entry in accounts:
+        if not isinstance(entry, dict) or canonical_account_label(entry.get('account')) != label:
+            continue
+        raw = entry.get('plan_end')
+        if not isinstance(raw, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            return None
+        try:
+            parsed = time.strptime(raw, '%Y-%m-%d')
+        except ValueError:
+            return None
+        return calendar.timegm(parsed) + 86400
+    return None
+
+
+def account_plan_expired(account, now):
+    end = account_plan_end(account)
+    return end is not None and now >= end
+
+
+def plan_end_horizon_days():
+    raw = (_policy_document().get('rules') or {}).get('plan_end_reset_horizon_days')
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw <= 0:
+        raise ValueError('plan_end_reset_horizon_days_invalid')
+    return float(raw)
+
+
+def plan_end_burn_deadline(account, now, horizon_days):
+    """Return the plan deadline when it falls within the configured horizon."""
+    end = account_plan_end(account)
+    if end is None or end <= now or not math.isfinite(horizon_days) or horizon_days <= 0:
+        return None
+    return end if end - now <= horizon_days * 86400 else None
 
 
 def configured_selection(selection, engine, provider):

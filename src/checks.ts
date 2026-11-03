@@ -253,7 +253,7 @@ export class ChecksService {
       }
       case 'quota': {
         const min = p.min_percent ?? 20;
-        const low = deps.evaluateQuota().filter(a => a.enabled && (a.status === 'blocked' || (typeof a.remaining_percent === 'number' && a.remaining_percent < min)));
+        const low = deps.evaluateQuota().filter(a => a.enabled && a.status !== 'expired' && (a.status === 'blocked' || (typeof a.remaining_percent === 'number' && a.remaining_percent < min)));
         return low.length ? { status: 'fail', detail: low.map(a => `${a.label}: ${a.status}, ${a.remaining_percent ?? 'unknown'}% left`).join('; ') } : { status: 'pass', detail: `no account below ${min}%` };
       }
       case 'burn_forecast': {

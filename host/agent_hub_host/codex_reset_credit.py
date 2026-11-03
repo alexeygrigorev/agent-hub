@@ -144,7 +144,7 @@ def _credit(view, credit_id):
     return next((c for c in view['credits'] if c['id'] == credit_id), None)
 
 
-def _eligible(view, credit_id, now):
+def _eligible(view, credit_id, now, plan_end_deadline=None):
     if view['ordinaryUsageAllowed'] is None:
         raise CreditError('usage_permission_unknown')
     credit = _credit(view, credit_id)
@@ -155,7 +155,8 @@ def _eligible(view, credit_id, now):
     expiry = credit['expiresAt']
     if expiry is None or expiry <= now:
         raise CreditError('credit_expired_or_no_deadline')
-    if expiry - now > 86400:
+    plan_end_is_active = type(plan_end_deadline) is int and plan_end_deadline > now
+    if expiry - now > 86400 and not plan_end_is_active:
         raise CreditError('credit_not_expiring')
     # Do not reset healthy unused quota merely because a coupon exists. The
     # provider remains the authority for whether a window can actually reset.

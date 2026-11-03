@@ -1,5 +1,6 @@
 """Offline workflow ordering/correlation tests; never invokes a provider."""
 import copy
+import calendar
 import json
 import sqlite3
 import tempfile
@@ -55,6 +56,32 @@ class WorkflowTests(unittest.TestCase):
         with patch.object(native, 'snapshot', return_value=self.before):
             with self.assertRaisesRegex(native.CreditError, 'identity_mismatch'):
                 flow.prepare(unittest.mock.Mock(), self.hub, 'shared-codex', 'credit-a')
+
+    def test_plan_end_burn_prepares_long_lived_credit_until_inclusive_deadline(self):
+        now = int(time.mktime(time.strptime('2026-11-03 12:00:00', '%Y-%m-%d %H:%M:%S')))
+        expiry = now + 20 * 86400
+        self.before['observedAt'] = now
+        self.before['credits'][0]['expiresAt'] = expiry
+        self.before['windows'][0]['resetsAt'] = now + 86400
+        self.event['decision'].update(account='codex-orin', expires_at_ms=expiry * 1000)
+        with patch('agent_hub_host.reset_credit_workflow.time.time', return_value=now), \
+                patch.object(native, 'snapshot', return_value=self.before), \
+                patch.object(native, '_eligible', wraps=native._eligible) as eligible:
+            result = flow.prepare(unittest.mock.Mock(), self.hub, 'codex-orin', 'credit-a')
+        body = self.calls[-1][2]
+        expected_end = calendar.timegm(time.strptime('2026-11-14 00:00:00', '%Y-%m-%d %H:%M:%S'))
+        self.assertEqual(result['event_id'], self.event['event_id'])
+        self.assertEqual(expiry * 1000, body['expires_at_ms'])
+        self.assertEqual(expected_end, eligible.call_args.kwargs['plan_end_deadline'])
+
+    def test_expired_plan_refuses_before_provider_read(self):
+        now = calendar.timegm(time.strptime('2026-11-14 00:00:00', '%Y-%m-%d %H:%M:%S'))
+        rpc = unittest.mock.Mock()
+        with patch('agent_hub_host.reset_credit_workflow.time.time', return_value=now):
+            with self.assertRaisesRegex(native.CreditError, 'plan_expired'):
+                flow.prepare(rpc, self.hub, 'codex-orin', 'credit-a')
+        rpc.call.assert_not_called()
+        self.assertEqual(self.calls, [])
 
     def test_receipt_mismatch_does_not_post(self):
         receipt = self.receipt()

@@ -15,9 +15,12 @@
   <div class="dk-main__inner engine-page">
     <nav aria-label="Navigation"><a href="/">Agent Hub</a> · <a href="/fleet.html#quota">Usage</a> · <a href="/engines.html">Accounts</a></nav>
     <h1>Banked reset expiry</h1>
-    <p>Hub asks Alexey to approve a reset 48 hours before expiry, then again below 24 hours. Deadlines below use Europe/Berlin time. Only Alexey may approve and apply a reset manually.</p>
+    <p>Hub asks Alexey to approve a reset 48 hours before its expiry, then again below 24 hours. An account plan end is also a hard reset deadline. Deadlines below use Europe/Berlin time. Only Alexey may approve and apply a reset manually.</p>
     <p id="status" role="status">Loading…</p>
     <div id="accounts"></div>
+    <h2>Reset usage to date</h2>
+    <p>Used counts include grants observed consumed; verified counts have an operator receipt. Lost counts include unused grants past their grant expiry or account plan end.</p>
+    <div id="reset-usage"></div>
     <h2>Record grants manually</h2>
     <p>When automatic quota data is unavailable, read the provider's reset list and record every available grant here. For z.ai, sign in with email and password and complete any captcha yourself.</p>
     <form id="record-form">

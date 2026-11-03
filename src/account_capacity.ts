@@ -1,4 +1,5 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
+import { accountPlanExpired } from './model-routing';
 
 /** Reconcile reservations from positive terminal evidence, never catalog absence.
  * Returns the proposed changes before applying so operators can save a backup.
@@ -50,6 +51,7 @@ export function accountCapacityAlerts(sql: SqlStorage, now: number) {
     let intent: any;
     try { intent = JSON.parse(queued.request_json); } catch { continue; }
     for (const account of sql.exec('SELECT * FROM fleet_accounts WHERE enabled = 1').toArray() as any[]) {
+      if (accountPlanExpired(String(account.label), now)) continue;
       const routes = sql.exec('SELECT * FROM fleet_routes WHERE account = ?', account.label).toArray() as any[];
       if (!routes.some(r => (!intent.machine || intent.machine === r.machine_id) && (!intent.engine || intent.engine === r.engine))) continue;
       const reserved = Number(sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE account = ? AND state IN ('offered','starting','running','uncertain')", account.label).one().n);
