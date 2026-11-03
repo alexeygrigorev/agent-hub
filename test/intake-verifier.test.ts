@@ -3,7 +3,8 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { IntakeVerifier, classifyVerification, latestDoneClaim } from '../src/intake-verifier';
 import { IntakeWatchdog, queuePolicyFrom } from '../src/intake-watchdog';
 const inDO: any = runInDurableObject;
-const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
+let fixtureSeq = 0;
+const stub = (name: string) => (env as any).HUB.get((env as any).HUB.idFromName(name));
 const admin = { caller: { isAdmin: true, actor: 'human:operator', kind: 'human' }, scopes: ['admin'] } as any;
 const source = { type: 'unknown', reference: null, timestamp: null };
 let seq = 0;
@@ -26,11 +27,8 @@ async function note(h: any, id: string, text: string, actor?: string) {
 const show = async (h: any, id: string) => (await call(h, '/tasks/' + id)).body.task;
 const DONE_EVIDENCE = 'DONE\nevidence: agent-hub@0123456789abcdef pushed\nlive check: curl https://example.test/health -> 200\nresult: AC1 proven';
 async function fixture(fn: (h: any) => any) {
-  return inDO(stub(), async (h: any) => {
-    for (const t of ['tasks', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    for (const t of ['intake_verifications', 'intake_verifier_meta', 'intake_human_alerts', 'intake_restart_queue', 'intake_watchdog_meta', 'session_control_sessions', 'fleet_launches'])
-      h.sql.exec('DELETE FROM ' + t);
-    tickDO = h;
+  const name = 'verifier-tests-' + (++fixtureSeq) + '-' + crypto.randomUUID();
+  return inDO(stub(name), async (h: any) => {
     return fn(h);
   });
 }
@@ -44,9 +42,8 @@ function verifier(h: any, starts: any[], clock: { now: number }, alerts: string[
   return v;
 }
 // Notes carry real timestamps, so ticks run on the real clock with the interval guard reset.
-let tickDO: any;
 const tick = async (v: IntakeVerifier, clock: { now: number }) => {
-  tickDO.sql.exec('UPDATE intake_verifier_meta SET last_tick=NULL WHERE id=1'); clock.now = Date.now(); return v.tick();
+  (v as any).sql.exec('UPDATE intake_verifier_meta SET last_tick=NULL WHERE id=1'); clock.now = Date.now(); return v.tick();
 };
 function running(h: any, id: string, taskId: string) {
   h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
@@ -225,6 +222,8 @@ describe('post-DONE verifier (d8d509d2 t1936u)', () => {
     await note(h, t.id, DONE_EVIDENCE);
     const clock = { now: Date.now() + 1000 }; const starts: any[] = [];
     const v = verifier(h, starts, clock);
+    const claim = latestDoneClaim(await show(h, t.id));
+    h.sql.exec('UPDATE intake_verifier_meta SET enabled_at=? WHERE id=1', (claim?.captured_at ?? Date.now()) + 1);
     expect(await tick(v, clock)).toMatchObject({ launched: 0, closed: 0 });
     expect(starts).toHaveLength(0);
   }));

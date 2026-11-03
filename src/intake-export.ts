@@ -15,6 +15,12 @@ const select = (prefix: string) => {
   };
 
 export function initIntakeExport(sql: SqlStorage) {
+  // Intake rows are the permanent task ledger. Retention, cancellation,
+  // archival and every other caller may update a row, but must never remove
+  // it. Keep this invariant in SQLite so an accidental SQL DELETE fails
+  // before any projection/cleanup trigger can discard related history.
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_tasks_no_delete BEFORE DELETE ON intake_tasks
+    BEGIN SELECT RAISE(ABORT,'intake_tasks_hard_delete_forbidden'); END`);
   sql.exec(`CREATE TABLE IF NOT EXISTS intake_export (
     id TEXT PRIMARY KEY, project TEXT NOT NULL, status TEXT NOT NULL,
     archived INTEGER NOT NULL, updated_at INTEGER NOT NULL, data TEXT NOT NULL)`);

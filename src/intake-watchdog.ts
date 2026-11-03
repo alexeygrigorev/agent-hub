@@ -965,7 +965,7 @@ export class IntakeWatchdog {
         await this.escalate(t, 'hold_ttl_' + q.reason, now);
       }
     }
-    // Rows for tasks outside the batch (done, archived, deleted intakes) never
+    // Rows for tasks outside the batch (done or archived intakes) never
     // reappear in a cursor range. The scan is a raw keyset window over the queue
     // PK: at most QUEUE_SWEEP_LIMIT*2 rows examined per tick regardless of how
     // many are actionable (review F2 of intake 0841a966 — an OR predicate here

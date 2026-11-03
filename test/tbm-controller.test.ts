@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { env, SELF, runInDurableObject } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import type { Hub } from '../src/hub';
 import { modelCandidates } from '../src/model-routing';
@@ -22,7 +22,8 @@ import {
 } from '../src/tbm-controller';
 
 const inDO: any = runInDurableObject;
-const stub = (name = 'hub') => (env as any).HUB.get((env as any).HUB.idFromName(name));
+let testDO = '';
+const stub = (name = testDO || 'hub') => (env as any).HUB.get((env as any).HUB.idFromName(name));
 const HOUR = 3_600_000;
 const MIN = 60_000;
 const DAY = 24 * HOUR;
@@ -412,7 +413,7 @@ describe('Staged low-quota floor and kill-switch end-to-end scenario (AC6)', () 
   let seq = 0;
 
   async function api(path: string, payload?: any) {
-    const res = await SELF.fetch('https://hub.test' + path, {
+    const res = await stub().fetch('https://hub.test' + path, {
       method: payload ? 'POST' : 'GET',
       headers: { Cookie: cookie, 'x-csrf-token': 'csrf' },
       ...(payload ? { body: JSON.stringify(payload) } : {}),
@@ -421,6 +422,7 @@ describe('Staged low-quota floor and kill-switch end-to-end scenario (AC6)', () 
   }
 
   beforeEach(async () => {
+    testDO = 'tbm-controller-tests-' + crypto.randomUUID();
     cookie = (
       await createSessionCookie(env as any, {
         sub: 'operator',
@@ -433,10 +435,6 @@ describe('Staged low-quota floor and kill-switch end-to-end scenario (AC6)', () 
     await inDO(stub(), (h: any) => {
       h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
       ensureTbmControllerSchema(h.sql);
-      for (const t of ['tasks', 'grants', 'rules', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-      h.sql.exec('UPDATE intake_meta SET revision=0');
-      h.sql.exec('DELETE FROM tbm_quota_pools');
-      h.sql.exec('DELETE FROM tbm_banked_tranches');
       h.sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('fixture', 'admin@fake.local', 1, '2026-01-01', '2026-01-01')");
     });
   });

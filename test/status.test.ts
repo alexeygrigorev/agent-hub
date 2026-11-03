@@ -1,18 +1,19 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { env, SELF, runInDurableObject } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
 import { updateHeartbeatMemoryOnly } from '../src/registry';
 import { StatusService } from '../src/status';
 
 const inDO: any = runInDurableObject;
-const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
+let testDO = '';
+const stub = () => (env as any).HUB.get((env as any).HUB.idFromName(testDO));
 const source = { type: 'unknown', reference: null, timestamp: null };
 let cookie: string;
 let seq = 0;
 
 async function call(path: string, bearer?: string) {
-  return SELF.fetch('https://hub.test/api/status' + path, { method: 'GET',
+  return stub().fetch('https://hub.test/api/status' + path, { method: 'GET',
     headers: bearer ? { Authorization: 'Bearer ' + bearer } : { Cookie: cookie, 'x-csrf-token': 'csrf' } });
 }
 async function ok(path: string, bearer?: string): Promise<any> {
@@ -22,7 +23,7 @@ async function ok(path: string, bearer?: string): Promise<any> {
   return data;
 }
 async function intakeCall(path: string, payload?: any, bearer?: string) {
-  return SELF.fetch('https://hub.test/api/intake' + path, { method: payload ? 'POST' : 'GET',
+  return stub().fetch('https://hub.test/api/intake' + path, { method: payload ? 'POST' : 'GET',
     headers: { ...(bearer ? { Authorization: 'Bearer ' + bearer } : { Cookie: cookie, 'x-csrf-token': 'csrf' }) },
     ...(payload ? { body: JSON.stringify(payload) } : {}) });
 }
@@ -86,7 +87,7 @@ function seedHostMachine(machine: string, token: string, family = 'host-family-'
   })();
 }
 async function obsCall(payload: any, bearer?: string, csrf = 'csrf') {
-  return SELF.fetch('https://hub.test/api/status/observations', { method: 'POST',
+  return stub().fetch('https://hub.test/api/status/observations', { method: 'POST',
     headers: { ...(bearer ? { Authorization: 'Bearer ' + bearer } : { Cookie: cookie, 'x-csrf-token': csrf }), 'Content-Type': 'application/json' },
     body: JSON.stringify(payload) });
 }
@@ -110,20 +111,10 @@ function seedHubSession(sessionId: string, actor: string, machine: string, state
 }
 
 beforeEach(async () => {
+  testDO = 'status-tests-' + crypto.randomUUID();
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
   await inDO(stub(), (h: any) => {
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
-    for (const t of ['tasks', 'grants', 'rules', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    h.sql.exec('UPDATE intake_meta SET revision=0');
-    h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
-    h.sql.exec('DELETE FROM routing_jobs'); h.sql.exec('DELETE FROM fleet_launches'); h.sql.exec('DELETE FROM fleet_sessions');
-    h.sql.exec('DELETE FROM machines');
-    try { h.sql.exec('DELETE FROM session_control_sessions'); } catch {}
-    try { h.sql.exec('DELETE FROM session_control_commands'); } catch {}
-    try { h.sql.exec('DELETE FROM session_lifecycle_observations'); } catch {}
-    try { h.sql.exec('DELETE FROM session_lifecycle_decisions'); } catch {}
-    try { h.sql.exec('DELETE FROM status_observations'); } catch {}
-    try { h.sql.exec('DELETE FROM status_baselines'); } catch {}
   });
 });
 
@@ -684,7 +675,7 @@ describe('M14b slice2 machine-authenticated host observations', () => {
 
 describe('M14d caller-scoped durable baseline with complete POST summary', () => {
   async function postCall(path: string, payload: any = {}, bearer?: string, csrf = 'csrf') {
-    return SELF.fetch('https://hub.test/api/status' + path, { method: 'POST',
+    return stub().fetch('https://hub.test/api/status' + path, { method: 'POST',
       headers: { ...(bearer ? { Authorization: 'Bearer ' + bearer } : { Cookie: cookie, 'x-csrf-token': csrf }), 'Content-Type': 'application/json' },
       body: JSON.stringify(payload) });
   }
@@ -839,7 +830,7 @@ describe('M14d caller-scoped durable baseline with complete POST summary', () =>
     const first = await postOk('', {});
     expect(first.categories.diff.state).toBe('first_baseline');
     // Malformed JSON is a clean 400, never a baseline write.
-    const bad = await SELF.fetch('https://hub.test/api/status', { method: 'POST',
+    const bad = await stub().fetch('https://hub.test/api/status', { method: 'POST',
       headers: { Cookie: cookie, 'x-csrf-token': 'csrf', 'Content-Type': 'application/json' }, body: '{oops' });
     expect(bad.status).toBe(400);
   });

@@ -3,7 +3,8 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { AskLedger, splitAsks, acLines, matchAcLine, noteMarks, ASK_GRACE_MS } from '../src/asks';
 import { toolRequest } from '../src/mcp-tools';
 const inDO: any = runInDurableObject;
-const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
+let fixtureSeq = 0;
+const stub = (name = 'hub') => (env as any).HUB.get((env as any).HUB.idFromName(name));
 const admin = { caller: { isAdmin: true, actor: 'human:operator', kind: 'human' }, scopes: ['admin'] } as any;
 const op = { admin: true, actor: 'human:operator' };
 const source = { type: 'chat', reference: null, timestamp: null };
@@ -31,10 +32,8 @@ const close = async (h: any, id: string) => {
 const show = async (h: any, id: string) => (await call(h, '/tasks/' + id)).body.task;
 const DONE = (extra: string) => `DONE\nevidence: agent-hub@0123456789abcdef pushed\nlive check: curl https://example.test/health -> 200\nresult: proven\n${extra}`;
 async function fixture(fn: (h: any, ledger: AskLedger, alerts: any[], clock: { now: number }) => any) {
-  return inDO(stub(), async (h: any) => {
-    for (const t of ['tasks', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    for (const t of ['ask_messages', 'asks', 'ask_agents', 'ask_gaps', 'ask_sources', 'liveness_alerts']) h.sql.exec('DELETE FROM ' + t);
-    h.sql.exec("UPDATE ask_meta SET gap_scope='agent',last_tick=NULL,last_result=NULL,daily_day=NULL WHERE id=1");
+  const name = 'asks-tests-' + (++fixtureSeq) + '-' + crypto.randomUUID();
+  return inDO(stub(name), async (h: any) => {
     const alerts: any[] = [];
     const clock = { now: Date.now() };
     const ledger = new AskLedger(h.sql, h.intakeService, (f: any) => f(), {
@@ -403,6 +402,7 @@ describe('review regressions', () => {
 
 describe('gap detector (AC4)', () => {
   it('flags holes between recorded refs once, resolves when filled', () => fixture(async (h, l, alerts) => {
+    l.settings({ gap_scope: 'agent' });
     const r = ingest(l, 'dev', [msg('t600u', 'a b c'), msg('t603u', 'd e f')]);
     expect(r.gaps).toEqual([{ agent_id: 'dev', after_t_id: 't600u', before_t_id: 't603u', missing: ['t601u', 't602u'], kind: 'hole' }]);
     expect((await l.tick()).gap_alerts).toBe(1);
@@ -450,9 +450,7 @@ describe('gap detector (AC4)', () => {
 });
 
 describe('Hub composition', () => {
-  it('watchdog tick runs the ledger, status carries counts, /api/asks is wired', () => inDO(stub(), async (h: any) => {
-    for (const t of ['ask_messages', 'asks', 'ask_gaps']) h.sql.exec('DELETE FROM ' + t);
-    h.sql.exec('UPDATE intake_watchdog_meta SET last_tick=NULL WHERE id=1');
+  it('watchdog tick runs the ledger, status carries counts, /api/asks is wired', () => fixture(async (h: any) => {
     const r = await h.intakeWatchdog.tick('test');
     expect(r.asks?.state).toBe('checked');
     const res = await h.fetch(new Request('https://hub.test/api/asks'));

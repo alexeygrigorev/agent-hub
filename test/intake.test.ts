@@ -1,18 +1,19 @@
 import { initIntakeExport, advanceIntakeExport } from '../src/intake-export';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { env, SELF, runInDurableObject } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie, tokenAdminSubject, TOKEN_ADMIN_EMAIL } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
 import { IntakeService, INTAKE_LIMITS, INTAKE_EVENT_KINDS, recordIntakeSessionLink } from '../src/intake';
 
 const inDO: any = runInDurableObject;
-const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
+let testDO = '';
+const stub = () => (env as any).HUB.get((env as any).HUB.idFromName(testDO));
 const operatorHash = async (value: string) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))].map(b => b.toString(16).padStart(2, '0')).join('');
 const source = { type: 'unknown', reference: null, timestamp: null };
 let cookie: string;
 let seq = 0;
 async function call(path: string, payload?: any, bearer?: string, extra: any = {}) {
-  return SELF.fetch('https://hub.test/api/intake' + path, { method: payload ? 'POST' : 'GET',
+  return stub().fetch('https://hub.test/api/intake' + path, { method: payload ? 'POST' : 'GET',
     headers: { ...(bearer ? { Authorization: 'Bearer ' + bearer } : { Cookie: cookie, 'x-csrf-token': 'csrf' }), ...extra },
     ...(payload ? { body: JSON.stringify(payload) } : {}) });
 }
@@ -54,16 +55,12 @@ async function fullHistory(id: string): Promise<any[]> {
 async function state() { return inDO(stub(), (h: any) => Object.fromEntries(['tasks','rules','grants','receipts','meta','note_archive'].map(t => [t, h.sql.exec('SELECT * FROM intake_' + t + ' ORDER BY id').toArray()]))); }
 
 beforeEach(async () => {
+  // Permanent task/audit ledgers get a fresh isolated Durable Object per test.
+  // Never reset intake rows with DELETE.
+  testDO = 'intake-tests-' + crypto.randomUUID();
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
   await inDO(stub(), (h: any) => {
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
-    // Only fixture-owned archive rows are reset; production archives are append-only.
-    h.sql.exec('DROP TRIGGER IF EXISTS intake_note_archive_no_delete');
-    h.sql.exec('DELETE FROM intake_note_archive');
-    h.sql.exec("CREATE TRIGGER intake_note_archive_no_delete BEFORE DELETE ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
-    for (const t of ['tasks','grants','rules','receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    h.sql.exec('UPDATE intake_meta SET revision=0');
-    h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
     h.sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('fixture', 'admin@fake.local', 1, '2026-01-01', '2026-01-01')");
   });
 });
@@ -78,13 +75,13 @@ describe('private durable intake HTTP/SQLite', () => {
       initIntakeExport(sql);
       expect(sql.exec('SELECT COUNT(*) AS n FROM intake_export').toArray()[0].n).toBe(25);
       sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify({ project: 'changed', status: 'done' }), '030');
-      sql.exec('DELETE FROM intake_tasks WHERE id=?', '031');
+      expect(() => sql.exec('DELETE FROM intake_tasks WHERE id=?', '031')).toThrow(/hard_delete_forbidden/);
       expect(advanceIntakeExport(sql)).toBe(false);
       expect(advanceIntakeExport(sql)).toBe(true);
       expect(advanceIntakeExport(sql)).toBe(true);
       initIntakeExport(sql);
-      expect(sql.exec('SELECT COUNT(*) AS n FROM intake_export').toArray()[0].n).toBe(60);
-      expect(sql.exec('SELECT SUM(n) AS n FROM intake_export_totals').toArray()[0].n).toBe(60);
+      expect(sql.exec('SELECT COUNT(*) AS n FROM intake_export').toArray()[0].n).toBe(61);
+      expect(sql.exec('SELECT SUM(n) AS n FROM intake_export_totals').toArray()[0].n).toBe(61);
       expect(sql.exec('SELECT project,status FROM intake_export WHERE id=?', '001').toArray()[0]).toEqual({ project: '', status: 'open' });
       expect(sql.exec('SELECT project,status FROM intake_export WHERE id=?', '030').toArray()[0]).toEqual({ project: 'changed', status: 'done' });
     });
@@ -430,10 +427,10 @@ describe('private durable intake HTTP/SQLite', () => {
   it('accepts bounded streamed UTF-8 chunks and rejects malformed byte sequences atomically', async () => {
     const bytes = new TextEncoder().encode(JSON.stringify({ key: 'stream', project: 'demo', title: 'Synthetic', text: '世界', source }));
     const stream = new ReadableStream({ start(controller) { for (const byte of bytes) controller.enqueue(new Uint8Array([byte])); controller.close(); } });
-    const response = await SELF.fetch('https://hub.test/api/intake/tasks', { method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }, body: stream });
+    const response = await stub().fetch('https://hub.test/api/intake/tasks', { method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }, body: stream });
     expect(response.status).toBe(200);
     const before = await state();
-    const invalid = await SELF.fetch('https://hub.test/api/intake/tasks', { method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }, body: new Uint8Array([0xff,0xfe]) });
+    const invalid = await stub().fetch('https://hub.test/api/intake/tasks', { method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }, body: new Uint8Array([0xff,0xfe]) });
     expect(invalid.status).toBe(400); expect(await state()).toEqual(before);
   });
 
@@ -476,7 +473,7 @@ describe('private durable intake HTTP/SQLite', () => {
     await inDO(stub(), (h: any) => h.sql.exec("INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES('human-refresh','human',?,?,'fixture-admin-family','admin@fake.local','human:fixture','[\"admin\"]','fixture','2026-01-01',?)", hash, rh, new Date(Date.now()+3600000).toISOString()));
     const payload = { key: 'admin-retry', project: 'demo', title: 'Synthetic', text: 'Original', source };
     const first = await ok('/tasks', payload, 'hubt_fixture_admin_refresh');
-    const refresh = await SELF.fetch('https://hub.test/api/token/refresh', { method: 'POST', body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: 'hubr_fixture_admin_refresh' }) });
+    const refresh = await stub().fetch('https://hub.test/api/token/refresh', { method: 'POST', body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: 'hubr_fixture_admin_refresh' }) });
     expect(refresh.status).toBe(200); const fresh: any = await refresh.json();
     expect(await ok('/tasks', payload, fresh.access_token)).toEqual(first);
     expect((await ok('/tasks')).total).toBe(1);
@@ -620,7 +617,7 @@ describe('private durable intake HTTP/SQLite', () => {
     const link = assigned.task.payload_data.history.find((e: any) => e.kind === 'link');
     expect(link).toMatchObject({ hub_session_id: sessionId, evidence: 'hub_launch_verified' });
     // The same operator controls the real session through hub sessions.
-    const sessions = async () => ((await (await SELF.fetch('https://hub.test/api/sessions?limit=50',
+    const sessions = async () => ((await (await stub().fetch('https://hub.test/api/sessions?limit=50',
       { headers: { Cookie: cookie, 'x-csrf-token': 'csrf' } })).json()) as any).sessions.map((s: any) => s.id);
     expect(await sessions()).toContain(sessionId);
     // Handoff projects the live canonical state, never caller assertions.
@@ -649,7 +646,7 @@ describe('private durable intake HTTP/SQLite', () => {
     const sessionId = assigned.assigned_session.hub_session_id;
     expect(sessionId).toMatch(/^[0-9a-f-]{36}$/i);
     // The same agent credential controls its session through hub sessions.
-    const listed = await SELF.fetch('https://hub.test/api/sessions?limit=50',
+    const listed = await stub().fetch('https://hub.test/api/sessions?limit=50',
       { headers: { Authorization: 'Bearer ' + agent.token } });
     expect(listed.status).toBe(200);
     expect((((await listed.json()) as any).sessions as any[]).map(s => s.id)).toContain(sessionId);
@@ -694,7 +691,7 @@ describe('private durable intake HTTP/SQLite', () => {
   });
   it('carries session.parent_id to canonical session service, preserving lineage, idempotency, and failure boundaries', async () => {
     const parentTask = (await create()).task;
-    const parentRes = await SELF.fetch('https://hub.test/api/sessions', {
+    const parentRes = await stub().fetch('https://hub.test/api/sessions', {
       method: 'POST',
       headers: { Cookie: cookie, 'x-csrf-token': 'csrf' },
       body: JSON.stringify({ key: 'parent-session-' + ++seq, workspace: 'demo', mode: 'headless', brief: 'Parent session', intake_task_id: parentTask.id })
@@ -727,7 +724,7 @@ describe('private durable intake HTTP/SQLite', () => {
       expect(row.parent_id).toBe(parentId);
       expect(row.parent_source).toBe('explicit_parent');
     });
-    const childShowRes = await SELF.fetch('https://hub.test/api/sessions/' + childSessionId, {
+    const childShowRes = await stub().fetch('https://hub.test/api/sessions/' + childSessionId, {
       headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }
     });
     expect(childShowRes.status).toBe(200);
@@ -851,7 +848,7 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await ok('/tasks/' + task.id + '/links')).task.payload_data.history).toHaveLength(10);
   });
   it('requires current session CSRF and supports current token-admin cookie and human admin bearer', async () => {
-    expect((await SELF.fetch('https://hub.test/api/intake/tasks')).status).toBe(401);
+    expect((await stub().fetch('https://hub.test/api/intake/tasks')).status).toBe(401);
     expect((await call('/tasks', { key: 'x' }, undefined, { 'x-csrf-token': '' })).status).toBe(403);
     expect((await call('/tasks', { key: 'x' }, undefined, { Origin: 'https://foreign.test' })).status).toBe(403);
     const tokenCookie = (await createSessionCookie(env as any, { sub: tokenAdminSubject('a'.repeat(64)), email: TOKEN_ADMIN_EMAIL, isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
@@ -901,7 +898,7 @@ describe('private durable intake HTTP/SQLite', () => {
 
     expect((await call('/grantees?actor=demo:assistant', undefined, a.token)).status).toBe(403);
 
-    const unauth = await SELF.fetch('https://hub.test/api/intake/grantees?actor=demo:assistant');
+    const unauth = await stub().fetch('https://hub.test/api/intake/grantees?actor=demo:assistant');
     expect([401, 403]).toContain(unauth.status);
 
     expect((await call('/grantees')).status).toBe(400);
@@ -1063,13 +1060,13 @@ describe('private durable intake HTTP/SQLite', () => {
     const a = await seedAgent(); await grant(a);
     const payload = { key: 'family-retry', project: 'demo', title: 'Synthetic', text: 'Data', source };
     const original = await ok('/tasks', payload, a.token);
-    const refresh = await SELF.fetch('https://hub.test/api/token/refresh', { method: 'POST', body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: a.refresh }) });
+    const refresh = await stub().fetch('https://hub.test/api/token/refresh', { method: 'POST', body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: a.refresh }) });
     expect(refresh.status).toBe(200); const fresh: any = await refresh.json();
     expect(await ok('/tasks', payload, fresh.access_token)).toEqual(original);
     const other = await seedAgent('demo:assistant');
     expect((await call('/handoff', undefined, other.token)).status).toBe(403);
     expect((await call('/handoff', undefined, a.token)).status).toBe(401);
-    await SELF.fetch('https://hub.test/api/token/refresh', { method: 'POST', body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: a.refresh }) });
+    await stub().fetch('https://hub.test/api/token/refresh', { method: 'POST', body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: a.refresh }) });
     expect((await call('/handoff', undefined, fresh.access_token)).status).toBe(401);
   });
   it.each(['expiry','credential_revoke','registration_delete','machine_rebound','machine_delete'])('fails closed after %s, including actor-name reuse', async action => {
@@ -1425,7 +1422,6 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(await state()).toEqual(before);
     // t1038u: task row count no longer hard-refuses create (soft warn only).
     await inDO(stub(), (h: any) => {
-      h.sql.exec('DELETE FROM intake_tasks');
       for (let i=0;i<128;i++) h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'fixture-padding-' + i, JSON.stringify({ id: 'fixture-padding-' + i, padding: 'x'.repeat(32 * 1024 * 1024/128), captured_at: Date.now() }));
     });
     // Hash each bounded record inside the DO instead of cloning a full
@@ -1472,7 +1468,6 @@ describe('private durable intake HTTP/SQLite', () => {
 
   it('emits intake_open_warning on list/create when open non-terminal count exceeds 100', async () => {
     await inDO(stub(), (h: any) => {
-      h.sql.exec('DELETE FROM intake_tasks');
       for (let i = 0; i < 101; i++) {
         h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-open-' + i, JSON.stringify({
           id: 'fixture-open-' + i, project: 'demo', title: 'Open ' + i, status: 'open', version: 1,
@@ -1543,6 +1538,100 @@ describe('archive retention, evidence gates and durable audit', () => {
     expect((await call('/tasks/' + task.id, { key: 'stale-evidence', expected_version: task.version, status: 'done' })).status).toBe(409);
     expect((await ok('/tasks/' + task.id + '/audit')).items[0].kind).toBe('reopen');
   });
+  it('retains done, cancelled and pruned tasks after 400 days and repeated prune passes', async () => {
+    const project = 'retention-400-days';
+    let doneTask = (await create(project, 'retention-done')).task;
+    doneTask = (await append(doneTask.id, doneTask.version, done)).task;
+    doneTask = (await ok('/tasks/' + doneTask.id, { key: 'retention-close', expected_version: doneTask.version, status: 'done' })).task;
+
+    let cancelledTask = (await create(project, 'retention-cancel')).task;
+    cancelledTask = (await ok('/tasks/' + cancelledTask.id, { key: 'retention-cancel-close', expected_version: cancelledTask.version,
+      status: 'cancelled', reason: 'dropped by Alexey: retention fixture' })).task;
+
+    const legacyId = 'f1742529-9279-4be7-b99f-6140f1c2d4e8';
+    const legacyNote = { id: 'e523ea2c-df77-48f4-9716-e5b879b7c013', kind: 'note', text: 'Legacy full history remains available after archival.' };
+    const legacyData = { id: legacyId, project, title: 'Legacy terminal payload', status: 'done', version: 3,
+      created_at: Date.now() - 86400000, updated_at: Date.now() - 86400000,
+      current_state: 'saved current state', next_step: 'saved next step', owner: 'retained owner', uncertainty: null,
+      acceptance_criteria: 'Retain the complete historical payload and event.', history: [legacyNote] };
+    await inDO(stub(), (h: any) => h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)', legacyId, JSON.stringify(legacyData)));
+
+    const fakeNow = Date.now() + 400 * 86400000;
+    await inDO(stub(), (h: any) => {
+      // Invoke the production bounded archival pass repeatedly with a fake
+      // clock beyond the old retention horizon. Pruning may archive rows but
+      // must never remove their payload or audit history.
+      for (let pass = 0; pass < 4; pass++) (h.intakeService as any).prune(fakeNow + pass);
+    });
+
+    const expected = [
+      { id: doneTask.id, status: 'done', title: 'Synthetic task' },
+      { id: cancelledTask.id, status: 'cancelled', title: 'Synthetic task' },
+      { id: legacyId, status: 'done', title: legacyData.title },
+    ];
+    const shownById = new Map<string, any>();
+    for (const item of expected) {
+      const shown = (await ok('/tasks/' + item.id)).task;
+      expect(shown).toMatchObject({ id: item.id, status: item.status, archived_at: expect.any(Number), payload_data: { title: item.title } });
+      shownById.set(item.id, shown);
+      const history = await fullHistory(item.id);
+      expect(history.length).toBeGreaterThan(0);
+      expect(history).toEqual(shown.payload_data.history);
+      expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', item.id).one().n)).toBe(1);
+    }
+    const archived = await ok('/tasks?archived=true&project=' + project + '&limit=50');
+    const all = await ok('/tasks?all=true&project=' + project + '&limit=50');
+    expect(archived.items.map((t: any) => t.id)).toEqual(expect.arrayContaining(expected.map(t => t.id)));
+    expect(all.items.map((t: any) => t.id)).toEqual(expect.arrayContaining(expected.map(t => t.id)));
+    for (const item of expected) {
+      expect(archived.items.find((t: any) => t.id === item.id).payload_data).toEqual(shownById.get(item.id).payload_data);
+      expect(all.items.find((t: any) => t.id === item.id).payload_data).toEqual(shownById.get(item.id).payload_data);
+    }
+    expect((archived.items.find((t: any) => t.id === legacyId)).payload_data).toMatchObject({
+      current_state: legacyData.current_state, next_step: legacyData.next_step, owner: legacyData.owner,
+      acceptance_criteria: legacyData.acceptance_criteria, history: [legacyNote],
+    });
+    expect((await ok('/tasks/' + legacyId + '/audit')).items.map((e: any) => e.kind)).toContain('archive');
+    expect((await ok('/tasks/' + doneTask.id + '/audit')).items.map((e: any) => e.kind)).toEqual(['close', 'archive']);
+    expect((await ok('/tasks/' + cancelledTask.id + '/audit')).items.map((e: any) => e.kind)).toEqual(['cancel', 'archive']);
+  });
+  it('restores original IDs additively for operators, keeps terminal state archived, and refuses duplicates', async () => {
+    const id = 'e8a0e807-6c7d-45d1-aec6-8a0c05e42b39';
+    const archivedEvent = { id: '5b68f8a0-eed4-45c8-83d7-f9c4e6b59cb5', kind: 'note', text: 'Older archived source note.' };
+    const inlineEvent = { id: '53073054-260e-4509-9ba1-985bf71fc22f', kind: 'note', text: 'Latest original note, still in the task.' };
+    const record = { id, project: 'restore-fixture', title: 'Original restored task', status: 'done', version: 7,
+      created_at: 1700000000000, updated_at: 1700000001000, current_state: 'original state', next_step: 'original next step',
+      owner: 'original owner', uncertainty: null, acceptance_criteria: 'Preserve the full record and original final state.',
+      history: [inlineEvent], history_archive: { count: 1, href: '/api/intake/tasks/' + id + '/history?archived=1' } };
+    const payload = { key: 'restore-e8a0e807', task: record,
+      archived_notes: [{ sequence: 0, event: archivedEvent }], inline_sequences: { [inlineEvent.id]: 1 } };
+
+    const agent = await seedAgent('restore-fixture:worker');
+    expect((await call('/tasks/restore', payload, agent.token)).status).toBe(403);
+
+    const restored = await ok('/tasks/restore', payload);
+    expect(restored).toMatchObject({ restored: true, task: { id, status: 'done', archived_at: expect.any(Number),
+      payload_data: { title: record.title, current_state: record.current_state, next_step: record.next_step, owner: record.owner } } });
+    expect(await fullHistory(id)).toEqual([archivedEvent, inlineEvent]);
+    expect((await ok('/tasks?archived=true&project=restore-fixture')).items.map((t: any) => t.id)).toContain(id);
+    expect((await ok('/tasks/' + id + '/audit')).items).toEqual([expect.objectContaining({
+      kind: 'restore', from_status: null, to_status: 'done', reason: 'operator restored a previously lost intake',
+    })]);
+
+    const duplicate = await call('/tasks/restore', { ...payload, key: 'restore-duplicate' });
+    expect(duplicate.status).toBe(409);
+    expect(await duplicate.json()).toMatchObject({ error: 'intake_exists' });
+    expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', id).one().n)).toBe(1);
+
+    const cancelledId = 'c7097c4b-ce22-4e4f-9eb2-aa8a7f358829';
+    const cancelled = await ok('/tasks/restore', { key: 'restore-cancelled', task: { ...record, id: cancelledId, status: 'cancelled',
+      history_archive: undefined, history: [inlineEvent] } });
+    expect(cancelled.task).toMatchObject({ id: cancelledId, status: 'cancelled', archived_at: expect.any(Number) });
+    const openId = '56c3422a-26e9-4617-b8c3-53e07420f5de';
+    const open = await ok('/tasks/restore', { key: 'restore-open', task: { ...record, id: openId, status: 'open',
+      history_archive: undefined, history: [inlineEvent] } });
+    expect(open.task).toMatchObject({ id: openId, status: 'open', archived_at: null });
+  });
   it('list/show/update/history agree for every visible full id and prefix during parallel archive passes', async () => {
     const first = await create(), second = await create();
     const closed = await append(second.task.id, 1, done);
@@ -1560,7 +1649,7 @@ describe('archive retention, evidence gates and durable audit', () => {
     }
     expect((await ok('/tasks/' + first.task.id)).task.status).toBe('open');
   });
-  it('audit is append-only, survives row loss, and does not disclose other projects', async () => {
+  it('audit is append-only, direct task deletion is refused, and other projects stay private', async () => {
     let { task } = await create('secret');
     task = (await append(task.id, 1, done)).task;
     task = (await ok('/tasks/' + task.id, { key: 'audit-close', expected_version: task.version, status: 'done' })).task;
@@ -1570,10 +1659,11 @@ describe('archive retention, evidence gates and durable audit', () => {
     await inDO(stub(), (h: any) => {
       expect(() => h.sql.exec('UPDATE intake_audit SET reason=? WHERE task_id=?', 'tamper', task.id)).toThrow();
       expect(() => h.sql.exec('DELETE FROM intake_audit WHERE task_id=?', task.id)).toThrow();
-      h.sql.exec('DELETE FROM intake_tasks WHERE id=?', task.id); // disposable fixture only
+      expect(() => h.sql.exec('DELETE FROM intake_tasks WHERE id=?', task.id)).toThrow('intake_tasks_hard_delete_forbidden');
+      expect(h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', task.id).one().n).toBe(1);
     });
     const events = (await ok('/tasks/' + task.id.slice(0, 8) + '/audit')).items;
-    expect(events.map((e: any) => e.kind)).toEqual(['delete', 'close', 'archive']);
+    expect(events.map((e: any) => e.kind)).toEqual(['close', 'archive']);
   });
 });
 

@@ -458,11 +458,9 @@ export class IntakeService {
         WHEN json_extract(OLD.data,'$.archived_at') IS NULL AND json_extract(NEW.data,'$.archived_at') IS NOT NULL BEGIN
         INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason)
         VALUES(NEW.id,json_extract(NEW.data,'$.project'),'archive',${auditActor},json_extract(NEW.data,'$.archived_at'),${oldStatus},${newStatus},${auditReason}); END`);
-      // Defensive audit for any future SQL deletion path. No product deletion endpoint exists.
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_delete AFTER DELETE ON intake_tasks BEGIN
-        INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason)
-        VALUES(OLD.id,json_extract(OLD.data,'$.project'),'delete','hub:sql',CAST(strftime('%s','now') AS INTEGER)*1000,
-        ${oldStatus},NULL,'direct SQL delete; initiating actor unavailable'); END`);
+      // Old builds may still have an AFTER DELETE audit observer installed.
+      // Leave it inert: initIntakeExport installs a BEFORE DELETE abort guard,
+      // so a forbidden task deletion fails before any AFTER trigger can run.
       // A renamed/rebound registry identity cannot revive a former grant by moving back.
       // These triggers affect only our grant store; credential/registry ownership is unchanged.
       const actor = "CASE WHEN COALESCE(OLD.project,'')='' THEN OLD.tag ELSE OLD.project || ':' || OLD.tag END";
@@ -624,6 +622,108 @@ export class IntakeService {
     task.status = status;
     task.archived_at = OPEN.includes(status) ? null : now;
     if (status === 'done' || status === 'cancelled') this.mergeGate.closed(task.id); else if (OPEN.includes(status)) this.mergeGate.reopened(task.id);
+  }
+  /** Additive operator recovery for a task row lost by an older build.
+   * `task` is the canonical stored record (or a complete show response with
+   * payload_data); archived notes and inline sequence metadata accompany it
+   * when the record used the separate note archive. Existing IDs are never
+   * overwritten. */
+  private restoreTask(b: Obj, p: Obj, now: number): Obj {
+    this.operator(p);
+    keys(b, ['key', 'task', 'archived_notes', 'inline_sequences', 'reason']);
+    const incoming = object(b.task);
+    const payload = incoming.payload_data === undefined ? null : object(incoming.payload_data);
+    const task: Obj = payload ? { ...incoming, ...payload } : { ...incoming };
+    for (const field of ['control', 'capacity_warning', 'scope_flag', 'unresolved', 'assigned_sessions', 'worktrees',
+      'close_gate', 'merge_state', 'operator_rules', 'data_notice', 'payload_data']) delete task[field];
+
+    const id = identifier(task.id);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) fail('restore_requires_full_uuid');
+    if (this.sql.exec('SELECT 1 FROM intake_tasks WHERE id=?', id).toArray().length) fail('intake_exists', 409);
+    if (task.project != null) task.project = identifier(task.project);
+    if (!STATUSES.includes(task.status)) fail('invalid_status');
+    task.version = integer(task.version, 1);
+    task.created_at = integer(task.created_at, 0);
+    task.updated_at = integer(task.updated_at, 0);
+    task.title = str(task.title, 256, 'title');
+    if (!Array.isArray(task.history) || task.history.some((event: any) => !event || typeof event !== 'object' || Array.isArray(event))) fail('invalid_restore_history');
+    if (task.history.length > INTAKE_LIMITS.events) fail('history_capacity', 507);
+    const inlineIds = task.history.filter((event: any) => typeof event.id === 'string').map((event: any) => event.id);
+    if (new Set(inlineIds).size !== inlineIds.length) fail('invalid_restore_history');
+
+    const inlineOrder: Obj = Object.create(null);
+    if (task._history_order && typeof task._history_order === 'object' && !Array.isArray(task._history_order)) {
+      for (const [eventId, sequence] of Object.entries(task._history_order)) inlineOrder[eventId] = sequence;
+    }
+    const suppliedOrder = b.inline_sequences === undefined ? {} : object(b.inline_sequences);
+    const archivedInput = b.archived_notes === undefined ? [] : b.archived_notes;
+    if (!Array.isArray(archivedInput)) fail('invalid_archived_notes');
+    const existingRows = this.sql.exec('SELECT id,seq,data FROM intake_note_archive WHERE task_id=? ORDER BY seq', id).toArray() as any[];
+    const bySequence = new Map<number, { id: string; data: string; event: Obj }>();
+    const byArchiveId = new Map<string, number>();
+    for (const row of existingRows) {
+      let event: Obj;
+      try { event = object(JSON.parse(row.data)); } catch { fail('invalid_existing_archive'); }
+      bySequence.set(Number(row.seq), { id: String(row.id), data: String(row.data), event });
+      byArchiveId.set(String(row.id), Number(row.seq));
+    }
+    const inserts: Obj[] = [];
+    for (const entryValue of archivedInput) {
+      const entry = object(entryValue);
+      const seq = integer(entry.sequence ?? entry.seq, 0);
+      const event = object(entry.event);
+      const eventId = str(event.id, 128, 'event.id');
+      const archiveId = id + ':' + eventId;
+      const data = JSON.stringify(event);
+      const atSequence = bySequence.get(seq);
+      const atId = byArchiveId.get(archiveId);
+      if (atSequence || atId !== undefined) {
+        if (!atSequence || atSequence.id !== archiveId || canonical(atSequence.event) !== canonical(event) || atId !== seq) fail('restore_archive_conflict', 409);
+        continue;
+      }
+      bySequence.set(seq, { id: archiveId, data, event });
+      byArchiveId.set(archiveId, seq);
+      inserts.push({ id: archiveId, task_id: id, seq, data });
+    }
+
+    const archiveMeta = task.history_archive == null ? null : object(task.history_archive);
+    const expectedArchiveCount = archiveMeta === null ? bySequence.size : integer(archiveMeta.count, 0);
+    if (bySequence.size !== expectedArchiveCount) throw new IntakeError('restore_archive_incomplete', 409, undefined, undefined,
+      { expected: expectedArchiveCount, available: bySequence.size });
+    if (archiveMeta || bySequence.size) task.history_archive = {
+      ...(archiveMeta ?? {}), count: expectedArchiveCount,
+      href: '/api/intake/tasks/' + id + '/history?archived=1',
+    };
+
+    let maxSequence = -1;
+    for (const sequence of bySequence.keys()) maxSequence = Math.max(maxSequence, sequence);
+    for (const event of task.history) {
+      if (typeof event.id !== 'string' || !event.id) {
+        if (expectedArchiveCount) fail('restore_history_order_required', 409);
+        continue;
+      }
+      const sequence = (Object.hasOwn(suppliedOrder, event.id) ? suppliedOrder[event.id] : undefined) ??
+        (Object.hasOwn(inlineOrder, event.id) ? inlineOrder[event.id] : undefined);
+      if (sequence !== undefined) {
+        inlineOrder[event.id] = integer(sequence, 0);
+        maxSequence = Math.max(maxSequence, inlineOrder[event.id]);
+      } else if (expectedArchiveCount) fail('restore_history_order_required', 409);
+      else inlineOrder[event.id] = ++maxSequence;
+    }
+    if (Object.keys(inlineOrder).length) task._history_order = inlineOrder;
+    task._history_next_seq = Math.max(integer(task._history_next_seq ?? 0, 0), maxSequence + 1);
+    if (['done', 'cancelled'].includes(task.status) && task.archived_at == null) task.archived_at = now;
+    else if (task.archived_at === undefined) task.archived_at = null;
+    const restoreReason = str(b.reason ?? 'operator restored a previously lost intake', 8192, 'reason');
+
+    // Every write below is in the surrounding SQLite transaction. A capacity,
+    // archive or audit failure therefore leaves neither a partial task nor a
+    // partial history behind.
+    this.put('tasks', task);
+    for (const row of inserts) this.sql.exec('INSERT INTO intake_note_archive(id,task_id,seq,data) VALUES(?,?,?,?)', row.id, row.task_id, row.seq, row.data);
+    this.sql.exec(`INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason)
+      VALUES(?,?,'restore',?,?,NULL,?,?)`, id, task.project ?? '', p.actor, now, task.status, restoreReason);
+    return { restored: true, task: this.view(task, p) };
   }
   /** Fresh credential, binding and grant checks run in the same synchronous transaction as the effect. */
   private principal(auth: Auth): Obj {
@@ -1000,7 +1100,8 @@ export class IntakeService {
         const task = this.get('tasks', auditMatch[1]);
         if (task) { if (!this.allowed(p, task)) fail('not_found', 404); id = task.id; }
         else {
-          // A deleted task remains operator-readable from its durable audit identity.
+          // Keep historical audit access for task rows lost by older builds;
+          // the current database guard refuses all future hard deletes.
           this.operator(p);
           const ids = this.sql.exec("SELECT DISTINCT task_id FROM intake_audit WHERE task_id=? OR substr(task_id,1,?)=? LIMIT 2", auditMatch[1], auditMatch[1].length, auditMatch[1]).toArray() as any[];
           if (ids.length !== 1) fail('not_found', 404);
@@ -1452,6 +1553,7 @@ export class IntakeService {
   }
   private write(path: string, b: Obj, p: Obj): Obj {
     const now = Date.now();
+    if (path === '/tasks/restore') return this.restoreTask(b, p, now);
     if (path === '/tasks') {
       keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria', 'verification', 'priority']);
       const project = identifier(b.project);
@@ -2020,9 +2122,9 @@ export class IntakeService {
         if (p.worker && /\/merge-evidence$/.test(path)) payload.event = undefined;
         if (p.worker && !triageUpdate && !workerCreate && payload.event) payload.event = redactClaimData(payload.event);
         // Do not replay a private response after the caller loses its task/operator grant.
-        if (path.startsWith('/rules') || path.startsWith('/grants')) this.operator(p);
+        if (path.startsWith('/rules') || path.startsWith('/grants') || path === '/tasks/restore') this.operator(p);
         const taskMatch = /^\/tasks\/([^/]+)/.exec(path);
-        if (taskMatch) { const t = this.get('tasks', taskMatch[1]); if (!t || !this.allowed(p, t, true)) fail('not_found', 404); }
+        if (taskMatch && path !== '/tasks/restore') { const t = this.get('tasks', taskMatch[1]); if (!t || !this.allowed(p, t, true)) fail('not_found', 404); }
         if (path === '/tasks' && !workerCreate && !this.allowed(p, { project: payload.project, id: '' }, true)) fail('forbidden', 403);
         const id = p.identity + ':' + payload.key;
         const previous = this.get('receipts', id); const fingerprint = canonical({ path, payload });
