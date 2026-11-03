@@ -1342,13 +1342,6 @@ export class FleetService {
         rejected.push({ machine: route.machine_id, engine: route.engine, reason: engineHealth.reason || 'engine_auth_expired' });
         continue;
       }
-      // Circuit breaker (intake 0e1b61c9): a route whose last launches all died at the
-      // launcher before the engine produced work is skipped until the window passes, then
-      // one probe is let through. An operator pinning account AND machine still probes it.
-      if (!(request.account && request.machine) && routeQuarantined(route.account, route.machine_id)) {
-        rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'route_quarantined' });
-        continue;
-      }
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
       let commandChannel = commandChannelByMachine.get(route.machine_id);
       if (!commandChannel) {
@@ -1589,6 +1582,13 @@ export class FleetService {
       const busyRatio = (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / Math.max(1, caps.cpu_count || 1);
       const cpuLoad = Math.max(busyRatio, observedLoad);
       const isDegraded = Boolean(gateProjection && !gateRefusal);
+      // Circuit breaker (intake 0e1b61c9): a route whose last launches all died at the
+      // launcher before the engine produced work is skipped until the window passes, then
+      // one probe is let through. Evaluated here so routes already rejected above never pay for the lookup. An operator pinning account AND machine still probes it.
+      if (!(request.account && request.machine) && routeQuarantined(route.account, route.machine_id)) {
+        rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'route_quarantined' });
+        continue;
+      }
       const burn = request.mode === 'interactive' ? null : burnForecast(routeProv?.quota, this.now(), Number(account!.reserve_percent) || 0);
       const burn_weight = burnFactor(burn);
       const decide = (healthyAlt: boolean) => computeEngineDecision({ healthyAlternative: healthyAlt,
