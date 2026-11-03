@@ -31,8 +31,4 @@ means approved repositories can be cloned; `not_configured` means the Hub
 operator must enable repository access; `declined` or `forbidden` means access
 was not granted; `unavailable` means retry after a temporary outage.
 
-The Windows controller runs as a per-user logon task. Linux uses a systemd
-user service. Keep your user session active so the controller can report
-availability. macOS installs per-user files, but its controller currently does
-not start because required resource limits cannot be enforced there. Fresh
-Windows-profile end-to-end verification is still pending.
+The Windows controller runs as a per-user logon task and updates automatically when Hub serves a new `hub.pyz` (spaced by 12 hours, or immediately when requested via `hub host-release --machine <id> --sha <sha>`; see [HOST-RELEASE.md](HOST-RELEASE.md#windows-package-installs-immutable-release-trees-supported-update-path)). Linux uses a systemd user service. Keep your user session active so the controller can report availability. macOS installs per-user files, but its controller currently does not start because required resource limits cannot be enforced there. Fresh Windows-profile end-to-end verification is still pending.

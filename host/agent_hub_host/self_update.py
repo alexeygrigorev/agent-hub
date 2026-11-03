@@ -242,7 +242,11 @@ def step_once(request, *, root=None, run=subprocess.run, python=None, log=print)
     target = target.lower() if isinstance(target, str) and SHA.match(target.lower()) else None
     if root is None:
         sha = release_sha()
-        if sha and target and sha != target:
+        from . import package_update
+        pkg_release = package_update.running_release()
+        if pkg_release is not None:
+            state, error = package_update.apply_host_release(target, sha, release=pkg_release, log=log)
+        elif sha and target and sha != target:
             request('POST', '/api/fleet/routing/host-release/report', {'current_sha': sha, 'state': 'updating', 'error': None})
             from .immutable_release import apply as apply_immutable
             state, error, sha = apply_immutable(target, sha, request,

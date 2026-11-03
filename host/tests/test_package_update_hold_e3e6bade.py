@@ -9,6 +9,7 @@ scheduling for a stated reason, at most 72 h, and is released by deleting it.
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -210,3 +211,79 @@ def test_hold_write_is_atomic_and_leaves_no_temp(tmp_path, monkeypatch):
     [(src, dst)] = replaced
     assert dst.endswith(u.HOLD_FILE) and src.endswith('.tmp')
     assert not list(tmp_path.glob(u.HOLD_FILE + '.*.tmp'))
+
+
+def test_automatic_updates_keep_12h_spacing_while_operator_request_bypasses_once(tmp_path):
+    release = make_release(tmp_path, 'd' * 64)
+    registered = []
+    call = lambda archive, now, **kw: u.step_once(
+        'https://hub.example', tmp_path, release=release, now=now,
+        fetch=lambda url: archive + '\n', register=lambda *a: registered.append(a), free_gb=500, **kw)
+    t0 = 10_000.0
+    assert call('e' * 64, t0) == 'scheduled'
+    assert len(registered) == 1
+    # Automatic check 1 h later sees a newer archive ('f' * 64) but still waits for the 12 h window.
+    assert call('f' * 64, t0 + 3600) == 'pending'
+    assert len(registered) == 1
+    # After 12 h, automatic check schedules the new archive.
+    t1 = t0 + u.MIN_INTERVAL_S + 1
+    assert call('f' * 64, t1) == 'scheduled'
+    assert len(registered) == 2
+    # Another critical fix ('a' * 64) arrives 30 min later: automatic check waits, operator request bypasses once.
+    assert call('a' * 64, t1 + 1800) == 'pending'
+    assert call('a' * 64, t1 + 1800, requested_sha='1' * 40) == 'scheduled'
+    assert len(registered) == 3
+    # The same operator request does not bypass the 12 h window a second time.
+    assert call('b' * 64, t1 + 2400, requested_sha='1' * 40) == 'pending'
+    # Bounded retry policy: even a new operator request cannot re-trigger the same failing archive inside RETRY_S.
+    assert call('a' * 64, t1 + 2400, requested_sha='2' * 40) == 'pending'
+    assert len(registered) == 3
+
+
+def test_host_release_pin_triggers_package_update_on_windows_package_install(tmp_path, monkeypatch):
+    from agent_hub_host import config, self_update
+    release = make_release(tmp_path, 'd' * 64)
+    old_sha = '1' * 40
+    new_sha = '2' * 40
+    monkeypatch.setattr(u, 'running_release', lambda: release)
+    monkeypatch.setattr(self_update, 'repo_root', lambda run=None: None)
+    monkeypatch.setattr(self_update, 'release_sha', lambda package=None: old_sha)
+    monkeypatch.setattr(self_update, 'ensure_windows_autostart', lambda root, run=None: ('configured', None))
+    monkeypatch.setattr(config, 'load_host_config', lambda: {'base_url': 'https://hub.example'})
+    monkeypatch.setattr(u, 'served_archive_sha', lambda base_url, fetch=None: 'e' * 64)
+    registered = []
+    monkeypatch.setattr(u, 'register_task', lambda base_url, state_dir: registered.append((base_url, Path(state_dir))))
+    monkeypatch.setattr('shutil.disk_usage', lambda path: type('U', (), {'free': 200 * (1024 ** 3)})())
+    # Seed a recent automatic update 1 h ago so we also verify the host-release pin bypasses the 12 h spacing once.
+    now = time.time()
+    (tmp_path / 'package-update.json').write_text(json.dumps({'sha': 'c' * 64, 'from': 'b' * 64, 'at': now - 3600}))
+    reports = []
+    desired = {'sha': new_sha}
+
+    def request(method, path, body=None):
+        if method == 'GET' and path == '/api/fleet/routing/host-release':
+            return dict(desired)
+        if method == 'POST' and path == '/api/fleet/routing/host-release/report':
+            reports.append(body)
+            return {'status': 'recorded'}
+        raise AssertionError((method, path))
+
+    assert self_update.step_once(request, root=None, log=lambda *a, **k: None) is False
+    assert len(registered) == 1 and registered[0] == ('https://hub.example', tmp_path)
+    assert reports[-1] == {'current_sha': old_sha, 'state': 'updating', 'error': None,
+                           'autostart_state': 'configured', 'autostart_error': None}
+    # Next poll while the background installer task is still pending stays in 'updating' without re-registering.
+    assert self_update.step_once(request, root=None, log=lambda *a, **k: None) is False
+    assert len(registered) == 1
+    assert reports[-1]['state'] == 'updating' and reports[-1]['error'] is None
+    # Active hold refuses cleanly with a fixed reason.
+    u.set_hold(tmp_path, 2, 'canary-red', now=now)
+    assert self_update.step_once(request, root=None, log=lambda *a, **k: None) is False
+    assert reports[-1] == {'current_sha': old_sha, 'state': 'refused', 'error': 'package_update_held',
+                           'autostart_state': 'configured', 'autostart_error': None}
+    u.clear_hold(tmp_path)
+    # Once the new release is running, step_once reports current.
+    monkeypatch.setattr(self_update, 'release_sha', lambda package=None: new_sha)
+    assert self_update.step_once(request, root=None, log=lambda *a, **k: None) is False
+    assert reports[-1] == {'current_sha': new_sha, 'state': 'current', 'error': None,
+                           'autostart_state': 'configured', 'autostart_error': None}

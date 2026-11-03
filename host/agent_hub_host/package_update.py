@@ -228,7 +228,8 @@ def register_task(base_url, state_dir, run=None):
         raise RuntimeError('update task registration failed')
 
 
-def step_once(base_url, state_dir, *, now=None, fetch=None, register=None, release=None, free_gb=None):
+def step_once(base_url, state_dir, *, now=None, fetch=None, register=None, release=None, free_gb=None,
+              requested_sha=None, requested=False):
     """One check. Returns a fixed state slug; never raises for expected cases."""
     now = time.time() if now is None else now
     current = current_archive_sha(release)
@@ -247,14 +248,19 @@ def step_once(base_url, state_dir, *, now=None, fetch=None, register=None, relea
     except (OSError, ValueError):
         last = {}
     # One attempt per served archive per RETRY_S: a failing installer is not
-    # rerun in a loop, and a newer deploy is picked up on the next check.
+    # rerun in a loop. Automatic updates also keep MIN_INTERVAL_S (12 h)
+    # spacing, while an operator request (e.g. hub host-release) bypasses the
+    # 12 h window once per request.
     if not isinstance(last, dict):
         last = {}
     try:
         age = now - float(last['at'])
     except (KeyError, TypeError, ValueError):
         age = None  # no earlier attempt
-    if age is not None and last.get('sha') == served and age < max(RETRY_S, MIN_INTERVAL_S):
+    req_key = (requested_sha.lower() if isinstance(requested_sha, str) and requested_sha else None) or (
+        'operator' if requested else None)
+    bypass = req_key is not None and last.get('requested_sha') != req_key
+    if age is not None and ((last.get('sha') == served and age < RETRY_S) or (not bypass and age < MIN_INTERVAL_S)):
         return 'pending'
     if free_gb is None:
         import shutil
@@ -262,9 +268,54 @@ def step_once(base_url, state_dir, *, now=None, fetch=None, register=None, relea
     if free_gb < DISK_FLOOR_GB:
         return 'disk_low'
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({'sha': served, 'from': current, 'at': now}), encoding='utf-8')
+    record = {'sha': served, 'from': current, 'at': now}
+    if req_key is not None:
+        record['requested_sha'] = req_key
+    elif isinstance(last.get('requested_sha'), str):
+        record['requested_sha'] = last['requested_sha']
+    marker.write_text(json.dumps(record), encoding='utf-8')
     (register or register_task)(base_url, state_dir)
     return 'scheduled'
+
+
+def apply_host_release(target, current_sha, *, release=None, base_url=None, state_dir=None, now=None,
+                       fetch=None, register=None, free_gb=None, log=print):
+    """Apply a Hub host-release pin on a Windows package install via package_update."""
+    if not current_sha:
+        return 'unsupported', 'release_provenance_missing'
+    if not target or target == current_sha:
+        return 'current', None
+    release = release or running_release()
+    if release is None:
+        return 'unsupported', 'package_release_missing'
+    from . import bootstrap, config
+    if base_url is None:
+        base_url = config.load_host_config().get('base_url')
+    if not base_url:
+        return 'failed', 'base_url_missing'
+    if state_dir is None:
+        release_path = Path(release)
+        state_dir = release_path.parent.parent if release_path.parent.name == 'releases' else bootstrap.user_install_root()
+    try:
+        pkg_state = step_once(base_url, state_dir, now=now, fetch=fetch, register=register,
+                              release=release, free_gb=free_gb, requested_sha=target)
+    except (OSError, RuntimeError, ValueError):
+        return 'failed', 'package_update_failed'
+    event = {'event': 'package_update', 'state': pkg_state, 'requested_sha': target}
+    if pkg_state == 'held':
+        event['hold'] = active_hold(state_dir, now)
+    log(json.dumps(event), flush=True)
+    if pkg_state in ('scheduled', 'pending'):
+        return 'updating', None
+    if pkg_state == 'current':
+        return 'current', None
+    if pkg_state == 'held':
+        return 'refused', 'package_update_held'
+    if pkg_state == 'disk_low':
+        return 'refused', 'disk_low'
+    if pkg_state == 'served_unknown':
+        return 'failed', 'served_unknown'
+    return 'unsupported', 'package_release_missing'
 
 
 def maybe_update(clock=time.monotonic, _last=[None]):
