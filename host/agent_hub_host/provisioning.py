@@ -2181,16 +2181,30 @@ def note_epoch(epoch, tick_fn=None, clock=time.monotonic, spawn=True):
     return True
 
 
+class HostIdentityMissingError(RuntimeError):
+    """Host credential (host.json / HUB_CONFIG_FILE) is missing or has no base_url/access_token."""
+
+
 def host_request(method, path, payload=None):
     """Always the host identity, even when a human profile is also logged in."""
     from . import api, auth
     import urllib.request
     cfg = config.load_host_config()
-    base = cfg.get('base_url')
+    if config.is_human_config(cfg):
+        raise HostIdentityMissingError('Host identity missing: configured profile is human, not host')
+    base = cfg.get('base_url') if isinstance(cfg, dict) else None
+    if not isinstance(base, str) or not base.strip():
+        raise HostIdentityMissingError('Host identity missing: host.json has no base_url')
+    try:
+        token = auth.get_host_access_token()
+    except RuntimeError as exc:
+        if 'Not logged in' in str(exc):
+            raise HostIdentityMissingError('Host identity missing: host.json has no access_token') from None
+        raise
     api.check_url(base)
     req = urllib.request.Request(base.rstrip('/') + path, method=method,
         data=None if payload is None else json.dumps(payload).encode(),
-        headers={'Authorization': 'Bearer ' + auth.get_host_access_token(), 'Content-Type': 'application/json'})
+        headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
     return api.safe_http_json(req)
 
 
@@ -2741,6 +2755,13 @@ def admission():
 
     try:
         result = host_request('POST', '/api/engines/admission', {'label': label})
+    except HostIdentityMissingError:
+        result = {
+            'launch_allowed': False,
+            'profile_supported': False,
+            'account_label': label,
+            'reason': 'host_identity_missing',
+        }
     except Exception:
         result = {'launch_allowed': False, 'profile_supported': False, 'account_label': label, 'reason': 'hub_unreachable'}
 
@@ -2785,12 +2806,28 @@ def admission():
         if isinstance(selection, dict):
             sel_model = selection.get('model')
             sel_effort = selection.get('effort')
-            from .model_contract import configured_selection
+            effective_engine = payload.get('engine') or PACKAGES.get(bundle['provider'], (None, None, None))[2]
+            from .model_contract import configured_selection, policy_models
             try:
-                configured_selection(selection, payload.get('engine'), meta.get('launcher_provider'))
+                configured_selection(selection, effective_engine, meta.get('launcher_provider'))
                 supported = True
             except ValueError:
                 supported = False
+                if not selection.get('id') and sel_model:
+                    for candidate in policy_models():
+                        if candidate.get('model') == sel_model and ('effort' not in selection or candidate.get('effort') == sel_effort):
+                            try:
+                                configured_selection(
+                                    {'id': candidate.get('id'), 'model': sel_model, 'effort': candidate.get('effort')},
+                                    effective_engine,
+                                    meta.get('launcher_provider'),
+                                )
+                                if 'effort' not in selection:
+                                    sel_effort = candidate.get('effort')
+                                supported = True
+                                break
+                            except ValueError:
+                                continue
             if supported or (sel_model == meta.get('launcher_model') and sel_effort == meta.get('launcher_effort')):
                 result['model_supported'] = True
                 result['model'] = sel_model
@@ -2798,7 +2835,9 @@ def admission():
             else:
                 result['model_supported'] = False
                 result['launch_allowed'] = False
-                result['reason'] = 'model_mismatch'
+                # A missing host identity is the root cause; keep it dominant.
+                if result.get('reason') != 'host_identity_missing':
+                    result['reason'] = 'model_mismatch'
 
     # Quota and credential admission is Hub's (intake 5814e109 I4): the
     # result above already carries Hub's verdict; the host runs no probe.

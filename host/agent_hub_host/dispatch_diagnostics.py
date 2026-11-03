@@ -27,6 +27,7 @@ MESSAGES = {
     'claim_timeout': 'The launch claim timed out before a confirmed response; the launch is held for an idempotent same-host retry.',
     'model_unsupported': 'The selected model or effort is unsupported by this local route.',
     'admission_unconfigured': 'This local route has no maintained fresh admission adapter.',
+    'host_identity_missing': 'The host credential (~/.config/agent-hub/host.json) is missing or not logged in; managed admission cannot authenticate to Hub.',
     'admission_refused': 'Fresh admission refused this account or could not verify its timestamp and model.',
     'admission_quota_unverified': 'The maintained launcher could not read a trusted quota observation for this managed account (probe unavailable or rate-limited).',
     'engine_auth_expired': 'The engine authentication is unavailable or expired.',
@@ -112,7 +113,7 @@ def classify(exc, *, workspace_available=True):
             else:
                 reason = 'codex_quota_gate_quota_unavailable'
         else:
-            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
+            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'admission_quota_unverified', 'host_identity_missing', 'engine_auth_expired', 'not_logged_in', 'repo_clone_auth_failed', 'repo_not_found', 'repo_clone_failed', 'host_overload', 'host_load_high', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'} else EXACT.get(value, reason)
             if reason == 'dispatch_internal_error':
                 reason = next((slug for head, slug in PREFIXES if value.startswith(head)), reason)
             if reason == 'dispatch_internal_error':

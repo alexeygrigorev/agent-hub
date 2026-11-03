@@ -187,6 +187,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "dispatch_claim_refused": "The Hub refused the dispatch claim before native start.",
   "model_unsupported": "The selected model or effort is unsupported by this local route.",
   "admission_unconfigured": "This local route has no maintained fresh admission adapter.",
+  "host_identity_missing": "The host credential (~/.config/agent-hub/host.json) is missing or not logged in; managed admission cannot authenticate to Hub.",
   "admission_refused": "Fresh admission refused this account or could not verify its timestamp and model.",
   "admission_quota_unverified": "The maintained launcher could not read a trusted quota observation for this managed account (probe unavailable or rate-limited).",
   "engine_auth_expired": "The engine authentication is unavailable or expired.",
